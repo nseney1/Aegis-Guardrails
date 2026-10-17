@@ -113,7 +113,12 @@ Generate ONLY the complete markdown rule file content. Start with --- for the YA
 _VIEW_PROPERTY = {
     "type": "string",
     "enum": ["full", "summary", "ids"],
-    "description": "Optional response projection: full (default), summary or ids.",
+    "description": (
+        "Optional response projection: 'full' (default, complete payload), 'summary' "
+        "(retains identity/type/status/fitness fields, caps lists at 10 items, and adds "
+        "<list>_count), or 'ids' (projects each list to rule ID strings). Error responses "
+        "are never projected."
+    ),
 }
 _RULE_TYPE_PROPERTY = {"type": "string", "enum": list(CANONICAL_RULE_TYPES)}
 
@@ -142,7 +147,10 @@ TOOL_DEFINITIONS = [
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Workspace-relative files you are about to edit. Defaults to the git diff.",
+                    "description": (
+                        "Workspace-relative file paths you are about to edit. When omitted or "
+                        "empty, defaults to modified files in the current git working tree and index."
+                    ),
                 },
                 "view": _VIEW_PROPERTY,
             },
@@ -168,27 +176,64 @@ TOOL_DEFINITIONS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "outcome": {"type": "string", "enum": list(_VALID_OUTCOMES), "description": "Verification outcome."},
+                "outcome": {
+                    "type": "string",
+                    "enum": list(_VALID_OUTCOMES),
+                    "description": (
+                        "Verification result for the rules in this change: 'success'/'tp'/'pass' "
+                        "record a true positive ('tp'), 'failure'/'fp'/'fail' record a false "
+                        "positive ('fp'), and 'partial' records a neutral trigger ('trigger')."
+                    ),
+                },
                 "idempotency_key": {
                     "type": "string",
                     "maxLength": 256,
-                    "description": "Unique key for this report. Retrying with the same key never records twice.",
+                    "description": (
+                        "Caller-supplied unique key (1-256 chars, scoped per host and session). "
+                        "Retrying with the same key and outcome is a no-op; reusing a key with a "
+                        "different outcome fails with status 'FAIL'."
+                    ),
                 },
                 "rules_used": {
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
-                    "description": "Names of the rules this outcome is about, as aegis_scan returned them.",
+                    "description": (
+                        "Non-empty list of existing rule IDs from aegis_scan. Validated against "
+                        "the workspace rule inventory; actual fitness credit is computed "
+                        "server-side from session scan exposure and git diff paths."
+                    ),
                 },
-                "tests_passed": {"type": "boolean"},
-                "rework_count": {"type": "integer", "default": 0},
-                "notes": {"type": "string", "maxLength": 4096},
+                "tests_passed": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional boolean recording whether the project's test suite passed "
+                        "during verification."
+                    ),
+                },
+                "rework_count": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": (
+                        "Optional non-negative integer count of edit-and-retest cycles before "
+                        "verification succeeded (default: 0)."
+                    ),
+                },
+                "notes": {
+                    "type": "string",
+                    "maxLength": 4096,
+                    "description": (
+                        "Optional free-text context describing how the rules helped or failed "
+                        "(max 4096 chars)."
+                    ),
+                },
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Optional: the files this change edited (workspace-relative). They measure "
-                        "scan-before-edit compliance (aegis status --compliance); they credit no rule."
+                        "Optional workspace-relative file paths edited in this change. Records "
+                        "one 'edit' activity event per idempotency_key for scan-before-edit "
+                        "compliance (aegis status --compliance); does not affect rule credit."
                     ),
                 },
                 "view": _VIEW_PROPERTY,
@@ -213,9 +258,28 @@ TOOL_DEFINITIONS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "description": {"type": "string", "description": "The concern, in natural language."},
-                "rule_type": dict(_RULE_TYPE_PROPERTY, description="Optional rule type hint."),
-                "domain": {"type": "string", "description": "Optional domain hint."},
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "Non-empty natural-language description of the engineering defect, "
+                        "anti-pattern, or invariant to codify into a rule."
+                    ),
+                },
+                "rule_type": dict(
+                    _RULE_TYPE_PROPERTY,
+                    description=(
+                        "Optional target rule category ('invariant' or 'gate' for blocking "
+                        "checks; 'trap', 'boundary', 'persona', or 'contract' for advisory "
+                        "guidance). Determines the target subdirectory under .aegis/rules/."
+                    ),
+                ),
+                "domain": {
+                    "type": "string",
+                    "description": (
+                        "Optional domain hint injected into the drafting prompt (e.g., "
+                        "'security', 'correctness', 'efficiency', 'style', 'governance')."
+                    ),
+                },
             },
             "required": ["description"],
             "additionalProperties": False,
@@ -239,7 +303,14 @@ TOOL_DEFINITIONS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "rule_type": dict(_RULE_TYPE_PROPERTY, description="Optional rule type filter."),
+                "rule_type": dict(
+                    _RULE_TYPE_PROPERTY,
+                    description=(
+                        "Optional filter restricting both 'rules' and 'stale_rules' to a single "
+                        "rule category ('invariant', 'trap', 'gate', 'boundary', 'persona', or "
+                        "'contract'). Omit to list all categories."
+                    ),
+                ),
                 "view": _VIEW_PROPERTY,
             },
             "additionalProperties": False,
@@ -266,12 +337,20 @@ TOOL_DEFINITIONS = [
                 "quote": {
                     "type": "string",
                     "maxLength": 1024,
-                    "description": "Quote of the user's correction (redacted and capped at 300 chars).",
+                    "description": (
+                        "Non-empty verbatim quote of the user's correction or preference "
+                        "(1-1024 chars; secrets are automatically redacted and stored text is "
+                        "capped at 300 chars)."
+                    ),
                 },
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional workspace-relative file paths this correction applies to.",
+                    "description": (
+                        "Optional workspace-relative file paths this correction applies to "
+                        "(sets psrc='explicit'). When omitted or empty, defaults to currently "
+                        "modified git worktree paths (psrc='dirty')."
+                    ),
                 },
             },
             "required": ["quote"],

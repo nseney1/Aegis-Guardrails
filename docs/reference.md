@@ -565,8 +565,8 @@ Call before editing files: returns the governance rules that apply to them, rank
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `files` | array of string | no | Workspace-relative files you are about to edit. Defaults to the git diff. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: full (default), summary or ids. |
+| `files` | array of string | no | Workspace-relative file paths you are about to edit. When omitted or empty, defaults to modified files in the current git working tree and index. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
 
 Input schema:
 
@@ -579,7 +579,7 @@ Input schema:
       "items": {
         "type": "string"
       },
-      "description": "Workspace-relative files you are about to edit. Defaults to the git diff."
+      "description": "Workspace-relative file paths you are about to edit. When omitted or empty, defaults to modified files in the current git working tree and index."
     },
     "view": {
       "type": "string",
@@ -588,7 +588,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "Optional response projection: full (default), summary or ids."
+      "description": "Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected."
     }
   },
   "additionalProperties": false
@@ -603,14 +603,14 @@ Report whether the rules you were shown helped. The server ties the report to th
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | Verification outcome. |
-| `idempotency_key` | string | yes | Unique key for this report. Retrying with the same key never records twice. |
-| `rules_used` | array of string | yes | Names of the rules this outcome is about, as aegis_scan returned them. |
-| `tests_passed` | boolean | no |  |
-| `rework_count` | integer | no |  |
-| `notes` | string | no |  |
-| `files` | array of string | no | Optional: the files this change edited (workspace-relative). They measure scan-before-edit compliance (aegis status --compliance); they credit no rule. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: full (default), summary or ids. |
+| `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | Verification result for the rules in this change: 'success'/'tp'/'pass' record a true positive ('tp'), 'failure'/'fp'/'fail' record a false positive ('fp'), and 'partial' records a neutral trigger ('trigger'). |
+| `idempotency_key` | string | yes | Caller-supplied unique key (1-256 chars, scoped per host and session). Retrying with the same key and outcome is a no-op; reusing a key with a different outcome fails with status 'FAIL'. |
+| `rules_used` | array of string | yes | Non-empty list of existing rule IDs from aegis_scan. Validated against the workspace rule inventory; actual fitness credit is computed server-side from session scan exposure and git diff paths. |
+| `tests_passed` | boolean | no | Optional boolean recording whether the project's test suite passed during verification. |
+| `rework_count` | integer | no | Optional non-negative integer count of edit-and-retest cycles before verification succeeded (default: 0). |
+| `notes` | string | no | Optional free-text context describing how the rules helped or failed (max 4096 chars). |
+| `files` | array of string | no | Optional workspace-relative file paths edited in this change. Records one 'edit' activity event per idempotency_key for scan-before-edit compliance (aegis status --compliance); does not affect rule credit. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
 
 Input schema:
 
@@ -629,12 +629,12 @@ Input schema:
         "pass",
         "fail"
       ],
-      "description": "Verification outcome."
+      "description": "Verification result for the rules in this change: 'success'/'tp'/'pass' record a true positive ('tp'), 'failure'/'fp'/'fail' record a false positive ('fp'), and 'partial' records a neutral trigger ('trigger')."
     },
     "idempotency_key": {
       "type": "string",
       "maxLength": 256,
-      "description": "Unique key for this report. Retrying with the same key never records twice."
+      "description": "Caller-supplied unique key (1-256 chars, scoped per host and session). Retrying with the same key and outcome is a no-op; reusing a key with a different outcome fails with status 'FAIL'."
     },
     "rules_used": {
       "type": "array",
@@ -642,25 +642,28 @@ Input schema:
         "type": "string"
       },
       "minItems": 1,
-      "description": "Names of the rules this outcome is about, as aegis_scan returned them."
+      "description": "Non-empty list of existing rule IDs from aegis_scan. Validated against the workspace rule inventory; actual fitness credit is computed server-side from session scan exposure and git diff paths."
     },
     "tests_passed": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "Optional boolean recording whether the project's test suite passed during verification."
     },
     "rework_count": {
       "type": "integer",
-      "default": 0
+      "default": 0,
+      "description": "Optional non-negative integer count of edit-and-retest cycles before verification succeeded (default: 0)."
     },
     "notes": {
       "type": "string",
-      "maxLength": 4096
+      "maxLength": 4096,
+      "description": "Optional free-text context describing how the rules helped or failed (max 4096 chars)."
     },
     "files": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Optional: the files this change edited (workspace-relative). They measure scan-before-edit compliance (aegis status --compliance); they credit no rule."
+      "description": "Optional workspace-relative file paths edited in this change. Records one 'edit' activity event per idempotency_key for scan-before-edit compliance (aegis status --compliance); does not affect rule credit."
     },
     "view": {
       "type": "string",
@@ -669,7 +672,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "Optional response projection: full (default), summary or ids."
+      "description": "Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected."
     }
   },
   "required": [
@@ -689,9 +692,9 @@ Turn a natural language concern into a prompt that drafts a governance rule. It 
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `description` | string | yes | The concern, in natural language. |
-| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional rule type hint. |
-| `domain` | string | no | Optional domain hint. |
+| `description` | string | yes | Non-empty natural-language description of the engineering defect, anti-pattern, or invariant to codify into a rule. |
+| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional target rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance). Determines the target subdirectory under .aegis/rules/. |
+| `domain` | string | no | Optional domain hint injected into the drafting prompt (e.g., 'security', 'correctness', 'efficiency', 'style', 'governance'). |
 
 Input schema:
 
@@ -701,7 +704,7 @@ Input schema:
   "properties": {
     "description": {
       "type": "string",
-      "description": "The concern, in natural language."
+      "description": "Non-empty natural-language description of the engineering defect, anti-pattern, or invariant to codify into a rule."
     },
     "rule_type": {
       "type": "string",
@@ -713,11 +716,11 @@ Input schema:
         "persona",
         "contract"
       ],
-      "description": "Optional rule type hint."
+      "description": "Optional target rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance). Determines the target subdirectory under .aegis/rules/."
     },
     "domain": {
       "type": "string",
-      "description": "Optional domain hint."
+      "description": "Optional domain hint injected into the drafting prompt (e.g., 'security', 'correctness', 'efficiency', 'style', 'governance')."
     }
   },
   "required": [
@@ -735,8 +738,8 @@ List the governance rules as {rules, stale_rules, ignored}: every rule with its 
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional rule type filter. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: full (default), summary or ids. |
+| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional filter restricting both 'rules' and 'stale_rules' to a single rule category ('invariant', 'trap', 'gate', 'boundary', 'persona', or 'contract'). Omit to list all categories. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
 
 Input schema:
 
@@ -754,7 +757,7 @@ Input schema:
         "persona",
         "contract"
       ],
-      "description": "Optional rule type filter."
+      "description": "Optional filter restricting both 'rules' and 'stale_rules' to a single rule category ('invariant', 'trap', 'gate', 'boundary', 'persona', or 'contract'). Omit to list all categories."
     },
     "view": {
       "type": "string",
@@ -763,7 +766,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "Optional response projection: full (default), summary or ids."
+      "description": "Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected."
     }
   },
   "additionalProperties": false
@@ -778,8 +781,8 @@ Record a user correction as an unconfirmed suggestion in user scope. Agent sugge
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `quote` | string | yes | Quote of the user's correction (redacted and capped at 300 chars). |
-| `paths` | array of string | no | Optional workspace-relative file paths this correction applies to. |
+| `quote` | string | yes | Non-empty verbatim quote of the user's correction or preference (1-1024 chars; secrets are automatically redacted and stored text is capped at 300 chars). |
+| `paths` | array of string | no | Optional workspace-relative file paths this correction applies to (sets psrc='explicit'). When omitted or empty, defaults to currently modified git worktree paths (psrc='dirty'). |
 
 Input schema:
 
@@ -790,14 +793,14 @@ Input schema:
     "quote": {
       "type": "string",
       "maxLength": 1024,
-      "description": "Quote of the user's correction (redacted and capped at 300 chars)."
+      "description": "Non-empty verbatim quote of the user's correction or preference (1-1024 chars; secrets are automatically redacted and stored text is capped at 300 chars)."
     },
     "paths": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Optional workspace-relative file paths this correction applies to."
+      "description": "Optional workspace-relative file paths this correction applies to (sets psrc='explicit'). When omitted or empty, defaults to currently modified git worktree paths (psrc='dirty')."
     }
   },
   "required": [

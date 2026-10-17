@@ -58,3 +58,16 @@ def test_write_tools_declare_exact_handler_behavior_hints(tools):
         "openWorldHint": False,
         "title": "Capture Insight",
     }
+
+
+def test_every_input_schema_property_has_a_meaningful_description(tools):
+    for name, tool in tools.items():
+        schema = tool.get("inputSchema", {})
+        props = schema.get("properties", {})
+        assert props, f"{name}: empty inputSchema properties"
+        for prop_name, prop_schema in props.items():
+            desc = prop_schema.get("description")
+            assert isinstance(desc, str) and len(desc.strip()) >= 40, (
+                f"{name}.inputSchema.properties.{prop_name} missing or stub description: {desc!r}"
+            )
+
