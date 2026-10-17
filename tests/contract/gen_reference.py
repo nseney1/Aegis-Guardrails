@@ -157,6 +157,15 @@ def _tool(tool: Dict[str, Any]) -> List[str]:
     else:
         lines += ["It takes no parameters.", ""]
     lines += ["Input schema:", "", "```json", json.dumps(schema, indent=2, ensure_ascii=False), "```", ""]
+    if "outputSchema" in tool:
+        lines += [
+            "Output schema:",
+            "",
+            "```json",
+            json.dumps(tool["outputSchema"], indent=2, ensure_ascii=False),
+            "```",
+            "",
+        ]
     return lines
 
 
