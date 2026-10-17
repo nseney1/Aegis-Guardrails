@@ -156,6 +156,159 @@ TOOL_DEFINITIONS = [
             },
             "additionalProperties": False,
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "relevant_rules": {
+                    "type": "array",
+                    "description": (
+                        "Active rules matching the target files, ranked by fitness within the "
+                        "JIT token budget (rule objects in 'full'/'summary' view, or rule ID "
+                        "strings in 'ids' view)."
+                    ),
+                },
+                "relevant_rules_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of relevant_rules before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "guidance": {
+                    "type": "string",
+                    "description": (
+                        "Rendered markdown guidance block ready for prompt injection "
+                        "(omitted when view='summary' or 'ids')."
+                    ),
+                },
+                "invariant_warnings": {
+                    "type": "array",
+                    "description": "Mandatory gate and invariant rules triggered by the target files.",
+                },
+                "invariant_warnings_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of invariant_warnings before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "rules_staged": {
+                    "type": ["integer", "array"],
+                    "description": (
+                        "Count of rules staged in relevant_rules after budget clamping "
+                        "(omitted when view='ids')."
+                    ),
+                },
+                "rules_staged_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of rules_staged before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "omitted_mandatory": {
+                    "type": "array",
+                    "description": (
+                        "Mandatory gate or invariant rules that matched but exceeded the "
+                        "two-slot mandatory cap."
+                    ),
+                },
+                "omitted_mandatory_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of omitted_mandatory before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "stale_rules": {
+                    "type": "array",
+                    "description": "Rules edited on disk since the last 'aegis sync' derived-file regeneration.",
+                },
+                "stale_rules_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of stale_rules before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "unreviewed_rules": {
+                    "type": "array",
+                    "description": (
+                        "Gate or invariant rules added or modified since rules_base whose "
+                        "local changes do not bind."
+                    ),
+                },
+                "unreviewed_rules_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of unreviewed_rules before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "unreviewed_total": {
+                    "type": "integer",
+                    "description": "Total count of unreviewed gate or invariant rules across the workspace.",
+                },
+                "rules_base": {
+                    "type": ["object", "string", "null"],
+                    "description": (
+                        "Reviewed git base anchor from which binding gate and invariant "
+                        "rules were loaded."
+                    ),
+                },
+                "stats": {
+                    "type": "object",
+                    "description": (
+                        "Scan telemetry summary including matched counts and token budget "
+                        "usage (omitted in 'summary'/'ids' views)."
+                    ),
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional non-fatal scan warning messages.",
+                },
+                "warnings_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of warnings before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "user_layer": {
+                    "type": "object",
+                    "description": (
+                        "Read-only user-layer metadata ({path, rules}) when scanning "
+                        "outside a governed Aegis workspace."
+                    ),
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "Optional status indicator ('not_governed' when scanning the user "
+                        "layer outside an Aegis workspace, or 'FAIL' on error)."
+                    ),
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Informational message when status='not_governed'.",
+                },
+                "reason": {
+                    "type": ["string", "null"],
+                    "description": "Unbound workspace reason code when status='not_governed'.",
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Error detail when status='FAIL'.",
+                },
+                "rule_errors": {
+                    "type": "array",
+                    "description": "Rule files that failed to parse when status='FAIL'.",
+                },
+            },
+            "required": ["relevant_rules"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "aegis_report_outcome",
@@ -241,6 +394,84 @@ TOOL_DEFINITIONS = [
             "required": ["outcome", "rules_used", "idempotency_key"],
             "additionalProperties": False,
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["recorded", "claimed", "rate_limited", "FAIL"],
+                    "description": (
+                        "Report disposition: 'recorded' (witnessed by a matching check record), "
+                        "'claimed' (unwitnessed self-report), 'rate_limited' (session cap "
+                        "reached), or 'FAIL'."
+                    ),
+                },
+                "witness": {
+                    "type": "string",
+                    "enum": ["aegis", "self"],
+                    "description": (
+                        "Attestation tier: 'aegis' when backed by an 'aegis check --record' "
+                        "run for the current tree, or 'self' for unwitnessed claims."
+                    ),
+                },
+                "credited": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Rule IDs credited in the outcome ledger (empty for unwitnessed "
+                        "'claimed' or 'rate_limited' reports)."
+                    ),
+                },
+                "credited_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of credited rules before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "check": {
+                    "type": "string",
+                    "description": "Check record ID that witnessed the report (present when status='recorded').",
+                },
+                "tree": {
+                    "type": ["string", "null"],
+                    "description": "Git tree hash computed for the workspace at report time.",
+                },
+                "recorded": {
+                    "type": "boolean",
+                    "description": (
+                        "False when status='rate_limited' or when an unwitnessed claim for "
+                        "the same session and tree was already recorded."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Per-session report cap (200) returned when status='rate_limited'.",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Command or tool name that produced the response ('aegis_report_outcome').",
+                },
+                "aegis_version": {
+                    "type": "string",
+                    "description": "Running Aegis package version string.",
+                },
+                "checked_at": {
+                    "type": "string",
+                    "description": "UTC ISO-8601 timestamp when the report was processed.",
+                },
+                "scope": {
+                    "type": "object",
+                    "description": "Workspace scope metadata envelope ({tree}).",
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Error message when status='FAIL'.",
+                },
+            },
+            "required": ["credited"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "aegis_create_rule",
@@ -284,6 +515,35 @@ TOOL_DEFINITIONS = [
             "required": ["description"],
             "additionalProperties": False,
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Structured rule-generation prompt containing schema requirements and "
+                        "up to three workspace rule examples."
+                    ),
+                },
+                "instruction": {
+                    "type": "string",
+                    "description": (
+                        "Step-by-step instruction telling the caller where under "
+                        ".aegis/rules/<type_dir>/<id>.md to save the drafted markdown."
+                    ),
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Present with value 'FAIL' only when input validation fails.",
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Error message when status='FAIL'.",
+                },
+            },
+            "required": ["prompt", "instruction"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "aegis_list_rules",
@@ -313,6 +573,60 @@ TOOL_DEFINITIONS = [
                 ),
                 "view": _VIEW_PROPERTY,
             },
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "rules": {
+                    "type": "array",
+                    "description": (
+                        "Workspace rule records with metadata and ledger fitness "
+                        "(or rule ID strings when view='ids')."
+                    ),
+                },
+                "rules_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of rules before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "stale_rules": {
+                    "type": "array",
+                    "description": "Rules edited since the last 'aegis sync' derived-file regeneration.",
+                },
+                "stale_rules_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of stale_rules before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "ignored": {
+                    "type": "array",
+                    "description": "Non-rule markdown files under .aegis/rules/ with path and reason.",
+                },
+                "ignored_count": {
+                    "type": "integer",
+                    "description": (
+                        "Total count of ignored files before 'summary' view truncation "
+                        "(present when view='summary')."
+                    ),
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "Present with value 'FAIL' only when the rules directory cannot "
+                        "be safely loaded."
+                    ),
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Error message when status='FAIL'.",
+                },
+            },
+            "required": ["rules", "stale_rules", "ignored"],
             "additionalProperties": False,
         },
     },
@@ -354,6 +668,54 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["quote"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["OK", "FAIL"],
+                    "description": "'OK' when the insight row was appended, or 'FAIL' on validation/storage error.",
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Content-addressed insight identifier ('ins-<12-hex>').",
+                },
+                "level": {
+                    "type": "string",
+                    "enum": ["suggestion", "W2"],
+                    "description": (
+                        "Corroboration tier: 'suggestion' initially, or 'W2' when matched "
+                        "to a hook-captured user prompt in the same session."
+                    ),
+                },
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "Secret-redacted and length-capped (max 300 chars) correction quote "
+                        "stored in the ledger."
+                    ),
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace-relative file paths associated with this insight.",
+                },
+                "psrc": {
+                    "type": "string",
+                    "enum": ["explicit", "dirty"],
+                    "description": (
+                        "Path provenance: 'explicit' when caller supplied paths, or 'dirty' "
+                        "when inferred from git status."
+                    ),
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Error message when status='FAIL'.",
+                },
+            },
+            "required": ["status", "id", "level", "text", "paths", "psrc"],
             "additionalProperties": False,
         },
     },

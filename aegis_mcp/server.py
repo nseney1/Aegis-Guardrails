@@ -282,11 +282,19 @@ def _unbound_result(binding: WorkspaceBinding) -> Dict[str, Any]:
     return {"status": "not_governed", "error": NOT_GOVERNED_MESSAGE, "binding": binding.as_dict()}
 
 
-def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
+def _tool_result(
+    req_id: Any,
+    text: str,
+    is_error: bool,
+    structured: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": is_error}
+    if not is_error and isinstance(structured, dict):
+        payload["structuredContent"] = structured
     return {
         "jsonrpc": "2.0",
         "id": req_id,
-        "result": {"content": [{"type": "text", "text": text}], "isError": is_error},
+        "result": payload,
     }
 
 
@@ -380,7 +388,12 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         return _tool_result(req_id, f"Tool execution failed: {exc}", True)
-    return _tool_result(req_id, json.dumps(result), is_error_result(result))
+    return _tool_result(
+        req_id,
+        json.dumps(result),
+        is_error_result(result),
+        structured=result if isinstance(result, dict) else None,
+    )
 
 
 def _start(environ: Optional[Dict[str, str]] = None) -> None:
