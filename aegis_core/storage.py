@@ -50,7 +50,7 @@ import secrets
 import stat
 import threading
 import time
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Union
 
 from aegis_core import gitsafe
 from aegis_core.errors import AegisError, LockTimeoutError, PathTraversalError
@@ -82,11 +82,14 @@ __all__ = [
     "atomic_write_and_unlink",
     "atomic_write_bytes",
     "atomic_write_text",
+    "file_lock",
     "fsync_dir",
     "ledger_locked",
     "ledger_site",
     "locked",
+    "read_json_dict",
     "read_jsonl",
+    "read_tail_bytes",
     "StateModes",
     "shared_locked",
     "shared_state_dir",
@@ -711,6 +714,49 @@ def locked(workspace: Any, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[Pa
         yield path
 
 
+@contextmanager
+def file_lock(lock_path: Path, timeout: float = 5.0) -> Iterator[None]:
+    """Hold an arbitrary lock file ``lock_path`` (e.g. a user-scope ``.lock`` file).
+
+    Re-entrant per thread, bounded by ``timeout`` seconds, using the same thread lock
+    and OS lock primitives as ``locked`` without participating in workspace/shared lock
+    ordering.
+    """
+    target = Path(os.fspath(lock_path))
+    if target.parent.is_symlink():
+        raise _link_error(target.parent)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    key = f"file:{_real(target)}"
+    held = _held()
+    if key in held:
+        yield
+        return
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    thread_lock = _thread_lock(key)
+    if not thread_lock.acquire(timeout=max(0.0, timeout)):
+        raise _timeout_error(target, timeout, "file")
+    fd = None
+    try:
+        fd = _open_regular(target, os.O_RDWR | os.O_CREAT, mode=_PRIVATE_FILE_MODE)
+        interval = LOCK_RETRY_INTERVAL_SECONDS
+        while not _try_os_lock(fd):
+            if time.monotonic() >= deadline:
+                raise _timeout_error(target, timeout, "file")
+            time.sleep(interval)
+            interval = min(interval * 1.5, LOCK_MAX_BACKOFF_SECONDS)
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.discard(key)
+            _os_unlock(fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        thread_lock.release()
+
+
 # ── Atomic writes ─────────────────────────────────────────────────────────────
 
 def fsync_dir(directory: Path | str) -> None:
@@ -908,7 +954,87 @@ def _parse_line(raw: bytes, errors: str) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
-def read_jsonl(path: Path | str, errors: str = "strict") -> JsonlRead:
+def _read_tail_from_fd(fd: int, limit: int) -> bytes:
+    if limit <= 0:
+        return b""
+    found = os.fstat(fd)
+    if not stat.S_ISREG(found.st_mode):
+        return b""
+    size = found.st_size
+    start = max(0, size - limit)
+    os.lseek(fd, start, os.SEEK_SET)
+    chunks: List[bytes] = []
+    remaining = size - start
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    return data[data.find(b"\n") + 1:] if start else data
+
+
+def read_tail_bytes(path: Union[str, os.PathLike[str]], limit: int) -> bytes:
+    """The whole lines in the last ``limit`` bytes of ``path`` (a partial first line
+    dropped); b"" when it is missing, unreadable, a symlink or not a regular file."""
+    if limit <= 0:
+        return b""
+    try:
+        fd = _open_regular(Path(path), os.O_RDONLY | _O_NONBLOCK)
+    except (OSError, PathTraversalError):
+        return b""
+    try:
+        return _read_tail_from_fd(fd, limit)
+    except OSError:
+        return b""
+    finally:
+        os.close(fd)
+
+
+def read_json_dict(
+    path: Union[str, os.PathLike[str]],
+    *,
+    max_bytes: int = 1024 * 1024,
+) -> Optional[Dict[str, Any]]:
+    """Safely read a regular non-symlink JSON file and return its dict, or None."""
+    if max_bytes <= 0:
+        return None
+    try:
+        fd = _open_regular(Path(path), os.O_RDONLY | _O_NONBLOCK)
+    except (OSError, PathTraversalError):
+        return None
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_size > max_bytes:
+            return None
+        chunks: List[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if total > max_bytes:
+        return None
+    try:
+        parsed = json.loads(b"".join(chunks).decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def read_jsonl(
+    path: Path | str,
+    errors: str = "strict",
+    *,
+    tail_bytes: Optional[int] = None,
+) -> JsonlRead:
     """Read a JSONL file; never raises for its content. A missing file reads as empty.
 
     ``errors`` is the UTF-8 error handler: ``"surrogatepass"`` reads what v3 wrote with
@@ -924,11 +1050,19 @@ def read_jsonl(path: Path | str, errors: str = "strict") -> JsonlRead:
         return JsonlRead([], [], [], error=f"cannot read {path}: {exc}")
     except OSError as exc:
         return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            data = fh.read()
-    except OSError as exc:
-        return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
+    if tail_bytes is not None:
+        try:
+            data = _read_tail_from_fd(fd, tail_bytes)
+        except OSError as exc:
+            return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
+        finally:
+            os.close(fd)
+    else:
+        try:
+            with os.fdopen(fd, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 
     rows: List[Dict[str, Any]] = []
     numbers: List[int] = []

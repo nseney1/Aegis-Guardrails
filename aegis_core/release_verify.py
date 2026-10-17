@@ -25,13 +25,12 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-import re
-import subprocess
-import tempfile
 from pathlib import Path
+import re
+import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe, pathlookup
+from aegis_core import gitsafe, human_gate
 from aegis_core._version import __version__
 
 __all__ = [
@@ -43,6 +42,7 @@ __all__ = [
     "SUBJECT_DOMAIN",
     "UNVERIFIED_GH",
     "WORKFLOW",
+    "default_gh",
     "subject_bytes",
     "verify_release",
 ]
@@ -61,7 +61,8 @@ _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 _RUN_ID_ATTEMPT = re.compile(r"\A\d+/\d+\Z")
 _VERSION = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")
 _REMOTE = re.compile(
-    r"(?:https?://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?\Z")
+    r"(?:https?://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?\Z"
+)
 
 #: ``runner(argv, timeout)``: run ``gh <argv>`` and return (returncode, stdout, stderr), or None
 #: when gh is not installed. Injectable so a test never reaches a real gh.
@@ -108,8 +109,10 @@ class ReleaseReport:
         if self.unverified_gh:
             lines = [UNVERIFIED_GH, f"  {self.message}"]
         elif self.verified:
-            lines = [f"VERIFIED: the CI verdict for {self.sha} is attested by {self.repository}'s {WORKFLOW}",
-                     f"  {self.message}"]
+            lines = [
+                f"VERIFIED: the CI verdict for {self.sha} is attested by {self.repository}'s {WORKFLOW}",
+                f"  {self.message}",
+            ]
         elif self.code == "agent_editable":
             lines = [f"NOT VERIFIED: {TIER_C_CAVEAT}", f"  {self.message}"]
         else:
@@ -121,31 +124,51 @@ class ReleaseReport:
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA, "source": SOURCE, "aegis_version": __version__, "checked_at": _utc_now(),
-            "scope": {"machine": "local", "workspace": None if workspace is None else str(workspace),
-                      "mode": "release", "commit": self.sha, "repository": self.repository},
-            "status": self.status, "verified": self.verified, "attested": self.attested,
-            "code": self.code, "message": self.message,
-            "gh_version": self.gh_version, "tier": self.tier, "caveats": list(self.caveats),
+            "schema": SCHEMA,
+            "source": SOURCE,
+            "aegis_version": __version__,
+            "checked_at": _utc_now(),
+            "scope": {
+                "machine": "local",
+                "workspace": None if workspace is None else str(workspace),
+                "mode": "release",
+                "commit": self.sha,
+                "repository": self.repository,
+            },
+            "status": self.status,
+            "verified": self.verified,
+            "attested": self.attested,
+            "code": self.code,
+            "message": self.message,
+            "gh_version": self.gh_version,
+            "tier": self.tier,
+            "caveats": list(self.caveats),
             "details": dict(self.details),
         }
 
 
-def default_gh(root: Any) -> GhRun:
-    def run(argv: Sequence[str], timeout: float) -> Optional[Tuple[int, str, str]]:
-        exe = pathlookup.which("gh", outside=root)  # an absolute PATH entry outside the repository
-        if exe is None:
-            return None
-        env = dict(os.environ)
-        env.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"})
-        try:
-            proc = subprocess.run([exe, *argv], capture_output=True, env=env, timeout=timeout, check=False,
-                                  stdin=subprocess.DEVNULL, cwd=str(root))
-        except subprocess.TimeoutExpired:
-            return 124, "", f"gh timed out after {timeout:g}s"
-        except OSError as exc:
-            return 126, "", f"cannot run gh: {exc}"
-        return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+def _invoke_gh(
+    argv: Sequence[str],
+    *,
+    cwd: Any = None,
+    timeout: float = GH_TIMEOUT_SECONDS,
+) -> Optional[Tuple[int, str, str]]:
+    try:
+        res = human_gate.default_gh_runner(argv, cwd=cwd, timeout=timeout)
+    except TypeError:
+        res = human_gate._real_default_gh_runner(argv, cwd=cwd, timeout=timeout)
+    if res is None:
+        return None
+    return res.returncode, res.stdout, res.stderr
+
+
+def default_gh(root: Any, timeout: Optional[float] = None) -> Any:
+    if isinstance(root, (list, tuple)):
+        eff_timeout = GH_TIMEOUT_SECONDS if timeout is None else timeout
+        return _invoke_gh(root, timeout=eff_timeout)
+
+    def run(argv: Sequence[str], call_timeout: float = GH_TIMEOUT_SECONDS) -> Optional[Tuple[int, str, str]]:
+        return _invoke_gh(argv, cwd=root, timeout=call_timeout)
 
     return run
 

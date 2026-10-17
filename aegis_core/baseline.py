@@ -537,31 +537,38 @@ class Sources:
 
     def sites(self, path: str, kind: str, pattern: str) -> List[int]:
         """The lines of ``path`` where a ``forbid_ast`` pattern (``call`` or ``import``) is
-        violated. Each call target and each import is judged alone by evaluate_forbid_ast
-        against the file's own imports, so aliases resolve exactly as in the gate. A
-        decorator has no line: the answer is empty."""
+        violated. Matched lines are extracted in a single pass against the file's own
+        imports so aliases resolve exactly as in the gate. A decorator has no line: the
+        answer is empty."""
         key = (path, kind, pattern)
         if key in self._sites:
             return self._sites[key]
-        from aegis_core.ast.policy import evaluate_forbid_ast
-        from aegis_core.ast.schema import CallSiteNode, NormalizedAST
+        from aegis_core.ast.policy import (
+            _match_ImportNode_against_pattern,
+            evaluate_forbid_ast_structured,
+        )
+        from aegis_core.ast.schema import NormalizedAST
 
-        found: set = set()
+        found: set[int] = set()
         tree = self._ast(path)
         try:
             if tree is not None and kind == "call":
-                by_target: Dict[str, List[int]] = {}
-                for site in tree.call_sites:
-                    by_target.setdefault(site.target, []).append(site.line)
-                for target, where in by_target.items():
-                    probe = NormalizedAST(file_path=tree.file_path, language=tree.language, imports=tree.imports,
-                                          call_sites=[CallSiteNode(target=target, line=where[0])])
-                    if evaluate_forbid_ast(probe, {"calls": [pattern]}):
-                        found.update(where)
+                probe = NormalizedAST(
+                    file_path=tree.file_path,
+                    language=tree.language,
+                    imports=tree.imports,
+                    call_sites=tree.call_sites,
+                )
+                confirmed, _ = evaluate_forbid_ast_structured(
+                    probe, {"calls": [pattern]}, source=""
+                )
+                for hit in confirmed:
+                    ln = hit.get("line", 0)
+                    if isinstance(ln, int) and ln > 0:
+                        found.add(ln)
             elif tree is not None and kind == "import":
                 for imp in tree.imports:
-                    probe = NormalizedAST(file_path=tree.file_path, language=tree.language, imports=[imp])
-                    if evaluate_forbid_ast(probe, {"imports": [pattern]}):
+                    if _match_ImportNode_against_pattern(imp, pattern):
                         found.add(imp.line)
         except Exception:
             found = set()
@@ -598,13 +605,19 @@ def _findings_of(path: Optional[str], evidence: ToolEvidence, sources: Sources) 
         violations = _violations(evidence.detail)
         if violations is None:
             return None
-        for kind, pattern, message in violations:
-            lines = sources.sites(path, kind, pattern)
-            if not lines:
-                return None
-            for number in lines:
+        if len(violations) == 1 and violations[0][0] != "decorator" and evidence.lines:
+            _, _, message = violations[0]
+            for number in sorted(set(evidence.lines)):
                 found.append(Finding(evidence.tool, path, sources.line_text(path, number),
                                      sources.occurrence(path, number), number, message))
+        else:
+            for kind, pattern, message in violations:
+                lines = sources.sites(path, kind, pattern)
+                if not lines:
+                    return None
+                for number in lines:
+                    found.append(Finding(evidence.tool, path, sources.line_text(path, number),
+                                         sources.occurrence(path, number), number, message))
     return found or None
 
 

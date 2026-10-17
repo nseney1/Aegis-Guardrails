@@ -19,7 +19,7 @@ from pathlib import Path, PureWindowsPath
 import re
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
-from aegis_core.storage import atomic_write_bytes
+from aegis_core.storage import atomic_write_bytes, read_json_dict
 
 __all__ = ["MANIFEST", "PLUGIN_NAME", "PackagingError", "build_plugin", "write_plugin"]
 
@@ -97,10 +97,7 @@ def build_plugin(*, version: str, mcp: Mapping[str, Any], hook_group: Mapping[st
 
 
 def _is_ours(out: Path) -> bool:
-    try:
-        manifest = json.loads((out / MANIFEST).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+    manifest = read_json_dict(out / MANIFEST)
     return isinstance(manifest, dict) and manifest.get("name") == PLUGIN_NAME
 
 

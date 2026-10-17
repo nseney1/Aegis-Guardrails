@@ -915,7 +915,7 @@ _SQL_DESTRUCTIVE = ("DROP TABLE", "DROP DATABASE", "DELETE FROM", "TRUNCATE TABL
 # A heredoc operator and its delimiter word (``<<EOF``, ``<<-'EOF'``, ``<< "END"``,
 # ``<<\EOF``), matched where _split_heredocs finds an unquoted ``<<`` that is not a
 # ``<<<`` here-string.
-_HEREDOC = re.compile(r"<<(-?)[ \t]*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3")
 # A heredoc these read is a script they run, so its body is checked as commands.
 _HEREDOC_SHELLS = SHELL_INTERPRETERS | {"ssh", "ash", "mksh"}
 
@@ -1062,12 +1062,12 @@ def _feeds_a_shell(line: str, command_start: int, operator: int) -> bool:
     return False
 
 
-def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, str, bool]]:
-    """``(strip_tabs, delimiter, feeds_a_shell)`` for each heredoc operator on ``line``
-    outside quotes and comments, in order. ``open_quotes`` is the stack of quotes and
-    ``$(``/``(`` substitutions still open from earlier lines (a ``<<`` inside a
+def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, str, bool, bool]]:
+    """``(strip_tabs, delimiter, feeds_a_shell, is_quoted)`` for each heredoc operator on
+    ``line`` outside quotes and comments, in order. ``open_quotes`` is the stack of quotes
+    and ``$(``/``(`` substitutions still open from earlier lines (a ``<<`` inside a
     substitution counts, even within double quotes); it is updated in place."""
-    found: List[Tuple[bool, str, bool]] = []
+    found: List[Tuple[bool, str, bool, bool]] = []
     command_start = 0
     index = 0
     while index < len(line):
@@ -1112,7 +1112,13 @@ def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, st
             if heredoc is None:
                 index += 2
                 continue
-            found.append((heredoc.group(1) == "-", heredoc.group(3), _feeds_a_shell(line, command_start, index)))
+            is_quoted = bool(heredoc.group(2) or heredoc.group(3))
+            found.append((
+                heredoc.group(1) == "-",
+                heredoc.group(4),
+                _feeds_a_shell(line, command_start, index),
+                is_quoted,
+            ))
             index = heredoc.end()
             continue
         index += 1
@@ -1120,13 +1126,15 @@ def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, st
 
 
 def _split_heredocs(text: str) -> Tuple[str, List[str]]:
-    """``text`` without the body lines of its heredocs, and the bodies a shell reads.
+    """``text`` without the body lines of its heredocs, and the bodies/substitutions a shell runs.
 
     A body is data for the command that reads it (Claude Code passes commit messages
     this way), unless that command is a shell or ssh (``bash <<'EOF'``, ``bash -s``,
     ``ssh host <<EOF``, ``cat <<EOF | sh``): then it is a script, returned to be checked
-    as commands. A ``<<`` inside quotes or a comment is not an operator. An unterminated
-    heredoc swallows the rest, as the shell would.
+    as commands. For an unquoted heredoc (``<<EOF``), ``$(...)`` and backtick command
+    substitutions inside the body are expanded by the shell before passing stdin, so any
+    extracted subshells are also returned. A ``<<`` inside quotes or a comment is not an
+    operator. An unterminated heredoc swallows the rest, as the shell would.
     """
     if "<<" not in text:
         return text, []
@@ -1139,7 +1147,7 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
         line = lines[index]
         kept.append(line)
         index += 1
-        for strip_tabs, delimiter, feeds_a_shell in _heredoc_operators(line, open_quotes):
+        for strip_tabs, delimiter, feeds_a_shell, is_quoted in _heredoc_operators(line, open_quotes):
             body: List[str] = []  # several heredocs on one line are read in order
             while index < len(lines):
                 raw = lines[index].rstrip("\r")
@@ -1149,7 +1157,14 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
                 body.append(raw)
             if feeds_a_shell:
                 scripts.append("\n".join(body))
+            elif not is_quoted:
+                body_text = "\n".join(body)
+                if "$" in body_text or "`" in body_text:
+                    scripts.extend(extract_subshell_commands(body_text))
     return "\n".join(kept), scripts
+
+
+split_heredocs = _split_heredocs
 
 
 def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
@@ -1189,7 +1204,9 @@ def classify_command(command: object) -> Optional[GuardRule]:
     found: List[GuardRule] = []
     if not _guard_scan(command, 0, found):
         return None
-    if any(pattern in command.upper() for pattern in _SQL_DESTRUCTIVE):
+    text, _ = _split_heredocs(command)
+    upper = text.upper()
+    if any(pattern in upper for pattern in _SQL_DESTRUCTIVE):
         found.append(_GUARD["sql-destructive"])
     blocked = next((rule for rule in found if rule.tier == GUARD_BLOCK), None)
     return blocked or (found[0] if found else None)
@@ -1205,6 +1222,11 @@ __all__ = [
     "classify_command",
     "CommandAnalyzer",
     "SafetyEvaluation",
+    "decompose_command",
+    "extract_subshell_commands",
+    "split_heredocs",
+    "tokenize_command",
+    "unwrap_command_stage",
     "REASON_CHMOD_777",
     "REASON_CMD_DELETE",
     "REASON_DB_DESTRUCTIVE",

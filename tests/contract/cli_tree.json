@@ -2625,6 +2625,30 @@
                     "metavar": null,
                     "nargs": null,
                     "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "commit",
+                    "flags": [
+                      "--commit"
+                    ],
+                    "help": "Optional signed commit SHA carrying Aegis-Approve-Insight",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "base_ref",
+                    "flags": [
+                      "--base-ref"
+                    ],
+                    "help": "Optional base branch reference for --commit",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
                   }
                 ],
                 "description": null,

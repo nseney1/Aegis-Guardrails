@@ -177,6 +177,7 @@ def run_external_cmd(
     """Run an external command with shell=False and return structured execution status."""
     import subprocess
     import time
+    from aegis_core import checkrun
 
     if not argv:
         return {
@@ -188,23 +189,44 @@ def run_external_cmd(
             "duration_s": 0.0,
         }
     t0 = time.perf_counter()
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
     try:
-        res = subprocess.run(
+        proc = subprocess.Popen(
             [str(a) for a in argv],
             cwd=str(cwd),
             env=dict(env) if env is not None else None,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             shell=False,
-            check=False,
+            **kwargs,
         )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            checkrun.kill_group(proc)
+            out_tail, err_tail = proc.communicate()
+            return {
+                "returncode": 124,
+                "stdout": out_tail or "",
+                "stderr": err_tail or "",
+                "missing_binary": False,
+                "timed_out": True,
+                "duration_s": time.perf_counter() - t0,
+            }
+        finally:
+            checkrun.kill_group(proc)
         return {
-            "returncode": res.returncode,
-            "stdout": res.stdout or "",
-            "stderr": res.stderr or "",
+            "returncode": proc.returncode,
+            "stdout": out or "",
+            "stderr": err or "",
             "missing_binary": False,
             "timed_out": False,
             "duration_s": time.perf_counter() - t0,
@@ -216,17 +238,6 @@ def run_external_cmd(
             "stderr": str(exc),
             "missing_binary": True,
             "timed_out": False,
-            "duration_s": time.perf_counter() - t0,
-        }
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return {
-            "returncode": 124,
-            "stdout": out,
-            "stderr": err,
-            "missing_binary": False,
-            "timed_out": True,
             "duration_s": time.perf_counter() - t0,
         }
     except OSError as exc:

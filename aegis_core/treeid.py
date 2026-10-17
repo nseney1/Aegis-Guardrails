@@ -227,9 +227,10 @@ class BoundTree:
         res = self.run(["diff-tree", "-r", "-z", "--raw", "--no-renames", "--ignore-submodules=none", base_tree, tree])
         if res.returncode != 0:
             raise TreeError("git diff-tree failed")
-        fields = res.stdout.split(b"\0")
-        return [(meta.lstrip(b":").split()[4].decode("ascii")[:1], os.fsdecode(path))
-                for meta, path in zip(fields[0::2], fields[1::2]) if meta and path]
+        return [
+            (status[:1], new_path if new_path is not None else path)
+            for status, path, new_path in gitsafe.parse_name_status_z(res.stdout)
+        ]
 
     def export(self, destination: Path) -> None:
         """Write the tree's files below ``destination`` (``checkout-index -a --prefix``)."""

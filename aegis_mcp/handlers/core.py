@@ -83,9 +83,19 @@ def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List
 
     names = [item.get("name") for key in ("relevant_rules", "invariant_warnings")
              for item in (res.get(key) or []) if isinstance(item, dict)]
-    persist = bool(args.get("_session")) and ledger_site(workspace.root, create=False).shared
-    credit.record_exposure(workspace.root, str(args.get("_host") or ""), str(args.get("_session") or ""),
-                           [n for n in names if isinstance(n, str)], paths=files, persist=persist)
+    rule_ids = [n for n in names if isinstance(n, str)]
+    host = str(args.get("_host") or "")
+    session = str(args.get("_session") or "")
+    try:
+        persist = bool(session) and (not args.get("_binding") or ledger_site(workspace.root, create=False).shared)
+    except Exception as exc:  # telemetry only: never fail the scan
+        credit.record_exposure(workspace.root, host, session, rule_ids, paths=files, persist=False)
+        print(f"aegis-mcp: exposure record not written: {exc}", file=sys.stderr)
+        return
+    try:
+        credit.record_exposure(workspace.root, host, session, rule_ids, paths=files, persist=persist)
+    except Exception as exc:  # telemetry only: never fail the scan
+        print(f"aegis-mcp: exposure record not written: {exc}", file=sys.stderr)
 
 
 def _scan_user_layer(args: dict) -> dict:

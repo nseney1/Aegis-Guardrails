@@ -448,15 +448,50 @@ def run_layer1(
     from aegis_core import credit
     from aegis_core.ast.policy import (
         ASTExtractionError,
+        _match_ImportNode_against_pattern,
+        evaluate_forbid_ast_structured,
         evaluate_forbid_ast_with_overrides,
         extract_normalized_ast,
     )
+    from aegis_core.ast.schema import NormalizedAST
+
+    def _forbid_ast_lines(tree: Any, spec: dict[str, Any]) -> list[int]:
+        found: set[int] = set()
+        try:
+            raw_imports = spec.get("imports")
+            if isinstance(raw_imports, (list, tuple, set)):
+                for raw_mod in raw_imports:
+                    if isinstance(raw_mod, str) and raw_mod.strip():
+                        for imp in getattr(tree, "imports", ()) or ():
+                            if _match_ImportNode_against_pattern(imp, raw_mod):
+                                ln = getattr(imp, "line", 0)
+                                if isinstance(ln, int) and ln > 0:
+                                    found.add(ln)
+            raw_calls = spec.get("calls")
+            if isinstance(raw_calls, (list, tuple, set)) and raw_calls:
+                probe = NormalizedAST(
+                    file_path=getattr(tree, "file_path", ""),
+                    language=getattr(tree, "language", "python"),
+                    imports=getattr(tree, "imports", ()),
+                    call_sites=getattr(tree, "call_sites", ()),
+                )
+                confirmed, _ = evaluate_forbid_ast_structured(
+                    probe, {"calls": list(raw_calls)}, source=""
+                )
+                for hit in confirmed:
+                    ln = hit.get("line", 0)
+                    if isinstance(ln, int) and ln > 0:
+                        found.add(ln)
+        except Exception:
+            return []
+        return sorted(found)
 
     try:
         forbid_rules, broken_rules = _discover_forbid_ast_rules(repo_root_str)
     except Exception as exc:
         # The rules are gate rules: if they cannot be read, nothing may pass unchecked.
-        forbid_rules, broken_rules = [], []
+        forbid_rules = []
+        broken_rules = []
         results.append(ToolEvidence(
             tool="forbid_ast",
             target=RULES_RELDIR,
@@ -540,6 +575,7 @@ def run_layer1(
                             target=rel_path,
                             verdict=False,
                             detail="; ".join(violations),
+                            lines=_forbid_ast_lines(norm_ast, forbid_spec),
                         )
                     )
 
@@ -669,7 +705,9 @@ def _read_blobs(repo_root: str, oids: list[str]) -> dict[str, bytes]:
     res = gitsafe.run(["cat-file", "--batch"], repo_root, stdin="".join(f"{oid}\n" for oid in wanted).encode("ascii"))
     if res.returncode != 0:
         raise gitsafe.GitError(f"git cat-file failed: {res.stderr.decode('utf-8', 'replace').strip()}")
-    out, pos, blobs = res.stdout, 0, {}
+    out = res.stdout
+    pos = 0
+    blobs: dict[str, bytes] = {}
     for oid in wanted:
         end = out.find(b"\n", pos)
         header = out[pos:end].split() if end >= 0 else []
@@ -726,7 +764,8 @@ def snapshot_index(repo_root: str, paths: list[str], snapshot: str) -> tuple[lis
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with open(target, "wb") as fh:
                     fh.write(blobs[entries[done][1]])
-            batch, batch_bytes = [], 0
+            batch = []
+            batch_bytes = 0
         if rel is not None:
             batch.append(rel)
             batch_bytes += size
@@ -771,9 +810,43 @@ def _layer1_on_snapshot(
     from aegis_core import credit
     from aegis_core.ast.policy import (
         ASTExtractionError,
+        _match_ImportNode_against_pattern,
+        evaluate_forbid_ast_structured,
         evaluate_forbid_ast_with_overrides,
         extract_normalized_ast,
     )
+    from aegis_core.ast.schema import NormalizedAST
+
+    def _snapshot_forbid_lines(tree: Any, spec: dict[str, Any]) -> list[int]:
+        found: set[int] = set()
+        try:
+            raw_imports = spec.get("imports")
+            if isinstance(raw_imports, (list, tuple, set)):
+                for raw_mod in raw_imports:
+                    if isinstance(raw_mod, str) and raw_mod.strip():
+                        for imp in getattr(tree, "imports", ()) or ():
+                            if _match_ImportNode_against_pattern(imp, raw_mod):
+                                ln = getattr(imp, "line", 0)
+                                if isinstance(ln, int) and ln > 0:
+                                    found.add(ln)
+            raw_calls = spec.get("calls")
+            if isinstance(raw_calls, (list, tuple, set)) and raw_calls:
+                probe = NormalizedAST(
+                    file_path=getattr(tree, "file_path", ""),
+                    language=getattr(tree, "language", "python"),
+                    imports=getattr(tree, "imports", ()),
+                    call_sites=getattr(tree, "call_sites", ()),
+                )
+                confirmed, _ = evaluate_forbid_ast_structured(
+                    probe, {"calls": list(raw_calls)}, source=""
+                )
+                for hit in confirmed:
+                    ln = hit.get("line", 0)
+                    if isinstance(ln, int) and ln > 0:
+                        found.add(ln)
+        except Exception:
+            return []
+        return sorted(found)
 
     results: list[ToolEvidence] = []
     checked = [
@@ -810,7 +883,8 @@ def _layer1_on_snapshot(
     try:
         forbid_rules, broken_rules = _discover_forbid_ast_rules(repo_root)
     except Exception as exc:
-        forbid_rules, broken_rules = [], []
+        forbid_rules = []
+        broken_rules = []
         results.append(ToolEvidence(
             tool="forbid_ast", target=RULES_RELDIR, verdict=False,
             detail=f"forbid_ast: cannot load rules: {type(exc).__name__}: {exc}",
@@ -879,7 +953,15 @@ def _layer1_on_snapshot(
                 except Exception:
                     pass
             if violations:
-                results.append(ToolEvidence(tool=tool, target=rel, verdict=False, detail="; ".join(violations)))
+                results.append(
+                    ToolEvidence(
+                        tool=tool,
+                        target=rel,
+                        verdict=False,
+                        detail="; ".join(violations),
+                        lines=_snapshot_forbid_lines(norm_ast, forbid_spec),
+                    )
+                )
     return results
 
 

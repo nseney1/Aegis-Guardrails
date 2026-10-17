@@ -221,6 +221,54 @@ def has_rules_dir(directory: Path | str) -> bool:
     return (Path(directory) / AEGIS_DIRNAME / "rules").is_dir()
 
 
+def module_ancestors(rel_path: str) -> list[str]:
+    """``rel_path``'s directory (or ``rel_path`` itself if already a directory) and each
+    directory above it, nearest first, ending with the workspace root (``''``)."""
+    import posixpath
+
+    clean = str(rel_path or "").replace("\\", "/").strip("/")
+    if posixpath.splitext(clean)[1].lower() in (".py", ".pyi", ".rs", ".js", ".ts", ".go"):
+        directory = posixpath.dirname(clean)
+    else:
+        directory = clean
+    found: list[str] = []
+    while directory and directory != ".":
+        found.append(directory)
+        directory = posixpath.dirname(directory)
+    found.append("")
+    return found
+
+
+def resolve_module_file(
+    module: str | list[str] | tuple[str, ...],
+    known_files: set[str] | frozenset[str],
+    *,
+    importer: str = "",
+    language: str = "python",
+) -> Optional[str]:
+    """Resolve a module name or segment sequence against ``known_files`` upward from ``importer``."""
+    import posixpath
+
+    if isinstance(module, str):
+        if language == "rust":
+            segments = [p for p in module.split("::") if p and p not in ("crate", "self", "super")]
+        else:
+            segments = [p for p in module.replace("/", ".").split(".") if p]
+    else:
+        segments = [str(p) for p in module if p]
+    if not segments:
+        return None
+    files = known_files if isinstance(known_files, (set, frozenset)) else set(known_files)
+    tail = "/".join(segments)
+    for directory in module_ancestors(importer):
+        base = posixpath.join(directory, tail) if directory else tail
+        options = (f"{base}.py", f"{base}/__init__.py") if language == "python" else (f"{base}.rs", f"{base}/mod.rs")
+        for option in options:
+            if option in files:
+                return option
+    return None
+
+
 __all__ = [
     "AEGIS_DIRNAME",
     "GITIGNORE_ENTRIES",
@@ -242,4 +290,6 @@ __all__ = [
     "WorkspaceLayout",
     "has_rules_dir",
     "is_aegis_workspace",
+    "module_ancestors",
+    "resolve_module_file",
 ]

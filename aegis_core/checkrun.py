@@ -37,12 +37,12 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
-from aegis_core.storage import ledger_locked, read_jsonl
+from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
 from aegis_core.workspace.layout import UserLayout
 
@@ -51,6 +51,10 @@ __all__ = [
     "CheckOutcome",
     "TestsRun",
     "env_class",
+    "hermetic_env",
+    "kill_group",
+    "parse_junit",
+    "parse_junit_cases",
     "plan_command",
     "record",
     "rerun_commit_snapshot",
@@ -64,6 +68,7 @@ _PYTHON_FLAGS = ("-s", "--check-hash-based-pycs", "always")
 _PYTEST_FLAGS = ("-p", "no:cacheprovider", "-o", "addopts=")
 _HERMETIC = "hermetic-v1"
 _MAX_CONFIG_BYTES = 64 * 1024
+_MAX_JUNIT_BYTES = 8 * 1024 * 1024
 _TAIL_BYTES = 256 * 1024
 _PYTHON_NAME = re.compile(r"python[0-9.]*(?:\.exe)?", re.IGNORECASE)
 _COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected|xfailed|xpassed)")
@@ -179,17 +184,36 @@ def env_class() -> str:
     return f"{platform.system().lower()}-py{sys.version_info[0]}.{sys.version_info[1]}"
 
 
-def _hermetic_env(home: Path, scratch: Path) -> Dict[str, str]:
+def _hermetic_env(
+    home: Union[str, os.PathLike[str]],
+    scratch: Optional[Union[str, os.PathLike[str]]] = None,
+) -> Dict[str, str]:
+    home_str = os.fspath(home)
+    scratch_str = os.fspath(scratch) if scratch is not None else home_str
     if os.name == "nt":
         system = os.environ.get("SystemRoot", r"C:\Windows")
-        return {"PATH": rf"{system}\System32;{system}", "SystemRoot": system, "HOME": str(home),
-                "USERPROFILE": str(home), "TEMP": str(scratch), "TMP": str(scratch)}
-    return {"PATH": "/usr/bin:/bin", "HOME": str(home), "TMPDIR": str(scratch), "LC_ALL": "C"}
+        return {
+            "PATH": rf"{system}\System32;{system}",
+            "SystemRoot": system,
+            "HOME": home_str,
+            "USERPROFILE": home_str,
+            "TEMP": scratch_str,
+            "TMP": scratch_str,
+        }
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": home_str,
+        "TMPDIR": scratch_str,
+        "LC_ALL": "C",
+    }
+
+
+hermetic_env = _hermetic_env
 
 
 # ── Running it ───────────────────────────────────────────────────────────────
 
-def _kill_group(proc: "subprocess.Popen[bytes]") -> None:
+def _kill_group(proc: "subprocess.Popen[Any]") -> None:
     if os.name == "nt":
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
         return
@@ -199,15 +223,11 @@ def _kill_group(proc: "subprocess.Popen[bytes]") -> None:
         pass
 
 
+kill_group = _kill_group
+
+
 def _tail(path: Path) -> str:
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - _TAIL_BYTES))
-            return fh.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
+    return read_tail_bytes(path, _TAIL_BYTES).decode("utf-8", "replace")
 
 
 def _summary(text: str) -> Dict[str, int]:
@@ -223,23 +243,74 @@ def _summary(text: str) -> Dict[str, int]:
     return {}
 
 
-def _junit(path: Path) -> Optional[Tuple[int, int, int, int, str]]:
-    """``(tests, passed, failed, skipped, nodeid digest)`` from a JUnit file, or None."""
+def _inspect_junit(
+    path: Path,
+) -> Optional[Tuple[int, int, int, int, str, Set[str], Set[str], List[str]]]:
     try:
-        root = ET.parse(path).getroot()
+        if not path.is_file() or path.stat().st_size > _MAX_JUNIT_BYTES:
+            return None
+        raw = path.read_bytes()
+        if len(raw) > _MAX_JUNIT_BYTES:
+            return None
+        root = ET.fromstring(raw)
     except (OSError, ET.ParseError):
         return None
+    col_errors: List[str] = []
+    suites = [root] if root.tag == "testsuite" else []
+    suites.extend(el for el in root.iter("testsuite") if el is not root)
+    for suite in suites:
+        if suite.find("error") is not None or suite.find("failure") is not None:
+            col_errors.append(f"<suite:{suite.attrib.get('name', 'testsuite')}>")
     cases = list(root.iter("testcase"))
-    failed = skipped = 0
-    ids = []
+    failed_count = 0
+    skipped_count = 0
+    ids: List[str] = []
+    passed_ids: Set[str] = set()
+    failed_ids: Set[str] = set()
     for case in cases:
-        ids.append(f"{case.get('classname', '')}::{case.get('name', '')}")
-        if case.find("failure") is not None or case.find("error") is not None:
-            failed += 1
-        elif case.find("skipped") is not None:
-            skipped += 1
+        raw_cls = case.get("classname", "")
+        raw_name = case.get("name", "")
+        ids.append(f"{raw_cls}::{raw_name}")
+        cls = (raw_cls or "").strip()
+        name = (raw_name or "").strip()
+        err = case.find("error")
+        fail = case.find("failure")
+        skip = case.find("skipped")
+        if fail is not None or err is not None:
+            failed_count += 1
+        elif skip is not None:
+            skipped_count += 1
+        if err is not None and (not cls or err.get("message") == "collection failure"):
+            col_errors.append(name or cls or "<collection>")
+        elif name and (fail is not None or err is not None or skip is None):
+            nodeid = f"{cls}::{name}" if cls else name
+            if fail is not None or err is not None:
+                failed_ids.add(nodeid)
+            else:
+                passed_ids.add(nodeid)
     digest = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8", "replace")).hexdigest()
-    return len(cases), len(cases) - failed - skipped, failed, skipped, digest
+    passed_count = len(cases) - failed_count - skipped_count
+    return len(cases), passed_count, failed_count, skipped_count, digest, passed_ids, failed_ids, col_errors
+
+
+def _parse_junit(path: Path) -> Optional[Tuple[int, int, int, int, str]]:
+    """``(tests, passed, failed, skipped, nodeid digest)`` from a JUnit file, or None."""
+    inspected = _inspect_junit(path)
+    if inspected is None:
+        return None
+    return inspected[:5]
+
+
+_junit = _parse_junit
+parse_junit = _parse_junit
+
+
+def parse_junit_cases(path: Path) -> Tuple[Set[str], Set[str], List[str]]:
+    """``(passed_ids, failed_ids, collection_errors)`` from a JUnit file."""
+    inspected = _inspect_junit(path)
+    if inspected is None:
+        return set(), set(), []
+    return inspected[5], inspected[6], inspected[7]
 
 
 def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float, junit: Path,
@@ -271,7 +342,7 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
             _kill_group(proc)
     text = _tail(output)
     counts = _summary(text)
-    parsed = _junit(junit) if junit.is_file() else None
+    parsed = _parse_junit(junit) if junit.is_file() else None
     if parsed is not None:
         collected, passed, failed, skipped, digest = parsed
     else:
@@ -395,22 +466,25 @@ def rerun_commit_snapshot(
     base_commit = gitsafe.merge_base(top, base_ref, commit) or gitsafe.resolve_commit(top, base_ref) or commit
     entries = gitsafe.diff_entries(top, base_commit, commit)
     changed = [p for s, _o, _n, p in entries if s != "D"]
-    tree_entries = regression._tree_blobs(str(top), commit)
-    blobs = regression._read_blobs(str(top), {oid for _m, oid in tree_entries.values()})
+    tree_entries = gitsafe.tree_blobs(top, commit)
     scratch = Path(tempfile.mkdtemp(prefix="aegis-trailer-rerun-"))
     try:
         snapshot = scratch / "snapshot"
-        regression._export_snapshot(snapshot, tree_entries, blobs)
+        gitsafe.export_tree(top, commit, snapshot)
         layer1 = _layer1(snapshot, changed)
         user_cmd = user_test_command(workspace)
-        tests_ok, raw_exit = True, 0
+        tests_ok = True
+        raw_exit = 0
         if user_cmd is not None:
-            junit, home, tmp = scratch / "junit.xml", scratch / "home", scratch / "tmp"
+            junit = scratch / "junit.xml"
+            home = scratch / "home"
+            tmp = scratch / "tmp"
             home.mkdir(mode=0o700)
             tmp.mkdir(mode=0o700)
             argv, _ = plan_command(user_cmd, junit)
             run = run_tests(argv, snapshot, _hermetic_env(home, tmp), timeout or 120.0, junit, scratch / "output.txt")
-            tests_ok, raw_exit = run.evidence, run.exit
+            tests_ok = run.evidence
+            raw_exit = run.exit
         else:
             t_files = sorted(p for p in tree_entries if regression.is_test_file(p) and (snapshot / p).is_file())
             if t_files:

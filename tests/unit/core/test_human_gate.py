@@ -76,6 +76,25 @@ def test_a_hostile_codeowners_is_bounded():
     assert uncovered, "no pattern of it covers the set, and reading it does not hang"
 
 
+def test_codeowners_coverage_includes_tracked_repo_paths_and_fails_closed_on_negation_or_invalid_override():
+    partial = hg.CODEOWNERS_FULL.replace("/.github/workflows/ @octo\n", "/.github/workflows/ci.yml @org/sec\n")
+    _cov, uncov = human_gate.codeowners_coverage(
+        partial, ".github/CODEOWNERS", repo_paths=(".github/workflows/validate.yml",)
+    )
+    assert ".github/workflows/validate.yml" in uncov
+
+    for suffix in (
+        "/.github/workflows/validate.yml\n",
+        "/.github/workflows/validate.yml invalid-owner-token\n",
+        "!/.github/workflows/validate.yml @org/sec\n",
+        "/.github/workflows/[v]alidate.yml @org/sec\n",
+    ):
+        _cov2, uncov2 = human_gate.codeowners_coverage(
+            "* @org/sec\n" + suffix, ".github/CODEOWNERS", repo_paths=(".github/workflows/validate.yml",)
+        )
+        assert ".github/workflows/validate.yml" in uncov2, f"expected uncovered for {suffix!r}"
+
+
 # ── signing-key custody ──────────────────────────────────────────────────────
 
 @needs_signing
@@ -195,6 +214,35 @@ def test_uncovered_governance_files_block_tier_a(tmp_path):
     report = human_gate.detect_tier(repo.root, gh=gh)
     assert report.tier == "C"
     assert report.evidence["codeowners"]["uncovered"]
+    assert report.codeowners_complete is False
+
+
+@needs_git
+def test_tracked_workflow_outside_sample_or_unowned_override_blocks_tier_a(tmp_path):
+    partial_co = hg.CODEOWNERS_FULL.replace("/.github/workflows/ @octo\n", "/.github/workflows/ci.yml @org/sec\n")
+    home = hg.Home(tmp_path / "home")
+    repo = hg.Repo(tmp_path / "project", home)
+    repo.write("README.md", "# p\n")
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE)
+    repo.write(".github/workflows/validate.yml", "name: Validate\non: [push]\n")
+    repo.write(".github/CODEOWNERS", partial_co)
+    repo.commit("base")
+    repo.branch("work")
+    gh = hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()])
+    report = human_gate.detect_tier(repo.root, gh=gh)
+    assert report.tier != "A"
+    assert report.codeowners_complete is False
+    assert ".github/workflows/validate.yml" in report.evidence["codeowners"]["uncovered"]
+
+    for override in ("/.github/workflows/validate.yml\n", "!/.github/workflows/validate.yml\n"):
+        repo.git("checkout", "-q", "main")
+        repo.write(".github/CODEOWNERS", "* @org/sec\n" + override)
+        repo.commit("override codeowners")
+        repo.git("checkout", "-q", "work")
+        rep2 = human_gate.detect_tier(repo.root, gh=gh)
+        assert rep2.tier != "A"
+        assert rep2.codeowners_complete is False
+        assert ".github/workflows/validate.yml" in rep2.evidence["codeowners"]["uncovered"]
 
 
 @needs_signing

@@ -3,6 +3,6 @@
 pyproject.toml reads it as the dynamic version, and `aegis --version`, the MCP
 serverInfo and every package's ``__version__`` import it.
 """
-__version__ = "4.3.0"
+__version__ = "4.3.1"
 
 __all__ = ["__version__"]

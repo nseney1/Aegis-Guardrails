@@ -553,6 +553,135 @@ def test_read_blob_rejects_content_that_does_not_match_the_object_id(repo: Path,
         gitsafe.read_blob(repo, "HEAD", "a.py")
 
 
+# ── Consolidated plumbing primitives ─────────────────────────────────────────
+
+def test_blob_id_computes_sha1_and_sha256_blob_hashes(repo: Path):
+    data = b"a = 1\n"
+    expected_sha1 = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    assert gitsafe.blob_id(data) == expected_sha1
+    assert gitsafe._blob_id(data, 40) == expected_sha1
+    sha256_id = gitsafe.blob_id(data, 64)
+    assert len(sha256_id) == 64 and sha256_id != expected_sha1
+
+
+def test_read_blobs_batches_and_verifies_hashes(repo: Path, monkeypatch):
+    oid_a = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    oid_b = _git(repo, "rev-parse", "HEAD:b.py").strip()
+    assert gitsafe.read_blobs(repo, []) == {}
+    blobs = gitsafe.read_blobs(repo, [oid_a, oid_b, oid_a])
+    assert blobs == {oid_a: b"a = 1\n", oid_b: b"b = 1\n"}
+
+    with pytest.raises(gitsafe.GitError, match="cannot read object"):
+        gitsafe.read_blobs(repo, ["0" * 40])
+
+    head_commit_oid = gitsafe.head_commit(repo)
+    assert head_commit_oid is not None
+    with pytest.raises(gitsafe.GitError, match="cannot read object"):
+        gitsafe.read_blobs(repo, [head_commit_oid])
+
+    real_run = gitsafe.run
+
+    def forged_run(args, cwd, **kwargs):
+        if args and args[0] == "cat-file":
+            forged = f"{oid_a} blob 6\nlies!\n\n".encode("ascii")
+            return subprocess.CompletedProcess(["git", *args], 0, forged, b"")
+        return real_run(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", forged_run)
+    with pytest.raises(gitsafe.GitError, match="does not match the object id"):
+        gitsafe.read_blobs(repo, [oid_a])
+
+
+def test_tree_blobs_lists_blobs_and_filters_paths_and_symlinks(repo: Path):
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "mod.py").write_text("m = 1\n", encoding="utf-8")
+    link = repo / "pkg" / "link.py"
+    has_symlink = False
+    try:
+        link.symlink_to("../a.py")
+        has_symlink = True
+    except (OSError, NotImplementedError):
+        pass
+    _commit(repo, "add pkg")
+
+    all_blobs = gitsafe.tree_blobs(repo, "HEAD")
+    assert "a.py" in all_blobs and "pkg/mod.py" in all_blobs
+    mode_a, oid_a = all_blobs["a.py"]
+    assert mode_a == "100644" and oid_a == gitsafe.blob_id(b"a = 1\n")
+
+    scoped = gitsafe.tree_blobs(repo, "HEAD", paths=("pkg",))
+    assert "pkg/mod.py" in scoped and "a.py" not in scoped
+    if has_symlink and _git(repo, "ls-files", "-s", "pkg/link.py").split()[0] == "120000":
+        assert "pkg/link.py" not in scoped
+        with_links = gitsafe.tree_blobs(repo, "HEAD", paths=("pkg",), include_symlinks=True)
+        assert with_links["pkg/link.py"][0] == "120000"
+
+    with pytest.raises(gitsafe.GitError):
+        gitsafe.tree_blobs(repo, "no-such-revision")
+    with pytest.raises(gitsafe.GitError):
+        gitsafe.tree_blobs(repo, "--bad-flag")
+
+
+def test_parse_name_status_z_handles_renames_and_copies_without_desync(repo: Path):
+    raw = (
+        b"R100\0old_a.py\0new_a.py\0"
+        b"M\0mod.py\0"
+        b"C100\0src.py\0copy.py\0"
+        b"A\0added.py\0"
+        b"D\0deleted.py\0"
+        b"T\0typechanged.py\0"
+    )
+    parsed = gitsafe.parse_name_status_z(raw)
+    assert parsed == [
+        ("R100", "old_a.py", "new_a.py"),
+        ("M", "mod.py", None),
+        ("C100", "src.py", "copy.py"),
+        ("A", "added.py", None),
+        ("D", "deleted.py", None),
+        ("T", "typechanged.py", None),
+    ]
+    assert gitsafe.parse_name_status_z(b"") == []
+
+
+def test_export_tree_with_and_without_overlay_and_fallback(repo: Path, tmp_path: Path, monkeypatch):
+    (repo / "sub").mkdir()
+    (repo / "sub" / "nested.py").write_text("n = 1\n", encoding="utf-8")
+    _commit(repo, "nested")
+    (repo / "a.py").write_text("dirty worktree\n", encoding="utf-8")
+
+    dest1 = tmp_path / "export1"
+    gitsafe.export_tree(repo, "HEAD", dest1)
+    assert (dest1 / "a.py").read_bytes() == b"a = 1\n"
+    assert (dest1 / "sub" / "nested.py").read_bytes() == b"n = 1\n"
+
+    dest2 = tmp_path / "export2"
+    overlay = {
+        "a.py": b"a = 42\n",
+        "extra/new_test.py": b"assert True\n",
+        "../escape.py": b"should not write\n",
+    }
+    gitsafe.export_tree(repo, "HEAD", dest2, overlay=overlay)
+    assert (dest2 / "a.py").read_bytes() == b"a = 42\n"
+    assert (dest2 / "sub" / "nested.py").read_bytes() == b"n = 1\n"
+    assert (dest2 / "extra" / "new_test.py").read_bytes() == b"assert True\n"
+    assert not (tmp_path / "escape.py").exists()
+
+    # Fallback to tree_blobs + read_blobs when checkout-index fails
+    real_run = gitsafe.run
+
+    def fail_checkout_index(args, cwd, **kwargs):
+        if args and args[0] == "checkout-index":
+            return subprocess.CompletedProcess(["git", *args], 1, b"", b"checkout-index failed")
+        return real_run(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", fail_checkout_index)
+    dest3 = tmp_path / "export3"
+    gitsafe.export_tree(repo, "HEAD", dest3, overlay={"b.py": b"b = 99\n"})
+    assert (dest3 / "a.py").read_bytes() == b"a = 1\n"
+    assert (dest3 / "b.py").read_bytes() == b"b = 99\n"
+    assert (dest3 / "sub" / "nested.py").read_bytes() == b"n = 1\n"
+
+
 # ── Other queries ────────────────────────────────────────────────────────────
 
 def test_git_path_honours_the_repository_hooks_path(repo: Path, tmp_path: Path):

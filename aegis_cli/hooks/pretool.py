@@ -189,7 +189,13 @@ def _decide(host: str, data: bytes, environ: Mapping[str, str], now: Optional[da
     if call is None:
         return _ALLOW
     if call.kind == hook_events.KIND_SHELL:
-        return _guard(call, environ)
+        guard_decision = _guard(call, environ)
+        if guard_decision.code != EXIT_ALLOW or not call.paths:
+            return guard_decision
+        scan_decision = _scan_gate(call, environ, now)
+        if scan_decision.code != EXIT_ALLOW:
+            return scan_decision
+        return guard_decision if guard_decision.event else scan_decision
     if call.kind == hook_events.KIND_EDIT and call.paths:
         return _scan_gate(call, environ, now)
     return _ALLOW

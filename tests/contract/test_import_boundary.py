@@ -50,6 +50,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.config": 0,
     # The events log (prune metrics): storage and gitsafe only, so any layer may record.
     "aegis_core.events": 0,
+    "aegis_core.stats": 0,
     "aegis_core.workspace": 0,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,

@@ -233,9 +233,11 @@ def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[st
                                                 "region": {"startLine": f["line"], "startColumn": f["col"]}}}],
             "partialFingerprints": {"primaryLocationLineHash": line_hash},
         })
+    from aegis_core._version import __version__
+
     payload: dict[str, Any] = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
-        "runs": [{"tool": {"driver": {"name": "Aegis Guardrails", "version": "4.3.0", "rules": list(rules_seen.values())}},
+        "runs": [{"tool": {"driver": {"name": "Aegis Guardrails", "version": __version__, "rules": list(rules_seen.values())}},
                   "results": results}],
         "step_summary": format_github_step_summary(report_dict, workspace_root=workspace_root),
     }

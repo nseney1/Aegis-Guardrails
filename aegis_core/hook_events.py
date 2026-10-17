@@ -28,6 +28,8 @@ import os
 import re
 from typing import Any, List, Mapping, Optional, Tuple
 
+from aegis_core import command_safety
+
 __all__ = [
     "HOSTS",
     "HookCall",
@@ -46,11 +48,8 @@ _CLAUDE_EDIT = {"Write": "file_path", "Edit": "file_path", "NotebookEdit": "note
 _AGY_EDIT = frozenset({"write_to_file", "replace_file_content", "multi_replace_file_content"})
 
 _PATCH_HEADER = re.compile(r"\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)")
-# A shell command Codex runs as a patch: `apply_patch` (or `applypatch`) first, after an
-# optional `cd <dir> &&`, with the patch in a heredoc or an argument.
-_APPLY_PATCH_COMMAND = re.compile(
-    r"\s*(?:cd\s+(?P<dir>'[^']*'|\"[^\"]*\"|[^\s;&|'\"]+)\s*&&\s*)?(?:apply_patch|applypatch)(?=\s|$)"
-)
+_HEREDOC_TOKEN = re.compile(r"<<-?[A-Za-z_][A-Za-z0-9_]*")
+_HEREDOC_DELIM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass(frozen=True)
@@ -58,9 +57,10 @@ class HookCall:
     """One tool call as every host's hook sees it.
 
     ``command`` is set only for a shell call with a non-empty command string; ``paths``
-    only for an edit call (absolute when the hint made them so, in payload order,
-    without duplicates). ``workspace`` is the absolute workspace hint and
-    ``workspace_source`` names it: "claude_project_dir", "cwd" or "workspace_paths".
+    for an edit call or a shell call that also applies a patch (absolute when the hint
+    made them so, in payload order, without duplicates). ``workspace`` is the absolute
+    workspace hint and ``workspace_source`` names it: "claude_project_dir", "cwd" or
+    "workspace_paths".
     """
 
     host: str
@@ -101,16 +101,57 @@ def apply_patch_paths(text: str) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
-def _codex_patch_command(command: str, base: Optional[str]) -> Optional[Tuple[str, ...]]:
-    """The paths of a Bash command Codex runs as apply_patch, or None for any other command."""
-    invocation = _APPLY_PATCH_COMMAND.match(command)
-    if invocation is None or "*** Begin Patch" not in command:
-        return None
-    directory = invocation.group("dir")
-    if directory:
-        directory = directory.strip("'\"")
-        base = directory if os.path.isabs(directory) else (os.path.join(base, directory) if base else None)
-    return _joined(list(apply_patch_paths(command)), base)
+def _parse_codex_patch(
+    command: str, base: Optional[str]
+) -> Tuple[bool, Optional[str], Tuple[str, ...]]:
+    """Classify a Codex Bash command that may carry an ``apply_patch`` payload.
+
+    Returns ``(is_pure_edit, safe_shell_command, patched_paths)``.
+    """
+    if "*** Begin Patch" not in command:
+        return False, command, ()
+    shell_text, heredoc_scripts = command_safety.split_heredocs(command)
+    subshells = command_safety.extract_subshell_commands(shell_text)
+    try:
+        tokens = command_safety.tokenize_command(shell_text)
+    except ValueError:
+        tokens = []
+    pipelines = command_safety.decompose_command(tokens) if tokens else []
+    if (
+        pipelines
+        and len(pipelines[0].stages) == 1
+        and len(pipelines[0].stages[0].raw_tokens) == 2
+        and pipelines[0].stages[0].raw_tokens[0] == "cd"
+        and not subshells
+    ):
+        cd_dir = pipelines[0].stages[0].raw_tokens[1]
+        base = cd_dir if os.path.isabs(cd_dir) else (os.path.join(base, cd_dir) if base else None)
+    patched = _joined(list(apply_patch_paths(command)), base)
+    if not heredoc_scripts and not subshells and all(len(p.stages) == 1 for p in pipelines):
+        stage = (
+            pipelines[0].stages[0].raw_tokens
+            if len(pipelines) == 1
+            else (
+                pipelines[1].stages[0].raw_tokens
+                if len(pipelines) == 2 and len(tokens) >= 3 and tokens[0] == "cd" and tokens[2] == "&&"
+                else []
+            )
+        )
+        if stage and stage[0] in ("apply_patch", "applypatch"):
+            rest = stage[1:]
+            is_heredoc = "*** Begin Patch" not in shell_text and (
+                (len(rest) == 1 and bool(_HEREDOC_TOKEN.fullmatch(rest[0])))
+                or (len(rest) == 2 and rest[0] in ("<<", "<<-") and bool(_HEREDOC_DELIM.fullmatch(rest[1])))
+            )
+            is_arg = len(rest) == 1 and "*** Begin Patch" in rest[0]
+            if (is_heredoc or is_arg) and patched:
+                return True, None, patched
+    safe_cmd = (
+        command
+        if shell_text != command
+        else re.sub(r"'[^']*\*\*\* Begin Patch[^']*'", "''", command)
+    )
+    return False, safe_cmd, patched
 
 
 def _claude(payload: Mapping[str, Any], environ: Mapping[str, str]) -> HookCall:
@@ -137,11 +178,11 @@ def _codex(payload: Mapping[str, Any]) -> HookCall:
     if tool == "apply_patch":
         kind, paths = KIND_EDIT, _joined(list(apply_patch_paths(text)) if text else [], cwd)
     elif tool == "Bash":
-        patched = _codex_patch_command(text, cwd) if text else None
-        if patched is not None:
-            kind, paths = KIND_EDIT, patched
+        if text:
+            is_edit, command, paths = _parse_codex_patch(text, cwd)
+            kind = KIND_EDIT if is_edit else KIND_SHELL
         else:
-            kind, command = KIND_SHELL, text
+            kind = KIND_SHELL
     return HookCall("codex-cli", tool, kind, command, paths, cwd, "cwd" if cwd else None, _text(payload.get("tool_use_id")))
 
 

@@ -172,6 +172,38 @@ def test_an_absolute_patch_header_stays_absolute():
     assert call.paths == (other,)
 
 
+@pytest.mark.parametrize("command", [
+    "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: a.sh\n@@\n+git reset --hard\n*** End Patch\nEOF",
+    'apply_patch <<"EOF"\n*** Begin Patch\n*** Update File: a.sh\n@@\n+git reset --hard\n*** End Patch\nEOF',
+    "apply_patch <<\\EOF\n*** Begin Patch\n*** Update File: a.sh\n@@\n+git reset --hard\n*** End Patch\nEOF",
+    "apply_patch <<- 'EOF'\n\t*** Begin Patch\n\t*** Update File: a.sh\n\t@@\n\t+git reset --hard\n\t*** End Patch\n\tEOF\n",
+    "apply_patch <<EOF\n*** Begin Patch\n*** Update File: a.sh\n@@\n+git reset --hard\n*** End Patch\nEOF",
+    "apply_patch '*** Begin Patch\n*** Update File: a.sh\n@@\n+git reset --hard\n*** End Patch'",
+    'apply_patch "*** Begin Patch\n*** Update File: a.sh\n@@\n+git reset --hard\n*** End Patch"',
+])
+def test_pure_codex_apply_patch_forms_are_edits_without_a_shell_command(command):
+    call = normalize("codex-cli", codex("Bash", command), {})
+    assert (call.kind, call.command, call.paths) == (KIND_EDIT, None, (_in("a.sh"),))
+
+
+@pytest.mark.parametrize("command", [
+    "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch\nEOF\ngit reset --hard",
+    "apply_patch <<'EOF' && git reset --hard\n*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch\nEOF",
+    "apply_patch '*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch' && git reset --hard",
+    'apply_patch "*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch" && git reset --hard',
+    "apply_patch <<EOF\n*** Begin Patch\n*** Add File: a.py\n+$(git reset --hard)\n*** End Patch\nEOF",
+    'apply_patch <<EOF\n*** Begin Patch\n*** Add File: a.py\n+$(echo ")" && git reset --hard)\n*** End Patch\nEOF',
+    "apply_patch <<EOF\n*** Begin Patch\n*** Add File: a.py\n+`git reset --hard`\n*** End Patch\nEOF",
+    'apply_patch "*** Begin Patch\n*** Add File: a.py\n+$(git reset --hard)\n*** End Patch"',
+    "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch\nEOF\necho done",
+])
+def test_compound_or_expanding_codex_apply_patch_stays_a_shell_call_with_paths(command):
+    call = normalize("codex-cli", codex("Bash", command), {})
+    assert call.kind == KIND_SHELL
+    assert call.command is not None
+    assert call.paths == (_in("a.py"),)
+
+
 # ── Antigravity ──────────────────────────────────────────────────────────────
 
 def test_agy_run_command_carries_its_command_line_and_the_first_workspace_path():

@@ -1,6 +1,11 @@
 """AST policy evaluation, extraction, and planned-symbol synthesis."""
 from __future__ import annotations
-import ast, io, os, re, tokenize
+
+import ast
+import io
+import os
+import re
+import tokenize
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 from aegis_core.errors import AegisError
@@ -69,7 +74,8 @@ def _site_args(site: Any) -> Dict[str, Any]:
 
 def _match_where(site: Any, where: Mapping[str, Any]) -> Optional[bool]:
     args = _site_args(site)
-    has_splat, res = ("*" in args or "**" in args), True
+    has_splat = "*" in args or "**" in args
+    res: Optional[bool] = True
     for raw_key, cond in where.items():
         v = _cond(next((args[k] for k in (p.strip() for p in str(raw_key).split("|")) if k in args), _ABSENT), cond, has_splat)
         if v is False:
@@ -145,11 +151,15 @@ def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
 
 def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str]) -> Tuple[str, str, List[Tuple[Any, Optional[bool]]]]:
     if isinstance(raw_call, str):
-        call, where, builtin_only, unknown_mode = _normalize_ast_token(raw_call), None, False, "report"
+        call = _normalize_ast_token(raw_call)
+        where = None
+        builtin_only = False
+        unknown_mode = "report"
     elif isinstance(raw_call, Mapping):
         call = _normalize_ast_token(str(raw_call.get("name") or raw_call.get("call") or ""))
         where = raw_call.get("where") if isinstance(raw_call.get("where"), Mapping) else None
-        builtin_only, unknown_mode = bool(raw_call.get("builtin")), str(raw_call.get("unknown") or "report")
+        builtin_only = bool(raw_call.get("builtin"))
+        unknown_mode = str(raw_call.get("unknown") or "report")
     else:
         return "", "report", []
     if not call:
@@ -172,9 +182,13 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
 def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, allow_map: Optional[Mapping[int, List[Dict[str, Any]]]] = None) -> Tuple[list[str], list[dict[str, Any]]]:
     if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
         return [], []
-    violations, overrides, allows = [], [], allow_map or {}
+    violations: list[str] = []
+    overrides: list[dict[str, Any]] = []
+    allows = allow_map or {}
     fp = str(getattr(normalized_ast, "file_path", "") or "")
-    parsed_imports, imported_qual_map, aliases = [], {}, {}
+    parsed_imports: list[ Any ] = []
+    imported_qual_map: dict[str, Any] = {}
+    aliases: dict[str, Any] = {}
     for imp in getattr(normalized_ast, "imports", ()) or ():
         src, syms = _extract_import_tuple(imp)
         for name, originals in _import_aliases(imp).items():
@@ -204,7 +218,8 @@ def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[s
         if mod:
             _record_hits([r for r, t in parsed_imports if _match_ImportNode_against_pattern(t, mod)], "imports", mod, "import")
 
-    raw_call_sites, call_index = getattr(normalized_ast, "call_sites", ()) or (), _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
+    raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
+    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
     defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
         call, unknown_mode, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
@@ -257,8 +272,10 @@ def evaluate_forbid_ast_with_overrides(normalized_ast: NormalizedAST, forbid_spe
 def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, source: Optional[str] = None) -> Tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
         return [], []
-    allows, fp = _resolve_allow_map(normalized_ast, source=source), str(getattr(normalized_ast, "file_path", "") or "")
-    imported_qual_map, aliases = {}, {}
+    allows = _resolve_allow_map(normalized_ast, source=source)
+    fp = str(getattr(normalized_ast, "file_path", "") or "")
+    imported_qual_map: dict[str, Any] = {}
+    aliases: dict[str, Any] = {}
     for imp in getattr(normalized_ast, "imports", ()) or ():
         src, syms = _extract_import_tuple(imp)
         for name, originals in _import_aliases(imp).items():
@@ -267,7 +284,8 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
         for sym in syms if src else ():
             if sym and sym != src:
                 _add_binding(imported_qual_map, sym, f"{src}.{sym}")
-    raw_call_sites, call_index = getattr(normalized_ast, "call_sites", ()) or (), _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
+    raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
+    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
     defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
     confirmed: list[dict[str, Any]] = []
     unverified: list[dict[str, Any]] = []
@@ -298,7 +316,10 @@ def evaluate_forbid_ast_delta(spec: Any, head_ast: Any, base_ast: Any = None, *,
     remaining: list[dict[str, Any]] = []
     for h in head_hits:
         pair = (key_of(h), h.get("line", 0))
-        (exact_pool.remove(pair) if pair in exact_pool else remaining.append(h))
+        if pair in exact_pool:
+            exact_pool.remove(pair)
+        else:
+            remaining.append(h)
     counts: Dict[Tuple[str, str, str], int] = {}
     for k, _ in exact_pool:
         counts[k] = counts.get(k, 0) + 1
@@ -314,12 +335,15 @@ def evaluate_forbid_ast_delta(spec: Any, head_ast: Any, base_ast: Any = None, *,
 
 def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional[Union[str, Path]] = None, code: Optional[str] = None, ast_runner: Any = None, confine_root: Optional[Union[str, Path]] = None) -> Optional[NormalizedAST]:
     from aegis_core.ast.drivers.python import parse_python_ast, read_python_source
-    path_str, ext = str(file_path), os.path.splitext(str(file_path))[1].lower()
+    path_str = str(file_path)
+    ext = os.path.splitext(path_str)[1].lower()
     try:
         if code is not None or ext == ".py":
             source_text = code if code is not None else read_python_source(path_str)
-            tree, norm_ast = ast.parse(source_text, filename=path_str), parse_python_ast(source_text, file_path=path_str)
-            decs, allows = _extract_python_decorators_from_tree(tree), parse_allow_comments(source_text)
+            tree = ast.parse(source_text, filename=path_str)
+            norm_ast = parse_python_ast(source_text, file_path=path_str)
+            decs = _extract_python_decorators_from_tree(tree)
+            allows = parse_allow_comments(source_text)
             if decs or allows:
                 meta = {**norm_ast.metadata, **({"decorators": list(decs)} if decs else {}), **({"allow_comments": allows} if allows else {})}
                 object.__setattr__(norm_ast, "metadata", meta)

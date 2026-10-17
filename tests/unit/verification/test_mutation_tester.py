@@ -618,3 +618,55 @@ class TestModuleSwapStaging:
         assert swap.stage("x = 1\n") == swap.workdir + os.pathsep + "/opt/inherited"
         monkeypatch.delenv("PYTHONPATH")
         assert swap.stage("x = 1\n") == swap.workdir
+
+    def test_mutant_startup_timeout_retries_once_and_does_not_survive(self, tmp_path):
+        """A mutant run that times out before loading the target module retries once
+        and, if still timed out, is classified as timed-out/killed rather than survived."""
+        from aegis_core.verification import mutation_tester
+
+        src = tmp_path / "target.py"
+        src.write_text("def inc(x):\n    return x + 1\n", encoding="utf-8")
+        test = tmp_path / "test_target.py"
+        test.write_text("def test_inc():\n    assert True\n", encoding="utf-8")
+
+        baseline_ok = mutation_tester.TestRunResult(passed=True, status="pass", loaded=True)
+        startup_timeout = mutation_tester.TestRunResult(
+            passed=False, status="timeout", detail="timed out after 30s", loaded=False
+        )
+
+        with patch(
+            "aegis_core.verification.mutation_tester._check_tests",
+            side_effect=[baseline_ok, startup_timeout, startup_timeout],
+        ) as mock_check:
+            ev = mutation_tester.check(str(src), "inc", str(test), max_mutations=1)
+
+        assert mock_check.call_count == 3  # 1 baseline + 1 mutant + 1 startup-timeout retry
+        assert ev.verdict is True, ev.detail
+        assert ev.detail == "0/1 survived (1 test file ran)"
+        assert ev.lines == []
+
+    def test_check_tests_kills_process_group_on_timeout(self, tmp_path):
+        """A timed-out subprocess in _check_tests has its process group killed via checkrun.kill_group."""
+        import subprocess
+        from aegis_core.verification import mutation_tester
+
+        test = tmp_path / "test_target.py"
+        test.write_text("def test_inc():\n    assert True\n", encoding="utf-8")
+
+        class _FakeProc:
+            pid = 42424
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd=["pytest"], timeout=timeout)
+
+        fake_proc = _FakeProc()
+        with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]), patch(
+            "subprocess.Popen", return_value=fake_proc
+        ) as mock_popen, patch("aegis_core.checkrun.kill_group") as mock_kill_group:
+            res = mutation_tester._check_tests([str(test)], timeout=5)
+
+        assert res.passed is False
+        assert res.status == "timeout"
+        assert mock_popen.called
+        assert mock_kill_group.called
+

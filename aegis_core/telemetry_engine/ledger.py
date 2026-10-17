@@ -68,6 +68,21 @@ __all__ = [
 LEDGER_VERSION = 2
 OUTCOMES = ("tp", "fp", "trigger")
 SOURCES = ("ci", "session", "mcp", "manual", "migrate")
+_CREDIT_EVENTS = frozenset({
+    "exposure",
+    "detection",
+    "check_confirm",
+    "override",
+    "human_label",
+    "claim",
+    "claimed",
+    "transition",
+    "check",
+    "adjudication",
+    "report",
+    "ci",
+    "void",
+})
 _V1_SIGNALS = {"tp": "tp", "success": "tp", "fp": "fp", "failure": "fp", "trigger": "trigger"}
 _MAX_LEGACY_WEIGHT = Decimal("10")
 
@@ -161,6 +176,8 @@ def normalize_rows(
     v1_triggers: Dict[str, List[Dict[str, Any]]] = {}
     v1_outcomes: Dict[str, int] = {}
     for index, row in enumerate(rows):
+        if isinstance(row, dict) and row.get("event") in _CREDIT_EVENTS and "outcome" not in row:
+            continue
         if row.get("v") == LEDGER_VERSION:
             if "rule" not in row and "outcome" not in row:
                 continue  # epoch or other bookkeeping row

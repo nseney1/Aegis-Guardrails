@@ -191,3 +191,43 @@ def test_hook_entrypoint_exits_zero_empty_stdout_and_under_budget(tmp_path: Path
     rows = read_insight_rows(ws, home=home)
     assert len(rows) == 1
     assert rows[0]["event"] == "heartbeat"
+
+
+def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    text_a = "Always pass explicit timeout to subprocess calls in cli"
+    sha = repo.commit(
+        f"chore: approve insight\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: {human_gate.insight_text_hash(text_a)}\n",
+        sign_key=human_key,
+        allow_empty=True,
+    )
+
+    rc, out, err = _invoke_rule(
+        repo.root,
+        "insight",
+        "add",
+        text_a,
+        "--paths",
+        "src/app.py",
+        "--commit",
+        sha,
+        "--base-ref",
+        "main",
+        "--json",
+    )
+    assert rc == 0, err
+    assert json.loads(out)["level"] == "H"

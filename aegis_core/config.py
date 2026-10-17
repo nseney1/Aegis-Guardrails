@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -57,6 +58,8 @@ __all__ = [
 CONFIG_VERSION = 1
 MAX_CONFIG_BYTES = 64 * 1024
 DEFAULT_EXPIRY_DAYS = 30
+DEFAULT_HALF_LIFE_SESSIONS = 30
+DEFAULT_EPSILON = 0.01
 # How long an aegis_scan row lets the scan-before-edit hook pass an edit of its files.
 # Bounded: the file is committed, so a huge value must not switch the gate off.
 DEFAULT_SCAN_WINDOW_S = 3600
@@ -70,7 +73,7 @@ ENV_MAX_JIT_TOKENS = "AEGIS_MAX_JIT_TOKENS"
 ENV_LLM_CMD = "AEGIS_LLM_CMD"
 ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
 
-_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast"})
+_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "half_life_sessions", "epsilon"})
 _USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor"})
 # Keys a repository might use to smuggle in a command. Only these names (aegis's own
 # vocabulary) are ever echoed in a warning; any other unknown key is only counted,
@@ -129,6 +132,22 @@ def _positive_int(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return number if isinstance(number, int) and number > 0 else None
+
+
+def _valid_half_life_sessions(value: Any) -> Optional[int]:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return _positive_int(value)
+
+
+def _valid_epsilon(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip()) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and 0.0 < number < 1.0 else None
 
 
 # ── Reading files ────────────────────────────────────────────────────────────
@@ -209,6 +228,8 @@ class RepoConfig:
     scan_window_s: int = DEFAULT_SCAN_WINDOW_S
     expiry_days: Optional[int] = DEFAULT_EXPIRY_DAYS
     expiry_per_type: Mapping[str, Optional[int]] = field(default_factory=dict)
+    half_life_sessions: int = DEFAULT_HALF_LIFE_SESSIONS
+    epsilon: float = DEFAULT_EPSILON
     packaged_drivers: Tuple[str, ...] = ()
     warnings: Tuple[str, ...] = ()
 
@@ -302,6 +323,36 @@ class RepoConfig:
         else:
             warnings.append(f"ignored 'expiry' in {REPO_LABEL}: it must be an object")
 
+        fitness_raw = raw.get("fitness", {})
+        fitness_map = fitness_raw if isinstance(fitness_raw, Mapping) else {}
+        expiry_map = expiry if isinstance(expiry, Mapping) else {}
+
+        half_life_sessions = DEFAULT_HALF_LIFE_SESSIONS
+        raw_hl = raw.get("half_life_sessions")
+        if raw_hl is None:
+            raw_hl = fitness_map.get("half_life_sessions")
+        if raw_hl is None:
+            raw_hl = expiry_map.get("half_life_sessions")
+        if raw_hl is not None:
+            parsed_hl = _valid_half_life_sessions(raw_hl)
+            if parsed_hl is not None:
+                half_life_sessions = parsed_hl
+            else:
+                warnings.append(f"ignored 'half_life_sessions' in {REPO_LABEL}: it must be a positive integer")
+
+        epsilon = DEFAULT_EPSILON
+        raw_eps = raw.get("epsilon")
+        if raw_eps is None:
+            raw_eps = fitness_map.get("epsilon")
+        if raw_eps is None:
+            raw_eps = expiry_map.get("epsilon")
+        if raw_eps is not None:
+            parsed_eps = _valid_epsilon(raw_eps)
+            if parsed_eps is not None:
+                epsilon = parsed_eps
+            else:
+                warnings.append(f"ignored 'epsilon' in {REPO_LABEL}: it must be a number between 0 and 1")
+
         packaged: List[str] = []
         ast = raw.get("ast", {})
         if isinstance(ast, dict):
@@ -337,6 +388,8 @@ class RepoConfig:
             scan_window_s=window,
             expiry_days=expiry_days,
             expiry_per_type=per_type,
+            half_life_sessions=half_life_sessions,
+            epsilon=epsilon,
             packaged_drivers=tuple(packaged),
             warnings=tuple(warnings),
         )

@@ -539,3 +539,58 @@ def test_editable_install_pth_and_pep660_finder_cannot_shadow_snapshot_source(
     assert item.failed_on_base is True
     assert item.passed_on_head is True
     assert report.findings == ()
+
+
+@needs_git
+def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Path):
+    repo = make_calc_repo(tmp_path)
+    repo.git("config", "diff.renames", "true")
+    repo.git("mv", "README.md", "GUIDE.md")
+    repo.write(
+        "src/calc.py",
+        "def divide(a: int, b: int) -> float:\n"
+        "    return a / b\n\n"
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n",
+    )
+    repo.write(
+        "tests/test_calc.py",
+        "from src.calc import add, divide\n\n"
+        "def test_divide():\n"
+        "    assert divide(6, 2) == 3.0\n\n"
+        "def test_add_regression():\n"
+        "    assert add(2, 3) == 5\n",
+    )
+    oid = repo.commit("fix: rename readme and fix addition operator")
+
+    meta = regression._commit_meta(str(repo.root), oid, "main")
+    assert "src/calc.py" in meta.changed_files
+    assert "tests/test_calc.py" in meta.present_files
+    assert "GUIDE.md" in meta.present_files
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert report.passed is True
+    assert report.total_fix_commits == 1
+    item = report.commits[0]
+    assert item.status == "passed"
+    assert "src/calc.py" in item.source_files
+    assert "tests/test_calc.py" in item.test_files
+
+
+def test_suite_level_junit_error_is_recorded_as_collection_error(tmp_path: Path):
+    from aegis_core import checkrun
+
+    junit_xml = tmp_path / "junit.xml"
+    junit_xml.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites>\n'
+        '  <testsuite name="pytest-collect" errors="1" failures="0" tests="0">\n'
+        '    <error message="collection error">ImportError</error>\n'
+        '  </testsuite>\n'
+        '</testsuites>\n',
+        encoding="utf-8",
+    )
+    passed, failed, col_errors = checkrun.parse_junit_cases(junit_xml)
+    assert passed == set()
+    assert failed == set()
+    assert "<suite:pytest-collect>" in col_errors

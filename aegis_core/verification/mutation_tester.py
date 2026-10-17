@@ -8,19 +8,22 @@ test files against each mutant, and reports surviving mutations.
 """
 
 import ast
-import atexit
 from dataclasses import dataclass
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from aegis_core import checkrun
 from aegis_core.ast.schema import MutationPoint, NormalizedAST
 from aegis_core.storage import atomic_write_text
 from . import ToolEvidence
 
 __all__ = ["check", "apply_mutation_point", "collect_mutations_from_ast"]
+
+_STDLIB_SUBPROCESS_RUN = subprocess.run
 
 
 # ── AST Mutation Visitors ──────────────────────────────────────────────────
@@ -386,23 +389,61 @@ def _check_tests(
             detail="pytest executable could not be resolved in active environment",
         )
     cmd = pytest_cmd + ["-x", "-q", "--no-header", "--tb=short", "-p", "no:cacheprovider"]
-    env = dict(os.environ)
+    env_root = swap.workdir if swap is not None else tempfile.gettempdir()
+    env = checkrun.hermetic_env(env_root)
+    py_bin_dir = os.path.dirname(sys.executable)
+    if py_bin_dir:
+        existing_path = env.get("PATH", "")
+        if py_bin_dir not in existing_path.split(os.pathsep):
+            env["PATH"] = py_bin_dir + (os.pathsep + existing_path if existing_path else "")
     # No bytecode and no cache: the runs leave the tree as they found it.
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    sys_dirs = os.pathsep.join(p for p in sys.path if p and os.path.isdir(p))
     if swap is not None:
         cmd += ["-p", _SWAP_PLUGIN]
-        env["PYTHONPATH"] = swap.stage(source or "")
+        staged = swap.stage(source or "")
+        env["PYTHONPATH"] = staged + (os.pathsep + sys_dirs if sys_dirs else "")
+    elif sys_dirs and not env.get("PYTHONPATH"):
+        env["PYTHONPATH"] = sys_dirs
     cmd += list(test_files)
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=timeout,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-        )
+        if subprocess.run is not _STDLIB_SUBPROCESS_RUN:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=timeout,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            returncode = result.returncode
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+        else:
+            popen_kwargs: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "env": env,
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            else:
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                out_str, err_str = proc.communicate(timeout=timeout)
+                returncode = proc.returncode
+                stdout = out_str or ""
+                stderr = err_str or ""
+            except subprocess.TimeoutExpired:
+                checkrun.kill_group(proc)
+                raise
+            finally:
+                checkrun.kill_group(proc)
     except subprocess.TimeoutExpired:
         return TestRunResult(
             passed=False,
@@ -417,14 +458,14 @@ def _check_tests(
             detail=f"execution error: {e}",
         )
     loaded = swap is not None and swap.loaded()
-    if result.returncode == 0:
+    if returncode == 0:
         return TestRunResult(passed=True, status="pass", detail="", loaded=loaded)
-    err_msg = (result.stderr or result.stdout or "").strip()
+    err_msg = (stderr or stdout or "").strip()
     tail = "\n".join(err_msg.splitlines()[-5:])
     return TestRunResult(
         passed=False,
         status="fail",
-        detail=f"exit code {result.returncode}: {tail[:300]}",
+        detail=f"exit code {returncode}: {tail[:300]}",
         loaded=loaded,
     )
 
@@ -578,32 +619,20 @@ def check(
         if failure:
             return evidence(False, failure, [-1])
 
-        # Non-Python mutants are written beside the original: only tests that read
-        # sibling files can observe them.
-        for m in mutation_points:
-            mutated_source = apply_mutation_point(source, m)
-            if mutated_source is None:
-                continue
-
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=target_path.suffix,
-                dir=str(target_path.parent),
-                delete=False,
-                prefix="_mutant_",
-                encoding="utf-8",
-            ) as tmp:
-                tmp.write(mutated_source)
-                tmp_path = tmp.name
-
-            clean_target = lambda p=tmp_path: Path(p).unlink(missing_ok=True)
-            atexit.register(clean_target)
-            try:
-                if _check_tests(test_files, timeout).passed:
-                    survived.append(m.line)
-            finally:
-                atexit.unregister(clean_target)
-                clean_target()
+        # Stage non-Python mutants in an isolated temporary directory rather than
+        # leaving sibling files beside the source tree.
+        with tempfile.TemporaryDirectory(prefix="aegis-mutant-") as mutant_dir:
+            for m in mutation_points:
+                mutated_source = apply_mutation_point(source, m)
+                if mutated_source is None:
+                    continue
+                tmp_path = os.path.join(mutant_dir, f"_mutant_{target_path.name}")
+                atomic_write_text(tmp_path, mutated_source)
+                try:
+                    if _check_tests(test_files, timeout).passed:
+                        survived.append(m.line)
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
 
         return evidence(not survived, f"{len(survived)}/{total} survived ({note})", sorted(set(survived)))
 
@@ -653,9 +682,11 @@ def check(
             if mutated_source is None:
                 continue
             run = _check_tests(test_files, timeout, swap, mutated_source)
-            # Killed only by a failing (or hung) run that loaded the mutant; a run that
-            # never loaded it says nothing about the tests.
-            if run.passed or not run.loaded:
+            if run.status == "timeout" and not run.loaded:
+                run = _check_tests(test_files, timeout, swap, mutated_source)
+            # Killed only by a failing (or hung) run; a non-timeout run that
+            # never loaded the mutant says nothing about the tests.
+            if run.status != "timeout" and (run.passed or not run.loaded):
                 survived.append(mutation.lineno)
 
     return evidence(not survived, f"{len(survived)}/{total} survived ({note})", sorted(set(survived)))

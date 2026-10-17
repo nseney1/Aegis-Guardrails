@@ -169,3 +169,53 @@ def test_tfidf_cosine_and_dirty_paths(tmp_path: Path):
     sim_diff = tfidf_cosine("validate path confinement before deletion", "configure oauth2 bearer token refresh")
     assert sim_same > sim_diff
     assert sim_same > 0.3
+
+
+def test_add_insight_level_h_requires_explicit_commit_and_matching_insight_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "updated"))
+    repo.commit("update rule")
+    gov_hash = human_gate.governance_tree_hash(repo.root, "HEAD")
+    gov_sha = repo.commit(
+        f"chore: approve gov\n\nAegis-Approve: {gov_hash}\n",
+        sign_key=human_key,
+        allow_empty=True,
+    )
+
+    text_a = "Never call subprocess.run without an explicit timeout parameter"
+    text_b = "Never deserialize untrusted pickle payloads from network sockets"
+
+    # 1. Governance approval on branch does NOT grant level="H" (neither commit=None nor commit=gov_sha)
+    ins_gov_none = add_insight(repo.root, text_a, paths=["src/app.py"], commit=None, base_ref="main", home=home)
+    ins_gov_sha = add_insight(repo.root, text_a, paths=["src/app.py"], commit=gov_sha, base_ref="main", home=home)
+    assert ins_gov_none["level"] == "cli"
+    assert ins_gov_sha["level"] == "cli"
+
+    # 2. Signed commit with Aegis-Approve-Insight: <insight_text_hash(text_a)> grants level="H" ONLY for text_a with commit=sha
+    ins_sha = repo.commit(
+        f"chore: approve insight\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: {human_gate.insight_text_hash(text_a)}\n",
+        sign_key=human_key,
+        allow_empty=True,
+    )
+    ins_ok = add_insight(repo.root, text_a, paths=["src/app.py"], commit=ins_sha, base_ref="main", home=home)
+    ins_wrong_text = add_insight(repo.root, text_b, paths=["src/app.py"], commit=ins_sha, base_ref="main", home=home)
+    ins_no_commit = add_insight(repo.root, text_a, paths=["src/app.py"], commit=None, base_ref="main", home=home)
+    assert ins_ok["level"] == "H"
+    assert ins_wrong_text["level"] == "cli"
+    assert ins_no_commit["level"] == "cli"

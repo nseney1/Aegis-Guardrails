@@ -705,6 +705,8 @@ class RuleCommand(AegisCommand):
         p_ins_add.add_argument("--kind", default=None, help="Optional insight category or kind")
         p_ins_add.add_argument("--host", default="cli", help="Host identifier (default: cli)")
         p_ins_add.add_argument("--session", default=None, help="Optional session identifier (stored as keyed hs)")
+        p_ins_add.add_argument("--commit", default=None, help="Optional signed commit SHA carrying Aegis-Approve-Insight")
+        p_ins_add.add_argument("--base-ref", dest="base_ref", default=None, help="Optional base branch reference for --commit")
 
         p_ins_rev = ins_sub.add_parser("review", parents=[common], help="Cluster and review insights or record a decision")
         p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise"],
@@ -787,7 +789,8 @@ def _run_insight(args: argparse.Namespace) -> int:
             row = add_insight(
                 root, getattr(args, "text", ""), paths=_normalize_paths_arg(getattr(args, "paths", None)),
                 kind=getattr(args, "kind", None), host=getattr(args, "host", "cli") or "cli",
-                session=getattr(args, "session", None),
+                session=getattr(args, "session", None), commit=getattr(args, "commit", None),
+                base_ref=getattr(args, "base_ref", None),
             )
         except Exception as exc:
             return _emit_error(args, str(exc))

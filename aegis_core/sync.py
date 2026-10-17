@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from aegis_core.fitness import for_rules
 from aegis_core.rules import RuleSet, load_rules
-from aegis_core.storage import atomic_write_text, locked, state_dir
+from aegis_core.storage import atomic_write_text, locked, read_json_dict, state_dir
 from aegis_core.telemetry_engine import ledger
 from aegis_core.workspace import literal_workspace
 from aegis_core.workspace.layout import WorkspaceLayout
@@ -66,13 +66,10 @@ def build(workspace: Any, ruleset: Optional[RuleSet] = None, now: Optional[datet
 def read_derived(workspace: Any) -> Optional[Dict[str, Any]]:
     """The last derived document, or None when there is none or it cannot be used."""
     path = WorkspaceLayout(Path(literal_workspace(workspace).root)).derived_file
-    try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        doc = json.loads(path.read_bytes().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
-        return None
-    return doc if isinstance(doc, dict) and doc.get("v") == DERIVED_VERSION and isinstance(doc.get("rules"), dict) else None
+    doc = read_json_dict(path)
+    if isinstance(doc, dict) and doc.get("v") == DERIVED_VERSION and isinstance(doc.get("rules"), dict):
+        return doc
+    return None
 
 
 def stale_rules(ruleset: RuleSet, derived: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:

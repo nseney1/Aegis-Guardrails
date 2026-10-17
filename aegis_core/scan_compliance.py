@@ -44,10 +44,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path, PurePath
-import stat
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from aegis_core.storage import append_jsonl, locked, read_jsonl
+from aegis_core.storage import append_jsonl, locked, read_jsonl, read_tail_bytes
 from aegis_core.workspace.layout import WorkspaceLayout
 
 __all__ = [
@@ -168,34 +167,7 @@ def _tail(path: Path, limit: int) -> bytes:
     """The whole lines in the last ``limit`` bytes of ``path`` (a partial first line
     dropped); b"" when it is missing, unreadable, a symlink or not a regular file (the
     checks ``storage.read_jsonl`` makes)."""
-    try:
-        if os.path.islink(path):
-            return b""
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-        fd = os.open(path, flags)
-    except OSError:
-        return b""
-    try:
-        found = os.fstat(fd)
-        if not stat.S_ISREG(found.st_mode):
-            return b""
-        size = found.st_size
-        start = max(0, size - limit)
-        os.lseek(fd, start, os.SEEK_SET)
-        chunks = []
-        remaining = size - start
-        while remaining > 0:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-    except OSError:
-        return b""
-    finally:
-        os.close(fd)
-    data = b"".join(chunks)
-    return data[data.find(b"\n") + 1:] if start else data
+    return read_tail_bytes(path, limit)
 
 
 def _spellings(path: str) -> Tuple[bytes, ...]:

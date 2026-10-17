@@ -2,104 +2,100 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json, math, re
+import math
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+
+from aegis_core import stats as _stats
+from aegis_core.stats import (
+    _betacf,
+    _num,
+    beta_cdf,
+    beta_ppf,
+    clopper_pearson_interval,
+    clopper_pearson_lower,
+    clopper_pearson_upper,
+    regularized_incomplete_beta,
+)
 from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, WILSON_CONFIDENCE_Z_SCORES
 
-__all__ = ["DEFAULT_ARCHIVE_EPSILON", "DEFAULT_HALF_LIFE_SESSIONS", "DEFAULT_MIN_N", "Fitness", "MAX_PRIOR_MASS", "MDE_UNTESTABLE_THRESHOLD", "beta_cdf", "beta_ppf", "cap_prior", "clopper_pearson_interval", "compute", "compute_mde_180d", "compute_silence_credit", "decay_factor", "for_rules", "replay_detector_history", "session_decay_factor", "wilson_interval", "wilson_lower_bound"]
+__all__ = [
+    "DEFAULT_ARCHIVE_EPSILON",
+    "DEFAULT_HALF_LIFE_SESSIONS",
+    "DEFAULT_MIN_N",
+    "Fitness",
+    "MAX_PRIOR_MASS",
+    "MDE_UNTESTABLE_THRESHOLD",
+    "beta_cdf",
+    "beta_ppf",
+    "cap_prior",
+    "clopper_pearson_interval",
+    "clopper_pearson_lower",
+    "clopper_pearson_upper",
+    "compute",
+    "compute_mde_180d",
+    "compute_silence_credit",
+    "decay_factor",
+    "for_rules",
+    "regularized_incomplete_beta",
+    "replay_detector_history",
+    "session_decay_factor",
+    "wilson_interval",
+    "wilson_lower_bound",
+]
+
 Z = WILSON_CONFIDENCE_Z_SCORES[DEFAULT_CONFIDENCE_LEVEL]
-MAX_PRIOR_MASS, DEFAULT_MIN_N, DEFAULT_HALF_LIFE_SESSIONS = 10.0, 10, 20
-DEFAULT_ARCHIVE_EPSILON, DEFAULT_MDE_HORIZON_DAYS, MDE_UNTESTABLE_THRESHOLD = 0.15, 180.0, 0.6
+MAX_PRIOR_MASS = 10.0
+DEFAULT_MIN_N = 10
+DEFAULT_HALF_LIFE_SESSIONS = 20
+DEFAULT_ARCHIVE_EPSILON = 0.15
+DEFAULT_MDE_HORIZON_DAYS = 180.0
+MDE_UNTESTABLE_THRESHOLD = 0.6
 _VIOLATION_PATTERN_RE = re.compile(r"Forbidden (?:call|import|decorator) '([^']+)'")
 _MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)'")
 
 
-def _num(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-    v = float(value)
-    return v if math.isfinite(v) and v > 0 else 0.0
-
-
 def wilson_interval(successes: float, n: float, z: float = Z) -> Tuple[float, float]:
-    total = _num(n)
-    if total == 0.0:
-        return 0.0, 1.0
-    p, z2 = min(_num(successes), total) / total, z * z
-    denom = 1.0 + z2 / total
-    center, spread = (p + z2 / (2.0 * total)) / denom, z * math.sqrt(max(0.0, (p * (1.0 - p) + z2 / (4.0 * total)) / total)) / denom
-    return max(0.0, center - spread), min(1.0, center + spread)
+    return _stats.wilson_interval(successes, n, z)
 
 
 def wilson_lower_bound(successes: float, n: float, z: float = Z) -> float:
-    return 0.0 if _num(n) == 0.0 else wilson_interval(successes, n, z)[0]
-
-
-def _betacf(a: float, b: float, x: float) -> float:
-    fpmin, qab, qap, qam = 1.0e-300, a + b, a + 1.0, a - 1.0
-    c, d = 1.0, 1.0 - (a + b) * x / (a + 1.0)
-    h = d = 1.0 / (fpmin if abs(d) < fpmin else d)
-    for m in range(1, 201):
-        m2 = 2 * m
-        for aa in (m * (b - m) * x / ((qam + m2) * (a + m2)), -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))):
-            d = 1.0 / (fpmin if abs(1.0 + aa * d) < fpmin else (1.0 + aa * d))
-            c = fpmin if abs(1.0 + aa / c) < fpmin else (1.0 + aa / c)
-            h *= d * c
-        if abs(d * c - 1.0) < 3.0e-14:
-            break
-    return h
-
-
-def beta_cdf(x: float, a: float, b: float) -> float:
-    if x <= 0.0 or a <= 0.0 or b <= 0.0:
-        return 0.0
-    if x >= 1.0:
-        return 1.0
-    bt = math.exp(a * math.log(x) + b * math.log(1.0 - x) - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)))
-    return max(0.0, min(1.0, bt * _betacf(a, b, x) / a if x < (a + 1.0) / (a + b + 2.0) else 1.0 - bt * _betacf(b, a, 1.0 - x) / b))
-
-
-def beta_ppf(q: float, a: float, b: float) -> float:
-    if q <= 0.0 or q >= 1.0:
-        return 0.0 if q <= 0.0 else 1.0
-    lo, hi = 0.0, 1.0
-    for _ in range(52):
-        mid = 0.5 * (lo + hi)
-        lo, hi = (mid, hi) if beta_cdf(mid, a, b) < q else (lo, mid)
-    return 0.5 * (lo + hi)
+    return _stats.wilson_lower_bound(successes, n, z)
 
 
 def cap_prior(alpha0: float, beta0: float, max_mass: float = MAX_PRIOR_MASS) -> Tuple[float, float]:
-    a, b = max(0.0, float(alpha0)), max(0.0, float(beta0))
+    a = max(0.0, float(alpha0))
+    b = max(0.0, float(beta0))
     mass = a + b
-    return (a * (max_mass / mass), b * (max_mass / mass)) if mass > max_mass and mass > 0.0 else (a, b)
-
-
-def clopper_pearson_interval(tp: float, n: float, alpha: float = 0.10, *, prior: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
-    k, total = _num(tp), _num(n)
-    a0, b0 = cap_prior(prior[0], prior[1]) if prior is not None else (0.0, 0.0)
-    eff_k, eff_fail = k + a0, max(0.0, total - k) + b0
-    if eff_k + eff_fail <= 0.0:
-        return 0.0, 1.0
-    lo = 0.0 if eff_k <= 0.0 else beta_ppf(alpha / 2.0, eff_k, eff_fail + (1.0 if a0 == 0.0 else 0.0))
-    hi = 1.0 if eff_fail <= 0.0 else beta_ppf(1.0 - alpha / 2.0, eff_k + (1.0 if b0 == 0.0 else 0.0), eff_fail)
-    return max(0.0, lo), min(1.0, hi)
+    if mass > max_mass and mass > 0.0:
+        scale = max_mass / mass
+        return (a * scale, b * scale)
+    return (a, b)
 
 
 def compute_mde_180d(trigger_rate_per_day: float, horizon_days: float = DEFAULT_MDE_HORIZON_DAYS) -> float:
     expected_n = _num(trigger_rate_per_day) * _num(horizon_days)
-    return 1.0 if expected_n <= 0.0 else min(1.0, 1.24324 / math.sqrt(expected_n))
+    if expected_n <= 0.0:
+        return 1.0
+    return min(1.0, 1.24324 / math.sqrt(expected_n))
 
 
-def compute_silence_credit(rrr: float, *, c: float = 0.1, heartbeat_alive: bool = True, scope_basis: Optional[str] = None, clean_sessions: int = 1) -> float:
+def compute_silence_credit(
+    rrr: float,
+    *,
+    c: float = 0.1,
+    heartbeat_alive: bool = True,
+    scope_basis: Optional[str] = None,
+    clean_sessions: int = 1,
+) -> float:
     if not heartbeat_alive or scope_basis == "fallback_unscoped":
         return 1.0
-    r, k = _num(rrr), max(0, int(clean_sessions))
-    return 1.0 if r <= 0.0 or k == 0 else math.exp(float(c) * r * k)
+    r = _num(rrr)
+    k = max(0, int(clean_sessions))
+    if r <= 0.0 or k == 0:
+        return 1.0
+    return math.exp(float(c) * r * k)
 
 
 def _parse_ts(value: Any) -> Optional[datetime]:
@@ -248,27 +244,22 @@ def compute(
 
 
 def _read_session_expiry_config(workspace: Any) -> Tuple[float, float]:
+    from aegis_core.config import ConfigError, RepoConfig
     from aegis_core.rules import workspace_root
-    from aegis_core.workspace.layout import WorkspaceLayout
-    cfg_path = WorkspaceLayout(Path(workspace_root(workspace))).config_file
-    half_life, epsilon = float(DEFAULT_HALF_LIFE_SESSIONS), float(DEFAULT_ARCHIVE_EPSILON)
+
     try:
-        exp = (json.loads(cfg_path.read_text(encoding="utf-8")) or {}).get("expiry") if cfg_path.is_file() else None
-        if isinstance(exp, dict):
-            if isinstance(exp.get("half_life_sessions"), (int, float)) and exp["half_life_sessions"] > 0:
-                half_life = float(exp["half_life_sessions"])
-            if isinstance(exp.get("epsilon"), (int, float)) and exp["epsilon"] > 0:
-                epsilon = float(exp["epsilon"])
-    except (OSError, ValueError):
-        pass
-    return half_life, epsilon
+        cfg = RepoConfig.load(workspace_root(workspace))
+    except ConfigError:
+        cfg = RepoConfig()
+    return float(cfg.half_life_sessions), float(cfg.epsilon)
 
 
 def _extract_rule_prior(rule: Any) -> Optional[Tuple[float, float]]:
     meta = getattr(rule, "meta", None)
     prior_raw = (meta.get("prior") or meta.get("pack_prior")) if isinstance(meta, Mapping) else None
     if isinstance(prior_raw, Mapping):
-        a, b = _num(prior_raw.get("alpha", prior_raw.get("tp", 0))), _num(prior_raw.get("beta", prior_raw.get("fp", 0)))
+        a = _num(prior_raw.get("alpha", prior_raw.get("tp", 0)))
+        b = _num(prior_raw.get("beta", prior_raw.get("fp", 0)))
         if a + b > 0:
             return (a, b)
     return None
@@ -292,7 +283,19 @@ def _collect_t4_events_for_rules(
     from aegis_core.telemetry_engine import ledger
     rule_map = {r.id: r for r in rules}
     info: Dict[str, Dict[str, Any]] = {
-        r.id: {"adjudicated_tp": 0, "adjudicated_fp": 0, "caught": 0, "leaked": 0, "contested": 0, "sessions": set(), "repos": set(), "timestamps": [], "samples": [], "post_reinforce_exposures": {}, "last_ts": None}
+        r.id: {
+            "adjudicated_tp": 0,
+            "adjudicated_fp": 0,
+            "caught": 0,
+            "leaked": 0,
+            "contested": 0,
+            "sessions": set(),
+            "repos": set(),
+            "timestamps": [],
+            "samples": [],
+            "post_reinforce_exposures": {},
+            "last_ts": None,
+        }
         for r in rules
     }
     try:
@@ -308,7 +311,9 @@ def _collect_t4_events_for_rules(
         rid = str(raw.get("rule") or raw.get("for_rule") or "")
         if rid not in info:
             continue
-        b, ts, ev = info[rid], (raw.get("ts") or raw.get("timestamp")), raw.get("event")
+        b = info[rid]
+        ts = raw.get("ts") or raw.get("timestamp")
+        ev = raw.get("event")
         if ev is None:
             if (raw.get("outcome") or raw.get("signal")) in ("tp", "success", "pass"):
                 b["post_reinforce_exposures"] = {}
@@ -319,7 +324,8 @@ def _collect_t4_events_for_rules(
         elif ev == "adjudication":
             verdict = raw.get("verdict")
             if verdict == "tp":
-                b["adjudicated_tp"], b["post_reinforce_exposures"] = b["adjudicated_tp"] + 1, {}
+                b["adjudicated_tp"] += 1
+                b["post_reinforce_exposures"] = {}
             elif verdict == "fp":
                 b["adjudicated_fp"] += 1
             if raw.get("session"):
@@ -328,9 +334,17 @@ def _collect_t4_events_for_rules(
                 b["repos"].add(str(raw["repo"]))
             if isinstance(ts, str) and ts:
                 b["timestamps"].append(ts)
-                b["last_ts"] = ts if b["last_ts"] is None or ts > b["last_ts"] else b["last_ts"]
+                if b["last_ts"] is None or ts > b["last_ts"]:
+                    b["last_ts"] = ts
             if len(b["samples"]) < 3:
-                b["samples"].append({"kind": "adjudication", "verdict": verdict, "ref": raw.get("ref"), "file": raw.get("file"), "line": raw.get("line"), "summary": raw.get("summary") or raw.get("snippet") or ""})
+                b["samples"].append({
+                    "kind": "adjudication",
+                    "verdict": verdict,
+                    "ref": raw.get("ref"),
+                    "file": raw.get("file"),
+                    "line": raw.get("line"),
+                    "summary": raw.get("summary") or raw.get("snippet") or "",
+                })
         elif ev == "detection":
             disp = str(raw.get("disposition") or "")
             d_key = (rid, str(raw.get("file") or ""), str(raw.get("pattern") or ""), str(raw.get("branch") or "main"))
@@ -342,15 +356,28 @@ def _collect_t4_events_for_rules(
             if disp in ("caught", "leaked"):
                 active_detections[d_key] = disp
             if disp == "caught":
-                b["caught"], b["post_reinforce_exposures"] = b["caught"] + 1, {}
+                b["caught"] += 1
+                b["post_reinforce_exposures"] = {}
             elif disp == "leaked":
                 b["leaked"] += 1
             if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
                 b["last_ts"] = ts
-            sample_item = {"kind": "detection", "disposition": disp, "file": raw.get("file"), "pattern": raw.get("pattern"), "branch": raw.get("branch"), "rev": raw.get("rev")}
+            sample_item = {
+                "kind": "detection",
+                "disposition": disp,
+                "file": raw.get("file"),
+                "pattern": raw.get("pattern"),
+                "branch": raw.get("branch"),
+                "rev": raw.get("rev"),
+            }
             replaced = False
             for idx, s_item in enumerate(b["samples"]):
-                if s_item.get("kind") == "detection" and s_item.get("file") == raw.get("file") and s_item.get("pattern") == raw.get("pattern") and s_item.get("branch") == raw.get("branch"):
+                if (
+                    s_item.get("kind") == "detection"
+                    and s_item.get("file") == raw.get("file")
+                    and s_item.get("pattern") == raw.get("pattern")
+                    and s_item.get("branch") == raw.get("branch")
+                ):
                     b["samples"][idx] = sample_item
                     replaced = True
                     break
@@ -372,7 +399,11 @@ def _collect_t4_events_for_rules(
             if all(hb for hb, _ in records) and (not scoped_or_trap or all(sb in (None, "", "match") for _, sb in records))
         )
         created_raw = (getattr(rule_obj, "meta", {}) or {}).get("created")
-        parsed_created = _parse_ts(created_raw if "T" in created_raw else f"{created_raw}T00:00:00Z") if isinstance(created_raw, str) and created_raw else None
+        parsed_created = (
+            _parse_ts(created_raw if "T" in created_raw else f"{created_raw}T00:00:00Z")
+            if isinstance(created_raw, str) and created_raw
+            else None
+        )
         b["days_span"] = max(0.0, (moment - parsed_created).total_seconds() / 86400.0) if parsed_created else 0.0
     return info
 
@@ -386,13 +417,15 @@ def for_rules(workspace: Any, rules: Iterable[Any], now: Optional[datetime] = No
         config = RepoConfig.load(workspace)
     except ConfigError:
         config = RepoConfig()
-    half_life_sessions, epsilon = _read_session_expiry_config(workspace)
+    half_life_sessions = float(config.half_life_sessions)
+    epsilon = float(config.epsilon)
     view_obj = view if view is not None else ledger.read(workspace)
     proj_credits = credit.project_credits(workspace, view=view_obj)
     combined_rows: List[Dict[str, Any]] = []
     seen_keys: Set[Tuple[str, str]] = set()
     for r in list(view_obj.rows) + list(proj_credits.outcome_rows):
-        k, rid = r.get("key"), r.get("rule")
+        k = r.get("key")
+        rid = r.get("rule")
         if isinstance(k, str) and k and isinstance(rid, str):
             if (k, rid) in seen_keys:
                 continue
@@ -402,8 +435,11 @@ def for_rules(workspace: Any, rules: Iterable[Any], now: Optional[datetime] = No
     t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=proj_credits)
     out: Dict[str, Fitness] = {}
     for rule in rule_list:
-        rid, rtype, meta = rule.id, (getattr(rule, "type", "trap") or "trap"), (getattr(rule, "meta", {}) or {})
-        rule_totals, t4 = dict(totals.get(rid, {})), t4_by_rule.get(rid, {})
+        rid = rule.id
+        rtype = getattr(rule, "type", "trap") or "trap"
+        meta = getattr(rule, "meta", {}) or {}
+        rule_totals = dict(totals.get(rid, {}))
+        t4 = t4_by_rule.get(rid, {})
         if not rule_totals.get("last_ts") and t4.get("last_ts"):
             rule_totals["last_ts"] = t4["last_ts"]
         out[rid] = compute(
@@ -419,16 +455,30 @@ def for_rules(workspace: Any, rules: Iterable[Any], now: Optional[datetime] = No
     return out
 
 
+def _python_blobs_at_commit(workspace: Any, commit: str) -> Dict[str, Tuple[str, str]]:
+    from aegis_core import gitsafe
+
+    try:
+        entries = gitsafe.tree_blobs(workspace, commit)
+    except gitsafe.GitError:
+        return {}
+    return {
+        path: entry
+        for path, entry in entries.items()
+        if path.endswith(".py")
+    }
+
+
 def _violations_at_commit(root: Path, commit: str, rules: Sequence[Any]) -> Set[Tuple[str, str, str]]:
     from aegis_core import gitsafe
     from aegis_core.ast.policy import evaluate_forbid_ast_with_overrides, extract_normalized_ast
-    res = gitsafe.run(["ls-tree", "-r", "--name-only", commit], root)
-    if res.returncode != 0:
+
+    py_blobs = _python_blobs_at_commit(root, commit)
+    if not py_blobs:
         return set()
     hits: Set[Tuple[str, str, str]] = set()
-    for line in res.stdout.decode("utf-8", "replace").splitlines():
-        rel = line.strip()
-        applicable = [r for r in rules if r.applies_to(rel)] if rel.endswith(".py") else []
+    for rel in sorted(py_blobs):
+        applicable = [r for r in rules if r.applies_to(rel)]
         if not applicable:
             continue
         try:
@@ -437,7 +487,9 @@ def _violations_at_commit(root: Path, commit: str, rules: Sequence[Any]) -> Set[
             norm_ast = extract_normalized_ast(rel, workspace_root=root, code=source) if source else None
         except Exception:
             norm_ast = None
-        for rule in applicable if norm_ast is not None else ():
+        if norm_ast is None:
+            continue
+        for rule in applicable:
             spec = (getattr(rule, "meta", {}) or {}).get("forbid_ast")
             if not isinstance(spec, dict):
                 continue

@@ -816,3 +816,46 @@ def test_ordinary_mcp_aegis_scan_records_exposure_for_review_insights_without_ou
     assert rev_persisted["clusters"][0]["matched_rule"] == "trap-no-shell-true"
     assert rev_persisted["clusters"][0]["match_status"] == "exposed_and_ignored"
 
+
+def test_human_level_h_insight_requires_content_bound_signed_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "changed"))
+    repo.commit("edit rule")
+    gov_digest = human_gate.governance_tree_hash(repo.root, "HEAD")
+    gov_commit = repo.commit(
+        f"chore: approve governance\n\nAegis-Approve: {gov_digest}\n",
+        sign_key=human_key,
+        allow_empty=True,
+    )
+
+    text_a = "Validate symlink confinement before opening user state files."
+    text_b = "Avoid mutable default arguments in public SDK helpers."
+
+    assert add_insight(repo.root, text_a, commit=None, base_ref="main", home=home)["level"] == "cli"
+    assert add_insight(repo.root, text_a, commit=gov_commit, base_ref="main", home=home)["level"] == "cli"
+
+    insight_commit = repo.commit(
+        f"chore: approve insight\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: {human_gate.insight_text_hash(text_a)}\n",
+        sign_key=human_key,
+        allow_empty=True,
+    )
+    assert add_insight(repo.root, text_a, commit=insight_commit, base_ref="main", home=home)["level"] == "H"
+    assert add_insight(repo.root, text_b, commit=insight_commit, base_ref="main", home=home)["level"] == "cli"
+    assert add_insight(repo.root, text_a, commit=None, base_ref="main", home=home)["level"] == "cli"
+

@@ -168,6 +168,23 @@ def test_a_later_governance_change_voids_an_earlier_approval(tmp_path, keys):
     repo.commit("one more weakening")
     assert human_gate.find_approval(repo.root, "HEAD", "main") is None
 
+
+@needs_signing
+def test_verify_insight_approval_binds_to_signed_commit_and_insight_text_hash(tmp_path, keys):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    text_a = "Always pass timeout to subprocess.run in aegis_core."
+    text_b = "Never use eval on untrusted input in aegis_core."
+    digest_a = human_gate.insight_text_hash(text_a)
+    sha = repo.commit(
+        f"chore: approve insight\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: {digest_a}\n",
+        sign_key=keys["human"],
+        allow_empty=True,
+    )
+    ok_verdict = human_gate.verify_insight_approval(repo.root, sha, text_a, "main")
+    assert ok_verdict.valid and ok_verdict.ok
+    mismatch = human_gate.verify_insight_approval(repo.root, sha, text_b, "main")
+    assert not mismatch.valid and not mismatch.ok and mismatch.code == "hash_mismatch"
+
 # ── 2. Tier C is self-attested ───────────────────────────────────────────────
 
 @needs_git

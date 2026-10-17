@@ -115,6 +115,59 @@ def test_a_codex_apply_patch_heredoc_is_gated_as_an_edit(ws, capsys):
     assert code == 2 and "aegis scan src/a.py" in err
 
 
+def test_a_pure_quoted_apply_patch_heredoc_with_destructive_diff_line_is_only_scan_gated(ws, capsys):
+    command = (
+        "apply_patch <<'EOF'\n"
+        "*** Begin Patch\n"
+        "*** Update File: a.sh\n"
+        "@@\n"
+        "+git reset --hard\n"
+        "*** End Patch\n"
+        "EOF"
+    )
+    code, out, err = _run(capsys, "codex-cli", codex(ws, "Bash", command))
+    assert (code, out) == (2, "")
+    assert "aegis scan a.sh" in err
+    assert _events(ws) == [("scan_gate", "codex-cli", "block", {"paths": 1})]
+    _fresh_row(ws, ["a.sh"], host="codex-cli")
+    assert _run(capsys, "codex-cli", codex(ws, "Bash", command)) == (0, "", "")
+    assert _events(ws)[-1] == ("scan_gate", "codex-cli", "pass", {"paths": 1})
+
+
+@pytest.mark.parametrize("command", [
+    "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch\nEOF\ngit reset --hard",
+    "apply_patch <<'EOF' && git reset --hard\n*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch\nEOF",
+    "apply_patch '*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch' && git reset --hard",
+    "apply_patch <<EOF\n*** Begin Patch\n*** Add File: a.py\n+$(git reset --hard)\n*** End Patch\nEOF",
+    'apply_patch <<EOF\n*** Begin Patch\n*** Add File: a.py\n+$(echo ")" && git reset --hard)\n*** End Patch\nEOF',
+])
+def test_codex_apply_patch_command_chaining_and_unquoted_substitutions_are_blocked_by_guard(ws, capsys, command):
+    _fresh_row(ws, ["a.py"], host="codex-cli")
+    code, out, err = _run(capsys, "codex-cli", codex(ws, "Bash", command))
+    assert (code, out) == (2, "")
+    assert err.startswith("aegis: blocked git-reset-hard")
+    assert _events(ws) == [("guard_match", "codex-cli", "block", {"tier": "block", "action": "block", "rule": "git-reset-hard"})]
+
+
+def test_a_compound_benign_apply_patch_command_is_still_gated_by_scan_before_edit(ws, capsys):
+    command = (
+        "apply_patch <<'EOF'\n"
+        "*** Begin Patch\n"
+        "*** Add File: a.py\n"
+        "+x = 1\n"
+        "*** End Patch\n"
+        "EOF\n"
+        "echo done"
+    )
+    code, out, err = _run(capsys, "codex-cli", codex(ws, "Bash", command))
+    assert (code, out) == (2, "")
+    assert "aegis scan a.py" in err
+    assert _events(ws) == [("scan_gate", "codex-cli", "block", {"paths": 1})]
+    _fresh_row(ws, ["a.py"], host="codex-cli")
+    assert _run(capsys, "codex-cli", codex(ws, "Bash", command)) == (0, "", "")
+    assert _events(ws)[-1] == ("scan_gate", "codex-cli", "pass", {"paths": 1})
+
+
 def test_agy_only_records_an_unscanned_edit_silently(ws, capsys):
     assert _run(capsys, "antigravity", agy(ws, "write_to_file", {"TargetFile": "src/a.py"})) == (0, "", "")
     assert _events(ws) == [("scan_gate", "antigravity", "record", {"paths": 1})]

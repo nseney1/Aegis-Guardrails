@@ -1,11 +1,15 @@
 """Opt-in diff coverage verification over changed lines (v4.3 T9)."""
 from __future__ import annotations
 
-import importlib, json, os, re, sys
+import json
+import os
 from pathlib import Path
+import re
+import sys
 from typing import Any, Callable, Optional
 
 from aegis_core import gitsafe
+from aegis_core.verification.test_runner import run_external_cmd
 from aegis_core.workspace.layout import WorkspaceLayout as AegisLayout
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -66,7 +70,8 @@ def evaluate_diff_coverage(
         files_map = files_map["files"]
     norm_cov = {k.replace("\\", "/"): v for k, v in files_map.items()}
     norm_exec = {k.replace("\\", "/"): set(v) for k, v in (executable_lines_by_file or {}).items()}
-    total_exec = total_cov = 0
+    total_exec = 0
+    total_cov = 0
     uncovered_by_file: dict[str, list[int]] = {}
     uncovered_ranges: dict[str, list[tuple[int, int]]] = {}
     for raw_path, raw_lines in sorted(changed_lines.items()):
@@ -89,9 +94,14 @@ def evaluate_diff_coverage(
             uncovered_ranges[rel] = _to_ranges(uncovered)
     ratio = 1.0 if total_exec == 0 else (total_cov / total_exec)
     return {
-        "passed": bool(ratio >= threshold), "coverage": ratio, "ratio": ratio,
-        "threshold": threshold, "covered_lines": total_cov, "executable_lines": total_exec,
-        "uncovered_by_file": uncovered_by_file, "uncovered_ranges": uncovered_ranges,
+        "passed": bool(ratio >= threshold),
+        "coverage": ratio,
+        "ratio": ratio,
+        "threshold": threshold,
+        "covered_lines": total_cov,
+        "executable_lines": total_exec,
+        "uncovered_by_file": uncovered_by_file,
+        "uncovered_ranges": uncovered_ranges,
     }
 
 
@@ -101,6 +111,7 @@ def run_diff_coverage(
     threshold: float = 0.80,
     runner: Optional[Callable[..., Any]] = None,
     diff_text: Optional[str] = None,
+    timeout: int = 120,
 ) -> dict[str, Any]:
     """Run pytest under coverage into isolated state_dir and evaluate diff coverage."""
     root = Path(workspace_root).resolve()
@@ -116,15 +127,18 @@ def run_diff_coverage(
         env["COVERAGE_CORE"] = "sysmon"
     if diff_text is None:
         res = gitsafe.run(["diff-tree", "-p", "-U0", base_ref, "HEAD"], cwd=root)
-        diff_text = res.stdout if res.returncode == 0 else ""
+        raw_out = res.stdout if res.returncode == 0 else b""
+        diff_text = raw_out.decode("utf-8", "replace") if isinstance(raw_out, bytes) else (raw_out or "")
     changed = {k: v for k, v in parse_changed_lines(diff_text).items() if k.endswith(".py")}
     cmd = [sys.executable, "-m", "coverage", "run", "-m", "pytest", "-q"]
     if runner is not None:
         runner(cmd, cwd=str(root), env=env, json_path=str(cov_json))
     else:
-        sp = importlib.import_module("subprocess")
-        sp.run(cmd, cwd=str(root), env=env, check=False, capture_output=True, text=True)
-        sp.run([sys.executable, "-m", "coverage", "json", "-o", str(cov_json)], cwd=str(root), env=env, check=False, capture_output=True, text=True)
+        run_external_cmd(cmd, cwd=str(root), env=env, timeout=timeout)
+        run_external_cmd([sys.executable, "-m", "coverage", "json", "-o", str(cov_json)], cwd=str(root), env=env, timeout=timeout)
     payload = json.loads(cov_json.read_text(encoding="utf-8")) if cov_json.exists() else {}
     return evaluate_diff_coverage(changed, payload, threshold=threshold)
+
+
+verify_coverage_threshold = run_diff_coverage
 

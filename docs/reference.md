@@ -387,6 +387,8 @@ Record an explicit human correction insight
 | `--kind` | `KIND` |  | Optional insight category or kind |
 | `--host` | `HOST` | `"cli"` | Host identifier (default: cli) |
 | `--session` | `SESSION` |  | Optional session identifier (stored as keyed hs) |
+| `--commit` | `COMMIT` |  | Optional signed commit SHA carrying Aegis-Approve-Insight |
+| `--base-ref` | `BASE_REF` |  | Optional base branch reference for --commit |
 
 ### `aegis rule insight enable`
 

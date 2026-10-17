@@ -9,6 +9,8 @@ import shlex
 import sys
 from typing import Any
 
+from aegis_core import command_safety
+
 _AEGIS_HOOK_START = "# >>> aegis pre-commit >>>"
 _AEGIS_HOOK_END = "# <<< aegis pre-commit <<<"
 _SOMA_HOOK_START = "# >>> soma pre-commit >>>"
@@ -428,33 +430,37 @@ _SEPARATOR = re.compile(r"(\$\(|&&|\|\||;;|[;&|()])")
 _RUNS_ALWAYS_AFTER = frozenset({";", ";;", "&", "\n"})  # not `&&`, `||` or `|`
 _BLOCKS = frozenset({"case", "for", "while", "until", "select", "{"})
 _BLOCK_ENDS = frozenset({"esac", "done", "}"})
-_HEREDOC = re.compile(r"(?<!<)<<-?(?!<)\s*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def _shell_lines(lines: list[str]) -> list[tuple[int, str, str]]:
     """(first line number, text, text without quoted strings or comments) per shell line:
     backslash continuations joined, here-document bodies left out."""
     found: list[tuple[int, str, str]] = []
-    first, raw, clean = 0, [], []
-    heredoc = None
-    for number, line in enumerate(lines, start=1):
-        if heredoc is not None:
-            heredoc = None if line.strip() == heredoc else heredoc
+    first_line_num = 0
+    raw_parts: list[str] = []
+    clean_parts: list[str] = []
+    heredoc_delim: str | None = None
+    for line_num, line in enumerate(lines, start=1):
+        if heredoc_delim is not None:
+            if line.strip() == heredoc_delim:
+                heredoc_delim = None
             continue
-        text = re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", "''", line)
-        text = re.sub(r"(^|\s)#.*$", "", text).rstrip()
-        match = _HEREDOC.search(line) if "<<" in text else None
-        heredoc = match.group(2) if match else None
-        if not clean:
-            first = number
-        continued = text.endswith("\\")
-        raw.append(line.strip()[:-1].rstrip() if continued and line.strip().endswith("\\") else line.strip())
-        clean.append(text[:-1] if continued else text)
-        if not continued:
-            found.append((first, " ".join(raw), " ".join(clean)))
-            raw, clean = [], []
-    if clean:
-        found.append((first, " ".join(raw), " ".join(clean)))
+        unquoted = re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", "''", line)
+        uncommented = re.sub(r"(^|\s)#.*$", "", unquoted).rstrip()
+        no_herestring = uncommented.replace("<<<", "")
+        match = command_safety._HEREDOC.search(line) if "<<" in no_herestring else None
+        heredoc_delim = match.group(4) if match else None
+        if not clean_parts:
+            first_line_num = line_num
+        is_continued = uncommented.endswith("\\")
+        stripped = line.strip()
+        raw_parts.append(stripped[:-1].rstrip() if is_continued and stripped.endswith("\\") else stripped)
+        clean_parts.append(uncommented[:-1] if is_continued else uncommented)
+        if not is_continued:
+            found.append((first_line_num, " ".join(raw_parts), " ".join(clean_parts)))
+            raw_parts, clean_parts = [], []
+    if clean_parts:
+        found.append((first_line_num, " ".join(raw_parts), " ".join(clean_parts)))
     return found
 
 

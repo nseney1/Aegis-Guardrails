@@ -64,6 +64,25 @@ def test_a_scan_in_a_session_records_one_scan_event_per_files(mcp_workspace: Pat
     ]
 
 
+def test_scan_succeeds_when_exposure_ledger_write_fails(mcp_workspace: Path, monkeypatch, capsys):
+    def read_only_ledger(*_args, **_kwargs):
+        raise OSError("read-only ledger")
+
+    monkeypatch.setattr(telemetry_handlers.credit.ledger, "append_rows", read_only_ledger)
+    res = handle_scan({
+        "workspace": str(mcp_workspace),
+        "files": ["src/main.py"],
+        "_session": "s-readonly",
+        "_host": "codex-cli",
+    })
+    assert res.get("status") != "FAIL"
+    assert [r["name"] for r in res["relevant_rules"]] == ["sample-rule"]
+    assert "Sample hypothesis" in res["guidance"]
+    assert "aegis-mcp: exposure record not written: read-only ledger" in capsys.readouterr().err
+    assert telemetry_handlers.credit.session_exposed_rules(mcp_workspace, "s-readonly") == {"sample-rule"}
+    assert telemetry_handlers.credit.exposed_rules(mcp_workspace, "codex-cli", "s-readonly") == {"sample-rule"}
+
+
 def test_scan_blocks_path_traversal(mcp_workspace: Path):
     res = handle_scan({"workspace": str(mcp_workspace), "files": ["../outside.py"]})
     assert res["status"] == "FAIL"

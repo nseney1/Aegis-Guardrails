@@ -48,11 +48,14 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import posixpath
 import re
+import shutil
 import stat
 import subprocess
+import tempfile
 import time
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from aegis_core import pathlookup
 from aegis_core.errors import AegisError
@@ -67,10 +70,12 @@ __all__ = [
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
+    "blob_id",
     "blob_oid",
     "changed_files",
     "common_dir",
     "diff_entries",
+    "export_tree",
     "git_path",
     "git_version",
     "head_commit",
@@ -78,13 +83,16 @@ __all__ = [
     "list_refs",
     "merge_base",
     "merge_tree_conflicted",
+    "parse_name_status_z",
     "read_blob",
+    "read_blobs",
     "read_object",
     "read_ref",
     "resolve_base_ref",
     "resolve_commit",
     "run",
     "toplevel",
+    "tree_blobs",
     "update_ref",
     "write_blob",
 ]
@@ -157,6 +165,7 @@ def run(
     timeout: float = GIT_TIMEOUT_SECONDS,
     stdin: Optional[bytes] = None,
     _hardening: Sequence[str] = _HARDENING,
+    _env: Optional[Mapping[str, str]] = None,
 ) -> subprocess.CompletedProcess:
     """Run ``git <args>`` hardened as described above; return the completed process (bytes).
 
@@ -166,6 +175,8 @@ def run(
     argv = [_git_executable(), *_hardening, *args]
     env = dict(os.environ)
     env.update(_ENV)
+    if _env is not None:
+        env.update(_env)
     try:
         return subprocess.run(
             argv,
@@ -305,10 +316,14 @@ def _head_or_empty_tree(cwd: Path | str) -> Optional[str]:
 
 # ── Changed and listed files ─────────────────────────────────────────────────
 
-def _blob_id(data: bytes, oid_length: int) -> str:
+def blob_id(data: bytes, oid_length: int = 40) -> str:
+    """The git blob object id of ``data`` (40-char SHA-1 or 64-char SHA-256)."""
     header = b"blob %d\0" % len(data)
     digest = hashlib.sha256 if oid_length == 64 else hashlib.sha1
     return digest(header + data).hexdigest()
+
+
+_blob_id = blob_id
 
 
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
@@ -551,6 +566,199 @@ def read_blob(cwd: Path | str, rev: str, path: str) -> Optional[bytes]:
     if len(data) != size or _blob_id(data, len(entry.oid)) != entry.oid:
         raise GitError(f"git returned content for {path} at {rev} that does not match object {entry.oid}")
     return data
+
+
+def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]:
+    blobs: Dict[str, bytes] = {}
+    position = 0
+    for oid in wanted:
+        end = out.find(b"\n", position)
+        header = out[position:end].split() if end >= 0 else []
+        if (
+            len(header) != 3
+            or header[0].decode("ascii", "replace") != oid
+            or header[1] != b"blob"
+            or not header[2].isdigit()
+        ):
+            raise GitError(f"git cannot read object {oid}")
+        size = int(header[2])
+        data = out[end + 1 : end + 1 + size]
+        if len(data) != size or blob_id(data, len(oid)) != oid:
+            raise GitError(f"git returned content for {oid} that does not match the object id")
+        blobs[oid] = data
+        position = end + 1 + size + 1
+    return blobs
+
+
+def read_blobs(
+    cwd: Union[str, os.PathLike[str]],
+    oids: Iterable[str],
+    *,
+    timeout: float = 60.0,
+) -> Dict[str, bytes]:
+    """Batch-read git blob objects via ``cat-file --batch``, verifying each object's type, size, and hash."""
+    wanted = list(dict.fromkeys(oids))
+    if not wanted:
+        return {}
+    stdin = ("\n".join(wanted) + "\n").encode("ascii")
+    res = run(["cat-file", "--batch"], cwd, timeout=timeout, stdin=stdin)
+    if res.returncode != 0:
+        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
+        raise GitError(f"git cat-file failed: {detail}")
+    return _parse_cat_file_batch(res.stdout, wanted)
+
+
+def tree_blobs(
+    cwd: Union[str, os.PathLike[str]],
+    rev: str,
+    *,
+    paths: Sequence[str] = (),
+    include_symlinks: bool = False,
+    timeout: float = 60.0,
+) -> Dict[str, Tuple[str, str]]:
+    """List blob entries in ``rev`` via ``ls-tree -r -z --full-tree`` as ``{path: (mode, oid)}``."""
+    if not isinstance(rev, str) or not rev or rev.startswith("-"):
+        raise GitError(f"invalid revision {rev!r}")
+    args = ["ls-tree", "-r", "-z", "--full-tree", rev]
+    if paths:
+        args.append("--")
+        args.extend(paths)
+    res = run(args, cwd, timeout=timeout)
+    if res.returncode != 0:
+        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
+        raise GitError(f"git ls-tree failed: {detail}")
+    found: Dict[str, Tuple[str, str]] = {}
+    for record in res.stdout.split(b"\0"):
+        if not record:
+            continue
+        meta, sep, raw_path = record.partition(b"\t")
+        if not sep or not raw_path:
+            continue
+        fields = meta.split()
+        if len(fields) != 3:
+            continue
+        mode, kind, oid = (field.decode("ascii", "replace") for field in fields)
+        if kind == "blob" and (include_symlinks or mode != _LINK_MODE):
+            found[os.fsdecode(raw_path)] = (mode, oid)
+    return found
+
+
+def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
+    """Parse NUL-delimited ``--name-status -z`` (or ``--raw -z``) output into
+    ``(status, path, new_path)`` records without desynchronizing on 3-token ``R*``/``C*`` records.
+    """
+    if not raw:
+        return []
+    fields = raw.split(b"\0")
+    records: List[Tuple[str, str, Optional[str]]] = []
+    index = 0
+    total = len(fields)
+    while index < total:
+        token = fields[index]
+        if not token:
+            index += 1
+            continue
+        parts = token.split()
+        if not parts:
+            index += 1
+            continue
+        status = parts[-1].decode("ascii", "replace")
+        kind = status[:1]
+        if kind in ("R", "C"):
+            if index + 2 >= total or not fields[index + 1] or not fields[index + 2]:
+                break
+            old_path = os.fsdecode(fields[index + 1])
+            new_path = os.fsdecode(fields[index + 2])
+            records.append((status, old_path, new_path))
+            index += 3
+        else:
+            if index + 1 >= total or not fields[index + 1]:
+                break
+            path = os.fsdecode(fields[index + 1])
+            records.append((status, path, None))
+            index += 2
+    return records
+
+
+def _safe_export_target(destination: Path, rel_path: str) -> Optional[Path]:
+    if not isinstance(rel_path, str) or not rel_path:
+        return None
+    cleaned = rel_path.replace("\\", "/")
+    if cleaned.startswith("/"):
+        return None
+    norm = posixpath.normpath(cleaned)
+    if not norm or norm in (".", "..") or norm.startswith(("../", "/")):
+        return None
+    return destination.joinpath(*norm.split("/"))
+
+
+def export_tree(
+    cwd: Union[str, os.PathLike[str]],
+    tree_or_commit: str,
+    destination: Union[str, os.PathLike[str]],
+    *,
+    overlay: Optional[Mapping[str, bytes]] = None,
+    timeout: float = 60.0,
+) -> None:
+    """Export ``tree_or_commit`` into ``destination`` using a temporary ``GIT_INDEX_FILE`` and
+    ``checkout-index -a -f --prefix``, falling back to ``tree_blobs`` + ``read_blobs`` if needed,
+    then write any ``overlay`` files via ``atomic_write_bytes``.
+    """
+    from aegis_core.storage import atomic_write_bytes
+
+    tree = _tree_of(cwd, tree_or_commit)
+    dest = Path(destination).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    root = toplevel(cwd) or Path(cwd).resolve()
+
+    exported = False
+    overrides = _filter_overrides(root)
+    if overrides is not None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="aegis-export-"))
+        try:
+            os.chmod(temp_dir, 0o700)
+            index_file = temp_dir / "index"
+            hardening = (
+                *_HARDENING,
+                "-c", "core.symlinks=false",
+                "-c", "core.sparseCheckout=false",
+                "-c", "core.autocrlf=false",
+                *overrides,
+            )
+            env_extra = {"GIT_INDEX_FILE": str(index_file)}
+            read_res = run(["read-tree", tree], root, timeout=timeout, _hardening=hardening, _env=env_extra)
+            if read_res.returncode == 0:
+                prefix = str(dest).rstrip("/\\") + os.sep
+                checkout_res = run(
+                    ["checkout-index", "-a", "-f", f"--prefix={prefix}"],
+                    root,
+                    timeout=timeout,
+                    _hardening=hardening,
+                    _env=env_extra,
+                )
+                if checkout_res.returncode == 0:
+                    exported = True
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    if not exported:
+        entries = tree_blobs(cwd, tree, timeout=timeout)
+        blobs = read_blobs(cwd, (oid for _mode, oid in entries.values()), timeout=timeout)
+        for rel_path, (mode, oid) in entries.items():
+            target = _safe_export_target(dest, rel_path)
+            if target is None or oid not in blobs:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            file_mode = 0o755 if (mode == "100755" and os.name != "nt") else None
+            atomic_write_bytes(target, blobs[oid], mode=file_mode)
+
+    if overlay:
+        for rel_path, content in overlay.items():
+            target = _safe_export_target(dest, rel_path)
+            if target is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(target, content)
 
 
 
