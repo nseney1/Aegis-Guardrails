@@ -126,13 +126,16 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_scan",
         "description": (
-            "Call before editing files: returns the governance rules that apply to them, "
-            "ranked by ledger fitness and clamped to the JIT token budget. Mandatory rules "
-            "(gates, invariants) take at most two slots; the others are listed in "
-            "omitted_mandatory. Gates and invariants are served from the reviewed base commit "
-            "(rules_base); branch-local edits to them never bind and are listed in unreviewed_rules. "
-            "stale_rules lists rules edited since the last aegis sync. "
-            "If any rule file cannot be loaded the scan fails (status FAIL) and names it."
+            "Call before editing files: returns the governance rules matching `files` (or the git "
+            "diff when `files` is omitted), ranked by ledger fitness and clamped to the JIT token "
+            "budget. Use this tool before any file edit to satisfy the pre-edit scan gate and "
+            "record session rule exposure; use `aegis_list_rules` to inspect the full inventory "
+            "without file matching, and `aegis_report_outcome` after verifying your changes. "
+            "Mandatory rules (gates, invariants) take at most two slots; any excess is listed in "
+            "`omitted_mandatory`. Gates and invariants are served from the reviewed base commit "
+            "(`rules_base`), so branch-local edits to them never bind and are listed in "
+            "`unreviewed_rules`, while `stale_rules` lists rules edited since the last `aegis sync`. "
+            "Fails closed (`status: 'FAIL'`) if any rule file cannot be loaded."
         ),
         "annotations": {
             "readOnlyHint": True,
@@ -480,8 +483,13 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_create_rule",
         "description": (
-            "Turn a natural language concern into a prompt that drafts a governance rule. "
-            "It writes nothing: save the drafted rule under .aegis/rules/ yourself."
+            "Build a structured prompt for drafting a new governance rule from a natural-language "
+            "`description`. Use this tool when asked to author or codify a repository rule; use "
+            "`aegis_list_rules` to inspect existing rules first, or `aegis_capture_insight` to log "
+            "a raw user correction without creating a rule file. Samples up to three active "
+            "workspace rules (500 chars each) as style examples, incorporates optional `rule_type` "
+            "and `domain` hints, and writes nothing to disk: save the drafted markdown to "
+            "`.aegis/rules/<type_dir>/<id>.md` yourself as directed by `instruction`."
         ),
         "annotations": {
             "readOnlyHint": True,
@@ -552,10 +560,14 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_list_rules",
         "description": (
-            "List the governance rules as {rules, stale_rules, ignored}: every rule with its "
-            "type, hypothesis and ledger fitness (a file that cannot be loaded is listed with "
-            "_error), the rules edited since the last aegis sync, and markdown under "
-            ".aegis/rules that is not a rule."
+            "List the workspace governance rule inventory in directory order without recording a "
+            "scan or exposure event. Use this tool to browse or audit rules, check ledger fitness, "
+            "or find stale/broken rule files; use `aegis_scan` instead before editing files so "
+            "pre-edit scan compliance and session rule exposure are recorded. Returns every rule "
+            "with its metadata and ledger fitness (or `_error` if unloadable, and `_expired: true` "
+            "if retired), rules modified since the last `aegis sync` (`stale_rules`), and non-rule "
+            "markdown under `.aegis/rules/` (`ignored`). Pass `rule_type` to filter `rules` and "
+            "`stale_rules` to one category, or `view` (`'summary'` or `'ids'`) to compact the payload."
         ),
         "annotations": {
             "readOnlyHint": True,

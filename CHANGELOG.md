@@ -2,6 +2,13 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
+## [4.3.3] - 2026-10-17
+
+### Changed
+
+- **MCP `outputSchema` and `structuredContent` support (`aegis_mcp.registry`, `aegis_mcp.server`, `docs/reference.md`).** All 5 MCP tools now declare formal JSON Schema `outputSchema` definitions, and `_tool_result` emits `structuredContent` on non-error dict responses alongside `content` text blocks.
+- **100% MCP `inputSchema` property coverage and TDQS description remediation (`aegis_mcp.registry`, `tests/contract/mcp_tools.json`).** Added missing parameter descriptions on `aegis_report_outcome` (`tests_passed`, `rework_count`, `notes`), documented parameter semantics/defaults (`view`, `outcome`, `idempotency_key`, `paths`, `files`), and updated all 5 tool descriptions with explicit sibling routing, rate/session limits, and side-effect disclosures.
+
 ## [4.3.2] - 2026-10-17
 
 ### Changed
