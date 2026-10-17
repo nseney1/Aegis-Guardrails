@@ -313,11 +313,15 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_report_outcome",
         "description": (
-            "Report whether the rules you were shown helped. The server ties the report to the tree "
-            "it computes now: with an `aegis check --record` run of exactly that tree it credits the "
-            "rules it showed you that match the change (your rules_used is not what is credited), and "
-            "even then only CI on the landing commit makes it count; without one it records a single "
-            "unwitnessed claim per session and tree that earns nothing. Reports per session are capped."
+            "Record post-verification rule feedback in the local outcome ledger after running tests "
+            "or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` "
+            "before editing files and `aegis_capture_insight` to record user corrections. When a "
+            "passing `aegis check --record` exists for the current git tree, the server credits rules "
+            "exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated "
+            "against the rule inventory, not used as the credit source). Those credits count "
+            "toward fitness once CI passes on the landing commit. Without a matching check record, it "
+            "writes at most one unwitnessed claim per session and tree that earns no fitness credit. "
+            "Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds."
         ),
         "annotations": {
             "readOnlyHint": False,
@@ -633,10 +637,15 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_capture_insight",
         "description": (
-            "Record a user correction as an unconfirmed suggestion in user scope. "
-            "Agent suggestions never count toward proposals or debits and never appear in "
-            "aegis_scan; a suggestion upgrades to W2 only when its quote matches a "
-            "hook-captured prompt in the same session."
+            "Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) "
+            "for rule curation. Use this tool when the user corrects your approach or states a "
+            "recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file "
+            "immediately, or `aegis_report_outcome` to report whether existing rules helped. Each "
+            "call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty "
+            "git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted "
+            "records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded "
+            "from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a "
+            "matching user prompt captured by a host hook in the same session."
         ),
         "annotations": {
             "readOnlyHint": False,

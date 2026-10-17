@@ -182,3 +182,25 @@ def test_live_tool_calls_emit_structured_content_matching_output_schema(tmp_path
     assert "structuredContent" not in err_resp["result"]
 
 
+def test_write_tool_descriptions_specify_sibling_routing_and_limits(tools):
+    report_desc = tools["aegis_report_outcome"]["description"]
+    assert "aegis_scan" in report_desc
+    assert "aegis_capture_insight" in report_desc
+    assert "200" in report_desc
+    assert "5 calls per 60 seconds" in report_desc
+    assert "aegis check --record" in report_desc
+    assert "unwitnessed" in report_desc
+    for sentence in [s.strip() for s in report_desc.split(".") if s.strip()]:
+        assert len(sentence.split()) <= 45, f"Sentence exceeds 45 words: {sentence!r}"
+
+    insight_desc = tools["aegis_capture_insight"]["description"]
+    assert "aegis_create_rule" in insight_desc
+    assert "aegis_report_outcome" in insight_desc
+    assert "~/.aegis/insights/" in insight_desc
+    assert "level: 'suggestion'" in insight_desc
+    assert "level: 'W2'" in insight_desc
+    assert "debits" not in insight_desc
+    assert "redacts secrets" in insight_desc
+    assert "300 characters" in insight_desc
+
+
