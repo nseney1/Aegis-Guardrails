@@ -103,6 +103,7 @@ def test_every_mcp_tool_and_schema_is_documented(gen, snapshots):
             assert schema.get("description", "") in section, (tool["name"], prop)
         # The full schema, exactly as tools/list sends it.
         assert json.dumps(tool["inputSchema"], indent=2, ensure_ascii=False) in section
+        assert json.dumps(tool["outputSchema"], indent=2, ensure_ascii=False) in section
 
 
 def test_render_escapes_table_cells(gen):
