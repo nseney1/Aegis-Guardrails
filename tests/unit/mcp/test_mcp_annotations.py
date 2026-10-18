@@ -204,3 +204,29 @@ def test_write_tool_descriptions_specify_sibling_routing_and_limits(tools):
     assert "300 characters" in insight_desc
 
 
+def test_read_tool_descriptions_specify_sibling_routing_and_mechanics(tools):
+    create_desc = tools["aegis_create_rule"]["description"]
+    assert "aegis_list_rules" in create_desc
+    assert "aegis_capture_insight" in create_desc
+    assert "three active workspace rules" in create_desc
+    assert "500 chars" in create_desc
+    assert "writes nothing to disk" in create_desc
+    assert ".aegis/rules/<type_dir>/<id>.md" in create_desc
+
+    list_desc = tools["aegis_list_rules"]["description"]
+    assert "aegis_scan" in list_desc
+    assert "directory order without recording a scan or exposure event" in list_desc
+    assert "_error" in list_desc
+    assert "_expired: true" in list_desc
+    assert "stale_rules" in list_desc
+    assert "ignored" in list_desc
+    assert "rule_type" in list_desc
+    assert "view" in list_desc
+
+    scan_desc = tools["aegis_scan"]["description"]
+    assert "aegis_list_rules" in scan_desc
+    assert "aegis_report_outcome" in scan_desc
+    assert "at most two slots" in scan_desc
+    assert "unreviewed_rules" in scan_desc
+    assert "pre-edit scan" in scan_desc
+    assert "session rule exposure" in scan_desc
