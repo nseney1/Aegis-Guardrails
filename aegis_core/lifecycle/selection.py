@@ -42,7 +42,7 @@ def evaluate_archives(workspace: Workspace | Path | str, now: Optional[datetime]
 
     ws = literal_workspace(workspace)
     rules = list(load_rules(ws).served)
-    fits = for_rules(ws, rules, now)
+    fits = for_rules(ws, rules, now, verify_ci=True)
     return [
         {
             "rule_id": rule.id,
@@ -78,7 +78,7 @@ def _still_misfiring(ws: Workspace, rule_id: str, view: Any) -> bool:
     from .promotion import suggest
 
     rule = load_rules(ws).get(rule_id)
-    return rule is not None and suggest(rule, for_rules(ws, [rule], view=view)[rule_id]) == "archive"
+    return rule is not None and suggest(rule, for_rules(ws, [rule], view=view, verify_ci=True)[rule_id]) == "archive"
 
 
 def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False) -> Dict[str, Any]:
