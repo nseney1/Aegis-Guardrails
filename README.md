@@ -186,7 +186,7 @@ Aegis does not claim enforcement it lacks. `aegis doctor` reports these tiers, i
 - **Tier A (Separation of duties)**: GitHub branch protection / rulesets require pull-request reviews from a human `CODEOWNERS` reviewer and required status checks (`aegis check --ci`) before merge.
 - **Tier B (Solo developer with cryptographic signing)**: When one developer owns both the repo and the agent, `aegis approve` signs the governance tree hash (`Aegis-Approve: <hash>`) using your SSH key (`git config gpg.format ssh`), verified by `aegis check --ci` against `.aegis/allowed_signers` on the base branch.
 - **Tier C (Self-attested)**: Local hooks and unsigned CI checks; `aegis doctor` reports the active tier read-only (`aegis doctor --github` inspects branch protection).
-- **Hook & sandbox boundaries**: Pre-tool hooks block unscanned edits on Claude Code and trusted Codex CLI (`Antigravity` records only; shell edits pass everywhere; `aegis status --compliance` measures scan-before-edit rates). Aegis does not sandbox processes or make network calls unless you run `aegis check --full --llm-cmd`.
+- **Hook & sandbox boundaries**: Pre-tool hooks block unscanned edits on Claude Code and trusted Codex CLI (`Antigravity` records only; shell edits pass everywhere; `aegis status --compliance` measures scan-before-edit rates). Aegis does not sandbox processes. Its own code opens no network connection; `aegis check --full --llm-cmd` and the commands that start your `gh` (listed in [PRIVACY.md](PRIVACY.md)) are the only ways it reaches one.
 
 </details>
 
@@ -198,7 +198,7 @@ Aegis does not claim enforcement it lacks. `aegis doctor` reports these tiers, i
 
 **What is AGENTS.md?** A markdown instructions file in the repository root that coding agents (Codex CLI, Antigravity, Claude Code) read at session start. Aegis writes only a small bootstrap block into it; rules stay in `.aegis/rules/` and are served just-in-time via `aegis_scan`.
 
-**Does Aegis send my code anywhere?** No. The CLI and MCP server make no network calls, and the ledger stays in `.aegis/state/` on your machine. Only optional Layer 2 (`aegis check --full --llm-cmd ...`) pipes the diff to the command you specify.
+**Does Aegis send my code anywhere?** No. Aegis opens no network connection of its own, and the ledger stays in `.aegis/state/` on your machine. Two things can reach the network, both started by you: `aegis check --full --llm-cmd ...` pipes the diff to the command you name, and the commands listed in [PRIVACY.md](PRIVACY.md) run your own `gh`.
 
 **I used Aegis 3.x. How do I upgrade?** Run `aegis migrate`, then `aegis migrate --apply`, `aegis init --host <your hosts>`, and `aegis doctor --fix`. See the [changelog](https://github.com/nseney1/Aegis-Guardrails/blob/main/CHANGELOG.md#upgrading-from-3x) for details.
 

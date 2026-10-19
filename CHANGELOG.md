@@ -2,6 +2,38 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
+## [4.3.4] - Unreleased
+
+4.3.4 is a security and repair release. It fixes the user harms of 4.3.0-4.3.3 and the trust claims the 4.3 review found forgeable. **4.3.3 never reached PyPI**: its publish run failed on a Windows timing test, so PyPI went from 4.3.2 to 4.3.4.
+
+### Security
+
+- **`aegis rule insight enable` no longer destroys host settings.** It refuses a settings file it cannot read back whole (unparseable, JSONC, BOM, non-UTF-8, wrong shape) or that is a symlink, hard link or FIFO, and leaves it byte-identical. Otherwise it merges, keeps everything else, backs the file up to `~/.aegis/backups/` first and re-reads the result. The hook registrar is now the only writer of host config files. The entry runs the interpreter that wrote it, not whatever `python3` is first on `PATH`. A 4.3.0-4.3.3 entry ran `python3 -I`, which fails where Aegis is not installed in the system Python; it stays as it is until you re-run `aegis rule insight enable`, which replaces it.
+- **Secrets are redacted.** The `key=value` pattern never matched in 4.3 (an f-string turned `{4,}` into a format field), so values such as `password=...` and `API_TOKEN=...` were stored as written. Stored insights, `aegis_capture_insight` and hook logs now share one bounded pattern table that also covers prose (`the password is ...`), `Authorization` headers and all 11 formats the Tier A detector blocks. Redaction time is linear in its input. **Exposure:** insight rows written by 4.3.0-4.3.3 may hold raw `key=value` secrets; there is no scrub command, so delete `~/.aegis/insights/<workspace-id>.jsonl` if that matters to you.
+- **Reads make no GitHub call.** `aegis_scan`, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics, packs, the hooks and the SDK no longer start `gh` (a scan made 14 `gh` calls with 7 CI rows in the ledger). Only `aegis doctor`, `doctor --release`, `aegis sync` and the promote, demote and archive decisions read GitHub; a dead `gh` costs one attempt per projection. PRIVACY.md lists them.
+- **Publishing runs only on a published release.** `publish.yml` has no manual trigger, and a `guard` job checks that the ref is the tag, that the tag is `v` + the package version and that the tag's commit is the commit being built. Before uploading, the job reads PyPI: it uploads only the files PyPI lacks, succeeds when PyPI already holds identical files, and fails without uploading on a digest mismatch or when PyPI cannot be read. A failed release is re-run with "Re-run failed jobs".
+
+### Changed behaviour
+
+- In a fresh process, scan-time fitness ignores CI-confirmed credit; `aegis sync`, `rule promote`, `demote` and `archive` still verify it (the read-path change above).
+- `aegis hook uninstall --host` also removes the insight capture entry; a file that held only that entry is rewritten, with a backup.
+- On Windows, `aegis rule insight enable --host codex-cli` refuses and writes nothing (Codex runs hooks through `%COMSPEC%`). Codex users must trust the re-written hook in Codex's `/hooks` screen.
+- A relative `CLAUDE_CONFIG_DIR` or `CODEX_HOME` is ignored when locating the insight hook's file.
+- Hook logs redact more formats. An `Aegis-Approve-Insight` trailer signed over 4.3 text that held a `key=value` secret stops verifying, because the stored text is now redacted.
+- `publish.yml` loses its `workflow_dispatch` trigger, and release runs no longer produce or need a verdict attestation (`validate.yml` still runs the verdict on pushes to `main` and on dispatch).
+
+### Fixed
+
+- The wall-clock assertions that failed Windows legs (a 1.0 s scan budget, a 300 ms hook median, a 40 ms insight-hook budget) are replaced by spawn and ledger-open counters and one baseline-subtracted overhead test. The report-flood test makes `cap + 50` calls instead of 10,000 (about 75 s shorter per leg).
+- `.github/scripts/ci_green.py` drops unused pagination and `--repo` options, and `aegis_core.credit` now skips a CI run with a non-integer id the way `ci_green.py` does instead of raising.
+
+### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
+
+- Breaking: `aegis_core.insights.enable_host_hook` is removed; the registrar writes host files (`aegis_cli.hooks.registrar.install_insight_hook`, `edit_hook_file`), and core keeps the pure `merge_insight_hook` and `remove_insight_hook`.
+- Breaking: `aegis_core.insights.redact_secrets` and `aegis_core.insights.shannon_entropy` are removed; redaction lives in `aegis_core.verification.scanners`.
+- Breaking: `aegis_core.verification.scanners.redact_secrets`, `aegis_core.verification.scanners.redact_hook_text`, `aegis_core.verification.scanners.redact_payload` and `aegis_core.verification.scanners.HOOK_REDACTION_PATTERNS` are removed in favour of the one pattern table.
+- Breaking: `aegis_cli.hooks.redaction.HOOK_REDACTION_PATTERNS` and `aegis_cli.hooks.redaction.redact_payload` are removed.
+
 ## [4.3.3] - 2026-10-17
 
 ### Changed
