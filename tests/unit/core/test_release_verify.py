@@ -1,7 +1,7 @@
 """Release verification (v4.3 spec T2): the verdict job and ``aegis doctor --release <sha>``.
 
 The verdict job attests ``sha256("aegis-ci-verdict/v1\\ncommit <sha>\\ntree <tree>\\n")`` only
-when every other job succeeded, never on pull_request. ``doctor --release`` asks
+when every other job succeeded, on push and dispatch only. ``doctor --release`` asks
 ``gh attestation verify`` (gh >= 2.93.0, every pin), re-checks the JSON gh prints, and fails
 closed: a missing or old gh is UNVERIFIED, and at tier C the attestation does not make the
 release claim true (the agent can edit the workflow). gh is always a fake.
@@ -62,9 +62,15 @@ def test_the_verdict_job_needs_every_other_job():
     assert needs == set(jobs) - {"verdict"}
 
 
-def test_the_verdict_job_never_runs_on_pull_request_and_holds_only_what_it_needs():
+def test_the_verdict_job_runs_only_where_its_attestation_is_consumed_and_holds_only_what_it_needs():
+    """doctor --release accepts only default-branch push (or dispatch) verdicts; a release run
+    calling validate.yml must not depend on producing one nobody reads."""
     block = _jobs(WORKFLOW.read_text(encoding="utf-8"))["verdict"]
-    assert re.search(r"(?m)^    if: github\.event_name != 'pull_request'\s*$", block)
+    cond = re.search(r"(?m)^    if: (.*)$", block)
+    assert cond, "verdict must state its events"
+    events = set(re.findall(r"github\.event_name == '([^']+)'", cond.group(1)))
+    assert events == {"push", "workflow_dispatch"}
+    assert re.fullmatch(r"github\.event_name == '\w+'( \|\| github\.event_name == '\w+')*", cond.group(1).strip())
     found = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", block)
     assert found
     perms = dict(line.strip().split(": ", 1) for line in found.group(1).splitlines())

@@ -235,17 +235,11 @@ jobs:
           python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
           python -m pytest tests/ -q -n auto
 
-  # The CI verdict (v4.3 T2). It runs only when every job above succeeded (a failed or
-  # skipped need skips it, so nothing is attested and `aegis doctor --release` fails
-  # closed), never on pull_request (a fork PR gets no OIDC token), and attests a subject
-  # anyone can rebuild from the commit alone: sha256 of
-  #   aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n
-  # The build-provenance attestation above is issued before the tests run, so it proves
-  # "built here", not "green"; this one proves the whole workflow passed. Keep `needs`
-  # equal to every other job: tests/unit/core/test_release_verify.py checks it.
+  # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
+  # once every job passed, only on the events doctor --release consumes (not release, not PRs).
   verdict:
     needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows]
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
