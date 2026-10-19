@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Pre-tag check: the required workflow is green on the exact commit about to be tagged.
 
-    python3 .github/scripts/ci_green.py <full-sha> [--workflow validate.yml] [--repo OWNER/REPO]
+    python3 .github/scripts/ci_green.py <full-sha> [--workflow validate.yml]
 
 Run it before `git tag`. It cannot be a step inside validate.yml: a job never sees its own
 run's conclusion (the workflow's final `verdict` job attests the result for
 `aegis doctor --release`, which is the check that does not trust this script's host).
 
 It asks the GitHub REST API (`gh api`), never `gh run list`, and applies the v4.3 T1 rules to
-`GET /repos/{owner}/{repo}/actions/runs?head_sha=<sha>`:
+`GET /repos/{owner}/{repo}/actions/runs?head_sha=<sha>&per_page=100` (one page: the API lists
+the newest-created runs first, and only a commit with 100 or more runs could push a later re-run off it):
 
 - only runs whose workflow `path` is `.github/workflows/<workflow>` (a run's name is not an
   identity), whose `head_sha` is the commit, whose head repository is the repository itself
@@ -29,11 +30,8 @@ import sys
 from typing import Any, Dict, List, Optional
 
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
-REPO = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 DEFAULT_WORKFLOW = "validate.yml"
 EVENTS = frozenset({"push", "workflow_dispatch", "release"})
-PER_PAGE = 100
-MAX_PAGES = 10
 
 
 class GhError(Exception):
@@ -59,16 +57,10 @@ def _api(endpoint: str) -> Dict[str, Any]:
     return body
 
 
-def _runs_for(sha: str, repo: Optional[str]) -> List[Dict[str, Any]]:
-    slug = repo if repo else "{owner}/{repo}"  # gh fills the placeholders from the current directory
-    runs: List[Dict[str, Any]] = []
-    for page in range(1, MAX_PAGES + 1):
-        body = _api(f"repos/{slug}/actions/runs?head_sha={sha}&per_page={PER_PAGE}&page={page}")
-        batch = body["workflow_runs"]
-        runs += [r for r in batch if isinstance(r, dict)]
-        if len(batch) < PER_PAGE:
-            break
-    return runs
+def _runs_for(sha: str) -> List[Dict[str, Any]]:
+    # gh fills {owner}/{repo} from the repository of the current directory.
+    body = _api(f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={sha}&per_page=100")
+    return [r for r in body["workflow_runs"] if isinstance(r, dict)]
 
 
 def _full_name(run: Dict[str, Any], key: str) -> Optional[str]:
@@ -108,17 +100,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("sha", help="full 40-character commit SHA")
     parser.add_argument("--workflow", default=DEFAULT_WORKFLOW,
                         help=f"the required workflow file name under .github/workflows (default {DEFAULT_WORKFLOW})")
-    parser.add_argument("--repo", default=None, help="OWNER/REPO (default: the repository of the current directory)")
     args = parser.parse_args(argv)
 
     if not FULL_SHA.match(args.sha):
         return _fail(2, f"expected a full 40-character commit SHA in lowercase hex, got {args.sha!r}")
-    if args.repo is not None and not REPO.match(args.repo):
-        return _fail(2, f"expected OWNER/REPO, got {args.repo!r}")
-    if "/" in args.workflow or not args.workflow.endswith((".yml", ".yaml")):
-        return _fail(2, f"expected a workflow file name such as validate.yml, got {args.workflow!r}")
     try:
-        runs = _runs_for(args.sha, args.repo)
+        runs = _runs_for(args.sha)
     except GhError as exc:
         return _fail(2, str(exc))
 
