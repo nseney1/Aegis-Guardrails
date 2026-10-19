@@ -65,7 +65,6 @@ def test_both_selectors_name_the_same_decisive_run(runs, expected):
         assert credit.ci_conclusion(chosen) == "none"
 
 
-@pytest.mark.xfail(strict=True, reason="credit skips malformed ids after lane C")
 def test_a_run_with_a_non_numeric_id_is_skipped_by_both():
     runs = [_run(1, started=EARLY), _run("x", conclusion="failure", started=LATE)]
     by_script, by_credit, _ = _decisive(runs)

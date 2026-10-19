@@ -490,7 +490,7 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
 
 
 @needs_git
-def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_verifies(
+def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_stays_offline(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """1. Repeated `sync.sync()` calls refresh CI on every call (revoking on later failure, querying newly landed commits).
