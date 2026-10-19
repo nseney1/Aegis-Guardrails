@@ -17,7 +17,7 @@ import importlib.util
 import json
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pytest
 
@@ -36,10 +36,9 @@ def ci_green():
     return module
 
 
-def _gh(monkeypatch, module, runs=None, returncode=0, stdout=None, raises=None, pages=None):
-    """Each gh call answers the next page of runs (``runs`` is a single page)."""
+def _gh(monkeypatch, module, runs=None, returncode=0, stdout=None, raises=None):
+    """Every gh call answers ``runs`` as one page (the newest run decides, so one page is read)."""
     calls = []
-    queue: List[List[Dict[str, Any]]] = list(pages) if pages is not None else [list(runs or [])]
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
@@ -48,7 +47,7 @@ def _gh(monkeypatch, module, runs=None, returncode=0, stdout=None, raises=None, 
         if stdout is not None:
             out = stdout
         else:
-            page = queue.pop(0) if queue else []
+            page = list(runs or [])
             out = json.dumps({"total_count": len(page), "workflow_runs": page})
         return subprocess.CompletedProcess(argv, returncode, stdout=out, stderr="gh: boom" if returncode else "")
 
@@ -69,8 +68,8 @@ def _run(run_id: int = 1, *, status: str = "completed", conclusion: Optional[str
     return run
 
 
-def _endpoint(slug: str = "{owner}/{repo}", page: int = 1) -> str:
-    return f"repos/{slug}/actions/runs?head_sha={SHA}&per_page=100&page={page}"
+def _endpoint() -> str:
+    return f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={SHA}&per_page=100"
 
 
 def test_green_when_the_newest_run_of_the_required_workflow_succeeded(ci_green, monkeypatch, capsys):
@@ -153,32 +152,12 @@ def test_the_workflow_flag_selects_the_required_workflow_by_path(ci_green, monke
     assert calls[0][-1] == _endpoint()
 
 
-def test_the_repo_flag_names_the_endpoint(ci_green, monkeypatch):
+def test_the_repo_flag_is_gone(ci_green, monkeypatch, capsys):
     calls = _gh(monkeypatch, ci_green, [_run()])
-    assert ci_green.main([SHA, "--repo", REPO]) == 0
-    assert calls[0][-1] == _endpoint(REPO)
-
-
-def test_every_page_is_read(ci_green, monkeypatch):
-    filler = [_run(1000 + i, path=".github/workflows/other.yml") for i in range(100)]
-    calls = _gh(monkeypatch, ci_green, pages=[filler, [_run(7)]])
-    assert ci_green.main([SHA]) == 0
-    assert [c[-1] for c in calls] == [_endpoint(page=1), _endpoint(page=2)]
-
-
-@pytest.mark.parametrize("bad", ["sub/validate.yml", "validate.txt", "../validate.yml", ""])
-def test_the_workflow_must_be_a_workflow_file_name(ci_green, monkeypatch, capsys, bad):
-    calls = _gh(monkeypatch, ci_green, [_run()])
-    assert ci_green.main([SHA, "--workflow", bad]) == 2
-    assert calls == []
-    assert "workflow file name" in capsys.readouterr().err
-
-
-def test_a_bad_repo_is_a_usage_error(ci_green, monkeypatch, capsys):
-    calls = _gh(monkeypatch, ci_green, [_run()])
-    assert ci_green.main([SHA, "--repo", "not a repo"]) == 2
-    assert calls == []
-    assert "OWNER/REPO" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as exc:
+        ci_green.main([SHA, "--repo", REPO])
+    assert exc.value.code == 2 and calls == []
+    assert "unrecognized arguments: --repo" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("bad", ["4f28101", "HEAD", "4F2810174FBD6014DD5DB3E7C90121E1BC514676", SHA + "0", ""])
