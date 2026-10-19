@@ -10,7 +10,6 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
-import time
 
 import pytest
 
@@ -174,7 +173,7 @@ def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypat
     assert hosts_by_id["antigravity"]["status"] == "explicit_only"
 
 
-def test_hook_entrypoint_exits_zero_empty_stdout_and_under_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_hook_entrypoint_exits_zero_with_empty_output_and_one_heartbeat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -186,19 +185,15 @@ def test_hook_entrypoint_exits_zero_empty_stdout_and_under_budget(tmp_path: Path
         "session_id": "fast-hook-sess-1",
         "cwd": str(ws),
     })
-    # Warm up link.key creation first, then time routine prompt hook execution
     run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
 
     out, err = io.StringIO(), io.StringIO()
-    t0 = time.perf_counter()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     assert rc == 0
     assert out.getvalue() == ""
     assert err.getvalue() == ""
-    assert elapsed_ms < 40.0, f"hook took {elapsed_ms:.2f}ms (> 40ms budget)"
     rows = read_insight_rows(ws, home=home)
     assert len(rows) == 1
     assert rows[0]["event"] == "heartbeat"

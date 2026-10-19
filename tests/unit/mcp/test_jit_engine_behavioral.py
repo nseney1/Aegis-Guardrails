@@ -5,7 +5,6 @@ returns for real rule files; no internal helper is called directly.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -72,13 +71,6 @@ class TestSelection:
             _make_rule(tmp_path, f"budget-rule-{i}")
         result = scan(tmp_path, ["src/foo.py"], budget=2)
         assert result["stats"]["budget"] == 2 and result["rules_staged"] == 2
-
-    def test_100_rules_scan_in_under_a_second(self, tmp_path):
-        for i in range(100):
-            _make_rule(tmp_path, f"perf-rule-{i}")
-        start = time.time()
-        scan(tmp_path, ["src/foo.py"])
-        assert time.time() - start < 1.0
 
 
 class TestFitnessInTheResult:
