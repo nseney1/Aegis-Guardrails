@@ -135,7 +135,8 @@ def test_symlinked_file_is_refused_and_its_target_kept(env, capsys, host):
     symlink_or_skip(target, path)
     rc, doc, _ = enable(capsys, host)
     assert rc == 1 and "symlink" in doc["error"]
-    assert path.is_symlink() and os.readlink(path) == str(target)
+    # Windows readlink returns the \\?\ form of an absolute target, so compare identity.
+    assert path.is_symlink() and os.path.samefile(path, target)
     assert target.read_bytes() == FOREIGN + b"}\n"
     assert not (env.home / ".aegis" / "link.key").exists() and backups(env) == []
 
