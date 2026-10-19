@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 
 from aegis_cli.cli import main
-from aegis_core import human_gate, release_verify as rv
+from aegis_core import release_verify as rv
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -124,10 +124,20 @@ class FakeGh:
         return [c for c in self.calls if c[:2] == ["attestation", "verify"]]
 
 
-def make_repo(tmp_path: Path, remote: Optional[str] = f"https://github.com/{REPOSITORY}.git") -> hg.Repo:
+# What the base branch must hold for the tier detector to reach each tier (with tier_runner's rules).
+TIER_FILES = {"A": {".github/CODEOWNERS": hg.CODEOWNERS_FULL},
+              "B": {"allowed_signers": hg.allowed_signers_text(hg.hardware_public_key())}}
+
+
+def make_repo(tmp_path: Path, remote: Optional[str] = f"https://github.com/{REPOSITORY}.git",
+              tier: Optional[str] = None) -> hg.Repo:
     repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
     repo.write("src/app.py", "x = 1\n")
+    for path, text in TIER_FILES.get(tier or "", {}).items():
+        repo.write(path, text)
     repo.commit("base")
+    if tier == "B":
+        repo.home.sign_with("key::" + hg.hardware_public_key())  # a security key: adequate custody
     if remote is not None:
         repo.git("remote", "add", "origin", remote)
     repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
@@ -169,8 +179,10 @@ def tier_runner_none(*_args: Any, **_kw: Any) -> None:
     return None  # gh unavailable for tier detection: tier C
 
 
-def as_tier(monkeypatch, tier: str) -> None:
-    monkeypatch.setattr(human_gate, "detect_tier", lambda root, gh=None, environ=None: human_gate.TierReport(tier))
+def tier_runner(tier: str) -> hg.FakeGh:
+    """The gh that tier detection reads: A adds review and code-owner rules to B's required checks."""
+    rules = [hg.pull_request_rule(), hg.checks_rule()] if tier == "A" else [hg.checks_rule()]
+    return hg.FakeGh(rules=rules)
 
 
 @pytest.mark.parametrize("version", ["2.45.0", "2.66.0", "2.92.9", "1.99.99"])
@@ -193,13 +205,12 @@ def test_no_gh_or_a_gh_without_a_version_is_unverified(tmp_path, version):
 
 
 @needs_git
-def test_every_pin_is_passed_and_the_subject_file_is_the_commit_subject(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+def test_every_pin_is_passed_and_the_subject_file_is_the_commit_subject(tmp_path):
+    repo = make_repo(tmp_path, tier="B")
     commit, tree, digest = facts(repo)
     gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
-    as_tier(monkeypatch, "B")
-    report = rv.verify_release(repo.root, commit, run=gh)
-    assert report.verified, report.message
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("B"))
+    assert report.verified and report.tier == "B", report.message
     (argv,) = gh.verify_calls
     pairs = dict(zip(argv[3::2], argv[4::2]))
     expected = {"--repo": REPOSITORY, "--predicate-type": rv.PREDICATE_TYPE,
@@ -214,19 +225,17 @@ def test_every_pin_is_passed_and_the_subject_file_is_the_commit_subject(tmp_path
 
 
 @needs_git
-def test_a_newer_gh_is_accepted(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+def test_a_newer_gh_is_accepted(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
-    as_tier(monkeypatch, "A")
-    report = rv.verify_release(repo.root, commit, run=FakeGh("3.0.0", (0, json.dumps([record(commit, tree, digest)]), "")))
-    assert report.verified and report.caveats == ()
+    report = rv.verify_release(repo.root, commit, run=FakeGh("3.0.0", (0, json.dumps([record(commit, tree, digest)]), "")), tier_runner=tier_runner("A"))
+    assert report.verified and report.caveats == () and report.tier == "A"
 
 
 @needs_git
-def test_gh_refusing_the_attestation_is_not_verified(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
-    as_tier(monkeypatch, "A")
-    report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (1, "", "no matching attestations found\n")))
+def test_gh_refusing_the_attestation_is_not_verified(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
+    report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (1, "", "no matching attestations found\n")), tier_runner=tier_runner("A"))
     assert not report.verified and report.code == "rejected"
     assert "no matching attestations" in report.message
 
@@ -249,44 +258,40 @@ def test_gh_refusing_the_attestation_is_not_verified(tmp_path, monkeypatch):
     ("other-workflow", {"cert__buildSignerURI": f"https://github.com/{REPOSITORY}/.github/workflows/evil.yml@refs/heads/main"}),
     ("no-signer-uri", {"cert__buildSignerURI": None}),
 ])
-def test_exit_zero_is_not_enough_the_json_is_rechecked(tmp_path, monkeypatch, label, overrides):
-    repo = make_repo(tmp_path)
+def test_exit_zero_is_not_enough_the_json_is_rechecked(tmp_path, label, overrides):
+    repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
-    as_tier(monkeypatch, "A")
     gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest, **overrides)]), ""))
-    report = rv.verify_release(repo.root, commit, run=gh)
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("A"))
     assert not report.verified and report.code == "bad_output", label
 
 
 @needs_git
-def test_expected_run_pin_rejects_mismatched_run_id_or_attempt(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+def test_expected_run_pin_rejects_mismatched_run_id_or_attempt(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
-    as_tier(monkeypatch, "A")
     gh_mismatch = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest, predicate__run="1/1")]), ""))
-    bad = rv.verify_release(repo.root, commit, run=gh_mismatch, expected_run="1/2")
+    bad = rv.verify_release(repo.root, commit, run=gh_mismatch, expected_run="1/2", tier_runner=tier_runner("A"))
     assert not bad.verified and bad.code == "bad_output"
     gh_match = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest, predicate__run="42/3")]), ""))
-    good = rv.verify_release(repo.root, commit, run=gh_match, expected_run="42/3")
+    good = rv.verify_release(repo.root, commit, run=gh_match, expected_run="42/3", tier_runner=tier_runner("A"))
     assert good.verified and good.details.get("run") == "42/3"
 
 
 @needs_git
 @pytest.mark.parametrize("stdout", ["", "not json", "[]", "{}", json.dumps([{"verificationResult": {}}])])
-def test_an_empty_or_shapeless_answer_is_not_verified(tmp_path, monkeypatch, stdout):
-    repo = make_repo(tmp_path)
-    as_tier(monkeypatch, "A")
-    report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (0, stdout, "")))
+def test_an_empty_or_shapeless_answer_is_not_verified(tmp_path, stdout):
+    repo = make_repo(tmp_path, tier="A")
+    report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (0, stdout, "")), tier_runner=tier_runner("A"))
     assert not report.verified and report.code == "bad_output"
 
 
 @needs_git
-def test_one_matching_attestation_among_others_is_enough(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+def test_one_matching_attestation_among_others_is_enough(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
-    as_tier(monkeypatch, "A")
     records = [record(commit, tree, digest, cert__sourceRepositoryRef="refs/tags/v1"), record(commit, tree, digest)]
-    assert rv.verify_release(repo.root, commit, run=FakeGh("2.93.0", (0, json.dumps(records), ""))).verified
+    assert rv.verify_release(repo.root, commit, run=FakeGh("2.93.0", (0, json.dumps(records), "")), tier_runner=tier_runner("A")).verified
 
 
 @needs_git
@@ -303,13 +308,12 @@ def test_at_tier_c_an_attestation_is_reported_but_the_release_claim_fails_closed
 
 
 @needs_git
-def test_the_source_ref_follows_origin_head(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+def test_the_source_ref_follows_origin_head(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
     repo.git("update-ref", "refs/remotes/origin/trunk", "HEAD")
     repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
-    as_tier(monkeypatch, "A")
     gh = FakeGh("2.93.0", (1, "", "no"))
-    rv.verify_release(repo.root, "HEAD", run=gh)
+    rv.verify_release(repo.root, "HEAD", run=gh, tier_runner=tier_runner("A"))
     argv = gh.verify_calls[0]
     assert argv[argv.index("--source-ref") + 1] == "refs/heads/trunk"
 
@@ -321,11 +325,10 @@ def test_the_source_ref_follows_origin_head(tmp_path, monkeypatch):
     ("https://gitlab.com/owner/project.git", None),
     (None, None),
 ])
-def test_the_repository_pin_comes_from_a_github_origin_only(tmp_path, monkeypatch, remote, expected):
-    repo = make_repo(tmp_path, remote=remote)
-    as_tier(monkeypatch, "A")
+def test_the_repository_pin_comes_from_a_github_origin_only(tmp_path, remote, expected):
+    repo = make_repo(tmp_path, remote=remote, tier="A")
     gh = FakeGh("2.93.0", (1, "", "no"))
-    report = rv.verify_release(repo.root, "HEAD", run=gh)
+    report = rv.verify_release(repo.root, "HEAD", run=gh, tier_runner=tier_runner("A"))
     if expected is None:
         assert report.code == "no_repository" and gh.verify_calls == []
     else:
@@ -347,12 +350,11 @@ def test_outside_a_repository_nothing_is_verified(tmp_path):
 
 
 @needs_git
-def test_verifying_writes_nothing_into_the_repository(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+def test_verifying_writes_nothing_into_the_repository(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
-    as_tier(monkeypatch, "A")
     before = sorted(p.relative_to(repo.root).as_posix() for p in repo.root.rglob("*") if ".git" not in p.parts)
-    rv.verify_release(repo.root, commit, run=FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), "")))
+    rv.verify_release(repo.root, commit, run=FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), "")), tier_runner=tier_runner("A"))
     after = sorted(p.relative_to(repo.root).as_posix() for p in repo.root.rglob("*") if ".git" not in p.parts)
     assert before == after
 

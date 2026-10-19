@@ -1,7 +1,6 @@
 """aegis_core.rule_integrity beyond the acceptance contract: sad paths, edges and the shape of the output.
 
-Real git repositories in tmp dirs; the only mock is the git read boundary where a corrupt
-object has to be simulated.
+Real git repositories in tmp dirs; a corrupt object is a forged loose object on disk.
 """
 from __future__ import annotations
 
@@ -9,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -171,19 +171,23 @@ def test_an_enforcement_drop_is_a_rank_loss_even_when_the_type_stays(tmp_path):
 # ── reading git ──────────────────────────────────────────────────────────────
 
 @needs_git
-def test_content_that_does_not_hash_to_its_object_id_is_refused(tmp_path, monkeypatch):
+def test_a_forged_base_object_is_refused_by_the_public_loaders(tmp_path):
     repo = make_repo(tmp_path)
     oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
-    real = rule_integrity._run
-
-    def forged(cwd, args, stdin=None):
-        if args[0] == "cat-file":
-            return f"{oid} blob 5\nlies!\n".encode()
-        return real(cwd, args, stdin)
-
-    monkeypatch.setattr(rule_integrity, "_run", forged)
+    # The base blob is read from git only when the working-tree rule no longer hashes to it.
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nA reworded reason.\n"))
+    assert rule_integrity.effective(repo.root).ruleset  # control: the untouched object loads
+    ok = scan_mod.scan(repo.root, ["src/app.py"])
+    assert ok.get("status") != "FAIL" and ok["relevant_rules"]
+    loose = repo.root / ".git" / "objects" / oid[:2] / oid[2:]
+    os.chmod(str(loose), 0o644)
+    loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
     with pytest.raises(IntegrityError, match="does not match the object id"):
-        rule_integrity._read_blobs(str(repo.root), [oid])
+        rule_integrity.effective(repo.root)
+    result = scan_mod.scan(repo.root, ["src/app.py"])
+    assert result["status"] == "FAIL"
+    assert "the reviewed (base) version of the rules cannot be read" in result["error"]
+    assert not result.get("relevant_rules")
 
 
 @needs_git
