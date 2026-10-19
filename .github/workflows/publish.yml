@@ -76,9 +76,20 @@ jobs:
           python .github/scripts/verify_dist.py verify dist > publish-files.txt
           cat publish-files.txt
 
+      # A re-run must never change or mask PyPI content (so no skip-existing): keep only the
+      # files PyPI lacks, skip the upload when it holds them all, fail on a digest mismatch
+      # or an unreadable answer. guard proved the tag is v + the package version.
+      - name: Compare with what PyPI holds
+        id: pypi
+        shell: bash
+        run: |
+          python .github/scripts/pypi_state.py plan --project aegis-guardrails --version "${GITHUB_REF_NAME#v}" --sums dist/SHA256SUMS --files publish-files.txt
+          cat publish-files.txt
+
       # The publish action uploads every file in packages-dir, and dist/ also
       # holds SHA256SUMS. Stage exactly the verified files listed above.
       - name: Stage verified files for upload
+        if: steps.pypi.outputs.state != 'identical'
         shell: bash
         run: |
           set -euo pipefail
@@ -90,9 +101,14 @@ jobs:
           ls -l publish-dist
 
       - name: Publish to PyPI (Trusted Publishing)
+        if: steps.pypi.outputs.state != 'identical'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: publish-dist/
+
+      - name: Wait until PyPI holds exactly the verified files
+        shell: bash
+        run: python .github/scripts/pypi_state.py wait --project aegis-guardrails --version "${GITHUB_REF_NAME#v}" --sums dist/SHA256SUMS
 
   release-assets:
     needs: publish
