@@ -53,12 +53,14 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
     (re.compile(pattern), hook, text) for pattern, hook, text in (
         # The body is optional, so an unterminated header cannot backtrack over the rest.
         (_PEM_HEAD + "(?:(?:[^-]|-(?!-)){0,16384}" + _PEM_TAIL + ")?", "[REDACTED_PEM]", "[REDACTED_PEM]"),
-        ("(?i)(" + _NB + "[a-z][a-z0-9+.-]{0,31}://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
+        # The scheme is optional because Tier A blocks a bare "://user:pass@host" too.
+        ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
          r"\1[REDACTED]@"),
         (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
          "[REDACTED_JWT]"),
         (_NB + "AKIA[0-9A-Z]{16}", "AKIA_REDACTED", "[REDACTED_AWS]"),
         (_NB + "ASIA[0-9A-Z]{16}", "ASIA_REDACTED", "[REDACTED_AWS]"),
+        (_NB + "(?:AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}", "[REDACTED_AWS]", "[REDACTED_AWS]"),
         (_NB + "ghp_[A-Za-z0-9]{20,255}", "ghp_REDACTED", "[REDACTED_VCS_TOKEN]"),
         (_NB + "gh[ousr]_[A-Za-z0-9]{20,255}", "gh_token_REDACTED", "[REDACTED_VCS_TOKEN]"),
         (_NB + "github_pat_[A-Za-z0-9_]{20,255}", "github_pat_REDACTED", "[REDACTED_VCS_TOKEN]"),
@@ -164,7 +166,9 @@ def _bounded_head(text: str, limit: int) -> str:
         words.pop()
     head = " ".join(words)
     begin = head.rfind("-----BEGIN")
-    return head[:begin].rstrip() if begin != -1 and "-----END" not in head[begin:] else head
+    # Closed only by a whole END marker: a cut inside the END line leaves a block the PEM row
+    # cannot match, and its body would survive. The join turned newlines into single spaces.
+    return head[:begin].rstrip() if begin != -1 and not re.search(_PEM_TAIL, head[begin:]) else head
 
 
 def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:

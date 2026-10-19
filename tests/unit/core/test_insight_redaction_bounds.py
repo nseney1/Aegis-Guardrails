@@ -1,7 +1,10 @@
 """Insight redaction scans a bounded, whole-token head of a long prompt (R-checks-26)."""
 from __future__ import annotations
 
+import base64
 from pathlib import Path
+import random
+from typing import List, Tuple
 
 import pytest
 
@@ -37,6 +40,35 @@ def test_a_pem_block_cut_by_the_bound_leaves_no_key_material():
     assert second < 4096 < text.rindex("-----END")
     out = redact_insight_text(text, max_len=0)
     assert "MIIEvQIBADANBgkqhkiG9w0BAQEF" not in out
+
+
+def _pem_cut_at_the_bound(where: str) -> Tuple[str, List[str]]:
+    """A PEM block whose base64 body holds '/' and '+' (which split it into short words), placed
+    so the 4,096-character bound falls inside the body or inside the END line."""
+    rng = random.Random(4096)
+    raw = bytes(rng.getrandbits(8) for _ in range(2900))
+    b64 = base64.b64encode(raw).decode("ascii")
+    lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
+    assert "/" in b64 and "+" in b64
+    end = "-----END RSA PRIVATE KEY-----"
+    core = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n"
+    # The bound keeps text[:4097]; land its last character in "PRIVATE" or mid-body.
+    at = 4096 - len("-----END RSA PR") if where == "end-line" else 4096 + 300
+    pad = at - len(core) - len("key dump: ")
+    assert pad > 0
+    text = "key dump: " + "w " * (pad // 2) + " " * (pad % 2) + core + end + "\n" + "tail " * 50
+    assert text.index(end) == at and len(text) > 4096
+    return text, lines
+
+
+@pytest.mark.parametrize("max_len", [300, 0], ids=["default", "unbounded"])
+@pytest.mark.parametrize("where", ["body", "end-line"])
+def test_a_pem_body_cut_anywhere_by_the_bound_leaves_no_fragment(where, max_len):
+    text, lines = _pem_cut_at_the_bound(where)
+    out = redact_insight_text(text) if max_len == 300 else redact_insight_text(text, max_len=0)
+    leaked = sorted({ln[i:i + 8] for ln in lines for i in range(len(ln) - 7) if ln[i:i + 8] in out})
+    assert leaked == []
+    assert out.startswith("key dump: w")
 
 
 def test_a_secret_straddling_the_bound_is_dropped_whole():

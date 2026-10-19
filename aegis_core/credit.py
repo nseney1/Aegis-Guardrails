@@ -634,14 +634,16 @@ def project_credits(
     if err:
         return CreditProjection((), (), available=False, error=str(err))
     v_map: Dict[str, str] = {}
+    stopped: Optional[str] = None
     # Read paths (scan, status, list) pass verify_ci=False and stay offline: a ``ci`` row then counts
     # only when this process verified it, so they can under-credit but never over-credit.
     if p_branch and verify_ci:
         rest_client = GhRestClient(cwd=str(root)) if (client is None and attestation_runner is None) else None
         latest = {str(r.get("commit") or ""): r for r in _of(rows, "ci")}
-        for commit, ci_row in latest.items():
-            if not commit or (c_root, commit) in _UNAVAILABLE_CI or _ci_cache_current(_VERIFIED_CI.get((c_root, commit)), ci_row):
-                continue
+        pending = [(commit, ci_row) for commit, ci_row in latest.items()
+                   if commit and (c_root, commit) not in _UNAVAILABLE_CI
+                   and not _ci_cache_current(_VERIFIED_CI.get((c_root, commit)), ci_row)]
+        for idx, (commit, ci_row) in enumerate(pending):
             wf = str(ci_row.get("workflow") or workflow)
             if rest_client is not None:
                 try:
@@ -665,11 +667,16 @@ def project_credits(
                     continue
             # Circuit breaker: a dead gh costs one attempt per projection. Only a well-formed id trips
             # it, so one malformed (never-asked) row cannot switch verification off for the rest.
+            # Tripping makes the projection unavailable: verify_ci callers decide (promote, demote,
+            # archive), and under-credited fitness must not drive those decisions.
             if rest_client is not None and _FULL_SHA.fullmatch(commit):
+                stopped = (f"CI verification stopped after gh failed for {commit[:12]}; "
+                           f"{len(pending) - idx} commit(s) were not verified")
                 break
     app_fn = approved or approval_lookup(root, rows, landed=look)
     derived = derive(rows, landed=look, approved=app_fn, verified_ci=v_map or None)
-    return CreditProjection(tuple(derived), tuple(confirmed_outcome_rows(derived)), available=True, error=None)
+    return CreditProjection(tuple(derived), tuple(confirmed_outcome_rows(derived)),
+                            available=stopped is None, error=stopped)
 
 
 def claimed_summary(root: Any) -> Dict[str, Any]:

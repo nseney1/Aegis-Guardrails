@@ -195,3 +195,63 @@ def test_without_gh_sync_reports_ci_unavailable_and_promotion_is_ineligible(tmp_
     res = promote_rule(repo.root, "trap-sample", force=False)
     assert res["status"] == "ineligible" and "does not meet the promotion threshold" in res["message"]
     assert (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").is_file()
+
+
+class FlakyGh(CountingGh):
+    """``gh`` whose first ``api`` call fails and every later one answers."""
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        if argv[:1] == ["api"] and not any(c[:1] == ["api"] for c in self.calls):
+            self.calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, "", "transient")
+        return super().__call__(argv, stdin, cwd, timeout)
+
+
+def _api_calls(gh: CountingGh) -> int:
+    return sum(1 for c in gh.calls if c[:1] == ["api"])
+
+
+@needs_git
+def test_a_transient_gh_failure_stops_ci_verification_and_decisions_fail_closed(tmp_path, monkeypatch):
+    from aegis_core import fitness
+    from aegis_core.lifecycle.promotion import promote_rule
+    from aegis_core.rules import load_rules
+
+    repo, commit = _project(tmp_path, monkeypatch)
+    gh = FlakyGh([hv.ci_run(commit, run_id=10)])
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert _api_calls(gh) == 1
+    assert proj.available is False
+    assert proj.error == f"CI verification stopped after gh failed for {commit[:12]}; 7 commit(s) were not verified"
+
+    _fresh_process()
+    gh.calls.clear()  # the next api call fails again
+    rule = load_rules(repo.root).get("trap-sample")
+    fit = fitness.for_rules(repo.root, [rule], verify_ci=True)["trap-sample"]
+    assert (fit.state, fit.suggestion, fit.evidence_available) == ("evidence_unavailable", None, False)
+
+    _fresh_process()
+    gh.calls.clear()
+    res = promote_rule(repo.root, "trap-sample", force=False)
+    assert res["status"] == "ineligible"
+    assert (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").is_file()
+
+
+@needs_git
+def test_a_healthy_gh_verifies_every_commit_and_reads_stay_offline(tmp_path, monkeypatch):
+    repo, commit = _project(tmp_path, monkeypatch)
+    gh = CountingGh([hv.ci_run(commit, run_id=10)])
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert (proj.available, proj.error) == (True, None)
+    assert [c.state for c in proj.credits] == ["confirmed"]
+    assert _api_calls(gh) == 1 + len(FORGED)
+
+    _fresh_process()
+    gh.calls.clear()
+    proj = credit.project_credits(repo.root)
+    assert (proj.available, proj.error) == (True, None)
+    assert gh.calls == []

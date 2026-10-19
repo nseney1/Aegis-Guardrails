@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
-from typing import Callable, Dict
+from typing import Callable, Dict, List, Tuple
 
 import pytest
 
@@ -45,6 +45,20 @@ def _secret_part(rule_id: str, sample: str) -> str:
     return "p9Q8r7S6t5U4" if rule_id == "url-basic-auth" else sample
 
 
+def _variants() -> Dict[str, Tuple[str, str]]:
+    """Further shapes a Tier A family blocks: every other AWS id prefix and a URL with no scheme."""
+    out = {f"aws-{p.lower()}": ("aws-access-key-id", _tok(p[:2], p[2:], "9F8E7D6C5B4A3210"))
+           for p in ("AGPA", "AIDA", "AROA", "ANPA", "ANVA", "AIPA")}
+    out["url-no-scheme"] = ("url-basic-auth", _tok("://", "svc_admin", ":", "p9Q8r7S6t5U4", "@api.internal.corp/v1"))
+    return out
+
+
+#: (case id, Tier A family, sample) for every sample and variant.
+CASES: List[Tuple[str, str, str]] = ([(rid, rid, s) for rid, s in _samples().items()]
+                                     + [(cid, rid, s) for cid, (rid, s) in _variants().items()])
+CASE_IDS = [c[0] for c in CASES]
+
+
 REDACTORS: Dict[str, Callable[[str], str]] = {
     "hook": redaction.redact_secrets,
     "command": scanners.redact_command_secrets,
@@ -56,20 +70,23 @@ def test_sample_table_covers_every_tier_a_format():
     assert set(_samples()) == set(scanners.TIER_A_PATTERNS)
 
 
+def test_every_case_is_one_the_tier_a_detector_blocks():
+    for case_id, rule_id, sample in CASES:
+        assert scanners.TIER_A_PATTERNS[rule_id].search(sample), case_id
+
+
 @pytest.mark.parametrize("redactor", list(REDACTORS))
-@pytest.mark.parametrize("rule_id", list(_samples()))
-def test_every_tier_a_format_is_scrubbed_and_context_kept(redactor, rule_id):
-    sample = _samples()[rule_id]
+@pytest.mark.parametrize("case_id,rule_id,sample", CASES, ids=CASE_IDS)
+def test_every_tier_a_format_is_scrubbed_and_context_kept(redactor, case_id, rule_id, sample):
     out = REDACTORS[redactor](f"deploy --opt {sample} --next")
     assert _secret_part(rule_id, sample) not in out
     assert "MIIEpAIBAAKCAQEA0123456789" not in out
     assert out.startswith("deploy --opt ") and out.endswith(" --next")
 
 
-@pytest.mark.parametrize("rule_id", list(_samples()))
-def test_gate_log_holds_no_secret(tmp_path: Path, rule_id):
+@pytest.mark.parametrize("case_id,rule_id,sample", CASES, ids=CASE_IDS)
+def test_gate_log_holds_no_secret(tmp_path: Path, case_id, rule_id, sample):
     (tmp_path / ".aegis").mkdir()
-    sample = _samples()[rule_id]
     log_gate_event(f"curl --data {sample}", "ALLOWED", "", tmp_path)
     (row,) = [json.loads(line) for line in (tmp_path / ".aegis" / "state" / "gate_events.jsonl")
               .read_text(encoding="utf-8").splitlines()]
@@ -111,8 +128,8 @@ def test_hook_log_keeps_paths_and_addresses():
 
 
 @pytest.mark.parametrize("redactor", list(REDACTORS))
-@pytest.mark.parametrize("text", [s for s in _samples().values()] + [t for t, _ in KEY_VALUES.values()],
-                         ids=[*_samples(), *KEY_VALUES])
+@pytest.mark.parametrize("text", [c[2] for c in CASES] + [t for t, _ in KEY_VALUES.values()],
+                         ids=[*CASE_IDS, *KEY_VALUES])
 def test_a_second_pass_is_a_no_op(redactor, text):
     once = REDACTORS[redactor](f"deploy {text} now")
     assert REDACTORS[redactor](once) == once
