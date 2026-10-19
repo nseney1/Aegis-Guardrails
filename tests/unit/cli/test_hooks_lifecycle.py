@@ -200,6 +200,19 @@ class TestSafetyGate:
         assert "GEMINI_API_KEY=REDACTED" in content
         assert "Bearer REDACTED" in content
 
+    def test_redacts_the_other_known_formats_and_leaves_lookalikes(self, tmp_path: Path):
+        (tmp_path / ".aegis").mkdir()
+        slack = "xox" + "b-" + "123456789012-ABCDEFGHIJKLMN"
+        stripe = "sk" + "_live_" + "9876543210abcdefghijklmnoPQR"
+        jwt = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0" + ".SflKxwRJSMeKKF2QT4fw"
+        url_pw = "p9Q8" + "r7S6t5U4"
+        cmd = f"S={slack} T={stripe} J={jwt} https://svc:{url_pw}@h.corp API_TOKEN=abcd1234efgh task-runner-x"
+        run_safety_gate(cmd=cmd, workspace=tmp_path)
+        content = (tmp_path / ".aegis" / "state" / "gate_events.jsonl").read_text(encoding="utf-8")
+        for secret in (slack, stripe, jwt, url_pw, "abcd1234efgh"):
+            assert secret not in content
+        assert "API_TOKEN=REDACTED" in content and "task-runner-x" in content
+
     def test_gate_outside_an_aegis_workspace_writes_no_log(self, tmp_path: Path):
         rc, res = run_safety_gate(cmd="ls", workspace=tmp_path)
         assert (rc, res["decision"]) == (0, "allow")

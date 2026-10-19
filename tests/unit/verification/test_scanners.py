@@ -171,6 +171,20 @@ class TestKeyValueRedaction:
     def test_value_under_four_characters_is_kept_by_design(self) -> None:
         assert scanners.redact_insight_text("pwd=abc", max_len=300) == "pwd=abc"
 
+    @pytest.mark.parametrize("text, secret", [
+        (_tok("authorization: ", "Basic dXNlcjpwYXNz"), "dXNlcjpwYXNz"),
+        (_tok("Proxy-Authorization: ", "Basic Zm9vOmJhcg=="), "Zm9vOmJhcg=="),
+        (_tok("auth", "=abcd1234"), "abcd1234"),
+    ], ids=["basic", "proxy-basic", "auth"])
+    def test_authorization_credentials_are_redacted(self, text: str, secret: str) -> None:
+        out = scanners.redact_insight_text(text, max_len=300)
+        assert secret not in out and "[REDACTED]" in out
+        assert scanners.redact_insight_text(out, max_len=300) == out
+
+    @pytest.mark.parametrize("text", ["the author: John Smith wrote this", "authorization: Basic"])
+    def test_authorship_and_a_bare_scheme_are_left_alone(self, text: str) -> None:
+        assert scanners.redact_insight_text(text, max_len=300) == text
+
 
 class TestSarifIngest:
     def test_ingest_sarif_fingerprints_delta_and_suppressions(self, tmp_path: Path) -> None:

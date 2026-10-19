@@ -27,14 +27,7 @@ from aegis_core.storage import (
     workspace_relative,
 )
 from aegis_core.telemetry_engine import ledger
-from aegis_core.verification.scanners import (
-    MAX_EXCERPT_CHARS,
-    _REDACT_PATTERNS,
-    _is_high_entropy_secret,
-    redact_insight_text,
-    redact_secrets,
-    shannon_entropy,
-)
+from aegis_core.verification.scanners import MAX_EXCERPT_CHARS, redact_insight_text
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 __all__ = [
@@ -63,11 +56,9 @@ __all__ = [
     "record_decision",
     "record_hook_prompt",
     "redact_insight_text",
-    "redact_secrets",
     "remove_insight_hook",
     "review_insights",
     "session_hs",
-    "shannon_entropy",
     "tfidf_cosine",
     "write_proposal",
 ]
@@ -544,17 +535,9 @@ def record_hook_prompt(
         to_write.append(hb)
     cue = has_correction_cue(prompt_text)
     insight_row: Optional[Dict[str, Any]] = None
-    if cue and excerpts:
-        insight_row = _build_insight_row(
-            actual_ws,
-            "W2",
-            redact_insight_text(prompt_text),
-            dirty_paths(actual_ws),
-            "dirty",
-            host,
-            hs,
-            now=now,
-        )
+    excerpt = redact_insight_text(prompt_text) if cue and excerpts else ""
+    if excerpt:
+        insight_row = _build_insight_row(actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now)
         to_write.append(insight_row)
     if to_write:
         _append_user_insights(path, to_write)
