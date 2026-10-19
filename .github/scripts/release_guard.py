@@ -1,9 +1,7 @@
-"""Refuse a publish run unless it is the tag `v` + package version, at that tag's commit.
+"""Refuse a publish run unless its ref is the tag `v` + package version at that tag's commit.
 
-    python3 .github/scripts/release_guard.py   # reads GITHUB_REF_TYPE, GITHUB_REF_NAME, GITHUB_SHA
-
-Exit 0 when every check passes, 1 with one line per failed check, 2 when it cannot
-decide (no _version.py, no git, the tag missing from the checkout).
+Reads GITHUB_REF_TYPE, GITHUB_REF_NAME and GITHUB_SHA. Exit 0 when every check passes, 1 with
+one line per failed check, 2 when it cannot decide (no _version.py, no git, tag not checked out).
 """
 import os
 import re
@@ -12,14 +10,10 @@ import subprocess
 import sys
 
 VERSION_FILE = os.path.join("aegis_core", "_version.py")
-# The assignment setuptools reads without importing the package (pyproject.toml).
-VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.M)
 
 
 def check(ref_type, ref_name, sha, version, tag_commit):
-    failed = []
-    if ref_type != "tag":
-        failed.append(f"ref type is '{ref_type}', not 'tag'")
+    failed = [f"ref type is '{ref_type}', not 'tag'"] if ref_type != "tag" else []
     if ref_name != "v" + version:
         failed.append(f"tag '{ref_name}' is not 'v{version}'")
     if tag_commit is not None and tag_commit != sha:
@@ -27,37 +21,30 @@ def check(ref_type, ref_name, sha, version, tag_commit):
     return failed
 
 
-def _undecided(msg):
-    print(f"release_guard: cannot decide: {msg}", file=sys.stderr)
-    return 2
-
-
 def main():
-    ref_type = os.environ.get("GITHUB_REF_TYPE", "")
-    ref_name = os.environ.get("GITHUB_REF_NAME", "")
-    sha = os.environ.get("GITHUB_SHA", "")
+    env = os.environ.get
+    ref_type, ref_name, sha = env("GITHUB_REF_TYPE", ""), env("GITHUB_REF_NAME", ""), env("GITHUB_SHA", "")
     try:
-        with open(VERSION_FILE, encoding="utf-8") as f:
-            found = VERSION_RE.search(f.read())
-    except OSError as exc:
-        return _undecided(f"{VERSION_FILE}: {exc}")
-    if not found:
-        return _undecided(f"no __version__ assignment in {VERSION_FILE}")
+        with open(VERSION_FILE, encoding="utf-8") as f:  # the assignment setuptools reads unimported
+            version = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', f.read(), re.M).group(1)
+    except (OSError, AttributeError) as exc:
+        return _undecided(f"no __version__ in {VERSION_FILE}: {exc}")
     tag_commit = None
     if ref_type == "tag":
-        git = shutil.which("git")
-        if not git:
-            return _undecided("git is not on PATH")
-        ref = f"refs/tags/{ref_name}^{{commit}}"  # ^{commit} peels an annotated tag
-        out = subprocess.run([git, "rev-parse", "--verify", "--quiet", ref],
-                             capture_output=True, text=True)
-        if out.returncode != 0:
-            return _undecided(f"{ref} does not resolve in this checkout")
+        git, ref = shutil.which("git"), f"refs/tags/{ref_name}^{{commit}}"  # ^{commit} peels annotated tags
+        out = git and subprocess.run([git, "rev-parse", "--verify", "--quiet", ref], capture_output=True, text=True)
+        if not out or out.returncode != 0:
+            return _undecided(f"{ref} does not resolve" if git else "git is not on PATH")
         tag_commit = out.stdout.strip()
-    failed = check(ref_type, ref_name, sha, found.group(1), tag_commit)
+    failed = check(ref_type, ref_name, sha, version, tag_commit)
     for msg in failed:
         print(f"release_guard: {msg}", file=sys.stderr)
     return 1 if failed else 0
+
+
+def _undecided(msg):
+    print(f"release_guard: cannot decide: {msg}", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
