@@ -587,3 +587,4 @@ def test_uninstall_says_host_hooks_stay_until_hook_uninstall(tmp_path, monkeypat
     assert main(["uninstall", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "aegis hook uninstall --host <host>" in out
+    assert "aegis rule insight enable" in out

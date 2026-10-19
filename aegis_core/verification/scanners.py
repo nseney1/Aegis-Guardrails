@@ -41,45 +41,51 @@ _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0
 _HASH_FIELD_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:sha1|sha256|sha384|sha512|md5|integrity|checksum|digest|hash|commit|oid|etag|fingerprint)(?:$|[^a-z0-9])")
 _SUPPRESSION_RE = re.compile(r"#\s*(?:noqa|nosec|gitleaks:allow)\b", re.IGNORECASE)
 
-SECRET_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA_REDACTED"),
-    (re.compile(r"ASIA[0-9A-Z]{16}"), "ASIA_REDACTED"),
-    (re.compile(r"ghp_[a-zA-Z0-9]{36}"), "ghp_REDACTED"),
-    (re.compile(r"gh[ousr]_[a-zA-Z0-9]{36}"), "gh_token_REDACTED"),
-    (re.compile(r"github_pat_[a-zA-Z0-9_]{20,}"), "github_pat_REDACTED"),
-    (re.compile(r"sk-(?:proj-|ant-)?[a-zA-Z0-9_-]{20,}"), "sk-REDACTED"),
-    (re.compile(r"AIzaSy[a-zA-Z0-9_-]{33}"), "AIzaSy_REDACTED"),
-    (re.compile(r"Bearer\s+[a-zA-Z0-9._-]{20,}"), "Bearer REDACTED"),
-    (re.compile(r"GEMINI_API_KEY=[^\s]*"), "GEMINI_API_KEY=REDACTED"),
-]
-HOOK_REDACTION_PATTERNS = SECRET_REPLACEMENTS
-
-_SENSITIVE_KEYS = r"(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|auth|credential|authorization)"
-_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL), "[REDACTED_PEM]"),
-    (re.compile(r"\b([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@"), r"\1[REDACTED]@"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"), "[REDACTED_JWT]"),
-    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED_AWS]"),
-    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b|\bglpat-[A-Za-z0-9_-]{16,}\b"), "[REDACTED_VCS_TOKEN]"),
-    (re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b|\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b"), "[REDACTED_API_KEY]"),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}\b|\bnpm_[A-Za-z0-9]{20,}\b|\bAIza[A-Za-z0-9_-]{25,}\b|\bpypi-[A-Za-z0-9_-]{20,}\b"), "[REDACTED_TOKEN]"),
-    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"), "Bearer [REDACTED]"),
-    (re.compile(rf"(?i)(\b[A-Za-z0-9_]*{_SENSITIVE_KEYS}[A-Za-z0-9_]*[\"']?\s*(?:=|:|\bis\b)\s*[\"']?)([^\s\"',;]{4,})"), r"\1[REDACTED]"),
-    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
-    (re.compile(r"(?<=/home/)[^/\s]+|(?<=/Users/)[^/\s]+|(?<=C:\\Users\\)[^\\\s]+"), "~user"),
+_NB = r"(?<![A-Za-z0-9])"
+_PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
+_PEM_TAIL = r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
+_KEYS = ("(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|credential|"
+         "authorization|auth(?![A-Za-z]))")
+_SCHEMES = "(?:basic|digest|token|negotiate)"
+# Built by concatenation, never as an rf-string: f-string formatting turns a {4,} quantifier
+# into the tuple "(4,)". Every quantifier is bounded so redaction stays linear in its input.
+_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
+    (re.compile(pattern), hook, text) for pattern, hook, text in (
+        # The body is optional, so an unterminated header cannot backtrack over the rest.
+        (_PEM_HEAD + "(?:(?:[^-]|-(?!-)){0,16384}" + _PEM_TAIL + ")?", "[REDACTED_PEM]", "[REDACTED_PEM]"),
+        ("(?i)(" + _NB + "[a-z][a-z0-9+.-]{0,31}://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
+         r"\1[REDACTED]@"),
+        (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
+         "[REDACTED_JWT]"),
+        (_NB + "AKIA[0-9A-Z]{16}", "AKIA_REDACTED", "[REDACTED_AWS]"),
+        (_NB + "ASIA[0-9A-Z]{16}", "ASIA_REDACTED", "[REDACTED_AWS]"),
+        (_NB + "ghp_[A-Za-z0-9]{20,255}", "ghp_REDACTED", "[REDACTED_VCS_TOKEN]"),
+        (_NB + "gh[ousr]_[A-Za-z0-9]{20,255}", "gh_token_REDACTED", "[REDACTED_VCS_TOKEN]"),
+        (_NB + "github_pat_[A-Za-z0-9_]{20,255}", "github_pat_REDACTED", "[REDACTED_VCS_TOKEN]"),
+        (_NB + "glpat-[A-Za-z0-9_-]{16,255}", "[REDACTED_VCS_TOKEN]", "[REDACTED_VCS_TOKEN]"),
+        (_NB + "(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,99}", "[REDACTED_API_KEY]", "[REDACTED_API_KEY]"),
+        (_NB + "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,255}", "sk-REDACTED", "[REDACTED_API_KEY]"),
+        (_NB + "AIza[A-Za-z0-9_-]{25,255}", "AIzaSy_REDACTED", "[REDACTED_TOKEN]"),
+        (_NB + "(?:xox[abprs]-[A-Za-z0-9-]{10,255}|npm_[A-Za-z0-9]{20,255}|pypi-[A-Za-z0-9_-]{20,255})",
+         "[REDACTED_TOKEN]", "[REDACTED_TOKEN]"),
+        ("(?i)" + _NB + r"Bearer\s{1,8}[A-Za-z0-9._~+/=-]{16,1024}", "Bearer REDACTED", "Bearer [REDACTED]"),
+        # key=value and key: value; an Authorization scheme word is kept and its credential goes.
+        ("(?i)(" + _NB + "[A-Za-z0-9_]{0,32}" + _KEYS + "[A-Za-z0-9_]{0,32}[\"']?\\s{0,8}(?:=|:)\\s{0,8}[\"']?"
+         "(?:" + _SCHEMES + "\\s{1,8})?)(?!" + _SCHEMES + "\\b)([^\\s\"',;]{4,512})", r"\1REDACTED", r"\1[REDACTED]"),
+        # "the password is hunter2": the narrow keys only, so "the auth is broken" stays.
+        ("(?i)(" + _NB + "(?:password|passwd|pwd|secret|token|api key|private key)\\s{1,8}is\\s{1,8}[\"']?)"
+         "([^\\s\"',;]{6,512})", r"\1REDACTED", r"\1[REDACTED]"),
+    ))
+#: The hook-log form of the table: (pattern, replacement), applied in order.
+SECRET_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [(p, hook) for p, hook, _ in _SECRET_REDACTIONS]
+#: Personal data, scrubbed from stored insights only: the hook log keeps paths and addresses.
+_PII_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,63}(?![A-Za-z0-9])"),
+     "[REDACTED_EMAIL]"),
+    (re.compile(r"(?<=/home/)[^/\s]{1,255}|(?<=/Users/)[^/\s]{1,255}|(?<=C:\\Users\\)[^\\\s]{1,255}"), "~user"),
     (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
 )
-_GENERIC_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL), "[REDACTED]"),
-    (re.compile(r"\b([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@"), r"\1[REDACTED]@"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"), "[REDACTED]"),
-    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED]"),
-    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b|\bglpat-[A-Za-z0-9_-]{16,}\b"), "[REDACTED]"),
-    (re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b|\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b"), "[REDACTED]"),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b|\bnpm_[A-Za-z0-9]{20,}\b|\bAIza[A-Za-z0-9_-]{25,}\b|\bpypi-[A-Za-z0-9_-]{20,}\b"), "[REDACTED]"),
-    (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
-    (re.compile(rf"(?i)(\b[A-Za-z0-9_]*{_SENSITIVE_KEYS}[A-Za-z0-9_]*[\"']?\s*(?:=|:|\bis\b)\s*[\"']?)([^\s\"',;]{4,})"), r"\1[REDACTED]"),
-)
+_TEXT_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS) + _PII_REDACTIONS
 _HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 _CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
 
@@ -131,8 +137,6 @@ def shannon_entropy(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
-_shannon_entropy = shannon_entropy
-
 
 def _is_high_entropy_secret(tok: str, threshold: float = 3.8) -> bool:
     if "REDACTED" in tok or _HEX_UUID_RE.match(tok) or not any(c.isdigit() for c in tok):
@@ -150,50 +154,27 @@ def redact_command_secrets(cmd: str) -> str:
     return cmd
 
 
-redact_hook_text = redact_command_secrets
-
-
-def redact_payload(payload: Any) -> Any:
-    """Recursively redact known secret patterns in a hook payload structure."""
-    if isinstance(payload, str):
-        return redact_command_secrets(payload)
-    if isinstance(payload, Mapping):
-        return {k: redact_payload(v) for k, v in payload.items()}
-    if isinstance(payload, tuple):
-        return tuple(redact_payload(v) for v in payload)
-    if isinstance(payload, list):
-        return [redact_payload(v) for v in payload]
-    return payload
-
-
-def redact_secrets(text: str) -> tuple[str, int]:
-    """Replace known secret tokens and high-entropy mixed-class tokens with [REDACTED]."""
-    if not isinstance(text, str) or not text:
-        return "", 0
-    out = text
-    total = 0
-    for pat, repl in _GENERIC_SECRET_PATTERNS:
-        out, n = pat.subn(repl, out)
-        total += n
-
-    def _replace_candidate(match: re.Match[str]) -> str:
-        nonlocal total
-        tok = match.group(0)
-        if _is_high_entropy_secret(tok, threshold=4.0):
-            total += 1
-            return "[REDACTED]"
-        return tok
-
-    out = _CANDIDATE_TOKEN_RE.sub(_replace_candidate, out)
-    return out, total
+def _bounded_head(text: str, limit: int) -> str:
+    """The whole words of ``text`` up to about ``limit`` characters. A secret cut in half
+    would no longer match its pattern, so a word the cut splits is dropped, as is a trailing
+    PEM header whose END lies past the cut."""
+    raw = text[: limit + 1]
+    words = raw.split()
+    if words and not raw[-1].isspace():
+        words.pop()
+    head = " ".join(words)
+    begin = head.rfind("-----BEGIN")
+    return head[:begin].rstrip() if begin != -1 and "-----END" not in head[begin:] else head
 
 
 def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:
-    """Scrub secrets, PII, paths, IPs, and high-entropy tokens from insight text."""
+    """Scrub secrets, PII, paths, IPs, and high-entropy tokens from insight text; past
+    ``max(MAX_LINE_LENGTH, 4 * max_len)`` characters only a whole-word head is kept."""
     if not isinstance(text, str) or not text:
         return ""
-    out = text
-    for pat, repl in _REDACT_PATTERNS:
+    limit = max(MAX_LINE_LENGTH, 4 * max_len)
+    out = text if len(text) <= limit else _bounded_head(text, limit)
+    for pat, repl in _TEXT_REDACTIONS:
         out = pat.sub(repl, out)
     out = _CANDIDATE_TOKEN_RE.sub(
         lambda m: "[REDACTED_HIENT]" if _is_high_entropy_secret(m.group(0)) else m.group(0),
