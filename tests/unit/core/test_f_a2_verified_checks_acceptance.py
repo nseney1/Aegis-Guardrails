@@ -378,7 +378,8 @@ def test_a_flood_of_reports_leaves_the_ledger_bounded(tmp_path, monkeypatch):
         return treeid.TreeBinding("ok", trees[state["n"] % len(trees)], "")
 
     monkeypatch.setattr(treeid, "tree_of", fake_tree)
-    results = [_report(repo, key=f"k{n}") for n in range(10_000)]
+    # 50 past the cap exercises rate limiting; every call beyond it answers the same way.
+    results = [_report(repo, key=f"k{n}") for n in range(credit.MAX_REPORT_ROWS_PER_SESSION + 50)]
     statuses = {r["status"] for r in results}
     assert "rate_limited" in statuses
     written = [r for r in hv.ledger_rows(repo.root) if r.get("event") in ("claimed", "report")]
