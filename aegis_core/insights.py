@@ -40,6 +40,7 @@ from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayo
 __all__ = [
     "BURST_WINDOW_SECONDS",
     "DECISIONS",
+    "INSIGHT_HOOK_MARKER",
     "INSIGHT_LEVELS",
     "INSIGHT_SCHEMA_VERSION",
     "KEY_SIZE",
@@ -51,18 +52,19 @@ __all__ = [
     "capture_suggestion",
     "create_link_key",
     "dirty_paths",
-    "enable_host_hook",
     "has_correction_cue",
     "host_capture_status",
     "insight_workspace_id",
     "insights_path",
     "measure_recurrence",
+    "merge_insight_hook",
     "read_insight_rows",
     "read_link_key",
     "record_decision",
     "record_hook_prompt",
     "redact_insight_text",
     "redact_secrets",
+    "remove_insight_hook",
     "review_insights",
     "session_hs",
     "shannon_entropy",
@@ -1133,54 +1135,69 @@ def measure_recurrence(
     }
 
 
+#: Marks Aegis's insight handler: in the exec form's args, the Codex string or 4.3's ``-m``.
+INSIGHT_HOOK_MARKER = "aegis_cli.hooks.insights"
+
+
 def _host_config_path(host: str, home: Path) -> Path:
+    # A relative CLAUDE_CONFIG_DIR/CODEX_HOME is ignored, as the hook registrar ignores it.
     if host == "claude-code":
         env_var, default_dir, fname = "CLAUDE_CONFIG_DIR", ".claude", "settings.json"
     else:
         env_var, default_dir, fname = "CODEX_HOME", ".codex", "hooks.json"
-    cfg = os.environ.get(env_var, "").strip()
-    return (Path(cfg) if cfg else (home / default_dir)) / fname
+    cfg = os.environ.get(env_var) or ""
+    return (Path(cfg) if os.path.isabs(cfg) else home / default_dir) / fname
 
 
-def _entry_cmds(entry: Any) -> List[str]:
-    if not isinstance(entry, Mapping):
-        return []
-    hooks = entry.get("hooks") if isinstance(entry.get("hooks"), list) else []
-    return [str(x.get("command") or "") for x in (entry, *hooks) if isinstance(x, Mapping)]
+def _insight_words(handler: Any) -> Optional[List[str]]:
+    """The command words of an Aegis insight handler; None for any other handler."""
+    if not isinstance(handler, Mapping):
+        return None
+    args = handler.get("args")
+    words = [w for w in (handler.get("command"), *(args if isinstance(args, list) else [])) if isinstance(w, str)]
+    return words if any(INSIGHT_HOOK_MARKER in w for w in words) else None
 
 
-def enable_host_hook(host: str, *, excerpts: bool = False, home: Optional[Path] = None) -> Dict[str, Any]:
-    if host not in SUPPORTED_INSIGHT_HOSTS:
-        raise ValueError(f"unsupported host {host!r} for insight hook; supported hosts: {list(SUPPORTED_INSIGHT_HOSTS)}")
-    layout = _user_layout(home)
-    if layout is None:
-        raise OSError("cannot resolve user home directory")
-    create_link_key(layout.home)
-    target = _host_config_path(host, layout.home)
-    data: Dict[str, Any] = {}
-    if target.exists() and not target.is_symlink():
-        try:
-            loaded = json.loads(target.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, ValueError):
-            pass
-    cmd = f"python3 -I -m aegis_cli.hooks.insights --host {host}{' --excerpts' if excerpts else ' --no-excerpts'}"
-    hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
-    data["hooks"] = hooks
-    ups = hooks.get("UserPromptSubmit") if isinstance(hooks.get("UserPromptSubmit"), list) else []
-    hooks["UserPromptSubmit"] = [
-        e for e in ups if not any("aegis_cli.hooks.insights" in c for c in _entry_cmds(e))
-    ] + [{"matcher": "", "hooks": [{"type": "command", "command": cmd}]}]
-    target.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(target, json.dumps(data, indent=2) + "\n")
-    return {
-        "host": host,
-        "status": "enabled_excerpts" if excerpts else "enabled_counters_only",
-        "excerpts": bool(excerpts),
-        "config_path": str(target),
-        "command": cmd,
-    }
+def _strip_insight(groups: List[Any]) -> int:
+    """Drop Aegis insight handlers from ``groups`` in place, and the groups they emptied."""
+    kept: List[Any] = []
+    dropped = 0
+    for group in groups:
+        handlers = group.get("hooks") if isinstance(group, Mapping) else None
+        rest = [h for h in handlers if _insight_words(h) is None] if isinstance(handlers, list) else None
+        if rest is None or len(rest) == len(handlers):
+            kept.append(group)
+            continue
+        dropped += len(handlers) - len(rest)
+        if rest:
+            kept.append(dict(group, hooks=rest))
+    groups[:] = kept
+    return dropped
+
+
+def merge_insight_hook(data: Dict[str, Any], handler: Mapping[str, Any]) -> None:
+    """Put ``handler`` last in UserPromptSubmit, replacing Aegis's earlier one; ValueError
+    for a shape the host would not load."""
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("'hooks' must be a JSON object")
+    groups = hooks.setdefault("UserPromptSubmit", [])
+    if not isinstance(groups, list):
+        raise ValueError("'hooks.UserPromptSubmit' must be a list")
+    _strip_insight(groups)
+    groups.append({"matcher": "", "hooks": [dict(handler)]})
+
+
+def remove_insight_hook(host: str, data: Dict[str, Any]) -> int:
+    """Drop Aegis insight handlers (and the containers they emptied); how many. Never raises."""
+    hooks = data.get("hooks")
+    groups = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
+    dropped = _strip_insight(groups) if host in SUPPORTED_INSIGHT_HOSTS and isinstance(groups, list) else 0
+    if dropped and not groups:
+        del hooks["UserPromptSubmit"]
+        if not hooks:
+            del data["hooks"]
+    return dropped
 
 
 def host_capture_status(host: str, home: Optional[Path] = None) -> Dict[str, Any]:
@@ -1196,17 +1213,16 @@ def host_capture_status(host: str, home: Optional[Path] = None) -> Dict[str, Any
     if layout is None:
         return {"status": "disabled", "excerpts": False}
     target = _host_config_path(host, layout.home)
-    if not target.exists() or target.is_symlink():
-        return {"status": "disabled", "excerpts": False}
+    # is_file follows a link as the host does, and is False for a FIFO, which would hang a read.
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
+        data = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else None
     except (OSError, ValueError):
+        data = None
+    hooks = data.get("hooks") if isinstance(data, Mapping) else None
+    ups = hooks.get("UserPromptSubmit") if isinstance(hooks, Mapping) else None
+    found = [words for g in (ups if isinstance(ups, list) else []) if isinstance(g, Mapping)
+             and isinstance(g.get("hooks"), list) for words in map(_insight_words, g["hooks"]) if words]
+    if not found:
         return {"status": "disabled", "excerpts": False}
-    ups = data.get("hooks", {}).get("UserPromptSubmit") if isinstance(data, Mapping) and isinstance(data.get("hooks"), Mapping) else None
-    if not isinstance(ups, list):
-        return {"status": "disabled", "excerpts": False}
-    for cmd in (c for e in ups for c in _entry_cmds(e)):
-        if "aegis_cli.hooks.insights" in cmd:
-            ex = "--excerpts" in cmd and "--no-excerpts" not in cmd
-            return {"status": "enabled_excerpts" if ex else "enabled_counters_only", "excerpts": ex}
-    return {"status": "disabled", "excerpts": False}
+    ex = "--excerpts" in " ".join(found[0]).split()
+    return {"status": "enabled_excerpts" if ex else "enabled_counters_only", "excerpts": ex}

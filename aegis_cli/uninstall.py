@@ -239,8 +239,8 @@ def run_uninstall(args: argparse.Namespace) -> int:
             detail = f" ({action.detail})" if action.detail else ""
             report.say(f"  ✅ {action.target}: {result}{detail}")
     report.say("  .aegis/ was kept (rules, config and ledger belong to the repository).")
-    report.say("  Host hooks (aegis hook install --host) are not removed here: run aegis hook uninstall --host <host> "
-               "for each host that has one.")
+    report.say("  Host hooks (aegis hook install --host, aegis rule insight enable) are not removed here: run "
+               "aegis hook uninstall --host <host> for each host that has one.")
     if dry_run:
         report.say("  Dry run: nothing was changed.")
     report.finish("ok", scope, dry_run, actions)

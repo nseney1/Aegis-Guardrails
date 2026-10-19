@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import time
 
 import pytest
@@ -140,9 +141,19 @@ def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypat
     assert rc1 == 0, err1
     assert json.loads(out1)["status"] == "enabled_excerpts"
 
+    claude = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    (handler,) = claude["hooks"]["UserPromptSubmit"][-1]["hooks"]
+    assert handler["command"] == sys.executable and handler["args"][:2] == ["-I", "-c"]
+    assert handler["args"][-2:] == ["claude-code", "--excerpts"]
+
     rc2, out2, err2 = _invoke_rule(ws, "insight", "enable", "--host", "codex-cli", "--json")
-    assert rc2 == 0, err2
-    assert json.loads(out2)["status"] == "enabled_counters_only"
+    if os.name == "nt":
+        # Codex runs hooks through %COMSPEC% /C, which cannot take the pinned -c program.
+        assert rc2 == 1 and "%COMSPEC%" in json.loads(out2)["error"]
+        assert not (home / ".codex").exists()
+    else:
+        assert rc2 == 0, err2
+        assert json.loads(out2)["status"] == "enabled_counters_only"
 
     # Run doctor --json and verify per-host insight_capture state
     monkeypatch.setattr(
@@ -158,7 +169,7 @@ def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypat
     hosts_by_id = {h["id"]: h["insight_capture"] for h in payload["hosts"]}
     assert hosts_by_id["claude-code"]["status"] == "enabled_excerpts"
     assert hosts_by_id["claude-code"]["excerpts"] is True
-    assert hosts_by_id["codex-cli"]["status"] == "enabled_counters_only"
+    assert hosts_by_id["codex-cli"]["status"] == ("disabled" if os.name == "nt" else "enabled_counters_only")
     assert hosts_by_id["codex-cli"]["excerpts"] is False
     assert hosts_by_id["antigravity"]["status"] == "explicit_only"
 
