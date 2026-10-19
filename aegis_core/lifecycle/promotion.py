@@ -92,7 +92,7 @@ def suggest(rule: Rule, fit: Fitness, now: Optional[datetime] = None) -> Optiona
 def _evaluate(workspace: Workspace | Path | str, wanted: str, now: Optional[datetime]) -> List[Dict[str, Any]]:
     ws = literal_workspace(workspace)
     rules = [r for r in load_rules(ws).served]
-    fits = for_rules(ws, rules, now)
+    fits = for_rules(ws, rules, now, verify_ci=True)
     out = []
     for rule in rules:
         fit = fits[rule.id]
@@ -207,7 +207,7 @@ def promote_rule(
                 "message": f"Rule '{rule_id}' was not promoted: the ledger is incomplete ({view.incomplete})",
             }
         rule = load_rules(ws).get(clean_id)
-        fit = for_rules(ws, [rule], view=view)[clean_id] if rule is not None else Fitness(clean_id)
+        fit = for_rules(ws, [rule], view=view, verify_ci=True)[clean_id] if rule is not None else Fitness(clean_id)
         if rule is None or suggest(rule, fit) != "promote":
             return {
                 "status": "ineligible",
@@ -292,7 +292,7 @@ def evaluate_rule_tiers(workspace: Workspace | Path | str | None = None, execute
     ws = literal_workspace(workspace)
     rules = [r for r in load_rules(ws).served if not RULE_TYPES[r.type].mandatory]
     view = ledger.read(ws.root)
-    fits = for_rules(ws, rules, view=view)
+    fits = for_rules(ws, rules, view=view, verify_ci=True)
     refused = f"not written: the ledger is incomplete ({view.incomplete})" if execute and view.incomplete else None
     if refused:
         execute = False

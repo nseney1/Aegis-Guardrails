@@ -28,6 +28,7 @@ CI_EVENTS = ("push", "workflow_dispatch", "release")
 CI_FAILED = ("failure", "timed_out", "startup_failure")
 DEFAULT_WORKFLOW = "validate.yml"
 _RESULT = {"success": "tp", "tp": "tp", "pass": "tp", "failure": "fp", "fp": "fp", "fail": "fp", "partial": "trigger"}
+_FULL_SHA = re.compile(r"[0-9a-f]{40,64}")
 _TRAILER = re.compile(r"\s*Aegis-Check:\s*tree=([0-9a-f]{40,64})\s+exit=(-?\d+)\s*")
 _REV_LIMIT = 5000
 _VERIFIED_CI: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -127,12 +128,14 @@ def select_ci_run(
         head = (run.get("head_repository") or {}).get("full_name") if isinstance(run.get("head_repository"), Mapping) else None
         home = (run.get("repository") or {}).get("full_name") if isinstance(run.get("repository"), Mapping) else None
         run_branch = run.get("head_branch")
+        run_id = run.get("id")
         if (not isinstance(run_branch, str) or not run_branch or run_branch != branch
                 or _workflow_path(run) != wanted or run.get("head_sha") != commit or run.get("event") not in CI_EVENTS
-                or not head or head != home or run.get("conclusion") == "cancelled"):
+                or not head or head != home or run.get("conclusion") == "cancelled"
+                or not isinstance(run_id, int) or isinstance(run_id, bool)):
             continue
         started = str(run.get("run_started_at") or run.get("updated_at") or run.get("created_at") or "")
-        key = (started, str(run.get("created_at") or ""), int(run.get("run_attempt") or 0), int(run.get("id") or 0))
+        key = (started, str(run.get("created_at") or ""), int(run.get("run_attempt") or 0), run_id)
         if best_key is None or key > best_key:
             best, best_key = run, key
     return best
@@ -152,7 +155,7 @@ class GhRestClient:
         self.repo, self.runner, self.cwd = repo, runner or human_gate.default_gh_runner, cwd
 
     def runs_for(self, commit: str) -> List[Dict[str, Any]]:
-        if not re.fullmatch(r"[0-9a-f]{40,64}", commit or ""):
+        if not _FULL_SHA.fullmatch(commit or ""):
             raise CIUnavailable("not a full commit id")
         result = self.runner(["api", f"repos/{self.repo or '{owner}/{repo}'}/actions/runs?head_sha={commit}&per_page=100"], cwd=self.cwd)
         if result is None:
@@ -597,6 +600,13 @@ class CreditProjection:
     error: Optional[str] = None
 
 
+def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, Any]) -> bool:
+    """A cached verdict is final only when terminal and for the run the newest ``ci`` row names (B14b)."""
+    if not entry or not (entry.get("conclusion") == "success" or entry.get("conclusion") in CI_FAILED):
+        return False
+    return (entry.get("run_id"), entry.get("run_attempt")) == (ci_row.get("run_id"), ci_row.get("ci_run_attempt"))
+
+
 _DEFAULT_SNAPSHOT_RERUN: Optional[Callable[[Any, str, str], Mapping[str, Any]]] = None
 
 
@@ -605,6 +615,7 @@ def project_credits(
     attestation_runner: Optional[Callable[..., Any]] = None,
     landed: Optional[Callable[..., Optional[str]]] = None,
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
+    verify_ci: bool = False,
 ) -> CreditProjection:
     from aegis_core import release_verify
     c_root = _canon_root(root)
@@ -623,11 +634,13 @@ def project_credits(
     if err:
         return CreditProjection((), (), available=False, error=str(err))
     v_map: Dict[str, str] = {}
-    if p_branch:
+    # Read paths (scan, status, list) pass verify_ci=False and stay offline: a ``ci`` row then counts
+    # only when this process verified it, so they can under-credit but never over-credit.
+    if p_branch and verify_ci:
         rest_client = GhRestClient(cwd=str(root)) if (client is None and attestation_runner is None) else None
-        for ci_row in _of(rows, "ci"):
-            commit = str(ci_row.get("commit") or "")
-            if not commit or (c_root, commit) in _UNAVAILABLE_CI or (c_root, commit) in _VERIFIED_CI:
+        latest = {str(r.get("commit") or ""): r for r in _of(rows, "ci")}
+        for commit, ci_row in latest.items():
+            if not commit or (c_root, commit) in _UNAVAILABLE_CI or _ci_cache_current(_VERIFIED_CI.get((c_root, commit)), ci_row):
                 continue
             wf = str(ci_row.get("workflow") or workflow)
             if rest_client is not None:
@@ -649,6 +662,11 @@ def project_credits(
                 if rep.verified:
                     v_map[commit] = "success"
                     _VERIFIED_CI[(c_root, commit)] = {"conclusion": "success", "workflow": wf, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
+                    continue
+            # Circuit breaker: a dead gh costs one attempt per projection. Only a well-formed id trips
+            # it, so one malformed (never-asked) row cannot switch verification off for the rest.
+            if rest_client is not None and _FULL_SHA.fullmatch(commit):
+                break
     app_fn = approved or approval_lookup(root, rows, landed=look)
     derived = derive(rows, landed=look, approved=app_fn, verified_ci=v_map or None)
     return CreditProjection(tuple(derived), tuple(confirmed_outcome_rows(derived)), available=True, error=None)
