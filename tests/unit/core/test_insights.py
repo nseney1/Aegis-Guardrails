@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from aegis_core import insights as core_insights
 from aegis_core.errors import PathTraversalError
 from aegis_core.insights import (
     KEY_SIZE,
@@ -15,7 +16,6 @@ from aegis_core.insights import (
     capture_suggestion,
     create_link_key,
     dirty_paths,
-    enable_host_hook,
     has_correction_cue,
     host_capture_status,
     insight_workspace_id,
@@ -219,3 +219,57 @@ def test_add_insight_level_h_requires_explicit_commit_and_matching_insight_hash(
     assert ins_ok["level"] == "H"
     assert ins_wrong_text["level"] == "cli"
     assert ins_no_commit["level"] == "cli"
+
+
+def _ours(command: str = "python3 -I -m aegis_cli.hooks.insights --host claude-code") -> dict:
+    return {"matcher": "", "hooks": [{"type": "command", "command": command}]}
+
+
+def test_merge_insight_hook_replaces_ours_and_keeps_foreign_entries():
+    foreign = {"matcher": "", "hooks": [{"type": "command", "command": "echo mine"}]}
+    shared = {"matcher": "", "hooks": [{"type": "command", "command": "echo shared"},
+                                       {"type": "command", "command": "/py", "args": ["-c", "aegis_cli.hooks.insights"]}]}
+    data = {"model": "x", "hooks": {"UserPromptSubmit": [_ours(), foreign, shared]}}
+    handler = {"type": "command", "command": "/py", "args": ["-I", "-c", "from aegis_cli.hooks.insights import main"]}
+    core_insights.merge_insight_hook(data, handler)
+    assert data == {"model": "x", "hooks": {"UserPromptSubmit": [
+        foreign, {"matcher": "", "hooks": [{"type": "command", "command": "echo shared"}]},
+        {"matcher": "", "hooks": [handler]}]}}
+    assert core_insights.INSIGHT_HOOK_MARKER == "aegis_cli.hooks.insights"
+
+
+@pytest.mark.parametrize("data, where", [
+    ({"hooks": ["x"]}, "hooks"),
+    ({"hooks": {"UserPromptSubmit": {}}}, "UserPromptSubmit"),
+])
+def test_merge_insight_hook_refuses_a_wrong_shape(data, where):
+    with pytest.raises(ValueError, match=where):
+        core_insights.merge_insight_hook(data, {"type": "command", "command": "/py"})
+
+
+def test_remove_insight_hook_counts_ours_and_drops_emptied_containers():
+    data = {"hooks": {"UserPromptSubmit": [_ours(), _ours("/py -c 'from aegis_cli.hooks.insights import main'")],
+                      "Stop": []}}
+    assert core_insights.remove_insight_hook("claude-code", data) == 2
+    assert data == {"hooks": {"Stop": []}}
+    data = {"hooks": {"UserPromptSubmit": [_ours()]}}
+    assert core_insights.remove_insight_hook("codex-cli", data) == 1 and data == {}
+
+
+@pytest.mark.parametrize("data", [
+    {}, {"hooks": ["x"]}, {"hooks": {"UserPromptSubmit": {}}}, {"hooks": {"UserPromptSubmit": ["x", {"hooks": 3}]}},
+])
+def test_remove_insight_hook_never_raises_on_odd_shapes(data):
+    before = repr(data)
+    assert core_insights.remove_insight_hook("claude-code", data) == 0
+    assert repr(data) == before
+
+
+def test_host_capture_status_ignores_a_relative_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text(
+        '{"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "/py", "args": ["-c", "aegis_cli.hooks.insights", "--excerpts"]}]}]}}',
+        encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/dir")
+    assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True}

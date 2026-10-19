@@ -408,7 +408,9 @@ def _collect_t4_events_for_rules(
     return info
 
 
-def for_rules(workspace: Any, rules: Iterable[Any], now: Optional[datetime] = None, view: Any = None) -> Dict[str, Fitness]:
+def for_rules(
+    workspace: Any, rules: Iterable[Any], now: Optional[datetime] = None, view: Any = None, *, verify_ci: bool = False,
+) -> Dict[str, Fitness]:
     from aegis_core import credit
     from aegis_core.config import ConfigError, RepoConfig
     from aegis_core.telemetry_engine import ledger
@@ -420,7 +422,7 @@ def for_rules(workspace: Any, rules: Iterable[Any], now: Optional[datetime] = No
     half_life_sessions = float(config.half_life_sessions)
     epsilon = float(config.epsilon)
     view_obj = view if view is not None else ledger.read(workspace)
-    proj_credits = credit.project_credits(workspace, view=view_obj)
+    proj_credits = credit.project_credits(workspace, view=view_obj, verify_ci=verify_ci)
     combined_rows: List[Dict[str, Any]] = []
     seen_keys: Set[Tuple[str, str]] = set()
     for r in list(view_obj.rows) + list(proj_credits.outcome_rows):

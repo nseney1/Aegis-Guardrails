@@ -490,11 +490,12 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
 
 
 @needs_git
-def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_verifies(
+def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_stays_offline(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """1. Repeated `sync.sync()` calls refresh CI on every call (revoking on later failure, querying newly landed commits).
-    2. A fresh `status` process (`_VERIFIED_CI` cleared, no `client` passed) verifies recorded `ci` rows via GitHub REST or attestation."""
+    2. A fresh `status` process (`_VERIFIED_CI` cleared, no `client` passed) stays offline (R-trust-52): it makes no
+       `gh` call and shows the rule without the CI-confirmed credit, which lives in the sync-derived document."""
     from aegis_core import checkrun, human_gate, rules
     from tests import helpers_verified as hv
 
@@ -516,21 +517,23 @@ def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_v
     s1 = sync.sync(repo.root, ci_client=hv.FakeCI([r1_ok]))
     assert s1.derived["rules"]["trap-sample"]["tp"] == 1
 
-    # Fresh status process (empty _VERIFIED_CI) verifies recorded ci row via default_gh_runner
+    # Fresh status process (empty _VERIFIED_CI) reads no GitHub and counts no unverified ci credit
     credit._VERIFIED_CI.clear()
     credit._UNAVAILABLE_CI.clear()
-    monkeypatch.setattr(
-        human_gate,
-        "default_gh_runner",
-        lambda argv, stdin=None, cwd=None: subprocess.CompletedProcess(
-            argv, 0, json.dumps({"workflow_runs": [r1_ok]}).encode("utf-8"), b"",
-        ),
-    )
+    gh_calls: list = []
+
+    def counting_gh(argv, stdin=None, cwd=None, timeout=None):
+        gh_calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [r1_ok]}), "")
+
+    monkeypatch.setattr(human_gate, "default_gh_runner", counting_gh)
     capsys.readouterr()
     run_status(argparse.Namespace(_root=repo.root, plain=True))
     status_out = capsys.readouterr().out
-    assert "insufficient (n=1)" in status_out
-    assert "no evidence" not in status_out
+    assert gh_calls == []
+    assert "insufficient (n=1)" not in status_out
+    assert any(line.split()[:2] == ["trap-sample", "0"] for line in status_out.splitlines())
+    assert s1.derived["rules"]["trap-sample"]["tp"] == 1
 
     # Later failed CI rerun on c1 -> second sync revokes c1 credit even though c1 was already in _VERIFIED_CI
     r1_fail = hv.ci_run(c1, "failure", run_id=11, attempt=2, run_started_at="2026-10-17T10:05:00Z")

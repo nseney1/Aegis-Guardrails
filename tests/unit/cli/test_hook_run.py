@@ -575,12 +575,30 @@ def _busy_log(ws: Path, covering) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def overhead(timings, baseline) -> float:
+    """Median of ``timings`` minus median of ``baseline``: what Aegis adds to a Python start,
+    so a uniformly slow runner does not fail and a real regression still does."""
+    def median(values):
+        ordered = sorted(values)
+        return ordered[len(ordered) // 2]
+
+    return median(timings) - median(baseline)
+
+
+@pytest.mark.parametrize("baseline, ok", [([0.4] * 12, False), ([0.7] * 12, True)], ids=["regression", "slow-runner"])
+def test_overhead_subtracts_the_interpreter_start(baseline, ok):
+    assert (overhead([0.9] * 12, baseline) < 0.25) is ok
+
+
+@pytest.mark.timing
 @pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])
-def test_hook_run_median_latency_is_under_300_ms(ws, home, covered):
-    """One Python start per matching tool call (v4.1 §2 Behaviour 3), median-timed as the hosts
+def test_hook_run_overhead_is_under_250_ms(ws, home, covered):
+    """One Python start per matching tool call (v4.1 §2 Behaviour 3), timed as the hosts
     run it (`aegis hook run pre-tool --host claude-code`, payload on stdin) on the
     expensive path: an edit in a governed repository whose activity log is a full, busy
-    tail (the covering scan row deep in it, or none), and an event to append."""
+    tail (the covering scan row deep in it, or none), and an event to append. The only
+    wall-clock assertion on this path; the spawn counters in test_scan_spawn_budget pin the
+    regression class."""
     _busy_log(ws, "src/a.py" if covered else None)
     assert scan_compliance.activity_path(ws).stat().st_size > 3.5 * 1024 * 1024
     data = json.dumps(claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")})).encode("utf-8")
@@ -594,12 +612,15 @@ def test_hook_run_median_latency_is_under_300_ms(ws, home, covered):
         assert (proc.returncode, proc.stdout, proc.stderr.replace(b"\r\n", b"\n")) == expected  # Windows text stderr
         return elapsed
 
+    def noop() -> float:
+        started = time.perf_counter()
+        subprocess.run([sys.executable, "-c", "import sys"], cwd=str(ws), capture_output=True, timeout=60, check=True)
+        return time.perf_counter() - started
+
     once()  # warm the OS file cache
-    timings = sorted(once() for _ in range(12))
-    # The median, not a tail percentile: one stalled sample on a shared CI runner moved the p95
-    # of 12 runs over the budget. A real regression (the code this replaced took 676 ms) moves all runs.
-    median = timings[len(timings) // 2]
-    if median > 1.0:
-        pytest.skip(f"this machine is too slow to judge the 300 ms budget: median {median * 1000:.0f} ms")
-    assert median < 0.3, f"median {median * 1000:.0f} ms over the 300 ms budget: {[round(t * 1000) for t in timings]}"
+    timings = [once() for _ in range(12)]
+    baseline = [noop() for _ in range(12)]
+    extra = overhead(timings, baseline)
+    assert extra < 0.25, (f"Aegis adds {extra * 1000:.0f} ms over a Python start: "
+                          f"{[round(t * 1000) for t in sorted(timings)]} vs {[round(t * 1000) for t in sorted(baseline)]}")
     assert [r["result"] for r in events.read(ws, "scan_gate").rows] == ["pass" if covered else "block"] * 13

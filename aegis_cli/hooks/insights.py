@@ -2,18 +2,26 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from aegis_core.insights import (
     SUPPORTED_INSIGHT_HOSTS,
-    enable_host_hook as enable_insight_hook,
     host_capture_status as insight_hook_status,
     record_hook_prompt,
 )
 
 __all__ = ["SUPPORTED_INSIGHT_HOSTS", "enable_insight_hook", "insight_hook_status", "main", "run_insight_hook"]
+
+
+def enable_insight_hook(host: str, *, excerpts: bool = False, home: Optional[Path] = None) -> Dict[str, Any]:
+    """Register the UserPromptSubmit insight hook for ``host`` (see registrar.install_insight_hook)."""
+    # Imported here: this module is the per-prompt hook, and the registrar pulls in the host plane.
+    from aegis_cli.hooks import registrar
+
+    return registrar.install_insight_hook(host, excerpts, home=home, environ=os.environ)
 
 
 def _build_parser() -> argparse.ArgumentParser:

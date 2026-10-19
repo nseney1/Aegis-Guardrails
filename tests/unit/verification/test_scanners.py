@@ -146,6 +146,46 @@ class TestTierBAndTierCAdvisory:
         assert ws_findings[0].rule_id == "slack-token"
 
 
+class TestKeyValueRedaction:
+    # Values stay under 20 characters so the high-entropy fallback cannot mask a broken key=value rule.
+    @pytest.mark.parametrize(
+        ("text", "secret", "context"),
+        [
+            (_tok("password", "=hunter2abc"), "hunter2abc", "password"),
+            (_tok("api_key", ": Zx9Qw3rt"), "Zx9Qw3rt", "api_key"),
+            (_tok("PASSWORD", " = 'hunter2abc'"), "hunter2abc", "PASSWORD"),
+            (_tok('{"password"', ': "hunter2abc", "user": "bob"}'), "hunter2abc", '"user": "bob"'),
+            (_tok("the password", " is hunter2abc, rotate it"), "hunter2abc", "rotate it"),
+            (_tok("export DB_PASSWORD", "=p@ss/w0rd+x"), "p@ss/w0rd+x", "export DB_PASSWORD"),
+            (_tok("client_secret", "=abcd"), "abcd", "client_secret"),
+        ],
+        ids=["eq", "colon", "quoted", "json", "prose", "export", "short"],
+    )
+    def test_short_key_value_secret_is_redacted(self, text: str, secret: str, context: str) -> None:
+        out = scanners.redact_insight_text(text, max_len=300)
+        assert secret not in out
+        assert "[REDACTED]" in out
+        assert context in out
+        assert scanners.redact_insight_text(out, max_len=300) == out
+
+    def test_value_under_four_characters_is_kept_by_design(self) -> None:
+        assert scanners.redact_insight_text("pwd=abc", max_len=300) == "pwd=abc"
+
+    @pytest.mark.parametrize("text, secret", [
+        (_tok("authorization: ", "Basic dXNlcjpwYXNz"), "dXNlcjpwYXNz"),
+        (_tok("Proxy-Authorization: ", "Basic Zm9vOmJhcg=="), "Zm9vOmJhcg=="),
+        (_tok("auth", "=abcd1234"), "abcd1234"),
+    ], ids=["basic", "proxy-basic", "auth"])
+    def test_authorization_credentials_are_redacted(self, text: str, secret: str) -> None:
+        out = scanners.redact_insight_text(text, max_len=300)
+        assert secret not in out and "[REDACTED]" in out
+        assert scanners.redact_insight_text(out, max_len=300) == out
+
+    @pytest.mark.parametrize("text", ["the author: John Smith wrote this", "authorization: Basic"])
+    def test_authorship_and_a_bare_scheme_are_left_alone(self, text: str) -> None:
+        assert scanners.redact_insight_text(text, max_len=300) == text
+
+
 class TestSarifIngest:
     def test_ingest_sarif_fingerprints_delta_and_suppressions(self, tmp_path: Path) -> None:
         (tmp_path / "app.py").write_text(

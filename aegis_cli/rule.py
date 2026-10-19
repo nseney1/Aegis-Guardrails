@@ -767,20 +767,27 @@ def _normalize_paths_arg(raw_paths: Any) -> Optional[List[str]]:
 
 def _run_insight(args: argparse.Namespace) -> int:
     from aegis_core.insights import (
-        add_insight, enable_host_hook, measure_recurrence, record_decision, review_insights, write_proposal,
+        add_insight, measure_recurrence, record_decision, review_insights, write_proposal,
     )
     sub_action = getattr(args, "insight_action", None)
     use_json = bool(getattr(args, "json", False))
     if sub_action == "enable":
+        from aegis_cli.hooks.insights import enable_insight_hook
+        from aegis_cli.hooks.registrar import CODEX_TRUST_STEP
+
         host, excerpts = getattr(args, "host", None), bool(getattr(args, "excerpts", False))
         try:
-            res = enable_host_hook(host, excerpts=excerpts)
+            res = enable_insight_hook(host, excerpts=excerpts)
         except Exception as exc:
             return _emit_error(args, str(exc))
         if use_json:
             print(json.dumps(res, indent=2))
         else:
             print(f"Enabled insight capture for {host} ({'excerpts + heartbeats' if excerpts else 'heartbeats only'}) in {res['config_path']}")
+            if res.get("backup_dir"):
+                print(f"   backup: {res['backup_dir']}")
+        if host == "codex-cli":
+            print(f"   Next: {CODEX_TRUST_STEP}", file=sys.stderr if use_json else sys.stdout)
         return 0
 
     if sub_action == "add":

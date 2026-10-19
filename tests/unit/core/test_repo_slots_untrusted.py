@@ -76,7 +76,9 @@ def _user_drivers(home: Path, **drivers: str) -> None:
 
 def _parse(path: Path, ws: Path) -> Tuple[Optional[Any], Optional[Exception]]:
     try:
-        return ASTDriverRunner().parse_file(path, workspace_root=ws), None
+        # A hang ceiling, not a budget: these tests check which driver runs, and a real node or
+        # go start-up on a loaded Windows runner can pass the 3.0 s production default.
+        return ASTDriverRunner().parse_file(path, workspace_root=ws, timeout=120.0), None
     except ASTDriverError as exc:
         return None, exc
 

@@ -378,9 +378,12 @@ def test_targeted_test_exemption_exempts_only_named_fix_commit(
 
 
 @needs_git
-def test_tree_blobs_is_cached_and_not_recomputed_on_cache_hits(
+def test_performance_invariant_each_commit_tree_is_read_at_most_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    """Performance invariant, not behaviour: the regression check reads each commit's tree once
+    however many fix commits share it. The verdict is the same either way, so only counting the
+    calls to the private tree reader can see a regression here."""
     repo = make_calc_repo(tmp_path)
     repo.write(
         "src/calc.py",
@@ -429,7 +432,7 @@ def test_tree_blobs_is_cached_and_not_recomputed_on_cache_hits(
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert all(count == 1 for count in call_counts.values()), call_counts
+    assert call_counts and all(count == 1 for count in call_counts.values()), call_counts
 
 
 # ── 4. Warning-tier rollout & `aegis check --ci` integration ─────────────────

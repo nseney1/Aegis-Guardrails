@@ -1257,7 +1257,7 @@
                 "flags": [
                   "--host"
                 ],
-                "help": "Remove Aegis's PreToolUse hook entries from this host instead of the git hook: claude-code, codex-cli, antigravity",
+                "help": "Remove Aegis's PreToolUse and insight capture hook entries from this host instead of the git hook: claude-code, codex-cli, antigravity",
                 "kind": "store",
                 "metavar": "HOST",
                 "nargs": null,
@@ -1280,8 +1280,8 @@
                 "required": false
               }
             ],
-            "description": "Without --host: remove the aegis block from the git pre-commit hook.\n\nWith --host: remove Aegis's PreToolUse entries from that host's files at --scope (default: both scopes) and nothing else, backing each file up first; for Codex also ~/.codex/rules/aegis.rules once no Aegis Codex hook is left. Run it from any directory but your home directory, which Aegis never takes as a workspace, even for --scope user (which changes only your user files).",
-            "help": "Remove the aegis block from the pre-commit hook, or with --host an agent host's PreToolUse hook"
+            "description": "Without --host: remove the aegis block from the git pre-commit hook.\n\nWith --host: remove Aegis's PreToolUse entries and its insight capture (UserPromptSubmit) entries from that host's files at --scope (default: both scopes) and nothing else, backing each file up first; for Codex also ~/.codex/rules/aegis.rules once no Aegis Codex hook is left. Run it from any directory but your home directory, which Aegis never takes as a workspace, even for --scope user (which changes only your user files).",
+            "help": "Remove the aegis block from the pre-commit hook, or with --host an agent host's PreToolUse hook and its insight capture hook"
           }
         },
         "description": null,
