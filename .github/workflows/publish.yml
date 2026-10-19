@@ -1,16 +1,35 @@
 name: Publish to PyPI
 
+# No workflow_dispatch: a dispatch runs the chosen ref's own copy of this file, so no guard here
+# binds it. Recover with "Re-run failed jobs" or a new release; PyPI filenames are immutable.
 on:
   release:
     types: [published]
-  workflow_dispatch:
 
 # Least privilege: every job gets a read-only token unless it grants more below.
 permissions:
   contents: read
 
+# A second run for the same tag waits for the first instead of racing its upload.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag is v + package version, at this commit
+        run: python3 .github/scripts/release_guard.py
+
   validate:
+    needs: guard
     uses: ./.github/workflows/validate.yml
     # A reusable workflow can never exceed its caller's grants; the build job
     # inside needs these to sign build provenance attestations.

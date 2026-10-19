@@ -1,12 +1,13 @@
-from pathlib import Path
 """CI supply-chain hardening regression tests (v0.90).
 
 Covers least-privilege tokens, SHA-pinned actions, Dependabot, dependency
 auditing, build provenance attestations and PyPI Trusted Publishing (OIDC).
-PyYAML parses the workflow key ``on`` as boolean ``True``; nothing here reads it.
+PyYAML parses the workflow key ``on`` as boolean ``True``; ``_triggers`` reads either spelling.
 """
 import os
 import re
+from pathlib import Path
+
 import pytest
 
 yaml = pytest.importorskip("yaml")
@@ -36,6 +37,10 @@ def _uses(workflow):
         for step in job.get("steps", []):
             if "uses" in step:
                 yield step["uses"]
+
+
+def _triggers(workflow):
+    return workflow["on"] if "on" in workflow else workflow[True]
 
 
 def _step_using(job, prefix):
@@ -242,3 +247,23 @@ def test_publish_workflow_isolates_release_assets():
     assert len(upload) == 1
     assert "RELEASE_TAG" in upload[0].get("env", {})
     assert "|| true" not in _read("publish.yml")
+
+
+def test_publish_runs_only_on_a_published_release():
+    """A dispatch runs the chosen ref's own copy of publish.yml, so no in-file guard binds it."""
+    triggers = _triggers(_load("publish.yml"))
+    assert set(triggers) == {"release"}
+    assert triggers["release"] == {"types": ["published"]}
+    # credit and ci_green count dispatch runs of validate.yml as CI.
+    assert "workflow_dispatch" in _triggers(_load("validate.yml"))
+
+
+def test_publish_guards_the_tag_before_any_build():
+    wf = _load("publish.yml")
+    assert wf.get("concurrency") == {"group": "publish-${{ github.ref }}", "cancel-in-progress": False}
+    guard = wf["jobs"]["guard"]
+    assert guard.get("permissions") == {"contents": "read"}
+    runs = [s.get("run", "") for s in guard["steps"]]
+    assert any("python3 .github/scripts/release_guard.py" in r for r in runs)
+    needs = wf["jobs"]["validate"].get("needs")
+    assert needs == "guard" or "guard" in needs
