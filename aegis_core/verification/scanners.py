@@ -64,7 +64,7 @@ _REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b|\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b"), "[REDACTED_API_KEY]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}\b|\bnpm_[A-Za-z0-9]{20,}\b|\bAIza[A-Za-z0-9_-]{25,}\b|\bpypi-[A-Za-z0-9_-]{20,}\b"), "[REDACTED_TOKEN]"),
     (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"), "Bearer [REDACTED]"),
-    (re.compile(rf"(?i)(\b[A-Za-z0-9_]*{_SENSITIVE_KEYS}[A-Za-z0-9_]*[\"']?\s*(?:=|:|\bis\b)\s*[\"']?)([^\s\"',;]{4,})"), r"\1[REDACTED]"),
+    (re.compile(rf"(?i)(\b[A-Za-z0-9_]*{_SENSITIVE_KEYS}[A-Za-z0-9_]*[\"']?\s*(?:=|:|\bis\b)\s*[\"']?)([^\s\"',;]{{4,}})"), r"\1[REDACTED]"),
     (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
     (re.compile(r"(?<=/home/)[^/\s]+|(?<=/Users/)[^/\s]+|(?<=C:\\Users\\)[^\\\s]+"), "~user"),
     (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
@@ -78,7 +78,7 @@ _GENERIC_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b|\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b"), "[REDACTED]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b|\bnpm_[A-Za-z0-9]{20,}\b|\bAIza[A-Za-z0-9_-]{25,}\b|\bpypi-[A-Za-z0-9_-]{20,}\b"), "[REDACTED]"),
     (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
-    (re.compile(rf"(?i)(\b[A-Za-z0-9_]*{_SENSITIVE_KEYS}[A-Za-z0-9_]*[\"']?\s*(?:=|:|\bis\b)\s*[\"']?)([^\s\"',;]{4,})"), r"\1[REDACTED]"),
+    (re.compile(rf"(?i)(\b[A-Za-z0-9_]*{_SENSITIVE_KEYS}[A-Za-z0-9_]*[\"']?\s*(?:=|:|\bis\b)\s*[\"']?)([^\s\"',;]{{4,}})"), r"\1[REDACTED]"),
 )
 _HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 _CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
