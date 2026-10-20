@@ -729,6 +729,14 @@ def project_credits(
                 break
     app_fn = approved or approval_lookup(root, rows, landed=look)
     derived = derive(rows, landed=look, approved=app_fn, verified_ci=v_map or None)
+    if verify_ci and stopped is None:
+        # confirm() (sync) parks a landed commit whose CI gh could not read in _UNAVAILABLE_CI, and the
+        # loop above never retries it, so its credit stays landed: as cut short as a tripped breaker.
+        unread = sorted({c.commit for c in derived
+                         if c.commit and c.state == "landed" and (c_root, c.commit) in _UNAVAILABLE_CI})
+        if unread:
+            stopped = (f"CI verification stopped: gh failed while confirming CI for {unread[0][:12]}; "
+                       f"{len(unread)} landed commit(s) were not verified")
     return CreditProjection(tuple(derived), tuple(confirmed_outcome_rows(derived)),
                             available=stopped is None, error=stopped)
 

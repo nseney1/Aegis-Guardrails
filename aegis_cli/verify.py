@@ -833,7 +833,11 @@ def run_verify(args: argparse.Namespace) -> int:
 
     # T6 is log-only: the Layer 2 verdict is meta text, never the exit status or a rule outcome.
     passed = layer1_pass
-    _record_telemetry(tools_pass, pipeline_res.verdict)
+    arb = pipeline_res.arbitration_result
+    # arbitrate() still names a verdict (SHIP over a passing Layer 1) for a review that never completed;
+    # the ledger says UNVERIFIED, as the text and JSON output do.
+    unverified = arb is not None and getattr(arb, "infra_status", "ok") != "ok"
+    _record_telemetry(tools_pass, "UNVERIFIED" if unverified else pipeline_res.verdict)
     _record_baseline(passed)
     if use_json:
         _emit_json(passed, pipeline_res)

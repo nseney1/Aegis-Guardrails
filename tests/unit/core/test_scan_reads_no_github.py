@@ -30,11 +30,13 @@ RULE_B = ("---\nid: trap-b\ntype: trap\nenforcement: advisory\nhypothesis: b\n"
 
 
 class CountingGh:
-    """``gh`` at the runner boundary: answers ``gh api .../runs?head_sha=`` from ``runs`` and the
-    repository GET with default branch ``main`` (R-trust-62), refuses the rest."""
+    """``gh`` at the runner boundary: answers ``gh api .../runs?head_sha=`` from ``runs`` (or fails it
+    with ``fail_runs``) and the repository GET with default branch ``main`` (R-trust-62), refuses
+    the rest; ``fail`` refuses every call."""
 
-    def __init__(self, runs: Optional[List[Dict[str, Any]]] = None, fail: bool = False) -> None:
-        self.runs, self.fail = list(runs or []), fail
+    def __init__(self, runs: Optional[List[Dict[str, Any]]] = None, fail: bool = False, *,
+                 fail_runs: bool = False) -> None:
+        self.runs, self.fail, self.fail_runs = list(runs or []), fail, fail_runs
         self.calls: List[List[str]] = []
 
     def __call__(self, argv, stdin=None, cwd=None, timeout=None):
@@ -43,6 +45,8 @@ class CountingGh:
             return subprocess.CompletedProcess(argv, 1, "", "offline")
         if "head_sha=" not in argv[1]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"default_branch": "main"}), "")
+        if self.fail_runs:
+            return subprocess.CompletedProcess(argv, 1, "", "rate limited")
         sha = argv[1].split("head_sha=", 1)[1].split("&", 1)[0]
         body = {"workflow_runs": [r for r in self.runs if r.get("head_sha") == sha]}
         return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -143,13 +147,30 @@ def test_offline_projection_never_credits_an_unverified_ci_row_and_verifying_doe
 
 @needs_git
 def test_a_dead_gh_costs_one_attempt_per_projection(tmp_path, monkeypatch):
+    """Given GitHub names the default branch and then every runs GET fails, When seven well-formed
+    commits are pending, Then the breaker stops at the first: one runs GET, projection unavailable."""
+    repo, commit = _landed(tmp_path)
+    ledger.append_rows(repo.root, [_ci_row(commit)] + [_ci_row(sha) for sha in FORGED])
+    gh = _gh(monkeypatch, CountingGh(fail_runs=True))
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert (len(gh.api), len(gh.runs_api)) == (2, 1)
+    assert (proj.available, proj.error) == (
+        False, f"CI verification stopped after gh failed for {commit[:12]}; 7 commit(s) were not verified")
+    assert _states(proj) == [("landed", "unverified_ci", False)]
+    assert credit._UNAVAILABLE_CI == set()
+
+
+@needs_git
+def test_a_dead_repository_get_costs_one_attempt_and_reads_no_run(tmp_path, monkeypatch):
     repo, commit = _landed(tmp_path)
     ledger.append_rows(repo.root, [_ci_row(commit)] + [_ci_row(sha) for sha in FORGED])
     gh = _gh(monkeypatch, CountingGh(fail=True))
     proj = credit.project_credits(repo.root, verify_ci=True)
-    assert len(gh.api) == 1
+    assert (len(gh.api), len(gh.runs_api)) == (1, 0)
+    assert (proj.available, proj.error) == (
+        False, "CI verification stopped: GitHub did not name the default branch (gh api failed (exit 1)); "
+               "7 commit(s) were not verified")
     assert _states(proj) == [("landed", "unverified_ci", False)]
-    assert credit._UNAVAILABLE_CI == set()
 
 
 @needs_git

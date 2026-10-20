@@ -467,6 +467,27 @@ class TestLayer2:
         assert "SHIP" not in out
         assert "BLOCK" not in out
 
+    @pytest.mark.parametrize("mode,expected", [("garbage", "UNVERIFIED"), ("block", "BLOCK"), ("ship", "SHIP")],
+                             ids=["unreadable", "block", "ship"])
+    def test_the_ledger_records_unverified_for_a_review_that_did_not_complete(self, ws, llm, mode, expected):
+        """Given a trap matching the change and a passing Layer 1, When ``aegis check --full`` runs and the
+        Spec Agent's reply cannot be parsed, Then the telemetry row says UNVERIFIED (never SHIP) and the
+        exit status is Layer 1's; a review that completed records its own verdict."""
+        from aegis_core.telemetry_engine import ledger
+        from aegis_core.verification import Verdict
+
+        traps = ws / ".aegis" / "rules" / "traps"
+        traps.mkdir(parents=True)
+        (traps / "trap-py.md").write_text(
+            "---\nid: trap-py\ntype: trap\ndomain: correctness\nenforcement: advisory\nhypothesis: py\n"
+            "target_paths:\n  - '*.py'\n---\n# Py\n\nBody long enough to be a rule body.\n", encoding="utf-8")
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--full", "--plan", "Add compute", "--llm-cmd", llm(mode), "clean.py"]
+        assert _exit_code(argv) == 0
+        rows = [r for r in ledger.read(ws).rows if r.get("rule") == "trap-py"]
+        want = "UNVERIFIED" if expected == "UNVERIFIED" else str(Verdict[expected])
+        assert [(r.get("outcome"), (r.get("meta") or {}).get("verdict")) for r in rows] == [("tp", want)]
+
     @staticmethod
     def _spec_reply(tmp_path: Path, severity: str, risk) -> str:
         reply = tmp_path / "spec_reply.json"
