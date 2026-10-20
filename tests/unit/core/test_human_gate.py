@@ -40,6 +40,15 @@ def test_every_coverage_sample_is_a_governance_path():
     assert {"pytest.py", "pytest/__init__.py", "iniconfig.py", "py/__init__.py"} <= set(human_gate.COVERAGE_SAMPLES)
 
 
+def test_a_codeowners_that_owns_only_the_source_init_of_a_runner_package_leaves_it_uncovered():
+    """Given CODEOWNERS lines that own ``/pytest/__init__.py`` but not the package directory, When
+    coverage is checked, Then a compiled ``__init__`` and the ``__main__`` of that package are uncovered."""
+    narrow = hg.CODEOWNERS_FULL.replace("/pytest/ @octo\n", "/pytest/__init__.py @octo\n")
+    _covered, uncovered = human_gate.codeowners_coverage(narrow)
+    assert {"pytest/__init__.pyc", "pytest/__main__.py"} <= set(uncovered)
+    assert "pytest/__init__.py" not in uncovered
+
+
 def test_the_codeowners_lines_doctor_prints_cover_the_whole_set_it_checks():
     text = "\n".join(human_gate.codeowners_lines("@octo"))
     for location in (".github/CODEOWNERS", "CODEOWNERS"):

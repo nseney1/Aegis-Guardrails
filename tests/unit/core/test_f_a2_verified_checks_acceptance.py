@@ -330,6 +330,51 @@ def test_a_root_module_that_shadows_the_runner_is_protected_and_earns_no_credit(
         assert [(c.state, c.reason) for c in derived] == [("confirmed", "protected_changed")]
 
 
+def _sourceless(source: str) -> bytes:
+    """A .pyc Python loads without a source file next to it (flags 0, no mtime check when sourceless)."""
+    import importlib.util
+    import marshal
+
+    return importlib.util.MAGIC_NUMBER + b"\x00" * 12 + marshal.dumps(compile(source, "__init__.py", "exec"))
+
+
+@needs_git
+def test_a_compiled_runner_package_with_a_main_is_protected_and_earns_no_credit(tmp_path):
+    """Given a failing test on the branch, When a root ``pytest`` package is made of a sourceless
+    ``__init__.pyc`` (a regular package to Python) and a ``__main__.py`` that forges a passing junit
+    file, Then ``python -m pytest`` runs the forgery, the row is protected (test-infra) and a
+    CI-confirmed credit for it does not count."""
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.write("tests/test_real.py", "def test_real():\n    assert False\n")
+    repo.commit("a failing test")
+    (repo.root / "pytest").mkdir()
+    (repo.root / "pytest" / "__init__.pyc").write_bytes(_sourceless("x = 1\n"))
+    repo.write("pytest/__main__.py", FORGED_RUN)
+    _edit_app(repo)
+    _scan(repo)
+    out = checkrun.record(repo.root, tests=True, base="main")
+    assert out.row["passed"] is True  # the forgery runs: protection is what has to withhold it
+    assert out.row["protected_changed"] is True and out.row["protected"] == ["test-infra"]
+    _report(repo)
+    commit = repo.commit("work")
+    credit.confirm(repo.root, client=hv.FakeCI([hv.ci_run(commit)]), workflow=hv.CI_WORKFLOW, landed=_landed(repo))
+    assert [(c.state, c.reason, c.counts) for c in _credits(repo)] == [("confirmed", "protected_changed", False)]
+
+
+@needs_git
+def test_a_runner_name_below_the_root_is_not_protected(tmp_path):
+    """Control: a ``tests/pytest/`` package (not first on sys.path) and a ``src/pytest_helpers.py``
+    module are ordinary files."""
+    repo = hv.make_project(tmp_path)
+    hv.use_stub_runner(repo.home.path)
+    (repo.root / "tests" / "pytest").mkdir(parents=True)
+    (repo.root / "tests" / "pytest" / "__init__.pyc").write_bytes(_sourceless("x = 1\n"))
+    repo.write("tests/pytest/__main__.py", "x = 1\n")
+    repo.write("src/pytest_helpers.py", "x = 1\n")
+    out = checkrun.record(repo.root, tests=True, base="main")
+    assert out.row["protected_changed"] is False and out.row["protected"] == []
+
+
 @needs_git
 def test_a_path_that_only_resembles_the_runner_is_not_protected(tmp_path):
     repo = hv.make_project(tmp_path)

@@ -98,6 +98,8 @@ COVERAGE_SAMPLES: Tuple[str, ...] = (
     "Makefile",
     *(f"{name}.py" for name in governance.RUNNER_MODULES),
     *(f"{name}/__init__.py" for name in governance.RUNNER_MODULES),
+    *(f"{name}/__init__.pyc" for name in governance.RUNNER_MODULES),
+    *(f"{name}/__main__.py" for name in governance.RUNNER_MODULES),
 )
 _CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 _OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")

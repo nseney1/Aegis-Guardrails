@@ -126,11 +126,26 @@ def test_a_module_that_shadows_the_runner_is_test_infra(path):
     assert governance.touches_governance([path]) == ["test-infra"]
 
 
+# Given a root package of a runner module in any form Python imports as a regular package (a sourceless
+# or compiled __init__), or its __main__ (what ``python -m pytest`` runs), When classified, Then it is
+# test infrastructure; a .pyw module is source on Windows.
+@pytest.mark.parametrize("path", [
+    "pytest/__init__.pyc", "pytest/__init__.so", "pytest/__init__.cpython-312-x86_64-linux-gnu.so",
+    "pytest/__init__.abi3.so", "pytest/__init__.pyd", "pytest/__init__.cp312-win_amd64.pyd", "pytest/__init__.pyw",
+    "pytest/__main__.py", "pytest/__main__.pyc", "_pytest/__init__.pyc", "_pytest/__main__.py", "pluggy/__init__.so",
+    "py/__init__.pyc", "py/__main__.py", "iniconfig/__init__.pyd", "PYTEST/__INIT__.PYC", "pytest.pyw",
+], ids=lambda p: p.replace("/", "-").replace("cpython-312-x86_64-linux-gnu", "abi")[:28])
+def test_a_compiled_runner_package_or_its_main_is_test_infra(path):
+    assert governance.touches_governance([path]) == ["test-infra"]
+
+
 # Sad path: names that only resemble a runner module, or a package below the root, stay outside.
 @pytest.mark.parametrize("path", [
     "pytest.md", "pytest_helpers.py", "mypytest.py", "numpy.py", "docs/pytest/usage.md", "src/pytest/__init__.py",
-    "pytest/__main__.py", "py/helpers/util.py", "tests/pytest_cases.py", "pytestx/__init__.py",
-], ids=lambda p: p.replace("/", "-")[:20])
+    "py/helpers/util.py", "tests/pytest_cases.py", "pytestx/__init__.py", "src/pytest_helpers.py",
+    "tests/pytest/__init__.pyc", "tests/pytest/__main__.py", "src/pytest/__init__.so", "pytest/helpers.pyc",
+    "pytest/__pycache__/x.pyc", "pytestx/__main__.py",
+], ids=lambda p: p.replace("/", "-")[:24])
 def test_a_name_that_only_resembles_a_runner_module_is_outside(path):
     assert governance.touches_governance([path]) == []
     assert governance.category_of(path) is None

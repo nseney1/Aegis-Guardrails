@@ -12,7 +12,8 @@ needs a ``human_gate`` approval (``aegis_core.human_gate``) before it counts:
 - ``test-infra``: ``conftest.py``, the files that hold pytest's configuration (``pytest.ini``,
   ``tox.ini``, ``setup.cfg``, ``pyproject.toml``, ``pytest.toml``), ``sitecustomize.py``,
   ``*.pth``, the ``Makefile`` and a root module that shadows the runner (``RUNNER_MODULES``:
-  ``pytest.py``, ``_pytest/__init__.py``, ``pluggy``, ``py``, ``iniconfig`` and their compiled forms);
+  ``pytest.py``, ``_pytest/__init__.py``, ``pluggy``, ``py``, ``iniconfig``, their compiled forms
+  and a root package's ``__main__``);
 - ``tests-deleted``: a deleted test file (``match.is_test_path``); an approval's hash binds the
   ones deleted since the base (``human_gate.governance_tree_hash``).
 
@@ -39,10 +40,12 @@ from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 __all__ = ["CATEGORIES", "DELETED_TESTS", "RUNNER_MODULES", "category_of", "touches_governance"]
 
 #: What ``python -m pytest`` imports first from the snapshot root (first on sys.path), so a root
-#: module or package of one of these names replaces the runner. A package counts by its
-#: ``__init__.py`` only: a directory without one is a namespace portion the installed package beats.
+#: module or package of one of these names replaces the runner. A package counts by any
+#: ``__init__`` file (Python takes a sourceless ``__init__.pyc`` or a compiled one as a regular
+#: package) and its ``__main__`` (what ``-m`` runs); a directory without an ``__init__`` is a
+#: namespace portion the installed package beats. ``.pyw`` is source on Windows.
 RUNNER_MODULES = ("pytest", "_pytest", "pluggy", "py", "iniconfig")
-_RUNNER_SUFFIXES = (".py", ".pyc", ".so", ".*.so", ".pyd", ".*.pyd", "/__init__.py")
+_RUNNER_SUFFIXES = (".py", ".pyw", ".pyc", ".so", ".*.so", ".pyd", ".*.pyd", "/__init__.*", "/__main__.*")
 
 # (category, patterns), in the order touches_governance reports them. A pattern with no "/"
 # also matches the file's basename at any depth (aegis_core.match).
