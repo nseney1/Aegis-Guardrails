@@ -546,8 +546,9 @@ def pytest_settings(filename: str, data: bytes) -> Optional[Dict[str, str]]:
     COLLECTION_KEYS it sets (``{}`` for a configuration without them; a
     ``pytest.toml``, ``.pytest.toml``, ``pytest.ini`` or ``.pytest.ini`` is one even
     when empty, as pytest reads it). Values are compared as text: whitespace around ini
-    lines and, in TOML, whitespace and comments outside strings do not count. Raises
-    ValueError for a file that cannot be read."""
+    lines and, in TOML, whitespace and comments outside strings do not count. In TOML a
+    quoted key part written with a backslash escape may stand for any name, so it counts
+    where pytest's would (fail closed). Raises ValueError for a file that cannot be read."""
     text = bytes(data).decode("utf-8-sig")
     if filename == "pyproject.toml":
         return _toml_settings(text, _PYPROJECT_TABLES, always=False)
@@ -580,8 +581,10 @@ def pytest_config_view(filename: str, data: bytes) -> Optional[Dict[str, str]]:
     """Everything pytest reads from ``pyproject.toml`` (``[tool.pytest]`` and its sub-tables,
     headers included: an empty ``[tool.pytest.ini_options]`` still makes it the config file),
     ``tox.ini`` (``[pytest]``) or ``setup.cfg`` (``[tool:pytest]``), with the parsers of
-    ``pytest_settings`` and every key, not only COLLECTION_KEYS. None when the file holds no
-    pytest configuration; ValueError when it cannot be read (or is not one of the three)."""
+    ``pytest_settings`` and every key, not only COLLECTION_KEYS. It fails closed: any value set
+    at the root ``tool`` key (``tool = {...}``) and any key with an escaped part that may decode
+    to ``tool.pytest`` count. None when the file can hold no pytest configuration; ValueError
+    when it cannot be read (or is not one of the three)."""
     text = bytes(data).decode("utf-8-sig")
     if filename == "pyproject.toml":
         root = ("tool", "pytest")
