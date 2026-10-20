@@ -102,9 +102,12 @@ def test_status_list_sync_scan_and_sdk_report_one_fitness(ws: Path, capsys):
     from aegis_mcp.tools import execute_tool
     from aegis_sdk import Governance
 
-    # 9 tp of 10 verdicts: the Wilson lower bound (90%) is the score everywhere.
-    score = compute({"tp": 9, "fp": 1, "triggers": 10}).score
-    assert score == 0.6523
+    from aegis_core.telemetry_engine import ledger
+
+    # 24 tp of 25 verdicts (MIN_N, R-evidence-8): the Wilson lower bound (90%) is the score everywhere.
+    ledger.append(ws, [{"rule": "trap-src-any", "outcome": "tp", "source": "ci", "key": f"m{n}"} for n in range(15)])
+    score = compute({"tp": 24, "fp": 1, "triggers": 25}).score
+    assert score == 0.8391
 
     RULE_CACHE.invalidate()
     scanned = {r["name"]: r["fitness"] for r in scan(ws, ["src/app.py"], budget=5)["relevant_rules"]}
@@ -115,12 +118,14 @@ def test_status_list_sync_scan_and_sdk_report_one_fitness(ws: Path, capsys):
     status = {r["name"]: r for r in json.loads(capsys.readouterr().out)["rules"]}
 
     assert scanned["trap-src-any"] == score
-    assert listed["trap-src-any"] == {"triggers": 10, "tp": 9, "fp": 1, "last_ts": listed["trap-src-any"]["last_ts"], "score": score}
-    assert (derived["trap-src-any"]["fitness"], derived["trap-src-any"]["triggers"]) == (score, 10)
-    assert (landscape["trap-src-any"]["score"], landscape["trap-src-any"]["tp"]) == (score, 9)
-    assert (status["trap-src-any"]["score"], status["trap-src-any"]["triggers"]) == (score, 10)
-    # A rule with no verdicts: 0.0 where a number is required, unknown where status shows it.
-    assert scanned["trap-top-level"] == listed["trap-top-level"]["score"] == derived["trap-top-level"]["fitness"] == 0.0
+    assert listed["trap-src-any"] == {"triggers": 25, "tp": 24, "fp": 1, "last_ts": listed["trap-src-any"]["last_ts"],
+                                      "score": score, "reported_score": score, "status": None}
+    assert (derived["trap-src-any"]["fitness"], derived["trap-src-any"]["triggers"]) == (score, 25)
+    assert (landscape["trap-src-any"]["score"], landscape["trap-src-any"]["tp"]) == (score, 24)
+    assert (status["trap-src-any"]["score"], status["trap-src-any"]["triggers"]) == (score, 25)
+    # A rule with no verdicts: 0.0 where a number is required, no number where one is shown.
+    assert listed["trap-top-level"]["score"] == derived["trap-top-level"]["fitness"] == 0.0
+    assert scanned["trap-top-level"] is listed["trap-top-level"]["reported_score"] is None
     assert status["trap-top-level"]["score"] is None
 
 
@@ -198,11 +203,12 @@ def test_check_telemetry_records_each_rules_share_of_the_credit(ws: Path):
         str(ws), ["docs/guide/intro.md", "README.md", "tests/conftest.py", "src/app.py"], passed=False, run_id="clamp",
     )
     clamp = {r["rule"]: (r["outcome"], r.get("weight", 1.0)) for r in ledger.read(ws).rows if r.get("key") == "clamp"}
+    # A local run writes triggers (R-evidence-1); the shares are kept on the row.
     assert clamp == {
-        "trap-docs": ("fp", 1.0),
-        "trap-basename": ("fp", 1.0),
-        "trap-src-any": ("fp", 0.5),
-        "trap-top-level": ("fp", 0.5),
+        "trap-docs": ("trigger", 1.0),
+        "trap-basename": ("trigger", 1.0),
+        "trap-src-any": ("trigger", 0.5),
+        "trap-top-level": ("trigger", 0.5),
     }
 
 

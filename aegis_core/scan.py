@@ -32,6 +32,7 @@ from pathlib import Path, PurePath
 import posixpath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import rule_integrity
@@ -156,8 +157,16 @@ def _item(m: _Match) -> Dict[str, Any]:
         "hypothesis": rule.meta.get("hypothesis", ""),
         "prediction": rule.meta.get("prediction", ""),
         "matched_files": list(m.files),
-        "fitness": m.fitness.score,
+        "fitness": m.fitness.reported_score,
     }
+
+
+def _fitness_text(fit: Fitness) -> str:
+    if fit.reported_score is not None:
+        return f"{fit.reported_score:.2f}"
+    if fit.evidence_available and not fit.triggers and not fit.verdicts:
+        return "no evidence yet"
+    return fit.status_label or "—"
 
 
 def _text(m: _Match) -> str:
@@ -174,7 +183,7 @@ def _text(m: _Match) -> str:
     if rule.body:
         lines = rule.body.strip().split("\n")[:8]
         out += f"   Detail: {' '.join(line.strip() for line in lines)[:300]}\n"
-    out += f"   Fitness: {m.fitness.score:.2f}\n"
+    out += f"   Fitness: {_fitness_text(m.fitness)}\n"
     return out
 
 
@@ -327,8 +336,9 @@ def scan(
     # Workspace-relative, each file once, as every other surface matches them.
     files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
     stale = stale_rules(ruleset, read_derived(workspace))
-    return _select(ruleset, files, budget, token_budget, stale, lambda served: for_rules(workspace, served),
-                   _integrity_extras(view))
+    # Labels are read only by decision callers: scan ranks without them and spawns no git for them.
+    return _select(ruleset, files, budget, token_budget, stale,
+                   lambda served: for_rules(workspace, served, adjudications=Adjudications()), _integrity_extras(view))
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from aegis_core import sync
-from aegis_core.fitness import wilson_lower_bound
+from aegis_core.fitness import MIN_N, wilson_lower_bound
 from aegis_core.rules import lf_digest, load_rules
 from aegis_core.telemetry_engine import ledger
 
@@ -49,12 +49,12 @@ def _rule_bytes(ws: Path) -> dict:
 @pytest.fixture
 def ws(tmp_path: Path) -> Path:
     _rule(tmp_path, "trap", "trap-good")       # 25 tp: promote
-    _rule(tmp_path, "invariant", "inv-noisy")  # 3 fp: demote
-    _rule(tmp_path, "trap", "trap-noisy")      # 3 fp, no lower tier: archive
+    _rule(tmp_path, "invariant", "inv-noisy")  # MIN_N fp: demote
+    _rule(tmp_path, "trap", "trap-noisy")      # MIN_N fp, no lower tier: archive
     _rule(tmp_path, "persona", "persona-new")  # no evidence: nothing
     _report(tmp_path, "trap-good", "tp", 25)
-    _report(tmp_path, "inv-noisy", "fp", 3)
-    _report(tmp_path, "trap-noisy", "fp", 3)
+    _report(tmp_path, "inv-noisy", "fp", MIN_N)
+    _report(tmp_path, "trap-noisy", "fp", MIN_N)
     return tmp_path
 
 

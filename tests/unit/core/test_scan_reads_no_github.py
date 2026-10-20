@@ -222,8 +222,10 @@ def test_scan_ranks_a_credit_only_rule_as_a_no_credit_rule_in_a_fresh_process(tm
     repo, commit = _landed(tmp_path)
     ledger.append_rows(repo.root, [_ci_row(commit)])
     gh = _gh(monkeypatch, CountingGh([hv.ci_run(commit, run_id=10)]))
-    scanned = scan.scan(repo.root, changed_files=["src/app.py"])["relevant_rules"]
-    assert [(r["name"], r["fitness"]) for r in scanned] == [("trap-sample", 0.0)]
+    result = scan.scan(repo.root, changed_files=["src/app.py"])
+    # no number below MIN_N either way (R-evidence-8); the text says the CI tp was not counted
+    assert [(r["name"], r["fitness"]) for r in result["relevant_rules"]] == [("trap-sample", None)]
+    assert "Fitness: no evidence yet" in result["guidance"]
     assert gh.calls == []
     verified = _fit(repo.root, verify_ci=True)
     assert verified.tp == 1 and verified.score > 0.0

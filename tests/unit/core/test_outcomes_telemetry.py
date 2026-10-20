@@ -48,10 +48,11 @@ def test_record_verification_telemetry(tmp_path: Path):
     )
     assert ok_fail is True
     from aegis_core.telemetry_engine import ledger
-    # One row per rule and run; each outcome row is also the trigger.
+    # One trigger row per rule and run: a local run is never a verdict (R-evidence-1).
     assert ledger.aggregate(tmp_path, "test-cell") == {
-        "triggers": 2, "tp": 1, "fp": 1, "last_ts": ledger.read(tmp_path).rows[-1]["ts"],
+        "triggers": 2, "tp": 0, "fp": 0, "last_ts": ledger.read(tmp_path).rows[-1]["ts"],
     }
+    assert [r["meta"]["passed"] for r in ledger.read(tmp_path).rows] == [True, False]
 
     # Target files do not match
     assert record_verification_telemetry(ws, ["unmatched/file.txt"], passed=True) is False

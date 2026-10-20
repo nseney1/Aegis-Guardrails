@@ -4,8 +4,9 @@ A change to any of these is a change to what binds the agent, so it earns no cre
 needs a ``human_gate`` approval (``aegis_core.human_gate``) before it counts:
 
 - ``rules``: ``.aegis/rules/**``;
-- ``aegis-state``: ``.aegis/config.json``, ``.aegis/team.json``, ``.aegis/baseline.json``
-  (this and ``rules`` at any depth: a workspace below the repository root has its own ``.aegis``);
+- ``aegis-state``: ``.aegis/config.json``, ``.aegis/team.json``, ``.aegis/baseline.json`` and the
+  adjudication labels ``.aegis/adjudications/**``, which count only once merged (this and ``rules``
+  at any depth: a workspace below the repository root has its own ``.aegis``);
 - ``signers``: ``allowed_signers`` (the keys that may approve) and ``CODEOWNERS``;
 - ``workflows``: ``.github/workflows/**`` (the pinned Aegis version lives in a workflow or in
   ``.aegis/config.json``, both covered);
@@ -51,7 +52,8 @@ _RUNNER_SUFFIXES = (".py", ".pyw", ".pyc", ".so", ".*.so", ".pyd", ".*.pyd", "/_
 # also matches the file's basename at any depth (aegis_core.match).
 CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("rules", (f"**/{RULES_RELDIR}/**",)),
-    ("aegis-state", tuple(f"**/{AEGIS_DIRNAME}/{name}" for name in ("config.json", "team.json", "baseline.json"))),
+    ("aegis-state", tuple(f"**/{AEGIS_DIRNAME}/{name}"
+                          for name in ("config.json", "team.json", "baseline.json", "adjudications/**"))),
     ("signers", ("allowed_signers", "CODEOWNERS")),
     ("workflows", (".github/workflows/**",)),
     ("test-infra", (

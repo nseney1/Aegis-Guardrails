@@ -184,7 +184,7 @@ def run_status(args: argparse.Namespace) -> int:
     def _core_fitness(*names: str) -> tuple[int, float | None]:
         entry = next((totals[n] for n in names if n in totals), {})
         fit = compute(entry, evidence_available=proj_credits.available, evidence_error=proj_credits.error)
-        return fit.triggers, (fit.score if fit.evidence_available and fit.score is not None and fit.verdicts else None)
+        return fit.triggers, fit.reported_score
 
     # 4. Process all rules and calculate character overhead
     # Host-installed instruction rules ("core") list first, then the rule types in table order.
@@ -214,12 +214,10 @@ def run_status(args: argparse.Namespace) -> int:
     for rule in loaded:
         total_chars += len(rule.raw.decode("utf-8-sig", "replace"))
         fit = fits[rule.id]
-        hide_score = not fit.evidence_available or not fit.verdicts or fit.state in ("insufficient", "untestable", "evidence_unavailable")
         all_rules.append({
             "name": sanitize_display(rule.id),
             "type": rule.type,
-            # No verdict yet or insufficient sample size (n < 10) shows status_label / unknown, never a misleading precision.
-            "score": None if hide_score else fit.score,
+            "score": fit.reported_score,
             "state": fit.state,
             "status_label": fit.status_label,
             "evidence_available": fit.evidence_available,

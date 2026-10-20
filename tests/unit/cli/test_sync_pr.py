@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from aegis_cli.sync import EXIT_OK, EXIT_PROBLEMS, SyncCommand, run_sync
-from aegis_core import credit
 from aegis_core.sync import format_pr_body
+from tests import helpers_adjudication as ha
 
 
 def _write_rule(ws: Path, rule_type: str, rule_id: str) -> Path:
@@ -34,19 +34,13 @@ def _write_rule(ws: Path, rule_type: str, rule_id: str) -> Path:
 
 
 def _seed_decided_promotion(ws: Path, rule_id: str) -> None:
-    for i in range(25):
-        credit.record_adjudication(
-            ws,
-            rule_id,
-            "tp",
-            adjudicator="human",
-            ref=f"PR-{i + 1}",
-            session=f"sess-{(i % 3) + 1}",
-            repo=f"repo-{(i % 2) + 1}",
-            file="src/app.py",
-            line=i + 1,
-            summary=f"Caught issue #{i + 1}",
-        )
+    """25 tp labels merged at the reviewed base: the only labels that count (R-evidence-3)."""
+    ha.write_labels(ws, rule_id, [
+        {"example_id": f"PR-{i + 1}", "verdict": "tp", "ref": f"PR-{i + 1}", "session": f"sess-{(i % 3) + 1}",
+         "repo": f"repo-{(i % 2) + 1}", "file": "src/app.py", "line": i + 1, "summary": f"Caught issue #{i + 1}"}
+        for i in range(25)
+    ])
+    ha.merge_to_base(ws)
 
 
 def test_sync_command_parser_registers_pr_flag() -> None:

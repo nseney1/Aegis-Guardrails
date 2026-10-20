@@ -39,6 +39,7 @@ def build(
         fit = fits[rule.id]
         entry: Dict[str, Any] = {
             "path": rule.path, "sha256": rule.digest, "type": rule.type, "fitness": fit.score,
+            "reported_score": fit.reported_score, "status": fit.status_label,
             "triggers": fit.triggers, "tp": fit.tp, "fp": fit.fp, "last_ts": fit.last_ts,
             "suggestion": None if not fit.evidence_available else suggest(rule, fit, now), "state": fit.state,
             "evidence_available": fit.evidence_available,

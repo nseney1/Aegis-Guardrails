@@ -1,4 +1,4 @@
-"""Ambient verification evidence: `aegis check` records rule triggers and outcomes in the ledger."""
+"""Ambient verification telemetry: `aegis check` records rule triggers in the ledger, never verdicts (spec T1)."""
 from __future__ import annotations
 
 import secrets
@@ -19,7 +19,8 @@ def record_verification_telemetry(
     source: str = "session",
     run_id: Optional[str] = None,
 ) -> bool:
-    """Append ambient verification evidence (triggers and outcomes) for the matched rules to the ledger."""
+    """Append one trigger row per matched rule to the ledger. An unwitnessed local run is not a verdict:
+    whether it passed is kept in ``meta`` and moves no tp/fp."""
     if not workspace or not target_files:
         return False
 
@@ -46,10 +47,9 @@ def record_verification_telemetry(
     for rule, _files in matched:
         rule_id = rule.id
         weight = max(0.0, min(1.0, float(weights.get(rule_id, 0.0))))
-        # One row per rule and run: a v2 outcome row is also the rule's trigger (#15).
         events.append({
             "rule": rule_id,
-            "outcome": "tp" if passed else "fp",
+            "outcome": "trigger",
             "source": source,
             "key": run_id,
             "weight": weight,

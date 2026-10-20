@@ -125,8 +125,9 @@ class TestRunCheckpoint:
         _clean_workspace(tmp_path)
         (tmp_path / ".aegis" / "state" / "ledger.jsonl").write_text(
             "\n".join(
-                json.dumps({"cell": "noisy-rule", "signal": s, "timestamp": f"2026-09-30T10:0{i}:00Z"})
-                for i, s in enumerate(("trigger", "trigger", "trigger", "fp", "fp", "fp"))
+                json.dumps({"cell": "noisy-rule", "signal": s, "timestamp": f"2026-09-30T10:{i:02d}:00Z"})
+                # MIN_N (25) false positives: no misfire flag below the one sample gate (R-evidence-8)
+                for i, s in enumerate(("trigger",) * 3 + ("fp",) * 25)
             )
             + "\n",
             encoding="utf-8",
@@ -135,7 +136,7 @@ class TestRunCheckpoint:
         evidence = tmp_path / ".aegis" / "evidence"
         evidence.mkdir(parents=True, exist_ok=True)
         (evidence / "outcomes.jsonl").write_text(
-            "\n".join(json.dumps({"cell_id": "noisy-rule", "outcome": "tp"}) for _ in range(3)) + "\n",
+            "\n".join(json.dumps({"cell_id": "noisy-rule", "outcome": "tp"}) for _ in range(25)) + "\n",
             encoding="utf-8",
         )
         issues, _ = run_checkpoint(tmp_path, strict=True)
