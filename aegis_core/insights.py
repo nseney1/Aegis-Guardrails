@@ -419,27 +419,19 @@ def add_insight(
     *,
     paths: Optional[Sequence[str]] = None,
     kind: Optional[str] = None,
-    host: str = "cli",
-    session: Optional[str] = None,
     commit: Optional[str] = None,
     base_ref: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    # No session identity: it comes from the host (record_hook_prompt, capture_suggestion),
+    # never from a typed argument, so CLI rows cannot forge distinct recurrence episodes.
     if not isinstance(text, str) or not text.strip():
         raise ValueError("insight text must be a non-empty string")
     clean = redact_insight_text(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     level = "H" if _has_human_approval(workspace, commit, base_ref, clean) else "cli"
-    hs = _ensure_hs(host, session, home)
     row = _build_insight_row(
-        workspace,
-        level,
-        clean,
-        norm_paths,
-        psrc,
-        host or "cli",
-        hs,
-        kind=str(kind) if kind else None,
+        workspace, level, clean, norm_paths, psrc, "cli", None, kind=str(kind) if kind else None,
     )
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
