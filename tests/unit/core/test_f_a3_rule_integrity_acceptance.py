@@ -525,6 +525,106 @@ def test_the_enforcement_ruleset_is_the_base_version(tmp_path):
     assert ruleset.get("gate-no-eval") is not None
 
 
+# ── 2b. Layer 1 enforces the reviewed rules too (v4.4 R-trust-44) ───────────
+
+EVAL_APP = "def app():\n    return eval('1')\n"
+
+
+def plain_check(root: Path, capsys) -> Tuple[int, Dict[str, Any]]:
+    os.chdir(root)
+    rc = main(["check", "--format", "json", "src/app.py"])
+    captured = capsys.readouterr()
+    assert captured.out.strip(), captured.err
+    return rc, json.loads(captured.out)
+
+
+def forbid_failures(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    return sorted((e["tool"], e["target"]) for e in payload["layer1"]
+                  if not e["verdict"] and e["tool"].startswith("forbid_ast"))
+
+
+@needs_git
+@pytest.mark.parametrize("weakening", ["narrowed", "deleted"])
+def test_a_branch_that_weakens_a_gate_is_still_held_to_the_reviewed_gate(tmp_path, capsys, weakening):
+    repo = make_repo(tmp_path)
+    if weakening == "deleted":
+        (repo.root / rule_path("gate-no-eval")).unlink()
+    else:
+        repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", "gate", forbid={"calls": ["exec"]}))
+    repo.write("src/app.py", EVAL_APP)
+    rc, payload = plain_check(repo.root, capsys)
+    assert rc == 1 and forbid_failures(payload) == [("forbid_ast:gate-no-eval", "src/app.py")]
+
+
+@needs_git
+def test_a_branch_local_new_gate_does_not_gate_until_it_is_reviewed(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    repo.write(rule_path("gate-no-print"), rule_text("gate-no-print", "gate", forbid={"calls": ["print"]}))
+    repo.write("src/app.py", "def app():\n    print('x')\n    return 1\n")
+    _rc, payload = plain_check(repo.root, capsys)
+    assert forbid_failures(payload) == []
+    assert [(u.id, u.change) for u in rule_integrity.effective(repo.root).unreviewed] == [("gate-no-print", "new")]
+
+
+@needs_git
+def test_a_new_gate_with_a_malformed_forbid_ast_still_fails_closed(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    repo.write(rule_path("gate-bad"), rule_text("gate-bad", "gate", extra="forbid_ast:\n  calls: eval"))
+    rc, payload = plain_check(repo.root, capsys)
+    assert rc == 1 and ("forbid_ast", rule_path("gate-bad")) in forbid_failures(payload)
+
+
+@needs_git
+@pytest.mark.parametrize("layout", ["no-git", "unborn", "local-head"])
+def test_without_a_reviewed_base_the_working_rules_are_enforced(tmp_path, capsys, layout):
+    if layout == "local-head":
+        repo = make_repo(tmp_path, origin=False)
+        root = repo.root
+        assert rule_integrity.resolve_base(root).source == "local-head"
+    else:
+        root = tmp_path / "project"
+        if layout == "unborn":
+            hg.Repo(root, hg.Home(tmp_path / "home"))
+        (root / "src").mkdir(parents=True)
+        (root / rule_path("gate-no-eval")).parent.mkdir(parents=True)
+        (root / rule_path("gate-no-eval")).write_text(rule_text("gate-no-eval", forbid={"calls": ["eval"]}),
+                                                     encoding="utf-8")
+        assert rule_integrity.resolve_base(root) is None
+    (root / "src" / "app.py").write_text(EVAL_APP, encoding="utf-8")
+    rc, payload = plain_check(root, capsys)
+    assert rc == 1 and forbid_failures(payload) == [("forbid_ast:gate-no-eval", "src/app.py")]
+
+
+@needs_git
+def test_an_unreadable_base_fails_the_check_closed(tmp_path, capsys):
+    import zlib
+
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + rule_path("gate-no-eval"))
+    repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", forbid={"calls": ["eval"]}, body="# Reworded\n"))
+    repo.write("src/app.py", EVAL_APP)
+    loose = repo.root / ".git" / "objects" / oid[:2] / oid[2:]
+    os.chmod(str(loose), 0o644)
+    loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
+    rc, payload = plain_check(repo.root, capsys)
+    failed = [e["detail"] for e in payload["layer1"] if not e["verdict"] and e["tool"] == "forbid_ast"]
+    assert rc == 1 and any("the reviewed (base) version of the rules cannot be read, so none is enforced" in d
+                           for d in failed), payload["layer1"]
+
+
+@needs_git
+def test_the_rule_lint_still_reads_the_branch_while_layer_one_enforces_the_base(tmp_path, capsys):
+    from aegis_core.verification.checkpoint_checks import check_paper_gates
+
+    repo = make_repo(tmp_path)
+    repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", "gate", "advisory", forbid={"calls": ["eval"]}))
+    repo.write("src/app.py", EVAL_APP)
+    assert rule_path("gate-no-eval") in [i["file"] for i in check_paper_gates(repo.root)]
+    rc, payload = plain_check(repo.root, capsys)
+    assert rc == 1 and forbid_failures(payload) == [("forbid_ast:gate-no-eval", "src/app.py")]
+    assert rule_integrity.effective(repo.root).ruleset.get("gate-no-eval").enforcement == "gate"
+
+
 # ── 3. release verification fails closed ────────────────────────────────────
 
 SHA = "a" * 40
