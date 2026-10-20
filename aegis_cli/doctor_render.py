@@ -371,6 +371,8 @@ def _print_github(plan: Dict[str, Any], report: Any) -> None:
     else:
         print(f"\nNo workflow jobs found: the rulesets below name a placeholder check {checks!r}; replace it with "
               "your Aegis job, and --apply refuses until a workflow exists.")
+    print(f"Each check's source is pinned to GitHub Actions (integration_id {human_gate.GITHUB_ACTIONS_APP_ID}): a status "
+          "posted by any other app or token does not satisfy it.")
     for tier, title in (("B", "solo, signed: pull request + required checks, approvals are `aegis approve` signatures"),
                         ("A", "separation of duties: one approving review + code-owner review + required checks")):
         print(f"\nRuleset, tier {tier} ({title}):")

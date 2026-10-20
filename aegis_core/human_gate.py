@@ -27,6 +27,7 @@ __all__ = [
     "ALLOWED_SIGNERS",
     "Approval",
     "COVERAGE_SAMPLES",
+    "GITHUB_ACTIONS_APP_ID",
     "GhResult",
     "HumanGateError",
     "INSIGHT_APPROVE_TRAILER",
@@ -64,6 +65,8 @@ SOURCE = "aegis human_gate"
 ALLOWED_SIGNERS = "allowed_signers"
 RULESET_NAME = "aegis-human-gate"
 INSIGHT_APPROVE_TRAILER = "Aegis-Approve-Insight"
+# github.com's GitHub Actions app: a required check sourced from it cannot be posted by a token.
+GITHUB_ACTIONS_APP_ID = 15368
 GH_TIMEOUT_SECONDS = 10.0
 SIGN_TIMEOUT_SECONDS = 300.0
 HASH_DOMAIN = b"aegis-governance-tree/v1\n"
@@ -518,6 +521,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     approvals = 0
     owners = False
     contexts: List[str] = []
+    unpinned: List[str] = []
     has_pr = False
     for rule in rules if isinstance(rules, list) else []:
         if not isinstance(rule, dict):
@@ -531,17 +535,20 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
             owners = owners or params.get("require_code_owner_review") is True
         elif rule.get("type") == "required_status_checks":
             for check in params.get("required_status_checks") or []:
-                if (
-                    isinstance(check, dict)
-                    and isinstance(check.get("context"), str)
-                    and check["context"] not in contexts
-                ):
-                    contexts.append(check["context"])
+                if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+                    continue
+                context, app = check["context"], check.get("integration_id")
+                if context not in contexts:
+                    contexts.append(context)
+                # Without a positive app id as its source, anyone with write access can post the status.
+                if not (type(app) is int and app > 0) and context not in unpinned:
+                    unpinned.append(context)
     return {
         "pull_request": has_pr,
         "required_approving_review_count": approvals,
         "require_code_owner_review": owners,
         "required_status_checks": contexts,
+        "unpinned_status_checks": unpinned,
     }
 
 
@@ -644,6 +651,12 @@ def detect_tier(
     evidence["key_custody"] = custody.as_dict()
 
     checks = facts["required_status_checks"] if facts else []
+    unpinned = facts["unpinned_status_checks"] if facts else []
+    unpinned_why = (
+        f"the required check(s) {', '.join(unpinned)} have no pinned source (integration_id): anyone with write access, "
+        "including the agent's gh token, can post a passing status; set each check's source to GitHub Actions "
+        f"(app {GITHUB_ACTIONS_APP_ID}) in the ruleset"
+    )
     a_missing: List[str] = []
     if facts is None:
         a_missing.append("the default branch's ruleset was not read")
@@ -670,6 +683,8 @@ def detect_tier(
         b_missing.append("the default branch's ruleset was not read")
     elif not checks:
         b_missing.append("the default branch has no required status checks")
+    elif unpinned:
+        b_missing.append(unpinned_why)
     if signers["keys"] < 1:
         b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
     if custody.degrades:
@@ -698,6 +713,8 @@ def detect_tier(
         caveats.append(
             "a ruleset can name bypass actors, which this endpoint does not show; classic branch protection is not read at all"
         )
+        if unpinned:
+            caveats.append(unpinned_why)
         if facts is not None and facts["required_status_checks"]:
             caveats.append(
                 "which required checks run Aegis, and that they have no path filter, is not visible from here"
@@ -1120,7 +1137,7 @@ def build_ruleset(tier: str, contexts: Iterable[str]) -> Dict[str, Any]:
                 "type": "required_status_checks",
                 "parameters": {
                     "strict_required_status_checks_policy": False,
-                    "required_status_checks": [{"context": c} for c in contexts],
+                    "required_status_checks": [{"context": c, "integration_id": GITHUB_ACTIONS_APP_ID} for c in contexts],
                 },
             },
         ],

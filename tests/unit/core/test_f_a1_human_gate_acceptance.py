@@ -524,7 +524,8 @@ def test_github_prints_both_rulesets_the_codeowners_lines_and_the_signing_setup(
     rc, out, _err = _doctor_github(repo, monkeypatch, hg.FakeGh())
     assert rc == 0
     for needle in ("Ruleset, tier A", "Ruleset, tier B", '"required_approving_review_count": 1', "~DEFAULT_BRANCH",
-                   "/.aegis/rules/ @octo", "conftest.py @octo", "allowed_signers", "gpg.format ssh", "aegis approve", "Trust tier (human_gate): C"):
+                   "/.aegis/rules/ @octo", "conftest.py @octo", "allowed_signers", "gpg.format ssh", "aegis approve", "Trust tier (human_gate): C",
+                   "integration_id"):
         assert needle in out, needle
 
 @needs_git

@@ -281,6 +281,75 @@ def test_tier_b_degrades_to_c_and_says_why_when_the_key_is_a_plain_file(tmp_path
     assert report.evidence["key_custody"]["status"] == "plain_file"
 
 
+def _tier_b_repo(tmp_path) -> hg.Repo:
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    return repo
+
+
+def _check(context, **source):
+    return {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": context, **source}]}}
+
+
+@needs_git
+@pytest.mark.parametrize("source", [{}, {"integration_id": None}, {"integration_id": 0}, {"integration_id": -1},
+                                    {"integration_id": True}, {"integration_id": "15368"}],
+                         ids=["absent", "null", "zero", "negative", "bool", "string"])
+def test_a_required_check_any_writer_can_post_is_not_tier_b(tmp_path, source):
+    """Given allowed_signers on the base, a security key, and a ruleset whose only required check has no
+    integer app id as its source, When the tier is detected, Then it is C and the reason names the
+    check, integration_id and the GitHub Actions app id."""
+    repo = _tier_b_repo(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[_check("aegis-check", **source)]))
+    assert report.tier == "C"
+    assert report.evidence["rules"]["unpinned_status_checks"] == ["aegis-check"]
+    reason = next(r for r in report.reasons if "integration_id" in r)
+    assert "aegis-check" in reason and "15368" in reason and "write access" in reason
+
+
+@needs_git
+def test_one_unpinned_check_beside_a_pinned_one_is_still_not_tier_b(tmp_path):
+    repo = _tier_b_repo(tmp_path)
+    rules = [hg.checks_rule("aegis-check"), hg.checks_rule("coverage", integration_id=None)]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier == "C" and report.evidence["rules"]["unpinned_status_checks"] == ["coverage"]
+    twice = [hg.checks_rule("aegis-check"), hg.checks_rule("aegis-check", integration_id=None)]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=twice))
+    assert report.tier == "C" and report.evidence["rules"]["unpinned_status_checks"] == ["aegis-check"]
+
+
+@needs_git
+def test_a_check_pinned_to_any_app_keeps_tier_b(tmp_path):
+    repo = _tier_b_repo(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule("aegis-check", integration_id=4242)]))
+    assert report.tier == "B", report.reasons
+    assert report.evidence["rules"]["unpinned_status_checks"] == []
+
+
+@needs_git
+def test_tier_a_with_an_unpinned_check_stays_a_with_a_caveat(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    rules = [hg.pull_request_rule(), hg.checks_rule("aegis-check", integration_id=None)]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier == "A", report.reasons
+    assert any("aegis-check" in c and "integration_id" in c for c in report.caveats), report.caveats
+
+
+@pytest.mark.parametrize("tier", ["A", "B"])
+def test_the_ruleset_pins_every_required_check_to_github_actions(tier):
+    ruleset = human_gate.build_ruleset(tier, ["aegis-check", "Unit tests"])
+    (checks,) = [r["parameters"]["required_status_checks"] for r in ruleset["rules"] if r["type"] == "required_status_checks"]
+    assert checks == [{"context": "aegis-check", "integration_id": 15368}, {"context": "Unit tests", "integration_id": 15368}]
+    assert human_gate.GITHUB_ACTIONS_APP_ID == 15368
+
+
+@needs_git
+def test_the_tier_b_ruleset_doctor_prints_reads_back_as_tier_b(tmp_path):
+    repo = _tier_b_repo(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=human_gate.build_ruleset("B", ["aegis-check"])["rules"]))
+    assert report.tier == "B", report.reasons
+
+
 @needs_git
 @pytest.mark.parametrize("signing", [None, "openpgp"], ids=["no-key", "openpgp"])
 def test_no_ssh_signing_key_on_this_machine_is_a_tier_b_caveat_not_a_downgrade(tmp_path, signing):

@@ -194,9 +194,11 @@ def pull_request_rule(approvals: int = 1, code_owners: bool = True) -> Dict[str,
                                                     "require_code_owner_review": code_owners}}
 
 
-def checks_rule(*contexts: str) -> Dict[str, Any]:
+def checks_rule(*contexts: str, integration_id: Any = human_gate.GITHUB_ACTIONS_APP_ID) -> Dict[str, Any]:
+    """Required checks whose source is pinned to GitHub Actions; ``integration_id=None`` omits the source."""
+    source = {} if integration_id is None else {"integration_id": integration_id}
     return {"type": "required_status_checks", "parameters": {
-        "required_status_checks": [{"context": c} for c in (contexts or ("validate",))]}}
+        "required_status_checks": [{"context": c, **source} for c in (contexts or ("validate",))]}}
 
 
 CODEOWNERS_FULL = (
