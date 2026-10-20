@@ -26,7 +26,7 @@ timed out or a Layer 1 finding.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -46,7 +46,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Uni
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.config import read_user_config
-from aegis_core.errors import AegisError
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
 
