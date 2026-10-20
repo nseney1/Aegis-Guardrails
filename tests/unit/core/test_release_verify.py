@@ -99,6 +99,10 @@ def test_the_subject_is_derivable_from_the_commit_alone():
 # ── doctor --release, library level ─────────────────────────────────────────
 
 DEFAULT_API = {"full_name": REPOSITORY, "default_branch": "main"}
+PR_HEAD = "c" * 40
+DEFAULT_PULLS = [{"number": 7, "merged_at": "2026-10-19T10:00:00Z", "base": {"ref": "main"},
+                  "head": {"sha": PR_HEAD}, "user": {"login": "author"}}]
+DEFAULT_REVIEWS = [{"state": "APPROVED", "user": {"login": "reviewer"}, "commit_id": PR_HEAD}]
 
 
 class FakeGh:
@@ -106,10 +110,12 @@ class FakeGh:
     a tuple is ``(rc, stdout, stderr)``); ``gh attestation verify`` answers ``verify``."""
 
     def __init__(self, version: Optional[str] = "2.93.0", verify: Tuple[int, str, str] = (0, "[]", ""),
-                 api: Any = DEFAULT_API) -> None:
+                 api: Any = DEFAULT_API, pulls: Any = DEFAULT_PULLS, reviews: Any = DEFAULT_REVIEWS) -> None:
         self.version = version
         self.verify = verify
         self.api = api
+        self.pulls = pulls
+        self.reviews = reviews
         self.calls: List[List[str]] = []
         self.subjects: List[bytes] = []
 
@@ -121,7 +127,10 @@ class FakeGh:
         if argv == ["--version"]:
             return 0, f"gh version {self.version} (2026-10-01)\nhttps://github.com/cli/cli/releases/tag/v{self.version}\n", ""
         if argv[:1] == ["api"]:
-            return self.api if isinstance(self.api, tuple) else (0, json.dumps(self.api), "")
+            path = argv[-1]
+            answer = (self.pulls if re.search(r"/commits/[0-9a-f]+/pulls\Z", path) else
+                      self.reviews if re.search(r"/pulls/\d+/reviews\?per_page=100\Z", path) else self.api)
+            return answer if isinstance(answer, tuple) else (0, json.dumps(answer), "")
         if argv[:2] == ["attestation", "verify"]:
             self.subjects.append(Path(argv[2]).read_bytes())
             return self.answer(argv)
@@ -370,6 +379,7 @@ def test_the_source_ref_is_githubs_default_branch_not_origin_head(tmp_path, gith
     repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/release/x")
     gh = PinHonoringGh("refs/heads/release/x", (0, _signed_on(repo, "release/x"), ""),
                        api={"full_name": REPOSITORY, "default_branch": github_default})
+    gh.pulls = [dict(DEFAULT_PULLS[0], base={"ref": github_default})]
     report = rv.verify_release(repo.root, "HEAD", run=gh, tier_runner=tier_runner("A"))
     argv = gh.verify_calls[0]
     assert argv[argv.index("--source-ref") + 1] == f"refs/heads/{github_default}"
@@ -466,6 +476,72 @@ def test_doctor_drivers_says_it_did_not_read_the_tier_and_asks_gh_nothing(tmp_pa
     repo = make_repo(tmp_path)
     _rc, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--drivers")
     assert "Trust tier: not read in this mode (run aegis doctor)" in out.splitlines() and asked == []
+
+
+# ── tier A needs an independent approving review (R-trust-55) ───────────────
+
+def _approval(tmp_path, tier: str = "A", **answers: Any):
+    repo = make_repo(tmp_path, tier=tier)
+    commit, tree, digest = facts(repo)
+    gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""), **answers)
+    runner = tier_runner(tier) if tier in ("A", "B") else tier_runner_none
+    return rv.verify_release(repo.root, commit, run=gh, tier_runner=runner), gh, commit
+
+
+@needs_git
+def test_an_approving_review_by_someone_else_on_the_merged_head_verifies(tmp_path):
+    report, gh, commit = _approval(tmp_path)
+    assert report.verified and report.code == "verified"
+    assert gh.api_calls[1:] == [["api", "--method", "GET", f"repos/{REPOSITORY}/commits/{commit}/pulls"],
+                                ["api", "--method", "GET", f"repos/{REPOSITORY}/pulls/7/reviews?per_page=100"]]
+
+
+_REVIEW_CASES = {
+    "author-only": [{"state": "APPROVED", "user": {"login": "author"}, "commit_id": PR_HEAD}],
+    "changes": [{"state": "CHANGES_REQUESTED", "user": {"login": "reviewer"}, "commit_id": PR_HEAD}],
+    "dismissed": [{"state": "DISMISSED", "user": {"login": "reviewer"}, "commit_id": PR_HEAD}],
+    "stale": [{"state": "APPROVED", "user": {"login": "reviewer"}, "commit_id": "d" * 40}],
+    "none": [],
+    "rc1": (1, "", "HTTP 502"),
+    "notjson": (0, "not json", ""),
+    "object": {"state": "APPROVED"},
+}
+
+
+@needs_git
+@pytest.mark.parametrize("case", sorted(_REVIEW_CASES))
+def test_without_an_independent_approval_on_the_head_it_is_not_approved(tmp_path, case):
+    report, _gh, _commit = _approval(tmp_path, reviews=_REVIEW_CASES[case])
+    assert (report.verified, report.attested, report.code, report.status) == (False, True, "not_approved", "failed")
+    assert report.tier == "A" and report.text_lines()[0].startswith("NOT VERIFIED:")
+
+
+_PULL_CASES = {
+    "direct-push": [],
+    "unmerged": [dict(DEFAULT_PULLS[0], merged_at=None)],
+    "other-base": [dict(DEFAULT_PULLS[0], base={"ref": "develop"})],
+    "rc1": (1, "", "HTTP 404"),
+    "notjson": (0, "<html>", ""),
+}
+
+
+@needs_git
+@pytest.mark.parametrize("case", sorted(_PULL_CASES))
+def test_a_commit_no_merged_pull_request_landed_is_not_approved(tmp_path, case):
+    report, gh, _commit = _approval(tmp_path, pulls=_PULL_CASES[case])
+    assert (report.verified, report.code) == (False, "not_approved")
+    assert not [c for c in gh.api_calls if c[-1].endswith("/reviews?per_page=100")]
+
+
+@needs_git
+def test_a_tier_below_a_is_agent_editable_before_any_review_is_read(tmp_path):
+    report, gh, _commit = _approval(tmp_path, tier="C", reviews=[])
+    assert report.code == "agent_editable" and gh.api_calls == [["api", "--method", "GET", f"repos/{REPOSITORY}"]]
+
+
+def test_an_attested_but_unapproved_report_is_consistent():
+    report = rv.ReleaseReport("a" * 40, False, "not_approved", "m", attested=True)
+    assert report.status == "failed" and report.as_dict()["attested"] is True
 
 
 # ── one consistent report, git failures included (R-trust-56) ───────────────
@@ -642,7 +718,7 @@ class TierAndReleaseGh:
     def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None, timeout: float = 0.0):
         from aegis_core import human_gate
 
-        if list(argv)[:1] == ["api"] and list(argv)[-1] != f"repos/{REPOSITORY}":
+        if list(argv)[:1] == ["api"] and not list(argv)[-1].startswith(f"repos/{REPOSITORY}"):
             return self.tier(argv, stdin, cwd)
         result = self.release(argv, timeout)
         return None if result is None else human_gate.GhResult(*result)

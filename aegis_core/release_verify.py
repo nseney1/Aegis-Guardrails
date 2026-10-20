@@ -20,7 +20,10 @@ JSON it prints is re-checked field by field.
 Whatever is verified, an attestation proves "this workflow, at this commit, said so". The release
 claim needs trust tier A (``aegis_core.human_gate``): at tier C the workflow file is editable by
 the agent, and at tier B a pull request runs its own workflow and aegis, so both report
-"attestation present, but the workflow is agent-editable" and the exit code is not zero.
+"attestation present, but the workflow is agent-editable" and the exit code is not zero. At tier A
+the release also needs the independent review that tier A promises (spec T2): a merged pull request
+into the default branch holding the commit, approved on its head by someone other than its author
+(two read-only ``gh api`` GETs); otherwise it is ``not_approved``.
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ __all__ = [
     "UNVERIFIED_GH",
     "WORKFLOW",
     "default_gh",
+    "release_approved",
     "subject_bytes",
     "verify_release",
 ]
@@ -62,7 +66,7 @@ GH_TIMEOUT_SECONDS = 180.0
 
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 #: Codes reached after gh verified an attestation and its JSON re-checked.
-_ATTESTED_CODES = frozenset({"verified", "agent_editable"})
+_ATTESTED_CODES = frozenset({"verified", "agent_editable", "not_approved"})
 #: Why a report printed before the trust tier could be read has none.
 _NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
                 "not_a_repository": "not a git repository", "git_failed": "git could not answer"}
@@ -92,8 +96,8 @@ class ReleaseReport:
 
     sha: str
     verified: bool
-    # verified | agent_editable | gh_missing | gh_too_old | not_a_repository | bad_commit | git_failed |
-    # no_repository | default_branch_unknown | source_ref_mismatch | rejected | bad_output
+    # verified | agent_editable | not_approved | gh_missing | gh_too_old | not_a_repository | bad_commit |
+    # git_failed | no_repository | default_branch_unknown | source_ref_mismatch | rejected | bad_output
     code: str
     message: str
     tier: Optional[str] = None
@@ -293,6 +297,46 @@ def _record_problem(record: Any, commit: str, tree: str, subject_digest: str, re
     return None, run_val
 
 
+def _gh_get(run: GhRun, path: str) -> Tuple[Any, str]:
+    """(parsed JSON of ``gh api --method GET <path>``, why not)."""
+    result = run(["api", "--method", "GET", path], 30.0)
+    if result is None or result[0] != 0:
+        detail = "gh is not installed" if result is None else (" ".join(result[2].split())[:200] or f"exit {result[0]}")
+        return None, f"gh api {path.split('?', 1)[0]} failed: {detail}"
+    try:
+        return json.loads(result[1]), ""
+    except ValueError:
+        return None, f"gh api {path.split('?', 1)[0]} printed no JSON"
+
+
+def _field(obj: Mapping[str, Any], outer: str, inner: str) -> Any:
+    value = obj.get(outer)
+    return value.get(inner) if isinstance(value, dict) else None
+
+
+def release_approved(commit: str, repository: str, branch: str, gh: GhRun) -> Tuple[bool, str]:
+    """(approved, why not): a pull request into ``branch`` that merged ``commit`` holds an APPROVED
+    review by someone other than its author on its head commit. Any failed or odd answer is False."""
+    pulls, why = _gh_get(gh, f"repos/{repository}/commits/{commit}/pulls")
+    if not isinstance(pulls, list):
+        return False, why or "GitHub listed no pull requests for the commit"
+    merged = [p for p in pulls if isinstance(p, dict) and p.get("merged_at") and _field(p, "base", "ref") == branch
+              and isinstance(p.get("number"), int) and not isinstance(p["number"], bool)]
+    if not merged:
+        return False, f"no merged pull request into {branch} holds this commit"
+    pull = merged[0]
+    author, head = _field(pull, "user", "login"), _field(pull, "head", "sha")
+    reviews, why = _gh_get(gh, f"repos/{repository}/pulls/{pull['number']}/reviews?per_page=100")
+    if not isinstance(reviews, list):
+        return False, why or "GitHub listed no reviews"
+    for review in reviews:
+        login = _field(review, "user", "login") if isinstance(review, dict) else None
+        if (review.get("state") == "APPROVED" and isinstance(login, str) and login and isinstance(author, str)
+                and login != author and isinstance(head, str) and review.get("commit_id") == head):
+            return True, ""
+    return False, f"pull request #{pull['number']} has no approving review by someone other than its author on its head"
+
+
 def _tier(root: Path, tier_runner: Optional[Callable[..., Any]]) -> Optional[str]:
     from aegis_core import human_gate
 
@@ -375,6 +419,10 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
         # tier B a pull request runs its own workflow, so the claim is not established; the
         # attestation is reported.
         return ReleaseReport(commit, False, "agent_editable", signed, tier=tier or "C", caveats=(TIER_C_CAVEAT,),
+                             repository=repository, gh_version=shown, details=pins, attested=True)
+    approved, why_not = release_approved(commit, repository, branch, gh)
+    if not approved:
+        return ReleaseReport(commit, False, "not_approved", f"attestation present ({signed}), but {why_not}", tier=tier,
                              repository=repository, gh_version=shown, details=pins, attested=True)
     return ReleaseReport(commit, True, "verified", signed, tier=tier, repository=repository, gh_version=shown,
                          details=pins, attested=True)
