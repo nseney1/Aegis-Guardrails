@@ -273,3 +273,65 @@ def test_host_capture_status_ignores_a_relative_config_dir(tmp_path: Path, monke
         encoding="utf-8")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/dir")
     assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True}
+
+
+# ── One workspace, one insights file, whatever the hook's cwd (R-evidence-39) ──
+
+@pytest.fixture
+def hook_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    (home / ".aegis").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AEGIS_WORKSPACE"):
+        monkeypatch.delenv(name, raising=False)
+    return home
+
+
+def _insight_texts(workspace: Path, home: Path) -> list:
+    return sorted(r["text"] for r in read_insight_rows(workspace, home=home) if r.get("event") == "insight")
+
+
+def test_a_hook_in_a_subdirectory_writes_the_governed_roots_file(tmp_path: Path, hook_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    (repo / "src").mkdir()
+    record_hook_prompt("claude-code", {"prompt": "No, stop breaking the parser", "session_id": "s1",
+                                       "cwd": str(repo / "src")}, home=hook_home)
+    record_hook_prompt("claude-code", {"prompt": "Don't touch the lockfile again", "session_id": "s2",
+                                       "cwd": str(repo)}, home=hook_home)
+    assert insights_path(repo / "src", home=hook_home) == insights_path(repo, home=hook_home)
+    assert _insight_texts(repo, hook_home) == ["Don't touch the lockfile again", "No, stop breaking the parser"]
+    assert len(list((hook_home / ".aegis" / "insights").glob("*.jsonl"))) == 1
+
+
+def test_an_ungoverned_repository_under_home_keeps_the_cwds_own_id(hook_home: Path):
+    # A walk-up that went past the git top would reach ~/.aegis, the user plane every user has.
+    proj = hook_home / "proj"
+    proj.mkdir()
+    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    (proj / "sub").mkdir()
+    record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(proj / "sub")}, home=hook_home)
+    assert insight_workspace_id(proj / "sub") != insight_workspace_id(hook_home)
+    assert _insight_texts(proj / "sub", hook_home) == ["No, wrong file"]
+
+
+def test_claude_project_dir_wins_over_the_payload_cwd(tmp_path: Path, hook_home: Path, monkeypatch):
+    repo, other = _make_repo(tmp_path / "repo"), _make_repo(tmp_path / "other")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
+    record_hook_prompt("claude-code", {"prompt": "No, revert that", "cwd": str(other)}, home=hook_home)
+    assert _insight_texts(repo, hook_home) == ["No, revert that"]
+    assert _insight_texts(other, hook_home) == []
+
+
+def test_a_relative_claude_project_dir_is_ignored(tmp_path: Path, hook_home: Path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "repo")
+    record_hook_prompt("claude-code", {"prompt": "No, revert that", "cwd": str(repo)}, home=hook_home)
+    assert _insight_texts(repo, hook_home) == ["No, revert that"]
+
+
+def test_a_cwd_that_does_not_exist_falls_back_to_itself(tmp_path: Path, hook_home: Path):
+    missing = _make_repo(tmp_path / "repo") / "gone"
+    record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(missing)}, home=hook_home)
+    assert _insight_texts(missing, hook_home) == ["No, wrong file"]

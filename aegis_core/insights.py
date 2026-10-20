@@ -28,6 +28,7 @@ from aegis_core.storage import (
 )
 from aegis_core.telemetry_engine import ledger
 from aegis_core.verification.scanners import MAX_EXCERPT_CHARS, redact_insight_text
+from aegis_core.workspace.binding import bounded_walk_up
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 __all__ = [
@@ -228,7 +229,10 @@ def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
 
 
 def insight_workspace_id(workspace: Any) -> str:
+    # Keyed to the governed root (the nearest .aegis inside the git boundary), so a hook
+    # running in a subdirectory and `review` at the root share one file.
     root = Path(os.fspath(workspace)).resolve()
+    root = bounded_walk_up(root) or root
     fast = _fast_git_common_and_top(root)
     if fast is not None:
         common, top = fast
@@ -515,7 +519,8 @@ def record_hook_prompt(
     prompt_text, payload_session, payload_cwd = _extract_hook_fields(actual_payload)
     if actual_ws is None:
         from aegis_core.config import env_workspace
-        actual_ws = payload_cwd or env_workspace() or os.getcwd()
+        project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
+        actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
     hs = _ensure_hs(host, session or payload_session, home=home)
     path = insights_path(actual_ws, home=home)
     existing = read_insight_rows(actual_ws, home=home)
