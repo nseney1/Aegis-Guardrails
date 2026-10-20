@@ -361,13 +361,17 @@ def _aegis_jobs(root: Path) -> List[str]:
 def _github_plan(root: Path, report: Any) -> Dict[str, Any]:
     found = _aegis_jobs(root)
     contexts = found or [_PLACEHOLDER_CHECK]
-    owner = (report.evidence.get("repo") or {}).get("full_name") or ""
-    handle = "@" + owner.split("/")[0] if "/" in owner else "@OWNER"
+    repo = report.evidence.get("repo") or {}
+    owner = repo.get("full_name") or ""
+    org = (repo.get("owner") or {}).get("type") == "Organization"
+    handle = "@OWNER-OR-@org/team" if org else ("@" + owner.split("/")[0] if "/" in owner else "@OWNER")
     return {
         "required_checks": contexts,
         "required_checks_from_workflows": bool(found),
         "ruleset": {"A": human_gate.build_ruleset("A", contexts), "B": human_gate.build_ruleset("B", contexts)},
         "codeowners": human_gate.codeowners_lines(handle),
+        "codeowners_note": ("an organization owns this repository, and GitHub ignores a bare @org owner: "
+                            "name a team (@org/team) or people") if org else None,
         "signing_setup": human_gate.signers_setup(),
     }
 
@@ -391,6 +395,8 @@ def _print_github(plan: Dict[str, Any], report: Any) -> None:
         print(f"\nRuleset, tier {tier} ({title}):")
         print(json.dumps(plan["ruleset"][tier], indent=2))
     print("\nCODEOWNERS lines (commit to the default branch; replace the owner with your reviewer):")
+    if plan["codeowners_note"]:
+        print(f"  ({plan['codeowners_note']})")
     for line in plan["codeowners"]:
         print(f"  {line}")
     print("\nSigning setup for tier B (nothing here is run for you):")

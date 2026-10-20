@@ -4,6 +4,7 @@ gh is faked at its runner boundary (hg.FakeGh); git and ssh-keygen are real.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -262,6 +263,47 @@ def test_the_tier_a_ruleset_doctor_prints_reads_back_as_tier_a(tmp_path):
     repo = _repo_with_governance(tmp_path)
     report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=human_gate.build_ruleset("A", ["aegis-check"])["rules"]))
     assert report.tier == "A", report.reasons
+
+
+@needs_git
+def test_a_bare_organization_owner_covers_nothing_in_an_organization_repository(tmp_path):
+    """Given an organization-owned repository whose CODEOWNERS names the bare ``@acme`` on every
+    governance path, When the tier is detected, Then every path is uncovered, the tier is not A and a
+    reason names the organization owner; with ``@acme/security`` the paths are covered."""
+    repo = _repo_with_governance(tmp_path, codeowners=hg.CODEOWNERS_FULL.replace("@octo", "@acme"))
+    gh = hg.FakeGh(owner="acme", owner_type="Organization", rules=[hg.pull_request_rule(), hg.checks_rule()])
+    report = human_gate.detect_tier(repo.root, gh=gh)
+    assert report.tier != "A" and report.evidence["codeowners"]["covered"] == []
+    assert report.evidence["repo"]["owner"] == {"login": "acme", "type": "Organization"}
+    assert any("@acme" in r and "team" in r for r in report.reasons), report.reasons
+    team = _repo_with_governance(tmp_path / "team", codeowners=hg.CODEOWNERS_FULL.replace("@octo", "@ACME/security"))
+    assert human_gate.detect_tier(team.root, gh=gh).tier == "A"
+
+
+@needs_git
+@pytest.mark.parametrize("owner, owner_type", [("alice", "User"), ("acme", None), ("acme", "missing")])
+def test_a_user_owner_or_an_owner_of_unknown_type_still_counts(tmp_path, owner, owner_type):
+    repo = _repo_with_governance(tmp_path, codeowners=hg.CODEOWNERS_FULL.replace("@octo", f"@{owner}"))
+    fake = hg.FakeGh(owner=owner, owner_type=owner_type, rules=[hg.pull_request_rule(), hg.checks_rule()])
+
+    def gh(argv, stdin=None, cwd=None):
+        result = fake(argv, stdin, cwd)
+        if owner_type == "missing" and argv[-1] == "repos/{owner}/{repo}":
+            body = json.loads(result.stdout)
+            del body["owner"]
+            return human_gate.GhResult(0, json.dumps(body), "")
+        return result
+
+    report = human_gate.detect_tier(repo.root, gh=gh)
+    assert report.tier == "A", report.reasons
+
+
+def test_coverage_drops_only_the_organizations_own_bare_handle():
+    text = hg.CODEOWNERS_FULL.replace("@octo", "@Acme")
+    assert human_gate.codeowners_coverage(text)[1] == []
+    assert human_gate.codeowners_coverage(text, org_login="acme")[0] == []
+    assert human_gate.codeowners_coverage(text.replace("@Acme", "@acme/sec"), org_login="acme")[1] == []
+    assert human_gate.codeowners_coverage(text.replace("@Acme", "@alice"), org_login="acme")[1] == []
 
 
 @needs_git

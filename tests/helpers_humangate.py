@@ -151,12 +151,14 @@ class FakeGh:
     """The gh runner boundary: answers `gh api` GETs from ``routes`` and records every call."""
 
     def __init__(self, default_branch: str = "main", admin: bool = False, rules: Optional[List[Dict[str, Any]]] = None,
-                 rulesets: Optional[List[Dict[str, Any]]] = None, owner: str = "octo") -> None:
+                 rulesets: Optional[List[Dict[str, Any]]] = None, owner: str = "octo",
+                 owner_type: Optional[str] = "User") -> None:
         self.default_branch = default_branch
         self.admin = admin
         self.rules = rules if rules is not None else []
         self.rulesets = rulesets if rulesets is not None else []
         self.owner = owner
+        self.owner_type = owner_type
         self.calls: List[Tuple[Tuple[str, ...], Optional[bytes]]] = []
         self.missing = False
 
@@ -168,8 +170,9 @@ class FakeGh:
         method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
         path = argv[-1] if stdin is None else argv[argv.index("--input") - 1]
         if method == "GET" and path == "repos/{owner}/{repo}":
+            owner = {"login": self.owner, **({} if self.owner_type is None else {"type": self.owner_type})}
             body: Any = {"full_name": f"{self.owner}/proj", "default_branch": self.default_branch,
-                         "owner": {"login": self.owner}, "permissions": {"admin": self.admin, "push": True}}
+                         "owner": owner, "permissions": {"admin": self.admin, "push": True}}
         elif method == "GET" and "/rules/branches/" in path:
             body = self.rules
         elif method == "GET" and path.endswith("/rulesets"):

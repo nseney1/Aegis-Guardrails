@@ -184,7 +184,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_codeowners(text: str) -> List[Tuple[str, Tuple[str, ...]]]:
+def _parse_codeowners(text: str, *, org_login: Optional[str] = None) -> List[Tuple[str, Tuple[str, ...]]]:
+    # GitHub ignores the bare handle of the organization that owns the repository (it takes a user,
+    # @org/team or an email), so that owner is dropped when the caller knows the owner is one.
+    org_handle = f"@{org_login}".lower() if org_login else None
     entries: List[Tuple[str, Tuple[str, ...]]] = []
     for line in text.splitlines()[:_MAX_CODEOWNERS_LINES]:
         tokens = line.strip().split()
@@ -194,7 +197,7 @@ def _parse_codeowners(text: str) -> List[Tuple[str, Tuple[str, ...]]]:
         for token in tokens[1:]:
             if token.startswith("#"):
                 break
-            if _OWNER.match(token):
+            if _OWNER.match(token) and token.lower() != org_handle:
                 owners.append(token)
         entries.append((tokens[0], tuple(owners)))
     return entries
@@ -253,8 +256,9 @@ def codeowners_coverage(
     location: str = "CODEOWNERS",
     *,
     repo_paths: Sequence[str] = (),
+    org_login: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
-    entries = _parse_codeowners(text)
+    entries = _parse_codeowners(text, org_login=org_login)
     covered: List[str] = []
     uncovered: List[str] = []
     unsupported = any(any(c in pat for c in "[]\\") for pat, _ in entries)
@@ -595,6 +599,7 @@ def detect_tier(
     facts: Optional[Dict[str, Any]] = None
     default_branch: Optional[str] = None
     admin: Optional[bool] = None
+    org_login: Optional[str] = None
     if why is not None or not isinstance(repo_info, dict):
         why = why or "gh api repos/{owner}/{repo} did not return an object"
         evidence["gh"] = {"available": why != "gh is not installed", "error": why}
@@ -607,8 +612,13 @@ def detect_tier(
         if isinstance(perms.get("admin"), bool):
             admin = perms.get("admin")
         full = repo_info.get("full_name") if isinstance(repo_info.get("full_name"), str) else None
+        owner = repo_info.get("owner") if isinstance(repo_info.get("owner"), dict) else {}
+        login, kind = owner.get("login"), owner.get("type")
+        known = isinstance(login, str) and isinstance(kind, str)
+        org_login = login if known and kind == "Organization" else None
         scope["repository"] = full
-        evidence["repo"] = {"full_name": full, "default_branch": default_branch}
+        evidence["repo"] = {"full_name": full, "default_branch": default_branch,
+                            "owner": {"login": login, "type": kind} if known else None}
         evidence["identity"] = {"admin": admin}
         if default_branch:
             rules, why = _gh_json(
@@ -639,21 +649,22 @@ def detect_tier(
         "uncovered": list(dict.fromkeys((*COVERAGE_SAMPLES, *tracked_gov))),
     }
     signers: Dict[str, Any] = {"present": False, "keys": 0}
+    bare_org = False
     if base is not None:
         for location in _CODEOWNERS_LOCATIONS:
             blob = _blob(top, base, location)
             if blob is not None:
-                covered, uncovered = codeowners_coverage(
-                    blob.decode("utf-8", "replace"),
-                    location,
-                    repo_paths=tracked_gov,
-                )
+                text = blob.decode("utf-8", "replace")
+                covered, uncovered = codeowners_coverage(text, location, repo_paths=tracked_gov, org_login=org_login)
                 codeowners = {
                     "present": True,
                     "path": location,
                     "covered": covered,
                     "uncovered": uncovered,
                 }
+                bare_org = bool(org_login) and any(
+                    o.lower() == f"@{org_login}".lower() for _p, found in _parse_codeowners(text) for o in found
+                )
                 break
         blob = _blob(top, base, ALLOWED_SIGNERS)
         signers = {"present": blob is not None, "keys": _signer_keys(blob)}
@@ -687,6 +698,11 @@ def detect_tier(
         a_missing.append("no CODEOWNERS file on the base branch")
     elif codeowners["uncovered"]:
         a_missing.append(f"CODEOWNERS leaves {len(codeowners['uncovered'])} governance path(s) without an owner")
+    if bare_org:
+        a_missing.append(
+            f"CODEOWNERS names @{org_login}, the organization that owns this repository, which GitHub ignores as a "
+            f"code owner: name a team (@{org_login}/<team>) or people"
+        )
     if admin is True:
         a_missing.append(
             "the gh identity doctor used is a repository admin, who can edit the ruleset (an agent needs its own non-admin identity)"

@@ -529,6 +529,15 @@ def test_github_prints_both_rulesets_the_codeowners_lines_and_the_signing_setup(
         assert needle in out, needle
 
 @needs_git
+def test_github_codeowners_for_an_organization_repository_name_a_team_not_the_org(tmp_path, monkeypatch):
+    repo = hg.make_repo(tmp_path)
+    rc, out, _err = _doctor_github(repo, monkeypatch, hg.FakeGh(owner="acme", owner_type="Organization"))
+    assert rc == 0
+    assert "conftest.py @OWNER-OR-@org/team" in out and "team" in out
+    assert not [line for line in out.splitlines() if line.rstrip().endswith(" @acme")]
+
+
+@needs_git
 def test_github_json_carries_the_envelope_and_applies_nothing(tmp_path, monkeypatch):
     repo, gh = hg.make_repo(tmp_path), hg.FakeGh()
     rc, out, _err = _doctor_github(repo, monkeypatch, gh, json=True)
