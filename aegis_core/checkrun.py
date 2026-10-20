@@ -16,8 +16,9 @@ the interpreter that runs Aegis; a first word ``pytest`` (or ``py.test``, any pa
 ``python -m pytest`` under the interpreter that runs Aegis. Either way the interpreter gets
 ``-s --check-hash-based-pycs always`` (its own site dirs stay visible, the user site does not), and
 a pytest run also gets ``-p no:cacheprovider -o addopts=`` and a JUnit file. Everything runs with a fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a
-redirected ``HOME``), no stdin, closed descriptors and a process-group timeout; the group is
-killed when the run ends, so nothing it left behind keeps writing.
+redirected ``HOME``), no stdin, closed descriptors and a process-group timeout; on POSIX the group is
+killed when the run ends, so nothing it left behind keeps writing. On Windows the group is killed
+while the run is alive; descendants a test run leaves behind after a normal exit are not swept.
 
 ``exit 5`` (no tests collected) and ``passed == 0`` are never evidence, and neither is a run that
 timed out or a Layer 1 finding.
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -197,11 +199,18 @@ hermetic_env = _hermetic_env
 
 # ── Running it ───────────────────────────────────────────────────────────────
 
+def _taskkill() -> str:
+    root = os.environ.get("SystemRoot", "")
+    return ntpath.join(root if ntpath.isabs(root) else "C:\\Windows", "System32", "taskkill.exe")
+
+
 def _kill_group(proc: "subprocess.Popen[Any]") -> None:
     if os.name == "nt":
+        # taskkill /T addresses a pid, which is reusable once the root has exited, so an exited
+        # root is left alone and its orphans are not swept (documented in the module docstring).
         if getattr(proc, "poll", lambda: None)() is not None:
             return
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
+        subprocess.run([_taskkill(), "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -302,7 +311,7 @@ def parse_junit_cases(path: Path) -> Tuple[Set[str], Set[str], List[str]]:
 def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float, junit: Path,
               output: Path) -> TestsRun:
     """Run ``argv`` in ``cwd`` with ``env`` and nothing else inherited; kill the process group at
-    the end, whatever happened."""
+    the end, whatever happened (on Windows only while the root is alive, see the module docstring)."""
     started = datetime.now(timezone.utc)
     if shutil.which(argv[0], path=env.get("PATH")) is None and not os.path.isabs(argv[0]):
         return TestsRun(exit=127)
