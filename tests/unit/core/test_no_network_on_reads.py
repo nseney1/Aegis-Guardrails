@@ -23,8 +23,10 @@ from tests import helpers_verified as hv
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
 
 FORGED = [f"{0xbeef + i:040x}" for i in range(6)]
-AMBIENT_TP = 19  # one short of MIN_PROMOTION_VERDICTS: only the CI-confirmed credit makes it promotable
-AMBIENT_FP = 5  # misfiring alone (Wilson lower bound of the fp rate 0.65 > 0.5); 0.50 with the confirmed tp
+AMBIENT_TP = 24  # one short of fitness.MIN_N: only the CI-confirmed credit makes it promotable
+# 8 tp + 17 fp are MIN_N verdicts misfiring alone (Wilson lower bound of the fp rate 0.516 > 0.5);
+# 0.493 with the confirmed tp
+AMBIENT_FP_TP, AMBIENT_FP = 8, 17
 RULE = ("---\nid: trap-sample\ntype: trap\nenforcement: advisory\nhypothesis: sample\ncreated: '2026-01-01'\n"
         "target_paths:\n  - src/*.py\n---\n# Sample\n\nBody long enough to be a rule body.\n")
 
@@ -98,7 +100,7 @@ def _landed(tmp_path: Path, monkeypatch):
 
 
 def _project(tmp_path: Path, monkeypatch):
-    """``trap-sample`` with 19 ledger tp rows and one reported check landed on ``main``, plus a
+    """``trap-sample`` with 24 ledger tp rows and one reported check landed on ``main``, plus a
     ``ci`` row for that commit and 6 forged full-SHA ``ci`` rows."""
     repo, commit = _landed(tmp_path, monkeypatch)
     ledger.append(repo.root, [{"rule": "trap-sample", "outcome": "tp", "source": "ci", "key": f"tp{i}"}
@@ -112,11 +114,13 @@ def _project(tmp_path: Path, monkeypatch):
 
 
 def _misfiring(tmp_path: Path, monkeypatch):
-    """``trap-sample`` with 5 ledger fp rows and one reported check landed on ``main``, no ``ci`` row:
-    archived on the ledger alone, kept once CI confirms the landed check."""
+    """``trap-sample`` with 8 tp and 17 fp ledger rows and one reported check landed on ``main``, no ``ci``
+    row: archived on the ledger alone, kept once CI confirms the landed check."""
     repo, commit = _landed(tmp_path, monkeypatch)
     ledger.append(repo.root, [{"rule": "trap-sample", "outcome": "fp", "source": "ci", "key": f"fp{i}"}
-                              for i in range(AMBIENT_FP)])
+                              for i in range(AMBIENT_FP)]
+                  + [{"rule": "trap-sample", "outcome": "tp", "source": "ci", "key": f"tp{i}"}
+                     for i in range(AMBIENT_FP_TP)])
     return repo, commit
 
 
@@ -332,7 +336,7 @@ def test_sync_with_a_healthy_gh_confirms_and_decides(tmp_path, monkeypatch, conc
     assert (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").is_file() is not archived
     if not archived:
         row = res.derived["rules"]["trap-sample"]
-        assert (row["evidence_available"], row["tp"], row["fp"], row["suggestion"]) == (True, 1, AMBIENT_FP, None)
+        assert (row["evidence_available"], row["tp"], row["fp"], row["suggestion"]) == (True, AMBIENT_FP_TP + 1, AMBIENT_FP, None)
 
 
 @needs_git

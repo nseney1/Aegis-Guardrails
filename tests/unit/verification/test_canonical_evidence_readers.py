@@ -104,13 +104,13 @@ def test_lifecycle_uses_weighted_ledger_rows(tmp_path):
             for i in range(n)
         ]
 
-    # 22 rows weigh 18.7 verdicts: fewer than the 20 a promotion needs.
-    _write_jsonl(_ledger(tmp_path), rows(22))
+    # 25 rows weigh 21.25 verdicts: fewer than the MIN_N (25) a transition needs (R-evidence-8).
+    _write_jsonl(_ledger(tmp_path), rows(25))
     assert evaluate_promotions(str(tmp_path)) == []
 
-    _write_jsonl(_ledger(tmp_path), rows(25))
+    _write_jsonl(_ledger(tmp_path), rows(30))
     candidates = evaluate_promotions(str(tmp_path))
-    assert [(c["rule_id"], c["tp"], c["triggers"]) for c in candidates] == [("canonical", 21.25, 25)]
+    assert [(c["rule_id"], c["tp"], c["triggers"]) for c in candidates] == [("canonical", 25.5, 30)]
 
 
 def test_checkpoint_fails_closed_and_uses_weighted_outcomes(tmp_path):
@@ -118,19 +118,19 @@ def test_checkpoint_fails_closed_and_uses_weighted_outcomes(tmp_path):
 
     path = _ledger(tmp_path)
     path.parent.mkdir(parents=True)
-    # Counted at full weight the tp would make this 3 false positives of 4 verdicts,
-    # which is not confidently a misfire; at weight 0 it is 3 of 3.
+    # Counted at full weight the tps would make this 25 false positives of 50 verdicts,
+    # which is not confidently a misfire; at weight 0 it is 25 of 25 (MIN_N, R-evidence-8).
     path.write_text(
-        json.dumps(_signal("weighted", "tp", weight="0")) + "\n"
-        + "".join(json.dumps(_signal("weighted", "fp", weight="1")) + "\n" for _ in range(3))
+        "".join(json.dumps(_signal("weighted", "tp", weight="0")) + "\n" for _ in range(25))
+        + "".join(json.dumps(_signal("weighted", "fp", weight="1")) + "\n" for _ in range(25))
         + "not-json\n",
         encoding="utf-8",
     )
 
     issues = check_rule_fitness(tmp_path)
-    assert any("line 5 is not a JSON object row" in issue["message"] for issue in issues)
+    assert any("line 51 is not a JSON object row" in issue["message"] for issue in issues)
     assert [issue["message"] for issue in issues if issue.get("rule") == "weighted"] == [
-        "Rule 'weighted' misfires: 3 of 3 verdicts are false positives (misfire bound 0.53 > 0.5); "
+        "Rule 'weighted' misfires: 25 of 25 verdicts are false positives (misfire bound 0.90 > 0.5); "
         "aegis sync suggests demoting or archiving it"
     ]
 

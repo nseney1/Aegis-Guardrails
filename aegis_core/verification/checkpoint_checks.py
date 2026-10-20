@@ -464,7 +464,7 @@ def check_rule_fitness(root: Path) -> list[dict]:
 
     for rule_id, counts in sorted(ledger.aggregate_rows(view.rows).items()):
         fit = compute(counts, rule=rule_id)
-        if fit.misfire > MISFIRE_THRESHOLD:
+        if fit.has_min_n and fit.misfire > MISFIRE_THRESHOLD:
             issues.append({
                 "check": "rule_fitness",
                 "rule": rule_id,

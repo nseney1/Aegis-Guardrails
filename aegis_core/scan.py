@@ -156,8 +156,16 @@ def _item(m: _Match) -> Dict[str, Any]:
         "hypothesis": rule.meta.get("hypothesis", ""),
         "prediction": rule.meta.get("prediction", ""),
         "matched_files": list(m.files),
-        "fitness": m.fitness.score,
+        "fitness": m.fitness.reported_score,
     }
+
+
+def _fitness_text(fit: Fitness) -> str:
+    if fit.reported_score is not None:
+        return f"{fit.reported_score:.2f}"
+    if fit.evidence_available and not fit.triggers and not fit.verdicts:
+        return "no evidence yet"
+    return fit.status_label or "—"
 
 
 def _text(m: _Match) -> str:
@@ -174,7 +182,7 @@ def _text(m: _Match) -> str:
     if rule.body:
         lines = rule.body.strip().split("\n")[:8]
         out += f"   Detail: {' '.join(line.strip() for line in lines)[:300]}\n"
-    out += f"   Fitness: {m.fitness.score:.2f}\n"
+    out += f"   Fitness: {_fitness_text(m.fitness)}\n"
     return out
 
 

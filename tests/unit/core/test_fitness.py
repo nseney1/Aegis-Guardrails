@@ -136,3 +136,51 @@ def test_a_rule_with_no_ledger_rows_scores_zero_whatever_its_frontmatter_says(tm
     fits = for_rules(ws, load_rules(ws).rules, now=NOW)
     assert {k: (v.triggers, v.score) for k, v in fits.items()} == {"t": (0, 0.0), "i": (0, 0.0)}
 
+
+# ── One minimum-sample gate (R-evidence-8, spec T4 and section 9) ─────────────
+#
+# Given fewer than MIN_N verdicts, When fitness is computed, Then the state is
+# `insufficient`, nothing is suggested and no number is reported; Given MIN_N, Then the
+# decision and the number appear. Decay-archive of a quiet trap does not need verdicts.
+
+from aegis_core.fitness import MIN_N  # noqa: E402
+
+
+@pytest.mark.parametrize(("rule_type", "tp", "fp"), [
+    ("trap", 0, 3), ("gate", 0, 3), ("invariant", 1, 2), ("trap", 1, 3), ("trap", 0, MIN_N - 1),
+])
+def test_below_min_n_is_insufficient_with_no_suggestion_and_no_number(rule_type: str, tp: int, fp: int) -> None:
+    fit = compute({"triggers": tp + fp, "tp": tp, "fp": fp}, rule_type=rule_type)
+    assert (fit.state, fit.suggestion, fit.has_min_n) == ("insufficient", None, False)
+    assert fit.status_label == f"insufficient (n={tp + fp})"
+    assert fit.reported_score is None
+    assert fit.as_dict()["reported_score"] is None and fit.as_dict()["status"] == fit.status_label
+
+
+@pytest.mark.parametrize(("rule_type", "suggestion"), [("trap", "archive"), ("gate", "demote"), ("invariant", "demote")])
+def test_min_n_false_positives_decide(rule_type: str, suggestion: str) -> None:
+    fit = compute({"triggers": MIN_N, "tp": 0, "fp": MIN_N}, rule_type=rule_type)
+    assert (fit.state, fit.suggestion, fit.has_min_n, fit.status_label) == ("decided", suggestion, True, None)
+    assert fit.reported_score == fit.score == 0.0
+
+
+def test_an_explicit_min_n_is_honoured() -> None:
+    assert compute({"tp": 0, "fp": 5}, rule_type="gate", min_n=5).state == "decided"
+    assert compute({"tp": 0, "fp": 4}, rule_type="gate", min_n=5).state == "insufficient"
+
+
+def test_the_number_appears_exactly_at_min_n() -> None:
+    below = compute({"tp": MIN_N - 2, "fp": 1})
+    at = compute({"tp": MIN_N - 1, "fp": 1})
+    assert (below.state, below.reported_score) == ("insufficient", None)
+    assert at.state != "insufficient" and at.reported_score == at.score > 0.0
+    # the raw score is kept for ranking and for derived.json at any n
+    assert below.score > 0.0
+
+
+def test_a_quiet_unpinned_trap_archives_by_decay_at_n_zero() -> None:
+    fit = compute({}, rule_type="trap", eligible_sessions=60, half_life_sessions=20, epsilon=0.15)
+    assert (fit.state, fit.suggestion, fit.archive_candidate) == ("decided", "archive", True)
+    assert fit.reported_score is None
+    assert compute({}, rule_type="trap", pinned=True, eligible_sessions=60, half_life_sessions=20,
+                   epsilon=0.15).suggestion is None

@@ -52,27 +52,34 @@ def _protected(rule_id: str) -> bool:
 
 
 def _promotable(fit: Fitness) -> bool:
+    if not fit.has_min_n:
+        return False
     if fit.adjudicated_n > 0:
         return fit.suggestion == "promote"
     return fit.verdicts >= MIN_PROMOTION_VERDICTS and fit.score >= PROMOTION_THRESHOLD
 
 
 def _misfiring(fit: Fitness) -> bool:
-    """Confident (Wilson lower bound or Beta posterior P(p < 0.7) >= 0.90) that the rule misfires."""
+    """Confident (Wilson lower bound or Beta posterior P(p < 0.7) >= 0.90) over at least MIN_N verdicts
+    that the rule misfires."""
+    if not fit.has_min_n:
+        return False
     if fit.adjudicated_n > 0:
-        return fit.misfire > MISFIRE_THRESHOLD or (fit.verdicts >= 3 and fit.p_below_demote >= 0.9)
+        return fit.misfire > MISFIRE_THRESHOLD or fit.p_below_demote >= 0.9
     return fit.misfire > MISFIRE_THRESHOLD
 
 
 def suggest(rule: Rule, fit: Fitness, now: Optional[datetime] = None) -> Optional[str]:
     """The transition a rule's ledger evidence supports: promote, demote, archive or None.
 
+    No promotion, demotion or archive by misfire below fitness.MIN_N verdicts.
+
     - promote: it has a next tier, at least MIN_PROMOTION_VERDICTS verdicts (or T4
       adjudicated promotion criteria), fitness of at least PROMOTION_THRESHOLD and is
       MIN_AGE_DAYS_FOR_PROMOTION days old;
     - demote (archive when it has no lower tier): it misfires, i.e. the Wilson lower
       bound of its false-positive rate exceeds MISFIRE_THRESHOLD (or adjudicated
-      P(precision < 0.7) >= 0.90 over >= 3 verdicts);
+      P(precision < 0.7) >= 0.90);
     - archive: a non-pinned trap whose session-decay effective weight falls below epsilon.
 
     Rules that are broken, expired or protected get no suggestion.
@@ -257,7 +264,7 @@ _TIERS = ("advisory", "mechanical", "gate")
 
 def _next_tier(enforcement: str, fit: Fitness) -> tuple[str, str]:
     """``(new tier, reason)`` for an advisory/mechanical/gate enforcement tier."""
-    if enforcement not in _TIERS:
+    if enforcement not in _TIERS or not fit.has_min_n:
         return enforcement, ""
     index = _TIERS.index(enforcement)
     if index > 0 and fit.misfire > TIER_DOWN_MISFIRE[enforcement]:

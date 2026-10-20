@@ -256,20 +256,26 @@ def test_asymmetric_promotion_and_demotion_states(tmp_path: Path) -> None:
     assert fit_narrow.suggestion is None
     assert suggest(rules["r-inconclusive-one-session"], fit_narrow, now=now) is None
 
-    # 2 TP / 8 FP (n=10 >= 8, precision_hi < 0.65) -> state == 'decided', suggestion == 'demote'.
+    # 5 TP / 20 FP (n = MIN_N = 25, precision_hi < 0.65) -> state == 'decided', suggestion == 'demote'.
     fit_demote = fitness.compute(
-        {"triggers": 10, "tp": 2, "fp": 8},
+        {"triggers": 25, "tp": 5, "fp": 20},
         now=now,
         rule="r-demote",
         rule_type="invariant",
-        adjudicated_tp=2,
-        adjudicated_fp=8,
+        adjudicated_tp=5,
+        adjudicated_fp=20,
         sessions_count=3,
         repos_count=1,
     )
     assert fit_demote.state == "decided"
     assert fit_demote.suggestion == "demote"
     assert suggest(rules["r-demote"], fit_demote, now=now) == "demote"
+
+    # 2 TP / 8 FP is below MIN_N: insufficient, no number, no transition (R-evidence-8).
+    fit_small = fitness.compute({"triggers": 10, "tp": 0, "fp": 0}, now=now, rule="r-demote",
+                                rule_type="invariant", adjudicated_tp=2, adjudicated_fp=8)
+    assert (fit_small.state, fit_small.suggestion, fit_small.status_label) == ("insufficient", None, "insufficient (n=10)")
+    assert suggest(rules["r-demote"], fit_small, now=now) is None
 
 
 @needs_git

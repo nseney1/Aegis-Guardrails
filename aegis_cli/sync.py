@@ -36,6 +36,11 @@ def _rows(derived: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [dict(entry, id=rule_id) for rule_id, entry in sorted(derived["rules"].items())]
 
 
+def _fitness_column(row: Dict[str, Any]) -> str:
+    shown = row.get("reported_score")
+    return f"{shown:.2f}" if isinstance(shown, (int, float)) else str(row.get("status") or "—")
+
+
 def _status(result: Any) -> str:
     if result.refused:
         return "refused"
@@ -57,7 +62,7 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
             tbl.add_column(column, no_wrap=True)
         for row in rows:
             tbl.add_row(
-                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])), f"{row['fitness']:.2f}",
+                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])), _fitness_column(row),
                 str(row["triggers"]), f"{row['tp']:g}", f"{row['fp']:g}", row["suggestion"] or "—",
             )
         for line in tbl.render(ui).splitlines():

@@ -166,3 +166,41 @@ def test_rules_that_apply_to_no_file_are_named(ws, capsys):
 
     assert main(["sync", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["untargeted"] == [{"id": "nowhere", "path": ".aegis/rules/traps/nowhere.md"}]
+
+
+# ── One minimum-sample gate (R-evidence-8): no number and no transition below MIN_N ──
+
+def test_the_fitness_column_shows_insufficient_below_min_n_and_json_keeps_the_raw_number(ws, capsys):
+    from aegis_core.fitness import MIN_N
+
+    _rule(ws, "traps", "trap", "trap-twelve")
+    ledger.append(ws, [{"rule": "trap-twelve", "outcome": "tp", "source": "ci", "key": f"t{i}"} for i in range(12)])
+
+    assert main(["sync"]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "trap-twelve" in ln)
+    assert "insufficient (n=12)" in line and "0." not in line
+
+    assert main(["sync", "--json"]) == 0
+    rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)["rules"]}
+    assert rows["trap-twelve"]["reported_score"] is None and rows["trap-twelve"]["fitness"] > 0.5
+    assert rows["trap-good"]["reported_score"] == rows["trap-good"]["fitness"]
+    assert rows["trap-good"]["tp"] == MIN_N
+
+
+def test_apply_moves_only_the_rule_with_min_n_verdicts(tmp_path, monkeypatch, capsys):
+    from aegis_core.fitness import MIN_N
+
+    root = tmp_path / "project"
+    for directory, rule_type, rule_id, fps in (("traps", "trap", "trap-three", 3),
+                                               ("invariants", "invariant", "invariant-three", 3),
+                                               ("traps", "trap", "trap-enough", MIN_N)):
+        _rule(root, directory, rule_type, rule_id)
+        ledger.append(root, [{"rule": rule_id, "outcome": "fp", "source": "ci", "key": f"{rule_id}-{i}"}
+                             for i in range(fps)])
+    monkeypatch.chdir(root)
+
+    assert main(["sync", "--apply", "--json"]) == 0
+    applied = json.loads(capsys.readouterr().out)["applied"]
+    assert [(a["rule"], a["action"], a["status"]) for a in applied] == [("trap-enough", "archive", "archived")]
+    assert (root / ".aegis" / "rules" / "traps" / "trap-three.md").is_file()
+    assert (root / ".aegis" / "rules" / "invariants" / "invariant-three.md").is_file()

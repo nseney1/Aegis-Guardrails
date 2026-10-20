@@ -351,7 +351,8 @@ class TestStatus:
         assert "🛡️ Aegis Workspace Status" in out_tty
         assert "\x1b[" in out_tty
         assert "0.92" in out_tty  # Wilson lower bound of 30 of 30
-        assert "0.54" in out_tty  # of 8 of 10
+        # 8 of 10 is below the one sample gate (MIN_N = 25, R-evidence-8): a label, never 0.54
+        assert "insufficient (n=10)" in out_tty and "0.54" not in out_tty
         assert "0.11" not in out_tty and "0.13" not in out_tty
         assert "wall" not in out_tty.lower()
         assert "vacuole" not in out_tty.lower()

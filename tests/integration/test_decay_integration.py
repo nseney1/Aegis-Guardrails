@@ -43,7 +43,8 @@ class TestTierCheck:
 
     def test_a_self_declared_gate_that_misfires_steps_down(self, soma_workspace, capsys):
         rules = soma_workspace / ".aegis" / "rules"
-        path = write_cell_with_fitness(rules, "noisy-gate", "gate", 10, 2, 8)
+        # 5 of 25 verdicts: MIN_N (R-evidence-8), misfire bound above the gate's 0.3
+        path = write_cell_with_fitness(rules, "noisy-gate", "gate", 25, 5, 20)
 
         assert _tier_check(soma_workspace, "--json") == 0
 

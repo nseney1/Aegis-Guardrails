@@ -178,6 +178,49 @@ def test_small_n_shows_insufficient_and_no_precision_number_in_status(
     assert rule_json["score"] is None
 
 
+def test_scan_status_and_list_rules_show_no_number_below_min_n_and_agree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R-evidence-8: Given n in (0, 1, MIN_N - 1) verdicts, When scan, status and list_rules
+    run, Then none shows a number (`insufficient (n=N)`, or `no evidence yet` without any
+    ledger row); Given exactly MIN_N, Then the number appears; ranking keeps the raw score."""
+    from aegis_core.fitness import MIN_N
+    from aegis_core.rules import load_rules
+    from aegis_core.scan import RULE_CACHE, scan
+    from aegis_core.telemetry_engine import ledger
+    from aegis_mcp.registry import list_rules
+
+    counts = {"trap-none": None, "trap-zero": 0, "trap-one": 1, "trap-low": MIN_N - 1, "trap-at": MIN_N}
+    for rid, n in counts.items():
+        _write_rule(tmp_path, "trap", rid, target_paths=["src/*.py"])
+        if n is None:
+            continue
+        rows = [{"rule": rid, "outcome": "tp", "source": "ci", "key": f"{rid}-{i}"} for i in range(n)]
+        ledger.append(tmp_path, rows or [{"rule": rid, "outcome": "trigger", "source": "ci", "key": f"{rid}-t"}])
+    RULE_CACHE.invalidate()
+    raw = fitness.for_rules(tmp_path, load_rules(tmp_path).served)
+
+    result = scan(tmp_path, ["src/app.py"], budget=10, max_tokens=100000)
+    shown = {r["name"]: r["fitness"] for r in result["relevant_rules"]}
+    assert shown == {"trap-none": None, "trap-zero": None, "trap-one": None, "trap-low": None,
+                     "trap-at": raw["trap-at"].score}
+    assert raw["trap-at"].score > 0.8
+    assert "Fitness: no evidence yet" in result["guidance"]
+    for rid in ("trap-zero", "trap-one", "trap-low"):
+        assert f"Fitness: insufficient (n={counts[rid]})" in result["guidance"]
+    assert f"Fitness: {raw['trap-at'].score:.2f}" in result["guidance"]
+    assert [r["name"] for r in result["relevant_rules"]] == sorted(raw, key=lambda rid: (-raw[rid].score, rid))
+
+    assert run_status(argparse.Namespace(_root=tmp_path, json=True)) == 0
+    status_scores = {r["name"]: r["score"] for r in json.loads(capsys.readouterr().out)["rules"]}
+    assert {rid: status_scores[rid] for rid in counts} == shown
+
+    listed = {r["id"]: r["fitness"] for r in list_rules(tmp_path)["rules"]}
+    assert {rid: listed[rid]["reported_score"] for rid in counts} == shown
+    assert {rid: listed[rid]["score"] for rid in counts} == {rid: raw[rid].score for rid in counts}
+    assert listed["trap-low"]["status"] == f"insufficient (n={MIN_N - 1})"
+
+
 # ── 3. A quiet trap decays (with v4.4 §12.9 scope_basis & immunities) ────────
 
 

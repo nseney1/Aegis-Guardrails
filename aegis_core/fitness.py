@@ -27,6 +27,7 @@ __all__ = [
     "Fitness",
     "MAX_PRIOR_MASS",
     "MDE_UNTESTABLE_THRESHOLD",
+    "MIN_N",
     "beta_cdf",
     "beta_ppf",
     "cap_prior",
@@ -47,7 +48,9 @@ __all__ = [
 
 Z = WILSON_CONFIDENCE_Z_SCORES[DEFAULT_CONFIDENCE_LEVEL]
 MAX_PRIOR_MASS = 10.0
-DEFAULT_MIN_N = 10
+# One minimum-sample gate (spec T4, section 9): below it no number is shown and no transition is suggested.
+MIN_N = 25
+DEFAULT_MIN_N = MIN_N
 DEFAULT_HALF_LIFE_SESSIONS = 20
 DEFAULT_ARCHIVE_EPSILON = 0.15
 DEFAULT_MDE_HORIZON_DAYS = 180.0
@@ -158,10 +161,22 @@ class Fitness:
     suggestion: Optional[str] = None
     evidence_available: bool = True
     evidence_error: Optional[str] = None
+    min_n: int = MIN_N
 
     @property
     def verdicts(self) -> float:
         return self.tp + self.fp
+
+    @property
+    def has_min_n(self) -> bool:
+        return self.verdicts >= self.min_n
+
+    @property
+    def reported_score(self) -> Optional[float]:
+        """The number surfaces may show: None until a sample is large enough to mean something."""
+        if not self.evidence_available or not self.verdicts or self.state in ("insufficient", "untestable", "evidence_unavailable"):
+            return None
+        return self.score
 
     @property
     def status_label(self) -> Optional[str]:
@@ -170,10 +185,11 @@ class Fitness:
         n = self.adjudicated_n if self.adjudicated_n > 0 else int(self.verdicts)
         if self.state == "untestable":
             return "untestable (insufficient trigger volume)"
-        return f"insufficient (n={n})" if self.state == "insufficient" and n > 0 else None
+        return f"insufficient (n={n})" if self.state == "insufficient" else None
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"triggers": self.triggers, "tp": self.tp, "fp": self.fp, "last_ts": self.last_ts, "score": self.score}
+        return {"triggers": self.triggers, "tp": self.tp, "fp": self.fp, "last_ts": self.last_ts, "score": self.score,
+                "reported_score": self.reported_score, "status": self.status_label}
 
 
 def compute(
@@ -209,13 +225,14 @@ def compute(
     override_rate = round(float(contested) / float(max(1, int(contested) + int(triggers))), 4) if contested > 0 else 0.0
     flagged_for_review = bool(contested > 0 and (contested >= 3 or override_rate >= 0.25))
     archive_candidate = bool(rule_type == "trap" and not pinned and eligible_sessions > 0 and effective_weight < epsilon)
-    demote_ready = bool(n >= 3 and (misfire > 0.5 or p_below_07 >= 0.9 or cp_hi < 0.7))
+    enough_n = n >= min_n
+    demote_ready = bool(enough_n and (misfire > 0.5 or p_below_07 >= 0.9 or cp_hi < 0.7))
     if adj_n > 0:
         enough_pos = (adjudicated_tp >= 25 and adjudicated_fp == 0) or (adj_n >= 42 and adjudicated_fp <= 1 and cp_lo >= 0.88)
         enough_div = (sessions_count == 0 or sessions_count >= 3) and (repos_count >= 2 or days_span >= 14.0 or (repos_count == 0 and days_span == 0.0))
-        promote_ready = bool(rule_type == "trap" and enough_pos and enough_div)
+        promote_ready = bool(enough_n and rule_type == "trap" and enough_pos and enough_div)
     else:
-        promote_ready = bool(rule_type == "trap" and n >= 20 and score >= 0.85)
+        promote_ready = bool(enough_n and rule_type == "trap" and n >= 20 and score >= 0.85)
     suggestion: Optional[str] = None
     if not evidence_available:
         state, suggestion = "evidence_unavailable", None
@@ -226,9 +243,9 @@ def compute(
     elif promote_ready:
         state, suggestion = "decided", "promote"
     elif archive_candidate:
-        state, suggestion = ("decided" if n >= min_n else "insufficient"), "archive"
+        state, suggestion = "decided", "archive"
     else:
-        state = "insufficient" if n < min_n else "inconclusive"
+        state = "inconclusive" if enough_n else "insufficient"
     return Fitness(
         rule=rule, triggers=triggers, tp=tp, fp=fp, last_ts=totals.get("last_ts"), score=score, misfire=misfire,
         state=state, adjudicated_n=adj_n, adjudicated_tp=int(adjudicated_tp), adjudicated_fp=int(adjudicated_fp),
@@ -239,7 +256,7 @@ def compute(
         decay_factor=round(combined_decay, 6), effective_weight=effective_weight, archive_candidate=archive_candidate,
         silence_lr=round(float(silence_lr), 6), sessions_count=int(sessions_count), repos_count=int(repos_count),
         days_span=round(float(days_span), 2), samples=tuple(dict(s) for s in list(samples)[:3]), suggestion=suggestion,
-        evidence_available=evidence_available, evidence_error=evidence_error,
+        evidence_available=evidence_available, evidence_error=evidence_error, min_n=int(min_n),
     )
 
 

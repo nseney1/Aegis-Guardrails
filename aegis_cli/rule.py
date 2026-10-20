@@ -169,6 +169,7 @@ def collect_workspace_rules(
             "domain": rule.meta.get("domain", "general"),
             "enforcement": rule.enforcement,
             "score": score,
+            "reported_score": fit.reported_score if fit is not None else None,
             "triggers": fit.triggers if fit is not None else 0,
             "path": rule.path,
         }
@@ -213,7 +214,7 @@ def _run_list(args: argparse.Namespace) -> int:
         tbl.add_column(col, no_wrap=True)
     tbl.add_column("Fitness", justify="right", no_wrap=True)
     for r in rules:
-        score_str = ui.color_fitness(float(r["score"])) if isinstance(r.get("score"), (int, float)) else "—"
+        score_str = ui.color_fitness(float(r["reported_score"])) if isinstance(r.get("reported_score"), (int, float)) else "—"
         if r.get("error"):
             score_str = "error"
         tbl.add_row(sanitize_display(str(r["id"])), ui.color_rule_type(str(r["type"])), str(r["enforcement"]), score_str)
