@@ -1,13 +1,13 @@
 """Paired interleaved performance regression check (v4.3 spec §3 T7)."""
 from __future__ import annotations
 
-import json, os, shlex, shutil, statistics, tempfile, time
+import os, shlex, shutil, statistics, tempfile, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from aegis_core import gitsafe
+from aegis_core.config import read_user_config
 from aegis_core.verification import test_runner
-from aegis_core.workspace.layout import UserLayout
 
 MIN_ROUNDS = 15
 DEFAULT_THRESHOLD = 0.05
@@ -43,32 +43,18 @@ def evaluate_paired_samples(
     }
 
 
-def _is_within(path: Path, root: Path) -> bool:
-    real_p, real_r = os.path.realpath(path), os.path.realpath(root)
-    return real_p == real_r or real_p.startswith(real_r.rstrip(os.sep) + os.sep)
-
-
 def _load_user_perf_command(workspace_root: Path, user_config_path: Path | str | None = None) -> list[str] | None:
     """Read perf.command from user-scope config only; never from repository config."""
-    if user_config_path is not None:
-        cfg_file = Path(user_config_path)
-    else:
-        layout = UserLayout.current()
-        if layout is None:
-            return None
-        cfg_file = layout.config_file
-    if not cfg_file.is_file() or _is_within(cfg_file, workspace_root):
-        return None
-    try:
-        raw = json.loads(cfg_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(raw, Mapping):
+    raw = read_user_config(workspace_root, path=user_config_path)
+    if raw is None:
         return None
     perf = raw.get("perf")
     cmd = perf.get("command") if isinstance(perf, Mapping) else raw.get("perf.command")
     if isinstance(cmd, str) and cmd.strip():
-        return shlex.split(cmd, posix=os.name != "nt")
+        try:
+            return shlex.split(cmd, posix=os.name != "nt")
+        except ValueError:  # unbalanced quotes: unusable, like any other bad value
+            return None
     if isinstance(cmd, list) and cmd and all(isinstance(x, str) and x.strip() for x in cmd):
         return [x.strip() for x in cmd]
     return None

@@ -51,6 +51,7 @@ __all__ = [
     "env_max_jit_tokens",
     "env_workspace",
     "jit_max_tokens",
+    "read_user_config",
     "scan_window_s",
     "update_repo_config",
 ]
@@ -74,7 +75,8 @@ ENV_LLM_CMD = "AEGIS_LLM_CMD"
 ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
 
 _REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "half_life_sessions", "epsilon"})
-_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor"})
+# tests, rules, perf and regression are read through read_user_config by their own consumers.
+_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression"})
 # Keys a repository might use to smuggle in a command. Only these names (aegis's own
 # vocabulary) are ever echoed in a warning; any other unknown key is only counted,
 # since warnings reach the agent and key names are repo-chosen text.
@@ -477,6 +479,32 @@ class UserConfig:
         raw_vendor = raw.get("arbiter_vendor")
         arbiter_vendor = str(raw_vendor).strip() if isinstance(raw_vendor, str) and raw_vendor.strip() else None
         return cls(drivers=drivers, slots=slots, warnings=tuple(warnings), arbiter_vendor=arbiter_vendor)
+
+
+def read_user_config(
+    workspace_root: Any = None, *, user: Optional[UserLayout] = None, path: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """The user-scope config as a dict, or None; never raises.
+
+    The one lenient reader for the command-like user keys (``tests.command``,
+    ``rules.base_ref``, ``perf.command``, ``regression.*``): the repository never supplies
+    them. ``path`` overrides ``~/.aegis/config.json``. None without a home directory, when
+    the file lies inside ``workspace_root`` (repository content), and whenever
+    UserConfig.load would raise ConfigError (not a regular file, over the size cap, not a
+    JSON object, or a version this aegis does not read).
+    """
+    if path is None:
+        user = user or UserLayout.current()
+        if user is None:
+            return None
+        path = user.config_file
+    path = Path(os.fspath(path))
+    if workspace_root is not None and _is_within(path, Path(os.fspath(workspace_root))):
+        return None
+    try:
+        return _read_json(path, USER_LABEL)
+    except ConfigError:
+        return None
 
 
 # ── Resolved values ──────────────────────────────────────────────────────────
