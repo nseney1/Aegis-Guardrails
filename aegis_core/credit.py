@@ -735,12 +735,10 @@ def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, A
 
 def project_credits(
     root: Any, *, view: Any = None, client: Any = None, workflow: Optional[str] = None,
-    attestation_runner: Optional[Callable[..., Any]] = None,
     landed: Optional[Callable[..., Optional[str]]] = None,
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
     verify_ci: bool = False,
 ) -> CreditProjection:
-    from aegis_core import release_verify
     workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
     look = landed or landed_lookup(root)
@@ -756,13 +754,12 @@ def project_credits(
     err = view_err or read_err
     if err:
         return CreditProjection((), (), available=False, error=str(err))
-    v_map: Dict[str, str] = {}
     stopped: Optional[str] = None
     p_branch: Optional[str] = None
     # Read paths (scan, status, list) pass verify_ci=False and stay offline: a ``ci`` row then counts
     # only when this process verified it, so they can under-credit but never over-credit.
     if verify_ci:
-        rest_client = GhRestClient(cwd=str(root)) if (client is None and attestation_runner is None) else None
+        rest_client = GhRestClient(cwd=str(root)) if client is None else None
         latest = {str(r.get("commit") or ""): r for r in _of(rows, "ci")}
         pending = [(commit, ci_row) for commit, ci_row in latest.items()
                    if commit and (c_root, commit) not in _UNAVAILABLE_CI
@@ -784,17 +781,6 @@ def project_credits(
                     continue
                 except CIUnavailable:
                     pass
-            if ci_row.get("ci_conclusion") == "success":
-                rid, ratt = ci_row.get("run_id"), ci_row.get("ci_run_attempt")
-                exp_run = f"{rid}/{ratt}" if rid is not None and ratt is not None else None
-                rep = release_verify.verify_release(
-                    root, commit, run=attestation_runner,
-                    source_ref=f"refs/heads/{p_branch}", workflow=f".github/workflows/{workflow}", expected_run=exp_run,
-                )
-                if rep.verified:
-                    v_map[commit] = "success"
-                    _VERIFIED_CI[(c_root, commit)] = {"conclusion": "success", "workflow": workflow, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
-                    continue
             # Circuit breaker: a dead gh costs one attempt per projection. Only a well-formed id trips
             # it, so one malformed (never-asked) row cannot switch verification off for the rest.
             # Tripping makes the projection unavailable: verify_ci callers decide (promote, demote,
@@ -804,7 +790,7 @@ def project_credits(
                            f"{len(pending) - idx} commit(s) were not verified")
                 break
     app_fn = approved or approval_lookup(root, rows, landed=look, branch=p_branch)
-    derived = derive(rows, landed=look, approved=app_fn, verified_ci=v_map or None)
+    derived = derive(rows, landed=look, approved=app_fn)
     if verify_ci and stopped is None:
         # confirm() (sync) parks a landed commit whose CI gh could not read in _UNAVAILABLE_CI, and the
         # loop above never retries it, so its credit stays landed: as cut short as a tripped breaker.

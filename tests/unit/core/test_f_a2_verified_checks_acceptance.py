@@ -995,3 +995,34 @@ def test_a_runs_get_that_fails_after_github_named_the_branch_still_trips_the_bre
     assert proj.error == f"CI verification stopped after gh failed for {commit[:12]}; 1 commit(s) were not verified"
     asked = [c[1].split("?", 1)[0] for c in gh.calls if c[:1] == ["api"]]
     assert asked == ["repos/{owner}/{repo}", "repos/{owner}/{repo}/actions/runs"]
+
+
+@needs_git
+def test_a_failed_rest_read_never_falls_back_to_an_attestation(tmp_path, monkeypatch):
+    """Given GitHub names the default branch, its runs GET fails and a ledger ci row says success,
+    When credit is projected, Then it stays landed/unverified_ci and no second gh command
+    (``gh attestation verify`` or ``gh --version``) is issued (R-trust-67)."""
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    repo.git("branch", "-f", "main", commit)
+    repo.git("remote", "add", "origin", "https://github.com/octo/proj.git")
+    gh = GitHub([])
+
+    def runner(argv, stdin=None, cwd=None, timeout=None):
+        argv = list(argv)
+        if argv == ["--version"]:
+            gh.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "gh version 2.93.0 (2026-01-01)\n", "")
+        if argv[:1] == ["api"] and "/actions/runs?" in argv[1]:
+            gh.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "rate limited")
+        if argv[:2] == ["attestation", "verify"]:
+            gh.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "no attestation")
+        return gh(argv, stdin, cwd, timeout)
+
+    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    ledger.append_rows(repo.root, [_ci_row(commit)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]
+    assert [c[:2] if c[:1] == ["api"] else c[:1] for c in gh.calls] == [
+        ["api", "repos/{owner}/{repo}"], ["api", f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={commit}&per_page=100"]]

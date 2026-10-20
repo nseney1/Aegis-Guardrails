@@ -815,3 +815,19 @@ def test_detector_replay_walks_commits_after_merge_and_prefers_ahead_remote_bran
 
     detections = fitness.replay_detector_history(repo.root)
     assert any(d["pattern"] == "eval" and d["disposition"] == "leaked" for d in detections)
+
+
+@needs_git
+def test_projecting_credit_never_imports_release_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One CI-confirmation path (REST): ``project_credits`` does not reach ``release_verify`` (R-trust-67)."""
+    import sys
+
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    code = (
+        "import sys\n"
+        "from aegis_core import credit\n"
+        "credit.project_credits(sys.argv[1], verify_ci=True)\n"  # no ci row: nothing asks gh
+        "print('aegis_core.release_verify' in sys.modules)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code, str(repo.root)], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "False"
