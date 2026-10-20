@@ -287,13 +287,17 @@ def evaluate_rule_tiers(workspace: Workspace | Path | str | None = None, execute
     its ledger fitness; with ``execute``, rewrite only the ``enforcement`` key.
 
     Gates and invariants are always ``gate`` and are not evaluated. While the ledger is
-    incomplete the changes are reported but not written (``refused`` says why).
+    incomplete, or its CI evidence could not be read, the changes are reported but not
+    written (``refused`` says why).
     """
     ws = literal_workspace(workspace)
     rules = [r for r in load_rules(ws).served if not RULE_TYPES[r.type].mandatory]
     view = ledger.read(ws.root)
     fits = for_rules(ws, rules, view=view, verify_ci=True)
     refused = f"not written: the ledger is incomplete ({view.incomplete})" if execute and view.incomplete else None
+    unavailable = next((f.evidence_error for f in fits.values() if not f.evidence_available), None)
+    if execute and not refused and unavailable:
+        refused = f"not written: the evidence is unavailable ({unavailable})"
     if refused:
         execute = False
     changes: List[Dict[str, Any]] = []

@@ -351,3 +351,46 @@ def test_a_healthy_gh_verifies_every_commit_and_reads_stay_offline(tmp_path, mon
     proj = credit.project_credits(repo.root)
     assert (proj.available, proj.error) == (True, None)
     assert gh.calls == []
+
+
+def _ci_confirmable(repo, commit: str) -> None:
+    ledger.append_rows(repo.root, [
+        {"v": ledger.LEDGER_VERSION, "ts": "2026-10-17T10:00:00Z", "event": "ci", "commit": commit,
+         "workflow": hv.CI_WORKFLOW, "ci_conclusion": "success", "run_id": 10, "ci_run_attempt": 1}])
+
+
+@needs_git
+@pytest.mark.parametrize("fails", ["fail_repo", "fail_runs"], ids=["repository-get", "runs-get"])
+def test_direct_decisions_refuse_when_ci_verification_stops(tmp_path, monkeypatch, fails):
+    """Given a misfiring trap whose landed check has a ``ci`` row CI would confirm, When gh fails while
+    ``aegis rule archive`` or ``aegis rule tiers`` verifies CI, Then nothing is archived or rewritten and
+    each says the evidence is unavailable: an unavailable projection never drives a decision."""
+    from aegis_core.lifecycle.promotion import evaluate_rule_tiers
+    from aegis_core.lifecycle.selection import archive_rule
+
+    repo, commit = _misfiring(tmp_path, monkeypatch)
+    _ci_confirmable(repo, commit)
+    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, run_id=10)], **{fails: True}))
+    path = repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md"
+    before = path.read_bytes()
+
+    res = archive_rule(repo.root, "trap-sample")
+    assert res["status"] == "ineligible" and "its evidence is unavailable (CI verification stopped" in res["message"]
+    _fresh_process()
+    assert evaluate_rule_tiers(repo.root, execute=True)["refused"].startswith(
+        "not written: the evidence is unavailable (CI verification stopped")
+    assert path.read_bytes() == before
+
+
+@needs_git
+def test_direct_archive_still_acts_on_complete_evidence(tmp_path, monkeypatch):
+    """Control: when gh answers and CI failed on the landed commit, the credit is void, the evidence is
+    complete, and the misfiring trap is archived."""
+    from aegis_core.lifecycle.selection import archive_rule
+
+    repo, commit = _misfiring(tmp_path, monkeypatch)
+    _ci_confirmable(repo, commit)
+    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, "failure", run_id=10)]))
+
+    assert archive_rule(repo.root, "trap-sample")["status"] == "archived"
+    assert not (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").exists()
