@@ -6,9 +6,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import struct
@@ -36,6 +38,7 @@ __all__ = [
     "SCHEMA",
     "SOURCE",
     "TierReport",
+    "aegis_check_jobs",
     "approval_message",
     "build_ruleset",
     "check_key_custody",
@@ -57,7 +60,6 @@ __all__ = [
     "verify_approval",
     "verify_insight_approval",
     "verify_test_exemption",
-    "workflow_contexts",
 ]
 
 SCHEMA = "aegis.human_gate/v1"
@@ -117,6 +119,12 @@ _EXEMPT_TEST_LINE = re.compile(
 )
 _JOB_ID = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?$")
 _JOB_NAME = re.compile(r"""^    name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^#\n]*?))[ \t]*(?:#.*)?$""")
+_JOB_MATRIX = re.compile(r"^    strategy:.*\bmatrix\b|^      matrix[ \t]*:")
+_RUN = re.compile(r"^([ \t]*)(?:-[ \t]+)?run:[ \t]*(.*)$")
+_AEGIS_CHECK_CI = re.compile(r"(?:\baegis|-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check\b[^\n]*?[ \t]--ci(?![\w-])")
+_PR_EVENT = re.compile(r"""["']?\bpull_request(?:_target)?["']?[ \t]*:[ \t]*""")
+_PATHS_KEY = re.compile(r"""(?:^|[\s{,])["']?paths(?:-ignore)?["']?[ \t]*:""")
+_MAX_WORKFLOW_LINES = 5000
 
 
 class HumanGateError(AegisError):
@@ -622,7 +630,8 @@ def detect_tier(
         or gitsafe.resolve_base_ref(top)
     )
     scope["base"] = base
-    tracked_gov = _tracked_governance_paths(top, base) if base is not None else ()
+    tracked = _tracked_governance_entries(top, base) if base is not None else {}
+    tracked_gov = tuple(tracked)
     codeowners: Dict[str, Any] = {
         "present": False,
         "path": None,
@@ -650,16 +659,13 @@ def detect_tier(
         signers = {"present": blob is not None, "keys": _signer_keys(blob)}
     evidence["codeowners"] = codeowners
     evidence["allowed_signers"] = signers
+    aegis_jobs = _base_aegis_jobs(top, tracked)
+    evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs), "path_filtered": sorted(j for j, f in aegis_jobs.items() if f)}
     custody = check_key_custody(top)
     evidence["key_custody"] = custody.as_dict()
 
     checks = facts["required_status_checks"] if facts else []
-    unpinned = facts["unpinned_status_checks"] if facts else []
-    unpinned_why = (
-        f"the required check(s) {', '.join(unpinned)} have no pinned source (integration_id): anyone with write access, "
-        "including the agent's gh token, can post a passing status; set each check's source to GitHub Actions "
-        f"(app {GITHUB_ACTIONS_APP_ID}) in the ruleset"
-    )
+    unpinned_why, workflow_why = _required_check_gaps(facts, aegis_jobs)
     a_missing: List[str] = []
     if facts is None:
         a_missing.append("the default branch's ruleset was not read")
@@ -675,6 +681,8 @@ def detect_tier(
             )
         if not checks:
             a_missing.append("the default branch has no required status checks")
+        elif workflow_why:
+            a_missing.append(workflow_why)
     if not codeowners["present"]:
         a_missing.append("no CODEOWNERS file on the base branch")
     elif codeowners["uncovered"]:
@@ -691,8 +699,10 @@ def detect_tier(
         b_missing.append("the default branch's ruleset was not read")
     elif not checks:
         b_missing.append("the default branch has no required status checks")
-    elif unpinned:
+    elif unpinned_why:
         b_missing.append(unpinned_why)
+    if workflow_why:
+        b_missing.append(workflow_why)
     if signers["keys"] < 1:
         b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
     if custody.degrades:
@@ -721,17 +731,37 @@ def detect_tier(
         caveats.append(
             "a ruleset can name bypass actors, which this endpoint does not show; classic branch protection is not read at all"
         )
-        if unpinned:
+        if unpinned_why:
             caveats.append(unpinned_why)
-        if facts is not None and facts["required_status_checks"]:
-            caveats.append(
-                "which required checks run Aegis, and that they have no path filter, is not visible from here"
-            )
     if tier == "B":
         caveats.append(
             "required checks run the pull request's own workflow and aegis, so a pull request can edit the check that verifies the signature; tier B holds only while pull requests leave .github/workflows/** and aegis alone"
         )
     return TierReport(tier, tuple(why_not), tuple(caveats), evidence, scope)
+
+
+def _required_check_gaps(
+    facts: Optional[Mapping[str, Any]], aegis_jobs: Mapping[str, bool]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Why a passing required check would not show that Aegis ran in CI: (a source anyone with write
+    access can post as, a required check that is not an Aegis job or whose workflow skips pull requests)."""
+    checks = facts["required_status_checks"] if facts else []
+    unpinned = facts["unpinned_status_checks"] if facts else []
+    source = (
+        f"the required check(s) {', '.join(unpinned)} have no pinned source (integration_id): anyone with write access, "
+        "including the agent's gh token, can post a passing status; set each check's source to GitHub Actions "
+        f"(app {GITHUB_ACTIONS_APP_ID}) in the ruleset"
+    ) if unpinned else None
+    required = [c for c in checks if c in aegis_jobs]
+    if checks and not required:
+        return source, "the required checks do not include the Aegis job: " + (
+            f"require {', '.join(sorted(aegis_jobs))}" if aegis_jobs else
+            "no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix"
+        )
+    if required and all(aegis_jobs[c] for c in required):
+        return source, ("the Aegis workflow filters pull requests by path (paths: or paths-ignore: under "
+                        "on.pull_request), so it does not run on every pull request")
+    return source, None
 
 
 def _blob(top: Path, rev: str, path: str) -> Optional[bytes]:
@@ -748,20 +778,66 @@ def _top(root: Any) -> Path:
     return top
 
 
-def _tracked_governance_paths(workspace: Any, rev: str) -> Tuple[str, ...]:
+def _tracked_governance_entries(workspace: Any, rev: str) -> Dict[str, Tuple[str, str]]:
     top = gitsafe.toplevel(Path(workspace))
     commit = gitsafe.resolve_commit(top, rev) if top else None
     if not top or not commit:
-        return ()
+        return {}
     try:
         entries = gitsafe.tree_blobs(top, commit, include_symlinks=True, timeout=60.0)
     except gitsafe.GitError:
-        return ()
-    return tuple(
-        path
-        for path in entries
-        if governance.category_of(path) is not None
-    )
+        return {}
+    return {path: entry for path, entry in entries.items() if governance.category_of(path) is not None}
+
+
+def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[str, bool]:
+    """{check name of an Aegis job: whether its workflow filters pull requests by path}, read from
+    the base branch's workflow files (GitHub reads no subdirectory and no symlink there)."""
+    workflows = {
+        path: oid
+        for path, (mode, oid) in tracked.items()
+        if posixpath.dirname(path) == ".github/workflows" and path.endswith((".yml", ".yaml")) and mode != "120000"
+    }
+    try:
+        blobs = gitsafe.read_blobs(top, workflows.values())
+    except gitsafe.GitError:
+        return {}
+    jobs: Dict[str, bool] = {}
+    for path in sorted(workflows):
+        text = blobs[workflows[path]].decode("utf-8", "replace")
+        filtered = _filters_pull_requests_by_path(text)
+        for name in aegis_check_jobs(text):
+            jobs[name] = jobs.get(name, False) or filtered
+    return jobs
+
+
+def _filters_pull_requests_by_path(text: str) -> bool:
+    """``paths:`` or ``paths-ignore:`` under ``on.pull_request(_target)``, in block or flow style."""
+    lines = ["" if ln.lstrip().startswith("#") else re.sub(r"[ \t]+#.*$", "", ln)
+             for ln in text.splitlines()[:_MAX_WORKFLOW_LINES]]
+    start = next((i for i, ln in enumerate(lines) if re.match(r"""^["']?on["']?[ \t]*:""", ln)), None)
+    if start is None:
+        return False
+    end = next((i for i in range(start + 1, len(lines)) if lines[i][:1] not in ("", " ", "\t")), len(lines))
+    section = "\n".join(lines[start:end])
+    for event in _PR_EVENT.finditer(section):
+        rest = section[event.end():]
+        if rest.startswith("{"):
+            depth = 0
+            for i, char in enumerate(rest):
+                depth += {"{": 1, "}": -1}.get(char, 0)
+                if depth == 0:
+                    rest = rest[: i + 1]
+                    break
+        else:
+            line_start = section.rfind("\n", 0, event.start()) + 1
+            indent = len(section[line_start:]) - len(section[line_start:].lstrip())
+            first, *more = rest.split("\n")
+            deeper = itertools.takewhile(lambda ln: not ln.strip() or len(ln) - len(ln.lstrip()) > indent, more)
+            rest = "\n".join([first, *deeper])
+        if _PATHS_KEY.search(rest):
+            return True
+    return False
 
 
 def _deleted_tests(top: Path, commit: str, base: str) -> List[bytes]:
@@ -1152,68 +1228,39 @@ def build_ruleset(tier: str, contexts: Iterable[str]) -> Dict[str, Any]:
     }
 
 
-def workflow_contexts(root: Any) -> List[str]:
-    directory = Path(root) / ".github" / "workflows"
-    contexts: List[str] = []
-    try:
-        files = sorted(p for p in directory.iterdir() if p.suffix in (".yml", ".yaml") and p.is_file())
-    except OSError:
-        return contexts
-    for path in files:
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+def aegis_check_jobs(text: str) -> List[str]:
+    """The check names (literal ``name:``, else the job id) of the jobs in one workflow file that run
+    ``aegis check --ci``. A templated name or a matrix gives no fixed check name, so that job is left out."""
+    jobs: Dict[str, List[Any]] = {}
+    job: Optional[List[Any]] = None
+    in_jobs, block = False, None
+    for line in text.splitlines()[:_MAX_WORKFLOW_LINES]:
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        lines = text.splitlines()[:5000]
-        on_match = re.search(r"(?m)^on:[ \t]*(.*(?:\n(?:[ \t]+.*|[ \t]*))*)", text)
-        if on_match and not re.search(r"\b(?:push|pull_request)\b", on_match.group(1)):
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_jobs, job = line.startswith("jobs:"), None
             continue
-        in_jobs = False
-        jobs: List[Dict[str, Any]] = []
-        cur: Optional[Dict[str, Any]] = None
-        for line in lines + ["x:"]:
-            if line.startswith("jobs:"):
-                in_jobs = True
-                continue
-            if in_jobs and line and not line[0].isspace() and not line.startswith("#"):
-                in_jobs = False
-            if not in_jobs:
-                continue
-            found = _JOB_ID.match(line)
-            if found:
-                cur = {
-                    "ctx": found.group(1),
-                    "named": False,
-                    "matrix": False,
-                    "no_pr": False,
-                    "always": False,
-                    "needs": False,
-                }
-                jobs.append(cur)
-                continue
-            if cur is None:
-                continue
-            named_as = _JOB_NAME.match(line)
-            if named_as and not cur["named"]:
-                value = next((g for g in named_as.groups() if g), "")
-                if value and "${{" not in value:
-                    cur["ctx"] = value
-                cur["named"] = True
-            elif re.match(r"^      matrix\s*:", line):
-                cur["matrix"] = True
-            elif re.match(r"^    if\s*:", line):
-                if "!= 'pull_request'" in line or '!= "pull_request"' in line:
-                    cur["no_pr"] = True
-                if "always()" in line:
-                    cur["always"] = True
-            elif re.match(r"^    needs\s*:", line):
-                after = line.split(":", 1)[1].split("#", 1)[0].strip()
-                if after != "[]":
-                    cur["needs"] = True
-        eligible = [j for j in jobs if not j["no_pr"] and not j["matrix"]]
-        agg = [j["ctx"] for j in eligible if j["always"] and j["needs"]]
-        contexts.extend(agg if agg else [j["ctx"] for j in eligible])
-    return contexts
+        found = _JOB_ID.match(line) if in_jobs else None
+        if found:
+            job, block = jobs.setdefault(found.group(1), [found.group(1), False, False]), None
+            continue
+        if job is None:
+            continue
+        if block is not None and indent > block:
+            job[1] = job[1] or bool(_AEGIS_CHECK_CI.search(line))
+            continue
+        block = None
+        named, run = _JOB_NAME.match(line), _RUN.match(line)
+        if named:
+            job[0] = next((g for g in named.groups() if g), "") or job[0]
+        elif _JOB_MATRIX.match(line):
+            job[2] = True
+        elif run and run.group(2)[:1] in ("|", ">"):
+            block = len(run.group(1))
+        elif run:
+            job[1] = job[1] or bool(_AEGIS_CHECK_CI.search(run.group(2)))
+    return [name for name, runs, matrix in jobs.values() if runs and not matrix and "${{" not in name]
 
 
 def ruleset_exists(root: Any, gh: Optional[GhRunner] = None) -> bool:

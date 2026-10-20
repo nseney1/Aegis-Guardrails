@@ -343,10 +343,23 @@ def _print_results(results: List[Dict[str, Any]], backup: Optional[Path]) -> Non
 # ── --github: what the trust tiers need, and --apply ────────────────────────
 
 _PLACEHOLDER_CHECK = "aegis"
+# GitHub names a check after the job's name:, expanded, so only a literal name can be required.
+_NO_AEGIS_JOB = ("no job in .github/workflows runs aegis check --ci under a literal name outside a matrix "
+                 "(a templated name: or a matrix has no fixed check name to require)")
+
+
+def _aegis_jobs(root: Path) -> List[str]:
+    """The Aegis jobs of the working tree's workflows: what a ruleset written now should require."""
+    found: List[str] = []
+    for path in sorted(p for p in (root / ".github" / "workflows").glob("*") if p.suffix in (".yml", ".yaml")):
+        with contextlib.suppress(OSError):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            found += [job for job in human_gate.aegis_check_jobs(text) if job not in found]
+    return found
 
 
 def _github_plan(root: Path, report: Any) -> Dict[str, Any]:
-    found = human_gate.workflow_contexts(root)
+    found = _aegis_jobs(root)
     contexts = found or [_PLACEHOLDER_CHECK]
     owner = (report.evidence.get("repo") or {}).get("full_name") or ""
     handle = "@" + owner.split("/")[0] if "/" in owner else "@OWNER"
@@ -367,10 +380,10 @@ def _print_github(plan: Dict[str, Any], report: Any) -> None:
         print(_doc._clean(line, 4096))
     checks = ", ".join(plan["required_checks"])
     if plan["required_checks_from_workflows"]:
-        print(f"\nRequired status checks (the jobs in .github/workflows; keep the ones that must pass): {checks}")
+        print(f"\nRequired status checks (the jobs in .github/workflows that run aegis check --ci): {checks}")
     else:
-        print(f"\nNo workflow jobs found: the rulesets below name a placeholder check {checks!r}; replace it with "
-              "your Aegis job, and --apply refuses until a workflow exists.")
+        print(f"\nRequired status checks: none found ({_NO_AEGIS_JOB}); the rulesets below name a placeholder "
+              f"check {checks!r}, and --apply refuses until such a job exists.")
     print(f"Each check's source is pinned to GitHub Actions (integration_id {human_gate.GITHUB_ACTIONS_APP_ID}): a status "
           "posted by any other app or token does not satisfy it.")
     for tier, title in (("B", "solo, signed: pull request + required checks, approvals are `aegis approve` signatures"),
@@ -399,8 +412,8 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
                   "interactive y/N answer (--yes does not apply); nothing was changed.", file=sys.stderr)
             return 1
         if not plan["required_checks_from_workflows"]:
-            print("aegis doctor: no workflow jobs found in .github/workflows to require; add the Aegis workflow "
-                  "first. Nothing was changed.", file=sys.stderr)
+            print(f"aegis doctor: {_NO_AEGIS_JOB}; add the Aegis workflow (aegis init --ci) first. Nothing was changed.",
+                  file=sys.stderr)
             return 1
         try:
             exists = human_gate.ruleset_exists(root)

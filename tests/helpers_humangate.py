@@ -201,7 +201,14 @@ def checks_rule(*contexts: str, integration_id: Any = human_gate.GITHUB_ACTIONS_
     """Required checks whose source is pinned to GitHub Actions; ``integration_id=None`` omits the source."""
     source = {} if integration_id is None else {"integration_id": integration_id}
     return {"type": "required_status_checks", "parameters": {
-        "required_status_checks": [{"context": c, **source} for c in (contexts or ("validate",))]}}
+        "required_status_checks": [{"context": c, **source} for c in (contexts or ("aegis-check",))]}}
+
+
+# The Aegis job a required check must name (the scaffold's shape, without a version pin).
+AEGIS_WORKFLOW = (
+    "name: Aegis\non:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n  aegis-check:\n"
+    "    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n      - run: aegis check --ci\n"
+)
 
 
 CODEOWNERS_FULL = (

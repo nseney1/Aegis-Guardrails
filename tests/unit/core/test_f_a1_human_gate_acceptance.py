@@ -472,7 +472,7 @@ def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
 def _doctor_github(repo: hg.Repo, monkeypatch, gh: hg.FakeGh, answers=None, tty=False, workflow=True, **kw):
     from aegis_cli import doctor
     if workflow:
-        repo.write(".github/workflows/ci.yml", "name: CI\non: [push]\njobs:\n  validate:\n    runs-on: ubuntu-latest\n")
+        repo.write(".github/workflows/aegis.yml", hg.AEGIS_WORKFLOW if workflow is True else workflow)
     monkeypatch.setattr(human_gate, "default_gh_runner", gh)
     monkeypatch.setattr(doctor, "_stdin_is_tty", lambda: tty)
     replies = iter(answers or [])
@@ -503,7 +503,7 @@ def test_apply_with_a_terminal_and_a_yes_creates_exactly_the_printed_ruleset(tmp
     assert rc == 0
     ((argv, body),) = gh.posts
     assert argv[:3] == ("api", "--method", "POST") and "rulesets" in argv[3]
-    sent, printed = json.loads(body), human_gate.build_ruleset("B", ["validate"])
+    sent, printed = json.loads(body), human_gate.build_ruleset("B", ["aegis-check"])
     assert sent == printed and sent["enforcement"] == "active" and sent["bypass_actors"] == []
 
 @needs_git
@@ -836,9 +836,24 @@ def test_find_test_exemption_never_takes_the_fix_commit_as_its_own_approval(tmp_
     assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
     assert fix not in seen
 
-def test_repo_workflow_contexts_returns_aggregate_aegis_check():
-    root = Path(__file__).resolve().parents[3]
-    assert human_gate.workflow_contexts(root) == ["aegis-check"]
+@needs_git
+def test_github_json_requires_only_the_scaffold_aegis_job(tmp_path, monkeypatch):
+    from aegis_core import scaffolding
+    repo = hg.make_repo(tmp_path)
+    repo.write(".github/workflows/lint.yml", "name: Lint\non: [pull_request]\njobs:\n  lint:\n    runs-on: ubuntu-latest\n")
+    rc, out, _err = _doctor_github(repo, monkeypatch, hg.FakeGh(), workflow=scaffolding.ci_workflow(), json=True)
+    doc = json.loads(out)
+    assert rc == 0 and doc["github"]["required_checks"] == ["aegis-check"]
+
+
+@needs_git
+def test_apply_refuses_an_aegis_job_whose_name_is_templated(tmp_path, monkeypatch):
+    repo, gh = hg.make_repo(tmp_path), hg.FakeGh()
+    templated = ("name: Aegis\non: [pull_request]\njobs:\n  aegis:\n    name: 'Aegis (${{ github.event_name }})'\n"
+                 "    steps:\n      - run: aegis check --ci\n")
+    rc, out, err = _doctor_github(repo, monkeypatch, gh, answers=["y"], tty=True, workflow=templated, apply=True, tier="B")
+    assert rc != 0 and gh.posts == []
+    assert "literal name" in out + err
 
 # ── 5. the Aegis-Test-Change trailer authorizes nothing ──────────────────────
 
