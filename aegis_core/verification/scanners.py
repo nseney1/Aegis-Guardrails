@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 from dataclasses import dataclass
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -52,6 +53,7 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-f
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0-9+/=]+|\bsha(?:1|256|384|512)-[A-Za-z0-9+/=]{16,})")
 _HASH_FIELD_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:sha1|sha256|sha384|sha512|md5|integrity|checksum|digest|hash|commit|oid|etag|fingerprint)(?:$|[^a-z0-9])")
+_PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 _SUPPRESSION_RE = re.compile(r"#\s*(?:noqa|nosec|gitleaks:allow)\b", re.IGNORECASE)
 
 _NB = r"(?<![A-Za-z0-9])"
@@ -66,7 +68,7 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
     (re.compile(pattern), hook, text) for pattern, hook, text in (
         # The body is optional, so an unterminated header cannot backtrack over the rest.
         (_PEM_HEAD + "(?:(?:[^-]|-(?!-)){0,16384}" + _PEM_TAIL + ")?", "[REDACTED_PEM]", "[REDACTED_PEM]"),
-        # The scheme is optional because Tier A blocks a bare "://user:pass@host" too.
+        # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
         ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
          r"\1[REDACTED]@"),
         (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
@@ -219,10 +221,21 @@ def _is_benign_token(val: str, *, human_text: bool = False) -> bool:
     return placeholder or bool(_UUID_RE.match(val) or _HEX_RE.match(val))
 
 
+def _pem_key_material(lines: list[str], index: int, end: int) -> str | None:
+    """Base64 after a PEM header on its own line (a one-line string with escaped newlines), "" for a
+    base64 line among the next 6 non-blank lines, else None: a bare header is not key material."""
+    same = _PEM_BODY_RE.search(lines[index], end)
+    if same:
+        return same.group(0)
+    window = itertools.islice(filter(None, (lines[i].strip() for i in range(index + 1, len(lines)))), 6)
+    return "" if any(_PEM_BODY_RE.fullmatch(line) for line in window) else None
+
+
 def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bool = False) -> list[Finding]:
     """Scan text for Tier A (blocking) and optionally Tier B/C (advisory) secrets."""
     findings: list[Finding] = []
-    for lineno, raw_line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    for lineno, raw_line in enumerate(lines, 1):
         cleaned = _DATA_URL_OR_SRI_RE.sub('""', raw_line)
         line_secrets: list[str] = []
         matched: list[tuple[str, str, str]] = []
@@ -230,17 +243,23 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
             # The raw line: a known-format token is a secret whatever precedes it. Blanking data-URL
             # payloads only suppresses heuristic (advisory) false positives; the payload may be the token.
             for m in rx.finditer(raw_line):
-                full = m.group(0)
+                full, tier = m.group(0), "gate"
                 if rule_id == "url-basic-auth":
                     user, pwd = m.group(1), m.group(2)
                     if _is_placeholder_text(user) or _is_placeholder_text(pwd) or "$" in user or "$" in pwd:
                         continue
                     line_secrets.extend([full, pwd])
-                elif rule_id != "private-key-pem" and _is_benign_token(full):
+                elif rule_id == "private-key-pem":
+                    material = _pem_key_material(lines, lineno - 1, m.end())
+                    if material is None and not include_advisory:
+                        continue
+                    tier = "gate" if material is not None else "advisory"
+                    line_secrets.extend([full, material] if material else [full])
+                elif _is_benign_token(full):
                     continue
                 else:
                     line_secrets.append(full)
-                matched.append((rule_id, "gate", full))
+                matched.append((rule_id, tier, full))
         if include_advisory and not _HASH_FIELD_RE.search(cleaned):
             for m in _TIER_B_RE.finditer(cleaned):
                 key_name, val = m.group(1), m.group(3)

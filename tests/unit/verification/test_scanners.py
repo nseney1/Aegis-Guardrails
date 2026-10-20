@@ -31,7 +31,8 @@ def _tier_a_samples() -> dict[str, str]:
         "openai-api-key": _tok("sk", "-proj-", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd"),
         "anthropic-api-key": _tok("sk", "-ant-", "api03-AbCdEfGhIjKlMnOpQrStUvWxYz012345"),
         "google-api-key": _tok("AI", "za", "SyD-9876543210abcdefghijklmnopqrstu"),
-        "private-key-pem": _tok("-----BEGIN ", "RSA ", "PRIVATE KEY-----"),
+        # One line with an escaped newline before the key body: a bare header is not key material.
+        "private-key-pem": _tok("-----BEGIN ", "RSA ", "PRIVATE KEY-----", "\\n", "MIIEowIBAAKCAQEA3Tz2mr7SZiAMfQyuvBjM9OiJ"),
         "jwt-three-segment": _tok(
             "eyJ", "hbGciOiJIUzI1NiJ9", ".",
             "eyJ", "zdWIiOiIxMjM0NTY3ODkwIn0", ".",
@@ -286,6 +287,54 @@ class TestPlaceholderSuppressionIsWordAware:
     def test_glued_tier_a_placeholders_stay_suppressed(self):
         lines = [_tok("k = '", "AK", "IA", "TESTTESTTESTTEST'"), _tok("k = '", "AK", "IA", "IOSFODNN7EXAMPLE'")]
         assert scanners.scan_secrets_text("\n".join(lines), include_advisory=True) == []
+
+
+_REPO = Path(__file__).resolve().parents[3]
+
+
+class TestPemNeedsKeyMaterial:
+    """R-checks-a2: a PEM header gates only with key material after it (on the same line, or on one
+    of the next 6 non-blank lines); a bare mention stays visible as an advisory."""
+
+    HEADER = _tok("-----BEGIN ", "OPENSSH ", "PRIVATE KEY-----")
+    BODY = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7" + "x" * 12, "Ab3" * 21 + "Z", "Zq9/" * 16]
+
+    def _gate(self, text):
+        return [(f.rule_id, f.line) for f in scanners.scan_secrets_text(text) if f.tier == "gate"]
+
+    def test_a_header_in_a_comparison_does_not_gate(self):
+        text = f'if b"{self.HEADER}" in data:\n    body = data.split(b"{self.HEADER}", 1)[1]\n'
+        assert self._gate(text) == []
+        advisory = scanners.scan_secrets_text(text, include_advisory=True)
+        assert [(f.rule_id, f.tier, f.line) for f in advisory] == [
+            ("private-key-pem", "advisory", 1), ("private-key-pem", "advisory", 2)]
+
+    def test_a_pem_block_gates_once_at_its_header_without_showing_the_body(self):
+        end = _tok("-----END ", "OPENSSH ", "PRIVATE KEY-----")
+        findings = scanners.scan_secrets_text("\n".join(["key:", self.HEADER, *self.BODY, end]))
+        assert [(f.rule_id, f.tier, f.line) for f in findings] == [("private-key-pem", "gate", 2)]
+        assert not any(b in json.dumps(findings[0].as_dict()) for b in self.BODY)
+
+    def test_encryption_headers_and_a_blank_line_before_the_body_still_gate(self):
+        text = "\n".join([self.HEADER, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0123456789ABCDEF", "", *self.BODY])
+        assert self._gate(text) == [("private-key-pem", 1)]
+
+    def test_a_one_line_string_with_escaped_newlines_gates(self):
+        line = _tok('KEY = "', "-----BEGIN ", "PRIVATE KEY-----", "\\n", self.BODY[0], "\\n", "-----END ", 'PRIVATE KEY-----"')
+        findings = scanners.scan_secrets_text(line)
+        assert [(f.rule_id, f.tier) for f in findings] == [("private-key-pem", "gate")]
+        assert self.BODY[0] not in json.dumps(findings[0].as_dict())
+
+    @pytest.mark.parametrize("after", [[], ["see the docs for how to rotate it"], ["# note"] * 7],
+                             ids=["last-line", "prose", "beyond-window"])
+    def test_a_header_without_key_material_in_its_window_does_not_gate(self, after):
+        assert self._gate("\n".join([self.HEADER, *after, *(self.BODY if after == ["# note"] * 7 else [])])) == []
+
+    def test_the_shipped_packages_have_no_gate_finding(self):
+        found = [(f.path, f.line, f.rule_id) for pkg in ("aegis_core", "aegis_cli", "aegis_mcp")
+                 for path in sorted((_REPO / pkg).rglob("*.py"))
+                 for f in scanners.scan_secrets_file(path, repo_root=_REPO) if f.tier == "gate"]
+        assert found == []
 
 
 class TestTierBAndTierCAdvisory:
