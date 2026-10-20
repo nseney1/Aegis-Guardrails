@@ -15,10 +15,11 @@ is a Python interpreter runs under that interpreter when the word is an absolute
 the interpreter that runs Aegis; a first word ``pytest`` (or ``py.test``, any path) runs as
 ``python -m pytest`` under the interpreter that runs Aegis. Either way the interpreter gets
 ``-s --check-hash-based-pycs always`` (its own site dirs stay visible, the user site does not), and
-a pytest run also gets ``-p no:cacheprovider -o addopts=`` and a JUnit file. Everything runs with a fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a
-redirected ``HOME``), no stdin, closed descriptors and a process-group timeout; on POSIX the group is
-killed when the run ends, so nothing it left behind keeps writing. On Windows the group is killed
-while the run is alive; descendants a test run leaves behind after a normal exit are not swept.
+a pytest run also gets ``-p no:cacheprovider -o addopts=`` and a JUnit file. Everything runs with a
+fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a redirected ``HOME``), no stdin, closed
+descriptors and a process-group timeout; on POSIX the group is killed when the run ends, so nothing
+it left behind keeps writing. On Windows the group is killed while the run is alive; descendants a
+test run leaves behind after a normal exit are not swept.
 
 ``exit 5`` (no tests collected) and ``passed == 0`` are never evidence, and neither is a run that
 timed out or a Layer 1 finding.
