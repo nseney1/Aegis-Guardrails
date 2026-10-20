@@ -377,6 +377,9 @@ def record_adjudication(
     summary: Optional[str] = None, file: Optional[str] = None, line: Optional[int] = None,
     snippet: Optional[str] = None, session: Optional[str] = None, repo: Optional[str] = None, ts: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Append a ledger ``adjudication`` row. Fitness reads such rows and never counts them (any
+    writer can append one); a label counts only as git content merged at the reviewed BASE
+    (``aegis rule adjudicate`` and aegis_core.adjudication)."""
     norm_verdict = _RESULT.get(verdict, verdict)
     if norm_verdict not in ("tp", "fp"):
         raise ValueError(f"adjudication verdict must be 'tp' or 'fp', got {verdict!r}")

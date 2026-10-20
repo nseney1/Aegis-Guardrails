@@ -278,6 +278,7 @@ def _read_session_expiry_config(workspace: Any) -> Tuple[float, float]:
 
 def _collect_t4_events_for_rules(
     workspace: Any, rules: Sequence[Any], now: Optional[datetime] = None, *, proj_credits: Any = None,
+    adjudications: Any = None,
 ) -> Dict[str, Dict[str, Any]]:
     from aegis_core import credit
     from aegis_core.errors import PathTraversalError
@@ -293,7 +294,6 @@ def _collect_t4_events_for_rules(
             "contested": 0,
             "sessions": set(),
             "repos": set(),
-            "timestamps": [],
             "samples": [],
             "post_reinforce_exposures": {},
             "last_ts": None,
@@ -327,30 +327,6 @@ def _collect_t4_events_for_rules(
             b["post_reinforce_exposures"] = {}
             if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
                 b["last_ts"] = ts
-        elif ev == "adjudication":
-            verdict = raw.get("verdict")
-            if verdict == "tp":
-                b["adjudicated_tp"] += 1
-                b["post_reinforce_exposures"] = {}
-            elif verdict == "fp":
-                b["adjudicated_fp"] += 1
-            if raw.get("session"):
-                b["sessions"].add(str(raw["session"]))
-            if raw.get("repo"):
-                b["repos"].add(str(raw["repo"]))
-            if isinstance(ts, str) and ts:
-                b["timestamps"].append(ts)
-                if b["last_ts"] is None or ts > b["last_ts"]:
-                    b["last_ts"] = ts
-            if len(b["samples"]) < 3:
-                b["samples"].append({
-                    "kind": "adjudication",
-                    "verdict": verdict,
-                    "ref": raw.get("ref"),
-                    "file": raw.get("file"),
-                    "line": raw.get("line"),
-                    "summary": raw.get("summary") or raw.get("snippet") or "",
-                })
         elif ev == "detection":
             disp = str(raw.get("disposition") or "")
             # One unit per introducing commit (the PR), as replay and credit.record_detection key it.
@@ -394,24 +370,41 @@ def _collect_t4_events_for_rules(
             b["contested"] += 1
         elif ev == "exposure" and raw.get("session"):
             hb_ok = raw.get("heartbeat") is not False and raw.get("heartbeat_alive") is not False
-            b["post_reinforce_exposures"].setdefault(str(raw["session"]), []).append((hb_ok, raw.get("scope_basis")))
+            b["post_reinforce_exposures"].setdefault(str(raw["session"]), []).append((hb_ok, raw.get("scope_basis"), seen_at))
+        # A ledger "adjudication" row is read and never counted: any writer can append one. Labels
+        # count only as git content at the reviewed BASE (aegis_core.adjudication, R-evidence-3).
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
+    labels_by_rule = getattr(adjudications, "by_rule", None) or {}
     for rid, b in info.items():
         rule_obj = rule_map[rid]
+        stamps: List[datetime] = []
+        reinforced: Optional[datetime] = None
+        label_samples: List[Dict[str, Any]] = []
+        for label in labels_by_rule.get(rid, ()):
+            b["adjudicated_tp" if label["verdict"] == "tp" else "adjudicated_fp"] += 1
+            b["sessions"].update([label["session"]] if label.get("session") else [])
+            b["repos"].update([label["repo"]] if label.get("repo") else [])
+            stamp = _parse_ts(label.get("ts"))
+            if stamp is not None:
+                stamps.append(stamp)
+                if label["verdict"] == "tp" and (reinforced is None or stamp > reinforced):
+                    reinforced = stamp
+            if len(label_samples) < 3:
+                label_samples.append({"kind": "adjudication", "verdict": label["verdict"], "ref": label.get("ref"),
+                                      "file": label.get("file"), "line": label.get("line"), "summary": label.get("summary") or ""})
+        b["samples"] = (label_samples + b["samples"])[:3]
         scoped_or_trap = bool(getattr(rule_obj, "target_paths", None)) or getattr(rule_obj, "type", "") == "trap"
+        # A merged tp label reinforces the rule as of its ts: only exposures after it decay it.
+        windows = [[r for r in records if reinforced is None or (r[2] is not None and r[2] > reinforced)]
+                   for records in b["post_reinforce_exposures"].values()]
         b["eligible_sessions"] = sum(
-            1 for records in b["post_reinforce_exposures"].values()
-            if all(hb for hb, _ in records) and (not scoped_or_trap or all(sb in (None, "", "match") for _, sb in records))
+            1 for records in windows
+            if records and all(hb for hb, _, _ in records)
+            and (not scoped_or_trap or all(sb in (None, "", "match") for _, sb, _ in records))
         )
-        created_raw = (getattr(rule_obj, "meta", {}) or {}).get("created")
-        parsed_created = (
-            _parse_ts(created_raw if "T" in created_raw else f"{created_raw}T00:00:00Z")
-            if isinstance(created_raw, str) and created_raw
-            else None
-        )
-        b["days_span"] = max(0.0, (moment - parsed_created).total_seconds() / 86400.0) if parsed_created else 0.0
+        b["days_span"] = (max(stamps) - min(stamps)).total_seconds() / 86400.0 if stamps else 0.0
         # Trigger volume is measured from the ledger, never from branch-editable frontmatter (H6).
         b["observed_days"] = (moment - b["first_seen"]).total_seconds() / 86400.0 if b["first_seen"] else None
     return info
@@ -419,8 +412,12 @@ def _collect_t4_events_for_rules(
 
 def for_rules(
     workspace: Any, rules: Iterable[Any], now: Optional[datetime] = None, view: Any = None, *, verify_ci: bool = False,
+    adjudications: Any = None,
 ) -> Dict[str, Fitness]:
-    from aegis_core import credit
+    """Fitness per rule from the ledger, CI-confirmed credit and the labels merged at the reviewed
+    BASE (``adjudications``: read with ``adjudication.read_adjudications`` unless given; scan
+    passes an empty set so it spawns no git for them)."""
+    from aegis_core import adjudication, credit
     from aegis_core.config import ConfigError, RepoConfig
     from aegis_core.telemetry_engine import ledger
     rule_list = list(rules)
@@ -443,7 +440,8 @@ def for_rules(
             seen_keys.add((k, rid))
         combined_rows.append(r)
     totals = ledger.aggregate_rows(combined_rows)
-    t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=proj_credits)
+    labels = adjudications if adjudications is not None else adjudication.read_adjudications(workspace)
+    t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=proj_credits, adjudications=labels)
     out: Dict[str, Fitness] = {}
     for rule in rule_list:
         rid = rule.id

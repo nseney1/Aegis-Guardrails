@@ -12,6 +12,7 @@ from aegis_core import governance
     (".aegis/config.json", "aegis-state"),
     (".aegis/team.json", "aegis-state"),
     (".aegis/baseline.json", "aegis-state"),
+    (".aegis/adjudications/trap-x.jsonl", "aegis-state"),  # labels count only once merged (R-evidence-3)
     ("allowed_signers", "signers"),
     ("CODEOWNERS", "signers"),
     (".github/CODEOWNERS", "signers"),
@@ -41,6 +42,7 @@ def test_each_member_of_the_set_has_its_category(path, category):
     ".aegis/rulesx/a.md",
     ".aegisx/config.json",
     ".aegis/proposals/p.md",
+    ".aegis/adjudicationsx/x.jsonl",
     "docs/guide.md",
     "src/conftest_helper.py",
     "allowed_signers_notes.txt",
@@ -95,8 +97,9 @@ def test_a_path_with_dot_segments_does_not_escape_the_table():
     ("a/b/.aegis/baseline.json", "aegis-state"),
     ("pkg/.aegis/config.json", "aegis-state"),
     ("pkg/.aegis/team.json", "aegis-state"),
+    ("pkg/.aegis/adjudications/x.jsonl", "aegis-state"),
     (".AEGIS/Rules/X.md", "rules"),
-], ids=["rules", "baseline", "config", "team", "folded"])
+], ids=["rules", "baseline", "config", "team", "labels", "folded"])
 def test_a_nested_workspace_aegis_directory_is_governance_wherever_it_sits(path, category):
     assert governance.category_of(path) == category
 
@@ -153,3 +156,26 @@ def test_a_name_that_only_resembles_a_runner_module_is_outside(path):
 
 def test_the_runner_modules_are_named():
     assert governance.RUNNER_MODULES == ("pytest", "_pytest", "pluggy", "py", "iniconfig")
+
+
+@pytest.mark.skipif(not __import__("shutil").which("git"), reason="needs git")
+def test_the_label_pattern_leaves_an_approval_hash_without_label_files_unchanged(tmp_path, monkeypatch):
+    """U8 (R-evidence-3): ``governance_tree_hash`` hashes existing matches only, so adding
+    ``.aegis/adjudications/**`` keeps every 4.3 ``Aegis-Approve`` hash of a tree without labels."""
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(tmp_path / "home"))
+    repo = hg.make_repo(tmp_path)
+    plain = repo.head()
+    repo.write(".aegis/adjudications/trap-sample.jsonl", '{"example_id": "e1", "verdict": "tp"}\n')
+    labelled = repo.commit("labels")
+
+    with_pattern = (human_gate.governance_tree_hash(repo.root, plain), human_gate.governance_tree_hash(repo.root, labelled))
+    old_table = tuple((name, tuple(p for p in pats if "adjudications" not in p)) for name, pats in governance._FOLDED)
+    monkeypatch.setattr(governance, "_FOLDED", old_table)
+    without_pattern = (human_gate.governance_tree_hash(repo.root, plain), human_gate.governance_tree_hash(repo.root, labelled))
+
+    assert with_pattern[0] == without_pattern[0]
+    assert with_pattern[1] != without_pattern[1] and without_pattern[1] == without_pattern[0]

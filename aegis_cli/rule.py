@@ -723,7 +723,7 @@ class RuleCommand(AegisCommand):
         p_ins_en.add_argument("--excerpts", action="store_true", default=False,
                               help="Also store redacted <=300 char excerpts on correction cues (default: counters/heartbeats only)")
 
-        p_adj = sub.add_parser("adjudicate", parents=[common], help="Record a human adjudication verdict (tp or fp) for a rule")
+        p_adj = sub.add_parser("adjudicate", parents=[common], help=_ADJUDICATE_HELP, description=_ADJUDICATE_DESCRIPTION)
         p_adj.add_argument("rule_id", metavar="RULE_ID", help="Rule identifier to adjudicate")
         p_adj.add_argument("verdict", choices=["tp", "fp"], metavar="VERDICT", help="Adjudication verdict (tp or fp)")
         p_adj.add_argument("--ref", default=None, help="Optional commit SHA, PR number, or issue reference")
@@ -737,22 +737,44 @@ class RuleCommand(AegisCommand):
         return run_rule(args)
 
 
+_ADJUDICATE_HELP = "Record an adjudication label (tp or fp) in .aegis/adjudications/; it counts after it is merged to the base branch"
+_ADJUDICATE_DESCRIPTION = ("Append a tp or fp label for a rule to .aegis/adjudications/<rule-id>.jsonl. The label counts "
+                           "toward the rule's fitness only after a reviewed pull request merges it to the base branch.")
+
+
 def _run_adjudicate(args: argparse.Namespace) -> int:
-    from aegis_core import credit
+    import hashlib
+
+    from aegis_core.adjudication import ADJUDICATIONS_DIR, RULE_ID
+    from aegis_core.errors import AegisError
+    from aegis_core.storage import append_jsonl
+
+    rule_id = str(args.rule_id)
+    if not RULE_ID.fullmatch(rule_id):
+        return _emit_error(args, f"invalid rule id {sanitize_display(rule_id, 80)!r}: use letters, digits, '.', '_' or '-' (at most 128)")
     root = _resolve_workspace_root(args)
+    directory = root.joinpath(*ADJUDICATIONS_DIR.split("/"))
+    if directory.is_symlink() or directory.parent.is_symlink():
+        return _emit_error(args, f"{ADJUDICATIONS_DIR} is a symlink; refusing to write a label through it")
+    ref, file, line, summary = (getattr(args, k, None) for k in ("ref", "file", "line", "summary"))
+    example = ref or hashlib.sha256(f"{rule_id}|{file or ''}|{'' if line is None else line}|{summary or ''}".encode("utf-8")).hexdigest()[:16]
+    row: Dict[str, Any] = {"example_id": str(example), "verdict": str(args.verdict),
+                           "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    for key in ("ref", "summary", "file", "session", "repo"):
+        if getattr(args, key, None) is not None:
+            row[key] = str(getattr(args, key))
+    if line is not None:
+        row["line"] = int(line)
+    rel = f"{ADJUDICATIONS_DIR}/{rule_id}.jsonl"
     try:
-        row = credit.record_adjudication(
-            root, str(args.rule_id), str(args.verdict), adjudicator="human",
-            ref=getattr(args, "ref", None), summary=getattr(args, "summary", None),
-            file=getattr(args, "file", None), line=getattr(args, "line", None),
-            session=getattr(args, "session", None), repo=getattr(args, "repo", None),
-        )
-    except Exception as exc:
-        return _emit_error(args, str(exc))
+        append_jsonl(directory / f"{rule_id}.jsonl", [row])
+    except (OSError, AegisError) as exc:
+        return _emit_error(args, f"cannot write {rel}: {exc}")
     if getattr(args, "json", False):
-        print(json.dumps(row, indent=2))
+        print(json.dumps({"status": "recorded", "rule": rule_id, "path": rel, "label": row}, indent=2))
     else:
-        print(f"Recorded adjudication ({row['verdict']}) for {row['rule']}")
+        print(f"Recorded a {row['verdict']} label for {sanitize_display(rule_id)} in {rel}; "
+              "it counts after it is merged to the base branch")
     return 0
 
 

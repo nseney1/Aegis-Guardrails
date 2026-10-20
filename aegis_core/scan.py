@@ -32,6 +32,7 @@ from pathlib import Path, PurePath
 import posixpath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import rule_integrity
@@ -335,8 +336,9 @@ def scan(
     # Workspace-relative, each file once, as every other surface matches them.
     files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
     stale = stale_rules(ruleset, read_derived(workspace))
-    return _select(ruleset, files, budget, token_budget, stale, lambda served: for_rules(workspace, served),
-                   _integrity_extras(view))
+    # Labels are read only by decision callers: scan ranks without them and spawns no git for them.
+    return _select(ruleset, files, budget, token_budget, stale,
+                   lambda served: for_rules(workspace, served, adjudications=Adjudications()), _integrity_extras(view))
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.
