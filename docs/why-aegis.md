@@ -147,7 +147,7 @@ flowchart LR
 
 ## 6. v4.3 trust and evidence: label locally, confirm externally, approve humanly
 
-v4.0 removed claims v3 could not back. v4.3 (ADR 0006, [SECURITY.md](../SECURITY.md#trust-tiers)) makes them verifiable rather than dropping them. Its principle is **label locally, confirm externally, approve humanly**: Aegis labels what it observes on the developer's machine (`witness: aegis`), CI on the exact commit confirms outcomes, and approvals the agent cannot produce (a non-author PR review at Tier A, or an `aegis approve` commit signed by a key in the base branch's `allowed_signers` at Tier B) gate governance changes. `aegis doctor` detects the repository's trust tier (`A`, `B` or `C` self-attested) read-only and prints it on every report.
+v4.0 removed claims v3 could not back. v4.3 (ADR 0006, [SECURITY.md](../SECURITY.md#trust-tiers)) makes them verifiable rather than dropping them. Its principle is **label locally, confirm externally, approve humanly**: Aegis labels what it observes on the developer's machine (`witness: aegis`), CI on the exact commit confirms outcomes, and approvals the agent cannot produce (a non-author PR review at Tier A, or an `aegis approve` commit signed by a key in the base branch's `allowed_signers` at Tier B, which holds only while the pull request leaves `.github/workflows/**` and aegis alone) gate governance changes. `aegis doctor` detects the repository's trust tier (`A`, `B` or `C` self-attested) read-only and prints it on every report.
 
 | Component (v4.3) | Replaces | What holds (and at which tier) |
 |---|---|---|

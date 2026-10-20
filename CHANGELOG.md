@@ -14,6 +14,10 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - **Publishing runs only on a published release.** `publish.yml` has no manual trigger, and a `guard` job checks that the ref is the tag, that the tag is `v` + the package version and that the tag's commit is the commit being built. Before uploading, the job reads PyPI: it uploads only the files PyPI lacks, succeeds when PyPI already holds identical files, and fails without uploading on a digest mismatch or when PyPI cannot be read. A failed release is re-run with "Re-run failed jobs".
 - **CI-confirmed credit can no longer be steered from the ledger or local refs.** Confirmation reads the required workflow the caller names and the default branch GitHub reports; a `ci` row naming another workflow, or a locally repointed `origin/HEAD`, no longer confirms credit. The repository identity still comes from the local `remote.origin.url`.
 - **The agent no longer chooses the sign or scope of its own credit.** A `failure` or `fp` report on a CI-confirmed check is a neutral trigger, never a false positive; only a `success` report on a passed check earns a true positive. `aegis_report_outcome` credits only rules this server process's own scans showed; exposure rows written into the ledger no longer widen the credited set.
+- **PGP and X.509 approvals are refused.** Approvals, test exemptions and insight approvals verify only as SSH signatures against the base branch's `allowed_signers`; a PGP or X.509 signature returns `bad_signature`. Every git command Aegis runs sets `log.showSignature=false` and points `gpg.program`, `gpg.openpgp.program` and `gpg.x509.program` at the null device, so no signature program named in repository or user git config starts. Existing SSH approvals still verify: the approval hash is unchanged.
+- **The prepare-commit-msg hook no longer runs repository trailer commands.** It adds its `Aegis-Check` trailer without reading the repository's git config, so a repository `trailer.<alias>.cmd` or `.command` no longer runs during `git commit` (a trailer command in your user or system config still runs, as for any git command).
+- **Windows path containment.** The fallback tree export (`aegis check --record`, the regression check) skips entries with a drive or stream component (`D:x`, `x:stream`) and checks that every joined path stays below the snapshot; rule ids containing `:` are rejected on Windows. Nothing changes on POSIX.
+- **Tier B is reported honestly.** At tier B the required checks run the pull request's own workflow, so SECURITY.md's truth table no longer ticks Tier B for human-approved weakenings (partial), CI-confirmed credit (as Tier C) or release attestation (✘), and `aegis doctor --release` reports tier B as `agent_editable` and exits non-zero instead of printing `VERIFIED`. Credit's attestation fallback no longer confirms credit at tier B.
 
 ### Changed behaviour
 
@@ -30,6 +34,9 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `aegis sync` and the promote, demote and archive decisions make one extra read-only `gh api repos/{owner}/{repo}` call per process to read the default branch; if GitHub cannot name it, the credit stays landed and the evidence is reported unavailable.
 - `~/.aegis/config.json` has one reader for `tests.command`, `rules.base_ref`, `perf.command` and `regression.*`: a config whose `v` is not 1 is ignored by all four, `perf.command` is honoured in a BOM-prefixed file and capped at 64 KiB, an unsplittable `perf.command` is ignored instead of crashing the perf check, and those four keys no longer trigger the unknown-key warning.
 - `VerificationPipeline.run` and `DeterministicVerifier.verify` called without `changed_files` outside a git work tree (or when git fails) raise `ValueError` instead of returning a clean pass.
+- PGP and X.509 approvals are refused (see Security); re-sign governance changes with an SSH key.
+- `aegis doctor --release` at tier B reports `agent_editable` and exits non-zero (see Security).
+- The fallback tree export refuses `''`, `.` and `..` path parts, so `a//b`, `a/./b` and `a/x/../b` are skipped instead of normalised; git trees never contain them.
 
 ### Fixed
 
@@ -38,6 +45,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `aegis_scan` called with `files: []` records its git-diff scan, so the scan-before-edit hook and `aegis status --compliance` see it; `aegis_report_outcome` computes the work tree once per report.
 - Hook insights recorded from a subdirectory (or with `CLAUDE_PROJECT_DIR` set) land in the governed workspace's insights file, so `aegis rule insight review` sees them. Files already written under subdirectory ids are not migrated.
 - Layer 2 risk text from the model, and the `Layer 2 failed` and test-discovery error lines, print as one sanitized line of at most 300 characters.
+- `gitsafe.list_files` is documented as returning workspace-relative paths, which it always did.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 

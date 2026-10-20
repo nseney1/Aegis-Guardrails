@@ -48,8 +48,8 @@ terminal: ``--yes`` and ``--json`` never apply, and a ruleset of the same name i
 touched. ``--release SHA`` (aegis_core.release_verify) asks ``gh attestation verify`` whether the
 CI verdict job attested that exact commit, pinning repository, workflow, digest and ref; a gh
 that is missing or older than 2.93.0 prints ``UNVERIFIED (gh >= 2.93.0 required)`` and exits
-non-zero, and at tier C the report says "attestation present, but the workflow is agent-editable"
-and exits non-zero too (the release claim needs tier A or B).
+non-zero, and at tiers B and C the report says the workflow is agent-editable and exits non-zero too
+(the release claim needs tier A).
 
 Each row lists the ``surfaces`` its config plane covers (CLI, IDE extension, desktop app).
 A row whose host table entry is unverified (``verified_row`` false: Cursor, Copilot, Kiro,
