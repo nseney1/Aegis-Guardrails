@@ -318,6 +318,51 @@ def tokenize_command(cmd: str) -> list[str]:
     return list(lex)
 
 
+_COMMENT_CONTEXTS = ("", "(", "$(")  # where a word starting with # is a comment
+_WORD_BREAKS = " \t\n;&|()"
+
+
+def strip_shell_comments(cmd: str) -> str:
+    """``cmd`` without its shell comments, so a quote inside one (``# it's``) cannot
+    unbalance the lexer. A ``#`` starts a comment only where a word starts, outside
+    quotes, backticks and ``${...}`` (``a#b``, ``$#``, ``${#x}``, ``"a # b"`` stay);
+    the comment runs up to, not including, its newline, which still ends the command.
+    Unbalanced quotes are left for the lexer to fail on."""
+    if "#" not in cmd:
+        return cmd
+    out: List[str] = []
+    stack: List[str] = []  # open ' $' " ` ( $( ${
+    word_start = True
+    index = 0
+    while index < len(cmd):
+        char, pair = cmd[index], cmd[index:index + 2]
+        top = stack[-1] if stack else ""
+        step = 1
+        if top in ("'", "$'"):
+            if char == "\\" and top == "$'":
+                step = 2
+            elif char == "'":
+                stack.pop()
+        elif char == "\\":
+            step = 2
+        elif char == "#" and word_start and top in _COMMENT_CONTEXTS:
+            end = cmd.find("\n", index)
+            index = len(cmd) if end == -1 else end
+            continue
+        elif pair in ("$(", "${") or (pair == "$'" and top != '"'):
+            stack.append(pair)
+            step = 2
+        elif (char == top and char in "\"`") or (char == "}" and top == "${") or (char == ")" and top in ("(", "$(")):
+            stack.pop()
+        elif char == "`" or (top != '"' and char in "'\"("):
+            stack.append(char)
+        out.append(cmd[index:index + step])
+        if pair != "\\\n":  # a line continuation joins the words around it
+            word_start = char in _WORD_BREAKS or pair == "$("
+        index += step
+    return "".join(out)
+
+
 def decompose_command(tokens: list[str]) -> list[Pipeline]:
     """Split token stream into Pipelines by sequence delimiters (; , &&, ||, &, newline)."""
     seq_delims = {";", "&&", "||", "&", "\n", "\r", "\r\n"}
@@ -1161,7 +1206,7 @@ def _reader_stages(line: str, command_start: int, operator: int) -> List[Command
     (``cat <<EOF | bash``)."""
     for text in (line[command_start:], line[command_start:operator]):
         try:
-            pipelines = decompose_command(tokenize_command(text))
+            pipelines = decompose_command(tokenize_command(strip_shell_comments(text)))
         except ValueError:  # an unbalanced quote that closes on a later line
             continue
         return pipelines[0].stages if pipelines else []
@@ -1357,6 +1402,7 @@ def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
     if depth >= MAX_DEPTH:
         return False
     text, scripts = _split_heredocs(cmd)
+    text = strip_shell_comments(text)  # after the split: a body apostrophe is not a quote
     try:
         tokens = tokenize_command(text)
     except ValueError:
@@ -1411,6 +1457,7 @@ __all__ = [
     "decompose_command",
     "extract_subshell_commands",
     "split_heredocs",
+    "strip_shell_comments",
     "tokenize_command",
     "unwrap_command_stage",
     "REASON_CHMOD_777",
