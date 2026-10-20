@@ -265,6 +265,8 @@ _CHAIN = " ".join(f"-c alias.a{i}=a{i + 1}" for i in range(20))
     ("PVAL='push -f' git --config-env=alias.p=PVAL p", "git-push-force"),
     ("PVAL='push -f' git --config-env alias.p=PVAL p", "git-push-force"),
     ("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push -f' git p", "git-push-force"),
+    ("GIT_CONFIG_PARAMETERS=\"'alias.p=push -f'\" git p", "git-push-force"),
+    ("GIT_CONFIG_PARAMETERS=\"'user.name'='x' 'alias.p'='reset --hard'\" git p", "git-reset-hard"),
     ("git -c alias.reset=status reset --hard", "git-reset-hard"),
 ], ids=lambda value: value[:40] if value.startswith(("git", "sudo", "bash", "PVAL", "GIT_")) else "")
 def test_a_command_line_git_alias_is_judged_by_its_expansion(command, rule):

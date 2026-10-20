@@ -725,6 +725,8 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
     for f in flags:
         if f in ("-c", "--exec-path", "--config-env") or f.startswith(("--exec-path=", "--config-env=")):
             return SafetyEvaluation(True, REASON_GIT_CONFIG)
+    if any(var.startswith("GIT_CONFIG") and var != "GIT_CONFIG_NOSYSTEM" for var in cmd.env_vars):
+        return SafetyEvaluation(True, REASON_GIT_CONFIG)
 
     sub = cmd.subcommand
     if not sub:
@@ -1351,9 +1353,13 @@ split_heredocs = _split_heredocs
 
 def _git_aliases(cmd: UnwrappedCommand) -> Dict[str, str]:
     """The aliases a git invocation defines for itself (``-c alias.NAME=VALUE``,
-    ``--config-env alias.NAME=VAR``, ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``), by
-    lowercase name: git compares config names without case."""
+    ``--config-env alias.NAME=VAR``, ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``,
+    ``GIT_CONFIG_PARAMETERS``), by lowercase name: git compares config names without case."""
     settings: List[str] = []
+    try:  # 'key'='value' or 'key=value' words, which shlex joins into key=value
+        settings.extend(shlex.split(cmd.env_vars.get("GIT_CONFIG_PARAMETERS", "")))
+    except ValueError:
+        pass
     following = cmd.flags[1:] + [""]
     for flag, after in zip(cmd.flags, following):
         if flag == "-c":

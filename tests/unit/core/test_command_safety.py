@@ -397,3 +397,18 @@ def test_the_analyzer_asks_for_dd_writing_a_device_without_if(cmd):
 @pytest.mark.parametrize("cmd", ["dd of=/dev//null", "yes | dd of=out.img", "dd of=//dev/shm/x"])
 def test_the_analyzer_allows_dd_writing_a_harmless_target_without_if(cmd):
     assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)
+
+
+# ── R-checks-3 gate parity: inline git configuration through the environment ──
+
+@pytest.mark.parametrize("cmd", [
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push -f' git p",
+    "GIT_CONFIG_PARAMETERS=\"'alias.p=push -f'\" git p",
+    "env GIT_CONFIG_GLOBAL=/tmp/evil git p",
+])
+def test_the_analyzer_asks_on_git_configuration_given_through_the_environment(cmd):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(True, REASON_GIT_CONFIG)
+
+
+def test_the_analyzer_allows_git_without_system_config():
+    assert CommandAnalyzer.evaluate("GIT_CONFIG_NOSYSTEM=1 git status") == SafetyEvaluation(False)
