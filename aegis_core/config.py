@@ -236,7 +236,8 @@ class RepoConfig:
     warnings: Tuple[str, ...] = ()
 
     def expiry_for(self, rule_type: Optional[str]) -> Optional[int]:
-        """Days a rule of ``rule_type`` lasts without a trigger; None means it never expires."""
+        """Days a rule of ``rule_type`` lasted without a trigger (None: never). Parsed for N-1 configs
+        and inert since 4.4: fitness decays by exposed sessions, never by calendar days (R-evidence-15)."""
         if rule_type and rule_type in self.expiry_per_type:
             return self.expiry_per_type[rule_type]
         return self.expiry_days

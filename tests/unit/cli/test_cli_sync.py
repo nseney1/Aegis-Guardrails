@@ -204,3 +204,17 @@ def test_apply_moves_only_the_rule_with_min_n_verdicts(tmp_path, monkeypatch, ca
     assert [(a["rule"], a["action"], a["status"]) for a in applied] == [("trap-enough", "archive", "archived")]
     assert (root / ".aegis" / "rules" / "traps" / "trap-three.md").is_file()
     assert (root / ".aegis" / "rules" / "invariants" / "invariant-three.md").is_file()
+
+
+def test_sync_names_the_inert_day_expiry_once(ws, capsys):
+    """R-evidence-15: `expiry.days`/`per_type` still load, change no fitness, and sync says so once."""
+    assert main(["sync"]) == 0
+    assert "no longer change fitness" not in capsys.readouterr().out
+
+    (ws / ".aegis" / "config.json").write_text(json.dumps({"v": 1, "expiry": {"days": 7}}), encoding="utf-8")
+    assert main(["sync"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("expiry.days and expiry.per_type in .aegis/config.json no longer change fitness") == 1
+    assert main(["sync", "--json"]) == 0
+    rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)["rules"]}
+    assert rows["trap-good"]["fitness"] > 0.85  # 25 tp with no calendar decay

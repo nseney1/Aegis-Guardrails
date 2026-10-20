@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import stats as _stats
+from aegis_core.config import DEFAULT_EPSILON, DEFAULT_HALF_LIFE_SESSIONS
 from aegis_core.stats import (
     _betacf,
     _num,
@@ -38,7 +39,6 @@ __all__ = [
     "compute",
     "compute_mde_180d",
     "compute_silence_credit",
-    "decay_factor",
     "for_rules",
     "regularized_incomplete_beta",
     "replay_detector_history",
@@ -52,8 +52,8 @@ MAX_PRIOR_MASS = 10.0
 # One minimum-sample gate (spec T4, section 9): below it no number is shown and no transition is suggested.
 MIN_N = 25
 DEFAULT_MIN_N = MIN_N
-DEFAULT_HALF_LIFE_SESSIONS = 20
-DEFAULT_ARCHIVE_EPSILON = 0.15
+# H and epsilon are defined once, in config (30 sessions, 0.01); these names stay as aliases.
+DEFAULT_ARCHIVE_EPSILON = DEFAULT_EPSILON
 DEFAULT_MDE_HORIZON_DAYS = 180.0
 MDE_UNTESTABLE_THRESHOLD = 0.6
 # Below this many days of ledger history the trigger volume says nothing: 180 / (1.24324 / 0.6)^2 = 41.9.
@@ -112,15 +112,6 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
-
-
-def decay_factor(last_ts: Optional[str], half_life_days: Optional[float], now: Optional[datetime] = None) -> float:
-    last = _parse_ts(last_ts) if half_life_days and half_life_days > 0 else None
-    if last is None:
-        return 1.0
-    current = now or datetime.now(timezone.utc)
-    days = ((current if current.tzinfo is not None else current.replace(tzinfo=timezone.utc)) - last).total_seconds() / 86400.0
-    return 1.0 if days <= 0 else 0.5 ** (days / float(half_life_days))
 
 
 def session_decay_factor(eligible_sessions: int, half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS) -> float:
@@ -196,10 +187,10 @@ class Fitness:
 
 
 def compute(
-    totals: Mapping[str, Any], half_life_days: Optional[float] = None, now: Optional[datetime] = None,
-    rule: str = "", *, prior: Optional[Tuple[float, float]] = None, trigger_rate_per_day: Optional[float] = None,
-    observed_days: Optional[float] = None, min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0, half_life_sessions: Optional[float] = None,
-    epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
+    totals: Mapping[str, Any], now: Optional[datetime] = None, rule: str = "", *,
+    prior: Optional[Tuple[float, float]] = None, trigger_rate_per_day: Optional[float] = None,
+    observed_days: Optional[float] = None, min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0,
+    half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS, epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
     repos_count: int = 0, days_span: float = 0.0, samples: Sequence[Mapping[str, Any]] = (), silence_lr: float = 1.0,
     evidence_available: bool = True, evidence_error: Optional[str] = None,
@@ -212,21 +203,24 @@ def compute(
     fp = round(base_fp + float(adjudicated_fp), 6)
     n, triggers = tp + fp, int(_num(totals.get("triggers", 0)))
     a0, b0 = cap_prior(prior[0], prior[1]) if prior is not None else (0.0, 0.0)
+    # Spec T4: evidence decays by eligible exposure sessions, never by calendar days, and every
+    # posterior statistic uses the decayed counts, so a stale verdict lapses towards the (undecayed)
+    # prior. The raw n still guards the sample gate.
+    decay = session_decay_factor(eligible_sessions, half_life_sessions) if half_life_sessions is not None else 1.0
+    tp_w, fp_w = tp * decay, fp * decay
+    n_w = tp_w + fp_w
     prior_mass = a0 + b0
-    prior_share = (prior_mass / (prior_mass + n)) if (prior_mass + n) > 0.0 else 0.0
+    prior_share = (prior_mass / (prior_mass + n_w)) if (prior_mass + n_w) > 0.0 else 0.0
     prior_disclosure = f"prior supplies {int(round(prior_share * 100))}% of the evidence" if prior_mass > 0.0 else None
     rate = trigger_rate_per_day
     if rate is None and observed_days is not None and observed_days >= MIN_OBSERVATION_DAYS:
         rate = n / observed_days
     mde = round(compute_mde_180d(rate), 4) if rate is not None else None
-    time_decay = decay_factor(totals.get("last_ts"), half_life_days, now)
-    sess_decay = session_decay_factor(eligible_sessions, half_life_sessions) if half_life_sessions is not None and eligible_sessions > 0 else 1.0
-    combined_decay = sess_decay if eligible_sessions > 0 else time_decay
-    effective_weight = round(1.0 * combined_decay, 6)
-    score = round(wilson_lower_bound(_num(tp) + a0, n + prior_mass) * combined_decay, 4) if n > 0 else 0.0
-    misfire = round(wilson_lower_bound(_num(fp), n), 4) if n > 0 else 0.0
-    cp_lo, cp_hi = clopper_pearson_interval(tp, n, alpha=0.10, prior=prior)
-    p_below_07 = beta_cdf(0.7, 1.0 + _num(tp) + a0, 1.0 + _num(fp) + b0) if n > 0 else 0.0
+    effective_weight = round(decay, 6)
+    score = round(wilson_lower_bound(tp + a0, n + prior_mass) * decay, 4) if n > 0 else 0.0
+    misfire = round(wilson_lower_bound(fp_w, n_w), 4) if n > 0 else 0.0
+    cp_lo, cp_hi = clopper_pearson_interval(tp_w, n_w, alpha=0.10, prior=prior)
+    p_below_07 = beta_cdf(0.7, 1.0 + tp_w + a0, 1.0 + fp_w + b0) if n > 0 else 0.0
     override_rate = round(float(contested) / float(max(1, int(contested) + int(triggers))), 4) if contested > 0 else 0.0
     flagged_for_review = bool(contested > 0 and (contested >= 3 or override_rate >= 0.25))
     archive_candidate = bool(rule_type == "trap" and not pinned and eligible_sessions > 0 and effective_weight < epsilon)
@@ -258,22 +252,11 @@ def compute(
         flagged_for_review=flagged_for_review, precision_lo=round(cp_lo, 4), precision_hi=round(cp_hi, 4),
         p_below_demote=round(p_below_07, 4), prior_mass=round(prior_mass, 4), prior_share=round(prior_share, 4),
         prior_disclosure=prior_disclosure, mde=mde, eligible_sessions=int(eligible_sessions),
-        decay_factor=round(combined_decay, 6), effective_weight=effective_weight, archive_candidate=archive_candidate,
+        decay_factor=round(decay, 6), effective_weight=effective_weight, archive_candidate=archive_candidate,
         silence_lr=round(float(silence_lr), 6), sessions_count=int(sessions_count), repos_count=int(repos_count),
         days_span=round(float(days_span), 2), samples=tuple(dict(s) for s in list(samples)[:3]), suggestion=suggestion,
         evidence_available=evidence_available, evidence_error=evidence_error, min_n=int(min_n),
     )
-
-
-def _read_session_expiry_config(workspace: Any) -> Tuple[float, float]:
-    from aegis_core.config import ConfigError, RepoConfig
-    from aegis_core.rules import workspace_root
-
-    try:
-        cfg = RepoConfig.load(workspace_root(workspace))
-    except ConfigError:
-        cfg = RepoConfig()
-    return float(cfg.half_life_sessions), float(cfg.epsilon)
 
 
 def _collect_t4_events_for_rules(
@@ -452,7 +435,7 @@ def for_rules(
         if not rule_totals.get("last_ts") and t4.get("last_ts"):
             rule_totals["last_ts"] = t4["last_ts"]
         out[rid] = compute(
-            rule_totals, config.expiry_for(rtype), now, rid, observed_days=t4.get("observed_days"),
+            rule_totals, now, rid, observed_days=t4.get("observed_days"),
             eligible_sessions=int(t4.get("eligible_sessions", 0)),
             half_life_sessions=half_life_sessions, epsilon=epsilon, rule_type=rtype,
             pinned=bool(meta.get("pin") is True or meta.get("pinned") is True), contested=int(t4.get("contested", 0)),

@@ -1,8 +1,10 @@
 """Fitness at read time (defense #15, ADR 0005 H6): one estimator, one decay, the ledger only.
 
 A rule's fitness is the Wilson lower bound (90%) of its true-positive rate over the
-verdict rows in .aegis/state/ledger.jsonl, halved every `expiry` days (the
-repository config) since its last trigger. Nothing is read from rule frontmatter.
+verdict rows in the ledger. Evidence decays by eligible exposure sessions,
+w = 2^(-sessions / half_life_sessions), never by calendar days (R-evidence-15), and
+every statistic of the posterior uses the decayed evidence. Nothing is read from rule
+frontmatter.
 """
 from __future__ import annotations
 
@@ -65,20 +67,40 @@ def test_a_rule_without_evidence_has_fitness_zero() -> None:
     assert (fit.triggers, fit.tp, fit.fp, fit.last_ts, fit.score, fit.misfire) == (0, 0, 0, None, 0.0, 0.0)
 
 
-@pytest.mark.parametrize(("age_days", "factor"), [(0, 1.0), (30, 0.5), (60, 0.25), (15, 0.5 ** 0.5)])
-def test_fitness_halves_every_half_life_since_the_last_trigger(age_days: int, factor: float) -> None:
-    totals = {"triggers": 20, "tp": 20, "fp": 0, "last_ts": _iso(NOW - timedelta(days=age_days))}
-    undecayed = wilson_lower_bound(20, 20)
-    fit = compute(totals, half_life_days=30, now=NOW)
-    assert fit.score == pytest.approx(undecayed * factor, abs=1e-4)
+@pytest.mark.parametrize("age_days", [0, 1, 30, 400])
+def test_calendar_days_never_decay_a_rule(age_days: int) -> None:
+    totals = {"triggers": 40, "tp": 40, "fp": 0, "last_ts": _iso(NOW - timedelta(days=age_days))}
+    fit = compute(totals, now=NOW)
+    assert (fit.decay_factor, fit.effective_weight) == (1.0, 1.0)
+    assert fit.score == pytest.approx(wilson_lower_bound(40, 40), abs=1e-4)
 
 
-def test_no_half_life_or_no_usable_timestamp_means_no_decay() -> None:
-    old = {"triggers": 20, "tp": 20, "fp": 0, "last_ts": "2020-01-01T00:00:00Z"}
-    assert compute(old, half_life_days=None, now=NOW).score == pytest.approx(wilson_lower_bound(20, 20), abs=1e-4)
-    for ts in (None, "not a date", _iso(NOW + timedelta(days=10))):
-        fit = compute(dict(old, last_ts=ts), half_life_days=30, now=NOW)
-        assert fit.score == pytest.approx(wilson_lower_bound(20, 20), abs=1e-4)
+def test_the_half_life_and_epsilon_are_defined_once() -> None:
+    from aegis_core import config, fitness
+
+    assert fitness.DEFAULT_HALF_LIFE_SESSIONS == config.DEFAULT_HALF_LIFE_SESSIONS == 30
+    assert fitness.DEFAULT_ARCHIVE_EPSILON == config.DEFAULT_EPSILON == 0.01
+    assert fitness.session_decay_factor(30) == pytest.approx(0.5)
+    assert compute({}, eligible_sessions=30).effective_weight == pytest.approx(0.5)
+    assert not hasattr(fitness, "decay_factor")
+
+
+def test_the_posterior_decays_with_sessions_and_reverts_to_the_prior() -> None:
+    from aegis_core.fitness import beta_cdf
+
+    def gate(sessions: int) -> Fitness:
+        return compute({}, rule_type="gate", adjudicated_fp=5, min_n=5, eligible_sessions=sessions, half_life_sessions=20)
+
+    fresh, stale = gate(0), gate(60)
+    assert fresh.p_below_demote == pytest.approx(0.9993, abs=1e-4)
+    assert (fresh.state, fresh.suggestion) == ("decided", "demote")
+    assert stale.p_below_demote < 0.9
+    assert stale.p_below_demote == pytest.approx(beta_cdf(0.7, 1.0, 1.0 + 5 * 0.125), abs=1e-4)
+    assert (stale.state, stale.suggestion) != ("decided", "demote")
+    path = [gate(k).p_below_demote for k in (0, 20, 60, 200, 2000)]
+    assert path == sorted(path, reverse=True)
+    assert path[-1] == pytest.approx(beta_cdf(0.7, 1.0, 1.0), abs=1e-3)  # the uniform prior
+    assert gate(2000).fp == 5.0  # the raw count still guards the sample gate
 
 
 def _workspace(tmp_path: Path, config: dict | None = None) -> Path:
@@ -97,19 +119,40 @@ def _workspace(tmp_path: Path, config: dict | None = None) -> Path:
     return tmp_path
 
 
-def test_for_rules_reads_the_ledger_and_the_configured_half_life_per_type(tmp_path: Path) -> None:
-    ws = _workspace(tmp_path, {"v": 1, "expiry": {"days": 30, "per_type": {"invariant": None}}})
-    ledger.append(ws, [{"rule": "t", "outcome": "tp", "source": "manual", "key": f"k{n}"} for n in range(5)])
-    ledger.append(ws, [{"rule": "i", "outcome": "tp", "source": "manual", "key": f"k{n}"} for n in range(5)])
-    later = datetime.now(timezone.utc) + timedelta(days=60)
+def _old_verdicts(ws: Path, rule: str, n: int = 40, days_ago: int = 400) -> None:
+    stamp = _iso(NOW - timedelta(days=days_ago))
+    ledger.append_rows(ws, [{"v": 2, "ts": stamp, "rule": rule, "outcome": "tp", "source": "ci", "key": f"{rule}-{k}"}
+                            for k in range(n)])
 
-    fits = for_rules(ws, load_rules(ws).rules, now=later)
 
-    assert set(fits) == {"t", "i"}
-    assert (fits["t"].triggers, fits["t"].tp) == (5, 5)
-    # The trap decays (30-day half-life, 60 days later); the invariant never expires.
-    assert fits["t"].score == pytest.approx(wilson_lower_bound(5, 5) * 0.25, abs=1e-3)
-    assert fits["i"].score == pytest.approx(wilson_lower_bound(5, 5), abs=1e-4)
+@pytest.mark.parametrize("days", [7, 90, None])
+def test_the_expiry_config_is_accepted_and_changes_nothing(tmp_path: Path, days) -> None:
+    from aegis_core.config import RepoConfig
+
+    ws = _workspace(tmp_path, {"v": 1, "expiry": {"days": days, "per_type": {"invariant": None}}})
+    assert RepoConfig.load(ws).warnings == ()
+    _old_verdicts(ws, "t")
+    _old_verdicts(ws, "i")
+
+    fits = for_rules(ws, load_rules(ws).rules, now=NOW)
+
+    for rid in ("t", "i"):
+        assert (fits[rid].triggers, fits[rid].tp, fits[rid].effective_weight) == (40, 40, 1.0)
+        assert fits[rid].score == pytest.approx(wilson_lower_bound(40, 40), abs=1e-4)
+
+
+def test_session_decay_has_no_cliff_at_the_first_session(tmp_path: Path) -> None:
+    from aegis_core import credit
+
+    weights = []
+    for sessions in (0, 1, 2, 5):
+        ws = _workspace(tmp_path / f"s{sessions}")
+        _old_verdicts(ws, "t")
+        for k in range(sessions):
+            credit.record_exposure(ws, "claude-code", f"sess-{k}", ["t"], scope_basis="match", heartbeat=True)
+        weights.append(for_rules(ws, [load_rules(ws).get("t")], now=NOW)["t"].effective_weight)
+    assert weights == sorted(weights, reverse=True) and weights[0] == 1.0
+    assert weights[1] > 0.95
 
 
 def test_for_rules_counts_weighted_and_v1_rows(tmp_path: Path) -> None:

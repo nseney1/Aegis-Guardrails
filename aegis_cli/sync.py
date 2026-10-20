@@ -41,6 +41,17 @@ def _fitness_column(row: Dict[str, Any]) -> str:
     return f"{shown:.2f}" if isinstance(shown, (int, float)) else str(row.get("status") or "—")
 
 
+def _inert_expiry(root: Any) -> bool:
+    """Whether the repository config sets the day expiry that fitness no longer reads (R-evidence-15)."""
+    from aegis_core.config import DEFAULT_EXPIRY_DAYS, ConfigError, RepoConfig
+
+    try:
+        config = RepoConfig.load(root)
+    except ConfigError:
+        return False
+    return config.expiry_days != DEFAULT_EXPIRY_DAYS or bool(config.expiry_per_type)
+
+
 def _status(result: Any) -> str:
     if result.refused:
         return "refused"
@@ -148,6 +159,9 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         print(json.dumps(payload, indent=2, default=str))
     else:
         _print_text(args, result, rel_path)
+        if _inert_expiry(root):
+            print("  ℹ️  expiry.days and expiry.per_type in .aegis/config.json no longer change fitness: "
+                  "rules decay by exposed sessions (half_life_sessions), never by calendar days")
         if claimed["claimed"]:
             print(f"  {claimed['label']}: {claimed['claimed']} report(s) from {claimed['sessions']} session(s), "
                   "no rule's evidence")
