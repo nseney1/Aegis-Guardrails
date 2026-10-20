@@ -786,6 +786,61 @@ def test_on_windows_a_drive_relative_rule_id_creates_nothing(tmp_path: Path):
     assert list((tmp_path / ".aegis" / "rules").rglob("*.md")) == []
 
 
+# ── add_trailer: interpret-trailers where no repository config is read ────────
+#
+# A repository's trailer.<alias>.cmd (for the trailer's key) and trailer.<any>.command name
+# programs interpret-trailers runs. Given such config, When add_trailer edits a message
+# file, Then the program never runs and the trailer is written, even when the caller
+# inherited GIT_DIR, GIT_COMMON_DIR and GIT_WORK_TREE (a linked worktree's hook does).
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="a shell-script trailer command")
+
+
+def _plant_trailer_commands(repo: Path, tmp_path: Path) -> Path:
+    marker, program = tmp_path / "trailer-ran", tmp_path / "trailer.sh"
+    program.write_bytes(f'#!/bin/sh\necho ran >> "{marker}"\necho planted\n'.encode())
+    program.chmod(0o755)
+    _git(repo, "config", "trailer.x.key", "Aegis-Check")
+    _git(repo, "config", "trailer.x.cmd", str(program))
+    _git(repo, "config", "trailer.unrelated.command", str(program))
+    return marker
+
+
+@posix_only
+def test_add_trailer_runs_no_trailer_command_of_the_repository(repo: Path, tmp_path: Path, monkeypatch):
+    marker = _plant_trailer_commands(repo, tmp_path)
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo))
+    monkeypatch.chdir(repo)
+    message = tmp_path / "msg"
+    message.write_bytes(b"subject\n")
+    assert gitsafe.add_trailer(message, "Aegis-Check: tree=abc exit=0") is True
+    assert not marker.exists()
+    assert message.read_bytes() == b"subject\n\nAegis-Check: tree=abc exit=0\n"
+
+
+def test_add_trailer_resolves_a_relative_message_file_against_the_callers_directory(repo: Path, monkeypatch):
+    (repo / ".git" / "COMMIT_EDITMSG").write_bytes(b"subject\n")
+    monkeypatch.chdir(repo)
+    assert gitsafe.add_trailer(os.path.join(".git", "COMMIT_EDITMSG"), "Aegis-Check: tree=abc exit=0") is True
+    assert (repo / ".git" / "COMMIT_EDITMSG").read_bytes() == b"subject\n\nAegis-Check: tree=abc exit=0\n"
+
+
+def test_add_trailer_replaces_its_own_key_and_keeps_other_trailers(tmp_path: Path):
+    message = tmp_path / "msg"
+    message.write_bytes(b"subject\n\nSigned-off-by: A <a@example.com>\nAegis-Check: tree=old exit=0\n")
+    assert gitsafe.add_trailer(message, "Aegis-Check: tree=abc exit=0") is True
+    text = message.read_bytes().decode()
+    assert "Signed-off-by: A <a@example.com>" in text
+    assert [line for line in text.splitlines() if line.startswith("Aegis-Check")] == ["Aegis-Check: tree=abc exit=0"]
+
+
+def test_add_trailer_on_a_missing_file_is_false_not_an_exception(tmp_path: Path):
+    assert gitsafe.add_trailer(tmp_path / "absent", "Aegis-Check: tree=abc exit=0") is False
+    assert not (tmp_path / "absent").exists()
+
+
 # ── Other queries ────────────────────────────────────────────────────────────
 
 def test_git_path_honours_the_repository_hooks_path(repo: Path, tmp_path: Path):

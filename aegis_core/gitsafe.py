@@ -18,12 +18,13 @@ every call here:
 - uses plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
   ``check-ref-format``, ``hash-object``, ``version`` and ``config`` (reads only). It
-  writes in three places only, never to the work tree, the index, a branch or a tag:
+  writes in four places only, never to the work tree, the index, a branch or a tag:
   ``hash-object -w`` stores a blob, ``update-ref --no-deref --stdin`` creates, swaps
   or deletes one ref under compare-and-swap, always under ``refs/aegis/`` (the team's
   leases; ``update_ref`` refuses any other name), and ``merge-tree --write-tree``
   stores the objects of a trial merge that nothing references (git's gc collects
-  them). ``diff-index`` without ``--cached``, ``ls-files --others`` and
+  them), and ``interpret-trailers --in-place`` edits the prepare-commit-msg hook's message
+  file, with no repository config read (its ``trailer.*`` commands). ``diff-index`` without ``--cached``, ``ls-files --others`` and
   ``hash-object --stdin-paths`` read the working tree, which is where an fsmonitor or
   a clean filter would run; they are needed (no plumbing lists changed or untracked
   files otherwise, and only git knows its line-ending conversion). The forced
@@ -71,6 +72,7 @@ __all__ = [
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
+    "add_trailer",
     "blob_id",
     "blob_oid",
     "changed_files",
@@ -202,6 +204,19 @@ def run(
         raise GitError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
     except OSError as exc:
         raise GitError(f"cannot run git: {exc}") from exc
+
+
+def add_trailer(message_file: Path | str, trailer: str) -> bool:
+    """Put ``trailer`` in a commit message file, replacing its key; False when git cannot. No repository
+    config is read (its ``trailer.*`` commands are programs; a linked worktree's hook inherits GIT_DIR)."""
+    target = os.path.abspath(message_file)  # git hands a hook a relative .git/COMMIT_EDITMSG
+    try:
+        with tempfile.TemporaryDirectory(prefix="aegis-trailer-") as scratch:
+            res = run(["interpret-trailers", "--in-place", "--if-exists", "replace", "--trailer", trailer, target],
+                      scratch, _env={"GIT_DIR": scratch, "GIT_COMMON_DIR": scratch})
+    except OSError as exc:
+        raise GitError(f"cannot make a directory for git: {exc}") from exc
+    return res.returncode == 0
 
 
 def _completed(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[subprocess.CompletedProcess]:
