@@ -85,9 +85,13 @@ def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
         return None
     ref = _user_base_ref(root)
     if ref:
-        commit = gitsafe.resolve_commit(root, ref)
-        if commit:
-            return BaseAnchor(ref, commit, "user-config", True, f"rules.base_ref {ref} (user config)")
+        tip = gitsafe.resolve_commit(root, ref)
+        if tip:
+            # The fork point, as check --ci and the origin/HEAD anchor compare: a rule the ref changed
+            # after the branch forked is not an edit of this branch.
+            fork = gitsafe.merge_base(root, tip, "HEAD")
+            note = "" if fork else "; no common history with HEAD, using its tip"
+            return BaseAnchor(ref, fork or tip, "user-config", True, f"rules.base_ref {ref} (user config{note})")
     reviewed = gitsafe.merge_base(root, "refs/remotes/origin/HEAD", "HEAD")
     if reviewed:
         return BaseAnchor("origin/HEAD", reviewed, "origin-head", True, "merge-base of HEAD and origin/HEAD")

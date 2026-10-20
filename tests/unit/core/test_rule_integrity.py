@@ -273,6 +273,42 @@ def test_a_user_base_ref_that_does_not_resolve_falls_back_to_the_next_anchor(tmp
     assert anchor is not None and anchor.source == "origin-head"
 
 
+def user_base_ref(tmp_path: Path, ref: str) -> None:
+    cfg = tmp_path / "home" / ".aegis"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "config.json").write_text(json.dumps({"v": 1, "rules": {"base_ref": ref}}), encoding="utf-8")
+
+
+@needs_git
+def test_a_user_base_ref_anchors_at_the_fork_point_not_at_its_moving_tip(tmp_path):
+    repo = make_repo(tmp_path)
+    fork = repo.head()
+    repo.git("checkout", "-q", "main")
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nReworded on main after the fork.\n"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("main moves on"))
+    repo.git("checkout", "-q", "work")
+    repo.write("src/app.py", "x = 5\n")
+    repo.commit("branch work that touches no rule")
+    user_base_ref(tmp_path, "origin/main")
+    anchor = rule_integrity.resolve_base(repo.root)
+    assert anchor is not None and (anchor.source, anchor.commit) == ("user-config", fork)
+    assert list(rule_integrity.effective(repo.root).unreviewed) == []
+
+
+@needs_git
+def test_a_user_base_ref_with_no_common_history_falls_back_to_its_tip_and_says_so(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "--orphan", "island")
+    repo.git("rm", "-rfq", ".")
+    repo.write("a.txt", "x\n")
+    island = repo.commit("island")
+    repo.git("checkout", "-q", "work")
+    user_base_ref(tmp_path, "island")
+    anchor = rule_integrity.resolve_base(repo.root)
+    assert anchor is not None and anchor.commit == island
+    assert "no common history with HEAD, using its tip" in anchor.label
+
+
 @needs_git
 def test_a_user_config_that_lies_inside_the_workspace_is_repository_content(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
