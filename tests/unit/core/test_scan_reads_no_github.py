@@ -30,7 +30,8 @@ RULE_B = ("---\nid: trap-b\ntype: trap\nenforcement: advisory\nhypothesis: b\n"
 
 
 class CountingGh:
-    """``gh`` at the runner boundary: answers ``gh api .../runs?head_sha=`` from ``runs``, refuses the rest."""
+    """``gh`` at the runner boundary: answers ``gh api .../runs?head_sha=`` from ``runs`` and the
+    repository GET with default branch ``main`` (R-trust-62), refuses the rest."""
 
     def __init__(self, runs: Optional[List[Dict[str, Any]]] = None, fail: bool = False) -> None:
         self.runs, self.fail = list(runs or []), fail
@@ -40,6 +41,8 @@ class CountingGh:
         self.calls.append(list(argv))
         if self.fail or argv[:1] != ["api"]:
             return subprocess.CompletedProcess(argv, 1, "", "offline")
+        if "head_sha=" not in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"default_branch": "main"}), "")
         sha = argv[1].split("head_sha=", 1)[1].split("&", 1)[0]
         body = {"workflow_runs": [r for r in self.runs if r.get("head_sha") == sha]}
         return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -47,6 +50,10 @@ class CountingGh:
     @property
     def api(self) -> List[List[str]]:
         return [c for c in self.calls if c[:1] == ["api"]]
+
+    @property
+    def runs_api(self) -> List[List[str]]:
+        return [c for c in self.api if "head_sha=" in c[1]]
 
 
 @pytest.fixture(autouse=True)
@@ -131,7 +138,7 @@ def test_offline_projection_never_credits_an_unverified_ci_row_and_verifying_doe
     assert gh.calls == []
     assert _states(credit.project_credits(repo.root, verify_ci=True)) == [("confirmed", "", True)]
     assert _fit(repo.root, verify_ci=True).tp == 1
-    assert len(gh.api) == 1
+    assert (len(gh.api), len(gh.runs_api)) == (2, 1)
 
 
 @needs_git
@@ -151,7 +158,7 @@ def test_a_healthy_gh_still_verifies_every_row(tmp_path, monkeypatch):
     ledger.append_rows(repo.root, [_ci_row(sha) for sha in FORGED[:3]] + [_ci_row(commit)])
     gh = _gh(monkeypatch, CountingGh([hv.ci_run(commit, run_id=10)]))
     proj = credit.project_credits(repo.root, verify_ci=True)
-    assert len(gh.api) == 4
+    assert (len(gh.api), len(gh.runs_api)) == (5, 4)
     assert _states(proj) == [("confirmed", "", True)]
 
 
@@ -161,7 +168,7 @@ def test_malformed_commit_ids_do_not_switch_verification_off(tmp_path, monkeypat
     ledger.append_rows(repo.root, [_ci_row(f"not-a-sha-{i}") for i in range(6)] + [_ci_row(commit)])
     gh = _gh(monkeypatch, CountingGh([hv.ci_run(commit, run_id=10)]))
     proj = credit.project_credits(repo.root, verify_ci=True)
-    assert len(gh.api) == 1 and commit in gh.api[0][1]
+    assert len(gh.runs_api) == 1 and commit in gh.runs_api[0][1]
     assert _states(proj) == [("confirmed", "", True)]
 
 

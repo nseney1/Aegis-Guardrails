@@ -156,9 +156,6 @@
       "description": "Record post-verification rule feedback in the local outcome ledger after running tests or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` before editing files and `aegis_capture_insight` to record user corrections. When a passing `aegis check --record` exists for the current git tree, the server credits rules exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated against the rule inventory, not used as the credit source). Those credits count toward fitness once CI passes on the landing commit. Without a matching check record, it writes at most one unwitnessed claim per session and tree that earns no fitness credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.",
       "annotations": {
         "readOnlyHint": false,
-        "destructiveHint": false,
-        "idempotentHint": true,
-        "openWorldHint": false,
         "title": "Report Outcome"
       },
       "inputSchema": {
@@ -458,9 +455,6 @@
       "description": "Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) for rule curation. Use this tool when the user corrects your approach or states a recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file immediately, or `aegis_report_outcome` to report whether existing rules helped. Each call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a matching user prompt captured by a host hook in the same session.",
       "annotations": {
         "readOnlyHint": false,
-        "destructiveHint": false,
-        "idempotentHint": false,
-        "openWorldHint": false,
         "title": "Capture Insight"
       },
       "inputSchema": {

@@ -37,6 +37,8 @@ class CountingGh:
         self.calls.append(list(argv))
         if self.fail or argv[:1] != ["api"]:
             return subprocess.CompletedProcess(argv, 1, "", "offline")
+        if "head_sha=" not in argv[1]:  # the repository GET (R-trust-62): GitHub names the default branch
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"default_branch": "main"}), "")
         sha = argv[1].split("head_sha=", 1)[1].split("&", 1)[0]
         body = {"workflow_runs": [r for r in self.runs if r.get("head_sha") == sha]}
         return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -224,7 +226,8 @@ def test_a_transient_gh_failure_stops_ci_verification_and_decisions_fail_closed(
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert _api_calls(gh) == 1
     assert proj.available is False
-    assert proj.error == f"CI verification stopped after gh failed for {commit[:12]}; 7 commit(s) were not verified"
+    assert proj.error == ("CI verification stopped: GitHub did not name the default branch "
+                          "(gh api failed (exit 1)); 7 commit(s) were not verified")
 
     _fresh_process()
     gh.calls.clear()  # the next api call fails again
@@ -248,7 +251,7 @@ def test_a_healthy_gh_verifies_every_commit_and_reads_stay_offline(tmp_path, mon
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert (proj.available, proj.error) == (True, None)
     assert [c.state for c in proj.credits] == ["confirmed"]
-    assert _api_calls(gh) == 1 + len(FORGED)
+    assert _api_calls(gh) == 2 + len(FORGED)  # the repository GET, then one runs GET per commit
 
     _fresh_process()
     gh.calls.clear()
