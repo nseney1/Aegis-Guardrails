@@ -122,10 +122,7 @@ class _Match:
     fitness: Fitness
 
 
-def _match(rule: Rule, files: List[str], fitness: Fitness) -> Optional[_Match]:
-    matched = tuple(rule.matching_files(files))
-    if not matched:
-        return None
+def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
     exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
     return _Match(rule, matched, exact, fitness)
 
@@ -459,8 +456,10 @@ def _select(
             if payload["stats"]["estimated_tokens"] <= token_budget or not _trim_unreviewed(extras):
                 return payload
 
-    fits = fitness_of(served)
-    matches = [m for m in (_match(r, files, fits[r.id]) for r in served) if m is not None]
+    # Fitness reads the ledger and projects credit: only for rules that matched, and only if any did.
+    hits = [(r, f) for r, f in ((r, tuple(r.matching_files(files))) for r in served) if f]
+    fits = fitness_of([r for r, _f in hits]) if hits else {}
+    matches = [_match(r, f, fits[r.id]) for r, f in hits]
     stats["matched"] = len(matches)
     mandatory = _rank([m for m in matches if m.rule.mandatory], mandatory=True)
     advisory = _rank([m for m in matches if not m.rule.mandatory], mandatory=False)

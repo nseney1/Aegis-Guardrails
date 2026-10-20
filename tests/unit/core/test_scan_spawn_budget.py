@@ -171,6 +171,62 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
     assert max(counts) <= 2, counts
 
 
+# ── (d): a scan that matches no rule does no fitness work (R-structure-7) ───
+
+def _seed_exposures(ws: Path) -> None:
+    ledger.append(ws, [{"rule": f"perf-rule-{i}", "outcome": "tp", "source": "ci", "key": f"e{i}"} for i in range(5)])
+
+
+def _projections(monkeypatch) -> List[int]:
+    from aegis_core import credit
+
+    calls: List[int] = []
+    real = credit.project_credits
+    monkeypatch.setattr(credit, "project_credits", lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    return calls
+
+
+def test_a_scan_that_matches_no_rule_opens_no_ledger_and_projects_no_credit(git_ws, monkeypatch):
+    _seed_exposures(git_ws)
+    projected = _projections(monkeypatch)
+    _scan(git_ws)
+    assert projected  # a scan that matches does read the evidence
+    projected.clear()
+    out: Dict = {}
+    seen = _count(monkeypatch, lambda: out.update(scan(git_ws, ["README.md"])))
+    assert out["relevant_rules"] == [] and out["stats"]["matched"] == 0 and out["stats"]["total_rules"] == 100
+    assert _ledger_opens(git_ws, seen) == 0 and projected == []
+    assert not [argv for argv in seen.spawns if Path(argv[0]).stem.lower() == "gh"]
+
+
+def test_a_rule_that_cannot_load_fails_the_scan_before_any_fitness_work(git_ws, monkeypatch):
+    _seed_exposures(git_ws)
+    (git_ws / ".aegis" / "rules" / "traps" / "bad-paths.md").write_text(
+        "---\nid: bad-paths\ntype: trap\ntarget_paths: 5\n---\n# Bad\n", encoding="utf-8")
+    projected = _projections(monkeypatch)
+    out: Dict = {}
+    seen = _count(monkeypatch, lambda: out.update(scan(git_ws, ["README.md"])))
+    assert out["status"] == "FAIL" and "bad-paths" in out["error"]
+    assert _ledger_opens(git_ws, seen) == 0 and projected == []
+
+
+@pytest.mark.parametrize("files", [["src/foo.py"], ["lib/a.py", "README.md"]], ids=["all", "three"])
+def test_a_matching_scan_is_what_fitness_over_every_rule_gives(git_ws, monkeypatch, files):
+    import aegis_core.scan as scan_mod
+
+    for i in range(3):  # three of the hundred also cover lib/
+        path = git_ws / ".aegis" / "rules" / "traps" / f"perf-rule-{i}.md"
+        path.write_text(path.read_text(encoding="utf-8").replace("src/*.py", "lib/*.py"), encoding="utf-8")
+    _git(git_ws, "commit", "-qam", "scope three rules to lib")
+    _seed_exposures(git_ws)
+    served = scan(git_ws, files)
+    assert served["stats"]["matched"] == (97 if files == ["src/foo.py"] else 3)
+    real = scan_mod.for_rules
+    every = lambda ws, rules, **kw: real(ws, scan_mod.RULE_CACHE.get(ws).served, **kw)  # noqa: E731
+    monkeypatch.setattr(scan_mod, "for_rules", every)
+    assert json.dumps(served, sort_keys=True) == json.dumps(scan(git_ws, files), sort_keys=True)
+
+
 # ── (e): the pre-tool hook ──────────────────────────────────────────────────
 
 def _hook(ws: Path, tool: str, tool_input: Dict) -> Callable[[], None]:
