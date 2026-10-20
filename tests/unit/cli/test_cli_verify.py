@@ -2,7 +2,6 @@
 
 The command-line behavior of `aegis check` is tested in test_cli_check.py. This
 module covers the helpers and the direct run_verify(args) entry point:
-- verdict_to_exit_code: SHIP=0, BLOCK/REVISE (and anything unknown) = 1
 - run_verify on parsed `check` arguments and on the bare namespaces older callers build
 - resolve_target_files: explicit files, out-of-tree refusal, git and branch fallbacks
 - resolve_task_plan: --plan, --plan-file, docs/plan.md
@@ -24,28 +23,7 @@ from aegis_cli.cli import _build_parser
 
 
 class TestVerifyExitCodes:
-    """Exit code mapping: SHIP=0, BLOCK=1, REVISE=1, anything else 1 (fail closed)."""
-
-    def test_verdict_to_exit_code_ship_returns_zero(self):
-        """Verdict.SHIP maps to exit code 0."""
-        from aegis_cli.verify import verdict_to_exit_code
-        assert verdict_to_exit_code(Verdict.SHIP) == 0
-
-    def test_verdict_to_exit_code_block_returns_one(self):
-        """Verdict.BLOCK maps to exit code 1."""
-        from aegis_cli.verify import verdict_to_exit_code
-        assert verdict_to_exit_code(Verdict.BLOCK) == 1
-
-    def test_verdict_to_exit_code_revise_returns_one(self):
-        """Verdict.REVISE maps to exit code 1."""
-        from aegis_cli.verify import verdict_to_exit_code
-        assert verdict_to_exit_code(Verdict.REVISE) == 1
-
-    def test_verdict_to_exit_code_unknown_fails_closed(self):
-        """A value that is not a Verdict never maps to success."""
-        from aegis_cli.verify import verdict_to_exit_code
-        assert verdict_to_exit_code("ship") == 1
-        assert verdict_to_exit_code(None) == 1
+    """run_verify returns 0 when Layer 1 passes and 1 when it fails."""
 
     def test_run_verify_returns_zero_on_ship_verdict(self, tmp_path):
         """Direct call to run_verify returning SHIP verdict yields exit code 0."""
@@ -226,6 +204,59 @@ class TestVerifyLayer2Execution:
         assert len(telemetry_calls) >= 1
         assert telemetry_calls[-1]["passed"] is True
         assert telemetry_calls[-1]["verdict"] == Verdict.SHIP
+
+    @staticmethod
+    def _layer2_args(tmp_path: Path, llm_source: str) -> argparse.Namespace:
+        fake_llm = tmp_path / "fake_llm.py"
+        fake_llm.write_text(llm_source, encoding="utf-8")
+        (tmp_path / "worker.py").write_text(
+            "def compute(x: int) -> int:\n    return x\n\ndef main():\n    return compute(1)\n", encoding="utf-8")
+        return argparse.Namespace(
+            files=["worker.py"], repo_root=str(tmp_path), workspace=str(tmp_path), plan="Implement worker",
+            llm_cmd=f"{sys.executable} {fake_llm}", dry_run=False, strict=False,
+        )
+
+    def test_a_layer2_block_records_the_layer1_pass(self, tmp_path, monkeypatch):
+        """The Layer 2 verdict is meta text: rule outcomes follow Layer 1 only (R-checks-43)."""
+        from aegis_cli.verify import run_verify
+
+        calls = []
+        monkeypatch.setattr("aegis_core.outcomes.telemetry.record_verification_telemetry", lambda **kw: calls.append(kw))
+        critical_for_spec_only = (
+            "import json, sys\n"
+            "prompt = sys.stdin.read()\n"
+            "if 'Spec Agent' in prompt:\n"
+            "    print(json.dumps([{'category': 'code_injection', 'severity': 'critical', 'risk': 'eval',"
+            " 'mechanism': 'exec', 'affected_function': 'compute'}]))\n"
+            "else:\n"
+            "    print('[]')\n"
+        )
+        assert run_verify(self._layer2_args(tmp_path, critical_for_spec_only)) == 0
+        assert [(c["passed"], c["verdict"]) for c in calls] == [(True, Verdict.BLOCK)]
+
+    def test_a_model_command_that_cannot_run_fails_without_fp_rows(self, tmp_path, monkeypatch, capsys):
+        from aegis_cli.verify import run_verify
+
+        calls = []
+        monkeypatch.setattr("aegis_core.outcomes.telemetry.record_verification_telemetry", lambda **kw: calls.append(kw))
+        failing = "import sys\nsys.stdin.read()\nsys.stderr.write('quota exceeded\\n')\nsys.exit(7)\n"
+        assert run_verify(self._layer2_args(tmp_path, failing)) == 1
+        assert "Layer 2 failed" in capsys.readouterr().err
+        assert calls == []
+
+    def test_failed_test_discovery_fails_without_fp_rows(self, tmp_path, monkeypatch, capsys):
+        from aegis_cli import verify
+
+        calls = []
+        monkeypatch.setattr("aegis_core.outcomes.telemetry.record_verification_telemetry", lambda **kw: calls.append(kw))
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("discovery broke")
+
+        monkeypatch.setattr(verify, "discover_test_evidence", boom)
+        assert verify.run_verify(self._layer2_args(tmp_path, "import sys\nsys.stdin.read()\nprint('[]')\n")) == 1
+        assert "Test discovery and execution failed" in capsys.readouterr().err
+        assert calls == []
 
 class TestResolveTargetFilesFallbacks:
     """resolve_target_files falls back from the working tree to branch diffs (real git, via gitsafe)."""

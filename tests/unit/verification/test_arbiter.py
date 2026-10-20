@@ -237,10 +237,10 @@ class TestArbiterV030GroundTruth:
 # ── Arbiter: Fail-Closed on Spec Agent Failure ────────────────────────────
 
 class TestArbiterFailClosed:
-    """Verify the Arbiter blocks when the Spec Agent fails to produce output."""
+    """A Spec Agent failure is reported as unverified, never as a BLOCK (T6 is log-only)."""
 
-    def test_spec_agent_failed_empty_predictions_blocks(self):
-        """When spec_agent_failed=True and predictions are empty → BLOCK."""
+    def test_spec_agent_failed_empty_predictions_is_unverified(self):
+        """When spec_agent_failed=True and predictions are empty → unverified, not BLOCK."""
         result = arbitrate(
             predictions=[],
             claims=[],
@@ -249,7 +249,8 @@ class TestArbiterFailClosed:
             ],
             spec_agent_failed=True,
         )
-        assert result.verdict == Verdict.BLOCK
+        assert result.verdict != Verdict.BLOCK
+        assert result.infra_status == "unverified"
 
     def test_spec_agent_not_failed_empty_predictions_ships(self):
         """Default spec_agent_failed=False with no predictions → SHIP (existing behavior)."""

@@ -39,6 +39,15 @@ from . import runner
 Backend = Any
 
 
+def _working_changes(root: Path) -> list[str]:
+    """What git reports as changed against HEAD, staged or not. None from git means it
+    could not answer, which must not read as "nothing changed" (fail closed)."""
+    found = gitsafe.changed_files(root, "working")
+    if found is None:
+        raise ValueError("cannot list the changed files (not a git work tree, or git failed); pass changed_files")
+    return found
+
+
 # ── Base Verifier ─────────────────────────────────────────────────────────
 
 
@@ -76,14 +85,15 @@ class DeterministicVerifier(BaseVerifier):
         """Run Layer 1 checks.
 
         Without ``changed_files``, checks what git reports as changed against HEAD,
-        staged or not (``gitsafe.changed_files(..., "working")``); outside git, nothing.
+        staged or not (``gitsafe.changed_files(..., "working")``); outside a git work
+        tree, or when git fails, raises ValueError.
         """
         ws = as_workspace(workspace)
         repo_root = str(ws.root)
 
         files = changed_files
         if files is None:
-            files = gitsafe.changed_files(ws.root, "working") or []
+            files = _working_changes(ws.root)
 
         is_fast = self.fast_mode if fast_mode is None else fast_mode
         return runner.run_layer1(
@@ -295,7 +305,7 @@ class VerificationPipeline:
         ws = as_workspace(workspace)
         files = changed_files
         if files is None:
-            files = gitsafe.changed_files(ws.root, "working") or []
+            files = _working_changes(ws.root)
 
         wants_layer2 = bool(files) and not layer1_only
         if wants_layer2:
@@ -357,9 +367,11 @@ class VerificationPipeline:
             spec_agent_failed=spec_failed,
         )
 
-        overall_passed = bool(l1_passed and arb_result.verdict == Verdict.SHIP)
+        # T6 is log-only: the arbiter's verdict is reported, never gating.
+        overall_passed = bool(l1_passed)
+        layer2_label = arb_result.verdict.name if arb_result.infra_status == "ok" else "UNVERIFIED"
         summary = (
-            f"{l1_summary} | Layer 2: {arb_result.verdict.name} "
+            f"{l1_summary} | Layer 2 (advisory): {layer2_label} "
             f"({len(arb_result.divergences)} divergences, {len(arb_result.convergences)} convergences)"
         )
 

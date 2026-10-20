@@ -16,7 +16,8 @@ The v4.2 modes work on the whole workspace and take no FILES: --card (aegis_core
 (aegis_core.partition). A plain check with a baseline fails only on the findings the
 baseline does not hold (aegis_core.baseline); --base names where the baseline is read from.
 
-Exit codes: 0 pass, 1 findings or a failed run, 2 usage error.
+Exit codes: 0 pass, 1 findings or a failed run, 2 usage error. Layer 2 is advisory: the
+exit status is Layer 1's, and a model command that cannot run is a failed run.
 """
 from __future__ import annotations
 
@@ -40,15 +41,7 @@ __all__ = [
     "resolve_target_files",
     "resolve_task_plan",
     "run_verify",
-    "verdict_to_exit_code",
 ]
-
-
-def verdict_to_exit_code(verdict: Any) -> int:
-    """SHIP is 0; BLOCK, REVISE and anything else are 1 (fail closed)."""
-    from aegis_core.verification import Verdict
-
-    return 0 if verdict == Verdict.SHIP else 1
 
 
 def _resolve_git_cwd(args: argparse.Namespace) -> str:
@@ -820,8 +813,8 @@ def run_verify(args: argparse.Namespace) -> int:
     try:
         test_names, test_results = discover_test_evidence(target_files, repo_root)
     except Exception as e:
+        # A command that cannot run is not evidence about the rules: nothing is recorded.
         print(f"Error: Test discovery and execution failed: {e}", file=sys.stderr)
-        _record_telemetry(False, "BLOCK")
         return 1
 
     try:
@@ -836,11 +829,11 @@ def run_verify(args: argparse.Namespace) -> int:
         )
     except Exception as e:
         print(f"Error: Layer 2 failed: {e}", file=sys.stderr)
-        _record_telemetry(False, "BLOCK")
         return 1
 
-    passed = layer1_pass and verdict_to_exit_code(pipeline_res.verdict) == 0
-    _record_telemetry(tools_pass and pipeline_res.passed, pipeline_res.verdict)
+    # T6 is log-only: the Layer 2 verdict is meta text, never the exit status or a rule outcome.
+    passed = layer1_pass
+    _record_telemetry(tools_pass, pipeline_res.verdict)
     _record_baseline(passed)
     if use_json:
         _emit_json(passed, pipeline_res)
