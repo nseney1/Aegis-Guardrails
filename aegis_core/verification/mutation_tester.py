@@ -405,6 +405,22 @@ def _resolve_test_rootdir(test_files: Sequence[str]) -> Optional[str]:
     return conftest_root or common
 
 
+def _filter_sys_path(entries: Sequence[str], test_files: Sequence[str], temp_root: str) -> list[str]:
+    """The existing directories of *entries* a test run may import from: one under *temp_root* only
+    when it holds a test file, so another run's scratch directory cannot shadow the code under test."""
+    temp_real = os.path.normcase(os.path.realpath(temp_root))
+    test_real = [os.path.normcase(os.path.realpath(f)) for f in test_files if f and os.path.exists(f)]
+    kept: list[str] = []
+    for p in entries:
+        if not p or not os.path.isdir(p):
+            continue
+        p_real = os.path.normcase(os.path.realpath(p))
+        if _is_within(p_real, temp_real) and not any(_is_within(tf, p_real) for tf in test_real):
+            continue
+        kept.append(p)
+    return kept
+
+
 def _check_tests(
     test_files: Sequence[str],
     timeout: int,
@@ -434,17 +450,7 @@ def _check_tests(
             env["PATH"] = py_bin_dir + (os.pathsep + existing_path if existing_path else "")
     # No bytecode and no cache: the runs leave the tree as they found it.
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    temp_root = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
-    test_real = [os.path.normcase(os.path.realpath(f)) for f in test_files if f and os.path.exists(f)]
-    clean_sys_dirs: list[str] = []
-    for p in sys.path:
-        if not p or not os.path.isdir(p):
-            continue
-        p_real = os.path.normcase(os.path.realpath(p))
-        if _is_within(p_real, temp_root) and not any(_is_within(tf, p_real) for tf in test_real):
-            continue
-        clean_sys_dirs.append(p)
-    sys_dirs = os.pathsep.join(clean_sys_dirs)
+    sys_dirs = os.pathsep.join(_filter_sys_path(sys.path, test_files, tempfile.gettempdir()))
     if swap is not None:
         cmd += ["-p", _SWAP_PLUGIN]
         staged = swap.stage(source or "")
