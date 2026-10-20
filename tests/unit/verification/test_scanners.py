@@ -99,13 +99,92 @@ class TestTierASecretDetection:
         assert scanners.scan_secrets_text(text, include_advisory=False) == []
         assert scanners.scan_secrets_text(text, include_advisory=True) == []
 
-    def test_redos_and_minified_line_guard_under_50ms(self) -> None:
-        adversarial = _tok("sk", "-") + ("a" * 100_000)
+def _pad(n: int) -> str:
+    return "a," * (n // 2)
+
+
+def _best_of(runs: int, fn, *args) -> float:
+    best = float("inf")
+    for _ in range(runs):
         start = time.perf_counter()
-        findings = scanners.scan_secrets_text(adversarial, include_advisory=True)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        assert elapsed_ms < 50.0, f"100 KB line took {elapsed_ms:.2f}ms (> 50ms)"
-        assert findings == []
+        fn(*args)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+class TestLongLinesAreScanned:
+    """R-checks-21: a line of any length is scanned in full; above MAX_LINE_LENGTH a finding's
+    snippet is the masked token alone, so snippets stay bounded and leak no neighbouring text."""
+
+    @pytest.mark.parametrize("pad", [4090, 4097, 120_000])
+    @pytest.mark.parametrize("rule_id", list(_tier_a_samples().keys()))
+    def test_a_secret_on_a_long_line_is_reported(self, rule_id, pad):
+        line = f'{_pad(pad)} cfg = "{_tier_a_samples()[rule_id]}" {_pad(pad)}'
+        found = [f for f in scanners.scan_secrets_text(line, path="dist/app.min.js") if f.rule_id == rule_id]
+        assert found and all((f.tier, f.line, f.path) == ("gate", 1, "dist/app.min.js") for f in found)
+
+    @pytest.mark.parametrize("length", [4096, 4097])
+    def test_both_sides_of_the_boundary_detect(self, length):
+        body = f' k="{_tier_a_samples()["aws-access-key-id"]}"'
+        line = "#" * (length - len(body)) + body
+        assert len(line) == length
+        assert [f.rule_id for f in scanners.scan_secrets_text(line)] == ["aws-access-key-id"]
+
+    def test_a_secret_at_the_end_of_a_400_kb_line_is_found(self):
+        line = _pad(400_000) + " " + _tier_a_samples()["github-pat"]
+        assert [f.rule_id for f in scanners.scan_secrets_text(line)] == ["github-pat"]
+
+    def test_line_numbers_stay_right_around_a_long_line(self):
+        samples = _tier_a_samples()
+        text = f"first\n{_pad(9000)} {samples['aws-access-key-id']}\nmiddle\nx = '{samples['slack-token']}'\n"
+        assert sorted((f.line, f.rule_id) for f in scanners.scan_secrets_text(text)) == [
+            (2, "aws-access-key-id"), (4, "slack-token")]
+
+    def test_every_secret_on_one_long_line_is_reported(self):
+        samples = _tier_a_samples()
+        names = ["aws-access-key-id", "github-pat", "slack-token", "google-api-key"]
+        line = _pad(10_000).join(f" {samples[n]} " for n in names)
+        assert sorted({f.rule_id for f in scanners.scan_secrets_text(line)}) == sorted(names)
+
+    def test_a_large_data_url_is_no_false_positive_and_a_key_after_it_is_found(self):
+        blob = 'img = "data:image/png;base64,' + "iVBORw0KGgo" * 18_000 + '"'
+        assert scanners.scan_secrets_text(blob, include_advisory=True) == []
+        key = _tier_a_samples()["aws-access-key-id"]
+        assert [f.rule_id for f in scanners.scan_secrets_text(blob + f' k = "{key}"', include_advisory=True)] == [
+            "aws-access-key-id"]
+
+    def test_a_long_line_snippet_is_the_masked_token_only(self):
+        raw = _tier_a_samples()["github-pat"]
+        (finding,) = scanners.scan_secrets_text(_pad(120_000) + f' TOKEN = "{raw}" ' + _pad(120_000))
+        dumped = json.dumps(finding.as_dict())
+        assert finding.snippet == scanners.mask_secret(raw)
+        assert raw not in dumped and len(dumped) < 500
+
+    def test_many_keys_on_one_long_line_keep_snippets_bounded(self):
+        keys = [f"AKIA{i:016d}" for i in range(1_500)]
+        findings = scanners.scan_secrets_text(" ".join(keys))
+        assert len(findings) == 1_500
+        assert sum(len(f.snippet) for f in findings) <= 32 * 1_500
+
+    def test_a_short_line_keeps_its_masked_context_and_fingerprint(self):
+        raw = _tier_a_samples()["github-pat"]
+        (finding,) = scanners.scan_secrets_text(f"TOKEN = '{raw}'\n", path="app.py")
+        assert finding.snippet == f"TOKEN = '{scanners.mask_secret(raw)}'"
+        assert finding.fingerprint == scanners.sarif_fingerprint("github-pat", "app.py", finding.snippet)
+
+    def test_scan_cost_stays_linear_in_line_length(self):
+        """No absolute budget: twice the input may cost at most about twice the time."""
+        def scan(n):
+            assert scanners.scan_secrets_text(_tok("sk", "-") + "a" * n, include_advisory=True) == []
+
+        ratio = _best_of(3, scan, 100_000) / max(_best_of(3, scan, 50_000), 1e-9)
+        assert ratio < 3, f"doubling the line multiplied the scan time by {ratio:.1f}"
+
+    def test_the_ratio_check_catches_a_quadratic_cost(self):
+        def quadratic(n):
+            sum(1 for _ in range(n // 50) for _ in range(n // 50))
+
+        assert _best_of(3, quadratic, 100_000) / _best_of(3, quadratic, 50_000) >= 3
 
 
 class TestTierBAndTierCAdvisory:

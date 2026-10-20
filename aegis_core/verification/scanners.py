@@ -15,6 +15,8 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from aegis_core import gitsafe, pathlookup
 from aegis_core.verification import test_runner
 
+# Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear); above
+# this length a finding's snippet is the masked token alone, never the surrounding line.
 MAX_LINE_LENGTH = 4096
 MAX_EXCERPT_CHARS = 300
 _B_PRE, _B_SUF = r"(?<![A-Za-z0-9+/_-])", r"(?![A-Za-z0-9+/=_-])"
@@ -204,8 +206,6 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
     """Scan text for Tier A (blocking) and optionally Tier B/C (advisory) secrets."""
     findings: list[Finding] = []
     for lineno, raw_line in enumerate(text.splitlines(), 1):
-        if len(raw_line) > MAX_LINE_LENGTH:
-            continue
         cleaned = _DATA_URL_OR_SRI_RE.sub('""', raw_line)
         line_secrets: list[str] = []
         matched: list[tuple[str, str, str]] = []
@@ -235,8 +235,8 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
                     matched.append(("high-entropy-token", "advisory", val))
         if not matched:
             continue
-        masked_line = raw_line.strip()
-        for sec in sorted(set(line_secrets), key=len, reverse=True):
+        masked_line = raw_line.strip() if len(raw_line) <= MAX_LINE_LENGTH else ""
+        for sec in sorted(set(line_secrets), key=len, reverse=True) if masked_line else ():
             masked_line = masked_line.replace(sec, mask_secret(sec))
         for rule_id, tier, sec in matched:
             masked_tok = mask_secret(sec)
