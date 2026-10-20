@@ -79,9 +79,11 @@ def keys(tmp_path):
     return {"human": human, "human_pub": human_pub}
 
 
-def make_repo(tmp_path: Path, signer_pub: Optional[str] = None, origin: bool = True) -> hg.Repo:
-    """main: a gate, an invariant, a trap, sources; ``work`` is checked out. With ``origin`` the
-    remote-tracking refs a clone has (origin/main, origin/HEAD) point at main's tip."""
+def make_repo(tmp_path: Path, signer_pub: Optional[str] = None, origin: bool = True,
+              rules: Optional[Dict[str, str]] = None) -> hg.Repo:
+    """main: a gate, an invariant, a trap, sources (plus ``rules``, path to text); ``work`` is
+    checked out. With ``origin`` the remote-tracking refs a clone has (origin/main, origin/HEAD)
+    point at main's tip."""
     home = hg.Home(tmp_path / "home")
     repo = hg.Repo(tmp_path / "project", home)
     repo.write("README.md", "# project\n")
@@ -91,6 +93,8 @@ def make_repo(tmp_path: Path, signer_pub: Optional[str] = None, origin: bool = T
     repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", "gate", forbid={"calls": ["eval"]}))
     repo.write(rule_path("inv-sample", "invariant"), rule_text("inv-sample", "invariant", "advisory"))
     repo.write(rule_path("trap-sample", "trap"), rule_text("trap-sample", "trap", "advisory", paths=("lib/*.py",)))
+    for path, text in (rules or {}).items():
+        repo.write(path, text)
     if signer_pub is not None:
         repo.write("allowed_signers", hg.allowed_signers_text(signer_pub))
     repo.commit("base")
@@ -303,6 +307,27 @@ def test_forbid_ast_subsumption_uses_prefix_for_imports_and_suffix_for_calls(tmp
     rc, out, _err = run_ci(repo, capsys, "--format", "json", base="specific")
     payload = json.loads(out)
     assert rc == 1 and "forbid_ast" in {w["code"] for w in payload["weakenings"]}
+
+
+@needs_git
+@needs_signing
+def test_narrowing_a_call_entry_needs_an_approval_and_the_base_entry_is_served(tmp_path, capsys, keys):
+    run_shell = "{name: subprocess.run, where: {shell: {equals: true}}}"
+    repo = make_repo(tmp_path, keys["human_pub"], rules={
+        rule_path("gate-run"): rule_text("gate-run", "gate", paths=("lib/*.py",), forbid={"calls": [run_shell]})})
+    reviewed = rule_integrity.effective(repo.root).ruleset.get("gate-run").meta["forbid_ast"]
+    repo.write(rule_path("gate-run"), rule_text("gate-run", "gate", paths=("lib/*.py",), forbid={
+        "calls": ["{name: subprocess.run, where: {shell: {equals: never-matches}}}"]}))
+    repo.commit("narrow the call entry")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and codes(payload) == [("forbid_ast", "gate-run")]
+    view = rule_integrity.effective(repo.root)
+    assert view.ruleset.get("gate-run").meta["forbid_ast"] == reviewed
+    assert [(u.id, u.change) for u in view.unreviewed] == [("gate-run", "changed")]
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.commit(f"approve\n\nAegis-Approve: {digest}\n", sign_key=keys["human"], allow_empty=True)
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 0 and payload["approval"]["valid"] is True
 
 
 @needs_git

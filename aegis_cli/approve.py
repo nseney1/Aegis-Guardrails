@@ -1,9 +1,10 @@
 """aegis approve: sign a human approval of the governance files a branch changed (v4.3 §2.2).
 
 Makes one signed, empty commit whose message carries ``Aegis-Approve: <governance tree hash>``
-(``aegis_core.human_gate``). The hash covers the governance files as committed at HEAD, so the
-approval names exactly the state the person saw, and any later governance change voids it. CI
-checks it against ``allowed_signers`` on the base branch.
+(``aegis_core.human_gate``). The hash covers the governance files as committed at HEAD and the
+tests deleted since the base branch, so the approval names exactly the state the person saw, and
+any later governance change (another deleted test included) voids it. CI checks it against
+``allowed_signers`` on the base branch.
 
 What it will not do:
 
@@ -99,7 +100,7 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
                        f"({', '.join(dirty)}): commit them first, then approve the committed state")
 
     try:
-        digest = human_gate.governance_tree_hash(top, "HEAD")
+        digest = human_gate.governance_tree_hash(top, "HEAD", base=merge_base)
         before = human_gate.governance_tree_hash(top, merge_base)
         entries = gitsafe.diff_entries(top, merge_base, "HEAD")
     except (human_gate.HumanGateError, gitsafe.GitError) as exc:

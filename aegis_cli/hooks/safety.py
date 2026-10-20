@@ -1,4 +1,10 @@
-"""Safety gate: fast-path allowlist, metacharacter inspection, and AST command safety evaluation."""
+"""Safety gate: fast-path allowlist, metacharacter inspection, and AST command safety evaluation.
+
+This is the fail-closed policy of `aegis hook safety-gate` (CommandAnalyzer): it asks on
+anything destructive or unparseable. The pre-tool guard (command_safety.classify_command)
+is the fail-open policy the host hooks run. Both are kept; the parity table in
+tests/unit/core/test_command_safety.py pins every row where they differ and why.
+"""
 from __future__ import annotations
 
 import datetime

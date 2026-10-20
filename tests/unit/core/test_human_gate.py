@@ -35,6 +35,20 @@ def test_the_full_codeowners_covers_every_governance_sample():
     assert uncovered == [] and covered
 
 
+def test_every_coverage_sample_is_a_governance_path():
+    assert [s for s in human_gate.COVERAGE_SAMPLES if governance.category_of(s) is None] == []
+    assert {"pytest.py", "pytest/__init__.py", "iniconfig.py", "py/__init__.py"} <= set(human_gate.COVERAGE_SAMPLES)
+
+
+def test_a_codeowners_that_owns_only_the_source_init_of_a_runner_package_leaves_it_uncovered():
+    """Given CODEOWNERS lines that own ``/pytest/__init__.py`` but not the package directory, When
+    coverage is checked, Then a compiled ``__init__`` and the ``__main__`` of that package are uncovered."""
+    narrow = hg.CODEOWNERS_FULL.replace("/pytest/ @octo\n", "/pytest/__init__.py @octo\n")
+    _covered, uncovered = human_gate.codeowners_coverage(narrow)
+    assert {"pytest/__init__.pyc", "pytest/__main__.py"} <= set(uncovered)
+    assert "pytest/__init__.py" not in uncovered
+
+
 def test_the_codeowners_lines_doctor_prints_cover_the_whole_set_it_checks():
     text = "\n".join(human_gate.codeowners_lines("@octo"))
     for location in (".github/CODEOWNERS", "CODEOWNERS"):
@@ -409,6 +423,79 @@ def test_deleting_a_governance_file_changes_the_hash(tmp_path):
     repo.git("rm", "-q", "conftest.py")
     repo.commit("remove conftest")
     assert human_gate.governance_tree_hash(repo.root, "HEAD") != with_it
+
+
+@needs_git
+def test_a_rule_edit_in_a_nested_workspace_moves_the_hash(tmp_path):
+    repo = hg.Repo(tmp_path / "mono", hg.Home(tmp_path / "home"))
+    repo.write("README.md", "# mono\n")
+    repo.write("pkg/.aegis/rules/traps/trap-sample.md", hg.RULE)
+    repo.commit("base")
+    before = human_gate.governance_tree_hash(repo.root / "pkg", "HEAD")
+    repo.write("pkg/.aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "other"))
+    repo.commit("rule")
+    assert human_gate.governance_tree_hash(repo.root / "pkg", "HEAD") != before
+
+
+def _with_tests(tmp_path) -> hg.Repo:
+    repo = hg.make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    repo.write("tests/test_a.py", "def test_a():\n    assert True\n")
+    repo.write("tests/test_b.py", "def test_b():\n    assert True\n")
+    repo.commit("tests")
+    repo.git("checkout", "-q", "-B", "work")
+    return repo
+
+
+@needs_git
+def test_with_no_deleted_test_the_hash_against_a_base_is_the_v1_digest(tmp_path):
+    import hashlib
+
+    repo = _with_tests(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("ordinary")
+    rule = ".aegis/rules/traps/trap-sample.md"
+    oid = repo.git("rev-parse", f"HEAD:{rule}")
+    expected = hashlib.sha256(b"aegis-governance-tree/v1\n" + f"100644 {oid} {rule}\n".encode()).hexdigest()
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") == expected
+    assert human_gate.governance_tree_hash(repo.root, "HEAD") == expected
+
+
+@needs_git
+def test_the_hash_against_a_base_binds_exactly_the_tests_deleted_since_it(tmp_path):
+    repo = _with_tests(tmp_path)
+    plain = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    repo.git("rm", "-q", "README.md")
+    repo.commit("drop the readme")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") == plain
+    repo.git("rm", "-q", "tests/test_a.py")
+    repo.commit("drop a")
+    drop_a = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    assert drop_a != plain and human_gate.governance_tree_hash(repo.root, "HEAD") == plain
+    repo.git("checkout", "-q", "main", "--", "tests/test_a.py")
+    repo.commit("restore a")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") == plain
+    repo.git("rm", "-q", "tests/test_b.py")
+    repo.commit("drop b")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") not in (plain, drop_a)
+
+
+@needs_git
+def test_a_version_bump_in_pyproject_moves_the_hash_because_the_whole_blob_is_digested(tmp_path):
+    repo = hg.make_repo(tmp_path)
+    repo.write("pyproject.toml", '[project]\nname = "x"\nversion = "1.0.0"\n')
+    repo.commit("pyproject")
+    before = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.write("pyproject.toml", '[project]\nname = "x"\nversion = "1.0.1"\n')
+    repo.commit("bump")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD") != before
+
+
+@needs_git
+def test_an_unresolvable_base_is_an_error(tmp_path):
+    repo = _with_tests(tmp_path)
+    with pytest.raises(human_gate.HumanGateError):
+        human_gate.governance_tree_hash(repo.root, "HEAD", base="nonesuch")
 
 
 @needs_git

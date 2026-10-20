@@ -52,6 +52,7 @@ __all__ = [
     "signed_empty_commit",
     "signers_setup",
     "signing_config",
+    "signing_keys_at",
     "verify_approval",
     "verify_insight_approval",
     "verify_test_exemption",
@@ -95,6 +96,10 @@ COVERAGE_SAMPLES: Tuple[str, ...] = (
     "sitecustomize.py",
     "evil.pth",
     "Makefile",
+    *(f"{name}.py" for name in governance.RUNNER_MODULES),
+    *(f"{name}/__init__.py" for name in governance.RUNNER_MODULES),
+    *(f"{name}/__init__.pyc" for name in governance.RUNNER_MODULES),
+    *(f"{name}/__main__.py" for name in governance.RUNNER_MODULES),
 )
 _CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 _OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")
@@ -286,6 +291,8 @@ def codeowners_lines(owner: str = "@OWNER") -> List[str]:
         "sitecustomize.py",
         "*.pth",
         "Makefile",
+        *(f"{name}.*" for name in governance.RUNNER_MODULES),
+        *(f"/{name}/" for name in governance.RUNNER_MODULES),
     ]
     return [f"{path} {owner}" for path in paths]
 
@@ -499,6 +506,12 @@ def _signer_keys(text: Optional[bytes]) -> int:
         and not ln.strip().startswith("#")
         and re.search(r"\b(?:ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]* [A-Za-z0-9+/=]{20,}", ln)
     )
+
+
+def signing_keys_at(root: Any, rev: str) -> int:
+    """How many keys ``allowed_signers`` lists at ``rev`` (0 when the file is absent). A GitError
+    propagates: an unreadable base must fail the caller, not read as "no keys"."""
+    return _signer_keys(gitsafe.read_blob(_top(root), rev, ALLOWED_SIGNERS))
 
 
 def _ruleset_facts(rules: Any) -> Dict[str, Any]:
@@ -725,7 +738,25 @@ def _tracked_governance_paths(workspace: Any, rev: str) -> Tuple[str, ...]:
     )
 
 
-def governance_tree_hash(root: Any, rev: str = "HEAD") -> str:
+def _deleted_tests(top: Path, commit: str, base: str) -> List[bytes]:
+    merge = gitsafe.merge_base(top, base, commit)
+    if not merge:
+        raise HumanGateError(f"cannot find where {base!r} and {commit[:12]} diverge in {top}")
+    try:
+        entries = gitsafe.diff_entries(top, merge, commit)
+    except gitsafe.GitError as exc:
+        raise HumanGateError(str(exc)) from exc
+    return sorted(
+        os.fsencode(path)
+        for status, _old, _new, path in entries
+        if status == "D" and governance.category_of(path, deleted=True) == governance.DELETED_TESTS
+    )
+
+
+def governance_tree_hash(root: Any, rev: str = "HEAD", base: Optional[str] = None) -> str:
+    """The digest an approval signs: every governance blob at ``rev`` and, given ``base``, the
+    tests deleted since ``merge-base(base, rev)``. Without a deleted test (or without ``base``)
+    the digest is the v1 one, so earlier approvals keep verifying."""
     top = _top(root)
     commit = gitsafe.resolve_commit(top, rev)
     if not commit:
@@ -745,6 +776,12 @@ def governance_tree_hash(root: Any, rev: str = "HEAD") -> str:
     digest = hashlib.sha256(HASH_DOMAIN)
     for raw_path, meta in sorted(records):
         digest.update(meta + b" " + raw_path + b"\n")
+    deleted = _deleted_tests(top, commit, base) if base is not None else []
+    if deleted:
+        # NUL never occurs in a git path, so this section cannot be mistaken for a record.
+        digest.update(b"\0tests-deleted\0")
+        for raw_path in deleted:
+            digest.update(raw_path + b"\0")
     return digest.hexdigest()
 
 
@@ -993,7 +1030,7 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
     base = gitsafe.merge_base(top, base_ref, head)
     if not tip or not base:
         return None
-    digest = governance_hash or governance_tree_hash(top, tip)
+    digest = governance_hash or governance_tree_hash(top, tip, base=base)
     res = gitsafe.run(["rev-list", f"--max-count={MAX_SCANNED_COMMITS}", f"{base}..{tip}"], top)
     if res.returncode != 0:
         return None

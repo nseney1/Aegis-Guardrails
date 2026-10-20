@@ -7,7 +7,9 @@ The commit gate itself is `aegis check --hook`, which the installed hook runs.
 attaches a workspace, so the parser below serves its help and a form with global
 options first (``aegis --plain hook run ...``). Agent-side lifecycle phases (pre-invocation,
 session-close, post-session, ...) were cut in v4 (ADR 0005 D15). `safety-gate`
-stays as a manual check of one command (it fails closed: it asks).
+stays as a manual check of one command (it fails closed: it asks); where it differs
+from the pre-tool guard is pinned by the parity table in
+tests/unit/core/test_command_safety.py.
 """
 from __future__ import annotations
 

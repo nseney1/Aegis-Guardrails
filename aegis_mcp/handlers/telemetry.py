@@ -6,7 +6,7 @@ from pathlib import PurePath
 import sys
 from typing import List, Optional, Set, Tuple
 
-from aegis_core import credit, treeid
+from aegis_core import credit, gitsafe, treeid
 from aegis_core.baseline import envelope
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import validate_rule_names
@@ -38,7 +38,13 @@ def _credited_rules(workspace, check, bound, host: Optional[str], session: Optio
     try:
         if bound.binding.tree != check.get("tree"):
             return []
-        changed = [path for status, path in bound.diff_entries(str(check.get("base"))) if status != "D"]
+        # diff_entries names top-level paths; rule patterns are workspace-relative.
+        prefix = gitsafe.show_prefix(workspace.root)
+        changed = [
+            relative
+            for status, path in bound.diff_entries(str(check.get("base")))
+            if status != "D" and (relative := gitsafe.relative_to_prefix(prefix, path)) is not None
+        ]
         ruleset = RULE_CACHE.get(workspace)
     except Exception:  # an unreadable tree or rule set credits nothing
         return []

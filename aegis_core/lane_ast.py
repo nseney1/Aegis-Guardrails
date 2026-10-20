@@ -24,7 +24,6 @@ from __future__ import annotations
 import ast
 import configparser
 import hashlib
-import json
 import re
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -35,6 +34,7 @@ __all__ = [
     "PYTEST_CONFIG_FILES",
     "collected_ids",
     "collection_hooks",
+    "pytest_config_view",
     "pytest_settings",
     "skip_forms",
 ]
@@ -546,8 +546,9 @@ def pytest_settings(filename: str, data: bytes) -> Optional[Dict[str, str]]:
     COLLECTION_KEYS it sets (``{}`` for a configuration without them; a
     ``pytest.toml``, ``.pytest.toml``, ``pytest.ini`` or ``.pytest.ini`` is one even
     when empty, as pytest reads it). Values are compared as text: whitespace around ini
-    lines and, in TOML, whitespace and comments outside strings do not count. Raises
-    ValueError for a file that cannot be read."""
+    lines and, in TOML, whitespace and comments outside strings do not count. In TOML a
+    quoted key part written with a backslash escape may stand for any name, so it counts
+    where pytest's would (fail closed). Raises ValueError for a file that cannot be read."""
     text = bytes(data).decode("utf-8-sig")
     if filename == "pyproject.toml":
         return _toml_settings(text, _PYPROJECT_TABLES, always=False)
@@ -573,10 +574,70 @@ def pytest_settings(filename: str, data: bytes) -> Optional[Dict[str, str]]:
     }
 
 
+_VIEW_SECTIONS = {"tox.ini": "pytest", "setup.cfg": "tool:pytest"}
+
+
+def pytest_config_view(filename: str, data: bytes) -> Optional[Dict[str, str]]:
+    """Everything pytest reads from ``pyproject.toml`` (``[tool.pytest]`` and its sub-tables,
+    headers included: an empty ``[tool.pytest.ini_options]`` still makes it the config file),
+    ``tox.ini`` (``[pytest]``) or ``setup.cfg`` (``[tool:pytest]``), with the parsers of
+    ``pytest_settings`` and every key, not only COLLECTION_KEYS. It fails closed: any value set
+    at the root ``tool`` key (``tool = {...}``) and any key with an escaped part that may decode
+    to ``tool.pytest`` count. None when the file can hold no pytest configuration; ValueError
+    when it cannot be read (or is not one of the three)."""
+    text = bytes(data).decode("utf-8-sig")
+    if filename == "pyproject.toml":
+        root = ("tool", "pytest")
+        found: Dict[str, str] = {}
+        table: Tuple[str, ...] = ()
+        for is_table, key, value in _toml_statements(text):
+            full = key if is_table else table + key
+            if is_table:
+                table = key
+            # A header counts from tool.pytest down; a value also above it (``tool = {...}``),
+            # whatever the inline table's keys look like.
+            if _key_may_be(full, root) if is_table else _keys_may_meet(full, root):
+                name = f"[{'.'.join(full)}]" if is_table else ".".join(full)
+                # A key or array-table header seen twice keeps both, so neither copy can change unseen.
+                found[name] = value if name not in found else f"{found[name]}\0{value}"
+        return found or None
+    section = _VIEW_SECTIONS.get(filename)
+    if section is None:
+        raise ValueError(f"{filename} is not compared by its pytest section")
+    parser = configparser.ConfigParser(interpolation=None, strict=True, default_section="\x00")
+    parser.optionxform = str  # type: ignore[assignment,method-assign]
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        raise ValueError(f"not a valid ini file ({type(exc).__name__})") from None
+    if not parser.has_section(section):
+        return None
+    return {
+        key: "\n".join(line.strip() for line in parser.get(section, key).splitlines() if line.strip())
+        for key in parser.options(section)
+    }
+
+
 # The tables pytest reads settings from, the last being the root of its configuration.
 _PYPROJECT_TABLES = (("tool", "pytest", "ini_options"), ("tool", "pytest"))
 _PYTEST_TOML_TABLES = (("pytest",),)
 _TOML_BARE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+class _EscapedKey(str):
+    """A quoted TOML key part spelled with a backslash escape, kept as written. What it decodes
+    to is not trusted (TOML and JSON differ on ``\\U``, ``\\x``, ``\\e`` and ``\\/``), so it may
+    stand for any name: ``"py\\u0074est"`` is ``pytest`` to pytest."""
+
+
+def _keys_may_meet(key: Tuple[str, ...], names: Tuple[str, ...]) -> bool:
+    """Whether ``key`` may name ``names``, a table above it or a key below it."""
+    return all(isinstance(part, _EscapedKey) or part == name for part, name in zip(key, names))
+
+
+def _key_may_be(key: Tuple[str, ...], names: Tuple[str, ...]) -> bool:
+    """Whether ``key`` may name ``names`` or a key below it."""
+    return len(key) >= len(names) and _keys_may_meet(key, names)
 
 
 def _toml_settings(text: str, tables: Tuple[Tuple[str, ...], ...], always: bool) -> Optional[Dict[str, str]]:
@@ -588,16 +649,17 @@ def _toml_settings(text: str, tables: Tuple[Tuple[str, ...], ...], always: bool)
     for is_table, key, value in _toml_statements(text):
         if is_table:
             table = key
-            present = present or key[:len(root)] == root
+            present = present or _key_may_be(key, root)
             continue
         full = table + key
-        present = present or full[:len(root)] == root
+        present = present or _key_may_be(full, root)
         for watched in tables:
-            if full[:-1] == watched and full[-1] in COLLECTION_KEYS:
+            if (len(full) == len(watched) + 1 and _keys_may_meet(full, watched)
+                    and (full[-1] in COLLECTION_KEYS or isinstance(full[-1], _EscapedKey))):
                 found[f"[{'.'.join(watched)}] {full[-1]}"] = value
-        # An inline table that holds the pytest tables: kept whole, so any change counts.
-        # Above the root (``tool = {...}``) it counts only when it mentions pytest.
-        if full in holders and value.startswith("{") and (len(full) >= len(root) or "pytest" in value):
+        # An inline table that holds the pytest tables: kept whole, so any change counts. Above the
+        # root (``tool = {...}``) too, whatever it mentions: its keys may be escaped.
+        if value.startswith("{") and any(len(full) == len(h) and _keys_may_meet(full, h) for h in holders):
             present = True
             found[f"{'.'.join(full)} (inline table)"] = value
     return found if present else None
@@ -660,10 +722,7 @@ def _toml_key(text: str, i: int, stop: str) -> Tuple[Tuple[str, ...], int]:
         if i < len(text) and text[i] in "\"'":
             end = _toml_string_end(text, i)
             raw = text[i:end]
-            try:
-                parts.append(json.loads(raw) if raw[0] == '"' else raw[1:-1])
-            except ValueError:
-                parts.append(raw[1:-1])
+            parts.append(_EscapedKey(raw) if raw[0] == '"' and "\\" in raw else raw[1:-1])
             i = end
         else:
             bare = _TOML_BARE.match(text, i)

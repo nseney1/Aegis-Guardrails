@@ -20,6 +20,7 @@ from aegis_core.rules import load_rules
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+needs_signing = pytest.mark.skipif(not hg.signing_ok(), reason="needs git >= 2.34 and ssh-keygen")
 DIRS = {"gate": "gates", "invariant": "invariants", "trap": "traps"}
 
 
@@ -51,19 +52,23 @@ def _env(tmp_path, monkeypatch):
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
-    monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+    for name in ("GITHUB_EVENT_PATH", "GITHUB_BASE_REF", "SSH_AUTH_SOCK", "GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR",
+                 "CODEX_HOME"):
+        monkeypatch.delenv(name, raising=False)
     before = os.getcwd()
     yield
     os.chdir(before)
 
 
-def make_repo(tmp_path: Path, origin: bool = True) -> hg.Repo:
+def make_repo(tmp_path: Path, origin: bool = True, paths: Tuple[str, ...] = ("src/*.py",),
+              signer_pub: Optional[str] = None) -> hg.Repo:
     repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
     repo.write("src/app.py", "x = 1\n")
     repo.write("src/util.py", "y = 2\n")
-    repo.write(path_of("inv-a"), rule_text("inv-a"))
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=paths))
     repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", paths=("src/*.py",)))
+    if signer_pub is not None:
+        repo.write("allowed_signers", hg.allowed_signers_text(signer_pub))
     repo.commit("base")
     if origin:
         repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
@@ -124,12 +129,65 @@ def test_dotted_prefix_for_imports_and_suffix_for_calls_and_decorators(tmp_path)
     assert found.code == "forbid_ast" and "decorator 'app.route'" in found.message
 
 
-def test_a_forbid_ast_option_this_version_cannot_compare_must_be_carried_over(tmp_path):
-    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"imports": ["os"], "where": ["x"]}))
-    dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"imports": ["os"]}))
-    assert codes(weakenings(base, dropped)) == ["forbid_ast"]
-    widened = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"imports": ["os"], "where": ["x", "y"]}))
-    assert weakenings(base, widened) == []
+def test_a_call_entry_where_is_compared_and_a_top_level_key_the_enforcer_rejects_is_not(tmp_path):
+    entry = "{name: eval, where: {x: {equals: 1}}}"
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [entry], "where": ["x"]}))
+    dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": [entry]}))
+    assert weakenings(base, dropped) == []  # verification.runner refuses a top-level where: it bound nothing
+    narrowed = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: {equals: 2}}}"]}))
+    (found,) = weakenings(base, narrowed)
+    assert found.code == "forbid_ast" and "call 'eval' is no longer forbidden everywhere it was" in found.message
+
+
+RUN_SHELL = "{name: subprocess.run, where: {shell: {equals: true}}}"
+
+
+@pytest.mark.parametrize("entry", [
+    "{name: subprocess.run, where: {shell: {equals: never-matches}}}",
+    "{name: subprocess.run, where: {shell: {equals: 1}}}",
+    "{name: subprocess.run, where: {shell: {equals: true}, cwd: {equals: x}}}",
+    "{name: subprocess.run, where: {shell: {equals: true}}, builtin: true}",
+    "{name: subprocess.run, where: {shell: {equals: true}}, unknown: skip}",
+    "{name: subprocess.run, where: {shell: {equals: true}}, unknown: bogus}",
+    "{name: subprocess.runx, where: {shell: {equals: true}}}",
+], ids=["never", "one", "addkey", "builtin", "skip", "bogus", "rename"])
+def test_each_narrowing_of_a_call_entry_is_one_finding(tmp_path, entry):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [RUN_SHELL]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [entry, "os.system"]}))
+    found = weakenings(base, head)
+    assert [w.code for w in found] == ["forbid_ast"] and "call 'subprocess.run'" in found[0].message
+
+
+def test_a_where_or_builtin_added_to_a_plain_call_narrows_it_and_removing_them_does_not(tmp_path):
+    plain = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": ["eval"]}))
+    where = parsed(tmp_path / "w", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: {equals: never}}}"]}))
+    (found,) = weakenings(plain, where)
+    assert "call 'eval' is no longer forbidden everywhere it was (its where, builtin or unknown was narrowed)" in found.message
+    builtin = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, builtin: true}"]}))
+    assert codes(weakenings(plain, builtin)) == ["forbid_ast"]
+    assert weakenings(builtin, plain) == []
+
+
+@pytest.mark.parametrize("base_entry,entries", [
+    (RUN_SHELL, [RUN_SHELL]),
+    (RUN_SHELL, ["{where: {shell: {equals: true}}, call: subprocess.run}"]),
+    (RUN_SHELL, ["{name: subprocess.run, where: {shell: {equals: true}}, unknown: flag, builtin: false}"]),
+    (RUN_SHELL, ["{name: run, where: {shell: {equals: true}}}"]),
+    (RUN_SHELL, ["{name: subprocess.run}"]),
+    (RUN_SHELL, ["subprocess.run"]),
+    ("{name: subprocess.run, where: {shell: {equals: true}, cwd: {equals: x}}}", [RUN_SHELL]),
+    (RUN_SHELL, [RUN_SHELL, "eval", "{name: exec, builtin: true}"]),
+], ids=["same", "alias", "flag", "broader", "nowhere", "plain", "dropkey", "added"])
+def test_an_equal_or_broader_call_entry_is_not_a_weakening(tmp_path, base_entry, entries):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [base_entry]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [*entries, "os.system"]}))
+    assert weakenings(base, head) == []
+
+
+def test_the_compared_call_keys_are_the_keys_the_enforcer_accepts():
+    from aegis_core.verification.runner import _CALL_SPEC_KEYS
+
+    assert set(rule_integrity._CallEntry._fields) | {"call"} == set(_CALL_SPEC_KEYS)
 
 
 def test_a_detect_key_must_stay_an_exact_superset(tmp_path):
@@ -213,6 +271,42 @@ def test_a_user_base_ref_that_does_not_resolve_falls_back_to_the_next_anchor(tmp
     (cfg / "config.json").write_text(json.dumps({"v": 1, "rules": {"base_ref": "no-such-ref"}}), encoding="utf-8")
     anchor = rule_integrity.resolve_base(repo.root)
     assert anchor is not None and anchor.source == "origin-head"
+
+
+def user_base_ref(tmp_path: Path, ref: str) -> None:
+    cfg = tmp_path / "home" / ".aegis"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "config.json").write_text(json.dumps({"v": 1, "rules": {"base_ref": ref}}), encoding="utf-8")
+
+
+@needs_git
+def test_a_user_base_ref_anchors_at_the_fork_point_not_at_its_moving_tip(tmp_path):
+    repo = make_repo(tmp_path)
+    fork = repo.head()
+    repo.git("checkout", "-q", "main")
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nReworded on main after the fork.\n"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("main moves on"))
+    repo.git("checkout", "-q", "work")
+    repo.write("src/app.py", "x = 5\n")
+    repo.commit("branch work that touches no rule")
+    user_base_ref(tmp_path, "origin/main")
+    anchor = rule_integrity.resolve_base(repo.root)
+    assert anchor is not None and (anchor.source, anchor.commit) == ("user-config", fork)
+    assert list(rule_integrity.effective(repo.root).unreviewed) == []
+
+
+@needs_git
+def test_a_user_base_ref_with_no_common_history_falls_back_to_its_tip_and_says_so(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "--orphan", "island")
+    repo.git("rm", "-rfq", ".")
+    repo.write("a.txt", "x\n")
+    island = repo.commit("island")
+    repo.git("checkout", "-q", "work")
+    user_base_ref(tmp_path, "island")
+    anchor = rule_integrity.resolve_base(repo.root)
+    assert anchor is not None and anchor.commit == island
+    assert "no common history with HEAD, using its tip" in anchor.label
 
 
 @needs_git
@@ -305,19 +399,102 @@ def test_the_report_names_the_range_and_counts_the_binding_rules(tmp_path, capsy
 
 
 @needs_git
-def test_deleting_a_file_a_gate_covered_is_not_a_loss_of_coverage(tmp_path, capsys):
+def test_narrowing_target_paths_is_a_loss_of_coverage_even_when_the_dropped_file_is_deleted(tmp_path, capsys):
     repo = make_repo(tmp_path)
     repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/app.py",)))
     repo.commit("narrow to one file")
     rc, payload, _err = ci(repo, capsys)
     assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["coverage"]
-    assert "src/util.py" in payload["weakenings"][0]["message"]
+    assert "'src/*.py'" in payload["weakenings"][0]["message"]
     repo.git("reset", "-q", "--hard", "main")
     repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/app.py",)))
     repo.git("rm", "-q", "src/util.py")
     repo.commit("narrow and remove what it no longer covers")
     rc, payload, _err = ci(repo, capsys)
-    assert rc == 0, payload["weakenings"]
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["coverage"]
+
+
+DEEP = ("src/**/*.py",)
+LISTED = ("src/app.py", "src/util.py")
+
+
+def approve(repo: hg.Repo, key: Path) -> None:
+    from aegis_core import human_gate
+
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.commit(f"approve\n\nAegis-Approve: {digest}\n", sign_key=key, allow_empty=True)
+
+
+@needs_git
+def test_narrowing_a_glob_to_the_present_files_is_flagged_although_no_file_loses_the_rule(tmp_path, capsys):
+    repo = make_repo(tmp_path, paths=DEEP)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=LISTED))
+    repo.write("src/evil.py", "import os\n")
+    repo.commit("narrow to what exists, then add a file")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("coverage", "inv-a")]
+    assert "'src/**/*.py'" in payload["weakenings"][0]["message"]
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("move", [False, True], ids=["listed", "moved"])
+def test_a_pattern_rewrite_needs_an_approval_even_when_it_reaches_every_file(tmp_path, capsys, move):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, paths=DEEP if not move else ("src/*.py",), signer_pub=pub)
+    if move:
+        repo.git("mv", "src", "lib")
+        repo.write(path_of("inv-a"), rule_text("inv-a", paths=("lib/*.py",)))
+    else:
+        repo.write("src/new.py", "z = 3\n")
+        repo.write("docs/notes.md", "notes\n")
+        repo.write(path_of("inv-a"), rule_text("inv-a", paths=(*LISTED, "src/new.py", "docs/notes.md")))
+    repo.commit("rewrite the patterns")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["coverage"]
+    approve(repo, key)
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 0 and payload["approval"]["valid"] is True
+
+
+@needs_git
+def test_a_local_narrowing_is_not_served_so_files_that_do_not_exist_yet_stay_covered(tmp_path):
+    repo = make_repo(tmp_path, paths=DEEP)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=LISTED))
+    repo.write("src/evil.py", "import os\n")
+    view = rule_integrity.effective(repo.root)
+    served = view.ruleset.get("inv-a")
+    assert served.applies_to("src/evil.py") and served.applies_to("src/pkg/deep.py")
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+
+
+def test_a_reach_lost_to_a_new_pattern_list_or_to_skipping_tests_is_coverage(tmp_path):
+    everywhere = parsed(tmp_path, "inv-a", rule_text("inv-a", paths=(), forbid={"calls": ["eval"]}))
+    scoped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", paths=("src/**",), forbid={"calls": ["eval"]}))
+    (found,) = weakenings(everywhere, scoped)
+    assert found.code == "coverage" and "'**'" in found.message
+    plain = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", paths=("src/**",)))
+    (found,) = weakenings(plain, scoped)
+    assert found.code == "coverage" and "test files" in found.message
+    assert weakenings(scoped, parsed(tmp_path / "d", "inv-a", rule_text(
+        "inv-a", paths=("src/**", "lib/**"), forbid={"calls": ["eval"]}))) == []
+
+
+@needs_git
+def test_serving_a_broader_pattern_list_lists_no_tree(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/*.py", "lib/*.py")))
+    calls: List[List[str]] = []
+    real = gitsafe.run
+
+    def spy(args, *a, **kw):
+        calls.append(list(args))
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    served = rule_integrity.effective(repo.root).ruleset.get("inv-a")
+    assert served.applies_to("lib/x.py")
+    assert calls and not [c for c in calls if "ls-tree" in c and "--name-only" in c]
 
 
 @needs_git
@@ -411,6 +588,136 @@ def test_the_mandatory_cap_counts_only_rules_that_share_a_real_file(tmp_path, ca
     repo.commit("a third")
     rc, payload, _err = ci(repo, capsys)
     assert rc == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("mandatory_cap", "inv-c")]
+
+
+def cap_repo(tmp_path: Path) -> hg.Repo:
+    """main: gate-a and gate-b on src/*.py (the cap is full there), gate-c on lib/*.py."""
+    repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
+    for path in ("src/app.py", "lib/x.py", "lib/deep/y.py", "docs/a.md"):
+        repo.write(path, "x = 1\n")
+    for rid, paths in (("gate-a", ("src/*.py",)), ("gate-b", ("src/*.py",)), ("gate-c", ("lib/*.py",))):
+        repo.write(path_of(rid, "gate"), rule_text(rid, "gate", paths=paths, forbid={"calls": ["exec"]}))
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    return repo
+
+
+def widen_c(repo: hg.Repo, *paths: str) -> None:
+    repo.write(path_of("gate-c", "gate"), rule_text("gate-c", "gate", paths=("lib/*.py", *paths), forbid={"calls": ["exec"]}))
+
+
+@needs_git
+@pytest.mark.parametrize("added,expected", [
+    (("**/*.py",), [("mandatory_cap", "gate-c")]),
+    (("docs/*.md",), []),
+    (("lib/**/*.py",), []),
+], ids=["crowded", "free", "inside"])
+def test_widening_a_mandatory_rule_is_held_to_the_cap_where_its_reach_is_new(tmp_path, capsys, added, expected):
+    repo = cap_repo(tmp_path)
+    widen_c(repo, *added)
+    repo.commit("widen gate-c")
+    rc, payload, _err = ci(repo, capsys)
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == expected
+    assert rc == (1 if expected else 0)
+    if expected:
+        assert "src/app.py" in payload["weakenings"][0]["message"]
+
+
+@needs_git
+@pytest.mark.parametrize("added,served_paths", [
+    (("**/*.py",), ("lib/*.py",)),
+    (("docs/*.md",), ("lib/*.py", "docs/*.md")),
+], ids=["crowded", "free"])
+def test_a_local_widening_into_a_full_slot_is_not_served(tmp_path, added, served_paths):
+    repo = cap_repo(tmp_path)
+    widen_c(repo, *added)
+    view = rule_integrity.effective(repo.root)
+    assert view.ruleset.get("gate-c").target_paths == served_paths
+    assert [(u.id, u.change) for u in view.unreviewed] == [("gate-c", "changed")]
+
+
+# ── a workspace below the git top level ──────────────────────────────────────
+
+def nested_repo(tmp_path: Path, prefix: str) -> Tuple[hg.Repo, Path]:
+    """A monorepo whose workspace ``prefix`` holds a gate invariant on src/*.py; a sibling
+    ``other/`` workspace holds a rule of its own."""
+    repo = hg.Repo(tmp_path / "mono", hg.Home(tmp_path / "home"))
+    repo.write("README.md", "# mono\n")
+    repo.write(f"{prefix}/src/a.py", "x = 1\n")
+    repo.write(f"{prefix}/{path_of('inv-a')}", rule_text("inv-a"))
+    repo.write(f"other/{path_of('inv-o')}", rule_text("inv-o"))
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    return repo, repo.root / prefix
+
+
+def ci_from(where: Path, capsys) -> Tuple[int, Any, str]:
+    os.chdir(where)
+    rc = main(["check", "--ci", "--base", "main", "--format", "json"])
+    captured = capsys.readouterr()
+    return rc, json.loads(captured.out) if captured.out.strip() else None, captured.err
+
+
+@needs_git
+@pytest.mark.parametrize("prefix", ["pkg", "pkg dir/ü", ""], ids=["nested", "spaced", "flat"])
+def test_a_workspace_below_the_top_level_checks_its_own_binding_rules(tmp_path, capsys, prefix):
+    repo, ws = nested_repo(tmp_path, prefix) if prefix else (make_repo(tmp_path), None)
+    ws = ws or repo.root
+    repo.write(f"{prefix}/{path_of('inv-a')}".lstrip("/"), rule_text("inv-a", enforcement="advisory"))
+    repo.commit("drop the gate to advisory")
+    rc, payload, err = ci_from(ws, capsys)
+    assert rc == 1, err
+    assert payload["rules_checked"] == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("rank", "inv-a")]
+
+
+@needs_git
+def test_a_nested_workspace_serves_its_base_rules_and_lists_an_edit_as_changed(tmp_path):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    repo.write(f"pkg/{path_of('inv-a')}", rule_text("inv-a", body="# The title\n\nA softer reason.\n"))
+    view = rule_integrity.effective(ws)
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+    assert "Why this rule exists." in view.ruleset.get("inv-a").body
+    assert view.ruleset.get("inv-o") is None
+
+
+@needs_git
+@pytest.mark.parametrize("move,expected", [
+    (("pkg/src", "pkg/lib"), [("coverage", "inv-a")]),
+    (("pkg/src/a.py", "pkg/src/b.py"), []),
+], ids=["out", "inside"])
+def test_coverage_follows_renames_inside_a_nested_workspace(tmp_path, capsys, move, expected):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    repo.git("mv", *move)
+    repo.commit("move")
+    rc, payload, err = ci_from(ws, capsys)
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == expected, err
+    assert rc == (1 if expected else 0)
+
+
+@needs_git
+def test_a_layout_git_cannot_place_fails_the_ci_check(tmp_path, capsys, monkeypatch):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    real = gitsafe.run
+
+    def refuse(args, *a, **kw):
+        if "--show-prefix" in args:
+            return subprocess.CompletedProcess(list(args), 128, b"", b"fatal: not a git repository")
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    rc, payload, err = ci_from(ws, capsys)
+    assert rc == 1 and payload is None and err.startswith("Error:")
+
+
+def test_a_path_is_relative_to_the_workspace_prefix_only_inside_it():
+    assert gitsafe.relative_to_prefix("", "src/a.py") == "src/a.py"
+    assert gitsafe.relative_to_prefix("pkg dir/ü/", "pkg dir/ü/src/a.py") == "src/a.py"
+    assert gitsafe.relative_to_prefix("pkg/", "pkgx/src/a.py") is None
+    assert gitsafe.relative_to_prefix("pkg/", "other/pkg/a.py") is None
 
 
 def test_the_cap_is_the_one_the_scan_uses():
