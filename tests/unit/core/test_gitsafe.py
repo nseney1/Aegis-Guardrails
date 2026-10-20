@@ -66,14 +66,18 @@ def test_every_call_is_hardened(monkeypatch, tmp_path: Path):
 
     argv, kwargs = seen["argv"], seen["kwargs"]
     assert Path(argv[0]).name.startswith("git")
-    assert argv[1:11] == [
+    assert argv[1:19] == [
         "-c", f"core.hooksPath={os.devnull}",
         "-c", "core.fsmonitor=false",
         "-c", "protocol.allow=never",
         "-c", "core.sshCommand=false",
         "-c", "credential.helper=",
+        "-c", "log.showSignature=false",
+        "-c", f"gpg.program={os.devnull}",
+        "-c", f"gpg.openpgp.program={os.devnull}",
+        "-c", f"gpg.x509.program={os.devnull}",
     ]
-    assert argv[11:] == ["rev-parse", "HEAD"]
+    assert argv[19:] == ["rev-parse", "HEAD"]
     assert "shell" not in kwargs and kwargs["timeout"] == gitsafe.GIT_TIMEOUT_SECONDS
     env = kwargs["env"]
     assert {k: env[k] for k in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_NO_REPLACE_OBJECTS", "LC_ALL")} == {

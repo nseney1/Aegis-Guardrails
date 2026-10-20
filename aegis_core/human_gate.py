@@ -805,6 +805,9 @@ def _verify_commit_sig(top: Path, oid: str, base: str, ok_reason: str) -> Approv
     signers = gitsafe.read_blob(top, base, ALLOWED_SIGNERS)
     if _signer_keys(signers) < 1:
         return _no("no_allowed_signers", f"{ALLOWED_SIGNERS} on the base branch lists no key", oid)
+    armor = _signature_armor(top, oid)
+    if armor is not None and not armor.startswith(_SSH_ARMOR):
+        return _no("bad_signature", "the signature is not an SSH signature, so it cannot be checked against allowed_signers", oid)
     status, fingerprint = _signature(top, oid, signers or b"")
     if status == "G":
         return Approval(True, "ok", ok_reason, oid, fingerprint)
@@ -930,6 +933,22 @@ def verify_test_exemption(
         return _no("unresolved", str(exc), str(approval_commit))
     except HumanGateError as exc:
         return _no("unverifiable", str(exc), str(approval_commit))
+
+
+_SSH_ARMOR = "-----BEGIN SSH SIGNATURE-----"
+
+
+def _signature_armor(top: Path, oid: str) -> Optional[str]:
+    """The first line of the signature git checks (None when unsigned): git takes its format
+    from this armor, and reads ``gpgsig-sha256`` in a SHA-256 repository, ``gpgsig`` otherwise."""
+    raw = gitsafe.run(["cat-file", "commit", oid], top)
+    if raw.returncode != 0:
+        raise HumanGateError(f"cannot read commit {oid}")
+    header = b"gpgsig-sha256 " if len(oid) == 64 else b"gpgsig "
+    for line in raw.stdout.partition(b"\n\n")[0].split(b"\n"):
+        if line.startswith(header):
+            return line[len(header):].decode("ascii", "replace")
+    return None
 
 
 def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]:

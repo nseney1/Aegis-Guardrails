@@ -8,7 +8,9 @@ every call here:
 
 - runs ``git`` as an argv list (no shell) with a timeout;
 - passes ``-c core.fsmonitor=false -c core.hooksPath=<devnull> -c protocol.allow=never
-  -c core.sshCommand=false -c credential.helper=`` (command-line config beats repo config);
+  -c core.sshCommand=false -c credential.helper= -c log.showSignature=false`` and points the
+  signature programs (``gpg.program``, ``gpg.openpgp.program``, ``gpg.x509.program``) at
+  <devnull> (command-line config beats repo config);
 - sets ``GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 LC_ALL=C``.
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
@@ -107,11 +109,20 @@ MERGE_TREE_MIN_VERSION = (2, 38)
 #: The only ref hierarchy update_ref writes: never a branch, a tag or a remote ref.
 _WRITABLE_REFS = "refs/aegis/"
 _ACMR = "--diff-filter=ACMR"
+# git takes a signature's format from its armor, so a PGP or X.509 signature runs gpg.program
+# or gpg.x509.program, which repository config can set (log.showSignature makes plain ``git
+# log`` check them). Aegis checks SSH signatures only, through the gpg.ssh.program human_gate
+# pins. <devnull>, not a bare ``false``: git looks a bare name up on PATH, where a relative or
+# empty entry finds a program planted in the work tree.
 _HARDENING_KEEP_HOOKS_PATH = (
     "-c", "core.fsmonitor=false",
     "-c", "protocol.allow=never",
     "-c", "core.sshCommand=false",
     "-c", "credential.helper=",
+    "-c", "log.showSignature=false",
+    "-c", f"gpg.program={os.devnull}",
+    "-c", f"gpg.openpgp.program={os.devnull}",
+    "-c", f"gpg.x509.program={os.devnull}",
 )
 _HARDENING = ("-c", f"core.hooksPath={os.devnull}", *_HARDENING_KEEP_HOOKS_PATH)
 _ENV = {

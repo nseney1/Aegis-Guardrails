@@ -3,7 +3,8 @@
 Given/When/Then, written before the code and never weakened to make it pass:
 
 1. A forged trailer, an unsigned commit, a commit signed by a key that is not in the BASE
-   allowed_signers, or a commit that carries an ``Aegis-Accept:`` line is never an approval.
+   allowed_signers, a signature that is not an SSH signature, or a commit that carries an
+   ``Aegis-Accept:`` line is never an approval, and no signature program the repository names runs.
 2. Tier C says it is self-attested, on the text report and in the JSON.
 3. ``doctor --github --apply`` without a terminal refuses and changes nothing on GitHub; with a
    terminal it asks first.
@@ -22,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 
 import pytest
 
@@ -184,6 +186,201 @@ def test_verify_insight_approval_binds_to_signed_commit_and_insight_text_hash(tm
     assert ok_verdict.valid and ok_verdict.ok
     mismatch = human_gate.verify_insight_approval(repo.root, sha, text_b, "main")
     assert not mismatch.valid and not mismatch.ok and mismatch.code == "hash_mismatch"
+
+
+# ── 1b. an approval is an SSH signature, checked against the base allowed_signers ──
+#
+# git takes a signature's format from its armor, not from gpg.format, so a PGP or X.509
+# signature is checked by gpg.program / gpg.x509.program (which a repository's config can
+# set) and allowed_signers is never read. Given a base with allowed_signers, a weakened rule
+# and an approval commit carrying a correct Aegis-Approve trailer, When its signature is not
+# an SSH signature, Then it is never an approval and no program the repository names runs.
+
+PGP = "-----BEGIN PGP SIGNATURE-----\n\niQEzBAABCAAdFiEEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PGP SIGNATURE-----\n"
+X509 = "-----BEGIN SIGNED MESSAGE-----\nMIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQMEAgEFADCABgkq\n-----END SIGNED MESSAGE-----\n"
+SSH_STUB = "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg\n-----END SSH SIGNATURE-----\n"
+
+
+def _approval_commit(repo: hg.Repo) -> str:
+    """On ``work``: a weakened rule, then an unsigned empty commit carrying the Aegis-Approve trailer."""
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), allow_empty=True)
+    return digest
+
+
+def _carry_signature(repo: hg.Repo, *signatures: tuple) -> str:
+    """Rewrite HEAD (``work``) to carry ``(header, armor)`` signature headers without signing anything."""
+    raw = subprocess.run(["git", "cat-file", "commit", "HEAD"], cwd=repo.root, capture_output=True,
+                         check=True).stdout.decode()
+    head, _, body = raw.partition("\n\n")
+    block = ""
+    for header, armor in signatures:
+        first, *rest = armor.rstrip("\n").split("\n")
+        block += f"{header} {first}\n" + "".join(f" {line}\n" for line in rest)
+    forged = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo.root,
+                            input=(head + "\n" + block.rstrip("\n") + "\n\n" + body).encode(),
+                            capture_output=True, check=True).stdout.decode().strip()
+    subprocess.run(["git", "update-ref", "refs/heads/work", forged], cwd=repo.root, check=True)
+    return forged
+
+
+def _recording_signer(tmp_path: Path):
+    """A program that answers like a gpg that found a good, fully trusted signature, and records that it ran."""
+    marker, program = tmp_path / "ran", tmp_path / "fake-gpg.sh"
+    program.write_bytes((
+        f'#!/bin/sh\necho ran >> "{marker}"\n'
+        'echo "[GNUPG:] NEWSIG"\necho "[GNUPG:] GOODSIG AAAAAAAAAAAAAAAA human"\n'
+        'echo "[GNUPG:] VALIDSIG AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2026-01-01 0 4 0 1 10 00 '
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\necho "[GNUPG:] TRUST_ULTIMATE 0 pgp"\nexit 0\n').encode())
+    program.chmod(program.stat().st_mode | stat.S_IXUSR)
+    return program, marker
+
+
+@posix_only
+@needs_signing
+@pytest.mark.parametrize("config_key, armor", [
+    pytest.param("gpg.program", PGP, id="pgp-program"),
+    pytest.param("gpg.openpgp.program", PGP, id="pgp-openpgp"),
+    pytest.param("gpg.x509.program", X509, id="x509"),
+])
+def test_a_repository_cannot_turn_a_non_ssh_signature_into_an_approval(tmp_path, keys, config_key, armor):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _approval_commit(repo)
+    _carry_signature(repo, ("gpgsig", armor))
+    program, marker = _recording_signer(tmp_path)
+    repo.git("config", "--local", config_key, str(program))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert not marker.exists(), "the program the repository chose was run"
+    assert (verdict.valid, verdict.code) == (False, "bad_signature")
+    assert human_gate.find_approval(repo.root, "HEAD", "main", governance_hash=digest) is None
+
+
+@posix_only
+@needs_signing
+def test_test_exemptions_and_insight_approvals_refuse_a_non_ssh_signature_too(tmp_path, keys):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    program, marker = _recording_signer(tmp_path)
+    repo.git("config", "--local", "gpg.program", str(program))
+    fix = repo.commit("fix: hotfix\n\nAegis-No-Test: verified manually", allow_empty=True)
+    repo.commit(human_gate.exemption_message(fix, "verified manually"), allow_empty=True)
+    _carry_signature(repo, ("gpgsig", PGP))
+    exemption = human_gate.verify_test_exemption(repo.root, "HEAD", fix, "main")
+    text = "Always pass a timeout to subprocess.run."
+    repo.commit(f"approve\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: {human_gate.insight_text_hash(text)}\n",
+                allow_empty=True)
+    _carry_signature(repo, ("gpgsig", PGP))
+    insight = human_gate.verify_insight_approval(repo.root, "HEAD", text, "main")
+    assert not marker.exists()
+    assert (exemption.valid, exemption.code) == (insight.valid, insight.code) == (False, "bad_signature")
+
+
+@posix_only
+@needs_signing
+def test_a_user_level_gpg_program_does_not_make_a_pgp_signature_an_approval(tmp_path, keys):
+    """The user's own gpg config is not the repository's, but allowed_signers is the only list of approvers."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _approval_commit(repo)
+    _carry_signature(repo, ("gpgsig", PGP))
+    program, marker = _recording_signer(tmp_path)
+    repo.home.config("gpg.program", str(program))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert not marker.exists()
+    assert (verdict.valid, verdict.code) == (False, "bad_signature")
+
+
+@posix_only
+@needs_signing
+def test_a_signature_header_git_ignores_cannot_hide_a_pgp_one(tmp_path, keys):
+    """A sha1 repository's git reads ``gpgsig``; an SSH-looking ``gpgsig-sha256`` header ahead of it is not the signature."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _approval_commit(repo)
+    _carry_signature(repo, ("gpgsig-sha256", SSH_STUB), ("gpgsig", PGP))
+    program, marker = _recording_signer(tmp_path)
+    repo.git("config", "--local", "gpg.program", str(program))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert not marker.exists()
+    assert not verdict.valid
+
+
+@posix_only
+@needs_signing
+def test_the_signature_programs_are_not_looked_up_on_a_path_the_repository_can_plant_on(tmp_path, monkeypatch, keys):
+    """A bare program name (``false``, git's default ``gpg``) is looked up on PATH from the work
+    tree, where a relative or empty PATH entry finds a program the repository planted."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _approval_commit(repo)
+    _carry_signature(repo, ("gpgsig", PGP))
+    program, marker = _recording_signer(tmp_path)
+    for name in ("false", "gpg", "gpgsm"):
+        planted = repo.root / name
+        planted.write_bytes(program.read_bytes())
+        planted.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", os.environ["PATH"]]))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert not marker.exists()
+    assert not verdict.valid
+    # the git call itself, so the neutralised programs hold even without the armor check
+    signers = hg.allowed_signers_text(keys["human_pub"]).encode()
+    status, _fingerprint = human_gate._signature(repo.root, repo.head(), signers)
+    assert status != "G" and not marker.exists()
+
+
+@posix_only
+@needs_git
+def test_log_show_signature_in_a_repository_config_does_not_run_the_repositorys_program(tmp_path):
+    """Plain ``git log --format`` checks signatures under log.showSignature; no gitsafe call may
+    reach a program the repository's config names."""
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    repo.commit("a subject", allow_empty=True)
+    oid = _carry_signature(repo, ("gpgsig", PGP))
+    program, marker = _recording_signer(tmp_path)
+    repo.git("config", "--local", "gpg.program", str(program))
+    repo.git("config", "--local", "log.showSignature", "true")
+    res = gitsafe.run(["log", "-1", "--format=%s", oid], repo.root)
+    assert not marker.exists()
+    assert res.returncode == 0 and res.stdout.decode().strip() == "a subject"
+
+
+@needs_signing
+def test_log_show_signature_in_the_users_config_does_not_reject_a_genuine_approval(tmp_path, keys):
+    """Under log.showSignature git prints its check before the --format text; the verdict must not read that text."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    repo.home.config("log.showSignature", "true")
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (verdict.valid, verdict.code) == (True, "ok")
+
+
+@needs_signing
+def test_ssh_verdicts_keep_their_codes_beside_the_ssh_only_check(tmp_path, keys):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    good = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (good.valid, good.code) == (True, "ok") and good.signer
+    repo.commit(human_gate.approval_message(digest) + "\n", sign_key=keys["other"], allow_empty=True)
+    assert human_gate.verify_approval(repo.root, "HEAD", digest, "main").code == "untrusted_signature"
+    repo.commit(human_gate.approval_message(digest) + "\n\n", allow_empty=True)
+    assert human_gate.verify_approval(repo.root, "HEAD", digest, "main").code == "unsigned"
+
+
+@needs_signing
+def test_a_genuine_ssh_approval_verifies_in_a_sha256_repository(tmp_path, monkeypatch, keys):
+    """A SHA-256 repository names the signature header ``gpgsig-sha256``; the SSH-only check follows it."""
+    monkeypatch.setenv("GIT_DEFAULT_HASH", "sha256")
+    try:
+        repo = hg.make_repo(tmp_path, keys["human_pub"])
+    except subprocess.CalledProcessError:
+        pytest.skip("this git cannot make a SHA-256 repository")
+    if repo.git("rev-parse", "--show-object-format") != "sha256":
+        pytest.skip("this git cannot make a SHA-256 repository")
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (verdict.valid, verdict.code) == (True, "ok")
 
 # ── 2. Tier C is self-attested ───────────────────────────────────────────────
 
