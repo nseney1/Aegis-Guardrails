@@ -732,18 +732,17 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
     sub = cmd.subcommand
     if not sub:
         return SafetyEvaluation(False)
+    values = _GIT_SHORT_VALUES.get(sub, "")
 
     if sub == "branch":
         for f in flags:
             if _long_option(f, "--delete") or _long_option(f, "--force"):
                 return SafetyEvaluation(True, REASON_GIT_BRANCH)
-            if f.startswith("-") and not f.startswith("--"):
-                letters = f[1:]
-                if any(c in letters for c in "dDMf"):
-                    return SafetyEvaluation(True, REASON_GIT_BRANCH)
+            if any(c in _short_letters(f, values) for c in "dDMf"):
+                return SafetyEvaluation(True, REASON_GIT_BRANCH)
 
     elif sub == "push":
-        if any("f" in _short_letters(f) or _long_option(f, "--force") or _long_option(f, "--force-with-lease")
+        if any("f" in _short_letters(f, values) or _long_option(f, "--force") or _long_option(f, "--force-with-lease")
                for f in flags):
             return SafetyEvaluation(True, REASON_GIT_PUSH_FORCE)
         for arg in cmd.positional_args:
@@ -757,17 +756,17 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
             return SafetyEvaluation(True, REASON_GIT_RESET_HARD)
 
     elif sub == "checkout":
-        if any("f" in _short_letters(f) or _long_option(f, "--force") for f in flags):
+        if any("f" in _short_letters(f, values) or _long_option(f, "--force") for f in flags):
             return SafetyEvaluation(True, REASON_GIT_CHECKOUT_FORCE)
 
     elif sub == "clean":
         for f in flags:
-            if _long_option(f, "--force") or "f" in _short_letters(f):
+            if _long_option(f, "--force") or "f" in _short_letters(f, values):
                 return SafetyEvaluation(True, REASON_GIT_CLEAN_FORCE)
 
     elif sub == "add":
         for f in flags:
-            if "A" in _short_letters(f) or _long_option(f, "--all"):
+            if "A" in _short_letters(f, values) or _long_option(f, "--all"):
                 return SafetyEvaluation(True, REASON_GIT_ADD_BULK)
         for arg in cmd.positional_args:
             if arg in (".", "./", "*"):
@@ -1095,9 +1094,20 @@ RECORD_SET: Tuple[GuardRule, ...] = (
 _GUARD: Dict[str, GuardRule] = {rule.id: rule for rule in BLOCK_SET + RECORD_SET}
 
 
-def _short_letters(flag: str) -> str:
-    """The letters of a bundled short option (``-fu`` -> ``fu``); "" for anything else."""
-    return flag[1:] if flag.startswith("-") and not flag.startswith("--") else ""
+#: The short options that take a value, for the git subcommands whose bundles the guard
+#: or the gate reads (from ``git <subcommand> -h``); -t takes one only when it is stuck.
+_GIT_SHORT_VALUES: Dict[str, str] = {"push": "o", "checkout": "bBt", "clean": "e", "branch": "ut"}
+
+
+def _short_letters(flag: str, takes_value: str = "") -> str:
+    """The option letters of a bundled short option (``-fu`` -> ``fu``); "" for anything
+    else. The bundle ends at its first letter in ``takes_value``, as in git's
+    parse-options: the rest of the token is that option's value (``-ofeature`` -> ``o``)."""
+    letters = flag[1:] if flag.startswith("-") and not flag.startswith("--") else ""
+    for index, letter in enumerate(letters):
+        if letter in takes_value:
+            return letters[:index + 1]
+    return letters
 
 
 def _pushes_to_protected(refspec: str) -> bool:
@@ -1134,8 +1144,8 @@ _GUARD_GIT_SUBCOMMANDS = frozenset({"push", "reset", "clean", "merge", "add"})
 
 def _guard_git(cmd: UnwrappedCommand) -> List[GuardRule]:
     flags = [f.lstrip("\\") for f in cmd.flags]
-    letters = "".join(_short_letters(f) for f in flags)
     sub = cmd.subcommand
+    letters = "".join(_short_letters(f, _GIT_SHORT_VALUES.get(sub or "", "")) for f in flags)
     found: List[GuardRule] = []
     if sub == "push":
         if "f" in letters or any(_long_option(f, "--force") or _long_option(f, "--force-with-lease") for f in flags):

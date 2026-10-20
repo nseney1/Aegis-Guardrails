@@ -389,6 +389,33 @@ def test_the_analyzer_does_not_over_match_a_prefix(cmd):
     assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)
 
 
+# A short option that takes a value ends its bundle (git push -ofeature is -o feature):
+# push -o; checkout -b, -B and -t; clean -e; branch -u and -t (-t's value must be stuck).
+@pytest.mark.parametrize("cmd", [
+    "git checkout -bfeat",
+    "git checkout -Bfix",
+    "git checkout -qbfeat",
+    "git push -ofeature origin feat",
+    "git push -uofeature origin feat",
+    "git clean -ef",
+    "git branch -uorigin/feat",
+    "git branch -tdirect feat origin/feat",
+])
+def test_the_analyzer_reads_the_letters_after_a_value_taking_short_option_as_its_value(cmd):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)
+
+
+@pytest.mark.parametrize("cmd,reason", [
+    ("git push -fofeature origin feat", REASON_GIT_PUSH_FORCE),
+    ("git checkout -fbfeat", REASON_GIT_CHECKOUT_FORCE),
+    ("git clean -fe x", REASON_GIT_CLEAN_FORCE),
+    ("git branch -Dt feat", REASON_GIT_BRANCH),
+    ("git branch -fu origin/feat feat", REASON_GIT_BRANCH),
+], ids=lambda value: value if value.startswith("git") else "")
+def test_the_analyzer_still_reads_the_letters_before_a_value_taking_short_option(cmd, reason):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(True, reason)
+
+
 # ── R-checks-5: dd writes a device (gate parity with the guard's dd-device) ──
 
 @pytest.mark.parametrize("cmd", ["dd of=/dev/sda", "yes | dd of=/dev/sda", "dd of=//dev/sda", "dd of=/tmp/../dev/sdb bs=4M"])
@@ -532,6 +559,19 @@ PARITY_TABLE = [
     ("git clean -fdx --exclude .venv --dry-run", None, "force_ask", _DRY_RUN),
     ("git clean -fdx -e .env", "block:git-clean-force", "force_ask", _SAME),
     ("git clean -e x -e -n -f", "block:git-clean-force", "force_ask", _SAME),
+    # a value-taking short option ends its bundle (push -o, checkout -b/-B/-t, clean -e, branch -u/-t)
+    ("git checkout -bfeat", None, "allow", _SAME),
+    ("git checkout -Bfix", None, "allow", _SAME),
+    ("git push -ofeature origin feat", None, "allow", _SAME),
+    ("git push -uofeature origin feat", None, "allow", _SAME),
+    ("git clean -ef", None, "allow", _SAME),
+    ("git branch -uorigin/feat", None, "allow", _SAME),
+    ("git push -fu origin feat", "block:git-push-force", "force_ask", _SAME),
+    ("git push -fofeature origin feat", "block:git-push-force", "force_ask", _SAME),
+    ("git clean -fe x", "block:git-clean-force", "force_ask", _SAME),
+    ("git checkout -fq main", None, "force_ask", _NO_RULE),
+    ("git checkout -fbfeat", None, "force_ask", _NO_RULE),
+    ("git add -Av", "record:git-add-bulk", "force_ask", _RECORDS),
     # R-checks-3: command-line git aliases (guard-only; the gate asks on any git -c)
     ("git -c alias.p='push -f' p", "block:git-push-force", "force_ask", _SAME),
     ("git -c alias.p='push --force-with-lease' p origin feat", "block:git-push-force", "force_ask", _SAME),

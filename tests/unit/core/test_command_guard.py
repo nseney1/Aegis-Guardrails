@@ -249,6 +249,22 @@ def test_an_unrelated_prefix_or_a_real_dry_run_is_not_a_match(command):
     assert classify_command(command) is None
 
 
+# A short option that takes a value ends its bundle: git push -ofeature is -o feature and
+# git clean -ef excludes the pattern f; letters before it are still options.
+@pytest.mark.parametrize("command", ["git push -ofeature origin feat", "git push -uofeature origin feat", "git clean -ef"])
+def test_the_letters_after_a_value_taking_short_option_are_its_value(command):
+    assert classify_command(command) is None
+
+
+@pytest.mark.parametrize("command,rule", [
+    ("git push -fofeature origin feat", "git-push-force"),
+    ("git clean -fe x", "git-clean-force"),
+    ("git clean -dfe x", "git-clean-force"),
+])
+def test_the_letters_before_a_value_taking_short_option_are_options(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
 def test_delimiter_runs_alone_or_unterminated_fail_open_without_raising():
     assert classify_command(";;;;;") is None
     assert classify_command(";" * 100_000) is None
