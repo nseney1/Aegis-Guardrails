@@ -4,6 +4,7 @@ gh is faked at its runner boundary (hg.FakeGh); git and ssh-keygen are real.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -161,7 +162,7 @@ def test_no_signing_key_and_other_formats_are_reported_as_such(tmp_path):
     home = hg.Home(tmp_path / "home")
     home.sign_with("ABCDEF0123456789", fmt="openpgp")
     custody = human_gate.check_key_custody(tmp_path)
-    assert custody.status == "unsupported" and custody.degrades
+    assert custody.status == "unsupported" and not custody.degrades
 
 
 @needs_git
@@ -175,7 +176,7 @@ def test_a_repository_cannot_declare_a_hardware_key_for_the_user(tmp_path):
 
 # ── tier detection ───────────────────────────────────────────────────────────
 
-def _repo_with_governance(tmp_path, signer_pub=None, codeowners=hg.CODEOWNERS_FULL) -> hg.Repo:
+def _repo_with_governance(tmp_path, signer_pub=None, codeowners=hg.CODEOWNERS_FULL, workflow=hg.AEGIS_WORKFLOW) -> hg.Repo:
     home = hg.Home(tmp_path / "home")
     repo = hg.Repo(tmp_path / "project", home)
     repo.write("README.md", "# p\n")
@@ -184,6 +185,8 @@ def _repo_with_governance(tmp_path, signer_pub=None, codeowners=hg.CODEOWNERS_FU
         repo.write("allowed_signers", hg.allowed_signers_text(signer_pub))
     if codeowners:
         repo.write(".github/CODEOWNERS", codeowners)
+    if workflow:
+        repo.write(".github/workflows/aegis.yml", workflow)
     repo.commit("base")
     repo.branch("work")
     return repo
@@ -215,10 +218,92 @@ def test_an_admin_identity_cannot_be_tier_a(tmp_path):
     [hg.pull_request_rule(approvals=0), hg.checks_rule()],
     [hg.pull_request_rule(code_owners=False), hg.checks_rule()],
     [hg.pull_request_rule()],
+    [hg.pull_request_rule(dismiss_stale=False), hg.checks_rule()],
 ])
 def test_each_missing_ruleset_requirement_blocks_tier_a(tmp_path, rules):
     repo = _repo_with_governance(tmp_path)
     assert human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules)).tier != "A"
+
+
+@needs_git
+@pytest.mark.parametrize("last_push", [False, True], ids=["plain", "last-push"])
+def test_a_ruleset_that_keeps_stale_approvals_is_not_tier_a(tmp_path, last_push):
+    """Given one approving review and code-owner review that keep an approval after new commits
+    (even with require_last_push_approval), When the tier is detected, Then it is not A, the
+    evidence says so and a reason names dismissal and new commits."""
+    repo = _repo_with_governance(tmp_path)
+    rules = [hg.pull_request_rule(dismiss_stale=False, last_push=last_push), hg.checks_rule()]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier != "A"
+    assert report.evidence["rules"]["dismiss_stale_reviews_on_push"] is False
+    assert any("dismiss" in r and "new commits" in r for r in report.reasons), report.reasons
+
+
+@needs_git
+@pytest.mark.parametrize("value", ["true", 1, None, "yes", [True], "absent"])
+def test_only_a_literal_true_dismisses_stale_reviews(tmp_path, value):
+    repo = _repo_with_governance(tmp_path)
+    rule = hg.pull_request_rule(dismiss_stale=value)
+    if value == "absent":
+        del rule["parameters"]["dismiss_stale_reviews_on_push"]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[rule, hg.checks_rule()]))
+    assert report.tier != "A" and report.evidence["rules"]["dismiss_stale_reviews_on_push"] is False
+
+
+@needs_git
+@pytest.mark.parametrize("first, second, tier_a", [(False, False, False), (True, False, True), (False, True, True)])
+def test_any_pull_request_rule_that_dismisses_stale_reviews_counts(tmp_path, first, second, tier_a):
+    repo = _repo_with_governance(tmp_path)
+    rules = [hg.pull_request_rule(dismiss_stale=first), hg.pull_request_rule(dismiss_stale=second), hg.checks_rule()]
+    assert (human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules)).tier == "A") is tier_a
+
+
+@needs_git
+def test_the_tier_a_ruleset_doctor_prints_reads_back_as_tier_a(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=human_gate.build_ruleset("A", ["aegis-check"])["rules"]))
+    assert report.tier == "A", report.reasons
+
+
+@needs_git
+def test_a_bare_organization_owner_covers_nothing_in_an_organization_repository(tmp_path):
+    """Given an organization-owned repository whose CODEOWNERS names the bare ``@acme`` on every
+    governance path, When the tier is detected, Then every path is uncovered, the tier is not A and a
+    reason names the organization owner; with ``@acme/security`` the paths are covered."""
+    repo = _repo_with_governance(tmp_path, codeowners=hg.CODEOWNERS_FULL.replace("@octo", "@acme"))
+    gh = hg.FakeGh(owner="acme", owner_type="Organization", rules=[hg.pull_request_rule(), hg.checks_rule()])
+    report = human_gate.detect_tier(repo.root, gh=gh)
+    assert report.tier != "A" and report.evidence["codeowners"]["covered"] == []
+    assert report.evidence["repo"]["owner"] == {"login": "acme", "type": "Organization"}
+    assert any("@acme" in r and "team" in r for r in report.reasons), report.reasons
+    team = _repo_with_governance(tmp_path / "team", codeowners=hg.CODEOWNERS_FULL.replace("@octo", "@ACME/security"))
+    assert human_gate.detect_tier(team.root, gh=gh).tier == "A"
+
+
+@needs_git
+@pytest.mark.parametrize("owner, owner_type", [("alice", "User"), ("acme", None), ("acme", "missing")])
+def test_a_user_owner_or_an_owner_of_unknown_type_still_counts(tmp_path, owner, owner_type):
+    repo = _repo_with_governance(tmp_path, codeowners=hg.CODEOWNERS_FULL.replace("@octo", f"@{owner}"))
+    fake = hg.FakeGh(owner=owner, owner_type=owner_type, rules=[hg.pull_request_rule(), hg.checks_rule()])
+
+    def gh(argv, stdin=None, cwd=None):
+        result = fake(argv, stdin, cwd)
+        if owner_type == "missing" and argv[-1] == "repos/{owner}/{repo}":
+            body = json.loads(result.stdout)
+            del body["owner"]
+            return human_gate.GhResult(0, json.dumps(body), "")
+        return result
+
+    report = human_gate.detect_tier(repo.root, gh=gh)
+    assert report.tier == "A", report.reasons
+
+
+def test_coverage_drops_only_the_organizations_own_bare_handle():
+    text = hg.CODEOWNERS_FULL.replace("@octo", "@Acme")
+    assert human_gate.codeowners_coverage(text)[1] == []
+    assert human_gate.codeowners_coverage(text, org_login="acme")[0] == []
+    assert human_gate.codeowners_coverage(text.replace("@Acme", "@acme/sec"), org_login="acme")[1] == []
+    assert human_gate.codeowners_coverage(text.replace("@Acme", "@alice"), org_login="acme")[1] == []
 
 
 @needs_git
@@ -279,6 +364,108 @@ def test_tier_b_degrades_to_c_and_says_why_when_the_key_is_a_plain_file(tmp_path
     assert report.tier == "C" and report.label == "self-attested"
     assert any("plain" in reason for reason in report.reasons)
     assert report.evidence["key_custody"]["status"] == "plain_file"
+
+
+def _tier_b_repo(tmp_path) -> hg.Repo:
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    return repo
+
+
+def _check(context, **source):
+    return {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": context, **source}]}}
+
+
+@needs_git
+@pytest.mark.parametrize("source", [{}, {"integration_id": None}, {"integration_id": 0}, {"integration_id": -1},
+                                    {"integration_id": True}, {"integration_id": "15368"}],
+                         ids=["absent", "null", "zero", "negative", "bool", "string"])
+def test_a_required_check_any_writer_can_post_is_not_tier_b(tmp_path, source):
+    """Given allowed_signers on the base, a security key, and a ruleset whose only required check has no
+    integer app id as its source, When the tier is detected, Then it is C and the reason names the
+    check, integration_id and the GitHub Actions app id."""
+    repo = _tier_b_repo(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[_check("aegis-check", **source)]))
+    assert report.tier == "C"
+    assert report.evidence["rules"]["unpinned_status_checks"] == ["aegis-check"]
+    reason = next(r for r in report.reasons if "integration_id" in r)
+    assert "aegis-check" in reason and "15368" in reason and "write access" in reason
+
+
+@needs_git
+def test_one_unpinned_check_beside_a_pinned_one_is_still_not_tier_b(tmp_path):
+    repo = _tier_b_repo(tmp_path)
+    rules = [hg.checks_rule("aegis-check"), hg.checks_rule("coverage", integration_id=None)]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier == "C" and report.evidence["rules"]["unpinned_status_checks"] == ["coverage"]
+    twice = [hg.checks_rule("aegis-check"), hg.checks_rule("aegis-check", integration_id=None)]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=twice))
+    assert report.tier == "C" and report.evidence["rules"]["unpinned_status_checks"] == ["aegis-check"]
+
+
+@needs_git
+def test_a_check_pinned_to_any_app_keeps_tier_b(tmp_path):
+    repo = _tier_b_repo(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule("aegis-check", integration_id=4242)]))
+    assert report.tier == "B", report.reasons
+    assert report.evidence["rules"]["unpinned_status_checks"] == []
+
+
+@needs_git
+def test_tier_a_with_an_unpinned_check_stays_a_with_a_caveat(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    rules = [hg.pull_request_rule(), hg.checks_rule("aegis-check", integration_id=None)]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier == "A", report.reasons
+    assert any("aegis-check" in c and "integration_id" in c for c in report.caveats), report.caveats
+
+
+@pytest.mark.parametrize("tier", ["A", "B"])
+def test_the_ruleset_pins_every_required_check_to_github_actions(tier):
+    ruleset = human_gate.build_ruleset(tier, ["aegis-check", "Unit tests"])
+    (checks,) = [r["parameters"]["required_status_checks"] for r in ruleset["rules"] if r["type"] == "required_status_checks"]
+    assert checks == [{"context": "aegis-check", "integration_id": 15368}, {"context": "Unit tests", "integration_id": 15368}]
+    assert human_gate.GITHUB_ACTIONS_APP_ID == 15368
+
+
+@needs_git
+def test_the_tier_b_ruleset_doctor_prints_reads_back_as_tier_b(tmp_path):
+    repo = _tier_b_repo(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=human_gate.build_ruleset("B", ["aegis-check"])["rules"]))
+    assert report.tier == "B", report.reasons
+
+
+@needs_git
+@pytest.mark.parametrize("signing", [None, "openpgp"], ids=["no-key", "openpgp"])
+def test_no_ssh_signing_key_on_this_machine_is_a_tier_b_caveat_not_a_downgrade(tmp_path, signing):
+    """Given allowed_signers on the base, a required check, and (a) no user.signingkey or (b) an
+    OpenPGP signing format, When the tier is detected, Then it is B and a caveat says aegis approve
+    cannot be run here."""
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    if signing:
+        repo.home.sign_with("ABCDEF0123456789", fmt=signing)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule()]))
+    assert report.tier == "B", report.reasons
+    assert any("no SSH signing key is configured on this machine" in c and "aegis approve" in c
+               for c in report.caveats), report.caveats
+    assert report.evidence["key_custody"]["degrades"] is False
+
+
+@needs_git
+def test_a_configured_signing_key_carries_the_not_compared_with_allowed_signers_caveat(tmp_path):
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule()]))
+    assert report.tier == "B", report.reasons
+    assert "the local signing key is not compared with the keys in allowed_signers" in report.caveats
+
+
+def test_approve_says_what_it_reads_of_a_key():
+    from aegis_cli import approve
+    doc = " ".join((approve.__doc__ or "").split())
+    assert "reads at most the first 64 KiB of a key file to classify its protection" in doc
+    assert "it never copies, prints or stores it" in doc
+    assert "create, copy or read a key" not in doc
 
 
 @needs_signing
@@ -531,11 +718,115 @@ def test_ruleset_variants_differ_in_reviews_only():
         human_gate.build_ruleset("C", ["x"])
 
 
-def test_workflow_job_contexts_come_from_the_workflow_files(tmp_path):
-    wf = tmp_path / ".github" / "workflows"
-    wf.mkdir(parents=True)
-    (wf / "ci.yml").write_text(
-        "name: CI\non: [push]\njobs:\n  lint:\n    runs-on: ubuntu-latest\n  tests:\n    name: Unit tests\n"
-        "    runs-on: ubuntu-latest\n", encoding="utf-8")
-    assert human_gate.workflow_contexts(tmp_path) == ["lint", "Unit tests"]
-    assert human_gate.workflow_contexts(tmp_path / "none") == []
+# ── the Aegis job: the required check is identified, not guessed ────────────
+
+def _workflow(on="on:\n  pull_request:\n", job="  aegis-check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: aegis check --ci\n"):
+    return f"name: Aegis\n{on}jobs:\n{job}"
+
+
+def test_the_aegis_jobs_of_a_workflow_are_the_jobs_that_run_aegis_check_ci():
+    from aegis_core import scaffolding
+    assert human_gate.aegis_check_jobs(scaffolding.ci_workflow()) == ["aegis-check"]
+    text = _workflow(job=(
+        "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruff check .\n"
+        "  gate:\n    name: Aegis gate  # the check name\n    steps:\n      - name: Gate\n"
+        "        run: python3 -m aegis_cli.cli check --ci\n"
+        "  block:\n    steps:\n      - run: |\n          pip install aegis-guardrails\n          aegis check --ci --base main\n"
+        "  local:\n    steps:\n      - run: aegis check\n"))
+    assert human_gate.aegis_check_jobs(text) == ["Aegis gate", "block"]
+
+
+@pytest.mark.parametrize("job", [
+    "  aegis:\n    name: 'Aegis (${{ matrix.os }})'\n    steps:\n      - run: aegis check --ci\n",
+    "  aegis:\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n    steps:\n      - run: aegis check --ci\n",
+], ids=["templated", "matrix"])
+def test_an_aegis_job_without_a_fixed_check_name_is_not_a_literal_context(job):
+    assert human_gate.aegis_check_jobs(_workflow(job=job)) == []
+
+
+def test_this_repositorys_required_check_is_its_aggregate_aegis_job():
+    root = Path(__file__).resolve().parents[3]
+    text = (root / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
+    assert human_gate.aegis_check_jobs(text) == ["aegis-check"]
+
+
+@needs_git
+def test_a_required_aegis_job_without_a_path_filter_meets_the_check_criterion(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule("aegis-check")]))
+    assert report.tier == "A", report.reasons
+    assert not [c for c in report.caveats if "not visible from here" in c]
+    assert report.evidence["aegis_checks"] == {"jobs": ["aegis-check"], "path_filtered": []}
+
+
+@needs_git
+def test_a_required_check_that_is_not_the_aegis_job_is_neither_tier_a_nor_b(tmp_path):
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key())
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule("lint")]))
+    assert report.tier == "C"
+    reason = next(r for r in report.reasons if "the required checks do not include the Aegis job" in r)
+    assert "aegis-check" in reason
+
+
+@needs_git
+@pytest.mark.parametrize("on", [
+    "on:\n  pull_request:\n    paths:\n      - 'src/**'\n",
+    "on:\n  pull_request:\n    branches: [main]\n    paths-ignore: ['docs/**']\n",
+    "on:\n  pull_request: {paths: ['src/**']}\n",
+    "on:\n  push:\n  pull_request_target:\n    paths: ['src/**']  # only source\n",
+    "on: {push: {branches: [main]}, pull_request: {paths: ['src/**']}}\n",
+], ids=["block", "ignore", "flow", "target", "flow-on"])
+def test_an_aegis_workflow_that_filters_pull_requests_by_path_is_not_tier_a(tmp_path, on):
+    repo = _repo_with_governance(tmp_path, workflow=_workflow(on=on))
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()]))
+    assert report.tier != "A"
+    assert any("filters pull requests by path" in r for r in report.reasons), report.reasons
+    assert report.evidence["aegis_checks"]["path_filtered"] == ["aegis-check"]
+
+
+@needs_git
+@pytest.mark.parametrize("on", [
+    "on:\n  pull_request:\n  push:\n    paths: ['src/**']\n",
+    "on:\n  pull_request:\n    branches: [main, 'release/**']\n",
+    "on: {push: {paths: ['src/**']}, pull_request: {branches: [main]}}\n",
+    "on: [push, pull_request]\n",
+], ids=["push-paths", "branches", "flow-push", "list"])
+def test_a_push_path_filter_or_a_branch_filter_is_not_a_pull_request_path_filter(tmp_path, on):
+    repo = _repo_with_governance(tmp_path, workflow=_workflow(on=on))
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()]))
+    assert report.tier == "A", report.reasons
+
+
+@needs_git
+def test_an_aegis_workflow_only_in_the_working_tree_is_not_trusted(tmp_path):
+    repo = _repo_with_governance(tmp_path, workflow=None)
+    repo.write(".github/workflows/aegis.yml", hg.AEGIS_WORKFLOW)
+    repo.commit("add the workflow on the branch only")
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()]))
+    assert report.tier != "A"
+    assert any("the required checks do not include the Aegis job" in r for r in report.reasons), report.reasons
+
+
+@needs_git
+def test_reading_the_base_workflows_costs_one_batched_git_read(tmp_path, monkeypatch):
+    from collections import Counter
+    from aegis_core import gitsafe
+    counts = []
+    real = gitsafe.run
+    for name, workflow in (("without", None), ("with", hg.AEGIS_WORKFLOW)):
+        repo = _repo_with_governance(tmp_path / name, workflow=workflow)
+        seen = Counter()
+
+        def spy(args, cwd, *a, **kw):
+            seen[" ".join(x for x in args[:2] if x.startswith(("cat-file", "--batch", "ls-tree")))] += 1
+            return real(args, cwd, *a, **kw)
+
+        monkeypatch.setattr(gitsafe, "run", spy)
+        human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule()]))
+        monkeypatch.setattr(gitsafe, "run", real)
+        counts.append(seen)
+    without, with_ = counts
+    assert sum(with_.values()) - sum(without.values()) == 1
+    assert with_["cat-file --batch"] == without["cat-file --batch"] + 1
+    assert with_["ls-tree"] == without["ls-tree"]

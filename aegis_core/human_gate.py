@@ -6,15 +6,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import struct
 import subprocess
 import tempfile
-from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
 from aegis_core import gitsafe, governance, pathlookup
@@ -27,6 +29,7 @@ __all__ = [
     "ALLOWED_SIGNERS",
     "Approval",
     "COVERAGE_SAMPLES",
+    "GITHUB_ACTIONS_APP_ID",
     "GhResult",
     "HumanGateError",
     "INSIGHT_APPROVE_TRAILER",
@@ -35,6 +38,7 @@ __all__ = [
     "SCHEMA",
     "SOURCE",
     "TierReport",
+    "aegis_check_jobs",
     "approval_message",
     "build_ruleset",
     "check_key_custody",
@@ -56,7 +60,6 @@ __all__ = [
     "verify_approval",
     "verify_insight_approval",
     "verify_test_exemption",
-    "workflow_contexts",
 ]
 
 SCHEMA = "aegis.human_gate/v1"
@@ -64,6 +67,8 @@ SOURCE = "aegis human_gate"
 ALLOWED_SIGNERS = "allowed_signers"
 RULESET_NAME = "aegis-human-gate"
 INSIGHT_APPROVE_TRAILER = "Aegis-Approve-Insight"
+# github.com's GitHub Actions app: a required check sourced from it cannot be posted by a token.
+GITHUB_ACTIONS_APP_ID = 15368
 GH_TIMEOUT_SECONDS = 10.0
 SIGN_TIMEOUT_SECONDS = 300.0
 HASH_DOMAIN = b"aegis-governance-tree/v1\n"
@@ -109,11 +114,17 @@ _ACCEPT_LINE = re.compile(r"^[ \t]*aegis-accept[ \t]*:", re.IGNORECASE | re.MULT
 _APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 _APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 _EXEMPT_TEST_LINE = re.compile(
-    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{7,64})[ \t]+(\S[^\r\n]*?)[ \t]*$",
+    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*?)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _JOB_ID = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?$")
 _JOB_NAME = re.compile(r"""^    name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^#\n]*?))[ \t]*(?:#.*)?$""")
+_JOB_MATRIX = re.compile(r"^    strategy:.*\bmatrix\b|^      matrix[ \t]*:")
+_RUN = re.compile(r"^([ \t]*)(?:-[ \t]+)?run:[ \t]*(.*)$")
+_AEGIS_CHECK_CI = re.compile(r"(?:\baegis|-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check\b[^\n]*?[ \t]--ci(?![\w-])")
+_PR_EVENT = re.compile(r"""["']?\bpull_request(?:_target)?["']?[ \t]*:[ \t]*""")
+_PATHS_KEY = re.compile(r"""(?:^|[\s{,])["']?paths(?:-ignore)?["']?[ \t]*:""")
+_MAX_WORKFLOW_LINES = 5000
 
 
 class HumanGateError(AegisError):
@@ -173,7 +184,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_codeowners(text: str) -> List[Tuple[str, Tuple[str, ...]]]:
+def _parse_codeowners(text: str, *, org_login: Optional[str] = None) -> List[Tuple[str, Tuple[str, ...]]]:
+    # GitHub ignores the bare handle of the organization that owns the repository (it takes a user,
+    # @org/team or an email), so that owner is dropped when the caller knows the owner is one.
+    org_handle = f"@{org_login}".lower() if org_login else None
     entries: List[Tuple[str, Tuple[str, ...]]] = []
     for line in text.splitlines()[:_MAX_CODEOWNERS_LINES]:
         tokens = line.strip().split()
@@ -183,7 +197,7 @@ def _parse_codeowners(text: str) -> List[Tuple[str, Tuple[str, ...]]]:
         for token in tokens[1:]:
             if token.startswith("#"):
                 break
-            if _OWNER.match(token):
+            if _OWNER.match(token) and token.lower() != org_handle:
                 owners.append(token)
         entries.append((tokens[0], tuple(owners)))
     return entries
@@ -242,8 +256,9 @@ def codeowners_coverage(
     location: str = "CODEOWNERS",
     *,
     repo_paths: Sequence[str] = (),
+    org_login: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
-    entries = _parse_codeowners(text)
+    entries = _parse_codeowners(text, org_login=org_login)
     covered: List[str] = []
     uncovered: List[str] = []
     unsupported = any(any(c in pat for c in "[]\\") for pat, _ in entries)
@@ -383,12 +398,12 @@ def check_key_custody(root: Any) -> KeyCustody:
     config = signing_config(Path(root))
     value = config["key"]
     if not value:
-        return KeyCustody("none", "no user.signingkey in the user-level git config", True)
+        return KeyCustody("none", "no user.signingkey in the user-level git config", False)
     if config["format"] != "ssh":
         return KeyCustody(
             "unsupported",
             f"gpg.format is {config['format']!r}: approvals are SSH signatures checked against allowed_signers (git config --global gpg.format ssh)",
-            True,
+            False,
         )
     literal = _literal_key(value)
     if literal is not None:
@@ -517,7 +532,9 @@ def signing_keys_at(root: Any, rev: str) -> int:
 def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     approvals = 0
     owners = False
+    dismisses = False
     contexts: List[str] = []
+    unpinned: List[str] = []
     has_pr = False
     for rule in rules if isinstance(rules, list) else []:
         if not isinstance(rule, dict):
@@ -529,19 +546,24 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
             valid_count = count if isinstance(count, int) and not isinstance(count, bool) else 0
             approvals = max(approvals, valid_count)
             owners = owners or params.get("require_code_owner_review") is True
+            dismisses = dismisses or params.get("dismiss_stale_reviews_on_push") is True
         elif rule.get("type") == "required_status_checks":
             for check in params.get("required_status_checks") or []:
-                if (
-                    isinstance(check, dict)
-                    and isinstance(check.get("context"), str)
-                    and check["context"] not in contexts
-                ):
-                    contexts.append(check["context"])
+                if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+                    continue
+                context, app = check["context"], check.get("integration_id")
+                if context not in contexts:
+                    contexts.append(context)
+                # Without a positive app id as its source, anyone with write access can post the status.
+                if not (type(app) is int and app > 0) and context not in unpinned:
+                    unpinned.append(context)
     return {
         "pull_request": has_pr,
         "required_approving_review_count": approvals,
         "require_code_owner_review": owners,
+        "dismiss_stale_reviews_on_push": dismisses,
         "required_status_checks": contexts,
+        "unpinned_status_checks": unpinned,
     }
 
 
@@ -577,6 +599,7 @@ def detect_tier(
     facts: Optional[Dict[str, Any]] = None
     default_branch: Optional[str] = None
     admin: Optional[bool] = None
+    org_login: Optional[str] = None
     if why is not None or not isinstance(repo_info, dict):
         why = why or "gh api repos/{owner}/{repo} did not return an object"
         evidence["gh"] = {"available": why != "gh is not installed", "error": why}
@@ -589,8 +612,13 @@ def detect_tier(
         if isinstance(perms.get("admin"), bool):
             admin = perms.get("admin")
         full = repo_info.get("full_name") if isinstance(repo_info.get("full_name"), str) else None
+        owner = repo_info.get("owner") if isinstance(repo_info.get("owner"), dict) else {}
+        login, kind = owner.get("login"), owner.get("type")
+        known = isinstance(login, str) and isinstance(kind, str)
+        org_login = login if known and kind == "Organization" else None
         scope["repository"] = full
-        evidence["repo"] = {"full_name": full, "default_branch": default_branch}
+        evidence["repo"] = {"full_name": full, "default_branch": default_branch,
+                            "owner": {"login": login, "type": kind} if known else None}
         evidence["identity"] = {"admin": admin}
         if default_branch:
             rules, why = _gh_json(
@@ -612,7 +640,8 @@ def detect_tier(
         or gitsafe.resolve_base_ref(top)
     )
     scope["base"] = base
-    tracked_gov = _tracked_governance_paths(top, base) if base is not None else ()
+    tracked = _tracked_governance_entries(top, base) if base is not None else {}
+    tracked_gov = tuple(tracked)
     codeowners: Dict[str, Any] = {
         "present": False,
         "path": None,
@@ -620,30 +649,34 @@ def detect_tier(
         "uncovered": list(dict.fromkeys((*COVERAGE_SAMPLES, *tracked_gov))),
     }
     signers: Dict[str, Any] = {"present": False, "keys": 0}
+    bare_org = False
     if base is not None:
         for location in _CODEOWNERS_LOCATIONS:
             blob = _blob(top, base, location)
             if blob is not None:
-                covered, uncovered = codeowners_coverage(
-                    blob.decode("utf-8", "replace"),
-                    location,
-                    repo_paths=tracked_gov,
-                )
+                text = blob.decode("utf-8", "replace")
+                covered, uncovered = codeowners_coverage(text, location, repo_paths=tracked_gov, org_login=org_login)
                 codeowners = {
                     "present": True,
                     "path": location,
                     "covered": covered,
                     "uncovered": uncovered,
                 }
+                bare_org = bool(org_login) and any(
+                    o.lower() == f"@{org_login}".lower() for _p, found in _parse_codeowners(text) for o in found
+                )
                 break
         blob = _blob(top, base, ALLOWED_SIGNERS)
         signers = {"present": blob is not None, "keys": _signer_keys(blob)}
     evidence["codeowners"] = codeowners
     evidence["allowed_signers"] = signers
+    aegis_jobs = _base_aegis_jobs(top, tracked)
+    evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs), "path_filtered": sorted(j for j, f in aegis_jobs.items() if f)}
     custody = check_key_custody(top)
     evidence["key_custody"] = custody.as_dict()
 
     checks = facts["required_status_checks"] if facts else []
+    unpinned_why, workflow_why = _required_check_gaps(facts, aegis_jobs)
     a_missing: List[str] = []
     if facts is None:
         a_missing.append("the default branch's ruleset was not read")
@@ -652,12 +685,24 @@ def detect_tier(
             a_missing.append("the default branch does not require an approving review")
         if not facts["require_code_owner_review"]:
             a_missing.append("the default branch does not require code-owner review")
+        if not facts["dismiss_stale_reviews_on_push"]:
+            a_missing.append(
+                "the default branch keeps an approval after new commits are pushed, so a pull request can change "
+                "after its review and still merge (set dismiss_stale_reviews_on_push)"
+            )
         if not checks:
             a_missing.append("the default branch has no required status checks")
+        elif workflow_why:
+            a_missing.append(workflow_why)
     if not codeowners["present"]:
         a_missing.append("no CODEOWNERS file on the base branch")
     elif codeowners["uncovered"]:
         a_missing.append(f"CODEOWNERS leaves {len(codeowners['uncovered'])} governance path(s) without an owner")
+    if bare_org:
+        a_missing.append(
+            f"CODEOWNERS names @{org_login}, the organization that owns this repository, which GitHub ignores as a "
+            f"code owner: name a team (@{org_login}/<team>) or people"
+        )
     if admin is True:
         a_missing.append(
             "the gh identity doctor used is a repository admin, who can edit the ruleset (an agent needs its own non-admin identity)"
@@ -670,13 +715,14 @@ def detect_tier(
         b_missing.append("the default branch's ruleset was not read")
     elif not checks:
         b_missing.append("the default branch has no required status checks")
+    elif unpinned_why:
+        b_missing.append(unpinned_why)
+    if workflow_why:
+        b_missing.append(workflow_why)
     if signers["keys"] < 1:
         b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
     if custody.degrades:
-        if custody.status == "plain_file":
-            b_missing.append(custody.detail)
-        else:
-            b_missing.append(f"signing key: {custody.detail}")
+        b_missing.append(custody.detail)
 
     if not a_missing:
         tier = "A"
@@ -694,18 +740,44 @@ def detect_tier(
             )
         if custody.status in ("agent", "unknown"):
             caveats.append(custody.detail)
+        if custody.status in ("none", "unsupported"):
+            caveats.append(f"no SSH signing key is configured on this machine, so aegis approve cannot be run here ({custody.detail})")
+        else:
+            caveats.append("the local signing key is not compared with the keys in allowed_signers")
         caveats.append(
             "a ruleset can name bypass actors, which this endpoint does not show; classic branch protection is not read at all"
         )
-        if facts is not None and facts["required_status_checks"]:
-            caveats.append(
-                "which required checks run Aegis, and that they have no path filter, is not visible from here"
-            )
+        if unpinned_why:
+            caveats.append(unpinned_why)
     if tier == "B":
         caveats.append(
             "required checks run the pull request's own workflow and aegis, so a pull request can edit the check that verifies the signature; tier B holds only while pull requests leave .github/workflows/** and aegis alone"
         )
     return TierReport(tier, tuple(why_not), tuple(caveats), evidence, scope)
+
+
+def _required_check_gaps(
+    facts: Optional[Mapping[str, Any]], aegis_jobs: Mapping[str, bool]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Why a passing required check would not show that Aegis ran in CI: (a source anyone with write
+    access can post as, a required check that is not an Aegis job or whose workflow skips pull requests)."""
+    checks = facts["required_status_checks"] if facts else []
+    unpinned = facts["unpinned_status_checks"] if facts else []
+    source = (
+        f"the required check(s) {', '.join(unpinned)} have no pinned source (integration_id): anyone with write access, "
+        "including the agent's gh token, can post a passing status; set each check's source to GitHub Actions "
+        f"(app {GITHUB_ACTIONS_APP_ID}) in the ruleset"
+    ) if unpinned else None
+    required = [c for c in checks if c in aegis_jobs]
+    if checks and not required:
+        return source, "the required checks do not include the Aegis job: " + (
+            f"require {', '.join(sorted(aegis_jobs))}" if aegis_jobs else
+            "no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix"
+        )
+    if required and all(aegis_jobs[c] for c in required):
+        return source, ("the Aegis workflow filters pull requests by path (paths: or paths-ignore: under "
+                        "on.pull_request), so it does not run on every pull request")
+    return source, None
 
 
 def _blob(top: Path, rev: str, path: str) -> Optional[bytes]:
@@ -722,20 +794,66 @@ def _top(root: Any) -> Path:
     return top
 
 
-def _tracked_governance_paths(workspace: Any, rev: str) -> Tuple[str, ...]:
+def _tracked_governance_entries(workspace: Any, rev: str) -> Dict[str, Tuple[str, str]]:
     top = gitsafe.toplevel(Path(workspace))
     commit = gitsafe.resolve_commit(top, rev) if top else None
     if not top or not commit:
-        return ()
+        return {}
     try:
         entries = gitsafe.tree_blobs(top, commit, include_symlinks=True, timeout=60.0)
     except gitsafe.GitError:
-        return ()
-    return tuple(
-        path
-        for path in entries
-        if governance.category_of(path) is not None
-    )
+        return {}
+    return {path: entry for path, entry in entries.items() if governance.category_of(path) is not None}
+
+
+def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[str, bool]:
+    """{check name of an Aegis job: whether its workflow filters pull requests by path}, read from
+    the base branch's workflow files (GitHub reads no subdirectory and no symlink there)."""
+    workflows = {
+        path: oid
+        for path, (mode, oid) in tracked.items()
+        if posixpath.dirname(path) == ".github/workflows" and path.endswith((".yml", ".yaml")) and mode != "120000"
+    }
+    try:
+        blobs = gitsafe.read_blobs(top, workflows.values())
+    except gitsafe.GitError:
+        return {}
+    jobs: Dict[str, bool] = {}
+    for path in sorted(workflows):
+        text = blobs[workflows[path]].decode("utf-8", "replace")
+        filtered = _filters_pull_requests_by_path(text)
+        for name in aegis_check_jobs(text):
+            jobs[name] = jobs.get(name, False) or filtered
+    return jobs
+
+
+def _filters_pull_requests_by_path(text: str) -> bool:
+    """``paths:`` or ``paths-ignore:`` under ``on.pull_request(_target)``, in block or flow style."""
+    lines = ["" if ln.lstrip().startswith("#") else re.sub(r"[ \t]+#.*$", "", ln)
+             for ln in text.splitlines()[:_MAX_WORKFLOW_LINES]]
+    start = next((i for i, ln in enumerate(lines) if re.match(r"""^["']?on["']?[ \t]*:""", ln)), None)
+    if start is None:
+        return False
+    end = next((i for i in range(start + 1, len(lines)) if lines[i][:1] not in ("", " ", "\t")), len(lines))
+    section = "\n".join(lines[start:end])
+    for event in _PR_EVENT.finditer(section):
+        rest = section[event.end():]
+        if rest.startswith("{"):
+            depth = 0
+            for i, char in enumerate(rest):
+                depth += {"{": 1, "}": -1}.get(char, 0)
+                if depth == 0:
+                    rest = rest[: i + 1]
+                    break
+        else:
+            line_start = section.rfind("\n", 0, event.start()) + 1
+            indent = len(section[line_start:]) - len(section[line_start:].lstrip())
+            first, *more = rest.split("\n")
+            deeper = itertools.takewhile(lambda ln: not ln.strip() or len(ln) - len(ln.lstrip()) > indent, more)
+            rest = "\n".join([first, *deeper])
+        if _PATHS_KEY.search(rest):
+            return True
+    return False
 
 
 def _deleted_tests(top: Path, commit: str, base: str) -> List[bytes]:
@@ -831,8 +949,8 @@ def exemption_message(fix_commit: str, reason: str) -> str:
     return f"chore: approve test exemption for {commit[:12]}\n\nAegis-Exempt-Test: {commit} {why}\n"
 
 
-def _ssh_keygen() -> str:
-    found = pathlookup.which("ssh-keygen")
+def _ssh_keygen(top: Path) -> str:
+    found = pathlookup.which("ssh-keygen", outside=top)
     if not found:
         raise HumanGateError("ssh-keygen is not installed or not on PATH; SSH signatures cannot be made or checked")
     return found
@@ -861,6 +979,28 @@ def _verify_commit_sig(top: Path, oid: str, base: str, ok_reason: str) -> Approv
     return _no("bad_signature", f"the signature does not verify (git reports {status!r})", oid)
 
 
+def _read_message(top: Path, oid: str) -> Union[str, Approval]:
+    raw = gitsafe.run(["cat-file", "commit", oid], top)
+    if raw.returncode != 0:
+        return _no("unresolved", f"cannot read commit {oid}", oid)
+    message = raw.stdout.decode("utf-8", "replace").partition("\n\n")[2]
+    if _ACCEPT_LINE.search(message):
+        return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
+    return message
+
+
+def _commits_in(top: Path, head: str, base_ref: str) -> Optional[Tuple[str, str, List[str]]]:
+    """(tip, merge base, the commits of base..tip newest first, at most MAX_SCANNED_COMMITS)."""
+    tip = gitsafe.resolve_commit(top, head)
+    base = gitsafe.merge_base(top, base_ref, head)
+    if not tip or not base:
+        return None
+    res = gitsafe.run(["rev-list", f"--max-count={MAX_SCANNED_COMMITS}", f"{base}..{tip}"], top)
+    if res.returncode != 0:
+        return None
+    return tip, base, res.stdout.decode("ascii", "replace").split()
+
+
 def _verify_single_trailer(
     root: Any,
     commit: str,
@@ -878,12 +1018,9 @@ def _verify_single_trailer(
         base = gitsafe.resolve_commit(top, base_target) if base_target else None
         if not oid or not base:
             return _no("unresolved", f"cannot resolve {commit!r} or the base {base_ref!r}", str(commit))
-        raw = gitsafe.run(["cat-file", "commit", oid], top)
-        if raw.returncode != 0:
-            return _no("unresolved", f"cannot read commit {oid}", oid)
-        message = raw.stdout.decode("utf-8", "replace").partition("\n\n")[2]
-        if _ACCEPT_LINE.search(message):
-            return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
+        message = _read_message(top, oid)
+        if isinstance(message, Approval):
+            return message
         values = rx.findall(message)
         if not values:
             return _no("no_trailer", f"no {name} trailer", oid)
@@ -926,50 +1063,26 @@ def verify_insight_approval(workspace: Any, commit: str, text: str, base_ref: Op
     )
 
 
-def verify_test_exemption(
-    root: Any,
-    approval_commit: str,
-    fix_commit: str,
-    base_ref: str,
-    expected_reason: Optional[str] = None,
-) -> Approval:
+def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base_ref: str) -> Approval:
+    """No reason binding: the signature names the fix's full oid, which already commits to its message."""
     try:
         top = _top(root)
-        oid = gitsafe.resolve_commit(top, approval_commit)
-        fix_oid = gitsafe.resolve_commit(top, fix_commit)
-        base = gitsafe.resolve_commit(top, base_ref)
+        oid, fix_oid, base = (gitsafe.resolve_commit(top, rev) for rev in (approval_commit, fix_commit, base_ref))
         if not oid or not fix_oid or not base:
-            return _no(
-                "unresolved",
-                f"cannot resolve {approval_commit!r}, {fix_commit!r}, or the base {base_ref!r}",
-                str(approval_commit),
-            )
-        raw = gitsafe.run(["cat-file", "commit", oid], top)
-        if raw.returncode != 0:
-            return _no("unresolved", f"cannot read commit {oid}", oid)
-        message = raw.stdout.decode("utf-8", "replace").partition("\n\n")[2]
-        if _ACCEPT_LINE.search(message):
-            return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
+            why = f"cannot resolve {approval_commit!r}, {fix_commit!r}, or the base {base_ref!r}"
+            return _no("unresolved", why, str(approval_commit))
+        message = _read_message(top, oid)
+        if isinstance(message, Approval):
+            return message
         entries = _EXEMPT_TEST_LINE.findall(message)
         if not entries:
-            return _no("no_exemption_trailer", "no Aegis-Exempt-Test trailer", oid)
-        matched = [
-            (t, r)
-            for t, r in entries
-            if gitsafe.resolve_commit(top, t) == fix_oid or fix_oid.lower().startswith(t.lower())
-        ]
-        if not matched:
+            return _no("no_exemption_trailer", "no Aegis-Exempt-Test trailer naming a full commit id", oid)
+        reasons = [r.strip() for t, r in entries if t.lower() == fix_oid.lower()]
+        if not reasons:
             return _no("commit_mismatch", f"Aegis-Exempt-Test does not name fix commit {fix_oid[:12]}", oid)
-        if len(matched) > 1:
+        if len(reasons) > 1:
             return _no("multiple_trailers", "more than one Aegis-Exempt-Test trailer for this commit", oid)
-        signed_reason = matched[0][1].strip()
-        if isinstance(expected_reason, str) and expected_reason.strip() and signed_reason != expected_reason.strip():
-            return _no(
-                "reason_mismatch",
-                "the signed exemption reason does not match the commit's Aegis-No-Test reason",
-                oid,
-            )
-        return _verify_commit_sig(top, oid, base, f"good test exemption for {fix_oid[:12]}: {signed_reason}")
+        return _verify_commit_sig(top, oid, base, f"good test exemption for {fix_oid[:12]}: {reasons[0]}")
     except gitsafe.GitError as exc:
         return _no("unresolved", str(exc), str(approval_commit))
     except HumanGateError as exc:
@@ -993,7 +1106,7 @@ def _signature_armor(top: Path, oid: str) -> Optional[str]:
 
 
 def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]:
-    program = _ssh_keygen()
+    program = _ssh_keygen(top)
     directory = Path(tempfile.mkdtemp(prefix="aegis-signers-"))
     try:
         os.chmod(directory, 0o700)
@@ -1026,41 +1139,36 @@ def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]
 
 def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional[str] = None) -> Optional[Approval]:
     top = _top(root)
-    tip = gitsafe.resolve_commit(top, head)
-    base = gitsafe.merge_base(top, base_ref, head)
-    if not tip or not base:
+    scan = _commits_in(top, head, base_ref)
+    if scan is None:
         return None
+    tip, base, commits = scan
     digest = governance_hash or governance_tree_hash(top, tip, base=base)
-    res = gitsafe.run(["rev-list", f"--max-count={MAX_SCANNED_COMMITS}", f"{base}..{tip}"], top)
-    if res.returncode != 0:
-        return None
-    for oid in res.stdout.decode("ascii", "replace").split():
+    for oid in commits:
         verdict = verify_approval(top, oid, digest, base_ref)
         if verdict.valid:
             return verdict
     return None
 
 
-def find_test_exemption(
-    root: Any,
-    head: str,
-    base_ref: str,
-    fix_commit: str,
-    expected_reason: Optional[str] = None,
-) -> Optional[Approval]:
+def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
+    """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
+    trailer names it (so a refusal can say why); else None."""
     top = _top(root)
-    tip = gitsafe.resolve_commit(top, head)
-    base = gitsafe.merge_base(top, base_ref, head)
-    if not tip or not base:
+    scan = _commits_in(top, head, base_ref)
+    fix_oid = gitsafe.resolve_commit(top, fix_commit)
+    if scan is None or not fix_oid:
         return None
-    res = gitsafe.run(["rev-list", f"--max-count={MAX_SCANNED_COMMITS}", f"{base}..{tip}"], top)
-    if res.returncode != 0:
-        return None
-    for oid in dict.fromkeys([*res.stdout.decode("ascii", "replace").split(), fix_commit]):
-        verdict = verify_test_exemption(top, oid, fix_commit, base_ref, expected_reason=expected_reason)
+    rejected: Optional[Approval] = None
+    for oid in scan[2]:
+        if oid == fix_oid:  # a commit cannot carry its own full oid
+            continue
+        verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
         if verdict.valid:
             return verdict
-    return None
+        if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch"):
+            rejected = verdict
+    return rejected
 
 
 def signed_empty_commit(root: Any, message: str) -> str:
@@ -1080,7 +1188,7 @@ def signed_empty_commit(root: Any, message: str) -> str:
             "-c",
             f"user.signingkey={key}",
             "-c",
-            f"gpg.ssh.program={_ssh_keygen()}",
+            f"gpg.ssh.program={_ssh_keygen(top)}",
             "-c",
             "commit.gpgsign=true",
             "commit",
@@ -1129,75 +1237,46 @@ def build_ruleset(tier: str, contexts: Iterable[str]) -> Dict[str, Any]:
                 "type": "required_status_checks",
                 "parameters": {
                     "strict_required_status_checks_policy": False,
-                    "required_status_checks": [{"context": c} for c in contexts],
+                    "required_status_checks": [{"context": c, "integration_id": GITHUB_ACTIONS_APP_ID} for c in contexts],
                 },
             },
         ],
     }
 
 
-def workflow_contexts(root: Any) -> List[str]:
-    directory = Path(root) / ".github" / "workflows"
-    contexts: List[str] = []
-    try:
-        files = sorted(p for p in directory.iterdir() if p.suffix in (".yml", ".yaml") and p.is_file())
-    except OSError:
-        return contexts
-    for path in files:
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+def aegis_check_jobs(text: str) -> List[str]:
+    """The check names (literal ``name:``, else the job id) of the jobs in one workflow file that run
+    ``aegis check --ci``. A templated name or a matrix gives no fixed check name, so that job is left out."""
+    jobs: Dict[str, List[Any]] = {}
+    job: Optional[List[Any]] = None
+    in_jobs, block = False, None
+    for line in text.splitlines()[:_MAX_WORKFLOW_LINES]:
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        lines = text.splitlines()[:5000]
-        on_match = re.search(r"(?m)^on:[ \t]*(.*(?:\n(?:[ \t]+.*|[ \t]*))*)", text)
-        if on_match and not re.search(r"\b(?:push|pull_request)\b", on_match.group(1)):
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_jobs, job = line.startswith("jobs:"), None
             continue
-        in_jobs = False
-        jobs: List[Dict[str, Any]] = []
-        cur: Optional[Dict[str, Any]] = None
-        for line in lines + ["x:"]:
-            if line.startswith("jobs:"):
-                in_jobs = True
-                continue
-            if in_jobs and line and not line[0].isspace() and not line.startswith("#"):
-                in_jobs = False
-            if not in_jobs:
-                continue
-            found = _JOB_ID.match(line)
-            if found:
-                cur = {
-                    "ctx": found.group(1),
-                    "named": False,
-                    "matrix": False,
-                    "no_pr": False,
-                    "always": False,
-                    "needs": False,
-                }
-                jobs.append(cur)
-                continue
-            if cur is None:
-                continue
-            named_as = _JOB_NAME.match(line)
-            if named_as and not cur["named"]:
-                value = next((g for g in named_as.groups() if g), "")
-                if value and "${{" not in value:
-                    cur["ctx"] = value
-                cur["named"] = True
-            elif re.match(r"^      matrix\s*:", line):
-                cur["matrix"] = True
-            elif re.match(r"^    if\s*:", line):
-                if "!= 'pull_request'" in line or '!= "pull_request"' in line:
-                    cur["no_pr"] = True
-                if "always()" in line:
-                    cur["always"] = True
-            elif re.match(r"^    needs\s*:", line):
-                after = line.split(":", 1)[1].split("#", 1)[0].strip()
-                if after != "[]":
-                    cur["needs"] = True
-        eligible = [j for j in jobs if not j["no_pr"] and not j["matrix"]]
-        agg = [j["ctx"] for j in eligible if j["always"] and j["needs"]]
-        contexts.extend(agg if agg else [j["ctx"] for j in eligible])
-    return contexts
+        found = _JOB_ID.match(line) if in_jobs else None
+        if found:
+            job, block = jobs.setdefault(found.group(1), [found.group(1), False, False]), None
+            continue
+        if job is None:
+            continue
+        if block is not None and indent > block:
+            job[1] = job[1] or bool(_AEGIS_CHECK_CI.search(line))
+            continue
+        block = None
+        named, run = _JOB_NAME.match(line), _RUN.match(line)
+        if named:
+            job[0] = next((g for g in named.groups() if g), "") or job[0]
+        elif _JOB_MATRIX.match(line):
+            job[2] = True
+        elif run and run.group(2)[:1] in ("|", ">"):
+            block = len(run.group(1))
+        elif run:
+            job[1] = job[1] or bool(_AEGIS_CHECK_CI.search(run.group(2)))
+    return [name for name, runs, matrix in jobs.values() if runs and not matrix and "${{" not in name]
 
 
 def ruleset_exists(root: Any, gh: Optional[GhRunner] = None) -> bool:
