@@ -91,6 +91,13 @@ def test_the_verdict_job_attests_the_spec_subject_and_predicate_with_a_pinned_ac
         assert re.fullmatch(r"[0-9a-f]{40}", ref), ref
 
 
+@pytest.mark.parametrize("path", [ROOT / "aegis_core" / "release_verify.py", WORKFLOW], ids=["module", "workflow"])
+def test_the_predicate_type_uri_is_declared_permanent_where_it_is_pinned(path):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    at = next(i for i, line in enumerate(lines) if rv.PREDICATE_TYPE in line)
+    assert any("permanent" in line for line in lines[max(0, at - 2):at + 3]), path.name
+
+
 def test_the_subject_is_derivable_from_the_commit_alone():
     commit, tree = "1" * 40, "2" * 40
     assert rv.subject_bytes(commit, tree) == f"aegis-ci-verdict/v1\ncommit {commit}\ntree {tree}\n".encode()

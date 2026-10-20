@@ -58,6 +58,7 @@ SCHEMA = "aegis.release/v1"
 SOURCE = "aegis doctor --release"
 GH_MINIMUM = (2, 93, 0)
 UNVERIFIED_GH = "UNVERIFIED (gh >= 2.93.0 required)"
+# permanent: attestations already issued carry this URI; change it only in a release that accepts both
 PREDICATE_TYPE = "https://aegis.example/predicate/ci-verdict/v1"
 SUBJECT_DOMAIN = "aegis-ci-verdict/v1"
 WORKFLOW = ".github/workflows/validate.yml"
