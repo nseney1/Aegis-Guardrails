@@ -687,6 +687,7 @@ _MALFORMED_DOCS = {
     "location-string": _one_result(locations=["SECRET"]),
     "region-string": _one_result(locations=[{"physicalLocation": {"region": "SECRET"}}]),
     "startline-text": _one_result(locations=[{"physicalLocation": {"region": {"startLine": "SECRET"}}}]),
+    "startline-float": _one_result(locations=[{"physicalLocation": {"region": {"startLine": 2.5}}}]),
     "suppressions-number": _one_result(suppressions=5, message={"text": "SECRET"}),
 }
 

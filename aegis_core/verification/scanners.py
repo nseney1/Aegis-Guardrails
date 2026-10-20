@@ -442,10 +442,9 @@ def ingest_sarif(
                 uri = str(_sarif_obj(phys.get("artifactLocation"), f"{at}.artifactLocation").get("uri") or "")
                 rel_path, readable = _sarif_artifact(uri, root_path)
                 region = _sarif_obj(phys.get("region"), f"{at}.region")
-                try:
-                    line_no = int(region.get("startLine") or 0)
-                except (TypeError, ValueError, OverflowError):
-                    raise _SarifError(f"{at}.region.startLine must be an integer") from None
+                line_no = region.get("startLine") or 0
+                if not isinstance(line_no, int):
+                    raise _SarifError(f"{at}.region.startLine must be an integer")
                 snippet_raw = _sarif_obj(region.get("snippet"), f"{at}.region.snippet").get("text")
                 if snippet_raw is None and readable is not None and line_no > 0:
                     try:
