@@ -992,7 +992,11 @@ class CommandAnalyzer:
 # anything it cannot parse. The guard below decides what `aegis hook run pre-tool`
 # BLOCKS, so it fails open: an empty, absent or unparseable command is never a match,
 # and only the irreversible operations of BLOCK_SET block. It reuses the lexer and the
-# wrapper unwrapping, not the evaluators.
+# wrapper unwrapping, not the evaluators. The two policies are kept on purpose; where
+# they differ, and why, is pinned by the parity table in
+# tests/unit/core/test_command_safety.py, which a change to either must update. A
+# lexer helper serves both unless that table says why not (strip_shell_comments, the
+# git alias expansion and the heredoc SQL check are guard-only).
 
 GUARD_BLOCK = "block"
 GUARD_RECORD = "record"
