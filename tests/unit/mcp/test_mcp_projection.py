@@ -47,7 +47,8 @@ def test_list_rules_summary_view_keeps_identity_type_and_fitness(workspace):
     assert summary["rules"][0] == {
         "_name": "trap-noid",
         "type": "trap",
-        "fitness": {"triggers": 0, "tp": 0, "fp": 0, "last_ts": None, "score": 0.0},
+        "fitness": {"triggers": 0, "tp": 0, "fp": 0, "last_ts": None, "score": 0.0,
+                    "reported_score": None, "status": "insufficient (n=0)"},
     }
     assert summary["rules"][1]["_name"] == "trap-with-id"
     assert "hypothesis" not in summary["rules"][1]

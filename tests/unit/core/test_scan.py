@@ -53,7 +53,7 @@ def test_scan_returns_the_rules_whose_patterns_match(tmp_path: Path) -> None:
     assert _names(result) == ["trap-src"]
     item = result["relevant_rules"][0]
     assert item["_path"] == ".aegis/rules/traps/trap-src.md"
-    assert item["matched_files"] == ["src/a.py"] and item["fitness"] == 0.0
+    assert item["matched_files"] == ["src/a.py"] and item["fitness"] is None  # no verdicts: below MIN_N
     assert "trap-src" in result["guidance"]
     assert result["stats"]["total_rules"] == 2 and result["stats"]["matched"] == 1
     assert result["omitted_mandatory"] == [] and result["stale_rules"] == []
@@ -116,7 +116,7 @@ def test_advisory_rules_are_ranked_by_ledger_fitness_not_frontmatter(tmp_path: P
     _rule(tmp_path, "trap-claims", extra="fitness:\n  score: 0.99\n  triggers: 100\n  true_positives: 100\n")
     _rule(tmp_path, "trap-proven")
     ledger.append(tmp_path, [
-        {"rule": "trap-proven", "outcome": "tp", "source": "ci", "key": f"k{i}"} for i in range(10)
+        {"rule": "trap-proven", "outcome": "tp", "source": "ci", "key": f"k{i}"} for i in range(25)
     ])
 
     result = scan(tmp_path, ["src/a.py"], budget=1)

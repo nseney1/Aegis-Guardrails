@@ -1906,8 +1906,8 @@
                 "required": false
               }
             ],
-            "description": null,
-            "help": "Record a human adjudication verdict (tp or fp) for a rule"
+            "description": "Append a tp or fp label for a rule to .aegis/adjudications/<rule-id>.jsonl. The label counts toward the rule's fitness only after a reviewed pull request merges it to the base branch.",
+            "help": "Record an adjudication label (tp or fp) in .aegis/adjudications/; it counts after it is merged to the base branch"
           },
           "archive": {
             "aliases": [],

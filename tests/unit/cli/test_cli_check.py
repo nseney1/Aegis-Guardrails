@@ -486,7 +486,7 @@ class TestLayer2:
         assert _exit_code(argv) == 0
         rows = [r for r in ledger.read(ws).rows if r.get("rule") == "trap-py"]
         want = "UNVERIFIED" if expected == "UNVERIFIED" else str(Verdict[expected])
-        assert [(r.get("outcome"), (r.get("meta") or {}).get("verdict")) for r in rows] == [("tp", want)]
+        assert [(r.get("outcome"), (r.get("meta") or {}).get("verdict")) for r in rows] == [("trigger", want)]
 
     @staticmethod
     def _spec_reply(tmp_path: Path, severity: str, risk) -> str:

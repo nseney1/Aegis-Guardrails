@@ -57,7 +57,8 @@ def test_fitness_comes_from_the_ledger_not_the_frontmatter(workspace):
 
 def test_a_rule_with_no_ledger_rows_is_unobserved(workspace):
     fitness = _by_name(execute_tool("aegis_list_rules", {"workspace": str(workspace)}))["unobserved"]["fitness"]
-    assert fitness == {"triggers": 0, "tp": 0, "fp": 0, "last_ts": None, "score": 0.0}
+    assert fitness == {"triggers": 0, "tp": 0, "fp": 0, "last_ts": None, "score": 0.0,
+                       "reported_score": None, "status": "insufficient (n=0)"}
 
 
 def test_every_outcome_row_counts_as_a_trigger(tmp_path):
