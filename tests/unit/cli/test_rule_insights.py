@@ -277,3 +277,46 @@ def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path
     assert len(rows) == 3
     assert all("hs" not in r and r["host"] == "cli" for r in rows)
     assert measure_recurrence(ws, "trap-popen-timeout", home=home)["recurrences"] == 1
+
+
+# ── one confinement rule on every channel (R-evidence-43) ─────────────────────
+
+def test_insight_add_refuses_a_path_outside_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    rc, _out, _err = _invoke_rule(ws, "insight", "add", "Never read passwd", "--paths", "../../etc/passwd", "--json")
+    assert rc != 0
+    assert read_insight_rows(ws, home=home) == []
+
+
+def test_insight_add_keeps_a_comma_path_whole_and_stores_absolute_paths_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    rc, out, err = _invoke_rule(ws, "insight", "add", "Keep commas", "--paths", "src/a,b.py", "--json")
+    assert rc == 0, err
+    assert json.loads(out)["paths"] == ["src/a,b.py"]
+    rc, out, err = _invoke_rule(ws, "insight", "add", "Absolute", "--paths", str(ws / "src" / "main.py"), "--json")
+    assert rc == 0, err
+    assert json.loads(out)["paths"] == ["src/main.py"]
+
+
+def test_mcp_capture_insight_confines_like_the_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_mcp.tools import execute_tool
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    bad = execute_tool("aegis_capture_insight", {"workspace": str(ws), "quote": "Stay inside", "paths": ["../outside.py"]})
+    assert bad["status"] == "FAIL"
+    assert read_insight_rows(ws, home=home) == []
+    ok = execute_tool("aegis_capture_insight",
+                      {"workspace": str(ws), "quote": "Stay inside", "paths": [str(ws / "src" / "main.py"), "src/a,b.py"]})
+    assert ok["status"] == "OK", ok
+    assert ok["paths"] == ["src/a,b.py", "src/main.py"]

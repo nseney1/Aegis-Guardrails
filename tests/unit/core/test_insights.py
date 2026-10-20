@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -169,6 +170,86 @@ def test_tfidf_cosine_and_dirty_paths(tmp_path: Path):
     sim_diff = tfidf_cosine("validate path confinement before deletion", "configure oauth2 bearer token refresh")
     assert sim_same > sim_diff
     assert sim_same > 0.3
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
+                   cwd=str(cwd), check=True, capture_output=True)
+
+
+def _stat_dirty(path: Path) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+
+def test_dirty_paths_never_runs_a_submodule_clean_filter(tmp_path: Path):
+    # R-evidence-43: the submodule's own config must not choose a program dirty_paths runs.
+    sub_src = tmp_path / "subsrc"
+    sub_src.mkdir()
+    _git(sub_src, "init", "-q")
+    (sub_src / "f.txt").write_text("data\n", encoding="utf-8")
+    _git(sub_src, "add", ".")
+    _git(sub_src, "commit", "-q", "-m", "sub")
+    repo = _make_repo(tmp_path / "repo")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_src), "sub")
+    _git(repo, "commit", "-q", "-m", "add sub")
+    marker = tmp_path / "marker"
+    script = tmp_path / "filt.py"
+    script.write_text(
+        f"import sys\nopen({str(marker)!r}, 'w').close()\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    modules = repo / ".git" / "modules" / "sub"
+    _git(repo, "config", "-f", str(modules / "config"), "filter.evil.clean",
+         f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}"')
+    (modules / "info").mkdir(exist_ok=True)
+    (modules / "info" / "attributes").write_text("* filter=evil\n", encoding="utf-8")
+    _stat_dirty(repo / "sub" / "f.txt")
+    (repo / "app.py").write_text("a = 2\n", encoding="utf-8")
+
+    assert dirty_paths(repo) == ["app.py"]
+    assert not marker.exists()
+
+
+def test_dirty_paths_skips_deleted_touched_and_state_files(tmp_path: Path):
+    repo = _make_repo(tmp_path / "repo")
+    (repo / "gone.py").write_text("g = 1\n", encoding="utf-8")
+    (repo / "same.py").write_text("s = 1\n", encoding="utf-8")
+    (repo / ".aegis" / "state").mkdir()
+    (repo / ".aegis" / "state" / "x.json").write_text("{}\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".")
+    _git(repo, "commit", "-q", "-m", "more")
+    (repo / "gone.py").unlink()
+    _stat_dirty(repo / "same.py")
+    (repo / ".aegis" / "state" / "x.json").write_text('{"a": 1}\n', encoding="utf-8")
+
+    assert dirty_paths(repo) == []
+
+
+def test_add_insight_confines_explicit_paths_to_the_workspace(tmp_path: Path):
+    home = tmp_path / "home"
+    repo = _make_repo(tmp_path / "repo")
+    with pytest.raises(PathTraversalError):
+        add_insight(repo, "Never touch passwd", paths=["../../etc/passwd"], home=home)
+    with pytest.raises(PathTraversalError):
+        add_insight(repo, "Never touch passwd", paths=["src/ok.py", str(tmp_path / "outside.py")], home=home)
+    assert read_insight_rows(repo, home=home) == []
+
+    row = add_insight(repo, "Keep commas", paths=["src/a,b.py", str(repo.resolve() / "app.py"), " "], home=home)
+    assert row["paths"] == ["app.py", "src/a,b.py"]
+
+
+def test_add_insight_refuses_a_symlink_that_escapes(tmp_path: Path):
+    home = tmp_path / "home"
+    repo = _make_repo(tmp_path / "repo")
+    (tmp_path / "secret.py").write_text("s = 1\n", encoding="utf-8")
+    try:
+        (repo / "link.py").symlink_to(tmp_path / "secret.py")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(PathTraversalError):
+        capture_suggestion(repo, "Do not follow links", paths=["link.py"], home=home)
+    assert read_insight_rows(repo, home=home) == []
 
 
 def test_add_insight_level_h_requires_explicit_commit_and_matching_insight_hash(

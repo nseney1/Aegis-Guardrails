@@ -309,23 +309,9 @@ def has_correction_cue(text: str) -> bool:
 def dirty_paths(workspace: Any) -> List[str]:
     root = Path(os.fspath(workspace)).resolve()
     top = gitsafe.toplevel(root)
-    if top is None:
-        return []
-    head = gitsafe.resolve_commit(top, "HEAD")
-    raw_paths: List[str] = []
-    if head is not None:
-        try:
-            res = gitsafe.run(["diff-index", "--name-status", "-z", head], top, timeout=5.0)
-        except gitsafe.GitError:
-            return []
-        if res.returncode == 0:
-            for _status, path, new_path in gitsafe.parse_name_status_z(res.stdout):
-                raw_paths.append(new_path if new_path is not None else path)
-    untracked = gitsafe.list_files(top, tracked=(head is None), untracked=True)
-    if untracked:
-        raw_paths.extend(untracked)
+    changed = gitsafe.changed_files(top, "working", untracked=True) if top is not None else None
     found: Set[str] = set()
-    for rel_top in raw_paths:
+    for rel_top in changed or ():
         try:
             rel = (top / rel_top).resolve().relative_to(root).as_posix()
         except ValueError:
@@ -358,9 +344,17 @@ def _has_human_approval(workspace: Any, commit: Optional[str], base_ref: Optiona
         return False
 
 
+def _confine_paths(root: Any, paths: Sequence[str]) -> List[str]:
+    """Workspace-relative POSIX paths; PathTraversalError for one that resolves outside."""
+    from aegis_core.workspace.confinement import confine_path_internal
+
+    base = Path(os.fspath(root))
+    return sorted({PurePath(confine_path_internal(base, str(p))[1]).as_posix() for p in paths if str(p).strip()})
+
+
 def _resolve_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List[str], str]:
     if paths is not None and len(paths) > 0:
-        return sorted({PurePath(str(p)).as_posix() for p in paths if str(p).strip()}), "explicit"
+        return _confine_paths(workspace, paths), "explicit"
     return dirty_paths(workspace), "dirty"
 
 
