@@ -17,6 +17,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -68,6 +70,23 @@ def _credits(repo: hg.Repo, approved=None):
     return credit.derive(credit.read_rows(repo.root), landed=_landed(repo), approved=approved)
 
 
+def _fake_bind(next_tree):
+    """``treeid.bind`` for report floods: each report binds ``next_tree()`` without spawning git."""
+
+    class Bound:
+        def __init__(self, tree):
+            self.binding = treeid.TreeBinding("ok", tree, "")
+
+        def diff_entries(self, base):
+            return []
+
+    @contextlib.contextmanager
+    def bind(root):
+        yield Bound(next_tree())
+
+    return bind
+
+
 # ── 1. No credit without CI confirmation ─────────────────────────────────────
 
 @needs_git
@@ -98,6 +117,31 @@ def test_only_a_ci_confirmed_landing_counts(tmp_path, runs, state, counts):
     assert [r["rule"] for r in rows] == (["trap-sample"] if counts else [])
     # nothing in the ledger scores the rule before CI said so
     assert ledger.aggregate(repo.root, "trap-sample")["triggers"] == 0
+
+
+@needs_git
+def test_a_failure_report_on_a_confirmed_check_is_a_neutral_trigger_never_fp(tmp_path):
+    """Given three witnessed, landed, CI-green checks each reported ``failure``, When credit is
+    projected, Then each counts as a trigger, the rule's fp stays 0 and nothing is decided."""
+    from aegis_core import fitness, rules
+
+    repo = hv.make_project(tmp_path)
+    hv.use_stub_runner(repo.home.path)
+    commits = []
+    for n in range(3):
+        _edit_app(repo, n + 2)
+        _scan(repo)
+        assert checkrun.record(repo.root, tests=True, base="main").row["passed"] is True
+        assert _report(repo, key=f"f{n}", outcome="failure")["status"] == "recorded"
+        commits.append(repo.commit(f"work {n}"))
+    repo.git("branch", "-f", "main", commits[-1])
+    runs = [hv.ci_run(c, run_id=i + 1) for i, c in enumerate(commits)]
+    credit.confirm(repo.root, client=hv.FakeCI(runs), workflow=hv.CI_WORKFLOW)
+    proj = credit.project_credits(repo.root)
+    assert [(c.state, c.counts, c.result) for c in proj.credits] == [("confirmed", True, "trigger")] * 3
+    assert [r["outcome"] for r in proj.outcome_rows] == ["trigger"] * 3
+    fit = fitness.for_rules(repo.root, rules.load_rules(repo.root).served)["trap-sample"]
+    assert (fit.fp, fit.tp) == (0, 0) and fit.state != "decided"
 
 
 @needs_git
@@ -324,8 +368,6 @@ def test_claimed_rows_have_their_own_count_apart_from_per_rule_evidence(tmp_path
 @needs_git
 @pytest.mark.parametrize("command", ["status", "sync"])
 def test_status_and_sync_show_claims_apart_from_every_rule(tmp_path, monkeypatch, capsys, command):
-    import json
-
     from aegis_cli.cli import main
 
     repo = hv.make_project(tmp_path)
@@ -373,11 +415,11 @@ def test_a_flood_of_reports_leaves_the_ledger_bounded(tmp_path, monkeypatch):
     trees = [f"{n:040x}" for n in range(1, 400)]
     state = {"n": 0}
 
-    def fake_tree(root):
+    def fake_tree():
         state["n"] += 1
-        return treeid.TreeBinding("ok", trees[state["n"] % len(trees)], "")
+        return trees[state["n"] % len(trees)]
 
-    monkeypatch.setattr(treeid, "tree_of", fake_tree)
+    monkeypatch.setattr(treeid, "bind", _fake_bind(fake_tree))
     # 50 past the cap exercises rate limiting; every call beyond it answers the same way.
     results = [_report(repo, key=f"k{n}") for n in range(credit.MAX_REPORT_ROWS_PER_SESSION + 50)]
     statuses = {r["status"] for r in results}
@@ -395,11 +437,11 @@ def test_the_cap_is_per_session_so_another_session_still_reports(tmp_path, monke
     monkeypatch.setattr(credit, "MAX_REPORT_ROWS_PER_SESSION", 2)
     counter = {"n": 0}
 
-    def fake_tree(root):
+    def fake_tree():
         counter["n"] += 1
-        return treeid.TreeBinding("ok", f"{counter['n']:040x}", "")
+        return f"{counter['n']:040x}"
 
-    monkeypatch.setattr(treeid, "tree_of", fake_tree)
+    monkeypatch.setattr(treeid, "bind", _fake_bind(fake_tree))
     assert [_report(repo, key=f"a{n}")["status"] for n in range(4)] == ["claimed", "claimed", "rate_limited", "rate_limited"]
     assert _report(repo, key="z", session="sess-2")["status"] == "claimed"
 

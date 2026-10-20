@@ -1,6 +1,7 @@
 """aegis_report_outcome: advisory self-reports appended to the outcome ledger."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import PurePath
 import sys
 from typing import List, Optional, Set, Tuple
@@ -27,18 +28,17 @@ def _fail(message: str) -> dict:
     return {"status": _STATUS_FAIL, "error": message}
 
 
-def _credited_rules(workspace, check, host: Optional[str], session: Optional[str]) -> List[str]:
+def _credited_rules(workspace, check, bound, host: Optional[str], session: Optional[str]) -> List[str]:
     """Rules exposed in this server session's scans and matching ``diff(base, check tree)``."""
     from aegis_core.scan import RULE_CACHE
 
-    exposed = credit.exposed_rules(workspace.root, host, session)
-    if not exposed:
+    exposed = credit.witnessed_exposed_rules(workspace.root, host, session)
+    if not exposed or bound is None:
         return []
     try:
-        with treeid.bind(workspace.root) as bound:
-            if bound.binding.tree != check.get("tree"):
-                return []
-            changed = [path for status, path in bound.diff_entries(str(check.get("base"))) if status != "D"]
+        if bound.binding.tree != check.get("tree"):
+            return []
+        changed = [path for status, path in bound.diff_entries(str(check.get("base"))) if status != "D"]
         ruleset = RULE_CACHE.get(workspace)
     except Exception:  # an unreadable tree or rule set credits nothing
         return []
@@ -87,21 +87,26 @@ def handle_report_outcome(args: dict) -> dict:
     # credited rules are the server's: those this session's scans exposed that also match the
     # change the check covered. 'rules_used' above only had to be well formed.
     host, session = args.get("_host"), args.get("_session")
-    binding = treeid.tree_of(workspace.root)
-    try:
-        result = credit.submit_report(
-            workspace.root, tree=binding.tree if binding.bound else None, session=session, host=host,
-            key=idempotency_key, outcome=outcome, rules_for=lambda check: _credited_rules(workspace, check, host, session))
-    except credit.ReportConflict:
-        return _fail(
-            f"'idempotency_key' {idempotency_key!r} was already used for a different report: "
-            "send a new key for each new report."
-        )
-    except Exception as exc:
-        return _fail(f"Failed to record outcome: {exc}")
+    # One bind per report, held open: the check is chosen under the ledger lock, then diffed against it.
+    with ExitStack() as stack:
+        try:
+            bound = stack.enter_context(treeid.bind(workspace.root))
+        except (treeid.TreeError, OSError):  # as tree_of: an unreadable work tree is an unwitnessed claim
+            bound = None
+        tree = bound.binding.tree if bound is not None and bound.binding.bound else None
+        try:
+            result = credit.submit_report(
+                workspace.root, tree=tree, session=session, host=host, key=idempotency_key, outcome=outcome,
+                rules_for=lambda check: _credited_rules(workspace, check, bound, host, session))
+        except credit.ReportConflict:
+            return _fail(
+                f"'idempotency_key' {idempotency_key!r} was already used for a different report: "
+                "send a new key for each new report."
+            )
+        except Exception as exc:
+            return _fail(f"Failed to record outcome: {exc}")
     if edited and result.get("status") != "rate_limited":  # a capped session writes nothing at all
         _record_edit(workspace, args, idempotency_key, edited)
-    tree = binding.tree if binding.bound else None
     return {**envelope("aegis_report_outcome", {"tree": tree}), **result}
 
 

@@ -369,6 +369,29 @@ def test_derive_is_pure_and_needs_a_report_to_name_a_rule():
     assert credit.confirmed_outcome_rows(credits)[0]["rule"] == "r"
 
 
+@pytest.mark.parametrize("claimed,fields,expected", [
+    ("tp", {"passed": True}, "tp"),
+    ("trigger", {"passed": True}, "trigger"),
+    ("fp", {"passed": True}, "trigger"),  # a stored fp row is neutralised on read, no rewrite
+    (None, {"passed": True}, "trigger"),
+    ("tp", {"passed": False}, "trigger"),
+    ("tp", {"passed": 1}, "trigger"),
+    ("tp", {}, "trigger"),
+    ("tp", {"passed": True, "partial": True}, "trigger"),
+])
+def test_the_credit_sign_is_tp_only_for_a_tp_claim_on_a_passed_check(claimed, fields, expected):
+    """Given a confirmed landing, When the report claims ``claimed`` for a check with ``fields``,
+    Then the credit is ``tp`` only for a tp claim on a passed, complete check, else a trigger."""
+    check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", **fields}
+    report = {"event": "report", "check": "c1", "for_rule": "r", "ts": "t"}
+    if claimed is not None:
+        report["result"] = claimed
+    rows = [check, report, {"event": "ci", "commit": "c" * 40, "ci_conclusion": "success"}]
+    credits = credit.derive(rows, landed=lambda tree: "c" * 40, verified_ci={"c" * 40: "success"})
+    assert [(c.state, c.counts, c.result) for c in credits] == [("confirmed", True, expected)]
+    assert [r["outcome"] for r in credit.confirmed_outcome_rows(credits)] == [expected]
+
+
 def test_a_failed_ci_run_voids_and_a_revert_style_void_row_is_terminal():
     check = {"event": "check", "id": "c1", "tree": SHA, "passed": True}
     report = {"event": "report", "check": "c1", "for_rule": "r", "result": "tp"}

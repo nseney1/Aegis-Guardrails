@@ -20,7 +20,7 @@ __all__ = [
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows",
     "record_adjudication", "record_detection", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
-    "verify_commit_trailers",
+    "verify_commit_trailers", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
 MAX_REPORT_ROWS_PER_SESSION = 200
@@ -84,12 +84,22 @@ def flaky_keys(rows: Iterable[Mapping[str, Any]]) -> Set[Tuple[Any, Any, Any]]:
     return {key for key, outcomes in seen.items() if len(outcomes) == 2}
 
 
+def _passed(check: Mapping[str, Any]) -> bool:
+    return check.get("passed") is True and not check.get("partial")
+
+
+def _sign(claimed: Any, check: Mapping[str, Any]) -> str:
+    """Spec T4: a report confirms a passed check as tp or withdraws to a trigger, never fp. The
+    stored ``result`` stays the agent's claim (ReportConflict compares it); only the read is signed."""
+    return "tp" if claimed == "tp" and _passed(check) else "trigger"
+
+
 def passing_check(rows: Iterable[Mapping[str, Any]], tree: Optional[str]) -> Optional[Mapping[str, Any]]:
     if not tree:
         return None
     best = None
     for row in _of(rows, "check"):
-        if row.get("tree") == tree and row.get("witness") == "aegis" and row.get("passed") is True and not row.get("partial") and isinstance(row.get("id"), str):
+        if row.get("tree") == tree and row.get("witness") == "aegis" and _passed(row) and isinstance(row.get("id"), str):
             best = row
     return best
 
@@ -297,6 +307,12 @@ def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None)
 
 
 session_exposed_rules = exposed_rules
+
+
+def witnessed_exposed_rules(root: Any, host: Optional[str], session: Optional[str]) -> Set[str]:
+    """What this process's scans showed (host, session): the credited set of spec T1. Ledger exposure
+    rows are agent-writable, so only ``exposed_rules`` (display, other processes) merges them."""
+    return set(_EXPOSED.get((str(root), host or "", session or ""), ()))
 
 
 def record_detection(
@@ -542,7 +558,7 @@ def derive(
             counts, reason = False, "protected_changed"
         elif is_flaky and not reason:
             reason = "flaky"
-        credits.append(Credit(check=identity[0], rule=identity[1], tree=tree, state=state, result=str(report.get("result") or "trigger"), commit=commit, reason=reason, flaky=is_flaky, counts=counts, ts=str(report.get("ts") or ""), protected=categories))
+        credits.append(Credit(check=identity[0], rule=identity[1], tree=tree, state=state, result=_sign(report.get("result"), check), commit=commit, reason=reason, flaky=is_flaky, counts=counts, ts=str(report.get("ts") or ""), protected=categories))
     return credits
 
 
