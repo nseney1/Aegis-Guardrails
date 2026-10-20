@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -115,3 +120,71 @@ class TestRunPerfCheck:
             assert set(calls[i : i + 2]) == {"base", "head"}
         # Never writes a persistent baseline file
         assert list(repo_root.rglob("*baseline*")) == []
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                   cwd=str(repo), check=True, capture_output=True)
+
+
+def _program(path: Path, body: str) -> Path:
+    """A Python program PATH lookup finds as ``path.name`` (a .cmd launcher on Windows)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        script = path.with_name(path.name + "-script.py")
+        script.write_bytes(body.encode("utf-8"))
+        launcher = path.with_name(path.name + ".cmd")
+        launcher.write_bytes(f'@"{sys.executable}" "{script}" %*\r\n'.encode("utf-8"))
+        return launcher
+    path.write_bytes(f"#!{sys.executable}\n{body}".encode("utf-8"))
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+@pytest.fixture
+def bench_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A two-commit repository whose bench.py appends a line to a log outside it on every run."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    log = tmp_path / "bench.log"
+    (root / "bench.py").write_bytes(f"open({str(log)!r}, 'a').write('x')\n".encode("utf-8"))
+    _git(root, "add", "bench.py")
+    _git(root, "commit", "-q", "-m", "one")
+    (root / "a.py").write_bytes(b"a = 1\n")
+    _git(root, "add", "a.py")
+    _git(root, "commit", "-q", "-m", "two")
+    monkeypatch.chdir(root)  # Windows' CreateProcess searches the parent's cwd, not cwd=
+    return root
+
+
+class TestPerfProgramLookup:
+    """R-checks-15: a bare perf.command program is found only in an absolute PATH entry outside
+    the workspace; an explicit path is the user's own choice and runs as written."""
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX PATH lookup; git is reached through a symlink")
+    def test_a_program_the_repository_planted_never_runs(self, bench_repo, tmp_path, monkeypatch):
+        marker = tmp_path / "planted-ran"
+        _program(bench_repo / "python3", f"open({str(marker)!r}, 'w').close()\n")
+        _git(bench_repo, "add", "python3")
+        _git(bench_repo, "commit", "-q", "-m", "plant")  # both the base and the head hold it
+        trusted = tmp_path / "trusted"  # git only: no python3 is installed outside the workspace
+        trusted.mkdir()
+        os.symlink(shutil.which("git"), trusted / "git")
+        monkeypatch.setenv("PATH", os.pathsep.join([".", str(trusted)]))
+
+        res = perf_check.run_perf_check(bench_repo, base_ref="HEAD", rounds=15, command=["python3", "bench.py"])
+
+        assert not marker.exists(), "a program the repository planted ran"
+        assert res["status"] == "unverified" and "python3 not found" in res["reason"]
+
+    def test_a_command_given_as_an_explicit_path_runs_unchanged(self, bench_repo, tmp_path):
+        res = perf_check.run_perf_check(bench_repo, rounds=15, command=[sys.executable, "bench.py"])
+
+        assert res["command"] == [sys.executable, "bench.py"]
+        assert (tmp_path / "bench.log").read_text(encoding="utf-8") == "x" * 30

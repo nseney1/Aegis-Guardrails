@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
+import os
 from pathlib import Path
+import stat
+import sys
+import time
 
 import pytest
 
@@ -317,3 +320,96 @@ class TestExternalScannerPresets:
         res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=fake_missing_runner)
         assert res["status"] == "unverified"
         assert "not found" in res["reason"].lower()
+
+
+_SARIF_ONE_FINDING = {
+    "runs": [{"results": [{
+        "ruleId": "S307", "level": "error", "message": {"text": "eval"},
+        "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": "app.py"},
+            "region": {"startLine": 1, "snippet": {"text": "eval(x)"}},
+        }}],
+    }]}],
+}
+
+
+def _program(path: Path, body: str) -> Path:
+    """A Python program PATH lookup finds as ``path.name`` (a .cmd launcher on Windows)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        script = path.with_name(path.name + "-script.py")
+        script.write_bytes(body.encode("utf-8"))
+        launcher = path.with_name(path.name + ".cmd")
+        launcher.write_bytes(f'@"{sys.executable}" "{script}" %*\r\n'.encode("utf-8"))
+        return launcher
+    path.write_bytes(f"#!{sys.executable}\n{body}".encode("utf-8"))
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def _set_path(monkeypatch: pytest.MonkeyPatch, *entries: str) -> None:
+    if os.name == "nt":
+        entries = (*entries, os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"))
+    monkeypatch.setenv("PATH", os.pathsep.join(entries))
+
+
+class TestPresetScannerProgramLookup:
+    """R-checks-15: a preset runs the ruff or gitleaks found in an absolute PATH entry outside the
+    repository. An empty or relative entry names the cwd (the repository), so a bare name would
+    run a program the repository planted and take its silence for a clean scan."""
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        root = tmp_path / "repo"
+        root.mkdir()
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.chdir(root)  # Windows' CreateProcess searches the parent's cwd, not cwd=
+        return root
+
+    @staticmethod
+    def _plant(root: Path, name: str, marker: Path) -> None:
+        body = f"open({str(marker)!r}, 'w').close()\n"
+        _program(root / name, body)
+        _program(root / "bin" / name, body)
+
+    @pytest.mark.parametrize("preset", ["ruff", "gitleaks"])
+    @pytest.mark.parametrize("entry", ["", ".", "bin", "REPO_BIN"], ids=["empty", "dot", "rel", "abs"])
+    def test_a_scanner_the_repository_planted_never_runs(self, repo, tmp_path, monkeypatch, preset, entry):
+        marker = tmp_path / "planted-ran"
+        self._plant(repo, preset, marker)
+        trusted = tmp_path / "trusted"
+        trusted.mkdir()  # holds no scanner: the real one is not installed
+        _set_path(monkeypatch, str(repo / "bin") if entry == "REPO_BIN" else entry, str(trusted))
+
+        res = scanners.run_preset_scanner(preset, repo)
+
+        assert not marker.exists(), "a program the repository planted ran"
+        assert res["status"] == "unverified"
+        assert "not found" in res["reason"].lower()
+
+    @pytest.mark.parametrize("preset", ["ruff", "gitleaks"])
+    def test_a_scanner_installed_outside_the_repository_runs(self, repo, tmp_path, monkeypatch, preset):
+        marker = tmp_path / "planted-ran"
+        self._plant(repo, preset, marker)
+        trusted = tmp_path / "trusted"
+        _program(trusted / preset, f"import json\nprint(json.dumps({_SARIF_ONE_FINDING!r}))\n")
+        _set_path(monkeypatch, "", "bin", str(repo / "bin"), str(trusted))
+
+        res = scanners.run_preset_scanner(preset, repo)
+
+        assert not marker.exists()
+        assert res["status"] == "fail"
+        assert [f.rule_id for f in res["findings"]] == ["S307"]
+
+    def test_an_injected_runner_receives_the_bare_argv(self, tmp_path):
+        seen = []
+
+        def runner(argv, cwd, env=None, timeout=60):
+            seen.append(list(argv))
+            return {"returncode": 0, "stdout": json.dumps(_SARIF_ONE_FINDING), "stderr": ""}
+
+        scanners.run_preset_scanner("ruff", tmp_path, runner=runner)
+        assert [argv[0] for argv in seen] == ["ruff"]

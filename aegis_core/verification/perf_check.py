@@ -5,7 +5,7 @@ import os, shlex, shutil, statistics, tempfile, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, pathlookup
 from aegis_core.config import read_user_config
 from aegis_core.verification import test_runner
 
@@ -78,6 +78,17 @@ def _invoke_sample(cmd_runner: Callable[..., Any], argv: list[str], cwd: Path, t
     return elapsed, None
 
 
+def _default_runner(ws_root: Path) -> Callable[..., Any]:
+    """``run_external_cmd`` with a bare ``argv[0]`` found only in an absolute PATH entry outside the
+    workspace (an empty or relative entry names the repository); an explicit path runs as written."""
+    def run(argv: Sequence[str], cwd: Path, env: Mapping[str, str] | None = None, timeout: int = 60) -> dict[str, Any]:
+        exe = pathlookup.which(argv[0], outside=ws_root) if os.path.basename(argv[0]) == argv[0] else argv[0]
+        if exe is None:
+            return {"missing_binary": True, "stderr": f"{argv[0]} not found in an absolute PATH entry outside the workspace"}
+        return test_runner.run_external_cmd([exe, *argv[1:]], cwd=cwd, env=env, timeout=timeout)
+    return run
+
+
 def run_perf_check(
     workspace_root: Path | str,
     base_ref: str = "HEAD~1",
@@ -102,7 +113,7 @@ def run_perf_check(
     if not argv:
         return {"status": "unverified", "reason": "no perf.command configured in user-scope config", "regressed": False, "noisy": False}
 
-    cmd_runner = runner or test_runner.run_external_cmd
+    cmd_runner = runner or _default_runner(ws_root)
     git_fn = getattr(gitsafe, "run_git", gitsafe.run)
     tmp_base = Path(tempfile.mkdtemp(prefix="aegis-perf-base-"))
     worktree_added = False

@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, pathlookup
 from aegis_core.verification import test_runner
 
 MAX_LINE_LENGTH = 4096
@@ -413,6 +413,17 @@ def build_preset_argv(
     raise ValueError(f"Unsupported scanner preset: {preset!r}")
 
 
+def _run_found_program(argv: Sequence[str], cwd: Path | str, env: Mapping[str, str] | None = None, timeout: int | float = 60) -> dict[str, Any]:
+    """``run_external_cmd`` on the ``argv[0]`` found in an absolute PATH entry outside ``cwd``: the
+    scanner runs with the repository as its cwd, where an empty or relative entry would find a
+    program the repository planted, and its silence would read as a clean scan."""
+    exe = pathlookup.which(str(argv[0]), outside=cwd)
+    if exe is None:
+        return {"returncode": 127, "stdout": "", "stderr": f"{argv[0]} not found in an absolute PATH entry outside the workspace",
+                "missing_binary": True, "timed_out": False, "duration_s": 0.0}
+    return test_runner.run_external_cmd([exe, *argv[1:]], cwd=cwd, env=env, timeout=timeout)
+
+
 def run_preset_scanner(
     preset: str,
     workspace_root: Path | str,
@@ -424,7 +435,7 @@ def run_preset_scanner(
     runner: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir, config_path=config_path)
-    cmd_runner = runner or test_runner.run_external_cmd
+    cmd_runner = runner or _run_found_program
     try:
         res = cmd_runner(argv, cwd=Path(workspace_root), timeout=timeout)
     except FileNotFoundError as exc:
