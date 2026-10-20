@@ -285,10 +285,50 @@ def test_a_harmless_looping_or_unparseable_git_alias_is_not_a_match(command):
     assert classify_command(command) is None
 
 
-@pytest.mark.parametrize("target",["./", ".//", "../", "..//", "~/", "/home/", "/root/", "/"])
+@pytest.mark.parametrize("target", ["./", ".//", "../", "..//", "~/", "/home/", "/root/", "/"])
 def test_trailing_slashes_never_hide_a_dangerous_rm_target(target):
     """BUG-075 for the guard: trailing slashes are normalized away."""
     assert _id(f"rm -rf {target}") == (GUARD_BLOCK, "rm-recursive-dangerous")
+
+
+@pytest.mark.parametrize("command", [
+    "dd of=//dev/sda",
+    "dd of=///dev/sda bs=1M",
+    "dd if=image.iso of=//dev/sdb bs=4M",
+    'dd of="//dev/sda"',
+    "dd of=/./dev/sda",
+    "dd of=/tmp/../dev/sda",
+    "dd of=/dev//sda",
+    "dd of=//dev/../dev/sda",
+    "dd of=/dev/shm/../sda",
+    "dd of=/dev/fd/../sda",
+    "yes | dd of=//dev/sda",
+    "/bin/dd of=//dev/sda",
+    "env dd of=//dev/sda",
+    "bash -c 'dd of=//dev/sda'",
+])
+def test_a_device_path_is_resolved_before_the_dd_device_check(command):
+    """R-checks-5: the of= operand is resolved lexically (no filesystem access)."""
+    assert _id(command) == (GUARD_BLOCK, "dd-device")
+
+
+@pytest.mark.parametrize("command", [
+    "dd if=/dev/zero of=//dev/null bs=1M count=1",
+    "dd of=///dev/null",
+    "dd of=/dev//null",
+    "dd of=/dev/./null",
+    "dd of=/dev/null/",
+    "dd of=//dev/stdout",
+    "dd of=//dev/fd/1",
+    "dd of=//dev/shm/scratch.img",
+    "dd of=//tmp/out.img",
+    "dd of=/tmp/dev/sda",
+    "dd of=//dev",
+    "dd of=/dev/",
+    "dd of=out.img",
+])
+def test_a_harmless_dd_target_spelled_with_extra_slashes_or_dots_is_not_a_match(command):
+    assert classify_command(command) is None
 
 
 # ── record set ───────────────────────────────────────────────────────────────

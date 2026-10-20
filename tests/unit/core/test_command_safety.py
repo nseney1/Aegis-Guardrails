@@ -385,3 +385,15 @@ def test_the_gate_asks_for_an_abbreviated_long_option(cmd, tmp_path):
 @pytest.mark.parametrize("cmd", ["git reset -- f", "git push --force-if-includes o f", "git push -- feat", "git add --dry-run x"])
 def test_the_analyzer_does_not_over_match_a_prefix(cmd):
     assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)
+
+
+# ── R-checks-5: dd writes a device (gate parity with the guard's dd-device) ──
+
+@pytest.mark.parametrize("cmd", ["dd of=/dev/sda", "yes | dd of=/dev/sda", "dd of=//dev/sda", "dd of=/tmp/../dev/sdb bs=4M"])
+def test_the_analyzer_asks_for_dd_writing_a_device_without_if(cmd):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(True, REASON_DD)
+
+
+@pytest.mark.parametrize("cmd", ["dd of=/dev//null", "yes | dd of=out.img", "dd of=//dev/shm/x"])
+def test_the_analyzer_allows_dd_writing_a_harmless_target_without_if(cmd):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import fnmatch
 import os
+import posixpath
 import re
 import shlex
 from typing import Dict, List, Optional, Tuple, Union
@@ -806,7 +807,7 @@ def evaluate_system_binary(cmd: UnwrappedCommand) -> SafetyEvaluation:
 
     if b == "dd":
         all_items = cmd.positional_args + cmd.flags
-        if any(item.startswith("if=") for item in all_items):
+        if any(item.startswith("if=") or _writes_a_device(item) for item in all_items):
             return SafetyEvaluation(True, REASON_DD)
 
     if b == "chmod":
@@ -1111,9 +1112,15 @@ def _dangerous_rm_target(arg: str) -> bool:
 
 
 def _writes_a_device(arg: str) -> bool:
-    if not arg.startswith("of=/dev/"):
+    """Whether a dd operand writes a device, its path resolved lexically first
+    (``of=//dev/sda`` and ``of=/tmp/../dev/sda`` write /dev/sda; ``of=/dev//null`` is
+    /dev/null). The slash run is collapsed because normpath keeps a leading ``//``;
+    posixpath, so Windows does not turn ``/`` into ``\\``."""
+    if not arg.startswith("of=/"):
         return False
-    device = arg[len("of="):]
+    device = posixpath.normpath("/" + arg[len("of="):].lstrip("/"))
+    if not device.startswith("/dev/"):
+        return False
     return device not in _HARMLESS_DEVICES and not device.startswith(_HARMLESS_DEVICE_DIRS)
 
 

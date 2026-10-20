@@ -316,6 +316,18 @@ def test_a_block_set_command_is_blocked_with_the_hosts_exit_code(ws, capsys, hos
     assert _events(ws) == [("guard_match", host, "block", {"tier": "block", "action": "block", "rule": "git-push-force"})]
 
 
+@pytest.mark.parametrize("host,payload_of,expected", [
+    ("claude-code", lambda ws, c: claude(ws, "Bash", {"command": c}), 2),
+    ("codex-cli", lambda ws, c: codex(ws, "Bash", c), 2),
+    ("antigravity", lambda ws, c: agy(ws, "run_command", {"CommandLine": c}), 75),
+])
+def test_a_dd_device_spelled_with_a_double_slash_is_blocked(ws, capsys, host, payload_of, expected):
+    code, out, err = _run(capsys, host, payload_of(ws, "dd if=image.iso of=//dev/sda bs=4M"))
+    assert (code, out) == (expected, "")
+    assert err.startswith("aegis: blocked dd-device: ")
+    assert _events(ws) == [("guard_match", host, "block", {"tier": "block", "action": "block", "rule": "dd-device"})]
+
+
 @pytest.mark.parametrize("host,payload_of", [
     ("claude-code", lambda ws, c: claude(ws, "Bash", {"command": c})),
     ("codex-cli", lambda ws, c: codex(ws, "Bash", c)),
