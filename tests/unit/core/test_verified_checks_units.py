@@ -540,6 +540,65 @@ def test_a_rerun_without_a_merge_base_or_commit_is_unbound_with_a_reason(tmp_pat
         assert verdict["result"] == "unbound" and verdict["failed"] is False and verdict["reason"], commit
 
 
+# ── a passing check needs a tests run ────────────────────────────────────────
+
+def _staged_tree(repo) -> str:
+    repo.git("add", "-A")
+    return repo.git("write-tree")
+
+
+def _row(tree: str, check_id: str, *, passed: bool, tests, exit_code: int = 0):
+    from aegis_core.telemetry_engine import ledger
+
+    return {"v": ledger.LEDGER_VERSION, "ts": "2026-10-20T00:00:00Z", "event": "check", "id": check_id, "tree": tree,
+            "witness": "aegis", "passed": passed, "tests": tests, "exit": exit_code}
+
+
+def _append(repo, *rows) -> None:
+    from aegis_core.telemetry_engine import ledger
+
+    ledger.append_rows(repo.root, list(rows))
+
+
+def _report(repo, tree: str):
+    return credit.submit_report(repo.root, tree=tree, session="s", host="h", key="k", outcome="success",
+                                rules_for=lambda _check: ["trap-sample"])
+
+
+@needs_git
+def test_a_layer_one_only_row_cannot_launder_a_failed_tests_run(tmp_path):
+    from aegis_cli.hooks import commitmsg
+
+    repo = hv.make_project(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    tree = _staged_tree(repo)
+    _append(repo, _row(tree, "c-tests", passed=False, tests={"exit": 1, "passed": 2, "failed": 1}, exit_code=1),
+            _row(tree, "c-layer1", passed=True, tests=None))
+    assert credit.passing_check(credit.read_rows(repo.root), tree) is None
+    assert commitmsg.trailer_for_staged(repo.root) is None
+    out = _report(repo, tree)
+    assert out["status"] == "claimed" and out["witness"] == "self"
+
+
+@needs_git
+def test_a_passing_tests_row_still_counts_after_a_later_layer_one_only_row(tmp_path):
+    from aegis_cli.hooks import commitmsg
+
+    repo = hv.make_project(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    tree = _staged_tree(repo)
+    _append(repo, _row(tree, "c-tests", passed=True, tests={"exit": 0, "passed": 3, "failed": 0}),
+            _row(tree, "c-layer1", passed=True, tests=None))
+    assert credit.passing_check(credit.read_rows(repo.root), tree)["id"] == "c-tests"
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(tree, 0)
+    assert _report(repo, tree)["witness"] == "aegis"
+
+
+def test_a_run_that_collected_no_tests_is_never_a_passing_check():
+    rows = [_row(SHA, "c-empty", passed=False, tests={"exit": 5, "passed": 0, "collected": 0}, exit_code=5)]
+    assert credit.passing_check(rows, SHA) is None
+
+
 # ── derivation edges ─────────────────────────────────────────────────────────
 
 def test_derive_is_pure_and_needs_a_report_to_name_a_rule():

@@ -1,4 +1,8 @@
-"""The credit state machine (v4.3 spec §3 T1, T4): what a ``check`` row is worth, derived on read."""
+"""The credit state machine (v4.3 spec §3 T1, T4): what a ``check`` row is worth, derived on read.
+
+Only a passing ``check`` row that ran tests (``aegis check --record --tests``) is a witness: it is
+what ``submit_report`` credits and what the commit hook writes a trailer for.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -96,11 +100,14 @@ def _sign(claimed: Any, check: Mapping[str, Any]) -> str:
 
 
 def passing_check(rows: Iterable[Mapping[str, Any]], tree: Optional[str]) -> Optional[Mapping[str, Any]]:
+    """The newest passing ``aegis check --record --tests`` row for ``tree``: a Layer-1-only row (no
+    ``tests``) passes ``aegis check --record`` but never earns ``witness: aegis`` or a trailer."""
     if not tree:
         return None
     best = None
     for row in _of(rows, "check"):
-        if row.get("tree") == tree and row.get("witness") == "aegis" and _passed(row) and isinstance(row.get("id"), str):
+        if (row.get("tree") == tree and row.get("witness") == "aegis" and _passed(row)
+                and isinstance(row.get("tests"), dict) and isinstance(row.get("id"), str)):
             best = row
     return best
 
