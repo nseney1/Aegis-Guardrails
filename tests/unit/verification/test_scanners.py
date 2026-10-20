@@ -1,6 +1,7 @@
 """Behavioral tests for Tier A/B/C secret scanner, SARIF 2.1.0 ingest, and external presets."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -185,6 +186,34 @@ class TestLongLinesAreScanned:
             sum(1 for _ in range(n // 50) for _ in range(n // 50))
 
         assert _best_of(3, quadratic, 100_000) / _best_of(3, quadratic, 50_000) >= 3
+
+
+class TestDataUrlPrefixDoesNotHideGateSecrets:
+    """R-checks-22: data-URL and SRI payloads are blanked for the heuristic (advisory) tiers only;
+    a known-format token right after a data-URL prefix still gates."""
+
+    @pytest.mark.parametrize("prefix", ["data:x/y;base64,", "data:image/png;base64,"], ids=["xy", "png"])
+    @pytest.mark.parametrize("rule_id", list(_tier_a_samples().keys()))
+    def test_a_token_after_a_data_url_prefix_gates(self, rule_id, prefix):
+        token = _tier_a_samples()[rule_id]
+        findings = scanners.scan_secrets_text(f'blob = "{prefix}{token}"')
+        assert (rule_id, "gate", 1) in [(f.rule_id, f.tier, f.line) for f in findings]
+        assert token not in json.dumps([f.as_dict() for f in findings])
+
+    def test_a_token_lines_after_a_data_url_is_reported_alone(self):
+        text = 'img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="\nx = 1\n' + _tok(
+            "k = '", _tier_a_samples()["aws-access-key-id"], "'\n")
+        assert [(f.rule_id, f.line, f.tier) for f in scanners.scan_secrets_text(text)] == [("aws-access-key-id", 3, "gate")]
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    def test_benign_data_urls_and_sri_hashes_stay_quiet(self, include_advisory):
+        lines = []
+        for key in ("icon", "icon_token", "secret_image", "api_key_icon", "password_hint"):
+            payload = base64.b64encode(hashlib.sha256(key.encode()).digest() * 3).decode()
+            lines += [f'{key} = "data:{mime};base64,{payload}"' for mime in ("image/png", "font/woff2", "application/octet-stream")]
+        sri = base64.b64encode(hashlib.sha384(b"app.js").digest()).decode()
+        lines.append(f'<script src="app.js" integrity="sha384-{sri}"></script>')
+        assert scanners.scan_secrets_text("\n".join(lines), include_advisory=include_advisory) == []
 
 
 class TestTierBAndTierCAdvisory:

@@ -210,7 +210,9 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
         line_secrets: list[str] = []
         matched: list[tuple[str, str, str]] = []
         for rule_id, rx in TIER_A_PATTERNS.items():
-            for m in rx.finditer(cleaned):
+            # The raw line: a known-format token is a secret whatever precedes it. Blanking data-URL
+            # payloads only suppresses heuristic (advisory) false positives; the payload may be the token.
+            for m in rx.finditer(raw_line):
                 full = m.group(0)
                 if rule_id == "url-basic-auth":
                     user, pwd = m.group(1), m.group(2)
