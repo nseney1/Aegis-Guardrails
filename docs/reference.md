@@ -155,7 +155,7 @@ Category: Daily Workflow & Verification.
 | --- | --- | --- | --- |
 | `--base` | `REF` |  | The base branch to measure governance changes against (default: origin/main, main, origin/develop, develop) |
 | `--exempt-test` | `COMMIT` |  | Sign a test exemption (Aegis-Exempt-Test) for a specific fix commit |
-| `--reason` | `TEXT` |  | Explanation for --exempt-test (must match the fix commit's Aegis-No-Test reason) |
+| `--reason` | `TEXT` |  | Explanation for --exempt-test (signed into the commit) |
 
 ### `aegis check`
 

@@ -1165,6 +1165,7 @@
   "aegis_cli.hooks.redaction.HOOK_REDACTION_PATTERNS",
   "aegis_cli.hooks.redaction.redact_payload",
   "aegis_cli.verify.verdict_to_exit_code",
+  "aegis_core.human_gate.workflow_contexts",
   "aegis_core.insights.enable_host_hook",
   "aegis_core.insights.redact_secrets",
   "aegis_core.insights.shannon_entropy",

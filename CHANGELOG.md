@@ -70,6 +70,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Breaking: `aegis_cli.verify.verdict_to_exit_code` is removed; Layer 2 no longer maps to an exit code.
 - Breaking: `aegis_core.insights.add_insight` loses its `host` and `session` keyword arguments.
 - Breaking: the incidental re-exports `aegis_core.regression.UserLayout`, `aegis_core.rule_integrity.UserLayout` and `aegis_core.rule_integrity.Path` are removed; import `UserLayout` from `aegis_core.workspace.layout` and `Path` from `pathlib`.
+- Breaking: `aegis_core.human_gate.workflow_contexts` is removed in favour of `aegis_check_jobs`; `human_gate.verify_test_exemption` and `find_test_exemption` lose their `expected_reason` argument.
 
 ## [4.3.3] - 2026-10-17
 

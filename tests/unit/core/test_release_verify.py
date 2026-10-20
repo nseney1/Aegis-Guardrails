@@ -125,8 +125,10 @@ class FakeGh:
 
 
 # What the base branch must hold for the tier detector to reach each tier (with tier_runner's rules).
-TIER_FILES = {"A": {".github/CODEOWNERS": hg.CODEOWNERS_FULL},
-              "B": {"allowed_signers": hg.allowed_signers_text(hg.hardware_public_key())}}
+# Both need the Aegis job on the base: R-trust-35 reads the required check from the base workflows.
+TIER_FILES = {"A": {".github/CODEOWNERS": hg.CODEOWNERS_FULL, ".github/workflows/aegis.yml": hg.AEGIS_WORKFLOW},
+              "B": {"allowed_signers": hg.allowed_signers_text(hg.hardware_public_key()),
+                    ".github/workflows/aegis.yml": hg.AEGIS_WORKFLOW}}
 
 
 def make_repo(tmp_path: Path, remote: Optional[str] = f"https://github.com/{REPOSITORY}.git",

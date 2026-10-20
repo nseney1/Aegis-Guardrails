@@ -179,7 +179,7 @@
             "flags": [
               "--reason"
             ],
-            "help": "Explanation for --exempt-test (must match the fix commit's Aegis-No-Test reason)",
+            "help": "Explanation for --exempt-test (signed into the commit)",
             "kind": "store",
             "metavar": "TEXT",
             "nargs": null,
