@@ -292,6 +292,54 @@ def test_a_conftest_change_is_protected_and_earns_no_credit_until_approved(tmp_p
     assert approved.counts is True
 
 
+# Stands in for the runner, or for a module it imports: writes a passing junit file and exits 0.
+FORGED_RUN = (
+    "import sys\n"
+    "for arg in sys.argv:\n"
+    "    if arg.startswith('--junitxml='):\n"
+    "        with open(arg.split('=', 1)[1], 'w') as fh:\n"
+    "            fh.write('<testsuite tests=\"1\"><testcase classname=\"t\" name=\"test_ok\"/></testsuite>')\n"
+    "print('1 passed in 0.01s')\n"
+    "sys.exit(0)\n"
+)
+
+
+@needs_git
+@pytest.mark.parametrize("shadow", ["pytest.py", "pytest/__init__.py", "_pytest/__init__.py", "pluggy/__init__.py",
+                                    "py.py", "iniconfig.py"], ids=["pytest", "pkg", "_pytest", "pluggy", "py", "ini"])
+def test_a_root_module_that_shadows_the_runner_is_protected_and_earns_no_credit(tmp_path, shadow):
+    """Given a failing test on the branch, When a root module replaces what the default
+    ``python -m pytest`` imports and forges a passing junit file, Then the check row is protected
+    (test-infra) and a CI-confirmed credit for it does not count."""
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.write("tests/test_real.py", "def test_real():\n    assert False\n")
+    repo.commit("a failing test")
+    repo.write(shadow, FORGED_RUN)
+    _edit_app(repo)
+    _scan(repo)
+    out = checkrun.record(repo.root, tests=True, base="main")
+    assert out.row["protected_changed"] is True and "test-infra" in out.row["protected"]
+    if shadow in ("pytest.py", "pytest/__init__.py"):
+        assert out.row["passed"] is True  # the forgery itself works whatever else is installed
+    _report(repo)
+    commit = repo.commit("work")
+    credit.confirm(repo.root, client=hv.FakeCI([hv.ci_run(commit)]), workflow=hv.CI_WORKFLOW, landed=_landed(repo))
+    derived = _credits(repo)
+    assert all(c.counts is False for c in derived)
+    if out.row["passed"]:  # a forged pass reached the ledger: the protection is what withholds it
+        assert [(c.state, c.reason) for c in derived] == [("confirmed", "protected_changed")]
+
+
+@needs_git
+def test_a_path_that_only_resembles_the_runner_is_not_protected(tmp_path):
+    repo = hv.make_project(tmp_path)
+    hv.use_stub_runner(repo.home.path)
+    repo.write("docs/pytest/usage.md", "# usage\n")
+    repo.write("src/pytest_helpers.py", "x = 1\n")
+    out = checkrun.record(repo.root, tests=True, base="main")
+    assert out.row["protected_changed"] is False and out.row["protected"] == []
+
+
 @needs_git
 def test_an_unprotected_change_has_protected_changed_false(tmp_path):
     repo = hv.make_project(tmp_path)
@@ -462,6 +510,30 @@ def test_the_credited_rules_are_exposed_in_the_session_and_match_the_change(tmp_
     res = _report(repo, rules=("trap-docs",))  # the agent names a rule it never saw
     assert res["status"] == "recorded" and res["credited"] == ["trap-sample"]
     assert [c.rule for c in _credits(repo)] == ["trap-sample"]
+
+
+@needs_git
+def test_a_workspace_below_the_top_level_credits_the_exposed_rule_that_matches_the_change(tmp_path):
+    home = hg.Home(tmp_path / "home")
+    repo = hg.Repo(tmp_path / "mono", home)
+    repo.write("README.md", "# mono\n")
+    repo.write("pkg/src/app.py", hv.APP)
+    repo.write("pkg/.aegis/rules/traps/trap-sample.md", hg.RULE)
+    repo.write("pkg/.aegis/rules/traps/trap-docs.md", SECOND_RULE)
+    repo.write("pkg/docs/guide.md", "# guide\n")
+    repo.write("run_checks.py", hv.PASSING)  # checkrun runs the command at the snapshot's top level
+    repo.write("pkg/.gitignore", ".aegis/state/\n")
+    repo.commit("base")
+    repo.branch("work")
+    ws = repo.root / "pkg"
+    hv.use_stub_runner(home.path)
+    repo.write("pkg/src/app.py", "def app():\n    return 2\n")
+    scanned = hv.mcp_call("aegis_scan", ws, session="sess-1", files=["src/app.py", "docs/guide.md"])
+    assert scanned.get("status") != "FAIL", scanned  # both rules exposed; only src/ changes
+    checkrun.record(ws, tests=True, base="main")
+    res = hv.mcp_call("aegis_report_outcome", ws, session="sess-1", outcome="success",
+                      rules_used=["trap-sample", "trap-docs"], idempotency_key="k1")
+    assert res["status"] == "recorded" and res["credited"] == ["trap-sample"]
 
 
 @needs_git

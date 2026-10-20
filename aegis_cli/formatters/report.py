@@ -133,6 +133,14 @@ def _normalize_findings(
             raw_items.append({"rule": w.get("rule") or w.get("code") or "rule-weakening", "path": w.get("path", ""),
                               "line": w.get("line", 1 if w.get("path") else 0), "col": w.get("col", 1),
                               "message": f"{w.get('code', '')}: {w.get('message', '')}".strip(": "), "level": "error"})
+    gov = report_dict.get("governance")
+    if isinstance(gov, dict) and gov.get("enforced") and not gov.get("approved"):
+        for entry in gov.get("paths", []):
+            if isinstance(entry, dict):
+                path = str(entry.get("path") or "")
+                raw_items.append({"rule": f"governance:{entry.get('category', '')}", "path": path,
+                                  "line": 1 if path else 0, "col": 1, "level": "error",
+                                  "message": f"governance change without approval: {path}"})
     reg = report_dict.get("regression")
     if isinstance(reg, dict):
         reg_level = "error" if reg.get("tier") == "gate" else "warning"

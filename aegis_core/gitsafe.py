@@ -91,9 +91,11 @@ __all__ = [
     "read_blobs",
     "read_object",
     "read_ref",
+    "relative_to_prefix",
     "resolve_base_ref",
     "resolve_commit",
     "run",
+    "show_prefix",
     "toplevel",
     "tree_blobs",
     "update_ref",
@@ -253,6 +255,25 @@ def toplevel(cwd: Path | str) -> Optional[Path]:
     """The work tree root containing ``cwd``, or None outside a work tree."""
     text = _text(["rev-parse", "--show-toplevel"], cwd)
     return Path(text) if text else None
+
+
+def show_prefix(cwd: Path | str) -> str:
+    """``cwd`` below the work tree root (``rev-parse --show-prefix``): POSIX, ending in ``/``,
+    ``""`` at the top level. Raises GitError when git cannot place ``cwd``: tree listings and
+    diffs name top-level paths, so guessing a frame would silently drop or misplace them."""
+    res = run(["rev-parse", "--show-prefix"], cwd)
+    if res.returncode != 0:
+        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
+        raise GitError(f"git rev-parse --show-prefix failed: {detail}")
+    return os.fsdecode(res.stdout.rstrip(b"\r\n"))
+
+
+def relative_to_prefix(prefix: str, path: str) -> Optional[str]:
+    """A top-level ``path`` relative to the directory at ``prefix`` (from ``show_prefix``), or
+    None when it lies outside that directory."""
+    if not prefix:
+        return path
+    return path[len(prefix):] if path.startswith(prefix) and len(path) > len(prefix) else None
 
 
 def common_dir(cwd: Path | str) -> Optional[Path]:

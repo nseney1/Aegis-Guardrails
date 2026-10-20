@@ -604,6 +604,73 @@ def test_approve_json_carries_the_envelope(tmp_path, monkeypatch, keys):
     assert doc["commit"] == repo.head() and doc["categories"] == ["rules"]
     for key in ("source", "aegis_version", "checked_at", "scope"): assert doc[key]
 
+def _tests_on_main(repo: hg.Repo) -> None:
+    """``main`` gains tests/test_a.py and tests/test_b.py; ``work`` is reset onto it."""
+    repo.git("checkout", "-q", "main")
+    repo.write("tests/test_a.py", "def test_a():\n    assert True\n")
+    repo.write("tests/test_b.py", "def test_b():\n    assert True\n")
+    repo.commit("tests")
+    repo.git("checkout", "-q", "-B", "work")
+
+
+@needs_signing
+def test_a_branch_that_only_deletes_a_test_can_be_approved_and_a_further_deletion_voids_it(tmp_path, monkeypatch, keys):
+    """Given a signer on main and a branch that only deletes tests/test_a.py, When aegis approve
+    runs with a terminal and y, Then the approval binds the deletion: it verifies, and deleting
+    tests/test_b.py afterwards voids it (hash_mismatch)."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    _tests_on_main(repo)
+    repo.git("rm", "-q", "tests/test_a.py")
+    repo.commit("drop a test")
+    repo.home.sign_with(str(keys["human"]))
+    rc, out, err = _approve(repo, monkeypatch, json=True)
+    doc = json.loads(out)
+    assert rc == 0 and doc["categories"] == ["tests-deleted"], out + err
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    assert digest != human_gate.governance_tree_hash(repo.root, "HEAD")
+    assert f"Aegis-Approve: {digest}" in repo.git("log", "-1", "--format=%B")
+    approval = repo.head()
+    found = human_gate.find_approval(repo.root, "HEAD", "main")
+    assert found is not None and found.valid
+    repo.git("rm", "-q", "tests/test_b.py")
+    repo.commit("drop another")
+    assert human_gate.find_approval(repo.root, "HEAD", "main") is None
+    now = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    assert tuple(human_gate.verify_approval(repo.root, approval, now, "main")[:2]) == (False, "hash_mismatch")
+
+
+@needs_signing
+def test_an_approved_rule_change_does_not_cover_a_test_deleted_later(tmp_path, monkeypatch, keys):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    _tests_on_main(repo)
+    _changed_rule_branch(repo)
+    repo.home.sign_with(str(keys["human"]))
+    rc, out, err = _approve(repo, monkeypatch)
+    assert rc == 0, out + err
+    assert human_gate.find_approval(repo.root, "HEAD", "main") is not None
+    repo.git("rm", "-q", "tests/test_a.py")
+    repo.commit("then drop a test")
+    assert human_gate.find_approval(repo.root, "HEAD", "main") is None
+
+
+@needs_signing
+def test_credit_honours_an_approved_deletion_until_another_test_is_deleted(tmp_path, monkeypatch, keys):
+    from aegis_core import credit
+
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    _tests_on_main(repo)
+    base = repo.head()
+    repo.git("rm", "-q", "tests/test_a.py")
+    checked = repo.commit("drop a test")
+    repo.home.sign_with(str(keys["human"]))
+    assert _approve(repo, monkeypatch)[0] == 0
+    rows = [{"event": "check", "id": "c1", "tree": "t", "head": checked, "base": base}]
+    assert credit.approval_lookup(repo.root, rows, landed=lambda tree, head=None: checked)("c1") is True
+    repo.git("rm", "-q", "tests/test_b.py")
+    later = repo.commit("drop another")
+    assert credit.approval_lookup(repo.root, rows, landed=lambda tree, head=None: later)("c1") is False
+
+
 @needs_signing
 def test_approve_exempt_test_signs_and_verifies_commit_scoped_exemption(tmp_path, monkeypatch, keys):
     repo = hg.make_repo(tmp_path, keys["human_pub"])

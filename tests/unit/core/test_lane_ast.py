@@ -217,3 +217,57 @@ class TestPytestSettings:
     def test_invalid_config_raises_value_error(self, filename: str, bad_data: bytes):
         with pytest.raises(ValueError):
             lane_ast.pytest_settings(filename, bad_data)
+
+
+class TestPytestConfigView:
+    """Given a pyproject.toml, setup.cfg or tox.ini, When check --ci compares two versions of it,
+    Then only what pytest reads counts: every key of its sections, not formatting or other tables."""
+
+    PYPROJECT = (
+        b'[project]\nname = "demo"\nversion = "1.0.0"\n\n'
+        b'[tool.pytest.ini_options]\naddopts = "-q" # quiet\nrequired_plugins = ["a"]\n'
+    )
+
+    def test_whitespace_comments_and_other_tables_do_not_count(self):
+        view = lane_ast.pytest_config_view("pyproject.toml", self.PYPROJECT)
+        reformatted = self.PYPROJECT.replace(b'version = "1.0.0"', b'version = "2.0.0"').replace(
+            b'addopts = "-q" # quiet', b'addopts   =   "-q"')
+        assert view == lane_ast.pytest_config_view("pyproject.toml", reformatted)
+        assert view == {"tool.pytest.ini_options.addopts": '"-q"',
+                        "tool.pytest.ini_options.required_plugins": '["a"]',
+                        "[tool.pytest.ini_options]": ""}
+
+    @pytest.mark.parametrize("filename,data,key", [
+        ("pyproject.toml", b'[tool.pytest.ini_options]\npythonpath = ["src"]\n', "tool.pytest.ini_options.pythonpath"),
+        ("pyproject.toml", b'[tool.pytest]\nminversion = "8"\n', "tool.pytest.minversion"),
+        ("pyproject.toml", b'[tool]\npytest = {ini_options = {addopts = "-x"}}\n', "tool.pytest"),
+        ("setup.cfg", b"[metadata]\nname = x\n[tool:pytest]\nrequired_plugins = evil\n", "required_plugins"),
+        ("tox.ini", b"[tox]\nenvlist = py\n[pytest]\npythonpath = src\n", "pythonpath"),
+    ], ids=["pythonpath", "native", "inline", "setup", "tox"])
+    def test_keys_outside_the_collection_keys_count(self, filename, data, key):
+        assert key not in lane_ast.COLLECTION_KEYS
+        assert key in (lane_ast.pytest_config_view(filename, data) or {})
+
+    @pytest.mark.parametrize("filename,data", [
+        ("pyproject.toml", b'[project]\nname = "demo"\n'),
+        ("setup.cfg", b"[metadata]\nname = x\n"),
+        ("tox.ini", b"[tox]\nenvlist = py\n"),
+    ], ids=["pyproject", "setup", "tox"])
+    def test_a_file_without_a_pytest_section_has_no_view(self, filename, data):
+        assert lane_ast.pytest_config_view(filename, data) is None
+
+    @pytest.mark.parametrize("filename,data", [
+        ("pyproject.toml", b'[tool.pytest.ini_options\naddopts = "-q"\n'),
+        ("setup.cfg", b"\xff"),
+        ("tox.ini", b"[pytest]\naddopts = -q\naddopts = -x\n"),
+        ("pytest.ini", b"[pytest]\naddopts = -q\n"),
+    ], ids=["toml", "bytes", "dupkey", "notcompared"])
+    def test_an_unreadable_file_raises_value_error(self, filename, data):
+        with pytest.raises(ValueError):
+            lane_ast.pytest_config_view(filename, data)
+
+    def test_it_parses_without_tomllib(self, monkeypatch):
+        import sys
+
+        monkeypatch.setitem(sys.modules, "tomllib", None)
+        assert lane_ast.pytest_config_view("pyproject.toml", self.PYPROJECT)

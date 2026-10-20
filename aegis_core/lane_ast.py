@@ -35,6 +35,7 @@ __all__ = [
     "PYTEST_CONFIG_FILES",
     "collected_ids",
     "collection_hooks",
+    "pytest_config_view",
     "pytest_settings",
     "skip_forms",
 ]
@@ -570,6 +571,46 @@ def pytest_settings(filename: str, data: bytes) -> Optional[Dict[str, str]]:
         f"[{section}] {key}": "\n".join(line.strip() for line in parser.get(section, key).splitlines()
                                         if line.strip())
         for key in COLLECTION_KEYS if parser.has_option(section, key)
+    }
+
+
+_VIEW_SECTIONS = {"tox.ini": "pytest", "setup.cfg": "tool:pytest"}
+
+
+def pytest_config_view(filename: str, data: bytes) -> Optional[Dict[str, str]]:
+    """Everything pytest reads from ``pyproject.toml`` (``[tool.pytest]`` and its sub-tables,
+    headers included: an empty ``[tool.pytest.ini_options]`` still makes it the config file),
+    ``tox.ini`` (``[pytest]``) or ``setup.cfg`` (``[tool:pytest]``), with the parsers of
+    ``pytest_settings`` and every key, not only COLLECTION_KEYS. None when the file holds no
+    pytest configuration; ValueError when it cannot be read (or is not one of the three)."""
+    text = bytes(data).decode("utf-8-sig")
+    if filename == "pyproject.toml":
+        root = ("tool", "pytest")
+        found: Dict[str, str] = {}
+        table: Tuple[str, ...] = ()
+        for is_table, key, value in _toml_statements(text):
+            full = key if is_table else table + key
+            if is_table:
+                table = key
+            if full[:len(root)] == root or (full == ("tool",) and value.startswith("{") and "pytest" in value):
+                name = f"[{'.'.join(full)}]" if is_table else ".".join(full)
+                # A key or array-table header seen twice keeps both, so neither copy can change unseen.
+                found[name] = value if name not in found else f"{found[name]}\0{value}"
+        return found or None
+    section = _VIEW_SECTIONS.get(filename)
+    if section is None:
+        raise ValueError(f"{filename} is not compared by its pytest section")
+    parser = configparser.ConfigParser(interpolation=None, strict=True, default_section="\x00")
+    parser.optionxform = str  # type: ignore[assignment,method-assign]
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        raise ValueError(f"not a valid ini file ({type(exc).__name__})") from None
+    if not parser.has_section(section):
+        return None
+    return {
+        key: "\n".join(line.strip() for line in parser.get(section, key).splitlines() if line.strip())
+        for key in parser.options(section)
     }
 
 
