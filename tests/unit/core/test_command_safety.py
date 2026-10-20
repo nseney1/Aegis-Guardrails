@@ -354,3 +354,34 @@ def test_a_delimiter_run_before_an_unterminated_quote_fails_closed_and_never_rai
     assert CommandAnalyzer.evaluate("ls;\n\n'x") == SafetyEvaluation(True, REASON_UNABLE_TO_PARSE)
     assert CommandAnalyzer.evaluate(";;;;;").is_destructive is False
     assert CommandAnalyzer.evaluate(";" * 100_000).is_destructive is False
+
+
+# ── R-checks-2: abbreviated long options (gate parity with the guard) ────────
+
+@pytest.mark.parametrize("cmd,reason", [
+    ("git push --force-w origin f", REASON_GIT_PUSH_FORCE),
+    ("git push -fu origin feat", REASON_GIT_PUSH_FORCE),
+    ("git reset --har", REASON_GIT_RESET_HARD),
+    ("git clean --forc -d", REASON_GIT_CLEAN_FORCE),
+    ("git branch --dele x", REASON_GIT_BRANCH),
+    ("git branch --forc x", REASON_GIT_BRANCH),
+    ("git checkout --forc main", REASON_GIT_CHECKOUT_FORCE),
+    ("git checkout -fq main", REASON_GIT_CHECKOUT_FORCE),
+    ("git add --al", REASON_GIT_ADD_BULK),
+    ("git add -Av", REASON_GIT_ADD_BULK),
+    ("rm --recurs /", REASON_RM_RF),
+], ids=lambda value: value if value.startswith(("git", "rm")) else "")
+def test_the_analyzer_reads_an_abbreviated_long_option_or_a_bundle_as_the_option(cmd, reason):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(True, reason)
+
+
+@pytest.mark.parametrize("cmd", ["git push --force-w origin feat", "git reset --har", "git clean --forc -d", "rm --recurs /"])
+def test_the_gate_asks_for_an_abbreviated_long_option(cmd, tmp_path):
+    from aegis_cli.hooks.safety import run_safety_gate
+
+    assert run_safety_gate(cmd, workspace=tmp_path)[1]["decision"] == "force_ask"
+
+
+@pytest.mark.parametrize("cmd", ["git reset -- f", "git push --force-if-includes o f", "git push -- feat", "git add --dry-run x"])
+def test_the_analyzer_does_not_over_match_a_prefix(cmd):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)

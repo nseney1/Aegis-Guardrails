@@ -182,6 +182,61 @@ def test_a_run_of_delimiters_never_splits_quoted_text_or_harmless_commands(comma
     assert classify_command(command) is None
 
 
+# R-checks-2: git (parse-options) and GNU rm accept any unique prefix of a long option.
+@pytest.mark.parametrize("command,rule", [
+    ("git push --force-w origin feat", "git-push-force"),
+    ("git push --force-with origin feat", "git-push-force"),
+    ("git push --force-with-l origin feat", "git-push-force"),
+    ("git push origin feat --force-w", "git-push-force"),
+    ("git -C ../other push --force-w", "git-push-force"),
+    ('bash -lc "git push --force-w origin feat"', "git-push-force"),
+    ("git reset --har", "git-reset-hard"),
+    ("git reset --h", "git-reset-hard"),
+    ("git reset HEAD~1 --har", "git-reset-hard"),
+    ("git clean --forc -d", "git-clean-force"),
+    ("git clean --f -d", "git-clean-force"),
+    ("rm --recurs /", "rm-recursive-dangerous"),
+    ("rm --r ~", "rm-recursive-dangerous"),
+    # -e takes a pattern: the n of -en, or a -n after -e/--exclude, is that pattern.
+    ("git clean -fd -en", "git-clean-force"),
+    ("git clean -fen", "git-clean-force"),
+    ("git clean -fdx -e build", "git-clean-force"),
+    ("git clean -f -e n", "git-clean-force"),
+    ("git clean -f -e -n", "git-clean-force"),
+    ("git clean -f --exclude -n", "git-clean-force"),
+    # after -- a -n is a pathspec; --no-dry-run cancels a dry run
+    ("git clean -f -- -n .", "git-clean-force"),
+    ("git clean -n --no-dry-run -f", "git-clean-force"),
+    ("git clean -f --no-d", "git-clean-force"),
+])
+def test_an_abbreviated_long_option_is_the_option_it_abbreviates(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", [
+    "git push --",
+    "git push origin -- feat",
+    "git reset -- file.py",
+    "git reset HEAD -- file.py",
+    "git clean -n --",
+    "rm -r -- build",
+    "git push --force-i origin feat",
+    "git push --force-if origin feat",
+    "git push --follow-tags origin feat",
+    "git push --dry origin feat",
+    "git reset --soft HEAD~1",
+    "git clean -f --d",
+    "git clean -f --dry",
+    "git clean -fn",
+    "git clean -fdn",
+    "git clean -f -n",
+    "git clean -nfd",
+    "git clean -f --e=x -n",
+])
+def test_an_unrelated_prefix_or_a_real_dry_run_is_not_a_match(command):
+    assert classify_command(command) is None
+
+
 def test_delimiter_runs_alone_or_unterminated_fail_open_without_raising():
     assert classify_command(";;;;;") is None
     assert classify_command(";" * 100_000) is None

@@ -602,6 +602,14 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
 
 # ── Domain-Specific Command Evaluators ────────────────────────────────────────
 
+def _long_option(flag: str, full: str) -> bool:
+    """Whether ``flag`` spells the long option ``full``: git (parse-options) and GNU rm
+    accept any unique prefix (``--har`` is ``--hard``). The bare ``--`` never matches; an
+    ambiguous prefix the tool rejects may match, which only stops a failing command."""
+    name = flag.split("=", 1)[0]
+    return len(name) > 2 and full.startswith(name)
+
+
 def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
     flags = [f.lstrip("\\") for f in cmd.flags]
 
@@ -616,7 +624,7 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
 
     if sub == "branch":
         for f in flags:
-            if f in ("--delete", "--force"):
+            if _long_option(f, "--delete") or _long_option(f, "--force"):
                 return SafetyEvaluation(True, REASON_GIT_BRANCH)
             if f.startswith("-") and not f.startswith("--"):
                 letters = f[1:]
@@ -624,7 +632,8 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
                     return SafetyEvaluation(True, REASON_GIT_BRANCH)
 
     elif sub == "push":
-        if any(f in ("-f", "--force", "--force-with-lease") for f in flags):
+        if any("f" in _short_letters(f) or _long_option(f, "--force") or _long_option(f, "--force-with-lease")
+               for f in flags):
             return SafetyEvaluation(True, REASON_GIT_PUSH_FORCE)
         for arg in cmd.positional_args:
             if arg.startswith("+"):
@@ -633,21 +642,21 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
                 return SafetyEvaluation(True, REASON_PROTECTED_BRANCH)
 
     elif sub == "reset":
-        if any(f == "--hard" for f in flags):
+        if any(_long_option(f, "--hard") for f in flags):
             return SafetyEvaluation(True, REASON_GIT_RESET_HARD)
 
     elif sub == "checkout":
-        if any(f in ("-f", "--force") for f in flags):
+        if any("f" in _short_letters(f) or _long_option(f, "--force") for f in flags):
             return SafetyEvaluation(True, REASON_GIT_CHECKOUT_FORCE)
 
     elif sub == "clean":
         for f in flags:
-            if f == "--force" or (f.startswith("-") and not f.startswith("--") and "f" in f[1:]):
+            if _long_option(f, "--force") or "f" in _short_letters(f):
                 return SafetyEvaluation(True, REASON_GIT_CLEAN_FORCE)
 
     elif sub == "add":
         for f in flags:
-            if f in ("-A", "--all"):
+            if "A" in _short_letters(f) or _long_option(f, "--all"):
                 return SafetyEvaluation(True, REASON_GIT_ADD_BULK)
         for arg in cmd.positional_args:
             if arg in (".", "./", "*"):
@@ -683,7 +692,7 @@ def evaluate_rm(cmd: UnwrappedCommand) -> SafetyEvaluation:
     has_r = False
 
     for f in flags:
-        if f == "--recursive":
+        if _long_option(f, "--recursive"):
             has_r = True
         elif f.startswith("-") and not f.startswith("--"):
             body = f[1:]
@@ -975,29 +984,50 @@ def _pushes_to_protected(refspec: str) -> bool:
     return destination.rsplit("/", 1)[-1] in _PROTECTED_BRANCHES
 
 
+def _clean_dry_run(flags: List[str]) -> bool:
+    """Whether git clean's ``flags`` ask for a dry run, and no more often than git does:
+    ``-e``/``--exclude`` take a value (``-en`` and ``-e -n`` exclude the pattern n or -n),
+    a ``-n`` after ``--`` is a pathspec, and ``--no-dry-run`` cancels one."""
+    dry_run = value_next = False
+    for flag in flags:
+        if flag == "--":  # git takes "-e --" as a value; ending here never finds a dry run
+            break
+        if value_next:
+            value_next = False
+        elif _long_option(flag, "--no-dry-run"):
+            return False
+        elif flag.startswith("--"):
+            dry_run = dry_run or _long_option(flag, "--dry-run")
+            value_next = _long_option(flag, "--exclude") and "=" not in flag
+        else:
+            before, excluded, value = _short_letters(flag).partition("e")
+            dry_run = dry_run or "n" in before
+            value_next = bool(excluded) and not value
+    return dry_run
+
+
 def _guard_git(cmd: UnwrappedCommand) -> List[GuardRule]:
     flags = [f.lstrip("\\") for f in cmd.flags]
     letters = "".join(_short_letters(f) for f in flags)
     sub = cmd.subcommand
     found: List[GuardRule] = []
     if sub == "push":
-        if "f" in letters or any(f == "--force" or f.split("=", 1)[0] == "--force-with-lease" for f in flags):
+        if "f" in letters or any(_long_option(f, "--force") or _long_option(f, "--force-with-lease") for f in flags):
             found.append(_GUARD["git-push-force"])
         if any(arg.startswith("+") for arg in cmd.positional_args):
             found.append(_GUARD["git-push-refspec"])
         if any(_pushes_to_protected(arg) for arg in cmd.positional_args):
             found.append(_GUARD["git-push-protected"])
-    elif sub == "reset" and "--hard" in flags:
+    elif sub == "reset" and any(_long_option(f, "--hard") for f in flags):
         found.append(_GUARD["git-reset-hard"])
     elif sub == "clean":
-        forced = "f" in letters or "--force" in flags
-        dry_run = "n" in letters or "--dry-run" in flags
-        if forced and not dry_run:
+        if ("f" in letters or any(_long_option(f, "--force") for f in flags)) and not _clean_dry_run(flags):
             found.append(_GUARD["git-clean-force"])
     elif sub == "merge" and not any(f in ("--abort", "--quit", "--continue") for f in flags):
         found.append(_GUARD["git-merge"])
     elif sub == "add" and (
-        "A" in letters or "--all" in flags or any(arg in (".", "./", "*") for arg in cmd.positional_args)
+        "A" in letters or any(_long_option(f, "--all") for f in flags)
+        or any(arg in (".", "./", "*") for arg in cmd.positional_args)
     ):
         found.append(_GUARD["git-add-bulk"])
     return found
@@ -1034,7 +1064,7 @@ def _guard_stage(cmd: UnwrappedCommand) -> List[GuardRule]:
             found.append(_GUARD["gh-pr-merge"])
     elif binary == "rm":
         flags = [f.lstrip("\\") for f in cmd.flags]
-        recursive = "--recursive" in flags or any(c in "rR" for f in flags for c in _short_letters(f))
+        recursive = any(_long_option(f, "--recursive") or "r" in _short_letters(f).lower() for f in flags)
         if recursive and any(_dangerous_rm_target(arg) for arg in cmd.positional_args):
             found.append(_GUARD["rm-recursive-dangerous"])
     elif binary.startswith("mkfs"):
