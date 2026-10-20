@@ -30,6 +30,7 @@ from aegis_core.insights import (
     has_correction_cue,
     insights_path,
     measure_recurrence,
+    read_insight_rows,
     read_link_key,
     record_decision,
     record_hook_prompt,
@@ -41,6 +42,7 @@ from aegis_core.insights import (
 from aegis_core.rules import load_rules
 from aegis_core.scan import scan as scan_workspace
 from aegis_core.scan_compliance import record as record_activity
+from aegis_core.storage import append_jsonl
 from aegis_core.telemetry_engine import ledger
 
 
@@ -604,7 +606,14 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
         "Always check path confinement before recursive directory removal.",
     )
 
-    # Emit 10 heartbeats without session_id (missing hs)
+    # Seed 10 legacy heartbeats without session identity (4.3 wrote one per session-less
+    # prompt); a session-less prompt writes none now (R-structure-a2).
+    rev = load_rules(repo).get("trap-validate-rmtree").digest[:16]
+    legacy = {"v": 1, "ts": "2026-10-20T00:00:00Z", "event": "heartbeat", "host": "claude-code",
+              "revs": {"trap-validate-rmtree": rev}}
+    store = insights_path(repo, home=home)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    append_jsonl(store, [dict(legacy) for _ in range(10)])
     for _ in range(10):
         record_hook_prompt(
             repo,
@@ -612,6 +621,7 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
             {"prompt": "Please run the unit tests.", "cwd": str(repo)},
             home=home,
         )
+    assert len(read_insight_rows(repo, home=home)) == 10
 
     rec_missing = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert rec_missing["status"] == "insufficient_session_identity"

@@ -5,6 +5,13 @@ L0 transports at module load: credit, human_gate, the ledger, scan_compliance, t
 parser and the redaction scanners are imported where review or capture uses them, so a
 prompt that writes nothing pays for none of them. Their public re-exports stay reachable
 through the module ``__getattr__``.
+
+Rows of the user-scope log (compact JSONL, appended under a lock, never rewritten):
+``heartbeat`` {host, hs, cue, inv} on every hook prompt that carries a session id, text
+free, where ``inv`` is the first 16 hex of the rule-bytes fingerprint (absent without rule
+files); ``inventory`` {inv, revs} once per first-seen ``inv``, the only place the hook
+parses rules; ``insight`` and ``decision``. A prompt with no session id and no excerpt
+writes nothing. Old heartbeats that carry their own ``revs`` stay readable.
 """
 from __future__ import annotations
 
@@ -553,27 +560,31 @@ def record_hook_prompt(
         project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
         actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
     hs = _ensure_hs(host, session or payload_session, home=home)
-    path = insights_path(actual_ws, home=home)
-    now = _utc_now()
     cue = has_correction_cue(prompt_text)
     excerpt = _redact(prompt_text) if cue and excerpts else ""
+    if hs is None and not excerpt:
+        # Without session identity a prompt counts toward no session: no heartbeat, no I/O.
+        return {}
+    path = insights_path(actual_ws, home=home)
+    now = _utc_now()
     resolved = Path(os.fspath(actual_ws)).resolve()
     root = bounded_walk_up(resolved) or resolved
     to_write: List[Dict[str, Any]] = []
-    hb: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host}
-    if hs:
-        hb["hs"] = hs
-    hb["cue"] = cue
     revs: Optional[Dict[str, str]] = None
     inv = _inventory_id(root)
     if inv:
-        hb["inv"] = inv
         # Rules are parsed only for a rule set this log has not seen; later rows reuse its revs.
         revs = _known_inventory_revs(path, inv)
         if revs is None:
             revs = _served_rule_revs(root)
-            to_write.append({"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "inventory", "inv": inv, "revs": revs})
-    to_write.append(hb)
+            if hs is not None:
+                to_write.append({"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "inventory", "inv": inv, "revs": revs})
+    hb: Dict[str, Any] = {}
+    if hs is not None:
+        hb = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host, "hs": hs, "cue": cue}
+        if inv:
+            hb["inv"] = inv
+        to_write.append(hb)
     insight_row: Optional[Dict[str, Any]] = None
     if excerpt:
         insight_row = _build_insight_row(

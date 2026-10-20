@@ -505,3 +505,46 @@ def test_a_workspace_without_rule_files_writes_heartbeats_without_inv(tmp_path: 
     rows = read_insight_rows(repo, home=hb_home)
     assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
     assert all("inv" not in r and "revs" not in r for r in rows)
+
+
+# ── no session identity, no heartbeat (R-structure-a2) ────────────────────────
+
+def _hook_entry(repo: Path, home: Path, stdin: str):
+    import contextlib
+    import io
+
+    from aegis_cli.hooks.insights import run_insight_hook
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = run_insight_hook(["--host", "claude-code", "--workspace", str(repo), "--excerpts"], stdin=stdin, home=home)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_a_prompt_without_a_session_writes_nothing(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-nosess")
+    for stdin in ("", '{"prompt": "Please run the tests."}', '{"prompt": "Run the linter.", "session_id": "  "}'):
+        assert _hook_entry(repo, hb_home, stdin) == (0, "", "")
+    assert not (hb_home / ".aegis" / "insights").exists()
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_a_cue_prompt_without_a_session_writes_only_its_insight(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-nosess")
+    record_hook_prompt("claude-code", {"prompt": "No, stop breaking the build!", "cwd": str(repo)}, home=hb_home)
+    (row,) = read_insight_rows(repo, home=hb_home)
+    assert row["event"] == "insight" and "hs" not in row and set(row["revs"]) == {"trap-nosess"}
+    _prompt(repo, hb_home)
+    _prompt(repo, hb_home)
+    assert len(_events(repo, hb_home, "heartbeat")) == 2
+
+
+def test_a_corrupt_log_and_no_session_still_exit_zero_silently(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    store = insights_path(repo, home=hb_home)
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"\xff{garbage\n")
+    assert _hook_entry(repo, hb_home, '{"prompt": "No, wrong file again"}') == (0, "", "")
+    assert [r["event"] for r in read_insight_rows(repo, home=hb_home)] == ["insight"]
