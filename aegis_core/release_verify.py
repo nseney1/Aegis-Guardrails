@@ -222,23 +222,30 @@ def _repository(root: Path) -> Optional[str]:
 def _default_branch(run: GhRun, repository: str) -> Tuple[Optional[str], str]:
     """(GitHub's default branch of ``repository``, why not): asked with the explicit ``owner/repo``
     that ``--repo`` pins, never gh's ``{owner}/{repo}`` placeholders (gh picks those from remotes)."""
-    asked = f"gh api repos/{repository}"
-    result = run(["api", "--method", "GET", f"repos/{repository}"], 30.0)
+    body, why = _gh_get(run, f"repos/{repository}")
+    if why:
+        return None, why
+    if not isinstance(body, dict):
+        return None, f"gh api repos/{repository} printed no repository object"
+    branch = body.get("default_branch")
+    if not isinstance(branch, str) or not branch or not branch.isprintable() or any(c.isspace() for c in branch):
+        return None, f"gh api repos/{repository} printed no usable default_branch"
+    return branch, ""
+
+
+def _gh_get(run: GhRun, path: str) -> Tuple[Any, str]:
+    """(parsed JSON of ``gh api --method GET <path>``, why not)."""
+    asked = f"gh api {path.split('?', 1)[0]}"
+    result = run(["api", "--method", "GET", path], 30.0)
     if result is None:
         return None, f"{asked} failed: gh is not installed"
     if result[0] != 0:
         detail = " ".join(result[2].split())[:300]
         return None, f"{asked} failed: {detail}" if detail else f"{asked} failed (exit {result[0]})"
     try:
-        body = json.loads(result[1])
+        return json.loads(result[1]), ""
     except ValueError:
         return None, f"{asked} printed no JSON"
-    if not isinstance(body, dict):
-        return None, f"{asked} printed no repository object"
-    branch = body.get("default_branch")
-    if not isinstance(branch, str) or not branch or not branch.isprintable() or any(c.isspace() for c in branch):
-        return None, f"{asked} printed no usable default_branch"
-    return branch, ""
 
 
 def _recheck(output: str, commit: str, tree: str, subject_digest: str, repository: str,
@@ -296,18 +303,6 @@ def _record_problem(record: Any, commit: str, tree: str, subject_digest: str, re
     if not isinstance(signer, str) or not signer.lower().startswith(f"https://github.com/{repository.lower()}/{WORKFLOW.lower()}@"):
         return f"the signer is not {repository}/{WORKFLOW}", None
     return None, run_val
-
-
-def _gh_get(run: GhRun, path: str) -> Tuple[Any, str]:
-    """(parsed JSON of ``gh api --method GET <path>``, why not)."""
-    result = run(["api", "--method", "GET", path], 30.0)
-    if result is None or result[0] != 0:
-        detail = "gh is not installed" if result is None else (" ".join(result[2].split())[:200] or f"exit {result[0]}")
-        return None, f"gh api {path.split('?', 1)[0]} failed: {detail}"
-    try:
-        return json.loads(result[1]), ""
-    except ValueError:
-        return None, f"gh api {path.split('?', 1)[0]} printed no JSON"
 
 
 def _field(obj: Mapping[str, Any], outer: str, inner: str) -> Any:
