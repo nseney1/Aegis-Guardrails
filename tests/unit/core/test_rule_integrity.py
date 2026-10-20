@@ -256,6 +256,9 @@ def test_a_forged_base_object_is_refused_by_the_public_loaders(tmp_path):
     loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
     with pytest.raises(IntegrityError, match="does not match the object id"):
         rule_integrity.effective(repo.root)
+    # A process that read the commit's rules once keeps that verified copy; a new one reads the forgery.
+    assert scan_mod.scan(repo.root, ["src/app.py"]) == ok
+    scan_mod.RULE_CACHE.invalidate()
     result = scan_mod.scan(repo.root, ["src/app.py"])
     assert result["status"] == "FAIL"
     assert "the reviewed (base) version of the rules cannot be read" in result["error"]
@@ -446,6 +449,80 @@ def test_with_no_changed_files_the_unreviewed_list_still_fits_the_budget(tmp_pat
     result = scan_mod.scan(str(repo.root), changed_files=None, budget=5, max_tokens=300)
     assert result["guidance"] == scan_mod.NO_CHANGES_TEXT
     assert result["stats"]["estimated_tokens"] <= 300 and result["unreviewed_total"] == 10
+
+
+# ── the cost of reading the base (R-trust-45) ───────────────────────────────
+
+def git_calls(monkeypatch) -> List[List[str]]:
+    calls: List[List[str]] = []
+    real = gitsafe.run
+
+    def spy(args, *a, **kw):
+        calls.append(list(args))
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    return calls
+
+
+def parse_count(monkeypatch) -> List[str]:
+    from aegis_core import rules as rules_mod
+
+    parsed_paths: List[str] = []
+    real = rules_mod._parse
+    monkeypatch.setattr(rules_mod, "_parse", lambda entry, *a: parsed_paths.append(entry.relative_path) or real(entry, *a))
+    return parsed_paths
+
+
+@needs_git
+@pytest.mark.parametrize("origin", [True, False], ids=["origin", "local"])
+def test_reading_the_base_of_a_clean_tree_costs_two_git_calls_with_an_origin(tmp_path, monkeypatch, origin):
+    repo = make_repo(tmp_path, origin=origin)
+    calls = git_calls(monkeypatch)
+    view = rule_integrity.effective(repo.root, scan_mod.RuleCache())
+    assert view.anchor is not None and view.anchor.source == ("origin-head" if origin else "local-head")
+    assert view.unreviewed == () and len(calls) <= (2 if origin else 3), calls
+
+
+@needs_git
+def test_the_base_rules_are_parsed_once_per_anchor_and_working_tree(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# Softer\n\nEdited.\n"))
+    cache = scan_mod.RuleCache()
+    first = rule_integrity.effective(repo.root, cache)
+    parsed_paths = parse_count(monkeypatch)
+    second = rule_integrity.effective(repo.root, cache)
+    assert parsed_paths == [] and second == first
+    assert "Edited." in second.ruleset.get("trap-a").body and second.unreviewed == ()
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("move the reviewed base"))
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# Again\n\nEdited twice.\n"))
+    third = rule_integrity.effective(repo.root, cache)
+    assert third.anchor.commit != first.anchor.commit and parsed_paths  # a moved anchor is a new key
+    assert "Edited twice." in third.ruleset.get("trap-a").body
+
+
+@needs_git
+def test_a_binding_edit_is_still_held_to_the_base_when_the_base_is_cached(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", enforcement="advisory"))
+    cache = scan_mod.RuleCache()
+    for _ in range(2):
+        view = rule_integrity.effective(repo.root, cache)
+        assert view.ruleset.get("inv-a").enforcement == "gate"
+        assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+
+
+@needs_git
+def test_a_crlf_working_copy_of_lf_blobs_reads_no_blob_and_lists_nothing(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.git("config", "core.autocrlf", "true")
+    target = repo.root / path_of("inv-a")
+    lf = rule_integrity.effective(repo.root).ruleset.get("inv-a")
+    target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+    calls = git_calls(monkeypatch)
+    view = rule_integrity.effective(repo.root, scan_mod.RuleCache())
+    assert view.unreviewed == () and not [c for c in calls if "cat-file" in c], calls
+    assert rule_integrity.policy_view(view.ruleset.get("inv-a")) == rule_integrity.policy_view(lf)
 
 
 # ── the CI check ─────────────────────────────────────────────────────────────

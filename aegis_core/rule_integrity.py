@@ -82,8 +82,6 @@ def _user_base_ref(root: str) -> Optional[str]:
 
 def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
     root = workspace_root(workspace)
-    if gitsafe.toplevel(root) is None:
-        return None
     ref = _user_base_ref(root)
     if ref:
         tip = gitsafe.resolve_commit(root, ref)
@@ -93,7 +91,13 @@ def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
             fork = gitsafe.merge_base(root, tip, "HEAD")
             note = "" if fork else "; no common history with HEAD, using its tip"
             return BaseAnchor(ref, fork or tip, "user-config", True, f"rules.base_ref {ref} (user config{note})")
-    reviewed = gitsafe.merge_base(root, "refs/remotes/origin/HEAD", "HEAD")
+    # Constant refs need no option guard, and one merge-base resolves both: a failure (no
+    # origin/HEAD, no common history, not a repository) means no origin anchor.
+    try:
+        res = gitsafe.run(["merge-base", "refs/remotes/origin/HEAD", "HEAD"], root)
+    except gitsafe.GitError:
+        res = None
+    reviewed = os.fsdecode(res.stdout.strip()) if res is not None and res.returncode == 0 else ""
     if reviewed:
         return BaseAnchor("origin/HEAD", reviewed, "origin-head", True, "merge-base of HEAD and origin/HEAD")
     head = gitsafe.head_commit(root)
@@ -123,18 +127,18 @@ def _prefix(root: str) -> str:
         raise IntegrityError(str(exc)) from exc
 
 
-def _rule_blobs(cwd: str, commit: str, prefix: Optional[str] = None) -> Dict[str, str]:
-    # ls-tree --full-tree names top-level paths; the inventory names workspace-relative ones.
-    prefix = _prefix(cwd) if prefix is None else prefix
-    try:
-        entries = gitsafe.tree_blobs(cwd, commit, paths=(prefix + RULES_RELDIR,), timeout=_GIT_TIMEOUT)
-    except gitsafe.GitError as exc:
-        raise IntegrityError(str(exc)) from exc
+def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
+    # Without --full-tree, ls-tree takes and names paths relative to its cwd, the workspace root:
+    # a nested workspace needs no prefix lookup. Symlinks and gitlinks are not rules.
+    if not commit or commit.startswith("-"):
+        raise IntegrityError(f"invalid revision {commit!r}")
     found: Dict[str, str] = {}
-    for path, (_mode, oid) in entries.items():
-        relative = gitsafe.relative_to_prefix(prefix, path)
-        if relative is not None and relative.lower().endswith(_MD):
-            found[relative] = oid
+    for record in _run(cwd, ["ls-tree", "-r", "-z", commit, "--", RULES_RELDIR]).split(b"\0"):
+        meta, sep, raw_path = record.partition(b"\t")
+        fields = meta.split()
+        path = os.fsdecode(raw_path)
+        if sep and len(fields) == 3 and fields[1] == b"blob" and fields[0] != b"120000" and path.lower().endswith(_MD):
+            found[path] = fields[2].decode("ascii", "replace")
     return found
 
 
@@ -158,16 +162,21 @@ def _fingerprint(entries: Sequence[RuleInventoryEntry]) -> str:
     return aggregate.hexdigest()
 
 
-def _inventory_at(
-    root: str, commit: str, working: Optional[RuleInventory] = None, prefix: Optional[str] = None
-) -> RuleInventory:
-    blobs = _rule_blobs(root, commit, prefix)
+def _same_blob(data: bytes, oid: str) -> bool:
+    # A CRLF checkout (core.autocrlf) of an LF blob is the reviewed rule: policy_view ignores line endings.
+    if gitsafe.blob_id(data, len(oid)) == oid:
+        return True
+    return b"\r\n" in data and gitsafe.blob_id(data.replace(b"\r\n", b"\n"), len(oid)) == oid
+
+
+def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None) -> RuleInventory:
+    blobs = _rule_blobs(root, commit)
     present = {e.relative_path: e for e in working.entries} if working is not None else {}
     entries: List[RuleInventoryEntry] = []
     missing: List[Tuple[str, str]] = []
     for path, oid in sorted(blobs.items()):
         local = present.get(path)
-        if local is not None and gitsafe.blob_id(local.content, len(oid)) == oid:
+        if local is not None and _same_blob(local.content, oid):
             entries.append(local)
         else:
             missing.append((path, oid))
@@ -535,10 +544,17 @@ def effective(workspace: Any, cache: Optional[RuleCache] = None) -> Effective:
     anchor = resolve_base(root)
     if anchor is None:
         return Effective(head, None)
-    base_inventory = _inventory_at(root, anchor.commit, inventory, _prefix(root))
-    if base_inventory.fingerprint == inventory.fingerprint:
-        return Effective(head, anchor)
-    return _compose(root, head, load_rules(root, inventory=base_inventory), anchor)
+
+    def load_base() -> Optional[RuleSet]:
+        base_inventory = _inventory_at(root, anchor.commit, inventory)
+        if base_inventory.fingerprint == inventory.fingerprint:
+            return None  # the working rules are the reviewed ones
+        return load_rules(root, inventory=base_inventory)
+
+    # A commit's tree never changes, so these inputs fix the parsed BASE set.
+    key = (root, anchor.commit, inventory.fingerprint)
+    base = cache.base(key, load_base) if cache is not None else load_base()
+    return Effective(head, anchor) if base is None else _compose(root, head, base, anchor)
 
 
 def effective_ruleset(workspace: Any, cache: Optional[RuleCache] = None) -> RuleSet:
@@ -710,8 +726,8 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
     if not merge:
         raise IntegrityError(f"{base!r} and {head!r} share no history (a shallow clone needs fetch-depth: 0)")
     prefix = _prefix(root)
-    base_rules = load_rules(root, inventory=_inventory_at(root, merge, prefix=prefix))
-    head_rules = load_rules(root, inventory=_inventory_at(root, head_commit, prefix=prefix))
+    base_rules = load_rules(root, inventory=_inventory_at(root, merge))
+    head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
     renames, _deleted = _diff(root, merge, head_commit, prefix)
     tree = _Tree(renames)
 
