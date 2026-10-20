@@ -11,6 +11,7 @@ the block and record sets in aegis_core.command_safety.
 from __future__ import annotations
 
 import itertools
+import time
 
 import pytest
 
@@ -281,6 +282,55 @@ _CHAIN = " ".join(f"-c alias.a{i}=a{i + 1}" for i in range(20))
 ], ids=lambda value: value[:40] if value.startswith(("git", "sudo", "bash", "PVAL", "GIT_")) else "")
 def test_a_command_line_git_alias_is_judged_by_its_expansion(command, rule):
     assert _id(command) == (GUARD_BLOCK, rule)
+
+
+# git hands its -c settings to a ! alias's script through GIT_CONFIG_PARAMETERS, so every
+# git the script runs, however nested, expands the outer aliases; its own -c comes later
+# and wins.
+@pytest.mark.parametrize("command,rule", [
+    ("git -c alias.q='push -f' -c alias.p='!git q' p", "git-push-force"),
+    ("git -c alias.q='push -f' -c alias.p='!sh -c \"git q\"' p", "git-push-force"),
+    ("git -c alias.q=push -c alias.p='!git q' p -f", "git-push-force"),
+    ("git -c alias.r='reset --hard' -c alias.q='!git r' -c alias.p='!git q' p", "git-reset-hard"),
+], ids=["inherited", "nested-shell", "arguments", "two-levels"])
+def test_a_shell_alias_script_expands_the_outer_command_line_aliases(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", [
+    "git -c alias.q=status -c alias.p='!git q' p",
+    "git -c alias.q='push -f' -c alias.p='!git status' p",
+    "git -c alias.q='push -f' -c alias.p='!git -c alias.q=status q' p",
+], ids=["harmless-inner", "unused-outer", "inner-overrides"])
+def test_a_shell_alias_script_with_no_destructive_git_is_not_a_match(command):
+    assert classify_command(command) is None
+
+
+def _best_of_3(command):
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        assert classify_command(command) is None
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+def _rerunning_shell_alias(k):
+    """A ! alias whose script runs the alias itself k times (git would never finish)."""
+    return "git -c alias.p='!" + "; ".join(["git p"] * k) + "' p"
+
+
+@pytest.mark.timing
+def test_a_shell_alias_script_that_reruns_its_alias_is_scanned_in_linear_time():
+    # A ratio, never an absolute budget; the 20 ms floor keeps timer noise from failing it.
+    # Rescanning the script for each of its k stages at every nesting level grows as k**4.
+    small = _best_of_3(_rerunning_shell_alias(10))
+    large = _best_of_3(_rerunning_shell_alias(20))
+    assert large <= 2.5 * max(small, 0.02), (small, large)
+
+
+def test_a_rerunning_shell_alias_still_finds_its_destructive_git():
+    assert _id("git -c alias.q='push -f' -c alias.p='!git p; git p; git q' p") == (GUARD_BLOCK, "git-push-force")
 
 
 @pytest.mark.parametrize("command", [

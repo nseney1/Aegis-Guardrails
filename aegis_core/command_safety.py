@@ -6,13 +6,14 @@ Zero external dependencies (pure stdlib). Target latency < 0.05ms.
 """
 from __future__ import annotations
 
+from collections import ChainMap
 from dataclasses import dataclass, field
 import fnmatch
 import os
 import posixpath
 import re
 import shlex
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 # ── Canonical Reason Strings (1:1 Parity with aegis_cli/hooks.py) ─────────────
 
@@ -1384,17 +1385,42 @@ def _git_aliases(cmd: UnwrappedCommand) -> Dict[str, str]:
     return aliases
 
 
-def _guard_git_alias(cmd: UnwrappedCommand, depth: int, found: List[GuardRule]) -> None:
+# How many ``!`` alias scripts one command may have scanned. git runs a script each time
+# its alias is invoked, so a script that reruns aliases it inherits (``alias.p='!git p; git
+# p'``) would be rescanned for every stage at every nesting level; past this many, a script
+# contributes nothing (fail-open, like MAX_DEPTH).
+_MAX_ALIAS_SCRIPTS = 16
+
+
+@dataclass
+class _GuardScan:
+    """The rules one classify_command call has found, and the ``!`` alias scripts it may
+    still scan."""
+
+    found: List[GuardRule] = field(default_factory=list)
+    alias_scripts: int = _MAX_ALIAS_SCRIPTS
+
+
+def _guard_git_alias(
+    cmd: UnwrappedCommand, depth: int, scan: _GuardScan, inherited: Optional[Mapping[str, str]] = None,
+) -> None:
     """Classify the expansion of an alias defined on the same command line
-    (``git -c alias.p='push -f' p``). _guard_git has already matched the literal
-    subcommand, so a built-in still wins as it does in git; ``seen`` stops a cycle."""
-    aliases = _git_aliases(cmd)
+    (``git -c alias.p='push -f' p``), or by the git whose ``!`` alias script runs this one
+    (``inherited``; this git's own settings come later, so they win). _guard_git has
+    already matched the literal subcommand, so a built-in still wins as it does in git;
+    ``seen`` stops a cycle."""
+    own = _git_aliases(cmd)
+    aliases = ChainMap(own, inherited) if inherited else own  # not a copy per git stage
     seen = set()
     while cmd.subcommand in aliases and cmd.subcommand not in seen:
         seen.add(cmd.subcommand)
         value = aliases[cmd.subcommand]
-        if value.startswith("!"):  # git runs it with sh -c, the arguments appended
-            _guard_scan(" ".join([value[1:]] + [shlex.quote(t) for t in cmd.tail]), depth + 1, found)
+        if value.startswith("!"):
+            # git runs it with sh -c, the arguments appended, and hands its -c settings to
+            # every git the script runs through GIT_CONFIG_PARAMETERS.
+            if scan.alias_scripts > 0:
+                scan.alias_scripts -= 1
+                _guard_scan(" ".join([value[1:]] + [shlex.quote(t) for t in cmd.tail]), depth + 1, scan, aliases)
             return
         try:
             words = shlex.split(value)
@@ -1403,13 +1429,14 @@ def _guard_git_alias(cmd: UnwrappedCommand, depth: int, found: List[GuardRule]) 
         expanded, _ = unwrap_command_stage([cmd.binary, *words, *cmd.tail])
         if expanded is None:
             return
-        found.extend(_guard_git(expanded))
+        scan.found.extend(_guard_git(expanded))
         cmd = expanded
 
 
-def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
-    """Add the guard rules ``cmd`` matches to ``found``; False when it cannot be parsed
-    (or nests deeper than MAX_DEPTH), which contributes nothing."""
+def _guard_scan(cmd: str, depth: int, scan: _GuardScan, aliases: Optional[Mapping[str, str]] = None) -> bool:
+    """Add the guard rules ``cmd`` matches to ``scan.found``; False when it cannot be
+    parsed (or nests deeper than MAX_DEPTH), which contributes nothing. ``aliases`` are the
+    git aliases ``cmd`` inherits when it is a ``!`` alias's script."""
     if depth >= MAX_DEPTH:
         return False
     text, scripts = _split_heredocs(cmd)
@@ -1419,19 +1446,19 @@ def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
     except ValueError:
         return False
     for script in scripts:
-        _guard_scan(script, depth + 1, found)
+        _guard_scan(script, depth + 1, scan, aliases)
     if any(c in text for c in ("$", "`", "(", "<", ">")):
         for sub in extract_subshell_commands(text):
-            _guard_scan(sub, depth + 1, found)
+            _guard_scan(sub, depth + 1, scan, aliases)
     for pipeline in decompose_command(tokens):
         for stage in pipeline.stages:
             unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
             if inner:
-                _guard_scan(inner, depth + 1, found)
+                _guard_scan(inner, depth + 1, scan, aliases)
             if unwrapped is not None:
-                found.extend(_guard_stage(unwrapped))
+                scan.found.extend(_guard_stage(unwrapped))
                 if unwrapped.binary == "git":
-                    _guard_git_alias(unwrapped, depth, found)
+                    _guard_git_alias(unwrapped, depth, scan, aliases)
     return True
 
 
@@ -1440,13 +1467,15 @@ def classify_command(command: object) -> Optional[GuardRule]:
     first RECORD_SET rule, else None.
 
     Fail-open: an empty or non-string command, one the lexer cannot parse, an
-    unresolvable globbed binary and nesting beyond MAX_DEPTH are never a match.
+    unresolvable globbed binary, nesting beyond MAX_DEPTH and a ``!`` alias script past
+    the first _MAX_ALIAS_SCRIPTS are never a match.
     """
     if not isinstance(command, str) or not command.strip():
         return None
-    found: List[GuardRule] = []
-    if not _guard_scan(command, 0, found):
+    scan = _GuardScan()
+    if not _guard_scan(command, 0, scan):
         return None
+    found = scan.found
     text, scripts, sql_bodies = _scan_heredocs(command)
     upper = "\n".join([text, *scripts, *sql_bodies]).upper()
     if any(pattern in upper for pattern in _SQL_DESTRUCTIVE):
