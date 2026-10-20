@@ -554,6 +554,54 @@ def test_the_mandatory_cap_counts_only_rules_that_share_a_real_file(tmp_path, ca
     assert rc == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("mandatory_cap", "inv-c")]
 
 
+def cap_repo(tmp_path: Path) -> hg.Repo:
+    """main: gate-a and gate-b on src/*.py (the cap is full there), gate-c on lib/*.py."""
+    repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
+    for path in ("src/app.py", "lib/x.py", "lib/deep/y.py", "docs/a.md"):
+        repo.write(path, "x = 1\n")
+    for rid, paths in (("gate-a", ("src/*.py",)), ("gate-b", ("src/*.py",)), ("gate-c", ("lib/*.py",))):
+        repo.write(path_of(rid, "gate"), rule_text(rid, "gate", paths=paths, forbid={"calls": ["exec"]}))
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    return repo
+
+
+def widen_c(repo: hg.Repo, *paths: str) -> None:
+    repo.write(path_of("gate-c", "gate"), rule_text("gate-c", "gate", paths=("lib/*.py", *paths), forbid={"calls": ["exec"]}))
+
+
+@needs_git
+@pytest.mark.parametrize("added,expected", [
+    (("**/*.py",), [("mandatory_cap", "gate-c")]),
+    (("docs/*.md",), []),
+    (("lib/**/*.py",), []),
+], ids=["crowded", "free", "inside"])
+def test_widening_a_mandatory_rule_is_held_to_the_cap_where_its_reach_is_new(tmp_path, capsys, added, expected):
+    repo = cap_repo(tmp_path)
+    widen_c(repo, *added)
+    repo.commit("widen gate-c")
+    rc, payload, _err = ci(repo, capsys)
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == expected
+    assert rc == (1 if expected else 0)
+    if expected:
+        assert "src/app.py" in payload["weakenings"][0]["message"]
+
+
+@needs_git
+@pytest.mark.parametrize("added,served_paths", [
+    (("**/*.py",), ("lib/*.py",)),
+    (("docs/*.md",), ("lib/*.py", "docs/*.md")),
+], ids=["crowded", "free"])
+def test_a_local_widening_into_a_full_slot_is_not_served(tmp_path, added, served_paths):
+    repo = cap_repo(tmp_path)
+    widen_c(repo, *added)
+    view = rule_integrity.effective(repo.root)
+    assert view.ruleset.get("gate-c").target_paths == served_paths
+    assert [(u.id, u.change) for u in view.unreviewed] == [("gate-c", "changed")]
+
+
 def test_the_cap_is_the_one_the_scan_uses():
     assert scan_mod.MANDATORY_SLOT_CAP == rule_integrity.MANDATORY_SLOT_CAP == 2
 

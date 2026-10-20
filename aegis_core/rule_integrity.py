@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Opt
 from aegis_core import gitsafe
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
-from aegis_core.match import normalize_path
+from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import ENFORCEMENT_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -446,6 +446,7 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
     binding = {rule_id: r for rule_id, r in base_all.items() if r.rank >= 2}
     served: List[Rule] = []
     unreviewed: List[Unreviewed] = []
+    widened: List[Tuple[int, Rule, Tuple[str, ...]]] = []
     seen_ok, seen_any = set(), set()
     for rule in head.rules:
         seen_any.add(rule.id)
@@ -475,6 +476,10 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
                     **{k: rule.meta[k] for k in ("target_paths", "forbid_ast", "enforcement") if k in rule.meta},
                 },
             )
+            kept = {normalize_path(p) for p in reviewed.target_paths}
+            added = tuple(p for p in merged.target_paths if normalize_path(p) not in kept)
+            if merged.mandatory and added:
+                widened.append((len(served), reviewed, added))
             served.append(merged)
             unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
         else:
@@ -491,6 +496,12 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
                     reviewed.path,
                 )
             )
+    # Widening onto paths that may already hold the cap of mandatory rules would crowd one out of
+    # a scan (CI flags it as mandatory_cap): serve the reviewed version until that is approved.
+    for index, reviewed, added in widened:
+        others = [r for r in served if r.ok and r.mandatory and r.id != reviewed.id]
+        if sum(1 for o in others if sets_overlap(added, o.target_paths)) >= MANDATORY_SLOT_CAP:
+            served[index] = reviewed
     return Effective(
         RuleSet(tuple(served), head.ignored, f"{head.fingerprint}@{anchor.commit}"),
         anchor,
@@ -572,13 +583,16 @@ renamed_rules = _diff
 
 
 def _cap_findings(head: RuleSet, base: RuleSet, files: Callable[[], List[str]]) -> List[Weakening]:
-    already = {r.id for r in base.served if r.mandatory}
+    already = {r.id: r for r in base.served if r.mandatory}
     mandatory = [r for r in head.served if r.mandatory]
     found: List[Weakening] = []
     for rule in sorted(mandatory, key=lambda r: r.id):
-        if rule.id in already:
+        prior = already.get(rule.id)
+        if prior is not None and (prior.target_paths, prior.skips_tests) == (rule.target_paths, rule.skips_tests):
             continue
         for path in rule.matching_files(files()):
+            if prior is not None and prior.applies_to(path):
+                continue  # only where its reach is new
             crowd = [
                 o
                 for o in mandatory
