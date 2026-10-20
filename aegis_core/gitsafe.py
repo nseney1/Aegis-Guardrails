@@ -50,7 +50,6 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
-import posixpath
 import re
 import shutil
 import stat
@@ -691,16 +690,23 @@ def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
     return records
 
 
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
 def _safe_export_target(destination: Path, rel_path: str) -> Optional[Path]:
+    # On Windows ":" makes a part drive-relative (D:x) or a stream; on POSIX a:b.py is a plain file.
     if not isinstance(rel_path, str) or not rel_path:
         return None
-    cleaned = rel_path.replace("\\", "/")
-    if cleaned.startswith("/"):
+    parts = rel_path.replace("\\", "/").split("/")
+    if any(part in ("", ".", "..") or (_on_windows() and ":" in part) for part in parts):
         return None
-    norm = posixpath.normpath(cleaned)
-    if not norm or norm in (".", "..") or norm.startswith(("../", "/")):
+    target = destination.joinpath(*parts)
+    base = os.path.abspath(destination)
+    try:
+        return target if os.path.commonpath([os.path.abspath(target), base]) == base else None
+    except ValueError:  # another drive
         return None
-    return destination.joinpath(*norm.split("/"))
 
 
 def export_tree(

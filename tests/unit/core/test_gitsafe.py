@@ -686,6 +686,106 @@ def test_export_tree_with_and_without_overlay_and_fallback(repo: Path, tmp_path:
     assert (dest3 / "sub" / "nested.py").read_bytes() == b"n = 1\n"
 
 
+# Every write derived from a tree entry or overlay key lands below the destination: a `..`
+# part, a leading `/`, and (on Windows, where `:` is a drive or stream separator) a drive or
+# stream component are skipped. The rules are pure path logic, so `_on_windows` is patched
+# to run the Windows ones on every OS.
+
+def _outside(top: Path, dest: Path) -> list:
+    return [p for p in top.rglob("*") if p != dest and dest not in p.parents]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a file name with a colon is a POSIX tree entry")
+def test_the_fallback_export_keeps_a_posix_file_name_with_a_colon(tmp_path: Path, monkeypatch):
+    root = _repo(tmp_path / "repo")
+    (root / "a:b.py").write_bytes(b"colon\n")
+    (root / "src").mkdir()
+    (root / "src" / "x.py").write_bytes(b"x\n")
+    _commit(root)
+    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)  # checkout-index is not tried
+    dest = tmp_path / "dest"
+    gitsafe.export_tree(root, "HEAD", dest)
+    assert (dest / "a:b.py").read_bytes() == b"colon\n" and (dest / "src" / "x.py").read_bytes() == b"x\n"
+
+
+@pytest.mark.parametrize("key", ["../x", "/x", "a/../../x", "a\\..\\..\\x", "", "."])
+def test_an_overlay_key_outside_the_destination_is_skipped(repo: Path, tmp_path: Path, key):
+    dest = tmp_path / "out" / "dest"
+    gitsafe.export_tree(repo, "HEAD", dest, overlay={key: b"evil\n", "ok.py": b"ok\n"})
+    assert (dest / "ok.py").read_bytes() == b"ok\n"
+    assert _outside(tmp_path / "out", dest) == []
+
+
+def test_with_windows_rules_a_drive_or_stream_name_is_skipped(tmp_path: Path, monkeypatch):
+    root = _repo(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / "x.py").write_bytes(b"x\n")
+    if os.name != "nt":
+        (root / "a:b.py").write_bytes(b"colon\n")
+    _commit(root)
+    monkeypatch.setattr(gitsafe, "_on_windows", lambda: True)
+    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)
+    dest = tmp_path / "out" / "dest"
+    overlay = {"D:evil.py": b"x", "D:/x/evil.py": b"x", "x:stream": b"x", "ok.py": b"y"}
+    gitsafe.export_tree(root, "HEAD", dest, overlay=overlay)
+    assert (dest / "ok.py").read_bytes() == b"y" and (dest / "src" / "x.py").read_bytes() == b"x\n"
+    assert not [p.name for p in dest.rglob("*") if ":" in p.name]
+    assert not [p for p in _outside(tmp_path / "out", dest) if "evil" in p.name]
+
+
+def test_a_part_that_joins_onto_another_drive_is_outside_the_destination(tmp_path: Path, monkeypatch):
+    """The joined target is checked, not only the string: pathlib's Windows flavour joins
+    ``D:evil.py`` onto drive D, whichever OS runs the check."""
+    from pathlib import PureWindowsPath
+
+    monkeypatch.setattr(gitsafe, "_on_windows", lambda: False)  # the join check alone
+    for key in ("D:evil.py", "D:/x/evil.py"):
+        assert gitsafe._safe_export_target(PureWindowsPath(r"C:\snap\x"), key) is None, key
+    assert gitsafe._safe_export_target(tmp_path, "src/x.py") == tmp_path / "src" / "x.py"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive-relative name exists only on Windows")
+def test_on_windows_a_drive_relative_overlay_key_writes_nothing_outside(repo: Path, tmp_path: Path):
+    dest = tmp_path / "out" / "dest"
+    gitsafe.export_tree(repo, "HEAD", dest, overlay={"D:evil.py": b"x", "ok.py": b"y"})
+    assert (dest / "ok.py").read_bytes() == b"y"
+    assert not [p for p in _outside(tmp_path / "out", dest) if "evil" in p.name]
+
+
+def test_with_windows_rules_a_rule_id_with_a_drive_or_stream_is_refused(monkeypatch):
+    from aegis_core.lifecycle import parsers
+
+    monkeypatch.setattr(parsers, "_on_windows", lambda: True)
+    for bad in ("D:x", "x:stream", "C:"):
+        with pytest.raises(ValueError, match="path traversal"):
+            parsers.validate_rule_id(bad)
+        assert parsers.sanitize_rule_id(bad) is None
+    for good in ("trap-ok", "a.b"):
+        parsers.validate_rule_id(good)
+        assert parsers.sanitize_rule_id(good) == good
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a rule id with a colon is a legal POSIX file name")
+def test_on_posix_a_rule_id_with_a_colon_still_creates_its_rule(tmp_path: Path):
+    from aegis_core.lifecycle import parsers
+    from aegis_core.lifecycle.creation import create_rule
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    parsers.validate_rule_id("a:b")
+    path = create_rule("trap", "colon id", id_override="a:b", workspace=tmp_path)
+    assert path.name == "a:b.md" and path.is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive-relative rule id exists only on Windows")
+def test_on_windows_a_drive_relative_rule_id_creates_nothing(tmp_path: Path):
+    from aegis_core.lifecycle.creation import create_rule
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    with pytest.raises(ValueError, match="path traversal"):
+        create_rule("trap", "drive id", id_override="D:x", workspace=tmp_path)
+    assert list((tmp_path / ".aegis" / "rules").rglob("*.md")) == []
+
+
 # ── Other queries ────────────────────────────────────────────────────────────
 
 def test_git_path_honours_the_repository_hooks_path(repo: Path, tmp_path: Path):
