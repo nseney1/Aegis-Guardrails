@@ -29,6 +29,9 @@ def _unquote(val: str) -> str:
 
 
 def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
+    # The spec grammar only: a scalar literal, {in: [...]}, {not: cond}, {absent: bool}. Rule load
+    # (verification.runner._forbid_ast_spec_error) refuses anything else; an unvalidated caller's
+    # unknown operator is UNKNOWN, and no rule text ever reaches ``re``.
     if not isinstance(cond, Mapping):
         if value is _ABSENT:
             return None if has_splat else False
@@ -37,15 +40,11 @@ def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
         return value == repr(cond) or value == str(cond) or _unquote(value) == cond
     res: Optional[bool] = True
     for op, target in cond.items():
-        if op in ("not", "not_equals", "not_in"):
-            inner = _cond(value, {"in": target} if op == "not_in" else target, has_splat)
+        if op == "not":
+            inner = _cond(value, target, has_splat)
             v = None if inner is None else not inner
-        elif op == "equals":
-            v = _cond(value, target, has_splat)
-        elif op in ("absent", "present"):
-            v = None if (value is _ABSENT and has_splat) else ((value is _ABSENT) if ((op == "absent") == bool(target)) else (value is not _ABSENT))
-        elif op in ("is_literal", "not_literal"):
-            v = (None if has_splat else False) if value is _ABSENT else (_is_literal(value) if ((op == "is_literal") == bool(target)) else not _is_literal(value))
+        elif op == "absent":
+            v = None if (value is _ABSENT and has_splat) else ((value is _ABSENT) == bool(target))
         elif op == "in":
             opts = target if isinstance(target, (list, tuple, set, frozenset)) else ()
             if value is _ABSENT or not isinstance(value, str) or value == "<expr>":
@@ -54,10 +53,6 @@ def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
                 v = True
             else:
                 v = False if (_is_literal(value) or value.rpartition(".")[2][:1].isupper()) else None
-        elif op in ("contains", "not_contains"):
-            v = (None if has_splat else False) if value is _ABSENT else (None if not _is_literal(value) else ((str(target) in _unquote(value)) if op == "contains" else (str(target) not in _unquote(value))))
-        elif op == "matches":
-            v = (None if has_splat else False) if value is _ABSENT else (bool(re.search(str(target), _unquote(value))) if _is_literal(value) else (bool(re.search(str(target), value)) if isinstance(value, str) and value != "<expr>" and "." in value else None))
         else:
             v = None
         if v is False:
@@ -149,21 +144,19 @@ def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
     return any(s == mod or s.startswith(f"{mod}.") or (src and (f"{src}.{s}" == mod or f"{src}.{s}".startswith(f"{mod}."))) for s in syms)
 
 
-def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str]) -> Tuple[str, str, List[Tuple[Any, Optional[bool]]]]:
+def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str]) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
     if isinstance(raw_call, str):
         call = _normalize_ast_token(raw_call)
         where = None
         builtin_only = False
-        unknown_mode = "report"
     elif isinstance(raw_call, Mapping):
-        call = _normalize_ast_token(str(raw_call.get("name") or raw_call.get("call") or ""))
+        call = _normalize_ast_token(str(raw_call.get("name") or ""))
         where = raw_call.get("where") if isinstance(raw_call.get("where"), Mapping) else None
         builtin_only = bool(raw_call.get("builtin"))
-        unknown_mode = str(raw_call.get("unknown") or "report")
     else:
-        return "", "report", []
+        return "", []
     if not call:
-        return "", unknown_mode, []
+        return "", []
     hits: List[Tuple[Any, Optional[bool]]] = []
     for site in raw_call_sites:
         target = _call_target(site)
@@ -176,7 +169,7 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
         verdict = _match_where(site, where) if where else True
         if verdict is not False:
             hits.append((site, verdict))
-    return call, unknown_mode, hits
+    return call, hits
 
 
 def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, allow_map: Optional[Mapping[int, List[Dict[str, Any]]]] = None) -> Tuple[list[str], list[dict[str, Any]]]:
@@ -222,9 +215,9 @@ def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[s
     call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
     defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, unknown_mode, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
+        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
         if call:
-            _record_hits([s for s, v in hits if v is True or (v is None and unknown_mode == "flag")], "calls", call, "call")
+            _record_hits([s for s, v in hits if v is True], "calls", call, "call")
 
     forbidden_decs = forbid_spec.get("decorators")
     if not isinstance(forbidden_decs, (list, tuple, set)) or not forbidden_decs:
@@ -290,16 +283,16 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     confirmed: list[dict[str, Any]] = []
     unverified: list[dict[str, Any]] = []
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, unknown_mode, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
+        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
         for site, verdict in hits:
             ln = _line_of(site)
             if _allow_reason_for_line(allows, ln, rule_id) is not None:
                 continue
             args = _site_args(site)
             rec = {"rule_id": rule_id or "", "file": fp, "line": ln or 0, "kind": "calls", "pattern": call, "call_name": call, "target": _call_target(site), "args": args, "args_signature": ",".join(f"{k}={args[k]}" for k in sorted(args))}
-            if verdict is True or (verdict is None and unknown_mode == "flag"):
+            if verdict is True:
                 confirmed.append(rec)
-            elif verdict is None and unknown_mode not in ("skip", "ignore"):
+            else:  # UNKNOWN is advisory: never blocking, never dropped
                 unverified.append({**rec, "status": "unverified"})
     return confirmed, unverified
 

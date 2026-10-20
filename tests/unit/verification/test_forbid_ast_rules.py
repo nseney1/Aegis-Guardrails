@@ -7,13 +7,14 @@ deterministic mechanism.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from aegis_core.ast.policy import evaluate_forbid_ast
 from aegis_core.ast.schema import CallSiteNode, ImportNode, NormalizedAST
 from aegis_core.verification.pipeline import DeterministicVerifier
-from aegis_core.verification.runner import gate_verdict
+from aegis_core.verification.runner import gate_verdict, run_layer1_on_index
 
 
 class TestEvaluateForbidAST:
@@ -202,3 +203,77 @@ class TestLayer1DeterministicVerifierForbidAST:
         assert gate_verdict(evidence) is True
         forbid_results = [e for e in evidence if e.tool.startswith("forbid_ast:")]
         assert forbid_results == []
+
+
+# (flow-style where, the argument the reason names). The ReDoS literal below would backtrack for
+# hours if a rule-supplied regex ever reached ``re``.
+_MALFORMED_WHERE_YAML = [
+    ("{shell: {equal: true}}", "shell"),
+    ("{'#0': {in: SafeLoader}}", "#0"),
+    ("{shell: {matches: '^(a+)+$'}}", "shell"),
+    ("{shell: {not_equals: false}}", "shell"),
+    ("{shell: {in: []}}", "shell"),
+    ("{shell: {in: [1], not: 2}}", "shell"),
+    ("{shell: {absent: 'yes'}}", "shell"),
+    ("{shell: {}}", "shell"),
+]
+_REDOS_SOURCE = "import subprocess\n\ndef main(c):\n    return subprocess.run(c, shell='" + "a" * 40 + "!')\n"
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                   cwd=str(repo), check=True, capture_output=True)
+
+
+class TestMalformedWhereFailsClosedInLayer1:
+    """R-checks-8: a forbid_ast rule whose where would enforce nothing is refused at load by
+    every Layer 1 path, so the gate fails instead of passing (or hanging on) the file."""
+
+    def _workspace(self, tmp_path: Path, where: str) -> Path:
+        rules = tmp_path / ".aegis" / "rules" / "invariants"
+        rules.mkdir(parents=True)
+        (rules / "r1.md").write_text(
+            "---\nid: r1\ntype: invariant\nenforcement: gate\ntarget_paths:\n  - 'src/*.py'\n"
+            f"forbid_ast:\n  calls:\n    - {{name: subprocess.run, where: {where}}}\n---\n# R1\n",
+            encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "app.py").write_text(_REDOS_SOURCE, encoding="utf-8")
+        return tmp_path
+
+    @staticmethod
+    def _assert_refused(evidence, arg: str) -> None:
+        assert gate_verdict(evidence) is False
+        refused = [e for e in evidence if e.tool == "forbid_ast"]
+        assert [(e.target, e.verdict) for e in refused] == [(".aegis/rules/invariants/r1.md", False)]
+        assert refused[0].detail.startswith(
+            f"forbid_ast: cannot load rule .aegis/rules/invariants/r1.md: forbid_ast.calls[0].where.{arg}: ")
+        assert not [e for e in evidence if e.tool == "forbid_ast:r1"]
+
+    @pytest.mark.parametrize("where,arg", _MALFORMED_WHERE_YAML, ids=[w for w, _ in _MALFORMED_WHERE_YAML])
+    def test_the_working_tree_path_refuses_the_rule(self, tmp_path, where, arg):
+        ws = self._workspace(tmp_path, where)
+        evidence = DeterministicVerifier(fast_mode=True).verify(changed_files=["src/app.py"], workspace=ws)
+        self._assert_refused(evidence, arg)
+
+    @pytest.mark.parametrize("where,arg", _MALFORMED_WHERE_YAML, ids=[w for w, _ in _MALFORMED_WHERE_YAML])
+    def test_the_staged_snapshot_path_refuses_the_rule(self, tmp_path, monkeypatch, where, arg):
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        ws = self._workspace(tmp_path, where)
+        _git(ws, "init", "-q", "-b", "main")
+        _git(ws, "add", "src/app.py")
+        self._assert_refused(run_layer1_on_index(["src/app.py"], str(ws)), arg)
+
+    @pytest.mark.parametrize("where,src,blocked", [
+        ("{shell: true}", "import subprocess\nsubprocess.run(c, shell=True)\n", True),
+        ("{shell: true}", "import subprocess\nsubprocess.run(c)\n", False),
+        ("{shell: {absent: true}}", "import subprocess\nsubprocess.run(c)\n", True),
+        ("{check: {not: true}}", "import subprocess\nsubprocess.run(c, check=False)\n", True),
+        ("{check: {not: true}}", "import subprocess\nsubprocess.run(c, check=True)\n", False),
+        ("{'args|#0': {in: [ls, rm]}}", "import subprocess\nsubprocess.run('rm')\n", True),
+    ], ids=["literal-hit", "literal-miss", "absent", "not-hit", "not-miss", "in-alternation"])
+    def test_a_well_formed_where_loads_and_evaluates(self, tmp_path, where, src, blocked):
+        ws = self._workspace(tmp_path, where)
+        (ws / "src" / "app.py").write_text(src, encoding="utf-8")
+        evidence = DeterministicVerifier(fast_mode=True).verify(changed_files=["src/app.py"], workspace=ws)
+        assert not [e for e in evidence if e.tool == "forbid_ast"]
+        assert [e.verdict for e in evidence if e.tool == "forbid_ast:r1"] == ([False] if blocked else [])

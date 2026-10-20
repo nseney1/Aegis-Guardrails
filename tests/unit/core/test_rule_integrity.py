@@ -130,27 +130,26 @@ def test_dotted_prefix_for_imports_and_suffix_for_calls_and_decorators(tmp_path)
 
 
 def test_a_call_entry_where_is_compared_and_a_top_level_key_the_enforcer_rejects_is_not(tmp_path):
-    entry = "{name: eval, where: {x: {equals: 1}}}"
+    entry = "{name: eval, where: {x: 1}}"
     base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [entry], "where": ["x"]}))
     dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": [entry]}))
     assert weakenings(base, dropped) == []  # verification.runner refuses a top-level where: it bound nothing
-    narrowed = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: {equals: 2}}}"]}))
+    narrowed = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: 2}}"]}))
     (found,) = weakenings(base, narrowed)
     assert found.code == "forbid_ast" and "call 'eval' is no longer forbidden everywhere it was" in found.message
 
 
-RUN_SHELL = "{name: subprocess.run, where: {shell: {equals: true}}}"
+RUN_SHELL = "{name: subprocess.run, where: {shell: true}}"
 
 
 @pytest.mark.parametrize("entry", [
-    "{name: subprocess.run, where: {shell: {equals: never-matches}}}",
-    "{name: subprocess.run, where: {shell: {equals: 1}}}",
-    "{name: subprocess.run, where: {shell: {equals: true}, cwd: {equals: x}}}",
-    "{name: subprocess.run, where: {shell: {equals: true}}, builtin: true}",
-    "{name: subprocess.run, where: {shell: {equals: true}}, unknown: skip}",
-    "{name: subprocess.run, where: {shell: {equals: true}}, unknown: bogus}",
-    "{name: subprocess.runx, where: {shell: {equals: true}}}",
-], ids=["never", "one", "addkey", "builtin", "skip", "bogus", "rename"])
+    "{name: subprocess.run, where: {shell: never-matches}}",
+    "{name: subprocess.run, where: {shell: 1}}",
+    "{name: subprocess.run, where: {shell: true, cwd: x}}",
+    "{name: subprocess.run, where: {shell: true}, builtin: true}",
+    "{name: subprocess.run, where: {shell: {not: false}}}",
+    "{name: subprocess.runx, where: {shell: true}}",
+], ids=["never", "one", "addkey", "builtin", "reworded", "rename"])
 def test_each_narrowing_of_a_call_entry_is_one_finding(tmp_path, entry):
     base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [RUN_SHELL]}))
     head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [entry, "os.system"]}))
@@ -160,9 +159,9 @@ def test_each_narrowing_of_a_call_entry_is_one_finding(tmp_path, entry):
 
 def test_a_where_or_builtin_added_to_a_plain_call_narrows_it_and_removing_them_does_not(tmp_path):
     plain = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": ["eval"]}))
-    where = parsed(tmp_path / "w", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: {equals: never}}}"]}))
+    where = parsed(tmp_path / "w", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: never}}"]}))
     (found,) = weakenings(plain, where)
-    assert "call 'eval' is no longer forbidden everywhere it was (its where, builtin or unknown was narrowed)" in found.message
+    assert "call 'eval' is no longer forbidden everywhere it was (its where or builtin was narrowed)" in found.message
     builtin = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, builtin: true}"]}))
     assert codes(weakenings(plain, builtin)) == ["forbid_ast"]
     assert weakenings(builtin, plain) == []
@@ -170,14 +169,13 @@ def test_a_where_or_builtin_added_to_a_plain_call_narrows_it_and_removing_them_d
 
 @pytest.mark.parametrize("base_entry,entries", [
     (RUN_SHELL, [RUN_SHELL]),
-    (RUN_SHELL, ["{where: {shell: {equals: true}}, call: subprocess.run}"]),
-    (RUN_SHELL, ["{name: subprocess.run, where: {shell: {equals: true}}, unknown: flag, builtin: false}"]),
-    (RUN_SHELL, ["{name: run, where: {shell: {equals: true}}}"]),
+    (RUN_SHELL, ["{name: subprocess.run, where: {shell: true}, builtin: false}"]),
+    (RUN_SHELL, ["{name: run, where: {shell: true}}"]),
     (RUN_SHELL, ["{name: subprocess.run}"]),
     (RUN_SHELL, ["subprocess.run"]),
-    ("{name: subprocess.run, where: {shell: {equals: true}, cwd: {equals: x}}}", [RUN_SHELL]),
+    ("{name: subprocess.run, where: {shell: true, cwd: x}}", [RUN_SHELL]),
     (RUN_SHELL, [RUN_SHELL, "eval", "{name: exec, builtin: true}"]),
-], ids=["same", "alias", "flag", "broader", "nowhere", "plain", "dropkey", "added"])
+], ids=["same", "notbuiltin", "broader", "nowhere", "plain", "dropkey", "added"])
 def test_an_equal_or_broader_call_entry_is_not_a_weakening(tmp_path, base_entry, entries):
     base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [base_entry]}))
     head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [*entries, "os.system"]}))
@@ -187,7 +185,23 @@ def test_an_equal_or_broader_call_entry_is_not_a_weakening(tmp_path, base_entry,
 def test_the_compared_call_keys_are_the_keys_the_enforcer_accepts():
     from aegis_core.verification.runner import _CALL_SPEC_KEYS
 
-    assert set(rule_integrity._CallEntry._fields) | {"call"} == set(_CALL_SPEC_KEYS)
+    assert set(rule_integrity._CallEntry._fields) == set(_CALL_SPEC_KEYS)
+
+
+@pytest.mark.parametrize("entry,lost", [
+    ("{name: subprocess.run, where: {shell: true}, unknown: skip}", False),
+    ("{call: subprocess.run, where: {shell: true}}", True),
+], ids=["unknown", "call-alias"])
+def test_a_removed_call_key_is_refused_by_the_enforcer_and_never_counts_as_coverage(tmp_path, entry, lost):
+    """Given a head entry with a key the enforcer no longer accepts, Then the rule fails closed at
+    load (a broken gate blocks every change), and the comparison never reads the key: a ``call:``
+    alias names no call, so the base entry is reported lost."""
+    from aegis_core.verification.runner import _forbid_ast_spec_error
+
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [RUN_SHELL]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [entry, "os.system"]}))
+    assert "unknown key" in (_forbid_ast_spec_error(head.meta["forbid_ast"]) or "")
+    assert codes(weakenings(base, head)) == (["forbid_ast"] if lost else [])
 
 
 def test_a_detect_key_must_stay_an_exact_superset(tmp_path):

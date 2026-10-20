@@ -36,8 +36,8 @@ PACK_SPEC = {
         "marshal.load",
         "tempfile.mktemp",
         "yaml.unsafe_load",
-        {"name": "hashlib.md5", "where": {"usedforsecurity": {"not_equals": False}}},
-        {"name": "hashlib.sha1", "where": {"usedforsecurity": {"not_equals": False}}},
+        {"name": "hashlib.md5", "where": {"usedforsecurity": {"not": False}}},
+        {"name": "hashlib.sha1", "where": {"usedforsecurity": {"not": False}}},
         {"name": "subprocess.run", "where": {"shell": True}},
         {"name": "subprocess.Popen", "where": {"shell": True}},
         {"name": "subprocess.call", "where": {"shell": True}},
@@ -49,7 +49,9 @@ PACK_SPEC = {
     ]
 }
 
-UNK_FLAG_SPEC = {"calls": [{"name": "subprocess.run", "where": {"shell": True}, "unknown": "flag"}]}
+_PACK_RULES = {r["id"]: r["forbid_ast"] for r in PYTHON_SECURITY_RULES}
+YAML_RULE = _PACK_RULES["sec-py-yaml-unsafe-load"]
+HASH_RULE = _PACK_RULES["sec-py-weak-hash-md5-sha1"]
 
 # 36 probe cases covering forbid_probe2.py + predicate operators
 PROBE_CASES = [
@@ -76,8 +78,7 @@ PROBE_CASES = [
     ("subprocess shell=True TP", "import subprocess\nsubprocess.run(c, shell=True)\n", PACK_SPEC, True),
     ("subprocess list safe", "import subprocess\nsubprocess.run(['ls'])\n", PACK_SPEC, False),
     ("subprocess shell=var ignored", "import subprocess\nsubprocess.run(c, shell=flag)\n", PACK_SPEC, False),
-    ("subprocess shell=var + unknown:flag", "import subprocess\nsubprocess.run(c, shell=flag)\n", UNK_FLAG_SPEC, True),
-    ("subprocess **opts + unknown:flag", "import subprocess\nsubprocess.run(c, **opts)\n", UNK_FLAG_SPEC, True),
+    ("subprocess **opts advisory", "import subprocess\nsubprocess.run(c, **opts)\n", PACK_SPEC, False),
     ("alias sp.run shell=True TP", "import subprocess as sp\nsp.run(c, shell=True)\n", PACK_SPEC, True),
     ("from subprocess import run shell=True TP", "from subprocess import run\nrun(c, shell=True)\n", PACK_SPEC, True),
     ("from subprocess import Popen as P TP", "from subprocess import Popen as P\nP(c, shell=True)\n", PACK_SPEC, True),
@@ -90,7 +91,37 @@ PROBE_CASES = [
     ("requests default safe", "import requests\nrequests.get(u)\n", PACK_SPEC, False),
     ("requests verify=ca_path safe", "import requests\nrequests.get(u, verify=CA)\n", PACK_SPEC, False),
     ("hashlib.new('md5') positional TP", "import hashlib\nhashlib.new('md5')\n", PACK_SPEC, True),
+    ("pack yaml.load Loader TP", "import yaml\nyaml.load(f, Loader=yaml.Loader)\n", YAML_RULE, True),
+    ("pack yaml.load no Loader TP", "import yaml\nyaml.load(f)\n", YAML_RULE, True),
+    ("pack yaml.load SafeLoader safe", "import yaml\nyaml.load(f, Loader=yaml.SafeLoader)\n", YAML_RULE, False),
+    ("pack yaml.load CBaseLoader safe", "import yaml\nyaml.load(f, yaml.CBaseLoader)\n", YAML_RULE, False),
+    ("pack md5 default TP", "import hashlib\nhashlib.md5(b)\n", HASH_RULE, True),
+    ("pack md5 usedforsecurity=False safe", "import hashlib\nhashlib.md5(b, usedforsecurity=False)\n", HASH_RULE, False),
+    ("pack new('sha1') TP", "import hashlib\nhashlib.new('sha1', b)\n", HASH_RULE, True),
+    ("pack new('sha1') not for security", "import hashlib\nhashlib.new('sha1', b, usedforsecurity=False)\n", HASH_RULE, False),
 ]
+
+# Each malformed where, the argument it names, and what the reason says about it.
+MALFORMED_WHERE = [
+    ({"shell": {"equal": True}}, "shell", "unknown operator equal (allowed: in, not, absent)"),
+    ({"#0": {"in": "SafeLoader"}}, "#0", "in needs a non-empty list of scalars"),
+    ({"shell": {"matches": "^(a+)+$"}}, "shell", "unknown operator matches (allowed: in, not, absent)"),
+    ({"shell": {"not_equals": False}}, "shell", "unknown operator not_equals (allowed: in, not, absent)"),
+    ({"shell": {"equals": True}}, "shell", "unknown operator equals (allowed: in, not, absent)"),
+    ({"shell": {"present": True}}, "shell", "unknown operator present (allowed: in, not, absent)"),
+    ({"shell": {"in": []}}, "shell", "in needs a non-empty list of scalars"),
+    ({"shell": {"in": [["nested"]]}}, "shell", "in needs a non-empty list of scalars"),
+    ({"shell": {"in": [1], "not": 2}}, "shell", "a condition is a scalar or one operator: in, not, absent"),
+    ({"shell": {"absent": "yes"}}, "shell", "absent needs true or false"),
+    ({"shell": {}}, "shell", "a condition is a scalar or one operator: in, not, absent"),
+    ({"shell": {"not": {"bogus": 1}}}, "shell", "unknown operator bogus (allowed: in, not, absent)"),
+    ({"shell": ["a", "b"]}, "shell", "a condition is a scalar or one operator: in, not, absent"),
+    ({"": True}, "", "argument names are identifiers or #N, joined by |"),
+    ({"name|": True}, "name|", "argument names are identifiers or #N, joined by |"),
+    ({"#x": True}, "#x", "argument names are identifiers or #N, joined by |"),
+]
+MALFORMED_IDS = ["equal", "in-str", "matches", "not_equals", "equals", "present", "in-empty", "in-nested",
+                 "two-ops", "absent-str", "empty", "not-bogus", "list", "empty-key", "trailing-bar", "bad-pos"]
 
 
 class TestCallSiteArgsAndPredicates:
@@ -115,60 +146,85 @@ class TestCallSiteArgsAndPredicates:
         got = bool(evaluate_forbid_ast(norm, spec))
         assert got is expected, f"{label}: expected {expected}, got {got}"
 
-    def test_where_operators_comprehensive(self):
-        # present / absent
-        spec_present = {"calls": [{"name": "f", "where": {"k": {"present": True}}}]}
-        spec_absent = {"calls": [{"name": "f", "where": {"k": {"absent": True}}}]}
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f(k=1)\n"), spec_present)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f()\n"), spec_present)) is False
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f()\n"), spec_absent)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f(k=1)\n"), spec_absent)) is False
+    @pytest.mark.parametrize("where,src,expected", [
+        ({"k": 1}, "f(k=1)\n", True),
+        ({"k": 1}, "f(k=2)\n", False),
+        ({"#0": {"in": ["md5", "sha1"]}}, "f('md5')\n", True),
+        ({"#0": {"in": ["md5", "sha1"]}}, "f('sha256')\n", False),
+        ({"k": {"not": 1}}, "f(k=2)\n", True),
+        ({"k": {"not": 1}}, "f(k=1)\n", False),
+        ({"k": {"not": {"in": [1, 2]}}}, "f(k=3)\n", True),
+        ({"k": {"not": {"in": [1, 2]}}}, "f(k=2)\n", False),
+        ({"k": {"absent": True}}, "f()\n", True),
+        ({"k": {"absent": True}}, "f(k=1)\n", False),
+        ({"k": {"absent": False}}, "f(k=1)\n", True),
+        ({"k": {"absent": False}}, "f()\n", False),
+    ], ids=["lit-hit", "lit-miss", "in-hit", "in-miss", "not-hit", "not-miss", "notin-hit", "notin-miss",
+            "absent-hit", "absent-miss", "present-hit", "present-miss"])
+    def test_the_four_spec_forms_evaluate(self, where, src, expected):
+        spec = {"calls": [{"name": "f", "where": where}]}
+        assert _forbid_ast_spec_error(spec) is None
+        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code=src), spec)) is expected
 
-        # is_literal / not_literal
-        spec_lit = {"calls": [{"name": "f", "where": {"#0": {"is_literal": True}}}]}
-        spec_not_lit = {"calls": [{"name": "f", "where": {"#0": {"not_literal": True}}}]}
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('const')\n"), spec_lit)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f(var)\n"), spec_lit)) is False
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f(var)\n"), spec_not_lit)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f(42)\n"), spec_not_lit)) is False
+    def test_a_rule_supplied_regex_never_runs(self):
+        """Given ``matches`` (a removed operator) reaching the evaluator unvalidated, When a literal
+        that makes ``^(a+)+$`` backtrack exponentially is checked, Then it returns at once: the
+        operator is UNKNOWN (advisory), never handed to ``re``."""
+        spec = {"calls": [{"name": "f", "where": {"#0": {"matches": "^(a+)+$"}}}]}
+        norm = extract_normalized_ast("x.py", code="f('" + "a" * 40 + "!')\n")
+        confirmed, unverified = evaluate_forbid_ast_structured(norm, spec, rule_id="r")
+        assert confirmed == [] and [u["line"] for u in unverified] == [1]
 
-        # matches / contains / not_contains / not_in
-        spec_matches = {"calls": [{"name": "f", "where": {"#0": {"matches": r"^(md5|sha1)$"}}}]}
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('md5')\n"), spec_matches)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('sha256')\n"), spec_matches)) is False
+    def test_unknown_is_always_advisory(self):
+        norm_kw = extract_normalized_ast("x.py", code="import subprocess\nsubprocess.run(cmd, **kwargs)\n")
+        norm_star = extract_normalized_ast("x.py", code="import hashlib\nhashlib.new(*args)\n")
+        confirmed, unverified = evaluate_forbid_ast_structured(
+            norm_kw, {"calls": [{"name": "subprocess.run", "where": {"shell": True}}]}, rule_id="sec-sub")
+        assert confirmed == [] and [u["rule_id"] for u in unverified] == ["sec-sub"]
+        assert evaluate_forbid_ast(norm_kw, {"calls": [{"name": "subprocess.run", "where": {"shell": True}}]}) == []
+        c_star, u_star = evaluate_forbid_ast_structured(
+            norm_star, {"calls": [{"name": "hashlib.new", "where": {"#0": "'md5'"}}]}, rule_id="sec-hash")
+        assert c_star == [] and len(u_star) == 1
 
-        spec_contains = {"calls": [{"name": "f", "where": {"#0": {"contains": "unsafe"}}}]}
-        spec_not_contains = {"calls": [{"name": "f", "where": {"#0": {"not_contains": "safe"}}}]}
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('my_unsafe_mode')\n"), spec_contains)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('clean')\n"), spec_contains)) is False
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('raw')\n"), spec_not_contains)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="f('safe_mode')\n"), spec_not_contains)) is False
 
-        spec_not_in = {"calls": [{"name": "yaml.load", "where": {"Loader|#1": {"not_in": ["SafeLoader", "CSafeLoader"]}}}]}
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="import yaml\nyaml.load(s, yaml.Loader)\n"), spec_not_in)) is True
-        assert bool(evaluate_forbid_ast(extract_normalized_ast("x.py", code="import yaml\nyaml.load(s, yaml.SafeLoader)\n"), spec_not_in)) is False
+class TestWhereGrammarIsValidatedAtLoad:
+    @pytest.mark.parametrize("where,arg,reason", MALFORMED_WHERE, ids=MALFORMED_IDS)
+    def test_a_malformed_where_is_refused_with_its_argument_named(self, where, arg, reason):
+        error = _forbid_ast_spec_error({"calls": ["os.system", {"name": "subprocess.run", "where": where}]})
+        assert error == f"forbid_ast.calls[1].where.{arg}: {reason}"
 
-    def test_three_valued_unknown_report_vs_skip(self):
-        src_kwargs = "import subprocess\nsubprocess.run(cmd, **kwargs)\n"
-        src_star = "import hashlib\nhashlib.new(*args)\n"
-        norm_kw = extract_normalized_ast("x.py", code=src_kwargs)
-        norm_star = extract_normalized_ast("x.py", code=src_star)
+    def test_an_empty_where_has_its_own_reason(self):
+        assert _forbid_ast_spec_error({"calls": [{"name": "eval", "where": {}}]}) == (
+            "forbid_ast.calls[0].where must map argument names to conditions")
+        assert _forbid_ast_spec_error({"calls": [{"name": "eval", "where": ["shell"]}]}) == (
+            "forbid_ast.calls[0].where must map argument names to conditions")
 
-        spec_report = {"calls": [{"name": "subprocess.run", "where": {"shell": True}, "unknown": "report"}]}
-        spec_skip = {"calls": [{"name": "subprocess.run", "where": {"shell": True}, "unknown": "skip"}]}
-        confirmed, unverified = evaluate_forbid_ast_structured(norm_kw, spec_report, rule_id="sec-sub")
-        assert confirmed == []
-        assert len(unverified) == 1
-        assert unverified[0]["rule_id"] == "sec-sub"
+    @pytest.mark.parametrize("entry,key", [
+        ({"name": "subprocess.run", "where": {"shell": True}, "unknown": "flag"}, "unknown"),
+        ({"name": "subprocess.run", "unknown": "skip"}, "unknown"),
+        ({"name": "subprocess.run", "unknown": "report"}, "unknown"),
+        ({"name": "subprocess.run", "unknown": "ignore"}, "unknown"),
+        ({"call": "subprocess.run"}, "call"),
+        ({"name": "eval", "call": "eval"}, "call"),
+    ], ids=["flag", "skip", "report", "ignore", "call-alias", "call-beside-name"])
+    def test_a_removed_entry_key_is_refused_by_name(self, entry, key):
+        assert _forbid_ast_spec_error({"calls": [entry]}) == (
+            f"forbid_ast.calls[0]: unknown key '{key}' (allowed: builtin, name, where)")
 
-        confirmed_skip, unverified_skip = evaluate_forbid_ast_structured(norm_kw, spec_skip, rule_id="sec-sub")
-        assert confirmed_skip == []
-        assert unverified_skip == []
+    def test_a_where_needs_a_named_entry(self):
+        """Sad path: a where cannot ride on a bare-string entry; beside one it is an unknown
+        forbid_ast key, and an entry with a where and no name is refused."""
+        assert _forbid_ast_spec_error({"calls": ["eval"], "where": {"shell": True}}) == (
+            "unknown forbid_ast key 'where' (allowed: imports, calls, decorators)")
+        assert _forbid_ast_spec_error({"calls": [{"where": {"shell": True}}]}) == (
+            "forbid_ast.calls[0]: name must be a non-empty string and builtin true or false")
 
-        spec_star_report = {"calls": [{"name": "hashlib.new", "where": {"#0": "'md5'"}, "unknown": "report"}]}
-        c_star, u_star = evaluate_forbid_ast_structured(norm_star, spec_star_report, rule_id="sec-hash")
-        assert c_star == []
-        assert len(u_star) == 1
+    @pytest.mark.parametrize("where", [
+        {"shell": True}, {"verify": {"not": True}}, {"name|#0": {"in": ["md5", "sha1"]}},
+        {"shell": {"absent": True}}, {"shell": {"not": {"not": None}}}, {"#1": 1.5},
+    ], ids=["literal", "not", "in-alternation", "absent", "nested-not", "float"])
+    def test_a_well_formed_where_loads(self, where):
+        assert _forbid_ast_spec_error({"calls": [{"name": "f", "where": where, "builtin": False}]}) is None
 
 
 class TestDeltaEvaluationAndRunnerIntegrity:
@@ -205,13 +261,13 @@ class TestDeltaEvaluationAndRunnerIntegrity:
             "calls": [
                 "os.system",
                 {"name": "eval", "builtin": True},
-                {"name": "subprocess.run", "where": {"shell": True}, "unknown": "report"},
+                {"name": "subprocess.run", "where": {"shell": True}},
             ]
         }
         assert _forbid_ast_spec_error(valid_spec) is None
         assert _forbid_ast_spec_error({"calls": [{}]}) is not None
         assert _forbid_ast_spec_error({"calls": [{"name": ""}]}) is not None
-        assert _forbid_ast_spec_error({"calls": [{"name": "eval", "unknown": "invalid"}]}) is not None
+        assert "unknown key 'unknown'" in (_forbid_ast_spec_error({"calls": [{"name": "eval", "unknown": "invalid"}]}) or "")
 
         tokens = _forbid_tokens(valid_spec, "calls")
         assert tokens == ["os.system", "eval", "subprocess.run"]
