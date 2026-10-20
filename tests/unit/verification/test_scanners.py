@@ -41,6 +41,11 @@ def _tier_a_samples() -> dict[str, str]:
     }
 
 
+_PREFIXED = ["aws-access-key-id", "github-pat", "github-fine-grained-pat", "slack-token", "stripe-live-secret",
+             "anthropic-api-key", "google-api-key", "jwt-three-segment"]
+_ALNUM_BODY = ["aws-access-key-id", "github-pat", "stripe-live-secret"]
+
+
 class TestTierASecretDetection:
     @pytest.mark.parametrize("rule_id", list(_tier_a_samples().keys()))
     def test_detects_all_11_known_formats(self, rule_id: str) -> None:
@@ -72,6 +77,37 @@ class TestTierASecretDetection:
         raw = _tier_a_samples()["aws-access-key-id"]
         assert scanners.contains_secret_tier_a(f"export AWS_KEY={raw}") is True
         assert scanners.contains_secret_tier_a("normal code x = 42") is False
+
+    @pytest.mark.parametrize("delim,rule_id", [("/", r) for r in _PREFIXED] + [(d, r) for d in "_-" for r in _ALNUM_BODY])
+    def test_a_token_after_a_delimiter_is_found(self, delim, rule_id):
+        """R-checks-23: only a preceding letter or digit means "inside a longer run"."""
+        token = _tier_a_samples()[rule_id]
+        findings = scanners.scan_secrets_text(f"deploy{delim}{token}")
+        assert rule_id in [f.rule_id for f in findings]
+        assert token not in json.dumps([f.as_dict() for f in findings])
+
+    @pytest.mark.parametrize("rule_id", ["github-pat", "github-fine-grained-pat"])
+    def test_a_token_in_a_clone_url_is_found(self, rule_id):
+        token = _tier_a_samples()[rule_id]
+        findings = scanners.scan_secrets_text(f"git clone https://{token}@github.com/org/repo.git")
+        assert [f.rule_id for f in findings] == [rule_id]
+        assert token not in findings[0].snippet and scanners.mask_secret(token) in findings[0].snippet
+
+    @pytest.mark.parametrize("before", ["a", "Z", "7"])
+    @pytest.mark.parametrize("rule_id", _PREFIXED)
+    def test_a_token_glued_to_a_letter_or_digit_is_not_found(self, before, rule_id):
+        assert scanners.scan_secrets_text(before + _tier_a_samples()[rule_id]) == []
+
+    @pytest.mark.parametrize("line", [
+        "see docs/sk-evaluation-framework-implementation-notes.md for details",
+        "cp ./sk-evaluation-framework-implementation-notes.md /tmp",
+        "git checkout feature/sk-evaluation-framework-implementation-notes",
+        "def test_github_pat_regex_does_not_match_identifiers():",
+        "x = parse_github_pat_from_environment_variable()",
+        _tok("name = 'my-xo", "xb-aaaaaaaaaaaa-bbbbbbbb'"),
+    ], ids=["docs-path", "cp-path", "branch", "test-name", "identifier", "kebab"])
+    def test_paths_and_identifiers_stay_clean(self, line):
+        assert scanners.scan_secrets_text(line, include_advisory=False) == []
 
     def test_zero_false_positives_on_benign_inputs(self) -> None:
         benign_lines = [

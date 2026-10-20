@@ -19,19 +19,24 @@ from aegis_core.verification import test_runner
 # this length a finding's snippet is the masked token alone, never the surrounding line.
 MAX_LINE_LENGTH = 4096
 MAX_EXCERPT_CHARS = 300
-_B_PRE, _B_SUF = r"(?<![A-Za-z0-9+/_-])", r"(?![A-Za-z0-9+/=_-])"
+# Left edges. Each body starts with a distinctive literal, so only a letter or digit before it means
+# "inside a longer run"; `_ - / +` are delimiters (deploy_ghp_..., clone URLs). Bodies that contain
+# `_` or `-` also treat those as identifier characters, and the generic OpenAI `sk-` shape keeps the
+# strict edge so kebab-case paths and branch names stay clean.
+_B_PRE, _B_SUF = r"(?<![A-Za-z0-9])", r"(?![A-Za-z0-9+/=_-])"
+_B_PRE_ID, _B_PRE_STRICT = r"(?<![A-Za-z0-9_-])", r"(?<![A-Za-z0-9+/_-])"
 
 TIER_A_PATTERNS: dict[str, re.Pattern[str]] = {
     "aws-access-key-id": re.compile(_B_PRE + r"(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}" + _B_SUF),
     "github-pat": re.compile(_B_PRE + r"gh[pousr]_[A-Za-z0-9]{36,255}" + _B_SUF),
-    "github-fine-grained-pat": re.compile(_B_PRE + r"github_pat_[A-Za-z0-9_]{22,255}" + _B_SUF),
-    "slack-token": re.compile(_B_PRE + r"xox[abprs]-[A-Za-z0-9-]{10,255}" + _B_SUF),
+    "github-fine-grained-pat": re.compile(_B_PRE_ID + r"github_pat_[A-Za-z0-9_]{22,255}" + _B_SUF),
+    "slack-token": re.compile(_B_PRE_ID + r"xox[abprs]-[A-Za-z0-9-]{10,255}" + _B_SUF),
     "stripe-live-secret": re.compile(_B_PRE + r"[sr]k_live_[0-9A-Za-z]{24,99}" + _B_SUF),
-    "anthropic-api-key": re.compile(_B_PRE + r"sk-ant-[A-Za-z0-9_-]{20,255}" + _B_SUF),
-    "openai-api-key": re.compile(_B_PRE + r"sk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{32,255}" + _B_SUF),
-    "google-api-key": re.compile(_B_PRE + r"AIza[0-9A-Za-z_-]{35}" + _B_SUF),
+    "anthropic-api-key": re.compile(_B_PRE_ID + r"sk-ant-[A-Za-z0-9_-]{20,255}" + _B_SUF),
+    "openai-api-key": re.compile(_B_PRE_STRICT + r"sk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{32,255}" + _B_SUF),
+    "google-api-key": re.compile(_B_PRE_ID + r"AIza[0-9A-Za-z_-]{35}" + _B_SUF),
     "private-key-pem": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"),
-    "jwt-three-segment": re.compile(_B_PRE + r"eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}" + _B_SUF),
+    "jwt-three-segment": re.compile(_B_PRE_ID + r"eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}" + _B_SUF),
     "url-basic-auth": re.compile(r"://([^/\s:@'\"$<>]{1,64}):([^/\s:@'\"$<>]{3,64})@[A-Za-z0-9.-]{1,253}"),
 }
 
