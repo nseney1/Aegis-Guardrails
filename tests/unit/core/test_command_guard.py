@@ -243,7 +243,49 @@ def test_delimiter_runs_alone_or_unterminated_fail_open_without_raising():
     assert classify_command("ls;\n\n'x") is None
 
 
-@pytest.mark.parametrize("target", ["./", ".//", "../", "..//", "~/", "/home/", "/root/", "/"])
+# R-checks-3: an alias defined on the same git command line is judged by its expansion.
+_CHAIN = " ".join(f"-c alias.a{i}=a{i + 1}" for i in range(20))
+
+
+@pytest.mark.parametrize("command,rule", [
+    ("git -c alias.p='push -f' p", "git-push-force"),
+    ("git -c alias.p='push --force-with-lease' p origin feat", "git-push-force"),
+    ("git -c alias.p=push p -f", "git-push-force"),
+    ("git -c alias.P='push -f' p", "git-push-force"),
+    ("git -c alias.p='push origin +feat' p", "git-push-refspec"),
+    ("git -c alias.r='reset --hard' r", "git-reset-hard"),
+    ("git -c alias.c='clean -fdx' c", "git-clean-force"),
+    ("git -c alias.p='!git push -f' p", "git-push-force"),
+    ("git -c alias.p='!git push' p -f origin feat", "git-push-force"),
+    ("git -c alias.a=b -c alias.b='push -f' a", "git-push-force"),
+    (f"git {_CHAIN} -c alias.a20='reset --hard' a0", "git-reset-hard"),
+    ("sudo git -c alias.p='push -f' p", "git-push-force"),
+    ("bash -c \"git -c alias.p='push -f' p\"", "git-push-force"),
+    ("PVAL='push -f' git --config-env=alias.p=PVAL p", "git-push-force"),
+    ("PVAL='push -f' git --config-env alias.p=PVAL p", "git-push-force"),
+    ("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push -f' git p", "git-push-force"),
+    ("git -c alias.reset=status reset --hard", "git-reset-hard"),
+], ids=lambda value: value[:40] if value.startswith(("git", "sudo", "bash", "PVAL", "GIT_")) else "")
+def test_a_command_line_git_alias_is_judged_by_its_expansion(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", [
+    "git -c alias.st=status st",
+    "git -c alias.p='push origin feat' p",
+    "git -c alias.x='push -f' p",
+    "git -c alias.p push",
+    "git -c alias.p=p p",
+    "git -c alias.p=q -c alias.q=p p",
+    "git -c alias.p=\"push 'x\" p",
+    "git -c alias.p='!echo push -f' p",
+    "git --config-env=alias.p=UNSET p",
+])
+def test_a_harmless_looping_or_unparseable_git_alias_is_not_a_match(command):
+    assert classify_command(command) is None
+
+
+@pytest.mark.parametrize("target",["./", ".//", "../", "..//", "~/", "/home/", "/root/", "/"])
 def test_trailing_slashes_never_hide_a_dangerous_rm_target(target):
     """BUG-075 for the guard: trailing slashes are normalized away."""
     assert _id(f"rm -rf {target}") == (GUARD_BLOCK, "rm-recursive-dangerous")

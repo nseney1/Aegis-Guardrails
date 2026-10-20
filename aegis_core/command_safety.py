@@ -116,6 +116,7 @@ class UnwrappedCommand:
     positional_args: list[str]
     has_sudo: bool = False
     env_vars: dict[str, str] = field(default_factory=dict)
+    tail: list[str] = field(default_factory=list)  # raw tokens after a git/gh subcommand
 
 
 # ── String Pre-processing & Subshell Scanner ──────────────────────────────────
@@ -566,6 +567,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
         subcommand: str | None = None
         flags: list[str] = []
         pos_args: list[str] = []
+        tail: list[str] = []
 
         while idx < len(tokens):
             arg = tokens[idx]
@@ -584,6 +586,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
             else:
                 if subcommand is None and binary in ("git", "gh"):
                     subcommand = arg.lower()
+                    tail = tokens[idx + 1:]
                 else:
                     pos_args.append(arg)
             idx += 1
@@ -595,6 +598,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
             positional_args=pos_args,
             has_sudo=has_sudo,
             env_vars=env_vars,
+            tail=tail,
         ), None
 
     return None, None
@@ -1202,6 +1206,53 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
 split_heredocs = _split_heredocs
 
 
+def _git_aliases(cmd: UnwrappedCommand) -> Dict[str, str]:
+    """The aliases a git invocation defines for itself (``-c alias.NAME=VALUE``,
+    ``--config-env alias.NAME=VAR``, ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``), by
+    lowercase name: git compares config names without case."""
+    settings: List[str] = []
+    following = cmd.flags[1:] + [""]
+    for flag, after in zip(cmd.flags, following):
+        if flag == "-c":
+            settings.append(after)
+        elif flag == "--config-env" or flag.startswith("--config-env="):
+            name, _, var = (flag.partition("=")[2] or after).partition("=")
+            if var in cmd.env_vars:  # a variable exported earlier is not visible here
+                settings.append(f"{name}={cmd.env_vars[var]}")
+    for var, key in cmd.env_vars.items():
+        value = cmd.env_vars.get("GIT_CONFIG_VALUE_" + var[len("GIT_CONFIG_KEY_"):])
+        if var.startswith("GIT_CONFIG_KEY_") and value is not None:
+            settings.append(f"{key}={value}")
+    aliases: Dict[str, str] = {}
+    for key, sep, value in (setting.partition("=") for setting in settings):
+        if sep and key.lower().startswith("alias."):
+            aliases[key[len("alias."):].lower()] = value
+    return aliases
+
+
+def _guard_git_alias(cmd: UnwrappedCommand, depth: int, found: List[GuardRule]) -> None:
+    """Classify the expansion of an alias defined on the same command line
+    (``git -c alias.p='push -f' p``). _guard_git has already matched the literal
+    subcommand, so a built-in still wins as it does in git; ``seen`` stops a cycle."""
+    aliases = _git_aliases(cmd)
+    seen = set()
+    while cmd.subcommand in aliases and cmd.subcommand not in seen:
+        seen.add(cmd.subcommand)
+        value = aliases[cmd.subcommand]
+        if value.startswith("!"):  # git runs it with sh -c, the arguments appended
+            _guard_scan(" ".join([value[1:]] + [shlex.quote(t) for t in cmd.tail]), depth + 1, found)
+            return
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            return
+        expanded, _ = unwrap_command_stage([cmd.binary, *words, *cmd.tail])
+        if expanded is None:
+            return
+        found.extend(_guard_git(expanded))
+        cmd = expanded
+
+
 def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
     """Add the guard rules ``cmd`` matches to ``found``; False when it cannot be parsed
     (or nests deeper than MAX_DEPTH), which contributes nothing."""
@@ -1224,6 +1275,8 @@ def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
                 _guard_scan(inner, depth + 1, found)
             elif unwrapped is not None:
                 found.extend(_guard_stage(unwrapped))
+                if unwrapped.binary == "git":
+                    _guard_git_alias(unwrapped, depth, found)
     return True
 
 

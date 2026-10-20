@@ -326,6 +326,13 @@ def test_a_record_set_command_runs_and_is_recorded(ws, capsys, host, payload_of)
     assert _events(ws) == [("guard_match", host, "record", {"tier": "record", "action": "record", "rule": "git-merge"})]
 
 
+def test_a_command_line_git_alias_for_a_force_push_is_blocked(ws, capsys):
+    code, out, err = _run(capsys, "claude-code", claude(ws, "Bash", {"command": "git -c alias.p='push -f' p origin feat"}))
+    assert (code, out) == (2, "")
+    assert err.startswith("aegis: blocked git-push-force: force push")
+    assert _events(ws) == [("guard_match", "claude-code", "block", {"tier": "block", "action": "block", "rule": "git-push-force"})]
+
+
 @pytest.mark.parametrize("command", ["git status", "rm -rf build/", "", "   ", "git reset --hard 'unclosed"])
 def test_other_empty_or_unparseable_commands_pass_silently_and_unrecorded(ws, capsys, command):
     assert _run(capsys, "claude-code", claude(ws, "Bash", {"command": command})) == (0, "", "")
