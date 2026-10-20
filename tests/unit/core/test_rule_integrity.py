@@ -638,6 +638,88 @@ def test_a_local_widening_into_a_full_slot_is_not_served(tmp_path, added, served
     assert [(u.id, u.change) for u in view.unreviewed] == [("gate-c", "changed")]
 
 
+# ── a workspace below the git top level ──────────────────────────────────────
+
+def nested_repo(tmp_path: Path, prefix: str) -> Tuple[hg.Repo, Path]:
+    """A monorepo whose workspace ``prefix`` holds a gate invariant on src/*.py; a sibling
+    ``other/`` workspace holds a rule of its own."""
+    repo = hg.Repo(tmp_path / "mono", hg.Home(tmp_path / "home"))
+    repo.write("README.md", "# mono\n")
+    repo.write(f"{prefix}/src/a.py", "x = 1\n")
+    repo.write(f"{prefix}/{path_of('inv-a')}", rule_text("inv-a"))
+    repo.write(f"other/{path_of('inv-o')}", rule_text("inv-o"))
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    return repo, repo.root / prefix
+
+
+def ci_from(where: Path, capsys) -> Tuple[int, Any, str]:
+    os.chdir(where)
+    rc = main(["check", "--ci", "--base", "main", "--format", "json"])
+    captured = capsys.readouterr()
+    return rc, json.loads(captured.out) if captured.out.strip() else None, captured.err
+
+
+@needs_git
+@pytest.mark.parametrize("prefix", ["pkg", "pkg dir/ü", ""], ids=["nested", "spaced", "flat"])
+def test_a_workspace_below_the_top_level_checks_its_own_binding_rules(tmp_path, capsys, prefix):
+    repo, ws = nested_repo(tmp_path, prefix) if prefix else (make_repo(tmp_path), None)
+    ws = ws or repo.root
+    repo.write(f"{prefix}/{path_of('inv-a')}".lstrip("/"), rule_text("inv-a", enforcement="advisory"))
+    repo.commit("drop the gate to advisory")
+    rc, payload, err = ci_from(ws, capsys)
+    assert rc == 1, err
+    assert payload["rules_checked"] == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("rank", "inv-a")]
+
+
+@needs_git
+def test_a_nested_workspace_serves_its_base_rules_and_lists_an_edit_as_changed(tmp_path):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    repo.write(f"pkg/{path_of('inv-a')}", rule_text("inv-a", body="# The title\n\nA softer reason.\n"))
+    view = rule_integrity.effective(ws)
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+    assert "Why this rule exists." in view.ruleset.get("inv-a").body
+    assert view.ruleset.get("inv-o") is None
+
+
+@needs_git
+@pytest.mark.parametrize("move,expected", [
+    (("pkg/src", "pkg/lib"), [("coverage", "inv-a")]),
+    (("pkg/src/a.py", "pkg/src/b.py"), []),
+], ids=["out", "inside"])
+def test_coverage_follows_renames_inside_a_nested_workspace(tmp_path, capsys, move, expected):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    repo.git("mv", *move)
+    repo.commit("move")
+    rc, payload, err = ci_from(ws, capsys)
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == expected, err
+    assert rc == (1 if expected else 0)
+
+
+@needs_git
+def test_a_layout_git_cannot_place_fails_the_ci_check(tmp_path, capsys, monkeypatch):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    real = gitsafe.run
+
+    def refuse(args, *a, **kw):
+        if "--show-prefix" in args:
+            return subprocess.CompletedProcess(list(args), 128, b"", b"fatal: not a git repository")
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    rc, payload, err = ci_from(ws, capsys)
+    assert rc == 1 and payload is None and err.startswith("Error:")
+
+
+def test_a_path_is_relative_to_the_workspace_prefix_only_inside_it():
+    assert gitsafe.relative_to_prefix("", "src/a.py") == "src/a.py"
+    assert gitsafe.relative_to_prefix("pkg dir/ü/", "pkg dir/ü/src/a.py") == "src/a.py"
+    assert gitsafe.relative_to_prefix("pkg/", "pkgx/src/a.py") is None
+    assert gitsafe.relative_to_prefix("pkg/", "other/pkg/a.py") is None
+
+
 def test_the_cap_is_the_one_the_scan_uses():
     assert scan_mod.MANDATORY_SLOT_CAP == rule_integrity.MANDATORY_SLOT_CAP == 2
 

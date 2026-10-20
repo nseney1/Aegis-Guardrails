@@ -115,16 +115,26 @@ def _run(cwd: str, args: Sequence[str], stdin: Optional[bytes] = None) -> bytes:
 _DEFAULT_RUN = _run
 
 
-def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
+def _prefix(root: str) -> str:
     try:
-        entries = gitsafe.tree_blobs(cwd, commit, paths=(RULES_RELDIR,), timeout=_GIT_TIMEOUT)
+        return gitsafe.show_prefix(root)
     except gitsafe.GitError as exc:
         raise IntegrityError(str(exc)) from exc
-    return {
-        path: oid
-        for path, (_mode, oid) in entries.items()
-        if path.lower().endswith(_MD)
-    }
+
+
+def _rule_blobs(cwd: str, commit: str, prefix: Optional[str] = None) -> Dict[str, str]:
+    # ls-tree --full-tree names top-level paths; the inventory names workspace-relative ones.
+    prefix = _prefix(cwd) if prefix is None else prefix
+    try:
+        entries = gitsafe.tree_blobs(cwd, commit, paths=(prefix + RULES_RELDIR,), timeout=_GIT_TIMEOUT)
+    except gitsafe.GitError as exc:
+        raise IntegrityError(str(exc)) from exc
+    found: Dict[str, str] = {}
+    for path, (_mode, oid) in entries.items():
+        relative = gitsafe.relative_to_prefix(prefix, path)
+        if relative is not None and relative.lower().endswith(_MD):
+            found[relative] = oid
+    return found
 
 
 def _read_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
@@ -147,8 +157,10 @@ def _fingerprint(entries: Sequence[RuleInventoryEntry]) -> str:
     return aggregate.hexdigest()
 
 
-def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None) -> RuleInventory:
-    blobs = _rule_blobs(root, commit)
+def _inventory_at(
+    root: str, commit: str, working: Optional[RuleInventory] = None, prefix: Optional[str] = None
+) -> RuleInventory:
+    blobs = _rule_blobs(root, commit, prefix)
     present = {e.relative_path: e for e in working.entries} if working is not None else {}
     entries: List[RuleInventoryEntry] = []
     missing: List[Tuple[str, str]] = []
@@ -523,7 +535,7 @@ def effective(workspace: Any, cache: Optional[RuleCache] = None) -> Effective:
     anchor = resolve_base(root)
     if anchor is None:
         return Effective(head, None)
-    base_inventory = _inventory_at(root, anchor.commit, inventory)
+    base_inventory = _inventory_at(root, anchor.commit, inventory, _prefix(root))
     if base_inventory.fingerprint == inventory.fingerprint:
         return Effective(head, anchor)
     return _compose(root, head, load_rules(root, inventory=base_inventory), anchor)
@@ -570,16 +582,20 @@ class CiReport:
         }
 
 
-def _diff(root: str, base: str, head: str) -> Tuple[Dict[str, str], List[str]]:
+def _diff(root: str, base: str, head: str, prefix: Optional[str] = None) -> Tuple[Dict[str, str], List[str]]:
+    prefix = _prefix(root) if prefix is None else prefix
     raw = _run(root, ["diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "-M50%", base, head])
     renames: Dict[str, str] = {}
     deleted: List[str] = []
     for status, path, new_path in gitsafe.parse_name_status_z(raw):
-        kind = status[:1]
-        if kind == "R" and new_path is not None:
-            renames[path] = new_path
-        elif kind == "D":
-            deleted.append(path)
+        kind, old = status[:1], gitsafe.relative_to_prefix(prefix, path)
+        if old is None:
+            continue  # outside the workspace (a move into it is an addition)
+        new = None if new_path is None else gitsafe.relative_to_prefix(prefix, new_path)
+        if kind == "R" and new is not None:
+            renames[old] = new
+        elif kind in ("D", "R"):
+            deleted.append(old)
     return renames, deleted
 
 
@@ -631,9 +647,10 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
     merge = gitsafe.merge_base(root, base_commit, head_commit)
     if not merge:
         raise IntegrityError(f"{base!r} and {head!r} share no history (a shallow clone needs fetch-depth: 0)")
-    base_rules = load_rules(root, inventory=_inventory_at(root, merge))
-    head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
-    renames, _deleted = _diff(root, merge, head_commit)
+    prefix = _prefix(root)
+    base_rules = load_rules(root, inventory=_inventory_at(root, merge, prefix=prefix))
+    head_rules = load_rules(root, inventory=_inventory_at(root, head_commit, prefix=prefix))
+    renames, _deleted = _diff(root, merge, head_commit, prefix)
     tree = _Tree(renames)
 
     found: List[Weakening] = []

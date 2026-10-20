@@ -465,6 +465,30 @@ def test_the_credited_rules_are_exposed_in_the_session_and_match_the_change(tmp_
 
 
 @needs_git
+def test_a_workspace_below_the_top_level_credits_the_exposed_rule_that_matches_the_change(tmp_path):
+    home = hg.Home(tmp_path / "home")
+    repo = hg.Repo(tmp_path / "mono", home)
+    repo.write("README.md", "# mono\n")
+    repo.write("pkg/src/app.py", hv.APP)
+    repo.write("pkg/.aegis/rules/traps/trap-sample.md", hg.RULE)
+    repo.write("pkg/.aegis/rules/traps/trap-docs.md", SECOND_RULE)
+    repo.write("pkg/docs/guide.md", "# guide\n")
+    repo.write("run_checks.py", hv.PASSING)  # checkrun runs the command at the snapshot's top level
+    repo.write("pkg/.gitignore", ".aegis/state/\n")
+    repo.commit("base")
+    repo.branch("work")
+    ws = repo.root / "pkg"
+    hv.use_stub_runner(home.path)
+    repo.write("pkg/src/app.py", "def app():\n    return 2\n")
+    scanned = hv.mcp_call("aegis_scan", ws, session="sess-1", files=["src/app.py", "docs/guide.md"])
+    assert scanned.get("status") != "FAIL", scanned  # both rules exposed; only src/ changes
+    checkrun.record(ws, tests=True, base="main")
+    res = hv.mcp_call("aegis_report_outcome", ws, session="sess-1", outcome="success",
+                      rules_used=["trap-sample", "trap-docs"], idempotency_key="k1")
+    assert res["status"] == "recorded" and res["credited"] == ["trap-sample"]
+
+
+@needs_git
 def test_an_exposed_rule_that_does_not_match_the_change_is_not_credited(tmp_path):
     repo = hv.make_project(tmp_path)
     repo.write(".aegis/rules/traps/trap-docs.md", SECOND_RULE)
