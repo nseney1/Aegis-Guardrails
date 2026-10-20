@@ -17,13 +17,15 @@ Given/When/Then, written before the code and never weakened to make it pass:
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 from pathlib import Path
 import subprocess
 
 import pytest
 
-from aegis_core import checkrun, credit, treeid
+from aegis_core import checkrun, credit, human_gate, treeid
 from aegis_core.telemetry_engine import ledger
 from tests import helpers_humangate as hg
 from tests import helpers_verified as hv
@@ -68,6 +70,23 @@ def _credits(repo: hg.Repo, approved=None):
     return credit.derive(credit.read_rows(repo.root), landed=_landed(repo), approved=approved)
 
 
+def _fake_bind(next_tree):
+    """``treeid.bind`` for report floods: each report binds ``next_tree()`` without spawning git."""
+
+    class Bound:
+        def __init__(self, tree):
+            self.binding = treeid.TreeBinding("ok", tree, "")
+
+        def diff_entries(self, base):
+            return []
+
+    @contextlib.contextmanager
+    def bind(root):
+        yield Bound(next_tree())
+
+    return bind
+
+
 # ── 1. No credit without CI confirmation ─────────────────────────────────────
 
 @needs_git
@@ -98,6 +117,31 @@ def test_only_a_ci_confirmed_landing_counts(tmp_path, runs, state, counts):
     assert [r["rule"] for r in rows] == (["trap-sample"] if counts else [])
     # nothing in the ledger scores the rule before CI said so
     assert ledger.aggregate(repo.root, "trap-sample")["triggers"] == 0
+
+
+@needs_git
+def test_a_failure_report_on_a_confirmed_check_is_a_neutral_trigger_never_fp(tmp_path):
+    """Given three witnessed, landed, CI-green checks each reported ``failure``, When credit is
+    projected, Then each counts as a trigger, the rule's fp stays 0 and nothing is decided."""
+    from aegis_core import fitness, rules
+
+    repo = hv.make_project(tmp_path)
+    hv.use_stub_runner(repo.home.path)
+    commits = []
+    for n in range(3):
+        _edit_app(repo, n + 2)
+        _scan(repo)
+        assert checkrun.record(repo.root, tests=True, base="main").row["passed"] is True
+        assert _report(repo, key=f"f{n}", outcome="failure")["status"] == "recorded"
+        commits.append(repo.commit(f"work {n}"))
+    repo.git("branch", "-f", "main", commits[-1])
+    runs = [hv.ci_run(c, run_id=i + 1) for i, c in enumerate(commits)]
+    credit.confirm(repo.root, client=hv.FakeCI(runs), workflow=hv.CI_WORKFLOW)
+    proj = credit.project_credits(repo.root)
+    assert [(c.state, c.counts, c.result) for c in proj.credits] == [("confirmed", True, "trigger")] * 3
+    assert [r["outcome"] for r in proj.outcome_rows] == ["trigger"] * 3
+    fit = fitness.for_rules(repo.root, rules.load_rules(repo.root).served)["trap-sample"]
+    assert (fit.fp, fit.tp) == (0, 0) and fit.state != "decided"
 
 
 @needs_git
@@ -324,8 +368,6 @@ def test_claimed_rows_have_their_own_count_apart_from_per_rule_evidence(tmp_path
 @needs_git
 @pytest.mark.parametrize("command", ["status", "sync"])
 def test_status_and_sync_show_claims_apart_from_every_rule(tmp_path, monkeypatch, capsys, command):
-    import json
-
     from aegis_cli.cli import main
 
     repo = hv.make_project(tmp_path)
@@ -373,11 +415,11 @@ def test_a_flood_of_reports_leaves_the_ledger_bounded(tmp_path, monkeypatch):
     trees = [f"{n:040x}" for n in range(1, 400)]
     state = {"n": 0}
 
-    def fake_tree(root):
+    def fake_tree():
         state["n"] += 1
-        return treeid.TreeBinding("ok", trees[state["n"] % len(trees)], "")
+        return trees[state["n"] % len(trees)]
 
-    monkeypatch.setattr(treeid, "tree_of", fake_tree)
+    monkeypatch.setattr(treeid, "bind", _fake_bind(fake_tree))
     # 50 past the cap exercises rate limiting; every call beyond it answers the same way.
     results = [_report(repo, key=f"k{n}") for n in range(credit.MAX_REPORT_ROWS_PER_SESSION + 50)]
     statuses = {r["status"] for r in results}
@@ -395,11 +437,11 @@ def test_the_cap_is_per_session_so_another_session_still_reports(tmp_path, monke
     monkeypatch.setattr(credit, "MAX_REPORT_ROWS_PER_SESSION", 2)
     counter = {"n": 0}
 
-    def fake_tree(root):
+    def fake_tree():
         counter["n"] += 1
-        return treeid.TreeBinding("ok", f"{counter['n']:040x}", "")
+        return f"{counter['n']:040x}"
 
-    monkeypatch.setattr(treeid, "tree_of", fake_tree)
+    monkeypatch.setattr(treeid, "bind", _fake_bind(fake_tree))
     assert [_report(repo, key=f"a{n}")["status"] for n in range(4)] == ["claimed", "claimed", "rate_limited", "rate_limited"]
     assert _report(repo, key="z", session="sess-2")["status"] == "claimed"
 
@@ -611,3 +653,170 @@ def test_repeated_tree_after_revert_does_not_inherit_older_commit_ci(tmp_path):
     c_after, = credit.project_credits(repo.root).credits
     assert c_after.state == "confirmed" and c_after.commit == c3 and c_after.counts is True
 
+
+
+# ── 10. GitHub, not the ledger or a local ref, pins the workflow and the branch ──
+
+class GitHub:
+    """``gh api`` at the runner boundary: the repository GET answers ``repo`` (a body, or a
+    ``(returncode, stdout)`` pair, or None for a missing gh); the runs GET lists ``runs``."""
+
+    def __init__(self, runs, repo=None):
+        self.runs = list(runs)
+        self.repo = {"full_name": "octo/proj", "default_branch": "main"} if repo is None else repo
+        self.calls = []
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        self.calls.append(list(argv))
+        if argv[:1] != ["api"]:
+            return subprocess.CompletedProcess(argv, 1, "", "unexpected")
+        if "/actions/runs?head_sha=" in argv[1]:
+            sha = argv[1].split("head_sha=", 1)[1].split("&", 1)[0]
+            body = {"workflow_runs": [r for r in self.runs if r.get("head_sha") == sha]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if self.repo == "missing":
+            return None
+        code, out = self.repo if isinstance(self.repo, tuple) else (0, json.dumps(self.repo))
+        return subprocess.CompletedProcess(argv, code, out, "")
+
+    @property
+    def repo_gets(self):
+        return [c for c in self.calls if c[:1] == ["api"] and "/actions/" not in c[1]]
+
+
+def _ci_row(commit, workflow=hv.CI_WORKFLOW, run_id=9):
+    return {"v": ledger.LEDGER_VERSION, "ts": "2026-10-19T10:00:00Z", "event": "ci", "commit": commit,
+            "workflow": workflow, "ci_conclusion": "success", "run_id": run_id, "ci_run_attempt": 1}
+
+
+def _reported_commit(tmp_path, monkeypatch):
+    """A reported, passing check for trap-sample committed on ``work``; nothing points at it yet."""
+    monkeypatch.setattr(credit, "_VERIFIED_CI", {})
+    monkeypatch.setattr(credit, "_UNAVAILABLE_CI", set())
+    repo = hv.make_project(tmp_path)
+    hv.use_stub_runner(repo.home.path)
+    _edit_app(repo)
+    _scan(repo)
+    checkrun.record(repo.root, tests=True, base="main")
+    assert _report(repo)["status"] == "recorded"
+    return repo, repo.commit("work")
+
+
+def _point_origin_head_at(repo, branch, commit):
+    repo.git("update-ref", f"refs/remotes/origin/{branch}", commit)
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{branch}")
+
+
+@needs_git
+def test_a_ledger_row_cannot_name_the_workflow_that_confirms_credit(tmp_path, monkeypatch):
+    """Given commit C whose validate.yml run failed (id 9) and whose other.yml run succeeded (id 5),
+    and an agent-written ci row naming other.yml run 5, When credit is projected over REST, Then it
+    is not confirmed; GitHub's repository is asked once per process for the default branch."""
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    repo.git("branch", "-f", "main", commit)
+    gh = GitHub([hv.ci_run(commit, "failure", run_id=9), hv.ci_run(commit, workflow="other.yml", run_id=5)])
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    ledger.append_rows(repo.root, [_ci_row(commit, workflow="other.yml", run_id=5)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [(c.state, c.counts) for c in proj.credits] == [("landed", False)]
+    assert proj.outcome_rows == () and len(gh.repo_gets) == 1
+    again = credit.project_credits(repo.root, verify_ci=True)
+    assert [c.counts for c in again.credits] == [False] and len(gh.repo_gets) == 1  # memoised per root
+
+
+@needs_git
+def test_an_honest_ci_row_still_confirms_through_github(tmp_path, monkeypatch):
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    repo.git("branch", "-f", "main", commit)
+    gh = GitHub([hv.ci_run(commit, run_id=9)])
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    ledger.append_rows(repo.root, [_ci_row(commit)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [(c.state, c.counts) for c in proj.credits] == [("confirmed", True)]
+    assert len(gh.repo_gets) == 1
+
+
+@needs_git
+@pytest.mark.parametrize("github_default,counts", [("main", False), ("feature", True)])
+def test_the_default_branch_is_githubs_not_the_local_origin_head(tmp_path, monkeypatch, github_default, counts):
+    """Given origin/HEAD repointed at origin/feature, whose run succeeded, When credit is projected,
+    Then only GitHub's default branch decides whether the run speaks for the commit."""
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    _point_origin_head_at(repo, "feature", commit)
+    gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")],
+                repo={"full_name": "octo/proj", "default_branch": github_default})
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    ledger.append_rows(repo.root, [_ci_row(commit)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [c.counts for c in proj.credits] == [counts]
+
+
+_BAD_REPO_REPLIES = ["missing", (1, ""), (0, "not json"), {}, {"default_branch": ""}, {"default_branch": 7}]
+_BAD_IDS = ["no-gh", "exit-1", "not-json", "empty", "blank", "int"]
+
+
+@needs_git
+@pytest.mark.parametrize("reply", _BAD_REPO_REPLIES, ids=_BAD_IDS)
+def test_an_unreadable_default_branch_leaves_credit_landed_with_no_local_fallback(tmp_path, monkeypatch, reply):
+    """Given a local origin/HEAD naming a branch whose run succeeded, When GitHub's repository GET fails
+    or is malformed, Then nothing raises, nothing counts, and the projection says it is incomplete."""
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    _point_origin_head_at(repo, "feature", commit)
+    gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")], repo=reply)
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    ledger.append_rows(repo.root, [_ci_row(commit)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]
+    assert proj.available is False and "default branch" in proj.error
+    assert [c for c in gh.calls if "/actions/" in c[1]] == []  # no run was read for an unknown branch
+
+
+@needs_git
+@pytest.mark.parametrize("reply", _BAD_REPO_REPLIES, ids=_BAD_IDS)
+def test_confirm_records_an_unreadable_default_branch_as_ci_unavailable(tmp_path, monkeypatch, reply):
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    _point_origin_head_at(repo, "feature", commit)
+    gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")], repo=reply)
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    summary = credit.confirm(repo.root, client=credit.GhRestClient(cwd=str(repo.root)), workflow=hv.CI_WORKFLOW)
+    assert (summary["asked"], summary["confirmed"], len(summary["errors"])) == (0, 0, 1)
+    assert hv.rows_of(repo.root, "ci") == []
+    derived, = credit.project_credits(repo.root).credits
+    assert (derived.state, derived.reason, derived.counts) == ("landed", "ci_unavailable", False)
+
+
+@needs_git
+def test_confirm_asks_github_for_the_branch_and_the_run_once(tmp_path, monkeypatch):
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    _point_origin_head_at(repo, "feature", commit)  # the local ref says feature; GitHub says main
+    gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")])
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    summary = credit.confirm(repo.root, client=credit.GhRestClient(cwd=str(repo.root)), workflow=hv.CI_WORKFLOW)
+    assert (summary["asked"], summary["confirmed"]) == (1, 0)
+    row, = hv.rows_of(repo.root, "ci")
+    assert (row["ci_conclusion"], row["run_id"]) == ("none", None)
+    assert len(gh.repo_gets) == 1
+
+
+@needs_git
+def test_a_runs_get_that_fails_after_github_named_the_branch_still_trips_the_breaker(tmp_path, monkeypatch):
+    """Given GitHub names the default branch but its runs GET then fails, When credit is projected,
+    Then verification stops at that commit, nothing counts, and the projection is unavailable."""
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    repo.git("branch", "-f", "main", commit)
+    gh = GitHub([hv.ci_run(commit, run_id=9)])
+
+    def runs_fail(argv, stdin=None, cwd=None, timeout=None):
+        if argv[:1] == ["api"] and "/actions/runs?" in argv[1]:
+            gh.calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, "", "rate limited")
+        return gh(argv, stdin, cwd, timeout)
+
+    monkeypatch.setattr(human_gate, "default_gh_runner", runs_fail)
+    ledger.append_rows(repo.root, [_ci_row(commit)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]
+    assert proj.available is False
+    assert proj.error == f"CI verification stopped after gh failed for {commit[:12]}; 1 commit(s) were not verified"
+    asked = [c[1].split("?", 1)[0] for c in gh.calls if c[:1] == ["api"]]
+    assert asked == ["repos/{owner}/{repo}", "repos/{owner}/{repo}/actions/runs"]

@@ -1,11 +1,14 @@
-"""MCP tool annotations: every tool explicitly declares all four boolean hints
-(readOnlyHint, destructiveHint, idempotentHint, openWorldHint) and a title, matching
-its handler's actual behavior. The values are pinned by the contract snapshot
-(tests/contract/mcp_tools.json).
+"""MCP tool annotations (author decision 2026-10-17, R-evidence-48): every tool is either a read
+tool, which declares all four hints (read-only, not destructive, idempotent, closed world) plus a
+title, or a write tool, which declares only ``readOnlyHint: false`` plus a title. Hosts treat
+annotations as untrusted hints, so a write tool claims nothing more and the MCP defaults make the
+host prompt. The dicts are exact; the contract snapshot (tests/contract/mcp_tools.json) pins them too.
 """
 from __future__ import annotations
 
+import copy
 import json
+from typing import Dict, List
 
 import pytest
 
@@ -13,6 +16,9 @@ import aegis_mcp.server as server_module
 from aegis_mcp.server import handle_request
 
 _HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+_READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule"}
+WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight"}
 
 
 @pytest.fixture
@@ -23,14 +29,60 @@ def tools(monkeypatch):
     return {t["name"]: t for t in resp["result"]["tools"]}
 
 
-def test_every_tool_declares_all_four_boolean_hints_and_title(tools):
-    for name, tool in tools.items():
-        ann = tool.get("annotations")
-        assert isinstance(ann, dict), f"{name}: missing annotations"
-        assert set(ann) == {*_HINTS, "title"}, f"{name}: {sorted(ann)}"
-        for hint in _HINTS:
-            assert isinstance(ann.get(hint), bool), f"{name}: {hint} not a bool"
-        assert isinstance(ann.get("title"), str) and ann["title"], f"{name}: no title"
+def _classification_errors(tools: Dict[str, dict]) -> List[str]:
+    """One line per tool whose annotations are not exactly its class's, or that has no class."""
+    errors = []
+    for name in sorted(tools):
+        if name in WRITE:
+            expected = {"readOnlyHint": False, "title": WRITE[name]}
+        elif name in READ:
+            expected = {**_READ_HINTS, "title": READ[name]}
+        else:
+            errors.append(f"{name}: not classified as a read or a write tool")
+            continue
+        if tools[name].get("annotations") != expected:
+            errors.append(f"{name}: annotations {tools[name].get('annotations')!r} are not {expected!r}")
+    errors += [f"{name}: classified but not served" for name in sorted((set(READ) | set(WRITE)) - set(tools))]
+    return errors
+
+
+def test_every_tool_is_in_exactly_one_of_read_and_write():
+    assert not set(READ) & set(WRITE)
+
+
+def test_every_served_tool_has_exactly_the_annotations_of_its_class(tools):
+    assert _classification_errors(tools) == []
+
+
+def test_write_tools_claim_nothing_beyond_not_read_only(tools):
+    writers = {n: t["annotations"] for n, t in tools.items() if t["annotations"].get("readOnlyHint") is not True}
+    assert writers == {
+        "aegis_report_outcome": {"readOnlyHint": False, "title": "Report Outcome"},
+        "aegis_capture_insight": {"readOnlyHint": False, "title": "Capture Insight"},
+    }
+
+
+@pytest.mark.parametrize("name,extra", [
+    ("aegis_report_outcome", {"destructiveHint": False}),
+    ("aegis_report_outcome", {"idempotentHint": True}),
+    ("aegis_capture_insight", {"openWorldHint": False}),
+])
+def test_the_guard_names_a_write_tool_that_redeclares_a_hint(tools, name, extra):
+    broken = copy.deepcopy(tools)
+    broken[name]["annotations"].update(extra)
+    assert [e.split(":", 1)[0] for e in _classification_errors(broken)] == [name]
+
+
+@pytest.mark.parametrize("hint", _HINTS[1:])
+def test_the_guard_names_a_read_tool_missing_a_hint(tools, hint):
+    broken = copy.deepcopy(tools)
+    del broken["aegis_list_rules"]["annotations"][hint]
+    assert [e.split(":", 1)[0] for e in _classification_errors(broken)] == ["aegis_list_rules"]
+
+
+def test_the_guard_names_an_unclassified_tool(tools):
+    extra = dict(tools, aegis_new_tool={"name": "aegis_new_tool", "annotations": {**_READ_HINTS, "title": "New"}})
+    assert _classification_errors(extra) == ["aegis_new_tool: not classified as a read or a write tool"]
 
 
 def test_read_only_tools_are_never_destructive(tools):
@@ -40,28 +92,6 @@ def test_read_only_tools_are_never_destructive(tools):
             assert ann["destructiveHint"] is False, name
             assert ann["idempotentHint"] is True, name
             assert ann["openWorldHint"] is False, name
-
-
-def test_write_tools_declare_exact_handler_behavior_hints(tools):
-    writers = {n: t["annotations"] for n, t in tools.items() if not t["annotations"]["readOnlyHint"]}
-    assert set(writers) == {"aegis_report_outcome", "aegis_capture_insight"}
-    # Both write tools append to local JSONL files only (non-destructive, closed-world).
-    # aegis_report_outcome requires idempotency_key and deduplicates retries;
-    # aegis_capture_insight appends a new insight row on each call.
-    assert writers["aegis_report_outcome"] == {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-        "title": "Report Outcome",
-    }
-    assert writers["aegis_capture_insight"] == {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-        "title": "Capture Insight",
-    }
 
 
 def test_every_input_schema_property_has_a_meaningful_description(tools):

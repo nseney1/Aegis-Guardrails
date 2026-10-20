@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
 import aegis_mcp.server as server
 from aegis_core.yaml_engine.serializer import dump_frontmatter
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
 
 @pytest.fixture
@@ -130,6 +134,32 @@ def test_a_scan_of_the_git_diff_records_the_diffed_files(ws, monkeypatch):
     _call("aegis_scan", {})
     (event,) = _activity(ws)
     assert (event["files"], event["basis"]) == (["src/b.py"], "git_diff")
+
+
+@needs_git
+def test_an_empty_files_list_scans_the_git_diff_and_records_the_scan(ws, monkeypatch):
+    """Given a dirty tracked file, When aegis_scan runs with files omitted and, in a new session,
+    with files=[], Then each serves the diff's rules and writes one scan row with basis git_diff;
+    a confined-path failure still writes nothing."""
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    (ws / ".gitignore").write_text(".aegis/state/\n", encoding="utf-8")
+    for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=a@b.c", "-c", "user.name=n",
+                                                  "-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=str(ws), check=True, capture_output=True)
+    (ws / "src" / "b.py").write_text("b2\n", encoding="utf-8")
+    first = _initialize()
+    omitted = _call("aegis_scan", {})
+    second = _initialize()
+    empty = _call("aegis_scan", {"files": []}, 2)
+    assert omitted[0] is False and empty[0] is False
+    assert [r["name"] for r in empty[1]["relevant_rules"]] == [r["name"] for r in omitted[1]["relevant_rules"]] == ["trap-x"]
+    expected = [(first, ["src/b.py"], "git_diff"), (second, ["src/b.py"], "git_diff")]
+    assert [(e["session"], e["files"], e["basis"]) for e in _activity(ws)] == expected
+    _initialize()
+    is_error, payload = _call("aegis_scan", {"files": ["../x.py"]}, 3)
+    assert is_error and "path traversal blocked" in payload["error"].lower()
+    assert [(e["session"], e["files"], e["basis"]) for e in _activity(ws)] == expected
 
 
 def test_a_failed_scan_records_nothing(ws):

@@ -20,7 +20,7 @@ __all__ = [
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows",
     "record_adjudication", "record_detection", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
-    "verify_commit_trailers",
+    "verify_commit_trailers", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
 MAX_REPORT_ROWS_PER_SESSION = 200
@@ -33,6 +33,7 @@ _TRAILER = re.compile(r"\s*Aegis-Check:\s*tree=([0-9a-f]{40,64})\s+exit=(-?\d+)\
 _REV_LIMIT = 5000
 _VERIFIED_CI: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _UNAVAILABLE_CI: Set[Tuple[str, str]] = set()
+_DEFAULT_BRANCH: Dict[Tuple[str, str], str] = {}
 
 
 class CIUnavailable(AegisError):
@@ -84,12 +85,22 @@ def flaky_keys(rows: Iterable[Mapping[str, Any]]) -> Set[Tuple[Any, Any, Any]]:
     return {key for key, outcomes in seen.items() if len(outcomes) == 2}
 
 
+def _passed(check: Mapping[str, Any]) -> bool:
+    return check.get("passed") is True and not check.get("partial")
+
+
+def _sign(claimed: Any, check: Mapping[str, Any]) -> str:
+    """Spec T4: a report confirms a passed check as tp or withdraws to a trigger, never fp. The
+    stored ``result`` stays the agent's claim (ReportConflict compares it); only the read is signed."""
+    return "tp" if claimed == "tp" and _passed(check) else "trigger"
+
+
 def passing_check(rows: Iterable[Mapping[str, Any]], tree: Optional[str]) -> Optional[Mapping[str, Any]]:
     if not tree:
         return None
     best = None
     for row in _of(rows, "check"):
-        if row.get("tree") == tree and row.get("witness") == "aegis" and row.get("passed") is True and not row.get("partial") and isinstance(row.get("id"), str):
+        if row.get("tree") == tree and row.get("witness") == "aegis" and _passed(row) and isinstance(row.get("id"), str):
             best = row
     return best
 
@@ -154,22 +165,44 @@ class GhRestClient:
     def __init__(self, repo: Optional[str] = None, runner: Optional[Callable[..., Any]] = None, cwd: Any = None) -> None:
         self.repo, self.runner, self.cwd = repo, runner or human_gate.default_gh_runner, cwd
 
-    def runs_for(self, commit: str) -> List[Dict[str, Any]]:
-        if not _FULL_SHA.fullmatch(commit or ""):
-            raise CIUnavailable("not a full commit id")
-        result = self.runner(["api", f"repos/{self.repo or '{owner}/{repo}'}/actions/runs?head_sha={commit}&per_page=100"], cwd=self.cwd)
+    def _api(self, path: str) -> Any:
+        result = self.runner(["api", f"repos/{self.repo or '{owner}/{repo}'}{path}"], cwd=self.cwd)
         if result is None:
             raise CIUnavailable("gh is not installed")
         if result.returncode != 0:
             raise CIUnavailable(f"gh api failed (exit {result.returncode})")
         try:
-            body = json.loads(result.stdout)
+            return json.loads(result.stdout)
         except ValueError as exc:
             raise CIUnavailable("gh printed something that is not JSON") from exc
+
+    def runs_for(self, commit: str) -> List[Dict[str, Any]]:
+        if not _FULL_SHA.fullmatch(commit or ""):
+            raise CIUnavailable("not a full commit id")
+        body = self._api(f"/actions/runs?head_sha={commit}&per_page=100")
         runs = body.get("workflow_runs") if isinstance(body, dict) else None
         if not isinstance(runs, list):
             raise CIUnavailable("gh printed no workflow_runs")
         return [r for r in runs if isinstance(r, dict)]
+
+    def default_branch(self) -> str:
+        body = self._api("")
+        branch = body.get("default_branch") if isinstance(body, dict) else None
+        if not isinstance(branch, str) or not branch or not branch.isprintable() or any(c.isspace() for c in branch):
+            raise CIUnavailable("gh printed no usable default_branch")
+        return branch
+
+
+def _protected_branch(root: Any, client: Any) -> Optional[str]:
+    """GitHub's default branch (memoised per root and process), never the agent-writable origin/HEAD:
+    a failed answer raises CIUnavailable. Only an injected client that cannot ask uses the local ref."""
+    ask = getattr(client, "default_branch", None)
+    if not callable(ask):
+        return resolve_protected_branch(root)
+    key = (_canon_root(root), str(getattr(client, "repo", None) or ""))
+    if key not in _DEFAULT_BRANCH:
+        _DEFAULT_BRANCH[key] = ask()
+    return _DEFAULT_BRANCH[key]
 
 
 def _call_landed(landed: Callable[..., Optional[str]], tree: str, head: Optional[str] = None) -> Optional[str]:
@@ -299,6 +332,12 @@ def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None)
 session_exposed_rules = exposed_rules
 
 
+def witnessed_exposed_rules(root: Any, host: Optional[str], session: Optional[str]) -> Set[str]:
+    """What this process's scans showed (host, session): the credited set of spec T1. Ledger exposure
+    rows are agent-writable, so only ``exposed_rules`` (display, other processes) merges them."""
+    return set(_EXPOSED.get((str(root), host or "", session or ""), ()))
+
+
 def record_detection(
     root: Any, rule: str, file: str, pattern: str, *, disposition: str,
     rev: Optional[str] = None, branch: str = "main", fix_rev: Optional[str] = None,
@@ -407,7 +446,6 @@ def confirm(
             setattr(landed, "_aegis_root", c_root)
         except AttributeError:
             pass
-    target_branch = branch if branch is not None else resolve_protected_branch(root)
     voided_checks = {r.get("check") for r in _of(rows, "void")}
     latest_ci = {str(r.get("commit")): (str(r.get("ci_conclusion")), r.get("run_id"), r.get("ci_run_attempt")) for r in _of(rows, "ci")}
     by_id = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
@@ -419,6 +457,16 @@ def confirm(
             commit = _call_landed(look, str(chk.get("tree")), chk.get("head"))
             if commit:
                 commits.setdefault(commit, []).append(check_id)
+    target_branch = branch
+    if commits and target_branch is None:
+        try:
+            target_branch = _protected_branch(root, client)
+        except CIUnavailable as exc:
+            for commit in commits:
+                _VERIFIED_CI.pop((c_root, commit), None)
+                _UNAVAILABLE_CI.add((c_root, commit))
+            summary["errors"].append(str(exc))
+            return summary
     for commit, checks in commits.items():
         try:
             runs = client.runs_for(commit)
@@ -542,7 +590,7 @@ def derive(
             counts, reason = False, "protected_changed"
         elif is_flaky and not reason:
             reason = "flaky"
-        credits.append(Credit(check=identity[0], rule=identity[1], tree=tree, state=state, result=str(report.get("result") or "trigger"), commit=commit, reason=reason, flaky=is_flaky, counts=counts, ts=str(report.get("ts") or ""), protected=categories))
+        credits.append(Credit(check=identity[0], rule=identity[1], tree=tree, state=state, result=_sign(report.get("result"), check), commit=commit, reason=reason, flaky=is_flaky, counts=counts, ts=str(report.get("ts") or ""), protected=categories))
     return credits
 
 
@@ -625,9 +673,8 @@ def project_credits(
             setattr(landed, "_aegis_root", c_root)
         except AttributeError:
             pass
-    p_branch = resolve_protected_branch(root)
     if client is not None:
-        confirm(root, client=client, workflow=workflow, landed=look, branch=p_branch)
+        confirm(root, client=client, workflow=workflow, landed=look)
     rows, read_err = _read_ledger_events(root)
     view_err = getattr(view, "incomplete", None) if view is not None else None
     err = view_err or read_err
@@ -637,20 +684,27 @@ def project_credits(
     stopped: Optional[str] = None
     # Read paths (scan, status, list) pass verify_ci=False and stay offline: a ``ci`` row then counts
     # only when this process verified it, so they can under-credit but never over-credit.
-    if p_branch and verify_ci:
+    if verify_ci:
         rest_client = GhRestClient(cwd=str(root)) if (client is None and attestation_runner is None) else None
         latest = {str(r.get("commit") or ""): r for r in _of(rows, "ci")}
         pending = [(commit, ci_row) for commit, ci_row in latest.items()
                    if commit and (c_root, commit) not in _UNAVAILABLE_CI
                    and not _ci_cache_current(_VERIFIED_CI.get((c_root, commit)), ci_row)]
-        for idx, (commit, ci_row) in enumerate(pending):
-            wf = str(ci_row.get("workflow") or workflow)
+        # The workflow is the caller's and the branch GitHub's: a ci row's ``workflow`` is display only.
+        p_branch: Optional[str] = None
+        if any(_FULL_SHA.fullmatch(commit) for commit, _row in pending):
+            try:
+                p_branch = _protected_branch(root, rest_client or client)
+            except CIUnavailable as exc:
+                stopped = (f"CI verification stopped: GitHub did not name the default branch ({exc}); "
+                           f"{len(pending)} commit(s) were not verified")
+        for idx, (commit, ci_row) in enumerate(pending if p_branch else ()):
             if rest_client is not None:
                 try:
                     runs = rest_client.runs_for(commit)
-                    run = select_ci_run(runs, commit, wf, branch=p_branch)
+                    run = select_ci_run(runs, commit, workflow, branch=p_branch)
                     conc, rid, ratt = ci_conclusion(run), (run.get("id") if run else None), (run.get("run_attempt") if run else None)
-                    _VERIFIED_CI[(c_root, commit)] = {"conclusion": conc, "workflow": wf, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
+                    _VERIFIED_CI[(c_root, commit)] = {"conclusion": conc, "workflow": workflow, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
                     continue
                 except CIUnavailable:
                     pass
@@ -659,11 +713,11 @@ def project_credits(
                 exp_run = f"{rid}/{ratt}" if rid is not None and ratt is not None else None
                 rep = release_verify.verify_release(
                     root, commit, run=attestation_runner,
-                    source_ref=f"refs/heads/{p_branch}", workflow=f".github/workflows/{wf}", expected_run=exp_run,
+                    source_ref=f"refs/heads/{p_branch}", workflow=f".github/workflows/{workflow}", expected_run=exp_run,
                 )
                 if rep.verified:
                     v_map[commit] = "success"
-                    _VERIFIED_CI[(c_root, commit)] = {"conclusion": "success", "workflow": wf, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
+                    _VERIFIED_CI[(c_root, commit)] = {"conclusion": "success", "workflow": workflow, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
                     continue
             # Circuit breaker: a dead gh costs one attempt per projection. Only a well-formed id trips
             # it, so one malformed (never-asked) row cannot switch verification off for the rest.

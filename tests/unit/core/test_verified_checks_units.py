@@ -322,6 +322,28 @@ def test_the_gh_client_asks_for_exactly_one_commit_and_refuses_a_short_id():
         credit.GhRestClient("octo/proj", runner=runner).runs_for("abc")
 
 
+def test_the_gh_client_reads_the_default_branch_from_the_repository():
+    runner = _runner(0, json.dumps({"full_name": "octo/proj", "default_branch": "trunk"}))
+    assert credit.GhRestClient("octo/proj", runner=runner).default_branch() == "trunk"
+    assert runner.argv == ["api", "repos/octo/proj"]
+    assert credit.GhRestClient(runner=runner).default_branch() == "trunk"
+    assert runner.argv == ["api", "repos/{owner}/{repo}"]  # gh expands it from the clone's origin
+
+
+@pytest.mark.parametrize("runner,needle", [
+    (None, "gh is not installed"), (_runner(1), "exit 1"), (_runner(0, "nope"), "not JSON"),
+    (_runner(0, "[]"), "no usable default_branch"), (_runner(0, "{}"), "no usable default_branch"),
+    (_runner(0, '{"default_branch": ""}'), "no usable default_branch"),
+    (_runner(0, '{"default_branch": 7}'), "no usable default_branch"),
+    (_runner(0, '{"default_branch": "main\\nevil"}'), "no usable default_branch"),
+    (_runner(0, '{"default_branch": "ma in"}'), "no usable default_branch"),
+], ids=["missing", "exit", "not-json", "list", "empty", "blank", "int", "newline", "space"])
+def test_the_default_branch_fails_closed(runner, needle):
+    client = credit.GhRestClient("octo/proj", runner=runner or (lambda argv, cwd=None: None))
+    with pytest.raises(credit.CIUnavailable, match=needle):
+        client.default_branch()
+
+
 # ── trailer and CI falsification ─────────────────────────────────────────────
 
 def test_the_trailer_round_trips_and_rejects_anything_else():
@@ -367,6 +389,29 @@ def test_derive_is_pure_and_needs_a_report_to_name_a_rule():
     assert json.dumps(rows, sort_keys=True) == snapshot
     assert credit.derive([check], landed=lambda tree: None) == []
     assert credit.confirmed_outcome_rows(credits)[0]["rule"] == "r"
+
+
+@pytest.mark.parametrize("claimed,fields,expected", [
+    ("tp", {"passed": True}, "tp"),
+    ("trigger", {"passed": True}, "trigger"),
+    ("fp", {"passed": True}, "trigger"),  # a stored fp row is neutralised on read, no rewrite
+    (None, {"passed": True}, "trigger"),
+    ("tp", {"passed": False}, "trigger"),
+    ("tp", {"passed": 1}, "trigger"),
+    ("tp", {}, "trigger"),
+    ("tp", {"passed": True, "partial": True}, "trigger"),
+])
+def test_the_credit_sign_is_tp_only_for_a_tp_claim_on_a_passed_check(claimed, fields, expected):
+    """Given a confirmed landing, When the report claims ``claimed`` for a check with ``fields``,
+    Then the credit is ``tp`` only for a tp claim on a passed, complete check, else a trigger."""
+    check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", **fields}
+    report = {"event": "report", "check": "c1", "for_rule": "r", "ts": "t"}
+    if claimed is not None:
+        report["result"] = claimed
+    rows = [check, report, {"event": "ci", "commit": "c" * 40, "ci_conclusion": "success"}]
+    credits = credit.derive(rows, landed=lambda tree: "c" * 40, verified_ci={"c" * 40: "success"})
+    assert [(c.state, c.counts, c.result) for c in credits] == [("confirmed", True, expected)]
+    assert [r["outcome"] for r in credit.confirmed_outcome_rows(credits)] == [expected]
 
 
 def test_a_failed_ci_run_voids_and_a_revert_style_void_row_is_terminal():
