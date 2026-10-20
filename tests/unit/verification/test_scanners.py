@@ -359,7 +359,9 @@ class TestSnippetsMaskEverySecretOnTheLine:
 
     def test_a_high_entropy_blob_beside_a_gate_token_is_masked(self):
         blob = _tok("9zY8xW7vU6tS5rQ4", "pO3nM2lK1jI0hG+fE/dC=")
-        self._clean(scanners.scan_secrets_text(f'blob = "{blob}" k={self.GH}'), blob, self.GH)
+        findings = scanners.scan_secrets_text(f'blob = "{blob}" k={self.GH}')
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, blob, self.GH)
 
     def test_the_hash_field_guard_does_not_unmask_the_line(self):
         findings = scanners.scan_secrets_text(f'git commit; PASSWORD = "{self.PASSWORD}" key={self.GH}', include_advisory=True)
