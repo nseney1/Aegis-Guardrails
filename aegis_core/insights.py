@@ -359,7 +359,8 @@ def _inventory_id(root: Path) -> Optional[str]:
 
 
 def _known_inventory_revs(path: Path, inv: str) -> Optional[Dict[str, str]]:
-    for row in read_jsonl(path).rows:
+    # Rows are compact JSON, so these bytes are exact and appear only in inventory rows.
+    for row in read_jsonl(path, contains=b'"event":"inventory"').rows:
         if row.get("event") == "inventory" and row.get("inv") == inv and isinstance(row.get("revs"), dict):
             return dict(row["revs"])
     return None
@@ -392,6 +393,11 @@ def _resolve_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List
     if paths is not None and len(paths) > 0:
         return _confine_paths(workspace, paths), "explicit"
     return dirty_paths(workspace), "dirty"
+
+
+def _read_rows_of_session(path: Path, hs: str) -> List[Dict[str, Any]]:
+    # hs is 32 lowercase hex, never JSON-escaped, so every row of the session carries it verbatim.
+    return read_jsonl(path, contains=hs.encode("ascii")).rows
 
 
 def _matching_hook_insight(rows: Sequence[Mapping[str, Any]], hs: Optional[str], redacted_quote: str) -> Optional[str]:
@@ -483,7 +489,8 @@ def capture_suggestion(
     redacted = _redact(quote)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     hs = _ensure_hs(host, session, home)
-    m_hook = _matching_hook_insight(read_insight_rows(workspace, home=home), hs, redacted)
+    path = insights_path(workspace, home=home)
+    m_hook = _matching_hook_insight(_read_rows_of_session(path, hs) if hs else [], hs, redacted)
     row = _build_insight_row(
         workspace,
         "W2" if m_hook else "suggestion",
@@ -494,7 +501,7 @@ def capture_suggestion(
         hs,
         confirmed_by=m_hook,
     )
-    _append_user_insights(insights_path(workspace, home=home), [row])
+    _append_user_insights(path, [row])
     return row
 
 
