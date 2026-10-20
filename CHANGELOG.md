@@ -23,6 +23,10 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - **Nested workspaces are governed.** `check --ci` and serving in a workspace below the git top level checked zero rules and missed renames, and telemetry credited no rule; path frames are now translated, and `.aegis` rules, config, team and baseline files at any depth are governance.
 - **A committed runner module no longer forges a passing check.** A root `pytest.py`, `_pytest`, `pluggy`, `py` or `iniconfig` module (as a source, `.pyw` or compiled file, or a package with any `__init__` or `__main__`) is test infrastructure and withholds credit until approved.
 - **Destructive-command guard evasions are closed.** Commands after a blank line or a separator plus newline are checked; abbreviated long options of the blocked git and `rm` commands (`--force-w`, `--har`, `--recurs`), the `ionice`, `stdbuf`, `setsid`, `busybox`, `su -c` and `env -S` wrappers, option bundles such as `sudo -Eu root`, and non-canonical `dd of=//dev/sda` paths no longer hide a blocked command, in both the pre-tool guard and `aegis hook safety-gate`. In the pre-tool guard (the gate already asked for these), same-line git aliases (`git -c alias.*`, inline `GIT_CONFIG_*`, including a `!` alias that calls another and an alias defined by `-c` inside another alias's words) and quote-bearing shell comments no longer hide one either. `git clean` spellings that git treats as real deletions (`-e -n`, `-- -n`, `--no-dry-run`, `-e x -e -n -f`) are no longer taken for dry runs, while real dry runs that give `-e`/`--exclude` a separate value (`git clean -fdx -e .env -n`) are not blocked.
+- **Evidence an agent can write no longer counts.** A plain `aegis check` writes triggers, not tp/fp rows, and native session tp/fp rows already in a ledger read as triggers. Adjudication labels count only as `.aegis/adjudications/<rule-id>.jsonl` merged to the reviewed base branch (a governance path); ledger `adjudication` rows, which any process can write, never count. Leaked violations are dispositions, not false positives, and frontmatter is no longer an evidence channel.
+- **Tier detection can no longer be satisfied by settings an agent controls.** Tier B and A require each required check's source pinned to GitHub Actions; Tier A requires `dismiss_stale_reviews_on_push`; the required check must be the Aegis job (read from the base branch's workflows) with no path filter; a bare `@org` CODEOWNERS owner does not count for an organization-owned repository. `ssh-keygen` is found only outside the repository.
+- **`forbid_ast` rules can no longer be emptied by their own predicates.** The `where` grammar is four forms validated at load; a rule using a removed operator, an empty `where`, `unknown` or `call` fails closed at load instead of passing every file.
+- **Scanner fences.** Scanner presets and a bare `perf.command` program are found only outside the workspace; a repository `.gitleaks.toml` makes the gitleaks preset `unverified` instead of configuring it; SARIF is read only inside the workspace; a malformed SARIF file or a scan that did not demonstrably complete is `unverified`; the secret scanner no longer skips lines over 4,096 characters, finds Tier A tokens after a data-URL prefix and after `_`, `-`, `/` or `+`, and masks every secret on a finding's line.
 
 ### Changed behaviour
 
@@ -48,6 +52,14 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `rules.base_ref` anchors at the merge base with HEAD, as `origin/HEAD` already did; the tip is used, and labelled, only when there is no common history.
 - A short-option bundle stops at the first letter that takes a value, in the guard and the gate, so `git checkout -bfeat`, `git checkout -Bfix` and `git push -ofeature origin feat` are no longer flagged as forced.
 - The guard no longer reads text inside a shell comment as arguments (`rm -rf build # remove /` is no longer blocked); `dd of=/dev//null` is allowed and `dd of=/dev/` no longer matches; `aegis hook safety-gate` also asks for `dd of=<device>` without `if=`, `git push -fu`, `git checkout -fq`, `git add -Av` and inline `GIT_CONFIG_*` variables. The guard and the gate stay separate policies, pinned by a parity table.
+- Breaking: `forbid_ast` drops the operators `not_equals`, `not_in`, `equals`, `present`, `is_literal`, `not_literal`, `contains`, `not_contains` and `matches`, the per-call `unknown` key and the `call` alias (listed as supported in 4.3.0 to 4.3.3); `where` takes a scalar, `in`, `not` or `absent`. A rule that uses a removed form fails at load.
+- Breaking: `aegis rule adjudicate` writes `.aegis/adjudications/<rule-id>.jsonl`, and a label counts only after it is merged to the base branch. Ledger `adjudication` rows from 4.3.x stop counting, so until labels are merged almost no rule is promoted.
+- Breaking: promotion, demotion, tier changes and archive-by-misfire need 25 verdicts (`MIN_N`), and no precision number is shown below 25. Calendar days no longer decay a rule; decay counts sessions. `prior`, `pack_prior`, `trigger_rate_per_day` and `expected_triggers_per_day` are inert, and `expiry.*` is accepted and ignored.
+- Breaking: a plain `aegis check` no longer moves tp or fp; `aegis check --full` telemetry records triggers.
+- Tier detection reports lower tiers for rulesets made before this release: an unpinned check source reports C instead of B, Tier A needs `dismiss_stale_reviews_on_push`, the required check must be the Aegis job without a path filter, and a bare `@org` CODEOWNERS owner stops counting for an organization. A missing local signing key no longer downgrades Tier B (it becomes a caveat). `aegis doctor --github` requires only the Aegis job and pins its source. The `doctor` reason says what to set.
+- `Aegis-Exempt-Test` trailers must name the full commit id (short prefixes stop verifying); the signed reason no longer has to repeat the no-test reason word for word; a rejected exemption names its verdict in the `check --ci` report.
+- `--perf` benchmarks the merge-base through an export instead of `git worktree add`, and a base that does not resolve is `unverified`.
+- A bare mention of a PEM header no longer gates; key material is required. Placeholder suppression matches whole words.
 
 ### Fixed
 
@@ -60,6 +72,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `gitsafe.list_files` is documented as returning workspace-relative paths, which it always did.
 - Destructive SQL in a heredoc read by a SQL client (`psql`, `mysql`, `sqlite3` and others) or run by a shell is recorded again, as in 4.2.0.
 - When an approved change is blocked by a failing regression or trailer check, the `check --ci` headline names that check instead of "without approval".
+- `builtin: true` shadowing follows Python scoping, and a call site with no argument information makes `where` unknown instead of a match or a pass.
+- `gitsafe.merge_base` resolves a full commit id once instead of twice, and `checkrun`'s snapshot rerun validates its revision first.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -71,6 +85,12 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Breaking: `aegis_core.insights.add_insight` loses its `host` and `session` keyword arguments.
 - Breaking: the incidental re-exports `aegis_core.regression.UserLayout`, `aegis_core.rule_integrity.UserLayout` and `aegis_core.rule_integrity.Path` are removed; import `UserLayout` from `aegis_core.workspace.layout` and `Path` from `pathlib`.
 - Breaking: `aegis_core.human_gate.workflow_contexts` is removed in favour of `aegis_check_jobs`; `human_gate.verify_test_exemption` and `find_test_exemption` lose their `expected_reason` argument.
+- Breaking: `aegis_core.fitness.decay_factor` is removed and `fitness.compute` loses `half_life_days`.
+- Breaking: `aegis_core.verification.scanners.ingest_sarif` takes a parsed document and drops `base_sarif` and `diff_text`; `build_preset_argv` and `run_preset_scanner` drop `config_path`.
+
+### Corrections
+
+- The 4.3.0 entry's "4 KB line chunking" for the secret scanner never existed: the scanner skipped lines over 4,096 characters until 4.3.4.
 
 ## [4.3.3] - 2026-10-17
 
