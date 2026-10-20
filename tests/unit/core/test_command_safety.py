@@ -513,6 +513,8 @@ PARITY_TABLE = [
     ("ls;\n\n\nls", None, "allow", _SAME),
     ("echo 'a;\n\nrm -rf /'", None, "force_ask", _JOINED),
     ("rm -rf build\n\nls", None, "allow", _SAME),
+    ("ls;\n\n'x", None, "force_ask", _UNPARSEABLE),
+    (";;;;;", None, "allow", _SAME),
     # R-checks-2: abbreviated long options, git clean dry runs
     ("git push --force-w origin feat", "block:git-push-force", "force_ask", _SAME),
     ("git push --force-with origin feat", "block:git-push-force", "force_ask", _SAME),
@@ -536,6 +538,7 @@ PARITY_TABLE = [
     ("git clean -f -- -n .", "block:git-clean-force", "force_ask", _SAME),
     ("git clean -n --no-dry-run -f", "block:git-clean-force", "force_ask", _SAME),
     ("git clean -f --no-d", "block:git-clean-force", "force_ask", _SAME),
+    ("git branch --dele x", None, "force_ask", _NO_RULE),
     ("git push --", None, "allow", _SAME),
     ("git push origin -- feat", None, "allow", _SAME),
     ("git reset -- file.py", None, "allow", _SAME),
@@ -607,6 +610,7 @@ PARITY_TABLE = [
     ("git -c alias.q='push -f' -c alias.p='!git -c alias.q=status q' p", None, "force_ask", _GIT_CONFIG),
     # R-checks-5: dd device paths
     ("dd of=//dev/sda", "block:dd-device", "force_ask", _SAME),
+    ("yes | dd of=/dev/sda", "block:dd-device", "force_ask", _SAME),
     ("dd of=///dev/sda bs=1M", "block:dd-device", "force_ask", _SAME),
     ("dd if=image.iso of=//dev/sdb bs=4M", "block:dd-device", "force_ask", _SAME),
     ("dd of=\"//dev/sda\"", "block:dd-device", "force_ask", _SAME),
