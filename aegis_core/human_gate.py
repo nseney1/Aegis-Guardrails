@@ -988,11 +988,15 @@ def _verify_commit_sig(top: Path, oid: str, base: str, ok_reason: str) -> Approv
     return _no("bad_signature", f"the signature does not verify (git reports {status!r})", oid)
 
 
-def _read_message(top: Path, oid: str) -> Union[str, Approval]:
+def _commit_message(top: Path, oid: str) -> Optional[str]:
     raw = gitsafe.run(["cat-file", "commit", oid], top)
-    if raw.returncode != 0:
+    return raw.stdout.decode("utf-8", "replace").partition("\n\n")[2] if raw.returncode == 0 else None
+
+
+def _read_message(top: Path, oid: str) -> Union[str, Approval]:
+    message = _commit_message(top, oid)
+    if message is None:
         return _no("unresolved", f"cannot read commit {oid}", oid)
-    message = raw.stdout.decode("utf-8", "replace").partition("\n\n")[2]
     if _ACCEPT_LINE.search(message):
         return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
     return message
@@ -1175,7 +1179,10 @@ def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) ->
         verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
         if verdict.valid:
             return verdict
-        if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch"):
+        # unresolved and accept_reserved come before the trailer is read: keep them only for a commit naming the fix
+        if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch") and any(
+            t.lower() == fix_oid.lower() for t, _why in _EXEMPT_TEST_LINE.findall(_commit_message(top, oid) or "")
+        ):
             rejected = verdict
     return rejected
 

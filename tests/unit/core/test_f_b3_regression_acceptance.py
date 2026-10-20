@@ -385,6 +385,40 @@ def test_a_fix_with_no_exemption_at_all_names_no_exemption_code(tmp_path: Path):
 
 
 @needs_git
+@pytest.mark.parametrize("body", [
+    "Aegis-Accept: whatever\n",
+    "Aegis-Accept: x\nAegis-Exempt-Test: " + "a" * 40 + " another fix\n",
+], ids=["accept-only", "accept-beside-another-exemption"])
+def test_an_unrelated_reserved_line_is_not_a_rejected_exemption_of_the_fix(tmp_path: Path, body: str):
+    """Given a test-less fix commit and a later commit whose Aegis-Accept line sits beside no exemption
+    of that fix, When regressions are checked, Then the fix fails without a rejected-exemption code."""
+    repo = make_calc_repo(tmp_path)
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    repo.commit("fix: add fallback ping\n\nAegis-No-Test: trivial constant return")
+    repo.commit("docs: unrelated note\n\n" + body, allow_empty=True)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    item = report.commits[0]
+    assert (item.status, item.reason, item.exemption_code) == ("failed", "no_test_changes", None)
+    assert "rejected" not in report.findings[0].message
+
+
+@needs_git
+@needs_signing
+def test_the_rejected_exemption_reported_is_the_one_that_names_the_fix(tmp_path: Path, keys: Dict[str, Any]):
+    """Given an unsigned exemption naming a test-less fix and a newer unrelated commit with an
+    Aegis-Accept line, When regressions are checked, Then the fix's code is unsigned, not accept_reserved."""
+    repo = make_calc_repo(tmp_path, signer_pub=keys["human_pub"])
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    fix_oid = repo.commit("fix: add fallback ping\n\nAegis-No-Test: trivial constant return")
+    repo.commit(human_gate.exemption_message(fix_oid, "trivial constant return"), allow_empty=True)
+    repo.commit("docs: unrelated note\n\nAegis-Accept: whatever\n", allow_empty=True)
+
+    item = regression.check_ci_regressions(repo.root, "main", "HEAD").commits[0]
+    assert (item.status, item.exemption_code) == ("failed", "unsigned")
+
+
+@needs_git
 @needs_signing
 def test_governance_tree_approval_never_exempts_testless_fix_commit(
     tmp_path: Path, keys: Dict[str, Any]

@@ -847,6 +847,22 @@ def test_find_test_exemption_never_takes_the_fix_commit_as_its_own_approval(tmp_
     assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
     assert fix not in seen
 
+
+@needs_git
+@pytest.mark.parametrize("body", [
+    "Aegis-Accept: whatever\n",
+    "Aegis-Accept: x\nAegis-Exempt-Test: {other} reviewed\n",
+], ids=["accept-only", "accept-beside-another-exemption"])
+def test_a_reserved_line_in_a_commit_that_does_not_name_the_fix_is_no_rejected_exemption_of_it(tmp_path, body):
+    """Given a test-less fix commit and a later commit with an Aegis-Accept line and no exemption naming
+    that fix, When the branch is scanned for the fix's exemption, Then there is none, not a rejected one."""
+    repo = hg.make_repo(tmp_path)
+    other = repo.head()
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit("fix: hotfix app\n\nAegis-No-Test: by hand")
+    repo.commit("docs: unrelated\n\n" + body.format(other=other), allow_empty=True)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+
 @needs_git
 def test_github_json_requires_only_the_scaffold_aegis_job(tmp_path, monkeypatch):
     from aegis_core import scaffolding
