@@ -472,6 +472,17 @@ def test_the_hash_against_a_base_binds_exactly_the_tests_deleted_since_it(tmp_pa
 
 
 @needs_git
+def test_a_version_bump_in_pyproject_moves_the_hash_because_the_whole_blob_is_digested(tmp_path):
+    repo = hg.make_repo(tmp_path)
+    repo.write("pyproject.toml", '[project]\nname = "x"\nversion = "1.0.0"\n')
+    repo.commit("pyproject")
+    before = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.write("pyproject.toml", '[project]\nname = "x"\nversion = "1.0.1"\n')
+    repo.commit("bump")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD") != before
+
+
+@needs_git
 def test_an_unresolvable_base_is_an_error(tmp_path):
     repo = _with_tests(tmp_path)
     with pytest.raises(human_gate.HumanGateError):

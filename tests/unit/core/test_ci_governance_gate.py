@@ -390,3 +390,41 @@ def test_an_unreadable_base_fails_the_check_with_an_error(tmp_path, capsys, monk
     monkeypatch.setattr(gitsafe, "read_blob", unreadable)
     rc, out, err = run_ci(repo, capsys, "--format", "json")
     assert rc == 1 and not out.strip() and err.startswith("Error:")
+
+
+# ── an approval covers whole files, the gate their pytest section (R-trust-a2, option A) ──
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("base_change,needs_again", [
+    ("version", True),
+    ("pytest", True),
+    ("readme", False),
+], ids=["version", "pytest", "readme"])
+def test_an_approval_signed_before_merging_the_base_holds_only_while_the_hashed_files_do(
+        tmp_path, capsys, monkeypatch, keys, base_change, needs_again):
+    """Given a signed base and a branch whose workflow edit carries a valid approval, When the base
+    changes and the branch merges it, Then the approval still holds only if no governance blob
+    changed: a version bump in pyproject.toml is outside the gate's pytest section but inside the
+    hash, so it needs aegis approve again on the merged head."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    edit(repo, ".github/workflows/ci.yml", "# reviewed change\n")
+    repo.commit("workflow change")
+    approve(repo, keys["human"])
+    assert ci_json(repo, capsys)[0] == 0
+    repo.git("checkout", "-q", "main")
+    if base_change == "version":
+        repo.write("pyproject.toml", PYPROJECT.replace('version = "1.0.0"', 'version = "1.1.0"'))
+    elif base_change == "pytest":
+        repo.write("pyproject.toml", PYPROJECT.replace('addopts = "-q"', 'addopts = "-q -x"'))
+    else:
+        repo.write("README.md", "# project\n")
+    repo.commit("base moves on")
+    repo.git("checkout", "-q", "work")
+    repo.git("merge", "-q", "--no-edit", "main")
+    rc, payload = ci_json(repo, capsys)
+    assert payload["governance"]["categories"] == ["workflows"]
+    assert rc == (1 if needs_again else 0), payload
+    if needs_again:
+        assert _aegis_approve(repo, monkeypatch, keys["human"]) == 0
+        assert ci_json(repo, capsys)[0] == 0
