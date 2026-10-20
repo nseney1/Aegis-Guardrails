@@ -322,6 +322,28 @@ def test_the_gh_client_asks_for_exactly_one_commit_and_refuses_a_short_id():
         credit.GhRestClient("octo/proj", runner=runner).runs_for("abc")
 
 
+def test_the_gh_client_reads_the_default_branch_from_the_repository():
+    runner = _runner(0, json.dumps({"full_name": "octo/proj", "default_branch": "trunk"}))
+    assert credit.GhRestClient("octo/proj", runner=runner).default_branch() == "trunk"
+    assert runner.argv == ["api", "repos/octo/proj"]
+    assert credit.GhRestClient(runner=runner).default_branch() == "trunk"
+    assert runner.argv == ["api", "repos/{owner}/{repo}"]  # gh expands it from the clone's origin
+
+
+@pytest.mark.parametrize("runner,needle", [
+    (None, "gh is not installed"), (_runner(1), "exit 1"), (_runner(0, "nope"), "not JSON"),
+    (_runner(0, "[]"), "no usable default_branch"), (_runner(0, "{}"), "no usable default_branch"),
+    (_runner(0, '{"default_branch": ""}'), "no usable default_branch"),
+    (_runner(0, '{"default_branch": 7}'), "no usable default_branch"),
+    (_runner(0, '{"default_branch": "main\\nevil"}'), "no usable default_branch"),
+    (_runner(0, '{"default_branch": "ma in"}'), "no usable default_branch"),
+], ids=["missing", "exit", "not-json", "list", "empty", "blank", "int", "newline", "space"])
+def test_the_default_branch_fails_closed(runner, needle):
+    client = credit.GhRestClient("octo/proj", runner=runner or (lambda argv, cwd=None: None))
+    with pytest.raises(credit.CIUnavailable, match=needle):
+        client.default_branch()
+
+
 # ── trailer and CI falsification ─────────────────────────────────────────────
 
 def test_the_trailer_round_trips_and_rejects_anything_else():
