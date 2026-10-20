@@ -664,16 +664,22 @@ def _same_pytest_view(root: str, merge: str, head: str, path: str) -> bool:
         return False
 
 
-def _governance_paths(root: str, merge: str, head: str) -> Tuple[Tuple[str, str], ...]:
-    """(path, category) for each changed governance path a signed approval must cover. Rule edits
-    are left to the weakening check; pyproject.toml, setup.cfg and tox.ini modified as regular files
-    on both sides count only when their pytest view differs (a missing or unreadable side counts).
-    --no-renames: a moved governance file shows its old name as deleted."""
+def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tuple[str, str], ...]:
+    """(path, category) for each changed governance path a signed approval must cover. Edits to the
+    checked workspace's own rules (``prefix`` + RULES_RELDIR) are left to the weakening check;
+    pyproject.toml, setup.cfg and tox.ini modified as regular files on both sides count only when
+    their pytest view differs (a missing or unreadable side counts). --no-renames: a moved
+    governance file shows its old name as deleted."""
+    own_rules = f"{prefix}{RULES_RELDIR}/"
     found: List[Tuple[str, str]] = []
     for status, old_mode, new_mode, path in gitsafe.diff_entries(root, merge, head):
         gone = status == "D"
         category = governance.category_of(path, deleted=gone)
-        if category in (None, "rules"):
+        if category is None:
+            continue
+        # Exact case: the weakening check reads the tree by this name, while the category is
+        # case-folded (``.AEGIS/rules`` is another workspace's, or a case-insensitive checkout's, rules).
+        if category == "rules" and path.startswith(own_rules):
             continue
         # A symlink's blob is its link text, not the file pytest follows the link to, so any side
         # that is not a regular file (a T status, a link, a gitlink) counts whole.
@@ -734,7 +740,7 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
         return head_files
 
     found += _cap_findings(head_rules, base_rules, files)
-    paths = _governance_paths(root, merge, head_commit)
+    paths = _governance_paths(root, merge, head_commit, prefix)
     order = [name for name, _patterns in governance.CATEGORIES] + [governance.DELETED_TESTS]
     categories = tuple(c for c in order if c in {category for _path, category in paths})
     signers = human_gate.signing_keys_at(root, base_commit) if categories else 0

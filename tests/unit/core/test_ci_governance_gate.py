@@ -80,8 +80,8 @@ def make_repo(tmp_path: Path, signer_pub: Optional[str] = None) -> hg.Repo:
     return repo
 
 
-def run_ci(repo: hg.Repo, capsys, *extra: str) -> Tuple[int, str, str]:
-    os.chdir(repo.root)
+def run_ci(repo: hg.Repo, capsys, *extra: str, where: str = "") -> Tuple[int, str, str]:
+    os.chdir(repo.root / where)
     try:
         rc = main(["check", "--ci", "--base", "main", *extra])
     except SystemExit as exc:
@@ -90,8 +90,8 @@ def run_ci(repo: hg.Repo, capsys, *extra: str) -> Tuple[int, str, str]:
     return rc, captured.out, captured.err
 
 
-def ci_json(repo: hg.Repo, capsys) -> Tuple[int, Dict[str, Any]]:
-    rc, out, err = run_ci(repo, capsys, "--format", "json")
+def ci_json(repo: hg.Repo, capsys, where: str = "") -> Tuple[int, Dict[str, Any]]:
+    rc, out, err = run_ci(repo, capsys, "--format", "json", where=where)
     assert out.strip(), err
     return rc, json.loads(out)
 
@@ -247,6 +247,71 @@ def test_a_rule_edit_that_weakens_nothing_needs_no_approval(tmp_path, capsys, ke
     rc, payload = ci_json(repo, capsys)
     assert rc == 0, payload
     assert payload["weakenings"] == [] and payload["governance"]["categories"] == []
+
+
+# ── only the checked workspace's own rules are left to the weakening check (review finding 4) ──
+
+PKG_RULE = ".aegis/rules/invariants/inv-pkg.md"
+PKG_RULE_TEXT = ("---\nid: inv-pkg\ntype: invariant\nenforcement: gate\nhypothesis: x\n"
+                 "target_paths:\n  - 'src/*.py'\n---\n# Inv\n\nThe body explains why it matters.\n")
+
+
+def _monorepo(tmp_path: Path, keys) -> hg.Repo:
+    """The root workspace of make_repo plus a nested workspace pkg/ with its own gate, on the base."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    _set_base(repo, {"pkg/src/a.py": "x = 1\n", f"pkg/{PKG_RULE}": PKG_RULE_TEXT})
+    return repo
+
+
+@needs_git
+@needs_signing
+def test_deleting_a_nested_workspaces_rule_is_gated_from_the_root(tmp_path, capsys, keys):
+    """Given a root workspace and pkg/ with its own gate on the base, When the branch deletes pkg's gate,
+    Then check --ci from the root (whose weakening check reads only the root's rules) gates the path
+    as governance (rules): it fails without an approval and passes with a signed one."""
+    repo = _monorepo(tmp_path, keys)
+    (repo.root / "pkg" / PKG_RULE).unlink()
+    repo.commit("agent deletes pkg's gate")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and payload["weakenings"] == []
+    assert payload["governance"]["paths"] == [{"path": f"pkg/{PKG_RULE}", "category": "rules"}]
+    assert payload["governance"]["enforced"] is True
+    approve(repo, keys["human"])
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 0 and payload["approval"]["valid"] is True and payload["governance"]["approved"] is True
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("where,deleted,code,paths", [
+    ("pkg", f"pkg/{PKG_RULE}", ["deleted"], []),
+    ("", GATE, ["deleted"], []),
+    ("pkg", GATE, [], [{"path": GATE, "category": "rules"}]),
+], ids=["pkg-own", "root-own", "pkg-sees-root"])
+def test_a_workspaces_own_rule_goes_through_the_weakening_check_only(tmp_path, capsys, keys, where, deleted, code,
+                                                                     paths):
+    """Control: deleting the checked workspace's own gate is a weakening, not a governance path; a
+    rule of another workspace is governance from here."""
+    repo = _monorepo(tmp_path, keys)
+    (repo.root / deleted).unlink()
+    repo.commit("delete a gate")
+    rc, payload = ci_json(repo, capsys, where=where)
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == code
+    assert payload["governance"]["paths"] == paths
+
+
+@needs_git
+@needs_signing
+def test_a_rules_path_that_differs_from_the_workspaces_only_by_case_is_gated(tmp_path, capsys, keys):
+    """Given a case-insensitive checkout, ``.AEGIS/rules/`` lands in ``.aegis/rules/``, but the weakening
+    check reads the tree by its exact name: such a path is governance (fail closed)."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    path = ".AEGIS/rules/gates/gate-no-eval.md"
+    oid = repo.git("hash-object", "-w", "--stdin", stdin=RULE.replace("    - eval\n", "    - exec\n"))
+    repo.git("update-index", "--add", "--cacheinfo", f"100644,{oid},{path}")
+    _commit_index(repo, "case-variant rule")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and payload["governance"]["paths"] == [{"path": path, "category": "rules"}]
 
 
 @needs_git
