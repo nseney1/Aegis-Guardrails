@@ -164,7 +164,10 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
             continue
         if builtin_only:
             spelled = _spellings(target, imported_qual_map, aliases, qualify_heads=True)
-            if not (any(s in (f"builtins.{call}", f"__builtins__.{call}") for s in spelled) or (target == call and call not in imported_qual_map and call not in aliases and call not in defined_names)):
+            shadowed = site.get("shadowed") if isinstance(site, Mapping) else getattr(site, "shadowed", None)
+            if not isinstance(shadowed, bool):  # no driver verdict: the legacy file-wide test
+                shadowed = call in imported_qual_map or call in aliases or call in defined_names
+            if not (any(s in (f"builtins.{call}", f"__builtins__.{call}") for s in spelled) or (target == call and not shadowed)):
                 continue
         verdict = _match_where(site, where) if where else True
         if verdict is not False:
