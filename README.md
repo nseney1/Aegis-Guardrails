@@ -86,6 +86,12 @@ forbid_ast:
 Never call `eval` or `exec` on data. Parse it with `json.loads` or `ast.literal_eval`.
 ```
 
+`aegis check` enforces the **reviewed** rules: a rule is enforced locally once it is in the base (committed, when there is no `origin/HEAD`; on the branch `origin/HEAD` points to, when there is one). Commit `.aegis/` and `AGENTS.md` before you try it; the local ledger in `.aegis/state/` is git-ignored:
+
+```bash
+git add .aegis AGENTS.md && git commit -m "Add Aegis"
+```
+
 An agent that calls `aegis_scan` before editing `app.py` gets this rule (`aegis scan app.py` shows the same thing in a shell). If the change calls `eval` anyway, the check fails, and so does `git commit`, because the pre-commit hook runs the same check on the staged content. With no file arguments, `aegis check` looks only at tracked files: your changes and staged files (on a clean tree, what the branch adds to its base). It skips untracked files, so `git add` a new file first, or name it: `aegis check app.py`.
 
 ```text
@@ -96,7 +102,7 @@ checkpoint: all checks passed
 Layer 1: 1/3 FAILED — forbid_ast:no-eval
 ```
 
-Commit `.aegis/` and `AGENTS.md`; the local ledger in `.aegis/state/` is git-ignored. Run `aegis doctor` to verify your host registrations and enforcement tiers, and add `aegis check` to CI since `git commit --no-verify` skips the local hook:
+Run `aegis doctor` to verify your host registrations and enforcement tiers, and add `aegis check` to CI since `git commit --no-verify` skips the local hook:
 
 ```yaml
 - uses: actions/checkout@v7
@@ -124,7 +130,7 @@ On every host, rules are advisory through the bootstrap and `aegis_scan`, the gi
 
 1. **Bootstrap**: `aegis init` writes a compact bootstrap block into `AGENTS.md` (no rule text) and registers the `aegis` MCP server with your hosts.
 2. **Just-in-time scan**: Before editing, the agent calls `aegis_scan` with the files it will change and receives only matching rules, prioritizing gates and invariants within a token budget.
-3. **Witnessed verification**: The agent edits, runs tests, and reports with `aegis_report_outcome`. `aegis check --record --tests` snapshots the exact git tree so only witnessed passes earn rule credit.
+3. **Witnessed verification**: The agent edits, runs tests, and reports with `aegis_report_outcome`. `aegis check --record --tests` snapshots the exact git tree and runs your tests there, so only witnessed passes earn rule credit.
 4. **Pre-commit & CI enforcement**: `aegis check` runs Layer 1 (deterministic checks and every `forbid_ast` ban) in the pre-commit hook and in CI; `aegis check --full --plan "..." --llm-cmd 'claude -p'` adds an optional cross-vendor model review.
 5. **Evidence-driven promotion**: Outcomes append to a local ledger; `aegis sync` computes rule fitness and suggests promotions for human review.
 
@@ -133,7 +139,7 @@ On every host, rules are advisory through the bootstrap and `aegis_scan`, the gi
 
 - `aegis init` writes a 572-byte bootstrap block into `AGENTS.md`, and the MCP server repeats the same guidance in its `initialize` instructions so editing files cannot strip it.
 - `aegis_scan` returns at most 3 rules by default (gates and invariants first, capped at 2 slots so advisory rules are not starved) within a 2,000-token default budget (`jit.max_tokens` or `AEGIS_MAX_JIT_TOKENS`).
-- An `aegis_report_outcome` call without a matching `aegis check --record` row for that git tree is recorded as `claimed` and earns no rule credit.
+- An `aegis_report_outcome` call without a passing `aegis check --record --tests` row for that git tree is recorded as `claimed` and earns no rule credit; `aegis check --record` without `--tests` checks Layer 1 only and earns none.
 
 </details>
 
@@ -178,7 +184,7 @@ Aegis does not claim enforcement it lacks. `aegis doctor` reports these tiers, i
 | Local floor | git pre-commit runs aegis check --hook (--no-verify bypasses it) | anyone using `git commit --no-verify` |
 | Authoritative | CI runs aegis check on the exact SHA; a human merges | a pull request that also weakens the rules or the CI workflow it is checked with, unless `aegis check --ci` runs as a required check and a person reviews those changes (tier A); a signed `aegis approve` (tier B) holds only while the pull request leaves `.github/workflows/**` and aegis alone. `aegis doctor` prints the trust tier (A, B or C) GitHub actually enforces |
 
-**CI is the floor.** Agent hooks are guardrails, not a security boundary. Plain `aegis check` enforces the rules in the pull request itself, so a pull request that deletes a rule and breaks it passes it. Run `aegis check --ci` as a required pull-request check: it compares gates and invariants against the base branch and passes a governance weakening only with a signed `aegis approve` commit (at tier B that holds only while the pull request leaves `.github/workflows/**` and aegis alone), while `aegis_scan` serves mandatory rules from the reviewed base commit.
+**CI is the floor.** Agent hooks are guardrails, not a security boundary. Plain `aegis check` enforces the **reviewed** rules, not the rules in the pull request itself: a rule is enforced locally once it is in the base (committed, when there is no `origin/HEAD`), so a pull request that deletes a rule and breaks it now fails plain `check` too. Where `origin/HEAD` does not resolve, as in a checkout that does not set it, the base is the checked-out commit itself. Run `aegis check --ci` as a required pull-request check: it compares gates and invariants against the base branch and passes a governance weakening only with a signed `aegis approve` commit (at tier B that holds only while the pull request leaves `.github/workflows/**` and aegis alone), while `aegis_scan` serves mandatory rules from the reviewed base commit.
 
 <details>
 <summary>Trust Tiers (A/B/C) & Solo SSH Signing Ceremony (allowed_signers)</summary>
