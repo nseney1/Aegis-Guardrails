@@ -67,8 +67,15 @@ def _site_args(site: Any) -> Dict[str, Any]:
     return dict(raw) if isinstance(raw, Mapping) else {}
 
 
-def _match_where(site: Any, where: Mapping[str, Any]) -> Optional[bool]:
+def _driver_extracts_args(normalized_ast: Any) -> bool:
+    # Only the Python driver records call arguments; elsewhere an empty map means "not extracted".
+    return str(getattr(normalized_ast, "language", "") or "").lower() == "python"
+
+
+def _match_where(site: Any, where: Mapping[str, Any], args_known: bool = True) -> Optional[bool]:
     args = _site_args(site)
+    if not args and not args_known:
+        return None
     has_splat = "*" in args or "**" in args
     res: Optional[bool] = True
     for raw_key, cond in where.items():
@@ -144,7 +151,7 @@ def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
     return any(s == mod or s.startswith(f"{mod}.") or (src and (f"{src}.{s}" == mod or f"{src}.{s}".startswith(f"{mod}."))) for s in syms)
 
 
-def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str]) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
+def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str], args_known: bool = True) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
     if isinstance(raw_call, str):
         call = _normalize_ast_token(raw_call)
         where = None
@@ -169,7 +176,7 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
                 shadowed = call in imported_qual_map or call in aliases or call in defined_names
             if not (any(s in (f"builtins.{call}", f"__builtins__.{call}") for s in spelled) or (target == call and not shadowed)):
                 continue
-        verdict = _match_where(site, where) if where else True
+        verdict = _match_where(site, where, args_known) if where else True
         if verdict is not False:
             hits.append((site, verdict))
     return call, hits
@@ -218,7 +225,7 @@ def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[s
     call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
     defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
+        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
         if call:
             _record_hits([s for s, v in hits if v is True], "calls", call, "call")
 
@@ -286,7 +293,7 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     confirmed: list[dict[str, Any]] = []
     unverified: list[dict[str, Any]] = []
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names)
+        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
         for site, verdict in hits:
             ln = _line_of(site)
             if _allow_reason_for_line(allows, ln, rule_id) is not None:
