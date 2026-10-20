@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 import re
 from typing import Any, Optional, Tuple
@@ -21,9 +22,17 @@ __all__ = [
 ]
 
 
+def _on_windows() -> bool:
+    return os.name == "nt"  # where ":" makes a drive-relative name ("D:x") or a stream
+
+
+def _escapes(rule_id: str) -> bool:
+    return "/" in rule_id or "\\" in rule_id or ".." in rule_id or (_on_windows() and ":" in rule_id)
+
+
 def sanitize_rule_id(rule_id: str) -> Optional[str]:
     """A rule id with no path separator or "..", without a trailing .md (None if invalid)."""
-    if not rule_id or "/" in rule_id or "\\" in rule_id or ".." in rule_id:
+    if not rule_id or _escapes(rule_id):
         return None
     cleaned = rule_id.strip()
     if cleaned.endswith(".md"):
@@ -35,7 +44,7 @@ def validate_rule_id(rule_id: str | None) -> None:
     """Raise ValueError for a rule id that could escape its directory."""
     if not rule_id:
         return
-    if "/" in rule_id or "\\" in rule_id or ".." in rule_id:
+    if _escapes(rule_id):
         raise ValueError(f"Invalid ID_OVERRIDE contains path traversal characters: {rule_id!r}")
 
 

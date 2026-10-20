@@ -14,9 +14,9 @@ UNVERIFIED and the exit code is not zero. Exit 0 from gh is necessary, never suf
 JSON it prints is re-checked field by field.
 
 Whatever is verified, an attestation proves "this workflow, at this commit, said so". The release
-claim needs trust tier A or B (``aegis_core.human_gate``): at tier C the workflow file is
-editable by the agent, so the report says "attestation present, but the workflow is
-agent-editable" and the exit code is not zero.
+claim needs trust tier A (``aegis_core.human_gate``): at tier C the workflow file is editable by
+the agent, and at tier B a pull request runs its own workflow and aegis, so both report
+"attestation present, but the workflow is agent-editable" and the exit code is not zero.
 """
 from __future__ import annotations
 
@@ -331,9 +331,10 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
                              repository=repository, gh_version=shown, details=pins)
     signed = f"signed by {pins['signer_workflow']} at {commit[:12]} on {eff_ref}"
     tier = _tier(top, tier_runner)
-    if tier not in ("A", "B"):
-        # Spec T2 precondition and the SECURITY.md truth table: at tier C the agent can edit the
-        # workflow that signed, so the release claim is not established; the attestation is reported.
+    if tier != "A":
+        # The SECURITY.md truth table: at tier C the agent can edit the workflow that signed, and at
+        # tier B a pull request runs its own workflow, so the claim is not established; the
+        # attestation is reported.
         return ReleaseReport(commit, False, "agent_editable", signed, tier=tier or "C", caveats=(TIER_C_CAVEAT,),
                              repository=repository, gh_version=shown, details=pins, attested=True)
     return ReleaseReport(commit, True, "verified", signed, tier=tier, repository=repository, gh_version=shown,

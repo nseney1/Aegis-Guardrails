@@ -48,9 +48,7 @@ def main(argv: Sequence[str]) -> int:
         root = gitsafe.toplevel(Path.cwd())
         line = trailer_for_staged(root) if root is not None else None
         if line is not None:
-            key, _, value = line.partition(": ")
-            gitsafe.run(["interpret-trailers", "--in-place", "--if-exists", "replace", "--trailer",
-                         f"{key}: {value}", argv[0]], root)
+            gitsafe.add_trailer(argv[0], line)
     except Exception as exc:  # a commit is never blocked by bookkeeping
         print(f"aegis prepare-commit-msg: {exc}", file=sys.stderr)
     return 0
