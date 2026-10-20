@@ -196,7 +196,7 @@ def _approve_test_exemption(root: Path, base: Optional[str], exempt_commit: str,
         commit = human_gate.signed_empty_commit(top, human_gate.exemption_message(fix_commit, clean_reason))
     except human_gate.HumanGateError as exc:
         raise _Refused("sign_failed", str(exc)) from exc
-    verdict = human_gate.verify_test_exemption(top, commit, fix_commit, base_ref, expected_reason=clean_reason)
+    verdict = human_gate.verify_test_exemption(top, commit, fix_commit, base_ref)
     return {"commit": commit, "exempt_commit": fix_commit, "reason": clean_reason, "base": base_ref,
             "verified": verdict.valid, "verification": {"code": verdict.code, "reason": verdict.reason},
             "key_custody": custody.status, "warnings": warnings}
@@ -257,7 +257,7 @@ class ApproveCommand(AegisCommand):
         parser.add_argument("--exempt-test", metavar="COMMIT", default=None,
                             help="Sign a test exemption (Aegis-Exempt-Test) for a specific fix commit")
         parser.add_argument("--reason", metavar="TEXT", default=None,
-                            help="Explanation for --exempt-test (must match the fix commit's Aegis-No-Test reason)")
+                            help="Explanation for --exempt-test (signed into the commit)")
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_approve(args)

@@ -139,3 +139,34 @@ def test_ci_json_reports_exempted_fix_and_passing_status(
     assert reg["exempted_count"] == 1
     assert reg["exemption_rate"] == 1.0
     assert reg["prune_box_exceeded"] is True
+
+
+@needs_git
+@needs_signing
+def test_a_rejected_exemption_shows_its_code_and_approve_agrees_with_ci(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    """Given an exemption signed by a key that is not in the base allowed_signers, When aegis approve
+    --exempt-test signs it and check --ci runs, Then both name untrusted_signature, and CI fails the
+    fix commit with that code instead of only no_test_changes."""
+    from aegis_cli import approve
+
+    _human, human_pub = hg.keygen(tmp_path / "keys", "human")
+    intruder, _pub = hg.keygen(tmp_path / "keys", "intruder")
+    repo = make_repo(tmp_path, signer_pub=human_pub)
+    repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
+    fix_oid = repo.commit("fix: hotfix without test\n\nAegis-No-Test: verified manually")
+    repo.home.sign_with(str(intruder))
+    monkeypatch.setattr(approve, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    os.chdir(repo.root)
+    assert main(["approve", "--base", "main", "--exempt-test", fix_oid, "--reason", "reviewed by hand", "--json"]) == 0
+    signed = json.loads(capsys.readouterr().out)
+    assert (signed["verified"], signed["verification"]["code"]) == (False, "untrusted_signature")
+
+    _rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    (commit,) = json.loads(out)["regression"]["commits"]
+    assert (commit["status"], commit["reason"]) == ("failed", "no_test_changes")
+    assert commit["exemption_code"] == "untrusted_signature"
+    _rc, out, _err = run_ci(repo, capsys)
+    assert "no_test_changes" in out and "untrusted_signature" in out

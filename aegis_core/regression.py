@@ -1,7 +1,7 @@
 """Regression discipline: git is the registry (v4.3 spec §3 T5)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -178,6 +178,7 @@ class CommitRegression:
     no_test_reason: Optional[str] = None
     exempted: bool = False
     approval: Optional[Any] = None
+    exemption_code: Optional[str] = None
 
     @property
     def passed(self) -> bool:
@@ -199,6 +200,7 @@ class CommitRegression:
             "no_test_reason": self.no_test_reason,
             "exempted": self.exempted,
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
+            "exemption_code": self.exemption_code,
         }
 
 
@@ -437,12 +439,13 @@ def _cached_tree(root: str, c_oid: str, tree_cache: Dict[str, Dict[str, Tuple[st
     return tree_cache[c_oid]
 
 
-def _resolve_commit_exemption(root: str, head_commit: str, base_commit: str, meta: _CommitMeta) -> Optional[human_gate.Approval]:
+def _resolve_commit_exemption(root: str, head_commit: str, base_commit: str, meta: _CommitMeta) -> Tuple[Optional[human_gate.Approval], Optional[str]]:
+    """(the valid exemption, None), or (None, the code of a rejected one naming this commit)."""
     try:
-        found = human_gate.find_test_exemption(root, head_commit, base_commit, meta.oid, expected_reason=meta.no_test_reason)
-        return found if (found is not None and found.valid) else None
+        found = human_gate.find_test_exemption(root, head_commit, base_commit, meta.oid)
     except (human_gate.HumanGateError, gitsafe.GitError):
-        return None
+        return None, None
+    return (found, None) if found is None or found.valid else (None, found.code)
 
 
 def _run_fail_to_pass_snapshots(
@@ -565,12 +568,10 @@ def _evaluate_fix_commit(
     source_files = tuple(p for p in meta.changed_files if is_source_file(p))
     test_files = tuple(p for p in meta.present_files if is_python_test_file(p))
     primary_path = test_files[0] if test_files else (source_files[0] if source_files else "")
-    approval = _resolve_commit_exemption(root, head_commit, base_commit, meta)
-    nt_note = (
-        f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
-        if meta.no_test_reason
-        else ""
-    )
+    approval, rejected = _resolve_commit_exemption(root, head_commit, base_commit, meta)
+    nt_note = f" (its test exemption was rejected: {rejected})" if rejected else ""
+    if meta.no_test_reason:
+        nt_note += f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
 
     if not test_files:
         if approval is not None and approval.valid:
@@ -585,13 +586,14 @@ def _evaluate_fix_commit(
         return (
             CommitRegression(
                 meta.oid, meta.subject, "failed", "no_test_changes", False, False,
-                (), source_files, test_files, meta.fixes, meta.no_test_reason, False, None,
+                (), source_files, test_files, meta.fixes, meta.no_test_reason, False, None, rejected,
             ),
             RegressionFinding("no_test_changes", meta.oid, primary_path, msg, meta.no_test_reason),
         )
 
     base_run, head_run = _run_fail_to_pass_snapshots(root, workspace, meta, merge_commit, test_files, tree_cache, timeout)
-    return _classify_regression_outcome(meta, source_files, test_files, primary_path, base_run, head_run, approval, nt_note)
+    res, finding = _classify_regression_outcome(meta, source_files, test_files, primary_path, base_run, head_run, approval, nt_note)
+    return (replace(res, exemption_code=rejected) if res.status == "failed" else res), finding
 
 
 def check_ci_regressions(

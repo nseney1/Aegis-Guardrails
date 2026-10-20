@@ -735,11 +735,91 @@ def test_approve_exempt_test_signs_and_verifies_commit_scoped_exemption(tmp_path
     repo.home.sign_with(str(keys["human"]))
     rc_missing, _out_m, err_m = _approve(repo, monkeypatch, exempt_test=fix_oid, reason=None)
     assert rc_missing == 2 and "--reason" in err_m
-    rc, out, err = _approve(repo, monkeypatch, exempt_test=fix_oid, reason="verified manually")
+    rc, out, err = _approve(repo, monkeypatch, exempt_test=fix_oid, reason="checked by hand, no test possible")
     assert rc == 0, out + err
     assert fix_oid in out
-    verdict = human_gate.verify_test_exemption(repo.root, "HEAD", fix_oid, "main", expected_reason="verified manually")
-    assert verdict.valid, verdict
+    verdict = human_gate.verify_test_exemption(repo.root, "HEAD", fix_oid, "main")
+    assert verdict.valid and "checked by hand" in verdict.reason, verdict
+
+
+def test_approve_reason_help_says_it_is_signed_not_matched(capsys):
+    from aegis_cli import cli
+    with pytest.raises(SystemExit):
+        cli.main(["approve", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "signed into the commit" in out and "must match" not in out
+
+
+def _two_commits_sharing_a_prefix(repo: hg.Repo, width: int = 7) -> tuple:
+    """Two commit objects whose ids share their first ``width`` hex digits (a birthday search)."""
+    import hashlib
+    if repo.git("rev-parse", "--show-object-format") != "sha1":
+        pytest.skip("the prefix search builds SHA-1 commit ids")
+    tree, parent = repo.git("rev-parse", "HEAD^{tree}"), repo.head()
+    seen: dict = {}
+    for nonce in range(1 << 21):
+        body = (f"tree {tree}\nparent {parent}\nauthor A <a@example.com> 1700000000 +0000\n"
+                f"committer A <a@example.com> 1700000000 +0000\n\nfix: attempt {nonce}\n").encode()
+        oid = hashlib.sha1(b"commit %d\0" % len(body) + body).hexdigest()
+        first = seen.setdefault(oid[:width], body)
+        if first is not body:
+            return tuple(repo.git("hash-object", "-t", "commit", "-w", "--stdin", stdin=b.decode()) for b in (first, body))
+    pytest.skip("no shared prefix found")
+
+
+@needs_signing
+def test_a_short_prefix_exemption_names_no_commit_not_even_one_ground_to_share_it(tmp_path, keys):
+    """Given two commits whose ids share their first 7 hex digits and a signed exemption naming only
+    that prefix, When either is checked as the fix commit, Then neither is exempted; the full id
+    exempts exactly the commit it names."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    intended, ground = _two_commits_sharing_a_prefix(repo)
+    assert intended != ground and intended[:7] == ground[:7]
+    short = repo.commit(f"chore: approve\n\nAegis-Exempt-Test: {intended[:7]} reviewed by hand\n",
+                        sign_key=keys["human"], allow_empty=True)
+    for fix in (intended, ground):
+        verdict = human_gate.verify_test_exemption(repo.root, short, fix, "main")
+        assert not verdict.valid and verdict.code in ("no_exemption_trailer", "commit_mismatch"), verdict
+    full = repo.commit(human_gate.exemption_message(intended, "reviewed by hand"), sign_key=keys["human"], allow_empty=True)
+    assert human_gate.verify_test_exemption(repo.root, full, intended, "main").valid
+    assert human_gate.verify_test_exemption(repo.root, full, ground, "main").code == "commit_mismatch"
+
+
+@needs_signing
+@pytest.mark.parametrize("body, code", [
+    ("Aegis-Exempt-Test: {other} reviewed\n", "commit_mismatch"),
+    ("Aegis-Exempt-Test: {fix} reviewed\nAegis-Exempt-Test: {fix} again\n", "multiple_trailers"),
+    ("Aegis-Accept: x\nAegis-Exempt-Test: {fix} reviewed\n", "accept_reserved"),
+], ids=["other", "two", "accept"])
+def test_a_signed_exemption_for_another_commit_twice_or_beside_a_reserved_line_is_refused(tmp_path, keys, body, code):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    other = repo.head()
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit("fix: hotfix app\n\nAegis-No-Test: by hand")
+    approval = repo.commit("chore: approve\n\n" + body.format(fix=fix, other=other), sign_key=keys["human"],
+                           allow_empty=True)
+    verdict = human_gate.verify_test_exemption(repo.root, approval, fix, "main")
+    assert (verdict.valid, verdict.code) == (False, code)
+
+
+@needs_signing
+def test_find_test_exemption_never_takes_the_fix_commit_as_its_own_approval(tmp_path, monkeypatch, keys):
+    """Given a signed fix commit on the branch that carries an Aegis-Exempt-Test line, When the branch
+    is scanned for its exemption, Then no verdict computed or returned is for the fix commit itself."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit(f"fix: hotfix app\n\nAegis-Exempt-Test: {repo.head()} self\n", sign_key=keys["human"])
+    seen = []
+    real = human_gate.verify_test_exemption
+
+    def spy(*args, **kw):
+        verdict = real(*args, **kw)
+        seen.append(verdict.commit)
+        return verdict
+
+    monkeypatch.setattr(human_gate, "verify_test_exemption", spy)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    assert fix not in seen
 
 def test_repo_workflow_contexts_returns_aggregate_aegis_check():
     root = Path(__file__).resolve().parents[3]
