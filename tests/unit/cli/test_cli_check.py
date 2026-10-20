@@ -33,6 +33,9 @@ FAKE_LLM = textwrap.dedent(
     if mode == "fail":
         sys.stderr.write("quota exceeded\\n")
         sys.exit(7)
+    if mode == "hostile-fail":
+        sys.stderr.write("quota\\x1b]0;pwned\\x07 exceeded\\x1b[2K\\x9b31m\\x7f\\n")
+        sys.exit(7)
     if mode == "dump":
         with open(sys.argv[2], "a", encoding="utf-8") as out:
             out.write(prompt)
@@ -506,6 +509,15 @@ class TestLayer2:
         argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("fail"), "--plan", "Add compute", "clean.py"]
         assert _exit_code(argv) == 1
         assert "Layer 2 failed: LLM command exited 7: quota exceeded" in capsys.readouterr().err
+
+    def test_a_failing_model_commands_stderr_prints_as_one_sanitized_line(self, ws, capsys, llm):
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("hostile-fail"), "--plan", "p", "clean.py"]
+        assert _exit_code(argv) == 1
+        err = capsys.readouterr().err
+        assert "Layer 2 failed: LLM command exited 7: quota" in err
+        assert "exceeded" in err
+        assert not [c for c in err if c != "\n" and unicodedata.category(c) == "Cc"]
 
     def test_full_without_a_plan_exits_2(self, ws, capsys, llm):
         (ws / "clean.py").write_text(CLEAN, encoding="utf-8")

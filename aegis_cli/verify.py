@@ -814,7 +814,7 @@ def run_verify(args: argparse.Namespace) -> int:
         test_names, test_results = discover_test_evidence(target_files, repo_root)
     except Exception as e:
         # A command that cannot run is not evidence about the rules: nothing is recorded.
-        print(f"Error: Test discovery and execution failed: {e}", file=sys.stderr)
+        print(f"Error: Test discovery and execution failed: {_shown(str(e), 300)}", file=sys.stderr)
         return 1
 
     try:
@@ -828,7 +828,7 @@ def run_verify(args: argparse.Namespace) -> int:
             layer1_evidence=results,
         )
     except Exception as e:
-        print(f"Error: Layer 2 failed: {e}", file=sys.stderr)
+        print(f"Error: Layer 2 failed: {_shown(str(e), 300)}", file=sys.stderr)  # model stderr is untrusted
         return 1
 
     # T6 is log-only: the Layer 2 verdict is meta text, never the exit status or a rule outcome.

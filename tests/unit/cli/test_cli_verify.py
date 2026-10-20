@@ -251,11 +251,13 @@ class TestVerifyLayer2Execution:
         monkeypatch.setattr("aegis_core.outcomes.telemetry.record_verification_telemetry", lambda **kw: calls.append(kw))
 
         def boom(*_args, **_kwargs):
-            raise RuntimeError("discovery broke")
+            raise RuntimeError("discovery\x1b[2K broke")  # test output is repository content
 
         monkeypatch.setattr(verify, "discover_test_evidence", boom)
         assert verify.run_verify(self._layer2_args(tmp_path, "import sys\nsys.stdin.read()\nprint('[]')\n")) == 1
-        assert "Test discovery and execution failed" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "Test discovery and execution failed: discovery broke" in err
+        assert "\x1b" not in err
         assert calls == []
 
 class TestResolveTargetFilesFallbacks:
