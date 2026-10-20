@@ -490,6 +490,34 @@ def test_a_mode_change_between_regular_files_is_still_compared_by_section(tmp_pa
 
 @needs_git
 @needs_signing
+@pytest.mark.parametrize("text", [
+    'tool = { "py\\u0074est" = { ini_options = { addopts = "-k nothing_matches" } } }\n[project]\nname = "sub"\n',
+    '[project]\nname = "sub"\n\n[tool."py\\U00000074est".ini_options]\naddopts = "-k nothing_matches"\n',
+], ids=["escaped-inline", "escaped-header"])
+def test_pytest_configuration_behind_an_escaped_key_is_gated(tmp_path, capsys, keys, text):
+    """Given sub/pyproject.toml with no pytest section at the base, When the branch adds one through a
+    TOML key spelled with an escape (pytest decodes it to tool.pytest), Then the path needs the approval."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    repo.write("sub/pyproject.toml", text)
+    repo.commit("agent")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and payload["governance"]["paths"] == [{"path": "sub/pyproject.toml", "category": "test-infra"}]
+
+
+@needs_git
+@needs_signing
+def test_an_unrelated_tool_table_edit_is_not_gated(tmp_path, capsys, keys):
+    repo = make_repo(tmp_path, keys["human_pub"])
+    _set_base(repo, {"pyproject.toml": PYPROJECT + '\n[tool.ruff]\nline-length = 100\n'})
+    repo.write("pyproject.toml", PYPROJECT + '\n[tool.ruff]\nline-length = 120\n')
+    repo.write("sub/pyproject.toml", '[project]\nname = "sub"\n\n[tool."ruff"]\nline-length = 120\n')
+    repo.commit("ruff settings")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 0 and payload["governance"]["categories"] == []
+
+
+@needs_git
+@needs_signing
 def test_an_unreadable_base_fails_the_check_with_an_error(tmp_path, capsys, monkeypatch, keys):
     repo = make_repo(tmp_path, keys["human_pub"])
     repo.write("pyproject.toml", PYPROJECT.replace('version = "1.0.0"', 'version = "1.0.1"'))

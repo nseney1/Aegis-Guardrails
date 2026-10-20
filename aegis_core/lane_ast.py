@@ -24,7 +24,6 @@ from __future__ import annotations
 import ast
 import configparser
 import hashlib
-import json
 import re
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -592,7 +591,9 @@ def pytest_config_view(filename: str, data: bytes) -> Optional[Dict[str, str]]:
             full = key if is_table else table + key
             if is_table:
                 table = key
-            if full[:len(root)] == root or (full == ("tool",) and value.startswith("{") and "pytest" in value):
+            # A header counts from tool.pytest down; a value also above it (``tool = {...}``),
+            # whatever the inline table's keys look like.
+            if _key_may_be(full, root) if is_table else _keys_may_meet(full, root):
                 name = f"[{'.'.join(full)}]" if is_table else ".".join(full)
                 # A key or array-table header seen twice keeps both, so neither copy can change unseen.
                 found[name] = value if name not in found else f"{found[name]}\0{value}"
@@ -620,6 +621,22 @@ _PYTEST_TOML_TABLES = (("pytest",),)
 _TOML_BARE = re.compile(r"[A-Za-z0-9_-]+")
 
 
+class _EscapedKey(str):
+    """A quoted TOML key part spelled with a backslash escape, kept as written. What it decodes
+    to is not trusted (TOML and JSON differ on ``\\U``, ``\\x``, ``\\e`` and ``\\/``), so it may
+    stand for any name: ``"py\\u0074est"`` is ``pytest`` to pytest."""
+
+
+def _keys_may_meet(key: Tuple[str, ...], names: Tuple[str, ...]) -> bool:
+    """Whether ``key`` may name ``names``, a table above it or a key below it."""
+    return all(isinstance(part, _EscapedKey) or part == name for part, name in zip(key, names))
+
+
+def _key_may_be(key: Tuple[str, ...], names: Tuple[str, ...]) -> bool:
+    """Whether ``key`` may name ``names`` or a key below it."""
+    return len(key) >= len(names) and _keys_may_meet(key, names)
+
+
 def _toml_settings(text: str, tables: Tuple[Tuple[str, ...], ...], always: bool) -> Optional[Dict[str, str]]:
     root = tables[-1]
     holders = {watched[:i] for watched in tables for i in range(1, len(watched) + 1)}
@@ -629,16 +646,17 @@ def _toml_settings(text: str, tables: Tuple[Tuple[str, ...], ...], always: bool)
     for is_table, key, value in _toml_statements(text):
         if is_table:
             table = key
-            present = present or key[:len(root)] == root
+            present = present or _key_may_be(key, root)
             continue
         full = table + key
-        present = present or full[:len(root)] == root
+        present = present or _key_may_be(full, root)
         for watched in tables:
-            if full[:-1] == watched and full[-1] in COLLECTION_KEYS:
+            if (len(full) == len(watched) + 1 and _keys_may_meet(full, watched)
+                    and (full[-1] in COLLECTION_KEYS or isinstance(full[-1], _EscapedKey))):
                 found[f"[{'.'.join(watched)}] {full[-1]}"] = value
-        # An inline table that holds the pytest tables: kept whole, so any change counts.
-        # Above the root (``tool = {...}``) it counts only when it mentions pytest.
-        if full in holders and value.startswith("{") and (len(full) >= len(root) or "pytest" in value):
+        # An inline table that holds the pytest tables: kept whole, so any change counts. Above the
+        # root (``tool = {...}``) too, whatever it mentions: its keys may be escaped.
+        if value.startswith("{") and any(len(full) == len(h) and _keys_may_meet(full, h) for h in holders):
             present = True
             found[f"{'.'.join(full)} (inline table)"] = value
     return found if present else None
@@ -701,10 +719,7 @@ def _toml_key(text: str, i: int, stop: str) -> Tuple[Tuple[str, ...], int]:
         if i < len(text) and text[i] in "\"'":
             end = _toml_string_end(text, i)
             raw = text[i:end]
-            try:
-                parts.append(json.loads(raw) if raw[0] == '"' else raw[1:-1])
-            except ValueError:
-                parts.append(raw[1:-1])
+            parts.append(_EscapedKey(raw) if raw[0] == '"' and "\\" in raw else raw[1:-1])
             i = end
         else:
             bare = _TOML_BARE.match(text, i)

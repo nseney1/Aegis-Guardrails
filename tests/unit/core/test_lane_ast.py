@@ -266,6 +266,49 @@ class TestPytestConfigView:
         with pytest.raises(ValueError):
             lane_ast.pytest_config_view(filename, data)
 
+    # TOML spells a key with escapes too: each of these is tool.pytest.ini_options.addopts to pytest.
+    SPELLED = [
+        b'tool = { "py\\u0074est" = { ini_options = { addopts = "-k nothing_matches" } } }\n[project]\nname = "x"\n',
+        b'[tool."py\\U00000074est".ini_options]\naddopts = "-k nothing_matches"\n',
+        b'[tool]\n"py\\u0074est".ini_options.addopts = "-k nothing_matches"\n',
+        b'"t\\u006fol".pytest.ini_options.addopts = "-k nothing_matches"\n',
+        b'"tool"."pytest".ini_options.addopts = "-k nothing_matches"\n',
+        b'tool."pytest" = { ini_options = { addopts = "-k nothing_matches" } }\n',
+    ]
+    SPELLED_IDS = ["escaped-inline", "escaped-header", "escaped-dotted", "escaped-tool", "quoted", "quoted-inline"]
+
+    @pytest.mark.parametrize("data", SPELLED, ids=SPELLED_IDS)
+    def test_a_key_spelled_with_quotes_or_escapes_counts(self, data):
+        """Given a pyproject.toml whose only pytest configuration is reached through a quoted or escaped
+        key, When its view is taken, Then it is not None (an escape may decode to any name, so it counts)."""
+        assert lane_ast.pytest_config_view("pyproject.toml", data) is not None
+        assert lane_ast.pytest_config_view("pyproject.toml", data) != lane_ast.pytest_config_view(
+            "pyproject.toml", data.replace(b"nothing_matches", b"other"))
+
+    def test_any_root_inline_tool_table_counts(self):
+        """Fail closed: a root ``tool = {...}`` can hold pytest's table however its keys are spelled."""
+        data = b'tool = { ruff = { line-length = 100 } }\n'
+        assert lane_ast.pytest_config_view("pyproject.toml", data) is not None
+
+    @pytest.mark.parametrize("before,after", [
+        (b'[tool.ruff]\nline-length = 100\n', b'[tool.ruff]\nline-length = 120\n'),
+        (b'[tool.ruff]\nline-length = 100\n[tool.pytest.ini_options]\naddopts = "-q"\n',
+         b'[tool.ruff]\nline-length = 120\n[tool.pytest.ini_options]\naddopts = "-q"\n'),
+        (b'[tool]\nruff.line-length = 100\n', b'[tool]\nruff.line-length = 120\n'),
+        (b'[tool."ruff"]\nline-length = 100\n', b'[tool."ruff"]\nline-length = 120\n'),
+    ], ids=["ruff", "ruff-beside-pytest", "dotted", "quoted"])
+    def test_an_unrelated_tool_table_edit_leaves_the_view_alone(self, before, after):
+        assert lane_ast.pytest_config_view("pyproject.toml", before) == lane_ast.pytest_config_view(
+            "pyproject.toml", after)
+
+    @pytest.mark.parametrize("data", SPELLED, ids=SPELLED_IDS)
+    def test_pytest_settings_sees_the_same_spellings(self, data):
+        assert lane_ast.pytest_settings("pyproject.toml", data) is not None
+
+    def test_pytest_settings_reads_an_escaped_header_as_the_ini_options_table(self):
+        data = b'[tool."py\\U00000074est".ini_options]\naddopts = "-x"\n'
+        assert lane_ast.pytest_settings("pyproject.toml", data) == {"[tool.pytest.ini_options] addopts": '"-x"'}
+
     def test_it_parses_without_tomllib(self, monkeypatch):
         import sys
 
