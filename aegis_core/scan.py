@@ -122,10 +122,7 @@ class _Match:
     fitness: Fitness
 
 
-def _match(rule: Rule, files: List[str], fitness: Fitness) -> Optional[_Match]:
-    matched = tuple(rule.matching_files(files))
-    if not matched:
-        return None
+def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
     exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
     return _Match(rule, matched, exact, fitness)
 
@@ -357,6 +354,18 @@ def _integrity_extras(view: "rule_integrity.Effective") -> Dict[str, Any]:
     return extras
 
 
+def _trim_unreviewed(extras: Dict[str, Any]) -> bool:
+    """Drop the last listed unreviewed rule (branch-local text, bounded by the budget like the rest),
+    keeping the true count; False when none is listed."""
+    listed = extras.pop("unreviewed_rules", None)
+    if not listed:
+        return False
+    extras.setdefault("unreviewed_total", len(listed))
+    if len(listed) > 1:
+        extras["unreviewed_rules"] = listed[:-1]
+    return True
+
+
 def scan_user_layer(
     changed_files: Optional[List[str]] = None,
     budget: Optional[int] = None,
@@ -438,14 +447,19 @@ def _select(
         "estimated_tokens": 0,
         "max_tokens_budget": token_budget,
     }
+    extras = dict(extras or {})
     if not files:
-        payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
-        payload["guidance"] = NO_CHANGES_TEXT
-        payload["stats"]["estimated_tokens"] = _tokens(payload)
-        return payload
+        while True:
+            payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
+            payload["guidance"] = NO_CHANGES_TEXT
+            payload["stats"]["estimated_tokens"] = _tokens(payload)
+            if payload["stats"]["estimated_tokens"] <= token_budget or not _trim_unreviewed(extras):
+                return payload
 
-    fits = fitness_of(served)
-    matches = [m for m in (_match(r, files, fits[r.id]) for r in served) if m is not None]
+    # Fitness reads the ledger and projects credit: only for rules that matched, and only if any did.
+    hits = [(r, f) for r, f in ((r, tuple(r.matching_files(files))) for r in served) if f]
+    fits = fitness_of([r for r, _f in hits]) if hits else {}
+    matches = [_match(r, f, fits[r.id]) for r, f in hits]
     stats["matched"] = len(matches)
     mandatory = _rank([m for m in matches if m.rule.mandatory], mandatory=True)
     advisory = _rank([m for m in matches if not m.rule.mandatory], mandatory=False)
@@ -492,6 +506,8 @@ def _select(
             break
         if shown:
             shown -= 1  # names go before rules do
+        elif _trim_unreviewed(extras):
+            pass  # then the unreviewed list, last entry first
         elif staged:
             entry = staged.pop()
             clamped.insert(0, entry)

@@ -91,32 +91,44 @@ def _forbid_ast_spec_error(spec: object) -> Optional[str]:
 def _discover_forbid_ast_rules(
     repo_root: str,
 ) -> tuple[list[tuple[Any, dict]], list[tuple[str, str]]]:
-    """The workspace rules (aegis_core.rules, .aegis/rules/<type>/) that declare forbid_ast.
+    """The workspace rules (aegis_core.rules, .aegis/rules/<type>/) that declare forbid_ast, as
+    enforced: the reviewed BASE versions (aegis_core.rule_integrity.effective), so a branch can
+    neither weaken a gate nor gate on a rule nobody reviewed; outside git, the working tree.
 
     Returns (rules, broken): a rule file that cannot be loaded and names forbid_ast, or
     whose forbid_ast is malformed, would enforce nothing, so each is returned as
     (relative path, reason) for the caller to fail closed on instead of being dropped.
-    An unsafe rules tree raises (RuleInventoryError), which the caller also fails on.
+    ``broken`` reads the working tree too, so a malformed new gate fails before it is merged.
+    An unsafe rules tree or an unreadable BASE raises, which the caller also fails on.
     """
-    from aegis_core.rules import load_rules, workspace_root
+    from aegis_core import rule_integrity
+    from aegis_core.rules import RuleCache, workspace_root
 
-    ruleset = load_rules(workspace_root(repo_root))
+    root = workspace_root(repo_root)
+    cache = RuleCache()
+    try:
+        enforced = rule_integrity.effective(root, cache).ruleset
+    except rule_integrity.IntegrityError as exc:
+        raise rule_integrity.IntegrityError(
+            f"the reviewed (base) version of the rules cannot be read, so none is enforced: {exc}") from exc
     discovered: list[tuple[Any, dict]] = []
     broken: list[tuple[str, str]] = []
-    for rule in ruleset.rules:
-        if not rule.ok:
-            # Only a file that names the key can declare it: a damaged note does not gate.
-            if b"forbid_ast" in rule.raw:
-                broken.append((rule.path, rule.error or "cannot be loaded"))
-            continue
-        if rule.expired or "forbid_ast" not in rule.meta:
-            continue
-        spec = rule.meta.get("forbid_ast")
-        spec_error = _forbid_ast_spec_error(spec)
-        if spec_error:
-            broken.append((rule.path, spec_error))
-            continue
-        discovered.append((rule, spec))
+    for ruleset, collect in ((cache.get(root), False), (enforced, True)):
+        for rule in ruleset.rules:
+            if not rule.ok:
+                # Only a file that names the key can declare it: a damaged note does not gate.
+                if b"forbid_ast" in rule.raw and not collect:
+                    broken.append((rule.path, rule.error or "cannot be loaded"))
+                continue
+            if rule.expired or "forbid_ast" not in rule.meta:
+                continue
+            spec = rule.meta.get("forbid_ast")
+            spec_error = _forbid_ast_spec_error(spec)
+            if spec_error:
+                if (rule.path, spec_error) not in broken:
+                    broken.append((rule.path, spec_error))
+            elif collect:
+                discovered.append((rule, spec))
     return discovered, broken
 
 
