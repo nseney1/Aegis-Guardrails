@@ -432,7 +432,8 @@ def rerun_commit_snapshot(
 
     workspace = Path(os.fspath(root)).resolve()
     top = gitsafe.toplevel(workspace)
-    if top is None:
+    commit = gitsafe.resolve_commit(top, commit) if top is not None else None  # only an oid reaches git argv
+    if commit is None:
         return {"tree": "", "exit": 1}
     commit_tree = gitsafe.run(["rev-parse", f"{commit}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
     base_commit = gitsafe.merge_base(top, base_ref, commit) or gitsafe.resolve_commit(top, base_ref) or commit
