@@ -372,16 +372,23 @@ SymbolDef = DefinitionNode
 
 @dataclass(frozen=True)
 class CallSiteNode:
-    """Represents an invocation of a target identifier or member expression."""
+    """Represents an invocation of a target identifier or member expression.
+
+    ``shadowed``: whether a def, class or import binding of a bare-name target is visible at the
+    call, from a driver that resolves scope; None (omitted) makes policy use file-wide bindings.
+    """
     target: str
     line: int = 1
     caller_scope: Optional[str] = None
     args: Dict[str, Any] = field(default_factory=dict)
+    shadowed: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res: Dict[str, Any] = {"target": self.target, "line": self.line, "caller_scope": self.caller_scope}
         if self.args:
             res["args"] = dict(self.args)
+        if self.shadowed is not None:
+            res["shadowed"] = self.shadowed
         return res
 
     @classmethod
@@ -393,6 +400,7 @@ class CallSiteNode:
             line=int(data.get("line", 1)),
             caller_scope=str(data["caller_scope"]) if data.get("caller_scope") else None,
             args=args,
+            shadowed=data["shadowed"] if isinstance(data.get("shadowed"), bool) else None,
         )
 
 

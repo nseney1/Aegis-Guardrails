@@ -328,8 +328,10 @@ def head_commit(cwd: Path | str) -> Optional[str]:
 
 
 def merge_base(cwd: Path | str, a: str, b: str = "HEAD") -> Optional[str]:
-    """The best common ancestor of two commits, or None."""
-    first, second = resolve_commit(cwd, a), resolve_commit(cwd, b)
+    """The best common ancestor of two commits, or None. A full object id goes to git as is
+    (two of them cost one call); anything else is resolved first, ``a`` before ``b``."""
+    first = a if isinstance(a, str) and _OID.match(a) else resolve_commit(cwd, a)
+    second = (b if isinstance(b, str) and _OID.match(b) else resolve_commit(cwd, b)) if first else None
     if not first or not second:
         return None
     return _text(["merge-base", first, second], cwd)

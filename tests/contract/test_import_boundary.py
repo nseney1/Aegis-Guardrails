@@ -79,6 +79,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.credit": 1,
     "aegis_core.checkrun": 2,
     # v4.3 T3: rank 2+ rules served from the reviewed BASE (the loader, the inventory, gitsafe), under scan.
+    "aegis_core.adjudication": 1,
     "aegis_core.rule_integrity": 1,
     # v4.3 T2: `aegis doctor --release` and credit attestation verification (gitsafe, pathlookup, human_gate's tier).
     "aegis_core.release_verify": 1,

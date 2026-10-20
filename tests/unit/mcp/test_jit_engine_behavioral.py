@@ -82,7 +82,7 @@ class TestFitnessInTheResult:
         result = scan(tmp_path, ["app.py"], budget=5)
 
         fitness = {r["name"]: r["fitness"] for r in result["relevant_rules"]}
-        assert fitness["inv-auth"] > 0.9 and fitness["trap-style"] == 0.0
+        assert fitness["inv-auth"] > 0.9 and fitness["trap-style"] is None
         assert "Fitness: 0." in result["guidance"]
 
 

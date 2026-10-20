@@ -1,10 +1,14 @@
 """Behavioral tests for Tier A/B/C secret scanner, SARIF 2.1.0 ingest, and external presets."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
-import time
+import os
 from pathlib import Path
+import stat
+import sys
+import time
 
 import pytest
 
@@ -27,7 +31,8 @@ def _tier_a_samples() -> dict[str, str]:
         "openai-api-key": _tok("sk", "-proj-", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd"),
         "anthropic-api-key": _tok("sk", "-ant-", "api03-AbCdEfGhIjKlMnOpQrStUvWxYz012345"),
         "google-api-key": _tok("AI", "za", "SyD-9876543210abcdefghijklmnopqrstu"),
-        "private-key-pem": _tok("-----BEGIN ", "RSA ", "PRIVATE KEY-----"),
+        # One line with an escaped newline before the key body: a bare header is not key material.
+        "private-key-pem": _tok("-----BEGIN ", "RSA ", "PRIVATE KEY-----", "\\n", "MIIEowIBAAKCAQEA3Tz2mr7SZiAMfQyuvBjM9OiJ"),
         "jwt-three-segment": _tok(
             "eyJ", "hbGciOiJIUzI1NiJ9", ".",
             "eyJ", "zdWIiOiIxMjM0NTY3ODkwIn0", ".",
@@ -35,6 +40,11 @@ def _tier_a_samples() -> dict[str, str]:
         ),
         "url-basic-auth": _tok("https://", "svc_admin", ":", "p9Q8r7S6t5U4", "@api.internal.corp/v1"),
     }
+
+
+_PREFIXED = ["aws-access-key-id", "github-pat", "github-fine-grained-pat", "slack-token", "stripe-live-secret",
+             "anthropic-api-key", "google-api-key", "jwt-three-segment"]
+_ALNUM_BODY = ["aws-access-key-id", "github-pat", "stripe-live-secret"]
 
 
 class TestTierASecretDetection:
@@ -69,6 +79,37 @@ class TestTierASecretDetection:
         assert scanners.contains_secret_tier_a(f"export AWS_KEY={raw}") is True
         assert scanners.contains_secret_tier_a("normal code x = 42") is False
 
+    @pytest.mark.parametrize("delim,rule_id", [("/", r) for r in _PREFIXED] + [(d, r) for d in "_-" for r in _ALNUM_BODY])
+    def test_a_token_after_a_delimiter_is_found(self, delim, rule_id):
+        """R-checks-23: only a preceding letter or digit means "inside a longer run"."""
+        token = _tier_a_samples()[rule_id]
+        findings = scanners.scan_secrets_text(f"deploy{delim}{token}")
+        assert rule_id in [f.rule_id for f in findings]
+        assert token not in json.dumps([f.as_dict() for f in findings])
+
+    @pytest.mark.parametrize("rule_id", ["github-pat", "github-fine-grained-pat"])
+    def test_a_token_in_a_clone_url_is_found(self, rule_id):
+        token = _tier_a_samples()[rule_id]
+        findings = scanners.scan_secrets_text(f"git clone https://{token}@github.com/org/repo.git")
+        assert [f.rule_id for f in findings] == [rule_id]
+        assert token not in findings[0].snippet and scanners.mask_secret(token) in findings[0].snippet
+
+    @pytest.mark.parametrize("before", ["a", "Z", "7"])
+    @pytest.mark.parametrize("rule_id", _PREFIXED)
+    def test_a_token_glued_to_a_letter_or_digit_is_not_found(self, before, rule_id):
+        assert scanners.scan_secrets_text(before + _tier_a_samples()[rule_id]) == []
+
+    @pytest.mark.parametrize("line", [
+        "see docs/sk-evaluation-framework-implementation-notes.md for details",
+        "cp ./sk-evaluation-framework-implementation-notes.md /tmp",
+        "git checkout feature/sk-evaluation-framework-implementation-notes",
+        "def test_github_pat_regex_does_not_match_identifiers():",
+        "x = parse_github_pat_from_environment_variable()",
+        _tok("name = 'my-xo", "xb-aaaaaaaaaaaa-bbbbbbbb'"),
+    ], ids=["docs-path", "cp-path", "branch", "test-name", "identifier", "kebab"])
+    def test_paths_and_identifiers_stay_clean(self, line):
+        assert scanners.scan_secrets_text(line, include_advisory=False) == []
+
     def test_zero_false_positives_on_benign_inputs(self) -> None:
         benign_lines = [
             # UUIDs
@@ -96,13 +137,275 @@ class TestTierASecretDetection:
         assert scanners.scan_secrets_text(text, include_advisory=False) == []
         assert scanners.scan_secrets_text(text, include_advisory=True) == []
 
-    def test_redos_and_minified_line_guard_under_50ms(self) -> None:
-        adversarial = _tok("sk", "-") + ("a" * 100_000)
+def _pad(n: int) -> str:
+    return "a," * (n // 2)
+
+
+def _best_of(runs: int, fn, *args) -> float:
+    best = float("inf")
+    for _ in range(runs):
         start = time.perf_counter()
-        findings = scanners.scan_secrets_text(adversarial, include_advisory=True)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        assert elapsed_ms < 50.0, f"100 KB line took {elapsed_ms:.2f}ms (> 50ms)"
-        assert findings == []
+        fn(*args)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+class TestLongLinesAreScanned:
+    """R-checks-21: a line of any length is scanned in full; above MAX_LINE_LENGTH a finding's
+    snippet is the masked token alone, so snippets stay bounded and leak no neighbouring text."""
+
+    @pytest.mark.parametrize("pad", [4090, 4097, 120_000])
+    @pytest.mark.parametrize("rule_id", list(_tier_a_samples().keys()))
+    def test_a_secret_on_a_long_line_is_reported(self, rule_id, pad):
+        line = f'{_pad(pad)} cfg = "{_tier_a_samples()[rule_id]}" {_pad(pad)}'
+        found = [f for f in scanners.scan_secrets_text(line, path="dist/app.min.js") if f.rule_id == rule_id]
+        assert found and all((f.tier, f.line, f.path) == ("gate", 1, "dist/app.min.js") for f in found)
+
+    @pytest.mark.parametrize("length", [4096, 4097])
+    def test_both_sides_of_the_boundary_detect(self, length):
+        body = f' k="{_tier_a_samples()["aws-access-key-id"]}"'
+        line = "#" * (length - len(body)) + body
+        assert len(line) == length
+        assert [f.rule_id for f in scanners.scan_secrets_text(line)] == ["aws-access-key-id"]
+
+    def test_a_secret_at_the_end_of_a_400_kb_line_is_found(self):
+        line = _pad(400_000) + " " + _tier_a_samples()["github-pat"]
+        assert [f.rule_id for f in scanners.scan_secrets_text(line)] == ["github-pat"]
+
+    def test_line_numbers_stay_right_around_a_long_line(self):
+        samples = _tier_a_samples()
+        text = f"first\n{_pad(9000)} {samples['aws-access-key-id']}\nmiddle\nx = '{samples['slack-token']}'\n"
+        assert sorted((f.line, f.rule_id) for f in scanners.scan_secrets_text(text)) == [
+            (2, "aws-access-key-id"), (4, "slack-token")]
+
+    def test_every_secret_on_one_long_line_is_reported(self):
+        samples = _tier_a_samples()
+        names = ["aws-access-key-id", "github-pat", "slack-token", "google-api-key"]
+        line = _pad(10_000).join(f" {samples[n]} " for n in names)
+        assert sorted({f.rule_id for f in scanners.scan_secrets_text(line)}) == sorted(names)
+
+    def test_a_large_data_url_is_no_false_positive_and_a_key_after_it_is_found(self):
+        blob = 'img = "data:image/png;base64,' + "iVBORw0KGgo" * 18_000 + '"'
+        assert scanners.scan_secrets_text(blob, include_advisory=True) == []
+        key = _tier_a_samples()["aws-access-key-id"]
+        assert [f.rule_id for f in scanners.scan_secrets_text(blob + f' k = "{key}"', include_advisory=True)] == [
+            "aws-access-key-id"]
+
+    def test_a_long_line_snippet_is_the_masked_token_only(self):
+        raw = _tier_a_samples()["github-pat"]
+        (finding,) = scanners.scan_secrets_text(_pad(120_000) + f' TOKEN = "{raw}" ' + _pad(120_000))
+        dumped = json.dumps(finding.as_dict())
+        assert finding.snippet == scanners.mask_secret(raw)
+        assert raw not in dumped and len(dumped) < 500
+
+    def test_many_keys_on_one_long_line_keep_snippets_bounded(self):
+        keys = [f"AKIA{i:016d}" for i in range(1_500)]
+        findings = scanners.scan_secrets_text(" ".join(keys))
+        assert len(findings) == 1_500
+        assert sum(len(f.snippet) for f in findings) <= 32 * 1_500
+
+    def test_a_short_line_keeps_its_masked_context_and_fingerprint(self):
+        raw = _tier_a_samples()["github-pat"]
+        (finding,) = scanners.scan_secrets_text(f"TOKEN = '{raw}'\n", path="app.py")
+        assert finding.snippet == f"TOKEN = '{scanners.mask_secret(raw)}'"
+        assert finding.fingerprint == scanners.sarif_fingerprint("github-pat", "app.py", finding.snippet)
+
+    def test_scan_cost_stays_linear_in_line_length(self):
+        """No absolute budget. A 4x longer line costs about 4x when linear and 16x when quadratic,
+        so the bound of 8 leaves room for a loaded Windows runner on both sides."""
+        def scan(n):
+            assert scanners.scan_secrets_text(_tok("sk", "-") + "a" * n, include_advisory=True) == []
+
+        ratio = _best_of(5, scan, 200_000) / max(_best_of(5, scan, 50_000), 1e-9)
+        assert ratio < 8, f"quadrupling the line multiplied the scan time by {ratio:.1f}"
+
+    def test_the_ratio_check_catches_a_quadratic_cost(self):
+        def quadratic(n):
+            sum(1 for _ in range(n // 100) for _ in range(n // 100))
+
+        assert _best_of(3, quadratic, 200_000) / _best_of(3, quadratic, 50_000) >= 8
+
+
+class TestDataUrlPrefixDoesNotHideGateSecrets:
+    """R-checks-22: data-URL and SRI payloads are blanked for the heuristic (advisory) tiers only;
+    a known-format token right after a data-URL prefix still gates."""
+
+    @pytest.mark.parametrize("prefix", ["data:x/y;base64,", "data:image/png;base64,"], ids=["xy", "png"])
+    @pytest.mark.parametrize("rule_id", list(_tier_a_samples().keys()))
+    def test_a_token_after_a_data_url_prefix_gates(self, rule_id, prefix):
+        token = _tier_a_samples()[rule_id]
+        findings = scanners.scan_secrets_text(f'blob = "{prefix}{token}"')
+        assert (rule_id, "gate", 1) in [(f.rule_id, f.tier, f.line) for f in findings]
+        assert token not in json.dumps([f.as_dict() for f in findings])
+
+    def test_a_token_lines_after_a_data_url_is_reported_alone(self):
+        text = 'img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="\nx = 1\n' + _tok(
+            "k = '", _tier_a_samples()["aws-access-key-id"], "'\n")
+        assert [(f.rule_id, f.line, f.tier) for f in scanners.scan_secrets_text(text)] == [("aws-access-key-id", 3, "gate")]
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    def test_benign_data_urls_and_sri_hashes_stay_quiet(self, include_advisory):
+        lines = []
+        for key in ("icon", "icon_token", "secret_image", "api_key_icon", "password_hint"):
+            payload = base64.b64encode(hashlib.sha256(key.encode()).digest() * 3).decode()
+            lines += [f'{key} = "data:{mime};base64,{payload}"' for mime in ("image/png", "font/woff2", "application/octet-stream")]
+        sri = base64.b64encode(hashlib.sha384(b"app.js").digest()).decode()
+        lines.append(f'<script src="app.js" integrity="sha384-{sri}"></script>')
+        assert scanners.scan_secrets_text("\n".join(lines), include_advisory=include_advisory) == []
+
+
+class TestPlaceholderSuppressionIsWordAware:
+    """R-checks-24: a human-chosen value is a placeholder only when a placeholder word starts one of
+    its words (or it has a placeholder shape), not because an English word contains one."""
+
+    @staticmethod
+    def _url(user: str, pwd: str) -> str:
+        return _tok("db = 'postgres://", user, ":", pwd, "@db.internal/app'")
+
+    @pytest.mark.parametrize("pwd", ["contest2024Zq", "attestation99X", "latestGreat9", "mastodon9Zq", "counterexample9"])
+    def test_a_real_password_containing_a_placeholder_word_gates(self, pwd):
+        findings = scanners.scan_secrets_text(self._url("svc", pwd))
+        assert [(f.rule_id, f.tier) for f in findings] == [("url-basic-auth", "gate")]
+        assert pwd not in json.dumps(findings[0].as_dict())
+
+    def test_a_real_user_containing_a_placeholder_word_gates(self):
+        assert len(scanners.scan_secrets_text(self._url("contest_admin", "Zq9fRt3pLm"))) == 1
+
+    def test_a_real_assigned_password_is_an_advisory(self):
+        findings = scanners.scan_secrets_text('db_password = "contest2024Zq"', include_advisory=True)
+        assert [(f.rule_id, f.tier) for f in findings] == [("generic-secret-assign", "advisory")]
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    @pytest.mark.parametrize("pwd", ["test", "Test123", "test_password", "TestPassword", "testpass", "TESTPASS",
+                                     "changeme", "your_password", "example", "xxxxxxxx", "********"])
+    def test_a_placeholder_password_stays_quiet(self, pwd, include_advisory):
+        assert scanners.scan_secrets_text(self._url("svc", pwd), include_advisory=include_advisory) == []
+
+    @pytest.mark.parametrize("val", ["testpassword1", "changeme123", "your_password_here"])
+    def test_a_placeholder_assignment_stays_quiet(self, val):
+        assert scanners.scan_secrets_text(f'db_password = "{val}"', include_advisory=True) == []
+
+    def test_glued_tier_a_placeholders_stay_suppressed(self):
+        lines = [_tok("k = '", "AK", "IA", "TESTTESTTESTTEST'"), _tok("k = '", "AK", "IA", "IOSFODNN7EXAMPLE'")]
+        assert scanners.scan_secrets_text("\n".join(lines), include_advisory=True) == []
+
+
+_REPO = Path(__file__).resolve().parents[3]
+
+
+class TestPemNeedsKeyMaterial:
+    """R-checks-a2: a PEM header gates only with key material after it (on the same line, or on one
+    of the next 6 non-blank lines); a bare mention stays visible as an advisory."""
+
+    HEADER = _tok("-----BEGIN ", "OPENSSH ", "PRIVATE KEY-----")
+    BODY = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7" + "x" * 12, "Ab3" * 21 + "Z", "Zq9/" * 16]
+
+    def _gate(self, text):
+        return [(f.rule_id, f.line) for f in scanners.scan_secrets_text(text) if f.tier == "gate"]
+
+    def test_a_header_in_a_comparison_does_not_gate(self):
+        text = f'if b"{self.HEADER}" in data:\n    body = data.split(b"{self.HEADER}", 1)[1]\n'
+        assert self._gate(text) == []
+        advisory = scanners.scan_secrets_text(text, include_advisory=True)
+        assert [(f.rule_id, f.tier, f.line) for f in advisory] == [
+            ("private-key-pem", "advisory", 1), ("private-key-pem", "advisory", 2)]
+
+    def test_a_pem_block_gates_once_at_its_header_without_showing_the_body(self):
+        end = _tok("-----END ", "OPENSSH ", "PRIVATE KEY-----")
+        findings = scanners.scan_secrets_text("\n".join(["key:", self.HEADER, *self.BODY, end]))
+        assert [(f.rule_id, f.tier, f.line) for f in findings] == [("private-key-pem", "gate", 2)]
+        assert not any(b in json.dumps(findings[0].as_dict()) for b in self.BODY)
+
+    def test_encryption_headers_and_a_blank_line_before_the_body_still_gate(self):
+        text = "\n".join([self.HEADER, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0123456789ABCDEF", "", *self.BODY])
+        assert self._gate(text) == [("private-key-pem", 1)]
+
+    def test_a_one_line_string_with_escaped_newlines_gates(self):
+        line = _tok('KEY = "', "-----BEGIN ", "PRIVATE KEY-----", "\\n", self.BODY[0], "\\n", "-----END ", 'PRIVATE KEY-----"')
+        findings = scanners.scan_secrets_text(line)
+        assert [(f.rule_id, f.tier) for f in findings] == [("private-key-pem", "gate")]
+        assert self.BODY[0] not in json.dumps(findings[0].as_dict())
+
+    @pytest.mark.parametrize("after", [[], ["see the docs for how to rotate it"], ["# note"] * 7],
+                             ids=["last-line", "prose", "beyond-window"])
+    def test_a_header_without_key_material_in_its_window_does_not_gate(self, after):
+        assert self._gate("\n".join([self.HEADER, *after, *(self.BODY if after == ["# note"] * 7 else [])])) == []
+
+    def test_the_shipped_packages_have_no_gate_finding(self):
+        found = [(f.path, f.line, f.rule_id) for pkg in ("aegis_core", "aegis_cli", "aegis_mcp")
+                 for path in sorted((_REPO / pkg).rglob("*.py"))
+                 for f in scanners.scan_secrets_file(path, repo_root=_REPO) if f.tier == "gate"]
+        assert found == []
+
+
+class TestSnippetsMaskEverySecretOnTheLine:
+    """R-checks-25: a snippet shows no secret-shaped value from its line, whatever the scan mode,
+    the hash-field guard, the dedupe order or whether the format gates."""
+
+    GH = _tier_a_samples()["github-pat"]
+    PASSWORD = _tok("hunter2", "Hunter2!")
+
+    def _clean(self, findings, *raws):
+        assert findings
+        for f in findings:
+            assert not any(raw in json.dumps(f.as_dict()) for raw in raws), f.rule_id
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    def test_an_unreported_assignment_beside_a_gate_token_is_masked(self, include_advisory):
+        findings = scanners.scan_secrets_text(f'PASSWORD = "{self.PASSWORD}"  # {self.GH}', include_advisory=include_advisory)
+        self._clean(findings, self.PASSWORD, self.GH)
+        gate = [f for f in findings if f.tier == "gate"]
+        assert [f.rule_id for f in gate] == ["github-pat"]
+        assert scanners.mask_secret(self.GH) in gate[0].snippet and gate[0].snippet.startswith('PASSWORD = "')
+
+    def test_a_high_entropy_blob_beside_a_gate_token_is_masked(self):
+        blob = _tok("9zY8xW7vU6tS5rQ4", "pO3nM2lK1jI0hG+fE/dC=")
+        findings = scanners.scan_secrets_text(f'blob = "{blob}" k={self.GH}')
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, blob, self.GH)
+
+    def test_the_hash_field_guard_does_not_unmask_the_line(self):
+        findings = scanners.scan_secrets_text(f'git commit; PASSWORD = "{self.PASSWORD}" key={self.GH}', include_advisory=True)
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, self.PASSWORD, self.GH)
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    def test_a_short_url_password_does_not_shield_a_longer_value(self, include_advisory):
+        line = _tok('u = "https://svc:abc@host.example.net/x"; PASSWORD = "abcd', 'efghijkl"')
+        findings = scanners.scan_secrets_text(line, include_advisory=include_advisory)
+        assert findings and not any("defghij" in f.snippet for f in findings)
+
+    @pytest.mark.parametrize("other,shown", [
+        (_tok("glp", "at-", "AbCdEfGhIjKlMnOpQrSt"), "[REDACTED_VCS_TOKEN]"),
+        (_tok("npm", "_", "AbCdEfGhIjKlMnOpQrStUvWx12"), "[REDACTED_TOKEN]"),
+        (_tok("py", "pi-", "AbCdEfGhIjKlMnOpQrStUvWx12"), "[REDACTED_TOKEN]"),
+        (_tok("sk", "_test_", "AbCdEfGhIjKlMnOpQrStUvWx"), "[REDACTED_API_KEY]"),
+    ], ids=["glpat", "npm", "pypi", "sk-test"])
+    def test_an_ungated_vendor_token_is_masked_but_not_reported(self, other, shown):
+        findings = scanners.scan_secrets_text(f"a={self.GH} b={other}")
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, other, self.GH)
+        assert shown in findings[0].snippet
+
+    def test_a_bearer_credential_beside_a_gate_token_is_masked(self):
+        bearer = _tok("abcdEFGH1234", "ijklMNOP5678qrst")
+        findings = scanners.scan_secrets_text(f'curl -H "Authorization: Bearer {bearer}" {self.GH}')
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, bearer, self.GH)
+        assert "Bearer [REDACTED]" in findings[0].snippet
+
+    def test_a_reported_token_keeps_its_prefix_and_last_two_mask(self):
+        (finding,) = scanners.scan_secrets_text(f"TOKEN = '{self.GH}'\n", path="app.py")
+        assert finding.snippet == f"TOKEN = '{scanners.mask_secret(self.GH)}'"
+
+    def test_the_fingerprint_does_not_depend_on_the_scan_mode(self):
+        line = f'PASSWORD = "{self.PASSWORD}"  # {self.GH}'
+        off = scanners.scan_secrets_text(line, path="a.py")
+        on = [f for f in scanners.scan_secrets_text(line, path="a.py", include_advisory=True) if f.tier == "gate"]
+        assert [(f.fingerprint, f.snippet) for f in off] == [(f.fingerprint, f.snippet) for f in on]
+
+    def test_a_clean_line_yields_no_finding(self):
+        assert scanners.scan_secrets_text(f'PASSWORD = "{self.PASSWORD}"\nx = 1\n') == []
 
 
 class TestTierBAndTierCAdvisory:
@@ -246,7 +549,7 @@ class TestSarifIngest:
         }
 
         report = scanners.ingest_sarif(
-            json.dumps(sarif_doc),
+            sarif_doc,
             workspace_root=tmp_path,
             base_fingerprints={expected_fp1},
         )
@@ -259,6 +562,202 @@ class TestSarifIngest:
         assert finding.fingerprint == expected_fp2
         # 3 inline suppressions (noqa, nosec, gitleaks:allow) + 2 .gitleaksignore entries = 5
         assert report["suppression_count"] == 5
+
+
+_SARIF_ONE_FINDING = {
+    "runs": [{"results": [{
+        "ruleId": "S307", "level": "error", "message": {"text": "eval"},
+        "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": "app.py"},
+            "region": {"startLine": 1, "snippet": {"text": "eval(x)"}},
+        }}],
+    }]}],
+}
+
+
+def _sarif_for(uri: str, *, line: int = 1, snippet: str | None = None, message: str = "reported message") -> dict:
+    region: dict = {"startLine": line}
+    if snippet is not None:
+        region["snippet"] = {"text": snippet}
+    return {"version": "2.1.0", "runs": [{"results": [{
+        "ruleId": "S100", "level": "error", "message": {"text": message},
+        "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri}, "region": region}}],
+    }]}]}
+
+
+class TestSarifIngestStaysInsideWorkspace:
+    """R-checks-16: ingest_sarif reads only files whose real location is inside the workspace,
+    labels paths from the workspace (not the cwd) with dot-directories intact, never raises on
+    a bad URI and never displays an unmasked secret line."""
+
+    SENTINEL = "TOP-SECRET-OUTSIDE-LINE"
+
+    @pytest.fixture
+    def tree(self, tmp_path: Path):
+        ws = tmp_path / "ws"
+        (ws / "sub").mkdir(parents=True)
+        (ws / ".github").mkdir()
+        (ws / "sub" / "app.py").write_bytes(b"first\nin-tree line\n")
+        (ws / ".github" / "ci.yml").write_bytes(b"on: push\n")
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(self.SENTINEL.encode() + b"\n")
+        return ws, outside
+
+    @staticmethod
+    def _only_finding(doc: dict, ws: Path) -> scanners.Finding:
+        report = scanners.ingest_sarif(doc, workspace_root=ws)
+        assert (report["status"], report["total_raw"]) == ("fail", 1)  # kept, never silently dropped
+        return report["findings"][0]
+
+    @pytest.mark.parametrize("form", ["dotdot", "leading-dotdot", "absolute", "file-uri"])
+    def test_a_uri_outside_the_workspace_is_not_read(self, tree, form):
+        ws, outside = tree
+        uri = {"dotdot": "sub/../../outside.txt", "leading-dotdot": "../outside.txt",
+               "absolute": str(outside), "file-uri": "file://" + str(outside)}[form]
+        finding = self._only_finding(_sarif_for(uri), ws)
+        assert self.SENTINEL not in json.dumps(finding.as_dict())
+        assert finding.snippet == "reported message"
+        assert ".." not in finding.path.split("/")
+
+    def test_a_symlink_out_of_the_workspace_is_not_followed(self, tree):
+        ws, outside = tree
+        try:
+            os.symlink(outside.parent, ws / "escape")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are unavailable")
+        finding = self._only_finding(_sarif_for("escape/outside.txt"), ws)
+        assert self.SENTINEL not in json.dumps(finding.as_dict())
+        assert finding.snippet == "reported message"
+
+    def test_the_base_document_is_confined_the_same_way(self, tree):
+        ws, _ = tree
+        doc = _sarif_for("sub/../../outside.txt")
+        base = [f.fingerprint for f in scanners.ingest_sarif(doc, workspace_root=ws)["findings"]]
+        report = scanners.ingest_sarif(doc, workspace_root=ws, base_fingerprints=base)
+        assert (report["status"], report["base_subtracted"]) == ("pass", 1)
+
+    @pytest.mark.parametrize("uri", ["sub/app.py", "./sub/app.py", "ABS", "FILE"])
+    def test_an_in_tree_uri_reads_the_reported_line(self, tree, uri):
+        ws, _ = tree
+        target = ws / "sub" / "app.py"
+        uri = {"ABS": str(target), "FILE": "file://" + str(target)}.get(uri, uri)
+        finding = self._only_finding(_sarif_for(uri, line=2), ws)
+        assert (finding.path, finding.line, finding.snippet) == ("sub/app.py", 2, "in-tree line")
+
+    def test_paths_resolve_against_the_workspace_and_keep_dot_directories(self, tree, monkeypatch):
+        ws, _ = tree
+        monkeypatch.chdir(ws / "sub")
+        nested = self._only_finding(_sarif_for("sub/app.py", line=2), ws)
+        dotted = self._only_finding(_sarif_for(".github/ci.yml"), ws)
+        assert (nested.path, nested.snippet) == ("sub/app.py", "in-tree line")
+        assert (dotted.path, dotted.snippet) == (".github/ci.yml", "on: push")
+        assert scanners.ingest_sarif(_sarif_for(".github/ci.yml"))["findings"][0].path == ".github/ci.yml"
+
+    @pytest.mark.parametrize("uri", ["bad\0name.py", "x/" + "y" * 5000], ids=["nul", "long"])
+    def test_an_unresolvable_uri_is_kept_without_raising(self, tree, uri):
+        ws, _ = tree
+        assert self._only_finding(_sarif_for(uri), ws).snippet == "reported message"
+
+    def test_a_secret_on_the_disk_line_is_displayed_masked(self, tree):
+        ws, _ = tree
+        token = _tier_a_samples()["github-pat"]
+        (ws / "sub" / "keys.py").write_bytes(f"TOKEN = '{token}'\n".encode())
+        finding = self._only_finding(_sarif_for("sub/keys.py"), ws)
+        assert token not in json.dumps(finding.as_dict())
+        assert finding.snippet == f"TOKEN = '{scanners.mask_secret(token)}'"
+        assert finding.fingerprint == scanners.sarif_fingerprint("S100", "sub/keys.py", f"TOKEN = '{token}'")
+
+
+def _secret() -> str:
+    return _tier_a_samples()["stripe-live-secret"]
+
+
+def _one_result(**result: object) -> dict:
+    return {"version": "2.1.0", "runs": [{"results": [result]}]}
+
+
+_MALFORMED_DOCS = {
+    "empty-object": {},
+    "error-object": {"error": "config invalid"},
+    "runs-string": {"runs": "x"},
+    "run-string": {"runs": ["x"]},
+    "results-object": {"runs": [{"results": {"a": 1}}]},
+    "result-string": {"runs": [{"results": ["x"]}]},
+    "message-string": _one_result(message="SECRET"),
+    "locations-string": _one_result(locations="SECRET"),
+    "location-string": _one_result(locations=["SECRET"]),
+    "region-string": _one_result(locations=[{"physicalLocation": {"region": "SECRET"}}]),
+    "startline-text": _one_result(locations=[{"physicalLocation": {"region": {"startLine": "SECRET"}}}]),
+    "startline-float": _one_result(locations=[{"physicalLocation": {"region": {"startLine": 2.5}}}]),
+    "suppressions-number": _one_result(suppressions=5, message={"text": "SECRET"}),
+}
+
+
+class TestSarifVerdictNeedsACompletedScan:
+    """R-checks-17: a scanner result is ``pass`` only when the scan demonstrably ran and its output
+    was understood; anything else is ``unverified``, and untrusted output never raises."""
+
+    @staticmethod
+    def _fill(value):
+        if isinstance(value, dict):
+            return {k: TestSarifVerdictNeedsACompletedScan._fill(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [TestSarifVerdictNeedsACompletedScan._fill(v) for v in value]
+        return _secret() if value == "SECRET" else value
+
+    @pytest.mark.parametrize("case", sorted(_MALFORMED_DOCS))
+    def test_a_malformed_document_is_unverified_with_a_short_reason(self, case, tmp_path):
+        report = scanners.ingest_sarif(self._fill(_MALFORMED_DOCS[case]), workspace_root=tmp_path)
+        assert (report["status"], report["findings"]) == ("unverified", [])
+        assert 0 < len(report["reason"]) <= 200 and _secret() not in report["reason"]
+
+    def test_a_value_that_is_not_a_mapping_is_unverified(self):
+        assert scanners.ingest_sarif([])["status"] == "unverified"  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("doc", [{"version": "2.1.0", "runs": []}, {"runs": None}, {"runs": [{"results": []}]}],
+                             ids=["runs-empty", "runs-null", "results-empty"])
+    def test_a_valid_empty_document_still_passes(self, doc):
+        report = scanners.ingest_sarif(doc)
+        assert (report["status"], report["total_raw"]) == ("pass", 0)
+
+    @staticmethod
+    def _run(rc, stdout, stderr="scanner said so", base=()):
+        def runner(argv, cwd, env=None, timeout=60):
+            res = {"stdout": stdout, "stderr": stderr}
+            return res if rc == "none" else {**res, "returncode": rc}
+        return scanners.run_preset_scanner("ruff", Path("."), runner=runner, base_fingerprints=base)
+
+    @pytest.mark.parametrize("rc,stdout", [
+        (0, ""), (0, "   \n"), (0, "all good"), (0, "[]"), (0, "null"), (0, "{}"), (0, '{"error":"boom"}'),
+        (0, "\ufeff" + json.dumps(_SARIF_ONE_FINDING)), (0, "INFO scanning\n" + json.dumps(_SARIF_ONE_FINDING)),
+        (0, '{"runs": []}'), (1, '{"version": "2.1.0", "runs": [{"results": ['), (1, '{"runs": [{"results": []}]}'),
+        (2, '{"runs": [{"results": []}]}'), (-9, '{"runs": [{"results": []}]}'), ("none", '{"runs": [{"results": []}]}'),
+        (0, '{"a":' * 100_000), (0, "SECRET not json"),
+    ], ids=["empty", "blank", "text", "array", "null", "object", "error", "bom", "log-prefix", "no-run", "truncated",
+            "rc1-clean", "rc2-clean", "killed", "no-rc", "deep", "secret-text"])
+    def test_output_that_is_not_a_completed_scan_is_unverified(self, rc, stdout):
+        report = self._run(rc, stdout.replace("SECRET", _secret()))
+        assert (report["status"], report["findings"]) == ("unverified", [])
+        assert "scanner said so" in report["reason"] and _secret() not in report["reason"]
+
+    def test_empty_output_without_stderr_names_the_program(self):
+        report = self._run(0, "", stderr="")
+        assert report["status"] == "unverified" and report["reason"] == "ruff produced no SARIF output"
+
+    def test_a_clean_completed_scan_passes(self):
+        assert self._run(0, '{"version": "2.1.0", "runs": [{"results": []}]}')["status"] == "pass"
+
+    @pytest.mark.parametrize("rc", [0, 1, 2])
+    def test_a_new_finding_fails_whatever_the_exit_code(self, rc):
+        report = self._run(rc, json.dumps(_SARIF_ONE_FINDING))
+        assert report["status"] == "fail" and [f.rule_id for f in report["findings"]] == ["S307"]
+
+    def test_the_exit_code_is_judged_on_raw_findings_not_the_base_delta(self):
+        fp = scanners.ingest_sarif(_SARIF_ONE_FINDING)["findings"][0].fingerprint
+        baselined = self._run(1, json.dumps(_SARIF_ONE_FINDING), base=[fp])
+        assert (baselined["status"], baselined["base_subtracted"]) == ("pass", 1)
+        crashed = self._run(2, json.dumps(_SARIF_ONE_FINDING), stderr="crashed", base=[fp])
+        assert (crashed["status"], crashed["reason"]) == ("unverified", "crashed")
 
 
 class TestExternalScannerPresets:
@@ -274,35 +773,82 @@ class TestExternalScannerPresets:
     def test_gitleaks_preset_uses_redact_and_only_user_scope_config(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
-        repo_cfg = repo_dir / ".gitleaks.toml"
-        repo_cfg.write_text("[allowlist]\n", encoding="utf-8")
-
         user_dir = tmp_path / "user_aegis"
         user_dir.mkdir()
         user_cfg = user_dir / "gitleaks.toml"
-        user_cfg.write_text("# trusted user config\n", encoding="utf-8")
+        user_cfg.write_bytes(b"# trusted user config\n")
 
-        # Repo-local config path must be rejected/ignored
-        argv_repo = scanners.build_preset_argv(
-            "gitleaks",
-            repo_dir,
-            user_config_dir=user_dir,
-            config_path=repo_cfg,
-        )
-        assert "--redact" in argv_repo
-        assert str(repo_cfg) not in argv_repo
-
-        # User-scope config inside ~/.aegis/ is accepted
-        argv_user = scanners.build_preset_argv(
-            "gitleaks",
-            repo_dir,
-            user_config_dir=user_dir,
-            config_path=user_cfg,
-        )
+        argv_user = scanners.build_preset_argv("gitleaks", repo_dir, user_config_dir=user_dir)
         assert "--redact" in argv_user
-        assert "--config" in argv_user
-        cfg_idx = argv_user.index("--config")
-        assert argv_user[cfg_idx + 1] == str(user_cfg.resolve())
+        assert argv_user[argv_user.index("--config") + 1] == str(user_cfg.resolve())
+
+    @pytest.fixture
+    def home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        home = tmp_path / "home"
+        (home / ".aegis").mkdir(parents=True)
+        for name in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(name, str(home))
+        return home
+
+    @staticmethod
+    def _stub(calls: list):
+        def runner(argv, cwd, env=None, timeout=60):
+            calls.append(list(argv))
+            return {"returncode": 0, "stdout": '{"version": "2.1.0", "runs": [{"results": []}]}', "stderr": ""}
+        return runner
+
+    @staticmethod
+    def _allow_all_repo(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitleaks.toml").write_bytes(b'[allowlist]\npaths = [".*"]\n')
+        return repo
+
+    def test_a_repository_gitleaks_config_without_a_user_config_is_unverified(self, tmp_path, home):
+        """R-checks-18: gitleaks would read <source>/.gitleaks.toml when no --config is given, so a
+        repository allowlist could silence every finding; the preset refuses to run instead."""
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        assert (res["status"], res["findings"], calls) == ("unverified", [], [])
+        assert ".gitleaks.toml" in res["reason"]
+
+    def test_a_user_config_is_passed_explicitly_over_a_repository_config(self, tmp_path, home):
+        user_cfg = home / ".aegis" / "gitleaks.toml"
+        user_cfg.write_bytes(b"# trusted user config\n")
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        assert res["status"] == "pass"
+        assert calls[0][calls[0].index("--config") + 1] == str(user_cfg.resolve())
+
+    def test_a_user_config_dir_inside_the_repository_does_not_count(self, tmp_path, home):
+        repo = self._allow_all_repo(tmp_path)
+        (repo / ".aegis").mkdir()
+        (repo / ".aegis" / "gitleaks.toml").write_bytes(b"# planted\n")
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", repo, user_config_dir=repo / ".aegis", runner=self._stub(calls))
+        assert (res["status"], calls) == ("unverified", [])
+
+    def test_a_dangling_repository_config_symlink_still_counts(self, tmp_path, home):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        try:
+            os.symlink(tmp_path / "nowhere.toml", repo / ".gitleaks.toml")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are unavailable")
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", repo, runner=self._stub(calls))
+        assert (res["status"], calls) == ("unverified", [])
+
+    def test_with_neither_config_gitleaks_runs_redacted_without_a_config(self, tmp_path, home):
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=self._stub(calls))
+        assert res["status"] == "pass"
+        assert "--redact" in calls[0] and "--config" not in calls[0]
+
+    def test_the_ruff_preset_ignores_a_repository_gitleaks_config(self, tmp_path, home):
+        calls: list = []
+        res = scanners.run_preset_scanner("ruff", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        assert res["status"] == "pass" and calls[0][0] == "ruff"
 
     def test_missing_binary_returns_unverified_not_pass(self, tmp_path: Path) -> None:
         def fake_missing_runner(argv, cwd, env=None, timeout=60):
@@ -317,3 +863,85 @@ class TestExternalScannerPresets:
         res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=fake_missing_runner)
         assert res["status"] == "unverified"
         assert "not found" in res["reason"].lower()
+
+
+def _program(path: Path, body: str) -> Path:
+    """A Python program PATH lookup finds as ``path.name`` (a .cmd launcher on Windows)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        script = path.with_name(path.name + "-script.py")
+        script.write_bytes(body.encode("utf-8"))
+        launcher = path.with_name(path.name + ".cmd")
+        launcher.write_bytes(f'@"{sys.executable}" "{script}" %*\r\n'.encode("utf-8"))
+        return launcher
+    path.write_bytes(f"#!{sys.executable}\n{body}".encode("utf-8"))
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def _set_path(monkeypatch: pytest.MonkeyPatch, *entries: str) -> None:
+    if os.name == "nt":
+        entries = (*entries, os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"))
+    monkeypatch.setenv("PATH", os.pathsep.join(entries))
+
+
+class TestPresetScannerProgramLookup:
+    """R-checks-15: a preset runs the ruff or gitleaks found in an absolute PATH entry outside the
+    repository. An empty or relative entry names the cwd (the repository), so a bare name would
+    run a program the repository planted and take its silence for a clean scan."""
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        root = tmp_path / "repo"
+        root.mkdir()
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.chdir(root)  # Windows' CreateProcess searches the parent's cwd, not cwd=
+        return root
+
+    @staticmethod
+    def _plant(root: Path, name: str, marker: Path) -> None:
+        body = f"open({str(marker)!r}, 'w').close()\n"
+        _program(root / name, body)
+        _program(root / "bin" / name, body)
+
+    @pytest.mark.parametrize("preset", ["ruff", "gitleaks"])
+    @pytest.mark.parametrize("entry", ["", ".", "bin", "REPO_BIN"], ids=["empty", "dot", "rel", "abs"])
+    def test_a_scanner_the_repository_planted_never_runs(self, repo, tmp_path, monkeypatch, preset, entry):
+        marker = tmp_path / "planted-ran"
+        self._plant(repo, preset, marker)
+        trusted = tmp_path / "trusted"
+        trusted.mkdir()  # holds no scanner: the real one is not installed
+        _set_path(monkeypatch, str(repo / "bin") if entry == "REPO_BIN" else entry, str(trusted))
+
+        res = scanners.run_preset_scanner(preset, repo)
+
+        assert not marker.exists(), "a program the repository planted ran"
+        assert res["status"] == "unverified"
+        assert "not found" in res["reason"].lower()
+
+    @pytest.mark.parametrize("preset", ["ruff", "gitleaks"])
+    def test_a_scanner_installed_outside_the_repository_runs(self, repo, tmp_path, monkeypatch, preset):
+        marker = tmp_path / "planted-ran"
+        self._plant(repo, preset, marker)
+        trusted = tmp_path / "trusted"
+        _program(trusted / preset, f"import json\nprint(json.dumps({_SARIF_ONE_FINDING!r}))\n")
+        _set_path(monkeypatch, "", "bin", str(repo / "bin"), str(trusted))
+
+        res = scanners.run_preset_scanner(preset, repo)
+
+        assert not marker.exists()
+        assert res["status"] == "fail"
+        assert [f.rule_id for f in res["findings"]] == ["S307"]
+
+    def test_an_injected_runner_receives_the_bare_argv(self, tmp_path):
+        seen = []
+
+        def runner(argv, cwd, env=None, timeout=60):
+            seen.append(list(argv))
+            return {"returncode": 0, "stdout": json.dumps(_SARIF_ONE_FINDING), "stderr": ""}
+
+        scanners.run_preset_scanner("ruff", tmp_path, runner=runner)
+        assert [argv[0] for argv in seen] == ["ruff"]

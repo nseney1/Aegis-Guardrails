@@ -917,3 +917,70 @@ def test_no_git_subprocess_outside_gitsafe():
                         and node.args and _is_git_command_line(node.args[0]):
                     offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
     assert offenders == []
+
+
+# ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──
+
+@pytest.fixture
+def git_calls(monkeypatch):
+    """The argv of every git call gitsafe makes, in order."""
+    real_run, calls = gitsafe.run, []
+
+    def spy(args, cwd, *rest, **kwargs):
+        calls.append(list(args))
+        return real_run(args, cwd, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    return calls
+
+
+@pytest.fixture
+def forked(repo: Path):
+    """main moves on after `side` branches off: (fork point, main tip, side tip) as full oids."""
+    fork = gitsafe.head_commit(repo)
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "b.py").write_text("b = 2\n", encoding="utf-8")
+    _commit(repo, "side")
+    side = gitsafe.head_commit(repo)
+    _git(repo, "checkout", "-q", "main")
+    (repo / "a.py").write_text("a = 2\n", encoding="utf-8")
+    _commit(repo, "main")
+    return fork, gitsafe.head_commit(repo), side
+
+
+def test_merge_base_of_two_full_oids_is_one_git_call(repo: Path, forked, git_calls):
+    fork, main_tip, side_tip = forked
+    git_calls.clear()
+    assert gitsafe.merge_base(repo, main_tip, side_tip) == fork
+    assert git_calls == [["merge-base", main_tip, side_tip]]
+
+
+def test_a_name_or_a_short_oid_is_still_resolved_to_the_same_answer(repo: Path, forked, git_calls):
+    fork, main_tip, side_tip = forked
+    git_calls.clear()
+    assert gitsafe.merge_base(repo, "side", main_tip) == fork
+    assert gitsafe.merge_base(repo, side_tip[:12], "HEAD") == fork
+    assert [call[0] for call in git_calls] == ["rev-parse", "merge-base", "rev-parse", "rev-parse", "merge-base"]
+
+
+def test_a_full_oid_that_names_no_commit_gives_none(repo: Path, forked):
+    _fork, main_tip, _side = forked
+    tree = _git(repo, "rev-parse", "HEAD^{tree}").strip()
+    assert gitsafe.merge_base(repo, tree, main_tip) is None
+    assert gitsafe.merge_base(repo, "0" * 40, main_tip) is None
+
+
+def test_a_leading_dash_revision_never_reaches_git(repo: Path, git_calls):
+    git_calls.clear()
+    assert gitsafe.merge_base(repo, "--x", "HEAD") is None
+    assert git_calls == []
+    assert gitsafe.merge_base(repo, "HEAD", "--output=x") is None
+    assert not any(arg.startswith("--output=x") for call in git_calls for arg in call)
+
+
+def test_a_snapshot_rerun_of_a_leading_dash_revision_fails_without_reaching_git(repo: Path, git_calls):
+    from aegis_core import checkrun
+
+    git_calls.clear()
+    assert checkrun.rerun_commit_snapshot(repo, "--output=x", "main") == {"tree": "", "exit": 1}
+    assert not any("--output=x" in arg for call in git_calls for arg in call)

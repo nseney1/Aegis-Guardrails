@@ -34,6 +34,7 @@ from aegis_cli.status import run_status
 from aegis_cli.sync import run_sync
 from aegis_core import credit, fitness, sync
 from aegis_core.verification.runner import run_layer1
+from tests import helpers_adjudication as ha
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -100,19 +101,13 @@ def test_six_inline_allow_overrides_count_as_contested_and_never_demote_a_health
         target_paths=["src/*.py"],
         forbid_calls=["eval"],
     )
-    # Healthy gate with 12 adjudicated true positives across 3 sessions.
-    for i in range(12):
-        credit.record_adjudication(
-            tmp_path,
-            "gate-no-eval",
-            "tp",
-            adjudicator="human",
-            ref=f"PR-{i + 1}",
-            session=f"sess-{(i % 3) + 1}",
-            file="src/app.py",
-            line=i + 1,
-            summary=f"Caught unsafe eval #{i + 1}",
-        )
+    # Healthy gate with 12 adjudicated true positives across 3 sessions, merged at the base (R-evidence-3).
+    ha.write_labels(tmp_path, "gate-no-eval", [
+        {"example_id": f"PR-{i + 1}", "verdict": "tp", "ref": f"PR-{i + 1}", "session": f"sess-{(i % 3) + 1}",
+         "file": "src/app.py", "line": i + 1, "summary": f"Caught unsafe eval #{i + 1}"}
+        for i in range(12)
+    ])
+    ha.merge_to_base(tmp_path)
 
     # Six `# aegis: allow` overrides in source code evaluated by Layer 1.
     src_dir = tmp_path / "src"
@@ -135,6 +130,7 @@ def test_six_inline_allow_overrides_count_as_contested_and_never_demote_a_health
 
     result = sync.sync(tmp_path)
     gate_info = result.derived["rules"]["gate-no-eval"]
+    assert gate_info["adjudicated_n"] == 12
     assert gate_info["contested"] == 6
     assert gate_info["fp"] == 0
     assert gate_info["flagged_for_review"] is True
@@ -151,15 +147,11 @@ def test_small_n_shows_insufficient_and_no_precision_number_in_status(
     """§9 T4 Scenario 2: Given 4 adjudicated labels, when status runs,
     then the rule shows `insufficient (n=4)`, not a precision."""
     _write_rule(tmp_path, "trap", "trap-small-n", target_paths=["src/*.py"])
-    for i in range(4):
-        credit.record_adjudication(
-            tmp_path,
-            "trap-small-n",
-            "tp" if i < 3 else "fp",
-            adjudicator="human",
-            ref=f"adj-{i + 1}",
-            session=f"sess-{i + 1}",
-        )
+    ha.write_labels(tmp_path, "trap-small-n", [
+        {"example_id": f"adj-{i + 1}", "verdict": "tp" if i < 3 else "fp", "session": f"sess-{i + 1}"}
+        for i in range(4)
+    ])
+    ha.merge_to_base(tmp_path)
 
     rc = run_status(argparse.Namespace(_root=tmp_path, plain=True))
     assert rc == 0
@@ -176,6 +168,49 @@ def test_small_n_shows_insufficient_and_no_precision_number_in_status(
     rule_json = next(r for r in payload["rules"] if r["name"] == "trap-small-n")
     assert rule_json["state"] == "insufficient"
     assert rule_json["score"] is None
+
+
+def test_scan_status_and_list_rules_show_no_number_below_min_n_and_agree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R-evidence-8: Given n in (0, 1, MIN_N - 1) verdicts, When scan, status and list_rules
+    run, Then none shows a number (`insufficient (n=N)`, or `no evidence yet` without any
+    ledger row); Given exactly MIN_N, Then the number appears; ranking keeps the raw score."""
+    from aegis_core.fitness import MIN_N
+    from aegis_core.rules import load_rules
+    from aegis_core.scan import RULE_CACHE, scan
+    from aegis_core.telemetry_engine import ledger
+    from aegis_mcp.registry import list_rules
+
+    counts = {"trap-none": None, "trap-zero": 0, "trap-one": 1, "trap-low": MIN_N - 1, "trap-at": MIN_N}
+    for rid, n in counts.items():
+        _write_rule(tmp_path, "trap", rid, target_paths=["src/*.py"])
+        if n is None:
+            continue
+        rows = [{"rule": rid, "outcome": "tp", "source": "ci", "key": f"{rid}-{i}"} for i in range(n)]
+        ledger.append(tmp_path, rows or [{"rule": rid, "outcome": "trigger", "source": "ci", "key": f"{rid}-t"}])
+    RULE_CACHE.invalidate()
+    raw = fitness.for_rules(tmp_path, load_rules(tmp_path).served)
+
+    result = scan(tmp_path, ["src/app.py"], budget=10, max_tokens=100000)
+    shown = {r["name"]: r["fitness"] for r in result["relevant_rules"]}
+    assert shown == {"trap-none": None, "trap-zero": None, "trap-one": None, "trap-low": None,
+                     "trap-at": raw["trap-at"].score}
+    assert raw["trap-at"].score > 0.8
+    assert "Fitness: no evidence yet" in result["guidance"]
+    for rid in ("trap-zero", "trap-one", "trap-low"):
+        assert f"Fitness: insufficient (n={counts[rid]})" in result["guidance"]
+    assert f"Fitness: {raw['trap-at'].score:.2f}" in result["guidance"]
+    assert [r["name"] for r in result["relevant_rules"]] == sorted(raw, key=lambda rid: (-raw[rid].score, rid))
+
+    assert run_status(argparse.Namespace(_root=tmp_path, json=True)) == 0
+    status_scores = {r["name"]: r["score"] for r in json.loads(capsys.readouterr().out)["rules"]}
+    assert {rid: status_scores[rid] for rid in counts} == shown
+
+    listed = {r["id"]: r["fitness"] for r in list_rules(tmp_path)["rules"]}
+    assert {rid: listed[rid]["reported_score"] for rid in counts} == shown
+    assert {rid: listed[rid]["score"] for rid in counts} == {rid: raw[rid].score for rid in counts}
+    assert listed["trap-low"]["status"] == f"insufficient (n={MIN_N - 1})"
 
 
 # ── 3. A quiet trap decays (with v4.4 §12.9 scope_basis & immunities) ────────
@@ -269,7 +304,7 @@ def test_detector_replay_classifies_caught_and_leaked_and_deduplicates_per_branc
     """§3 T4 Detector Replay:
     - Pattern in intermediate commit and removed before merge -> `caught` (weight 0.5).
     - Pattern in merged commit that was later reverted/fixed -> `leaked` (weight 1.0).
-    - Deduplicated by `(rule, file, pattern, branch)`."""
+    - Deduplicated by `(rule, file, pattern, introducing commit)` (R-evidence-10)."""
     home = hg.Home(tmp_path / "home")
     repo = hg.Repo(tmp_path / "repo", home)
     _write_rule(
@@ -364,19 +399,13 @@ def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_m
     whose body contains the evidence report and up to 3 sampled examples, via injectable
     `gh` runner, and never auto-merges."""
     _write_rule(tmp_path, "trap", "trap-decided", created="2026-01-01", target_paths=["src/*.py"])
-    for i in range(25):
-        credit.record_adjudication(
-            tmp_path,
-            "trap-decided",
-            "tp",
-            adjudicator="human",
-            ref=f"PR-{100 + i}",
-            session=f"sess-{(i % 4) + 1}",
-            repo=f"repo-{(i % 2) + 1}",
-            file="src/app.py",
-            line=10 + i,
-            summary=f"Prevented bug example #{i + 1}",
-        )
+    ha.write_labels(tmp_path, "trap-decided", [
+        {"example_id": f"PR-{100 + i}", "verdict": "tp", "ref": f"PR-{100 + i}", "session": f"sess-{(i % 4) + 1}",
+         "repo": f"repo-{(i % 2) + 1}", "file": "src/app.py", "line": 10 + i,
+         "summary": f"Prevented bug example #{i + 1}"}
+        for i in range(25)
+    ])
+    ha.merge_to_base(tmp_path)
 
     gh_calls: list[list[str]] = []
 
@@ -415,6 +444,7 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
     unavailable evidence state, and `aegis rule adjudicate` CLI."""
     from aegis_cli.cli import main
     from aegis_core import checkrun, human_gate
+    from aegis_core.rules import load_rules
     from tests import helpers_verified as hv
 
     repo = hv.make_project(tmp_path)
@@ -471,12 +501,14 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
     assert s_res.derived["rules"]["trap-sample"]["tp"] == 1
     assert s_res.derived["rules"]["trap-sample"]["triggers"] == 1
 
-    # 6. CLI `aegis rule adjudicate` adds human adjudication
+    # 6. CLI `aegis rule adjudicate` writes a working-tree label that counts only once merged (R-evidence-3)
     monkeypatch.chdir(repo.root)
     capsys.readouterr()
     assert main(["rule", "adjudicate", "trap-sample", "tp", "--ref", "PR-1", "--summary", "good catch", "--json"]) == 0
     adj_out = json.loads(capsys.readouterr().out)
-    assert adj_out["event"] == "adjudication" and adj_out["verdict"] == "tp"
+    assert (adj_out["status"], adj_out["path"]) == ("recorded", ".aegis/adjudications/trap-sample.jsonl")
+    assert (adj_out["label"]["example_id"], adj_out["label"]["verdict"]) == ("PR-1", "tp")
+    assert fitness.for_rules(repo.root, load_rules(repo.root).served)["trap-sample"].adjudicated_n == 0
 
     # 7. Corrupt ledger line -> evidence unavailable in fitness, status, and sync refuses transitions
     hv.ledger_path(repo.root).open("ab").write(b"{corrupt json line\n")
@@ -589,11 +621,12 @@ def test_check_ci_trailer_independently_reruns_snapshot_without_local_ledger(
 
 
 @needs_git
-def test_detector_replay_ignores_unmerged_head_and_reconciles_leaked_to_caught_after_fix(
+def test_detector_replay_ignores_unmerged_head_and_keeps_a_landed_finding_leaked_after_a_fix(
     tmp_path: Path,
 ) -> None:
     """`replay_detector_history` walks the target protected branch (`main`), ignoring unmerged feature
-    commits on `HEAD`, and reconciles a previously recorded `leaked` finding to `caught` after a later fix."""
+    commits on `HEAD`; a finding that landed stays `leaked` after a later fix (spec T4.1: "later removed
+    by a fix or revert" is leaked), which the re-replay records as its `fix_rev` (R-evidence-10)."""
     from aegis_core import rules
 
     home = hg.Home(tmp_path / "home")
@@ -631,12 +664,13 @@ def test_detector_replay_ignores_unmerged_head_and_reconciles_leaked_to_caught_a
     repo.commit("fix: replace eval with int on main")
     repo.git("checkout", "work")
 
-    # Re-running replay / sync reconciles the earlier `leaked` finding for `eval` to `caught`
+    # Re-running replay supersedes the earlier row of the same unit: still `leaked`, now with its fix
     second_replay = fitness.replay_detector_history(repo.root)
-    patterns_2 = {d["pattern"]: d["disposition"] for d in second_replay}
-    assert patterns_2 == {"eval": "caught"}
+    patterns_2 = {d["pattern"]: (d["disposition"], d["rev"]) for d in second_replay}
+    assert patterns_2 == {"eval": ("leaked", first_replay[0]["rev"])}
+    assert second_replay[0]["fix_rev"] is not None and first_replay[0]["fix_rev"] is None
     fit_2 = fitness.for_rules(repo.root, rules.load_rules(repo.root).served)["no-eval-exec"]
-    assert fit_2.leaked == 0 and fit_2.caught == 1
+    assert fit_2.leaked == 1 and fit_2.caught == 0
 
 
 @needs_git

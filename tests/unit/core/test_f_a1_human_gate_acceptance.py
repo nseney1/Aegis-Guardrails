@@ -325,6 +325,62 @@ def test_the_signature_programs_are_not_looked_up_on_a_path_the_repository_can_p
     assert status != "G" and not marker.exists()
 
 
+def _planted_ssh_keygen(repo: hg.Repo, tmp_path: Path) -> Path:
+    """``<repo>/bin/ssh-keygen``: records that it ran and fails. Returns the marker path."""
+    marker = tmp_path / "planted-ran"
+    planted = repo.root / "bin" / "ssh-keygen"
+    planted.parent.mkdir()
+    planted.write_bytes(f'#!/bin/sh\necho ran >> "{marker}"\nexit 1\n'.encode())
+    planted.chmod(0o755)
+    return marker
+
+
+@posix_only
+@needs_signing
+def test_ssh_keygen_inside_the_repository_is_never_the_signature_program(tmp_path, monkeypatch, keys):
+    """Given PATH whose first absolute entry is ``<repo>/bin`` holding an ``ssh-keygen`` and the
+    system one later on PATH, When an approval is verified and one is signed, Then the planted
+    program never runs and both use the system ssh-keygen."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    repo.home.sign_with(str(keys["human"]))
+    marker = _planted_ssh_keygen(repo, tmp_path)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo.root / "bin"), os.environ["PATH"]]))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (verdict.valid, verdict.code) == (True, "ok"), verdict
+    signed = human_gate.signed_empty_commit(repo.root, human_gate.approval_message(digest))
+    assert human_gate.verify_approval(repo.root, signed, digest, "main").valid
+    assert not marker.exists()
+
+
+@posix_only
+@needs_signing
+def test_with_ssh_keygen_only_inside_the_repository_approvals_are_refused(tmp_path, monkeypatch, keys):
+    """Given PATH holding only ``<repo>/bin/ssh-keygen`` (and git, outside the repository), When an
+    approval is verified or signed, Then it is unverifiable or refused as "not installed", and the
+    planted program never runs."""
+    import shutil
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    repo.home.sign_with(str(keys["human"]))
+    marker = _planted_ssh_keygen(repo, tmp_path)
+    git_only = tmp_path / "git-only"
+    git_only.mkdir()
+    try:
+        os.symlink(shutil.which("git"), git_only / "git")
+    except OSError:
+        pytest.skip("cannot make a symlink here")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo.root / "bin"), str(git_only)]))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (verdict.valid, verdict.code) == (False, "unverifiable")
+    assert "ssh-keygen is not installed" in verdict.reason
+    with pytest.raises(human_gate.HumanGateError, match="ssh-keygen is not installed"):
+        human_gate.signed_empty_commit(repo.root, human_gate.approval_message(digest))
+    assert not marker.exists()
+
+
 @posix_only
 @needs_git
 def test_log_show_signature_in_a_repository_config_does_not_run_the_repositorys_program(tmp_path):
@@ -416,7 +472,7 @@ def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
 def _doctor_github(repo: hg.Repo, monkeypatch, gh: hg.FakeGh, answers=None, tty=False, workflow=True, **kw):
     from aegis_cli import doctor
     if workflow:
-        repo.write(".github/workflows/ci.yml", "name: CI\non: [push]\njobs:\n  validate:\n    runs-on: ubuntu-latest\n")
+        repo.write(".github/workflows/aegis.yml", hg.AEGIS_WORKFLOW if workflow is True else workflow)
     monkeypatch.setattr(human_gate, "default_gh_runner", gh)
     monkeypatch.setattr(doctor, "_stdin_is_tty", lambda: tty)
     replies = iter(answers or [])
@@ -447,7 +503,7 @@ def test_apply_with_a_terminal_and_a_yes_creates_exactly_the_printed_ruleset(tmp
     assert rc == 0
     ((argv, body),) = gh.posts
     assert argv[:3] == ("api", "--method", "POST") and "rulesets" in argv[3]
-    sent, printed = json.loads(body), human_gate.build_ruleset("B", ["validate"])
+    sent, printed = json.loads(body), human_gate.build_ruleset("B", ["aegis-check"])
     assert sent == printed and sent["enforcement"] == "active" and sent["bypass_actors"] == []
 
 @needs_git
@@ -468,8 +524,18 @@ def test_github_prints_both_rulesets_the_codeowners_lines_and_the_signing_setup(
     rc, out, _err = _doctor_github(repo, monkeypatch, hg.FakeGh())
     assert rc == 0
     for needle in ("Ruleset, tier A", "Ruleset, tier B", '"required_approving_review_count": 1', "~DEFAULT_BRANCH",
-                   "/.aegis/rules/ @octo", "conftest.py @octo", "allowed_signers", "gpg.format ssh", "aegis approve", "Trust tier (human_gate): C"):
+                   "/.aegis/rules/ @octo", "conftest.py @octo", "allowed_signers", "gpg.format ssh", "aegis approve", "Trust tier (human_gate): C",
+                   "integration_id"):
         assert needle in out, needle
+
+@needs_git
+def test_github_codeowners_for_an_organization_repository_name_a_team_not_the_org(tmp_path, monkeypatch):
+    repo = hg.make_repo(tmp_path)
+    rc, out, _err = _doctor_github(repo, monkeypatch, hg.FakeGh(owner="acme", owner_type="Organization"))
+    assert rc == 0
+    assert "conftest.py @OWNER-OR-@org/team" in out and "team" in out
+    assert not [line for line in out.splitlines() if line.rstrip().endswith(" @acme")]
+
 
 @needs_git
 def test_github_json_carries_the_envelope_and_applies_nothing(tmp_path, monkeypatch):
@@ -575,6 +641,20 @@ def test_approve_needs_ssh_signing_configured_at_user_scope(tmp_path, monkeypatc
     rc, out, err = _approve(repo, monkeypatch)
     assert rc == 1 and repo.head() == before and "gpg.format" in out + err
 
+@needs_signing
+@pytest.mark.parametrize("signing", [None, "openpgp"], ids=["no-key", "openpgp"])
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_approve_without_an_ssh_signing_key_is_refused_no_key(tmp_path, monkeypatch, keys, signing, exempt):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    _changed_rule_branch(repo)
+    if signing:
+        repo.home.sign_with("ABCDEF0123456789", fmt=signing)
+    before = repo.head()
+    extra = {"exempt_test": before, "reason": "by hand"} if exempt else {}
+    rc, out, _err = _approve(repo, monkeypatch, json=True, **extra)
+    assert rc == 1 and repo.head() == before
+    assert json.loads(out)["code"] == "no_key"
+
 @posix_only
 @needs_signing
 def test_a_repository_cannot_choose_the_signing_program(tmp_path, monkeypatch, keys):
@@ -679,15 +759,128 @@ def test_approve_exempt_test_signs_and_verifies_commit_scoped_exemption(tmp_path
     repo.home.sign_with(str(keys["human"]))
     rc_missing, _out_m, err_m = _approve(repo, monkeypatch, exempt_test=fix_oid, reason=None)
     assert rc_missing == 2 and "--reason" in err_m
-    rc, out, err = _approve(repo, monkeypatch, exempt_test=fix_oid, reason="verified manually")
+    rc, out, err = _approve(repo, monkeypatch, exempt_test=fix_oid, reason="checked by hand, no test possible")
     assert rc == 0, out + err
     assert fix_oid in out
-    verdict = human_gate.verify_test_exemption(repo.root, "HEAD", fix_oid, "main", expected_reason="verified manually")
-    assert verdict.valid, verdict
+    verdict = human_gate.verify_test_exemption(repo.root, "HEAD", fix_oid, "main")
+    assert verdict.valid and "checked by hand" in verdict.reason, verdict
 
-def test_repo_workflow_contexts_returns_aggregate_aegis_check():
-    root = Path(__file__).resolve().parents[3]
-    assert human_gate.workflow_contexts(root) == ["aegis-check"]
+
+def test_approve_reason_help_says_it_is_signed_not_matched(capsys):
+    from aegis_cli import cli
+    with pytest.raises(SystemExit):
+        cli.main(["approve", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "signed into the commit" in out and "must match" not in out
+
+
+def _two_commits_sharing_a_prefix(repo: hg.Repo, width: int = 7) -> tuple:
+    """Two commit objects whose ids share their first ``width`` hex digits (a birthday search)."""
+    import hashlib
+    if repo.git("rev-parse", "--show-object-format") != "sha1":
+        pytest.skip("the prefix search builds SHA-1 commit ids")
+    tree, parent = repo.git("rev-parse", "HEAD^{tree}"), repo.head()
+    seen: dict = {}
+    for nonce in range(1 << 21):
+        body = (f"tree {tree}\nparent {parent}\nauthor A <a@example.com> 1700000000 +0000\n"
+                f"committer A <a@example.com> 1700000000 +0000\n\nfix: attempt {nonce}\n").encode()
+        oid = hashlib.sha1(b"commit %d\0" % len(body) + body).hexdigest()
+        first = seen.setdefault(oid[:width], body)
+        if first is not body:
+            # bytes, not text: a Windows text-mode pipe would turn LF into CRLF and git would reject the object
+            return tuple(subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo.root, input=b,
+                                        capture_output=True, check=True).stdout.decode().strip() for b in (first, body))
+    pytest.skip("no shared prefix found")
+
+
+@needs_signing
+def test_a_short_prefix_exemption_names_no_commit_not_even_one_ground_to_share_it(tmp_path, keys):
+    """Given two commits whose ids share their first 7 hex digits and a signed exemption naming only
+    that prefix, When either is checked as the fix commit, Then neither is exempted; the full id
+    exempts exactly the commit it names."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    intended, ground = _two_commits_sharing_a_prefix(repo)
+    assert intended != ground and intended[:7] == ground[:7]
+    short = repo.commit(f"chore: approve\n\nAegis-Exempt-Test: {intended[:7]} reviewed by hand\n",
+                        sign_key=keys["human"], allow_empty=True)
+    for fix in (intended, ground):
+        verdict = human_gate.verify_test_exemption(repo.root, short, fix, "main")
+        assert not verdict.valid and verdict.code in ("no_exemption_trailer", "commit_mismatch"), verdict
+    full = repo.commit(human_gate.exemption_message(intended, "reviewed by hand"), sign_key=keys["human"], allow_empty=True)
+    assert human_gate.verify_test_exemption(repo.root, full, intended, "main").valid
+    assert human_gate.verify_test_exemption(repo.root, full, ground, "main").code == "commit_mismatch"
+
+
+@needs_signing
+@pytest.mark.parametrize("body, code", [
+    ("Aegis-Exempt-Test: {other} reviewed\n", "commit_mismatch"),
+    ("Aegis-Exempt-Test: {fix} reviewed\nAegis-Exempt-Test: {fix} again\n", "multiple_trailers"),
+    ("Aegis-Accept: x\nAegis-Exempt-Test: {fix} reviewed\n", "accept_reserved"),
+], ids=["other", "two", "accept"])
+def test_a_signed_exemption_for_another_commit_twice_or_beside_a_reserved_line_is_refused(tmp_path, keys, body, code):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    other = repo.head()
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit("fix: hotfix app\n\nAegis-No-Test: by hand")
+    approval = repo.commit("chore: approve\n\n" + body.format(fix=fix, other=other), sign_key=keys["human"],
+                           allow_empty=True)
+    verdict = human_gate.verify_test_exemption(repo.root, approval, fix, "main")
+    assert (verdict.valid, verdict.code) == (False, code)
+
+
+@needs_signing
+def test_find_test_exemption_never_takes_the_fix_commit_as_its_own_approval(tmp_path, monkeypatch, keys):
+    """Given a signed fix commit on the branch that carries an Aegis-Exempt-Test line, When the branch
+    is scanned for its exemption, Then no verdict computed or returned is for the fix commit itself."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit(f"fix: hotfix app\n\nAegis-Exempt-Test: {repo.head()} self\n", sign_key=keys["human"])
+    seen = []
+    real = human_gate.verify_test_exemption
+
+    def spy(*args, **kw):
+        verdict = real(*args, **kw)
+        seen.append(verdict.commit)
+        return verdict
+
+    monkeypatch.setattr(human_gate, "verify_test_exemption", spy)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    assert fix not in seen
+
+
+@needs_git
+@pytest.mark.parametrize("body", [
+    "Aegis-Accept: whatever\n",
+    "Aegis-Accept: x\nAegis-Exempt-Test: {other} reviewed\n",
+], ids=["accept-only", "accept-beside-another-exemption"])
+def test_a_reserved_line_in_a_commit_that_does_not_name_the_fix_is_no_rejected_exemption_of_it(tmp_path, body):
+    """Given a test-less fix commit and a later commit with an Aegis-Accept line and no exemption naming
+    that fix, When the branch is scanned for the fix's exemption, Then there is none, not a rejected one."""
+    repo = hg.make_repo(tmp_path)
+    other = repo.head()
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit("fix: hotfix app\n\nAegis-No-Test: by hand")
+    repo.commit("docs: unrelated\n\n" + body.format(other=other), allow_empty=True)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+
+@needs_git
+def test_github_json_requires_only_the_scaffold_aegis_job(tmp_path, monkeypatch):
+    from aegis_core import scaffolding
+    repo = hg.make_repo(tmp_path)
+    repo.write(".github/workflows/lint.yml", "name: Lint\non: [pull_request]\njobs:\n  lint:\n    runs-on: ubuntu-latest\n")
+    rc, out, _err = _doctor_github(repo, monkeypatch, hg.FakeGh(), workflow=scaffolding.ci_workflow(), json=True)
+    doc = json.loads(out)
+    assert rc == 0 and doc["github"]["required_checks"] == ["aegis-check"]
+
+
+@needs_git
+def test_apply_refuses_an_aegis_job_whose_name_is_templated(tmp_path, monkeypatch):
+    repo, gh = hg.make_repo(tmp_path), hg.FakeGh()
+    templated = ("name: Aegis\non: [pull_request]\njobs:\n  aegis:\n    name: 'Aegis (${{ github.event_name }})'\n"
+                 "    steps:\n      - run: aegis check --ci\n")
+    rc, out, err = _doctor_github(repo, monkeypatch, gh, answers=["y"], tty=True, workflow=templated, apply=True, tier="B")
+    assert rc != 0 and gh.posts == []
+    assert "literal name" in out + err
 
 # ── 5. the Aegis-Test-Change trailer authorizes nothing ──────────────────────
 

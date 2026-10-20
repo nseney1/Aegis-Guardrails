@@ -11,7 +11,7 @@ import io
 import os
 from pathlib import Path
 import tokenize
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple, Union
+from typing import Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple, Union
 
 from aegis_core.ast.schema import (
     CallSiteNode,
@@ -164,6 +164,48 @@ def _alias_pairs(names: List[ast.alias]) -> Tuple[Tuple[str, str], ...]:
     return tuple((a.asname, a.name) for a in names if a.asname and a.asname != a.name)
 
 
+class _Frame(NamedTuple):
+    kind: str  # "module", "function" or "class"
+    parent: Optional["_Frame"]
+    bound: Set[str]  # the names a def, class or import binds directly in this scope
+
+
+_FUNCTION_LIKE = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _bound_name_calls(tree: ast.AST) -> Set[int]:
+    """ids of the bare-name calls whose callee a def, class or import binds where Python's lookup
+    finds it: the call's scope, then enclosing function and module scopes (a class body only for
+    code directly in it). Parameters, assignments and plain ``import x`` do not bind; order inside
+    a scope is not modelled (a call before a later def, a def under ``if False:``)."""
+    pending: List[Tuple[int, str, _Frame]] = []
+    stack: List[Tuple[ast.AST, _Frame]] = [(tree, _Frame("module", None, set()))]
+    while stack:
+        node, frame = stack.pop()
+        if isinstance(node, _SCOPE_NODES):
+            frame.bound.add(node.name)
+            inner = _Frame("class" if isinstance(node, ast.ClassDef) else "function", frame, set())
+            body = {id(child) for child in node.body}
+            stack.extend((child, inner if id(child) in body else frame) for child in ast.iter_child_nodes(node))
+            continue
+        if isinstance(node, ast.Import):
+            frame.bound.update(a.asname for a in node.names if a.asname)
+        elif isinstance(node, ast.ImportFrom):
+            frame.bound.update(a.asname or a.name for a in node.names if a.name != "*")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            pending.append((id(node), node.func.id, frame))
+        frame = _Frame("function", frame, set()) if isinstance(node, _FUNCTION_LIKE) else frame
+        stack.extend((child, frame) for child in ast.iter_child_nodes(node))
+    bound: Set[int] = set()
+    for call_id, name, frame in pending:
+        scope: Optional[_Frame] = frame
+        while scope is not None and not (name in scope.bound and (scope.kind != "class" or scope is frame)):
+            scope = scope.parent
+        if scope is not None:
+            bound.add(call_id)
+    return bound
+
+
 class _PythonASTVisitor:
     """Collects the NormalizedAST parts in one pre-order pass (``walk``).
 
@@ -178,6 +220,7 @@ class _PythonASTVisitor:
         self.bindings = bindings or {}
         self._binding_sets = {name: frozenset(quals) for name, quals in self.bindings.items()}
         self._dynamic_cache: Dict[int, Optional[Tuple[str, FrozenSet[str]]]] = {}
+        self._bound_calls: Set[int] = set()
         self.dunder_all: Optional[Set[str]] = None
         self.scope_stack: List[str] = []
         self.class_stack: List[str] = []
@@ -188,6 +231,7 @@ class _PythonASTVisitor:
         self.mutation_points: List[MutationPoint] = []
 
     def walk(self, tree: ast.AST) -> None:
+        self._bound_calls = _bound_name_calls(tree)
         stack: List[Tuple[ast.AST, bool]] = [(tree, False)]
         while stack:
             node, leaving = stack.pop()
@@ -355,6 +399,7 @@ class _PythonASTVisitor:
 
         caller_scope = self.scope_stack[-1] if self.scope_stack else None
         call_args = _call_args(node)
+        shadowed = (id(node) in self._bound_calls) if isinstance(node.func, ast.Name) else None
         for target in self._call_targets(node.func):
             self.call_sites.append(
                 CallSiteNode(
@@ -362,6 +407,7 @@ class _PythonASTVisitor:
                     line=node.lineno,
                     caller_scope=caller_scope,
                     args=call_args,
+                    shadowed=shadowed,
                 )
             )
 

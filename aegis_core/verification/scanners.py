@@ -4,41 +4,56 @@ from __future__ import annotations
 import collections
 from dataclasses import dataclass
 import hashlib
+import itertools
 import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, pathlookup
 from aegis_core.verification import test_runner
 
+# Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear); above
+# this length a finding's snippet is the masked token alone, never the surrounding line.
 MAX_LINE_LENGTH = 4096
 MAX_EXCERPT_CHARS = 300
-_B_PRE, _B_SUF = r"(?<![A-Za-z0-9+/_-])", r"(?![A-Za-z0-9+/=_-])"
+# Left edges. Each body starts with a distinctive literal, so only a letter or digit before it means
+# "inside a longer run"; `_ - / +` are delimiters (deploy_ghp_..., clone URLs). Bodies that contain
+# `_` or `-` also treat those as identifier characters, and the generic OpenAI `sk-` shape keeps the
+# strict edge so kebab-case paths and branch names stay clean.
+_B_PRE, _B_SUF = r"(?<![A-Za-z0-9])", r"(?![A-Za-z0-9+/=_-])"
+_B_PRE_ID, _B_PRE_STRICT = r"(?<![A-Za-z0-9_-])", r"(?<![A-Za-z0-9+/_-])"
 
 TIER_A_PATTERNS: dict[str, re.Pattern[str]] = {
     "aws-access-key-id": re.compile(_B_PRE + r"(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[A-Z0-9]{16}" + _B_SUF),
     "github-pat": re.compile(_B_PRE + r"gh[pousr]_[A-Za-z0-9]{36,255}" + _B_SUF),
-    "github-fine-grained-pat": re.compile(_B_PRE + r"github_pat_[A-Za-z0-9_]{22,255}" + _B_SUF),
-    "slack-token": re.compile(_B_PRE + r"xox[abprs]-[A-Za-z0-9-]{10,255}" + _B_SUF),
+    "github-fine-grained-pat": re.compile(_B_PRE_ID + r"github_pat_[A-Za-z0-9_]{22,255}" + _B_SUF),
+    "slack-token": re.compile(_B_PRE_ID + r"xox[abprs]-[A-Za-z0-9-]{10,255}" + _B_SUF),
     "stripe-live-secret": re.compile(_B_PRE + r"[sr]k_live_[0-9A-Za-z]{24,99}" + _B_SUF),
-    "anthropic-api-key": re.compile(_B_PRE + r"sk-ant-[A-Za-z0-9_-]{20,255}" + _B_SUF),
-    "openai-api-key": re.compile(_B_PRE + r"sk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{32,255}" + _B_SUF),
-    "google-api-key": re.compile(_B_PRE + r"AIza[0-9A-Za-z_-]{35}" + _B_SUF),
+    "anthropic-api-key": re.compile(_B_PRE_ID + r"sk-ant-[A-Za-z0-9_-]{20,255}" + _B_SUF),
+    "openai-api-key": re.compile(_B_PRE_STRICT + r"sk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{32,255}" + _B_SUF),
+    "google-api-key": re.compile(_B_PRE_ID + r"AIza[0-9A-Za-z_-]{35}" + _B_SUF),
     "private-key-pem": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"),
-    "jwt-three-segment": re.compile(_B_PRE + r"eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}" + _B_SUF),
+    "jwt-three-segment": re.compile(_B_PRE_ID + r"eyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}" + _B_SUF),
     "url-basic-auth": re.compile(r"://([^/\s:@'\"$<>]{1,64}):([^/\s:@'\"$<>]{3,64})@[A-Za-z0-9.-]{1,253}"),
 }
 
 _TIER_B_RE = re.compile(r"""(?i)\b([A-Za-z0-9_.-]{0,32}(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|credential|auth[_-]?token|client[_-]?secret)[A-Za-z0-9_.-]{0,32})\s*[:=]\s*(['"])([^'"\s]{8,256})\2""")
 _TIER_C_RE = re.compile(r"""(['"])([A-Za-z0-9+/=_-]{20,256})\1""")
-_PLACEHOLDER_RE = re.compile(r"(?i)(?:example|dummy|test|placeholder|changeme|your[_-]|fake|redacted|todo|x{3,}|\*{3,}|\.{3}|^<.*>$|^\$\{?.*\}?$|^%.*%$|^(?:true|false|null|none)$)")
+_PLACEHOLDER_WORDS = ("example", "dummy", "test", "placeholder", "changeme", "fake", "redacted", "todo")
+_PLACEHOLDER_SHAPES = r"your[_-]|x{3,}|\*{3,}|\.{3}|^<.*>$|^\$\{?.*\}?$|^%.*%$|^(?:true|false|null|none)$"
+# Substring form for machine token bodies, where a prefix glues onto the placeholder (AKIA...EXAMPLE).
+_PLACEHOLDER_RE = re.compile(r"(?i)(?:" + "|".join(_PLACEHOLDER_WORDS) + "|" + _PLACEHOLDER_SHAPES + ")")
+_PLACEHOLDER_SHAPE_RE = re.compile(r"(?i)(?:" + _PLACEHOLDER_SHAPES + ")")
+_WORD_SPLIT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0-9+/=]+|\bsha(?:1|256|384|512)-[A-Za-z0-9+/=]{16,})")
 _HASH_FIELD_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:sha1|sha256|sha384|sha512|md5|integrity|checksum|digest|hash|commit|oid|etag|fingerprint)(?:$|[^a-z0-9])")
+_PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 _SUPPRESSION_RE = re.compile(r"#\s*(?:noqa|nosec|gitleaks:allow)\b", re.IGNORECASE)
 
 _NB = r"(?<![A-Za-z0-9])"
@@ -53,7 +68,7 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
     (re.compile(pattern), hook, text) for pattern, hook, text in (
         # The body is optional, so an unterminated header cannot backtrack over the rest.
         (_PEM_HEAD + "(?:(?:[^-]|-(?!-)){0,16384}" + _PEM_TAIL + ")?", "[REDACTED_PEM]", "[REDACTED_PEM]"),
-        # The scheme is optional because Tier A blocks a bare "://user:pass@host" too.
+        # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
         ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
          r"\1[REDACTED]@"),
         (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
@@ -88,6 +103,9 @@ _PII_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
 )
 _TEXT_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS) + _PII_REDACTIONS
+# The single-token rows, safe over a snippet that already carries masks: PEM spans lines, and the URL
+# userinfo and keyed rows (the ones with a backreference) rewrite whatever follows, masks included.
+_TOKEN_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS if "\\1" not in text and text != "[REDACTED_PEM]")
 _HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 _CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
 
@@ -195,48 +213,92 @@ def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:
     return out
 
 
-def _is_benign_token(val: str) -> bool:
-    return bool(_PLACEHOLDER_RE.search(val) or _UUID_RE.match(val) or _HEX_RE.match(val))
+def _is_placeholder_text(val: str) -> bool:
+    """For human-chosen strings a placeholder word must start a word: ``testpass`` and ``Test_Pw``
+    are placeholders, ``contest`` and ``latestGreat9`` are not."""
+    return bool(_PLACEHOLDER_SHAPE_RE.search(val)) or any(w.lower().startswith(_PLACEHOLDER_WORDS) for w in _WORD_SPLIT_RE.findall(val))
+
+
+def _is_benign_token(val: str, *, human_text: bool = False) -> bool:
+    placeholder = _is_placeholder_text(val) if human_text else bool(_PLACEHOLDER_RE.search(val))
+    return placeholder or bool(_UUID_RE.match(val) or _HEX_RE.match(val))
+
+
+def _sweep_unreported_secrets(line: str) -> str:
+    """Scrub secret-shaped values no scan pass reported, leaving the masks of reported ones intact."""
+    for pat, text in _TOKEN_REDACTIONS:
+        line = pat.sub(text, line)
+    return _CANDIDATE_TOKEN_RE.sub(lambda m: "[REDACTED]" if _is_high_entropy_secret(m.group(0), 4.0) else m.group(0), line)
+
+
+def _pem_key_material(lines: list[str], index: int, end: int) -> str | None:
+    """Base64 after a PEM header on its own line (a one-line string with escaped newlines), "" for a
+    base64 line among the next 6 non-blank lines, else None: a bare header is not key material."""
+    same = _PEM_BODY_RE.search(lines[index], end)
+    if same:
+        return same.group(0)
+    window = itertools.islice(filter(None, (lines[i].strip() for i in range(index + 1, len(lines)))), 6)
+    return "" if any(_PEM_BODY_RE.fullmatch(line) for line in window) else None
 
 
 def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bool = False) -> list[Finding]:
     """Scan text for Tier A (blocking) and optionally Tier B/C (advisory) secrets."""
     findings: list[Finding] = []
-    for lineno, raw_line in enumerate(text.splitlines(), 1):
-        if len(raw_line) > MAX_LINE_LENGTH:
-            continue
+    lines = text.splitlines()
+    for lineno, raw_line in enumerate(lines, 1):
         cleaned = _DATA_URL_OR_SRI_RE.sub('""', raw_line)
         line_secrets: list[str] = []
         matched: list[tuple[str, str, str]] = []
         for rule_id, rx in TIER_A_PATTERNS.items():
-            for m in rx.finditer(cleaned):
-                full = m.group(0)
+            # The raw line: a known-format token is a secret whatever precedes it. Blanking data-URL
+            # payloads only suppresses heuristic (advisory) false positives; the payload may be the token.
+            for m in rx.finditer(raw_line):
+                full, tier = m.group(0), "gate"
                 if rule_id == "url-basic-auth":
                     user, pwd = m.group(1), m.group(2)
-                    if _PLACEHOLDER_RE.search(user) or _PLACEHOLDER_RE.search(pwd) or "$" in user or "$" in pwd:
+                    if _is_placeholder_text(user) or _is_placeholder_text(pwd) or "$" in user or "$" in pwd:
                         continue
                     line_secrets.extend([full, pwd])
-                elif rule_id != "private-key-pem" and _is_benign_token(full):
+                elif rule_id == "private-key-pem":
+                    material = _pem_key_material(lines, lineno - 1, m.end())
+                    if material is None and not include_advisory:
+                        continue
+                    tier = "gate" if material is not None else "advisory"
+                    line_secrets.extend([full, material] if material else [full])
+                elif _is_benign_token(full):
                     continue
                 else:
                     line_secrets.append(full)
-                matched.append((rule_id, "gate", full))
-        if include_advisory and not _HASH_FIELD_RE.search(cleaned):
-            for m in _TIER_B_RE.finditer(cleaned):
-                key_name, val = m.group(1), m.group(3)
-                if not _HASH_FIELD_RE.search(key_name) and not _is_benign_token(val) and not any(val in s or s in val for s in line_secrets):
-                    line_secrets.append(val)
-                    matched.append(("generic-secret-assign", "advisory", val))
-            for m in _TIER_C_RE.finditer(cleaned):
-                val = m.group(2)
-                if not _is_benign_token(val) and not any(val in s or s in val for s in line_secrets) and shannon_entropy(val) >= 4.5:
-                    line_secrets.append(val)
-                    matched.append(("high-entropy-token", "advisory", val))
+                matched.append((rule_id, tier, full))
+        if not matched and not include_advisory:
+            continue
+        # Advisory values are masked in every snippet; include_advisory and the hash-field guard only
+        # decide whether they are reported, so the snippet and its fingerprint do not depend on them.
+        report_advisory = include_advisory and not _HASH_FIELD_RE.search(cleaned)
+        extra_masks: list[str] = []
+        for m in _TIER_B_RE.finditer(cleaned):
+            key_name, val = m.group(1), m.group(3)
+            if _is_benign_token(val, human_text=True):
+                continue
+            extra_masks.append(val)
+            if report_advisory and not _HASH_FIELD_RE.search(key_name) and not any(val in s or s in val for s in line_secrets):
+                line_secrets.append(val)
+                matched.append(("generic-secret-assign", "advisory", val))
+        for m in _TIER_C_RE.finditer(cleaned):
+            val = m.group(2)
+            if _is_benign_token(val) or shannon_entropy(val) < 4.5:
+                continue
+            extra_masks.append(val)
+            if report_advisory and not any(val in s or s in val for s in line_secrets):
+                line_secrets.append(val)
+                matched.append(("high-entropy-token", "advisory", val))
         if not matched:
             continue
-        masked_line = raw_line.strip()
-        for sec in sorted(set(line_secrets), key=len, reverse=True):
-            masked_line = masked_line.replace(sec, mask_secret(sec))
+        masked_line = raw_line.strip() if len(raw_line) <= MAX_LINE_LENGTH else ""
+        if masked_line:
+            for sec in sorted({*line_secrets, *extra_masks}, key=len, reverse=True):
+                masked_line = masked_line.replace(sec, mask_secret(sec))
+            masked_line = _sweep_unreported_secrets(masked_line)
         for rule_id, tier, sec in matched:
             masked_tok = mask_secret(sec)
             snippet = masked_line if masked_tok in masked_line else masked_tok
@@ -287,8 +349,8 @@ def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] |
     return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
 
 
-def _count_repo_suppressions(workspace_root: Path | str | None, diff_text: str | None = None) -> int:
-    count = len(_SUPPRESSION_RE.findall(diff_text)) if diff_text else 0
+def _count_repo_suppressions(workspace_root: Path | str | None) -> int:
+    count = 0
     if workspace_root is None:
         return count
     root = Path(workspace_root).resolve()
@@ -311,69 +373,91 @@ def _count_repo_suppressions(workspace_root: Path | str | None, diff_text: str |
     return count
 
 
+def _sarif_artifact(uri: str, root: Path | None) -> tuple[str, Path | None]:
+    """(repo-relative label, file safe to read) for a SARIF artifact URI. The URI is scanner output
+    about untrusted code (``a/../../x``, an absolute path, a symlink out): only a real location
+    inside ``root`` is readable; otherwise the label keeps no traversal segment and nothing is read."""
+    uri = uri[7:] if uri.startswith("file://") else uri
+    label = "/".join(s for s in posixpath.normpath(Path(uri).as_posix()).split("/") if s not in ("", ".", "..")) if uri else ""
+    if root is None or not uri:
+        return label, None
+    try:
+        real = Path(os.path.realpath(Path(uri) if Path(uri).is_absolute() else root / uri))
+        return real.relative_to(root).as_posix(), real
+    except (OSError, ValueError):  # outside the tree, a NUL byte, ELOOP, ENAMETOOLONG
+        return label, None
+
+
+def _mask_tier_a(text: str) -> str:
+    for rx in TIER_A_PATTERNS.values():
+        text = rx.sub(lambda m: mask_secret(m.group(0)), text)
+    return text
+
+
+class _SarifError(ValueError):
+    """A SARIF document that cannot be understood; the message names a location, never content."""
+
+
+def _sarif_unverified(reason: str) -> dict[str, Any]:
+    return {"status": "unverified", "reason": reason[:200], "findings": []}
+
+
+def _sarif_obj(value: Any, where: str) -> Mapping[str, Any]:
+    if value and not isinstance(value, Mapping):
+        raise _SarifError(f"{where} must be an object")
+    return value or {}
+
+
+def _sarif_arr(value: Any, where: str) -> Sequence[Any]:
+    if value and not isinstance(value, list):
+        raise _SarifError(f"{where} must be an array")
+    return value or ()
+
+
 def ingest_sarif(
-    sarif_data: str | bytes | Mapping[str, Any] | Path,
+    doc: Mapping[str, Any],
     *,
     workspace_root: Path | str | None = None,
-    base_sarif: str | bytes | Mapping[str, Any] | Path | None = None,
-    base_fingerprints: Iterable[str] | None = None,
-    diff_text: str | None = None,
+    base_fingerprints: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Ingest SARIF 2.1.0, compute fingerprints, subtract base findings, and count suppressions."""
-    def _load(src: Any) -> Mapping[str, Any]:
-        if isinstance(src, Mapping):
-            return src
-        if isinstance(src, Path):
-            return json.loads(src.read_text(encoding="utf-8"))
-        if isinstance(src, bytes):
-            return json.loads(src.decode("utf-8", "replace"))
-        s = str(src).strip()
-        if not s.startswith("{") and Path(s).is_file():
-            return json.loads(Path(s).read_text(encoding="utf-8"))
-        return json.loads(s)
-
-    doc = _load(sarif_data)
+    """Ingest a parsed SARIF 2.1.0 document: fingerprints, base subtraction, suppressions. Scanner
+    output is untrusted: a document that is not understood is ``unverified``, never raised."""
     base_fps: set[str] = set(base_fingerprints or ())
-    if base_sarif is not None:
-        base_fps.update(f.fingerprint for f in ingest_sarif(base_sarif, workspace_root=workspace_root)["findings"])
     root_path = Path(workspace_root).resolve() if workspace_root else None
     all_findings: list[Finding] = []
     sarif_supps = 0
-    for run in doc.get("runs") or []:
-        for res in run.get("results") or []:
-            sarif_supps += len(res.get("suppressions") or ())
-            rule_id = str(res.get("ruleId") or "unknown")
-            level = str(res.get("level") or "warning").lower()
-            msg = str((res.get("message") or {}).get("text") or "")
-            phys = ((res.get("locations") or [{}])[0].get("physicalLocation") or {})
-            uri = str((phys.get("artifactLocation") or {}).get("uri") or "")
-            uri = uri[7:] if uri.startswith("file://") else uri
-            rel_path = uri.lstrip("./")
-            if root_path and uri:
-                try:
-                    rel_path = Path(uri).resolve().relative_to(root_path).as_posix()
-                except ValueError:
-                    rel_path = Path(uri).as_posix().lstrip("./")
-            region = phys.get("region") or {}
-            line_no = int(region.get("startLine") or 0)
-            snippet_raw = (region.get("snippet") or {}).get("text")
-            if snippet_raw is None and root_path and rel_path and line_no > 0 and (root_path / rel_path).is_file():
-                lines = (root_path / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
-                snippet_raw = lines[line_no - 1] if 1 <= line_no <= len(lines) else None
-            norm_line = " ".join(str(snippet_raw if snippet_raw is not None else msg).split())
-            fp = sarif_fingerprint(rule_id, rel_path, norm_line)
-            all_findings.append(
-                Finding(
-                    rule_id,
-                    rel_path,
-                    line_no,
-                    norm_line,
-                    "gate",
-                    fp,
-                    "error" if level == "error" else "warning",
-                    msg,
-                )
-            )
+    try:
+        if not isinstance(doc, Mapping) or "runs" not in doc:
+            raise _SarifError("the document has no runs array")
+        for ri, run in enumerate(_sarif_arr(doc["runs"], "runs")):
+            for xi, res in enumerate(_sarif_arr(_sarif_obj(run, f"runs[{ri}]").get("results"), f"runs[{ri}].results")):
+                at = f"runs[{ri}].results[{xi}]"
+                res = _sarif_obj(res, at)
+                sarif_supps += len(_sarif_arr(res.get("suppressions"), f"{at}.suppressions"))
+                rule_id = str(res.get("ruleId") or "unknown")
+                level = str(res.get("level") or "warning").lower()
+                msg = str(_sarif_obj(res.get("message"), f"{at}.message").get("text") or "")
+                locs = _sarif_arr(res.get("locations"), f"{at}.locations")
+                phys = _sarif_obj(_sarif_obj(locs[0] if locs else None, f"{at}.locations[0]").get("physicalLocation"), f"{at}.physicalLocation")
+                uri = str(_sarif_obj(phys.get("artifactLocation"), f"{at}.artifactLocation").get("uri") or "")
+                rel_path, readable = _sarif_artifact(uri, root_path)
+                region = _sarif_obj(phys.get("region"), f"{at}.region")
+                line_no = region.get("startLine") or 0
+                if not isinstance(line_no, int):
+                    raise _SarifError(f"{at}.region.startLine must be an integer")
+                snippet_raw = _sarif_obj(region.get("snippet"), f"{at}.region.snippet").get("text")
+                if snippet_raw is None and readable is not None and line_no > 0:
+                    try:
+                        lines = readable.read_text(encoding="utf-8", errors="replace").splitlines() if readable.is_file() else []
+                    except OSError:
+                        lines = []
+                    snippet_raw = lines[line_no - 1] if 1 <= line_no <= len(lines) else None
+                norm_line = " ".join(str(snippet_raw if snippet_raw is not None else msg).split())
+                fp = sarif_fingerprint(rule_id, rel_path, norm_line)  # over the raw line; only the masked one is shown
+                all_findings.append(Finding(rule_id, rel_path, line_no, _mask_tier_a(norm_line), "gate", fp,
+                                            "error" if level == "error" else "warning", _mask_tier_a(msg)))
+    except _SarifError as exc:
+        return _sarif_unverified(f"SARIF is malformed: {exc}")
     delta = [f for f in all_findings if f.fingerprint not in base_fps]
     return {
         "status": "fail" if delta else "pass",
@@ -381,7 +465,7 @@ def ingest_sarif(
         "total_raw": len(all_findings),
         "delta_count": len(delta),
         "base_subtracted": len(all_findings) - len(delta),
-        "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root, diff_text),
+        "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root),
     }
 
 
@@ -390,12 +474,15 @@ def _is_within_dir(path: Path, directory: Path) -> bool:
     return real_p == real_d or real_p.startswith(real_d.rstrip(os.sep) + os.sep)
 
 
+class UntrustedScannerConfig(ValueError):
+    """A preset would read a scanner config the repository controls."""
+
+
 def build_preset_argv(
     preset: str,
     target_path: Path | str = ".",
     *,
     user_config_dir: Path | str | None = None,
-    config_path: Path | str | None = None,
 ) -> list[str]:
     target = Path(target_path).resolve()
     if preset == "ruff":
@@ -406,11 +493,26 @@ def build_preset_argv(
         ul = UserLayout.current()
         user_dir = Path(user_config_dir).resolve() if user_config_dir else (ul.aegis_dir.resolve() if ul else None)
         if user_dir is not None and not _is_within_dir(user_dir, target):
-            cand = Path(config_path).resolve() if config_path else (user_dir / "gitleaks.toml").resolve()
+            cand = (user_dir / "gitleaks.toml").resolve()
             if _is_within_dir(cand, user_dir) and not _is_within_dir(cand, target) and cand.is_file():
                 argv.extend(["--config", str(cand)])
+        # Without --config gitleaks reads <source>/.gitleaks.toml: a repository allowlist would
+        # silence the scan. lexists, so a dangling link or a case-folded name counts too.
+        if "--config" not in argv and os.path.lexists(target / ".gitleaks.toml"):
+            raise UntrustedScannerConfig("the repository has its own .gitleaks.toml; set ~/.aegis/gitleaks.toml to scan it")
         return argv
     raise ValueError(f"Unsupported scanner preset: {preset!r}")
+
+
+def _run_found_program(argv: Sequence[str], cwd: Path | str, env: Mapping[str, str] | None = None, timeout: int | float = 60) -> dict[str, Any]:
+    """``run_external_cmd`` on the ``argv[0]`` found in an absolute PATH entry outside ``cwd``: the
+    scanner runs with the repository as its cwd, where an empty or relative entry would find a
+    program the repository planted, and its silence would read as a clean scan."""
+    exe = pathlookup.which(str(argv[0]), outside=cwd)
+    if exe is None:
+        return {"returncode": 127, "stdout": "", "stderr": f"{argv[0]} not found in an absolute PATH entry outside the workspace",
+                "missing_binary": True, "timed_out": False, "duration_s": 0.0}
+    return test_runner.run_external_cmd([exe, *argv[1:]], cwd=cwd, env=env, timeout=timeout)
 
 
 def run_preset_scanner(
@@ -418,24 +520,31 @@ def run_preset_scanner(
     workspace_root: Path | str,
     *,
     user_config_dir: Path | str | None = None,
-    config_path: Path | str | None = None,
     base_fingerprints: Iterable[str] | None = None,
     timeout: int = 60,
     runner: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir, config_path=config_path)
-    cmd_runner = runner or test_runner.run_external_cmd
     try:
-        res = cmd_runner(argv, cwd=Path(workspace_root), timeout=timeout)
-    except FileNotFoundError as exc:
-        return {"status": "unverified", "reason": str(exc), "findings": [], "argv": argv}
+        argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir)
+    except UntrustedScannerConfig as exc:
+        return {"status": "unverified", "reason": str(exc), "findings": [], "argv": []}
+    res = (runner or _run_found_program)(argv, cwd=Path(workspace_root), timeout=timeout)
     if res.get("missing_binary") or res.get("timed_out"):
         reason = res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found")
         return {"status": "unverified", "reason": reason, "findings": [], "argv": argv}
-    stdout = (res.get("stdout") or "").strip()
-    if stdout.startswith("{"):
-        return {**ingest_sarif(stdout, workspace_root=workspace_root, base_fingerprints=base_fingerprints), "argv": argv}
-    if res.get("returncode", 0) == 0:
-        return {"status": "pass", "findings": [], "suppression_count": _count_repo_suppressions(workspace_root), "argv": argv}
-    return {"status": "unverified", "reason": res.get("stderr") or f"{argv[0]} failed", "findings": [], "argv": argv}
+    # pass needs positive evidence: a SARIF run on stdout and an exit code its findings explain.
+    stdout, stderr = str(res.get("stdout") or "").strip(), str(res.get("stderr") or "").strip()
+    try:
+        doc = json.loads(stdout) if stdout else None
+    except (ValueError, RecursionError):
+        doc = None
+    runs = doc.get("runs") if isinstance(doc, dict) else None
+    if not (isinstance(runs, list) and runs and all(isinstance(run, dict) for run in runs)):
+        why = "produced no SARIF output" if not stdout else "printed output that is not a SARIF run"
+        return {**_sarif_unverified(stderr or f"{argv[0]} {why}"), "argv": argv}
+    report = ingest_sarif(doc, workspace_root=workspace_root, base_fingerprints=base_fingerprints or ())
+    rc = res.get("returncode")
+    if report["status"] == "pass" and not (rc == 0 or (rc == 1 and report["total_raw"] > 0)):
+        return {**_sarif_unverified(stderr or f"{argv[0]} exited {rc} without findings to explain it"), "argv": argv}
+    return {**report, "argv": argv}
 

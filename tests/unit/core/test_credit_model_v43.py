@@ -186,7 +186,7 @@ def test_credit_event_writers_and_deduplication(tmp_path: Path) -> None:
     assert len(exp_rows) == 1
     assert exp_rows[0]["paths"] == ["src/a.py"]
 
-    # Detection deduplicates (rule, file, pattern, branch) and validates disposition.
+    # Detection deduplicates (rule, file, pattern, introducing commit) and validates disposition.
     with pytest.raises(ValueError, match="disposition"):
         credit.record_detection(tmp_path, "r-one", "src/a.py", "eval", disposition="invalid")
     d1 = credit.record_detection(
@@ -199,6 +199,9 @@ def test_credit_event_writers_and_deduplication(tmp_path: Path) -> None:
     assert d1 == d2
     det_rows = [r for r in credit.read_rows(tmp_path) if r.get("event") == "detection"]
     assert len(det_rows) == 1
+    # another introducing commit is another unit, whatever the branch label says
+    credit.record_detection(tmp_path, "r-one", "src/a.py", "eval", disposition="caught", branch="feat-1", rev="b" * 40)
+    assert len([r for r in credit.read_rows(tmp_path) if r.get("event") == "detection"]) == 2
 
     # Adjudication validates verdict and adjudicator.
     with pytest.raises(ValueError, match="verdict"):
@@ -256,20 +259,26 @@ def test_asymmetric_promotion_and_demotion_states(tmp_path: Path) -> None:
     assert fit_narrow.suggestion is None
     assert suggest(rules["r-inconclusive-one-session"], fit_narrow, now=now) is None
 
-    # 2 TP / 8 FP (n=10 >= 8, precision_hi < 0.65) -> state == 'decided', suggestion == 'demote'.
+    # 5 TP / 20 FP (n = MIN_N = 25, precision_hi < 0.65) -> state == 'decided', suggestion == 'demote'.
     fit_demote = fitness.compute(
-        {"triggers": 10, "tp": 2, "fp": 8},
+        {"triggers": 25, "tp": 5, "fp": 20},
         now=now,
         rule="r-demote",
         rule_type="invariant",
-        adjudicated_tp=2,
-        adjudicated_fp=8,
+        adjudicated_tp=5,
+        adjudicated_fp=20,
         sessions_count=3,
         repos_count=1,
     )
     assert fit_demote.state == "decided"
     assert fit_demote.suggestion == "demote"
     assert suggest(rules["r-demote"], fit_demote, now=now) == "demote"
+
+    # 2 TP / 8 FP is below MIN_N: insufficient, no number, no transition (R-evidence-8).
+    fit_small = fitness.compute({"triggers": 10, "tp": 0, "fp": 0}, now=now, rule="r-demote",
+                                rule_type="invariant", adjudicated_tp=2, adjudicated_fp=8)
+    assert (fit_small.state, fit_small.suggestion, fit_small.status_label) == ("insufficient", None, "insufficient (n=10)")
+    assert suggest(rules["r-demote"], fit_small, now=now) is None
 
 
 @needs_git
@@ -286,7 +295,8 @@ def test_detector_replay_linear_history_fallback(tmp_path: Path) -> None:
     repo.write("src/app.py", "def f(x):\n    return x\n")
     repo.commit("initial")
 
-    # Introduce eval and remove in a normal fix commit -> caught (0.5).
+    # Introduce eval on the protected line and remove it in a normal fix commit -> leaked (1.0):
+    # it landed (spec T4.1); only a fix on the branch before its merge is caught.
     repo.write("src/app.py", "def f(x):\n    return eval(x)\n")
     repo.commit("wip eval")
     repo.write("src/app.py", "def f(x):\n    return int(x)\n")
@@ -300,7 +310,98 @@ def test_detector_replay_linear_history_fallback(tmp_path: Path) -> None:
 
     rows = fitness.replay_detector_history(repo.root, persist=False)
     by_pat = {r["pattern"]: r for r in rows}
-    assert by_pat["eval"]["disposition"] == "caught"
-    assert by_pat["eval"]["weight"] == pytest.approx(0.5)
+    assert by_pat["eval"]["disposition"] == "leaked"
+    assert by_pat["eval"]["weight"] == pytest.approx(1.0)
+    assert by_pat["eval"]["fix_rev"] is not None
     assert by_pat["exec"]["disposition"] == "leaked"
     assert by_pat["exec"]["weight"] == pytest.approx(1.0)
+
+
+# ── Dispositions are not false positives (R-evidence-10, spec T4/T4.1) ─────────
+#
+# Given leaked findings, When fitness is computed, Then fp is unchanged (labels are the only
+# fp source) and leaked is reported as a "needs enforcement" count. Given history, When it is
+# replayed, Then a hit that landed (fixed later or not) is leaked, a hit fixed on its branch
+# before the merge is caught, and each introducing commit is its own unit.
+
+
+def test_leaked_findings_are_not_false_positives_and_do_not_demote() -> None:
+    for leaked in (3, fitness.MIN_N):
+        fit = fitness.compute({"triggers": 0, "tp": 0, "fp": 0}, rule="g", rule_type="gate", leaked=leaked)
+        assert (fit.fp, fit.leaked, fit.suggestion) == (0.0, leaked, None)
+        assert fit.state != "decided" and fit.triggers == 0
+
+
+@pytest.mark.parametrize("caught", [0, 2, 3])
+def test_tp_and_fp_are_always_floats(caught: int) -> None:
+    fit = fitness.compute({"triggers": 4, "tp": 4, "fp": 0}, caught=caught, adjudicated_fp=1)
+    assert type(fit.tp) is float and type(fit.fp) is float
+    assert fit.tp == pytest.approx(4 + 0.5 * caught) and fit.fp == 1.0
+
+
+def test_the_override_rate_denominator_is_ledger_triggers_only() -> None:
+    plain = fitness.compute({"triggers": 9}, contested=3)
+    labelled = fitness.compute({"triggers": 9}, contested=3, adjudicated_tp=25, caught=4, leaked=2)
+    assert plain.override_rate == labelled.override_rate == pytest.approx(3 / 12, abs=1e-4)
+    assert labelled.triggers == 9
+
+
+def _replay_repo(tmp_path: Path) -> "hg.Repo":
+    repo = hg.Repo(tmp_path / "repo", hg.Home(tmp_path / "home"))
+    _write_rule(repo.root, "gate", "no-eval-exec", target_paths=["src/*.py"], forbid_calls=["eval", "exec"])
+    repo.write("src/app.py", "def f(x):\n    return x\n")
+    repo.commit("initial")
+    return repo
+
+
+@needs_git
+def test_a_landed_hit_fixed_later_on_the_protected_line_is_leaked(tmp_path: Path) -> None:
+    repo = _replay_repo(tmp_path)
+    repo.write("src/app.py", "def f(x):\n    return eval(x)\n")
+    added = repo.commit("feat: eval (#1)")
+    repo.write("src/app.py", "def f(x):\n    return int(x)\n")
+    fixed = repo.commit("fix: drop eval (#2)")
+
+    (row,) = fitness.replay_detector_history(repo.root, persist=False)
+    assert (row["pattern"], row["disposition"], row["weight"]) == ("eval", "leaked", 1.0)
+    assert (row["rev"], row["fix_rev"]) == (added, fixed)
+
+
+@needs_git
+def test_introduced_and_fixed_twice_by_squash_merges_is_two_units(tmp_path: Path) -> None:
+    repo = _replay_repo(tmp_path)
+    revs = []
+    for n in (1, 3):
+        repo.write("src/app.py", "def f(x):\n    return eval(x)\n")
+        revs.append(repo.commit(f"feat: eval (#{n})"))
+        repo.write("src/app.py", "def f(x):\n    return int(x)\n")
+        repo.commit(f"fix: drop eval (#{n + 1})")
+
+    rows = fitness.replay_detector_history(repo.root, persist=False)
+    assert sorted((r["rev"], r["disposition"]) for r in rows) == sorted((rev, "leaked") for rev in revs)
+
+
+@needs_git
+def test_a_4_3_ledger_replayed_twice_supersedes_its_rows_without_double_counting(tmp_path: Path) -> None:
+    from aegis_core.telemetry_engine import ledger
+
+    repo = _replay_repo(tmp_path)
+    repo.write("src/app.py", "def f(x):\n    return eval(x)\n")
+    added = repo.commit("wip eval")
+    repo.write("src/app.py", "def f(x):\n    return int(x)\n")
+    fixed = repo.commit("replace eval with int")
+    # what 4.3.x replay wrote for this history: keyed by branch, "caught" for a landed-then-fixed hit
+    ledger.append_rows(repo.root, [{
+        "v": 2, "ts": "2026-10-01T00:00:00Z", "event": "detection", "rule": "no-eval-exec", "file": "src/app.py",
+        "pattern": "eval", "disposition": "caught", "branch": "main", "rev": added, "fix_rev": fixed, "weight": 0.5,
+    }])
+
+    def counts() -> tuple:
+        rule = load_rules(repo.root).get("no-eval-exec")
+        fit = fitness.for_rules(repo.root, [rule])["no-eval-exec"]
+        return fit.caught, fit.leaked, len([r for r in credit.read_rows(repo.root) if r.get("event") == "detection"])
+
+    fitness.replay_detector_history(repo.root)
+    first = counts()
+    fitness.replay_detector_history(repo.root)
+    assert first == counts() == (0, 1, 2)

@@ -58,6 +58,7 @@ __all__ = [
     "append_epoch",
     "append_rows",
     "incomplete",
+    "is_ambient_session_row",
     "ledger_path",
     "merge_rows",
     "normalize_rows",
@@ -153,13 +154,21 @@ def _v1_to_v2(row: Dict[str, Any], origin: Any = "v1") -> Optional[Dict[str, Any
     return out
 
 
+def is_ambient_session_row(row: Mapping[str, Any]) -> bool:
+    """A v2 tp/fp row a local ``aegis check`` wrote before 4.4 (``source: "session"``, no ``from``).
+    An unwitnessed run is a trigger, never a verdict (spec T1), so readers count it as one; the
+    file is not rewritten. Migrated v3 history carries ``from`` and keeps its verdict."""
+    return (row.get("v") == LEDGER_VERSION and row.get("source") == "session"
+            and row.get("outcome") in ("tp", "fp") and "from" not in row)
+
+
 def normalize_rows(
     rows: Iterable[Dict[str, Any]], origins: Optional[List[Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Return ``(v2 outcome rows, unusable row count)`` for raw ledger rows of any version.
 
-    v2 rows pass through; rows without ``rule`` and ``outcome`` (an epoch row) are
-    dropped without counting as unusable. v1 rows are converted in memory, never
+    v2 rows pass through (``is_ambient_session_row`` rows as triggers); rows without
+    ``rule`` and ``outcome`` (an epoch row) are dropped without counting as unusable. v1 rows are converted in memory, never
     rewritten on disk. v1 counted triggers in separate ``trigger`` rows (v3 ``aegis
     check`` wrote one trigger row and one outcome row per rule and run), while a v2
     outcome row is itself a trigger. So per rule, a v1 trigger row is dropped for each
@@ -185,7 +194,7 @@ def normalize_rows(
                 isinstance(row.get("rule"), str) and row["rule"]
                 and row.get("outcome") in OUTCOMES and _weight(row) is not None
             ):
-                out.append(row)
+                out.append(dict(row, outcome="trigger") if is_ambient_session_row(row) else row)
             else:
                 unusable += 1
             continue

@@ -155,7 +155,7 @@ Category: Daily Workflow & Verification.
 | --- | --- | --- | --- |
 | `--base` | `REF` |  | The base branch to measure governance changes against (default: origin/main, main, origin/develop, develop) |
 | `--exempt-test` | `COMMIT` |  | Sign a test exemption (Aegis-Exempt-Test) for a specific fix commit |
-| `--reason` | `TEXT` |  | Explanation for --exempt-test (must match the fix commit's Aegis-No-Test reason) |
+| `--reason` | `TEXT` |  | Explanation for --exempt-test (signed into the commit) |
 
 ### `aegis check`
 
@@ -299,7 +299,9 @@ Category: Rule Evolution & Intelligence. Subcommands: `adjudicate`, `archive`, `
 
 ### `aegis rule adjudicate`
 
-Record a human adjudication verdict (tp or fp) for a rule
+Record an adjudication label (tp or fp) in .aegis/adjudications/; it counts after it is merged to the base branch
+
+Append a tp or fp label for a rule to .aegis/adjudications/<rule-id>.jsonl. The label counts toward the rule's fitness only after a reviewed pull request merges it to the base branch.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
