@@ -42,7 +42,12 @@ TIER_A_PATTERNS: dict[str, re.Pattern[str]] = {
 
 _TIER_B_RE = re.compile(r"""(?i)\b([A-Za-z0-9_.-]{0,32}(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|credential|auth[_-]?token|client[_-]?secret)[A-Za-z0-9_.-]{0,32})\s*[:=]\s*(['"])([^'"\s]{8,256})\2""")
 _TIER_C_RE = re.compile(r"""(['"])([A-Za-z0-9+/=_-]{20,256})\1""")
-_PLACEHOLDER_RE = re.compile(r"(?i)(?:example|dummy|test|placeholder|changeme|your[_-]|fake|redacted|todo|x{3,}|\*{3,}|\.{3}|^<.*>$|^\$\{?.*\}?$|^%.*%$|^(?:true|false|null|none)$)")
+_PLACEHOLDER_WORDS = ("example", "dummy", "test", "placeholder", "changeme", "fake", "redacted", "todo")
+_PLACEHOLDER_SHAPES = r"your[_-]|x{3,}|\*{3,}|\.{3}|^<.*>$|^\$\{?.*\}?$|^%.*%$|^(?:true|false|null|none)$"
+# Substring form for machine token bodies, where a prefix glues onto the placeholder (AKIA...EXAMPLE).
+_PLACEHOLDER_RE = re.compile(r"(?i)(?:" + "|".join(_PLACEHOLDER_WORDS) + "|" + _PLACEHOLDER_SHAPES + ")")
+_PLACEHOLDER_SHAPE_RE = re.compile(r"(?i)(?:" + _PLACEHOLDER_SHAPES + ")")
+_WORD_SPLIT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0-9+/=]+|\bsha(?:1|256|384|512)-[A-Za-z0-9+/=]{16,})")
@@ -203,8 +208,15 @@ def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:
     return out
 
 
-def _is_benign_token(val: str) -> bool:
-    return bool(_PLACEHOLDER_RE.search(val) or _UUID_RE.match(val) or _HEX_RE.match(val))
+def _is_placeholder_text(val: str) -> bool:
+    """For human-chosen strings a placeholder word must start a word: ``testpass`` and ``Test_Pw``
+    are placeholders, ``contest`` and ``latestGreat9`` are not."""
+    return bool(_PLACEHOLDER_SHAPE_RE.search(val)) or any(w.lower().startswith(_PLACEHOLDER_WORDS) for w in _WORD_SPLIT_RE.findall(val))
+
+
+def _is_benign_token(val: str, *, human_text: bool = False) -> bool:
+    placeholder = _is_placeholder_text(val) if human_text else bool(_PLACEHOLDER_RE.search(val))
+    return placeholder or bool(_UUID_RE.match(val) or _HEX_RE.match(val))
 
 
 def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bool = False) -> list[Finding]:
@@ -221,7 +233,7 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
                 full = m.group(0)
                 if rule_id == "url-basic-auth":
                     user, pwd = m.group(1), m.group(2)
-                    if _PLACEHOLDER_RE.search(user) or _PLACEHOLDER_RE.search(pwd) or "$" in user or "$" in pwd:
+                    if _is_placeholder_text(user) or _is_placeholder_text(pwd) or "$" in user or "$" in pwd:
                         continue
                     line_secrets.extend([full, pwd])
                 elif rule_id != "private-key-pem" and _is_benign_token(full):
@@ -232,7 +244,7 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
         if include_advisory and not _HASH_FIELD_RE.search(cleaned):
             for m in _TIER_B_RE.finditer(cleaned):
                 key_name, val = m.group(1), m.group(3)
-                if not _HASH_FIELD_RE.search(key_name) and not _is_benign_token(val) and not any(val in s or s in val for s in line_secrets):
+                if not _HASH_FIELD_RE.search(key_name) and not _is_benign_token(val, human_text=True) and not any(val in s or s in val for s in line_secrets):
                     line_secrets.append(val)
                     matched.append(("generic-secret-assign", "advisory", val))
             for m in _TIER_C_RE.finditer(cleaned):

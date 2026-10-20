@@ -252,6 +252,42 @@ class TestDataUrlPrefixDoesNotHideGateSecrets:
         assert scanners.scan_secrets_text("\n".join(lines), include_advisory=include_advisory) == []
 
 
+class TestPlaceholderSuppressionIsWordAware:
+    """R-checks-24: a human-chosen value is a placeholder only when a placeholder word starts one of
+    its words (or it has a placeholder shape), not because an English word contains one."""
+
+    @staticmethod
+    def _url(user: str, pwd: str) -> str:
+        return _tok("db = 'postgres://", user, ":", pwd, "@db.internal/app'")
+
+    @pytest.mark.parametrize("pwd", ["contest2024Zq", "attestation99X", "latestGreat9", "mastodon9Zq", "counterexample9"])
+    def test_a_real_password_containing_a_placeholder_word_gates(self, pwd):
+        findings = scanners.scan_secrets_text(self._url("svc", pwd))
+        assert [(f.rule_id, f.tier) for f in findings] == [("url-basic-auth", "gate")]
+        assert pwd not in json.dumps(findings[0].as_dict())
+
+    def test_a_real_user_containing_a_placeholder_word_gates(self):
+        assert len(scanners.scan_secrets_text(self._url("contest_admin", "Zq9fRt3pLm"))) == 1
+
+    def test_a_real_assigned_password_is_an_advisory(self):
+        findings = scanners.scan_secrets_text('db_password = "contest2024Zq"', include_advisory=True)
+        assert [(f.rule_id, f.tier) for f in findings] == [("generic-secret-assign", "advisory")]
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    @pytest.mark.parametrize("pwd", ["test", "Test123", "test_password", "TestPassword", "testpass", "TESTPASS",
+                                     "changeme", "your_password", "example", "xxxxxxxx", "********"])
+    def test_a_placeholder_password_stays_quiet(self, pwd, include_advisory):
+        assert scanners.scan_secrets_text(self._url("svc", pwd), include_advisory=include_advisory) == []
+
+    @pytest.mark.parametrize("val", ["testpassword1", "changeme123", "your_password_here"])
+    def test_a_placeholder_assignment_stays_quiet(self, val):
+        assert scanners.scan_secrets_text(f'db_password = "{val}"', include_advisory=True) == []
+
+    def test_glued_tier_a_placeholders_stay_suppressed(self):
+        lines = [_tok("k = '", "AK", "IA", "TESTTESTTESTTEST'"), _tok("k = '", "AK", "IA", "IOSFODNN7EXAMPLE'")]
+        assert scanners.scan_secrets_text("\n".join(lines), include_advisory=True) == []
+
+
 class TestTierBAndTierCAdvisory:
     def test_advisory_tiers_only_emitted_when_include_advisory_true(self) -> None:
         # Tier B: generic-secret-assign; Tier C: high-entropy-token
