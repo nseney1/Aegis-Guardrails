@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Opt
 from aegis_core import gitsafe
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
+from aegis_core.match import normalize_path
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import ENFORCEMENT_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -206,24 +207,9 @@ class Weakening:
 
 
 class _Tree:
-    def __init__(
-        self,
-        root: Optional[str],
-        commit: Optional[str],
-        renames: Optional[Mapping[str, str]] = None,
-        deleted: Iterable[str] = (),
-    ) -> None:
-        self._root = root
-        self._commit = commit
-        self._files: Optional[List[str]] = None
+    def __init__(self, renames: Optional[Mapping[str, str]] = None) -> None:
         self.renames = renames or {}
-        self.deleted = frozenset(deleted)
 
-    @property
-    def files(self) -> List[str]:
-        if self._files is None:
-            self._files = _tree_files(self._root, self._commit) if self._root and self._commit else []
-        return self._files
 
 def _dotted_covers(kind: str, broad: str, narrow: str) -> bool:
     if broad == narrow:
@@ -347,19 +333,28 @@ def _level(rule: Rule) -> Tuple[int, int]:
     return rule.rank, _ENFORCEMENT_ORDER.get(rule.enforcement, 0)
 
 
+_TEST_FILES = "test files"
+
+
+def _reach_dropped(base: Rule, head: Rule) -> List[str]:
+    # target_paths is a union of positive globs, so keeping every base pattern (and not newly
+    # skipping tests) is a superset of reach over every file, including ones not yet written.
+    kept = {normalize_path(p) for p in head.target_paths}
+    dropped = [p for p in base.target_paths if normalize_path(p) not in kept]
+    return dropped + ([_TEST_FILES] if head.skips_tests and not base.skips_tests else [])
+
+
 def _coverage_lost(base: Rule, head: Rule, tree: _Tree) -> List[str]:
-    if base.target_paths == head.target_paths and base.skips_tests == head.skips_tests:
-        candidates: Iterable[str] = list(tree.renames)
-    else:
-        candidates = tree.files
-    lost: List[str] = []
-    for old in candidates:
-        if old in tree.deleted and old not in tree.renames:
-            continue
-        new = tree.renames.get(old, old)
-        if base.applies_to(old) and not head.applies_to(new):
-            lost.append(new)
-    return sorted(set(lost))
+    dropped = _reach_dropped(base, head)
+    if dropped:
+        return [
+            "it no longer applies to test files, which the reviewed version covered" if p == _TEST_FILES
+            else f"target pattern {p!r} is no longer kept; files it covered, including files this branch adds, "
+            "may lose the rule"
+            for p in dropped
+        ]
+    lost = {new for old, new in tree.renames.items() if base.applies_to(old) and not head.applies_to(new)}
+    return [f"no longer applies to {path}, which the reviewed version covered" for path in sorted(lost)]
 
 
 def _key_changes(base: Rule, head: Rule) -> List[str]:
@@ -408,22 +403,15 @@ def weakenings(base: Rule, head: Optional[Rule], tree: Optional[_Tree] = None) -
         found.append(
             Weakening("detect", base.id, head.path, "detect is not an exact superset of the reviewed version")
         )
-    for path in _coverage_lost(base, head, tree or _Tree(None, None)):
-        found.append(
-            Weakening(
-                "coverage",
-                base.id,
-                head.path,
-                f"no longer applies to {path}, which the reviewed version covered",
-            )
-        )
+    for message in _coverage_lost(base, head, tree or _Tree()):
+        found.append(Weakening("coverage", base.id, head.path, message))
     if base.meta.get("applies_to") != head.meta.get("applies_to"):
         found.append(Weakening("applies_to", base.id, head.path, "applies_to changed"))
     return found
 
 
-def _stricter(base: Rule, head: Rule, tree: _Tree) -> bool:
-    if weakenings(base, head, tree):
+def _stricter(base: Rule, head: Rule) -> bool:
+    if weakenings(base, head, None):
         return False
     return (
         any(base.meta.get(k) != head.meta.get(k) for k in ("target_paths", "forbid_ast", "enforcement"))
@@ -456,7 +444,6 @@ class Effective:
 def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Effective:
     base_all = {r.id: r for r in base.rules if r.ok}
     binding = {rule_id: r for rule_id, r in base_all.items() if r.rank >= 2}
-    tree = _Tree(root, anchor.commit)
     served: List[Rule] = []
     unreviewed: List[Unreviewed] = []
     seen_ok, seen_any = set(), set()
@@ -478,7 +465,7 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
             continue
         if policy_view(reviewed) == policy_view(rule):
             served.append(rule)
-        elif _stricter(reviewed, rule, tree):
+        elif _stricter(reviewed, rule):
             merged = replace(
                 reviewed,
                 type=rule.type,
@@ -628,8 +615,8 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
         raise IntegrityError(f"{base!r} and {head!r} share no history (a shallow clone needs fetch-depth: 0)")
     base_rules = load_rules(root, inventory=_inventory_at(root, merge))
     head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
-    renames, deleted = _diff(root, merge, head_commit)
-    tree = _Tree(root, merge, renames, deleted)
+    renames, _deleted = _diff(root, merge, head_commit)
+    tree = _Tree(renames)
 
     found: List[Weakening] = []
     checked = 0

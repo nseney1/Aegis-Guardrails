@@ -425,7 +425,8 @@ class CheckCommand(AegisCommand):
             action="store_true",
             help="The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at "
             "merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or "
-            "archive, a rank decrease, lost coverage of existing files, a forbid_ast pattern no longer covered, "
+            "archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a "
+            "forbid_ast pattern or call entry no longer covered, "
             "a new or unknown key, any applies_to change, or a mandatory rule added past the scan's slot cap). A "
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
             "branch's allowed_signers. Also runs T5 fix-commit regression checks (advisory at default warning tier; "
