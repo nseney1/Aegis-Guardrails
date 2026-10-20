@@ -996,6 +996,11 @@ _HEREDOC = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3")
 # A heredoc these read is a script they run, so its body is checked as commands
 # (su without -c starts a shell that reads it).
 _HEREDOC_SHELLS = SHELL_INTERPRETERS | {"ssh", "ash", "mksh", "su"}
+# A heredoc these read is SQL, so its body is checked for destructive SQL (record tier).
+_SQL_CLIENTS = frozenset({
+    "psql", "pgcli", "mysql", "mycli", "mariadb", "sqlite3", "sqlcmd", "sqlplus", "duckdb", "usql", "cqlsh",
+    "clickhouse-client", "snowsql",
+})
 
 BLOCK_SET: Tuple[GuardRule, ...] = (
     GuardRule(
@@ -1150,29 +1155,44 @@ def _guard_stage(cmd: UnwrappedCommand) -> List[GuardRule]:
     return found
 
 
-def _feeds_a_shell(line: str, command_start: int, operator: int) -> bool:
-    """Whether the heredoc whose operator is at ``line[operator]`` goes to a shell (or
-    ssh): the command it belongs to, or a later stage of that command's pipeline on the
-    same line (``cat <<EOF | bash``)."""
+def _reader_stages(line: str, command_start: int, operator: int) -> List[CommandStage]:
+    """The stages that may read the heredoc whose operator is at ``line[operator]``: the
+    command it belongs to and the rest of that command's pipeline on the same line
+    (``cat <<EOF | bash``)."""
     for text in (line[command_start:], line[command_start:operator]):
         try:
             pipelines = decompose_command(tokenize_command(text))
         except ValueError:  # an unbalanced quote that closes on a later line
             continue
-        for stage in pipelines[0].stages if pipelines else []:
-            unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
-            if inner is None and unwrapped is not None and unwrapped.binary.split("<<", 1)[0] in _HEREDOC_SHELLS:
-                return True
-        return False
+        return pipelines[0].stages if pipelines else []
+    return []
+
+
+def _feeds_a_shell(stages: List[CommandStage]) -> bool:
+    for stage in stages:
+        unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
+        if inner is None and unwrapped is not None and unwrapped.binary.split("<<", 1)[0] in _HEREDOC_SHELLS:
+            return True
     return False
 
 
-def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, str, bool, bool]]:
-    """``(strip_tabs, delimiter, feeds_a_shell, is_quoted)`` for each heredoc operator on
+def _feeds_sql(stages: List[CommandStage]) -> bool:
+    """Whether any word of the reading stages names a SQL client (``docker exec -i db
+    psql``): a heuristic for a record-tier rule, so it errs towards recording."""
+    for stage in stages:
+        for token in stage.raw_tokens:
+            name = os.path.basename(token.split("<<", 1)[0].lstrip("\\")).lower()
+            if (name[:-4] if name.endswith(".exe") else name) in _SQL_CLIENTS:
+                return True
+    return False
+
+
+def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, str, bool, bool, bool]]:
+    """``(strip_tabs, delimiter, feeds_a_shell, feeds_sql, is_quoted)`` for each heredoc operator on
     ``line`` outside quotes and comments, in order. ``open_quotes`` is the stack of quotes
     and ``$(``/``(`` substitutions still open from earlier lines (a ``<<`` inside a
     substitution counts, even within double quotes); it is updated in place."""
-    found: List[Tuple[bool, str, bool, bool]] = []
+    found: List[Tuple[bool, str, bool, bool, bool]] = []
     command_start = 0
     index = 0
     while index < len(line):
@@ -1218,10 +1238,12 @@ def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, st
                 index += 2
                 continue
             is_quoted = bool(heredoc.group(2) or heredoc.group(3))
+            stages = _reader_stages(line, command_start, index)
             found.append((
                 heredoc.group(1) == "-",
                 heredoc.group(4),
-                _feeds_a_shell(line, command_start, index),
+                _feeds_a_shell(stages),
+                _feeds_sql(stages),
                 is_quoted,
             ))
             index = heredoc.end()
@@ -1230,8 +1252,9 @@ def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, st
     return found
 
 
-def _split_heredocs(text: str) -> Tuple[str, List[str]]:
-    """``text`` without the body lines of its heredocs, and the bodies/substitutions a shell runs.
+def _scan_heredocs(text: str) -> Tuple[str, List[str], List[str]]:
+    """``text`` without the body lines of its heredocs, the bodies/substitutions a shell
+    runs, and the bodies a SQL client reads (never put among the scripts).
 
     A body is data for the command that reads it (Claude Code passes commit messages
     this way), unless that command is a shell or ssh (``bash <<'EOF'``, ``bash -s``,
@@ -1242,17 +1265,18 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
     operator. An unterminated heredoc swallows the rest, as the shell would.
     """
     if "<<" not in text:
-        return text, []
+        return text, [], []
     lines = text.split("\n")
     kept: List[str] = []
     scripts: List[str] = []
+    sql_bodies: List[str] = []
     open_quotes: List[str] = []
     index = 0
     while index < len(lines):
         line = lines[index]
         kept.append(line)
         index += 1
-        for strip_tabs, delimiter, feeds_a_shell, is_quoted in _heredoc_operators(line, open_quotes):
+        for strip_tabs, delimiter, feeds_a_shell, feeds_sql, is_quoted in _heredoc_operators(line, open_quotes):
             body: List[str] = []  # several heredocs on one line are read in order
             while index < len(lines):
                 raw = lines[index].rstrip("\r")
@@ -1262,11 +1286,19 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
                 body.append(raw)
             if feeds_a_shell:
                 scripts.append("\n".join(body))
-            elif not is_quoted:
+                continue
+            if feeds_sql:
+                sql_bodies.append("\n".join(body))
+            if not is_quoted:
                 body_text = "\n".join(body)
                 if "$" in body_text or "`" in body_text:
                     scripts.extend(extract_subshell_commands(body_text))
-    return "\n".join(kept), scripts
+    return "\n".join(kept), scripts, sql_bodies
+
+
+def _split_heredocs(text: str) -> Tuple[str, List[str]]:
+    kept, scripts, _ = _scan_heredocs(text)
+    return kept, scripts
 
 
 split_heredocs = _split_heredocs
@@ -1358,8 +1390,8 @@ def classify_command(command: object) -> Optional[GuardRule]:
     found: List[GuardRule] = []
     if not _guard_scan(command, 0, found):
         return None
-    text, _ = _split_heredocs(command)
-    upper = text.upper()
+    text, scripts, sql_bodies = _scan_heredocs(command)
+    upper = "\n".join([text, *scripts, *sql_bodies]).upper()
     if any(pattern in upper for pattern in _SQL_DESTRUCTIVE):
         found.append(_GUARD["sql-destructive"])
     blocked = next((rule for rule in found if rule.tier == GUARD_BLOCK), None)

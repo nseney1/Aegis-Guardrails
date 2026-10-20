@@ -338,6 +338,17 @@ def test_a_record_set_command_runs_and_is_recorded(ws, capsys, host, payload_of)
     assert _events(ws) == [("guard_match", host, "record", {"tier": "record", "action": "record", "rule": "git-merge"})]
 
 
+@pytest.mark.parametrize("host,payload_of", [
+    ("claude-code", lambda ws, c: claude(ws, "Bash", {"command": c})),
+    ("codex-cli", lambda ws, c: codex(ws, "Bash", c)),
+    ("antigravity", lambda ws, c: agy(ws, "run_command", {"CommandLine": c})),
+])
+def test_destructive_sql_in_a_client_heredoc_runs_and_is_recorded(ws, capsys, host, payload_of):
+    command = "psql -d app <<'EOF'\nDROP TABLE users;\nEOF\n"
+    assert _run(capsys, host, payload_of(ws, command)) == (0, "", "")
+    assert _events(ws) == [("guard_match", host, "record", {"tier": "record", "action": "record", "rule": "sql-destructive"})]
+
+
 def test_a_command_line_git_alias_for_a_force_push_is_blocked(ws, capsys):
     code, out, err = _run(capsys, "claude-code", claude(ws, "Bash", {"command": "git -c alias.p='push -f' p origin feat"}))
     assert (code, out) == (2, "")

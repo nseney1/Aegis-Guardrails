@@ -21,6 +21,7 @@ from aegis_core.command_safety import (
     RECORD_SET,
     GuardRule,
     classify_command,
+    split_heredocs,
 )
 
 BLOCK_IDS = {
@@ -466,6 +467,40 @@ def test_a_command_after_a_shell_heredoc_is_still_checked():
 
 def test_a_command_after_an_unterminated_heredoc_is_text():
     assert classify_command("cat <<EOF\ngit reset --hard") is None
+
+
+# R-checks-6: a heredoc a SQL client reads is SQL, and a shell-run heredoc is commands;
+# both are checked for destructive SQL (record tier). Other heredoc bodies stay data.
+@pytest.mark.parametrize("command", [
+    "psql <<EOF\nDROP TABLE users;\nEOF\n",
+    "psql -d app <<'EOF'\ndelete from sessions;\nEOF",
+    "mysql -u root <<SQL\nTRUNCATE TABLE audit_log;\nSQL",
+    "sqlite3 app.db <<-EOF\n\tDROP DATABASE x;\n\tEOF",
+    "cat <<EOF | psql\nDROP DATABASE prod;\nEOF",
+    "docker exec -i db psql -U postgres <<EOF\nDROP TABLE users;\nEOF",
+    "psql<<EOF\nDROP TABLE users;\nEOF",
+    "/usr/bin/psql.exe <<EOF\nDROP TABLE users;\nEOF",
+    "\\psql <<EOF\nDROP TABLE users;\nEOF",
+    "PGPASSWORD=x psql -h db <<EOF\nDROP TABLE users;\nEOF",
+    "ssh db psql <<EOF\nDROP TABLE users;\nEOF",
+    "bash <<'EOF'\npsql -c 'DROP TABLE users'\nEOF",
+], ids=[f"sql{i}" for i in range(12)])
+def test_destructive_sql_in_a_heredoc_a_client_or_shell_reads_is_recorded(command):
+    assert _id(command) == (GUARD_RECORD, "sql-destructive")
+
+
+@pytest.mark.parametrize("command", [
+    "psql <<EOF\nSELECT 1;\nEOF",
+    'git commit -m "$(cat <<\'EOF\'\nfix: stop recording DROP TABLE in notes\nEOF\n)"',
+    "cat <<EOF > migrate.sql\nDROP TABLE users;\nEOF",
+    "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: m.sql\n+DROP TABLE users;\n*** End Patch\nEOF",
+], ids=["select", "commit-msg", "cat-to-file", "apply-patch"])
+def test_sql_in_a_heredoc_other_commands_read_is_not_recorded(command):
+    assert classify_command(command) is None
+
+
+def test_split_heredocs_keeps_its_two_tuple_and_never_returns_sql_as_a_script():
+    assert split_heredocs("psql <<EOF\nDROP TABLE users;\nEOF\n") == ("psql <<EOF\n", [])
 
 
 @pytest.mark.parametrize("value", [None, "", "   ", "\n", 42, ["git", "reset", "--hard"]])
