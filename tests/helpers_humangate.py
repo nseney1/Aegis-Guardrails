@@ -189,9 +189,12 @@ class FakeGh:
         return [c for c in self.calls if "--method" in c[0] and c[0][c[0].index("--method") + 1] != "GET"]
 
 
-def pull_request_rule(approvals: int = 1, code_owners: bool = True) -> Dict[str, Any]:
+def pull_request_rule(approvals: int = 1, code_owners: bool = True, dismiss_stale: Any = True,
+                      last_push: bool = False) -> Dict[str, Any]:
     return {"type": "pull_request", "parameters": {"required_approving_review_count": approvals,
-                                                    "require_code_owner_review": code_owners}}
+                                                    "require_code_owner_review": code_owners,
+                                                    "dismiss_stale_reviews_on_push": dismiss_stale,
+                                                    "require_last_push_approval": last_push}}
 
 
 def checks_rule(*contexts: str, integration_id: Any = human_gate.GITHUB_ACTIONS_APP_ID) -> Dict[str, Any]:

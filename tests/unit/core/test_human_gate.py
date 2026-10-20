@@ -215,10 +215,51 @@ def test_an_admin_identity_cannot_be_tier_a(tmp_path):
     [hg.pull_request_rule(approvals=0), hg.checks_rule()],
     [hg.pull_request_rule(code_owners=False), hg.checks_rule()],
     [hg.pull_request_rule()],
+    [hg.pull_request_rule(dismiss_stale=False), hg.checks_rule()],
 ])
 def test_each_missing_ruleset_requirement_blocks_tier_a(tmp_path, rules):
     repo = _repo_with_governance(tmp_path)
     assert human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules)).tier != "A"
+
+
+@needs_git
+@pytest.mark.parametrize("last_push", [False, True], ids=["plain", "last-push"])
+def test_a_ruleset_that_keeps_stale_approvals_is_not_tier_a(tmp_path, last_push):
+    """Given one approving review and code-owner review that keep an approval after new commits
+    (even with require_last_push_approval), When the tier is detected, Then it is not A, the
+    evidence says so and a reason names dismissal and new commits."""
+    repo = _repo_with_governance(tmp_path)
+    rules = [hg.pull_request_rule(dismiss_stale=False, last_push=last_push), hg.checks_rule()]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier != "A"
+    assert report.evidence["rules"]["dismiss_stale_reviews_on_push"] is False
+    assert any("dismiss" in r and "new commits" in r for r in report.reasons), report.reasons
+
+
+@needs_git
+@pytest.mark.parametrize("value", ["true", 1, None, "yes", [True], "absent"])
+def test_only_a_literal_true_dismisses_stale_reviews(tmp_path, value):
+    repo = _repo_with_governance(tmp_path)
+    rule = hg.pull_request_rule(dismiss_stale=value)
+    if value == "absent":
+        del rule["parameters"]["dismiss_stale_reviews_on_push"]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[rule, hg.checks_rule()]))
+    assert report.tier != "A" and report.evidence["rules"]["dismiss_stale_reviews_on_push"] is False
+
+
+@needs_git
+@pytest.mark.parametrize("first, second, tier_a", [(False, False, False), (True, False, True), (False, True, True)])
+def test_any_pull_request_rule_that_dismisses_stale_reviews_counts(tmp_path, first, second, tier_a):
+    repo = _repo_with_governance(tmp_path)
+    rules = [hg.pull_request_rule(dismiss_stale=first), hg.pull_request_rule(dismiss_stale=second), hg.checks_rule()]
+    assert (human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules)).tier == "A") is tier_a
+
+
+@needs_git
+def test_the_tier_a_ruleset_doctor_prints_reads_back_as_tier_a(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=human_gate.build_ruleset("A", ["validate"])["rules"]))
+    assert report.tier == "A", report.reasons
 
 
 @needs_git

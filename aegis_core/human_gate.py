@@ -520,6 +520,7 @@ def signing_keys_at(root: Any, rev: str) -> int:
 def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     approvals = 0
     owners = False
+    dismisses = False
     contexts: List[str] = []
     unpinned: List[str] = []
     has_pr = False
@@ -533,6 +534,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
             valid_count = count if isinstance(count, int) and not isinstance(count, bool) else 0
             approvals = max(approvals, valid_count)
             owners = owners or params.get("require_code_owner_review") is True
+            dismisses = dismisses or params.get("dismiss_stale_reviews_on_push") is True
         elif rule.get("type") == "required_status_checks":
             for check in params.get("required_status_checks") or []:
                 if not isinstance(check, dict) or not isinstance(check.get("context"), str):
@@ -547,6 +549,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
         "pull_request": has_pr,
         "required_approving_review_count": approvals,
         "require_code_owner_review": owners,
+        "dismiss_stale_reviews_on_push": dismisses,
         "required_status_checks": contexts,
         "unpinned_status_checks": unpinned,
     }
@@ -665,6 +668,11 @@ def detect_tier(
             a_missing.append("the default branch does not require an approving review")
         if not facts["require_code_owner_review"]:
             a_missing.append("the default branch does not require code-owner review")
+        if not facts["dismiss_stale_reviews_on_push"]:
+            a_missing.append(
+                "the default branch keeps an approval after new commits are pushed, so a pull request can change "
+                "after its review and still merge (set dismiss_stale_reviews_on_push)"
+            )
         if not checks:
             a_missing.append("the default branch has no required status checks")
     if not codeowners["present"]:
