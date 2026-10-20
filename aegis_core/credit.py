@@ -625,7 +625,7 @@ def approval_lookup(
             cache[check_id] = False
             return False
         try:
-            gov_hash = human_gate.governance_tree_hash(top, commit)
+            gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
             p_branch = resolve_protected_branch(top)
             tips = [commit] + ([f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}"] if p_branch else []) + ["HEAD"]
             ok = any(

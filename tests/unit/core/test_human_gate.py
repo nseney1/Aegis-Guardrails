@@ -428,6 +428,56 @@ def test_a_rule_edit_in_a_nested_workspace_moves_the_hash(tmp_path):
     assert human_gate.governance_tree_hash(repo.root / "pkg", "HEAD") != before
 
 
+def _with_tests(tmp_path) -> hg.Repo:
+    repo = hg.make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    repo.write("tests/test_a.py", "def test_a():\n    assert True\n")
+    repo.write("tests/test_b.py", "def test_b():\n    assert True\n")
+    repo.commit("tests")
+    repo.git("checkout", "-q", "-B", "work")
+    return repo
+
+
+@needs_git
+def test_with_no_deleted_test_the_hash_against_a_base_is_the_v1_digest(tmp_path):
+    import hashlib
+
+    repo = _with_tests(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("ordinary")
+    rule = ".aegis/rules/traps/trap-sample.md"
+    oid = repo.git("rev-parse", f"HEAD:{rule}")
+    expected = hashlib.sha256(b"aegis-governance-tree/v1\n" + f"100644 {oid} {rule}\n".encode()).hexdigest()
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") == expected
+    assert human_gate.governance_tree_hash(repo.root, "HEAD") == expected
+
+
+@needs_git
+def test_the_hash_against_a_base_binds_exactly_the_tests_deleted_since_it(tmp_path):
+    repo = _with_tests(tmp_path)
+    plain = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    repo.git("rm", "-q", "README.md")
+    repo.commit("drop the readme")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") == plain
+    repo.git("rm", "-q", "tests/test_a.py")
+    repo.commit("drop a")
+    drop_a = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    assert drop_a != plain and human_gate.governance_tree_hash(repo.root, "HEAD") == plain
+    repo.git("checkout", "-q", "main", "--", "tests/test_a.py")
+    repo.commit("restore a")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") == plain
+    repo.git("rm", "-q", "tests/test_b.py")
+    repo.commit("drop b")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD", base="main") not in (plain, drop_a)
+
+
+@needs_git
+def test_an_unresolvable_base_is_an_error(tmp_path):
+    repo = _with_tests(tmp_path)
+    with pytest.raises(human_gate.HumanGateError):
+        human_gate.governance_tree_hash(repo.root, "HEAD", base="nonesuch")
+
+
 @needs_git
 def test_an_unresolvable_revision_is_an_error(tmp_path):
     repo = hg.make_repo(tmp_path)

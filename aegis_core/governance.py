@@ -13,7 +13,8 @@ needs a ``human_gate`` approval (``aegis_core.human_gate``) before it counts:
   ``tox.ini``, ``setup.cfg``, ``pyproject.toml``, ``pytest.toml``), ``sitecustomize.py``,
   ``*.pth``, the ``Makefile`` and a root module that shadows the runner (``RUNNER_MODULES``:
   ``pytest.py``, ``_pytest/__init__.py``, ``pluggy``, ``py``, ``iniconfig`` and their compiled forms);
-- ``tests-deleted``: a deleted test file (``match.is_test_path``).
+- ``tests-deleted``: a deleted test file (``match.is_test_path``); an approval's hash binds the
+  ones deleted since the base (``human_gate.governance_tree_hash``).
 
 A path-only table cannot see inside a file, so ``pyproject.toml``, ``setup.cfg`` and the
 ``Makefile`` count whole (a version bump in ``pyproject.toml`` is a governance change here),
