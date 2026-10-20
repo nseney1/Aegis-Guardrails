@@ -198,11 +198,12 @@ def test_check_telemetry_records_each_rules_share_of_the_credit(ws: Path):
         str(ws), ["docs/guide/intro.md", "README.md", "tests/conftest.py", "src/app.py"], passed=False, run_id="clamp",
     )
     clamp = {r["rule"]: (r["outcome"], r.get("weight", 1.0)) for r in ledger.read(ws).rows if r.get("key") == "clamp"}
+    # A local run writes triggers (R-evidence-1); the shares are kept on the row.
     assert clamp == {
-        "trap-docs": ("fp", 1.0),
-        "trap-basename": ("fp", 1.0),
-        "trap-src-any": ("fp", 0.5),
-        "trap-top-level": ("fp", 0.5),
+        "trap-docs": ("trigger", 1.0),
+        "trap-basename": ("trigger", 1.0),
+        "trap-src-any": ("trigger", 0.5),
+        "trap-top-level": ("trigger", 0.5),
     }
 
 

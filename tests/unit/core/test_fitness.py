@@ -117,15 +117,17 @@ def test_for_rules_counts_weighted_and_v1_rows(tmp_path: Path) -> None:
     state = ws / ".aegis" / "state"
     state.mkdir(parents=True)
     rows = [
-        {"v": 2, "seq": 1, "ts": _iso(NOW), "rule": "t", "outcome": "tp", "source": "session", "weight": 0.5},
-        {"v": 2, "seq": 2, "ts": _iso(NOW), "rule": "t", "outcome": "fp", "source": "session"},
+        {"v": 2, "seq": 1, "ts": _iso(NOW), "rule": "t", "outcome": "tp", "source": "manual", "weight": 0.5},
+        {"v": 2, "seq": 2, "ts": _iso(NOW), "rule": "t", "outcome": "fp", "source": "manual"},
         {"cell": "t", "signal": "success", "source": "mcp", "timestamp": _iso(NOW)},  # v1
+        # a native session verdict is a local `aegis check` run: a trigger only (R-evidence-1)
+        {"v": 2, "seq": 3, "ts": _iso(NOW), "rule": "t", "outcome": "fp", "source": "session"},
     ]
     (state / "ledger.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 
     fit = for_rules(ws, load_rules(ws).rules, now=NOW)["t"]
 
-    assert (fit.triggers, fit.tp, fit.fp) == (3, 1.5, 1)
+    assert (fit.triggers, fit.tp, fit.fp) == (4, 1.5, 1)
     assert fit.score == pytest.approx(wilson_lower_bound(1.5, 2.5), abs=1e-4)
 
 
@@ -133,3 +135,4 @@ def test_a_rule_with_no_ledger_rows_scores_zero_whatever_its_frontmatter_says(tm
     ws = _workspace(tmp_path)
     fits = for_rules(ws, load_rules(ws).rules, now=NOW)
     assert {k: (v.triggers, v.score) for k, v in fits.items()} == {"t": (0, 0.0), "i": (0, 0.0)}
+

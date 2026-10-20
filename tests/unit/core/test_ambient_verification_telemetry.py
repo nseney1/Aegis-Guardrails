@@ -1,7 +1,8 @@
 """Tests for ambient verification telemetry (Phase 13: v0.110.0).
 
 Verifies that:
-1. `record_verification_telemetry` writes one tp/fp ledger row per matched rule.
+1. `record_verification_telemetry` writes one trigger ledger row per matched rule (a local
+   run is never a verdict: R-evidence-1); whether it passed is kept in ``meta``.
 2. `aegis check` automatically records those rows in .aegis/state/ledger.jsonl.
 """
 from __future__ import annotations
@@ -56,13 +57,13 @@ def test_record_verification_telemetry_appends_signals(test_workspace: Path):
 
     assert recorded is True
     rows = ledger.read(test_workspace).rows
-    assert [(r["rule"], r["outcome"]) for r in rows] == [("cell-math", "tp")]
+    assert [(r["rule"], r["outcome"], r["meta"]["passed"]) for r in rows] == [("cell-math", "trigger", True)]
     assert ledger.aggregate(test_workspace, "cell-math")["triggers"] == 1
-    assert ledger.aggregate(test_workspace, "cell-math")["tp"] >= 1
+    assert ledger.aggregate(test_workspace, "cell-math")["tp"] == 0
 
 
 def test_record_verification_telemetry_handles_failure(test_workspace: Path):
-    """When verification fails, the row is an fp."""
+    """When verification fails, the row is still only a trigger: never an fp."""
     from aegis_core.outcomes.telemetry import record_verification_telemetry
     from aegis_core.telemetry_engine import ledger
 
@@ -79,7 +80,8 @@ def test_record_verification_telemetry_handles_failure(test_workspace: Path):
     assert recorded is True
     totals = ledger.aggregate(test_workspace, "cell-auth")
     assert totals["triggers"] == 1
-    assert totals["fp"] >= 1
+    assert totals["fp"] == 0
+    assert ledger.read(test_workspace).rows[-1]["meta"]["verdict"] == "BLOCK"
 
 
 def test_cli_verify_emits_telemetry_ambiently(test_workspace: Path, monkeypatch):

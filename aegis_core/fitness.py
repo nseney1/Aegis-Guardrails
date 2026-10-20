@@ -315,7 +315,7 @@ def _collect_t4_events_for_rules(
         ts = raw.get("ts") or raw.get("timestamp")
         ev = raw.get("event")
         if ev is None:
-            if (raw.get("outcome") or raw.get("signal")) in ("tp", "success", "pass"):
+            if (raw.get("outcome") or raw.get("signal")) in ("tp", "success", "pass") and not ledger.is_ambient_session_row(raw):
                 b["post_reinforce_exposures"] = {}
         elif ev == "report" and (str(raw.get("check")), rid) in confirmed_checks:
             b["post_reinforce_exposures"] = {}
