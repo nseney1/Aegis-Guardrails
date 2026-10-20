@@ -211,18 +211,19 @@ class TestLongLinesAreScanned:
         assert finding.fingerprint == scanners.sarif_fingerprint("github-pat", "app.py", finding.snippet)
 
     def test_scan_cost_stays_linear_in_line_length(self):
-        """No absolute budget: twice the input may cost at most about twice the time."""
+        """No absolute budget. A 4x longer line costs about 4x when linear and 16x when quadratic,
+        so the bound of 8 leaves room for a loaded Windows runner on both sides."""
         def scan(n):
             assert scanners.scan_secrets_text(_tok("sk", "-") + "a" * n, include_advisory=True) == []
 
-        ratio = _best_of(3, scan, 100_000) / max(_best_of(3, scan, 50_000), 1e-9)
-        assert ratio < 3, f"doubling the line multiplied the scan time by {ratio:.1f}"
+        ratio = _best_of(5, scan, 200_000) / max(_best_of(5, scan, 50_000), 1e-9)
+        assert ratio < 8, f"quadrupling the line multiplied the scan time by {ratio:.1f}"
 
     def test_the_ratio_check_catches_a_quadratic_cost(self):
         def quadratic(n):
-            sum(1 for _ in range(n // 50) for _ in range(n // 50))
+            sum(1 for _ in range(n // 100) for _ in range(n // 100))
 
-        assert _best_of(3, quadratic, 100_000) / _best_of(3, quadratic, 50_000) >= 3
+        assert _best_of(3, quadratic, 200_000) / _best_of(3, quadratic, 50_000) >= 8
 
 
 class TestDataUrlPrefixDoesNotHideGateSecrets:
