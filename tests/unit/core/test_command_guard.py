@@ -379,6 +379,20 @@ def test_every_link_of_an_alias_chain_is_judged_with_the_words_before_it(command
     assert _id(command) == rule
 
 
+# git reads -c and --config-env in a (non-!) alias's words, so an alias can define the
+# aliases the rest of the chain expands; they come after the command line's own settings.
+@pytest.mark.parametrize("command,rule", [
+    ("git -c alias.a='-c alias.l=reset l --hard' a", (GUARD_BLOCK, "git-reset-hard")),
+    ("git -c alias.a='-c alias.l=m l' -c alias.m='push -f' a", (GUARD_BLOCK, "git-push-force")),
+    ("LV='push -f' git -c alias.a='--config-env=alias.l=LV l' a", (GUARD_BLOCK, "git-push-force")),
+    ("git -c alias.a='-c alias.l=\"!git push -f\" l' a", (GUARD_BLOCK, "git-push-force")),
+    ("git -c alias.a='-c alias.l=status l --hard' a", None),
+    ("GIT_CONFIG_PARAMETERS=\"'alias.l=push -f'\" git -c alias.a='-c alias.l=status l' a", None),
+], ids=["reset", "chained", "config-env", "shell-alias", "harmless", "overrides-the-environment"])
+def test_an_alias_an_alias_defines_is_expanded(command, rule):
+    assert _id(command) == rule
+
+
 @pytest.mark.parametrize("command", [
     "git -c alias.st=status st",
     "git -c alias.p='push origin feat' p",

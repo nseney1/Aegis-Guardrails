@@ -608,6 +608,8 @@ PARITY_TABLE = [
     ("git -c alias.r='reset --hard' -c alias.q='!git r' -c alias.p='!git q' p", "block:git-reset-hard", "force_ask", _SAME),
     ("git -c alias.q=status -c alias.p='!git q' p", None, "force_ask", _GIT_CONFIG),
     ("git -c alias.q='push -f' -c alias.p='!git -c alias.q=status q' p", None, "force_ask", _GIT_CONFIG),
+    ("git -c alias.a='-c alias.l=reset l --hard' a", "block:git-reset-hard", "force_ask", _SAME),
+    ("git -c alias.a='-c alias.l=status l --hard' a", None, "force_ask", _GIT_CONFIG),
     # R-checks-5: dd device paths
     ("dd of=//dev/sda", "block:dd-device", "force_ask", _SAME),
     ("yes | dd of=/dev/sda", "block:dd-device", "force_ask", _SAME),

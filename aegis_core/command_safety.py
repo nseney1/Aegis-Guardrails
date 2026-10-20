@@ -1427,9 +1427,14 @@ def _guard_git_alias(
     Each link's words replace the alias name in front of the words after it. Those are
     kept on a stack, last word first, so a link costs only its own words: rebuilding the
     whole command per link would re-read the tail once per link. Only a link naming a
-    subcommand _guard_git has rules for is rebuilt and judged."""
-    own = _git_aliases(cmd)
-    aliases = ChainMap(own, inherited) if inherited else own  # not a copy per git stage
+    subcommand _guard_git has rules for is rebuilt and judged.
+
+    git also reads -c and --config-env in a link's words, which can define the aliases
+    the rest of the chain expands; they come after this git's own settings."""
+    # Chained, not copied per git stage; link definitions go in the first map.
+    aliases = ChainMap({}, _git_aliases(cmd), *([inherited] if inherited else []))
+    # --config-env in a link reads the stage's variables, never its GIT_CONFIG_* ones again.
+    config_env = {var: value for var, value in cmd.env_vars.items() if not var.startswith("GIT_CONFIG")}
     rest = cmd.tail[::-1]
     sub = cmd.subcommand
     seen = set()
@@ -1456,6 +1461,8 @@ def _guard_git_alias(
                 options.append(rest.pop())
         if not rest:
             return
+        if options:
+            aliases.maps[0].update(_git_aliases(UnwrappedCommand(cmd.binary, None, options, [], env_vars=config_env)))
         word = rest.pop()
         sub = word.lower()
         if sub in _GUARD_GIT_SUBCOMMANDS:
