@@ -1104,12 +1104,13 @@ def _pushes_to_protected(refspec: str) -> bool:
     return destination.rsplit("/", 1)[-1] in _PROTECTED_BRANCHES
 
 
-def _clean_dry_run(flags: List[str]) -> bool:
-    """Whether git clean's ``flags`` ask for a dry run, and no more often than git does:
-    ``-e``/``--exclude`` take a value (``-en`` and ``-e -n`` exclude the pattern n or -n),
-    a ``-n`` after ``--`` is a pathspec, and ``--no-dry-run`` cancels one."""
+def _clean_dry_run(args: List[str]) -> bool:
+    """Whether git clean's ``args`` (every word after ``clean``) ask for a dry run, and no
+    more often than git does: ``-e``/``--exclude`` take the next word as their value
+    (``-en``, ``-e -n`` and ``-e .env`` exclude n, -n and .env), a ``-n`` after ``--`` is a
+    pathspec, and ``--no-dry-run`` cancels one."""
     dry_run = value_next = False
-    for flag in flags:
+    for flag in args:
         if flag == "--":  # git takes "-e --" as a value; ending here never finds a dry run
             break
         if value_next:
@@ -1141,7 +1142,7 @@ def _guard_git(cmd: UnwrappedCommand) -> List[GuardRule]:
     elif sub == "reset" and any(_long_option(f, "--hard") for f in flags):
         found.append(_GUARD["git-reset-hard"])
     elif sub == "clean":
-        if ("f" in letters or any(_long_option(f, "--force") for f in flags)) and not _clean_dry_run(flags):
+        if ("f" in letters or any(_long_option(f, "--force") for f in flags)) and not _clean_dry_run(cmd.tail):
             found.append(_GUARD["git-clean-force"])
     elif sub == "merge" and not any(f in ("--abort", "--quit", "--continue") for f in flags):
         found.append(_GUARD["git-merge"])

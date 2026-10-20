@@ -527,6 +527,11 @@ PARITY_TABLE = [
     ("git clean -f -n", None, "force_ask", _DRY_RUN),
     ("git clean -nfd", None, "force_ask", _DRY_RUN),
     ("git clean -f --e=x -n", None, "force_ask", _DRY_RUN),
+    ("git clean -fdx -e .env -n", None, "force_ask", _DRY_RUN),
+    ("git clean -e x -fn", None, "force_ask", _DRY_RUN),
+    ("git clean -fdx --exclude .venv --dry-run", None, "force_ask", _DRY_RUN),
+    ("git clean -fdx -e .env", "block:git-clean-force", "force_ask", _SAME),
+    ("git clean -e x -e -n -f", "block:git-clean-force", "force_ask", _SAME),
     # R-checks-3: command-line git aliases (guard-only; the gate asks on any git -c)
     ("git -c alias.p='push -f' p", "block:git-push-force", "force_ask", _SAME),
     ("git -c alias.p='push --force-with-lease' p origin feat", "block:git-push-force", "force_ask", _SAME),

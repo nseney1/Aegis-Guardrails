@@ -209,6 +209,12 @@ def test_a_run_of_delimiters_never_splits_quoted_text_or_harmless_commands(comma
     ("git clean -f -- -n .", "git-clean-force"),
     ("git clean -n --no-dry-run -f", "git-clean-force"),
     ("git clean -f --no-d", "git-clean-force"),
+    # a separate -e/--exclude value is read, and a -n that is the value is still the value
+    ("git clean -fdx -e .env", "git-clean-force"),
+    ("git clean -e x -f", "git-clean-force"),
+    ("git clean -fdx --exclude .venv", "git-clean-force"),
+    ("git clean -e x -e -n -f", "git-clean-force"),
+    ("git clean -f -e .env -- -n", "git-clean-force"),
 ])
 def test_an_abbreviated_long_option_is_the_option_it_abbreviates(command, rule):
     assert _id(command) == (GUARD_BLOCK, rule)
@@ -233,6 +239,10 @@ def test_an_abbreviated_long_option_is_the_option_it_abbreviates(command, rule):
     "git clean -f -n",
     "git clean -nfd",
     "git clean -f --e=x -n",
+    # git takes the word after -e/--exclude as the pattern, so the -n after it is a dry run
+    "git clean -fdx -e .env -n",
+    "git clean -e x -fn",
+    "git clean -fdx --exclude .venv --dry-run",
 ])
 def test_an_unrelated_prefix_or_a_real_dry_run_is_not_a_match(command):
     assert classify_command(command) is None
