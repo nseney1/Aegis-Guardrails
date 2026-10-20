@@ -28,6 +28,7 @@ __all__ = [
     "MAX_PRIOR_MASS",
     "MDE_UNTESTABLE_THRESHOLD",
     "MIN_N",
+    "MIN_OBSERVATION_DAYS",
     "beta_cdf",
     "beta_ppf",
     "cap_prior",
@@ -55,6 +56,8 @@ DEFAULT_HALF_LIFE_SESSIONS = 20
 DEFAULT_ARCHIVE_EPSILON = 0.15
 DEFAULT_MDE_HORIZON_DAYS = 180.0
 MDE_UNTESTABLE_THRESHOLD = 0.6
+# Below this many days of ledger history the trigger volume says nothing: 180 / (1.24324 / 0.6)^2 = 41.9.
+MIN_OBSERVATION_DAYS = 42.0
 _VIOLATION_PATTERN_RE = re.compile(r"Forbidden (?:call|import|decorator) '([^']+)'")
 _MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)'")
 
@@ -195,7 +198,7 @@ class Fitness:
 def compute(
     totals: Mapping[str, Any], half_life_days: Optional[float] = None, now: Optional[datetime] = None,
     rule: str = "", *, prior: Optional[Tuple[float, float]] = None, trigger_rate_per_day: Optional[float] = None,
-    min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0, half_life_sessions: Optional[float] = None,
+    observed_days: Optional[float] = None, min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0, half_life_sessions: Optional[float] = None,
     epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
     repos_count: int = 0, days_span: float = 0.0, samples: Sequence[Mapping[str, Any]] = (), silence_lr: float = 1.0,
@@ -212,7 +215,10 @@ def compute(
     prior_mass = a0 + b0
     prior_share = (prior_mass / (prior_mass + n)) if (prior_mass + n) > 0.0 else 0.0
     prior_disclosure = f"prior supplies {int(round(prior_share * 100))}% of the evidence" if prior_mass > 0.0 else None
-    mde = round(compute_mde_180d(trigger_rate_per_day), 4) if trigger_rate_per_day is not None else None
+    rate = trigger_rate_per_day
+    if rate is None and observed_days is not None and observed_days >= MIN_OBSERVATION_DAYS:
+        rate = n / observed_days
+    mde = round(compute_mde_180d(rate), 4) if rate is not None else None
     time_decay = decay_factor(totals.get("last_ts"), half_life_days, now)
     sess_decay = session_decay_factor(eligible_sessions, half_life_sessions) if half_life_sessions is not None and eligible_sessions > 0 else 1.0
     combined_decay = sess_decay if eligible_sessions > 0 else time_decay
@@ -235,14 +241,14 @@ def compute(
     suggestion: Optional[str] = None
     if not evidence_available:
         state, suggestion = "evidence_unavailable", None
-    elif mde is not None and mde > MDE_UNTESTABLE_THRESHOLD:
-        state = "untestable"
     elif demote_ready:
         state, suggestion = "decided", ("demote" if rule_type in ("gate", "invariant") else "archive")
     elif promote_ready:
         state, suggestion = "decided", "promote"
     elif archive_candidate:
         state, suggestion = "decided", "archive"
+    elif mde is not None and mde > MDE_UNTESTABLE_THRESHOLD:
+        state = "untestable"
     else:
         state = "inconclusive" if enough_n else "insufficient"
     return Fitness(
@@ -270,26 +276,6 @@ def _read_session_expiry_config(workspace: Any) -> Tuple[float, float]:
     return float(cfg.half_life_sessions), float(cfg.epsilon)
 
 
-def _extract_rule_prior(rule: Any) -> Optional[Tuple[float, float]]:
-    meta = getattr(rule, "meta", None)
-    prior_raw = (meta.get("prior") or meta.get("pack_prior")) if isinstance(meta, Mapping) else None
-    if isinstance(prior_raw, Mapping):
-        a = _num(prior_raw.get("alpha", prior_raw.get("tp", 0)))
-        b = _num(prior_raw.get("beta", prior_raw.get("fp", 0)))
-        if a + b > 0:
-            return (a, b)
-    return None
-
-
-def _extract_rule_trigger_rate(rule: Any) -> Optional[float]:
-    meta = getattr(rule, "meta", None)
-    if isinstance(meta, Mapping):
-        for key in ("trigger_rate_per_day", "expected_triggers_per_day"):
-            if isinstance(meta.get(key), (int, float)):
-                return float(meta[key])
-    return None
-
-
 def _collect_t4_events_for_rules(
     workspace: Any, rules: Sequence[Any], now: Optional[datetime] = None, *, proj_credits: Any = None,
 ) -> Dict[str, Dict[str, Any]]:
@@ -311,6 +297,7 @@ def _collect_t4_events_for_rules(
             "samples": [],
             "post_reinforce_exposures": {},
             "last_ts": None,
+            "first_seen": None,
         }
         for r in rules
     }
@@ -329,6 +316,9 @@ def _collect_t4_events_for_rules(
             continue
         b = info[rid]
         ts = raw.get("ts") or raw.get("timestamp")
+        seen_at = _parse_ts(ts)
+        if seen_at is not None and (b["first_seen"] is None or seen_at < b["first_seen"]):
+            b["first_seen"] = seen_at
         ev = raw.get("event")
         if ev is None:
             if (raw.get("outcome") or raw.get("signal")) in ("tp", "success", "pass") and not ledger.is_ambient_session_row(raw):
@@ -422,6 +412,8 @@ def _collect_t4_events_for_rules(
             else None
         )
         b["days_span"] = max(0.0, (moment - parsed_created).total_seconds() / 86400.0) if parsed_created else 0.0
+        # Trigger volume is measured from the ledger, never from branch-editable frontmatter (H6).
+        b["observed_days"] = (moment - b["first_seen"]).total_seconds() / 86400.0 if b["first_seen"] else None
     return info
 
 
@@ -462,8 +454,8 @@ def for_rules(
         if not rule_totals.get("last_ts") and t4.get("last_ts"):
             rule_totals["last_ts"] = t4["last_ts"]
         out[rid] = compute(
-            rule_totals, config.expiry_for(rtype), now, rid, prior=_extract_rule_prior(rule),
-            trigger_rate_per_day=_extract_rule_trigger_rate(rule), eligible_sessions=int(t4.get("eligible_sessions", 0)),
+            rule_totals, config.expiry_for(rtype), now, rid, observed_days=t4.get("observed_days"),
+            eligible_sessions=int(t4.get("eligible_sessions", 0)),
             half_life_sessions=half_life_sessions, epsilon=epsilon, rule_type=rtype,
             pinned=bool(meta.get("pin") is True or meta.get("pinned") is True), contested=int(t4.get("contested", 0)),
             caught=int(t4.get("caught", 0)), leaked=int(t4.get("leaked", 0)), adjudicated_tp=int(t4.get("adjudicated_tp", 0)),
