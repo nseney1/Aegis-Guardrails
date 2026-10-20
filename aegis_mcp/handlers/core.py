@@ -122,8 +122,8 @@ def handle_scan(args: dict) -> dict:
     if files is not None:
         if not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files):
             return {"error": "'files' must be a list of file paths", "status": _STATUS_FAIL}
-        try:
-            files = [str(workspace.confine_path(f)[1]) for f in files]
+        try:  # [] means "none given" here as in scan(): the git diff, recorded as such
+            files = [str(workspace.confine_path(f)[1]) for f in files] or None
         except ValueError as exc:
             return {"error": str(exc), "status": _STATUS_FAIL}
 
