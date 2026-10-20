@@ -79,9 +79,15 @@ class TestRunPerfCheck:
         assert res["status"] == "unverified"
         assert executed == []
 
-    def test_interleaved_paired_execution_with_user_config_and_no_baseline_file(self, tmp_path: Path) -> None:
+    def test_interleaved_paired_execution_with_user_config_and_no_baseline_file(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
+        _git(repo_root, "init", "-q", "-b", "main")
+        for n in (1, 2):
+            (repo_root / "a.py").write_bytes(f"a = {n}\n".encode())
+            _git(repo_root, "add", "a.py")
+            _git(repo_root, "commit", "-q", "-m", f"c{n}")
         user_cfg = tmp_path / "user_aegis" / "config.json"
         user_cfg.parent.mkdir(parents=True)
         user_cfg.write_text(
@@ -120,7 +126,6 @@ class TestRunPerfCheck:
             assert set(calls[i : i + 2]) == {"base", "head"}
         # Never writes a persistent baseline file
         assert list(repo_root.rglob("*baseline*")) == []
-
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
@@ -188,3 +193,99 @@ class TestPerfProgramLookup:
 
         assert res["command"] == [sys.executable, "bench.py"]
         assert (tmp_path / "bench.log").read_text(encoding="utf-8") == "x" * 30
+
+
+def _git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, text=True).stdout
+
+
+@pytest.fixture
+def forked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Commit I (bench.txt 0.020); main then changes bench.txt to 0.010; the workspace is branch
+    `feature`, which forked at I and only appends to b.py. Returns (workspace, I)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _git(ws, "init", "-q", "-b", "main")
+    for name, data in (("bench.txt", b"0.020\n"), ("a.py", b"a = 1\n"), ("b.py", b"b = 1\n")):
+        (ws / name).write_bytes(data)
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-q", "-m", "I")
+    fork = _git_out(ws, "rev-parse", "HEAD").strip()
+    _git(ws, "branch", "feature")
+    (ws / "bench.txt").write_bytes(b"0.010\n")
+    _git(ws, "commit", "-q", "-am", "main gets faster")
+    _git(ws, "checkout", "-q", "feature")
+    (ws / "b.py").write_bytes(b"b = 1\nc = 2\n")
+    _git(ws, "commit", "-q", "-am", "feature")
+    return ws, fork
+
+
+class TestPerfMergeBase:
+    """R-checks-30: perf compares the working tree with merge-base(base, HEAD), exported with the
+    repository's filters off; no git worktree is created and an unprovable base is unverified."""
+
+    @staticmethod
+    def _runner(ws: Path, seen: list):
+        def run(argv, cwd, env=None, timeout=60):
+            here = Path(cwd)
+            if here.resolve() != ws.resolve():
+                seen.append((here / "bench.txt").read_text(encoding="utf-8").strip())
+                seen.append(len(_git_out(ws, "worktree", "list").splitlines()))
+            return {"returncode": 0, "duration_s": float((here / "bench.txt").read_text(encoding="utf-8"))}
+        return run
+
+    @pytest.mark.parametrize("base", ["main", "FORK"])
+    def test_the_base_side_is_the_merge_base_tree(self, forked, base):
+        ws, fork = forked
+        seen: list = []
+        res = perf_check.run_perf_check(ws, base_ref=fork if base == "FORK" else base, rounds=15, command=["bench"],
+                                        runner=self._runner(ws, seen))
+        assert set(seen[0::2]) == {"0.020"}  # I's bench.txt, not main's tip
+        assert set(seen[1::2]) == {1}  # git worktree list: the workspace only, during the run
+        assert (res["status"], res["regressed"]) == ("pass", False)
+        assert len(_git_out(ws, "worktree", "list").splitlines()) == 1
+        assert not (ws / ".git" / "worktrees").exists()
+
+    def test_an_unrelated_base_is_unverified_and_nothing_runs(self, forked):
+        ws, _ = forked
+        _git(ws, "checkout", "-q", "--orphan", "orphan")
+        _git(ws, "commit", "-q", "-m", "unrelated")
+        _git(ws, "checkout", "-q", "feature")
+        calls: list = []
+        res = perf_check.run_perf_check(ws, base_ref="orphan", rounds=15, command=["bench"],
+                                        runner=lambda argv, cwd, **kw: calls.append(cwd) or {"returncode": 0})
+        assert res["status"] == "unverified" and "share no history" in res["reason"]
+        assert calls == []
+
+    @pytest.mark.parametrize("base", ["--foo", "no-such-ref"])
+    def test_a_base_that_does_not_resolve_never_reaches_git_argv(self, forked, base, monkeypatch):
+        from aegis_core import gitsafe
+
+        ws, _ = forked
+        real_run, argvs = gitsafe.run, []
+        monkeypatch.setattr(gitsafe, "run", lambda args, cwd, *a, **k: argvs.append(list(args)) or real_run(args, cwd, *a, **k))
+        calls: list = []
+        res = perf_check.run_perf_check(ws, base_ref=base, rounds=15, command=["bench"],
+                                        runner=lambda argv, cwd, **kw: calls.append(cwd) or {"returncode": 0})
+        assert res["status"] == "unverified" and calls == []
+        assert not any(arg == base for argv in argvs for arg in argv)
+
+    @pytest.mark.skipif(os.name == "nt", reason="the marker filter is a POSIX shell script")
+    def test_a_smudge_filter_from_the_repository_config_never_runs(self, forked, tmp_path):
+        ws, _ = forked
+        marker = tmp_path / "smudge-ran"
+        script = tmp_path / "smudge.sh"
+        script.write_bytes(f'#!/bin/sh\necho ran >> "{marker}"\ncat\n'.encode())
+        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        (ws / ".gitattributes").write_bytes(b"* filter=evil\n")
+        _git(ws, "add", ".gitattributes")
+        _git(ws, "commit", "-q", "-m", "attributes")
+        _git(ws, "config", "filter.evil.smudge", str(script))
+        _git(ws, "config", "filter.evil.required", "true")
+        perf_check.run_perf_check(ws, base_ref="HEAD", rounds=15, command=["bench"], runner=self._runner(ws, []))
+        assert not marker.exists()
