@@ -472,35 +472,82 @@ class TestExternalScannerPresets:
     def test_gitleaks_preset_uses_redact_and_only_user_scope_config(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
-        repo_cfg = repo_dir / ".gitleaks.toml"
-        repo_cfg.write_text("[allowlist]\n", encoding="utf-8")
-
         user_dir = tmp_path / "user_aegis"
         user_dir.mkdir()
         user_cfg = user_dir / "gitleaks.toml"
-        user_cfg.write_text("# trusted user config\n", encoding="utf-8")
+        user_cfg.write_bytes(b"# trusted user config\n")
 
-        # Repo-local config path must be rejected/ignored
-        argv_repo = scanners.build_preset_argv(
-            "gitleaks",
-            repo_dir,
-            user_config_dir=user_dir,
-            config_path=repo_cfg,
-        )
-        assert "--redact" in argv_repo
-        assert str(repo_cfg) not in argv_repo
-
-        # User-scope config inside ~/.aegis/ is accepted
-        argv_user = scanners.build_preset_argv(
-            "gitleaks",
-            repo_dir,
-            user_config_dir=user_dir,
-            config_path=user_cfg,
-        )
+        argv_user = scanners.build_preset_argv("gitleaks", repo_dir, user_config_dir=user_dir)
         assert "--redact" in argv_user
-        assert "--config" in argv_user
-        cfg_idx = argv_user.index("--config")
-        assert argv_user[cfg_idx + 1] == str(user_cfg.resolve())
+        assert argv_user[argv_user.index("--config") + 1] == str(user_cfg.resolve())
+
+    @pytest.fixture
+    def home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        home = tmp_path / "home"
+        (home / ".aegis").mkdir(parents=True)
+        for name in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(name, str(home))
+        return home
+
+    @staticmethod
+    def _stub(calls: list):
+        def runner(argv, cwd, env=None, timeout=60):
+            calls.append(list(argv))
+            return {"returncode": 0, "stdout": '{"version": "2.1.0", "runs": [{"results": []}]}', "stderr": ""}
+        return runner
+
+    @staticmethod
+    def _allow_all_repo(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitleaks.toml").write_bytes(b'[allowlist]\npaths = [".*"]\n')
+        return repo
+
+    def test_a_repository_gitleaks_config_without_a_user_config_is_unverified(self, tmp_path, home):
+        """R-checks-18: gitleaks would read <source>/.gitleaks.toml when no --config is given, so a
+        repository allowlist could silence every finding; the preset refuses to run instead."""
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        assert (res["status"], res["findings"], calls) == ("unverified", [], [])
+        assert ".gitleaks.toml" in res["reason"]
+
+    def test_a_user_config_is_passed_explicitly_over_a_repository_config(self, tmp_path, home):
+        user_cfg = home / ".aegis" / "gitleaks.toml"
+        user_cfg.write_bytes(b"# trusted user config\n")
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        assert res["status"] == "pass"
+        assert calls[0][calls[0].index("--config") + 1] == str(user_cfg.resolve())
+
+    def test_a_user_config_dir_inside_the_repository_does_not_count(self, tmp_path, home):
+        repo = self._allow_all_repo(tmp_path)
+        (repo / ".aegis").mkdir()
+        (repo / ".aegis" / "gitleaks.toml").write_bytes(b"# planted\n")
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", repo, user_config_dir=repo / ".aegis", runner=self._stub(calls))
+        assert (res["status"], calls) == ("unverified", [])
+
+    def test_a_dangling_repository_config_symlink_still_counts(self, tmp_path, home):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        try:
+            os.symlink(tmp_path / "nowhere.toml", repo / ".gitleaks.toml")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are unavailable")
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", repo, runner=self._stub(calls))
+        assert (res["status"], calls) == ("unverified", [])
+
+    def test_with_neither_config_gitleaks_runs_redacted_without_a_config(self, tmp_path, home):
+        calls: list = []
+        res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=self._stub(calls))
+        assert res["status"] == "pass"
+        assert "--redact" in calls[0] and "--config" not in calls[0]
+
+    def test_the_ruff_preset_ignores_a_repository_gitleaks_config(self, tmp_path, home):
+        calls: list = []
+        res = scanners.run_preset_scanner("ruff", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        assert res["status"] == "pass" and calls[0][0] == "ruff"
 
     def test_missing_binary_returns_unverified_not_pass(self, tmp_path: Path) -> None:
         def fake_missing_runner(argv, cwd, env=None, timeout=60):

@@ -414,12 +414,15 @@ def _is_within_dir(path: Path, directory: Path) -> bool:
     return real_p == real_d or real_p.startswith(real_d.rstrip(os.sep) + os.sep)
 
 
+class UntrustedScannerConfig(ValueError):
+    """A preset would read a scanner config the repository controls."""
+
+
 def build_preset_argv(
     preset: str,
     target_path: Path | str = ".",
     *,
     user_config_dir: Path | str | None = None,
-    config_path: Path | str | None = None,
 ) -> list[str]:
     target = Path(target_path).resolve()
     if preset == "ruff":
@@ -430,9 +433,13 @@ def build_preset_argv(
         ul = UserLayout.current()
         user_dir = Path(user_config_dir).resolve() if user_config_dir else (ul.aegis_dir.resolve() if ul else None)
         if user_dir is not None and not _is_within_dir(user_dir, target):
-            cand = Path(config_path).resolve() if config_path else (user_dir / "gitleaks.toml").resolve()
+            cand = (user_dir / "gitleaks.toml").resolve()
             if _is_within_dir(cand, user_dir) and not _is_within_dir(cand, target) and cand.is_file():
                 argv.extend(["--config", str(cand)])
+        # Without --config gitleaks reads <source>/.gitleaks.toml: a repository allowlist would
+        # silence the scan. lexists, so a dangling link or a case-folded name counts too.
+        if "--config" not in argv and os.path.lexists(target / ".gitleaks.toml"):
+            raise UntrustedScannerConfig("the repository has its own .gitleaks.toml; set ~/.aegis/gitleaks.toml to scan it")
         return argv
     raise ValueError(f"Unsupported scanner preset: {preset!r}")
 
@@ -453,17 +460,15 @@ def run_preset_scanner(
     workspace_root: Path | str,
     *,
     user_config_dir: Path | str | None = None,
-    config_path: Path | str | None = None,
     base_fingerprints: Iterable[str] | None = None,
     timeout: int = 60,
     runner: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir, config_path=config_path)
-    cmd_runner = runner or _run_found_program
     try:
-        res = cmd_runner(argv, cwd=Path(workspace_root), timeout=timeout)
-    except FileNotFoundError as exc:
-        return {"status": "unverified", "reason": str(exc), "findings": [], "argv": argv}
+        argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir)
+    except UntrustedScannerConfig as exc:
+        return {"status": "unverified", "reason": str(exc), "findings": [], "argv": []}
+    res = (runner or _run_found_program)(argv, cwd=Path(workspace_root), timeout=timeout)
     if res.get("missing_binary") or res.get("timed_out"):
         reason = res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found")
         return {"status": "unverified", "reason": reason, "findings": [], "argv": argv}
