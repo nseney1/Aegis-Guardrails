@@ -89,6 +89,7 @@ ENV_VAR_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*=")
 WIN_DRIVE_RE = re.compile(r'([a-zA-Z]:)\\([\s*?$"]|$)')
 RM_DANGEROUS_TARGETS = frozenset({"/", "~", "/home", "$home", "/root", "$root", ".", "..", "*"})
 GLOB_CHARS = frozenset({"*", "?", "[", "]"})
+_DELIMITER_PIECE = re.compile(r"&&|\|\||\|&|[;&|\n\r]")
 
 
 @dataclass(frozen=True)
@@ -322,13 +323,17 @@ def decompose_command(tokens: list[str]) -> list[Pipeline]:
             pipelines.append(Pipeline(stages=list(curr_pipeline_stages)))
             curr_pipeline_stages = []
 
-    for tok in tokens:
-        if tok in seq_delims:
-            flush_pipeline()
-        elif tok in ("|", "|&"):
-            flush_stage()
-        else:
-            curr_stage_tokens.append(tok)
+    for token in tokens:
+        # shlex returns a run of adjacent delimiters (";\n", "\n\n", "&&\n", ";;") as one
+        # token; split it back so the command after the run starts a new stage.
+        pieces = _DELIMITER_PIECE.findall(token) if token and not token.strip("|;&\n\r") else (token,)
+        for tok in pieces:
+            if tok in seq_delims:
+                flush_pipeline()
+            elif tok in ("|", "|&"):
+                flush_stage()
+            else:
+                curr_stage_tokens.append(tok)
 
     flush_pipeline()
     return pipelines

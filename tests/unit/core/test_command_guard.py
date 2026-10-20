@@ -150,6 +150,44 @@ def test_wrapped_and_chained_block_set_commands_are_blocked(command, rule):
     assert _id(command) == (GUARD_BLOCK, rule)
 
 
+# R-checks-a1: the lexer returns a run of adjacent delimiters (";\n", "\n\n", "&&\n") as
+# one token; each command after such a run is still classified.
+DELIMITER_RUNS = [
+    ("echo a\n\nrm -rf /", "rm-recursive-dangerous"),
+    ("echo a;\nrm -rf /", "rm-recursive-dangerous"),
+    ("git add x &&\n git push --force origin main", "git-push-force"),
+    ("echo a ||\n rm -rf /", "rm-recursive-dangerous"),
+    ("a;;rm -rf /", "rm-recursive-dangerous"),
+    ("true &\nrm -rf /", "rm-recursive-dangerous"),
+    ("ls |\n rm -rf /", "rm-recursive-dangerous"),
+    ("git status\n\ngit reset --hard", "git-reset-hard"),
+]
+DELIMITER_RUNS_HARMLESS = [
+    "echo a\n\nls",
+    "ls;\n\nls",
+    "ls;\n\n\nls",
+    "cat f |& tee g",
+    "echo 'a;\n\nrm -rf /'",
+    "rm -rf build\n\nls",
+]
+
+
+@pytest.mark.parametrize("command,rule", DELIMITER_RUNS, ids=[f"run{i}" for i in range(len(DELIMITER_RUNS))])
+def test_a_command_after_a_run_of_delimiters_is_classified(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", DELIMITER_RUNS_HARMLESS, ids=[f"ok{i}" for i in range(len(DELIMITER_RUNS_HARMLESS))])
+def test_a_run_of_delimiters_never_splits_quoted_text_or_harmless_commands(command):
+    assert classify_command(command) is None
+
+
+def test_delimiter_runs_alone_or_unterminated_fail_open_without_raising():
+    assert classify_command(";;;;;") is None
+    assert classify_command(";" * 100_000) is None
+    assert classify_command("ls;\n\n'x") is None
+
+
 @pytest.mark.parametrize("target", ["./", ".//", "../", "..//", "~/", "/home/", "/root/", "/"])
 def test_trailing_slashes_never_hide_a_dangerous_rm_target(target):
     """BUG-075 for the guard: trailing slashes are normalized away."""

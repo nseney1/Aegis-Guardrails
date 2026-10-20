@@ -321,3 +321,36 @@ class TestCommandAnalyzerBehavioral:
         assert res_branch.is_destructive is True
         assert res_branch.reason == REASON_GIT_BRANCH
 
+
+
+# ── R-checks-a1: delimiter runs ("\n\n", ";\n", "&&\n", ";;") ────────────────
+
+_DELIMITER_RUNS = [
+    "echo a\n\nrm -rf /",
+    "echo a;\nrm -rf /",
+    "git add x &&\n git push --force origin main",
+    "echo a ||\n rm -rf /",
+    "a;;rm -rf /",
+    "true &\nrm -rf /",
+    "ls |\n rm -rf /",
+    "git status\n\ngit reset --hard",
+]
+
+
+@pytest.mark.parametrize("cmd", _DELIMITER_RUNS, ids=[f"run{i}" for i in range(len(_DELIMITER_RUNS))])
+def test_the_analyzer_and_the_gate_see_the_command_after_a_delimiter_run(cmd, tmp_path):
+    from aegis_cli.hooks.safety import run_safety_gate
+
+    assert CommandAnalyzer.evaluate(cmd).is_destructive is True
+    assert run_safety_gate(cmd, workspace=tmp_path)[1]["decision"] == "force_ask"
+
+
+@pytest.mark.parametrize("cmd", ["echo a\n\nls", "ls;\n\nls", "cat f |& tee g", "echo 'a;\n\nrm -rf /'", "rm -rf build\n\nls"])
+def test_a_delimiter_run_does_not_make_harmless_commands_destructive(cmd):
+    assert CommandAnalyzer.evaluate(cmd) == SafetyEvaluation(False)
+
+
+def test_a_delimiter_run_before_an_unterminated_quote_fails_closed_and_never_raises():
+    assert CommandAnalyzer.evaluate("ls;\n\n'x") == SafetyEvaluation(True, REASON_UNABLE_TO_PARSE)
+    assert CommandAnalyzer.evaluate(";;;;;").is_destructive is False
+    assert CommandAnalyzer.evaluate(";" * 100_000).is_destructive is False
