@@ -61,6 +61,8 @@ TIER_C_CAVEAT = "attestation present, but the workflow is agent-editable"
 GH_TIMEOUT_SECONDS = 180.0
 
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
+#: Codes reached after gh verified an attestation and its JSON re-checked.
+_ATTESTED_CODES = frozenset({"verified", "agent_editable"})
 _RUN_ID_ATTEMPT = re.compile(r"\A\d+/\d+\Z")
 _VERSION = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")
 _REMOTE = re.compile(
@@ -87,8 +89,8 @@ class ReleaseReport:
 
     sha: str
     verified: bool
-    # verified | agent_editable | gh_missing | gh_too_old | not_a_repository | bad_commit | no_repository |
-    # default_branch_unknown | source_ref_mismatch | rejected | bad_output
+    # verified | agent_editable | gh_missing | gh_too_old | not_a_repository | bad_commit | git_failed |
+    # no_repository | default_branch_unknown | source_ref_mismatch | rejected | bad_output
     code: str
     message: str
     tier: Optional[str] = None
@@ -97,6 +99,11 @@ class ReleaseReport:
     gh_version: Optional[str] = None
     details: Mapping[str, Any] = field(default_factory=dict)
     attested: bool = False  # gh verified the attestation and its JSON re-checked (true at tier C too)
+
+    def __post_init__(self) -> None:
+        if self.verified != (self.code == "verified") or self.attested != (self.code in _ATTESTED_CODES):
+            raise ValueError(f"inconsistent release report: verified={self.verified}, attested={self.attested}, "
+                             f"code={self.code!r}")
 
     @property
     def unverified_gh(self) -> bool:
@@ -304,13 +311,17 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
     if version < GH_MINIMUM:
         return ReleaseReport(sha, False, "gh_too_old", f"gh {shown} is installed; earlier versions mis-verify attestations "
                              "(CVE-2025-25204) or leak a token (to 2.92) and cannot pin the source digest", gh_version=shown)
-    if gitsafe.toplevel(top) is None:
-        return ReleaseReport(sha, False, "not_a_repository", f"{top} is not inside a git work tree", gh_version=shown)
-    commit = gitsafe.resolve_commit(top, sha)
-    if not commit or not _SHA.match(commit):
+    try:
+        if gitsafe.toplevel(top) is None:
+            return ReleaseReport(sha, False, "not_a_repository", f"{top} is not inside a git work tree", gh_version=shown)
+        commit = gitsafe.resolve_commit(top, sha)
+        res = gitsafe.run(["rev-parse", "--verify", f"{commit}^{{tree}}"], top) if commit and _SHA.match(commit) else None
+    except gitsafe.GitError as exc:
+        return ReleaseReport(sha, False, "git_failed", f"git could not answer: {exc}", gh_version=shown)
+    if res is None or res.returncode != 0 or not commit:
         return ReleaseReport(sha, False, "bad_commit", f"{sha!r} is not a commit of this repository (fetch it first)",
                              gh_version=shown)
-    tree = gitsafe.run(["rev-parse", "--verify", f"{commit}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
+    tree = res.stdout.decode("ascii", "replace").strip()
     repository = _repository(top)
     if not repository:
         return ReleaseReport(sha, False, "no_repository", "origin is not a github.com repository, so there is nothing to pin "

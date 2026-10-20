@@ -429,6 +429,70 @@ def test_a_caller_may_assert_the_source_ref_but_not_choose_another(tmp_path, sou
             f"refs/heads/release/x is not the default branch GitHub reports for {REPOSITORY} (refs/heads/main)")
 
 
+# ── one consistent report, git failures included (R-trust-56) ───────────────
+
+@pytest.mark.parametrize("verified, code, attested", [
+    (True, "rejected", False), (False, "verified", True), (True, "verified", False), (False, "agent_editable", False),
+    (False, "rejected", True),
+], ids=["v-rejected", "verified-unset", "verified-unattested", "editable-unattested", "rejected-attested"])
+def test_an_inconsistent_report_cannot_be_built(verified, code, attested):
+    with pytest.raises(ValueError):
+        rv.ReleaseReport("a" * 40, verified, code, "message", attested=attested)
+
+
+def _git_tree_lookup(monkeypatch, answer):
+    """``gitsafe.run`` with the commit's tree lookup replaced by ``answer`` (a result or an exception)."""
+    import subprocess
+
+    from aegis_core import gitsafe
+
+    real = gitsafe.run
+
+    def run(args, cwd, *a, **kw):
+        if any(str(x).endswith("^{tree}") for x in args):
+            if isinstance(answer, Exception):
+                raise answer
+            return subprocess.CompletedProcess(["git", *args], answer, b"", b"fatal: bad object")
+        return real(args, cwd, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", run)
+
+
+@needs_git
+def test_a_git_failure_is_a_report_not_an_exception(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path, tier="A")
+    _git_tree_lookup(monkeypatch, gitsafe.GitError("git rev-parse timed out after 30s"))
+    gh = FakeGh("2.93.0")
+    report = rv.verify_release(repo.root, "HEAD", run=gh, tier_runner=tier_runner("A"))
+    assert (report.verified, report.code, report.status) == (False, "git_failed", "failed")
+    assert report.message == "git could not answer: git rev-parse timed out after 30s" and gh.verify_calls == []
+
+
+@needs_git
+def test_a_tree_lookup_that_git_refuses_is_a_bad_commit(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path, tier="A")
+    _git_tree_lookup(monkeypatch, 128)
+    report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0"), tier_runner=tier_runner("A"))
+    assert (report.verified, report.code) == (False, "bad_commit")
+
+
+@needs_git
+def test_the_cli_prints_the_json_envelope_for_a_git_failure(tmp_path, monkeypatch, capsys):
+    from aegis_core import gitsafe, human_gate
+
+    repo = make_repo(tmp_path)
+    head = repo.head()
+    release = FakeGh("2.93.0")
+    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh("A", release))
+    _git_tree_lookup(monkeypatch, gitsafe.GitError("git rev-parse timed out after 30s"))
+    rc, out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", head, "--json")
+    payload = json.loads(out)
+    assert rc == 1 and (payload["code"], payload["status"], payload["verified"]) == ("git_failed", "failed", False)
+    assert "Error" not in err
+
+
 @needs_git
 @pytest.mark.parametrize("remote,expected", [
     ("git@github.com:owner/project.git", REPOSITORY),
