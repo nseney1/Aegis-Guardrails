@@ -12,6 +12,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - **Secrets are redacted.** The `key=value` pattern never matched in 4.3 (an f-string turned `{4,}` into a format field), so values such as `password=...` and `API_TOKEN=...` were stored as written. Stored insights, `aegis_capture_insight` and hook logs now share one bounded pattern table that also covers prose (`the password is ...`), `Authorization` headers and every format the Tier A detector blocks (all AWS key id prefixes, and `://user:pass@host` with or without a scheme). A private key cut by the length bound is dropped whole. Redaction time is linear in its input, and a prompt longer than 4,096 characters is scanned through its first 4,096 (past that only a whole-word head is kept). **Exposure:** insight rows written by 4.3.0-4.3.3 may hold raw `key=value` secrets; there is no scrub command, so delete `~/.aegis/insights/<workspace-id>.jsonl` if that matters to you.
 - **Reads make no GitHub call.** `aegis_scan`, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics, packs, the hooks and the SDK no longer start `gh` (a scan made 14 `gh` calls with 7 CI rows in the ledger). Only `aegis doctor`, `doctor --release`, `aegis sync` and the promote, demote and archive decisions read GitHub; a dead `gh` costs one attempt per projection. PRIVACY.md lists them.
 - **Publishing runs only on a published release.** `publish.yml` has no manual trigger, and a `guard` job checks that the ref is the tag, that the tag is `v` + the package version and that the tag's commit is the commit being built. Before uploading, the job reads PyPI: it uploads only the files PyPI lacks, succeeds when PyPI already holds identical files, and fails without uploading on a digest mismatch or when PyPI cannot be read. A failed release is re-run with "Re-run failed jobs".
+- **CI-confirmed credit can no longer be steered from the ledger or local refs.** Confirmation reads the required workflow the caller names and the default branch GitHub reports; a `ci` row naming another workflow, or a locally repointed `origin/HEAD`, no longer confirms credit. The repository identity still comes from the local `remote.origin.url`.
+- **The agent no longer chooses the sign or scope of its own credit.** A `failure` or `fp` report on a CI-confirmed check is a neutral trigger, never a false positive; only a `success` report on a passed check earns a true positive. `aegis_report_outcome` credits only rules this server process's own scans showed; exposure rows written into the ledger no longer widen the credited set.
 
 ### Changed behaviour
 
@@ -22,11 +24,20 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - A relative `CLAUDE_CONFIG_DIR` or `CODEX_HOME` is ignored when locating the insight hook's file.
 - Hook logs redact more formats. An `Aegis-Approve-Insight` trailer signed over 4.3 text that held a `key=value` secret stops verifying, because the stored text is now redacted.
 - `publish.yml` loses its `workflow_dispatch` trigger, and release runs no longer produce or need a verdict attestation (`validate.yml` still runs the verdict on pushes to `main` and on dispatch).
+- `aegis check --full` exits on Layer 1 only. A Layer 2 `BLOCK` or `REVISE` is printed and reported as advisory (`layer2.advisory: true` in JSON); a Spec Agent reply that cannot be read prints `Layer 2: UNVERIFIED` instead of `BLOCK`. Rule telemetry from `--full` records the Layer 1 result. A model command that cannot run, or a failed test discovery, still exits 1 but no longer writes `fp` rows.
+- `aegis rule insight add` no longer accepts `--host` or `--session` (usage error, exit 2); CLI insights carry no session identity.
+- The MCP write tools `aegis_report_outcome` and `aegis_capture_insight` declare only `readOnlyHint: false` and a title, reverting the extra hints added in 4.3.2, so hosts that honour hints prompt before running them again.
+- `aegis sync` and the promote, demote and archive decisions make one extra read-only `gh api repos/{owner}/{repo}` call per process to read the default branch; if GitHub cannot name it, the credit stays landed and the evidence is reported unavailable.
+- `~/.aegis/config.json` has one reader for `tests.command`, `rules.base_ref`, `perf.command` and `regression.*`: a config whose `v` is not 1 is ignored by all four, `perf.command` is honoured in a BOM-prefixed file and capped at 64 KiB, an unsplittable `perf.command` is ignored instead of crashing the perf check, and those four keys no longer trigger the unknown-key warning.
+- `VerificationPipeline.run` and `DeterministicVerifier.verify` called without `changed_files` outside a git work tree (or when git fails) raise `ValueError` instead of returning a clean pass.
 
 ### Fixed
 
 - The wall-clock assertions that failed Windows legs (a 1.0 s scan budget, a 300 ms hook median, a 40 ms insight-hook budget) are replaced by spawn and ledger-open counters and one baseline-subtracted overhead test. The report-flood test makes `cap + 50` calls instead of 10,000 (about 70 s shorter per leg).
 - `.github/scripts/ci_green.py` drops unused pagination and `--repo` options, and `aegis_core.credit` now skips a CI run with a non-integer id the way `ci_green.py` does instead of raising.
+- `aegis_scan` called with `files: []` records its git-diff scan, so the scan-before-edit hook and `aegis status --compliance` see it; `aegis_report_outcome` computes the work tree once per report.
+- Hook insights recorded from a subdirectory (or with `CLAUDE_PROJECT_DIR` set) land in the governed workspace's insights file, so `aegis rule insight review` sees them. Files already written under subdirectory ids are not migrated.
+- Layer 2 risk text from the model, and the `Layer 2 failed` and test-discovery error lines, print as one sanitized line of at most 300 characters.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -34,6 +45,9 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Breaking: `aegis_core.insights.redact_secrets` and `aegis_core.insights.shannon_entropy` are removed; redaction lives in `aegis_core.verification.scanners`.
 - Breaking: `aegis_core.verification.scanners.redact_secrets`, `aegis_core.verification.scanners.redact_hook_text`, `aegis_core.verification.scanners.redact_payload` and `aegis_core.verification.scanners.HOOK_REDACTION_PATTERNS` are removed in favour of the one pattern table.
 - Breaking: `aegis_cli.hooks.redaction.HOOK_REDACTION_PATTERNS` and `aegis_cli.hooks.redaction.redact_payload` are removed.
+- Breaking: `aegis_cli.verify.verdict_to_exit_code` is removed; Layer 2 no longer maps to an exit code.
+- Breaking: `aegis_core.insights.add_insight` loses its `host` and `session` keyword arguments.
+- Breaking: the incidental re-exports `aegis_core.regression.UserLayout`, `aegis_core.rule_integrity.UserLayout` and `aegis_core.rule_integrity.Path` are removed; import `UserLayout` from `aegis_core.workspace.layout` and `Path` from `pathlib`.
 
 ## [4.3.3] - 2026-10-17
 

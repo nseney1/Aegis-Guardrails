@@ -385,8 +385,6 @@ Record an explicit human correction insight
 | `text` | `TEXT` |  | Correction insight text (redacted and capped at 300 chars) (required) |
 | `--paths` | `[PATHS ...]` |  | Target file paths (default: git dirty set) |
 | `--kind` | `KIND` |  | Optional insight category or kind |
-| `--host` | `HOST` | `"cli"` | Host identifier (default: cli) |
-| `--session` | `SESSION` |  | Optional session identifier (stored as keyed hs) |
 | `--commit` | `COMMIT` |  | Optional signed commit SHA carrying Aegis-Approve-Insight |
 | `--base-ref` | `BASE_REF` |  | Optional base branch reference for --commit |
 
