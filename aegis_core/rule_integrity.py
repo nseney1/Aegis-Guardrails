@@ -650,6 +650,7 @@ def _cap_findings(head: RuleSet, base: RuleSet, files: Callable[[], List[str]]) 
 
 
 _PYTEST_SECTION_FILES = ("pyproject.toml", "setup.cfg", "tox.ini")
+_REGULAR_MODES = ("100644", "100755")
 
 
 def _same_pytest_view(root: str, merge: str, head: str, path: str) -> bool:
@@ -665,16 +666,24 @@ def _same_pytest_view(root: str, merge: str, head: str, path: str) -> bool:
 
 def _governance_paths(root: str, merge: str, head: str) -> Tuple[Tuple[str, str], ...]:
     """(path, category) for each changed governance path a signed approval must cover. Rule edits
-    are left to the weakening check; pyproject.toml, setup.cfg and tox.ini count only when their
-    pytest view differs (a missing or unreadable side counts). --no-renames: a moved governance
-    file shows its old name as deleted."""
+    are left to the weakening check; pyproject.toml, setup.cfg and tox.ini modified as regular files
+    on both sides count only when their pytest view differs (a missing or unreadable side counts).
+    --no-renames: a moved governance file shows its old name as deleted."""
     found: List[Tuple[str, str]] = []
-    for status, _old, _new, path in gitsafe.diff_entries(root, merge, head):
+    for status, old_mode, new_mode, path in gitsafe.diff_entries(root, merge, head):
         gone = status == "D"
         category = governance.category_of(path, deleted=gone)
         if category in (None, "rules"):
             continue
-        if not gone and path.rsplit("/", 1)[-1] in _PYTEST_SECTION_FILES and _same_pytest_view(root, merge, head, path):
+        # A symlink's blob is its link text, not the file pytest follows the link to, so any side
+        # that is not a regular file (a T status, a link, a gitlink) counts whole.
+        if (
+            status == "M"
+            and old_mode in _REGULAR_MODES
+            and new_mode in _REGULAR_MODES
+            and path.rsplit("/", 1)[-1] in _PYTEST_SECTION_FILES
+            and _same_pytest_view(root, merge, head, path)
+        ):
             continue
         found.append((path, str(category)))
     return tuple(found)

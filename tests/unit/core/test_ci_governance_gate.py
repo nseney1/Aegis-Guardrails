@@ -377,6 +377,117 @@ def test_a_pytest_view_that_cannot_be_shown_equal_stays_gated(tmp_path, capsys, 
     assert payload["governance"]["categories"] == expected
 
 
+def _set_base(repo: hg.Repo, files: Dict[str, str]) -> None:
+    """Commit ``files`` on ``work`` and move ``main`` (the base) to that commit."""
+    for path, text in files.items():
+        repo.write(path, text)
+    repo.commit("base files", allow_empty=True)
+    repo.git("branch", "-f", "main", "HEAD")
+
+
+def _stage_symlink(repo: hg.Repo, path: str, target: str) -> None:
+    """Stage ``path`` as a symlink (mode 120000) whose link text is ``target``, without touching the
+    work tree, so it works where the OS refuses symlinks."""
+    oid = repo.git("hash-object", "-w", "--stdin", stdin=target)
+    repo.git("update-index", "--add", "--cacheinfo", f"120000,{oid},{path}")
+
+
+def _commit_index(repo: hg.Repo, message: str, sign_key: Optional[Path] = None) -> None:
+    """Commit what is staged as is (``Repo.commit`` would re-add the work tree over a staged symlink)."""
+    args = ["commit", "-q", "--allow-empty", "-m", message]
+    if sign_key is not None:
+        args = ["-c", "gpg.format=ssh", "-c", f"user.signingkey={sign_key}", *args, "-S"]
+    repo.git(*args)
+
+
+# Each base file holds no pytest section; the link text parses as a comment in its format (a TOML or
+# ini comment), so a reader of the blob sees no pytest view on either side while pytest follows the
+# link to a file that deselects the failing test.
+SYMLINKED_CONFIGS = [
+    ("sub/pyproject.toml", '[project]\nname = "sub"\n', "sub/evil.toml",
+     '[tool.pytest.ini_options]\naddopts = "-k nothing_matches"\n', "#/../evil.toml"),
+    ("sub/tox.ini", "[tox]\nenvlist = py\n", "sub/evil.ini", "[pytest]\naddopts = -k nothing_matches\n",
+     "#/../evil.ini"),
+    ("sub/setup.cfg", "[metadata]\nname = sub\n", "sub/evil.cfg", "[tool:pytest]\naddopts = -k nothing_matches\n",
+     "#/../evil.cfg"),
+]
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("path,base_text,target,target_text,link", SYMLINKED_CONFIGS,
+                         ids=["pyproject", "tox", "setup"])
+def test_a_pytest_config_file_replaced_by_a_symlink_is_gated_as_a_whole_file(tmp_path, capsys, keys, path,
+                                                                            base_text, target, target_text, link):
+    """Given a base whose config file has no pytest section, When the branch replaces it with a symlink
+    (a type change, 100644 -> 120000) to a file that configures pytest, Then the gate does not compare
+    the link text by section: the path needs the approval, and a signed one passes."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    _set_base(repo, {path: base_text})
+    repo.write(target, target_text)
+    repo.git("add", "--", target)
+    repo.git("rm", "-q", "--cached", "--", path)
+    _stage_symlink(repo, path, link)
+    _commit_index(repo, "agent")
+    assert repo.git("diff-tree", "-r", "--raw", "--no-renames", "main", "HEAD").count(" T\t" + path) == 1
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and payload["governance"]["paths"] == [{"path": path, "category": "test-infra"}]
+    assert payload["governance"]["enforced"] is True
+    _commit_index(repo, f"approve\n\nAegis-Approve: {human_gate.governance_tree_hash(repo.root, 'HEAD', base='main')}\n",
+                  sign_key=keys["human"])
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 0 and payload["approval"]["valid"] is True
+
+
+@needs_git
+@needs_signing
+def test_a_symlinked_pytest_config_file_that_is_relinked_is_gated(tmp_path, capsys, keys):
+    """Given a base where sub/pyproject.toml is already a symlink, When the branch points it elsewhere
+    (mode 120000 on both sides), Then the change counts whole: both link texts parse as comments."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    repo.write("sub/a.toml", '[project]\nname = "sub"\n')
+    repo.write("sub/b.toml", '[tool.pytest.ini_options]\naddopts = "-k nothing_matches"\n')
+    repo.git("add", "--", "sub/a.toml", "sub/b.toml")
+    repo.git("rm", "-q", "--cached", "--", "sub/pyproject.toml")
+    _stage_symlink(repo, "sub/pyproject.toml", "#/../a.toml")
+    _commit_index(repo, "base symlink")
+    repo.git("branch", "-f", "main", "HEAD")
+    _stage_symlink(repo, "sub/pyproject.toml", "#/../b.toml")
+    _commit_index(repo, "relink")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and payload["governance"]["paths"] == [{"path": "sub/pyproject.toml", "category": "test-infra"}]
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("direction,section_edit,gated", [
+    ("+x", False, False),
+    ("-x", False, False),
+    ("+x", True, True),
+], ids=["exec-on", "exec-off", "exec-and-section"])
+def test_a_mode_change_between_regular_files_is_still_compared_by_section(tmp_path, capsys, keys, direction,
+                                                                         section_edit, gated):
+    """Given pyproject.toml as a regular file on both sides, When only its executable bit flips
+    (100644 <-> 100755), Then the pytest view decides: unchanged stays ungated, a section edit is gated."""
+    repo = make_repo(tmp_path, keys["human_pub"])
+    if direction == "-x":
+        repo.git("update-index", "--chmod=+x", "--", "pyproject.toml")
+        _commit_index(repo, "executable at the base")
+        repo.git("branch", "-f", "main", "HEAD")
+    if section_edit:
+        repo.write("pyproject.toml", PYPROJECT.replace('addopts = "-q"', 'addopts = "-k nothing_matches"'))
+        repo.git("add", "--", "pyproject.toml")
+    repo.git("update-index", f"--chmod={direction}", "--", "pyproject.toml")
+    _commit_index(repo, "mode change")
+    modes = repo.git("diff-tree", "-r", "--raw", "--no-renames", "main", "HEAD")
+    assert ("100644 100755" if direction == "+x" else "100755 100644") in modes
+    rc, payload = ci_json(repo, capsys)
+    if gated:
+        assert rc == 1 and payload["governance"]["paths"] == [{"path": "pyproject.toml", "category": "test-infra"}]
+    else:
+        assert rc == 0 and payload["governance"]["categories"] == []
+
+
 @needs_git
 @needs_signing
 def test_an_unreadable_base_fails_the_check_with_an_error(tmp_path, capsys, monkeypatch, keys):
