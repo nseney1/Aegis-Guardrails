@@ -504,6 +504,93 @@ class TestRebindingDoesNotHideAlias:
             "Forbidden decorator 'functools.lru_cache' matched rule forbid_ast.decorators"
         ]
 
+# ── R-checks-9: builtin shadowing follows Python's lexical scoping ──
+
+_BUILTIN_EVAL = {"calls": [{"name": "eval", "builtin": True}]}
+_EVAL_FLAGGED = ["Forbidden call 'eval' matched rule forbid_ast.calls"]
+
+
+class TestBuiltinShadowFollowsPythonScoping:
+    """A name shadows the builtin only where Python's own lookup finds that binding first: the
+    call's scope, then enclosing function and module scopes. A class body is seen only by code
+    directly in it; a lambda or comprehension does not see it."""
+
+    @pytest.mark.parametrize("code", [
+        "def helper():\n    def eval(x):\n        return x\n    return eval(1)\n\neval(input())\n",
+        "async def helper():\n    async def eval(x):\n        return x\n\neval(input())\n",
+        "def helper():\n    class eval:\n        pass\n\neval(input())\n",
+        "def helper():\n    from mylib import eval\n\neval(input())\n",
+        "def helper():\n    import mylib as eval\n\neval(input())\n",
+        "def a():\n    def eval(x):\n        return x\n\ndef b():\n    return eval(input())\n",
+        "class A:\n    class eval:\n        pass\n\neval(input())\n",
+        "def f(a=eval(input())):\n    def eval(x):\n        return x\n",
+        "class A:\n    def m(self):\n        def eval(x):\n            return x\n\neval(input())\n",
+        "def h():\n    from builtins import eval\n\ndef g():\n    return eval(input())\n",
+    ], ids=["def", "async-def", "class", "from-import", "import-as", "sibling", "class-body", "default", "in-method",
+            "builtins-import"])
+    def test_a_binding_in_another_scope_does_not_hide_the_call(self, code):
+        assert _violations(code, _BUILTIN_EVAL) == _EVAL_FLAGGED
+
+    @pytest.mark.parametrize("code", [
+        "class A:\n    def eval(self, x):\n        return x\n\n    def m(self):\n        return eval(input())\n",
+        "class A:\n    def eval(self, x):\n        return x\n\n    xs = [eval(i) for i in data]\n",
+        "class A:\n    def eval(self, x):\n        return x\n\n    f = lambda: eval(input())\n",
+    ], ids=["sibling-method", "comprehension", "lambda"])
+    def test_a_class_body_binding_is_not_seen_by_nested_code(self, code):
+        assert _violations(code, _BUILTIN_EVAL) == _EVAL_FLAGGED
+
+    @pytest.mark.parametrize("code", [
+        "def eval(x):\n    return x\n\neval(1)\n",
+        "from mylib import eval\n\neval(1)\n",
+        "import mylib as eval\n\neval(1)\n",
+        "def h():\n    def eval(x):\n        return x\n    return eval(1)\n",
+        "def h():\n    def eval(x):\n        return x\n\n    def g():\n        return eval(1)\n\n    return g\n",
+        "def eval(x):\n    return x\n\ndef g():\n    return eval(1)\n",
+        "class A:\n    def eval(self, x):\n        return x\n\n    y = eval(1)\n",
+    ], ids=["module-def", "module-from-import", "module-import-as", "same-function", "enclosing-function",
+            "module-def-from-function", "class-body-direct"])
+    def test_a_binding_visible_at_the_call_shadows_the_builtin(self, code):
+        assert _violations(code, _BUILTIN_EVAL) == []
+
+    def test_exec_is_resolved_the_same_way(self):
+        code = "def helper():\n    def exec(x):\n        return x\n\nexec(input())\n"
+        assert _violations(code, {"calls": [{"name": "exec", "builtin": True}]}) == [
+            "Forbidden call 'exec' matched rule forbid_ast.calls"]
+
+    def test_the_structured_evaluator_reports_the_module_level_line_only(self):
+        from aegis_core.ast.policy import evaluate_forbid_ast_structured
+
+        code = "def helper():\n    def eval(x):\n        return x\n    return eval(1)\n\neval(input())\n"
+        confirmed, _ = evaluate_forbid_ast_structured(extract_normalized_ast("mod.py", code=code), _BUILTIN_EVAL, rule_id="r")
+        assert [hit["line"] for hit in confirmed] == [6]
+
+    def test_the_driver_resolves_bare_names_only(self):
+        norm = extract_normalized_ast("mod.py", code="import os\ndef f():\n    pass\nf()\ng()\nos.getcwd()\n")
+        assert [(c.target, c.shadowed) for c in norm.call_sites] == [("f", True), ("g", False), ("os.getcwd", None)]
+        assert NormalizedAST.from_json(norm.to_json()) == norm
+
+    def test_shadowed_round_trips_is_omitted_when_none_and_a_non_bool_loads_as_none(self):
+        for value in (True, False):
+            site = CallSiteNode(target="eval", line=3, shadowed=value)
+            assert site.to_dict()["shadowed"] is value
+            assert CallSiteNode.from_dict(site.to_dict()) == site
+        assert "shadowed" not in CallSiteNode(target="eval", line=3).to_dict()
+        assert CallSiteNode.from_dict({"target": "eval", "line": 3}).shadowed is None
+        assert CallSiteNode.from_dict({"target": "eval", "shadowed": "yes"}).shadowed is None
+        assert CallSiteNode.from_dict({"target": "eval", "shadowed": 1}).shadowed is None
+
+    def test_a_site_without_a_driver_verdict_keeps_the_file_wide_test(self):
+        from aegis_core.ast.schema import DefinitionNode
+
+        defs = (DefinitionNode(name="eval", kind="function"),)
+        free = NormalizedAST(file_path="m.py", definitions=defs, call_sites=(CallSiteNode("eval", 4, shadowed=False),))
+        bound = NormalizedAST(file_path="m.py", call_sites=(CallSiteNode("eval", 4, shadowed=True),))
+        legacy = NormalizedAST(file_path="m.py", definitions=defs, call_sites=(CallSiteNode("eval", 4),))
+        assert evaluate_forbid_ast(free, _BUILTIN_EVAL) == _EVAL_FLAGGED
+        assert evaluate_forbid_ast(bound, _BUILTIN_EVAL) == []
+        assert evaluate_forbid_ast(legacy, _BUILTIN_EVAL) == []
+
+
 # ── Review round 2, finding 2: encoding detection must split lines like CPython ──
 
 # CPython treats \r and \r\n as line breaks when it looks for a PEP 263 cookie in the first

@@ -247,7 +247,7 @@ def _forbid_tokens(spec: Any, kind: str = "calls") -> List[str]:
     raw = (
         v
         if isinstance(v, str)
-        else (str(v.get("name") or v.get("call") or "") if isinstance(v, Mapping) else "")
+        else (str(v.get("name") or "") if isinstance(v, Mapping) else "")
         for v in values
     )
     return [t for t in (_normalize_ast_token(r) for r in raw if r) if t]
@@ -255,15 +255,10 @@ def _forbid_tokens(spec: Any, kind: str = "calls") -> List[str]:
 
 _forbid_patterns = _forbid_tokens
 
-# A value no version defines counts below "ignore": it cannot be shown to bind as much (fail closed).
-_UNKNOWN_STRICTNESS = {"ignore": 0, "skip": 0, "report": 1, "flag": 2}
-
-
 class _CallEntry(NamedTuple):
     name: str
     where: Optional[Mapping[str, Any]]
     builtin: bool
-    unknown: int
 
 
 def _call_entries(spec: Any) -> List[_CallEntry]:
@@ -276,14 +271,13 @@ def _call_entries(spec: Any) -> List[_CallEntry]:
     entries: List[_CallEntry] = []
     for value in values if isinstance(values, (list, tuple)) else ():
         if isinstance(value, str):
-            entry = _CallEntry(_normalize_ast_token(value), None, False, _UNKNOWN_STRICTNESS["report"])
+            entry = _CallEntry(_normalize_ast_token(value), None, False)
         elif isinstance(value, Mapping):
             where = value.get("where")
             entry = _CallEntry(
-                _normalize_ast_token(str(value.get("name") or value.get("call") or "")),
+                _normalize_ast_token(str(value.get("name") or "")),
                 where if isinstance(where, Mapping) and where else None,
                 bool(value.get("builtin")),
-                _UNKNOWN_STRICTNESS.get(str(value.get("unknown") or "report"), -1),
             )
         else:
             continue
@@ -304,7 +298,7 @@ def _same_value(a: Any, b: Any) -> bool:
 def _call_covers(head: _CallEntry, base: _CallEntry) -> bool:
     if not _dotted_covers("calls", head.name, base.name):
         return False
-    if (head.builtin and not base.builtin) or head.unknown < base.unknown:
+    if head.builtin and not base.builtin:
         return False
     # A where is a conjunction: a head that keeps a subset of the base conjuncts matches more sites.
     return head.where is None or (
@@ -337,7 +331,7 @@ def _forbid_findings(base: Rule, head: Rule) -> List[str]:
                 if not any(_call_covers(other, entry) for other in heads):
                     named = any(_dotted_covers(kind, other.name, entry.name) for other in heads)
                     lost.append(f"call {entry.name!r} is no longer forbidden" + (
-                        " everywhere it was (its where, builtin or unknown was narrowed)" if named else ""))
+                        " everywhere it was (its where or builtin was narrowed)" if named else ""))
             continue
         kept = _forbid_patterns(after, kind)
         for pattern in _forbid_patterns(before, kind):

@@ -312,12 +312,12 @@ def test_forbid_ast_subsumption_uses_prefix_for_imports_and_suffix_for_calls(tmp
 @needs_git
 @needs_signing
 def test_narrowing_a_call_entry_needs_an_approval_and_the_base_entry_is_served(tmp_path, capsys, keys):
-    run_shell = "{name: subprocess.run, where: {shell: {equals: true}}}"
+    run_shell = "{name: subprocess.run, where: {shell: true}}"
     repo = make_repo(tmp_path, keys["human_pub"], rules={
         rule_path("gate-run"): rule_text("gate-run", "gate", paths=("lib/*.py",), forbid={"calls": [run_shell]})})
     reviewed = rule_integrity.effective(repo.root).ruleset.get("gate-run").meta["forbid_ast"]
     repo.write(rule_path("gate-run"), rule_text("gate-run", "gate", paths=("lib/*.py",), forbid={
-        "calls": ["{name: subprocess.run, where: {shell: {equals: never-matches}}}"]}))
+        "calls": ["{name: subprocess.run, where: {shell: never-matches}}"]}))
     repo.commit("narrow the call entry")
     rc, payload = ci_json(repo, capsys)
     assert rc == 1 and codes(payload) == [("forbid_ast", "gate-run")]
