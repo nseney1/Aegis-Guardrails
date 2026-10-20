@@ -43,7 +43,7 @@ Aegis treats a repository you clone as untrusted input. What it runs, and from w
 
 | What runs | When | Where it comes from |
 |---|---|---|
-| `git` | most commands, and `aegis_scan` | your PATH, always through `gitsafe`: the repository's own config cannot make git run anything (fsmonitor, hooks, filter drivers, credential helpers, remote protocols and submodule status are switched off; your user and system git config still apply) |
+| `git` | most commands, and `aegis_scan` | your PATH, always through `gitsafe`: the repository's own config cannot make git run anything (fsmonitor, hooks, filter drivers, credential helpers, signature-verification programs, trailer commands, remote protocols and submodule status are switched off; your user and system git config still apply, except that signature programs are switched off there too) |
 | `codex`, `claude` | `aegis init --host`, `aegis uninstall`, and `aegis doctor` (`codex mcp get` only) | by name from the absolute entries of PATH; relative and empty entries, which point into the current directory, are skipped, and doctor also skips entries inside the workspace |
 | AST drivers (`node`, `go`) | `aegis check` on TypeScript or Go files, or on files your user config names a driver for | Aegis's packaged driver templates, which a repository may only switch on, or commands from your user `~/.aegis/config.json`; the interpreter must be outside the workspace, and a Python driver runs under the Python running Aegis. The packaged Rust driver starts no program: it runs inside Aegis's own process |
 | `aegis-mcp`, the MCP server | every session of a host you registered with `aegis init --host`, started by the host in the project directory | the absolute command `init` registered: the `aegis-mcp` script from an absolute PATH entry or from next to the Python running `aegis`, else that Python in isolated mode (`-I -c`) importing `aegis_mcp` from the directory Aegis is installed in. Never `python -m aegis_mcp`, which imports from the project directory first. `aegis doctor` reports as unsafe a registration that is not an absolute path, a Python that runs `-m` or `-c` without `-I` or a script by a relative path, or either behind `env`; it starts no MCP server and no `python3` |
@@ -51,7 +51,7 @@ Aegis treats a repository you clone as untrusted input. What it runs, and from w
 | `pytest` | `aegis check --full` only | your active virtualenv, then `.venv/` inside the repository, then PATH. It runs the tests that match the changed files, which executes repository code (tests, `conftest.py`) just as running the suite yourself would |
 | your model command | `aegis check --full` only | `--llm-cmd` or `AEGIS_LLM_CMD`, never repository files. It runs in an empty temporary directory and receives the prompt, which includes the diff, on stdin |
 | your test command | `aegis check --record --tests` only | `tests.command` in your user `~/.aegis/config.json` (default `python -m pytest`, run under the Python running Aegis), never the repository's config. It runs in a snapshot export of the tree with a fixed environment, no stdin and a timeout that kills its process group; like any test run, it executes the repository's tests and `conftest.py` |
-| `gh` | `aegis doctor` (the trust tier: read-only `gh api` GETs), `aegis doctor --github --apply` (one POST that creates the ruleset, after a typed y/N at a terminal) and `aegis doctor --release` (`gh --version`, then `gh attestation verify`) | by name from an absolute PATH entry outside the repository, with your own gh login. No other command calls GitHub |
+| `gh` | `aegis doctor` (the trust tier: read-only `gh api` GETs), `aegis doctor --github --apply` (one POST that creates the ruleset, after a typed y/N at a terminal) and `aegis doctor --release` (`gh --version`, then `gh attestation verify`); `aegis sync` and the `aegis rule promote`, `demote` and `archive` decisions (read-only GETs of the repository's default branch and its CI runs, to confirm credit; when the runs GET fails, the same tier GETs plus `gh --version` and `gh attestation verify` as a fallback), and `aegis sync --pr` (`gh pr create`) | by name from an absolute PATH entry outside the repository, with your own gh login. No other command starts `gh`: scanning, `aegis_list_rules`, `aegis status`, `aegis rule list`, `aegis check` and the agent hooks stay offline |
 
 Plain `aegis check` and the git pre-commit hook (`aegis check --hook`) parse files and never run the repository's code or a model. Run `aegis check --full` only on code you would run yourself.
 
@@ -75,17 +75,19 @@ The hooks are guardrails, not a security boundary. They fail open on any Aegis e
 The adversary Aegis plans for is the coding agent itself: it runs as your user, can edit the repository, `$HOME`, host configs and Aegis's own state, and holds your git and gh credentials unless you separate them. Nothing local is a witness against it, so what Aegis sees locally (the ledger, `aegis check --record` rows, commit trailers) is a **label**. What holds depends on what GitHub enforces, which `aegis doctor` detects and prints on every report:
 
 - **Tier A, separation of duties:** the default branch requires a pull request, an approving review by a non-author, the Aegis status checks and CODEOWNERS on the governance files, and the agent's identity cannot approve.
-- **Tier B, solo and signed:** required status checks, plus `aegis approve` commits signed by a key listed in the base branch's `allowed_signers` that the agent cannot use (a hardware key, or a passphrase or touch-confirmed agent). A key stored as a plain, readable file degrades B to C.
+- **Tier B, solo and signed:** required status checks, plus `aegis approve` commits signed by a key listed in the base branch's `allowed_signers` that the agent cannot use (a hardware key, or a passphrase or touch-confirmed agent). A key stored as a plain, readable file degrades B to C. Only SSH signatures count: a PGP or X.509 signature is never an approval. Tier B is weaker than it looks; see the caveat under the table.
 - **Tier C, self-attested:** neither. Detection and audit only, and every report says "self-attested".
 
 `aegis doctor --github` prints the ruleset, CODEOWNERS lines and signing setup tiers A and B need.
 
 | Claim | Tier A | Tier B | Tier C |
 |---|---|---|---|
-| A rule weakening was approved by a human | ✔ | ✔ | ✘ (itemized, auditable) |
-| An outcome credited to a rule was confirmed by CI on the landing commit | ✔ | ✔ | ✔ (CI only, workflow editable by the agent) |
-| A release passed CI on its exact SHA, with a signed attestation | ✔ | ✔ | ✘ (agent can edit the workflow) |
+| A rule weakening was approved by a human | ✔ | partial: holds only if the pull request leaves `.github/workflows/**` and aegis alone (it runs its own check; itemized, auditable) | ✘ (itemized, auditable) |
+| An outcome credited to a rule was confirmed by CI on the landing commit | ✔ | ✔ (CI only, workflow editable by the agent) | ✔ (CI only, workflow editable by the agent) |
+| A release passed CI on its exact SHA, with a signed attestation | ✔ | ✘ (agent can edit the workflow) | ✘ (agent can edit the workflow) |
 | Local labels (`witness: aegis`) | label | label | label |
+
+At tier B the required checks run the pull request's own workflow and the aegis it installs, and a required status context accepts a result from any source unless the ruleset pins an integration, so a pull request that edits `.github/workflows/**` or aegis can change the check that verifies the signature. `aegis doctor --release` therefore reports tier B as `agent_editable`, never `VERIFIED`; restoring the tier B ticks needs a check sourced from the base branch. CI confirmation of credit reads the workflow and default branch from GitHub, but the repository it asks about still comes from the local `remote.origin.url`.
 
 The first row holds only where CI runs `aegis check --ci` as a required check; `aegis init --ci`'s workflow does not add it yet. The second row is read by `aegis sync` and `aegis sync --pr` (which opens an evidence-backed pull request with sampled examples and never auto-merges). The third is what `aegis doctor --release <sha>` verifies, and it prints `UNVERIFIED` and exits non-zero when it cannot.
 

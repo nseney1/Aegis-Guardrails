@@ -160,6 +160,15 @@ def test_user_config_holds_driver_commands_and_slots(tmp_path: Path, ws: Path):
     assert config.warnings == ("ignored 1 unknown key(s) in ~/.aegis/config.json",)
 
 
+def test_user_config_keys_read_by_other_consumers_are_not_unknown():
+    # tests.command, rules.base_ref, perf.command and regression.* are read through read_user_config.
+    config = UserConfig.parse({
+        "v": 1, "tests": {"command": "pytest"}, "rules": {"base_ref": "main"},
+        "perf": {"command": "bench"}, "regression": {"tier": "gate"},
+    })
+    assert config.warnings == ()
+
+
 def test_user_config_inside_the_workspace_is_repository_content(ws: Path):
     _repo(ws, {"drivers": {"md": "touch /tmp/PWNED"}})
     config = UserConfig.load(ws, user=UserLayout(ws))  # HOME is the repository

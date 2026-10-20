@@ -3,16 +3,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
-import json
 import os
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import gitsafe
+from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import ENFORCEMENT_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
-from aegis_core.workspace.layout import RULES_RELDIR, UserLayout
+from aegis_core.workspace.layout import RULES_RELDIR
 
 __all__ = [
     "BENIGN_KEYS",
@@ -45,7 +44,7 @@ _CHECKED_KEYS = frozenset({"detect", "applies_to"})
 _KNOWN_KEYS = ENFORCEMENT_KEYS | EXCLUDED_KEYS | BENIGN_KEYS | _CHECKED_KEYS
 _FORBID_KINDS = ("imports", "calls", "decorators")
 _ENFORCEMENT_ORDER = {name: index for index, name in enumerate(VALID_ENFORCEMENT)}
-_USER_CONFIG_LIMIT, _GIT_TIMEOUT, _MD, _MISSING = 64 * 1024, 60.0, ".md", object()
+_GIT_TIMEOUT, _MD, _MISSING = 60.0, ".md", object()
 
 
 class IntegrityError(AegisError):
@@ -70,29 +69,9 @@ class BaseAnchor:
         }
 
 
-def _within(path: Path, root: Path) -> bool:
-    try:
-        return os.path.commonpath([str(path.resolve()), str(root.resolve())]) == str(root.resolve())
-    except (OSError, ValueError, RuntimeError):
-        return False
-
-
 def _user_base_ref(root: str) -> Optional[str]:
-    layout = UserLayout.current()
-    if layout is None:
-        return None
-    path = layout.config_file
-    try:
-        if not path.is_file() or _within(path, Path(root)):
-            return None
-        with open(path, "rb") as handle:
-            raw = handle.read(_USER_CONFIG_LIMIT + 1)
-        if len(raw) > _USER_CONFIG_LIMIT:
-            return None
-        data = json.loads(raw.decode("utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    rules = data.get("rules") if isinstance(data, dict) else None
+    data = read_user_config(root)
+    rules = data.get("rules") if data else None
     ref = rules.get("base_ref") if isinstance(rules, dict) else None
     if isinstance(ref, str) and ref.strip() and not ref.strip().startswith("-"):
         return ref.strip()

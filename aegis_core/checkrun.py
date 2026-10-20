@@ -32,7 +32,6 @@ import re
 import shlex
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -41,10 +40,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Uni
 
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
+from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
-from aegis_core.workspace.layout import UserLayout
 
 __all__ = [
     "DEFAULT_TIMEOUT_S",
@@ -67,7 +66,6 @@ DEFAULT_COMMAND = ("python", "-m", "pytest")
 _PYTHON_FLAGS = ("-s", "--check-hash-based-pycs", "always")
 _PYTEST_FLAGS = ("-p", "no:cacheprovider", "-o", "addopts=")
 _HERMETIC = "hermetic-v1"
-_MAX_CONFIG_BYTES = 64 * 1024
 _MAX_JUNIT_BYTES = 8 * 1024 * 1024
 _TAIL_BYTES = 256 * 1024
 _PYTHON_NAME = re.compile(r"python[0-9.]*(?:\.exe)?", re.IGNORECASE)
@@ -114,37 +112,9 @@ class CheckOutcome:
 
 # ── The command ──────────────────────────────────────────────────────────────
 
-def _read_user_config(path: Path, workspace: Path) -> Optional[Mapping[str, Any]]:
-    if os.path.realpath(path).startswith(os.path.realpath(workspace).rstrip(os.sep) + os.sep):
-        return None  # a "user" file inside the repository is repository content
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        data = os.read(fd, _MAX_CONFIG_BYTES + 1)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    if len(data) > _MAX_CONFIG_BYTES:
-        return None
-    try:
-        value = json.loads(data.decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
 def user_test_command(workspace: Path) -> Optional[List[str]]:
     """``tests.command`` of the user-scope config as an argv list, or None when unset or unusable."""
-    layout = UserLayout.current()
-    if layout is None:
-        return None
-    raw = _read_user_config(layout.config_file, workspace)
+    raw = read_user_config(workspace)
     tests = raw.get("tests") if raw else None
     command = tests.get("command") if isinstance(tests, dict) else None
     if isinstance(command, str) and command.strip():

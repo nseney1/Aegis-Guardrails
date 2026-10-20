@@ -215,7 +215,8 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
     tools = mcp.get("tools", [])
     if tools:
         lines += [
-            "The server speaks MCP over stdio. Its tools, as `tools/list` returns them:",
+            "The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A write tool "
+            "declares only `readOnlyHint: false`, so the MCP defaults apply to its other hints:",
             "",
             "| Tool | Title |",
             "| --- | --- |",

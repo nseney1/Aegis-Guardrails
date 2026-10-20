@@ -191,3 +191,30 @@ def test_security_names_every_hook_registration_file_and_what_it_is_not(tmp_path
     for phrase in ("guardrails, not a security boundary", "teammates", "/hooks", "exit 75",
                    "not an identity", "refs/aegis/lanes"):
         assert phrase in text, phrase
+
+
+# R-trust-12: at tier B the required checks run the pull request's own workflow and aegis, so a
+# tier B tick is only as strong as a check the pull request can edit. Given the "Trust tiers"
+# table, Then column B ticks none of the first three claims the way column A does.
+
+def _tier_table():
+    section = _section(_security_text(), "Trust tiers")
+    rows = [line for line in section.splitlines() if line.startswith("| ") and not line.startswith("|---")]
+    header, *body = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows]
+    assert header == ["Claim", "Tier A", "Tier B", "Tier C"]
+    return [dict(zip(header, cells)) for cells in body]
+
+
+def test_the_tier_b_column_claims_no_more_than_a_pull_request_editable_check_supports():
+    weakening, credited, release = _tier_table()[:3]
+    assert "rule weakening" in weakening["Claim"] and "credited" in credited["Claim"] and "release" in release["Claim"]
+    for row in (weakening, credited, release):
+        assert row["Tier A"] == "✔", row
+    assert weakening["Tier B"] != "✔" and ".github/workflows" in weakening["Tier B"], weakening
+    assert "approved by a human" not in weakening["Tier B"]
+    assert credited["Tier B"] == credited["Tier C"] and release["Tier B"] == release["Tier C"]
+
+
+def test_readme_names_the_root_allowed_signers_file():
+    readme = read(str(ROOT / "README.md"))
+    assert "allowed_signers" in readme and ".aegis/allowed_signers" not in readme

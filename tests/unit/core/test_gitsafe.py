@@ -66,14 +66,18 @@ def test_every_call_is_hardened(monkeypatch, tmp_path: Path):
 
     argv, kwargs = seen["argv"], seen["kwargs"]
     assert Path(argv[0]).name.startswith("git")
-    assert argv[1:11] == [
+    assert argv[1:19] == [
         "-c", f"core.hooksPath={os.devnull}",
         "-c", "core.fsmonitor=false",
         "-c", "protocol.allow=never",
         "-c", "core.sshCommand=false",
         "-c", "credential.helper=",
+        "-c", "log.showSignature=false",
+        "-c", f"gpg.program={os.devnull}",
+        "-c", f"gpg.openpgp.program={os.devnull}",
+        "-c", f"gpg.x509.program={os.devnull}",
     ]
-    assert argv[11:] == ["rev-parse", "HEAD"]
+    assert argv[19:] == ["rev-parse", "HEAD"]
     assert "shell" not in kwargs and kwargs["timeout"] == gitsafe.GIT_TIMEOUT_SECONDS
     env = kwargs["env"]
     assert {k: env[k] for k in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_NO_REPLACE_OBJECTS", "LC_ALL")} == {
@@ -528,6 +532,20 @@ def test_list_files_under_a_directory(repo: Path):
     assert gitsafe.list_files(repo, ["pkg"], untracked=False) == ["pkg/m.py"]
 
 
+def test_list_files_answers_relative_to_the_workspace_not_the_repository_top(repo: Path, tmp_path: Path):
+    """Given ``pkg/src/a.py`` tracked and ``pkg/new.txt`` untracked, When list_files runs with
+    cwd ``<repo>/pkg``, Then the paths are relative to ``pkg`` (the frame its callers use)."""
+    (repo / "pkg" / "src").mkdir(parents=True)
+    (repo / "pkg" / "src" / "a.py").write_text("a\n", encoding="utf-8")
+    _commit(repo)
+    (repo / "pkg" / "new.txt").write_text("n\n", encoding="utf-8")
+    assert sorted(gitsafe.list_files(repo / "pkg")) == ["new.txt", "src/a.py"]
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if gitsafe.toplevel(plain) is None:
+        assert gitsafe.list_files(plain) is None
+
+
 # ── read_blob ────────────────────────────────────────────────────────────────
 
 def test_read_blob_returns_committed_bytes(repo: Path):
@@ -680,6 +698,161 @@ def test_export_tree_with_and_without_overlay_and_fallback(repo: Path, tmp_path:
     assert (dest3 / "a.py").read_bytes() == b"a = 1\n"
     assert (dest3 / "b.py").read_bytes() == b"b = 99\n"
     assert (dest3 / "sub" / "nested.py").read_bytes() == b"n = 1\n"
+
+
+# Every write derived from a tree entry or overlay key lands below the destination: a `..`
+# part, a leading `/`, and (on Windows, where `:` is a drive or stream separator) a drive or
+# stream component are skipped. The rules are pure path logic, so `_on_windows` is patched
+# to run the Windows ones on every OS.
+
+def _outside(top: Path, dest: Path) -> list:
+    return [p for p in top.rglob("*") if p != dest and dest not in p.parents]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a file name with a colon is a POSIX tree entry")
+def test_the_fallback_export_keeps_a_posix_file_name_with_a_colon(tmp_path: Path, monkeypatch):
+    root = _repo(tmp_path / "repo")
+    (root / "a:b.py").write_bytes(b"colon\n")
+    (root / "src").mkdir()
+    (root / "src" / "x.py").write_bytes(b"x\n")
+    _commit(root)
+    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)  # checkout-index is not tried
+    dest = tmp_path / "dest"
+    gitsafe.export_tree(root, "HEAD", dest)
+    assert (dest / "a:b.py").read_bytes() == b"colon\n" and (dest / "src" / "x.py").read_bytes() == b"x\n"
+
+
+@pytest.mark.parametrize("key", ["../x", "/x", "a/../../x", "a\\..\\..\\x", "", "."])
+def test_an_overlay_key_outside_the_destination_is_skipped(repo: Path, tmp_path: Path, key):
+    dest = tmp_path / "out" / "dest"
+    gitsafe.export_tree(repo, "HEAD", dest, overlay={key: b"evil\n", "ok.py": b"ok\n"})
+    assert (dest / "ok.py").read_bytes() == b"ok\n"
+    assert _outside(tmp_path / "out", dest) == []
+
+
+def test_with_windows_rules_a_drive_or_stream_name_is_skipped(tmp_path: Path, monkeypatch):
+    root = _repo(tmp_path / "repo")
+    (root / "src").mkdir()
+    (root / "src" / "x.py").write_bytes(b"x\n")
+    if os.name != "nt":
+        (root / "a:b.py").write_bytes(b"colon\n")
+    _commit(root)
+    monkeypatch.setattr(gitsafe, "_on_windows", lambda: True)
+    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)
+    dest = tmp_path / "out" / "dest"
+    overlay = {"D:evil.py": b"x", "D:/x/evil.py": b"x", "x:stream": b"x", "ok.py": b"y"}
+    gitsafe.export_tree(root, "HEAD", dest, overlay=overlay)
+    assert (dest / "ok.py").read_bytes() == b"y" and (dest / "src" / "x.py").read_bytes() == b"x\n"
+    assert not [p.name for p in dest.rglob("*") if ":" in p.name]
+    assert not [p for p in _outside(tmp_path / "out", dest) if "evil" in p.name]
+
+
+def test_a_part_that_joins_onto_another_drive_is_outside_the_destination(tmp_path: Path, monkeypatch):
+    """The joined target is checked, not only the string: pathlib's Windows flavour joins
+    ``D:evil.py`` onto drive D, whichever OS runs the check."""
+    from pathlib import PureWindowsPath
+
+    monkeypatch.setattr(gitsafe, "_on_windows", lambda: False)  # the join check alone
+    for key in ("D:evil.py", "D:/x/evil.py"):
+        assert gitsafe._safe_export_target(PureWindowsPath(r"C:\snap\x"), key) is None, key
+    assert gitsafe._safe_export_target(tmp_path, "src/x.py") == tmp_path / "src" / "x.py"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive-relative name exists only on Windows")
+def test_on_windows_a_drive_relative_overlay_key_writes_nothing_outside(repo: Path, tmp_path: Path):
+    dest = tmp_path / "out" / "dest"
+    gitsafe.export_tree(repo, "HEAD", dest, overlay={"D:evil.py": b"x", "ok.py": b"y"})
+    assert (dest / "ok.py").read_bytes() == b"y"
+    assert not [p for p in _outside(tmp_path / "out", dest) if "evil" in p.name]
+
+
+def test_with_windows_rules_a_rule_id_with_a_drive_or_stream_is_refused(monkeypatch):
+    from aegis_core.lifecycle import parsers
+
+    monkeypatch.setattr(parsers, "_on_windows", lambda: True)
+    for bad in ("D:x", "x:stream", "C:"):
+        with pytest.raises(ValueError, match="path traversal"):
+            parsers.validate_rule_id(bad)
+        assert parsers.sanitize_rule_id(bad) is None
+    for good in ("trap-ok", "a.b"):
+        parsers.validate_rule_id(good)
+        assert parsers.sanitize_rule_id(good) == good
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a rule id with a colon is a legal POSIX file name")
+def test_on_posix_a_rule_id_with_a_colon_still_creates_its_rule(tmp_path: Path):
+    from aegis_core.lifecycle import parsers
+    from aegis_core.lifecycle.creation import create_rule
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    parsers.validate_rule_id("a:b")
+    path = create_rule("trap", "colon id", id_override="a:b", workspace=tmp_path)
+    assert path.name == "a:b.md" and path.is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive-relative rule id exists only on Windows")
+def test_on_windows_a_drive_relative_rule_id_creates_nothing(tmp_path: Path):
+    from aegis_core.lifecycle.creation import create_rule
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    with pytest.raises(ValueError, match="path traversal"):
+        create_rule("trap", "drive id", id_override="D:x", workspace=tmp_path)
+    assert list((tmp_path / ".aegis" / "rules").rglob("*.md")) == []
+
+
+# ── add_trailer: interpret-trailers where no repository config is read ────────
+#
+# A repository's trailer.<alias>.cmd (for the trailer's key) and trailer.<any>.command name
+# programs interpret-trailers runs. Given such config, When add_trailer edits a message
+# file, Then the program never runs and the trailer is written, even when the caller
+# inherited GIT_DIR, GIT_COMMON_DIR and GIT_WORK_TREE (a linked worktree's hook does).
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="a shell-script trailer command")
+
+
+def _plant_trailer_commands(repo: Path, tmp_path: Path) -> Path:
+    marker, program = tmp_path / "trailer-ran", tmp_path / "trailer.sh"
+    program.write_bytes(f'#!/bin/sh\necho ran >> "{marker}"\necho planted\n'.encode())
+    program.chmod(0o755)
+    _git(repo, "config", "trailer.x.key", "Aegis-Check")
+    _git(repo, "config", "trailer.x.cmd", str(program))
+    _git(repo, "config", "trailer.unrelated.command", str(program))
+    return marker
+
+
+@posix_only
+def test_add_trailer_runs_no_trailer_command_of_the_repository(repo: Path, tmp_path: Path, monkeypatch):
+    marker = _plant_trailer_commands(repo, tmp_path)
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo))
+    monkeypatch.chdir(repo)
+    message = tmp_path / "msg"
+    message.write_bytes(b"subject\n")
+    assert gitsafe.add_trailer(message, "Aegis-Check: tree=abc exit=0") is True
+    assert not marker.exists()
+    assert message.read_bytes() == b"subject\n\nAegis-Check: tree=abc exit=0\n"
+
+
+def test_add_trailer_resolves_a_relative_message_file_against_the_callers_directory(repo: Path, monkeypatch):
+    (repo / ".git" / "COMMIT_EDITMSG").write_bytes(b"subject\n")
+    monkeypatch.chdir(repo)
+    assert gitsafe.add_trailer(os.path.join(".git", "COMMIT_EDITMSG"), "Aegis-Check: tree=abc exit=0") is True
+    assert (repo / ".git" / "COMMIT_EDITMSG").read_bytes() == b"subject\n\nAegis-Check: tree=abc exit=0\n"
+
+
+def test_add_trailer_replaces_its_own_key_and_keeps_other_trailers(tmp_path: Path):
+    message = tmp_path / "msg"
+    message.write_bytes(b"subject\n\nSigned-off-by: A <a@example.com>\nAegis-Check: tree=old exit=0\n")
+    assert gitsafe.add_trailer(message, "Aegis-Check: tree=abc exit=0") is True
+    text = message.read_bytes().decode()
+    assert "Signed-off-by: A <a@example.com>" in text
+    assert [line for line in text.splitlines() if line.startswith("Aegis-Check")] == ["Aegis-Check: tree=abc exit=0"]
+
+
+def test_add_trailer_on_a_missing_file_is_false_not_an_exception(tmp_path: Path):
+    assert gitsafe.add_trailer(tmp_path / "absent", "Aegis-Check: tree=abc exit=0") is False
+    assert not (tmp_path / "absent").exists()
 
 
 # ── Other queries ────────────────────────────────────────────────────────────

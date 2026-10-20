@@ -74,11 +74,18 @@ def _park(path: Path, dest_dir: Path) -> Path:
     return dest
 
 
-def _still_misfiring(ws: Workspace, rule_id: str, view: Any) -> bool:
+def _archive_refusal(ws: Workspace, rule_id: str, view: Any) -> Optional[str]:
+    """Why ``rule_id`` may not be archived now, or None. Credit cut short by a failed CI read
+    would make a sound rule look like it misfires, so unavailable evidence refuses."""
     from .promotion import suggest
 
     rule = load_rules(ws).get(rule_id)
-    return rule is not None and suggest(rule, for_rules(ws, [rule], view=view, verify_ci=True)[rule_id]) == "archive"
+    fit = for_rules(ws, [rule], view=view, verify_ci=True)[rule_id] if rule is not None else None
+    if fit is not None and not fit.evidence_available:
+        return f"Rule '{rule_id}' was not archived: its evidence is unavailable ({fit.evidence_error})"
+    if fit is None or suggest(rule, fit) != "archive":
+        return f"Rule '{rule_id}' no longer has evidence that supports archiving it"
+    return None
 
 
 def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False) -> Dict[str, Any]:
@@ -107,8 +114,9 @@ def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool 
                 "status": "ineligible",
                 "message": f"Rule '{clean}' was not archived: the ledger is incomplete ({view.incomplete})",
             }
-        if not _still_misfiring(ws, clean, view):
-            return {"status": "ineligible", "message": f"Rule '{clean}' no longer has evidence that supports archiving it"}
+        refusal = _archive_refusal(ws, clean, view)
+        if refusal:
+            return {"status": "ineligible", "message": refusal}
         dest = _park(path, archive_dir)
         append_jsonl(ws.layout.lifecycle_log, [{
             "timestamp": _utc_timestamp(),

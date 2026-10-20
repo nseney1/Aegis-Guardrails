@@ -385,8 +385,6 @@ Record an explicit human correction insight
 | `text` | `TEXT` |  | Correction insight text (redacted and capped at 300 chars) (required) |
 | `--paths` | `[PATHS ...]` |  | Target file paths (default: git dirty set) |
 | `--kind` | `KIND` |  | Optional insight category or kind |
-| `--host` | `HOST` | `"cli"` | Host identifier (default: cli) |
-| `--session` | `SESSION` |  | Optional session identifier (stored as keyed hs) |
 | `--commit` | `COMMIT` |  | Optional signed commit SHA carrying Aegis-Approve-Insight |
 | `--base-ref` | `BASE_REF` |  | Optional base branch reference for --commit |
 
@@ -547,7 +545,7 @@ Each of these exits with status 2 and prints where to go instead.
 
 ## MCP server: `aegis-mcp`
 
-The server speaks MCP over stdio. Its tools, as `tools/list` returns them:
+The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A write tool declares only `readOnlyHint: false`, so the MCP defaults apply to its other hints:
 
 | Tool | Title |
 | --- | --- |
@@ -720,7 +718,7 @@ Output schema:
 
 ### `aegis_report_outcome`
 
-**Report Outcome** (idempotent)
+**Report Outcome**
 
 Record post-verification rule feedback in the local outcome ledger after running tests or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` before editing files and `aegis_capture_insight` to record user corrections. When a passing `aegis check --record` exists for the current git tree, the server credits rules exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated against the rule inventory, not used as the credit source). Those credits count toward fitness once CI passes on the landing commit. Without a matching check record, it writes at most one unwitnessed claim per session and tree that earns no fitness credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.
 

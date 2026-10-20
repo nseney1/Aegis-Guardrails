@@ -279,6 +279,38 @@ def test_allowed_signers_must_be_on_the_base_not_only_in_the_working_tree(tmp_pa
     assert report.evidence["allowed_signers"]["keys"] == 0
 
 
+# At tier B (no required review) the required checks run the pull request's own workflow and
+# aegis, so a pull request can edit the check that verifies the signature (R-trust-12).
+_PR_OWN_WORKFLOW = "required checks run the pull request's own workflow and aegis"
+
+
+@needs_git
+def test_tier_b_says_a_pull_request_can_edit_the_check_that_verifies_the_signature(tmp_path):
+    """Given required status checks, 0 required approvals and a security key in the base
+    allowed_signers, When the tier is detected, Then it is B and the report, text and JSON,
+    says the required checks run the pull request's own workflow and aegis."""
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    gh = hg.FakeGh(rules=[hg.pull_request_rule(approvals=0), hg.checks_rule()])
+    report = human_gate.detect_tier(repo.root, gh=gh)
+    assert report.tier == "B", report.reasons
+    found = [c for c in report.caveats if c.startswith(_PR_OWN_WORKFLOW)]
+    assert len(found) == 1, report.caveats
+    caveat = found[0]
+    assert ".github/workflows/**" in caveat and "signature" in caveat
+    assert f"  ! {caveat}" in report.text_lines() and caveat in report.as_dict()["caveats"]
+
+
+@needs_git
+@pytest.mark.parametrize("tier", ["A", "C"])
+def test_tiers_a_and_c_carry_no_pull_request_workflow_caveat(tmp_path, tier):
+    repo = _repo_with_governance(tmp_path, codeowners=hg.CODEOWNERS_FULL if tier == "A" else None)
+    rules = [hg.pull_request_rule(), hg.checks_rule()] if tier == "A" else [hg.checks_rule()]
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=rules))
+    assert report.tier == tier, report.reasons
+    assert not [c for c in report.caveats if _PR_OWN_WORKFLOW in c]
+
+
 @needs_git
 def test_without_required_status_checks_there_is_no_tier_b(tmp_path):
     _key, pub = hg.keygen(tmp_path / "k", "human") if hg.signing_ok() else (None, "ssh-ed25519 AAAA x")

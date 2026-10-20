@@ -2603,30 +2603,6 @@
                     "required": false
                   },
                   {
-                    "default": "cli",
-                    "dest": "host",
-                    "flags": [
-                      "--host"
-                    ],
-                    "help": "Host identifier (default: cli)",
-                    "kind": "store",
-                    "metavar": null,
-                    "nargs": null,
-                    "required": false
-                  },
-                  {
-                    "default": null,
-                    "dest": "session",
-                    "flags": [
-                      "--session"
-                    ],
-                    "help": "Optional session identifier (stored as keyed hs)",
-                    "kind": "store",
-                    "metavar": null,
-                    "nargs": null,
-                    "required": false
-                  },
-                  {
                     "default": null,
                     "dest": "commit",
                     "flags": [
