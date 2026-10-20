@@ -688,6 +688,10 @@ def detect_tier(
             caveats.append(
                 "which required checks run Aegis, and that they have no path filter, is not visible from here"
             )
+    if tier == "B":
+        caveats.append(
+            "required checks run the pull request's own workflow and aegis, so a pull request can edit the check that verifies the signature; tier B holds only while pull requests leave .github/workflows/** and aegis alone"
+        )
     return TierReport(tier, tuple(why_not), tuple(caveats), evidence, scope)
 
 

@@ -206,11 +206,11 @@ def test_no_gh_or_a_gh_without_a_version_is_unverified(tmp_path, version):
 
 @needs_git
 def test_every_pin_is_passed_and_the_subject_file_is_the_commit_subject(tmp_path):
-    repo = make_repo(tmp_path, tier="B")
+    repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
     gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
-    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("B"))
-    assert report.verified and report.tier == "B", report.message
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("A"))
+    assert report.verified and report.tier == "A", report.message
     (argv,) = gh.verify_calls
     pairs = dict(zip(argv[3::2], argv[4::2]))
     expected = {"--repo": REPOSITORY, "--predicate-type": rv.PREDICATE_TYPE,
@@ -305,6 +305,21 @@ def test_at_tier_c_an_attestation_is_reported_but_the_release_claim_fails_closed
     text = "\n".join(report.text_lines())
     assert "attestation present, but the workflow is agent-editable" in text
     assert report.as_dict()["attested"] is True
+
+
+@needs_git
+def test_at_tier_b_an_attestation_is_reported_but_the_release_claim_is_agent_editable(tmp_path):
+    """Given tier B (required checks, a security key in the base allowed_signers) and a good
+    attestation, When the release is verified, Then it is agent_editable as at tier C, never
+    VERIFIED: a pull request runs its own workflow, which is the workflow that signs."""
+    repo = make_repo(tmp_path, tier="B")
+    commit, tree, digest = facts(repo)
+    gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("B"))
+    assert report.tier == "B" and report.attested
+    assert (report.verified, report.code, report.status) == (False, "agent_editable", "agent_editable")
+    assert report.text_lines()[0] == "NOT VERIFIED: attestation present, but the workflow is agent-editable"
+    assert report.as_dict()["verified"] is False
 
 
 @needs_git
@@ -405,6 +420,36 @@ def test_the_cli_with_gh_2_45_prints_unverified(tmp_path, monkeypatch, capsys):
     rc, out, _err = cli(repo.root, monkeypatch, capsys, path, "--release", repo.head())
     assert rc == 1
     assert out.splitlines()[0] == "UNVERIFIED (gh >= 2.93.0 required)"
+
+
+class TierAndReleaseGh:
+    """``human_gate.default_gh_runner`` for the CLI: ``gh api`` GETs go to the tier detector's
+    fake, the rest to the release fake."""
+
+    def __init__(self, tier: str, release: FakeGh) -> None:
+        self.tier, self.release = tier_runner(tier), release
+
+    def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None, timeout: float = 0.0):
+        from aegis_core import human_gate
+
+        if list(argv)[:1] == ["api"]:
+            return self.tier(argv, stdin, cwd)
+        result = self.release(argv, timeout)
+        return None if result is None else human_gate.GhResult(*result)
+
+
+@needs_git
+@pytest.mark.parametrize("tier, rc, first", [("A", 0, "VERIFIED:"), ("B", 1, "NOT VERIFIED:")])
+def test_the_cli_says_verified_at_tier_a_only(tmp_path, monkeypatch, capsys, tier, rc, first):
+    from aegis_core import human_gate
+
+    repo = make_repo(tmp_path, tier=tier)
+    commit, tree, digest = facts(repo)
+    release = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
+    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh(tier, release))
+    code, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", commit)
+    assert (code, out.splitlines()[0].startswith(first)) == (rc, True), out
+    assert f"trust tier: {tier}" in out and release.verify_calls
 
 
 @needs_git
