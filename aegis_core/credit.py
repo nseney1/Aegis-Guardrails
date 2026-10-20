@@ -38,6 +38,7 @@ CI_FAILED = ("failure", "timed_out", "startup_failure")
 DEFAULT_WORKFLOW = "validate.yml"
 _RESULT = {"success": "tp", "tp": "tp", "pass": "tp", "failure": "fp", "fp": "fp", "fail": "fp", "partial": "trigger"}
 _FULL_SHA = re.compile(r"[0-9a-f]{40,64}")
+_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _TRAILER = re.compile(r"\s*Aegis-Check:\s*tree=([0-9a-f]{40,64})\s+exit=(-?\d+)\s*")
 _REV_LIMIT = 5000
 _VERIFIED_CI: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -663,34 +664,45 @@ def confirmed_outcome_rows(credits: Iterable[Credit]) -> List[Dict[str, Any]]:
 
 def approval_lookup(
     root: Any, rows: Sequence[Mapping[str, Any]], landed: Optional[Callable[..., Optional[str]]] = None,
+    *, branch: Optional[str] = None,
 ) -> Callable[[str, Sequence[str]], bool]:
+    """Whether a signed approval covers a protected check. The row's ``base`` (the fork point
+    ``record`` saw) is only the range anchor: ledger rows are agent-writable, so it must be a full
+    oid that is an ancestor of the protected branch (``branch``, else the local one), or allowed_signers
+    would be read from a commit the agent chose."""
     top = gitsafe.toplevel(Path(str(root)))
     look = landed or landed_lookup(root)
     checks = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
     cache: Dict[str, bool] = {}
+    anchor: List[Optional[Tuple[str, str]]] = []
+
+    def protected_tip() -> Optional[Tuple[str, str]]:
+        if not anchor:
+            p_branch = branch if branch is not None else resolve_protected_branch(top)
+            refs = (f"refs/remotes/origin/{p_branch}", f"refs/heads/{p_branch}") if p_branch and top else ()
+            anchor.append(next(((p_branch, r) for r in refs if gitsafe.resolve_commit(top, r)), None))
+        return anchor[0]
 
     def is_approved(check_id: str, _categories: Sequence[str] = ()) -> bool:
         if check_id in cache:
             return cache[check_id]
         check = checks.get(check_id)
-        if top is None or check is None:
-            cache[check_id] = False
-            return False
-        commit = _call_landed(look, str(check.get("tree") or ""), check.get("head"))
-        base_ref = str(check.get("base") or "") or gitsafe.resolve_base_ref(top) or "main"
-        if not commit:
-            cache[check_id] = False
-            return False
-        try:
-            gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
-            p_branch = resolve_protected_branch(top)
-            tips = [commit] + ([f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}"] if p_branch else []) + ["HEAD"]
-            ok = any(
-                (app := human_gate.find_approval(top, tip, base_ref, governance_hash=gov_hash)) is not None and app.valid
-                for tip in dict.fromkeys(tips)
-            )
-        except Exception:
-            ok = False
+        base_ref = check.get("base") if check is not None else None
+        commit = _call_landed(look, str(check.get("tree") or ""), check.get("head")) if check is not None else None
+        tip = protected_tip() if commit and isinstance(base_ref, str) and _OID.fullmatch(base_ref) else None
+        ok = False
+        if top is not None and tip is not None:
+            p_branch, tip_ref = tip
+            try:
+                if gitsafe.run(["merge-base", "--is-ancestor", base_ref, tip_ref], top).returncode == 0:
+                    gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
+                    tips = [commit, f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}", "HEAD"]
+                    ok = any(
+                        (app := human_gate.find_approval(top, t, base_ref, governance_hash=gov_hash)) is not None
+                        and app.valid for t in dict.fromkeys(tips)
+                    )
+            except (human_gate.HumanGateError, gitsafe.GitError, OSError):
+                ok = False  # git or IO trouble fails closed; a programming error propagates
         cache[check_id] = ok
         return ok
 
@@ -736,6 +748,7 @@ def project_credits(
         return CreditProjection((), (), available=False, error=str(err))
     v_map: Dict[str, str] = {}
     stopped: Optional[str] = None
+    p_branch: Optional[str] = None
     # Read paths (scan, status, list) pass verify_ci=False and stay offline: a ``ci`` row then counts
     # only when this process verified it, so they can under-credit but never over-credit.
     if verify_ci:
@@ -745,7 +758,6 @@ def project_credits(
                    if commit and (c_root, commit) not in _UNAVAILABLE_CI
                    and not _ci_cache_current(_VERIFIED_CI.get((c_root, commit)), ci_row)]
         # The workflow is the caller's and the branch GitHub's: a ci row's ``workflow`` is display only.
-        p_branch: Optional[str] = None
         if any(_FULL_SHA.fullmatch(commit) for commit, _row in pending):
             try:
                 p_branch = _protected_branch(root, rest_client or client)
@@ -781,7 +793,7 @@ def project_credits(
                 stopped = (f"CI verification stopped after gh failed for {commit[:12]}; "
                            f"{len(pending) - idx} commit(s) were not verified")
                 break
-    app_fn = approved or approval_lookup(root, rows, landed=look)
+    app_fn = approved or approval_lookup(root, rows, landed=look, branch=p_branch)
     derived = derive(rows, landed=look, approved=app_fn, verified_ci=v_map or None)
     if verify_ci and stopped is None:
         # confirm() (sync) parks a landed commit whose CI gh could not read in _UNAVAILABLE_CI, and the

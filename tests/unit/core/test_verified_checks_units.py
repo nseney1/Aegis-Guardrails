@@ -540,6 +540,139 @@ def test_a_rerun_without_a_merge_base_or_commit_is_unbound_with_a_reason(tmp_pat
         assert verdict["result"] == "unbound" and verdict["failed"] is False and verdict["reason"], commit
 
 
+# ── the approval anchor comes from git, never from a ledger row ─────────────
+
+needs_signing = pytest.mark.skipif(not hg.signing_ok(), reason="needs git 2.34+ and ssh-keygen")
+
+
+class _Approvals:
+    """``main`` lists the human key in allowed_signers; ``work`` holds one protected change, recorded."""
+
+    def __init__(self, tmp_path, *, delete_test: bool = False):
+        from aegis_core import human_gate
+
+        self.gate = human_gate
+        self.repo = repo = hv.make_project(tmp_path)
+        self.human, human_pub = hg.keygen(tmp_path / "keys", "human")
+        self.agent, self.agent_pub = hg.keygen(tmp_path / "keys", "agent")
+        repo.git("checkout", "-q", "main")
+        repo.write("allowed_signers", hg.allowed_signers_text(human_pub))
+        repo.write("tests/test_old.py", "def test_old():\n    assert True\n")
+        self.fork = repo.commit("signers")
+        repo.git("checkout", "-q", "-B", "work", "main")
+        if delete_test:
+            repo.git("rm", "-q", "tests/test_old.py")
+        repo.write("conftest.py", "# protected change\n")
+        self.row = checkrun.record(repo.root, base="main").row
+        assert self.row["protected_changed"] is True and self.row["base"] == self.fork
+        self.change = repo.commit("protected change")
+
+    def approve(self, key, base: str) -> str:
+        digest = self.gate.governance_tree_hash(self.repo.root, self.change, base=base)
+        return self.repo.commit(self.gate.approval_message(digest), sign_key=key, allow_empty=True)
+
+    def land(self, squash: bool = False) -> str:
+        repo = self.repo
+        repo.git("checkout", "-q", "main")
+        if squash:
+            repo.git("merge", "-q", "--squash", "work")
+            repo.git("commit", "-q", "-m", "squashed")
+        else:
+            repo.git("merge", "-q", "--no-ff", "--no-edit", "work")
+        landed = repo.head()
+        repo.git("checkout", "-q", "work")
+        return landed
+
+    def forge(self, check_id: str, **fields) -> str:
+        from aegis_core.telemetry_engine import ledger
+
+        row = {k: v for k, v in self.row.items() if k != "seq"}
+        row.update(id=check_id, **fields)
+        for key in [k for k, v in fields.items() if v is None]:
+            row.pop(key)
+        ledger.append_rows(self.repo.root, [row])
+        return check_id
+
+    def lookup(self, check_id: str, **kw) -> bool:
+        return credit.approval_lookup(self.repo.root, credit.read_rows(self.repo.root), **kw)(check_id)
+
+
+@needs_signing
+def test_a_ledger_base_off_the_protected_branch_cannot_choose_the_signers(tmp_path):
+    from aegis_core.telemetry_engine import ledger
+
+    case = _Approvals(tmp_path)
+    repo = case.repo
+    repo.git("checkout", "-q", "-b", "evil", case.fork)
+    repo.write("allowed_signers", hg.allowed_signers_text(case.agent_pub))
+    evil = repo.commit("agent key")
+    repo.git("checkout", "-q", "work")
+    case.approve(case.agent, base=evil)
+    landed = case.land()
+    forged = case.forge("forged", base=evil)
+    assert case.lookup(forged) is False
+    stamp = "2026-10-20T00:00:00Z"
+    ledger.append_rows(repo.root, [
+        {"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "check": forged, "rule": "trap-sample", "result": "tp"},
+        {"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "ci", "commit": landed, "ci_conclusion": "success"},
+    ])
+    rows = credit.read_rows(repo.root)
+    derived, = credit.derive(rows, landed=credit.landed_lookup(repo.root),
+                             approved=credit.approval_lookup(repo.root, rows), verified_ci={landed: "success"})
+    assert (derived.state, derived.counts, derived.reason) == ("confirmed", False, "protected_changed")
+
+
+@needs_signing
+@pytest.mark.parametrize("squash", [False, True], ids=["merge", "squash"])
+def test_a_genuine_approval_at_the_recorded_fork_point_verifies_after_landing(tmp_path, squash):
+    case = _Approvals(tmp_path)
+    case.approve(case.human, base=case.fork)
+    case.land(squash=squash)
+    assert case.lookup(case.row["id"]) is True
+
+
+@needs_signing
+def test_an_approved_test_deletion_still_verifies_after_landing(tmp_path):
+    case = _Approvals(tmp_path, delete_test=True)
+    case.approve(case.human, base=case.fork)
+    case.land()
+    assert case.lookup(case.row["id"]) is True
+
+
+@needs_signing
+def test_an_unusable_base_or_branch_is_never_approved_and_never_falls_back(tmp_path, monkeypatch):
+    case = _Approvals(tmp_path)
+    case.approve(case.human, base=case.fork)
+    case.land()
+    for i, base in enumerate(("zz", "", case.fork[:12], case.fork.upper(), None)):
+        assert case.lookup(case.forge(f"bad-{i}", base=base)) is False, base
+    assert case.lookup(case.row["id"], branch="no-such-branch") is False
+    case.repo.git("branch", "-m", "main", "trunk")
+    assert case.lookup(case.row["id"]) is False
+
+
+@needs_signing
+def test_git_trouble_fails_closed_and_a_programming_error_propagates(tmp_path, monkeypatch):
+    from aegis_core import gitsafe, human_gate
+
+    case = _Approvals(tmp_path)
+    case.approve(case.human, base=case.fork)
+    case.land()
+
+    def git_trouble(*_a, **_k):
+        raise gitsafe.GitError("git timed out")
+
+    monkeypatch.setattr(human_gate, "find_approval", git_trouble)
+    assert case.lookup(case.row["id"]) is False
+
+    def bug(*_a, **_k):
+        raise ValueError("a bug")
+
+    monkeypatch.setattr(human_gate, "find_approval", bug)
+    with pytest.raises(ValueError):
+        case.lookup(case.row["id"])
+
+
 # ── a passing check needs a tests run ────────────────────────────────────────
 
 def _staged_tree(repo) -> str:
