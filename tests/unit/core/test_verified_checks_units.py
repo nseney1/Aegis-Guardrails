@@ -190,6 +190,80 @@ def test_the_user_config_command_may_be_an_argv_list_and_the_digest_is_machine_i
     assert checkrun.command_digest(logical) == first
 
 
+def test_a_bare_pytest_runs_as_python_m_pytest_with_every_hermetic_flag(tmp_path):
+    junit = tmp_path / "junit.xml"
+    argv, logical = checkrun.plan_command(["pytest", "-q"], junit)
+    assert argv[:6] == [sys.executable, "-s", "--check-hash-based-pycs", "always", "-m", "pytest"]
+    at = argv.index("-p")
+    assert argv[at:at + 4] == ["-p", "no:cacheprovider", "-o", "addopts="]
+    assert f"--junitxml={junit}" in argv and "-q" in argv
+    assert logical == ["pytest", "-q"]
+
+
+@pytest.mark.parametrize("word", ["/opt/venv/bin/pytest", "py.test", "PYTEST.EXE"])
+def test_any_pytest_program_runs_under_the_aegis_interpreter(word):
+    argv, logical = checkrun.plan_command([word, "-q"])
+    assert argv[0] == sys.executable and argv[4:6] == ["-m", "pytest"] and "addopts=" in argv
+    assert logical == [word, "-q"]
+
+
+def test_only_an_absolute_python_first_word_is_kept_as_the_interpreter(tmp_path):
+    python = tmp_path / "python3"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    argv, _ = checkrun.plan_command([str(python), "-m", "pytest"])
+    assert argv[:4] == [str(python), "-s", "--check-hash-based-pycs", "always"] and "addopts=" in argv
+    assert checkrun.plan_command(["python", "-m", "pytest"])[0][0] == sys.executable
+    tool = str(tmp_path / "runtests")
+    assert checkrun.plan_command([tool, "-x"])[0] == [tool, "-x"]
+
+
+def test_a_missing_absolute_interpreter_exits_127(tmp_path):
+    junit = tmp_path / "junit.xml"
+    argv, _ = checkrun.plan_command([str(tmp_path / "nowhere" / "python3"), "-m", "pytest"], junit)
+    run = checkrun.run_tests(argv, tmp_path, checkrun.hermetic_env(tmp_path), 60.0, junit, tmp_path / "out.txt")
+    assert run.exit == 127 and not run.evidence
+
+
+def test_the_default_command_keeps_its_digest():
+    _argv, logical = checkrun.plan_command(None)
+    assert checkrun.command_digest(logical) == "982597b8a8141596e8015b5c60700b600e69fc8873640cb98a23585cfff5b8ea"
+
+
+def _record_with_stand_in(tmp_path, monkeypatch, capsys, script: str):
+    from aegis_cli.cli import main
+
+    repo = hv.make_project(tmp_path)
+    hv.write_user_config(repo.home.path, tests={"command": ["pytest"]})
+    stand_in = tmp_path / "stand-in-python"
+    stand_in.write_text("#!/bin/sh\n" + script)
+    stand_in.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(stand_in))
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    code = main(["check", "--record", "--tests"])
+    return code, capsys.readouterr().out, hv.rows_of(repo.root, "check")
+
+
+@needs_git
+@posix_only
+def test_a_run_whose_interpreter_has_no_pytest_prints_a_hint(tmp_path, monkeypatch, capsys):
+    code, out, rows = _record_with_stand_in(tmp_path, monkeypatch, capsys,
+                                            "echo \"$0: No module named pytest\" >&2\nexit 1\n")
+    hint = [line for line in out.splitlines() if line.startswith("hint:")]
+    assert code == 1 and len(hint) == 1 and "tests.command" in hint[0]
+    assert rows[-1]["tests"]["collected"] == 0 and rows[-1]["passed"] is False
+
+
+@needs_git
+@posix_only
+def test_a_failing_run_with_pytest_present_prints_no_hint(tmp_path, monkeypatch, capsys):
+    code, out, rows = _record_with_stand_in(tmp_path, monkeypatch, capsys,
+                                            "echo '2 passed, 1 failed in 0.01s'\nexit 1\n")
+    assert code == 1 and "hint:" not in out and rows[-1]["passed"] is False
+
+
 @needs_git
 @pytest.mark.parametrize("config", ["not json", '{"tests": {"command": 5}}', '{"tests": {"command": ""}}', "[]"])
 def test_an_unusable_user_config_falls_back_to_the_default(tmp_path, config):

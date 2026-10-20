@@ -11,9 +11,11 @@ confirms it (``aegis_core.credit``).
 The test command comes from the **user-scope** config (``~/.aegis/config.json``
 ``tests.command``, a string or an argv list), never from the repository: a repository must not
 choose what the verifier executes. The default is ``python -m pytest``. A command whose first word
-is a Python interpreter is run with the absolute interpreter that runs Aegis and
-``-s --check-hash-based-pycs always``; a pytest run also gets ``-p no:cacheprovider -o addopts=``
-and a JUnit file. Everything runs with a fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a
+is a Python interpreter runs under that interpreter when the word is an absolute path, else under
+the interpreter that runs Aegis; a first word ``pytest`` (or ``py.test``, any path) runs as
+``python -m pytest`` under the interpreter that runs Aegis. Either way the interpreter gets
+``-s --check-hash-based-pycs always`` (its own site dirs stay visible, the user site does not), and
+a pytest run also gets ``-p no:cacheprovider -o addopts=`` and a JUnit file. Everything runs with a fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a
 redirected ``HOME``), no stdin, closed descriptors and a process-group timeout; the group is
 killed when the run ends, so nothing it left behind keeps writing.
 
@@ -69,6 +71,8 @@ _HERMETIC = "hermetic-v1"
 _MAX_JUNIT_BYTES = 8 * 1024 * 1024
 _TAIL_BYTES = 256 * 1024
 _PYTHON_NAME = re.compile(r"python[0-9.]*(?:\.exe)?", re.IGNORECASE)
+_PYTEST_NAME = re.compile(r"py\.?test(?:\.exe)?", re.IGNORECASE)
+_NO_PYTEST = re.compile(r"No module named '?pytest'?")
 _COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected|xfailed|xpassed)")
 
 
@@ -87,6 +91,7 @@ class TestsRun:
     deselected: int = 0
     nodeid_digest: Optional[str] = None
     duration_s: float = 0.0
+    pytest_missing: bool = False  # not recorded: it only feeds the ``hint`` of ``aegis check --record``
 
     @property
     def evidence(self) -> bool:
@@ -108,6 +113,7 @@ class CheckOutcome:
     row: Optional[Dict[str, Any]] = None
     reason: str = ""
     binding: Optional[treeid.TreeBinding] = None
+    hint: str = ""
 
 
 # ── The command ──────────────────────────────────────────────────────────────
@@ -132,13 +138,21 @@ def plan_command(logical: Optional[Sequence[str]], junit: Optional[Path] = None)
     """``(argv to execute, logical command)``: the logical command is machine-independent (the
     digest is taken from it), the argv has the absolute interpreter and the fixed flags."""
     words = list(logical) if logical else list(DEFAULT_COMMAND)
-    argv = list(words)
-    if _PYTHON_NAME.fullmatch(os.path.basename(words[0])):
-        argv = [sys.executable, *_PYTHON_FLAGS, *words[1:]]
-        if "-m" in words and words[words.index("-m") + 1:words.index("-m") + 2] == ["pytest"]:
-            argv += list(_PYTEST_FLAGS)
-            if junit is not None:
-                argv.append(f"--junitxml={junit}")
+    first = os.path.basename(words[0].replace("\\", "/"))
+    if _PYTEST_NAME.fullmatch(first):
+        # A pytest launcher (even an absolute venv one) runs under Aegis's interpreter: guessing a
+        # sibling python from its path would let the path choose the interpreter.
+        python, rest = sys.executable, ["-m", "pytest", *words[1:]]
+    elif _PYTHON_NAME.fullmatch(first):
+        # Only the user-scope config reaches here, so an absolute interpreter is the user's choice.
+        python, rest = (words[0] if os.path.isabs(words[0]) else sys.executable), words[1:]
+    else:
+        return list(words), words
+    argv = [python, *_PYTHON_FLAGS, *rest]
+    if "-m" in rest and rest[rest.index("-m") + 1:rest.index("-m") + 2] == ["pytest"]:
+        argv += list(_PYTEST_FLAGS)
+        if junit is not None:
+            argv.append(f"--junitxml={junit}")
     return argv, words
 
 
@@ -323,7 +337,8 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
         digest = None
     seconds = (datetime.now(timezone.utc) - started).total_seconds()
     return TestsRun(exit=code, timed_out=timed_out, collected=collected, passed=passed, failed=failed,
-                    skipped=skipped, deselected=counts.get("deselected", 0), nodeid_digest=digest, duration_s=seconds)
+                    skipped=skipped, deselected=counts.get("deselected", 0), nodeid_digest=digest, duration_s=seconds,
+                    pytest_missing=bool(_NO_PYTEST.search(text)))
 
 
 # ── The record ───────────────────────────────────────────────────────────────
@@ -421,7 +436,11 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
         identity = f"{binding.tree}|{digest}|{row['run_ordinal']}|{stamp}|{head}"
         row["id"] = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
         ledger.append_rows(workspace, [row])
-    return CheckOutcome("recorded", row, "", binding)
+    hint = ""
+    if run is not None and run.collected == 0 and run.pytest_missing:
+        hint = ('set "tests.command" in ~/.aegis/config.json to your project\'s Python, for example '
+                '["/path/to/.venv/bin/python", "-m", "pytest"]')
+    return CheckOutcome("recorded", row, "", binding, hint)
 
 
 def rerun_commit_snapshot(

@@ -89,6 +89,8 @@ def _run_record(args: argparse.Namespace) -> int:
         detail = f", tests {tests['passed']} passed, {tests['failed']} failed" if tests else ", Layer 1 only"
         print(f"recorded: tree {row['tree'][:12]} {'passed' if row['passed'] else 'FAILED'}{detail}"
               + ("; protected paths changed: no credit until approved" if row["protected_changed"] else ""))
+        if outcome.hint:
+            print(f"hint: {outcome.hint}")
     else:
         print(f"{outcome.status}: {sanitize_display(outcome.reason, max_len=300)}", file=sys.stderr)
     if outcome.status != "recorded":
