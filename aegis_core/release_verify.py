@@ -7,7 +7,11 @@ other job succeeded and attests a subject derived from the commit alone::
 
 with the predicate ``{commit, tree, run, jobs}``. ``verify_release`` rebuilds that subject from
 local git and asks ``gh attestation verify`` to check it, pinning the repository, the signing
-workflow and its digest, the source ref and digest, the predicate type, and hosted runners.
+workflow and its digest, the source ref and digest, the predicate type, and hosted runners. The
+source ref is the default branch GitHub reports for the repository (one read-only ``gh api`` GET),
+never the clone's ``origin/HEAD``: the attestation must come from the branch whose protection the
+trust tier measures. A caller may assert the expected ref; a different one is
+``source_ref_mismatch``, and an unreadable default branch is ``default_branch_unknown``.
 Pure-stdlib Python cannot check a Sigstore signature, so gh does, and a gh that is missing or
 older than 2.93.0 (CVE-2025-25204 to 2.66; a token leak to 2.92) means the answer is
 UNVERIFIED and the exit code is not zero. Exit 0 from gh is necessary, never sufficient: the
@@ -24,7 +28,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import tempfile
@@ -84,7 +87,9 @@ class ReleaseReport:
 
     sha: str
     verified: bool
-    code: str  # verified | agent_editable | gh_missing | gh_too_old | not_a_repository | bad_commit | no_repository | rejected | bad_output
+    # verified | agent_editable | gh_missing | gh_too_old | not_a_repository | bad_commit | no_repository |
+    # default_branch_unknown | source_ref_mismatch | rejected | bad_output
+    code: str
     message: str
     tier: Optional[str] = None
     caveats: Tuple[str, ...] = ()
@@ -184,8 +189,8 @@ def _gh_version(run: GhRun) -> Tuple[Optional[Tuple[int, int, int]], str]:
     return (int(found.group(1)), int(found.group(2)), int(found.group(3))), ""
 
 
-def _repository(root: Path, environ: Mapping[str, str]) -> Optional[str]:
-    """``owner/repo`` of the origin remote (github.com only), else $GITHUB_REPOSITORY."""
+def _repository(root: Path) -> Optional[str]:
+    """``owner/repo`` of the origin remote (github.com only)."""
     try:
         res = gitsafe.run(["config", "--get", "remote.origin.url"], root)
     except gitsafe.GitError:
@@ -194,19 +199,33 @@ def _repository(root: Path, environ: Mapping[str, str]) -> Optional[str]:
         found = _REMOTE.match(res.stdout.decode("utf-8", "replace").strip())
         if found:
             return f"{found.group(1)}/{found.group(2)}"
-    fallback = (environ.get("GITHUB_REPOSITORY") or "").strip()
-    return fallback if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", fallback) else None
+    return None
 
 
-def _default_source_ref(root: Path) -> str:
-    head = gitsafe.run(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], root)
-    name = head.stdout.decode("utf-8", "replace").strip() if head.returncode == 0 else ""
-    prefix = "refs/remotes/origin/"
-    return f"refs/heads/{name[len(prefix):]}" if name.startswith(prefix) and len(name) > len(prefix) else "refs/heads/main"
+def _default_branch(run: GhRun, repository: str) -> Tuple[Optional[str], str]:
+    """(GitHub's default branch of ``repository``, why not): asked with the explicit ``owner/repo``
+    that ``--repo`` pins, never gh's ``{owner}/{repo}`` placeholders (gh picks those from remotes)."""
+    asked = f"gh api repos/{repository}"
+    result = run(["api", "--method", "GET", f"repos/{repository}"], 30.0)
+    if result is None:
+        return None, f"{asked} failed: gh is not installed"
+    if result[0] != 0:
+        detail = " ".join(result[2].split())[:300]
+        return None, f"{asked} failed: {detail}" if detail else f"{asked} failed (exit {result[0]})"
+    try:
+        body = json.loads(result[1])
+    except ValueError:
+        return None, f"{asked} printed no JSON"
+    if not isinstance(body, dict):
+        return None, f"{asked} printed no repository object"
+    branch = body.get("default_branch")
+    if not isinstance(branch, str) or not branch or not branch.isprintable() or any(c.isspace() for c in branch):
+        return None, f"{asked} printed no usable default_branch"
+    return branch, ""
 
 
 def _recheck(output: str, commit: str, tree: str, subject_digest: str, repository: str,
-             source_ref: str, *, workflow: str = WORKFLOW, expected_run: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+             source_ref: str) -> Tuple[bool, str, Optional[str]]:
     """Whether gh's JSON holds at least one attestation that says exactly what was asked."""
     try:
         records = json.loads(output)
@@ -216,10 +235,7 @@ def _recheck(output: str, commit: str, tree: str, subject_digest: str, repositor
         return False, "gh reported no attestation for this commit", None
     reasons: List[str] = []
     for record in records:
-        problem, run_str = _record_problem(
-            record, commit, tree, subject_digest, repository, source_ref,
-            workflow=workflow, expected_run=expected_run,
-        )
+        problem, run_str = _record_problem(record, commit, tree, subject_digest, repository, source_ref)
         if problem is None:
             return True, "", run_str
         reasons.append(problem)
@@ -227,7 +243,7 @@ def _recheck(output: str, commit: str, tree: str, subject_digest: str, repositor
 
 
 def _record_problem(record: Any, commit: str, tree: str, subject_digest: str, repository: str,
-                    source_ref: str, *, workflow: str = WORKFLOW, expected_run: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                    source_ref: str) -> Tuple[Optional[str], Optional[str]]:
     result = record.get("verificationResult") if isinstance(record, dict) else None
     statement = result.get("statement") if isinstance(result, dict) else None
     signature = result.get("signature") if isinstance(result, dict) else None
@@ -247,8 +263,6 @@ def _record_problem(record: Any, commit: str, tree: str, subject_digest: str, re
     run_val = predicate.get("run")
     if not isinstance(run_val, str) or not _RUN_ID_ATTEMPT.match(run_val):
         return "the predicate lacks a valid run id and attempt", None
-    if expected_run is not None and run_val != expected_run:
-        return f"the predicate run {run_val!r} does not match expected {expected_run!r}", None
     jobs = predicate.get("jobs")
     if not isinstance(jobs, dict) or not jobs or any(value != "success" for value in jobs.values()):
         return "the predicate does not say every job succeeded", None
@@ -262,8 +276,8 @@ def _record_problem(record: Any, commit: str, tree: str, subject_digest: str, re
     if cert.get("sourceRepositoryRef") != source_ref:
         return f"the certificate is for another ref than {source_ref}", None
     signer = cert.get("buildSignerURI")
-    if not isinstance(signer, str) or not signer.lower().startswith(f"https://github.com/{repository.lower()}/{workflow.lower()}@"):
-        return f"the signer is not {repository}/{workflow}", None
+    if not isinstance(signer, str) or not signer.lower().startswith(f"https://github.com/{repository.lower()}/{WORKFLOW.lower()}@"):
+        return f"the signer is not {repository}/{WORKFLOW}", None
     return None, run_val
 
 
@@ -277,11 +291,11 @@ def _tier(root: Path, tier_runner: Optional[Callable[..., Any]]) -> Optional[str
 
 
 def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner: Optional[Callable[..., Any]] = None,
-                   environ: Optional[Mapping[str, str]] = None, *, source_ref: Optional[str] = None,
-                   workflow: Optional[str] = None, expected_run: Optional[str] = None) -> ReleaseReport:
-    """Verify the CI-verdict attestation of ``sha`` (a commit id or a ref of the repository in ``root``)."""
+                   *, source_ref: Optional[str] = None) -> ReleaseReport:
+    """Verify the CI-verdict attestation of ``sha`` (a commit id or a ref of the repository in ``root``).
+    ``source_ref`` asserts the expected ref; it must equal GitHub's default branch. A caller that
+    expects a particular run compares ``report.details["run"]`` itself."""
     top = Path(root)
-    env = os.environ if environ is None else environ
     gh = run if run is not None else default_gh(top)
     version, why = _gh_version(gh)
     if version is None:
@@ -297,22 +311,30 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
         return ReleaseReport(sha, False, "bad_commit", f"{sha!r} is not a commit of this repository (fetch it first)",
                              gh_version=shown)
     tree = gitsafe.run(["rev-parse", "--verify", f"{commit}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
-    repository = _repository(top, env)
+    repository = _repository(top)
     if not repository:
         return ReleaseReport(sha, False, "no_repository", "origin is not a github.com repository, so there is nothing to pin "
                              "the attestation to", gh_version=shown)
-    eff_ref = source_ref or _default_source_ref(top)
-    eff_workflow = workflow or WORKFLOW
+    branch, why_not = _default_branch(gh, repository)
+    if branch is None:
+        return ReleaseReport(commit, False, "default_branch_unknown",
+                             f"cannot pin the source ref to the default branch: {why_not}", repository=repository,
+                             gh_version=shown)
+    eff_ref = f"refs/heads/{branch}"
+    if source_ref is not None and source_ref != eff_ref:
+        return ReleaseReport(commit, False, "source_ref_mismatch",
+                             f"{source_ref} is not the default branch GitHub reports for {repository} ({eff_ref})",
+                             repository=repository, gh_version=shown)
     body = subject_bytes(commit, tree)
     digest = hashlib.sha256(body).hexdigest()
     with tempfile.TemporaryDirectory(prefix="aegis-release-") as directory:
         subject = Path(directory) / "subject.txt"
         subject.write_bytes(body)
         argv = ["attestation", "verify", str(subject), "--repo", repository, "--predicate-type", PREDICATE_TYPE,
-                "--signer-workflow", f"{repository}/{eff_workflow}", "--signer-digest", commit,
+                "--signer-workflow", f"{repository}/{WORKFLOW}", "--signer-digest", commit,
                 "--source-ref", eff_ref, "--source-digest", commit, "--deny-self-hosted-runners", "--format", "json"]
         result = gh(argv, GH_TIMEOUT_SECONDS)
-    pins: Dict[str, Any] = {"repository": repository, "signer_workflow": f"{repository}/{eff_workflow}",
+    pins: Dict[str, Any] = {"repository": repository, "signer_workflow": f"{repository}/{WORKFLOW}",
                             "source_ref": eff_ref, "digest": commit, "tree": tree, "subject_sha256": digest}
     if result is None:
         return ReleaseReport(sha, False, "gh_missing", "gh disappeared during verification", gh_version=shown)
@@ -320,10 +342,7 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
         detail = " ".join(result[2].split())[:300] or "no detail"
         return ReleaseReport(commit, False, "rejected", f"gh attestation verify failed: {detail}", repository=repository,
                              gh_version=shown, details=pins)
-    ok, reason, verified_run = _recheck(
-        result[1], commit, tree, digest, repository, eff_ref,
-        workflow=eff_workflow, expected_run=expected_run,
-    )
+    ok, reason, verified_run = _recheck(result[1], commit, tree, digest, repository, eff_ref)
     if verified_run is not None:
         pins["run"] = verified_run
     if not ok:

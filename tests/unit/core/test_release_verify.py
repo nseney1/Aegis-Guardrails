@@ -98,12 +98,18 @@ def test_the_subject_is_derivable_from_the_commit_alone():
 
 # ── doctor --release, library level ─────────────────────────────────────────
 
-class FakeGh:
-    """``gh --version`` answers ``version``; ``gh attestation verify`` answers ``verify``."""
+DEFAULT_API = {"full_name": REPOSITORY, "default_branch": "main"}
 
-    def __init__(self, version: Optional[str] = "2.93.0", verify: Tuple[int, str, str] = (0, "[]", "")) -> None:
+
+class FakeGh:
+    """``gh --version`` answers ``version``; ``gh api`` answers ``api`` (an object is printed as JSON,
+    a tuple is ``(rc, stdout, stderr)``); ``gh attestation verify`` answers ``verify``."""
+
+    def __init__(self, version: Optional[str] = "2.93.0", verify: Tuple[int, str, str] = (0, "[]", ""),
+                 api: Any = DEFAULT_API) -> None:
         self.version = version
         self.verify = verify
+        self.api = api
         self.calls: List[List[str]] = []
         self.subjects: List[bytes] = []
 
@@ -114,14 +120,36 @@ class FakeGh:
             return None
         if argv == ["--version"]:
             return 0, f"gh version {self.version} (2026-10-01)\nhttps://github.com/cli/cli/releases/tag/v{self.version}\n", ""
+        if argv[:1] == ["api"]:
+            return self.api if isinstance(self.api, tuple) else (0, json.dumps(self.api), "")
         if argv[:2] == ["attestation", "verify"]:
             self.subjects.append(Path(argv[2]).read_bytes())
-            return self.verify
+            return self.answer(argv)
         return 1, "", "unexpected call"
+
+    def answer(self, argv: List[str]) -> Tuple[int, str, str]:
+        return self.verify
 
     @property
     def verify_calls(self) -> List[List[str]]:
         return [c for c in self.calls if c[:2] == ["attestation", "verify"]]
+
+    @property
+    def api_calls(self) -> List[List[str]]:
+        return [c for c in self.calls if c[:1] == ["api"]]
+
+
+class PinHonoringGh(FakeGh):
+    """gh as it really filters: the attestation is returned only for the ref it was signed on."""
+
+    def __init__(self, signed_on: str, verify: Tuple[int, str, str], api: Any = DEFAULT_API) -> None:
+        super().__init__("2.93.0", verify, api)
+        self.signed_on = signed_on
+
+    def answer(self, argv: List[str]) -> Tuple[int, str, str]:
+        if argv[argv.index("--source-ref") + 1] != self.signed_on:
+            return 1, "", "no matching attestations found"
+        return self.verify
 
 
 # What the base branch must hold for the tier detector to reach each tier (with tier_runner's rules).
@@ -269,15 +297,18 @@ def test_exit_zero_is_not_enough_the_json_is_rechecked(tmp_path, label, override
 
 
 @needs_git
-def test_expected_run_pin_rejects_mismatched_run_id_or_attempt(tmp_path):
+def test_a_verified_report_carries_the_run_of_the_attestation(tmp_path):
     repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
-    gh_mismatch = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest, predicate__run="1/1")]), ""))
-    bad = rv.verify_release(repo.root, commit, run=gh_mismatch, expected_run="1/2", tier_runner=tier_runner("A"))
-    assert not bad.verified and bad.code == "bad_output"
-    gh_match = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest, predicate__run="42/3")]), ""))
-    good = rv.verify_release(repo.root, commit, run=gh_match, expected_run="42/3", tier_runner=tier_runner("A"))
-    assert good.verified and good.details.get("run") == "42/3"
+    gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest, predicate__run="42/3")]), ""))
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("A"))
+    assert report.verified and report.details.get("run") == "42/3"
+
+
+@pytest.mark.parametrize("keyword", ["workflow", "expected_run", "environ"])
+def test_the_removed_pins_are_refused_not_ignored(tmp_path, keyword):
+    with pytest.raises(TypeError):
+        rv.verify_release(tmp_path, "HEAD", run=FakeGh(), **{keyword: "x"})
 
 
 @needs_git
@@ -324,15 +355,78 @@ def test_at_tier_b_an_attestation_is_reported_but_the_release_claim_is_agent_edi
     assert report.as_dict()["verified"] is False
 
 
+def _signed_on(repo: hg.Repo, branch: str) -> str:
+    commit, tree, digest = facts(repo)
+    ref = f"refs/heads/{branch}"
+    signer = f"https://github.com/{REPOSITORY}/.github/workflows/validate.yml@{ref}"
+    return json.dumps([record(commit, tree, digest, cert__sourceRepositoryRef=ref, cert__buildSignerURI=signer)])
+
+
 @needs_git
-def test_the_source_ref_follows_origin_head(tmp_path):
+@pytest.mark.parametrize("github_default, verified", [("main", False), ("release/x", True)], ids=["main", "release"])
+def test_the_source_ref_is_githubs_default_branch_not_origin_head(tmp_path, github_default, verified):
     repo = make_repo(tmp_path, tier="A")
-    repo.git("update-ref", "refs/remotes/origin/trunk", "HEAD")
-    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
-    gh = FakeGh("2.93.0", (1, "", "no"))
+    repo.git("update-ref", "refs/remotes/origin/release/x", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/release/x")
+    gh = PinHonoringGh("refs/heads/release/x", (0, _signed_on(repo, "release/x"), ""),
+                       api={"full_name": REPOSITORY, "default_branch": github_default})
+    report = rv.verify_release(repo.root, "HEAD", run=gh, tier_runner=tier_runner("A"))
+    argv = gh.verify_calls[0]
+    assert argv[argv.index("--source-ref") + 1] == f"refs/heads/{github_default}"
+    assert report.verified is verified
+    if not verified:
+        assert (report.code, report.status) == ("rejected", "failed")
+
+
+@needs_git
+@pytest.mark.parametrize("origin_head", [True, False], ids=["origin-head", "none"])
+def test_the_default_branch_is_read_once_for_the_pinned_repository(tmp_path, origin_head):
+    repo = make_repo(tmp_path, tier="A")
+    if not origin_head:
+        repo.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    gh = FakeGh("2.93.0", (1, "", "no"), api={"full_name": REPOSITORY, "default_branch": "trunk"})
     rv.verify_release(repo.root, "HEAD", run=gh, tier_runner=tier_runner("A"))
+    assert gh.api_calls == [["api", "--method", "GET", f"repos/{REPOSITORY}"]]
     argv = gh.verify_calls[0]
     assert argv[argv.index("--source-ref") + 1] == "refs/heads/trunk"
+    assert argv[argv.index("--repo") + 1] == REPOSITORY
+
+
+_WHY = f"cannot pin the source ref to the default branch: gh api repos/{REPOSITORY}"
+
+
+@needs_git
+@pytest.mark.parametrize("api, message", [
+    ((1, "", "HTTP 404: Not Found\n"), f"{_WHY} failed: HTTP 404: Not Found"),
+    ((1, "", ""), f"{_WHY} failed (exit 1)"),
+    ((0, "not json", ""), f"{_WHY} printed no JSON"),
+    ([], f"{_WHY} printed no repository object"),
+    ({}, f"{_WHY} printed no usable default_branch"),
+    ({"default_branch": ""}, f"{_WHY} printed no usable default_branch"),
+    ({"default_branch": 7}, f"{_WHY} printed no usable default_branch"),
+    ({"default_branch": " main"}, f"{_WHY} printed no usable default_branch"),
+], ids=["404", "rc1", "notjson", "list", "empty", "blank", "int", "space"])
+def test_an_unreadable_default_branch_fails_closed_before_any_attestation(tmp_path, api, message):
+    repo = make_repo(tmp_path, tier="A")
+    commit, tree, digest = facts(repo)
+    gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""), api=api)
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("A"))
+    assert (report.verified, report.code, report.status) == (False, "default_branch_unknown", "failed")
+    assert report.message == message and gh.verify_calls == []
+
+
+@needs_git
+@pytest.mark.parametrize("source_ref, code", [("refs/heads/release/x", "source_ref_mismatch"),
+                                              ("refs/heads/main", "verified")], ids=["other", "default"])
+def test_a_caller_may_assert_the_source_ref_but_not_choose_another(tmp_path, source_ref, code):
+    repo = make_repo(tmp_path, tier="A")
+    commit, tree, digest = facts(repo)
+    gh = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
+    report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("A"), source_ref=source_ref)
+    assert report.code == code
+    if code == "source_ref_mismatch":
+        assert gh.verify_calls == [] and report.message == (
+            f"refs/heads/release/x is not the default branch GitHub reports for {REPOSITORY} (refs/heads/main)")
 
 
 @needs_git
@@ -424,6 +518,17 @@ def test_the_cli_with_gh_2_45_prints_unverified(tmp_path, monkeypatch, capsys):
     assert out.splitlines()[0] == "UNVERIFIED (gh >= 2.93.0 required)"
 
 
+@needs_git
+@posix_only
+def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, monkeypatch, capsys):
+    repo = make_repo(tmp_path)
+    gh_dir = fake_gh_dir(tmp_path / "bin", "2.93.0")
+    path = f"{gh_dir}{os.pathsep}{os.path.dirname(shutil.which('git'))}"
+    rc, out, _err = cli(repo.root, monkeypatch, capsys, path, "--release", repo.head(), "--json")
+    payload = json.loads(out)
+    assert rc == 1 and (payload["code"], payload["status"]) == ("default_branch_unknown", "failed")
+
+
 class TierAndReleaseGh:
     """``human_gate.default_gh_runner`` for the CLI: ``gh api`` GETs go to the tier detector's
     fake, the rest to the release fake."""
@@ -434,7 +539,7 @@ class TierAndReleaseGh:
     def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None, timeout: float = 0.0):
         from aegis_core import human_gate
 
-        if list(argv)[:1] == ["api"]:
+        if list(argv)[:1] == ["api"] and list(argv)[-1] != f"repos/{REPOSITORY}":
             return self.tier(argv, stdin, cwd)
         result = self.release(argv, timeout)
         return None if result is None else human_gate.GhResult(*result)
