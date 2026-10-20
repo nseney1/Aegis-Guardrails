@@ -1,4 +1,13 @@
-"""The credit state machine (v4.3 spec §3 T1, T4): what a ``check`` row is worth, derived on read."""
+"""The credit state machine (v4.3 spec §3 T1, T4): what a ``check`` row is worth, derived on read.
+
+Only a passing ``check`` row that ran tests (``aegis check --record --tests``) is a witness: it is
+what ``submit_report`` credits and what the commit hook writes a trailer for.
+
+A credit is voided by a CI failure on its landing commit (a later CI success on the same commit
+supersedes that) or by a terminal ``void`` row: a trailer divergence in ``check --ci``
+(``ci_divergence``), a failed lane or test-integrity gate (``lane_integrity``, ``check --lane``) or
+a revert of its landing commit on the protected branch (``reverted``, found by ``confirm``).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,10 +26,10 @@ __all__ = [
     "EVENTS", "MAX_REPORT_ROWS_PER_SESSION", "CIUnavailable", "Credit", "CreditProjection",
     "GhRestClient", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
-    "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows",
+    "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "required_workflow",
     "record_adjudication", "record_detection", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
-    "verify_commit_trailers", "witnessed_exposed_rules",
+    "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
 MAX_REPORT_ROWS_PER_SESSION = 200
@@ -29,6 +38,7 @@ CI_FAILED = ("failure", "timed_out", "startup_failure")
 DEFAULT_WORKFLOW = "validate.yml"
 _RESULT = {"success": "tp", "tp": "tp", "pass": "tp", "failure": "fp", "fp": "fp", "fail": "fp", "partial": "trigger"}
 _FULL_SHA = re.compile(r"[0-9a-f]{40,64}")
+_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _TRAILER = re.compile(r"\s*Aegis-Check:\s*tree=([0-9a-f]{40,64})\s+exit=(-?\d+)\s*")
 _REV_LIMIT = 5000
 _VERIFIED_CI: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -96,11 +106,14 @@ def _sign(claimed: Any, check: Mapping[str, Any]) -> str:
 
 
 def passing_check(rows: Iterable[Mapping[str, Any]], tree: Optional[str]) -> Optional[Mapping[str, Any]]:
+    """The newest passing ``aegis check --record --tests`` row for ``tree``: a Layer-1-only row (no
+    ``tests``) passes ``aegis check --record`` but never earns ``witness: aegis`` or a trailer."""
     if not tree:
         return None
     best = None
     for row in _of(rows, "check"):
-        if row.get("tree") == tree and row.get("witness") == "aegis" and _passed(row) and isinstance(row.get("id"), str):
+        if (row.get("tree") == tree and row.get("witness") == "aegis" and _passed(row)
+                and isinstance(row.get("tests"), dict) and isinstance(row.get("id"), str)):
             best = row
     return best
 
@@ -439,10 +452,51 @@ def record_void(root: Any, check_id: str, reason: str) -> Dict[str, Any]:
         return ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "void", "check": check_id, "reason": reason}])[0]
 
 
+def void_tree(root: Any, tree: str, reason: str) -> int:
+    """Void every ``check`` row of ``tree`` that has no void yet (one ``void`` row per check id, under
+    one ledger lock); returns how many were written. ``void`` rows are terminal."""
+    with ledger_locked(root):
+        rows = read_rows(root)
+        done = {r.get("check") for r in _of(rows, "void")}
+        ids = [c["id"] for c in _of(rows, "check") if c.get("tree") == tree and isinstance(c.get("id"), str)]
+        fresh = [i for i in dict.fromkeys(ids) if i not in done]
+        if fresh:
+            stamp = _now()
+            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "void", "check": i,
+                                       "reason": reason} for i in fresh])
+        return len(fresh)
+
+
+_REVERTS = re.compile(r"This reverts commit ([0-9a-f]{64}|[0-9a-f]{40})\b")
+
+
+def _reverted(top: Path, branch: str, commits: Mapping[str, Any]) -> Set[str]:
+    """Landed commits a ``This reverts commit <oid>`` line on the protected branch names. The message
+    is agent-writable text, which is acceptable here: it can only void credit, never grant it."""
+    ref = next((r for r in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}") if gitsafe.resolve_commit(top, r)), None)
+    if ref is None:
+        return set()
+    # -z: git refuses a NUL in a message, so a message cannot forge a record boundary (PC-3).
+    res = gitsafe.run(["log", "-z", "--max-count=500", "--format=%H%n%B", ref], top)
+    if res.returncode != 0:
+        raise gitsafe.GitError(f"git log {ref} failed (exit {res.returncode})")
+    named = set(_REVERTS.findall(res.stdout.decode("utf-8", "replace")))
+    return {c for c in commits if c in named}
+
+
+def required_workflow(root: Any) -> str:
+    """The workflow whose runs confirm credit: ``ci.workflow`` of the user-scope config, else
+    ``validate.yml``. Never the repository config or a ledger row (SECURITY.md truth table, row 2)."""
+    from aegis_core.config import user_ci_workflow
+
+    return user_ci_workflow(root) or DEFAULT_WORKFLOW
+
+
 def confirm(
-    root: Any, *, client: Any, workflow: str = DEFAULT_WORKFLOW,
+    root: Any, *, client: Any, workflow: Optional[str] = None,
     landed: Optional[Callable[..., Optional[str]]] = None, branch: Optional[str] = None,
 ) -> Dict[str, Any]:
+    workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
     rows, look = read_rows(root), landed or landed_lookup(root)
     if landed is not None:
@@ -471,6 +525,15 @@ def confirm(
                 _UNAVAILABLE_CI.add((c_root, commit))
             summary["errors"].append(str(exc))
             return summary
+    top = gitsafe.toplevel(Path(str(root)))
+    if commits and target_branch and top is not None:
+        try:
+            for commit in sorted(_reverted(top, target_branch, commits)):
+                for check_id in commits.pop(commit):
+                    record_void(root, check_id, "reverted")
+                    summary["voided"] += 1
+        except gitsafe.GitError as exc:
+            summary["errors"].append(f"cannot read the history of {target_branch}: {exc}")
     for commit, checks in commits.items():
         try:
             runs = client.runs_for(commit)
@@ -610,34 +673,45 @@ def confirmed_outcome_rows(credits: Iterable[Credit]) -> List[Dict[str, Any]]:
 
 def approval_lookup(
     root: Any, rows: Sequence[Mapping[str, Any]], landed: Optional[Callable[..., Optional[str]]] = None,
+    *, branch: Optional[str] = None,
 ) -> Callable[[str, Sequence[str]], bool]:
+    """Whether a signed approval covers a protected check. The row's ``base`` (the fork point
+    ``record`` saw) is only the range anchor: ledger rows are agent-writable, so it must be a full
+    oid that is an ancestor of the protected branch (``branch``, else the local one), or allowed_signers
+    would be read from a commit the agent chose."""
     top = gitsafe.toplevel(Path(str(root)))
     look = landed or landed_lookup(root)
     checks = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
     cache: Dict[str, bool] = {}
+    anchor: List[Optional[Tuple[str, str]]] = []
+
+    def protected_tip() -> Optional[Tuple[str, str]]:
+        if not anchor:
+            p_branch = branch if branch is not None else resolve_protected_branch(top)
+            refs = (f"refs/remotes/origin/{p_branch}", f"refs/heads/{p_branch}") if p_branch and top else ()
+            anchor.append(next(((p_branch, r) for r in refs if gitsafe.resolve_commit(top, r)), None))
+        return anchor[0]
 
     def is_approved(check_id: str, _categories: Sequence[str] = ()) -> bool:
         if check_id in cache:
             return cache[check_id]
         check = checks.get(check_id)
-        if top is None or check is None:
-            cache[check_id] = False
-            return False
-        commit = _call_landed(look, str(check.get("tree") or ""), check.get("head"))
-        base_ref = str(check.get("base") or "") or gitsafe.resolve_base_ref(top) or "main"
-        if not commit:
-            cache[check_id] = False
-            return False
-        try:
-            gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
-            p_branch = resolve_protected_branch(top)
-            tips = [commit] + ([f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}"] if p_branch else []) + ["HEAD"]
-            ok = any(
-                (app := human_gate.find_approval(top, tip, base_ref, governance_hash=gov_hash)) is not None and app.valid
-                for tip in dict.fromkeys(tips)
-            )
-        except Exception:
-            ok = False
+        base_ref = check.get("base") if check is not None else None
+        commit = _call_landed(look, str(check.get("tree") or ""), check.get("head")) if check is not None else None
+        tip = protected_tip() if commit and isinstance(base_ref, str) and _OID.fullmatch(base_ref) else None
+        ok = False
+        if top is not None and tip is not None:
+            p_branch, tip_ref = tip
+            try:
+                if gitsafe.run(["merge-base", "--is-ancestor", base_ref, tip_ref], top).returncode == 0:
+                    gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
+                    tips = [commit, f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}", "HEAD"]
+                    ok = any(
+                        (app := human_gate.find_approval(top, t, base_ref, governance_hash=gov_hash)) is not None
+                        and app.valid for t in dict.fromkeys(tips)
+                    )
+            except (human_gate.HumanGateError, gitsafe.GitError, OSError):
+                ok = False  # git or IO trouble fails closed; a programming error propagates
         cache[check_id] = ok
         return ok
 
@@ -659,17 +733,13 @@ def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, A
     return (entry.get("run_id"), entry.get("run_attempt")) == (ci_row.get("run_id"), ci_row.get("ci_run_attempt"))
 
 
-_DEFAULT_SNAPSHOT_RERUN: Optional[Callable[[Any, str, str], Mapping[str, Any]]] = None
-
-
 def project_credits(
-    root: Any, *, view: Any = None, client: Any = None, workflow: str = DEFAULT_WORKFLOW,
-    attestation_runner: Optional[Callable[..., Any]] = None,
+    root: Any, *, view: Any = None, client: Any = None, workflow: Optional[str] = None,
     landed: Optional[Callable[..., Optional[str]]] = None,
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
     verify_ci: bool = False,
 ) -> CreditProjection:
-    from aegis_core import release_verify
+    workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
     look = landed or landed_lookup(root)
     if landed is not None:
@@ -684,18 +754,17 @@ def project_credits(
     err = view_err or read_err
     if err:
         return CreditProjection((), (), available=False, error=str(err))
-    v_map: Dict[str, str] = {}
     stopped: Optional[str] = None
+    p_branch: Optional[str] = None
     # Read paths (scan, status, list) pass verify_ci=False and stay offline: a ``ci`` row then counts
     # only when this process verified it, so they can under-credit but never over-credit.
     if verify_ci:
-        rest_client = GhRestClient(cwd=str(root)) if (client is None and attestation_runner is None) else None
+        rest_client = GhRestClient(cwd=str(root)) if client is None else None
         latest = {str(r.get("commit") or ""): r for r in _of(rows, "ci")}
         pending = [(commit, ci_row) for commit, ci_row in latest.items()
                    if commit and (c_root, commit) not in _UNAVAILABLE_CI
                    and not _ci_cache_current(_VERIFIED_CI.get((c_root, commit)), ci_row)]
         # The workflow is the caller's and the branch GitHub's: a ci row's ``workflow`` is display only.
-        p_branch: Optional[str] = None
         if any(_FULL_SHA.fullmatch(commit) for commit, _row in pending):
             try:
                 p_branch = _protected_branch(root, rest_client or client)
@@ -712,17 +781,6 @@ def project_credits(
                     continue
                 except CIUnavailable:
                     pass
-            if ci_row.get("ci_conclusion") == "success":
-                rid, ratt = ci_row.get("run_id"), ci_row.get("ci_run_attempt")
-                exp_run = f"{rid}/{ratt}" if rid is not None and ratt is not None else None
-                rep = release_verify.verify_release(
-                    root, commit, run=attestation_runner,
-                    source_ref=f"refs/heads/{p_branch}", workflow=f".github/workflows/{workflow}", expected_run=exp_run,
-                )
-                if rep.verified:
-                    v_map[commit] = "success"
-                    _VERIFIED_CI[(c_root, commit)] = {"conclusion": "success", "workflow": workflow, "branch": p_branch, "run_id": rid, "run_attempt": ratt}
-                    continue
             # Circuit breaker: a dead gh costs one attempt per projection. Only a well-formed id trips
             # it, so one malformed (never-asked) row cannot switch verification off for the rest.
             # Tripping makes the projection unavailable: verify_ci callers decide (promote, demote,
@@ -731,8 +789,8 @@ def project_credits(
                 stopped = (f"CI verification stopped after gh failed for {commit[:12]}; "
                            f"{len(pending) - idx} commit(s) were not verified")
                 break
-    app_fn = approved or approval_lookup(root, rows, landed=look)
-    derived = derive(rows, landed=look, approved=app_fn, verified_ci=v_map or None)
+    app_fn = approved or approval_lookup(root, rows, landed=look, branch=p_branch)
+    derived = derive(rows, landed=look, approved=app_fn)
     if verify_ci and stopped is None:
         # confirm() (sync) parks a landed commit whose CI gh could not read in _UNAVAILABLE_CI, and the
         # loop above never retries it, so its credit stays landed: as cut short as a tripped breaker.
@@ -760,10 +818,14 @@ def parse_trailer(line: str) -> Optional[Dict[str, Any]]:
 
 
 def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    given = parse_trailer(trailer) if isinstance(trailer, str) else (dict(trailer) if isinstance(trailer, Mapping) else None)
+    """Spec T1: only an equal tree whose rerun diverges twice from the parsed trailer fails; a tree
+    mismatch or an inconclusive rerun (it timed out, git could not answer) is ``unbound``."""
+    given = dict(trailer) if isinstance(trailer, Mapping) else None
     if not given or not given.get("tree") or "exit" not in given:
         return {"result": "unbound", "failed": False, "reason": "no usable Aegis-Check trailer"}
     first = dict(rerun) if isinstance(rerun, Mapping) else {}
+    if first.get("inconclusive"):
+        return {"result": "unbound", "failed": False, "reason": f"CI rerun {first.get('reason') or 'was inconclusive'}"}
     if first.get("tree") != given["tree"]:
         return {"result": "unbound", "failed": False, "reason": "CI ran a different tree"}
     claimed_pass = given["exit"] == 0
@@ -772,6 +834,8 @@ def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional
     if second is None:
         return {"result": "rerun", "failed": False, "reason": "outcomes diverge on the same tree"}
     again = dict(second)
+    if again.get("inconclusive"):
+        return {"result": "unbound", "failed": False, "reason": f"CI rerun {again.get('reason') or 'was inconclusive'}"}
     if again.get("tree") == given["tree"] and (again.get("exit") == 0) == claimed_pass:
         return {"result": "agree", "failed": False, "reason": "flaky: the re-run agrees with the trailer"}
     return {"result": "void", "failed": True, "reason": "outcomes still diverge on the same tree after a re-run"}
@@ -780,37 +844,39 @@ def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional
 def verify_commit_trailers(
     root: Any, base: str, head: str = "HEAD", *, rerun_fn: Callable[[str, str], Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
+    """Spec T1: compare the head commit's ``Aegis-Check`` trailer with ``rerun_fn(commit, tree)``;
+    earlier commits and a head without a trailer rerun nothing. A divergence fails the CI job and
+    writes ``void`` rows to the ledger of the machine that ran ``check --ci``."""
     top = gitsafe.toplevel(Path(str(root)))
     if top is None:
         return []
     mb, tip = gitsafe.merge_base(top, base, head), gitsafe.resolve_commit(top, head)
-    if not mb or not tip:
+    if not mb or not tip or tip == mb:
         return []
-    rev = gitsafe.run(["rev-list", "--reverse", f"{mb}..{tip}"], top)
-    if rev.returncode != 0:
-        return []
-    rows = read_rows(root)
-    checks_by_tree: Dict[str, List[Mapping[str, Any]]] = {}
-    for chk in _of(rows, "check"):
-        if isinstance(chk.get("tree"), str):
-            checks_by_tree.setdefault(chk["tree"], []).append(chk)
+    msg = gitsafe.run(["log", "-1", "--format=%B", tip], top)
+    tree_res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{tip}^{{tree}}"], top)
+    if msg.returncode != 0 or tree_res.returncode != 0:
+        return [{"commit": tip, "result": "unbound", "failed": False, "reason": "git could not read the head commit"}]
+    commit_tree = tree_res.stdout.decode("ascii", "replace").strip()
+    trailers = [t for line in msg.stdout.decode("utf-8", "replace").splitlines() if (t := parse_trailer(line)) is not None]
+    reruns: List[Mapping[str, Any]] = []
+
+    def attempt(n: int) -> Mapping[str, Any]:
+        while len(reruns) <= n:
+            reruns.append(rerun_fn(tip, commit_tree))
+        return reruns[n]
+
     results: List[Dict[str, Any]] = []
-    for oid in rev.stdout.decode("ascii", "replace").split():
-        msg = gitsafe.run(["log", "-1", "--format=%B", oid], top).stdout.decode("utf-8", "replace")
-        commit_tree = gitsafe.run(["rev-parse", f"{oid}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
-        trailers = [t for line in msg.splitlines() if (t := parse_trailer(line)) is not None]
-        for tr in trailers:
-            t_checks = checks_by_tree.get(tr["tree"], [])
-            if commit_tree != tr["tree"]:
-                verdict = check_ci_divergence(tr, {"tree": commit_tree, "exit": 1})
-            else:
-                first = rerun_fn(oid, commit_tree)
-                verdict = check_ci_divergence(tr, first)
-                if verdict["result"] == "rerun":
-                    verdict = check_ci_divergence(tr, first, rerun_fn(oid, commit_tree))
-            if verdict["failed"]:
-                for c in t_checks:
-                    if isinstance(c.get("id"), str):
-                        record_void(root, c["id"], "ci_divergence")
-            results.append({"commit": oid, "trailer": tr, **verdict})
+    for tr in trailers:
+        if commit_tree != tr["tree"]:
+            verdict = check_ci_divergence(tr, {"tree": commit_tree, "exit": 1})
+        else:
+            verdict = check_ci_divergence(tr, attempt(0))
+            if verdict["result"] == "rerun":
+                verdict = check_ci_divergence(tr, attempt(0), attempt(1))
+        if verdict["failed"]:
+            for c in _of(read_rows(root), "check"):
+                if c.get("tree") == tr["tree"] and isinstance(c.get("id"), str):
+                    record_void(root, c["id"], "ci_divergence")
+        results.append({"commit": tip, "trailer": tr, **verdict})
     return results

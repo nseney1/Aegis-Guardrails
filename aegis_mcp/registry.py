@@ -324,7 +324,7 @@ TOOL_DEFINITIONS = [
             "Record post-verification rule feedback in the local outcome ledger after running tests "
             "or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` "
             "before editing files and `aegis_capture_insight` to record user corrections. When a "
-            "passing `aegis check --record` exists for the current git tree, the server credits rules "
+            "passing `aegis check --record --tests` row exists for the current git tree, the server credits rules "
             "exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated "
             "against the rule inventory, not used as the credit source). Those credits count "
             "toward fitness once CI passes on the landing commit. Without a matching check record, it "
@@ -416,8 +416,8 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "enum": ["aegis", "self"],
                     "description": (
-                        "Attestation tier: 'aegis' when backed by an 'aegis check --record' "
-                        "run for the current tree, or 'self' for unwitnessed claims."
+                        "Attestation tier: 'aegis' when backed by a passing 'aegis check --record --tests' "
+                        "row for the current tree, or 'self' for unwitnessed claims."
                     ),
                 },
                 "credited": {

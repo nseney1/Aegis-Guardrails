@@ -11,21 +11,26 @@ confirms it (``aegis_core.credit``).
 The test command comes from the **user-scope** config (``~/.aegis/config.json``
 ``tests.command``, a string or an argv list), never from the repository: a repository must not
 choose what the verifier executes. The default is ``python -m pytest``. A command whose first word
-is a Python interpreter is run with the absolute interpreter that runs Aegis and
-``-s --check-hash-based-pycs always``; a pytest run also gets ``-p no:cacheprovider -o addopts=``
-and a JUnit file. Everything runs with a fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a
-redirected ``HOME``), no stdin, closed descriptors and a process-group timeout; the group is
-killed when the run ends, so nothing it left behind keeps writing.
+is a Python interpreter runs under that interpreter when the word is an absolute path, else under
+the interpreter that runs Aegis; a first word ``pytest`` (or ``py.test``, any path) runs as
+``python -m pytest`` under the interpreter that runs Aegis. Either way the interpreter gets
+``-s --check-hash-based-pycs always`` (its own site dirs stay visible, the user site does not), and
+a pytest run also gets ``-p no:cacheprovider -o addopts=`` and a JUnit file. Everything runs with a
+fixed environment (no ``PYTHON*``, no ``PYTEST_*``, a redirected ``HOME``), no stdin, closed
+descriptors and a process-group timeout; on POSIX the group is killed when the run ends, so nothing
+it left behind keeps writing. On Windows the group is killed while the run is alive; descendants a
+test run leaves behind after a normal exit are not swept.
 
 ``exit 5`` (no tests collected) and ``passed == 0`` are never evidence, and neither is a run that
 timed out or a Layer 1 finding.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -41,7 +46,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Uni
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.config import read_user_config
-from aegis_core.errors import AegisError
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
 
@@ -69,6 +73,8 @@ _HERMETIC = "hermetic-v1"
 _MAX_JUNIT_BYTES = 8 * 1024 * 1024
 _TAIL_BYTES = 256 * 1024
 _PYTHON_NAME = re.compile(r"python[0-9.]*(?:\.exe)?", re.IGNORECASE)
+_PYTEST_NAME = re.compile(r"py\.?test(?:\.exe)?", re.IGNORECASE)
+_NO_PYTEST = re.compile(r"No module named '?pytest'?")
 _COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected|xfailed|xpassed)")
 
 
@@ -87,6 +93,7 @@ class TestsRun:
     deselected: int = 0
     nodeid_digest: Optional[str] = None
     duration_s: float = 0.0
+    pytest_missing: bool = False  # not recorded: it only feeds the ``hint`` of ``aegis check --record``
 
     @property
     def evidence(self) -> bool:
@@ -108,6 +115,7 @@ class CheckOutcome:
     row: Optional[Dict[str, Any]] = None
     reason: str = ""
     binding: Optional[treeid.TreeBinding] = None
+    hint: str = ""
 
 
 # ── The command ──────────────────────────────────────────────────────────────
@@ -132,13 +140,21 @@ def plan_command(logical: Optional[Sequence[str]], junit: Optional[Path] = None)
     """``(argv to execute, logical command)``: the logical command is machine-independent (the
     digest is taken from it), the argv has the absolute interpreter and the fixed flags."""
     words = list(logical) if logical else list(DEFAULT_COMMAND)
-    argv = list(words)
-    if _PYTHON_NAME.fullmatch(os.path.basename(words[0])):
-        argv = [sys.executable, *_PYTHON_FLAGS, *words[1:]]
-        if "-m" in words and words[words.index("-m") + 1:words.index("-m") + 2] == ["pytest"]:
-            argv += list(_PYTEST_FLAGS)
-            if junit is not None:
-                argv.append(f"--junitxml={junit}")
+    first = os.path.basename(words[0].replace("\\", "/"))
+    if _PYTEST_NAME.fullmatch(first):
+        # A pytest launcher (even an absolute venv one) runs under Aegis's interpreter: guessing a
+        # sibling python from its path would let the path choose the interpreter.
+        python, rest = sys.executable, ["-m", "pytest", *words[1:]]
+    elif _PYTHON_NAME.fullmatch(first):
+        # Only the user-scope config reaches here, so an absolute interpreter is the user's choice.
+        python, rest = (words[0] if os.path.isabs(words[0]) else sys.executable), words[1:]
+    else:
+        return list(words), words
+    argv = [python, *_PYTHON_FLAGS, *rest]
+    if "-m" in rest and rest[rest.index("-m") + 1:rest.index("-m") + 2] == ["pytest"]:
+        argv += list(_PYTEST_FLAGS)
+        if junit is not None:
+            argv.append(f"--junitxml={junit}")
     return argv, words
 
 
@@ -183,11 +199,18 @@ hermetic_env = _hermetic_env
 
 # ── Running it ───────────────────────────────────────────────────────────────
 
+def _taskkill() -> str:
+    root = os.environ.get("SystemRoot", "")
+    return ntpath.join(root if ntpath.isabs(root) else "C:\\Windows", "System32", "taskkill.exe")
+
+
 def _kill_group(proc: "subprocess.Popen[Any]") -> None:
     if os.name == "nt":
+        # taskkill /T addresses a pid, which is reusable once the root has exited, so an exited
+        # root is left alone and its orphans are not swept (documented in the module docstring).
         if getattr(proc, "poll", lambda: None)() is not None:
             return
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
+        subprocess.run([_taskkill(), "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -288,7 +311,7 @@ def parse_junit_cases(path: Path) -> Tuple[Set[str], Set[str], List[str]]:
 def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float, junit: Path,
               output: Path) -> TestsRun:
     """Run ``argv`` in ``cwd`` with ``env`` and nothing else inherited; kill the process group at
-    the end, whatever happened."""
+    the end, whatever happened (on Windows only while the root is alive, see the module docstring)."""
     started = datetime.now(timezone.utc)
     if shutil.which(argv[0], path=env.get("PATH")) is None and not os.path.isabs(argv[0]):
         return TestsRun(exit=127)
@@ -323,7 +346,8 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
         digest = None
     seconds = (datetime.now(timezone.utc) - started).total_seconds()
     return TestsRun(exit=code, timed_out=timed_out, collected=collected, passed=passed, failed=failed,
-                    skipped=skipped, deselected=counts.get("deselected", 0), nodeid_digest=digest, duration_s=seconds)
+                    skipped=skipped, deselected=counts.get("deselected", 0), nodeid_digest=digest, duration_s=seconds,
+                    pytest_missing=bool(_NO_PYTEST.search(text)))
 
 
 # ── The record ───────────────────────────────────────────────────────────────
@@ -372,24 +396,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
             entries = bound.diff_entries(base_commit)
             changed = [path for status, path in entries if status != "D"]
             protected = governance.touches_governance(changed, [path for status, path in entries if status == "D"])
-            scratch = Path(tempfile.mkdtemp(prefix="aegis-check-"))
-            try:
-                snapshot = scratch / "snapshot"
-                bound.export(snapshot)
-                layer1 = _layer1(snapshot, changed)
-                run: Optional[TestsRun] = None
-                logical = list(DEFAULT_COMMAND)
-                if tests:
-                    junit = scratch / "junit.xml"
-                    argv, logical = plan_command(user_test_command(workspace), junit)
-                    home = scratch / "home"
-                    tmp = scratch / "tmp"
-                    home.mkdir(mode=0o700)
-                    tmp.mkdir(mode=0o700)
-                    run = run_tests(argv, snapshot, _hermetic_env(home, tmp),
-                                    DEFAULT_TIMEOUT_S if timeout is None else timeout, junit, scratch / "output.txt")
-            finally:
-                shutil.rmtree(scratch, ignore_errors=True)
+            layer1, run, logical = _snapshot_check(workspace, bound.export, changed, tests, timeout)
     except treeid.TreeError as exc:
         return CheckOutcome("error", None, str(exc))
     except gitsafe.GitError as exc:
@@ -421,60 +428,74 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
         identity = f"{binding.tree}|{digest}|{row['run_ordinal']}|{stamp}|{head}"
         row["id"] = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
         ledger.append_rows(workspace, [row])
-    return CheckOutcome("recorded", row, "", binding)
+    hint = ""
+    if run is not None and run.collected == 0 and run.pytest_missing:
+        hint = ('set "tests.command" in ~/.aegis/config.json to your project\'s Python, for example '
+                '["/path/to/.venv/bin/python", "-m", "pytest"]')
+    return CheckOutcome("recorded", row, "", binding, hint)
+
+
+def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tests: bool,
+                    timeout: Optional[float]) -> Tuple[Dict[str, int], Optional[TestsRun], List[str]]:
+    """Export a tree with ``export_fn`` and run Layer 1 and, with ``tests``, the user's test command
+    on it: the one recipe ``record`` and the trailer rerun share, so CI falsifies the same check."""
+    scratch = Path(tempfile.mkdtemp(prefix="aegis-check-"))
+    try:
+        snapshot = scratch / "snapshot"
+        export_fn(snapshot)
+        layer1 = _layer1(snapshot, changed)
+        run: Optional[TestsRun] = None
+        logical = list(DEFAULT_COMMAND)
+        if tests:
+            junit = scratch / "junit.xml"
+            argv, logical = plan_command(user_test_command(workspace), junit)
+            home = scratch / "home"
+            tmp = scratch / "tmp"
+            home.mkdir(mode=0o700)
+            tmp.mkdir(mode=0o700)
+            run = run_tests(argv, snapshot, _hermetic_env(home, tmp),
+                            DEFAULT_TIMEOUT_S if timeout is None else timeout, junit, scratch / "output.txt")
+        return layer1, run, logical
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def rerun_commit_snapshot(
     root: object, commit: str, base_ref: str, *, timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Export ``commit``'s tree into an isolated snapshot and rerun Layer 1 and snapshot tests."""
-    from aegis_core import regression
-
+    """Rerun ``record --tests`` on ``commit``'s tree: ``{"tree", "exit"}``, or ``{"tree",
+    "inconclusive": True, "reason"}`` when git could not answer or the run timed out."""
     workspace = Path(os.fspath(root)).resolve()
     top = gitsafe.toplevel(workspace)
     commit = gitsafe.resolve_commit(top, commit) if top is not None else None  # only an oid reaches git argv
     if commit is None:
         return {"tree": "", "exit": 1}
-    commit_tree = gitsafe.run(["rev-parse", f"{commit}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
-    base_commit = gitsafe.merge_base(top, base_ref, commit) or gitsafe.resolve_commit(top, base_ref) or commit
-    entries = gitsafe.diff_entries(top, base_commit, commit)
-    changed = [p for s, _o, _n, p in entries if s != "D"]
-    tree_entries = gitsafe.tree_blobs(top, commit)
-    scratch = Path(tempfile.mkdtemp(prefix="aegis-trailer-rerun-"))
     try:
-        snapshot = scratch / "snapshot"
-        gitsafe.export_tree(top, commit, snapshot)
-        layer1 = _layer1(snapshot, changed)
-        user_cmd = user_test_command(workspace)
-        tests_ok = True
-        raw_exit = 0
-        if user_cmd is not None:
-            junit = scratch / "junit.xml"
-            home = scratch / "home"
-            tmp = scratch / "tmp"
-            home.mkdir(mode=0o700)
-            tmp.mkdir(mode=0o700)
-            argv, _ = plan_command(user_cmd, junit)
-            run = run_tests(argv, snapshot, _hermetic_env(home, tmp), timeout or 120.0, junit, scratch / "output.txt")
-            tests_ok = run.evidence
-            raw_exit = run.exit
-        else:
-            t_files = sorted(p for p in tree_entries if regression.is_test_file(p) and (snapshot / p).is_file())
-            if t_files:
-                out = regression._run_pytest_in_snapshot(snapshot, t_files, workspace, scratch, timeout or 120.0)
-                tests_ok = out.exit_code == 0 and bool(out.passed_ids) and not out.failed_ids and not out.collection_errors
-                raw_exit = out.exit_code
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    passed = layer1["findings"] == 0 and tests_ok
-    return {"tree": commit_tree, "exit": 0 if passed else (raw_exit if raw_exit != 0 else 1)}
+        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}"], top)
+        if res.returncode != 0:
+            return {"tree": "", "inconclusive": True, "reason": f"could not read the tree of {commit[:12]}"}
+        commit_tree = res.stdout.decode("ascii", "replace").strip()
+        base_commit = gitsafe.merge_base(top, base_ref, commit)
+        if not base_commit:
+            return {"tree": "", "inconclusive": True, "reason": f"found no merge-base with {commit[:12]}"}
+        changed = [p for s, _o, _n, p in gitsafe.diff_entries(top, base_commit, commit) if s != "D"]
+        layer1, run, _logical = _snapshot_check(
+            workspace, lambda dest: gitsafe.export_tree(top, commit, dest), changed, True, timeout)
+    except gitsafe.GitError as exc:
+        return {"tree": "", "inconclusive": True, "reason": f"git could not answer: {exc}"}
+    if run is not None and run.timed_out:
+        return {"tree": commit_tree, "inconclusive": True, "reason": "timed out"}
+    if layer1["findings"] == 0 and run is not None and run.evidence:
+        return {"tree": commit_tree, "exit": 0}
+    return {"tree": commit_tree, "exit": run.exit if run is not None and run.exit != 0 else 1}
 
 
 def verify_commit_trailers(
     root: object, base: str, head: str = "HEAD", *,
     rerun_fn: Optional[ Any ] = None, timeout: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Verify ``Aegis-Check`` trailers on commits in ``base..head`` by rerunning each commit's snapshot."""
+    """Verify the ``Aegis-Check`` trailer of the head commit by rerunning its snapshot with the
+    ``record --tests`` recipe (``DEFAULT_TIMEOUT_S`` unless ``timeout`` is given)."""
     from aegis_core import credit
 
     runner = rerun_fn or (lambda c, _t: rerun_commit_snapshot(root, c, base, timeout=timeout))

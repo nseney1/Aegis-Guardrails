@@ -190,6 +190,80 @@ def test_the_user_config_command_may_be_an_argv_list_and_the_digest_is_machine_i
     assert checkrun.command_digest(logical) == first
 
 
+def test_a_bare_pytest_runs_as_python_m_pytest_with_every_hermetic_flag(tmp_path):
+    junit = tmp_path / "junit.xml"
+    argv, logical = checkrun.plan_command(["pytest", "-q"], junit)
+    assert argv[:6] == [sys.executable, "-s", "--check-hash-based-pycs", "always", "-m", "pytest"]
+    at = argv.index("-p")
+    assert argv[at:at + 4] == ["-p", "no:cacheprovider", "-o", "addopts="]
+    assert f"--junitxml={junit}" in argv and "-q" in argv
+    assert logical == ["pytest", "-q"]
+
+
+@pytest.mark.parametrize("word", ["/opt/venv/bin/pytest", "py.test", "PYTEST.EXE"])
+def test_any_pytest_program_runs_under_the_aegis_interpreter(word):
+    argv, logical = checkrun.plan_command([word, "-q"])
+    assert argv[0] == sys.executable and argv[4:6] == ["-m", "pytest"] and "addopts=" in argv
+    assert logical == [word, "-q"]
+
+
+def test_only_an_absolute_python_first_word_is_kept_as_the_interpreter(tmp_path):
+    python = tmp_path / "python3"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    argv, _ = checkrun.plan_command([str(python), "-m", "pytest"])
+    assert argv[:4] == [str(python), "-s", "--check-hash-based-pycs", "always"] and "addopts=" in argv
+    assert checkrun.plan_command(["python", "-m", "pytest"])[0][0] == sys.executable
+    tool = str(tmp_path / "runtests")
+    assert checkrun.plan_command([tool, "-x"])[0] == [tool, "-x"]
+
+
+def test_a_missing_absolute_interpreter_exits_127(tmp_path):
+    junit = tmp_path / "junit.xml"
+    argv, _ = checkrun.plan_command([str(tmp_path / "nowhere" / "python3"), "-m", "pytest"], junit)
+    run = checkrun.run_tests(argv, tmp_path, checkrun.hermetic_env(tmp_path), 60.0, junit, tmp_path / "out.txt")
+    assert run.exit == 127 and not run.evidence
+
+
+def test_the_default_command_keeps_its_digest():
+    _argv, logical = checkrun.plan_command(None)
+    assert checkrun.command_digest(logical) == "982597b8a8141596e8015b5c60700b600e69fc8873640cb98a23585cfff5b8ea"
+
+
+def _record_with_stand_in(tmp_path, monkeypatch, capsys, script: str):
+    from aegis_cli.cli import main
+
+    repo = hv.make_project(tmp_path)
+    hv.write_user_config(repo.home.path, tests={"command": ["pytest"]})
+    stand_in = tmp_path / "stand-in-python"
+    stand_in.write_text("#!/bin/sh\n" + script)
+    stand_in.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(stand_in))
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    code = main(["check", "--record", "--tests"])
+    return code, capsys.readouterr().out, hv.rows_of(repo.root, "check")
+
+
+@needs_git
+@posix_only
+def test_a_run_whose_interpreter_has_no_pytest_prints_a_hint(tmp_path, monkeypatch, capsys):
+    code, out, rows = _record_with_stand_in(tmp_path, monkeypatch, capsys,
+                                            "echo \"$0: No module named pytest\" >&2\nexit 1\n")
+    hint = [line for line in out.splitlines() if line.startswith("hint:")]
+    assert code == 1 and len(hint) == 1 and "tests.command" in hint[0]
+    assert rows[-1]["tests"]["collected"] == 0 and rows[-1]["passed"] is False
+
+
+@needs_git
+@posix_only
+def test_a_failing_run_with_pytest_present_prints_no_hint(tmp_path, monkeypatch, capsys):
+    code, out, rows = _record_with_stand_in(tmp_path, monkeypatch, capsys,
+                                            "echo '2 passed, 1 failed in 0.01s'\nexit 1\n")
+    assert code == 1 and "hint:" not in out and rows[-1]["passed"] is False
+
+
 @needs_git
 @pytest.mark.parametrize("config", ["not json", '{"tests": {"command": 5}}', '{"tests": {"command": ""}}', "[]"])
 def test_an_unusable_user_config_falls_back_to_the_default(tmp_path, config):
@@ -369,8 +443,293 @@ def test_ci_divergence_is_decided_by_equal_trees_only(trailer, rerun, second, re
     assert (verdict["result"], verdict["failed"]) == (result, failed)
 
 
-def test_a_trailer_line_is_accepted_as_well_as_a_parsed_one():
-    assert credit.check_ci_divergence(credit.format_trailer(SHA, 0), {"tree": SHA, "exit": 0})["result"] == "agree"
+def test_a_raw_trailer_line_is_not_a_parsed_trailer():
+    verdict = credit.check_ci_divergence(credit.format_trailer(SHA, 0), {"tree": SHA, "exit": 0})
+    assert verdict["result"] == "unbound" and verdict["failed"] is False
+
+
+def test_an_inconclusive_rerun_is_unbound_never_a_failure():
+    verdict = credit.check_ci_divergence({"tree": SHA, "exit": 0},
+                                         {"tree": SHA, "inconclusive": True, "reason": "timed out"})
+    assert verdict == {"result": "unbound", "failed": False, "reason": "CI rerun timed out"}
+
+
+def _trailer_head(repo, value: int = 2, exit_code: int = 0) -> str:
+    repo.write("src/app.py", f"def app():\n    return {value}\n")
+    tree = hv.tree_now(repo.root)
+    repo.commit(f"change {value}\n\n{credit.format_trailer(tree, exit_code)}")
+    return tree
+
+
+def _check_row(repo, tree: str, check_id: str) -> None:
+    from aegis_core.telemetry_engine import ledger
+
+    ledger.append_rows(repo.root, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-20T00:00:00Z", "event": "check",
+                                    "id": check_id, "tree": tree, "witness": "aegis", "passed": True}])
+
+
+@needs_git
+def test_a_divergence_that_repeats_voids_the_checks_of_that_tree(tmp_path):
+    repo = hv.make_project(tmp_path)
+    tree = _trailer_head(repo)
+    _check_row(repo, tree, "c-diverged")
+    out = credit.verify_commit_trailers(repo.root, "main", "HEAD", rerun_fn=lambda _c, t: {"tree": t, "exit": 1})
+    assert [(e["result"], e["failed"]) for e in out] == [("void", True)]
+    assert [(r["check"], r["reason"]) for r in hv.rows_of(repo.root, "void")] == [("c-diverged", "ci_divergence")]
+
+
+@needs_git
+def test_a_divergence_the_second_rerun_contradicts_agrees_and_voids_nothing(tmp_path):
+    repo = hv.make_project(tmp_path)
+    tree = _trailer_head(repo)
+    _check_row(repo, tree, "c-flaky")
+    answers = iter([1, 0])
+    out = credit.verify_commit_trailers(repo.root, "main", "HEAD",
+                                        rerun_fn=lambda _c, t: {"tree": t, "exit": next(answers)})
+    assert [e["result"] for e in out] == ["agree"] and hv.rows_of(repo.root, "void") == []
+
+
+@needs_git
+@posix_only
+def test_a_rerun_that_times_out_is_unbound_and_check_ci_passes(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+
+    repo = hv.make_project(tmp_path, runner="import time\ntime.sleep(30)\n")
+    hv.use_stub_runner(repo.home.path)
+    _trailer_head(repo)
+    out = checkrun.verify_commit_trailers(repo.root, "main", "HEAD", timeout=1)
+    assert [(e["result"], e["failed"]) for e in out] == [("unbound", False)] and "timed out" in out[0]["reason"]
+    monkeypatch.setattr(checkrun, "DEFAULT_TIMEOUT_S", 1.0)
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    assert main(["check", "--ci", "--base", "main", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["trailer_checks"][0]["result"] == "unbound"
+
+
+@needs_git
+def test_the_rerun_uses_the_record_recipe_and_snapshot_bytes(tmp_path, monkeypatch):
+    repo = hv.make_project(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("committed LF")
+    repo.home.config("core.autocrlf", "true")
+    seen = []
+
+    def recorder(argv, cwd, env, timeout, junit, output):
+        seen.append(([a.replace(str(junit), "JUNIT") for a in argv], sorted(env), timeout,
+                     (Path(cwd) / "src" / "app.py").read_bytes()))
+        return checkrun.TestsRun(exit=0, collected=1, passed=1)
+
+    monkeypatch.setattr(checkrun, "run_tests", recorder)
+    recorded = checkrun.record(repo.root, tests=True, base="main")
+    rerun = checkrun.rerun_commit_snapshot(repo.root, "HEAD", "main")
+    assert recorded.status == "recorded" and rerun["tree"] == recorded.row["tree"] and rerun["exit"] == 0
+    assert len(seen) == 2 and seen[0] == seen[1]
+    assert seen[0][2] == checkrun.DEFAULT_TIMEOUT_S and seen[0][3] == b"def app():\n    return 2\n"
+
+
+@needs_git
+def test_a_rerun_without_a_merge_base_or_commit_is_unbound_with_a_reason(tmp_path):
+    repo = hv.make_project(tmp_path)
+    repo.git("checkout", "-q", "--orphan", "island")
+    repo.commit("unrelated history")
+    repo.git("checkout", "-q", "work")
+    tree = hv.tree_now(repo.root)
+    for commit, base in (("HEAD", "island"), ("0" * 40, "main")):
+        rerun = checkrun.rerun_commit_snapshot(repo.root, commit, base)
+        verdict = credit.check_ci_divergence({"tree": tree, "exit": 0}, rerun)
+        assert verdict["result"] == "unbound" and verdict["failed"] is False and verdict["reason"], commit
+
+
+# ── the approval anchor comes from git, never from a ledger row ─────────────
+
+needs_signing = pytest.mark.skipif(not hg.signing_ok(), reason="needs git 2.34+ and ssh-keygen")
+
+
+class _Approvals:
+    """``main`` lists the human key in allowed_signers; ``work`` holds one protected change, recorded."""
+
+    def __init__(self, tmp_path, *, delete_test: bool = False):
+        from aegis_core import human_gate
+
+        self.gate = human_gate
+        self.repo = repo = hv.make_project(tmp_path)
+        self.human, human_pub = hg.keygen(tmp_path / "keys", "human")
+        self.agent, self.agent_pub = hg.keygen(tmp_path / "keys", "agent")
+        repo.git("checkout", "-q", "main")
+        repo.write("allowed_signers", hg.allowed_signers_text(human_pub))
+        repo.write("tests/test_old.py", "def test_old():\n    assert True\n")
+        self.fork = repo.commit("signers")
+        repo.git("checkout", "-q", "-B", "work", "main")
+        if delete_test:
+            repo.git("rm", "-q", "tests/test_old.py")
+        repo.write("conftest.py", "# protected change\n")
+        self.row = checkrun.record(repo.root, base="main").row
+        assert self.row["protected_changed"] is True and self.row["base"] == self.fork
+        self.change = repo.commit("protected change")
+
+    def approve(self, key, base: str) -> str:
+        digest = self.gate.governance_tree_hash(self.repo.root, self.change, base=base)
+        return self.repo.commit(self.gate.approval_message(digest), sign_key=key, allow_empty=True)
+
+    def land(self, squash: bool = False) -> str:
+        repo = self.repo
+        repo.git("checkout", "-q", "main")
+        if squash:
+            repo.git("merge", "-q", "--squash", "work")
+            repo.git("commit", "-q", "-m", "squashed")
+        else:
+            repo.git("merge", "-q", "--no-ff", "--no-edit", "work")
+        landed = repo.head()
+        repo.git("checkout", "-q", "work")
+        return landed
+
+    def forge(self, check_id: str, **fields) -> str:
+        from aegis_core.telemetry_engine import ledger
+
+        row = {k: v for k, v in self.row.items() if k != "seq"}
+        row.update(id=check_id, **fields)
+        for key in [k for k, v in fields.items() if v is None]:
+            row.pop(key)
+        ledger.append_rows(self.repo.root, [row])
+        return check_id
+
+    def lookup(self, check_id: str, **kw) -> bool:
+        return credit.approval_lookup(self.repo.root, credit.read_rows(self.repo.root), **kw)(check_id)
+
+
+@needs_signing
+def test_a_ledger_base_off_the_protected_branch_cannot_choose_the_signers(tmp_path):
+    from aegis_core.telemetry_engine import ledger
+
+    case = _Approvals(tmp_path)
+    repo = case.repo
+    repo.git("checkout", "-q", "-b", "evil", case.fork)
+    repo.write("allowed_signers", hg.allowed_signers_text(case.agent_pub))
+    evil = repo.commit("agent key")
+    repo.git("checkout", "-q", "work")
+    case.approve(case.agent, base=evil)
+    landed = case.land()
+    forged = case.forge("forged", base=evil)
+    assert case.lookup(forged) is False
+    stamp = "2026-10-20T00:00:00Z"
+    ledger.append_rows(repo.root, [
+        {"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "check": forged, "rule": "trap-sample", "result": "tp"},
+        {"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "ci", "commit": landed, "ci_conclusion": "success"},
+    ])
+    rows = credit.read_rows(repo.root)
+    derived, = credit.derive(rows, landed=credit.landed_lookup(repo.root),
+                             approved=credit.approval_lookup(repo.root, rows), verified_ci={landed: "success"})
+    assert (derived.state, derived.counts, derived.reason) == ("confirmed", False, "protected_changed")
+
+
+@needs_signing
+@pytest.mark.parametrize("squash", [False, True], ids=["merge", "squash"])
+def test_a_genuine_approval_at_the_recorded_fork_point_verifies_after_landing(tmp_path, squash):
+    case = _Approvals(tmp_path)
+    case.approve(case.human, base=case.fork)
+    case.land(squash=squash)
+    assert case.lookup(case.row["id"]) is True
+
+
+@needs_signing
+def test_an_approved_test_deletion_still_verifies_after_landing(tmp_path):
+    case = _Approvals(tmp_path, delete_test=True)
+    case.approve(case.human, base=case.fork)
+    case.land()
+    assert case.lookup(case.row["id"]) is True
+
+
+@needs_signing
+def test_an_unusable_base_or_branch_is_never_approved_and_never_falls_back(tmp_path, monkeypatch):
+    case = _Approvals(tmp_path)
+    case.approve(case.human, base=case.fork)
+    case.land()
+    for i, base in enumerate(("zz", "", case.fork[:12], case.fork.upper(), None)):
+        assert case.lookup(case.forge(f"bad-{i}", base=base)) is False, base
+    assert case.lookup(case.row["id"], branch="no-such-branch") is False
+    case.repo.git("branch", "-m", "main", "trunk")
+    assert case.lookup(case.row["id"]) is False
+
+
+@needs_signing
+def test_git_trouble_fails_closed_and_a_programming_error_propagates(tmp_path, monkeypatch):
+    from aegis_core import gitsafe, human_gate
+
+    case = _Approvals(tmp_path)
+    case.approve(case.human, base=case.fork)
+    case.land()
+
+    def git_trouble(*_a, **_k):
+        raise gitsafe.GitError("git timed out")
+
+    monkeypatch.setattr(human_gate, "find_approval", git_trouble)
+    assert case.lookup(case.row["id"]) is False
+
+    def bug(*_a, **_k):
+        raise ValueError("a bug")
+
+    monkeypatch.setattr(human_gate, "find_approval", bug)
+    with pytest.raises(ValueError):
+        case.lookup(case.row["id"])
+
+
+# ── a passing check needs a tests run ────────────────────────────────────────
+
+def _staged_tree(repo) -> str:
+    repo.git("add", "-A")
+    return repo.git("write-tree")
+
+
+def _row(tree: str, check_id: str, *, passed: bool, tests, exit_code: int = 0):
+    from aegis_core.telemetry_engine import ledger
+
+    return {"v": ledger.LEDGER_VERSION, "ts": "2026-10-20T00:00:00Z", "event": "check", "id": check_id, "tree": tree,
+            "witness": "aegis", "passed": passed, "tests": tests, "exit": exit_code}
+
+
+def _append(repo, *rows) -> None:
+    from aegis_core.telemetry_engine import ledger
+
+    ledger.append_rows(repo.root, list(rows))
+
+
+def _report(repo, tree: str):
+    return credit.submit_report(repo.root, tree=tree, session="s", host="h", key="k", outcome="success",
+                                rules_for=lambda _check: ["trap-sample"])
+
+
+@needs_git
+def test_a_layer_one_only_row_cannot_launder_a_failed_tests_run(tmp_path):
+    from aegis_cli.hooks import commitmsg
+
+    repo = hv.make_project(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    tree = _staged_tree(repo)
+    _append(repo, _row(tree, "c-tests", passed=False, tests={"exit": 1, "passed": 2, "failed": 1}, exit_code=1),
+            _row(tree, "c-layer1", passed=True, tests=None))
+    assert credit.passing_check(credit.read_rows(repo.root), tree) is None
+    assert commitmsg.trailer_for_staged(repo.root) is None
+    out = _report(repo, tree)
+    assert out["status"] == "claimed" and out["witness"] == "self"
+
+
+@needs_git
+def test_a_passing_tests_row_still_counts_after_a_later_layer_one_only_row(tmp_path):
+    from aegis_cli.hooks import commitmsg
+
+    repo = hv.make_project(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    tree = _staged_tree(repo)
+    _append(repo, _row(tree, "c-tests", passed=True, tests={"exit": 0, "passed": 3, "failed": 0}),
+            _row(tree, "c-layer1", passed=True, tests=None))
+    assert credit.passing_check(credit.read_rows(repo.root), tree)["id"] == "c-tests"
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(tree, 0)
+    assert _report(repo, tree)["witness"] == "aegis"
+
+
+def test_a_run_that_collected_no_tests_is_never_a_passing_check():
+    rows = [_row(SHA, "c-empty", passed=False, tests={"exit": 5, "passed": 0, "collected": 0}, exit_code=5)]
+    assert credit.passing_check(rows, SHA) is None
 
 
 # ── derivation edges ─────────────────────────────────────────────────────────

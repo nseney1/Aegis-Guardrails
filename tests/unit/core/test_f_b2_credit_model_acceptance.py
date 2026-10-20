@@ -673,17 +673,7 @@ def test_detector_replay_ignores_unmerged_head_and_keeps_a_landed_finding_leaked
     assert fit_2.leaked == 1 and fit_2.caught == 0
 
 
-@needs_git
-def test_trailer_rerun_executes_unchanged_tests_and_works_in_fresh_credit_only_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When a commit modifies `src/app.py` (breaking an existing unchanged test) and adds a new passing
-    test file, trailer verification runs all snapshot tests (catching the broken unchanged test) and works
-    in a fresh Python process that imports only `aegis_core.credit`."""
-    import sys
-    from aegis_core import checkrun
-    from tests import helpers_verified as hv
-
+def _trailer_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> hg.Repo:
     home = hg.Home(tmp_path / "home")
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home.path))
@@ -691,21 +681,63 @@ def test_trailer_rerun_executes_unchanged_tests_and_works_in_fresh_credit_only_p
     repo.write("src/app.py", "def value():\n    return 1\n")
     repo.write("tests/test_existing.py", "from src.app import value\n\ndef test_existing():\n    assert value() == 1\n")
     repo.commit("initial")
-
-    # Branch and make a commit that breaks `test_existing.py` (without touching it) and adds `test_new.py`
     repo.branch("work")
-    repo.write("src/app.py", "def value():\n    return 2\n")
-    repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
+    return repo
+
+
+def _trailer_commit(repo: hg.Repo, value: int) -> str:
+    from tests import helpers_verified as hv
+
+    repo.write("src/app.py", f"def value():\n    return {value}\n")
     tree = hv.tree_now(repo.root)
-    repo.commit(f"feat: break existing test while adding passing test\n\n{credit.format_trailer(tree, 0)}")
+    repo.commit(f"feat: value {value}\n\n{credit.format_trailer(tree, 0)}")
+    return tree
 
-    # 1. Layer 2 `checkrun.verify_commit_trailers` runs all snapshot tests and catches the broken unchanged test
-    v_res = checkrun.verify_commit_trailers(repo.root, "main", "HEAD")
-    assert len(v_res) == 1
-    assert v_res[0]["result"] == "void"
-    assert v_res[0]["failed"] is True
 
-    # 2. Layer 1 `credit.verify_commit_trailers` requires an explicit `rerun_fn` (no import-order hook or subprocess spawn)
+@needs_git
+def test_only_the_head_commit_trailer_is_rerun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec T1 compares the head commit's trailer: three trailer commits cost one rerun, for the head."""
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    trees = [_trailer_commit(repo, value) for value in (2, 3, 4)]
+    asked = []
+
+    def spy(commit: str, tree: str) -> dict:
+        asked.append((commit, tree))
+        return {"tree": tree, "exit": 0}
+
+    res = credit.verify_commit_trailers(repo.root, "main", "HEAD", rerun_fn=spy)
+    assert asked == [(repo.head(), trees[-1])]
+    assert [(r["commit"], r["result"]) for r in res] == [(repo.head(), "agree")]
+
+
+@needs_git
+def test_a_head_without_a_trailer_or_on_the_base_reruns_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    _trailer_commit(repo, 2)
+    asked = []
+
+    def spy(commit: str, tree: str) -> dict:
+        asked.append(commit)
+        return {"tree": tree, "exit": 0}
+
+    repo.git("checkout", "-q", "main")
+    repo.write("other.txt", "x\n")
+    repo.commit("main moves on")
+    repo.git("merge", "-q", "--no-ff", "--no-edit", "work")  # the head is a merge commit with no trailer
+    assert credit.verify_commit_trailers(repo.root, "work", "HEAD", rerun_fn=spy) == []
+    assert credit.verify_commit_trailers(repo.root, "main", "main", rerun_fn=spy) == []
+    assert asked == []
+
+
+@needs_git
+def test_trailer_verification_works_in_a_fresh_credit_only_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``credit.verify_commit_trailers`` takes an explicit ``rerun_fn`` and never imports ``checkrun``."""
+    import sys
+
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    _trailer_commit(repo, 2)
     code = (
         "import json, sys\n"
         "from aegis_core import credit\n"
@@ -722,6 +754,27 @@ def test_trailer_rerun_executes_unchanged_tests_and_works_in_fresh_credit_only_p
     assert len(parsed) == 1
     assert parsed[0]["result"] == "void"
     assert parsed[0]["failed"] is True
+
+
+@needs_git
+def test_the_trailer_rerun_runs_the_whole_suite_with_the_record_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A head that breaks an unchanged test while its trailer claims a pass is caught: the rerun runs
+    ``python -m pytest`` on the snapshot, as ``aegis check --record --tests`` does."""
+    from aegis_core import checkrun
+    from tests import helpers_verified as hv
+
+    if not hv.hermetic_pytest_ok():
+        pytest.skip("pytest is not importable by the hermetic interpreter (user-site install)")
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    repo.write("pytest.ini", "[pytest]\npythonpath = .\n")
+    repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
+    _trailer_commit(repo, 2)
+    v_res = checkrun.verify_commit_trailers(repo.root, "main", "HEAD")
+    assert len(v_res) == 1
+    assert v_res[0]["result"] == "void"
+    assert v_res[0]["failed"] is True
 
 
 @needs_git
@@ -762,3 +815,19 @@ def test_detector_replay_walks_commits_after_merge_and_prefers_ahead_remote_bran
 
     detections = fitness.replay_detector_history(repo.root)
     assert any(d["pattern"] == "eval" and d["disposition"] == "leaked" for d in detections)
+
+
+@needs_git
+def test_projecting_credit_never_imports_release_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One CI-confirmation path (REST): ``project_credits`` does not reach ``release_verify`` (R-trust-67)."""
+    import sys
+
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    code = (
+        "import sys\n"
+        "from aegis_core import credit\n"
+        "credit.project_credits(sys.argv[1], verify_ci=True)\n"  # no ci row: nothing asks gh
+        "print('aegis_core.release_verify' in sys.modules)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code, str(repo.root)], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "False"
