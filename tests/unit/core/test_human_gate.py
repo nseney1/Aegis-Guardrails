@@ -929,3 +929,90 @@ def test_reading_the_base_workflows_costs_one_batched_git_read(tmp_path, monkeyp
     assert sum(with_.values()) - sum(without.values()) == 1
     assert with_["cat-file --batch"] == without["cat-file --batch"] + 1
     assert with_["ls-tree"] == without["ls-tree"]
+
+
+# ── find_approval: cost independent of the range length (R-trust-40) ─────────
+
+def _counted_find(repo, monkeypatch, **kw):
+    from collections import Counter
+    from aegis_core import gitsafe
+
+    real = gitsafe.run
+    seen = Counter()
+
+    def spy(args, cwd, *a, **k):
+        seen[next((x for x in args if not x.startswith("-")), "")] += 1
+        return real(args, cwd, *a, **k)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    try:
+        found = human_gate.find_approval(repo.root, "HEAD", "main", **kw)
+    finally:
+        monkeypatch.setattr(gitsafe, "run", real)
+    return found, seen
+
+
+def _range(tmp_path, n: int, signer_pub=None, approve_key=None, name="r"):
+    repo = hg.make_repo(tmp_path / name, signer_pub)
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    approval = None
+    if approve_key is not None:
+        approval = repo.commit(f"approve\n\nAegis-Approve: {digest}\n", sign_key=approve_key, allow_empty=True)
+    for i in range(n - (approve_key is not None)):
+        repo.commit(f"c{i}", allow_empty=True)
+    return repo, approval
+
+
+@needs_git
+def test_a_range_without_approval_costs_the_same_git_calls_at_4_and_40_commits(tmp_path, monkeypatch):
+    totals = []
+    for n in (4, 40):
+        repo, _ = _range(tmp_path, n, name=f"r{n}")
+        found, seen = _counted_find(repo, monkeypatch)
+        assert found is None
+        assert seen["cat-file"] == 0, seen
+        totals.append(sum(seen.values()))
+    assert totals[0] == totals[1] and totals[0] <= 12, totals
+
+
+@needs_signing
+def test_one_signed_approval_costs_a_constant_whatever_the_range(tmp_path, monkeypatch):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    totals = []
+    for n in (4, 40):
+        repo, approval = _range(tmp_path, n, pub, key, name=f"r{n}")
+        found, seen = _counted_find(repo, monkeypatch)
+        assert found is not None and found.valid and found.commit == approval
+        totals.append(sum(seen.values()))
+    assert totals[0] == totals[1], totals
+
+
+@needs_signing
+def test_a_bad_signature_candidate_is_skipped_for_the_next_one(tmp_path):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo, approval = _range(tmp_path, 2, pub, key)
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    repo.commit(f"forged\n\nAegis-Approve: {digest}\n", allow_empty=True)  # newer, unsigned
+    found = human_gate.find_approval(repo.root, "HEAD", "main")
+    assert found is not None and found.commit == approval
+
+
+@needs_signing
+def test_the_scan_stops_at_the_cap(tmp_path, monkeypatch):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo, approval = _range(tmp_path, 4, pub, key)  # the approval is the 4th newest commit
+    monkeypatch.setattr(human_gate, "MAX_SCANNED_COMMITS", 3)
+    assert human_gate.find_approval(repo.root, "HEAD", "main") is None
+    monkeypatch.setattr(human_gate, "MAX_SCANNED_COMMITS", 4)
+    assert human_gate.find_approval(repo.root, "HEAD", "main").commit == approval
+
+
+@needs_signing
+def test_a_control_byte_in_a_message_does_not_hide_an_approval(tmp_path):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, pub)
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
+    approval = repo.commit(f"approve \x01 this\n\nAegis-Approve: {digest}\n", sign_key=key, allow_empty=True)
+    repo.commit("later", allow_empty=True)
+    found = human_gate.find_approval(repo.root, "HEAD", "main")
+    assert found is not None and found.commit == approval
