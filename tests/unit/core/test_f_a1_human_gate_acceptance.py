@@ -325,6 +325,62 @@ def test_the_signature_programs_are_not_looked_up_on_a_path_the_repository_can_p
     assert status != "G" and not marker.exists()
 
 
+def _planted_ssh_keygen(repo: hg.Repo, tmp_path: Path) -> Path:
+    """``<repo>/bin/ssh-keygen``: records that it ran and fails. Returns the marker path."""
+    marker = tmp_path / "planted-ran"
+    planted = repo.root / "bin" / "ssh-keygen"
+    planted.parent.mkdir()
+    planted.write_bytes(f'#!/bin/sh\necho ran >> "{marker}"\nexit 1\n'.encode())
+    planted.chmod(0o755)
+    return marker
+
+
+@posix_only
+@needs_signing
+def test_ssh_keygen_inside_the_repository_is_never_the_signature_program(tmp_path, monkeypatch, keys):
+    """Given PATH whose first absolute entry is ``<repo>/bin`` holding an ``ssh-keygen`` and the
+    system one later on PATH, When an approval is verified and one is signed, Then the planted
+    program never runs and both use the system ssh-keygen."""
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    repo.home.sign_with(str(keys["human"]))
+    marker = _planted_ssh_keygen(repo, tmp_path)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo.root / "bin"), os.environ["PATH"]]))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (verdict.valid, verdict.code) == (True, "ok"), verdict
+    signed = human_gate.signed_empty_commit(repo.root, human_gate.approval_message(digest))
+    assert human_gate.verify_approval(repo.root, signed, digest, "main").valid
+    assert not marker.exists()
+
+
+@posix_only
+@needs_signing
+def test_with_ssh_keygen_only_inside_the_repository_approvals_are_refused(tmp_path, monkeypatch, keys):
+    """Given PATH holding only ``<repo>/bin/ssh-keygen`` (and git, outside the repository), When an
+    approval is verified or signed, Then it is unverifiable or refused as "not installed", and the
+    planted program never runs."""
+    import shutil
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    digest = _changed_rule_branch(repo)
+    repo.commit(human_gate.approval_message(digest), sign_key=keys["human"], allow_empty=True)
+    repo.home.sign_with(str(keys["human"]))
+    marker = _planted_ssh_keygen(repo, tmp_path)
+    git_only = tmp_path / "git-only"
+    git_only.mkdir()
+    try:
+        os.symlink(shutil.which("git"), git_only / "git")
+    except OSError:
+        pytest.skip("cannot make a symlink here")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo.root / "bin"), str(git_only)]))
+    verdict = human_gate.verify_approval(repo.root, "HEAD", digest, "main")
+    assert (verdict.valid, verdict.code) == (False, "unverifiable")
+    assert "ssh-keygen is not installed" in verdict.reason
+    with pytest.raises(human_gate.HumanGateError, match="ssh-keygen is not installed"):
+        human_gate.signed_empty_commit(repo.root, human_gate.approval_message(digest))
+    assert not marker.exists()
+
+
 @posix_only
 @needs_git
 def test_log_show_signature_in_a_repository_config_does_not_run_the_repositorys_program(tmp_path):

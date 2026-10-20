@@ -831,8 +831,8 @@ def exemption_message(fix_commit: str, reason: str) -> str:
     return f"chore: approve test exemption for {commit[:12]}\n\nAegis-Exempt-Test: {commit} {why}\n"
 
 
-def _ssh_keygen() -> str:
-    found = pathlookup.which("ssh-keygen")
+def _ssh_keygen(top: Path) -> str:
+    found = pathlookup.which("ssh-keygen", outside=top)
     if not found:
         raise HumanGateError("ssh-keygen is not installed or not on PATH; SSH signatures cannot be made or checked")
     return found
@@ -993,7 +993,7 @@ def _signature_armor(top: Path, oid: str) -> Optional[str]:
 
 
 def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]:
-    program = _ssh_keygen()
+    program = _ssh_keygen(top)
     directory = Path(tempfile.mkdtemp(prefix="aegis-signers-"))
     try:
         os.chmod(directory, 0o700)
@@ -1080,7 +1080,7 @@ def signed_empty_commit(root: Any, message: str) -> str:
             "-c",
             f"user.signingkey={key}",
             "-c",
-            f"gpg.ssh.program={_ssh_keygen()}",
+            f"gpg.ssh.program={_ssh_keygen(top)}",
             "-c",
             "commit.gpgsign=true",
             "commit",
