@@ -151,7 +151,6 @@ def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Pat
     )
     assert res["event"] == "heartbeat"
     assert res["cue"] is True
-    assert res["recorded"] is False
 
     rows = read_insight_rows(repo, home=home)
     assert len(rows) == 1
@@ -416,3 +415,93 @@ def test_a_cwd_that_does_not_exist_falls_back_to_itself(tmp_path: Path, hook_hom
     missing = _make_repo(tmp_path / "repo") / "gone"
     record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(missing)}, home=hook_home)
     assert _insight_texts(missing, hook_home) == ["No, wrong file"]
+
+
+# ── a heartbeat per identified prompt, revisions through inventory rows (R-evidence-40) ──
+
+_RULE_MD = (
+    "---\nid: {rid}\ntype: trap\nenforcement: advisory\nhypothesis: Popen hangs.\n"
+    "target_paths:\n  - '*.py'\n---\n# {rid}\n\nNever call subprocess.Popen without a timeout.{extra}\n"
+)
+
+
+def _put_rule(repo: Path, rid: str, extra: str = "") -> None:
+    (repo / ".aegis" / "rules" / "traps" / f"{rid}.md").write_text(_RULE_MD.format(rid=rid, extra=extra), encoding="utf-8")
+
+
+def _prompt(repo: Path, home: Path, text: str = "Please run the tests.", session: str = "s-hb", **kw):
+    return record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home, **kw)
+
+
+def _events(repo: Path, home: Path, event: str):
+    return [r for r in read_insight_rows(repo, home=home) if r.get("event") == event]
+
+
+@pytest.fixture
+def hb_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+def test_a_session_counts_alive_for_a_rule_created_between_its_prompts(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _prompt(repo, hb_home)
+    _put_rule(repo, "trap-mid")
+    _prompt(repo, hb_home)
+    rec = measure_recurrence(repo, "trap-mid", home=hb_home)
+    assert (rec["sessions"], rec["status"]) == (1, "ok")
+
+
+def test_counters_only_cue_prompts_store_a_text_free_heartbeat_each(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    for _ in range(2):
+        _prompt(repo, hb_home, "No, stop breaking the build!", excerpts=False)
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
+    assert all(r["cue"] is True and "text" not in r for r in rows)
+
+
+def test_an_unchanged_rule_set_writes_one_inventory_row(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-inv")
+    for _ in range(500):
+        _prompt(repo, hb_home)
+    (inv,) = _events(repo, hb_home, "inventory")
+    beats = _events(repo, hb_home, "heartbeat")
+    assert len(beats) == 500
+    assert all(b["inv"] == inv["inv"] and "revs" not in b for b in beats)
+    assert set(inv["revs"]) == {"trap-inv"}
+    lines = insights_path(repo, home=hb_home).read_bytes().splitlines()
+    assert max(len(line) for line in lines if b'"heartbeat"' in line) <= 200
+
+    _put_rule(repo, "trap-inv", extra=" Revised.")
+    _prompt(repo, hb_home)
+    assert len(_events(repo, hb_home, "inventory")) == 2
+
+
+def test_a_heartbeat_whose_inv_has_no_inventory_row_is_not_alive(tmp_path: Path, hb_home: Path):
+    from aegis_core.rules import load_rules
+    from aegis_core.storage import append_jsonl
+
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-orphan")
+    rev = load_rules(repo).get("trap-orphan").digest[:16]
+    base = {"v": 1, "ts": "2026-10-20T00:00:00Z", "event": "heartbeat", "host": "claude-code"}
+    path = insights_path(repo, home=hb_home)
+    path.parent.mkdir(parents=True)
+    append_jsonl(path, [dict(base, hs="a" * 32, cue=False, inv="0" * 16)])
+    assert measure_recurrence(repo, "trap-orphan", home=hb_home)["sessions"] == 0
+    append_jsonl(path, [dict(base, hs="b" * 32, revs={"trap-orphan": rev})])
+    assert measure_recurrence(repo, "trap-orphan", home=hb_home)["sessions"] == 1
+
+
+def test_a_workspace_without_rule_files_writes_heartbeats_without_inv(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _prompt(repo, hb_home)
+    _prompt(repo, hb_home)
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
+    assert all("inv" not in r and "revs" not in r for r in rows)

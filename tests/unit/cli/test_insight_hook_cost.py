@@ -112,15 +112,33 @@ def test_a_cue_prompt_in_a_fresh_session_loads_no_review_module(ws: Path, home: 
     proc, report = _fresh_hook(ws, home, _payload(ws, "No, stop editing the build file again."), "--excerpts")
     assert (proc.returncode, report["rc"], proc.stdout, proc.stderr) == (0, 0, b"", b"")
     assert set(report["mods"]).isdisjoint(REVIEW_ONLY)
-    assert [r["event"] for r in read_insight_rows(ws, home=home)] == ["heartbeat", "insight"]
+    assert [r["event"] for r in read_insight_rows(ws, home=home)] == ["inventory", "heartbeat", "insight"]
 
 
-def test_rules_are_parsed_at_most_once_per_prompt(ws: Path, home: Path, parses: list):
+@pytest.fixture
+def fingerprints(monkeypatch: pytest.MonkeyPatch) -> list:
+    from aegis_core import rule_inventory
+
+    calls: list = []
+    real = rule_inventory.inventory_rules
+    monkeypatch.setattr(rule_inventory, "inventory_rules", lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
+
+def test_one_fingerprint_per_prompt_and_a_parse_only_for_a_new_inventory(
+    ws: Path, home: Path, parses: list, fingerprints: list
+):
     record_hook_prompt("claude-code", _payload(ws, "No, stop editing the build file again."), home=home)
-    assert len(parses) <= 1
+    assert (len(fingerprints), len(parses)) == (1, 1)
+    for session in ("s-cost", "s-other"):
+        fingerprints.clear()
+        parses.clear()
+        record_hook_prompt("claude-code", _payload(ws, "No, stop editing it again.", session), home=home)
+        assert (len(fingerprints), len(parses)) == (1, 0)
+    (ws / ".aegis" / "rules" / "traps" / "trap-two.md").write_text(RULE.replace("trap-one", "trap-two"), encoding="utf-8")
     parses.clear()
     record_hook_prompt("claude-code", _payload(ws, "Please run the unit tests."), home=home)
-    assert len(parses) == 0
+    assert len(parses) == 1
 
 
 def test_a_malformed_rule_file_still_exits_zero_silently(ws: Path, home: Path):
@@ -133,6 +151,6 @@ def test_a_crlf_rule_file_records_the_lf_normalised_revision(ws: Path, home: Pat
     raw = RULE.replace("\n", "\r\n").encode("utf-8")
     (ws / ".aegis" / "rules" / "traps" / "trap-one.md").write_bytes(raw)
     record_hook_prompt("claude-code", _payload(ws, "Please run the unit tests."), home=home)
-    (row,) = [r for r in read_insight_rows(ws, home=home) if "revs" in r]
+    (row,) = [r for r in read_insight_rows(ws, home=home) if r["event"] == "inventory"]
     expected = hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()[:16]
     assert row["revs"]["trap-one"] == expected == core_rules.load_rules(ws).get("trap-one").digest[:16]

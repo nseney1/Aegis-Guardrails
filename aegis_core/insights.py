@@ -21,7 +21,7 @@ import secrets
 import stat
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core import gitsafe, storage
+from aegis_core import gitsafe, rule_inventory, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.storage import (
     append_jsonl,
@@ -298,24 +298,8 @@ def _append_user_insights(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     _ensure_private_dir(path.parent.parent)
     _ensure_private_dir(path.parent)
     with storage.file_lock(path.with_suffix(".lock")):
-        to_write = list(rows)
-        if path.exists():
-            existing_hb = {
-                (r.get("host"), r.get("hs"))
-                for r in read_jsonl(path).rows
-                if r.get("event") == "heartbeat" and r.get("hs") is not None
-            }
-            to_write = [
-                r for r in to_write
-                if not (
-                    r.get("event") == "heartbeat"
-                    and r.get("hs") is not None
-                    and (r.get("host"), r.get("hs")) in existing_hb
-                )
-            ]
-        if to_write:
-            append_jsonl(path, to_write, mode=0o600)
-            _chmod_quiet(path, 0o600)
+        append_jsonl(path, list(rows), mode=0o600)
+        _chmod_quiet(path, 0o600)
 
 
 def read_insight_rows(workspace: Any, home: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -363,6 +347,22 @@ def _served_rule_revs(workspace: Any) -> Dict[str, str]:
         return {r.id: r.digest[:16] for r in load_rules(root).served}
     except Exception:
         return {}
+
+
+def _inventory_id(root: Path) -> Optional[str]:
+    """First 16 hex of the rule-bytes fingerprint; None without rule files or when unreadable."""
+    try:
+        found = rule_inventory.inventory_rules(str(root))
+    except Exception:
+        return None
+    return found.fingerprint[:16] if found.entries else None
+
+
+def _known_inventory_revs(path: Path, inv: str) -> Optional[Dict[str, str]]:
+    for row in read_jsonl(path).rows:
+        if row.get("event") == "inventory" and row.get("inv") == inv and isinstance(row.get("revs"), dict):
+            return dict(row["revs"])
+    return None
 
 
 def _has_human_approval(workspace: Any, commit: Optional[str], base_ref: Optional[str], text: str = "") -> bool:
@@ -547,42 +547,34 @@ def record_hook_prompt(
         actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
     hs = _ensure_hs(host, session or payload_session, home=home)
     path = insights_path(actual_ws, home=home)
-    existing = read_insight_rows(actual_ws, home=home)
     now = _utc_now()
-    to_write: List[Dict[str, Any]] = []
-    has_hb = any(
-        r.get("event") == "heartbeat" and r.get("host") == host and hs is not None and r.get("hs") == hs
-        for r in existing
-    )
     cue = has_correction_cue(prompt_text)
     excerpt = _redact(prompt_text) if cue and excerpts else ""
-    revs = _served_rule_revs(actual_ws) if excerpt or not has_hb else {}
-    if not has_hb:
-        hb: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host}
-        if hs:
-            hb["hs"] = hs
-        if revs:
-            hb["revs"] = revs
-        to_write.append(hb)
+    resolved = Path(os.fspath(actual_ws)).resolve()
+    root = bounded_walk_up(resolved) or resolved
+    to_write: List[Dict[str, Any]] = []
+    hb: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host}
+    if hs:
+        hb["hs"] = hs
+    hb["cue"] = cue
+    revs: Optional[Dict[str, str]] = None
+    inv = _inventory_id(root)
+    if inv:
+        hb["inv"] = inv
+        # Rules are parsed only for a rule set this log has not seen; later rows reuse its revs.
+        revs = _known_inventory_revs(path, inv)
+        if revs is None:
+            revs = _served_rule_revs(root)
+            to_write.append({"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "inventory", "inv": inv, "revs": revs})
+    to_write.append(hb)
     insight_row: Optional[Dict[str, Any]] = None
     if excerpt:
         insight_row = _build_insight_row(
-            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs,
+            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {},
         )
         to_write.append(insight_row)
-    if to_write:
-        _append_user_insights(path, to_write)
-    if insight_row is not None:
-        return insight_row
-    return {
-        "v": INSIGHT_SCHEMA_VERSION,
-        "ts": now,
-        "event": "heartbeat",
-        "host": host,
-        "hs": hs,
-        "cue": cue,
-        "recorded": False,
-    }
+    _append_user_insights(path, to_write)
+    return insight_row if insight_row is not None else hb
 
 
 _STOPWORDS = frozenset(
@@ -1105,8 +1097,16 @@ def measure_recurrence(
     alive: Set[str] = set()
     unidentified_heartbeats = 0
     matching: List[Dict[str, Any]] = []
-    for row in read_insight_rows(root, home=home):
-        revs = row.get("revs") if isinstance(row.get("revs"), Mapping) else {}
+    rows = read_insight_rows(root, home=home)
+    inv_revs = {
+        r["inv"]: r["revs"] for r in rows
+        if r.get("event") == "inventory" and isinstance(r.get("inv"), str) and isinstance(r.get("revs"), Mapping)
+    }
+    for row in rows:
+        # A new heartbeat names its rule set by `inv`; an old one carries its own revs.
+        revs = row.get("revs")
+        if not isinstance(revs, Mapping):
+            revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
         if reset_on_rev_change and revs.get(rule_id) != cur_rev:
             continue
         ev = row.get("event")

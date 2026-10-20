@@ -171,7 +171,9 @@ def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypat
     assert hosts_by_id["antigravity"]["status"] == "explicit_only"
 
 
-def test_hook_entrypoint_exits_zero_with_empty_output_and_one_heartbeat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_hook_entrypoint_exits_zero_with_empty_output_and_a_heartbeat_per_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -185,6 +187,11 @@ def test_hook_entrypoint_exits_zero_with_empty_output_and_one_heartbeat(tmp_path
     })
     run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
 
+    from aegis_core import rules as core_rules
+
+    parses: list = []
+    real = core_rules.load_rules
+    monkeypatch.setattr(core_rules, "load_rules", lambda *a, **k: parses.append(a) or real(*a, **k))
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
@@ -192,9 +199,28 @@ def test_hook_entrypoint_exits_zero_with_empty_output_and_one_heartbeat(tmp_path
     assert rc == 0
     assert out.getvalue() == ""
     assert err.getvalue() == ""
+    assert parses == []  # no rule files: nothing to fingerprint or parse
     rows = read_insight_rows(ws, home=home)
-    assert len(rows) == 1
-    assert rows[0]["event"] == "heartbeat"
+    assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
+
+
+def test_a_corrupt_insights_log_still_exits_zero_silently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    (ws / ".aegis" / "rules" / "traps" / "trap-x.md").write_text(
+        "---\nid: trap-x\ntype: trap\nenforcement: advisory\n---\n# trap-x\n\nBody.\n", encoding="utf-8")
+    store = insights_path(ws, home=home)
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b'\xff\xfe{not json\n{"event": "inventory", "inv": 7\n')
+    payload = json.dumps({"prompt": "Please run the unit tests.", "session_id": "corrupt-1", "cwd": str(ws)})
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
+    assert (rc, out.getvalue(), err.getvalue()) == (0, "", "")
+    assert [r["event"] for r in read_insight_rows(ws, home=home)] == ["inventory", "heartbeat"]
 
 
 def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
