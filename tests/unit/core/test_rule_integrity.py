@@ -124,12 +124,65 @@ def test_dotted_prefix_for_imports_and_suffix_for_calls_and_decorators(tmp_path)
     assert found.code == "forbid_ast" and "decorator 'app.route'" in found.message
 
 
-def test_a_forbid_ast_option_this_version_cannot_compare_must_be_carried_over(tmp_path):
-    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"imports": ["os"], "where": ["x"]}))
-    dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"imports": ["os"]}))
-    assert codes(weakenings(base, dropped)) == ["forbid_ast"]
-    widened = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"imports": ["os"], "where": ["x", "y"]}))
-    assert weakenings(base, widened) == []
+def test_a_call_entry_where_is_compared_and_a_top_level_key_the_enforcer_rejects_is_not(tmp_path):
+    entry = "{name: eval, where: {x: {equals: 1}}}"
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [entry], "where": ["x"]}))
+    dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": [entry]}))
+    assert weakenings(base, dropped) == []  # verification.runner refuses a top-level where: it bound nothing
+    narrowed = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: {equals: 2}}}"]}))
+    (found,) = weakenings(base, narrowed)
+    assert found.code == "forbid_ast" and "call 'eval' is no longer forbidden everywhere it was" in found.message
+
+
+RUN_SHELL = "{name: subprocess.run, where: {shell: {equals: true}}}"
+
+
+@pytest.mark.parametrize("entry", [
+    "{name: subprocess.run, where: {shell: {equals: never-matches}}}",
+    "{name: subprocess.run, where: {shell: {equals: 1}}}",
+    "{name: subprocess.run, where: {shell: {equals: true}, cwd: {equals: x}}}",
+    "{name: subprocess.run, where: {shell: {equals: true}}, builtin: true}",
+    "{name: subprocess.run, where: {shell: {equals: true}}, unknown: skip}",
+    "{name: subprocess.run, where: {shell: {equals: true}}, unknown: bogus}",
+    "{name: subprocess.runx, where: {shell: {equals: true}}}",
+], ids=["never", "one", "addkey", "builtin", "skip", "bogus", "rename"])
+def test_each_narrowing_of_a_call_entry_is_one_finding(tmp_path, entry):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [RUN_SHELL]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [entry, "os.system"]}))
+    found = weakenings(base, head)
+    assert [w.code for w in found] == ["forbid_ast"] and "call 'subprocess.run'" in found[0].message
+
+
+def test_a_where_or_builtin_added_to_a_plain_call_narrows_it_and_removing_them_does_not(tmp_path):
+    plain = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": ["eval"]}))
+    where = parsed(tmp_path / "w", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: {equals: never}}}"]}))
+    (found,) = weakenings(plain, where)
+    assert "call 'eval' is no longer forbidden everywhere it was (its where, builtin or unknown was narrowed)" in found.message
+    builtin = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, builtin: true}"]}))
+    assert codes(weakenings(plain, builtin)) == ["forbid_ast"]
+    assert weakenings(builtin, plain) == []
+
+
+@pytest.mark.parametrize("base_entry,entries", [
+    (RUN_SHELL, [RUN_SHELL]),
+    (RUN_SHELL, ["{where: {shell: {equals: true}}, call: subprocess.run}"]),
+    (RUN_SHELL, ["{name: subprocess.run, where: {shell: {equals: true}}, unknown: flag, builtin: false}"]),
+    (RUN_SHELL, ["{name: run, where: {shell: {equals: true}}}"]),
+    (RUN_SHELL, ["{name: subprocess.run}"]),
+    (RUN_SHELL, ["subprocess.run"]),
+    ("{name: subprocess.run, where: {shell: {equals: true}, cwd: {equals: x}}}", [RUN_SHELL]),
+    (RUN_SHELL, [RUN_SHELL, "eval", "{name: exec, builtin: true}"]),
+], ids=["same", "alias", "flag", "broader", "nowhere", "plain", "dropkey", "added"])
+def test_an_equal_or_broader_call_entry_is_not_a_weakening(tmp_path, base_entry, entries):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [base_entry]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [*entries, "os.system"]}))
+    assert weakenings(base, head) == []
+
+
+def test_the_compared_call_keys_are_the_keys_the_enforcer_accepts():
+    from aegis_core.verification.runner import _CALL_SPEC_KEYS
+
+    assert set(rule_integrity._CallEntry._fields) | {"call"} == set(_CALL_SPEC_KEYS)
 
 
 def test_a_detect_key_must_stay_an_exact_superset(tmp_path):

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import os
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from aegis_core import gitsafe
 from aegis_core.config import read_user_config
@@ -252,6 +252,63 @@ def _forbid_tokens(spec: Any, kind: str = "calls") -> List[str]:
 
 _forbid_patterns = _forbid_tokens
 
+# A value no version defines counts below "ignore": it cannot be shown to bind as much (fail closed).
+_UNKNOWN_STRICTNESS = {"ignore": 0, "skip": 0, "report": 1, "flag": 2}
+
+
+class _CallEntry(NamedTuple):
+    name: str
+    where: Optional[Mapping[str, Any]]
+    builtin: bool
+    unknown: int
+
+
+def _call_entries(spec: Any) -> List[_CallEntry]:
+    """The ``calls`` entries as ``ast.policy._eval_call_entry`` reads them."""
+    from aegis_core.ast.schema import _normalize_ast_token
+
+    values = spec.get("calls") if isinstance(spec, Mapping) else spec
+    if isinstance(values, str):
+        values = [values]
+    entries: List[_CallEntry] = []
+    for value in values if isinstance(values, (list, tuple)) else ():
+        if isinstance(value, str):
+            entry = _CallEntry(_normalize_ast_token(value), None, False, _UNKNOWN_STRICTNESS["report"])
+        elif isinstance(value, Mapping):
+            where = value.get("where")
+            entry = _CallEntry(
+                _normalize_ast_token(str(value.get("name") or value.get("call") or "")),
+                where if isinstance(where, Mapping) and where else None,
+                bool(value.get("builtin")),
+                _UNKNOWN_STRICTNESS.get(str(value.get("unknown") or "report"), -1),
+            )
+        else:
+            continue
+        if entry.name:
+            entries.append(entry)
+    return entries
+
+
+def _same_value(a: Any, b: Any) -> bool:
+    # Type-strict: YAML ``true`` and ``1`` match different call sites.
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        return set(a) == set(b) and all(_same_value(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _call_covers(head: _CallEntry, base: _CallEntry) -> bool:
+    if not _dotted_covers("calls", head.name, base.name):
+        return False
+    if (head.builtin and not base.builtin) or head.unknown < base.unknown:
+        return False
+    # A where is a conjunction: a head that keeps a subset of the base conjuncts matches more sites.
+    return head.where is None or (
+        base.where is not None
+        and all(k in base.where and _same_value(c, base.where[k]) for k, c in head.where.items())
+    )
+
 
 def _is_superset(before: Any, after: Any) -> bool:
     if before is None:
@@ -271,14 +328,18 @@ def _forbid_findings(base: Rule, head: Rule) -> List[str]:
         return ["forbid_ast was removed"]
     lost: List[str] = []
     for kind in _FORBID_KINDS:
+        if kind == "calls":
+            heads = _call_entries(after)
+            for entry in _call_entries(before):
+                if not any(_call_covers(other, entry) for other in heads):
+                    named = any(_dotted_covers(kind, other.name, entry.name) for other in heads)
+                    lost.append(f"call {entry.name!r} is no longer forbidden" + (
+                        " everywhere it was (its where, builtin or unknown was narrowed)" if named else ""))
+            continue
         kept = _forbid_patterns(after, kind)
         for pattern in _forbid_patterns(before, kind):
             if not any(_dotted_covers(kind, other, pattern) for other in kept):
                 lost.append(f"{kind[:-1]} {pattern!r} is no longer forbidden")
-    if isinstance(before, dict):
-        for kind in sorted(k for k in before if k not in _FORBID_KINDS):
-            if not _is_superset(before.get(kind), after.get(kind)):
-                lost.append(f"forbid_ast option {kind!r} is not an exact superset")
     return lost
 
 
