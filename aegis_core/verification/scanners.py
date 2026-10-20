@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import posixpath
 import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -311,6 +312,27 @@ def _count_repo_suppressions(workspace_root: Path | str | None, diff_text: str |
     return count
 
 
+def _sarif_artifact(uri: str, root: Path | None) -> tuple[str, Path | None]:
+    """(repo-relative label, file safe to read) for a SARIF artifact URI. The URI is scanner output
+    about untrusted code (``a/../../x``, an absolute path, a symlink out): only a real location
+    inside ``root`` is readable; otherwise the label keeps no traversal segment and nothing is read."""
+    uri = uri[7:] if uri.startswith("file://") else uri
+    label = "/".join(s for s in posixpath.normpath(Path(uri).as_posix()).split("/") if s not in ("", ".", "..")) if uri else ""
+    if root is None or not uri:
+        return label, None
+    try:
+        real = Path(os.path.realpath(Path(uri) if Path(uri).is_absolute() else root / uri))
+        return real.relative_to(root).as_posix(), real
+    except (OSError, ValueError):  # outside the tree, a NUL byte, ELOOP, ENAMETOOLONG
+        return label, None
+
+
+def _mask_tier_a(text: str) -> str:
+    for rx in TIER_A_PATTERNS.values():
+        text = rx.sub(lambda m: mask_secret(m.group(0)), text)
+    return text
+
+
 def ingest_sarif(
     sarif_data: str | bytes | Mapping[str, Any] | Path,
     *,
@@ -347,27 +369,24 @@ def ingest_sarif(
             msg = str((res.get("message") or {}).get("text") or "")
             phys = ((res.get("locations") or [{}])[0].get("physicalLocation") or {})
             uri = str((phys.get("artifactLocation") or {}).get("uri") or "")
-            uri = uri[7:] if uri.startswith("file://") else uri
-            rel_path = uri.lstrip("./")
-            if root_path and uri:
-                try:
-                    rel_path = Path(uri).resolve().relative_to(root_path).as_posix()
-                except ValueError:
-                    rel_path = Path(uri).as_posix().lstrip("./")
+            rel_path, readable = _sarif_artifact(uri, root_path)
             region = phys.get("region") or {}
             line_no = int(region.get("startLine") or 0)
             snippet_raw = (region.get("snippet") or {}).get("text")
-            if snippet_raw is None and root_path and rel_path and line_no > 0 and (root_path / rel_path).is_file():
-                lines = (root_path / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
+            if snippet_raw is None and readable is not None and line_no > 0:
+                try:
+                    lines = readable.read_text(encoding="utf-8", errors="replace").splitlines() if readable.is_file() else []
+                except OSError:
+                    lines = []
                 snippet_raw = lines[line_no - 1] if 1 <= line_no <= len(lines) else None
             norm_line = " ".join(str(snippet_raw if snippet_raw is not None else msg).split())
-            fp = sarif_fingerprint(rule_id, rel_path, norm_line)
+            fp = sarif_fingerprint(rule_id, rel_path, norm_line)  # over the raw line; only the masked one is shown
             all_findings.append(
                 Finding(
                     rule_id,
                     rel_path,
                     line_no,
-                    norm_line,
+                    _mask_tier_a(norm_line),
                     "gate",
                     fp,
                     "error" if level == "error" else "warning",

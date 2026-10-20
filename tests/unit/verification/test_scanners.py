@@ -264,6 +264,99 @@ class TestSarifIngest:
         assert report["suppression_count"] == 5
 
 
+def _sarif_for(uri: str, *, line: int = 1, snippet: str | None = None, message: str = "reported message") -> dict:
+    region: dict = {"startLine": line}
+    if snippet is not None:
+        region["snippet"] = {"text": snippet}
+    return {"version": "2.1.0", "runs": [{"results": [{
+        "ruleId": "S100", "level": "error", "message": {"text": message},
+        "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri}, "region": region}}],
+    }]}]}
+
+
+class TestSarifIngestStaysInsideWorkspace:
+    """R-checks-16: ingest_sarif reads only files whose real location is inside the workspace,
+    labels paths from the workspace (not the cwd) with dot-directories intact, never raises on
+    a bad URI and never displays an unmasked secret line."""
+
+    SENTINEL = "TOP-SECRET-OUTSIDE-LINE"
+
+    @pytest.fixture
+    def tree(self, tmp_path: Path):
+        ws = tmp_path / "ws"
+        (ws / "sub").mkdir(parents=True)
+        (ws / ".github").mkdir()
+        (ws / "sub" / "app.py").write_bytes(b"first\nin-tree line\n")
+        (ws / ".github" / "ci.yml").write_bytes(b"on: push\n")
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(self.SENTINEL.encode() + b"\n")
+        return ws, outside
+
+    @staticmethod
+    def _only_finding(doc: dict, ws: Path) -> scanners.Finding:
+        report = scanners.ingest_sarif(doc, workspace_root=ws)
+        assert (report["status"], report["total_raw"]) == ("fail", 1)  # kept, never silently dropped
+        return report["findings"][0]
+
+    @pytest.mark.parametrize("form", ["dotdot", "leading-dotdot", "absolute", "file-uri"])
+    def test_a_uri_outside_the_workspace_is_not_read(self, tree, form):
+        ws, outside = tree
+        uri = {"dotdot": "sub/../../outside.txt", "leading-dotdot": "../outside.txt",
+               "absolute": str(outside), "file-uri": "file://" + str(outside)}[form]
+        finding = self._only_finding(_sarif_for(uri), ws)
+        assert self.SENTINEL not in json.dumps(finding.as_dict())
+        assert finding.snippet == "reported message"
+        assert ".." not in finding.path.split("/")
+
+    def test_a_symlink_out_of_the_workspace_is_not_followed(self, tree):
+        ws, outside = tree
+        try:
+            os.symlink(outside.parent, ws / "escape")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are unavailable")
+        finding = self._only_finding(_sarif_for("escape/outside.txt"), ws)
+        assert self.SENTINEL not in json.dumps(finding.as_dict())
+        assert finding.snippet == "reported message"
+
+    def test_the_base_document_is_confined_the_same_way(self, tree):
+        ws, _ = tree
+        doc = _sarif_for("sub/../../outside.txt")
+        base = [f.fingerprint for f in scanners.ingest_sarif(doc, workspace_root=ws)["findings"]]
+        report = scanners.ingest_sarif(doc, workspace_root=ws, base_fingerprints=base)
+        assert (report["status"], report["base_subtracted"]) == ("pass", 1)
+
+    @pytest.mark.parametrize("uri", ["sub/app.py", "./sub/app.py", "ABS", "FILE"])
+    def test_an_in_tree_uri_reads_the_reported_line(self, tree, uri):
+        ws, _ = tree
+        target = ws / "sub" / "app.py"
+        uri = {"ABS": str(target), "FILE": "file://" + str(target)}.get(uri, uri)
+        finding = self._only_finding(_sarif_for(uri, line=2), ws)
+        assert (finding.path, finding.line, finding.snippet) == ("sub/app.py", 2, "in-tree line")
+
+    def test_paths_resolve_against_the_workspace_and_keep_dot_directories(self, tree, monkeypatch):
+        ws, _ = tree
+        monkeypatch.chdir(ws / "sub")
+        nested = self._only_finding(_sarif_for("sub/app.py", line=2), ws)
+        dotted = self._only_finding(_sarif_for(".github/ci.yml"), ws)
+        assert (nested.path, nested.snippet) == ("sub/app.py", "in-tree line")
+        assert (dotted.path, dotted.snippet) == (".github/ci.yml", "on: push")
+        assert scanners.ingest_sarif(_sarif_for(".github/ci.yml"))["findings"][0].path == ".github/ci.yml"
+
+    @pytest.mark.parametrize("uri", ["bad\0name.py", "x/" + "y" * 5000], ids=["nul", "long"])
+    def test_an_unresolvable_uri_is_kept_without_raising(self, tree, uri):
+        ws, _ = tree
+        assert self._only_finding(_sarif_for(uri), ws).snippet == "reported message"
+
+    def test_a_secret_on_the_disk_line_is_displayed_masked(self, tree):
+        ws, _ = tree
+        token = _tier_a_samples()["github-pat"]
+        (ws / "sub" / "keys.py").write_bytes(f"TOKEN = '{token}'\n".encode())
+        finding = self._only_finding(_sarif_for("sub/keys.py"), ws)
+        assert token not in json.dumps(finding.as_dict())
+        assert finding.snippet == f"TOKEN = '{scanners.mask_secret(token)}'"
+        assert finding.fingerprint == scanners.sarif_fingerprint("S100", "sub/keys.py", f"TOKEN = '{token}'")
+
+
 class TestExternalScannerPresets:
     def test_ruff_preset_argv_isolated_and_ignores_s603_s607(self, tmp_path: Path) -> None:
         argv = scanners.build_preset_argv("ruff", tmp_path)
