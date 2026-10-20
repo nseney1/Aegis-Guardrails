@@ -95,6 +95,8 @@ COVERAGE_SAMPLES: Tuple[str, ...] = (
     "sitecustomize.py",
     "evil.pth",
     "Makefile",
+    *(f"{name}.py" for name in governance.RUNNER_MODULES),
+    *(f"{name}/__init__.py" for name in governance.RUNNER_MODULES),
 )
 _CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 _OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")
@@ -286,6 +288,8 @@ def codeowners_lines(owner: str = "@OWNER") -> List[str]:
         "sitecustomize.py",
         "*.pth",
         "Makefile",
+        *(f"{name}.*" for name in governance.RUNNER_MODULES),
+        *(f"/{name}/" for name in governance.RUNNER_MODULES),
     ]
     return [f"{path} {owner}" for path in paths]
 

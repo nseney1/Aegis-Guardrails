@@ -113,3 +113,28 @@ def test_a_leading_double_star_also_matches_at_the_top_level():
     from aegis_core import match
 
     assert match.matches("**/.aegis/rules/**", ".aegis/rules/x.md")
+
+
+# Given a root module that `python -m pytest` would import instead of the runner (the snapshot root
+# is first on sys.path), When its path is classified, Then it is test infrastructure.
+@pytest.mark.parametrize("path", [
+    "pytest.py", "_pytest.py", "pluggy.py", "py.py", "iniconfig.py", "pytest.pyc", "pytest.so",
+    "pytest.cpython-312-x86_64-linux-gnu.so", "pytest.cp312-win_amd64.pyd", "PYTEST.PY", "pytest/__init__.py",
+    "_pytest/__init__.py", "pluggy/__init__.py", "py/__init__.py", "iniconfig/__init__.py",
+], ids=lambda p: p.replace("/__init__.py", "-pkg").replace("cpython-312-x86_64-linux-gnu", "abi")[:20])
+def test_a_module_that_shadows_the_runner_is_test_infra(path):
+    assert governance.touches_governance([path]) == ["test-infra"]
+
+
+# Sad path: names that only resemble a runner module, or a package below the root, stay outside.
+@pytest.mark.parametrize("path", [
+    "pytest.md", "pytest_helpers.py", "mypytest.py", "numpy.py", "docs/pytest/usage.md", "src/pytest/__init__.py",
+    "pytest/__main__.py", "py/helpers/util.py", "tests/pytest_cases.py", "pytestx/__init__.py",
+], ids=lambda p: p.replace("/", "-")[:20])
+def test_a_name_that_only_resembles_a_runner_module_is_outside(path):
+    assert governance.touches_governance([path]) == []
+    assert governance.category_of(path) is None
+
+
+def test_the_runner_modules_are_named():
+    assert governance.RUNNER_MODULES == ("pytest", "_pytest", "pluggy", "py", "iniconfig")

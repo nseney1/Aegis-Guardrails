@@ -204,4 +204,6 @@ CODEOWNERS_FULL = (
     "/allowed_signers @octo\n/CODEOWNERS @octo\n/.github/CODEOWNERS @octo\n/.github/workflows/ @octo\n"
     "conftest.py @octo\npytest.ini @octo\n.pytest.ini @octo\npytest.toml @octo\n.pytest.toml @octo\n"
     "tox.ini @octo\nsetup.cfg @octo\npyproject.toml @octo\nsitecustomize.py @octo\n*.pth @octo\nMakefile @octo\n"
+    "pytest.* @octo\n_pytest.* @octo\npluggy.* @octo\npy.* @octo\niniconfig.* @octo\n"
+    "/pytest/ @octo\n/_pytest/ @octo\n/pluggy/ @octo\n/py/ @octo\n/iniconfig/ @octo\n"
 )

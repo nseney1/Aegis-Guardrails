@@ -35,6 +35,11 @@ def test_the_full_codeowners_covers_every_governance_sample():
     assert uncovered == [] and covered
 
 
+def test_every_coverage_sample_is_a_governance_path():
+    assert [s for s in human_gate.COVERAGE_SAMPLES if governance.category_of(s) is None] == []
+    assert {"pytest.py", "pytest/__init__.py", "iniconfig.py", "py/__init__.py"} <= set(human_gate.COVERAGE_SAMPLES)
+
+
 def test_the_codeowners_lines_doctor_prints_cover_the_whole_set_it_checks():
     text = "\n".join(human_gate.codeowners_lines("@octo"))
     for location in (".github/CODEOWNERS", "CODEOWNERS"):
