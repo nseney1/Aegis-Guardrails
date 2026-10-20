@@ -76,7 +76,7 @@ ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
 
 _REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "half_life_sessions", "epsilon"})
 # tests, rules, perf and regression are read through read_user_config by their own consumers.
-_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression"})
+_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci"})
 # Keys a repository might use to smuggle in a command. Only these names (aegis's own
 # vocabulary) are ever echoed in a warning; any other unknown key is only counted,
 # since warnings reach the agent and key names are repo-chosen text.
@@ -87,6 +87,7 @@ _COMMAND_KEYS = frozenset({
 _MAX_LISTED = 5
 _LISTABLE_DRIVER_KEY = re.compile(r"ast_driver(?:_[a-z0-9]{1,8})?")
 _EXTENSION = re.compile(r"[a-z0-9]{1,8}")
+_WORKFLOW_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml")
 
 
 class ConfigError(AegisValidationError):
@@ -435,6 +436,7 @@ class UserConfig:
     slots: Mapping[str, str] = field(default_factory=dict)
     warnings: Tuple[str, ...] = ()
     arbiter_vendor: Optional[str] = None
+    ci_workflow: Optional[str] = None
 
     @classmethod
     def load(cls, workspace_root: Any = None, user: Optional[UserLayout] = None) -> "UserConfig":
@@ -479,7 +481,30 @@ class UserConfig:
             warnings.append(f"ignored 'slots' in {USER_LABEL}: it must be an object")
         raw_vendor = raw.get("arbiter_vendor")
         arbiter_vendor = str(raw_vendor).strip() if isinstance(raw_vendor, str) and raw_vendor.strip() else None
-        return cls(drivers=drivers, slots=slots, warnings=tuple(warnings), arbiter_vendor=arbiter_vendor)
+        ci_workflow = None
+        if "ci" in raw:
+            raw_ci = raw["ci"]
+            ci_workflow = ci_workflow_name(raw_ci.get("workflow")) if isinstance(raw_ci, dict) else None
+            if ci_workflow is None:
+                warnings.append(f"ignored 'ci.workflow' in {USER_LABEL}: it must be a bare .yml or .yaml file name")
+        return cls(drivers=drivers, slots=slots, warnings=tuple(warnings), arbiter_vendor=arbiter_vendor,
+                   ci_workflow=ci_workflow)
+
+
+def ci_workflow_name(value: Any) -> Optional[str]:
+    """``value`` when it is a bare workflow file name (``aegis.yml``): 1 to 100 characters of
+    ``[A-Za-z0-9._-]`` ending ``.yml`` or ``.yaml``, no leading dot, no ``..``; else None."""
+    if isinstance(value, str) and len(value) <= 100 and _WORKFLOW_NAME.fullmatch(value) and ".." not in value:
+        return value
+    return None
+
+
+def user_ci_workflow(workspace_root: Any = None) -> Optional[str]:
+    """``ci.workflow`` of the user-scope config when usable: the workflow whose runs confirm credit.
+    The repository config never names it (an agent could point credit at a workflow it controls)."""
+    raw = read_user_config(workspace_root) or {}
+    ci = raw.get("ci")
+    return ci_workflow_name(ci.get("workflow")) if isinstance(ci, dict) else None
 
 
 def read_user_config(

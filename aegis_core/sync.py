@@ -173,7 +173,7 @@ def _default_gh_runner(argv: List[str], cwd: Optional[str] = None) -> Any:
 def sync(
     workspace: Any, apply: bool = False, now: Optional[datetime] = None, *,
     pr: bool = False, gh_runner: Optional[Callable[..., Any]] = None,
-    ci_client: Any = None, workflow: str = "validate.yml",
+    ci_client: Any = None, workflow: Optional[str] = None,
 ) -> SyncResult:
     """Rebuild derived state under the workspace lock; optionally apply transitions or open a PR."""
     from aegis_core import credit

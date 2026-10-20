@@ -26,7 +26,7 @@ __all__ = [
     "EVENTS", "MAX_REPORT_ROWS_PER_SESSION", "CIUnavailable", "Credit", "CreditProjection",
     "GhRestClient", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
-    "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows",
+    "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "required_workflow",
     "record_adjudication", "record_detection", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
     "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
@@ -484,10 +484,19 @@ def _reverted(top: Path, branch: str, commits: Mapping[str, Any]) -> Set[str]:
     return {c for c in commits if c in named}
 
 
+def required_workflow(root: Any) -> str:
+    """The workflow whose runs confirm credit: ``ci.workflow`` of the user-scope config, else
+    ``validate.yml``. Never the repository config or a ledger row (SECURITY.md truth table, row 2)."""
+    from aegis_core.config import user_ci_workflow
+
+    return user_ci_workflow(root) or DEFAULT_WORKFLOW
+
+
 def confirm(
-    root: Any, *, client: Any, workflow: str = DEFAULT_WORKFLOW,
+    root: Any, *, client: Any, workflow: Optional[str] = None,
     landed: Optional[Callable[..., Optional[str]]] = None, branch: Optional[str] = None,
 ) -> Dict[str, Any]:
+    workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
     rows, look = read_rows(root), landed or landed_lookup(root)
     if landed is not None:
@@ -725,13 +734,14 @@ def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, A
 
 
 def project_credits(
-    root: Any, *, view: Any = None, client: Any = None, workflow: str = DEFAULT_WORKFLOW,
+    root: Any, *, view: Any = None, client: Any = None, workflow: Optional[str] = None,
     attestation_runner: Optional[Callable[..., Any]] = None,
     landed: Optional[Callable[..., Optional[str]]] = None,
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
     verify_ci: bool = False,
 ) -> CreditProjection:
     from aegis_core import release_verify
+    workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
     look = landed or landed_lookup(root)
     if landed is not None:
