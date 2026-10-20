@@ -23,8 +23,6 @@ from . import ToolEvidence
 
 __all__ = ["check", "apply_mutation_point", "collect_mutations_from_ast"]
 
-_STDLIB_SUBPROCESS_RUN = subprocess.run
-
 
 # ── AST Mutation Visitors ──────────────────────────────────────────────────
 
@@ -455,48 +453,34 @@ def _check_tests(
         env["PYTHONPATH"] = sys_dirs
     cmd += list(test_files)
     try:
-        if subprocess.run is not _STDLIB_SUBPROCESS_RUN:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=timeout,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-            )
-            returncode = result.returncode
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": env,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
-            popen_kwargs: dict[str, Any] = {
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "replace",
-                "env": env,
-            }
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            else:
-                popen_kwargs["start_new_session"] = True
-            proc = subprocess.Popen(cmd, **popen_kwargs)
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            out_str, err_str = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
+            stdout = out_str or ""
+            stderr = err_str or ""
+        except subprocess.TimeoutExpired:
+            checkrun.kill_group(proc)
             try:
-                out_str, err_str = proc.communicate(timeout=timeout)
-                returncode = proc.returncode
-                stdout = out_str or ""
-                stderr = err_str or ""
-            except subprocess.TimeoutExpired:
+                proc.communicate()
+            except Exception:
+                pass
+            raise
+        finally:
+            if os.name != "nt" or getattr(proc, "poll", lambda: None)() is None:
                 checkrun.kill_group(proc)
-                try:
-                    proc.communicate()
-                except Exception:
-                    pass
-                raise
-            finally:
-                if os.name != "nt" or getattr(proc, "poll", lambda: None)() is None:
-                    checkrun.kill_group(proc)
     except subprocess.TimeoutExpired:
         return TestRunResult(
             passed=False,

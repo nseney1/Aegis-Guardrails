@@ -17,6 +17,7 @@ REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproj
 sys.path.insert(0, REPO_ROOT)
 
 from aegis_core.verification import ToolEvidence
+from tests.helpers_popen import install_fake_popen
 from unittest.mock import patch, MagicMock
 
 
@@ -549,10 +550,7 @@ class TestPolyglotMutationTesterCoverage:
             assert "pytest executable could not be resolved" in ev.detail
 
         # 2. Timeout
-        def mock_timeout(*a, **kw):
-            raise subprocess.TimeoutExpired("pytest", 30)
-
-        monkeypatch.setattr(subprocess, "run", mock_timeout)
+        install_fake_popen(monkeypatch, hang=True)
         with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]):
             ev = mutation_tester.check(str(src), "inc", str(test))
             assert ev.verdict is False
@@ -560,12 +558,7 @@ class TestPolyglotMutationTesterCoverage:
             assert "within 30s" in ev.detail
 
         # 3. Failure exit code
-        def mock_fail(*a, **kw):
-            return subprocess.CompletedProcess(
-                args=["pytest"], returncode=1, stdout="", stderr="AssertionError: expected 2 got 3"
-            )
-
-        monkeypatch.setattr(subprocess, "run", mock_fail)
+        install_fake_popen(monkeypatch, returncode=1, stderr="AssertionError: expected 2 got 3")
         with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]):
             ev = mutation_tester.check(str(src), "inc", str(test))
             assert ev.verdict is False
@@ -573,10 +566,7 @@ class TestPolyglotMutationTesterCoverage:
             assert "AssertionError" in ev.detail
 
         # 4. Execution error (OSError)
-        def mock_err(*a, **kw):
-            raise OSError("disk read failure")
-
-        monkeypatch.setattr(subprocess, "run", mock_err)
+        install_fake_popen(monkeypatch, spawn_error=OSError("disk read failure"))
         with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]):
             ev = mutation_tester.check(str(src), "inc", str(test))
             assert ev.verdict is False
@@ -670,3 +660,45 @@ class TestModuleSwapStaging:
         assert mock_popen.called
         assert mock_kill_group.called
 
+
+class TestCheckTestsSpawn:
+    """The spawn path does not depend on whether a test replaced subprocess.run (R-checks-52)."""
+
+    def test_pytest_runs_through_popen_in_its_own_group_even_when_run_is_replaced(self, tmp_path, monkeypatch):
+        import subprocess
+        from aegis_core.verification import mutation_tester
+
+        test = tmp_path / "test_trivial.py"
+        test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            spawned.append(kwargs)
+            return real_popen(*args, **kwargs)
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("pytest must not be started through subprocess.run")
+
+        monkeypatch.setattr(subprocess, "run", refuse)
+        monkeypatch.setattr(subprocess, "Popen", spy)
+        res = mutation_tester._check_tests([str(test)], timeout=600)
+
+        assert (res.status, res.detail) == ("pass", "")
+        assert len(spawned) == 1
+        if os.name == "nt":
+            assert spawned[0]["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            assert spawned[0]["start_new_session"] is True
+
+    def test_a_spawn_is_killed_as_a_group_after_it_ends(self, tmp_path, monkeypatch):
+        from aegis_core.verification import mutation_tester
+
+        test = tmp_path / "test_trivial.py"
+        test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        spawns = install_fake_popen(monkeypatch, returncode=0)
+        with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]):
+            res = mutation_tester._check_tests([str(test)], timeout=60)
+
+        assert res.status == "pass"
+        assert [(s["timeouts"], s["killed"] >= (0 if os.name == "nt" else 1)) for s in spawns] == [([60], True)]

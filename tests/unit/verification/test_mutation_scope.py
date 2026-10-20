@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import subprocess
 import textwrap
 from typing import Optional
 from unittest.mock import patch
@@ -17,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from aegis_core.verification import mutation_tester, runner
+from tests.helpers_popen import install_fake_popen
 
 _STRONG = """\
     from pkg.mod import double
@@ -276,12 +276,13 @@ class TestMutantReachesEveryImporter:
 
     def test_no_test_files_fails_closed_without_running_pytest(self, tmp_path, monkeypatch):
         root = _repo(tmp_path, {})
-        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("pytest must not run"))
+        spawns = install_fake_popen(monkeypatch)
 
         ev = mutation_tester.check(str(root / "pkg/mod.py"), "double", [])
 
         assert ev.verdict is False
         assert ev.detail == "could not assess: no test file to run"
+        assert spawns == []
 
     def test_source_that_cannot_be_regenerated_fails_closed(self, tmp_path, monkeypatch):
         root = _repo(tmp_path, {"tests/test_mod.py": _STRONG})
@@ -406,17 +407,11 @@ class TestRunTimeouts:
     def test_baseline_timeout_is_reported_with_its_limit(self, tmp_path, monkeypatch, count, timeout, note):
         root = _repo(tmp_path, {f"tests/test_t{i:02d}.py": _STRONG for i in range(count)})
         files = [str(root / f"tests/test_t{i:02d}.py") for i in range(count)]
-        limits = []
-
-        def hang(cmd, **kwargs):
-            limits.append(kwargs.get("timeout"))
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
-
-        monkeypatch.setattr(subprocess, "run", hang)
+        spawns = install_fake_popen(monkeypatch, hang=True)
         with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]):
             ev = mutation_tester.check(str(root / "pkg/mod.py"), "double", files)
 
         assert ev.verdict is False
         assert ev.detail == f"could not assess (timeout): the baseline run did not finish within {timeout}s ({note})"
         assert ev.lines == [-1]
-        assert limits == [timeout]
+        assert [s["timeouts"][0] for s in spawns] == [timeout]
