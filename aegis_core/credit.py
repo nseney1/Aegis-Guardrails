@@ -2,6 +2,11 @@
 
 Only a passing ``check`` row that ran tests (``aegis check --record --tests``) is a witness: it is
 what ``submit_report`` credits and what the commit hook writes a trailer for.
+
+A credit is voided by a CI failure on its landing commit (a later CI success on the same commit
+supersedes that) or by a terminal ``void`` row: a trailer divergence in ``check --ci``
+(``ci_divergence``), a failed lane or test-integrity gate (``lane_integrity``, ``check --lane``) or
+a revert of its landing commit on the protected branch (``reverted``, found by ``confirm``).
 """
 from __future__ import annotations
 
@@ -24,7 +29,7 @@ __all__ = [
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows",
     "record_adjudication", "record_detection", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
-    "verify_commit_trailers", "witnessed_exposed_rules",
+    "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
 MAX_REPORT_ROWS_PER_SESSION = 200
@@ -446,6 +451,38 @@ def record_void(root: Any, check_id: str, reason: str) -> Dict[str, Any]:
         return ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "void", "check": check_id, "reason": reason}])[0]
 
 
+def void_tree(root: Any, tree: str, reason: str) -> int:
+    """Void every ``check`` row of ``tree`` that has no void yet (one ``void`` row per check id, under
+    one ledger lock); returns how many were written. ``void`` rows are terminal."""
+    with ledger_locked(root):
+        rows = read_rows(root)
+        done = {r.get("check") for r in _of(rows, "void")}
+        ids = [c["id"] for c in _of(rows, "check") if c.get("tree") == tree and isinstance(c.get("id"), str)]
+        fresh = [i for i in dict.fromkeys(ids) if i not in done]
+        if fresh:
+            stamp = _now()
+            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "void", "check": i,
+                                       "reason": reason} for i in fresh])
+        return len(fresh)
+
+
+_REVERTS = re.compile(r"This reverts commit ([0-9a-f]{64}|[0-9a-f]{40})\b")
+
+
+def _reverted(top: Path, branch: str, commits: Mapping[str, Any]) -> Set[str]:
+    """Landed commits a ``This reverts commit <oid>`` line on the protected branch names. The message
+    is agent-writable text, which is acceptable here: it can only void credit, never grant it."""
+    ref = next((r for r in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}") if gitsafe.resolve_commit(top, r)), None)
+    if ref is None:
+        return set()
+    # -z: git refuses a NUL in a message, so a message cannot forge a record boundary (PC-3).
+    res = gitsafe.run(["log", "-z", "--max-count=500", "--format=%H%n%B", ref], top)
+    if res.returncode != 0:
+        raise gitsafe.GitError(f"git log {ref} failed (exit {res.returncode})")
+    named = set(_REVERTS.findall(res.stdout.decode("utf-8", "replace")))
+    return {c for c in commits if c in named}
+
+
 def confirm(
     root: Any, *, client: Any, workflow: str = DEFAULT_WORKFLOW,
     landed: Optional[Callable[..., Optional[str]]] = None, branch: Optional[str] = None,
@@ -478,6 +515,15 @@ def confirm(
                 _UNAVAILABLE_CI.add((c_root, commit))
             summary["errors"].append(str(exc))
             return summary
+    top = gitsafe.toplevel(Path(str(root)))
+    if commits and target_branch and top is not None:
+        try:
+            for commit in sorted(_reverted(top, target_branch, commits)):
+                for check_id in commits.pop(commit):
+                    record_void(root, check_id, "reverted")
+                    summary["voided"] += 1
+        except gitsafe.GitError as exc:
+            summary["errors"].append(f"cannot read the history of {target_branch}: {exc}")
     for commit, checks in commits.items():
         try:
             runs = client.runs_for(commit)

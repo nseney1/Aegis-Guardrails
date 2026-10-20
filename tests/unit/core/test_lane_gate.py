@@ -1374,3 +1374,76 @@ def test_unreadable_pytest_settings_raise(name: str, text: str):
     data = text.encode("latin-1") if text == "\xff" else text.encode("utf-8")
     with pytest.raises(ValueError):
         lane_gate.pytest_settings(name, data)
+
+
+# ── A failed integrity gate voids the credit of the lane's tree (R-trust-65) ─
+
+def _credited_head(repo: Repo, check_id: str = "c-lane") -> str:
+    from aegis_core.telemetry_engine import ledger
+
+    tree = _git(repo.root, "rev-parse", "HEAD^{tree}")
+    stamp = "2026-10-20T00:00:00Z"
+    ledger.append_rows(repo.root, [
+        {"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "check", "id": check_id, "tree": tree, "witness": "aegis",
+         "passed": True, "tests": {"exit": 0, "passed": 1}},
+        {"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "check": check_id, "tree": tree,
+         "rule": "trap-sample", "result": "tp"},
+    ])
+    return tree
+
+
+def _lane_cli(repo: Repo, monkeypatch, *extra: str) -> int:
+    from aegis_cli.cli import main
+
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(repo.root.parent / "home"))
+    monkeypatch.chdir(repo.root)
+    return main(["check", "--lane", "docs", "--base", "main", *extra])
+
+
+def _voids(repo: Repo) -> List[tuple]:
+    from aegis_core import credit
+
+    return [(r["check"], r["reason"]) for r in credit.read_rows(repo.root) if r.get("event") == "void"]
+
+
+def test_a_failed_integrity_gate_voids_the_checks_of_the_lane_tree(repo: Repo, monkeypatch):
+    from aegis_core import credit
+
+    repo.write("tests/test_app.py", TESTS.replace("def test_add():", "@pytest.mark.skip\ndef test_add():"))
+    repo.commit("skip a test")
+    _credited_head(repo)
+    assert _lane_cli(repo, monkeypatch, "--paths", "tests/**") == 1
+    assert _voids(repo) == [("c-lane", "lane_integrity")]
+    derived, = credit.derive(credit.read_rows(repo.root), landed=lambda _tree, _head=None: None)
+    assert (derived.state, derived.reason, derived.counts) == ("voided", "lane_integrity", False)
+
+
+def test_a_clean_lane_or_a_usage_error_voids_nothing(repo: Repo, monkeypatch):
+    repo.write("docs/guide.md", "guide v2\n")
+    repo.commit("docs")
+    _credited_head(repo)
+    assert _lane_cli(repo, monkeypatch, "--paths", "docs/**") == 0
+    assert _lane_cli(repo, monkeypatch, "--paths", "docs/../x") == 2
+    assert _voids(repo) == []
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="POSIX permission bits, not root")
+def test_a_ledger_that_cannot_be_written_keeps_the_lane_exit_code(repo: Repo, monkeypatch, capsys):
+    from aegis_core.telemetry_engine import ledger
+
+    repo.write("tests/test_app.py", TESTS.replace("def test_sub():\n    assert 2 - 1 == 1\n", ""))
+    repo.commit("drop a test")
+    _credited_head(repo)
+    state = Path(ledger.ledger_path(repo.root)).parent
+    for entry in state.iterdir():
+        entry.chmod(0o444)
+    state.chmod(0o555)
+    try:
+        capsys.readouterr()
+        assert _lane_cli(repo, monkeypatch, "--paths", "tests/**") == 1
+        notes = [line for line in capsys.readouterr().err.splitlines() if "void" in line]
+    finally:
+        state.chmod(0o755)
+    assert len(notes) == 1 and _voids(repo) == []

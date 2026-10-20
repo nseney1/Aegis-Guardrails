@@ -172,6 +172,64 @@ def test_a_void_row_is_terminal_even_when_ci_later_succeeds(tmp_path):
     assert derived.state == "voided" and derived.reason == "ci_divergence" and not derived.counts
 
 
+def _landed_on_main(repo: hg.Repo):
+    """A credited check whose change lands on main (fast-forward); returns (check row, landing commit)."""
+    hv.use_stub_runner(repo.home.path)
+    _edit_app(repo)
+    _scan(repo)
+    out = checkrun.record(repo.root, tests=True)
+    _report(repo)
+    commit = repo.commit("work")
+    repo.git("checkout", "-q", "main")
+    repo.git("merge", "-q", "--ff-only", "work")
+    return out.row, commit
+
+
+def _confirm_on_main(repo: hg.Repo, commit: str):
+    return credit.confirm(repo.root, client=hv.FakeCI([hv.ci_run(commit)]), workflow=hv.CI_WORKFLOW,
+                          landed=_landed(repo))
+
+
+@needs_git
+def test_a_reverted_landing_voids_its_credit(tmp_path):
+    repo = hv.make_project(tmp_path)
+    row, commit = _landed_on_main(repo)
+    repo.git("revert", "--no-edit", commit)
+    summary = _confirm_on_main(repo, commit)
+    assert [(r["check"], r["reason"]) for r in hv.rows_of(repo.root, "void")] == [(row["id"], "reverted")]
+    assert summary["voided"] == 1 and summary["confirmed"] == 0
+    derived, = _credits(repo)
+    assert (derived.state, derived.reason, derived.counts) == ("voided", "reverted", False)
+
+
+@needs_git
+def test_a_revert_of_another_commit_voids_nothing(tmp_path):
+    repo = hv.make_project(tmp_path)
+    _row, commit = _landed_on_main(repo)
+    repo.write("other.txt", "x\n")
+    repo.commit(f"unrelated\n\nThis reverts commit {'b' * 40}.")
+    _confirm_on_main(repo, commit)
+    assert hv.rows_of(repo.root, "void") == []
+    assert [c.state for c in _credits(repo)] == ["confirmed"]
+
+
+@needs_git
+def test_a_failing_history_read_is_an_error_and_voids_nothing(tmp_path, monkeypatch):
+    repo = hv.make_project(tmp_path)
+    _row, commit = _landed_on_main(repo)
+    repo.git("revert", "--no-edit", commit)
+    real = credit.gitsafe.run
+
+    def no_log(args, cwd, *rest, **kw):
+        if args and args[0] == "log":
+            return subprocess.CompletedProcess(["git", *args], 128, b"", b"fatal: bad object")
+        return real(args, cwd, *rest, **kw)
+
+    monkeypatch.setattr(credit.gitsafe, "run", no_log)
+    summary = _confirm_on_main(repo, commit)
+    assert summary["errors"] and hv.rows_of(repo.root, "void") == []
+
+
 # ── 2. Hidden files cannot fake a pass ───────────────────────────────────────
 
 @needs_git
