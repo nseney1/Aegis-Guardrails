@@ -77,6 +77,19 @@ EXEC_FLAGS_WITH_ARG = frozenset({
     "-a"
 })
 
+# Wrappers that run the rest of the line after their own options.
+OPTION_WRAPPER_FLAGS_WITH_ARG: Dict[str, frozenset] = {
+    "ionice": frozenset({"-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "setsid": frozenset(),
+    "busybox": frozenset(),
+}
+
+SU_COMMAND_FLAGS = frozenset({"-c", "--command", "--session-command"})
+SU_FLAGS_WITH_ARG = SU_COMMAND_FLAGS | {
+    "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-w", "--whitelist-environment"
+}
+
 GIT_GLOBAL_FLAGS_WITH_ARG = frozenset({
     "-C", "-c", "--exec-path", "--config-env", "--work-tree", "--namespace", "--git-dir"
 })
@@ -342,6 +355,39 @@ def decompose_command(tokens: list[str]) -> list[Pipeline]:
 
 # ── Wrapper & Keyword Unwrapping Automaton ────────────────────────────────────
 
+def _consume_option(tokens: list[str], idx: int, with_arg: frozenset) -> tuple[str, str | None, int]:
+    """The option at ``tokens[idx]`` as ``(spelling, value, next index)``: ``--name=value``,
+    ``--name value``, or a ``-xyz`` bundle, which ends at its first letter that takes a
+    value (the rest of the token, else the next token)."""
+    tok = tokens[idx]
+    following = tokens[idx + 1] if idx + 1 < len(tokens) else None
+    if tok.startswith("--"):
+        name, eq, value = tok.partition("=")
+        if eq or name not in with_arg:
+            return name, value if eq else None, idx + 1
+        return name, following, idx + 2
+    for pos in range(1, len(tok)):
+        if "-" + tok[pos] in with_arg:
+            if pos + 1 < len(tok):
+                return "-" + tok[pos], tok[pos + 1:], idx + 1
+            return "-" + tok[pos], following, idx + 2
+    return tok, None, idx + 1
+
+
+def _su_command(tokens: list[str], idx: int) -> str | None:
+    """The command ``su`` runs: the last -c/--command value anywhere after it (su passes
+    arguments after ``--`` to the shell, so the scan does not stop there)."""
+    command = None
+    while idx < len(tokens):
+        if tokens[idx].startswith("-"):
+            spelling, value, idx = _consume_option(tokens, idx, SU_FLAGS_WITH_ARG)
+            if spelling in SU_COMMAND_FLAGS:
+                command = value
+        else:
+            idx += 1
+    return command
+
+
 def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, str | None]:
     """Peel keywords, wrappers (with full option consumption), env vars, and expansions.
     
@@ -389,10 +435,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
                     idx += 1
                     break
                 if stok.startswith("-"):
-                    idx += 1
-                    if "=" not in stok and stok in SUDO_FLAGS_WITH_ARG:
-                        if idx < len(tokens):
-                            idx += 1
+                    _, _, idx = _consume_option(tokens, idx, SUDO_FLAGS_WITH_ARG)
                 else:
                     break
             continue
@@ -406,10 +449,10 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
                     idx += 1
                     break
                 if etok.startswith("-"):
-                    idx += 1
-                    if "=" not in etok and etok in ENV_FLAGS_WITH_ARG:
-                        if idx < len(tokens):
-                            idx += 1
+                    spelling, value, idx = _consume_option(tokens, idx, ENV_FLAGS_WITH_ARG)
+                    if spelling in ("-S", "--split-string"):
+                        # The value is a command line; the words after it stay words.
+                        return None, " ".join([value or ""] + [shlex.quote(t) for t in tokens[idx:]]).strip()
                 elif ENV_VAR_RE.match(etok):
                     k, _, v = etok.partition("=")
                     env_vars[k] = v
@@ -520,6 +563,21 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
                 else:
                     break
             continue
+
+        # 7e. option-only wrappers: skip their options, the program follows
+        if base in OPTION_WRAPPER_FLAGS_WITH_ARG:
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                _, _, idx = _consume_option(tokens, idx, OPTION_WRAPPER_FLAGS_WITH_ARG[base])
+            continue
+
+        # 7f. su: the su stage itself (sudo su is still sudo) and the command it runs
+        if base == "su":
+            su_stage = UnwrappedCommand("su", None, [], [], has_sudo=has_sudo, env_vars=env_vars)
+            return su_stage, _su_command(tokens, idx + 1)
 
         # 8. eval builtin (evaluates remaining tokens as inner command)
         if base == "eval":
@@ -934,8 +992,9 @@ _SQL_DESTRUCTIVE = ("DROP TABLE", "DROP DATABASE", "DELETE FROM", "TRUNCATE TABL
 # ``<<\EOF``), matched where _split_heredocs finds an unquoted ``<<`` that is not a
 # ``<<<`` here-string.
 _HEREDOC = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3")
-# A heredoc these read is a script they run, so its body is checked as commands.
-_HEREDOC_SHELLS = SHELL_INTERPRETERS | {"ssh", "ash", "mksh"}
+# A heredoc these read is a script they run, so its body is checked as commands
+# (su without -c starts a shell that reads it).
+_HEREDOC_SHELLS = SHELL_INTERPRETERS | {"ssh", "ash", "mksh", "su"}
 
 BLOCK_SET: Tuple[GuardRule, ...] = (
     GuardRule(
@@ -1094,8 +1153,8 @@ def _feeds_a_shell(line: str, command_start: int, operator: int) -> bool:
         except ValueError:  # an unbalanced quote that closes on a later line
             continue
         for stage in pipelines[0].stages if pipelines else []:
-            unwrapped, _ = unwrap_command_stage(stage.raw_tokens)
-            if unwrapped is not None and unwrapped.binary.split("<<", 1)[0] in _HEREDOC_SHELLS:
+            unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
+            if inner is None and unwrapped is not None and unwrapped.binary.split("<<", 1)[0] in _HEREDOC_SHELLS:
                 return True
         return False
     return False
@@ -1273,7 +1332,7 @@ def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
             unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
             if inner:
                 _guard_scan(inner, depth + 1, found)
-            elif unwrapped is not None:
+            if unwrapped is not None:
                 found.extend(_guard_stage(unwrapped))
                 if unwrapped.binary == "git":
                     _guard_git_alias(unwrapped, depth, found)
