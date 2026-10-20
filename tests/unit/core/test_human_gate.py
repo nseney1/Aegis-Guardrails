@@ -731,7 +731,7 @@ def test_the_aegis_jobs_of_a_workflow_are_the_jobs_that_run_aegis_check_ci():
         "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruff check .\n"
         "  gate:\n    name: Aegis gate  # the check name\n    steps:\n      - name: Gate\n"
         "        run: python3 -m aegis_cli.cli check --ci\n"
-        "  block:\n    steps:\n      - run: |\n          pip install aegis-guardrails\n          aegis check --ci --base main\n"
+        "  block:\n    steps:\n      - run: pip install aegis-guardrails\n      - run: |\n          aegis check --ci --base main\n"
         "  local:\n    steps:\n      - run: aegis check\n"))
     assert human_gate.aegis_check_jobs(text) == ["Aegis gate", "block"]
 
@@ -806,6 +806,105 @@ def test_an_aegis_workflow_only_in_the_working_tree_is_not_trusted(tmp_path):
     report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()]))
     assert report.tier != "A"
     assert any("the required checks do not include the Aegis job" in r for r in report.reasons), report.reasons
+
+
+# GitHub reports a job skipped by a condition as a passing required check, so only an Aegis job that
+# nothing can skip, and whose aegis step can fail it, is the required check.
+
+def _gate_workflow(job_keys="", step="      - run: aegis check --ci\n", top=""):
+    return ("name: Aegis\non:\n  pull_request:\n" + top + "jobs:\n"
+            "  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ruff check .\n"
+            "  aegis-check:\n" + job_keys + "    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: actions/checkout@v7\n" + step)
+
+
+def _tier_with_base_workflow(tmp_path, workflow):
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), workflow=workflow)
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    return human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule("aegis-check")]))
+
+
+_CONDITION = "has a condition (if: {}) and may be skipped"
+_STEP_CONDITION = "runs aegis check --ci in a step that has a condition (if: {})"
+_NOT_DIRECT = "does not run aegis check --ci as the whole of a step's run:"
+
+
+@needs_git
+@pytest.mark.parametrize("job_keys, step, top, why", [
+    ("    if: github.event_name == 'push'\n", None, "", _CONDITION.format("github.event_name == 'push'")),
+    ("    if: github.event.pull_request.draft == false\n", None, "",
+     _CONDITION.format("github.event.pull_request.draft == false")),
+    ("    if: ${{ !contains(github.event.pull_request.title, 'skip-aegis') }}\n", None, "", "has a condition (if: ${{ !contains("),
+    ("    if: always() && github.event_name == 'pull_request'\n", None, "", "has a condition (if: always() &&"),
+    ("    if: always()\n      && github.event_name == 'push'\n", None, "", "has a condition (if: always()"),
+    ("    \"if\": github.event_name == 'push'\n", None, "", _CONDITION.format("github.event_name == 'push'")),
+    ("    needs: [lint]\n", None, "", "needs other jobs without if: always()"),
+    ("    continue-on-error: true\n", None, "", "sets continue-on-error"),
+    ("    continue-on-error: ${{ github.event_name == 'pull_request' }}\n", None, "", "sets continue-on-error"),
+    ("    <<: *defaults\n", None, "", "is not laid out as this check reads a workflow"),
+    ("    \"name\": Aegis gate\n", None, "", "is not laid out as this check reads a workflow"),
+    ("", "      - if: github.event_name == 'push'\n        run: aegis check --ci\n", "",
+     _STEP_CONDITION.format("github.event_name == 'push'")),
+    ("", "      - run: aegis check --ci\n        if: false\n", "", _STEP_CONDITION.format("false")),
+    ("", "      - run: |\n          aegis check --ci\n        if: false\n", "", _STEP_CONDITION.format("false")),
+    ("", "      - run: aegis check --ci\n        continue-on-error: true\n", "", "runs aegis check --ci in a step that sets continue-on-error"),
+    ("", "      - run: aegis check --ci || true\n", "", _NOT_DIRECT),
+    ("", "      - run: aegis check --ci || :\n", "", _NOT_DIRECT),
+    ("", "      - run: aegis check --ci || exit 0\n", "", _NOT_DIRECT),
+    ("", "      - run: aegis check --ci; true\n", "", _NOT_DIRECT),
+    ("", "      - run: aegis check --ci; exit 0\n", "", _NOT_DIRECT),
+    ("", "      - run: aegis check --ci | tee aegis.log\n", "", _NOT_DIRECT),
+    ("", "      - run: echo aegis check --ci\n", "", _NOT_DIRECT),
+    ("", "      - run: printf 'aegis check --ci'\n", "", _NOT_DIRECT),
+    ("", "      - run: true  # aegis check --ci\n", "", _NOT_DIRECT),
+    ("", "      - run: bash -c 'echo \"aegis check --ci\"'\n", "", _NOT_DIRECT),
+    ("", "      - run: |\n          set +e\n          aegis check --ci\n          echo done\n", "", _NOT_DIRECT),
+    ("", "      - run: |\n          cat <<EOF\n          aegis check --ci\n          EOF\n", "", _NOT_DIRECT),
+    ("", "      - run: >\n          echo\n          aegis check --ci\n", "", _NOT_DIRECT),
+    ("", "      - run: aegis check --ci\n        shell: cat {0}\n", "", "runs aegis check --ci under a custom shell (cat {0})"),
+    ("", None, "defaults:\n  run:\n    shell: cat {0}\n", "runs aegis check --ci under a custom shell (cat {0})"),
+    ("", None, "defaults: {run: {shell: cat {0}}}\n", "runs aegis check --ci under a custom shell ({run: {shell: cat {0}}})"),
+], ids=["if-push", "if-draft", "if-title", "if-always-and", "if-folded", "if-quoted-key", "needs", "job-continue",
+        "job-continue-expr", "merge-key", "name-quoted-key", "step-if", "step-if-after-run", "step-if-after-block", "step-continue",
+        "or-true", "or-colon", "or-exit", "semi-true", "semi-exit", "pipe", "echo", "printf", "comment", "quoted",
+        "set-e-off", "heredoc", "folded", "step-shell", "default-shell", "inline-default-shell"])
+def test_an_aegis_job_that_can_be_skipped_or_cannot_fail_is_not_the_required_check(tmp_path, job_keys, step, top, why):
+    """Given a base-branch Aegis job, required by name, that a condition can skip or whose aegis step
+    cannot fail it, When the tier is detected, Then it is tier C and the reason says why the job does not count."""
+    workflow = _gate_workflow(job_keys, step or "      - run: aegis check --ci\n", top)
+    assert human_gate.aegis_check_jobs(workflow) == []
+    report = _tier_with_base_workflow(tmp_path, workflow)
+    assert report.tier == "C"
+    assert any("the Aegis job aegis-check " + why in r for r in report.reasons), report.reasons
+
+
+@needs_git
+@pytest.mark.parametrize("job_keys, step", [
+    ("", "      - run: aegis check --ci\n"),
+    ("    if: always()\n", "      - run: aegis check --ci\n"),
+    ("    needs: [lint]\n    if: ${{ always() }}\n", "      - run: aegis check --ci\n"),
+    ("    needs:\n      - lint\n    if: \"${{always()}}\"  # aggregate\n", "      - run: aegis check --ci\n"),
+    ("    continue-on-error: false\n",
+     "      - name: Gate\n        if: always()\n        continue-on-error: false\n        run: aegis check --ci  # the gate\n"),
+    ("", "      - run: |\n          aegis check --ci --base main\n"),
+    ("", "      - run: python3 -m aegis_cli.cli check --ci\n        shell: bash\n"),
+    ("", "      - run: echo aegis check --ci\n      - run: aegis check --ci\n"),
+], ids=["plain", "if-always", "needs-always-expr", "needs-always-tight", "continue-false", "block", "module-bash",
+        "decoy-then-real"])
+def test_an_unconditional_aegis_job_that_can_fail_is_the_required_check(tmp_path, job_keys, step):
+    workflow = _gate_workflow(job_keys, step)
+    assert human_gate.aegis_check_jobs(workflow) == ["aegis-check"]
+    report = _tier_with_base_workflow(tmp_path, workflow)
+    assert report.tier == "A", report.reasons
+
+
+@needs_git
+def test_this_repositorys_validate_workflow_on_the_base_branch_meets_the_check_criterion(tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    text = (root / ".github" / "workflows" / "validate.yml").read_text(encoding="utf-8")
+    report = _tier_with_base_workflow(tmp_path, text)
+    assert report.tier == "A", report.reasons
+    assert report.evidence["aegis_checks"]["jobs"] == ["aegis-check"]
 
 
 @needs_git

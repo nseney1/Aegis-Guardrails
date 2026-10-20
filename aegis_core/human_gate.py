@@ -120,8 +120,16 @@ _EXEMPT_TEST_LINE = re.compile(
 _JOB_ID = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?$")
 _JOB_NAME = re.compile(r"""^    name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^#\n]*?))[ \t]*(?:#.*)?$""")
 _JOB_MATRIX = re.compile(r"^    strategy:.*\bmatrix\b|^      matrix[ \t]*:")
-_RUN = re.compile(r"^([ \t]*)(?:-[ \t]+)?run:[ \t]*(.*)$")
 _AEGIS_CHECK_CI = re.compile(r"(?:\baegis|-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check\b[^\n]*?[ \t]--ci(?![\w-])")
+# The whole of a script that fails exactly when aegis fails, in any built-in shell: no operator, quote or expansion.
+_DIRECT_CHECK = re.compile(r"(?:aegis|python3?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?:[ \t]+[\w./=:@%+,-]+)*")
+_KEY = re.compile(r"""["']?([\w-]+)["']?[ \t]*:(?:[ \t]+(.*))?""")
+_ALWAYS = re.compile(r"""(["']?)(?:\$\{\{[ \t]*always\(\)[ \t]*\}\}|always\(\))\1""")
+_SHELLS = ("bash", "sh", "pwsh", "powershell", "cmd", "python")
+_PATH_FILTER_WHY = ("the Aegis workflow filters pull requests by path (paths: or paths-ignore: under "
+                    "on.pull_request), so it does not run on every pull request")
+_UNREAD_WHY = ("is not laid out as this check reads a workflow (job keys four spaces in, steps as a list of "
+               "key: value lines, no YAML merge key or repeated key)")
 _PR_EVENT = re.compile(r"""["']?\bpull_request(?:_target)?["']?[ \t]*:[ \t]*""")
 _PATHS_KEY = re.compile(r"""(?:^|[\s{,])["']?paths(?:-ignore)?["']?[ \t]*:""")
 _MAX_WORKFLOW_LINES = 5000
@@ -671,7 +679,8 @@ def detect_tier(
     evidence["codeowners"] = codeowners
     evidence["allowed_signers"] = signers
     aegis_jobs = _base_aegis_jobs(top, tracked)
-    evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs), "path_filtered": sorted(j for j, f in aegis_jobs.items() if f)}
+    evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs),
+                                "path_filtered": sorted(j for j, why in aegis_jobs.items() if why == _PATH_FILTER_WHY)}
     custody = check_key_custody(top)
     evidence["key_custody"] = custody.as_dict()
 
@@ -757,10 +766,10 @@ def detect_tier(
 
 
 def _required_check_gaps(
-    facts: Optional[Mapping[str, Any]], aegis_jobs: Mapping[str, bool]
+    facts: Optional[Mapping[str, Any]], aegis_jobs: Mapping[str, Optional[str]]
 ) -> Tuple[Optional[str], Optional[str]]:
     """Why a passing required check would not show that Aegis ran in CI: (a source anyone with write
-    access can post as, a required check that is not an Aegis job or whose workflow skips pull requests)."""
+    access can post as, a required check that is not an Aegis job that counts, with why it does not)."""
     checks = facts["required_status_checks"] if facts else []
     unpinned = facts["unpinned_status_checks"] if facts else []
     source = (
@@ -769,14 +778,14 @@ def _required_check_gaps(
         f"(app {GITHUB_ACTIONS_APP_ID}) in the ruleset"
     ) if unpinned else None
     required = [c for c in checks if c in aegis_jobs]
+    counted = sorted(j for j, why in aegis_jobs.items() if why is None)
     if checks and not required:
         return source, "the required checks do not include the Aegis job: " + (
-            f"require {', '.join(sorted(aegis_jobs))}" if aegis_jobs else
+            f"require {', '.join(counted)}" if counted else aegis_jobs[min(aegis_jobs)] if aegis_jobs else
             "no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix"
         )
     if required and all(aegis_jobs[c] for c in required):
-        return source, ("the Aegis workflow filters pull requests by path (paths: or paths-ignore: under "
-                        "on.pull_request), so it does not run on every pull request")
+        return source, aegis_jobs[required[0]]
     return source, None
 
 
@@ -806,9 +815,9 @@ def _tracked_governance_entries(workspace: Any, rev: str) -> Dict[str, Tuple[str
     return {path: entry for path, entry in entries.items() if governance.category_of(path) is not None}
 
 
-def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[str, bool]:
-    """{check name of an Aegis job: whether its workflow filters pull requests by path}, read from
-    the base branch's workflow files (GitHub reads no subdirectory and no symlink there)."""
+def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[str, Optional[str]]:
+    """{check name of an Aegis job: why it is not the required check, None when it is}, read from the
+    base branch's workflow files (GitHub reads no subdirectory and no symlink there)."""
     workflows = {
         path: oid
         for path, (mode, oid) in tracked.items()
@@ -818,12 +827,12 @@ def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[
         blobs = gitsafe.read_blobs(top, workflows.values())
     except gitsafe.GitError:
         return {}
-    jobs: Dict[str, bool] = {}
+    jobs: Dict[str, Optional[str]] = {}
     for path in sorted(workflows):
         text = blobs[workflows[path]].decode("utf-8", "replace")
-        filtered = _filters_pull_requests_by_path(text)
-        for name in aegis_check_jobs(text):
-            jobs[name] = jobs.get(name, False) or filtered
+        filtered = _PATH_FILTER_WHY if _filters_pull_requests_by_path(text) else None
+        for name, why in _aegis_job_verdicts(text).items():
+            jobs[name] = jobs.get(name) or why or filtered
     return jobs
 
 
@@ -1245,38 +1254,139 @@ def build_ruleset(tier: str, contexts: Iterable[str]) -> Dict[str, Any]:
 
 
 def aegis_check_jobs(text: str) -> List[str]:
-    """The check names (literal ``name:``, else the job id) of the jobs in one workflow file that run
-    ``aegis check --ci``. A templated name or a matrix gives no fixed check name, so that job is left out."""
-    jobs: Dict[str, List[Any]] = {}
-    job: Optional[List[Any]] = None
-    in_jobs, block = False, None
-    for line in text.splitlines()[:_MAX_WORKFLOW_LINES]:
-        if not line.strip() or line.lstrip().startswith("#"):
+    """The check names (literal ``name:``, else the job id) of the jobs in one workflow file that count as
+    the required Aegis check. A templated name or a matrix gives no fixed check name, so that job is left out."""
+    return [name for name, why in _aegis_job_verdicts(text).items() if why is None]
+
+
+def _value(text: Optional[str]) -> str:
+    return re.sub(r"(?:^|[ \t]+)#.*$", "", text or "").strip()
+
+
+def _step_line(step: Dict[str, Any], indent: int, body: str) -> None:
+    step["col"] = indent if step["col"] is None else step["col"]
+    if indent == step["col"]:
+        found = _KEY.fullmatch(body)
+        if not found or found.group(1) in step["vals"]:
+            step["bad"] = True
+            return
+        step["key"], value = found.group(1), found.group(2) or ""
+        step["vals"][step["key"]] = value
+        if step["key"] == "run":
+            step["literal"] = bool(re.fullmatch(r"\|[-+]?", _value(value)))
+            step["script"] = [] if step["literal"] else [_value(value)] if value[:1] not in ("", "|", ">") else None
+            step["runs"] = bool(_AEGIS_CHECK_CI.search(value))
+    elif indent < step["col"]:
+        step["bad"] = True
+    elif step["key"] == "run":
+        step["runs"] = step["runs"] or bool(_AEGIS_CHECK_CI.search(body))
+        step["script"] = step["script"] + [_value(body)] if step["literal"] else None
+    elif step["key"] in ("if", "continue-on-error", "shell"):
+        step["vals"][step["key"]] += " ..."
+
+
+def _skip_why(vals: Mapping[str, str]) -> Optional[str]:
+    cond, coe = (_value(vals[k]) if k in vals else None for k in ("if", "continue-on-error"))
+    if cond is not None and not _ALWAYS.fullmatch(cond):
+        return f"has a condition (if: {cond}) and may be skipped, which GitHub reports as a passing check"
+    return "sets continue-on-error, so it passes even when aegis check fails" if coe not in (None, "false") else None
+
+
+def _step_why(step: Mapping[str, Any], default_shell: Optional[str]) -> Optional[str]:
+    """Why a step that mentions ``aegis check --ci`` may not fail its job; None when it does."""
+    shell = _value(step["vals"]["shell"]) if "shell" in step["vals"] else default_shell
+    script, skips = step["script"] or [], _skip_why(step["vals"])
+    if step["bad"]:
+        return _UNREAD_WHY
+    if skips:
+        return "runs aegis check --ci in a step that " + skips
+    if shell not in (None, *_SHELLS):
+        return f"runs aegis check --ci under a custom shell ({shell}), so whether its failure fails the job is not visible"
+    if len(script) != 1 or not _DIRECT_CHECK.fullmatch(script[0]) or "--ci" not in script[0].split():
+        return ("does not run aegis check --ci as the whole of a step's run: with plain arguments (it is echoed, quoted, "
+                "commented out, combined with other commands or followed by || true), so its failure may not fail the job")
+    return None
+
+
+def _aegis_job_verdicts(text: str) -> Dict[str, Optional[str]]:
+    """{check name: None when the job counts as the required Aegis check, else why not}, for the jobs of one
+    workflow file that run ``aegis check --ci`` under a literal name, outside a matrix. GitHub reports a job
+    skipped by a condition as a passing required check, so a job counts only when nothing can skip it and an
+    Aegis step can fail it; a layout this line reader cannot follow does not count."""
+    jobs: Dict[str, Dict[str, Any]] = {}
+    job: Optional[Dict[str, Any]] = None
+    step: Optional[Dict[str, Any]] = None
+    section, key, seq, wf_shell = "", "", -1, None
+    lines = text.splitlines()
+    for line in [*lines[:_MAX_WORKFLOW_LINES], "end:"]:
+        body = line.strip()
+        if not body or body.startswith("#"):
             continue
         indent = len(line) - len(line.lstrip())
+        if step is not None and indent > seq:
+            _step_line(step, indent, body)
+            continue
+        step, item = None, re.match(r"-(?:[ \t]+|$)", body)
         if indent == 0:
-            in_jobs, job = line.startswith("jobs:"), None
+            section, _colon, inline = body.partition(":")
+            section, job = section.strip("\"' "), None
+            if section == "defaults":  # an inline mapping is not read, so a shell it may name counts as custom
+                wf_shell = _value(inline) or wf_shell
+        elif section == "defaults":
+            found = _KEY.fullmatch(body)
+            wf_shell = _value(found.group(2)) if found and found.group(1) == "shell" else wf_shell
+        elif section != "jobs":
             continue
-        found = _JOB_ID.match(line) if in_jobs else None
-        if found:
-            job, block = jobs.setdefault(found.group(1), [found.group(1), False, False]), None
+        elif indent <= 2:
+            found = _JOB_ID.match(line)
+            fresh = {"name": found.group(1) if found else "", "vals": {}, "steps": [], "shell": None,
+                     "bad": False, "matrix": False}
+            job, key = (jobs.setdefault(found.group(1), fresh) if found else None), ""
+            if job is not None and job is not fresh:
+                job["bad"] = True
+        elif job is None:
             continue
-        if job is None:
+        elif key == "steps" and item and indent >= 4 and seq in (-1, indent):
+            seq, rest = indent, body[item.end():]
+            step = {"vals": {}, "key": "", "col": indent + item.end() if rest else None, "script": None,
+                    "literal": False, "runs": False, "bad": False}
+            job["steps"].append(step)
+            if rest:
+                _step_line(step, indent + item.end(), rest)
+        elif indent == 4:
+            found, named, seq = _KEY.fullmatch(body), _JOB_NAME.match(line), -1
+            key = found.group(1) if found else ""
+            # a name key _JOB_NAME cannot read would leave the check named after the job id here, not on GitHub
+            job["bad"] = job["bad"] or not found or key in job["vals"] or (key == "name" and not named)
+            job["vals"][key] = found.group(2) or "" if found else ""
+            if key == "defaults":
+                job["shell"] = _value(job["vals"][key]) or job["shell"]
+            if named:
+                job["name"] = next((g for g in named.groups() if g), "") or job["name"]
+            job["matrix"] = job["matrix"] or bool(_JOB_MATRIX.match(line))
+        elif indent < 4 or key == "steps":
+            job["bad"] = True
+        elif key in ("if", "continue-on-error"):
+            job["vals"][key] += " ..."
+        else:
+            found = _KEY.fullmatch(body)
+            if key == "defaults" and found and found.group(1) == "shell":
+                job["shell"] = _value(found.group(2))
+            job["matrix"] = job["matrix"] or bool(_JOB_MATRIX.match(line))
+    verdicts: Dict[str, Optional[str]] = {}
+    for job in jobs.values():
+        name, vals = job["name"], job["vals"]
+        whys = [_step_why(s, job["shell"] or wf_shell) for s in job["steps"] if s["runs"]]
+        if not whys or job["matrix"] or "${{" in name:
             continue
-        if block is not None and indent > block:
-            job[1] = job[1] or bool(_AEGIS_CHECK_CI.search(line))
-            continue
-        block = None
-        named, run = _JOB_NAME.match(line), _RUN.match(line)
-        if named:
-            job[0] = next((g for g in named.groups() if g), "") or job[0]
-        elif _JOB_MATRIX.match(line):
-            job[2] = True
-        elif run and run.group(2)[:1] in ("|", ">"):
-            block = len(run.group(1))
-        elif run:
-            job[1] = job[1] or bool(_AEGIS_CHECK_CI.search(run.group(2)))
-    return [name for name, runs, matrix in jobs.values() if runs and not matrix and "${{" not in name]
+        if job["bad"] or len(lines) > _MAX_WORKFLOW_LINES:
+            why: Optional[str] = _UNREAD_WHY
+        elif "needs" in vals and "if" not in vals:
+            why = "needs other jobs without if: always(), so a failed or skipped job it needs skips it"
+        else:
+            why = _skip_why(vals) or (None if None in whys else whys[0])
+        verdicts[name] = verdicts.get(name) or (f"the Aegis job {name} {why}" if why else None)
+    return verdicts
 
 
 def ruleset_exists(root: Any, gh: Optional[GhRunner] = None) -> bool:
