@@ -412,6 +412,18 @@ def test_deleting_a_governance_file_changes_the_hash(tmp_path):
 
 
 @needs_git
+def test_a_rule_edit_in_a_nested_workspace_moves_the_hash(tmp_path):
+    repo = hg.Repo(tmp_path / "mono", hg.Home(tmp_path / "home"))
+    repo.write("README.md", "# mono\n")
+    repo.write("pkg/.aegis/rules/traps/trap-sample.md", hg.RULE)
+    repo.commit("base")
+    before = human_gate.governance_tree_hash(repo.root / "pkg", "HEAD")
+    repo.write("pkg/.aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "other"))
+    repo.commit("rule")
+    assert human_gate.governance_tree_hash(repo.root / "pkg", "HEAD") != before
+
+
+@needs_git
 def test_an_unresolvable_revision_is_an_error(tmp_path):
     repo = hg.make_repo(tmp_path)
     with pytest.raises(human_gate.HumanGateError):

@@ -88,3 +88,28 @@ def test_an_empty_change_touches_nothing_and_non_string_entries_are_ignored():
 def test_a_path_with_dot_segments_does_not_escape_the_table():
     # normalize_path strips ./ ; a traversal stays a different path and is not governance.
     assert governance.touches_governance(["src/../README.md"]) == []
+
+
+@pytest.mark.parametrize("path,category", [
+    ("pkg/.aegis/rules/invariants/x.md", "rules"),
+    ("a/b/.aegis/baseline.json", "aegis-state"),
+    ("pkg/.aegis/config.json", "aegis-state"),
+    ("pkg/.aegis/team.json", "aegis-state"),
+    (".AEGIS/Rules/X.md", "rules"),
+], ids=["rules", "baseline", "config", "team", "folded"])
+def test_a_nested_workspace_aegis_directory_is_governance_wherever_it_sits(path, category):
+    assert governance.category_of(path) == category
+
+
+@pytest.mark.parametrize("path", [
+    "docs/aegis-notes.md", "src/aegis/config.json", "x.aegis/config.json", "pkg/.aegis/state/ledger.jsonl",
+    "pkg/.aegis/proposals/p.md",
+], ids=["notes", "srcdir", "suffix", "state", "proposals"])
+def test_names_that_only_resemble_an_aegis_directory_stay_outside(path):
+    assert governance.category_of(path) is None
+
+
+def test_a_leading_double_star_also_matches_at_the_top_level():
+    from aegis_core import match
+
+    assert match.matches("**/.aegis/rules/**", ".aegis/rules/x.md")
