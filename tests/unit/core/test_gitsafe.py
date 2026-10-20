@@ -532,6 +532,20 @@ def test_list_files_under_a_directory(repo: Path):
     assert gitsafe.list_files(repo, ["pkg"], untracked=False) == ["pkg/m.py"]
 
 
+def test_list_files_answers_relative_to_the_workspace_not_the_repository_top(repo: Path, tmp_path: Path):
+    """Given ``pkg/src/a.py`` tracked and ``pkg/new.txt`` untracked, When list_files runs with
+    cwd ``<repo>/pkg``, Then the paths are relative to ``pkg`` (the frame its callers use)."""
+    (repo / "pkg" / "src").mkdir(parents=True)
+    (repo / "pkg" / "src" / "a.py").write_text("a\n", encoding="utf-8")
+    _commit(repo)
+    (repo / "pkg" / "new.txt").write_text("n\n", encoding="utf-8")
+    assert sorted(gitsafe.list_files(repo / "pkg")) == ["new.txt", "src/a.py"]
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if gitsafe.toplevel(plain) is None:
+        assert gitsafe.list_files(plain) is None
+
+
 # ── read_blob ────────────────────────────────────────────────────────────────
 
 def test_read_blob_returns_committed_bytes(repo: Path):

@@ -534,8 +534,8 @@ def list_files(
     tracked: bool = True,
     untracked: bool = True,
 ) -> Optional[List[str]]:
-    """Repo-relative files git knows about under ``paths`` (all when empty): tracked
-    ones and/or untracked, not ignored ones. None when git cannot answer."""
+    """Files git knows about under ``paths`` (all when empty), relative to ``cwd`` (the workspace,
+    not the repository top): tracked and/or untracked, not ignored. None when git cannot answer."""
     args = ["ls-files", "-z"]
     if tracked:
         args.append("--cached")
