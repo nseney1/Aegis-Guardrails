@@ -288,8 +288,8 @@ def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] |
     return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
 
 
-def _count_repo_suppressions(workspace_root: Path | str | None, diff_text: str | None = None) -> int:
-    count = len(_SUPPRESSION_RE.findall(diff_text)) if diff_text else 0
+def _count_repo_suppressions(workspace_root: Path | str | None) -> int:
+    count = 0
     if workspace_root is None:
         return count
     root = Path(workspace_root).resolve()
@@ -333,66 +333,71 @@ def _mask_tier_a(text: str) -> str:
     return text
 
 
+class _SarifError(ValueError):
+    """A SARIF document that cannot be understood; the message names a location, never content."""
+
+
+def _sarif_unverified(reason: str) -> dict[str, Any]:
+    return {"status": "unverified", "reason": reason[:200], "findings": []}
+
+
+def _sarif_obj(value: Any, where: str) -> Mapping[str, Any]:
+    if value and not isinstance(value, Mapping):
+        raise _SarifError(f"{where} must be an object")
+    return value or {}
+
+
+def _sarif_arr(value: Any, where: str) -> Sequence[Any]:
+    if value and not isinstance(value, list):
+        raise _SarifError(f"{where} must be an array")
+    return value or ()
+
+
 def ingest_sarif(
-    sarif_data: str | bytes | Mapping[str, Any] | Path,
+    doc: Mapping[str, Any],
     *,
     workspace_root: Path | str | None = None,
-    base_sarif: str | bytes | Mapping[str, Any] | Path | None = None,
-    base_fingerprints: Iterable[str] | None = None,
-    diff_text: str | None = None,
+    base_fingerprints: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Ingest SARIF 2.1.0, compute fingerprints, subtract base findings, and count suppressions."""
-    def _load(src: Any) -> Mapping[str, Any]:
-        if isinstance(src, Mapping):
-            return src
-        if isinstance(src, Path):
-            return json.loads(src.read_text(encoding="utf-8"))
-        if isinstance(src, bytes):
-            return json.loads(src.decode("utf-8", "replace"))
-        s = str(src).strip()
-        if not s.startswith("{") and Path(s).is_file():
-            return json.loads(Path(s).read_text(encoding="utf-8"))
-        return json.loads(s)
-
-    doc = _load(sarif_data)
+    """Ingest a parsed SARIF 2.1.0 document: fingerprints, base subtraction, suppressions. Scanner
+    output is untrusted: a document that is not understood is ``unverified``, never raised."""
     base_fps: set[str] = set(base_fingerprints or ())
-    if base_sarif is not None:
-        base_fps.update(f.fingerprint for f in ingest_sarif(base_sarif, workspace_root=workspace_root)["findings"])
     root_path = Path(workspace_root).resolve() if workspace_root else None
     all_findings: list[Finding] = []
     sarif_supps = 0
-    for run in doc.get("runs") or []:
-        for res in run.get("results") or []:
-            sarif_supps += len(res.get("suppressions") or ())
-            rule_id = str(res.get("ruleId") or "unknown")
-            level = str(res.get("level") or "warning").lower()
-            msg = str((res.get("message") or {}).get("text") or "")
-            phys = ((res.get("locations") or [{}])[0].get("physicalLocation") or {})
-            uri = str((phys.get("artifactLocation") or {}).get("uri") or "")
-            rel_path, readable = _sarif_artifact(uri, root_path)
-            region = phys.get("region") or {}
-            line_no = int(region.get("startLine") or 0)
-            snippet_raw = (region.get("snippet") or {}).get("text")
-            if snippet_raw is None and readable is not None and line_no > 0:
+    try:
+        if not isinstance(doc, Mapping) or "runs" not in doc:
+            raise _SarifError("the document has no runs array")
+        for ri, run in enumerate(_sarif_arr(doc["runs"], "runs")):
+            for xi, res in enumerate(_sarif_arr(_sarif_obj(run, f"runs[{ri}]").get("results"), f"runs[{ri}].results")):
+                at = f"runs[{ri}].results[{xi}]"
+                res = _sarif_obj(res, at)
+                sarif_supps += len(_sarif_arr(res.get("suppressions"), f"{at}.suppressions"))
+                rule_id = str(res.get("ruleId") or "unknown")
+                level = str(res.get("level") or "warning").lower()
+                msg = str(_sarif_obj(res.get("message"), f"{at}.message").get("text") or "")
+                locs = _sarif_arr(res.get("locations"), f"{at}.locations")
+                phys = _sarif_obj(_sarif_obj(locs[0] if locs else None, f"{at}.locations[0]").get("physicalLocation"), f"{at}.physicalLocation")
+                uri = str(_sarif_obj(phys.get("artifactLocation"), f"{at}.artifactLocation").get("uri") or "")
+                rel_path, readable = _sarif_artifact(uri, root_path)
+                region = _sarif_obj(phys.get("region"), f"{at}.region")
                 try:
-                    lines = readable.read_text(encoding="utf-8", errors="replace").splitlines() if readable.is_file() else []
-                except OSError:
-                    lines = []
-                snippet_raw = lines[line_no - 1] if 1 <= line_no <= len(lines) else None
-            norm_line = " ".join(str(snippet_raw if snippet_raw is not None else msg).split())
-            fp = sarif_fingerprint(rule_id, rel_path, norm_line)  # over the raw line; only the masked one is shown
-            all_findings.append(
-                Finding(
-                    rule_id,
-                    rel_path,
-                    line_no,
-                    _mask_tier_a(norm_line),
-                    "gate",
-                    fp,
-                    "error" if level == "error" else "warning",
-                    msg,
-                )
-            )
+                    line_no = int(region.get("startLine") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    raise _SarifError(f"{at}.region.startLine must be an integer") from None
+                snippet_raw = _sarif_obj(region.get("snippet"), f"{at}.region.snippet").get("text")
+                if snippet_raw is None and readable is not None and line_no > 0:
+                    try:
+                        lines = readable.read_text(encoding="utf-8", errors="replace").splitlines() if readable.is_file() else []
+                    except OSError:
+                        lines = []
+                    snippet_raw = lines[line_no - 1] if 1 <= line_no <= len(lines) else None
+                norm_line = " ".join(str(snippet_raw if snippet_raw is not None else msg).split())
+                fp = sarif_fingerprint(rule_id, rel_path, norm_line)  # over the raw line; only the masked one is shown
+                all_findings.append(Finding(rule_id, rel_path, line_no, _mask_tier_a(norm_line), "gate", fp,
+                                            "error" if level == "error" else "warning", _mask_tier_a(msg)))
+    except _SarifError as exc:
+        return _sarif_unverified(f"SARIF is malformed: {exc}")
     delta = [f for f in all_findings if f.fingerprint not in base_fps]
     return {
         "status": "fail" if delta else "pass",
@@ -400,7 +405,7 @@ def ingest_sarif(
         "total_raw": len(all_findings),
         "delta_count": len(delta),
         "base_subtracted": len(all_findings) - len(delta),
-        "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root, diff_text),
+        "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root),
     }
 
 
@@ -462,10 +467,19 @@ def run_preset_scanner(
     if res.get("missing_binary") or res.get("timed_out"):
         reason = res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found")
         return {"status": "unverified", "reason": reason, "findings": [], "argv": argv}
-    stdout = (res.get("stdout") or "").strip()
-    if stdout.startswith("{"):
-        return {**ingest_sarif(stdout, workspace_root=workspace_root, base_fingerprints=base_fingerprints), "argv": argv}
-    if res.get("returncode", 0) == 0:
-        return {"status": "pass", "findings": [], "suppression_count": _count_repo_suppressions(workspace_root), "argv": argv}
-    return {"status": "unverified", "reason": res.get("stderr") or f"{argv[0]} failed", "findings": [], "argv": argv}
+    # pass needs positive evidence: a SARIF run on stdout and an exit code its findings explain.
+    stdout, stderr = str(res.get("stdout") or "").strip(), str(res.get("stderr") or "").strip()
+    try:
+        doc = json.loads(stdout) if stdout else None
+    except (ValueError, RecursionError):
+        doc = None
+    runs = doc.get("runs") if isinstance(doc, dict) else None
+    if not (isinstance(runs, list) and runs and all(isinstance(run, dict) for run in runs)):
+        why = "produced no SARIF output" if not stdout else "printed output that is not a SARIF run"
+        return {**_sarif_unverified(stderr or f"{argv[0]} {why}"), "argv": argv}
+    report = ingest_sarif(doc, workspace_root=workspace_root, base_fingerprints=base_fingerprints or ())
+    rc = res.get("returncode")
+    if report["status"] == "pass" and not (rc == 0 or (rc == 1 and report["total_raw"] > 0)):
+        return {**_sarif_unverified(stderr or f"{argv[0]} exited {rc} without findings to explain it"), "argv": argv}
+    return {**report, "argv": argv}
 

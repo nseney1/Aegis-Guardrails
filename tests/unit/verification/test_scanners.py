@@ -249,7 +249,7 @@ class TestSarifIngest:
         }
 
         report = scanners.ingest_sarif(
-            json.dumps(sarif_doc),
+            sarif_doc,
             workspace_root=tmp_path,
             base_fingerprints={expected_fp1},
         )
@@ -262,6 +262,17 @@ class TestSarifIngest:
         assert finding.fingerprint == expected_fp2
         # 3 inline suppressions (noqa, nosec, gitleaks:allow) + 2 .gitleaksignore entries = 5
         assert report["suppression_count"] == 5
+
+
+_SARIF_ONE_FINDING = {
+    "runs": [{"results": [{
+        "ruleId": "S307", "level": "error", "message": {"text": "eval"},
+        "locations": [{"physicalLocation": {
+            "artifactLocation": {"uri": "app.py"},
+            "region": {"startLine": 1, "snippet": {"text": "eval(x)"}},
+        }}],
+    }]}],
+}
 
 
 def _sarif_for(uri: str, *, line: int = 1, snippet: str | None = None, message: str = "reported message") -> dict:
@@ -357,6 +368,97 @@ class TestSarifIngestStaysInsideWorkspace:
         assert finding.fingerprint == scanners.sarif_fingerprint("S100", "sub/keys.py", f"TOKEN = '{token}'")
 
 
+def _secret() -> str:
+    return _tier_a_samples()["stripe-live-secret"]
+
+
+def _one_result(**result: object) -> dict:
+    return {"version": "2.1.0", "runs": [{"results": [result]}]}
+
+
+_MALFORMED_DOCS = {
+    "empty-object": {},
+    "error-object": {"error": "config invalid"},
+    "runs-string": {"runs": "x"},
+    "run-string": {"runs": ["x"]},
+    "results-object": {"runs": [{"results": {"a": 1}}]},
+    "result-string": {"runs": [{"results": ["x"]}]},
+    "message-string": _one_result(message="SECRET"),
+    "locations-string": _one_result(locations="SECRET"),
+    "location-string": _one_result(locations=["SECRET"]),
+    "region-string": _one_result(locations=[{"physicalLocation": {"region": "SECRET"}}]),
+    "startline-text": _one_result(locations=[{"physicalLocation": {"region": {"startLine": "SECRET"}}}]),
+    "suppressions-number": _one_result(suppressions=5, message={"text": "SECRET"}),
+}
+
+
+class TestSarifVerdictNeedsACompletedScan:
+    """R-checks-17: a scanner result is ``pass`` only when the scan demonstrably ran and its output
+    was understood; anything else is ``unverified``, and untrusted output never raises."""
+
+    @staticmethod
+    def _fill(value):
+        if isinstance(value, dict):
+            return {k: TestSarifVerdictNeedsACompletedScan._fill(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [TestSarifVerdictNeedsACompletedScan._fill(v) for v in value]
+        return _secret() if value == "SECRET" else value
+
+    @pytest.mark.parametrize("case", sorted(_MALFORMED_DOCS))
+    def test_a_malformed_document_is_unverified_with_a_short_reason(self, case, tmp_path):
+        report = scanners.ingest_sarif(self._fill(_MALFORMED_DOCS[case]), workspace_root=tmp_path)
+        assert (report["status"], report["findings"]) == ("unverified", [])
+        assert 0 < len(report["reason"]) <= 200 and _secret() not in report["reason"]
+
+    def test_a_value_that_is_not_a_mapping_is_unverified(self):
+        assert scanners.ingest_sarif([])["status"] == "unverified"  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("doc", [{"version": "2.1.0", "runs": []}, {"runs": None}, {"runs": [{"results": []}]}],
+                             ids=["runs-empty", "runs-null", "results-empty"])
+    def test_a_valid_empty_document_still_passes(self, doc):
+        report = scanners.ingest_sarif(doc)
+        assert (report["status"], report["total_raw"]) == ("pass", 0)
+
+    @staticmethod
+    def _run(rc, stdout, stderr="scanner said so", base=()):
+        def runner(argv, cwd, env=None, timeout=60):
+            res = {"stdout": stdout, "stderr": stderr}
+            return res if rc == "none" else {**res, "returncode": rc}
+        return scanners.run_preset_scanner("ruff", Path("."), runner=runner, base_fingerprints=base)
+
+    @pytest.mark.parametrize("rc,stdout", [
+        (0, ""), (0, "   \n"), (0, "all good"), (0, "[]"), (0, "null"), (0, "{}"), (0, '{"error":"boom"}'),
+        (0, "\ufeff" + json.dumps(_SARIF_ONE_FINDING)), (0, "INFO scanning\n" + json.dumps(_SARIF_ONE_FINDING)),
+        (0, '{"runs": []}'), (1, '{"version": "2.1.0", "runs": [{"results": ['), (1, '{"runs": [{"results": []}]}'),
+        (2, '{"runs": [{"results": []}]}'), (-9, '{"runs": [{"results": []}]}'), ("none", '{"runs": [{"results": []}]}'),
+        (0, '{"a":' * 100_000), (0, "SECRET not json"),
+    ], ids=["empty", "blank", "text", "array", "null", "object", "error", "bom", "log-prefix", "no-run", "truncated",
+            "rc1-clean", "rc2-clean", "killed", "no-rc", "deep", "secret-text"])
+    def test_output_that_is_not_a_completed_scan_is_unverified(self, rc, stdout):
+        report = self._run(rc, stdout.replace("SECRET", _secret()))
+        assert (report["status"], report["findings"]) == ("unverified", [])
+        assert "scanner said so" in report["reason"] and _secret() not in report["reason"]
+
+    def test_empty_output_without_stderr_names_the_program(self):
+        report = self._run(0, "", stderr="")
+        assert report["status"] == "unverified" and report["reason"] == "ruff produced no SARIF output"
+
+    def test_a_clean_completed_scan_passes(self):
+        assert self._run(0, '{"version": "2.1.0", "runs": [{"results": []}]}')["status"] == "pass"
+
+    @pytest.mark.parametrize("rc", [0, 1, 2])
+    def test_a_new_finding_fails_whatever_the_exit_code(self, rc):
+        report = self._run(rc, json.dumps(_SARIF_ONE_FINDING))
+        assert report["status"] == "fail" and [f.rule_id for f in report["findings"]] == ["S307"]
+
+    def test_the_exit_code_is_judged_on_raw_findings_not_the_base_delta(self):
+        fp = scanners.ingest_sarif(_SARIF_ONE_FINDING)["findings"][0].fingerprint
+        baselined = self._run(1, json.dumps(_SARIF_ONE_FINDING), base=[fp])
+        assert (baselined["status"], baselined["base_subtracted"]) == ("pass", 1)
+        crashed = self._run(2, json.dumps(_SARIF_ONE_FINDING), stderr="crashed", base=[fp])
+        assert (crashed["status"], crashed["reason"]) == ("unverified", "crashed")
+
+
 class TestExternalScannerPresets:
     def test_ruff_preset_argv_isolated_and_ignores_s603_s607(self, tmp_path: Path) -> None:
         argv = scanners.build_preset_argv("ruff", tmp_path)
@@ -413,17 +515,6 @@ class TestExternalScannerPresets:
         res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=fake_missing_runner)
         assert res["status"] == "unverified"
         assert "not found" in res["reason"].lower()
-
-
-_SARIF_ONE_FINDING = {
-    "runs": [{"results": [{
-        "ruleId": "S307", "level": "error", "message": {"text": "eval"},
-        "locations": [{"physicalLocation": {
-            "artifactLocation": {"uri": "app.py"},
-            "region": {"startLine": 1, "snippet": {"text": "eval(x)"}},
-        }}],
-    }]}],
-}
 
 
 def _program(path: Path, body: str) -> Path:
