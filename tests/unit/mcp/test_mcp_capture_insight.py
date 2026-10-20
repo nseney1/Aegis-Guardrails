@@ -30,13 +30,7 @@ def _make_workspace(path: Path) -> Path:
 def test_aegis_capture_insight_schema_and_annotations():
     assert is_known_tool("aegis_capture_insight")
     tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "aegis_capture_insight")
-    assert tool["annotations"] == {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-        "title": "Capture Insight",
-    }
+    assert tool["annotations"] == {"readOnlyHint": False, "title": "Capture Insight"}
     schema = tool["inputSchema"]
     assert schema["required"] == ["quote"]
     assert set(schema["properties"]) == {"quote", "paths"}
