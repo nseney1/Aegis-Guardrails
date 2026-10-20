@@ -1128,6 +1128,10 @@ def _clean_dry_run(args: List[str]) -> bool:
     return dry_run
 
 
+#: The git subcommands _guard_git has rules for; keep the two in step.
+_GUARD_GIT_SUBCOMMANDS = frozenset({"push", "reset", "clean", "merge", "add"})
+
+
 def _guard_git(cmd: UnwrappedCommand) -> List[GuardRule]:
     flags = [f.lstrip("\\") for f in cmd.flags]
     letters = "".join(_short_letters(f) for f in flags)
@@ -1408,29 +1412,46 @@ def _guard_git_alias(
     (``git -c alias.p='push -f' p``), or by the git whose ``!`` alias script runs this one
     (``inherited``; this git's own settings come later, so they win). _guard_git has
     already matched the literal subcommand, so a built-in still wins as it does in git;
-    ``seen`` stops a cycle."""
+    ``seen`` stops a cycle.
+
+    Each link's words replace the alias name in front of the words after it. Those are
+    kept on a stack, last word first, so a link costs only its own words: rebuilding the
+    whole command per link would re-read the tail once per link. Only a link naming a
+    subcommand _guard_git has rules for is rebuilt and judged."""
     own = _git_aliases(cmd)
     aliases = ChainMap(own, inherited) if inherited else own  # not a copy per git stage
+    rest = cmd.tail[::-1]
+    sub = cmd.subcommand
     seen = set()
-    while cmd.subcommand in aliases and cmd.subcommand not in seen:
-        seen.add(cmd.subcommand)
-        value = aliases[cmd.subcommand]
+    while sub in aliases and sub not in seen:
+        seen.add(sub)
+        value = aliases[sub]
         if value.startswith("!"):
             # git runs it with sh -c, the arguments appended, and hands its -c settings to
             # every git the script runs through GIT_CONFIG_PARAMETERS.
             if scan.alias_scripts > 0:
                 scan.alias_scripts -= 1
-                _guard_scan(" ".join([value[1:]] + [shlex.quote(t) for t in cmd.tail]), depth + 1, scan, aliases)
+                arguments = [shlex.quote(t) for t in reversed(rest)]
+                _guard_scan(" ".join([value[1:]] + arguments), depth + 1, scan, aliases)
             return
         try:
             words = shlex.split(value)
         except ValueError:
             return
-        expanded, _ = unwrap_command_stage([cmd.binary, *words, *cmd.tail])
-        if expanded is None:
+        rest.extend(reversed(words))
+        options: List[str] = []  # read as unwrap_command_stage reads what precedes a subcommand
+        while rest and rest[-1].startswith("-"):
+            options.append(rest.pop())
+            if "=" not in options[-1] and options[-1] in GIT_GLOBAL_FLAGS_WITH_ARG and rest:
+                options.append(rest.pop())
+        if not rest:
             return
-        scan.found.extend(_guard_git(expanded))
-        cmd = expanded
+        word = rest.pop()
+        sub = word.lower()
+        if sub in _GUARD_GIT_SUBCOMMANDS:
+            expanded, _ = unwrap_command_stage([cmd.binary, *options, word, *reversed(rest)])
+            if expanded is not None:
+                scan.found.extend(_guard_git(expanded))
 
 
 def _guard_scan(cmd: str, depth: int, scan: _GuardScan, aliases: Optional[Mapping[str, str]] = None) -> bool:

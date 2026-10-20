@@ -333,6 +333,36 @@ def test_a_rerunning_shell_alias_still_finds_its_destructive_git():
     assert _id("git -c alias.q='push -f' -c alias.p='!git p; git p; git q' p") == (GUARD_BLOCK, "git-push-force")
 
 
+def _alias_chain(n, link):
+    """``git`` with an n-link alias chain ending in status, then a 10n-word tail."""
+    links = " ".join(f"-c alias.a{i}='{link(i)}'" for i in range(n))
+    return f"git {links} -c alias.a{n}=status a0 " + "x " * (10 * n)
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("link", [lambda i: f"a{i + 1}", lambda i: f"a{i + 1} y"], ids=["plain", "adds-a-word"])
+def test_an_alias_chain_is_expanded_in_linear_time(link):
+    # A ratio, never an absolute budget; the 20 ms floor keeps timer noise from failing it.
+    # Doubling the chain and the tail doubles a linear expansion and quadruples one that
+    # re-reads the tail at every link.
+    small = _best_of_3(_alias_chain(200, link))
+    large = _best_of_3(_alias_chain(400, link))
+    assert large <= 2.5 * max(small, 0.02), (small, large)
+
+
+@pytest.mark.parametrize("command,rule", [
+    ("git -c alias.a=b -c alias.b='merge feat' a", (GUARD_RECORD, "git-merge")),
+    ("git -c alias.a=b -c alias.b=add a -A", (GUARD_RECORD, "git-add-bulk")),
+    ("git -c alias.a='b -n' -c alias.b='clean -f' a", None),
+    ("git -c alias.a='-c core.pager=cat p' -c alias.p='push -f' a", (GUARD_BLOCK, "git-push-force")),
+    ("git -c alias.p=reset -c alias.reset=status p --hard", (GUARD_BLOCK, "git-reset-hard")),
+], ids=["merge", "add", "clean-dry-run", "leading-option", "shadowed-builtin"])
+def test_every_link_of_an_alias_chain_is_judged_with_the_words_before_it(command, rule):
+    """Each link sees the words earlier links added and the tail, as git builds them, and
+    a link naming a built-in that is also an alias is judged as that built-in."""
+    assert _id(command) == rule
+
+
 @pytest.mark.parametrize("command", [
     "git -c alias.st=status st",
     "git -c alias.p='push origin feat' p",
