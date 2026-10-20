@@ -337,6 +337,74 @@ class TestPemNeedsKeyMaterial:
         assert found == []
 
 
+class TestSnippetsMaskEverySecretOnTheLine:
+    """R-checks-25: a snippet shows no secret-shaped value from its line, whatever the scan mode,
+    the hash-field guard, the dedupe order or whether the format gates."""
+
+    GH = _tier_a_samples()["github-pat"]
+    PASSWORD = _tok("hunter2", "Hunter2!")
+
+    def _clean(self, findings, *raws):
+        assert findings
+        for f in findings:
+            assert not any(raw in json.dumps(f.as_dict()) for raw in raws), f.rule_id
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    def test_an_unreported_assignment_beside_a_gate_token_is_masked(self, include_advisory):
+        findings = scanners.scan_secrets_text(f'PASSWORD = "{self.PASSWORD}"  # {self.GH}', include_advisory=include_advisory)
+        self._clean(findings, self.PASSWORD, self.GH)
+        gate = [f for f in findings if f.tier == "gate"]
+        assert [f.rule_id for f in gate] == ["github-pat"]
+        assert scanners.mask_secret(self.GH) in gate[0].snippet and gate[0].snippet.startswith('PASSWORD = "')
+
+    def test_a_high_entropy_blob_beside_a_gate_token_is_masked(self):
+        blob = _tok("9zY8xW7vU6tS5rQ4", "pO3nM2lK1jI0hG+fE/dC=")
+        self._clean(scanners.scan_secrets_text(f'blob = "{blob}" k={self.GH}'), blob, self.GH)
+
+    def test_the_hash_field_guard_does_not_unmask_the_line(self):
+        findings = scanners.scan_secrets_text(f'git commit; PASSWORD = "{self.PASSWORD}" key={self.GH}', include_advisory=True)
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, self.PASSWORD, self.GH)
+
+    @pytest.mark.parametrize("include_advisory", [False, True], ids=["gate", "advisory"])
+    def test_a_short_url_password_does_not_shield_a_longer_value(self, include_advisory):
+        line = _tok('u = "https://svc:abc@host.example.net/x"; PASSWORD = "abcd', 'efghijkl"')
+        findings = scanners.scan_secrets_text(line, include_advisory=include_advisory)
+        assert findings and not any("defghij" in f.snippet for f in findings)
+
+    @pytest.mark.parametrize("other,shown", [
+        (_tok("glp", "at-", "AbCdEfGhIjKlMnOpQrSt"), "[REDACTED_VCS_TOKEN]"),
+        (_tok("npm", "_", "AbCdEfGhIjKlMnOpQrStUvWx12"), "[REDACTED_TOKEN]"),
+        (_tok("py", "pi-", "AbCdEfGhIjKlMnOpQrStUvWx12"), "[REDACTED_TOKEN]"),
+        (_tok("sk", "_test_", "AbCdEfGhIjKlMnOpQrStUvWx"), "[REDACTED_API_KEY]"),
+    ], ids=["glpat", "npm", "pypi", "sk-test"])
+    def test_an_ungated_vendor_token_is_masked_but_not_reported(self, other, shown):
+        findings = scanners.scan_secrets_text(f"a={self.GH} b={other}")
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, other, self.GH)
+        assert shown in findings[0].snippet
+
+    def test_a_bearer_credential_beside_a_gate_token_is_masked(self):
+        bearer = _tok("abcdEFGH1234", "ijklMNOP5678qrst")
+        findings = scanners.scan_secrets_text(f'curl -H "Authorization: Bearer {bearer}" {self.GH}')
+        assert [f.rule_id for f in findings] == ["github-pat"]
+        self._clean(findings, bearer, self.GH)
+        assert "Bearer [REDACTED]" in findings[0].snippet
+
+    def test_a_reported_token_keeps_its_prefix_and_last_two_mask(self):
+        (finding,) = scanners.scan_secrets_text(f"TOKEN = '{self.GH}'\n", path="app.py")
+        assert finding.snippet == f"TOKEN = '{scanners.mask_secret(self.GH)}'"
+
+    def test_the_fingerprint_does_not_depend_on_the_scan_mode(self):
+        line = f'PASSWORD = "{self.PASSWORD}"  # {self.GH}'
+        off = scanners.scan_secrets_text(line, path="a.py")
+        on = [f for f in scanners.scan_secrets_text(line, path="a.py", include_advisory=True) if f.tier == "gate"]
+        assert [(f.fingerprint, f.snippet) for f in off] == [(f.fingerprint, f.snippet) for f in on]
+
+    def test_a_clean_line_yields_no_finding(self):
+        assert scanners.scan_secrets_text(f'PASSWORD = "{self.PASSWORD}"\nx = 1\n') == []
+
+
 class TestTierBAndTierCAdvisory:
     def test_advisory_tiers_only_emitted_when_include_advisory_true(self) -> None:
         # Tier B: generic-secret-assign; Tier C: high-entropy-token

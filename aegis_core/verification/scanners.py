@@ -103,6 +103,9 @@ _PII_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
 )
 _TEXT_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS) + _PII_REDACTIONS
+# The single-token rows, safe over a snippet that already carries masks: PEM spans lines, and the URL
+# userinfo and keyed rows (the ones with a backreference) rewrite whatever follows, masks included.
+_TOKEN_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS if "\\1" not in text and text != "[REDACTED_PEM]")
 _HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 _CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
 
@@ -221,6 +224,13 @@ def _is_benign_token(val: str, *, human_text: bool = False) -> bool:
     return placeholder or bool(_UUID_RE.match(val) or _HEX_RE.match(val))
 
 
+def _sweep_unreported_secrets(line: str) -> str:
+    """Scrub secret-shaped values no scan pass reported, leaving the masks of reported ones intact."""
+    for pat, text in _TOKEN_REDACTIONS:
+        line = pat.sub(text, line)
+    return _CANDIDATE_TOKEN_RE.sub(lambda m: "[REDACTED]" if _is_high_entropy_secret(m.group(0), 4.0) else m.group(0), line)
+
+
 def _pem_key_material(lines: list[str], index: int, end: int) -> str | None:
     """Base64 after a PEM header on its own line (a one-line string with escaped newlines), "" for a
     base64 line among the next 6 non-blank lines, else None: a bare header is not key material."""
@@ -260,22 +270,35 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
                 else:
                     line_secrets.append(full)
                 matched.append((rule_id, tier, full))
-        if include_advisory and not _HASH_FIELD_RE.search(cleaned):
-            for m in _TIER_B_RE.finditer(cleaned):
-                key_name, val = m.group(1), m.group(3)
-                if not _HASH_FIELD_RE.search(key_name) and not _is_benign_token(val, human_text=True) and not any(val in s or s in val for s in line_secrets):
-                    line_secrets.append(val)
-                    matched.append(("generic-secret-assign", "advisory", val))
-            for m in _TIER_C_RE.finditer(cleaned):
-                val = m.group(2)
-                if not _is_benign_token(val) and not any(val in s or s in val for s in line_secrets) and shannon_entropy(val) >= 4.5:
-                    line_secrets.append(val)
-                    matched.append(("high-entropy-token", "advisory", val))
+        if not matched and not include_advisory:
+            continue
+        # Advisory values are masked in every snippet; include_advisory and the hash-field guard only
+        # decide whether they are reported, so the snippet and its fingerprint do not depend on them.
+        report_advisory = include_advisory and not _HASH_FIELD_RE.search(cleaned)
+        extra_masks: list[str] = []
+        for m in _TIER_B_RE.finditer(cleaned):
+            key_name, val = m.group(1), m.group(3)
+            if _is_benign_token(val, human_text=True):
+                continue
+            extra_masks.append(val)
+            if report_advisory and not _HASH_FIELD_RE.search(key_name) and not any(val in s or s in val for s in line_secrets):
+                line_secrets.append(val)
+                matched.append(("generic-secret-assign", "advisory", val))
+        for m in _TIER_C_RE.finditer(cleaned):
+            val = m.group(2)
+            if _is_benign_token(val) or shannon_entropy(val) < 4.5:
+                continue
+            extra_masks.append(val)
+            if report_advisory and not any(val in s or s in val for s in line_secrets):
+                line_secrets.append(val)
+                matched.append(("high-entropy-token", "advisory", val))
         if not matched:
             continue
         masked_line = raw_line.strip() if len(raw_line) <= MAX_LINE_LENGTH else ""
-        for sec in sorted(set(line_secrets), key=len, reverse=True) if masked_line else ():
-            masked_line = masked_line.replace(sec, mask_secret(sec))
+        if masked_line:
+            for sec in sorted({*line_secrets, *extra_masks}, key=len, reverse=True):
+                masked_line = masked_line.replace(sec, mask_secret(sec))
+            masked_line = _sweep_unreported_secrets(masked_line)
         for rule_id, tier, sec in matched:
             masked_tok = mask_secret(sec)
             snippet = masked_line if masked_tok in masked_line else masked_tok
