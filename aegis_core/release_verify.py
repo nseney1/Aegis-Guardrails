@@ -63,6 +63,9 @@ GH_TIMEOUT_SECONDS = 180.0
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 #: Codes reached after gh verified an attestation and its JSON re-checked.
 _ATTESTED_CODES = frozenset({"verified", "agent_editable"})
+#: Why a report printed before the trust tier could be read has none.
+_NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
+                "not_a_repository": "not a git repository", "git_failed": "git could not answer"}
 _RUN_ID_ATTEMPT = re.compile(r"\A\d+/\d+\Z")
 _VERSION = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")
 _REMOTE = re.compile(
@@ -131,6 +134,8 @@ class ReleaseReport:
             lines = [f"NOT VERIFIED: {self.message}"]
         if self.tier:
             lines.append(f"  trust tier: {self.tier}")
+        elif self.code in _NO_TIER_WHY:
+            lines.append(f"  trust tier: unknown ({_NO_TIER_WHY[self.code]})")
         lines += [f"  ! {caveat}" for caveat in self.caveats]
         return lines
 
@@ -314,28 +319,34 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
     try:
         if gitsafe.toplevel(top) is None:
             return ReleaseReport(sha, False, "not_a_repository", f"{top} is not inside a git work tree", gh_version=shown)
+    except gitsafe.GitError as exc:
+        return ReleaseReport(sha, False, "git_failed", f"git could not answer: {exc}", gh_version=shown)
+    tier = _tier(top, tier_runner)  # read once, so every report from here on carries it
+
+    def failed(name: str, code: str, message: str, **extra: Any) -> ReleaseReport:
+        return ReleaseReport(name, False, code, message, tier=tier, gh_version=shown, **extra)
+
+    try:
         commit = gitsafe.resolve_commit(top, sha)
         res = gitsafe.run(["rev-parse", "--verify", f"{commit}^{{tree}}"], top) if commit and _SHA.match(commit) else None
     except gitsafe.GitError as exc:
-        return ReleaseReport(sha, False, "git_failed", f"git could not answer: {exc}", gh_version=shown)
+        return failed(sha, "git_failed", f"git could not answer: {exc}")
     if res is None or res.returncode != 0 or not commit:
-        return ReleaseReport(sha, False, "bad_commit", f"{sha!r} is not a commit of this repository (fetch it first)",
-                             gh_version=shown)
+        return failed(sha, "bad_commit", f"{sha!r} is not a commit of this repository (fetch it first)")
     tree = res.stdout.decode("ascii", "replace").strip()
     repository = _repository(top)
     if not repository:
-        return ReleaseReport(sha, False, "no_repository", "origin is not a github.com repository, so there is nothing to pin "
-                             "the attestation to", gh_version=shown)
+        return failed(sha, "no_repository", "origin is not a github.com repository, so there is nothing to pin "
+                      "the attestation to")
     branch, why_not = _default_branch(gh, repository)
     if branch is None:
-        return ReleaseReport(commit, False, "default_branch_unknown",
-                             f"cannot pin the source ref to the default branch: {why_not}", repository=repository,
-                             gh_version=shown)
+        return failed(commit, "default_branch_unknown", f"cannot pin the source ref to the default branch: {why_not}",
+                      repository=repository)
     eff_ref = f"refs/heads/{branch}"
     if source_ref is not None and source_ref != eff_ref:
-        return ReleaseReport(commit, False, "source_ref_mismatch",
-                             f"{source_ref} is not the default branch GitHub reports for {repository} ({eff_ref})",
-                             repository=repository, gh_version=shown)
+        return failed(commit, "source_ref_mismatch",
+                      f"{source_ref} is not the default branch GitHub reports for {repository} ({eff_ref})",
+                      repository=repository)
     body = subject_bytes(commit, tree)
     digest = hashlib.sha256(body).hexdigest()
     with tempfile.TemporaryDirectory(prefix="aegis-release-") as directory:
@@ -348,19 +359,17 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
     pins: Dict[str, Any] = {"repository": repository, "signer_workflow": f"{repository}/{WORKFLOW}",
                             "source_ref": eff_ref, "digest": commit, "tree": tree, "subject_sha256": digest}
     if result is None:
-        return ReleaseReport(sha, False, "gh_missing", "gh disappeared during verification", gh_version=shown)
+        return failed(sha, "gh_missing", "gh disappeared during verification")
     if result[0] != 0:
         detail = " ".join(result[2].split())[:300] or "no detail"
-        return ReleaseReport(commit, False, "rejected", f"gh attestation verify failed: {detail}", repository=repository,
-                             gh_version=shown, details=pins)
+        return failed(commit, "rejected", f"gh attestation verify failed: {detail}", repository=repository, details=pins)
     ok, reason, verified_run = _recheck(result[1], commit, tree, digest, repository, eff_ref)
     if verified_run is not None:
         pins["run"] = verified_run
     if not ok:
-        return ReleaseReport(commit, False, "bad_output", f"gh exited 0 but its output does not check out: {reason}",
-                             repository=repository, gh_version=shown, details=pins)
+        return failed(commit, "bad_output", f"gh exited 0 but its output does not check out: {reason}",
+                      repository=repository, details=pins)
     signed = f"signed by {pins['signer_workflow']} at {commit[:12]} on {eff_ref}"
-    tier = _tier(top, tier_runner)
     if tier != "A":
         # The SECURITY.md truth table: at tier C the agent can edit the workflow that signed, and at
         # tier B a pull request runs its own workflow, so the claim is not established; the

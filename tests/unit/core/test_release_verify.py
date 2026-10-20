@@ -429,6 +429,45 @@ def test_a_caller_may_assert_the_source_ref_but_not_choose_another(tmp_path, sou
             f"refs/heads/release/x is not the default branch GitHub reports for {REPOSITORY} (refs/heads/main)")
 
 
+# ── the trust tier is on every report (R-trust-41) ──────────────────────────
+
+@needs_git
+def test_a_rejected_attestation_still_reports_the_tier(tmp_path):
+    repo = make_repo(tmp_path, tier="B")
+    report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (1, "", "no matching attestations")),
+                               tier_runner=tier_runner("B"))
+    assert (report.code, report.tier) == ("rejected", "B")
+    assert "  trust tier: B" in report.text_lines()
+
+
+@needs_git
+@pytest.mark.parametrize("api, code", [((1, "", "HTTP 404"), "default_branch_unknown"), (DEFAULT_API, "bad_commit")],
+                         ids=["no-branch", "bad-commit"])
+def test_every_failure_after_the_work_tree_check_carries_the_tier(tmp_path, api, code):
+    repo = make_repo(tmp_path, tier="A")
+    sha = "HEAD" if code == "default_branch_unknown" else "b" * 40
+    report = rv.verify_release(repo.root, sha, run=FakeGh("2.93.0", api=api), tier_runner=tier_runner("A"))
+    assert (report.code, report.tier) == (code, "A")
+
+
+def test_a_report_without_gh_says_the_tier_is_unknown(tmp_path):
+    report = rv.verify_release(tmp_path, "HEAD", run=FakeGh(None), tier_runner=tier_runner_none)
+    assert "  trust tier: unknown (gh unavailable)" in report.text_lines()
+    outside = rv.verify_release(tmp_path, "HEAD", run=FakeGh("2.93.0"), tier_runner=tier_runner_none)
+    assert "  trust tier: unknown (not a git repository)" in outside.text_lines()
+
+
+@needs_git
+def test_doctor_drivers_says_it_did_not_read_the_tier_and_asks_gh_nothing(tmp_path, monkeypatch, capsys):
+    from aegis_core import human_gate
+
+    asked = []
+    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, **kw: asked.append(argv))
+    repo = make_repo(tmp_path)
+    _rc, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--drivers")
+    assert "Trust tier: not read in this mode (run aegis doctor)" in out.splitlines() and asked == []
+
+
 # ── one consistent report, git failures included (R-trust-56) ───────────────
 
 @pytest.mark.parametrize("verified, code, attested", [

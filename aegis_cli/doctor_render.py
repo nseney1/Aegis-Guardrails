@@ -514,6 +514,7 @@ def _run_drivers_only(root: Path, use_json: bool, fix: bool, yes: bool) -> int:
     with contextlib.redirect_stdout(text) if use_json else contextlib.nullcontext():
         if not use_json:
             print(f"aegis doctor — AST driver health check ({_doc._clean(root, 4096)}):\n")
+            print("Trust tier: not read in this mode (run aegis doctor)")  # --drivers stays local, no gh
         plan = _plan([], _missing_ast_extensions(root), root) if fix else []
         if plan:
             _print_plan(plan, _doc._home())
