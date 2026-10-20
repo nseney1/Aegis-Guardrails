@@ -192,11 +192,21 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         print(json.dumps(document, indent=2))
         return
     approved = bool(report.weakenings) and report.passed
+    gated = report.governance_gated
+    cats = ", ".join(report.governance_categories)
+    note = (f"governance files changed ({cats}) but the base lists no key in allowed_signers, "
+            "so no approval can be required (tier C: detection only)") if cats and not gated else ""
     if fmt == "github":
         level, title = ("notice", "weakening approved") if approved else ("error", "weakening without approval")
         for item in report.weakenings:
             print(f"::{level} file={_escape_annotation(item.path, True)},title={_escape_annotation(title, True)}"
                   f"::{_escape_annotation(f'{item.code}: {item.rule}: {item.message}')}")
+        level, title = ("notice", "governance change approved") if report.passed else ("error", "governance change without approval")
+        for path, category in report.governance_paths if gated else ():
+            print(f"::{level} file={_escape_annotation(path, True)},title={_escape_annotation(title, True)}"
+                  f"::{_escape_annotation(f'governance:{category}: {path} changed; it passes only with a signed approval (aegis approve)')}")
+        if note:
+            print(f"::warning title={_escape_annotation('governance change not enforced', True)}::{_escape_annotation(note)}")
         if reg_report is not None:
             reg_level = "error" if reg_report.tier == "gate" else "warning"
             reg_title = "regression check failed" if reg_report.tier == "gate" else "regression check warning"
@@ -208,7 +218,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
                 )
     short = lambda sha: sha[:10]  # noqa: E731
     span = f"{short(report.merge_base)}..{short(report.head)}"
-    if not report.weakenings:
+    if not report.weakenings and not gated:
         if reg_blocking:
             print(f"aegis check --ci: FAILED: regression check failed ({len(reg_report.findings)} finding(s), {span})")
         elif trailer_blocking:
@@ -216,16 +226,31 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         else:
             print(f"aegis check --ci: PASSED, no rule weakened ({report.rules_checked} binding rule(s) at the merge base, {span})")
     else:
-        count = len(report.weakenings)
-        if approved and not reg_blocking and not trailer_blocking:
-            signer = report.approval.signer or "a key in the base allowed_signers"
-            print(f"aegis check --ci: PASSED, {count} weakening(s) approved by {sanitize_display(signer, 120)} ({span})")
+        count, paths = len(report.weakenings), len(report.governance_paths)
+        if not gated:
+            what, counted, done = "weakening", f"{count} finding{'' if count == 1 else 's'}", f"{count} weakening(s)"
+        elif not count:
+            what, counted, done = "governance change", f"{paths} path(s) in {cats}", f"{paths} governance path(s)"
         else:
-            print(f"aegis check --ci: FAILED: weakening without approval ({count} finding{'' if count == 1 else 's'}, {span})")
+            what, counted = "weakening and governance change", f"{count} finding(s), {paths} path(s) in {cats}"
+            done = f"{count} weakening(s) and {paths} governance path(s)"
+        if not report.passed:
+            print(f"aegis check --ci: FAILED: {what} without approval ({counted}, {span})")
+        elif reg_blocking:  # approved, but another check fails: say which, not "without approval"
+            print(f"aegis check --ci: FAILED: regression check failed ({len(reg_report.findings)} finding(s), {span})")
+        elif trailer_blocking:
+            print(f"aegis check --ci: FAILED: Aegis-Check trailer divergence ({span})")
+        else:
+            signer = report.approval.signer or "a key in the base allowed_signers"
+            print(f"aegis check --ci: PASSED, {done} approved by {sanitize_display(signer, 120)} ({span})")
         for item in report.weakenings:
             print(sanitize_display(f"  [{item.code}] {item.rule} ({item.path}): {item.message}", 400))
-        if not approved:
-            print("  A weakening passes only with a signed approval: aegis approve (a key listed in allowed_signers on the base branch).")
+        for path, category in report.governance_paths if gated else ():
+            print(sanitize_display(f"  [governance:{category}] {path}", 400))
+        if not report.passed:
+            print(f"  A {what} passes only with a signed approval: aegis approve (a key listed in allowed_signers on the base branch).")
+    if note:
+        print(sanitize_display(f"  note: {note}", 400))
     if reg_report is not None:
         if reg_report.findings and reg_report.tier != "gate":
             print('  regression tier: warning (advisory; blocking at gate tier via --strict or regression.tier="gate")')
@@ -427,7 +452,8 @@ class CheckCommand(AegisCommand):
             "merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or "
             "archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a "
             "forbid_ast pattern or call entry no longer covered, "
-            "a new or unknown key, any applies_to change, or a mandatory rule added past the scan's slot cap). A "
+            "a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's "
+            "slot cap), or a change to the governance set (when the base lists a signing key). A "
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
             "branch's allowed_signers. Also runs T5 fix-commit regression checks (advisory at default warning tier; "
             'blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail',

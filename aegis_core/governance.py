@@ -17,11 +17,14 @@ needs a ``human_gate`` approval (``aegis_core.human_gate``) before it counts:
   ones deleted since the base (``human_gate.governance_tree_hash``).
 
 A path-only table cannot see inside a file, so ``pyproject.toml``, ``setup.cfg`` and the
-``Makefile`` count whole (a version bump in ``pyproject.toml`` is a governance change here),
-and a skipped or weakened test is not a path at all: the lane gate's integrity findings
-(``aegis_core.lane_gate``) and the CI weakening check carry those. Nor can it name every module
-``python -m pytest`` imports: a root ``argparse.py`` or ``json.py`` can still replace what runs,
-so a ``witness: aegis`` row stays a label. This module answers only
+``Makefile`` count whole here (a version bump in ``pyproject.toml`` withholds credit and moves
+the approval hash), and a skipped or weakened test is not a path at all: the lane gate's
+integrity findings (``aegis_core.lane_gate``) and the CI weakening check carry those. Nor can
+the table name every module ``python -m pytest`` imports: a root ``argparse.py`` or ``json.py``
+can still replace what runs, so a ``witness: aegis`` row stays a label. Only the merge gate of
+``aegis check --ci`` looks inside files: it compares ``pyproject.toml``, ``setup.cfg`` and
+``tox.ini`` by their pytest section (``lane_ast.pytest_config_view``) and leaves ``rules`` to its
+weakening check. This module answers only
 "does this path belong to the set". Matching is case-folded, as a case-insensitive checkout
 sees the names, and uses the one matcher (``aegis_core.match``) so a pattern means here what
 it means everywhere.

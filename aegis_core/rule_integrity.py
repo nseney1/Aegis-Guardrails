@@ -6,9 +6,10 @@ import hashlib
 import os
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, governance
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
+from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import ENFORCEMENT_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
@@ -553,10 +554,20 @@ class CiReport:
     rules_checked: int
     weakenings: Tuple[Weakening, ...]
     approval: Optional[Any]
+    governance_categories: Tuple[str, ...] = ()
+    governance_paths: Tuple[Tuple[str, str], ...] = ()
+    signers_at_base: int = 0
+
+    @property
+    def governance_gated(self) -> bool:
+        """A governance change needs the approval only when the base lists a key to sign it with."""
+        return bool(self.governance_categories) and self.signers_at_base > 0
 
     @property
     def passed(self) -> bool:
-        return not self.weakenings or (self.approval is not None and self.approval.valid)
+        if not self.weakenings and not self.governance_gated:
+            return True
+        return self.approval is not None and self.approval.valid
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         from datetime import datetime, timezone
@@ -579,6 +590,12 @@ class CiReport:
             "rules_checked": self.rules_checked,
             "weakenings": [w.as_dict() for w in self.weakenings],
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
+            "governance": {
+                "categories": list(self.governance_categories),
+                "paths": [{"path": path, "category": category} for path, category in self.governance_paths],
+                "enforced": self.governance_gated,
+                "approved": self.governance_gated and self.passed,
+            },
         }
 
 
@@ -632,6 +649,37 @@ def _cap_findings(head: RuleSet, base: RuleSet, files: Callable[[], List[str]]) 
     return found
 
 
+_PYTEST_SECTION_FILES = ("pyproject.toml", "setup.cfg", "tox.ini")
+
+
+def _same_pytest_view(root: str, merge: str, head: str, path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    before, after = gitsafe.read_blob(root, merge, path), gitsafe.read_blob(root, head, path)
+    if before is None or after is None:
+        return False
+    try:
+        return pytest_config_view(name, before) == pytest_config_view(name, after)
+    except ValueError:
+        return False
+
+
+def _governance_paths(root: str, merge: str, head: str) -> Tuple[Tuple[str, str], ...]:
+    """(path, category) for each changed governance path a signed approval must cover. Rule edits
+    are left to the weakening check; pyproject.toml, setup.cfg and tox.ini count only when their
+    pytest view differs (a missing or unreadable side counts). --no-renames: a moved governance
+    file shows its old name as deleted."""
+    found: List[Tuple[str, str]] = []
+    for status, _old, _new, path in gitsafe.diff_entries(root, merge, head):
+        gone = status == "D"
+        category = governance.category_of(path, deleted=gone)
+        if category in (None, "rules"):
+            continue
+        if not gone and path.rsplit("/", 1)[-1] in _PYTEST_SECTION_FILES and _same_pytest_view(root, merge, head, path):
+            continue
+        found.append((path, str(category)))
+    return tuple(found)
+
+
 def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
     from aegis_core import human_gate
 
@@ -677,10 +725,14 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
         return head_files
 
     found += _cap_findings(head_rules, base_rules, files)
+    paths = _governance_paths(root, merge, head_commit)
+    order = [name for name, _patterns in governance.CATEGORIES] + [governance.DELETED_TESTS]
+    categories = tuple(c for c in order if c in {category for _path, category in paths})
+    signers = human_gate.signing_keys_at(root, base_commit) if categories else 0
     approval = None
-    if found:
+    if found or (categories and signers):
         try:
             approval = human_gate.find_approval(root, head_commit, base_commit)
         except (human_gate.HumanGateError, gitsafe.GitError):
             approval = None
-    return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval)
+    return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers)

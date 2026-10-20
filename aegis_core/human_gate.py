@@ -52,6 +52,7 @@ __all__ = [
     "signed_empty_commit",
     "signers_setup",
     "signing_config",
+    "signing_keys_at",
     "verify_approval",
     "verify_insight_approval",
     "verify_test_exemption",
@@ -503,6 +504,12 @@ def _signer_keys(text: Optional[bytes]) -> int:
         and not ln.strip().startswith("#")
         and re.search(r"\b(?:ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]* [A-Za-z0-9+/=]{20,}", ln)
     )
+
+
+def signing_keys_at(root: Any, rev: str) -> int:
+    """How many keys ``allowed_signers`` lists at ``rev`` (0 when the file is absent). A GitError
+    propagates: an unreadable base must fail the caller, not read as "no keys"."""
+    return _signer_keys(gitsafe.read_blob(_top(root), rev, ALLOWED_SIGNERS))
 
 
 def _ruleset_facts(rules: Any) -> Dict[str, Any]:
