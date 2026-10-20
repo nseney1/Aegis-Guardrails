@@ -312,7 +312,7 @@ def test_detector_replay_classifies_caught_and_leaked_and_deduplicates_per_branc
     """§3 T4 Detector Replay:
     - Pattern in intermediate commit and removed before merge -> `caught` (weight 0.5).
     - Pattern in merged commit that was later reverted/fixed -> `leaked` (weight 1.0).
-    - Deduplicated by `(rule, file, pattern, branch)`."""
+    - Deduplicated by `(rule, file, pattern, introducing commit)` (R-evidence-10)."""
     home = hg.Home(tmp_path / "home")
     repo = hg.Repo(tmp_path / "repo", home)
     _write_rule(
@@ -632,11 +632,12 @@ def test_check_ci_trailer_independently_reruns_snapshot_without_local_ledger(
 
 
 @needs_git
-def test_detector_replay_ignores_unmerged_head_and_reconciles_leaked_to_caught_after_fix(
+def test_detector_replay_ignores_unmerged_head_and_keeps_a_landed_finding_leaked_after_a_fix(
     tmp_path: Path,
 ) -> None:
     """`replay_detector_history` walks the target protected branch (`main`), ignoring unmerged feature
-    commits on `HEAD`, and reconciles a previously recorded `leaked` finding to `caught` after a later fix."""
+    commits on `HEAD`; a finding that landed stays `leaked` after a later fix (spec T4.1: "later removed
+    by a fix or revert" is leaked), which the re-replay records as its `fix_rev` (R-evidence-10)."""
     from aegis_core import rules
 
     home = hg.Home(tmp_path / "home")
@@ -674,12 +675,13 @@ def test_detector_replay_ignores_unmerged_head_and_reconciles_leaked_to_caught_a
     repo.commit("fix: replace eval with int on main")
     repo.git("checkout", "work")
 
-    # Re-running replay / sync reconciles the earlier `leaked` finding for `eval` to `caught`
+    # Re-running replay supersedes the earlier row of the same unit: still `leaked`, now with its fix
     second_replay = fitness.replay_detector_history(repo.root)
-    patterns_2 = {d["pattern"]: d["disposition"] for d in second_replay}
-    assert patterns_2 == {"eval": "caught"}
+    patterns_2 = {d["pattern"]: (d["disposition"], d["rev"]) for d in second_replay}
+    assert patterns_2 == {"eval": ("leaked", first_replay[0]["rev"])}
+    assert second_replay[0]["fix_rev"] is not None and first_replay[0]["fix_rev"] is None
     fit_2 = fitness.for_rules(repo.root, rules.load_rules(repo.root).served)["no-eval-exec"]
-    assert fit_2.leaked == 0 and fit_2.caught == 1
+    assert fit_2.leaked == 1 and fit_2.caught == 0
 
 
 @needs_git

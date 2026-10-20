@@ -128,8 +128,8 @@ def session_decay_factor(eligible_sessions: int, half_life_sessions: Optional[fl
 class Fitness:
     rule: str = ""
     triggers: int = 0
-    tp: float = 0
-    fp: float = 0
+    tp: float = 0.0
+    fp: float = 0.0
     last_ts: Optional[str] = None
     score: float = 0.0
     misfire: float = 0.0
@@ -203,12 +203,11 @@ def compute(
 ) -> Fitness:
     base_tp, base_fp = _num(totals.get("tp", 0) or 0), _num(totals.get("fp", 0) or 0)
     adj_n = int(adjudicated_tp) + int(adjudicated_fp)
-    tp, fp = base_tp + float(adjudicated_tp) + 0.5 * float(caught), base_fp + float(adjudicated_fp) + 1.0 * float(leaked)
-    if tp == int(tp) and isinstance(totals.get("tp", 0), int) and caught % 2 == 0:
-        tp = int(tp)
-    if fp == int(fp) and isinstance(totals.get("fp", 0), int):
-        fp = int(fp)
-    n, triggers = _num(tp) + _num(fp), int(_num(totals.get("triggers", 0))) + adj_n + int(caught) + int(leaked)
+    # Spec T4: labels are the only fp source. A leaked finding is a true alarm that landed (a
+    # "needs enforcement" count), and caught/leaked are dispositions, not triggers.
+    tp = round(base_tp + float(adjudicated_tp) + 0.5 * float(caught), 6)
+    fp = round(base_fp + float(adjudicated_fp), 6)
+    n, triggers = tp + fp, int(_num(totals.get("triggers", 0)))
     a0, b0 = cap_prior(prior[0], prior[1]) if prior is not None else (0.0, 0.0)
     prior_mass = a0 + b0
     prior_share = (prior_mass / (prior_mass + n)) if (prior_mass + n) > 0.0 else 0.0
@@ -364,7 +363,8 @@ def _collect_t4_events_for_rules(
                 })
         elif ev == "detection":
             disp = str(raw.get("disposition") or "")
-            d_key = (rid, str(raw.get("file") or ""), str(raw.get("pattern") or ""), str(raw.get("branch") or "main"))
+            # One unit per introducing commit (the PR), as replay and credit.record_detection key it.
+            d_key = (rid, str(raw.get("file") or ""), str(raw.get("pattern") or ""), str(raw.get("rev") or ""))
             prev_disp = active_detections.get(d_key)
             if prev_disp == "caught":
                 b["caught"] = max(0, b["caught"] - 1)
@@ -393,7 +393,7 @@ def _collect_t4_events_for_rules(
                     s_item.get("kind") == "detection"
                     and s_item.get("file") == raw.get("file")
                     and s_item.get("pattern") == raw.get("pattern")
-                    and s_item.get("branch") == raw.get("branch")
+                    and s_item.get("rev") == raw.get("rev")
                 ):
                     b["samples"][idx] = sample_item
                     replaced = True
@@ -572,28 +572,24 @@ def replay_detector_history(workspace: Any, rules: Optional[Iterable[Any]] = Non
         branch_shas = [s.strip() for s in br_res.stdout.decode("utf-8", "replace").splitlines() if s.strip()]
         base_hits, merge_hits = hits_for(p1), hits_for(merge_sha)
         for rid, rel, pat in sorted(merge_hits - base_hits):
-            findings[(rid, rel, pat, b_label)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "leaked", "weight": 1.0, "branch": b_label, "rev": merge_sha}
+            findings[(rid, rel, pat, merge_sha)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "leaked", "weight": 1.0, "branch": b_label, "rev": merge_sha}
+        # Fixed on the branch before the merge: caught, once per merge, at the first branch commit with the hit.
+        fixed_here: Set[Tuple[str, str, str]] = set()
         for b_sha in branch_shas:
-            for rid, rel, pat in sorted(hits_for(b_sha) - base_hits):
-                key = (rid, rel, pat, b_label)
-                if (rid, rel, pat) not in merge_hits and key not in findings:
-                    findings[key] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "caught", "weight": 0.5, "branch": b_label, "rev": b_sha, "fix_rev": merge_sha}
+            for rid, rel, pat in sorted(hits_for(b_sha) - base_hits - merge_hits - fixed_here):
+                fixed_here.add((rid, rel, pat))
+                findings[(rid, rel, pat, b_sha)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "caught", "weight": 0.5, "branch": b_label, "rev": b_sha, "fix_rev": merge_sha}
     fp_res = gitsafe.run(["rev-list", "--first-parent", "--reverse", target_rev], root)
     shas = [s.strip() for s in fp_res.stdout.decode("utf-8", "replace").splitlines() if s.strip()] if fp_res.returncode == 0 else [parts[0] for parts in commit_lines]
-    if shas:
-        tip_hits = hits_for(shas[-1])
-        for idx, sha in enumerate(shas):
-            if sha in merge_shas:
-                continue
-            prev_hits = hits_for(shas[idx - 1]) if idx > 0 else set()
-            for rid, rel, pat in sorted(hits_for(sha) - prev_hits):
-                key = (rid, rel, pat, target_branch)
-                if (rid, rel, pat) in tip_hits:
-                    findings[key] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "leaked", "weight": 1.0, "branch": target_branch, "rev": sha}
-                else:
-                    fix_sha = next((s for s in shas[idx + 1:] if (rid, rel, pat) not in hits_for(s)), shas[-1])
-                    disp = "leaked" if "revert" in commit_subject(fix_sha).lower() else "caught"
-                    findings[key] = {"rule": rid, "file": rel, "pattern": pat, "disposition": disp, "weight": 1.0 if disp == "leaked" else 0.5, "branch": target_branch, "rev": sha, "fix_rev": fix_sha}
+    # Spec T4.1: a hit that reached the protected first-parent line landed, whether a later fix or
+    # revert removed it (fix_rev) or not: leaked. Only the merge-branch loop above yields caught.
+    for idx, sha in enumerate(shas):
+        if sha in merge_shas:
+            continue
+        prev_hits = hits_for(shas[idx - 1]) if idx > 0 else set()
+        for rid, rel, pat in sorted(hits_for(sha) - prev_hits):
+            fix_sha = next((s for s in shas[idx + 1:] if (rid, rel, pat) not in hits_for(s)), None)
+            findings[(rid, rel, pat, sha)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "leaked", "weight": 1.0, "branch": target_branch, "rev": sha, "fix_rev": fix_sha}
     return [dict(i) for i in findings.values()] if not persist else [
         credit.record_detection(root, i["rule"], i["file"], i["pattern"], disposition=i["disposition"], rev=i.get("rev"), branch=i["branch"], fix_rev=i.get("fix_rev"), weight=i["weight"])
         for i in findings.values()
