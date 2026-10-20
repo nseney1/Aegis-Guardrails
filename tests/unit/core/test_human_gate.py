@@ -1016,3 +1016,17 @@ def test_a_control_byte_in_a_message_does_not_hide_an_approval(tmp_path):
     repo.commit("later", allow_empty=True)
     found = human_gate.find_approval(repo.root, "HEAD", "main")
     assert found is not None and found.commit == approval
+
+
+@needs_git
+def test_a_verification_error_still_names_the_commit_the_caller_gave(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+
+    def broken(*_a, **_k):
+        raise gitsafe.GitError("git cat-file timed out")
+
+    monkeypatch.setattr(human_gate, "_read_message", broken)
+    verdict = human_gate.verify_approval(repo.root, "HEAD", "0" * 64, "main")
+    assert (verdict.valid, verdict.code, verdict.commit) == (False, "unresolved", "HEAD")

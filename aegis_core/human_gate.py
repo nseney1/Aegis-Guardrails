@@ -1033,11 +1033,11 @@ def _verify_single_trailer(
         return _no("unresolved", str(exc), str(commit))
     except HumanGateError as exc:
         return _no("unverifiable", str(exc), str(commit))
-    return _verify_candidate(top, oid, base, rx, name, expected, mismatch_msg, ok_msg)
+    return _verify_candidate(top, oid, base, rx, name, expected, mismatch_msg, ok_msg, label=str(commit))
 
 
 def _verify_candidate(top: Path, oid: str, base: str, rx: re.Pattern[str], name: str, expected: str,
-                      mismatch_msg: str, ok_msg: str) -> Approval:
+                      mismatch_msg: str, ok_msg: str, label: Optional[str] = None) -> Approval:
     """Verify resolved commit ``oid`` against the allowed_signers of resolved ``base``. The message
     is re-read here (``cat-file``), so a caller's cheaper pre-filter can only skip a commit."""
     try:
@@ -1053,9 +1053,9 @@ def _verify_candidate(top: Path, oid: str, base: str, rx: re.Pattern[str], name:
             return _no("hash_mismatch", mismatch_msg, oid)
         return _verify_commit_sig(top, oid, base, ok_msg)
     except gitsafe.GitError as exc:
-        return _no("unresolved", str(exc), oid)
+        return _no("unresolved", str(exc), label or oid)
     except HumanGateError as exc:
-        return _no("unverifiable", str(exc), oid)
+        return _no("unverifiable", str(exc), label or oid)
 
 
 _APPROVE_MISMATCH = "the approved governance hash is not this governance state"
