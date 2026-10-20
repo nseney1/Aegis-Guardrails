@@ -66,7 +66,8 @@ def _decisions(root: Path) -> dict:
         return {"returncode": 1, "stderr": "spy stops the run"}
 
     anchor = rule_integrity.resolve_base(root)
-    perf_check.run_perf_check(root, runner=spy)
+    # The fixture repository has one commit, so the default HEAD~1 base would not resolve.
+    perf_check.run_perf_check(root, base_ref="HEAD", runner=spy)
     return {
         "tests": checkrun.user_test_command(root),
         "rules": "user-config" if anchor is not None and anchor.source == "user-config" else "other",
