@@ -659,9 +659,6 @@ def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, A
     return (entry.get("run_id"), entry.get("run_attempt")) == (ci_row.get("run_id"), ci_row.get("ci_run_attempt"))
 
 
-_DEFAULT_SNAPSHOT_RERUN: Optional[Callable[[Any, str, str], Mapping[str, Any]]] = None
-
-
 def project_credits(
     root: Any, *, view: Any = None, client: Any = None, workflow: str = DEFAULT_WORKFLOW,
     attestation_runner: Optional[Callable[..., Any]] = None,
@@ -760,10 +757,14 @@ def parse_trailer(line: str) -> Optional[Dict[str, Any]]:
 
 
 def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    given = parse_trailer(trailer) if isinstance(trailer, str) else (dict(trailer) if isinstance(trailer, Mapping) else None)
+    """Spec T1: only an equal tree whose rerun diverges twice from the parsed trailer fails; a tree
+    mismatch or an inconclusive rerun (it timed out, git could not answer) is ``unbound``."""
+    given = dict(trailer) if isinstance(trailer, Mapping) else None
     if not given or not given.get("tree") or "exit" not in given:
         return {"result": "unbound", "failed": False, "reason": "no usable Aegis-Check trailer"}
     first = dict(rerun) if isinstance(rerun, Mapping) else {}
+    if first.get("inconclusive"):
+        return {"result": "unbound", "failed": False, "reason": f"CI rerun {first.get('reason') or 'was inconclusive'}"}
     if first.get("tree") != given["tree"]:
         return {"result": "unbound", "failed": False, "reason": "CI ran a different tree"}
     claimed_pass = given["exit"] == 0
@@ -772,6 +773,8 @@ def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional
     if second is None:
         return {"result": "rerun", "failed": False, "reason": "outcomes diverge on the same tree"}
     again = dict(second)
+    if again.get("inconclusive"):
+        return {"result": "unbound", "failed": False, "reason": f"CI rerun {again.get('reason') or 'was inconclusive'}"}
     if again.get("tree") == given["tree"] and (again.get("exit") == 0) == claimed_pass:
         return {"result": "agree", "failed": False, "reason": "flaky: the re-run agrees with the trailer"}
     return {"result": "void", "failed": True, "reason": "outcomes still diverge on the same tree after a re-run"}
@@ -780,37 +783,39 @@ def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional
 def verify_commit_trailers(
     root: Any, base: str, head: str = "HEAD", *, rerun_fn: Callable[[str, str], Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
+    """Spec T1: compare the head commit's ``Aegis-Check`` trailer with ``rerun_fn(commit, tree)``;
+    earlier commits and a head without a trailer rerun nothing. A divergence fails the CI job and
+    writes ``void`` rows to the ledger of the machine that ran ``check --ci``."""
     top = gitsafe.toplevel(Path(str(root)))
     if top is None:
         return []
     mb, tip = gitsafe.merge_base(top, base, head), gitsafe.resolve_commit(top, head)
-    if not mb or not tip:
+    if not mb or not tip or tip == mb:
         return []
-    rev = gitsafe.run(["rev-list", "--reverse", f"{mb}..{tip}"], top)
-    if rev.returncode != 0:
-        return []
-    rows = read_rows(root)
-    checks_by_tree: Dict[str, List[Mapping[str, Any]]] = {}
-    for chk in _of(rows, "check"):
-        if isinstance(chk.get("tree"), str):
-            checks_by_tree.setdefault(chk["tree"], []).append(chk)
+    msg = gitsafe.run(["log", "-1", "--format=%B", tip], top)
+    tree_res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{tip}^{{tree}}"], top)
+    if msg.returncode != 0 or tree_res.returncode != 0:
+        return [{"commit": tip, "result": "unbound", "failed": False, "reason": "git could not read the head commit"}]
+    commit_tree = tree_res.stdout.decode("ascii", "replace").strip()
+    trailers = [t for line in msg.stdout.decode("utf-8", "replace").splitlines() if (t := parse_trailer(line)) is not None]
+    reruns: List[Mapping[str, Any]] = []
+
+    def attempt(n: int) -> Mapping[str, Any]:
+        while len(reruns) <= n:
+            reruns.append(rerun_fn(tip, commit_tree))
+        return reruns[n]
+
     results: List[Dict[str, Any]] = []
-    for oid in rev.stdout.decode("ascii", "replace").split():
-        msg = gitsafe.run(["log", "-1", "--format=%B", oid], top).stdout.decode("utf-8", "replace")
-        commit_tree = gitsafe.run(["rev-parse", f"{oid}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
-        trailers = [t for line in msg.splitlines() if (t := parse_trailer(line)) is not None]
-        for tr in trailers:
-            t_checks = checks_by_tree.get(tr["tree"], [])
-            if commit_tree != tr["tree"]:
-                verdict = check_ci_divergence(tr, {"tree": commit_tree, "exit": 1})
-            else:
-                first = rerun_fn(oid, commit_tree)
-                verdict = check_ci_divergence(tr, first)
-                if verdict["result"] == "rerun":
-                    verdict = check_ci_divergence(tr, first, rerun_fn(oid, commit_tree))
-            if verdict["failed"]:
-                for c in t_checks:
-                    if isinstance(c.get("id"), str):
-                        record_void(root, c["id"], "ci_divergence")
-            results.append({"commit": oid, "trailer": tr, **verdict})
+    for tr in trailers:
+        if commit_tree != tr["tree"]:
+            verdict = check_ci_divergence(tr, {"tree": commit_tree, "exit": 1})
+        else:
+            verdict = check_ci_divergence(tr, attempt(0))
+            if verdict["result"] == "rerun":
+                verdict = check_ci_divergence(tr, attempt(0), attempt(1))
+        if verdict["failed"]:
+            for c in _of(read_rows(root), "check"):
+                if c.get("tree") == tr["tree"] and isinstance(c.get("id"), str):
+                    record_void(root, c["id"], "ci_divergence")
+        results.append({"commit": tip, "trailer": tr, **verdict})
     return results

@@ -443,8 +443,101 @@ def test_ci_divergence_is_decided_by_equal_trees_only(trailer, rerun, second, re
     assert (verdict["result"], verdict["failed"]) == (result, failed)
 
 
-def test_a_trailer_line_is_accepted_as_well_as_a_parsed_one():
-    assert credit.check_ci_divergence(credit.format_trailer(SHA, 0), {"tree": SHA, "exit": 0})["result"] == "agree"
+def test_a_raw_trailer_line_is_not_a_parsed_trailer():
+    verdict = credit.check_ci_divergence(credit.format_trailer(SHA, 0), {"tree": SHA, "exit": 0})
+    assert verdict["result"] == "unbound" and verdict["failed"] is False
+
+
+def test_an_inconclusive_rerun_is_unbound_never_a_failure():
+    verdict = credit.check_ci_divergence({"tree": SHA, "exit": 0},
+                                         {"tree": SHA, "inconclusive": True, "reason": "timed out"})
+    assert verdict == {"result": "unbound", "failed": False, "reason": "CI rerun timed out"}
+
+
+def _trailer_head(repo, value: int = 2, exit_code: int = 0) -> str:
+    repo.write("src/app.py", f"def app():\n    return {value}\n")
+    tree = hv.tree_now(repo.root)
+    repo.commit(f"change {value}\n\n{credit.format_trailer(tree, exit_code)}")
+    return tree
+
+
+def _check_row(repo, tree: str, check_id: str) -> None:
+    from aegis_core.telemetry_engine import ledger
+
+    ledger.append_rows(repo.root, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-20T00:00:00Z", "event": "check",
+                                    "id": check_id, "tree": tree, "witness": "aegis", "passed": True}])
+
+
+@needs_git
+def test_a_divergence_that_repeats_voids_the_checks_of_that_tree(tmp_path):
+    repo = hv.make_project(tmp_path)
+    tree = _trailer_head(repo)
+    _check_row(repo, tree, "c-diverged")
+    out = credit.verify_commit_trailers(repo.root, "main", "HEAD", rerun_fn=lambda _c, t: {"tree": t, "exit": 1})
+    assert [(e["result"], e["failed"]) for e in out] == [("void", True)]
+    assert [(r["check"], r["reason"]) for r in hv.rows_of(repo.root, "void")] == [("c-diverged", "ci_divergence")]
+
+
+@needs_git
+def test_a_divergence_the_second_rerun_contradicts_agrees_and_voids_nothing(tmp_path):
+    repo = hv.make_project(tmp_path)
+    tree = _trailer_head(repo)
+    _check_row(repo, tree, "c-flaky")
+    answers = iter([1, 0])
+    out = credit.verify_commit_trailers(repo.root, "main", "HEAD",
+                                        rerun_fn=lambda _c, t: {"tree": t, "exit": next(answers)})
+    assert [e["result"] for e in out] == ["agree"] and hv.rows_of(repo.root, "void") == []
+
+
+@needs_git
+@posix_only
+def test_a_rerun_that_times_out_is_unbound_and_check_ci_passes(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+
+    repo = hv.make_project(tmp_path, runner="import time\ntime.sleep(30)\n")
+    hv.use_stub_runner(repo.home.path)
+    _trailer_head(repo)
+    out = checkrun.verify_commit_trailers(repo.root, "main", "HEAD", timeout=1)
+    assert [(e["result"], e["failed"]) for e in out] == [("unbound", False)] and "timed out" in out[0]["reason"]
+    monkeypatch.setattr(checkrun, "DEFAULT_TIMEOUT_S", 1.0)
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    assert main(["check", "--ci", "--base", "main", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["trailer_checks"][0]["result"] == "unbound"
+
+
+@needs_git
+def test_the_rerun_uses_the_record_recipe_and_snapshot_bytes(tmp_path, monkeypatch):
+    repo = hv.make_project(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("committed LF")
+    repo.home.config("core.autocrlf", "true")
+    seen = []
+
+    def recorder(argv, cwd, env, timeout, junit, output):
+        seen.append(([a.replace(str(junit), "JUNIT") for a in argv], sorted(env), timeout,
+                     (Path(cwd) / "src" / "app.py").read_bytes()))
+        return checkrun.TestsRun(exit=0, collected=1, passed=1)
+
+    monkeypatch.setattr(checkrun, "run_tests", recorder)
+    recorded = checkrun.record(repo.root, tests=True, base="main")
+    rerun = checkrun.rerun_commit_snapshot(repo.root, "HEAD", "main")
+    assert recorded.status == "recorded" and rerun["tree"] == recorded.row["tree"] and rerun["exit"] == 0
+    assert len(seen) == 2 and seen[0] == seen[1]
+    assert seen[0][2] == checkrun.DEFAULT_TIMEOUT_S and seen[0][3] == b"def app():\n    return 2\n"
+
+
+@needs_git
+def test_a_rerun_without_a_merge_base_or_commit_is_unbound_with_a_reason(tmp_path):
+    repo = hv.make_project(tmp_path)
+    repo.git("checkout", "-q", "--orphan", "island")
+    repo.commit("unrelated history")
+    repo.git("checkout", "-q", "work")
+    tree = hv.tree_now(repo.root)
+    for commit, base in (("HEAD", "island"), ("0" * 40, "main")):
+        rerun = checkrun.rerun_commit_snapshot(repo.root, commit, base)
+        verdict = credit.check_ci_divergence({"tree": tree, "exit": 0}, rerun)
+        assert verdict["result"] == "unbound" and verdict["failed"] is False and verdict["reason"], commit
 
 
 # ── derivation edges ─────────────────────────────────────────────────────────

@@ -396,24 +396,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
             entries = bound.diff_entries(base_commit)
             changed = [path for status, path in entries if status != "D"]
             protected = governance.touches_governance(changed, [path for status, path in entries if status == "D"])
-            scratch = Path(tempfile.mkdtemp(prefix="aegis-check-"))
-            try:
-                snapshot = scratch / "snapshot"
-                bound.export(snapshot)
-                layer1 = _layer1(snapshot, changed)
-                run: Optional[TestsRun] = None
-                logical = list(DEFAULT_COMMAND)
-                if tests:
-                    junit = scratch / "junit.xml"
-                    argv, logical = plan_command(user_test_command(workspace), junit)
-                    home = scratch / "home"
-                    tmp = scratch / "tmp"
-                    home.mkdir(mode=0o700)
-                    tmp.mkdir(mode=0o700)
-                    run = run_tests(argv, snapshot, _hermetic_env(home, tmp),
-                                    DEFAULT_TIMEOUT_S if timeout is None else timeout, junit, scratch / "output.txt")
-            finally:
-                shutil.rmtree(scratch, ignore_errors=True)
+            layer1, run, logical = _snapshot_check(workspace, bound.export, changed, tests, timeout)
     except treeid.TreeError as exc:
         return CheckOutcome("error", None, str(exc))
     except gitsafe.GitError as exc:
@@ -452,57 +435,67 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
     return CheckOutcome("recorded", row, "", binding, hint)
 
 
+def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tests: bool,
+                    timeout: Optional[float]) -> Tuple[Dict[str, int], Optional[TestsRun], List[str]]:
+    """Export a tree with ``export_fn`` and run Layer 1 and, with ``tests``, the user's test command
+    on it: the one recipe ``record`` and the trailer rerun share, so CI falsifies the same check."""
+    scratch = Path(tempfile.mkdtemp(prefix="aegis-check-"))
+    try:
+        snapshot = scratch / "snapshot"
+        export_fn(snapshot)
+        layer1 = _layer1(snapshot, changed)
+        run: Optional[TestsRun] = None
+        logical = list(DEFAULT_COMMAND)
+        if tests:
+            junit = scratch / "junit.xml"
+            argv, logical = plan_command(user_test_command(workspace), junit)
+            home = scratch / "home"
+            tmp = scratch / "tmp"
+            home.mkdir(mode=0o700)
+            tmp.mkdir(mode=0o700)
+            run = run_tests(argv, snapshot, _hermetic_env(home, tmp),
+                            DEFAULT_TIMEOUT_S if timeout is None else timeout, junit, scratch / "output.txt")
+        return layer1, run, logical
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def rerun_commit_snapshot(
     root: object, commit: str, base_ref: str, *, timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Export ``commit``'s tree into an isolated snapshot and rerun Layer 1 and snapshot tests."""
-    from aegis_core import regression
-
+    """Rerun ``record --tests`` on ``commit``'s tree: ``{"tree", "exit"}``, or ``{"tree",
+    "inconclusive": True, "reason"}`` when git could not answer or the run timed out."""
     workspace = Path(os.fspath(root)).resolve()
     top = gitsafe.toplevel(workspace)
     commit = gitsafe.resolve_commit(top, commit) if top is not None else None  # only an oid reaches git argv
     if commit is None:
         return {"tree": "", "exit": 1}
-    commit_tree = gitsafe.run(["rev-parse", f"{commit}^{{tree}}"], top).stdout.decode("ascii", "replace").strip()
-    base_commit = gitsafe.merge_base(top, base_ref, commit) or gitsafe.resolve_commit(top, base_ref) or commit
-    entries = gitsafe.diff_entries(top, base_commit, commit)
-    changed = [p for s, _o, _n, p in entries if s != "D"]
-    tree_entries = gitsafe.tree_blobs(top, commit)
-    scratch = Path(tempfile.mkdtemp(prefix="aegis-trailer-rerun-"))
     try:
-        snapshot = scratch / "snapshot"
-        gitsafe.export_tree(top, commit, snapshot)
-        layer1 = _layer1(snapshot, changed)
-        user_cmd = user_test_command(workspace)
-        tests_ok = True
-        raw_exit = 0
-        if user_cmd is not None:
-            junit = scratch / "junit.xml"
-            home = scratch / "home"
-            tmp = scratch / "tmp"
-            home.mkdir(mode=0o700)
-            tmp.mkdir(mode=0o700)
-            argv, _ = plan_command(user_cmd, junit)
-            run = run_tests(argv, snapshot, _hermetic_env(home, tmp), timeout or 120.0, junit, scratch / "output.txt")
-            tests_ok = run.evidence
-            raw_exit = run.exit
-        else:
-            t_files = sorted(p for p in tree_entries if regression.is_test_file(p) and (snapshot / p).is_file())
-            if t_files:
-                out = regression._run_pytest_in_snapshot(snapshot, t_files, workspace, scratch, timeout or 120.0)
-                tests_ok = out.exit_code == 0 and bool(out.passed_ids) and not out.failed_ids and not out.collection_errors
-                raw_exit = out.exit_code
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    passed = layer1["findings"] == 0 and tests_ok
-    return {"tree": commit_tree, "exit": 0 if passed else (raw_exit if raw_exit != 0 else 1)}
+        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}"], top)
+        if res.returncode != 0:
+            return {"tree": "", "inconclusive": True, "reason": f"could not read the tree of {commit[:12]}"}
+        commit_tree = res.stdout.decode("ascii", "replace").strip()
+        base_commit = gitsafe.merge_base(top, base_ref, commit)
+        if not base_commit:
+            return {"tree": "", "inconclusive": True, "reason": f"found no merge-base with {commit[:12]}"}
+        changed = [p for s, _o, _n, p in gitsafe.diff_entries(top, base_commit, commit) if s != "D"]
+        layer1, run, _logical = _snapshot_check(
+            workspace, lambda dest: gitsafe.export_tree(top, commit, dest), changed, True, timeout)
+    except gitsafe.GitError as exc:
+        return {"tree": "", "inconclusive": True, "reason": f"git could not answer: {exc}"}
+    if run is not None and run.timed_out:
+        return {"tree": commit_tree, "inconclusive": True, "reason": "timed out"}
+    if layer1["findings"] == 0 and run is not None and run.evidence:
+        return {"tree": commit_tree, "exit": 0}
+    return {"tree": commit_tree, "exit": run.exit if run is not None and run.exit != 0 else 1}
 
 
 def verify_commit_trailers(
     root: object, base: str, head: str = "HEAD", *,
     rerun_fn: Optional[ Any ] = None, timeout: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Verify ``Aegis-Check`` trailers on commits in ``base..head`` by rerunning each commit's snapshot."""
+    """Verify the ``Aegis-Check`` trailer of the head commit by rerunning its snapshot with the
+    ``record --tests`` recipe (``DEFAULT_TIMEOUT_S`` unless ``timeout`` is given)."""
     from aegis_core import credit
 
     runner = rerun_fn or (lambda c, _t: rerun_commit_snapshot(root, c, base, timeout=timeout))
