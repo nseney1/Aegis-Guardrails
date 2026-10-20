@@ -28,6 +28,7 @@ from aegis_core.storage import (
 )
 from aegis_core.telemetry_engine import ledger
 from aegis_core.verification.scanners import MAX_EXCERPT_CHARS, redact_insight_text
+from aegis_core.workspace.binding import bounded_walk_up
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 __all__ = [
@@ -228,7 +229,10 @@ def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
 
 
 def insight_workspace_id(workspace: Any) -> str:
+    # Keyed to the governed root (the nearest .aegis inside the git boundary), so a hook
+    # running in a subdirectory and `review` at the root share one file.
     root = Path(os.fspath(workspace)).resolve()
+    root = bounded_walk_up(root) or root
     fast = _fast_git_common_and_top(root)
     if fast is not None:
         common, top = fast
@@ -415,27 +419,19 @@ def add_insight(
     *,
     paths: Optional[Sequence[str]] = None,
     kind: Optional[str] = None,
-    host: str = "cli",
-    session: Optional[str] = None,
     commit: Optional[str] = None,
     base_ref: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    # No session identity: it comes from the host (record_hook_prompt, capture_suggestion),
+    # never from a typed argument, so CLI rows cannot forge distinct recurrence episodes.
     if not isinstance(text, str) or not text.strip():
         raise ValueError("insight text must be a non-empty string")
     clean = redact_insight_text(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     level = "H" if _has_human_approval(workspace, commit, base_ref, clean) else "cli"
-    hs = _ensure_hs(host, session, home)
     row = _build_insight_row(
-        workspace,
-        level,
-        clean,
-        norm_paths,
-        psrc,
-        host or "cli",
-        hs,
-        kind=str(kind) if kind else None,
+        workspace, level, clean, norm_paths, psrc, "cli", None, kind=str(kind) if kind else None,
     )
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
@@ -515,7 +511,8 @@ def record_hook_prompt(
     prompt_text, payload_session, payload_cwd = _extract_hook_fields(actual_payload)
     if actual_ws is None:
         from aegis_core.config import env_workspace
-        actual_ws = payload_cwd or env_workspace() or os.getcwd()
+        project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
+        actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
     hs = _ensure_hs(host, session or payload_session, home=home)
     path = insights_path(actual_ws, home=home)
     existing = read_insight_rows(actual_ws, home=home)

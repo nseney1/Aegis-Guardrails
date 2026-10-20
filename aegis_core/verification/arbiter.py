@@ -139,11 +139,7 @@ def arbitrate(
             ))
 
     # Verdict logic
-    verdict = _compute_verdict(
-        divergences, layer1_failures,
-        predictions=predictions,
-        spec_agent_failed=spec_agent_failed,
-    )
+    verdict = _compute_verdict(divergences, layer1_failures)
     l1_verdict = "FAIL" if layer1_failures else "PASS"
     resolved_infra = (
         infra_status
@@ -183,37 +179,18 @@ def arbitrate(
 def _compute_verdict(
     divergences: list[Divergence],
     layer1_failures: list[ToolEvidence],
-    *,
-    predictions: list[Prediction] | None = None,
-    spec_agent_failed: bool = False,
 ) -> Verdict:
-    """Deterministic verdict computation.
+    """Deterministic verdict computation. The verdict is advisory (T6 is log-only).
 
-    BLOCK if:
-      - Any Layer 1 tool FAILS
-      - Any divergence has a critical prediction
-      - Any claim is contradicted by Layer 1
-      - Spec Agent failed and produced no predictions (fail-closed)
+    BLOCK if any Layer 1 tool FAILS or an unmatched prediction is critical.
+    REVISE if an unmatched prediction is HIGH. SHIP otherwise.
 
-    REVISE if:
-      - Any unmatched prediction with severity >= HIGH
-
-    SHIP otherwise.
+    A Spec Agent failure is not a verdict: it only sets infra_status 'unverified'.
+    The contradicted_claim, confirmed_risk and undetected_by_both divergences each
+    need a failing Layer 1 row, so the first check already returns BLOCK for them.
     """
     if layer1_failures:
         return Verdict.BLOCK
-
-    # Fail-closed: if spec agent produced no predictions, don't silently ship
-    if spec_agent_failed and not (predictions or []):
-        return Verdict.BLOCK
-
-    for d in divergences:
-        if d.divergence_type == "contradicted_claim":
-            return Verdict.BLOCK
-        if d.divergence_type == "confirmed_risk":
-            return Verdict.BLOCK
-        if d.divergence_type == "undetected_by_both":
-            return Verdict.BLOCK
 
     for d in divergences:
         if d.prediction and d.prediction.severity == Severity.CRITICAL:

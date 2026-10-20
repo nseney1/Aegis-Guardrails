@@ -12,10 +12,10 @@ import sys
 import tempfile
 from typing import Any, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core import checkrun, gitsafe, governance, human_gate, match, rule_integrity
+from aegis_core import checkrun, gitsafe, governance, human_gate, match
+from aegis_core.config import _is_within, read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.rules import workspace_root
-from aegis_core.workspace.layout import UserLayout
 
 __all__ = [
     "CommitRegression",
@@ -289,9 +289,8 @@ class RegressionReport:
 
 
 def _user_regression_tier(root: str) -> str:
-    layout = UserLayout.current()
-    data = checkrun._read_user_config(layout.config_file, Path(root)) if layout else None
-    reg = data.get("regression") if isinstance(data, dict) else None
+    data = read_user_config(root)
+    reg = data.get("regression") if data else None
     tier = reg.get("tier") if isinstance(reg, dict) else None
     if isinstance(tier, str) and tier.strip().lower() in VALID_TIERS:
         return tier.strip().lower()
@@ -408,7 +407,7 @@ def _run_pytest_in_snapshot(
     ext_dirs = [
         str(Path(p).resolve())
         for p in sys.path
-        if p and Path(p).is_dir() and not rule_integrity._within(Path(p).resolve(), ws)
+        if p and Path(p).is_dir() and not _is_within(Path(p).resolve(), ws)
     ]
     pytest_args = [*_PYTEST_FLAGS, f"--junitxml={junit}", "--", *test_files]
     argv = [

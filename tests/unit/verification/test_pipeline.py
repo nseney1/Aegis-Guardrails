@@ -1,8 +1,11 @@
 """Test suite for soma_core/verification/pipeline.py conforming to strict checkpoint conventions."""
 from __future__ import annotations
 
+import json
 
-from aegis_core.verification import Verdict
+import pytest
+
+from aegis_core.verification import ToolEvidence, Verdict
 from aegis_core.verification.pipeline import VerificationPipeline
 
 
@@ -14,6 +17,44 @@ class FakeUnparseableBackend:
 
     def generate(self, prompt: str) -> str:
         return self.response
+
+
+_PASSING = [ToolEvidence("call_graph", "module.py", True, "ok")]
+_CRITICAL = json.dumps([{"category": "code_injection", "severity": "critical", "risk": "eval",
+                         "mechanism": "exec", "affected_function": "run"}])
+
+
+def _layer2(tmp_path, backend, evidence=_PASSING):
+    (tmp_path / "module.py").write_text("def run():\n    return 42\n", encoding="utf-8")
+    return VerificationPipeline().run(
+        changed_files=["module.py"], workspace=tmp_path, task_plan="Implement run", backend=backend,
+        test_names=[], test_results="", layer1_evidence=list(evidence),
+    )
+
+
+class TestLayer2IsAdvisory:
+    """T6 is log-only: `passed` is Layer 1's; the arbiter verdict is reported, never gating (R-checks-43)."""
+
+    @pytest.mark.parametrize("reply", ["Internal Server Error: 500", '{"error": "rate limit"}'], ids=["text", "dict"])
+    def test_an_unreadable_spec_reply_is_unverified_not_block(self, tmp_path, reply):
+        res = _layer2(tmp_path, FakeUnparseableBackend(reply))
+        assert res.verdict != Verdict.BLOCK
+        assert res.infra_status == "unverified"
+        assert res.passed is True
+        assert "Layer 2 (advisory): UNVERIFIED" in res.summary
+
+    def test_a_critical_prediction_blocks_but_passes(self, tmp_path):
+        res = _layer2(tmp_path, lambda prompt: _CRITICAL if "Spec Agent" in prompt else "[]")
+        assert res.verdict == Verdict.BLOCK
+        assert res.passed is True
+        assert res.layer1_verdict == "PASS"
+        assert "Layer 2 (advisory): BLOCK" in res.summary
+
+    def test_a_failing_layer1_row_fails_with_a_clean_layer2(self, tmp_path):
+        failing = [ToolEvidence("call_graph", "module.py", False, "run() is never called")]
+        res = _layer2(tmp_path, lambda prompt: "[]", evidence=failing)
+        assert res.passed is False
+        assert res.layer1_verdict == "FAIL"
 
 
 class TestPipelineFailClosed:
@@ -45,8 +86,8 @@ class TestPipelineFailClosed:
         assert calls == []
         assert not (tmp_path / ".aegis").exists()
 
-    def test_spec_agent_unparseable_json_fails_closed_to_block(self, tmp_path):
-        """When Spec Agent returns malformed JSON or error text, pipeline must FAIL-CLOSED with BLOCK."""
+    def test_garbage_reply_with_an_unwired_function_blocks_on_layer1(self, tmp_path):
+        """The BLOCK and the failure come from Layer 1 (call_graph: run() is never called), not the reply."""
         f = tmp_path / "module.py"
         f.write_text("def run():\n    return 42\n", encoding="utf-8")
 
@@ -60,13 +101,12 @@ class TestPipelineFailClosed:
             backend=bad_backend,
         )
 
-        assert res.verdict == Verdict.BLOCK, (
-            f"Expected Verdict.BLOCK on Spec Agent parse failure, got {res.verdict}"
-        )
+        assert res.verdict == Verdict.BLOCK
+        assert res.layer1_verdict == "FAIL"
         assert not res.passed
 
-    def test_spec_agent_dict_instead_of_list_fails_closed_to_block(self, tmp_path):
-        """When Spec Agent returns a JSON dictionary instead of a list of predictions, fail-closed."""
+    def test_dict_reply_with_an_unwired_function_blocks_on_layer1(self, tmp_path):
+        """The BLOCK and the failure come from Layer 1 (call_graph), not the dict reply."""
         f = tmp_path / "module.py"
         f.write_text("def run():\n    return 42\n", encoding="utf-8")
 
@@ -81,6 +121,7 @@ class TestPipelineFailClosed:
         )
 
         assert res.verdict == Verdict.BLOCK
+        assert res.layer1_verdict == "FAIL"
         assert not res.passed
 
     def test_pipeline_reusable_layer1_evidence_and_discovery(self, tmp_path):
@@ -202,3 +243,47 @@ def test_layer2_reads_only_the_changed_source_modules(tmp_path):
 
     assert implementation == "def transfer(amount: int) -> int:\n    return amount\n"
     assert len(signatures) == 1 and "def transfer(" in signatures[0]
+
+
+class TestChangedFilesFromGit:
+    """Without changed_files the library asks git; 'git cannot answer' is an error, never a clean pass (R-checks-45)."""
+
+    @staticmethod
+    def _git(root, *args):
+        import subprocess
+
+        subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True)
+
+    def test_the_pipeline_outside_a_git_work_tree_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        (tmp_path / "a.py").write_text("import os\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="cannot list the changed files"):
+            VerificationPipeline().run(workspace=tmp_path)
+
+    def test_the_layer1_verifier_outside_a_git_work_tree_raises(self, tmp_path, monkeypatch):
+        from aegis_core.verification.pipeline import DeterministicVerifier
+
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        (tmp_path / "a.py").write_text("import os\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="cannot list the changed files"):
+            DeterministicVerifier().verify(workspace=tmp_path)
+
+    def test_a_clean_git_tree_is_a_clean_pass(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        self._git(tmp_path, "init", "-q")
+        self._git(tmp_path, "config", "user.email", "t@example.com")
+        self._git(tmp_path, "config", "user.name", "T")
+        (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self._git(tmp_path, "add", "a.py")
+        self._git(tmp_path, "commit", "-q", "-m", "init")
+        res = VerificationPipeline().run(workspace=tmp_path)
+        assert res.passed is True
+        assert res.verdict == Verdict.SHIP
+        assert res.layer1_verdict == "PASS"
+        assert res.target_files == []
+
+    def test_an_explicit_empty_list_is_a_clean_pass_outside_git(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        res = VerificationPipeline().run(changed_files=[], workspace=tmp_path)
+        assert res.passed is True
+        assert res.verdict == Verdict.SHIP

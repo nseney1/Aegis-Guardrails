@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
+from aegis_cli import sanitize_display
+
 __all__ = [
     "format_github_annotations",
     "format_github_step_summary",
@@ -15,17 +17,28 @@ __all__ = [
     "format_sarif_report",
 ]
 
+_MODEL_TEXT_MAX = 300
+
+
+def _model_text(value: Any) -> str:
+    """Model text as one printable line: the model's reply is any JSON value, and the
+    slice comes first because sanitize_display is quadratic on unterminated OSC/DCS introducers."""
+    return sanitize_display(str(value)[:_MODEL_TEXT_MAX * 4], max_len=_MODEL_TEXT_MAX)
+
 
 def format_layer2_summary(result: Any) -> str:
     """Format Layer 2 arbitration results for CLI output."""
     from aegis_core.verification import Verdict
 
     lines = []
-    verdict_str = result.verdict.name if hasattr(result.verdict, "name") else str(result.verdict)
-    icon = "✅" if result.verdict == Verdict.SHIP else "🔴"
-    lines.append(f"Layer 2: {icon} {verdict_str}")
     l1_v = getattr(result, "layer1_verdict", "")
     infra = getattr(result, "infra_status", "")
+    if infra and infra != "ok":
+        lines.append("Layer 2: ⚠️ UNVERIFIED (advisory: the review did not complete; the exit status is Layer 1's)")
+    else:
+        verdict_str = result.verdict.name if hasattr(result.verdict, "name") else str(result.verdict)
+        icon = "✅" if result.verdict == Verdict.SHIP else "🔴"
+        lines.append(f"Layer 2: {icon} {verdict_str} (advisory: the exit status is Layer 1's)")
     preds = getattr(result, "llm_predictions", ())
     if l1_v or infra:
         lines.append(
@@ -36,7 +49,7 @@ def format_layer2_summary(result: Any) -> str:
     if result.divergences:
         lines.append(f"  Divergences ({len(result.divergences)}):")
         for d in result.divergences:
-            pred_desc = f" [{d.prediction.severity.value}] {d.prediction.risk}" if d.prediction else ""
+            pred_desc = f" [{d.prediction.severity.value}] {_model_text(d.prediction.risk)}" if d.prediction else ""
             lines.append(f"    - {d.category.value} ({d.divergence_type}):{pred_desc}")
             if d.resolution:
                 lines.append(f"      Resolution: {d.resolution}")
@@ -51,12 +64,14 @@ def format_layer2_summary(result: Any) -> str:
 
 
 def format_layer2_json(result: Any, verdict: Any) -> dict[str, Any]:
-    """JSON summary of a Layer 2 arbitration for `aegis check --format json`."""
+    """JSON summary of a Layer 2 arbitration for `aegis check --format json`; advisory, never the exit status."""
     preds = getattr(result, "llm_predictions", ()) if result else ()
+    infra = getattr(result, "infra_status", "ok") if result else "ok"
     return {
-        "verdict": verdict.value if hasattr(verdict, "value") else str(verdict),
+        "verdict": None if infra != "ok" else (verdict.value if hasattr(verdict, "value") else str(verdict)),
+        "advisory": True,
         "layer1_verdict": getattr(result, "layer1_verdict", "PASS") if result else "PASS",
-        "infra_status": getattr(result, "infra_status", "ok") if result else "ok",
+        "infra_status": infra,
         "llm_predictions": [
             p.to_dict() if hasattr(p, "to_dict") else str(p)
             for p in preds

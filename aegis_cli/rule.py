@@ -703,8 +703,6 @@ class RuleCommand(AegisCommand):
         p_ins_add.add_argument("text", metavar="TEXT", help="Correction insight text (redacted and capped at 300 chars)")
         p_ins_add.add_argument("--paths", nargs="*", default=None, help="Target file paths (default: git dirty set)")
         p_ins_add.add_argument("--kind", default=None, help="Optional insight category or kind")
-        p_ins_add.add_argument("--host", default="cli", help="Host identifier (default: cli)")
-        p_ins_add.add_argument("--session", default=None, help="Optional session identifier (stored as keyed hs)")
         p_ins_add.add_argument("--commit", default=None, help="Optional signed commit SHA carrying Aegis-Approve-Insight")
         p_ins_add.add_argument("--base-ref", dest="base_ref", default=None, help="Optional base branch reference for --commit")
 
@@ -795,8 +793,7 @@ def _run_insight(args: argparse.Namespace) -> int:
         try:
             row = add_insight(
                 root, getattr(args, "text", ""), paths=_normalize_paths_arg(getattr(args, "paths", None)),
-                kind=getattr(args, "kind", None), host=getattr(args, "host", "cli") or "cli",
-                session=getattr(args, "session", None), commit=getattr(args, "commit", None),
+                kind=getattr(args, "kind", None), commit=getattr(args, "commit", None),
                 base_ref=getattr(args, "base_ref", None),
             )
         except Exception as exc:

@@ -87,8 +87,6 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
         "src/main.py",
         "--kind",
         "reliability",
-        "--session",
-        "cli-sess-1",
         "--json",
     )
     assert rc == 0, err
@@ -96,7 +94,7 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
     assert added["level"] == "cli"
     assert added["psrc"] == "explicit"
     assert added["paths"] == ["src/main.py"]
-    assert "hs" in added
+    assert "hs" not in added  # session identity comes from the host, never a CLI argument
 
     rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
     assert rc == 0, err
@@ -237,3 +235,45 @@ def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: p
     )
     assert rc == 0, err
     assert json.loads(out)["level"] == "H"
+
+
+# ── `insight add` takes no session identity (R-evidence-42) ─────────────────
+
+@pytest.mark.parametrize("flag", ["--session", "--host"])
+def test_insight_add_refuses_a_typed_session_or_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, flag):
+    from aegis_cli.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    ws = _make_workspace(tmp_path / "ws")
+    with pytest.raises(SystemExit) as exc:
+        main(["rule", "insight", "add", "No, stop that", flag, "x", "--workspace", str(ws)])
+    assert exc.value.code == 2
+    assert flag in capsys.readouterr().err
+    assert read_insight_rows(ws, home=tmp_path / "home") == []
+
+
+def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core.insights import measure_recurrence
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    (ws / ".aegis" / "rules" / "traps" / "trap-popen-timeout.md").write_text(
+        "---\nid: trap-popen-timeout\ntype: trap\nenforcement: advisory\n"
+        "hypothesis: Popen without a timeout hangs.\ntarget_paths:\n  - src/*.py\n---\n"
+        "# trap-popen-timeout\n\nNever call subprocess.Popen without a timeout in src modules.\n",
+        encoding="utf-8",
+    )
+    for _ in range(3):
+        rc, _out, err = _invoke_rule(
+            ws, "insight", "add", "Never call subprocess.Popen without a timeout in src/main.py",
+            "--paths", "src/main.py", "--json",
+        )
+        assert rc == 0, err
+    rows = [r for r in read_insight_rows(ws, home=home) if r.get("event") == "insight"]
+    assert len(rows) == 3
+    assert all("hs" not in r and r["host"] == "cli" for r in rows)
+    assert measure_recurrence(ws, "trap-popen-timeout", home=home)["recurrences"] == 1
