@@ -21,6 +21,7 @@ from aegis_core.command_safety import (
     RECORD_SET,
     GuardRule,
     classify_command,
+    split_heredocs,
 )
 
 BLOCK_IDS = {
@@ -150,10 +151,187 @@ def test_wrapped_and_chained_block_set_commands_are_blocked(command, rule):
     assert _id(command) == (GUARD_BLOCK, rule)
 
 
+# R-checks-a1: the lexer returns a run of adjacent delimiters (";\n", "\n\n", "&&\n") as
+# one token; each command after such a run is still classified.
+DELIMITER_RUNS = [
+    ("echo a\n\nrm -rf /", "rm-recursive-dangerous"),
+    ("echo a;\nrm -rf /", "rm-recursive-dangerous"),
+    ("git add x &&\n git push --force origin main", "git-push-force"),
+    ("echo a ||\n rm -rf /", "rm-recursive-dangerous"),
+    ("a;;rm -rf /", "rm-recursive-dangerous"),
+    ("true &\nrm -rf /", "rm-recursive-dangerous"),
+    ("ls |\n rm -rf /", "rm-recursive-dangerous"),
+    ("git status\n\ngit reset --hard", "git-reset-hard"),
+]
+DELIMITER_RUNS_HARMLESS = [
+    "echo a\n\nls",
+    "ls;\n\nls",
+    "ls;\n\n\nls",
+    "cat f |& tee g",
+    "echo 'a;\n\nrm -rf /'",
+    "rm -rf build\n\nls",
+]
+
+
+@pytest.mark.parametrize("command,rule", DELIMITER_RUNS, ids=[f"run{i}" for i in range(len(DELIMITER_RUNS))])
+def test_a_command_after_a_run_of_delimiters_is_classified(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", DELIMITER_RUNS_HARMLESS, ids=[f"ok{i}" for i in range(len(DELIMITER_RUNS_HARMLESS))])
+def test_a_run_of_delimiters_never_splits_quoted_text_or_harmless_commands(command):
+    assert classify_command(command) is None
+
+
+# R-checks-2: git (parse-options) and GNU rm accept any unique prefix of a long option.
+@pytest.mark.parametrize("command,rule", [
+    ("git push --force-w origin feat", "git-push-force"),
+    ("git push --force-with origin feat", "git-push-force"),
+    ("git push --force-with-l origin feat", "git-push-force"),
+    ("git push origin feat --force-w", "git-push-force"),
+    ("git -C ../other push --force-w", "git-push-force"),
+    ('bash -lc "git push --force-w origin feat"', "git-push-force"),
+    ("git reset --har", "git-reset-hard"),
+    ("git reset --h", "git-reset-hard"),
+    ("git reset HEAD~1 --har", "git-reset-hard"),
+    ("git clean --forc -d", "git-clean-force"),
+    ("git clean --f -d", "git-clean-force"),
+    ("rm --recurs /", "rm-recursive-dangerous"),
+    ("rm --r ~", "rm-recursive-dangerous"),
+    # -e takes a pattern: the n of -en, or a -n after -e/--exclude, is that pattern.
+    ("git clean -fd -en", "git-clean-force"),
+    ("git clean -fen", "git-clean-force"),
+    ("git clean -fdx -e build", "git-clean-force"),
+    ("git clean -f -e n", "git-clean-force"),
+    ("git clean -f -e -n", "git-clean-force"),
+    ("git clean -f --exclude -n", "git-clean-force"),
+    # after -- a -n is a pathspec; --no-dry-run cancels a dry run
+    ("git clean -f -- -n .", "git-clean-force"),
+    ("git clean -n --no-dry-run -f", "git-clean-force"),
+    ("git clean -f --no-d", "git-clean-force"),
+])
+def test_an_abbreviated_long_option_is_the_option_it_abbreviates(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", [
+    "git push --",
+    "git push origin -- feat",
+    "git reset -- file.py",
+    "git reset HEAD -- file.py",
+    "git clean -n --",
+    "rm -r -- build",
+    "git push --force-i origin feat",
+    "git push --force-if origin feat",
+    "git push --follow-tags origin feat",
+    "git push --dry origin feat",
+    "git reset --soft HEAD~1",
+    "git clean -f --d",
+    "git clean -f --dry",
+    "git clean -fn",
+    "git clean -fdn",
+    "git clean -f -n",
+    "git clean -nfd",
+    "git clean -f --e=x -n",
+])
+def test_an_unrelated_prefix_or_a_real_dry_run_is_not_a_match(command):
+    assert classify_command(command) is None
+
+
+def test_delimiter_runs_alone_or_unterminated_fail_open_without_raising():
+    assert classify_command(";;;;;") is None
+    assert classify_command(";" * 100_000) is None
+    assert classify_command("ls;\n\n'x") is None
+
+
+# R-checks-3: an alias defined on the same git command line is judged by its expansion.
+_CHAIN = " ".join(f"-c alias.a{i}=a{i + 1}" for i in range(20))
+
+
+@pytest.mark.parametrize("command,rule", [
+    ("git -c alias.p='push -f' p", "git-push-force"),
+    ("git -c alias.p='push --force-with-lease' p origin feat", "git-push-force"),
+    ("git -c alias.p=push p -f", "git-push-force"),
+    ("git -c alias.P='push -f' p", "git-push-force"),
+    ("git -c alias.p='push origin +feat' p", "git-push-refspec"),
+    ("git -c alias.r='reset --hard' r", "git-reset-hard"),
+    ("git -c alias.c='clean -fdx' c", "git-clean-force"),
+    ("git -c alias.p='!git push -f' p", "git-push-force"),
+    ("git -c alias.p='!git push' p -f origin feat", "git-push-force"),
+    ("git -c alias.a=b -c alias.b='push -f' a", "git-push-force"),
+    (f"git {_CHAIN} -c alias.a20='reset --hard' a0", "git-reset-hard"),
+    ("sudo git -c alias.p='push -f' p", "git-push-force"),
+    ("bash -c \"git -c alias.p='push -f' p\"", "git-push-force"),
+    ("PVAL='push -f' git --config-env=alias.p=PVAL p", "git-push-force"),
+    ("PVAL='push -f' git --config-env alias.p=PVAL p", "git-push-force"),
+    ("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push -f' git p", "git-push-force"),
+    ("GIT_CONFIG_PARAMETERS=\"'alias.p=push -f'\" git p", "git-push-force"),
+    ("GIT_CONFIG_PARAMETERS=\"'user.name'='x' 'alias.p'='reset --hard'\" git p", "git-reset-hard"),
+    ("git -c alias.reset=status reset --hard", "git-reset-hard"),
+], ids=lambda value: value[:40] if value.startswith(("git", "sudo", "bash", "PVAL", "GIT_")) else "")
+def test_a_command_line_git_alias_is_judged_by_its_expansion(command, rule):
+    assert _id(command) == (GUARD_BLOCK, rule)
+
+
+@pytest.mark.parametrize("command", [
+    "git -c alias.st=status st",
+    "git -c alias.p='push origin feat' p",
+    "git -c alias.x='push -f' p",
+    "git -c alias.p push",
+    "git -c alias.p=p p",
+    "git -c alias.p=q -c alias.q=p p",
+    "git -c alias.p=\"push 'x\" p",
+    "git -c alias.p='!echo push -f' p",
+    "git --config-env=alias.p=UNSET p",
+])
+def test_a_harmless_looping_or_unparseable_git_alias_is_not_a_match(command):
+    assert classify_command(command) is None
+
+
 @pytest.mark.parametrize("target", ["./", ".//", "../", "..//", "~/", "/home/", "/root/", "/"])
 def test_trailing_slashes_never_hide_a_dangerous_rm_target(target):
     """BUG-075 for the guard: trailing slashes are normalized away."""
     assert _id(f"rm -rf {target}") == (GUARD_BLOCK, "rm-recursive-dangerous")
+
+
+@pytest.mark.parametrize("command", [
+    "dd of=//dev/sda",
+    "dd of=///dev/sda bs=1M",
+    "dd if=image.iso of=//dev/sdb bs=4M",
+    'dd of="//dev/sda"',
+    "dd of=/./dev/sda",
+    "dd of=/tmp/../dev/sda",
+    "dd of=/dev//sda",
+    "dd of=//dev/../dev/sda",
+    "dd of=/dev/shm/../sda",
+    "dd of=/dev/fd/../sda",
+    "yes | dd of=//dev/sda",
+    "/bin/dd of=//dev/sda",
+    "env dd of=//dev/sda",
+    "bash -c 'dd of=//dev/sda'",
+])
+def test_a_device_path_is_resolved_before_the_dd_device_check(command):
+    """R-checks-5: the of= operand is resolved lexically (no filesystem access)."""
+    assert _id(command) == (GUARD_BLOCK, "dd-device")
+
+
+@pytest.mark.parametrize("command", [
+    "dd if=/dev/zero of=//dev/null bs=1M count=1",
+    "dd of=///dev/null",
+    "dd of=/dev//null",
+    "dd of=/dev/./null",
+    "dd of=/dev/null/",
+    "dd of=//dev/stdout",
+    "dd of=//dev/fd/1",
+    "dd of=//dev/shm/scratch.img",
+    "dd of=//tmp/out.img",
+    "dd of=/tmp/dev/sda",
+    "dd of=//dev",
+    "dd of=/dev/",
+    "dd of=out.img",
+])
+def test_a_harmless_dd_target_spelled_with_extra_slashes_or_dots_is_not_a_match(command):
+    assert classify_command(command) is None
 
 
 # ── record set ───────────────────────────────────────────────────────────────
@@ -291,6 +469,40 @@ def test_a_command_after_a_shell_heredoc_is_still_checked():
 
 def test_a_command_after_an_unterminated_heredoc_is_text():
     assert classify_command("cat <<EOF\ngit reset --hard") is None
+
+
+# R-checks-6: a heredoc a SQL client reads is SQL, and a shell-run heredoc is commands;
+# both are checked for destructive SQL (record tier). Other heredoc bodies stay data.
+@pytest.mark.parametrize("command", [
+    "psql <<EOF\nDROP TABLE users;\nEOF\n",
+    "psql -d app <<'EOF'\ndelete from sessions;\nEOF",
+    "mysql -u root <<SQL\nTRUNCATE TABLE audit_log;\nSQL",
+    "sqlite3 app.db <<-EOF\n\tDROP DATABASE x;\n\tEOF",
+    "cat <<EOF | psql\nDROP DATABASE prod;\nEOF",
+    "docker exec -i db psql -U postgres <<EOF\nDROP TABLE users;\nEOF",
+    "psql<<EOF\nDROP TABLE users;\nEOF",
+    "/usr/bin/psql.exe <<EOF\nDROP TABLE users;\nEOF",
+    "\\psql <<EOF\nDROP TABLE users;\nEOF",
+    "PGPASSWORD=x psql -h db <<EOF\nDROP TABLE users;\nEOF",
+    "ssh db psql <<EOF\nDROP TABLE users;\nEOF",
+    "bash <<'EOF'\npsql -c 'DROP TABLE users'\nEOF",
+], ids=[f"sql{i}" for i in range(12)])
+def test_destructive_sql_in_a_heredoc_a_client_or_shell_reads_is_recorded(command):
+    assert _id(command) == (GUARD_RECORD, "sql-destructive")
+
+
+@pytest.mark.parametrize("command", [
+    "psql <<EOF\nSELECT 1;\nEOF",
+    'git commit -m "$(cat <<\'EOF\'\nfix: stop recording DROP TABLE in notes\nEOF\n)"',
+    "cat <<EOF > migrate.sql\nDROP TABLE users;\nEOF",
+    "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: m.sql\n+DROP TABLE users;\n*** End Patch\nEOF",
+], ids=["select", "commit-msg", "cat-to-file", "apply-patch"])
+def test_sql_in_a_heredoc_other_commands_read_is_not_recorded(command):
+    assert classify_command(command) is None
+
+
+def test_split_heredocs_keeps_its_two_tuple_and_never_returns_sql_as_a_script():
+    assert split_heredocs("psql <<EOF\nDROP TABLE users;\nEOF\n") == ("psql <<EOF\n", [])
 
 
 @pytest.mark.parametrize("value", [None, "", "   ", "\n", 42, ["git", "reset", "--hard"]])
