@@ -161,7 +161,7 @@ def test_no_signing_key_and_other_formats_are_reported_as_such(tmp_path):
     home = hg.Home(tmp_path / "home")
     home.sign_with("ABCDEF0123456789", fmt="openpgp")
     custody = human_gate.check_key_custody(tmp_path)
-    assert custody.status == "unsupported" and custody.degrades
+    assert custody.status == "unsupported" and not custody.degrades
 
 
 @needs_git
@@ -279,6 +279,39 @@ def test_tier_b_degrades_to_c_and_says_why_when_the_key_is_a_plain_file(tmp_path
     assert report.tier == "C" and report.label == "self-attested"
     assert any("plain" in reason for reason in report.reasons)
     assert report.evidence["key_custody"]["status"] == "plain_file"
+
+
+@needs_git
+@pytest.mark.parametrize("signing", [None, "openpgp"], ids=["no-key", "openpgp"])
+def test_no_ssh_signing_key_on_this_machine_is_a_tier_b_caveat_not_a_downgrade(tmp_path, signing):
+    """Given allowed_signers on the base, a required check, and (a) no user.signingkey or (b) an
+    OpenPGP signing format, When the tier is detected, Then it is B and a caveat says aegis approve
+    cannot be run here."""
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    if signing:
+        repo.home.sign_with("ABCDEF0123456789", fmt=signing)
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule()]))
+    assert report.tier == "B", report.reasons
+    assert any("no SSH signing key is configured on this machine" in c and "aegis approve" in c
+               for c in report.caveats), report.caveats
+    assert report.evidence["key_custody"]["degrades"] is False
+
+
+@needs_git
+def test_a_configured_signing_key_carries_the_not_compared_with_allowed_signers_caveat(tmp_path):
+    repo = _repo_with_governance(tmp_path, signer_pub=hg.hardware_public_key(), codeowners=None)
+    repo.home.sign_with("key::" + hg.hardware_public_key())
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.checks_rule()]))
+    assert report.tier == "B", report.reasons
+    assert "the local signing key is not compared with the keys in allowed_signers" in report.caveats
+
+
+def test_approve_says_what_it_reads_of_a_key():
+    from aegis_cli import approve
+    doc = " ".join((approve.__doc__ or "").split())
+    assert "reads at most the first 64 KiB of a key file to classify its protection" in doc
+    assert "it never copies, prints or stores it" in doc
+    assert "create, copy or read a key" not in doc
 
 
 @needs_signing

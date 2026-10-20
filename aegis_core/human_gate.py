@@ -383,12 +383,12 @@ def check_key_custody(root: Any) -> KeyCustody:
     config = signing_config(Path(root))
     value = config["key"]
     if not value:
-        return KeyCustody("none", "no user.signingkey in the user-level git config", True)
+        return KeyCustody("none", "no user.signingkey in the user-level git config", False)
     if config["format"] != "ssh":
         return KeyCustody(
             "unsupported",
             f"gpg.format is {config['format']!r}: approvals are SSH signatures checked against allowed_signers (git config --global gpg.format ssh)",
-            True,
+            False,
         )
     literal = _literal_key(value)
     if literal is not None:
@@ -673,10 +673,7 @@ def detect_tier(
     if signers["keys"] < 1:
         b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
     if custody.degrades:
-        if custody.status == "plain_file":
-            b_missing.append(custody.detail)
-        else:
-            b_missing.append(f"signing key: {custody.detail}")
+        b_missing.append(custody.detail)
 
     if not a_missing:
         tier = "A"
@@ -694,6 +691,10 @@ def detect_tier(
             )
         if custody.status in ("agent", "unknown"):
             caveats.append(custody.detail)
+        if custody.status in ("none", "unsupported"):
+            caveats.append(f"no SSH signing key is configured on this machine, so aegis approve cannot be run here ({custody.detail})")
+        else:
+            caveats.append("the local signing key is not compared with the keys in allowed_signers")
         caveats.append(
             "a ruleset can name bypass actors, which this endpoint does not show; classic branch protection is not read at all"
         )

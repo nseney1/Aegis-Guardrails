@@ -14,7 +14,9 @@ What it will not do:
 - run without a terminal and a typed ``y``: an approval is something a person looks at;
 - use a signing program, key or format from the repository's config: they come from the
   user-level git config, which a clone cannot set;
-- create, copy or read a key: git and ssh-keygen sign, Aegis only runs them.
+- create a key or sign with one itself: git and ssh-keygen sign, Aegis only runs them. Aegis reads
+  at most the first 64 KiB of a key file to classify its protection (plain, passphrase, hardware);
+  it never copies, prints or stores it.
 
 A signing key that is a plain, readable file with no passphrase is allowed to sign but flagged:
 an agent running as you can use it too, so such an approval does not show a human was there.

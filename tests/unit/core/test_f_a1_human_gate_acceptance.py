@@ -631,6 +631,20 @@ def test_approve_needs_ssh_signing_configured_at_user_scope(tmp_path, monkeypatc
     rc, out, err = _approve(repo, monkeypatch)
     assert rc == 1 and repo.head() == before and "gpg.format" in out + err
 
+@needs_signing
+@pytest.mark.parametrize("signing", [None, "openpgp"], ids=["no-key", "openpgp"])
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_approve_without_an_ssh_signing_key_is_refused_no_key(tmp_path, monkeypatch, keys, signing, exempt):
+    repo = hg.make_repo(tmp_path, keys["human_pub"])
+    _changed_rule_branch(repo)
+    if signing:
+        repo.home.sign_with("ABCDEF0123456789", fmt=signing)
+    before = repo.head()
+    extra = {"exempt_test": before, "reason": "by hand"} if exempt else {}
+    rc, out, _err = _approve(repo, monkeypatch, json=True, **extra)
+    assert rc == 1 and repo.head() == before
+    assert json.loads(out)["code"] == "no_key"
+
 @posix_only
 @needs_signing
 def test_a_repository_cannot_choose_the_signing_program(tmp_path, monkeypatch, keys):
