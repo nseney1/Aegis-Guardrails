@@ -401,6 +401,53 @@ def test_a_tight_token_budget_still_accounts_for_the_integrity_block(tmp_path):
     assert result["unreviewed_rules"][0]["id"] == "inv-evil"
 
 
+# A 200-character file name would pass MAX_PATH under a Windows runner's temp directory.
+_LONG_ID = 120 if os.name == "nt" else 200
+
+
+def long_unreviewed(repo: hg.Repo, count: int) -> List[str]:
+    ids = [f"inv-{i:02d}-" + "x" * (_LONG_ID - 7) for i in range(count)]
+    for rid in ids:
+        repo.write(path_of(rid), rule_text(rid, paths=("docs/*.md",), body="# " + "T" * 90 + "\n\nWhy.\n"))
+    return ids
+
+
+@needs_git
+def test_long_unreviewed_ids_are_trimmed_to_the_token_budget_and_counted(tmp_path):
+    repo = make_repo(tmp_path)
+    long_unreviewed(repo, 10)
+    scan_mod.RULE_CACHE.invalidate()
+    result = scan_mod.scan(str(repo.root), changed_files=["src/app.py"], budget=5, max_tokens=300)
+    assert result["stats"]["estimated_tokens"] <= 300
+    assert result["unreviewed_total"] == 10
+    listed = result.get("unreviewed_rules", [])
+    assert len(listed) < 10 and all(len(item["id"]) <= 80 for item in listed)
+
+
+@needs_git
+def test_a_short_unreviewed_list_that_is_trimmed_still_says_how_many_there_are(tmp_path):
+    repo = make_repo(tmp_path)
+    long_unreviewed(repo, 3)
+    scan_mod.RULE_CACHE.invalidate()
+    tight = scan_mod.scan(str(repo.root), changed_files=["src/app.py"], budget=5, max_tokens=300)
+    assert tight["stats"]["estimated_tokens"] <= 300
+    assert len(tight.get("unreviewed_rules", [])) < 3 and tight["unreviewed_total"] == 3
+    roomy = scan_mod.scan(str(repo.root), changed_files=["src/app.py"], budget=5, max_tokens=40000)
+    assert len(roomy["unreviewed_rules"]) == 3 and "unreviewed_total" not in roomy
+    assert all(len(item["id"]) == 80 and item["id"].endswith("...") for item in roomy["unreviewed_rules"])
+
+
+@needs_git
+def test_with_no_changed_files_the_unreviewed_list_still_fits_the_budget(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    long_unreviewed(repo, 10)
+    scan_mod.RULE_CACHE.invalidate()
+    monkeypatch.setattr(scan_mod, "_git_changed_files", lambda workspace: [])
+    result = scan_mod.scan(str(repo.root), changed_files=None, budget=5, max_tokens=300)
+    assert result["guidance"] == scan_mod.NO_CHANGES_TEXT
+    assert result["stats"]["estimated_tokens"] <= 300 and result["unreviewed_total"] == 10
+
+
 # ── the CI check ─────────────────────────────────────────────────────────────
 
 @needs_git

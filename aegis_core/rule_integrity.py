@@ -203,6 +203,11 @@ def title_of(rule: Rule) -> str:
         if line.lstrip().startswith("#") and stripped:
             text = stripped
             break
+    return _one_line(text)
+
+
+def _one_line(text: str) -> str:
+    """Branch-local text an agent reads: one printable line of at most 80 characters."""
     cleaned = " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
     return cleaned[:77] + "..." if len(cleaned) > 80 else cleaned
 
@@ -439,7 +444,7 @@ class Unreviewed:
 
     def as_dict(self) -> Dict[str, str]:
         return {
-            "id": self.id,
+            "id": _one_line(self.id),
             "title": self.title,
             "change": self.change,
         }

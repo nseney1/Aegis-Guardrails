@@ -357,6 +357,18 @@ def _integrity_extras(view: "rule_integrity.Effective") -> Dict[str, Any]:
     return extras
 
 
+def _trim_unreviewed(extras: Dict[str, Any]) -> bool:
+    """Drop the last listed unreviewed rule (branch-local text, bounded by the budget like the rest),
+    keeping the true count; False when none is listed."""
+    listed = extras.pop("unreviewed_rules", None)
+    if not listed:
+        return False
+    extras.setdefault("unreviewed_total", len(listed))
+    if len(listed) > 1:
+        extras["unreviewed_rules"] = listed[:-1]
+    return True
+
+
 def scan_user_layer(
     changed_files: Optional[List[str]] = None,
     budget: Optional[int] = None,
@@ -438,11 +450,14 @@ def _select(
         "estimated_tokens": 0,
         "max_tokens_budget": token_budget,
     }
+    extras = dict(extras or {})
     if not files:
-        payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
-        payload["guidance"] = NO_CHANGES_TEXT
-        payload["stats"]["estimated_tokens"] = _tokens(payload)
-        return payload
+        while True:
+            payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
+            payload["guidance"] = NO_CHANGES_TEXT
+            payload["stats"]["estimated_tokens"] = _tokens(payload)
+            if payload["stats"]["estimated_tokens"] <= token_budget or not _trim_unreviewed(extras):
+                return payload
 
     fits = fitness_of(served)
     matches = [m for m in (_match(r, files, fits[r.id]) for r in served) if m is not None]
@@ -492,6 +507,8 @@ def _select(
             break
         if shown:
             shown -= 1  # names go before rules do
+        elif _trim_unreviewed(extras):
+            pass  # then the unreviewed list, last entry first
         elif staged:
             entry = staged.pop()
             clamped.insert(0, entry)
