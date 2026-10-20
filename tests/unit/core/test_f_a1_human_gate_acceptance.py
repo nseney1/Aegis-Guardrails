@@ -787,7 +787,9 @@ def _two_commits_sharing_a_prefix(repo: hg.Repo, width: int = 7) -> tuple:
         oid = hashlib.sha1(b"commit %d\0" % len(body) + body).hexdigest()
         first = seen.setdefault(oid[:width], body)
         if first is not body:
-            return tuple(repo.git("hash-object", "-t", "commit", "-w", "--stdin", stdin=b.decode()) for b in (first, body))
+            # bytes, not text: a Windows text-mode pipe would turn LF into CRLF and git would reject the object
+            return tuple(subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo.root, input=b,
+                                        capture_output=True, check=True).stdout.decode().strip() for b in (first, body))
     pytest.skip("no shared prefix found")
 
 
