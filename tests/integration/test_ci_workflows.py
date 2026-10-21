@@ -15,7 +15,7 @@ yaml = pytest.importorskip("yaml")
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 GITHUB = os.path.join(REPO_ROOT, ".github")
 WORKFLOWS = os.path.join(GITHUB, "workflows")
-WORKFLOW_FILES = ("validate.yml", "publish.yml")
+WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml")
 SHA_REF = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 PINNED_LINE = re.compile(r"uses:\s*[^@\s]+@[0-9a-f]{40}\s+#\s*v\d+\.\d+\.\d+\s*$")
 
@@ -381,11 +381,8 @@ def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
 
 
 # --- R-trust-13 (c)-(f): a base-sourced, no-exec governance check ----------------------------
-# xfail(strict) until aegis-governance.yml lands after the author's pull_request_target spike.
 
 GOVERNANCE_WORKFLOW = "aegis-governance.yml"
-_AFTER_SPIKE = pytest.mark.xfail(strict=True, raises=FileNotFoundError,
-                                 reason="R-trust-13 c-f: aegis-governance.yml lands only after the author's spike")
 _BASE_SHA = "${{ github.event.pull_request.base.sha }}"
 
 
@@ -396,7 +393,6 @@ def _permission_maps(workflow):
             yield job["permissions"]
 
 
-@_AFTER_SPIKE
 def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_target():
     """N3: the base-sourced job counts as the required Aegis check under its literal name."""
     from aegis_core import human_gate
@@ -405,7 +401,6 @@ def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_tar
     assert human_gate.aegis_check_jobs(text) == ["aegis-governance"]
 
 
-@_AFTER_SPIKE
 def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
     """N4 (static): base.sha checkout without credentials, the head only as data, read-only token,
     no secret, nothing that builds, installs, caches or tests the checkout."""
