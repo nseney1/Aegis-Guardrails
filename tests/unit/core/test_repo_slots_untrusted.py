@@ -299,7 +299,7 @@ def test_packaged_go_driver_parses_real_go_source(ws: Path):
     main_go = ws / "main.go"
     main_go.write_text("package main\n\nfunc Helper() int { return 1 }\n\nfunc main() { Helper() }\n", encoding="utf-8")
 
-    result = ASTDriverRunner().parse_file(main_go, workspace_root=ws, timeout=120.0)
+    result = ASTDriverRunner().parse_file(main_go, workspace_root=ws, timeout=600.0)  # go run compiles; a hang ceiling
 
     assert result.language == "go"
     assert {"Helper", "main"} <= {d.name for d in result.definitions}
