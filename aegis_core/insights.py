@@ -41,7 +41,10 @@ from aegis_core.workspace.binding import bounded_walk_up
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 if TYPE_CHECKING:
+    # Bound for linters and type checkers only: at run time these names are served lazily by
+    # __getattr__ below, so a no-cue hook prompt never imports the scanner module.
     from aegis_core.rules import Rule
+    from aegis_core.verification.scanners import MAX_EXCERPT_CHARS, redact_insight_text
 
 __all__ = [
     "BURST_WINDOW_SECONDS",
