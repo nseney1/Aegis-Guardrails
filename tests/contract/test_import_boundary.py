@@ -81,7 +81,7 @@ CORE_LAYERS: Dict[str, int] = {
     # v4.3 T3: rank 2+ rules served from the reviewed BASE (the loader, the inventory, gitsafe), under scan.
     "aegis_core.adjudication": 1,
     "aegis_core.rule_integrity": 1,
-    # v4.3 T2: `aegis doctor --release` and credit attestation verification (gitsafe, pathlookup, human_gate's tier).
+    # v4.3 T2: `aegis doctor --release` (gitsafe, pathlookup, human_gate's tier); credit no longer verifies attestations.
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop (user-scope JSONL, redaction, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,

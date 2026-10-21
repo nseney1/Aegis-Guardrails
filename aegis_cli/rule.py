@@ -778,14 +778,6 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _normalize_paths_arg(raw_paths: Any) -> Optional[List[str]]:
-    if raw_paths is None:
-        return None
-    seq = [raw_paths] if isinstance(raw_paths, str) else (raw_paths if isinstance(raw_paths, (list, tuple)) else [])
-    items = [p.strip() for elem in seq for p in str(elem).split(",") if p.strip()]
-    return items or None
-
-
 def _run_insight(args: argparse.Namespace) -> int:
     from aegis_core.insights import (
         add_insight, measure_recurrence, record_decision, review_insights, write_proposal,
@@ -815,7 +807,7 @@ def _run_insight(args: argparse.Namespace) -> int:
         root = _resolve_workspace_root(args)
         try:
             row = add_insight(
-                root, getattr(args, "text", ""), paths=_normalize_paths_arg(getattr(args, "paths", None)),
+                root, getattr(args, "text", ""), paths=getattr(args, "paths", None),
                 kind=getattr(args, "kind", None), commit=getattr(args, "commit", None),
                 base_ref=getattr(args, "base_ref", None),
             )

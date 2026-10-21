@@ -303,7 +303,25 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
     else:
         for line in result.text_lines():  # warnings included, as "warning: ..." lines
             print(sanitize_display(line, max_len=len(line)))
+    if not result.integrity_passed:
+        _void_lane_tree(root, result.head)
     return 0 if result.passed else 1
+
+
+def _void_lane_tree(root: str, head: str) -> None:
+    """A failed integrity gate voids the credit of the lane head's tree; bookkeeping never changes
+    the gate's exit code, so a failure is one stderr note."""
+    from aegis_core import credit, gitsafe
+    from aegis_core.errors import AegisError
+
+    try:
+        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{head}^{{tree}}"], root)
+        tree = res.stdout.decode("ascii", "replace").strip() if res.returncode == 0 else ""
+        if not tree:
+            raise gitsafe.GitError(f"cannot read the tree of {head[:12]}")
+        credit.void_tree(root, tree, "lane_integrity")
+    except (AegisError, OSError) as exc:
+        print(f"note: could not void the credit of the lane's tree: {exc}", file=sys.stderr)
 
 
 # ── The v4.2 modes: whole-workspace reports, no FILES ───────────────────────

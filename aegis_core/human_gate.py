@@ -803,16 +803,21 @@ def _top(root: Any) -> Path:
     return top
 
 
+def _governance_blobs(top: Path, commit: str) -> Dict[str, Tuple[str, str]]:
+    """{path: (mode, oid)} of every governance file at ``commit``. Raises GitError."""
+    entries = gitsafe.tree_blobs(top, commit, include_symlinks=True, timeout=60.0)
+    return {path: entry for path, entry in entries.items() if governance.category_of(path) is not None}
+
+
 def _tracked_governance_entries(workspace: Any, rev: str) -> Dict[str, Tuple[str, str]]:
     top = gitsafe.toplevel(Path(workspace))
     commit = gitsafe.resolve_commit(top, rev) if top else None
     if not top or not commit:
         return {}
     try:
-        entries = gitsafe.tree_blobs(top, commit, include_symlinks=True, timeout=60.0)
+        return _governance_blobs(top, commit)
     except gitsafe.GitError:
         return {}
-    return {path: entry for path, entry in entries.items() if governance.category_of(path) is not None}
 
 
 def _base_aegis_jobs(top: Path, tracked: Mapping[str, Tuple[str, str]]) -> Dict[str, Optional[str]]:
@@ -889,17 +894,10 @@ def governance_tree_hash(root: Any, rev: str = "HEAD", base: Optional[str] = Non
     if not commit:
         raise HumanGateError(f"cannot resolve {rev!r} to a commit in {top}")
     try:
-        entries = gitsafe.tree_blobs(top, commit, include_symlinks=True, timeout=60.0)
+        entries = _governance_blobs(top, commit)
     except gitsafe.GitError as exc:
         raise HumanGateError(str(exc)) from exc
-    records = [
-        (
-            os.fsencode(path),
-            f"{mode} {oid}".encode("ascii"),
-        )
-        for path, (mode, oid) in entries.items()
-        if governance.category_of(path)
-    ]
+    records = [(os.fsencode(path), f"{mode} {oid}".encode("ascii")) for path, (mode, oid) in entries.items()]
     digest = hashlib.sha256(HASH_DOMAIN)
     for raw_path, meta in sorted(records):
         digest.update(meta + b" " + raw_path + b"\n")
@@ -1031,6 +1029,18 @@ def _verify_single_trailer(
         base = gitsafe.resolve_commit(top, base_target) if base_target else None
         if not oid or not base:
             return _no("unresolved", f"cannot resolve {commit!r} or the base {base_ref!r}", str(commit))
+    except gitsafe.GitError as exc:
+        return _no("unresolved", str(exc), str(commit))
+    except HumanGateError as exc:
+        return _no("unverifiable", str(exc), str(commit))
+    return _verify_candidate(top, oid, base, rx, name, expected, mismatch_msg, ok_msg, label=str(commit))
+
+
+def _verify_candidate(top: Path, oid: str, base: str, rx: re.Pattern[str], name: str, expected: str,
+                      mismatch_msg: str, ok_msg: str, label: Optional[str] = None) -> Approval:
+    """Verify resolved commit ``oid`` against the allowed_signers of resolved ``base``. The message
+    is re-read here (``cat-file``), so a caller's cheaper pre-filter can only skip a commit."""
+    try:
         message = _read_message(top, oid)
         if isinstance(message, Approval):
             return message
@@ -1043,22 +1053,19 @@ def _verify_single_trailer(
             return _no("hash_mismatch", mismatch_msg, oid)
         return _verify_commit_sig(top, oid, base, ok_msg)
     except gitsafe.GitError as exc:
-        return _no("unresolved", str(exc), str(commit))
+        return _no("unresolved", str(exc), label or oid)
     except HumanGateError as exc:
-        return _no("unverifiable", str(exc), str(commit))
+        return _no("unverifiable", str(exc), label or oid)
+
+
+_APPROVE_MISMATCH = "the approved governance hash is not this governance state"
+_APPROVE_OK = "good signature by a key in the base allowed_signers"
+_FULL_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def verify_approval(root: Any, commit: str, governance_hash: str, base_ref: str) -> Approval:
-    return _verify_single_trailer(
-        root,
-        commit,
-        base_ref,
-        _APPROVE_LINE,
-        "Aegis-Approve",
-        governance_hash,
-        "the approved governance hash is not this governance state",
-        "good signature by a key in the base allowed_signers",
-    )
+    return _verify_single_trailer(root, commit, base_ref, _APPROVE_LINE, "Aegis-Approve", governance_hash,
+                                  _APPROVE_MISMATCH, _APPROVE_OK)
 
 
 def verify_insight_approval(workspace: Any, commit: str, text: str, base_ref: Optional[str] = None) -> Approval:
@@ -1151,14 +1158,25 @@ def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]
 
 
 def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional[str] = None) -> Optional[Approval]:
+    """The newest valid ``Aegis-Approve`` commit in ``merge-base(base_ref, head)..head`` (at most
+    MAX_SCANNED_COMMITS), or None. One ``git log`` reads every message, so only commits that carry an
+    approve line cost a signature check: the git calls do not grow with the range."""
     top = _top(root)
-    scan = _commits_in(top, head, base_ref)
-    if scan is None:
+    tip, base_target = gitsafe.resolve_commit(top, head), gitsafe.resolve_commit(top, base_ref)
+    base = gitsafe.merge_base(top, base_target, tip) if tip and base_target else None
+    if not base:
         return None
-    tip, base, commits = scan
     digest = governance_hash or governance_tree_hash(top, tip, base=base)
-    for oid in commits:
-        verdict = verify_approval(top, oid, digest, base_ref)
+    # -z: git refuses a NUL in a message, so no message can forge a record boundary.
+    res = gitsafe.run(["log", "-z", f"--max-count={MAX_SCANNED_COMMITS}", "--format=%H%n%B", f"{base}..{tip}"], top)
+    if res.returncode != 0:
+        return None
+    for record in res.stdout.split(b"\0"):
+        oid, _, message = record.decode("utf-8", "replace").lstrip("\n").partition("\n")
+        if not _FULL_OID.fullmatch(oid) or not _APPROVE_LINE.search(message):
+            continue
+        verdict = _verify_candidate(top, oid, base_target, _APPROVE_LINE, "Aegis-Approve", digest,
+                                    _APPROVE_MISMATCH, _APPROVE_OK)
         if verdict.valid:
             return verdict
     return None

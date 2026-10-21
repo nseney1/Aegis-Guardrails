@@ -268,5 +268,6 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: subject.txt
+          # permanent: attestations already issued carry this URI; change it only in a release that accepts both
           predicate-type: https://aegis.example/predicate/ci-verdict/v1
           predicate-path: predicate.json

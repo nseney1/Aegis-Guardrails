@@ -90,5 +90,5 @@ def test_hook_prompt_of_one_huge_token_writes_no_excerpt_row(tmp_path: Path, mon
     prompt = "don't." + "1." * 15000
     res = record_hook_prompt("claude-code", {"prompt": prompt, "session_id": "s-huge", "cwd": str(repo)},
                              excerpts=True, home=home)
-    assert res["recorded"] is False
+    assert res["event"] == "heartbeat"  # R-evidence-40: a heartbeat, never an excerpt row
     assert [r["event"] for r in read_insight_rows(repo, home=home)] == ["heartbeat"]

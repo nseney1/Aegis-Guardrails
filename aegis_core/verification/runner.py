@@ -88,35 +88,71 @@ def _forbid_ast_spec_error(spec: object) -> Optional[str]:
     return None if patterns else "forbid_ast declares no patterns"
 
 
+def _base_holds(root: str, commit: str) -> bool:
+    """Whether the reviewed base ``commit`` holds the directory ``root`` at all. git answers for the
+    nearest enclosing work tree, which for a directory it does not track (a project inside a $HOME
+    repository, a snapshot under a temp dir there) is another project whose base has no rules here."""
+    from aegis_core import gitsafe, rule_integrity
+
+    try:
+        prefix = gitsafe.show_prefix(root).rstrip("/")
+        if not prefix:
+            return True
+        res = gitsafe.run(["cat-file", "-t", f"{commit}:{prefix}"], root)
+    except gitsafe.GitError as exc:
+        raise rule_integrity.IntegrityError(str(exc)) from exc
+    return res.returncode == 0 and res.stdout.strip() == b"tree"
+
+
 def _discover_forbid_ast_rules(
     repo_root: str,
+    reviewed: bool = True,
 ) -> tuple[list[tuple[Any, dict]], list[tuple[str, str]]]:
-    """The workspace rules (aegis_core.rules, .aegis/rules/<type>/) that declare forbid_ast.
+    """The workspace rules (aegis_core.rules, .aegis/rules/<type>/) that declare forbid_ast, as
+    enforced: the reviewed BASE versions (aegis_core.rule_integrity.effective), so a branch can
+    neither weaken a gate nor gate on a rule nobody reviewed; outside git, or when the base does
+    not hold ``repo_root`` at all, the working tree. ``reviewed=False`` enforces the working tree
+    as is: ``aegis check --record`` runs on an exported snapshot, which no base describes.
 
     Returns (rules, broken): a rule file that cannot be loaded and names forbid_ast, or
     whose forbid_ast is malformed, would enforce nothing, so each is returned as
     (relative path, reason) for the caller to fail closed on instead of being dropped.
-    An unsafe rules tree raises (RuleInventoryError), which the caller also fails on.
+    ``broken`` reads the working tree too, so a malformed new gate fails before it is merged.
+    An unsafe rules tree or an unreadable BASE raises, which the caller also fails on.
     """
-    from aegis_core.rules import load_rules, workspace_root
+    from aegis_core import rule_integrity
+    from aegis_core.rules import RuleCache, workspace_root
 
-    ruleset = load_rules(workspace_root(repo_root))
+    root = workspace_root(repo_root)
+    cache = RuleCache()
+    try:
+        if reviewed:
+            served = rule_integrity.effective(root, cache)
+            untracked = served.anchor is not None and not _base_holds(root, served.anchor.commit)
+            enforced = cache.get(root) if untracked else served.ruleset
+        else:
+            enforced = cache.get(root)
+    except rule_integrity.IntegrityError as exc:
+        raise rule_integrity.IntegrityError(
+            f"the reviewed (base) version of the rules cannot be read, so none is enforced: {exc}") from exc
     discovered: list[tuple[Any, dict]] = []
     broken: list[tuple[str, str]] = []
-    for rule in ruleset.rules:
-        if not rule.ok:
-            # Only a file that names the key can declare it: a damaged note does not gate.
-            if b"forbid_ast" in rule.raw:
-                broken.append((rule.path, rule.error or "cannot be loaded"))
-            continue
-        if rule.expired or "forbid_ast" not in rule.meta:
-            continue
-        spec = rule.meta.get("forbid_ast")
-        spec_error = _forbid_ast_spec_error(spec)
-        if spec_error:
-            broken.append((rule.path, spec_error))
-            continue
-        discovered.append((rule, spec))
+    for ruleset, collect in ((cache.get(root), False), (enforced, True)):
+        for rule in ruleset.rules:
+            if not rule.ok:
+                # Only a file that names the key can declare it: a damaged note does not gate.
+                if b"forbid_ast" in rule.raw and not collect:
+                    broken.append((rule.path, rule.error or "cannot be loaded"))
+                continue
+            if rule.expired or "forbid_ast" not in rule.meta:
+                continue
+            spec = rule.meta.get("forbid_ast")
+            spec_error = _forbid_ast_spec_error(spec)
+            if spec_error:
+                if (rule.path, spec_error) not in broken:
+                    broken.append((rule.path, spec_error))
+            elif collect:
+                discovered.append((rule, spec))
     return discovered, broken
 
 
@@ -399,6 +435,7 @@ def run_layer1(
     max_mutations: int = 5,
     fast_mode: bool = False,
     diff_base: Optional[str] = None,
+    reviewed: bool = True,
 ) -> list[ToolEvidence]:
     """Run all Layer 1 verification tools.
 
@@ -411,6 +448,8 @@ def run_layer1(
             If None, auto-discovers the changed functions of changed_files and,
             for each, the test files that exercise it (_find_mutation_test_files).
         max_mutations: Maximum mutations per function (default: 5).
+        reviewed: Enforce the reviewed BASE gate rules (default); False enforces the
+            working-tree rules of ``repo_root``, for a snapshot no base describes.
 
     Returns:
         List of ToolEvidence results for the Arbiter
@@ -510,7 +549,8 @@ def run_layer1(
         return sorted(found)
 
     try:
-        forbid_rules, broken_rules = _discover_forbid_ast_rules(repo_root_str)
+        # The default keeps the one-argument call that stand-ins for the discovery replace.
+        forbid_rules, broken_rules = _discover_forbid_ast_rules(*((repo_root_str,) if reviewed else (repo_root_str, False)))
     except Exception as exc:
         # The rules are gate rules: if they cannot be read, nothing may pass unchecked.
         forbid_rules = []

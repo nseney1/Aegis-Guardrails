@@ -116,7 +116,8 @@ SPAWN_SITES = {
     # private index, and runs the test command from the user-scope config (never the repository's) in a snapshot.
     "aegis_core/treeid.py": ("`git`",),
     "aegis_core/checkrun.py": ("your test command",),
-    # `aegis doctor --release` asks `gh --version`, then `gh attestation verify` (read-only).
+    # `aegis doctor --release` asks `gh --version`, one read-only `gh api` GET of the repository for its
+    # default branch, the tier GETs, then `gh attestation verify` (read-only).
     "aegis_core/release_verify.py": ("`gh`",),
 }
 _SPAWN_MODULES = {"subprocess", "pty", "multiprocessing"}

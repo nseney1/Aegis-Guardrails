@@ -172,6 +172,64 @@ def test_a_void_row_is_terminal_even_when_ci_later_succeeds(tmp_path):
     assert derived.state == "voided" and derived.reason == "ci_divergence" and not derived.counts
 
 
+def _landed_on_main(repo: hg.Repo):
+    """A credited check whose change lands on main (fast-forward); returns (check row, landing commit)."""
+    hv.use_stub_runner(repo.home.path)
+    _edit_app(repo)
+    _scan(repo)
+    out = checkrun.record(repo.root, tests=True)
+    _report(repo)
+    commit = repo.commit("work")
+    repo.git("checkout", "-q", "main")
+    repo.git("merge", "-q", "--ff-only", "work")
+    return out.row, commit
+
+
+def _confirm_on_main(repo: hg.Repo, commit: str):
+    return credit.confirm(repo.root, client=hv.FakeCI([hv.ci_run(commit)]), workflow=hv.CI_WORKFLOW,
+                          landed=_landed(repo))
+
+
+@needs_git
+def test_a_reverted_landing_voids_its_credit(tmp_path):
+    repo = hv.make_project(tmp_path)
+    row, commit = _landed_on_main(repo)
+    repo.git("revert", "--no-edit", commit)
+    summary = _confirm_on_main(repo, commit)
+    assert [(r["check"], r["reason"]) for r in hv.rows_of(repo.root, "void")] == [(row["id"], "reverted")]
+    assert summary["voided"] == 1 and summary["confirmed"] == 0
+    derived, = _credits(repo)
+    assert (derived.state, derived.reason, derived.counts) == ("voided", "reverted", False)
+
+
+@needs_git
+def test_a_revert_of_another_commit_voids_nothing(tmp_path):
+    repo = hv.make_project(tmp_path)
+    _row, commit = _landed_on_main(repo)
+    repo.write("other.txt", "x\n")
+    repo.commit(f"unrelated\n\nThis reverts commit {'b' * 40}.")
+    _confirm_on_main(repo, commit)
+    assert hv.rows_of(repo.root, "void") == []
+    assert [c.state for c in _credits(repo)] == ["confirmed"]
+
+
+@needs_git
+def test_a_failing_history_read_is_an_error_and_voids_nothing(tmp_path, monkeypatch):
+    repo = hv.make_project(tmp_path)
+    _row, commit = _landed_on_main(repo)
+    repo.git("revert", "--no-edit", commit)
+    real = credit.gitsafe.run
+
+    def no_log(args, cwd, *rest, **kw):
+        if args and args[0] == "log":
+            return subprocess.CompletedProcess(["git", *args], 128, b"", b"fatal: bad object")
+        return real(args, cwd, *rest, **kw)
+
+    monkeypatch.setattr(credit.gitsafe, "run", no_log)
+    summary = _confirm_on_main(repo, commit)
+    assert summary["errors"] and hv.rows_of(repo.root, "void") == []
+
+
 # ── 2. Hidden files cannot fake a pass ───────────────────────────────────────
 
 @needs_git
@@ -937,3 +995,34 @@ def test_a_runs_get_that_fails_after_github_named_the_branch_still_trips_the_bre
     assert proj.error == f"CI verification stopped after gh failed for {commit[:12]}; 1 commit(s) were not verified"
     asked = [c[1].split("?", 1)[0] for c in gh.calls if c[:1] == ["api"]]
     assert asked == ["repos/{owner}/{repo}", "repos/{owner}/{repo}/actions/runs"]
+
+
+@needs_git
+def test_a_failed_rest_read_never_falls_back_to_an_attestation(tmp_path, monkeypatch):
+    """Given GitHub names the default branch, its runs GET fails and a ledger ci row says success,
+    When credit is projected, Then it stays landed/unverified_ci and no second gh command
+    (``gh attestation verify`` or ``gh --version``) is issued (R-trust-67)."""
+    repo, commit = _reported_commit(tmp_path, monkeypatch)
+    repo.git("branch", "-f", "main", commit)
+    repo.git("remote", "add", "origin", "https://github.com/octo/proj.git")
+    gh = GitHub([])
+
+    def runner(argv, stdin=None, cwd=None, timeout=None):
+        argv = list(argv)
+        if argv == ["--version"]:
+            gh.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "gh version 2.93.0 (2026-01-01)\n", "")
+        if argv[:1] == ["api"] and "/actions/runs?" in argv[1]:
+            gh.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "rate limited")
+        if argv[:2] == ["attestation", "verify"]:
+            gh.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "no attestation")
+        return gh(argv, stdin, cwd, timeout)
+
+    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    ledger.append_rows(repo.root, [_ci_row(commit)])
+    proj = credit.project_credits(repo.root, verify_ci=True)
+    assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]
+    assert [c[:2] if c[:1] == ["api"] else c[:1] for c in gh.calls] == [
+        ["api", "repos/{owner}/{repo}"], ["api", f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={commit}&per_page=100"]]

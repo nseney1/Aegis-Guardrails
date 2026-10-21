@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 import hashlib
 import os
 import threading
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from aegis_core.match import first_match, is_test_path, matching_files
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
@@ -517,6 +517,7 @@ class RuleCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: Dict[str, Tuple[str, RuleSet]] = {}
+        self._bases: Dict[Tuple[str, ...], Optional[RuleSet]] = {}
 
     def get(self, workspace: Any) -> RuleSet:
         return self.snapshot(workspace)[1]
@@ -537,6 +538,20 @@ class RuleCache:
             self._entries[key] = (snapshot.fingerprint, ruleset)
         return snapshot, ruleset
 
+    def base(self, key: Tuple[str, ...], load: Callable[[], Optional[RuleSet]]) -> Optional[RuleSet]:
+        """``load()`` memoised on ``key``, which must name every input it reads (aegis_core.rule_integrity
+        keys the parsed BASE rules on the workspace, the anchor commit and the working fingerprint)."""
+        with self._lock:
+            if key in self._bases:
+                return self._bases[key]
+        value = load()
+        with self._lock:
+            if key not in self._bases and len(self._bases) >= self._MAX_WORKSPACES:
+                self._bases.pop(next(iter(self._bases)))
+            self._bases[key] = value
+        return value
+
     def invalidate(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._bases.clear()

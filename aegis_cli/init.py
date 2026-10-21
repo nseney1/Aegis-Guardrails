@@ -294,7 +294,9 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
         _need_writable(workflows)
     else:
         atomic_write_bytes(dest, data)
-    return Step(CI_WORKFLOW_LABEL, "created", "runs aegis check on every pull request")
+    return Step(CI_WORKFLOW_LABEL, "created", "runs aegis check on every pull request; to let credit confirmation "
+                                              'read this workflow set "ci": {"workflow": "aegis.yml"} in '
+                                              "~/.aegis/config.json")
 
 
 # ── The pre-commit hook ──────────────────────────────────────────────────────
