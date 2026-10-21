@@ -391,13 +391,14 @@ def test_prior_cap_at_ten_pseudo_labels_and_asymmetric_transitions(tmp_path: Pat
     )
 
 
-def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_merges(
+def test_sync_pr_writes_transitions_with_three_examples_to_label_and_never_auto_merges(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """§3 T4 Evidence-backed `aegis sync --pr`:
     When a rule reaches `decided`, `aegis sync --pr` writes the transition and opens a PR
-    whose body contains the evidence report and up to 3 sampled examples, via injectable
-    `gh` runner, and never auto-merges."""
+    whose body contains the evidence report (state, n, weight) and up to 3 examples for a human
+    to label (unlabelled replay detections, not labelled rows), via injectable `gh` runner, and
+    never auto-merges."""
     _write_rule(tmp_path, "trap", "trap-decided", created="2026-01-01", target_paths=["src/*.py"])
     ha.write_labels(tmp_path, "trap-decided", [
         {"example_id": f"PR-{100 + i}", "verdict": "tp", "ref": f"PR-{100 + i}", "session": f"sess-{(i % 4) + 1}",
@@ -406,6 +407,15 @@ def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_m
         for i in range(25)
     ])
     ha.merge_to_base(tmp_path)
+    origin = tmp_path.parent / f"{tmp_path.name}-origin.git"
+    ha._git(tmp_path.parent, "init", "-q", "--bare", str(origin))
+    for args in (("config", "user.email", "dev@example.com"), ("config", "user.name", "Dev"),
+                 ("remote", "add", "origin", str(origin)), ("push", "-q", "origin", "main"),
+                 ("remote", "set-head", "origin", "main")):
+        ha._git(tmp_path, *args)
+    for n in range(4):
+        credit.record_detection(tmp_path, "trap-decided", "src/app.py", f"call-{n}", disposition="leaked",
+                                rev=f"{n:040x}")
 
     gh_calls: list[list[str]] = []
 
@@ -425,13 +435,13 @@ def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_m
     assert payload["pr"]["status"] == "opened"
     assert payload["pr"]["url"] == "https://github.com/octo/proj/pull/42"
     body = payload["pr"]["body"]
-    assert "trap-decided" in body
-    assert "Prevented bug example #1" in body
-    assert "Prevented bug example #2" in body
-    assert "Prevented bug example #3" in body
-    # Exactly one gh call (`pr create`), never `pr merge`.
+    assert "trap-decided" in body and "- **State**: decided; n = 25; weight" in body
+    assert "Prevented bug example" not in body  # labelled rows are not samples to label
+    listed = [line for line in body.splitlines() if line.startswith("  ") and "`call-" in line]
+    assert len(listed) == 3 and "`call-0`" not in body  # the three newest detections
+    # Exactly one gh call (`pr create`) for the pushed lifecycle branch, never `pr merge`.
     assert len(gh_calls) == 1
-    assert gh_calls[0][:2] == ["pr", "create"]
+    assert gh_calls[0][:2] == ["pr", "create"] and payload["pr"]["branch"] in gh_calls[0]
     assert not any("merge" in call for call in gh_calls)
 
 

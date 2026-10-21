@@ -228,6 +228,9 @@ class LedgerView:
     torn_tail: bool = False
     error: Optional[str] = None
     path: Optional[Path] = None
+    # Every row as read (events included), for the other readers of the same call: one snapshot,
+    # one parse. None on a view that never read the file; such a reader reads it and says why not.
+    raw_rows: Optional[Tuple[Dict[str, Any], ...]] = field(default=None, repr=False, compare=False)
 
     def health(self) -> Dict[str, Any]:
         """What the read could not use, as derived.json and ``aegis status`` record it."""
@@ -274,7 +277,8 @@ def read(workspace: Any) -> LedgerView:
         return LedgerView([], error=f"cannot read {exc.filename or 'the ledger directory'}: {exc.strerror or exc}")
     raw = read_jsonl(path)
     rows, unusable = normalize_rows(raw.rows)
-    return LedgerView(rows, list(raw.skipped_lines), unusable, raw.torn_tail, raw.error, path)
+    return LedgerView(rows, list(raw.skipped_lines), unusable, raw.torn_tail, raw.error, path,
+                      None if raw.error else tuple(raw.rows))
 
 
 def _plain(value: Decimal) -> Any:

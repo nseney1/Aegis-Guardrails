@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from aegis_core import gitsafe, human_gate
+from aegis_core import gitevidence, gitsafe, human_gate
 from aegis_core.errors import AegisError, PathTraversalError
 from aegis_core.storage import ledger_locked, read_jsonl
 from aegis_core.telemetry_engine import ledger
@@ -71,14 +71,22 @@ def _normalize_event_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def _read_ledger_events(root: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _event_rows(raw_rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    return [_normalize_event_row(r) for r in raw_rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
+
+
+def _read_ledger_events(root: Any, view: Any = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """The event rows and why some could not be read; from ``view``'s snapshot when it holds one."""
+    raw = getattr(view, "raw_rows", None)
+    if raw is not None:
+        skipped = view.skipped_lines
+        return _event_rows(raw), view.error or (f"{len(skipped)} unreadable line(s)" if skipped else None)
     try:
         res = read_jsonl(ledger.ledger_path(root))
     except (PathTraversalError, OSError) as exc:
         return [], str(exc)
     err = res.error or (f"{len(res.skipped_lines)} unreadable line(s)" if res.skipped_lines else None)
-    rows = [_normalize_event_row(r) for r in res.rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
-    return rows, err
+    return _event_rows(res.rows), err
 
 
 def read_rows(root: Any) -> List[Dict[str, Any]]:
@@ -135,20 +143,7 @@ def _workflow_path(run: Mapping[str, Any]) -> str:
 
 
 def resolve_protected_branch(root: Any) -> Optional[str]:
-    top = gitsafe.toplevel(Path(str(root)))
-    if top is None:
-        return None
-    sym = gitsafe.run(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], top)
-    if sym.returncode == 0:
-        target = sym.stdout.decode("utf-8", "replace").strip()
-        if target.startswith("refs/remotes/origin/"):
-            branch = target[len("refs/remotes/origin/"):].strip()
-            if branch and branch != "HEAD":
-                return branch
-    for cand in ("main", "master"):
-        if gitsafe.resolve_commit(top, f"refs/remotes/origin/{cand}") or gitsafe.resolve_commit(top, f"refs/heads/{cand}"):
-            return cand
-    return None
+    return gitevidence.protected_branch(gitevidence.repo_facts(root))
 
 
 def select_ci_run(
@@ -242,44 +237,37 @@ def _call_landed(landed: Callable[..., Optional[str]], tree: str, head: Optional
 def landed_lookup(
     root: Any, refs: Optional[Sequence[str]] = None, limit: int = _REV_LIMIT,
 ) -> Callable[..., Optional[str]]:
-    top = gitsafe.toplevel(Path(str(root)))
-    entries: Optional[List[Tuple[str, str]]] = None
+    """``lookup(tree, head=None)``: the newest commit of the protected branch (or ``refs``) with
+    ``tree`` that ``head`` is an ancestor of. Git is asked nothing until the first lookup, and each
+    (tree, head) once; a ``head`` that is not a full object id (ledger text) lands nowhere."""
+    index: List[Any] = []
+    answers: Dict[Tuple[str, Optional[str]], Optional[str]] = {}
 
-    def load() -> List[Tuple[str, str]]:
-        if top is None:
-            return []
-        if refs is None:
-            branch = resolve_protected_branch(top)
-            target_refs: Sequence[str] = (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}") if branch else ()
-        else:
-            target_refs = refs
-        resolved = [r for r in target_refs if gitsafe.resolve_commit(top, r)]
-        if not resolved:
-            return []
-        res = gitsafe.run(["rev-list", f"--max-count={limit}", "--format=%T", *resolved], top)
-        if res.returncode != 0:
-            return []
-        out: List[Tuple[str, str]] = []
-        commit = None
-        for line in res.stdout.decode("ascii", "replace").splitlines():
-            if line.startswith("commit "):
-                commit = line.split()[1]
-            elif commit and line.strip():
-                out.append((commit, line.strip()))
-                commit = None
-        return out
+    def load() -> Tuple[Any, Dict[str, List[str]]]:
+        if not index:
+            facts = gitevidence.repo_facts(root)
+            if facts is None or facts.top is None:
+                tips: Sequence[str] = ()
+            elif refs is None:
+                tips = gitevidence.branch_tips(facts, gitevidence.protected_branch(facts) or "")
+            else:
+                tips = [oid for oid in (gitsafe.resolve_commit(facts.top, r) for r in refs) if oid]
+            by_tree: Dict[str, List[str]] = {}
+            for commit, commit_tree in gitevidence.commits(facts, tips, limit):
+                by_tree.setdefault(commit_tree, []).append(commit)
+            index.append((facts, by_tree))
+        return index[0]
 
     def lookup(tree: str, head: Optional[str] = None) -> Optional[str]:
-        nonlocal entries
-        if entries is None:
-            entries = load()
-        for commit, commit_tree in entries:
-            if commit_tree != tree:
-                continue
-            if head and top is not None and gitsafe.run(["merge-base", "--is-ancestor", head, commit], top).returncode != 0:
-                continue
-            return commit
-        return None
+        key = (tree, head or None)
+        if key not in answers:
+            facts, by_tree = load()
+            if head and not (isinstance(head, str) and _FULL_SHA.fullmatch(head)):
+                answers[key] = None
+            else:
+                answers[key] = next((c for c in by_tree.get(tree, ())
+                                     if not head or gitevidence.is_ancestor(facts, head, c)), None)
+        return answers[key]
 
     setattr(lookup, "_aegis_root", _canon_root(root))
     return lookup
@@ -287,6 +275,10 @@ def landed_lookup(
 
 _EXPOSED: Dict[Tuple[str, str, str], Set[str]] = {}
 _MAX_EXPOSED_SESSIONS = 256
+# (root, host, session, rule, scope_basis) this process wrote or found in the ledger: a rescan
+# of the same session then takes no lock and reads nothing. Rows are only ever appended.
+_PERSISTED: Set[Tuple[str, str, str, str, Optional[str]]] = set()
+_MAX_PERSISTED = 50_000
 
 
 def _now() -> str:
@@ -306,6 +298,9 @@ def record_exposure(
     if not persist or not rule_list:
         return []
     stamp, s_id, h_id = ts or _now(), session or "", host or ""
+    kept = [(str(root), h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
+    if all(k in _PERSISTED for k in kept):
+        return []
     path_list = [str(p) for p in (paths or ()) if isinstance(p, str)]
     with ledger_locked(root):
         seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read_rows(root), "exposure")}
@@ -329,7 +324,11 @@ def record_exposure(
             if heartbeat is not None:
                 row["heartbeat"] = bool(heartbeat)
             to_append.append(row)
-        return [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
+        written = [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
+        if len(_PERSISTED) + len(kept) > _MAX_PERSISTED:
+            _PERSISTED.clear()
+        _PERSISTED.update(kept)
+        return written
 
 
 def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None) -> Set[str]:
@@ -719,7 +718,7 @@ def approval_lookup(
 
     def protected_tip() -> Optional[Tuple[str, str]]:
         if not anchor:
-            p_branch = branch if branch is not None else resolve_protected_branch(top)
+            p_branch = branch if branch is not None else resolve_protected_branch(root)
             refs = (f"refs/remotes/origin/{p_branch}", f"refs/heads/{p_branch}") if p_branch and top else ()
             anchor.append(next(((p_branch, r) for r in refs if gitsafe.resolve_commit(top, r)), None))
         return anchor[0]
@@ -774,19 +773,26 @@ def project_credits(
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
     verify_ci: bool = False,
 ) -> CreditProjection:
-    workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
-    look = landed or landed_lookup(root)
     if landed is not None:
         try:
             setattr(landed, "_aegis_root", c_root)
         except AttributeError:
             pass
-    if client is not None:
-        confirm(root, client=client, workflow=workflow, landed=look)
-    rows, read_err = _read_ledger_events(root)
+    # confirm() appends ci rows, so with a client the snapshot is read again after it.
+    rows, read_err = _read_ledger_events(root, view if client is None else None)
     view_err = getattr(view, "incomplete", None) if view is not None else None
     err = view_err or read_err
+    # Credits derive from report rows only (confirm() iterates them too): without one there is
+    # nothing to land, verify or approve, so no git, no gh and no CI.
+    if not any(r.get("event") == "report" for r in rows):
+        return CreditProjection((), (), available=not err, error=str(err) if err else None)
+    workflow = required_workflow(root) if workflow is None else workflow
+    look = landed or landed_lookup(root)
+    if client is not None:
+        confirm(root, client=client, workflow=workflow, landed=look)
+        rows, read_err = _read_ledger_events(root)  # confirm() appends ci rows
+        err = view_err or read_err
     if err:
         return CreditProjection((), (), available=False, error=str(err))
     stopped: Optional[str] = None
@@ -838,8 +844,8 @@ def project_credits(
                             available=stopped is None, error=stopped)
 
 
-def claimed_summary(root: Any) -> Dict[str, Any]:
-    claims = _of(read_rows(root), "claimed")
+def claimed_summary(root: Any, view: Any = None) -> Dict[str, Any]:
+    claims = _of(_read_ledger_events(root, view)[0], "claimed")
     return {"label": "claimed (unwitnessed)", "claimed": len(claims), "sessions": len({(c.get("host"), c.get("session")) for c in claims})}
 
 

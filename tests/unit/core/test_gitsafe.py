@@ -984,3 +984,138 @@ def test_a_snapshot_rerun_of_a_leading_dash_revision_fails_without_reaching_git(
     git_calls.clear()
     assert checkrun.rerun_commit_snapshot(repo, "--output=x", "main") == {"tree": "", "exit": 1}
     assert not any("--output=x" in arg for call in git_calls for arg in call)
+
+
+# ── one request's repository facts: memo and layout (R-structure-4) ─────────
+
+def test_a_memo_scope_asks_git_once_for_the_top_level_and_the_common_dir(repo: Path, git_calls):
+    (repo / "sub").mkdir()
+    git_calls.clear()
+    with gitsafe.memo():
+        for _ in range(3):
+            assert gitsafe.toplevel(repo / "sub") == repo.resolve()
+            assert gitsafe.common_dir(repo / "sub") == repo / "sub" / ".." / ".git"
+            assert gitsafe.toplevel(str(repo / "sub")) == repo.resolve()
+    assert len(git_calls) == 1, git_calls
+    git_calls.clear()
+    assert gitsafe.toplevel(repo / "sub") == repo.resolve()
+    assert gitsafe.common_dir(repo / "sub") == repo / "sub" / ".." / ".git"
+    assert len(git_calls) == 2  # outside a scope every question is asked
+
+
+def test_a_nested_memo_shares_the_outer_one_and_every_exit_path_clears_it(repo: Path, git_calls):
+    git_calls.clear()
+    with gitsafe.memo():
+        gitsafe.toplevel(repo)
+        with gitsafe.memo():
+            gitsafe.toplevel(repo)
+        gitsafe.toplevel(repo)  # the inner exit did not clear the outer scope
+    assert len(git_calls) == 1
+    with pytest.raises(RuntimeError):
+        with gitsafe.memo():
+            gitsafe.toplevel(repo)
+            raise RuntimeError("the body fails")
+    with gitsafe.memo():
+        gitsafe.toplevel(repo)
+    assert len(git_calls) == 3
+
+
+def test_memoized_answers_none_once_and_computes_every_time_outside_a_scope():
+    produced = []
+    with gitsafe.memo():
+        assert [gitsafe.memoized(("k",), lambda: produced.append(1)) for _ in range(3)] == [None, None, None]
+    assert produced == [1]
+    gitsafe.memoized(("k",), lambda: produced.append(2))
+    gitsafe.memoized(("k",), lambda: produced.append(3))
+    assert produced == [1, 2, 3]
+
+
+def test_layout_names_the_common_dir_prefix_shallowness_and_top_level(repo: Path, tmp_path: Path):
+    (repo / "sub").mkdir()
+    assert gitsafe.layout(repo) == gitsafe.Layout(".git", "", False, str(repo.resolve()))
+    assert gitsafe.layout(repo / "sub") == gitsafe.Layout("../.git", "sub/", False, str(repo.resolve()))
+    inside = gitsafe.layout(repo / ".git")  # git places it, but no work tree contains it
+    assert inside is not None and inside.top is None and inside.common_dir == "."
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if gitsafe.toplevel(plain) is None:  # not inside some enclosing repository
+        assert gitsafe.layout(plain) is None
+
+
+def test_a_bare_repository_has_a_common_dir_and_no_top_level(repo: Path, tmp_path: Path):
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(repo), str(bare))
+    assert gitsafe.toplevel(bare) is None
+    assert gitsafe.common_dir(bare) == Path(os.path.abspath(bare)) / "."
+    assert gitsafe.layout(bare).shallow is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids a newline in a path")
+def test_a_workspace_path_with_a_newline_keeps_the_answers_of_the_single_calls(repo: Path, git_calls):
+    odd = repo / "line\nbreak"
+    odd.mkdir()
+    git_calls.clear()
+    with gitsafe.memo():
+        assert gitsafe.toplevel(odd) == repo.resolve()
+        assert gitsafe.common_dir(odd) == odd / ".." / ".git"
+        assert gitsafe.layout(odd).prefix == "line\nbreak/"
+    assert len(git_calls) >= 2  # the combined answer cannot be split by line, so it is asked again
+
+# ── the git executable is resolved once per PATH value (R-structure-10) ─────
+
+@pytest.fixture
+def fresh_git_lookup():
+    gitsafe._reset_for_tests()
+    yield
+    gitsafe._reset_for_tests()
+
+
+def _counting_which(monkeypatch):
+    from aegis_core import pathlookup
+
+    real, asked = pathlookup.which, []
+    monkeypatch.setattr(pathlookup, "which", lambda name, *a, **kw: asked.append(name) or real(name, *a, **kw))
+    return asked
+
+
+def test_twenty_git_calls_with_one_path_look_git_up_once(tmp_path, monkeypatch, fresh_git_lookup):
+    asked = _counting_which(monkeypatch)
+    for _ in range(20):
+        assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    assert asked == ["git"]
+    assert os.path.samefile(gitsafe.git_executable(), shutil.which("git")) and asked == ["git"]
+
+
+def _copy_git(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    real = Path(shutil.which("git"))
+    copy = directory / real.name
+    shutil.copy2(str(real), str(copy))
+    return copy
+
+
+@pytest.mark.skipif(os.name == "nt", reason="copies the git binary; Git for Windows needs its whole tree")
+def test_a_new_path_finds_its_own_git_and_a_deleted_git_fails_loudly(tmp_path, monkeypatch, fresh_git_lookup):
+    copy = _copy_git(tmp_path / "other")
+    monkeypatch.setenv("PATH", str(tmp_path / "other"))
+    assert gitsafe.git_executable() == str(copy)
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    saved = copy.read_bytes()
+    copy.unlink()
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+        gitsafe.run(["--version"], tmp_path)
+    copy.write_bytes(saved)
+    copy.chmod(0o755)
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+
+
+def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp_path, monkeypatch,
+                                                                            fresh_git_lookup):
+    marker = tmp_path / "PWNED"
+    _plant_git(tmp_path / "repo", marker)
+    monkeypatch.chdir(tmp_path / "repo")
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0  # cached under the real PATH
+    monkeypatch.setenv("PATH", ".")
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+        gitsafe.run(["--version"], tmp_path)
+    assert not marker.exists()

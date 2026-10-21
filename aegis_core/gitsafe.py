@@ -47,6 +47,8 @@ filter drivers and renormalization are switched off for it.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass
 import hashlib
 import os
@@ -57,7 +59,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 from aegis_core import pathlookup
 from aegis_core.errors import AegisError
@@ -69,6 +71,7 @@ __all__ = [
     "UPDATE_REF_ATTEMPTS",
     "UPDATE_REF_BACKOFF_SECONDS",
     "GitError",
+    "Layout",
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
@@ -79,12 +82,17 @@ __all__ = [
     "common_dir",
     "diff_entries",
     "export_tree",
+    "git_executable",
     "git_path",
     "git_version",
     "head_commit",
+    "in_memo",
+    "layout",
     "list_files",
     "list_refs",
     "merge_base",
+    "memo",
+    "memoized",
     "merge_tree_conflicted",
     "parse_name_status_z",
     "read_blob",
@@ -163,13 +171,26 @@ class MergeTreeUnavailable(GitError):
     driver from the repository's own config it would run)."""
 
 
-def _git_executable() -> str:
+_GIT_FOUND: Dict[Tuple[Optional[str], ...], str] = {}
+
+
+def _reset_for_tests() -> None:
+    _GIT_FOUND.clear()
+
+
+def git_executable() -> str:
+    """The git ``run`` starts, looked up once per PATH value; a git removed since raises GitError."""
     # Absolute PATH entries only: an empty or relative entry names the cwd (the
     # repository, where a clone can plant a git), and so does the current directory
     # the standard library's lookup searches first on Windows.
-    found = pathlookup.which("git")
-    if not found:
-        raise GitError("git is not installed or not on PATH")
+    key = (os.environ.get("PATH"), os.environ.get("PATHEXT"))
+    found = _GIT_FOUND.get(key)
+    if not (found and os.path.isfile(found) and os.access(found, os.X_OK)):
+        _GIT_FOUND.clear()
+        found = pathlookup.which("git")
+        if not found:
+            raise GitError("git is not installed or not on PATH")
+        _GIT_FOUND[key] = found
     return found
 
 
@@ -186,7 +207,7 @@ def run(
     A non-zero exit is returned, not raised. Raises GitError when git cannot be started
     or exceeds ``timeout``.
     """
-    argv = [_git_executable(), *_hardening, *args]
+    argv = [git_executable(), *_hardening, *args]
     env = dict(os.environ)
     env.update(_ENV)
     if _env is not None:
@@ -251,10 +272,76 @@ def _z_paths(out: Optional[bytes]) -> Optional[List[str]]:
 
 # ── Repository facts ─────────────────────────────────────────────────────────
 
+# One request's answers (a scan): None outside a scope. Only ``layout`` and gitevidence read it,
+# and nothing in it outlives the scope, so a ref that moves is seen by the next request.
+_MEMO: "contextvars.ContextVar[Optional[Dict[Any, Any]]]" = contextvars.ContextVar("aegis_git_memo", default=None)
+
+
+@contextmanager
+def memo() -> Iterator[None]:
+    """Remember repository facts until the outermost scope exits (an inner one shares it)."""
+    token = _MEMO.set({}) if _MEMO.get() is None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _MEMO.reset(token)
+
+
+def in_memo() -> bool:
+    return _MEMO.get() is not None
+
+
+def memoized(key: Tuple[Any, ...], produce: Callable[[], Any]) -> Any:
+    """``produce()`` once per scope for ``key`` (which starts with the realpath of the cwd it is
+    about), None answers included; outside a scope every call computes."""
+    store = _MEMO.get()
+    if store is None:
+        return produce()
+    if key not in store:
+        store[key] = produce()
+    return store[key]
+
+
+class Layout(NamedTuple):
+    """Where ``cwd`` sits: ``common_dir`` as git names it (maybe relative to cwd), ``prefix`` below the
+    top level, whether the repository is shallow, and the top level (None outside a work tree)."""
+
+    common_dir: str
+    prefix: str
+    shallow: bool
+    top: Optional[str]
+
+
+def _layout(cwd: Path | str) -> Optional[Layout]:
+    try:
+        res = run(["rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel"], cwd)
+    except GitError:
+        return None
+    # In a bare repository or inside .git, git dies on --show-toplevel after the first three lines.
+    lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
+    if len(lines) == (4 if res.returncode == 0 else 3):
+        # An old git echoes the flag it does not know: read as shallow, the side that caches nothing.
+        top = lines[3].strip() if len(lines) == 4 else ""
+        return Layout(lines[0].strip(), lines[1].rstrip("\r"), lines[2].strip() != "false", top or None)
+    common = _text(["rev-parse", "--git-common-dir"], cwd) if lines else None
+    if common is None:
+        return None
+    # A path holding a newline cannot be split by line: each question alone, as before the combined
+    # call, and shallow assumed so that nothing about it is kept beyond the request.
+    prefix = _out(["rev-parse", "--show-prefix"], cwd) or b""
+    return Layout(common, os.fsdecode(prefix.rstrip(b"\r\n")), True, _text(["rev-parse", "--show-toplevel"], cwd))
+
+
+def layout(cwd: Path | str) -> Optional[Layout]:
+    """``cwd``'s Layout in one git call (memoized in a scope), or None outside any repository."""
+    return memoized((os.path.realpath(cwd), "layout"), lambda: _layout(cwd))
+
+
 def toplevel(cwd: Path | str) -> Optional[Path]:
     """The work tree root containing ``cwd``, or None outside a work tree."""
-    text = _text(["rev-parse", "--show-toplevel"], cwd)
-    return Path(text) if text else None
+    found = layout(cwd)
+    return Path(found.top) if found is not None and found.top else None
 
 
 def show_prefix(cwd: Path | str) -> str:
@@ -283,10 +370,10 @@ def common_dir(cwd: Path | str) -> Optional[Path]:
     Every worktree of a repository answers the same directory (the main ``.git``), unlike
     ``--git-path``, which answers ``.git/worktrees/<name>/...`` in a linked worktree.
     """
-    text = _text(["rev-parse", "--git-common-dir"], cwd)
-    if not text:
+    found = layout(cwd)
+    if found is None or not found.common_dir:
         return None
-    path = Path(text)
+    path = Path(found.common_dir)
     # git names it relative to the directory it ran in (e.g. "../.git" from a subdirectory).
     return path if path.is_absolute() else Path(os.path.abspath(cwd)) / path
 
