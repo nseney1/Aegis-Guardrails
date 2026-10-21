@@ -293,3 +293,46 @@ def test_a_linked_worktree_shares_the_main_ledger(tmp_path):
     with gitsafe.memo():
         assert storage.ledger_site(shape["ws"], create=False).path == storage.ledger_site(tmp_path / "repo",
                                                                                           create=False).path
+
+
+# ── fetch_age (R-trust-48) ──────────────────────────────────────────────────
+
+def _age_file(path: Path, days_ago: float) -> None:
+    import time
+
+    path.write_bytes(b"x\n")
+    stamp = time.time() - days_ago * 86400
+    os.utime(str(path), (stamp, stamp))
+
+
+def test_the_fetch_age_is_that_of_the_newest_fetch_head(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    assert gitevidence.fetch_age(repo) is None  # never fetched
+    _age_file(repo / ".git" / "FETCH_HEAD", 3)
+    assert gitevidence.fetch_age(repo) == pytest.approx(3 * 86400, abs=120)
+    _age_file(repo / ".git" / "FETCH_HEAD", -1)
+    assert gitevidence.fetch_age(repo) == 0.0  # a clock set back never gives a negative age
+
+
+def test_a_linked_worktree_reads_the_fetch_the_main_one_made_and_its_own(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    _git(repo, "worktree", "add", "-q", "-b", "side", str(tmp_path / "wt"))
+    _age_file(repo / ".git" / "FETCH_HEAD", 5)  # git fetch run in the main work tree
+    assert gitevidence.fetch_age(tmp_path / "wt") == pytest.approx(5 * 86400, abs=120)
+    _age_file(repo / ".git" / "worktrees" / "wt" / "FETCH_HEAD", 2)  # and one run in the linked one
+    assert gitevidence.fetch_age(tmp_path / "wt") == pytest.approx(2 * 86400, abs=120)
+
+
+def test_without_git_there_is_no_fetch_age(tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "repo")
+    _age_file(repo / ".git" / "FETCH_HEAD", 3)
+
+    def unavailable(*args, **kwargs):
+        raise gitsafe.GitError("git is not installed or not on PATH")
+
+    monkeypatch.setattr(gitsafe, "run", unavailable)
+    assert gitevidence.fetch_age(repo) is None
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.undo()
+    assert gitevidence.fetch_age(plain) is None

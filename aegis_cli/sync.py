@@ -59,7 +59,7 @@ def _status(result: Any) -> str:
     return "applied" if result.applied else "synced"
 
 
-def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
+def _print_text(args: argparse.Namespace, result: Any, rel_path: str, root: Any) -> None:
     from aegis_cli.ui.table import Table
     from aegis_cli.ui.theme import OutputContext
 
@@ -104,10 +104,13 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
             print("  No decided transitions to open a PR for.")
     if result.refused:
         print(f"  ❌ {result.refused}")
-    from aegis_core.sync import replay_lines
+    from aegis_core.sync import base_fetch, replay_lines
 
     for line in replay_lines(result.replay):
         print(f"  {sanitize_display(line, 400)}")
+    fetched = base_fetch(root)[0]
+    if fetched:
+        print(f"  {fetched}")
     pending = sum(1 for row in rows if row["suggestion"])
     print(f"Wrote {rel_path} ({len(rows)} rules, {pending} suggested transitions).")
     if pending and not result.applied and not result.refused:
@@ -168,9 +171,12 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
             payload["pr"] = result.pr
         if result.replay is not None:
             payload["replay"] = result.replay.as_dict()
+        from aegis_core.sync import base_fetch
+
+        payload["base_fetch_age_days"] = base_fetch(root)[1]
         print(json.dumps(payload, indent=2, default=str))
     else:
-        _print_text(args, result, rel_path)
+        _print_text(args, result, rel_path, root)
         if _inert_expiry(root):
             print("  ℹ️  expiry.days and expiry.per_type in .aegis/config.json no longer change fitness: "
                   "rules decay by exposed sessions (half_life_sessions), never by calendar days")

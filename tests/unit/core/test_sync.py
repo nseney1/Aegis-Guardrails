@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -574,3 +575,58 @@ def test_the_list_returning_replay_is_unchanged_for_its_callers(tmp_path: Path, 
     rows = fitness.replay_detector_history(repo.root, persist=False)
     assert [(r["rule"], r["pattern"], r["disposition"]) for r in rows] == [("no-eval", "eval", "leaked")]
     assert rows == fitness.replay_detector_history_report(repo.root, persist=False).detections
+
+
+# ── the age of the BASE anchor's last fetch (R-trust-48) ────────────────────
+
+DAY = 86400.0
+
+
+def _fetched(path: Path, days_ago: float) -> None:
+    import time
+
+    path.write_bytes(b"0000000000000000000000000000000000000000\t\tbranch 'main' of /elsewhere\n")
+    stamp = time.time() - days_ago * DAY
+    os.utime(str(path), (stamp, stamp))
+
+
+def _base_lines(text: str) -> list:
+    return [line.strip() for line in text.splitlines() if "BASE as of last fetch" in line]
+
+
+@pytest.mark.parametrize("days,expected", [(3.2, "BASE as of last fetch 3 days ago"), (1.5, "BASE as of last fetch 1 day ago"),
+                                           (-2.0, "BASE as of last fetch today"), (None, "BASE as of last fetch: never fetched")],
+                         ids=["three-days", "one-day", "future", "never"])
+def test_sync_and_doctor_state_when_base_was_last_fetched(tmp_path: Path, monkeypatch, capsys, days, expected) -> None:
+    import argparse
+
+    from aegis_cli.doctor import run_doctor
+    from aegis_cli.sync import run_sync
+    from tests import helpers_adjudication as ha
+
+    _rule(tmp_path, "trap", "trap-a")
+    ha.merge_to_base(tmp_path)
+    if days is not None:
+        _fetched(tmp_path / ".git" / "FETCH_HEAD", days)
+    assert run_sync(argparse.Namespace(_root=tmp_path, json=False)) == 0
+    assert _base_lines(capsys.readouterr().out) == [expected]
+    assert run_sync(argparse.Namespace(_root=tmp_path, json=True)) == 0
+    age = json.loads(capsys.readouterr().out)["base_fetch_age_days"]
+    assert age is None if days is None else age == pytest.approx(max(days, 0.0), abs=0.05)
+    monkeypatch.chdir(tmp_path)
+    run_doctor(argparse.Namespace())
+    assert _base_lines(capsys.readouterr().out) == [expected]
+    run_doctor(argparse.Namespace(json=True))
+    out = capsys.readouterr().out
+    assert "base_fetch" not in out and "BASE as of" not in out  # doctor --json is unchanged
+
+
+def test_outside_git_nothing_is_said_about_a_fetch(ws: Path, capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+
+    assert run_sync(argparse.Namespace(_root=ws, json=False)) == 0
+    assert _base_lines(capsys.readouterr().out) == []
+    assert run_sync(argparse.Namespace(_root=ws, json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["base_fetch_age_days"] is None

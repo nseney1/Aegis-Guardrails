@@ -13,11 +13,12 @@ from collections import OrderedDict
 import os
 import re
 import threading
+import time
 from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from aegis_core import gitsafe
 
-__all__ = ["RepoFacts", "branch_tips", "commits", "is_ancestor", "merge_base_with", "protected_branch",
+__all__ = ["RepoFacts", "branch_tips", "commits", "fetch_age", "is_ancestor", "merge_base_with", "protected_branch",
            "repo_facts"]
 
 ORIGIN_HEAD = "refs/remotes/origin/HEAD"
@@ -203,3 +204,19 @@ def is_ancestor(facts: Optional[RepoFacts], ancestor: Any, descendant: Any) -> b
         _ANCESTORS.clear()
     _ANCESTORS.add(key)
     return True
+
+
+def fetch_age(cwd: Any) -> Optional[float]:
+    """Seconds since the newest FETCH_HEAD of ``cwd``'s repository was written, or None (not a
+    repository, git unavailable, never fetched). FETCH_HEAD is per work tree, so a fetch run in
+    another work tree of the repository is read from the common dir. Aegis never fetches: this
+    only says how old origin/HEAD, and so the BASE anchor, may be."""
+    common = gitsafe.common_dir(cwd)
+    stamps = []
+    for path in (gitsafe.git_path(cwd, "FETCH_HEAD"), common / "FETCH_HEAD" if common is not None else None):
+        try:
+            if path is not None:
+                stamps.append(os.stat(str(path)).st_mtime)
+        except OSError:
+            continue
+    return max(0.0, time.time() - max(stamps)) if stamps else None

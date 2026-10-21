@@ -19,7 +19,7 @@ from aegis_core.telemetry_engine import ledger
 from aegis_core.workspace import literal_workspace
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR, WorkspaceLayout
 
-__all__ = ["DERIVED_VERSION", "MOVED_STATUSES", "SyncResult", "build", "format_pr_body", "read_derived", "replay_lines", "stale_rules", "sync"]
+__all__ = ["DERIVED_VERSION", "MOVED_STATUSES", "SyncResult", "base_fetch", "build", "format_pr_body", "read_derived", "replay_lines", "stale_rules", "sync"]
 DERIVED_VERSION = 1
 
 
@@ -150,6 +150,21 @@ def _number_line(e: Mapping[str, Any]) -> List[str]:
         lines.append(f"- **P(precision < 0.7)**: {e.get('p_below_demote', 0.0):.2f}; precision 90% interval "
                      f"[{e.get('precision_lo', 0.0):.2f}, {e.get('precision_hi', 1.0):.2f}]")
     return lines
+
+
+def base_fetch(root: Any) -> Tuple[Optional[str], Optional[float]]:
+    """The line saying when the BASE anchor's refs were last fetched and that age in days; (None,
+    None) outside a repository. The line is about any fetch: FETCH_HEAD does not say which remote."""
+    from aegis_core import gitevidence, gitsafe
+
+    if gitsafe.layout(root) is None:
+        return None, None
+    age = gitevidence.fetch_age(root)
+    if age is None:
+        return "BASE as of last fetch: never fetched", None
+    days = int(age // 86400)
+    when = "today" if days == 0 else ("1 day ago" if days == 1 else f"{days} days ago")
+    return f"BASE as of last fetch {when}", round(age / 86400, 2)
 
 
 def replay_lines(replay: Any) -> List[str]:
