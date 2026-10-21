@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 from aegis_core import stats as _stats
 from aegis_core.config import DEFAULT_EPSILON, DEFAULT_HALF_LIFE_SESSIONS
 from aegis_core.stats import (
-    _betacf,
     _num,
     beta_cdf,
     beta_ppf,
@@ -36,6 +35,7 @@ __all__ = [
     "clopper_pearson_interval",
     "clopper_pearson_lower",
     "clopper_pearson_upper",
+    "combined_totals",
     "compute",
     "compute_mde_180d",
     "compute_silence_credit",
@@ -261,7 +261,7 @@ def compute(
 
 def _collect_t4_events_for_rules(
     workspace: Any, rules: Sequence[Any], now: Optional[datetime] = None, *, proj_credits: Any = None,
-    adjudications: Any = None,
+    adjudications: Any = None, raw_rows: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     from aegis_core import credit
     from aegis_core.errors import PathTraversalError
@@ -284,10 +284,11 @@ def _collect_t4_events_for_rules(
         }
         for r in rules
     }
-    try:
-        raw_rows = read_jsonl(ledger.ledger_path(workspace)).rows
-    except (PathTraversalError, OSError):
-        return info
+    if raw_rows is None:
+        try:
+            raw_rows = read_jsonl(ledger.ledger_path(workspace)).rows
+        except (PathTraversalError, OSError):
+            return info
     proj = proj_credits if proj_credits is not None else credit.project_credits(workspace)
     confirmed_checks = {(c.check, c.rule) for c in proj.credits if c.counts and c.result == "tp"}
     active_detections: Dict[Tuple[str, str, str, str], str] = {}
@@ -393,6 +394,23 @@ def _collect_t4_events_for_rules(
     return info
 
 
+def combined_totals(view: Any, proj: Any) -> Dict[str, Any]:
+    """Per-rule ledger totals of ``view``'s outcome rows plus the credit projection's confirmed rows,
+    each (key, rule) once."""
+    from aegis_core.telemetry_engine import ledger
+
+    combined_rows: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[str, str]] = set()
+    for r in list(view.rows) + list(proj.outcome_rows):
+        k, rid = r.get("key"), r.get("rule")
+        if isinstance(k, str) and k and isinstance(rid, str):
+            if (k, rid) in seen_keys:
+                continue
+            seen_keys.add((k, rid))
+        combined_rows.append(r)
+    return ledger.aggregate_rows(combined_rows)
+
+
 def for_rules(
     workspace: Any, rules: Iterable[Any], now: Optional[datetime] = None, view: Any = None, *, verify_ci: bool = False,
     adjudications: Any = None,
@@ -412,19 +430,10 @@ def for_rules(
     epsilon = float(config.epsilon)
     view_obj = view if view is not None else ledger.read(workspace)
     proj_credits = credit.project_credits(workspace, view=view_obj, verify_ci=verify_ci)
-    combined_rows: List[Dict[str, Any]] = []
-    seen_keys: Set[Tuple[str, str]] = set()
-    for r in list(view_obj.rows) + list(proj_credits.outcome_rows):
-        k = r.get("key")
-        rid = r.get("rule")
-        if isinstance(k, str) and k and isinstance(rid, str):
-            if (k, rid) in seen_keys:
-                continue
-            seen_keys.add((k, rid))
-        combined_rows.append(r)
-    totals = ledger.aggregate_rows(combined_rows)
+    totals = combined_totals(view_obj, proj_credits)
     labels = adjudications if adjudications is not None else adjudication.read_adjudications(workspace)
-    t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=proj_credits, adjudications=labels)
+    t4_by_rule = _collect_t4_events_for_rules(workspace, rule_list, now=now, proj_credits=proj_credits,
+                                              adjudications=labels, raw_rows=getattr(view_obj, "raw_rows", None))
     out: Dict[str, Fitness] = {}
     for rule in rule_list:
         rid = rule.id

@@ -71,14 +71,22 @@ def _normalize_event_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def _read_ledger_events(root: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _event_rows(raw_rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    return [_normalize_event_row(r) for r in raw_rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
+
+
+def _read_ledger_events(root: Any, view: Any = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """The event rows and why some could not be read; from ``view``'s snapshot when it holds one."""
+    raw = getattr(view, "raw_rows", None)
+    if raw is not None:
+        skipped = view.skipped_lines
+        return _event_rows(raw), view.error or (f"{len(skipped)} unreadable line(s)" if skipped else None)
     try:
         res = read_jsonl(ledger.ledger_path(root))
     except (PathTraversalError, OSError) as exc:
         return [], str(exc)
     err = res.error or (f"{len(res.skipped_lines)} unreadable line(s)" if res.skipped_lines else None)
-    rows = [_normalize_event_row(r) for r in res.rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
-    return rows, err
+    return _event_rows(res.rows), err
 
 
 def read_rows(root: Any) -> List[Dict[str, Any]]:
@@ -267,6 +275,10 @@ def landed_lookup(
 
 _EXPOSED: Dict[Tuple[str, str, str], Set[str]] = {}
 _MAX_EXPOSED_SESSIONS = 256
+# (root, host, session, rule, scope_basis) this process wrote or found in the ledger: a rescan
+# of the same session then takes no lock and reads nothing. Rows are only ever appended.
+_PERSISTED: Set[Tuple[str, str, str, str, Optional[str]]] = set()
+_MAX_PERSISTED = 50_000
 
 
 def _now() -> str:
@@ -286,6 +298,9 @@ def record_exposure(
     if not persist or not rule_list:
         return []
     stamp, s_id, h_id = ts or _now(), session or "", host or ""
+    kept = [(str(root), h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
+    if all(k in _PERSISTED for k in kept):
+        return []
     path_list = [str(p) for p in (paths or ()) if isinstance(p, str)]
     with ledger_locked(root):
         seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read_rows(root), "exposure")}
@@ -309,7 +324,11 @@ def record_exposure(
             if heartbeat is not None:
                 row["heartbeat"] = bool(heartbeat)
             to_append.append(row)
-        return [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
+        written = [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
+        if len(_PERSISTED) + len(kept) > _MAX_PERSISTED:
+            _PERSISTED.clear()
+        _PERSISTED.update(kept)
+        return written
 
 
 def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None) -> Set[str]:
@@ -760,7 +779,8 @@ def project_credits(
             setattr(landed, "_aegis_root", c_root)
         except AttributeError:
             pass
-    rows, read_err = _read_ledger_events(root)
+    # confirm() appends ci rows, so with a client the snapshot is read again after it.
+    rows, read_err = _read_ledger_events(root, view if client is None else None)
     view_err = getattr(view, "incomplete", None) if view is not None else None
     err = view_err or read_err
     # Credits derive from report rows only (confirm() iterates them too): without one there is
@@ -824,8 +844,8 @@ def project_credits(
                             available=stopped is None, error=stopped)
 
 
-def claimed_summary(root: Any) -> Dict[str, Any]:
-    claims = _of(read_rows(root), "claimed")
+def claimed_summary(root: Any, view: Any = None) -> Dict[str, Any]:
+    claims = _of(_read_ledger_events(root, view)[0], "claimed")
     return {"label": "claimed (unwitnessed)", "claimed": len(claims), "sessions": len({(c.get("host"), c.get("session")) for c in claims})}
 
 

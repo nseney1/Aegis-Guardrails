@@ -159,7 +159,7 @@ def run_status(args: argparse.Namespace) -> int:
     from aegis_core.credit import claimed_summary, project_credits
 
     # aegis_report_outcome calls with no check row for their tree: counted apart, never per rule.
-    claimed = claimed_summary(proj)
+    claimed = claimed_summary(proj, view=view)
     proj_credits = project_credits(proj, view=view)
     blocked_cmds = blocked_commands_summary(proj)
     loaded = [r for r in ruleset.rules if r.ok]
@@ -168,18 +168,9 @@ def run_status(args: argparse.Namespace) -> int:
     stale = stale_rules(ruleset, derived)
 
     # 3. Ledger totals of the host-installed rules (they have no rule file here)
-    from aegis_core.fitness import compute
+    from aegis_core.fitness import combined_totals, compute
 
-    combined_rows = []
-    seen_keys: set[tuple[str, str]] = set()
-    for r in list(view.rows) + list(proj_credits.outcome_rows):
-        k, rid = r.get("key"), r.get("rule")
-        if isinstance(k, str) and k and isinstance(rid, str):
-            if (k, rid) in seen_keys:
-                continue
-            seen_keys.add((k, rid))
-        combined_rows.append(r)
-    totals = ledger.aggregate_rows(combined_rows)
+    totals = combined_totals(view, proj_credits)
 
     def _core_fitness(*names: str) -> tuple[int, float | None]:
         entry = next((totals[n] for n in names if n in totals), {})

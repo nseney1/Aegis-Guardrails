@@ -1,6 +1,6 @@
 """Scan and hook budgets on platform-independent counters, never on wall-clock time (R-structure-6).
 
-Spawns are counted at ``subprocess.Popen.__init__`` and ledger opens at ``os.open`` (both
+Spawns are counted at ``subprocess.Popen.__init__`` and ledger reads at ``os.open`` (both
 patched reversibly; an audit hook cannot be removed). The fixture's 100 rules must load:
 a rule file that does not load makes the scan return early with fewer spawns (trap F2).
 Counters that today's code misses are ``xfail(strict=True)`` at the observed value, and
@@ -98,7 +98,9 @@ def _count(monkeypatch, fn: Callable[[], object], delay: float = 0.0) -> _Counte
         return real_init(self, args, *rest, **kwargs)
 
     def opener(path, *rest, **kwargs):
-        seen.opens.append(os.fspath(path))
+        flags = rest[0] if rest else kwargs.get("flags", os.O_RDONLY)
+        if not flags & (os.O_WRONLY | os.O_RDWR):  # a read: the append a first exposure needs is not one
+            seen.opens.append(os.fspath(path))
         return real_open(path, *rest, **kwargs)
 
     with monkeypatch.context() as patch:
@@ -179,15 +181,12 @@ def _seed_ledger(ws: Path) -> None:
     ledger.append(ws, [{"rule": "perf-rule-0", "outcome": "tp", "source": "ci", "key": f"k{i}"} for i in range(3)])
 
 
-@pytest.mark.xfail(strict=True, reason="3 ledger opens per core scan today; R-structure-5 brings it to 1")
 def test_a_core_scan_opens_the_ledger_once(git_ws, monkeypatch):
     _seed_ledger(git_ws)
     _scan(git_ws)
     assert _ledger_opens(git_ws, _count(monkeypatch, lambda: _scan(git_ws))) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="5 then 4 ledger opens per MCP scan in this fixture today (M5: 6 then 4); "
-                   "R-structure-5 brings it to 2")
 def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
     import aegis_mcp.server as server
 
@@ -203,7 +202,8 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
         assert json.loads(response["result"]["content"][0]["text"])["rules_staged"] > 0
 
     counts = [_ledger_opens(git_ws, _count(monkeypatch, lambda i=i: call(i))) for i in (1, 2)]
-    assert max(counts) <= 2, counts
+    # The first scan of a session also takes record_exposure's locked dedup read; the second reads once.
+    assert counts[0] <= 2 and counts[1] == 1, counts
 
 
 # ── (d): a scan that matches no rule does no fitness work (R-structure-7) ───
