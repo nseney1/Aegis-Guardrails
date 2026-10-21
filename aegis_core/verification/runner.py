@@ -442,7 +442,8 @@ def _forbid_evidence(root: str, rule_id: str, rel: str, findings: list[dict[str,
     violations = violation_messages(findings)
     if not violations:
         return []
-    lines = sorted({f["line"] for f in findings if not f["unknown"] and f["line"] > 0})
+    # The sites that produced the messages: an allowed site is a contested override, never a line.
+    lines = sorted({f["line"] for f in findings if not f["unknown"] and f["override"] is None and f["line"] > 0})
     return [ToolEvidence(tool=f"forbid_ast:{rule_id}", target=rel, verdict=False, detail="; ".join(violations),
                          lines=lines)]
 
