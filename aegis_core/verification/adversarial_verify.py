@@ -186,19 +186,21 @@ def build_code_prompt(
     """)
 
 
-def parse_predictions(raw: list[dict]) -> list[Prediction]:
-    """Parse a list of dicts into ``Prediction`` objects.
+def parse_predictions(raw: list[dict]) -> tuple[list[Prediction], int]:
+    """Parse a list of dicts into ``Prediction`` objects and count the dropped entries.
 
     Maps string ``category`` to ``RiskCategory`` and string ``severity``
-    to ``Severity``.  Entries with invalid/unknown categories are silently
-    skipped.
+    to ``Severity``.  An entry with an unknown category or severity, or that is
+    not an object, is skipped and counted.
     """
     predictions: list[Prediction] = []
+    dropped = 0
     for entry in raw:
         try:
             category = RiskCategory(entry["category"])
             severity = Severity(entry["severity"])
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
+            dropped += 1
             continue
 
         predictions.append(
@@ -210,20 +212,22 @@ def parse_predictions(raw: list[dict]) -> list[Prediction]:
                 affected_function=entry.get("affected_function", ""),
             )
         )
-    return predictions
+    return predictions, dropped
 
 
-def parse_claims(raw: list[dict]) -> list[Claim]:
-    """Parse a list of dicts into ``Claim`` objects.
+def parse_claims(raw: list[dict]) -> tuple[list[Claim], int]:
+    """Parse a list of dicts into ``Claim`` objects and count the dropped entries.
 
-    Maps string ``category`` to ``RiskCategory``.  Entries with
-    invalid/unknown categories are silently skipped.
+    Maps string ``category`` to ``RiskCategory``.  An entry with an unknown
+    category, or that is not an object, is skipped and counted.
     """
     claims: list[Claim] = []
+    dropped = 0
     for entry in raw:
         try:
             category = RiskCategory(entry["category"])
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
+            dropped += 1
             continue
 
         claims.append(
@@ -235,4 +239,4 @@ def parse_claims(raw: list[dict]) -> list[Claim]:
                 tests_covering=entry.get("tests_covering", []),
             )
         )
-    return claims
+    return claims, dropped

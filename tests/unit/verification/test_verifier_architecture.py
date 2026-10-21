@@ -90,8 +90,10 @@ class TestAdversarialVerifierBackend:
 
     def test_plain_callable_backend(self, tmp_path):
         prompts = []
-        preds, claims, spec_failed = self._verify(tmp_path, lambda prompt: prompts.append(prompt) or "[]")
+        preds, claims, spec_failed, gaps = self._verify(tmp_path, lambda prompt: prompts.append(prompt) or "[]")
         assert (preds, claims, spec_failed) == ([], [], False)
+        assert (gaps.reviewed_files, gaps.skipped_files, gaps.dropped_entries, gaps.code_agent_failed) == (
+            ("api.py",), (), 0, False)
         assert len(prompts) == 2
 
     def test_object_with_generate_backend(self, tmp_path):
@@ -104,7 +106,7 @@ class TestAdversarialVerifierBackend:
                     "mechanism": "negative amounts unexercised", "affected_function": "execute_transaction",
                 }])
 
-        preds, claims, _ = self._verify(tmp_path, Charging())
+        preds, claims, _, _ = self._verify(tmp_path, Charging())
         assert [(p.category, p.affected_function) for p in preds] == [
             (RiskCategory.MISSING_COVERAGE, "execute_transaction")
         ]

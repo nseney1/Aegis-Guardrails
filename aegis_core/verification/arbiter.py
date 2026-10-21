@@ -16,7 +16,7 @@ from aegis_core.stats import wilson_ci
 
 from . import (
     ArbitrationResult, Claim, Divergence, Prediction,
-    RiskCategory, Severity, ToolEvidence, Verdict,
+    ReviewGaps, RiskCategory, Severity, ToolEvidence, Verdict,
 )
 
 
@@ -26,13 +26,15 @@ def arbitrate(
     layer1_evidence: list[ToolEvidence],
     *,
     spec_agent_failed: bool = False,
+    gaps: Optional[ReviewGaps] = None,
 ) -> ArbitrationResult:
     """Compare predictions vs claims vs tool evidence.
 
     Divergence detection is pure set operations on RiskCategory enums.
     No natural language comparison. No LLM.
 
-    Returns ArbitrationResult with divergences, convergences, and verdict.
+    Returns ArbitrationResult with divergences, convergences, and verdict. ``gaps`` is what
+    the review left out; None means it was not tracked and adds no reason.
     """
     divergences: list[Divergence] = []
     convergences: list[RiskCategory] = []
@@ -132,6 +134,7 @@ def arbitrate(
     # Verdict logic
     verdict = _compute_verdict(divergences, layer1_failures)
     l1_verdict = "FAIL" if layer1_failures else "PASS"
+    reasons = _unverified_reasons(predictions, spec_agent_failed, gaps)
 
     return ArbitrationResult(
         divergences=divergences,
@@ -141,9 +144,35 @@ def arbitrate(
         predictions=predictions,
         claims=claims,
         layer1_verdict=l1_verdict,
-        infra_status="unverified" if spec_agent_failed else "ok",
+        infra_status="unverified" if reasons else "ok",
         llm_predictions=tuple(predictions),
+        unverified_reasons=reasons,
     )
+
+
+def _unverified_reasons(
+    predictions: Sequence[Prediction], spec_agent_failed: bool, gaps: Optional[ReviewGaps],
+) -> tuple[str, ...]:
+    """Why the review cannot be read as complete; empty means it can. These only ever make a
+    run 'unverified', never BLOCK."""
+    reasons = []
+    if spec_agent_failed:
+        reasons.append("spec_agent_unparseable")
+    if gaps is not None and gaps.code_agent_failed:
+        reasons.append("code_agent_unparseable")
+    if not predictions:
+        reasons.append("no_predictions")
+    if gaps is not None:
+        if not gaps.reviewed_files:
+            reasons.append("no_reviewed_files")
+        # Tests, __init__.py and non-Python files are excluded by design: beside a reviewed
+        # file they are not a hole, or every change with a test would read 'unverified'.
+        skipped = gaps.skipped_files
+        if skipped and (not gaps.reviewed_files or any(why == "error" for _, why in skipped)):
+            reasons.append(f"skipped:{len(skipped)}")
+        if gaps.dropped_entries > 0:
+            reasons.append(f"unknown_category:{gaps.dropped_entries}")
+    return tuple(reasons)
 
 
 def _compute_verdict(

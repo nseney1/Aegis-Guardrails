@@ -41,9 +41,10 @@ def format_layer2_summary(result: Any) -> str:
         lines.append(f"Layer 2: {icon} {verdict_str} (advisory: the exit status is Layer 1's)")
     preds = getattr(result, "llm_predictions", ())
     if l1_v or infra:
+        reasons = ", ".join(str(r) for r in (getattr(result, "unverified_reasons", ()) or ()))
         lines.append(
-            f"  layer1_verdict: {l1_v or 'PASS'} | infra_status: {infra or 'ok'} "
-            f"| llm_predictions: {len(preds)}"
+            f"  layer1_verdict: {l1_v or 'PASS'} | infra_status: {infra or 'ok'}"
+            f"{f' ({reasons})' if reasons else ''} | llm_predictions: {len(preds)}"
         )
 
     if result.divergences:
@@ -72,6 +73,7 @@ def format_layer2_json(result: Any, verdict: Any) -> dict[str, Any]:
         "advisory": True,
         "layer1_verdict": getattr(result, "layer1_verdict", "PASS") if result else "PASS",
         "infra_status": infra,
+        "unverified_reasons": list(getattr(result, "unverified_reasons", ()) or ()) if result else [],
         "llm_predictions": [
             p.to_dict() if hasattr(p, "to_dict") else str(p)
             for p in preds

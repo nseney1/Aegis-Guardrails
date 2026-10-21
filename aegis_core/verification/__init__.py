@@ -147,6 +147,16 @@ class Divergence:
     resolution: str = ""
 
 
+@dataclass(frozen=True)
+class ReviewGaps:
+    """What a Layer 2 run left out: ``skipped_files`` as ``(path, why)``, ``why`` in test, init,
+    not_python, deleted, error; ``dropped_entries`` from both replies (no known category)."""
+    reviewed_files: tuple[str, ...] = ()
+    skipped_files: tuple[tuple[str, str], ...] = ()
+    dropped_entries: int = 0
+    code_agent_failed: bool = False
+
+
 @dataclass
 class ArbitrationResult:
     """Final output of the two-layer verification."""
@@ -160,6 +170,7 @@ class ArbitrationResult:
     infra_status: str = "ok"
     llm_predictions: tuple[Prediction, ...] = ()
     verdict_id: str = ""
+    unverified_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.layer1_verdict:
@@ -242,6 +253,7 @@ __all__ = [
     "Claim",
     "Divergence",
     "Prediction",
+    "ReviewGaps",
     "RiskCategory",
     "Severity",
     "ToolEvidence",

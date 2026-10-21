@@ -204,8 +204,10 @@ class TestPipelineFailClosed:
 
         captured_kwargs = {}
         def mock_verify(**kwargs):
+            from aegis_core.verification import ReviewGaps
+
             captured_kwargs.update(kwargs)
-            return ([], [], False)
+            return ([], [], False, ReviewGaps(reviewed_files=("module.py",)))
 
         pipeline = VerificationPipeline()
         monkeypatch.setattr(pipeline.adversarial_verifier, "verify", mock_verify)
@@ -237,12 +239,16 @@ def test_layer2_reads_only_the_changed_source_modules(tmp_path):
     (tmp_path / "tests" / "test_mod.py").write_text("def test_transfer():\n    assert True\n", encoding="utf-8")
     (tmp_path / "notes.md").write_text("def nothing(): pass\n", encoding="utf-8")
 
-    signatures, implementation = AdversarialVerifier().extract_target_data(
+    signatures, implementation, reviewed, skipped = AdversarialVerifier().extract_target_data(
         ["pkg/__init__.py", "tests/test_mod.py", "pkg/mod.py", "notes.md", "pkg/deleted.py"], tmp_path,
     )
 
     assert implementation == "def transfer(amount: int) -> int:\n    return amount\n"
     assert len(signatures) == 1 and "def transfer(" in signatures[0]
+    # Every exclusion leaves a trace (R-checks-44).
+    assert reviewed == ["pkg/mod.py"]
+    assert skipped == [("pkg/__init__.py", "init"), ("tests/test_mod.py", "test"), ("notes.md", "not_python"),
+                       ("pkg/deleted.py", "deleted")]
 
 
 class TestChangedFilesFromGit:
@@ -287,3 +293,74 @@ class TestChangedFilesFromGit:
         res = VerificationPipeline().run(changed_files=[], workspace=tmp_path)
         assert res.passed is True
         assert res.verdict == Verdict.SHIP
+
+
+class TestLayer2NamesWhyAReviewIsIncomplete:
+    """R-checks-44: a review that did not happen is 'unverified' with a reason; `passed` stays Layer 1's."""
+
+    LOW = json.dumps([{"category": "overflow", "severity": "low", "risk": "r", "mechanism": "m",
+                       "affected_function": "run"}])
+
+    @staticmethod
+    def _run(tmp_path, files, backend):
+        for name, text in files.items():
+            (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / name).write_text(text, encoding="utf-8")
+        return VerificationPipeline().run(
+            changed_files=list(files), workspace=tmp_path, task_plan="Implement run", backend=backend,
+            test_names=[], test_results="", layer1_evidence=list(_PASSING),
+        )
+
+    def _reasons(self, res):
+        return res.arbitration_result.infra_status, res.arbitration_result.unverified_reasons
+
+    def test_an_empty_valid_spec_reply_is_no_predictions(self, tmp_path):
+        res = self._run(tmp_path, {"module.py": "def run():\n    return 1\n"}, lambda prompt: "[]")
+        assert self._reasons(res) == ("unverified", ("no_predictions",))
+        assert res.passed is True
+        assert "Layer 2 (advisory): UNVERIFIED" in res.summary
+
+    def test_only_tests_docs_and_yaml_changed_is_no_reviewed_files(self, tmp_path):
+        files = {"tests/test_run.py": "def test_run():\n    pass\n", "README.md": "# r\n", "ci.yml": "a: 1\n"}
+        infra, reasons = self._reasons(self._run(tmp_path, files, lambda prompt: self.LOW))
+        assert infra == "unverified"
+        assert "no_reviewed_files" in reasons and "skipped:3" in reasons
+
+    def test_unknown_categories_are_counted(self, tmp_path):
+        reply = json.dumps([{"category": "made_up", "severity": "high", "risk": "r", "mechanism": "m",
+                             "affected_function": "run"}, json.loads(self.LOW)[0]])
+        res = self._run(tmp_path, {"module.py": "def run():\n    return 1\n"},
+                        lambda prompt: reply if "Spec Agent" in prompt else "[]")
+        assert self._reasons(res) == ("unverified", ("unknown_category:1",))
+
+    def test_a_code_agent_reply_that_is_not_json_is_named(self, tmp_path):
+        res = self._run(tmp_path, {"module.py": "def run():\n    return 1\n"},
+                        lambda prompt: self.LOW if "Spec Agent" in prompt else "I refuse")
+        assert self._reasons(res) == ("unverified", ("code_agent_unparseable",))
+
+    def test_a_reviewed_source_beside_a_test_and_a_readme_is_ok(self, tmp_path):
+        files = {"module.py": "def run():\n    return 1\n", "test_module.py": "def test_run():\n    pass\n",
+                 "README.md": "# r\n"}
+        res = self._run(tmp_path, files, lambda prompt: self.LOW if "Spec Agent" in prompt else "[]")
+        assert self._reasons(res) == ("ok", ())
+        assert res.verdict == Verdict.SHIP
+
+    def test_every_category_unknown_and_every_file_skipped_never_looks_shipped(self, tmp_path):
+        reply = json.dumps([{"category": "made_up", "severity": "critical"}])
+        res = self._run(tmp_path, {"tests/test_x.py": "def test_x():\n    pass\n"},
+                        lambda prompt: reply if "Spec Agent" in prompt else "[]")
+        infra, reasons = self._reasons(res)
+        assert infra == "unverified"
+        assert set(reasons) >= {"no_predictions", "no_reviewed_files", "skipped:1", "unknown_category:1"}
+        assert "SHIP" not in res.summary
+
+    def test_a_source_file_that_fails_to_load_is_skipped_with_an_error(self, tmp_path):
+        files = {"module.py": "def run():\n    return 1\n", "broken.py": "def (:\n"}
+        res = self._run(tmp_path, files, lambda prompt: self.LOW if "Spec Agent" in prompt else "[]")
+        assert self._reasons(res) == ("unverified", ("skipped:1",))
+
+    def test_non_object_entries_in_a_reply_never_crash_the_review(self, tmp_path):
+        res = self._run(tmp_path, {"module.py": "def run():\n    return 1\n"}, lambda prompt: '["x", 3]')
+        # Two dropped from each agent's reply; both replies were JSON lists, so neither is unparseable.
+        assert self._reasons(res) == ("unverified", ("no_predictions", "unknown_category:4"))
+        assert res.passed is True

@@ -41,12 +41,15 @@ FAKE_LLM = textwrap.dedent(
             out.write(prompt)
     if mode == "garbage":
         print("Internal Server Error: 500 API Gateway Timeout")
-    elif mode in ("block", "revise") and spec:
+    elif mode in ("block", "revise", "ship") and spec:
         print(json.dumps([{
-            "category": "code_injection", "severity": "critical" if mode == "block" else "high",
+            "category": "code_injection", "severity": {"block": "critical", "revise": "high"}.get(mode, "low"),
             "risk": "eval of untrusted input", "mechanism": "code execution",
             "affected_function": "compute",
         }]))
+    elif mode == "unknown" and spec:
+        print(json.dumps([{"category": "not_a_category", "severity": "high", "risk": "r",
+                           "mechanism": "m", "affected_function": "compute"}]))
     elif mode == "spec-file" and spec:
         with open(sys.argv[2], encoding="utf-8") as reply:
             print(reply.read())
@@ -463,9 +466,29 @@ class TestLayer2:
         assert _exit_code(argv) == 0
         out = capsys.readouterr().out
         assert "Layer 2: ⚠️ UNVERIFIED" in out
-        assert "infra_status: unverified" in out
+        assert "infra_status: unverified (spec_agent_unparseable, code_agent_unparseable, no_predictions)" in out
         assert "SHIP" not in out
         assert "BLOCK" not in out
+
+    def test_an_empty_review_is_unverified_never_ship(self, ws, capsys, llm):
+        """R-checks-44: a valid `[]` from the Spec Agent is a review that predicted nothing, not a SHIP."""
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("empty"), "--plan", "Add compute", "clean.py"]
+        assert _exit_code(argv) == 0
+        out = capsys.readouterr().out
+        assert "Layer 2: ⚠️ UNVERIFIED" in out
+        assert "infra_status: unverified (no_predictions)" in out
+        assert "SHIP" not in out
+
+    def test_dropped_unknown_categories_are_counted_in_text_and_json(self, ws, capsys, llm):
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("unknown"), "--plan", "p", "clean.py"]
+        assert _exit_code(argv) == 0
+        assert "infra_status: unverified (no_predictions, unknown_category:1)" in capsys.readouterr().out
+        assert _exit_code([*argv[:1], "--format", "json", *argv[1:]]) == 0
+        layer2 = json.loads(capsys.readouterr().out)["layer2"]
+        assert layer2["verdict"] is None
+        assert layer2["unverified_reasons"] == ["no_predictions", "unknown_category:1"]
 
     @pytest.mark.parametrize("mode,expected", [("garbage", "UNVERIFIED"), ("block", "BLOCK"), ("ship", "SHIP")],
                              ids=["unreadable", "block", "ship"])
@@ -609,6 +632,8 @@ class TestLayer2:
         assert payload["passed"] is True
         assert payload["layer2"]["verdict"] is None
         assert payload["layer2"]["infra_status"] == "unverified"
+        assert payload["layer2"]["unverified_reasons"] == [
+            "spec_agent_unparseable", "code_agent_unparseable", "no_predictions"]
         assert payload["layer2"]["advisory"] is True
 
 
