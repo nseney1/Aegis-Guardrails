@@ -273,3 +273,57 @@ class TestArbiterFailClosed:
         )
         assert result.verdict == Verdict.SHIP
 
+
+
+# ── Arbiter: a review that did not happen never reads as clean (R-checks-44) ──
+
+class TestUnverifiedReasons:
+    """Every structural hole yields infra_status 'unverified' with a named reason."""
+
+    PASSING = [ToolEvidence("call_graph", "mod.py", True, "ok")]
+    LOW = Prediction(RiskCategory.OVERFLOW, Severity.LOW, "overflow", "big input", "f")
+
+    @staticmethod
+    def _gaps(**kw):
+        from aegis_core.verification import ReviewGaps
+
+        return ReviewGaps(**{"reviewed_files": ("mod.py",), **kw})
+
+    def test_a_complete_review_is_ok_with_no_reasons(self):
+        result = arbitrate([self.LOW], [], self.PASSING, gaps=self._gaps())
+        assert (result.infra_status, result.unverified_reasons) == ("ok", ())
+        assert result.verdict == Verdict.SHIP
+
+    def test_no_predictions_is_unverified_and_never_block(self):
+        result = arbitrate([], [], self.PASSING, gaps=self._gaps())
+        assert result.infra_status == "unverified"
+        assert result.unverified_reasons == ("no_predictions",)
+        assert result.verdict != Verdict.BLOCK
+
+    def test_each_hole_is_named(self):
+        gaps = self._gaps(reviewed_files=(), skipped_files=(("tests/test_a.py", "test"), ("README.md", "not_python")),
+                          dropped_entries=2, code_agent_failed=True)
+        result = arbitrate([], [], self.PASSING, spec_agent_failed=True, gaps=gaps)
+        assert result.unverified_reasons == (
+            "spec_agent_unparseable", "code_agent_unparseable", "no_predictions", "no_reviewed_files",
+            "skipped:2", "unknown_category:2",
+        )
+
+    def test_by_design_exclusions_beside_a_reviewed_file_add_no_reason(self):
+        gaps = self._gaps(skipped_files=(("tests/test_mod.py", "test"), ("README.md", "not_python")))
+        assert arbitrate([self.LOW], [], self.PASSING, gaps=gaps).unverified_reasons == ()
+
+    def test_a_file_that_failed_to_load_is_always_named(self):
+        gaps = self._gaps(skipped_files=(("broken.py", "error"), ("README.md", "not_python")))
+        result = arbitrate([self.LOW], [], self.PASSING, gaps=gaps)
+        assert (result.infra_status, result.unverified_reasons) == ("unverified", ("skipped:2",))
+
+    def test_without_gaps_a_library_caller_keeps_ok(self):
+        result = arbitrate([self.LOW], [], self.PASSING)
+        assert (result.infra_status, result.unverified_reasons) == ("ok", ())
+
+    def test_an_infrastructure_hole_with_failing_layer1_still_blocks_on_layer1(self):
+        failing = [ToolEvidence("call_graph", "mod.py", False, "unwired")]
+        result = arbitrate([], [], failing, gaps=self._gaps(reviewed_files=()))
+        assert result.verdict == Verdict.BLOCK
+        assert result.unverified_reasons == ("no_predictions", "no_reviewed_files")

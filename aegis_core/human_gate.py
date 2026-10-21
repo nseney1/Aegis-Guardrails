@@ -128,7 +128,9 @@ _JOB_NAME = re.compile(r"""^    name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^#\n]*?))[ \
 _JOB_MATRIX = re.compile(r"^    strategy:.*\bmatrix\b|^      matrix[ \t]*:")
 _AEGIS_CHECK_CI = re.compile(r"(?:\baegis|-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check\b[^\n]*?[ \t]--ci(?![\w-])")
 # The whole of a script that fails exactly when aegis fails, in any built-in shell: no operator, quote or expansion.
-_DIRECT_CHECK = re.compile(r"(?:aegis|python3?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?:[ \t]+[\w./=:@%+,-]+)*")
+# `-I` (isolated mode, which keeps the checkout off sys.path so the installed wheel runs) is the one
+# interpreter flag accepted; it cannot change the exit status.
+_DIRECT_CHECK = re.compile(r"(?:aegis|python3?(?:[ \t]+-I)?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?:[ \t]+[\w./=:@%+,-]+)*")
 _KEY = re.compile(r"""["']?([\w-]+)["']?[ \t]*:(?:[ \t]+(.*))?""")
 _ALWAYS = re.compile(r"""(["']?)(?:\$\{\{[ \t]*always\(\)[ \t]*\}\}|always\(\))\1""")
 _SHELLS = ("bash", "sh", "pwsh", "powershell", "cmd", "python")

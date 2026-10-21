@@ -110,8 +110,11 @@ def _archive_refusal(ws: Workspace, rule_id: str, view: Any) -> Optional[str]:
     return None
 
 
-def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False) -> Dict[str, Any]:
-    """Move one rule to ``.aegis/rules/.archive/`` and log it.
+def archive_rule(
+    workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False, *, audit: bool = True,
+) -> Dict[str, Any]:
+    """Move one rule to ``.aegis/rules/.archive/`` and log it (``audit=False``: no log row, for a
+    move that ``sync --pr`` makes only on its lifecycle branch and then undoes here).
 
     Only a rule whose ledger evidence supports archiving (``promotion.suggest``) moves,
     and that is checked again under the lock: evidence recorded since the caller judged
@@ -140,11 +143,12 @@ def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool 
         if refusal:
             return {"status": "ineligible", "message": refusal}
         dest = _park(path, archive_dir)
-        append_jsonl(ws.layout.lifecycle_log, [{
-            "timestamp": _utc_timestamp(),
-            "rule": clean,
-            "action": "moved_to_archive",
-        }])
+        if audit:
+            append_jsonl(ws.layout.lifecycle_log, [{
+                "timestamp": _utc_timestamp(),
+                "rule": clean,
+                "action": "moved_to_archive",
+            }])
     return {"status": "archived", "from_type": rule_type, "source_path": str(path), "target_path": str(dest)}
 
 

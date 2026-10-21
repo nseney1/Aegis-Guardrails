@@ -203,7 +203,8 @@ class TestVerifyLayer2Execution:
         assert exit_code == 0
         assert len(telemetry_calls) >= 1
         assert telemetry_calls[-1]["passed"] is True
-        assert telemetry_calls[-1]["verdict"] == Verdict.SHIP
+        # The fake reply is `[]`: no prediction means no review happened, so the run is unverified (R-checks-44).
+        assert telemetry_calls[-1]["verdict"] == "UNVERIFIED"
 
     @staticmethod
     def _layer2_args(tmp_path: Path, llm_source: str) -> argparse.Namespace:

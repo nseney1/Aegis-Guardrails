@@ -525,6 +525,105 @@ def test_a_crlf_working_copy_of_lf_blobs_reads_no_blob_and_lists_nothing(tmp_pat
     assert rule_integrity.policy_view(view.ruleset.get("inv-a")) == rule_integrity.policy_view(lf)
 
 
+# ── BASE is read once per commit and blob (R-structure-8) ───────────────────
+
+def base_loads(monkeypatch) -> List[int]:
+    loads: List[int] = []
+    real = rule_integrity.load_rules
+    monkeypatch.setattr(rule_integrity, "load_rules", lambda *a, **kw: loads.append(1) or real(*a, **kw))
+    return loads
+
+
+def object_reads(calls: List[List[str]]) -> List[List[str]]:
+    return [c for c in calls if c and c[0] in ("ls-tree", "cat-file")]
+
+
+def reword(repo: hg.Repo, n: int) -> None:
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body=f"# Softer\n\nEdit {n}.\n"))
+
+
+@needs_git
+def test_a_branch_that_keeps_editing_a_rule_reads_and_parses_the_base_once(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    cache = scan_mod.RuleCache()
+    loads, calls = base_loads(monkeypatch), git_calls(monkeypatch)
+    views = []
+    for n in range(3):
+        reword(repo, n)  # a new working fingerprint each time, the same BASE
+        views.append(rule_integrity.effective(repo.root, cache))
+        if n == 0:
+            calls.clear()
+    assert object_reads(calls) == [] and loads == [1], calls
+    for n, view in enumerate(views):
+        assert f"Edit {n}." in view.ruleset.get("trap-a").body and view.unreviewed == ()
+        assert view.anchor == views[0].anchor
+    assert rule_integrity.effective(repo.root).ruleset == views[-1].ruleset  # what an uncached read serves
+
+
+@needs_git
+def test_a_base_that_moves_is_listed_again_and_served_new(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    cache = scan_mod.RuleCache()
+    reword(repo, 0)
+    first = rule_integrity.effective(repo.root, cache)
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nReviewed anew.\n"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("move the reviewed base"))
+    reword(repo, 1)
+    calls = git_calls(monkeypatch)
+    second = rule_integrity.effective(repo.root, cache)
+    assert second.anchor.commit != first.anchor.commit
+    assert [c[0] for c in object_reads(calls)][:1] == ["ls-tree"]
+    assert "Reviewed anew." in second.ruleset.get("inv-a").body
+
+
+@needs_git
+def test_a_forged_blob_is_refused_and_nothing_of_it_is_kept(tmp_path):
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
+    loose = repo.root / ".git" / "objects" / oid[:2] / oid[2:]
+    genuine = loose.read_bytes()
+    os.chmod(str(loose), 0o644)
+    loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nA reworded reason.\n"))
+    cache = scan_mod.RuleCache()
+    with pytest.raises(IntegrityError, match="does not match the object id"):
+        rule_integrity.effective(repo.root, cache)
+    loose.write_bytes(genuine)
+    view = rule_integrity.effective(repo.root, cache)
+    assert "Why this rule exists." in view.ruleset.get("inv-a").body  # the reviewed text, not the forgery
+
+
+@needs_git
+def test_a_blob_cache_smaller_than_the_rules_evicts_and_still_serves_them_right(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    padding = "x" * 16000 + "\n"
+    for n in range(300):
+        repo.write(f".aegis/rules/traps/bulk-{n}.md", rule_text(f"bulk-{n}", "trap", "advisory", body=f"# B{n}\n\n{padding}"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("many large rules"))
+    monkeypatch.setattr(scan_mod.RuleCache, "_MAX_BLOB_BYTES", 4 * 1024 * 1024)
+    cache = scan_mod.RuleCache()
+    for round_ in range(2):
+        for n in range(300):
+            repo.write(f".aegis/rules/traps/bulk-{n}.md",
+                       rule_text(f"bulk-{n}", "trap", "advisory", body=f"# B{n} r{round_}\n\n{padding}"))
+        view = rule_integrity.effective(repo.root, cache)
+        assert view.ruleset == rule_integrity.effective(repo.root).ruleset
+    assert cache._blob_bytes <= 4 * 1024 * 1024
+
+
+@needs_git
+def test_a_replaced_git_seam_bypasses_the_base_caches(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    seen: List[str] = []
+    real = rule_integrity._run
+    monkeypatch.setattr(rule_integrity, "_run", lambda cwd, args, stdin=None: seen.append(args[0]) or real(cwd, args, stdin))
+    cache = scan_mod.RuleCache()
+    for n in range(2):
+        reword(repo, n)
+        rule_integrity.effective(repo.root, cache)
+    assert seen.count("ls-tree") == 2 and seen.count("cat-file") == 2
+
+
 # ── the CI check ─────────────────────────────────────────────────────────────
 
 @needs_git

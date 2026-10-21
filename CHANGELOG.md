@@ -2,6 +2,47 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
+## [Unreleased]
+
+The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
+
+### Security
+
+- **`aegis_capture_insight` is bounded.** It allows 5 calls per 60 seconds and 50 captures per session, and refuses more than 20 `paths` or a path longer than 512 characters; the dirty-path default keeps the first 20 and records `paths_dropped`. Hook rows do not count toward the cap.
+
+### Changed behaviour
+
+- **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
+- The `aegis sync` table shows State, n, Weight and Score (blank below the 25-verdict minimum) instead of Fitness, Triggers, TP and FP. The `--pr` body states each rule's state, n and weight and the BASE commit its labels were read at, prints P(precision < 0.7) and the interval only for decided or inconclusive rules, and lists up to three replay detections per rule that are still unlabelled, instead of already-labelled rows.
+- `derived.json` entries carry `n` and `p_below_demote`; `samples` is always empty.
+- Detector replay walks the branch you name, else the user-scope `rules.base_ref` branch, else the protected branch, and never HEAD; with none it prints `replay skipped: no base branch`. Replayed catches carry the time of their evidence commit, so an old catch no longer clears newer exposure sessions.
+- `aegis sync` and `aegis doctor` print `BASE as of last fetch N days ago` or `never fetched`, and `aegis sync --json` gains `base_fetch_age_days`. Aegis never fetches.
+- A dangling `origin/HEAD` is read as absent, so the protected branch falls through to `main` or `master`.
+- Layer 2 reports a review that did not happen as `unverified` with named reasons (`no_predictions`, `no_reviewed_files`, `skipped:N`, `unknown_category:N`, `spec_agent_unparseable`, `code_agent_unparseable`) in text and in JSON `unverified_reasons`, instead of SHIP. Exit codes are unchanged: Layer 2 is log-only.
+- `aegis check --full` prints a one-line vendor advisory (JSON `vendor_warning`) when the user-scope `arbiter_vendor` is declared.
+- CI: every job has a timeout, the `validate` matrix no longer fails fast, Windows runs the wheel smoke, pytest dumps the stacks of a test hung for 300 seconds, and `aegis-check` runs the installed wheel (`python3 -I`) with the same test dependencies as the other test jobs. `check --ci` runs only in `aegis-check`, and tier detection accepts `python3 -I -m aegis_cli.cli check --ci` as the whole of a step.
+
+### Fixed
+
+- A warm scan in a git repository starts 3 git processes (was 9, and 13 for an MCP scan); the first scan starts 4, and a scan outside git starts 1 (was 7).
+- A scan reads the ledger once (was 3 times); an MCP scan reads it at most twice on a session's first scan and once afterwards (was 4); `aegis status` reads it once (was 5).
+- A branch that keeps editing a rule no longer re-lists, re-reads and re-parses the BASE rules on every scan.
+- git is looked up on PATH once per process instead of on every call.
+- Detector replay reports how many commits it walked, how many files it skipped (`replay UNVERIFIED`) and that CI runs are not evaluated, and reports a git failure as `replay UNVERIFIED: ...` while still writing `derived.json`; `--json` gains `replay`.
+- A Layer 2 reply entry that is not a JSON object is dropped and counted instead of failing the run.
+- MCP tool text names `aegis rule insight review` (not the missing `aegis insights review`), calls insight ids random, says `failure`, `fp` and `fail` read as a neutral trigger, and marks `tests_passed`, `rework_count` and `notes` as ignored and never stored.
+
+### Breaking (internal `aegis_core` API; `aegis_sdk` is unchanged)
+
+- Breaking: `aegis_core.fitness.Fitness.samples` and the `samples=` parameter of `aegis_core.fitness.compute` are removed.
+- Breaking: `aegis_core.verification.arbiter` loses `structural_ship_gaps`, `prune_predictions`, `PruneResult`, `check_vendor_independence` and `Z95` (and the `Path` and `is_test_path` names it imported); `arbitrate` loses `infra_status`, `changed_files`, `all_files`, `rule_miss_counts`, `arbiter_vendor` and `generator_vendor` and takes `gaps=`.
+- Breaking: `aegis_core.verification` loses `Prediction.claim_type`, `target`, `horizon_commits` and `Prediction.from_dict`, and `ArbitrationResult.decision`, `confidence`, `rationale`, `structural_gaps` and `vendor_warning`; `aegis_core.verification.pipeline` loses `VerificationPipelineResult.layer1_verdict`, `infra_status` and `llm_predictions`, and `Arbiter.arbitrate` no longer takes `**kwargs`. `AdversarialVerifier.verify` and `extract_target_data` return four values, and `adversarial_verify.parse_predictions` and `parse_claims` return `(items, dropped)`.
+- Breaking: `aegis check --full --json` prediction rows no longer carry `claim_type`, `target` or `horizon_commits`.
+
+### Corrections
+
+- The 4.3.0 entry for the accountable Layer-2 arbiter advertised deterministic structural SHIP gaps, a vendor-family warning and 60-day prediction compaction. None of that code had a caller; 4.4.0 removes it, and the advisory above replaces the warning.
+
 ## [4.3.4] - 2026-10-20
 
 4.3.4 is a security and repair release. It fixes the user harms of 4.3.0-4.3.3 and the trust claims the 4.3 review found forgeable. **4.3.3 never reached PyPI**: its publish run failed on a Windows wall-clock test (`test_100_rules_scan_in_under_a_second`, 1.5 s against a 1.0 s limit) and never uploaded, so PyPI goes from 4.3.2 to 4.3.4.

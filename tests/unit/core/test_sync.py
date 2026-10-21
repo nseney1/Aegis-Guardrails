@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -334,3 +335,324 @@ def test_a_young_rule_is_not_promoted_however_good_its_evidence(tmp_path: Path) 
     _rule(tmp_path, "trap", "young", created=created)
     _report(tmp_path, "young", "tp", 40)
     assert sync.sync(tmp_path).derived["rules"]["young"]["suggestion"] is None
+
+
+# ── state, n and weight; no number below the minimum; examples to label (R-evidence-14) ──
+
+def _labelled(tmp_path: Path, rule_id: str, count: int) -> Path:
+    from tests import helpers_adjudication as ha
+
+    _rule(tmp_path, "trap", rule_id)
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / ".gitignore").write_text(".aegis/state/\n", encoding="utf-8")
+    ha.write_labels(tmp_path, rule_id, ha.labels(rule_id, count=count, sessions=4, repos=2))
+    ha.merge_to_base(tmp_path)
+    return tmp_path
+
+
+def _detections(ws: Path, rule_id: str, count: int) -> None:
+    from aegis_core import credit
+
+    for n in range(count):
+        credit.record_detection(ws, rule_id, f"src/m{n}.py", "eval", disposition="leaked", rev=f"{n:040x}",
+                                ts=f"2026-10-0{n + 1}T00:00:00Z")
+
+
+def test_the_table_shows_state_n_and_weight_and_no_score_below_the_minimum(tmp_path: Path, capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+
+    ws = _labelled(tmp_path, "trap-four", 4)
+    assert run_sync(argparse.Namespace(_root=ws, json=False)) == 0
+    out = capsys.readouterr().out
+    header = next((line for line in out.splitlines() if "Rule" in line and "Type" in line), "")
+    assert [c for c in ("Rule", "Type", "State", "n", "Weight", "Score", "Suggestion") if c in header] == [
+        "Rule", "Type", "State", "n", "Weight", "Score", "Suggestion"]
+    assert "Fitness" not in header and "TP" not in header
+    row = next(line for line in out.splitlines() if "trap-four" in line)
+    assert "insufficient (n=4)" in row and "1.00" in row
+    entry = sync.build(ws)["rules"]["trap-four"]
+    assert (entry["n"], entry["reported_score"], entry["state"]) == (4, None, "insufficient")
+    body = sync.format_pr_body({"trap-four": entry}, [{"rule": "trap-four", "action": "promote"}])
+    assert "insufficient (n=4)" in body and "interval" not in body and "P(precision" not in body
+    assert "**Score**" not in body
+
+
+def _null_rows(text: str) -> list:
+    return [json.loads(line) for line in text.splitlines() if '"verdict": null' in line]
+
+
+def test_a_decided_promotion_body_states_the_evidence_and_three_examples_to_label(tmp_path: Path) -> None:
+    from aegis_core import adjudication, fitness
+    from tests import helpers_syncpr as hs
+
+    repo = hs.make(tmp_path, rule="trap-ok", detections=5)
+    gh = hs.FakeGh(repo.origin)
+    result = sync.sync(repo.root, pr=True, gh_runner=gh)
+    assert result.pr["status"] == "opened", result.pr
+    body = result.pr["body"]
+    base = adjudication.read_adjudications(repo.root).base
+    for text in ("decided", "n = 25", "weight 1.00", "P(precision < 0.7)", f"`{base}`",
+                 "score = Wilson lower bound x weight", "Compliance", "Censored**: n/a"):
+        assert text in body, text
+    assert "posterior" not in body.lower()
+    examples = _null_rows(hs.git(repo.root, "show", f"{result.pr['branch']}:.aegis/adjudications/trap-ok.jsonl"))
+    assert len(examples) == 3 and {r["file"] for r in examples} == {"src/m4.py", "src/m3.py", "src/m2.py"}
+    assert all(set(r) == {"example_id", "verdict", "file", "pattern", "rev"} for r in examples)
+    assert all(r["example_id"] in body for r in examples)
+    hs.git(repo.root, "checkout", "-q", result.pr["branch"])  # as if the PR were merged: null rows count for nothing
+    assert fitness.for_rules(repo.root, load_rules(repo.root).served)["trap-ok"].adjudicated_n == 25
+
+
+def test_one_detection_gives_one_example_none_gives_none_and_a_rerun_adds_nothing(tmp_path: Path) -> None:
+    from tests import helpers_syncpr as hs
+
+    repo = hs.make(tmp_path, rule="trap-one", detections=1)
+    first = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+    store = ".aegis/adjudications/trap-one.jsonl"
+    rows = hs.git(repo.root, "show", f"{first['branch']}:{store}")
+    assert len(_null_rows(rows)) == 1
+    hs.git(repo.root, "checkout", "-q", first["branch"], "--", store)  # the examples reach main, not the move
+    hs.git(repo.root, "commit", "-q", "-m", "examples to label")
+    hs.git(repo.root, "push", "-q", "origin", "main")
+    second = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+    assert second["status"] == "opened" and len(_null_rows(hs.git(repo.root, "show", f"{second['branch']}:{store}"))) == 1
+    assert store not in hs.git(repo.root, "diff", "--name-only", "main", second["branch"])
+
+    (tmp_path / "other").mkdir()
+    bare = hs.make(tmp_path / "other", rule="trap-none", detections=0)
+    third = sync.sync(bare.root, pr=True, gh_runner=hs.FakeGh(bare.origin)).pr
+    assert "no replay examples" in third["body"]
+    assert ".aegis/adjudications" not in hs.git(bare.root, "diff", "--name-only", "main", third["branch"])
+
+
+def test_an_example_already_labelled_is_never_listed_and_takes_no_slot(tmp_path: Path) -> None:
+    import re
+
+    from tests import helpers_syncpr as hs
+
+    repo = hs.make(tmp_path, rule="trap-held", detections=4)
+    store = ".aegis/adjudications/trap-held.jsonl"
+    first = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+    listed = re.findall(r"^  \d\. `([0-9a-f]{12})`", first["body"], re.M)
+    assert len(listed) == 3
+    rows = hs.git(repo.root, "show", f"{first['branch']}:{store}").replace(
+        f'"example_id": "{listed[0]}", "verdict": null', f'"example_id": "{listed[0]}", "verdict": "tp"')
+    (repo.root / store).write_bytes(rows.encode("utf-8") + b"\n")  # merged, and the newest one labelled
+    hs.git(repo.root, "commit", "-q", "-am", "label one example")
+    hs.git(repo.root, "push", "-q", "origin", "main")
+
+    second = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+
+    assert second["status"] == "opened", second
+    again = re.findall(r"^  \d\. `([0-9a-f]{12})`", second["body"], re.M)
+    assert listed[0] not in again and again[:2] == listed[1:] and len(again) == 3
+    held = [json.loads(line) for line in hs.git(repo.root, "show", f"{second['branch']}:{store}").splitlines()]
+    ids = [r["example_id"] for r in held if "example_id" in r and r["example_id"] in again + listed]
+    assert sorted(ids) == sorted(set(ids)) and set(ids) == set(again) | {listed[0]}  # one new row, no duplicate
+
+
+def test_derived_entries_carry_no_samples_and_an_older_file_with_them_still_reads(ws: Path) -> None:
+    derived = sync.sync(ws).derived
+    assert all(entry["samples"] == [] for entry in derived["rules"].values())
+    path = ws / ".aegis" / "state" / "derived.json"
+    older = dict(derived, rules={rid: dict(e, samples=[{"kind": "adjudication", "verdict": "tp"}])
+                                 for rid, e in derived["rules"].items()})
+    path.write_text(json.dumps(older), encoding="utf-8")
+    assert sync.read_derived(ws) == older
+    assert sync.stale_rules(load_rules(ws), sync.read_derived(ws)) == []
+
+
+# ── detector replay: the base branch, what it skipped, evidence time (R-evidence-11) ──
+
+GATE = ("---\nid: no-eval\ntype: gate\nenforcement: gate\nhypothesis: h\ncreated: '2026-01-01'\n"
+        "target_paths:\n  - 'src/*.py'\nforbid_ast:\n  calls: [eval]\n---\n# no-eval\n\nNo eval.\n")
+
+
+@pytest.fixture
+def user_home(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    return home
+
+
+def _replay_repo(tmp_path: Path, branch: str = "main"):
+    from tests import helpers_humangate as hg
+
+    repo = hg.Repo(tmp_path / "repo", hg.Home(tmp_path / "home"))
+    if branch != "main":
+        repo.git("checkout", "-q", "-b", branch)  # before the first commit: main never exists
+    repo.write(".aegis/rules/gates/no-eval.md", GATE)
+    repo.write(".gitignore", ".aegis/state/\n")
+    repo.write("src/app.py", "def f(x):\n    return x\n")
+    repo.commit("initial")
+    repo.write("src/app.py", "def f(x):\n    return eval(x)\n")
+    repo.git("add", "-A")
+    stamp = "2025-01-02T03:04:05+02:00"
+    repo.git("commit", "-q", "-m", "introduce eval", env={"GIT_COMMITTER_DATE": stamp, "GIT_AUTHOR_DATE": stamp})
+    return repo
+
+
+def _detections_of(root: Path):
+    from aegis_core import credit
+
+    return [r for r in credit.read_rows(root) if r.get("event") == "detection"]
+
+
+def test_an_unmerged_branch_alone_is_never_replayed(tmp_path: Path, user_home, capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+
+    repo = _replay_repo(tmp_path, branch="feature")
+    result = sync.sync(repo.root)
+    assert result.replay.skipped_reason == "no base branch" and _detections_of(repo.root) == []
+    assert run_sync(argparse.Namespace(_root=repo.root, json=False)) == 0
+    assert "replay skipped: no base branch" in capsys.readouterr().out
+
+
+def test_a_user_base_ref_names_the_branch_replay_walks(tmp_path: Path, user_home) -> None:
+    from aegis_core import fitness
+    from tests import helpers_verified as hv
+
+    repo = _replay_repo(tmp_path)
+    repo.git("checkout", "-q", "-b", "release", "HEAD~1")
+    repo.git("checkout", "-q", "main")
+    hv.write_user_config(user_home, rules={"base_ref": "origin/release"})
+    report = fitness.replay_detector_history_report(repo.root, persist=False)
+    assert (report.branch, report.detections, report.commits) == ("release", [], 1)
+    hv.write_user_config(user_home, rules={"base_ref": "HEAD~1"})  # not a branch: the protected one
+    assert fitness.replay_detector_history_report(repo.root, persist=False).branch == "main"
+
+
+def test_an_unparsable_file_is_counted_and_said(tmp_path: Path, user_home, capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+
+    repo = _replay_repo(tmp_path)
+    repo.write("src/broken.py", "def (:\n")
+    repo.commit("a file that does not parse")
+    assert run_sync(argparse.Namespace(_root=repo.root, json=False)) == 0
+    out = capsys.readouterr().out
+    assert "replay: 3 commit(s) of main walked; 1 file(s) skipped (replay UNVERIFIED)" in out
+    assert "commits reachable from main are covered; CI runs are not evaluated" in out
+    assert run_sync(argparse.Namespace(_root=repo.root, json=True)) == 0
+    replay = json.loads(capsys.readouterr().out)["replay"]
+    assert (replay["branch"], replay["commits"], replay["files_skipped"]) == ("main", 3, ["src/broken.py"])
+
+
+def test_a_git_failure_during_replay_is_said_and_the_sync_still_writes(tmp_path: Path, user_home, monkeypatch,
+                                                                     capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+    from aegis_core import gitsafe
+
+    repo = _replay_repo(tmp_path)
+    real = gitsafe.run
+
+    def timing_out(args, cwd, *rest, **kwargs):
+        if args and args[0] == "rev-list" and "--parents" in args:
+            raise gitsafe.GitError("git timed out")
+        return real(args, cwd, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", timing_out)
+    assert run_sync(argparse.Namespace(_root=repo.root, json=False)) == 0
+    captured = capsys.readouterr()
+    assert "replay UNVERIFIED: git timed out" in captured.out and "Error:" not in captured.out + captured.err
+    assert (repo.root / ".aegis" / "state" / "derived.json").is_file()
+
+
+def test_a_finding_carries_the_time_of_its_evidence_commit(tmp_path: Path, user_home) -> None:
+    repo = _replay_repo(tmp_path)
+    sync.sync(repo.root)
+    (row,) = _detections_of(repo.root)
+    assert (row["disposition"], row["ts"]) == ("leaked", "2025-01-02T01:04:05Z")
+
+
+def _exposures_then(ws: Path, catch_ts) -> int:
+    from aegis_core import fitness
+
+    rows = [{"v": ledger.LEDGER_VERSION, "ts": f"2026-09-{1 + n % 28:02d}T00:00:{n % 60:02d}Z", "event": "exposure",
+             "rule": "trap-x", "session": f"s{n}", "host": "h", "paths": [], "rev": None} for n in range(30)]
+    catch = {"v": ledger.LEDGER_VERSION, "event": "detection", "rule": "trap-x", "file": "src/a.py", "pattern": "eval",
+             "disposition": "caught", "branch": "main", "rev": "r1", "fix_rev": "r2", "weight": 0.5}
+    if catch_ts is not None:
+        catch["ts"] = catch_ts
+    ledger.append_rows(ws, rows + [catch])  # replay appends at sync time, after every exposure
+    return fitness.for_rules(ws, load_rules(ws).served)["trap-x"].eligible_sessions
+
+
+@pytest.mark.parametrize("catch_ts,eligible", [("2025-08-01T00:00:00Z", 30), ("2026-10-15T00:00:00Z", 0), (None, 0)],
+                         ids=["old-catch", "new-catch", "no-ts"])
+def test_a_catch_resets_only_the_exposures_before_it_in_evidence_time(tmp_path: Path, catch_ts, eligible) -> None:
+    _rule(tmp_path, "trap", "trap-x")
+    assert _exposures_then(tmp_path, catch_ts) == eligible
+
+
+def test_the_list_returning_replay_is_unchanged_for_its_callers(tmp_path: Path, user_home) -> None:
+    from aegis_core import fitness
+
+    repo = _replay_repo(tmp_path)
+    rows = fitness.replay_detector_history(repo.root, persist=False)
+    assert [(r["rule"], r["pattern"], r["disposition"]) for r in rows] == [("no-eval", "eval", "leaked")]
+    assert rows == fitness.replay_detector_history_report(repo.root, persist=False).detections
+
+
+# ── the age of the BASE anchor's last fetch (R-trust-48) ────────────────────
+
+DAY = 86400.0
+
+
+def _fetched(path: Path, days_ago: float) -> None:
+    import time
+
+    path.write_bytes(b"0000000000000000000000000000000000000000\t\tbranch 'main' of /elsewhere\n")
+    stamp = time.time() - days_ago * DAY
+    os.utime(str(path), (stamp, stamp))
+
+
+def _base_lines(text: str) -> list:
+    return [line.strip() for line in text.splitlines() if "BASE as of last fetch" in line]
+
+
+@pytest.mark.parametrize("days,expected", [(3.2, "BASE as of last fetch 3 days ago"), (1.5, "BASE as of last fetch 1 day ago"),
+                                           (-2.0, "BASE as of last fetch today"), (None, "BASE as of last fetch: never fetched")],
+                         ids=["three-days", "one-day", "future", "never"])
+def test_sync_and_doctor_state_when_base_was_last_fetched(tmp_path: Path, monkeypatch, capsys, days, expected) -> None:
+    import argparse
+
+    from aegis_cli.doctor import run_doctor
+    from aegis_cli.sync import run_sync
+    from tests import helpers_adjudication as ha
+
+    _rule(tmp_path, "trap", "trap-a")
+    ha.merge_to_base(tmp_path)
+    if days is not None:
+        _fetched(tmp_path / ".git" / "FETCH_HEAD", days)
+    assert run_sync(argparse.Namespace(_root=tmp_path, json=False)) == 0
+    assert _base_lines(capsys.readouterr().out) == [expected]
+    assert run_sync(argparse.Namespace(_root=tmp_path, json=True)) == 0
+    age = json.loads(capsys.readouterr().out)["base_fetch_age_days"]
+    assert age is None if days is None else age == pytest.approx(max(days, 0.0), abs=0.05)
+    monkeypatch.chdir(tmp_path)
+    run_doctor(argparse.Namespace())
+    assert _base_lines(capsys.readouterr().out) == [expected]
+    run_doctor(argparse.Namespace(json=True))
+    out = capsys.readouterr().out
+    assert "base_fetch" not in out and "BASE as of" not in out  # doctor --json is unchanged
+
+
+def test_outside_git_nothing_is_said_about_a_fetch(ws: Path, capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+
+    assert run_sync(argparse.Namespace(_root=ws, json=False)) == 0
+    assert _base_lines(capsys.readouterr().out) == []
+    assert run_sync(argparse.Namespace(_root=ws, json=True)) == 0
+    assert json.loads(capsys.readouterr().out)["base_fetch_age_days"] is None

@@ -25,7 +25,6 @@ __all__ = ["SyncCommand", "run_sync"]
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
 EXIT_USAGE = 2
-_APPLIED_OK = frozenset({"promoted", "demoted", "archived"})
 LEDGER_WARNING = (
     "⚠️  The ledger is incomplete ({}): fitness counts only the rows that could be read, "
     "so moves that rely on it (sync --apply, rule archive, tier changes) are refused"
@@ -36,9 +35,9 @@ def _rows(derived: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [dict(entry, id=rule_id) for rule_id, entry in sorted(derived["rules"].items())]
 
 
-def _fitness_column(row: Dict[str, Any]) -> str:
+def _score_column(row: Dict[str, Any]) -> str:
     shown = row.get("reported_score")
-    return f"{shown:.2f}" if isinstance(shown, (int, float)) else str(row.get("status") or "—")
+    return f"{shown:.2f}" if isinstance(shown, (int, float)) else ""  # no number below the sample minimum
 
 
 def _inert_expiry(root: Any) -> bool:
@@ -60,7 +59,7 @@ def _status(result: Any) -> str:
     return "applied" if result.applied else "synced"
 
 
-def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
+def _print_text(args: argparse.Namespace, result: Any, rel_path: str, root: Any) -> None:
     from aegis_cli.ui.table import Table
     from aegis_cli.ui.theme import OutputContext
 
@@ -69,12 +68,13 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
     rows = _rows(result.derived)
     if rows:
         tbl = Table(ctx=ui)
-        for column in ("Rule", "Type", "Fitness", "Triggers", "TP", "FP", "Suggestion"):
+        for column in ("Rule", "Type", "State", "n", "Weight", "Score", "Suggestion"):
             tbl.add_column(column, no_wrap=True)
         for row in rows:
             tbl.add_row(
-                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])), _fitness_column(row),
-                str(row["triggers"]), f"{row['tp']:g}", f"{row['fp']:g}", row["suggestion"] or "—",
+                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])),
+                str(row.get("status") or row.get("state") or "—"), str(row.get("n", "")),
+                f"{float(row.get('effective_weight', 1.0)):.2f}", _score_column(row), row["suggestion"] or "—",
             )
         for line in tbl.render(ui).splitlines():
             print(f"  {line}")
@@ -97,13 +97,20 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
     if result.pr is not None:
         pr_status = result.pr.get("status")
         if pr_status == "opened" and result.pr.get("url"):
-            print(f"  Opened PR: {result.pr['url']}")
+            print(f"  Opened PR: {result.pr['url']} (branch {result.pr.get('branch')})")
         elif pr_status == "failed" and result.pr.get("error"):
             print(f"  ❌ PR creation failed: {result.pr['error']}")
         elif pr_status == "no_transitions":
             print("  No decided transitions to open a PR for.")
     if result.refused:
         print(f"  ❌ {result.refused}")
+    from aegis_core.sync import base_fetch, replay_lines
+
+    for line in replay_lines(result.replay):
+        print(f"  {sanitize_display(line, 400)}")
+    fetched = base_fetch(root)[0]
+    if fetched:
+        print(f"  {fetched}")
     pending = sum(1 for row in rows if row["suggestion"])
     print(f"Wrote {rel_path} ({len(rows)} rules, {pending} suggested transitions).")
     if pending and not result.applied and not result.refused:
@@ -137,7 +144,9 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         return EXIT_PROBLEMS
 
     rel_path = result.path.relative_to(root).as_posix()
-    failed = [a for a in result.applied if a["status"] not in _APPLIED_OK]
+    from aegis_core.sync import MOVED_STATUSES
+
+    failed = [a for a in result.applied if a["status"] not in MOVED_STATUSES]
     pr_failed = bool(result.pr and result.pr.get("status") == "failed")
     rc = EXIT_PROBLEMS if (result.refused or result.derived["errors"] or failed or pr_failed) else EXIT_OK
     from aegis_core.credit import claimed_summary
@@ -160,9 +169,14 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         }
         if result.pr is not None:
             payload["pr"] = result.pr
+        if result.replay is not None:
+            payload["replay"] = result.replay.as_dict()
+        from aegis_core.sync import base_fetch
+
+        payload["base_fetch_age_days"] = base_fetch(root)[1]
         print(json.dumps(payload, indent=2, default=str))
     else:
-        _print_text(args, result, rel_path)
+        _print_text(args, result, rel_path, root)
         if _inert_expiry(root):
             print("  ℹ️  expiry.days and expiry.per_type in .aegis/config.json no longer change fitness: "
                   "rules decay by exposed sessions (half_life_sessions), never by calendar days")

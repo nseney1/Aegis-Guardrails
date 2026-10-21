@@ -135,7 +135,9 @@ def _eligible_after(ws: Path, reinforcing: dict) -> int:
 
 
 def test_only_a_migrated_session_tp_resets_session_decay(ws: Path, tmp_path: Path) -> None:
-    native = {"v": 2, "ts": "2026-10-01T00:00:00Z", "rule": "trap-old", "outcome": "tp", "source": "session",
+    # The catch must post-date the exposures it clears: an older catch leaves newer sessions counting.
+    later = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    native = {"v": 2, "ts": later, "rule": "trap-old", "outcome": "tp", "source": "session",
               "key": "native-tp"}
     assert _eligible_after(ws, native) == 4
 

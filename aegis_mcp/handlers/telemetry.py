@@ -140,7 +140,7 @@ def _record_edit(workspace, args: dict, idempotency_key: str, files: List[str]) 
 
 
 def handle_capture_insight(args: dict) -> dict:
-    from aegis_core.insights import capture_suggestion
+    from aegis_core.insights import CaptureLimitReached, capture_suggestion
 
     try:
         workspace = _get_workspace(args)
@@ -167,7 +167,7 @@ def handle_capture_insight(args: dict) -> dict:
             host=host,
             session=str(session) if session else None,
         )
-    except PathTraversalError as exc:
+    except (PathTraversalError, CaptureLimitReached) as exc:
         return _fail(str(exc))
     except Exception as exc:
         return _fail(f"Failed to capture insight: {exc}")

@@ -28,6 +28,7 @@ from . import (
     ArbitrationResult,
     Claim,
     Prediction,
+    ReviewGaps,
     ToolEvidence,
     Verdict,
 )
@@ -141,28 +142,35 @@ class AdversarialVerifier(BaseVerifier):
         self,
         changed_files: list[str],
         workspace: Workspace | str | Path,
-    ) -> tuple[list[str], str]:
-        """Extract signatures and implementation text from changed Python files."""
+    ) -> tuple[list[str], str, list[str], list[tuple[str, str]]]:
+        """Signatures and implementation text of the changed Python source files, the files
+        reviewed, and the ``(path, why)`` of each file left out (see ``ReviewGaps``)."""
         ws = as_workspace(workspace)
         repo_root = str(ws.root)
 
         all_signatures: list[str] = []
         all_implementation: list[str] = []
+        reviewed: list[str] = []
+        skipped: list[tuple[str, str]] = []
 
         for filepath in changed_files:
             full_path = Path(repo_root) / filepath
-            if not full_path.exists() or not filepath.endswith(".py"):
-                continue
-            if is_test_path(filepath) or full_path.name == "__init__.py":
+            why = ("deleted" if not full_path.exists() else "not_python" if not filepath.endswith(".py")
+                   else "test" if is_test_path(filepath) else "init" if full_path.name == "__init__.py" else "")
+            if why:
+                skipped.append((filepath, why))
                 continue
             try:
                 sigs = adversarial_verify.extract_signatures(str(full_path))
-                all_signatures.extend(sigs)
-                all_implementation.append(full_path.read_text(encoding="utf-8", errors="replace"))
-            except Exception:
+                text = full_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:  # a file the review could not read is named, never silently dropped
+                skipped.append((filepath, "error"))
                 continue
+            all_signatures.extend(sigs)
+            all_implementation.append(text)
+            reviewed.append(filepath)
 
-        return all_signatures, "\n\n".join(all_implementation)
+        return all_signatures, "\n\n".join(all_implementation), reviewed, skipped
 
     def verify(
         self,
@@ -173,13 +181,13 @@ class AdversarialVerifier(BaseVerifier):
         backend: Backend = None,
         test_names: list[str] | None = None,
         test_results: str | None = None,
-    ) -> tuple[list[Prediction], list[Claim], bool]:
+    ) -> tuple[list[Prediction], list[Claim], bool, ReviewGaps]:
         """Run the Spec Agent (prosecution) then the Code Agent (defense).
 
-        Returns (predictions, claims, spec_agent_failed).
+        Returns (predictions, claims, spec_agent_failed, gaps).
         """
         generate = _generate_fn(backend if backend is not None else self.backend)
-        signatures, implementation_text = self.extract_target_data(changed_files, workspace)
+        signatures, implementation_text, reviewed, skipped = self.extract_target_data(changed_files, workspace)
 
         # Phase 1: Prosecution
         spec_prompt = adversarial_verify.build_spec_prompt(
@@ -195,7 +203,7 @@ class AdversarialVerifier(BaseVerifier):
             raw_predictions = []
             spec_agent_failed = True
 
-        predictions = adversarial_verify.parse_predictions(raw_predictions)
+        predictions, dropped_predictions = adversarial_verify.parse_predictions(raw_predictions)
 
         # Phase 2: Defense
         layer1_output: dict[str, list] = {}
@@ -208,16 +216,25 @@ class AdversarialVerifier(BaseVerifier):
             implementation=implementation_text,
             test_results=test_results or "",
             layer1_output=layer1_output,
-            spec_predictions=raw_predictions,
+            # The parsed charges: an entry the arbiter cannot judge is not put to the defense.
+            spec_predictions=predictions,
         )
         code_response = generate(code_prompt)
+        code_agent_failed = False
         try:
             raw_claims = self._parse_json(code_response)
         except Exception:
             raw_claims = []
-        claims = adversarial_verify.parse_claims(raw_claims)
+            code_agent_failed = True
+        claims, dropped_claims = adversarial_verify.parse_claims(raw_claims)
 
-        return predictions, claims, spec_agent_failed
+        gaps = ReviewGaps(
+            reviewed_files=tuple(reviewed),
+            skipped_files=tuple(skipped),
+            dropped_entries=dropped_predictions + dropped_claims,
+            code_agent_failed=code_agent_failed,
+        )
+        return predictions, claims, spec_agent_failed, gaps
 
     @staticmethod
     def _parse_json(text: str) -> list[dict[str, Any]]:
@@ -241,14 +258,14 @@ class Arbiter:
         layer1_evidence: list[ToolEvidence],
         *,
         spec_agent_failed: bool = False,
-        **kwargs: Any,
+        gaps: ReviewGaps | None = None,
     ) -> ArbitrationResult:
         return arbiter_module.arbitrate(
             predictions=predictions,
             claims=claims,
             layer1_evidence=layer1_evidence,
             spec_agent_failed=spec_agent_failed,
-            **kwargs,
+            gaps=gaps,
         )
 
 
@@ -264,18 +281,6 @@ class VerificationPipelineResult:
     passed: bool
     summary: str
     arbitration_result: ArbitrationResult | None = None
-    layer1_verdict: str = ""
-    infra_status: str = "ok"
-    llm_predictions: tuple[Prediction, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.layer1_verdict:
-            self.layer1_verdict = "PASS" if self.layer1_passed else "FAIL"
-        if self.arbitration_result is not None:
-            if self.infra_status == "ok" and self.arbitration_result.infra_status != "ok":
-                self.infra_status = self.arbitration_result.infra_status
-            if not self.llm_predictions and self.arbitration_result.llm_predictions:
-                self.llm_predictions = self.arbitration_result.llm_predictions
 
 
 class VerificationPipeline:
@@ -350,7 +355,7 @@ class VerificationPipeline:
             except Exception:
                 pass
 
-        predictions, claims, spec_failed = self.adversarial_verifier.verify(
+        predictions, claims, spec_failed, gaps = self.adversarial_verifier.verify(
             changed_files=files,
             workspace=ws,
             task_plan=task_plan,
@@ -365,6 +370,7 @@ class VerificationPipeline:
             claims=claims,
             layer1_evidence=l1_evidence,
             spec_agent_failed=spec_failed,
+            gaps=gaps,
         )
 
         # T6 is log-only: the arbiter's verdict is reported, never gating.

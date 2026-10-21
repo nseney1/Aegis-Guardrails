@@ -52,37 +52,33 @@ def test_sync_command_parser_registers_pr_flag() -> None:
     assert parsed.apply is False
 
 
-def test_format_pr_body_includes_up_to_three_samples_and_prior_disclosure() -> None:
+def test_format_pr_body_states_the_evidence_and_lists_the_examples_to_label() -> None:
     pre_rules = {
         "r-promote": {
-            "tp": 25,
-            "fp": 0,
-            "precision_lo": 0.89,
-            "precision_hi": 1.00,
-            "fitness": 0.91,
-            "sessions_count": 4,
-            "repos_count": 2,
-            "contested": 1,
-            "override_rate": 1 / 26,
+            "state": "decided", "status": None, "n": 25, "effective_weight": 0.5, "reported_score": 0.81,
+            "p_below_demote": 0.01, "precision_lo": 0.89, "precision_hi": 1.00, "sessions_count": 4,
+            "repos_count": 2, "contested": 1, "override_rate": 1 / 26, "caught": 3, "leaked": 1,
             "prior_disclosure": "prior supplies 28% of the evidence",
-            "samples": [
-                {"ref": "PR-1", "file": "src/a.py", "line": 10, "summary": "Sample one"},
-                {"ref": "PR-2", "file": "src/b.py", "line": 20, "summary": "Sample two"},
-                {"ref": "PR-3", "file": "src/c.py", "line": 30, "summary": "Sample three"},
-                {"ref": "PR-4", "file": "src/d.py", "line": 40, "summary": "Sample four ignored"},
-            ],
-        }
+        },
+        "r-young": {"state": "insufficient", "status": "insufficient (n=4)", "n": 4, "effective_weight": 1.0,
+                    "reported_score": None, "precision_lo": 0.4, "precision_hi": 1.0},
     }
     applied = [
-        {"rule": "r-promote", "action": "promote", "from_type": "trap", "to_type": "invariant"}
+        {"rule": "r-promote", "action": "promote", "from_type": "trap", "to_type": "invariant"},
+        {"rule": "r-young", "action": "archive"},
     ]
-    body = format_pr_body(pre_rules, applied)
-    assert "### `r-promote` — **promote** (`trap` -> `invariant`)" in body
-    assert "prior supplies 28% of the evidence" in body
-    assert "1. [PR-1] (`src/a.py:10`): Sample one" in body
-    assert "2. [PR-2] (`src/b.py:20`): Sample two" in body
-    assert "3. [PR-3] (`src/c.py:30`): Sample three" in body
-    assert "Sample four ignored" not in body
+    examples = {"r-promote": [{"example_id": "abc123def456", "verdict": None, "file": "src/a.py",
+                               "pattern": "eval", "rev": "f" * 40}]}
+    body = format_pr_body(pre_rules, applied, base="b" * 40, examples=examples)
+    promote, young = body.split("### `r-young`")
+    assert "### `r-promote` — **promote** (`trap` -> `invariant`)" in promote
+    assert "- **State**: decided; n = 25; weight 0.50" in promote and "- **Score**: 0.81" in promote
+    assert "P(precision < 0.7)**: 0.01; precision 90% interval [0.89, 1.00]" in promote
+    assert "prior supplies 28% of the evidence" in promote and "0.75 (3 caught, 1 leaked)" in promote
+    assert f"`{'b' * 40}`" in promote and "1. `abc123def456`: `eval` in `src/a.py`" in promote
+    assert "insufficient (n=4); n = 4" in young and "Score**" not in young and "interval" not in young
+    assert "no replay examples" in young and "Compliance** caught / (caught + leaked): n/a" in young
+    assert format_pr_body(pre_rules, applied[1:]).count("no BASE") == 1
 
 
 def test_sync_pr_no_transitions_does_not_invoke_gh(
@@ -102,27 +98,21 @@ def test_sync_pr_no_transitions_does_not_invoke_gh(
     assert gh_calls == []
 
 
-def test_sync_pr_gh_failure_returns_exit_problems_and_never_calls_merge(
+def test_sync_pr_without_a_remote_is_refused_and_never_calls_gh(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _write_rule(tmp_path, "trap", "r-promote")
-    _seed_decided_promotion(tmp_path, "r-promote")
+    _seed_decided_promotion(tmp_path, "r-promote")  # a reviewed base, but no remote to push a branch to
     gh_calls: list[list[str]] = []
 
-    def failing_gh(argv: list[str], cwd: str | None = None) -> object:
+    def gh(argv: list[str], cwd: str | None = None) -> object:
         gh_calls.append(list(argv))
+        raise AssertionError("gh must not be called when the PR is refused")
 
-        class _Res:
-            returncode = 1
-            stdout = ""
-            stderr = "gh: not authenticated"
-
-        return _Res()
-
-    rc = run_sync(argparse.Namespace(_root=tmp_path, pr=True, json=False), gh_runner=failing_gh)
+    rule = tmp_path / ".aegis" / "rules" / "traps" / "r-promote.md"
+    before = rule.read_bytes()
+    rc = run_sync(argparse.Namespace(_root=tmp_path, pr=True, json=False), gh_runner=gh)
     assert rc == EXIT_PROBLEMS
     out = capsys.readouterr().out
-    assert "PR creation failed: gh: not authenticated" in out
-    assert len(gh_calls) == 1
-    assert gh_calls[0][:2] == ["pr", "create"]
-    assert not any("merge" in call for call in gh_calls)
+    assert "no pull request opened: no usable remote named 'origin'" in out
+    assert gh_calls == [] and rule.read_bytes() == before

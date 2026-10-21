@@ -48,11 +48,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BURST_WINDOW_SECONDS",
+    "CaptureLimitReached",
     "DECISIONS",
     "INSIGHT_HOOK_MARKER",
     "INSIGHT_LEVELS",
     "INSIGHT_SCHEMA_VERSION",
     "KEY_SIZE",
+    "MAX_CAPTURES_PER_SESSION",
+    "MAX_CAPTURE_PATHS",
+    "MAX_CAPTURE_PATH_CHARS",
     "MAX_EXCERPT_CHARS",
     "RECURRENCE_ALARM_COUNT",
     "REJECTION_RESURFACE_COUNT",
@@ -90,6 +94,10 @@ INSIGHT_LEVELS = ("H", "cli", "W2", "hook", "suggestion")
 COUNTABLE_LEVELS = frozenset({"H", "cli", "W2", "hook"})
 DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise")
 SUPPORTED_INSIGHT_HOSTS = ("claude-code", "codex-cli")
+# aegis_capture_insight is reachable by the agent: its cost is bounded per call and per session.
+MAX_CAPTURES_PER_SESSION = 50
+MAX_CAPTURE_PATHS = 20
+MAX_CAPTURE_PATH_CHARS = 512
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _LAZY_NAMES = {
     "MAX_EXCERPT_CHARS": "aegis_core.verification.scanners",
@@ -405,6 +413,29 @@ def _resolve_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List
     return dirty_paths(workspace), "dirty"
 
 
+class CaptureLimitReached(ValueError):
+    """A bound of capture_suggestion: the session's capture cap, or ``paths`` over its size."""
+
+
+def _capture_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List[str], str, int]:
+    """(paths, psrc, dropped). Paths the caller chose that exceed the bounds fail the call; the
+    derived dirty-path default is cut to its first MAX_CAPTURE_PATHS and the rest counted."""
+    if paths is not None and len(paths) > 0:
+        if len(paths) > MAX_CAPTURE_PATHS or any(len(str(p)) > MAX_CAPTURE_PATH_CHARS for p in paths):
+            raise CaptureLimitReached(
+                f"'paths' takes at most {MAX_CAPTURE_PATHS} paths of at most {MAX_CAPTURE_PATH_CHARS} characters")
+        return _confine_paths(workspace, paths), "explicit", 0
+    found = dirty_paths(workspace)
+    return found[:MAX_CAPTURE_PATHS], "dirty", max(0, len(found) - MAX_CAPTURE_PATHS)
+
+
+def _is_capture(row: Mapping[str, Any], hs: Optional[str]) -> bool:
+    # Captures are 'suggestion' rows, or 'W2' rows a hook prompt confirmed; hook prompts write
+    # W2 rows without confirmed_by and never count. No hs is one shared bucket.
+    return (row.get("event") == "insight" and row.get("hs") == hs
+            and (row.get("level") == "suggestion" or (row.get("level") == "W2" and bool(row.get("confirmed_by")))))
+
+
 def _read_rows_of_session(path: Path, hs: str) -> List[Dict[str, Any]]:
     # hs is 32 lowercase hex, never JSON-escaped, so every row of the session carries it verbatim.
     return read_jsonl(path, contains=hs.encode("ascii")).rows
@@ -497,21 +528,32 @@ def capture_suggestion(
     if not isinstance(quote, str) or not quote.strip():
         raise ValueError("quote must be a non-empty string")
     redacted = _redact(quote)
-    norm_paths, psrc = _resolve_paths(workspace, paths)
+    norm_paths, psrc, dropped = _capture_paths(workspace, paths)
     hs = _ensure_hs(host, session, home)
     path = insights_path(workspace, home=home)
-    m_hook = _matching_hook_insight(_read_rows_of_session(path, hs) if hs else [], hs, redacted)
-    row = _build_insight_row(
-        workspace,
-        "W2" if m_hook else "suggestion",
-        redacted,
-        norm_paths,
-        psrc,
-        host or "mcp",
-        hs,
-        confirmed_by=m_hook,
-    )
-    _append_user_insights(path, [row])
+    revs = _served_rule_revs(workspace)
+    _ensure_private_dir(path.parent.parent)
+    _ensure_private_dir(path.parent)
+    # One read under the log's lock serves the hook match and the cap, so concurrent captures
+    # cannot both pass at the cap (file_lock is re-entrant for the append below).
+    with storage.file_lock(path.with_suffix(".lock")):
+        rows = _read_rows_of_session(path, hs) if hs else read_jsonl(path, contains=b'"level":"suggestion"').rows
+        if sum(1 for r in rows if _is_capture(r, hs)) >= MAX_CAPTURES_PER_SESSION:
+            raise CaptureLimitReached(f"capture limit reached: at most {MAX_CAPTURES_PER_SESSION} insights per session")
+        m_hook = _matching_hook_insight(rows, hs, redacted)
+        row = _build_insight_row(
+            workspace,
+            "W2" if m_hook else "suggestion",
+            redacted,
+            norm_paths,
+            psrc,
+            host or "mcp",
+            hs,
+            revs=revs,
+            confirmed_by=m_hook,
+            paths_dropped=dropped,
+        )
+        _append_user_insights(path, [row])
     return row
 
 

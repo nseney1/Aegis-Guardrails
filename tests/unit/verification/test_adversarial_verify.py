@@ -9,7 +9,6 @@ Audit findings applied:
 - test_parse_predictions/claims: checks ALL fields, not just category
 - Added missing test_full_pipeline_produces_arbitration_result
 """
-import os
 import sys
 import textwrap
 
@@ -21,13 +20,9 @@ sys.path.insert(0, REPO_ROOT)
 from aegis_core.verification import (
     RiskCategory,
     Severity,
-    Prediction,
-    Claim,
     ArbitrationResult,
     Verdict,
     ToolEvidence,
-    PREDICTION_SCHEMA,
-    CLAIM_SCHEMA,
 )
 
 
@@ -183,8 +178,8 @@ class TestParsing:
             }
         ]
 
-        predictions = parse_predictions(raw)
-        assert len(predictions) == 1
+        predictions, dropped = parse_predictions(raw)
+        assert (len(predictions), dropped) == (1, 0)
         p = predictions[0]
         assert p.category == RiskCategory.PERSISTENCE_GAP
         assert p.severity == Severity.CRITICAL
@@ -206,8 +201,8 @@ class TestParsing:
             }
         ]
 
-        claims = parse_claims(raw)
-        assert len(claims) == 1
+        claims, dropped = parse_claims(raw)
+        assert (len(claims), dropped) == (1, 0)
         c = claims[0]
         assert c.category == RiskCategory.PERSISTENCE_GAP
         assert c.claim == "Epoch persisted at L217"
@@ -215,8 +210,8 @@ class TestParsing:
         assert c.evidence_line == 217
         assert c.tests_covering == ["test_idempotent"]
 
-    def test_parse_skips_invalid_categories(self):
-        """Unknown categories should be skipped, not crash."""
+    def test_parse_skips_and_counts_invalid_categories(self):
+        """Unknown categories are skipped, not crashed on, and counted (R-checks-44)."""
         from aegis_core.verification.adversarial_verify import parse_predictions
 
         raw = [
@@ -229,8 +224,20 @@ class TestParsing:
             }
         ]
 
-        predictions = parse_predictions(raw)
-        assert len(predictions) == 0
+        assert parse_predictions(raw) == ([], 1)
+
+    @pytest.mark.parametrize("entry", ["not an object", 3, None, ["category"], {"severity": "low"}],
+                             ids=["str", "int", "null", "list", "no-category"])
+    def test_an_entry_that_is_not_a_usable_object_is_dropped_and_counted(self, entry):
+        """The reply is any JSON the model chose: a bad entry is a dropped entry, never a crash."""
+        from aegis_core.verification.adversarial_verify import parse_claims, parse_predictions
+
+        good = {"category": "overflow", "severity": "low", "risk": "r", "mechanism": "m", "affected_function": "f"}
+        predictions, dropped = parse_predictions([entry, good])
+        assert ([p.category for p in predictions], dropped) == ([RiskCategory.OVERFLOW], 1)
+        claim = {"category": "overflow", "claim": "c", "evidence_file": "f.py", "evidence_line": 1}
+        claims, dropped = parse_claims([claim, entry])
+        assert (len(claims), dropped) == (1, 1)
 
 
 class TestEndToEnd:
@@ -264,8 +271,8 @@ class TestEndToEnd:
                          True, "All keys serialized"),
         ]
 
-        predictions = parse_predictions(raw_preds)
-        claims = parse_claims(raw_claims)
+        predictions, _ = parse_predictions(raw_preds)
+        claims, _ = parse_claims(raw_claims)
         result = arbitrate(predictions, claims, evidence)
 
         assert isinstance(result, ArbitrationResult)

@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.match import normalize_path, workspace_files
-from aegis_core import rule_integrity
+from aegis_core import gitsafe, rule_integrity
 from aegis_core.rule_integrity import MANDATORY_SLOT_CAP
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
@@ -317,6 +317,12 @@ def scan(
     ``max_tokens`` bounds the whole response. Returns ``{"status": "FAIL", "error"}``
     (with ``rule_errors``) when the rules cannot all be loaded.
     """
+    with gitsafe.memo():  # one answer per repository question for the whole scan
+        return _scan(workspace, changed_files, budget, max_tokens)
+
+
+def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[int],
+          max_tokens: Optional[int]) -> Dict[str, Any]:
     from aegis_core.sync import read_derived, stale_rules
 
     token_budget = resolve_token_budget(workspace, max_tokens)

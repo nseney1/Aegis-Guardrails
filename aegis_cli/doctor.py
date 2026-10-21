@@ -885,6 +885,11 @@ def run_doctor(args: argparse.Namespace) -> int:
             _print_hosts(diag)
             _print_tiers(diag)
             _print_trust(diag)
+            from aegis_core.sync import base_fetch
+
+            fetched = base_fetch(root)[0]  # Aegis never fetches; this says how old BASE may be
+            if fetched:
+                print(f"  {fetched}")
             _print_findings(diag.findings)
         if fix:
             if not plan:

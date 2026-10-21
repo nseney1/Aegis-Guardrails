@@ -49,7 +49,7 @@ def test_sync_prints_a_table_of_suggestions_and_writes_derived_state(ws, capsys)
 
     out = capsys.readouterr().out
     assert rc == 0
-    for column in ("Rule", "Type", "Fitness", "Triggers", "TP", "FP", "Suggestion"):
+    for column in ("Rule", "Type", "State", "n", "Weight", "Score", "Suggestion"):
         assert column in out
     assert "trap-good" in out and "promote" in out and "persona-quiet" in out
     assert "aegis sync --apply" in out

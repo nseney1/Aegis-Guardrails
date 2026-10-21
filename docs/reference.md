@@ -658,7 +658,7 @@ Output schema:
     },
     "unreviewed_total": {
       "type": "integer",
-      "description": "Total count of unreviewed gate or invariant rules across the workspace."
+      "description": "Total count of unreviewed gate or invariant rules; present only when unreviewed_rules does not list them all (more than 10, or trimmed to the token budget)."
     },
     "rules_base": {
       "type": [
@@ -726,12 +726,12 @@ Record post-verification rule feedback in the local outcome ledger after running
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | Verification result for the rules in this change: 'success'/'tp'/'pass' record a true positive ('tp'), 'failure'/'fp'/'fail' record a false positive ('fp'), and 'partial' records a neutral trigger ('trigger'). |
+| `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | Verification result for the rules in this change: 'success'/'tp'/'pass' claim a true positive, which earns credit only after CI confirms the landing commit; 'failure'/'fp'/'fail' are kept as the claim and, like 'partial', read as a neutral trigger, never a false positive. |
 | `idempotency_key` | string | yes | Caller-supplied unique key (1-256 chars, scoped per host and session). Retrying with the same key and outcome is a no-op; reusing a key with a different outcome fails with status 'FAIL'. |
 | `rules_used` | array of string | yes | Non-empty list of existing rule IDs from aegis_scan. Validated against the workspace rule inventory; actual fitness credit is computed server-side from session scan exposure and git diff paths. |
-| `tests_passed` | boolean | no | Optional boolean recording whether the project's test suite passed during verification. |
-| `rework_count` | integer | no | Optional non-negative integer count of edit-and-retest cycles before verification succeeded (default: 0). |
-| `notes` | string | no | Optional free-text context describing how the rules helped or failed (max 4096 chars). |
+| `tests_passed` | boolean | no | Optional boolean. Accepted for compatibility; ignored, never stored. |
+| `rework_count` | integer | no | Optional integer. Accepted for compatibility; ignored, never stored. |
+| `notes` | string | no | Optional text (max 4096 chars). Accepted for compatibility; ignored, never stored. |
 | `files` | array of string | no | Optional workspace-relative file paths edited in this change. Records one 'edit' activity event per idempotency_key for scan-before-edit compliance (aegis status --compliance); does not affect rule credit. |
 | `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
 
@@ -752,7 +752,7 @@ Input schema:
         "pass",
         "fail"
       ],
-      "description": "Verification result for the rules in this change: 'success'/'tp'/'pass' record a true positive ('tp'), 'failure'/'fp'/'fail' record a false positive ('fp'), and 'partial' records a neutral trigger ('trigger')."
+      "description": "Verification result for the rules in this change: 'success'/'tp'/'pass' claim a true positive, which earns credit only after CI confirms the landing commit; 'failure'/'fp'/'fail' are kept as the claim and, like 'partial', read as a neutral trigger, never a false positive."
     },
     "idempotency_key": {
       "type": "string",
@@ -769,17 +769,17 @@ Input schema:
     },
     "tests_passed": {
       "type": "boolean",
-      "description": "Optional boolean recording whether the project's test suite passed during verification."
+      "description": "Optional boolean. Accepted for compatibility; ignored, never stored."
     },
     "rework_count": {
       "type": "integer",
       "default": 0,
-      "description": "Optional non-negative integer count of edit-and-retest cycles before verification succeeded (default: 0)."
+      "description": "Optional integer. Accepted for compatibility; ignored, never stored."
     },
     "notes": {
       "type": "string",
       "maxLength": 4096,
-      "description": "Optional free-text context describing how the rules helped or failed (max 4096 chars)."
+      "description": "Optional text (max 4096 chars). Accepted for compatibility; ignored, never stored."
     },
     "files": {
       "type": "array",
@@ -836,7 +836,7 @@ Output schema:
       "items": {
         "type": "string"
       },
-      "description": "Rule IDs credited in the outcome ledger (empty for unwitnessed 'claimed' or 'rate_limited' reports)."
+      "description": "Rule IDs the report was attached to (empty for 'claimed' or 'rate_limited' reports); they count as evidence only after CI confirms the landing commit."
     },
     "credited_count": {
       "type": "integer",
@@ -855,7 +855,7 @@ Output schema:
     },
     "recorded": {
       "type": "boolean",
-      "description": "False when status='rate_limited' or when an unwitnessed claim for the same session and tree was already recorded."
+      "description": "Present when status='claimed': False when an unwitnessed claim for the same session and tree was already recorded."
     },
     "limit": {
       "type": "integer",
@@ -898,7 +898,7 @@ Build a structured prompt for drafting a new governance rule from a natural-lang
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `description` | string | yes | Non-empty natural-language description of the engineering defect, anti-pattern, or invariant to codify into a rule. |
-| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional target rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance). Determines the target subdirectory under .aegis/rules/. |
+| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance), passed to the draft prompt as a hint. |
 | `domain` | string | no | Optional domain hint injected into the drafting prompt (e.g., 'security', 'correctness', 'efficiency', 'style', 'governance'). |
 
 Input schema:
@@ -921,7 +921,7 @@ Input schema:
         "persona",
         "contract"
       ],
-      "description": "Optional target rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance). Determines the target subdirectory under .aegis/rules/."
+      "description": "Optional rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance), passed to the draft prompt as a hint."
     },
     "domain": {
       "type": "string",
@@ -1061,12 +1061,12 @@ Output schema:
 
 **Capture Insight**
 
-Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) for rule curation. Use this tool when the user corrects your approach or states a recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file immediately, or `aegis_report_outcome` to report whether existing rules helped. Each call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a matching user prompt captured by a host hook in the same session.
+Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) for rule curation. Use this tool when the user corrects your approach or states a recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file immediately, or `aegis_report_outcome` to report whether existing rules helped. Each call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded from `aegis rule insight review` rule proposals until corroborated (`level: 'W2'`) by a matching user prompt captured by a host hook in the same session. Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `quote` | string | yes | Non-empty verbatim quote of the user's correction or preference (1-1024 chars; secrets are automatically redacted and stored text is capped at 300 chars). |
-| `paths` | array of string | no | Optional workspace-relative file paths this correction applies to (sets psrc='explicit'). When omitted or empty, defaults to currently modified git worktree paths (psrc='dirty'). |
+| `paths` | array of string | no | Optional workspace-relative file paths this correction applies to (sets psrc='explicit'; at most 20 of at most 512 characters, more fails the call). When omitted or empty, defaults to the first 20 currently modified git worktree paths (psrc='dirty'). |
 
 Input schema:
 
@@ -1082,9 +1082,11 @@ Input schema:
     "paths": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 512
       },
-      "description": "Optional workspace-relative file paths this correction applies to (sets psrc='explicit'). When omitted or empty, defaults to currently modified git worktree paths (psrc='dirty')."
+      "maxItems": 20,
+      "description": "Optional workspace-relative file paths this correction applies to (sets psrc='explicit'; at most 20 of at most 512 characters, more fails the call). When omitted or empty, defaults to the first 20 currently modified git worktree paths (psrc='dirty')."
     }
   },
   "required": [
@@ -1110,7 +1112,7 @@ Output schema:
     },
     "id": {
       "type": "string",
-      "description": "Content-addressed insight identifier ('ins-<12-hex>')."
+      "description": "Random insight identifier ('ins-<12 hex>'), new on every call."
     },
     "level": {
       "type": "string",
