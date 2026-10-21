@@ -248,7 +248,6 @@ def test_the_pre_tool_hook_spawns_at_most_two_gits_on_edit_and_none_on_bash(git_
 
 # ── (f): the insight hook's imports ─────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="a no-cue prompt imports aegis_core.credit today; R-structure-11")
 def test_a_no_cue_insight_prompt_does_not_import_credit(git_ws, isolated):
     payload = json.dumps({"prompt": "Please run the unit tests.", "session_id": "s-imports", "cwd": str(git_ws)})
     code = ("import sys; sys.path.insert(0, sys.argv[1]); from aegis_cli.hooks.insights import run_insight_hook; "
