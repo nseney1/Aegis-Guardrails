@@ -644,7 +644,8 @@ TOOL_DEFINITIONS = [
             "git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted "
             "records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded "
             "from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a "
-            "matching user prompt captured by a host hook in the same session."
+            "matching user prompt captured by a host hook in the same session. Capped at 50 captures "
+            "per session and rate-limited to 5 calls per 60 seconds."
         ),
         "annotations": _write("Capture Insight"),
         "inputSchema": {
@@ -661,11 +662,13 @@ TOOL_DEFINITIONS = [
                 },
                 "paths": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "maxLength": 512},
+                    "maxItems": 20,
                     "description": (
                         "Optional workspace-relative file paths this correction applies to "
-                        "(sets psrc='explicit'). When omitted or empty, defaults to currently "
-                        "modified git worktree paths (psrc='dirty')."
+                        "(sets psrc='explicit'; at most 20 of at most 512 characters, more fails the "
+                        "call). When omitted or empty, defaults to the first 20 currently modified "
+                        "git worktree paths (psrc='dirty')."
                     ),
                 },
             },
