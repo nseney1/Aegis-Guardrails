@@ -282,8 +282,12 @@ _PR_DIRS = (RULES_RELDIR, f"{AEGIS_DIRNAME}/adjudications")  # the second is adj
 # repository's choosing, or reach another remote helper, refuses the PR instead.
 _PUSH_PROGRAMS = (r"^(core\.(sshcommand|askpass|gitproxy)|credential\..*|protocol\..*|url\..*"
                   r"|remote\..*\.(receivepack|uploadpack|vcs))$")
+# Only https, ssh and local file transport: any other scheme makes git start git-remote-<scheme>.
 _PUSH_HARDENING = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", "-c", "core.askPass=",
-                   "-c", "protocol.ext.allow=never", "-c", f"gpg.program={os.devnull}")
+                   "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
+                   "-c", "protocol.file.allow=always", "-c", "protocol.ext.allow=never", "-c", f"gpg.program={os.devnull}")
+_PUSH_SCHEMES = ("https", "ssh", "git+ssh", "ssh+git", "file")  # git compares them case-sensitively
+_URL_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://")
 _PUSH_TIMEOUT = 60.0
 _REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -346,9 +350,14 @@ def _pr_plan(root: Path) -> Dict[str, Any]:
         raise _Refused(f"{' and '.join(_PR_DIRS)} hold uncommitted changes ({dirty[0]}); commit or remove them first")
     remote = os.fsdecode(gitsafe.run(["config", "--get", f"branch.{current}.remote"], top).stdout.strip()) or "origin"
     # The name reaches push argv (repository config chose it): never an option, never this repository.
-    url = gitsafe.run(["remote", "get-url", "--push", remote], top) if _REMOTE_NAME.fullmatch(remote) else None
-    if url is None or url.returncode != 0 or b"::" in url.stdout:
+    urls = gitsafe.run(["remote", "get-url", "--push", "--all", remote], top) if _REMOTE_NAME.fullmatch(remote) else None
+    if urls is None or urls.returncode != 0 or not urls.stdout.strip() or b"::" in urls.stdout:
         raise _Refused(f"no usable remote named {remote!r} to push the branch to")
+    for url in os.fsdecode(urls.stdout).splitlines():  # git pushes to every push URL
+        scheme = _URL_SCHEME.match(url)
+        if scheme and scheme.group(1) not in _PUSH_SCHEMES:  # the scheme only: a URL may hold a token
+            raise _Refused(f"{remote} has a push URL using {scheme.group(1)}://, not https, ssh or a local path; "
+                           "push the branch yourself")
     programs = gitsafe.run(["config", "--show-scope", "--null", "--name-only", "--get-regexp", _PUSH_PROGRAMS], top)
     if programs.returncode not in (0, 1):
         raise _Refused("git cannot say which config scope sets the push settings (git 2.26 or newer needed)")

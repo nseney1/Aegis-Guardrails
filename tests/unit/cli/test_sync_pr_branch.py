@@ -172,3 +172,32 @@ def test_a_branch_name_already_taken_gets_the_next_one(tmp_path, capsys, monkeyp
     gh = hs.FakeGh(repo.origin)
     rc, payload = _run(repo, gh, capsys)
     assert rc == EXIT_OK and payload["pr"]["branch"] == "aegis/lifecycle-20261021T000000Z-2"
+
+
+def _plant(path, marker) -> None:
+    path.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize("where", ["url", "second-pushurl"])
+def test_a_push_url_scheme_that_picks_a_remote_helper_is_refused_and_the_helper_never_runs(
+        tmp_path, capsys, monkeypatch, where):
+    repo = hs.make(tmp_path)
+    helpers = tmp_path / "bin"
+    helpers.mkdir()
+    _plant(helpers / "git-remote-xyz", tmp_path / "ran-helper")  # git runs git-remote-<scheme> from PATH
+    monkeypatch.setenv("PATH", os.pathsep.join([os.environ.get("PATH", ""), str(helpers)]))
+    if where == "url":
+        git(repo.root, "remote", "set-url", "origin", "xyz://host/repo")
+    else:  # git pushes to every push URL: the first is fine, the second picks the helper
+        git(repo.root, "remote", "set-url", "--add", "--push", "origin", str(repo.origin))
+        git(repo.root, "remote", "set-url", "--add", "--push", "origin", "xyz://host/repo")
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_PROBLEMS and payload["pr"]["status"] == "refused" and gh.calls == []
+    assert "xyz://" in payload["refused"] and "host/repo" not in payload["refused"]  # a URL may hold a token
+    assert repo.state() == before and repo.origin_branches() == ["main"]
+    assert not (tmp_path / "ran-helper").exists()
