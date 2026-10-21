@@ -264,12 +264,12 @@ def compute(
     demote_ready = bool(enough_n and p_below_07 >= 0.9)
     spec = RULE_TYPES.get(rule_type)
     movable = bool(spec is not None and spec.promotes_to and (age_days is None or age_days >= MIN_AGE_DAYS_FOR_PROMOTION))
-    if adj_n > 0:
-        enough_pos = (adjudicated_tp >= 25 and adjudicated_fp == 0) or (adj_n >= 42 and adjudicated_fp <= 1 and cp_lo >= 0.88)
-        enough_div = (sessions_count == 0 or sessions_count >= 3) and (repos_count >= 2 or days_span >= 14.0 or (repos_count == 0 and days_span == 0.0))
-        promote_ready = bool(enough_n and movable and enough_pos and enough_div)
-    else:
-        promote_ready = bool(enough_n and movable and n >= 20 and score >= 0.85)
+    # Spec T4: only adjudicated labels promote (local and CI verdicts never do), from enough sessions
+    # and repos or days that absent breadth never passes. With n >= 42 and at most one false positive
+    # the Clopper-Pearson lower bound is already >= 0.88, so it is not a separate term.
+    enough_labels = (adjudicated_tp >= 25 and adjudicated_fp == 0) or (adj_n >= 42 and adjudicated_fp <= 1)
+    enough_breadth = sessions_count >= 3 and (repos_count >= 2 or days_span >= 14.0)
+    promote_ready = bool(enough_n and movable and enough_labels and enough_breadth)
     suggestion: Optional[str] = None
     if not evidence_available:  # a flag, not a state: nothing is decided on evidence cut short
         state = "inconclusive" if enough_n else "insufficient"

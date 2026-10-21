@@ -90,11 +90,17 @@ def test_status_uses_ledger_triggers(tmp_path, capsys):
     assert canonical_line.split()[1] == "2"
 
 
-def test_lifecycle_uses_weighted_ledger_rows(tmp_path):
+def test_lifecycle_uses_weighted_ledger_rows(tmp_path, monkeypatch):
+    """Weighted rows count at their weight; they never promote alone, labels merged at the
+    reviewed BASE do (R-evidence-4)."""
     from aegis_core.lifecycle.promotion import evaluate_promotions
+    from aegis_core.telemetry_engine import ledger
+    from tests import helpers_adjudication as ha
 
     cells = tmp_path / ".aegis" / "rules" / "traps"
     _cell(cells / "canonical.md", "canonical")
+    monkeypatch.setenv("HOME", str(tmp_path.parent / f"{tmp_path.name}-home"))
+    ha.merge_to_base(tmp_path)
 
     recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # no decay
 
@@ -104,13 +110,14 @@ def test_lifecycle_uses_weighted_ledger_rows(tmp_path):
             for i in range(n)
         ]
 
-    # 25 rows weigh 21.25 verdicts: fewer than the MIN_N (25) a transition needs (R-evidence-8).
-    _write_jsonl(_ledger(tmp_path), rows(25))
+    # 30 rows weigh 25.5 verdicts: enough for MIN_N (R-evidence-8), never enough to promote.
+    _write_jsonl(ledger.ledger_path(tmp_path), rows(30))
     assert evaluate_promotions(str(tmp_path)) == []
 
-    _write_jsonl(_ledger(tmp_path), rows(30))
+    ha.write_labels(tmp_path, "canonical", ha.labels("canonical"))
+    ha.merge_to_base(tmp_path)
     candidates = evaluate_promotions(str(tmp_path))
-    assert [(c["rule_id"], c["tp"], c["triggers"]) for c in candidates] == [("canonical", 25.5, 30)]
+    assert [(c["rule_id"], c["tp"], c["triggers"]) for c in candidates] == [("canonical", 25.5 + 25, 30)]
 
 
 def test_checkpoint_fails_closed_and_uses_weighted_outcomes(tmp_path):

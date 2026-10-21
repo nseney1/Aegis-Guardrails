@@ -194,3 +194,78 @@ def test_an_unreadable_ledger_line_gives_no_suggestion_and_moves_nothing(tmp_pat
     assert promote_rule(ws, "trap-25")["status"] == "ineligible"
     assert (ws / ".aegis" / "rules" / "traps" / "trap-25.md").read_bytes() == before
 
+
+# ── No promotion without labels, with a breadth gate (R-evidence-4) ──────────
+
+@pytest.mark.parametrize("sessions,repos,days,moved", [
+    (3, 2, 0.0, True), (3, 0, 14.0, True),
+    (3, 1, 13.99, False), (2, 2, 31.0, False), (0, 2, 31.0, False), (0, 0, 0.0, False), (3, 0, 0.0, False),
+], ids=["3s-2r", "3s-14d", "1-repo-13.99d", "2-sessions", "no-session", "no-breadth", "no-repo-no-span"])
+def test_labels_promote_only_with_three_sessions_and_two_repos_or_fourteen_days(sessions, repos, days, moved) -> None:
+    fit = fitness.compute({}, rule_type="trap", adjudicated_tp=25, sessions_count=sessions, repos_count=repos,
+                          days_span=days)
+    assert (fit.state, fit.suggestion) == (("decided", "promote") if moved else ("inconclusive", None))
+
+
+@pytest.mark.parametrize("tp,fp,moved", [(25, 0, True), (24, 0, False), (25, 1, False), (41, 1, True)],
+                         ids=["25-labels", "24-labels", "25-and-1-fp", "41-and-1-fp"])
+def test_an_invariant_promotes_to_gate_on_the_same_label_criterion(tp: int, fp: int, moved: bool) -> None:
+    fit = fitness.compute({}, rule_type="invariant", adjudicated_tp=tp, adjudicated_fp=fp, sessions_count=3,
+                          repos_count=2)
+    assert fit.suggestion == ("promote" if moved else None)
+
+
+@pytest.mark.parametrize("totals", [{"tp": 30}, {"tp": 500, "triggers": 500}], ids=["30-rows", "500-rows"])
+def test_local_and_ci_verdicts_without_labels_never_promote(totals) -> None:
+    for rule_type in ("trap", "invariant"):
+        fit = fitness.compute(totals, rule_type=rule_type, age_days=400.0)
+        assert (fit.state, fit.suggestion) == ("inconclusive", None)
+
+
+def _unlabelled_ws(tmp_path: Path) -> Path:
+    from aegis_core.telemetry_engine import ledger
+
+    ws = tmp_path / "project"
+    _rule(ws, "trap", "busy")
+    ledger.append(ws, [{"rule": "busy", "outcome": "tp", "source": "ci", "key": f"ci{n}"} for n in range(250)])
+    ledger.append(ws, [{"rule": "busy", "outcome": "tp", "source": "manual", "key": f"local{n}"} for n in range(250)])
+    return ws
+
+
+def test_500_local_and_ci_rows_move_nothing_by_type_or_tier(tmp_path: Path, capsys) -> None:
+    from aegis_cli.cli import main
+    from aegis_core.lifecycle.promotion import evaluate_rule_tiers
+
+    ws = _unlabelled_ws(tmp_path)
+    path = ws / ".aegis" / "rules" / "traps" / "busy.md"
+    before = path.read_bytes()
+    assert evaluate_promotions(ws, NOW) == []
+    refused = promote_rule(ws, "busy")
+    assert refused["status"] == "ineligible" and "adjudicated labels" in refused["message"]
+    assert sync.sync(ws, apply=True, now=NOW).applied == []
+    assert main(["rule", "promote", "--tier-check", "--workspace", str(ws)]) == 0
+    assert "No tier changes required." in capsys.readouterr().out
+    assert evaluate_rule_tiers(ws, execute=True) == {"evaluated": 1, "changes": []}
+    assert path.read_bytes() == before
+    assert promote_rule(ws, "busy", force=True)["status"] == "promoted"  # an explicit move still works
+
+
+@needs_git
+@pytest.mark.parametrize("order", ["tier-check-first", "sync-first"])
+def test_one_labelled_promotion_is_one_move_never_also_a_tier_move(tmp_path: Path, monkeypatch, capsys, order) -> None:
+    from aegis_cli.cli import main
+
+    ws = tmp_path / "project"
+    _rule(ws, "trap", "proven")
+    _labelled(ws, "proven", 25, 0)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    ha.merge_to_base(ws)
+    steps = [lambda: main(["rule", "promote", "--tier-check", "--workspace", str(ws)]),
+             lambda: sync.sync(ws, apply=True, now=NOW).applied]
+    results = [step() for step in (steps if order == "tier-check-first" else steps[::-1])]
+    applied = next(r for r in results if isinstance(r, list))
+    assert [(a["rule"], a["action"], a["status"]) for a in applied] == [("proven", "promote", "promoted")]
+    assert "No tier changes required." in capsys.readouterr().out
+    text = (ws / ".aegis" / "rules" / "invariants" / "proven.md").read_text(encoding="utf-8")
+    assert "type: invariant" in text and "enforcement: gate" in text
+    assert not (ws / ".aegis" / "rules" / "traps" / "proven.md").exists()

@@ -99,12 +99,22 @@ class TestPromoteAndDemote:
         assert find_rule_file(workspace, "test-v") == (trap, "trap")
         assert find_rule_file(workspace, "../etc/passwd") == (None, None)
 
-    def test_promotion_without_force_needs_ledger_evidence(self, workspace: Path):
+    def test_promotion_without_force_needs_ledger_evidence(self, workspace: Path, monkeypatch):
+        """CI verdicts alone are not enough: labels merged at the reviewed BASE are (R-evidence-4)."""
+        from tests import helpers_adjudication as ha
+
         trap = _rule(workspace, "traps", "promote-me", "trap")
         refused = promote_rule(workspace, "promote-me", force=False)
         assert refused["status"] == "ineligible" and trap.exists()
 
+        monkeypatch.setenv("HOME", str(workspace.parent / "home"))
+        ha.merge_to_base(workspace)
         _report(workspace, "promote-me", tp=25)
+        refused = promote_rule(workspace, "promote-me", force=False)
+        assert refused["status"] == "ineligible" and "adjudicated labels" in refused["message"] and trap.exists()
+
+        ha.write_labels(workspace, "promote-me", ha.labels("promote-me"))
+        ha.merge_to_base(workspace)
         res = promote_rule(workspace, "promote-me", force=False)
 
         assert (res["status"], res["from_type"], res["to_type"]) == ("promoted", "trap", "invariant")
