@@ -56,6 +56,31 @@ def test_the_codeowners_lines_doctor_prints_cover_the_whole_set_it_checks():
         assert human_gate.codeowners_coverage(text, location)[1] == []
 
 
+NESTED_AND_LABEL_PATHS = (
+    ".aegis/adjudications/r.jsonl",
+    "svc/.aegis/rules/gates/x.md",
+    "svc/.aegis/adjudications/r.jsonl",
+    "svc/.aegis/config.json",
+    "svc/.aegis/team.json",
+    "a/b/.aegis/baseline.json",
+)
+
+
+def test_the_codeowners_lines_doctor_prints_own_labels_and_a_nested_workspace():
+    """Given doctor's CODEOWNERS lines, When a repository tracks adjudication labels or a nested
+    workspace's .aegis files, Then every one of them has an owner, so the tier does not drop."""
+    assert all(governance.category_of(p) for p in NESTED_AND_LABEL_PATHS)
+    text = "\n".join(human_gate.codeowners_lines("@octo"))
+    _covered, uncovered = human_gate.codeowners_coverage(text, repo_paths=NESTED_AND_LABEL_PATHS)
+    assert uncovered == []
+
+
+def test_the_coverage_samples_include_labels_and_a_nested_workspace():
+    assert {".aegis/adjudications/r.jsonl", "svc/.aegis/rules/gates/x.md", "svc/.aegis/config.json"} <= set(
+        human_gate.COVERAGE_SAMPLES
+    )
+
+
 @pytest.mark.parametrize("text", ["", "# only a comment\n", "*.txt @octo\n", "/src/ @octo\n"])
 def test_a_codeowners_that_misses_the_set_leaves_it_uncovered(text):
     _covered, uncovered = human_gate.codeowners_coverage(text)
@@ -71,7 +96,7 @@ def test_the_last_matching_entry_wins_and_an_entry_with_no_owner_unprotects():
 
 def test_a_single_star_does_not_cross_a_directory_as_the_matcher_of_target_paths_does():
     # /.aegis/* covers direct children only on GitHub; the rules live two levels down.
-    text = hg.CODEOWNERS_FULL.replace("/.aegis/rules/ @octo\n", "/.aegis/* @octo\n")
+    text = hg.CODEOWNERS_FULL.replace("**/.aegis/rules/ @octo\n", "").replace("/.aegis/rules/ @octo\n", "/.aegis/* @octo\n")
     _covered, uncovered = human_gate.codeowners_coverage(text)
     assert ".aegis/rules/trap/sample.md" in uncovered
     assert ".aegis/config.json" not in uncovered
