@@ -39,7 +39,7 @@ class TestLayer2IsAdvisory:
     def test_an_unreadable_spec_reply_is_unverified_not_block(self, tmp_path, reply):
         res = _layer2(tmp_path, FakeUnparseableBackend(reply))
         assert res.verdict != Verdict.BLOCK
-        assert res.infra_status == "unverified"
+        assert res.arbitration_result.infra_status == "unverified"
         assert res.passed is True
         assert "Layer 2 (advisory): UNVERIFIED" in res.summary
 
@@ -47,14 +47,14 @@ class TestLayer2IsAdvisory:
         res = _layer2(tmp_path, lambda prompt: _CRITICAL if "Spec Agent" in prompt else "[]")
         assert res.verdict == Verdict.BLOCK
         assert res.passed is True
-        assert res.layer1_verdict == "PASS"
+        assert res.layer1_passed is True
         assert "Layer 2 (advisory): BLOCK" in res.summary
 
     def test_a_failing_layer1_row_fails_with_a_clean_layer2(self, tmp_path):
         failing = [ToolEvidence("call_graph", "module.py", False, "run() is never called")]
         res = _layer2(tmp_path, lambda prompt: "[]", evidence=failing)
         assert res.passed is False
-        assert res.layer1_verdict == "FAIL"
+        assert res.layer1_passed is False
 
 
 class TestPipelineFailClosed:
@@ -102,7 +102,7 @@ class TestPipelineFailClosed:
         )
 
         assert res.verdict == Verdict.BLOCK
-        assert res.layer1_verdict == "FAIL"
+        assert res.layer1_passed is False
         assert not res.passed
 
     def test_dict_reply_with_an_unwired_function_blocks_on_layer1(self, tmp_path):
@@ -121,7 +121,7 @@ class TestPipelineFailClosed:
         )
 
         assert res.verdict == Verdict.BLOCK
-        assert res.layer1_verdict == "FAIL"
+        assert res.layer1_passed is False
         assert not res.passed
 
     def test_pipeline_reusable_layer1_evidence_and_discovery(self, tmp_path):
@@ -211,7 +211,7 @@ class TestPipelineFailClosed:
         monkeypatch.setattr(pipeline.adversarial_verifier, "verify", mock_verify)
 
         # Pass test_names but leave test_results None
-        res = pipeline.run(
+        pipeline.run(
             changed_files=["module.py"],
             workspace=tmp_path,
             task_plan="Plan",
@@ -279,7 +279,7 @@ class TestChangedFilesFromGit:
         res = VerificationPipeline().run(workspace=tmp_path)
         assert res.passed is True
         assert res.verdict == Verdict.SHIP
-        assert res.layer1_verdict == "PASS"
+        assert res.layer1_passed is True
         assert res.target_files == []
 
     def test_an_explicit_empty_list_is_a_clean_pass_outside_git(self, tmp_path, monkeypatch):

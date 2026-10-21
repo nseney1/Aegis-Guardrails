@@ -588,6 +588,19 @@ class TestLayer2:
         assert payload["layer2"]["advisory"] is True
         assert payload["layer2"]["layer1_verdict"] == "PASS"
 
+    def test_json_prediction_rows_carry_the_record_keys_and_no_4_3_aliases(self, ws, capsys, llm):
+        """R-checks-46: claim_type/target/horizon_commits served data that never shipped."""
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--format", "json", "--llm-cmd", llm("block"), "--plan", "p", "clean.py"]
+        assert _exit_code(argv) == 0
+        row, = json.loads(capsys.readouterr().out)["layer2"]["llm_predictions"]
+        assert set(row) == {
+            "id", "verdict_id", "ts", "tree", "backend", "scope", "observable", "window_days", "p",
+            "disposition", "outcome", "resolved_at", "resolving_commit", "category", "severity", "risk",
+            "mechanism", "affected_function",
+        }
+        assert (row["scope"], row["observable"]) == ("compute", "fix_touch_in_window")
+
     def test_json_reports_an_unreadable_spec_reply_as_unverified(self, ws, capsys, llm):
         (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
         argv = ["check", "--workspace", str(ws), "--format", "json", "--llm-cmd", llm("garbage"), "--plan", "p", "clean.py"]

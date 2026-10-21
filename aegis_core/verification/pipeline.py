@@ -241,14 +241,12 @@ class Arbiter:
         layer1_evidence: list[ToolEvidence],
         *,
         spec_agent_failed: bool = False,
-        **kwargs: Any,
     ) -> ArbitrationResult:
         return arbiter_module.arbitrate(
             predictions=predictions,
             claims=claims,
             layer1_evidence=layer1_evidence,
             spec_agent_failed=spec_agent_failed,
-            **kwargs,
         )
 
 
@@ -264,18 +262,6 @@ class VerificationPipelineResult:
     passed: bool
     summary: str
     arbitration_result: ArbitrationResult | None = None
-    layer1_verdict: str = ""
-    infra_status: str = "ok"
-    llm_predictions: tuple[Prediction, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.layer1_verdict:
-            self.layer1_verdict = "PASS" if self.layer1_passed else "FAIL"
-        if self.arbitration_result is not None:
-            if self.infra_status == "ok" and self.arbitration_result.infra_status != "ok":
-                self.infra_status = self.arbitration_result.infra_status
-            if not self.llm_predictions and self.arbitration_result.llm_predictions:
-                self.llm_predictions = self.arbitration_result.llm_predictions
 
 
 class VerificationPipeline:

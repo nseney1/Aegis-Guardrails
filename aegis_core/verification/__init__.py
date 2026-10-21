@@ -88,9 +88,6 @@ class Prediction:
     outcome: Optional[bool] = None
     resolved_at: Optional[float] = None
     resolving_commit: str = ""
-    claim_type: str = ""
-    target: str = ""
-    horizon_commits: int = 10
 
     def __post_init__(self) -> None:
         if isinstance(self.category, str):
@@ -103,12 +100,7 @@ class Prediction:
                 self.severity = Severity(self.severity)
             except ValueError:
                 pass
-        self.scope = self.scope or self.target or self.affected_function
-        self.target = self.target or self.scope
-        if self.claim_type and self.observable == "fix_touch_in_window":
-            self.observable = self.claim_type
-        elif not self.claim_type:
-            self.claim_type = self.observable
+        self.scope = self.scope or self.affected_function
         if not self.id:
             cat_val = getattr(self.category, "value", str(self.category))
             self.id = hashlib.sha256(f"{self.verdict_id}:{cat_val}:{self.scope}:{self.risk}".encode("utf-8")).hexdigest()[:12]
@@ -121,27 +113,7 @@ class Prediction:
             "resolving_commit": self.resolving_commit, "category": getattr(self.category, "value", str(self.category)),
             "severity": getattr(self.severity, "value", str(self.severity)), "risk": self.risk,
             "mechanism": self.mechanism, "affected_function": self.affected_function,
-            "claim_type": self.claim_type, "target": self.target, "horizon_commits": self.horizon_commits,
         }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Prediction":
-        out = data.get("outcome", data.get("correct"))
-        return cls(
-            category=data.get("category", RiskCategory.PERSISTENCE_GAP),
-            severity=data.get("severity", Severity.MEDIUM),
-            risk=data.get("risk", ""), mechanism=data.get("mechanism", ""),
-            affected_function=data.get("affected_function", ""),
-            id=data.get("id", ""), verdict_id=data.get("verdict_id", ""),
-            ts=float(data.get("ts", 0.0) or 0.0), tree=data.get("tree", ""), backend=data.get("backend", ""),
-            scope=data.get("scope", data.get("target", "")),
-            observable=data.get("observable", data.get("claim_type", "fix_touch_in_window")),
-            window_days=int(data.get("window_days", 14)), p=float(data.get("p", data.get("confidence", 0.5))),
-            disposition=data.get("disposition", "logged"), outcome=None if out is None else bool(out),
-            resolved_at=data.get("resolved_at"), resolving_commit=data.get("resolving_commit", ""),
-            claim_type=data.get("claim_type", ""), target=data.get("target", ""),
-            horizon_commits=int(data.get("horizon_commits", 10)),
-        )
 
 
 @dataclass
@@ -188,31 +160,13 @@ class ArbitrationResult:
     infra_status: str = "ok"
     llm_predictions: tuple[Prediction, ...] = ()
     verdict_id: str = ""
-    decision: str = ""
-    confidence: float = 1.0
-    rationale: str = ""
-    structural_gaps: list[dict[str, Any]] = field(default_factory=list)
-    vendor_warning: str = ""
 
     def __post_init__(self) -> None:
         if not self.layer1_verdict:
             self.layer1_verdict = "FAIL" if any(not e.verdict for e in self.layer1_results) else "PASS"
-        if not self.llm_predictions and self.predictions:
-            self.llm_predictions = tuple(self.predictions)
-        elif self.llm_predictions and not self.predictions:
-            self.predictions = list(self.llm_predictions)
-        elif isinstance(self.llm_predictions, list):
-            self.llm_predictions = tuple(self.llm_predictions)
-        if not self.decision:
-            self.decision = self.verdict.value.upper() if isinstance(self.verdict, Verdict) else str(self.verdict).upper()
         if not self.verdict_id:
-            raw = f"{self.layer1_verdict}:{self.decision}:{len(self.predictions)}:{len(self.divergences)}"
+            raw = f"{self.layer1_verdict}:{self.verdict.value.upper()}:{len(self.predictions)}:{len(self.divergences)}"
             self.verdict_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-        if not self.rationale:
-            self.rationale = (
-                f"Layer 1: {self.layer1_verdict}; infra: {self.infra_status}; "
-                f"divergences: {len(self.divergences)}, convergences: {len(self.convergences)}"
-            )
 
 
 # ── Structured Output Schemas (for agent prompts) ─────────────────────────
