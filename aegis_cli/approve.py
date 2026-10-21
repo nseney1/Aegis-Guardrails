@@ -126,7 +126,7 @@ def _sign(top: Path, use_json: bool, summary: List[str], what: str, message: str
     if answer.strip().lower() not in ("y", "yes"):
         raise _Refused("declined", "No approval made.")
     try:
-        commit = human_gate.signed_empty_commit(top, message)
+        commit = human_gate.signed_empty_commit(top, message, interactive=True)
     except human_gate.HumanGateError as exc:
         raise _Refused("sign_failed", str(exc)) from exc
     verdict = verify(commit)

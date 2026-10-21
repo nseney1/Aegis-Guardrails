@@ -1285,7 +1285,9 @@ def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) ->
     return rejected
 
 
-def signed_empty_commit(root: Any, message: str) -> str:
+def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -> str:
+    """``interactive``: a person at the caller's terminal; ssh-keygen asks there for a key passphrase
+    (with stdin on /dev/null it would try ssh-askpass instead)."""
     top = _top(root)
     config = signing_config(top)
     if config["format"] != "ssh" or not config["key"]:
@@ -1314,6 +1316,7 @@ def signed_empty_commit(root: Any, message: str) -> str:
         ],
         top,
         timeout=SIGN_TIMEOUT_SECONDS,
+        tty=interactive,
     )
     if res.returncode != 0:
         detail = " ".join((res.stderr or res.stdout).decode("utf-8", "replace").split())[:300]
