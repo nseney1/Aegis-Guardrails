@@ -684,6 +684,89 @@ def test_an_unusable_base_or_branch_is_never_approved_and_never_falls_back(tmp_p
     assert case.lookup(case.row["id"]) is False
 
 
+def _revoked_agent_key(tmp_path, *, later_commit: bool = False):
+    """``main`` first listed the agent key in allowed_signers, then replaced it with the human key
+    (optionally followed by an unrelated commit); ``work`` holds one recorded protected change."""
+    from aegis_core import human_gate
+
+    repo = hv.make_project(tmp_path)
+    human, human_pub = hg.keygen(tmp_path / "keys", "human")
+    agent, agent_pub = hg.keygen(tmp_path / "keys", "agent")
+    repo.git("checkout", "-q", "main")
+    repo.write("allowed_signers", hg.allowed_signers_text(agent_pub))
+    old = repo.commit("signers: agent key (mistake)")
+    repo.write("allowed_signers", hg.allowed_signers_text(human_pub))
+    fork = repo.commit("signers: revoke the agent key")
+    if later_commit:
+        repo.write("NOTES.md", "after the signer change\n")
+        fork = repo.commit("unrelated")
+    repo.git("checkout", "-q", "-B", "work", "main")
+    repo.write("conftest.py", "# protected change\n")
+    row = checkrun.record(repo.root, base="main").row
+    assert row["protected_changed"] is True and row["base"] == fork
+    change = repo.commit("protected change")
+
+    def approve(key, base):
+        digest = human_gate.governance_tree_hash(repo.root, change, base=base)
+        repo.commit(human_gate.approval_message(digest), sign_key=key, allow_empty=True)
+
+    def land():
+        repo.git("checkout", "-q", "main")
+        repo.git("merge", "-q", "--no-ff", "--no-edit", "work")
+        repo.git("checkout", "-q", "work")
+
+    return repo, row, old, fork, (human, agent), approve, land
+
+
+def _lookup(repo, check_id: str) -> bool:
+    return credit.approval_lookup(repo.root, credit.read_rows(repo.root))(check_id)
+
+
+@needs_signing
+def test_a_ledger_base_older_than_the_last_signer_change_cannot_revive_a_revoked_key(tmp_path):
+    """Given main replaced the agent key by the human key, When a forged row names the older
+    ancestor that still listed the agent key and the agent signed for it, Then credit sees no approval."""
+    from aegis_core.telemetry_engine import ledger
+
+    repo, row, old, _fork, (_human, agent), approve, land = _revoked_agent_key(tmp_path)
+    approve(agent, old)
+    land()
+    assert _lookup(repo, row["id"]) is False
+    forged = {k: v for k, v in row.items() if k != "seq"}
+    forged.update(id="forged", base=old)
+    ledger.append_rows(repo.root, [forged])
+    assert _lookup(repo, "forged") is False
+
+
+@needs_signing
+@pytest.mark.parametrize("later_commit", [False, True], ids=["base-is-the-signer-change", "base-after-it"])
+def test_a_human_approval_at_or_after_the_last_signer_change_still_verifies(tmp_path, later_commit):
+    repo, row, _old, fork, (human, _agent), approve, land = _revoked_agent_key(tmp_path, later_commit=later_commit)
+    approve(human, fork)
+    land()
+    assert _lookup(repo, row["id"]) is True
+
+
+@needs_signing
+def test_a_signer_history_git_cannot_read_fails_closed(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo, row, _old, fork, (human, _agent), approve, land = _revoked_agent_key(tmp_path)
+    approve(human, fork)
+    land()
+    real = gitsafe.run
+
+    def no_log(args, *a, **k):
+        if args and args[0] == "log":
+            return subprocess.CompletedProcess(args, 128, b"", b"fatal: bad object")
+        return real(args, *a, **k)
+
+    monkeypatch.setattr(gitsafe, "run", no_log)
+    assert _lookup(repo, row["id"]) is False
+    monkeypatch.setattr(gitsafe, "run", real)
+    assert _lookup(repo, row["id"]) is True  # a failure is not remembered
+
+
 @needs_signing
 def test_git_trouble_fails_closed_and_a_programming_error_propagates(tmp_path, monkeypatch):
     from aegis_core import gitsafe, human_gate

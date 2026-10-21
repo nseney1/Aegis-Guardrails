@@ -43,6 +43,7 @@ _TRAILER = re.compile(r"\s*Aegis-Check:\s*tree=([0-9a-f]{40,64})\s+exit=(-?\d+)\
 _REV_LIMIT = 5000
 _VERIFIED_CI: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _UNAVAILABLE_CI: Set[Tuple[str, str]] = set()
+_SIGNERS_CHANGED: Dict[Tuple[str, str], Optional[str]] = {}
 _DEFAULT_BRANCH: Dict[Tuple[str, str], str] = {}
 
 
@@ -671,6 +672,23 @@ def confirmed_outcome_rows(credits: Iterable[Credit]) -> List[Dict[str, Any]]:
     return out
 
 
+def _last_signers_change(top: Path, tip_ref: str) -> Optional[str]:
+    """The newest commit in the history of ``tip_ref`` that changed allowed_signers, None when none
+    did. Raises GitError when git cannot answer; only an answer is memoised (a tip never changes)."""
+    tip = gitsafe.resolve_commit(top, tip_ref)
+    if tip is None:
+        raise gitsafe.GitError(f"cannot resolve {tip_ref}")
+    key = (str(top), tip)
+    if key not in _SIGNERS_CHANGED:
+        res = gitsafe.run(["log", "-1", "--no-show-signature", "--format=%H", tip, "--", human_gate.ALLOWED_SIGNERS],
+                          top)
+        if res.returncode != 0:
+            raise gitsafe.GitError(f"git log failed: {' '.join(res.stderr.decode('utf-8', 'replace').split())[:200]}")
+        found = res.stdout.decode("ascii", "replace").strip()
+        _SIGNERS_CHANGED[key] = found if _OID.fullmatch(found) else None
+    return _SIGNERS_CHANGED[key]
+
+
 def approval_lookup(
     root: Any, rows: Sequence[Mapping[str, Any]], landed: Optional[Callable[..., Optional[str]]] = None,
     *, branch: Optional[str] = None,
@@ -678,7 +696,8 @@ def approval_lookup(
     """Whether a signed approval covers a protected check. The row's ``base`` (the fork point
     ``record`` saw) is only the range anchor: ledger rows are agent-writable, so it must be a full
     oid that is an ancestor of the protected branch (``branch``, else the local one), or allowed_signers
-    would be read from a commit the agent chose."""
+    would be read from a commit the agent chose; and it must not predate the branch's last change to
+    allowed_signers, or an older ancestor would revive a key the branch has since removed."""
     top = gitsafe.toplevel(Path(str(root)))
     look = landed or landed_lookup(root)
     checks = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
@@ -703,7 +722,10 @@ def approval_lookup(
         if top is not None and tip is not None:
             p_branch, tip_ref = tip
             try:
-                if gitsafe.run(["merge-base", "--is-ancestor", base_ref, tip_ref], top).returncode == 0:
+                signers = _last_signers_change(top, tip_ref)
+                if (signers is not None
+                        and gitsafe.run(["merge-base", "--is-ancestor", base_ref, tip_ref], top).returncode == 0
+                        and gitsafe.run(["merge-base", "--is-ancestor", signers, base_ref], top).returncode == 0):
                     gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
                     tips = [commit, f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}", "HEAD"]
                     ok = any(
