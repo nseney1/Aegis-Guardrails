@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
+import hashlib
 import io
 import os
 import re
 import tokenize
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core.errors import AegisError
 from aegis_core.ast.schema import (
     NormalizedAST, _SpellingIndex, _add_binding, _call_target, _decorator_name,
@@ -15,7 +17,7 @@ from aegis_core.ast.schema import (
     _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, _spellings,
 )
 
-__all__ = ["ASTExtractionError", "_match_ImportNode_against_pattern", "evaluate_forbid_ast", "evaluate_forbid_ast_delta", "evaluate_forbid_ast_structured", "evaluate_forbid_ast_with_overrides", "extract_normalized_ast", "parse_allow_comments"]
+__all__ = ["ASTExtractionError", "_match_ImportNode_against_pattern", "evaluate_forbid_ast", "evaluate_forbid_ast_delta", "evaluate_forbid_ast_structured", "extract_normalized_ast", "parse_allow_comments", "violation_messages"]
 _ALLOW_COMMENT_RE = re.compile(r"#\s*aegis:\s*allow(?:\[([^\]]+)\])?(?:\s*[:\-]?\s*(.*))?$", re.IGNORECASE)
 _ABSENT = object()
 
@@ -120,22 +122,6 @@ def _allow_reason_for_line(allow_map: Mapping[int, List[Dict[str, Any]]], line: 
     return None
 
 
-def _resolve_allow_map(normalized_ast: NormalizedAST, source: Optional[str] = None) -> Dict[int, List[Dict[str, Any]]]:
-    meta = getattr(normalized_ast, "metadata", None)
-    if isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
-        return meta["allow_comments"]
-    if isinstance(source, str):
-        return parse_allow_comments(source)
-    fp = getattr(normalized_ast, "file_path", "")
-    if isinstance(fp, str) and os.path.isfile(fp):
-        try:
-            from aegis_core.ast.drivers.python import read_python_source
-            return parse_allow_comments(read_python_source(fp) if fp.endswith(".py") else Path(fp).read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            return {}
-    return {}
-
-
 class ASTExtractionError(AegisError):
     def __init__(self, path: str, reason: str):
         super().__init__(f"cannot verify {path}: {reason}", code="AST_UNVERIFIABLE", path=path, reason=reason)
@@ -182,56 +168,31 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
     return call, hits
 
 
-def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, allow_map: Optional[Mapping[int, List[Dict[str, Any]]]] = None) -> Tuple[list[str], list[dict[str, Any]]]:
-    if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
-        return [], []
-    violations: list[str] = []
-    overrides: list[dict[str, Any]] = []
-    allows = allow_map or {}
-    fp = str(getattr(normalized_ast, "file_path", "") or "")
-    parsed_imports: list[ Any ] = []
-    imported_qual_map: dict[str, Any] = {}
-    aliases: dict[str, Any] = {}
-    for imp in getattr(normalized_ast, "imports", ()) or ():
-        src, syms = _extract_import_tuple(imp)
-        for name, originals in _import_aliases(imp).items():
-            for orig in originals:
-                _add_binding(aliases, name, orig)
-        parsed_imports.append((imp, (src, syms)))
-        for sym in syms if src else ():
-            if sym and sym != src:
-                _add_binding(imported_qual_map, sym, f"{src}.{sym}")
+_KIND_LABELS = {"imports": "import", "calls": "call", "decorators": "decorator"}
+_SNIPPET_MAX, _SNIPPET_KEEP = 240, 200
 
-    def _record_hits(items: list[Any], kind: str, pat: str, label: str) -> None:
-        if not items:
-            return
-        unoverridden = False
-        for item in items:
-            ln = _line_of(item)
-            reason = _allow_reason_for_line(allows, ln, rule_id)
-            if reason is not None and ln is not None:
-                overrides.append({"rule": rule_id or "", "file": fp, "line": ln, "kind": kind, "pattern": pat, "reason": reason, "status": "contested"})
-            else:
-                unoverridden = True
-        if unoverridden:
-            violations.append(f"Forbidden {label} '{pat}' matched rule forbid_ast.{kind}")
 
-    for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
-        mod = _normalize_ast_token(raw_mod) if isinstance(raw_mod, str) else ""
-        if mod:
-            _record_hits([r for r, t in parsed_imports if _match_ImportNode_against_pattern(t, mod)], "imports", mod, "import")
+def _read_source(fp: str) -> Optional[str]:
+    if not fp or not os.path.isfile(fp):
+        return None
+    try:
+        from aegis_core.ast.drivers.python import read_python_source
+        return read_python_source(fp) if fp.endswith(".py") else Path(fp).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
 
-    raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
-    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
-    defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
-    for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
-        if call:
-            _record_hits([s for s, v in hits if v is True], "calls", call, "call")
 
-    forbidden_decs = forbid_spec.get("decorators")
-    if not isinstance(forbidden_decs, (list, tuple, set)) or not forbidden_decs:
-        return violations, overrides
+def _snippet(text: str) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= _SNIPPET_MAX:
+        return collapsed
+    # Minified sources: bounded memory, and the digest keeps the identity of the whole line exact.
+    return f"{collapsed[:_SNIPPET_KEEP]}#{hashlib.sha256(collapsed.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}"
+
+
+def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any]) -> List[str]:
+    if not isinstance(forbidden, (list, tuple, set)) or not forbidden:
+        return []
     try:
         raw_decs: list[Any] = list(getattr(normalized_ast, "decorators", None) or ())
     except Exception as exc:
@@ -243,18 +204,89 @@ def _evaluate_forbid_ast_core(normalized_ast: NormalizedAST, forbid_spec: dict[s
         d_decs = getattr(defn, "decorators", None) if not isinstance(defn, dict) else defn.get("decorators")
         if isinstance(d_decs, (list, tuple, set)):
             raw_decs.extend(d_decs)
-    if not raw_decs and isinstance(fp, str) and fp.endswith(".py") and os.path.isfile(fp):
+    if not raw_decs and fp.endswith(".py") and os.path.isfile(fp):
         try:
             raw_decs.extend(_extract_python_decorators_from_file(fp))
         except Exception as exc:
             raise ASTExtractionError(fp, f"{type(exc).__name__}: {exc}") from exc
-    decorator_names = list(dict.fromkeys(n for n in map(_decorator_name, raw_decs) if n))
-    decorator_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=False)
-    for raw_dec in forbidden_decs:
-        dec = _decorator_pattern(raw_dec) if isinstance(raw_dec, str) else ""
-        if dec and any(decorator_index.matches(name, _decorator_pattern(dec)) for name in decorator_names):
-            violations.append(f"Forbidden decorator '{dec}' matched rule forbid_ast.decorators")
-    return violations, overrides
+    names = list(dict.fromkeys(n for n in map(_decorator_name, raw_decs) if n))
+    index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=False)
+    pats = (_decorator_pattern(raw) if isinstance(raw, str) else "" for raw in forbidden)
+    return [dec for dec in pats if dec and any(index.matches(name, _decorator_pattern(dec)) for name in names)]
+
+
+def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, source: Optional[str] = None) -> list[dict[str, Any]]:
+    """The one forbid_ast evaluator: a finding per matched site, imports then calls then decorators
+    (each in spec order, sites by line). A finding is ``{rule, kind, pattern, path, line, snippet,
+    unknown, override}``: ``line`` is 0 for a decorator; ``snippet`` is the site's source line with
+    whitespace collapsed (``target(arguments)`` when no source exists); ``unknown`` marks a site
+    whose ``where`` cannot be decided (advisory); ``override`` is the reason of a ``# aegis: allow``
+    on that line naming this rule or none, and such a hit is kept, never dropped.
+
+    ``source`` is the file text (allow comments and snippets); ``""`` means none. Without it the
+    tree's own allow comments and the file it names are read, once."""
+    if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
+        return []
+    fp = str(getattr(normalized_ast, "file_path", "") or "")
+    parsed_imports: list[Any] = []
+    imported_qual_map: dict[str, Any] = {}
+    aliases: dict[str, Any] = {}
+    for imp in getattr(normalized_ast, "imports", ()) or ():
+        src, syms = _extract_import_tuple(imp)
+        for name, originals in _import_aliases(imp).items():
+            for orig in originals:
+                _add_binding(aliases, name, orig)
+        parsed_imports.append((imp, (src, syms)))
+        for sym in syms if src else ():
+            if sym and sym != src:
+                _add_binding(imported_qual_map, sym, f"{src}.{sym}")
+    by_line = lambda hit: _line_of(hit[0]) or 0
+    hits: List[Tuple[str, str, Any, Optional[bool]]] = []
+    for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
+        mod = _normalize_ast_token(raw_mod) if isinstance(raw_mod, str) else ""
+        if mod:
+            matched = sorted(((r, True) for r, t in parsed_imports if _match_ImportNode_against_pattern(t, mod)), key=by_line)
+            hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
+    raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
+    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
+    defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
+    for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
+        call, matched = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
+        hits.extend(("calls", call, site, verdict) for site, verdict in sorted(matched, key=by_line))
+    hits.extend(("decorators", dec, None, True) for dec in _decorator_hits(normalized_ast, forbid_spec.get("decorators"), fp, imported_qual_map, aliases))
+    if not hits:
+        return []
+    meta = getattr(normalized_ast, "metadata", None)
+    text = source if isinstance(source, str) else _read_source(fp)
+    if isinstance(source, str):
+        allows = parse_allow_comments(source)
+    elif isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
+        allows = meta["allow_comments"]
+    else:
+        allows = parse_allow_comments(text or "")
+    # Universal newlines, as the parsers count lines; split once per call, never per finding.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if text else []
+    findings: list[dict[str, Any]] = []
+    for kind, pattern, site, verdict in hits:
+        ln = _line_of(site) if site is not None else None
+        if ln is not None and ln <= len(lines):
+            snippet = _snippet(lines[ln - 1])
+        elif kind == "calls":
+            args = _site_args(site)
+            snippet = f"{_call_target(site)}({','.join(f'{k}={args[k]}' for k in sorted(args))})"
+        else:
+            snippet = pattern if kind == "imports" else ""
+        findings.append({"rule": rule_id or "", "kind": kind, "pattern": pattern, "path": fp, "line": ln or 0,
+                         "snippet": snippet, "unknown": verdict is None,
+                         "override": _allow_reason_for_line(allows, ln, rule_id)})
+    return findings
+
+
+def violation_messages(findings: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One message per distinct (kind, pattern) among the findings that are neither UNKNOWN nor
+    allowed, in finding order: what a forbid_ast check reports."""
+    kept = dict.fromkeys((f["kind"], f["pattern"]) for f in findings if not f["unknown"] and f["override"] is None)
+    return [f"Forbidden {_KIND_LABELS[kind]} '{pattern}' matched rule forbid_ast.{kind}" for kind, pattern in kept]
 
 
 def evaluate_forbid_ast(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any]) -> list[str]:
@@ -264,76 +296,39 @@ def evaluate_forbid_ast(normalized_ast: NormalizedAST, forbid_spec: dict[str, An
     scope: computed module names, ``getattr``/``globals`` and subscript access, ``f = subprocess.run``
     rebinding by assignment, functions as values, ``from x import *``, and relative ``__import__``.
     """
-    return _evaluate_forbid_ast_core(normalized_ast, forbid_spec)[0]
+    return violation_messages(evaluate_forbid_ast_structured(normalized_ast, forbid_spec, source=""))
 
 
-def evaluate_forbid_ast_with_overrides(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, source: Optional[str] = None) -> Tuple[list[str], list[dict[str, Any]]]:
-    allow_map = _resolve_allow_map(normalized_ast, source=source) if normalized_ast is not None else {}
-    return (evaluate_forbid_ast(normalized_ast, forbid_spec), []) if not allow_map else _evaluate_forbid_ast_core(normalized_ast, forbid_spec, rule_id=rule_id, allow_map=allow_map)
-
-
-def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, source: Optional[str] = None) -> Tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
-        return [], []
-    allows = _resolve_allow_map(normalized_ast, source=source)
-    fp = str(getattr(normalized_ast, "file_path", "") or "")
-    imported_qual_map: dict[str, Any] = {}
-    aliases: dict[str, Any] = {}
-    for imp in getattr(normalized_ast, "imports", ()) or ():
-        src, syms = _extract_import_tuple(imp)
-        for name, originals in _import_aliases(imp).items():
-            for orig in originals:
-                _add_binding(aliases, name, orig)
-        for sym in syms if src else ():
-            if sym and sym != src:
-                _add_binding(imported_qual_map, sym, f"{src}.{sym}")
-    raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
-    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
-    defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
-    confirmed: list[dict[str, Any]] = []
-    unverified: list[dict[str, Any]] = []
-    for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, hits = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
-        for site, verdict in hits:
-            ln = _line_of(site)
-            if _allow_reason_for_line(allows, ln, rule_id) is not None:
-                continue
-            args = _site_args(site)
-            rec = {"rule_id": rule_id or "", "file": fp, "line": ln or 0, "kind": "calls", "pattern": call, "call_name": call, "target": _call_target(site), "args": args, "args_signature": ",".join(f"{k}={args[k]}" for k in sorted(args))}
-            if verdict is True:
-                confirmed.append(rec)
-            else:  # UNKNOWN is advisory: never blocking, never dropped
-                unverified.append({**rec, "status": "unverified"})
-    return confirmed, unverified
+def _new_findings(head: Sequence[Dict[str, Any]], base: Optional[Sequence[Dict[str, Any]]]) -> list[dict[str, Any]]:
+    """The confirmed head findings the base does not account for, keyed on (rule, pattern, snippet):
+    a key is new when the head holds it more often than the base. The surplus is taken from head
+    lines the key does not occupy at base first, then from the last line backwards."""
+    confirmed = [f for f in head if not f["unknown"] and f["override"] is None]
+    if base is None:
+        return confirmed
+    key = lambda f: (f["rule"], f["pattern"], f["snippet"])
+    at_base = Counter(key(f) for f in base if not f["unknown"] and f["override"] is None)
+    base_lines: Dict[Tuple[str, str, str], set] = {}
+    for f in base:
+        if not f["unknown"] and f["override"] is None:
+            base_lines.setdefault(key(f), set()).add(f["line"])
+    by_key: Dict[Tuple[str, str, str], List[int]] = {}
+    for idx, f in enumerate(confirmed):
+        by_key.setdefault(key(f), []).append(idx)
+    chosen: set = set()
+    for k, idxs in by_key.items():
+        surplus = len(idxs) - at_base[k]
+        if surplus > 0:
+            seen = base_lines.get(k, set())
+            fresh = [i for i in idxs if confirmed[i]["line"] not in seen]
+            chosen.update((fresh + [i for i in reversed(idxs) if confirmed[i]["line"] in seen])[:surplus])
+    return [f for idx, f in enumerate(confirmed) if idx in chosen]
 
 
 def evaluate_forbid_ast_delta(spec: Any, head_ast: Any, base_ast: Any = None, *, rule_id: Optional[str] = None) -> list[dict[str, Any]]:
-    if isinstance(spec, NormalizedAST) and isinstance(head_ast, dict):
-        spec, head_ast = head_ast, spec
-    head_hits, _ = evaluate_forbid_ast_structured(head_ast, spec, rule_id=rule_id)
-    if base_ast is None or not head_hits:
-        return head_hits
-    base_hits, _ = evaluate_forbid_ast_structured(base_ast, spec, rule_id=rule_id)
-    key_of = lambda h: (h.get("rule_id", ""), h.get("pattern", ""), h.get("args_signature", ""))
-    exact_pool = [(key_of(b), b.get("line", 0)) for b in base_hits]
-    remaining: list[dict[str, Any]] = []
-    for h in head_hits:
-        pair = (key_of(h), h.get("line", 0))
-        if pair in exact_pool:
-            exact_pool.remove(pair)
-        else:
-            remaining.append(h)
-    counts: Dict[Tuple[str, str, str], int] = {}
-    for k, _ in exact_pool:
-        counts[k] = counts.get(k, 0) + 1
-    delta: list[dict[str, Any]] = []
-    for h in remaining:
-        k = key_of(h)
-        if counts.get(k, 0) > 0:
-            counts[k] -= 1
-        else:
-            delta.append(h)
-    return delta
+    """The findings ``head_ast`` adds over ``base_ast`` (all confirmed head findings without a base)."""
+    base = evaluate_forbid_ast_structured(base_ast, spec, rule_id=rule_id) if base_ast is not None else None
+    return _new_findings(evaluate_forbid_ast_structured(head_ast, spec, rule_id=rule_id), base)
 
 
 def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional[Union[str, Path]] = None, code: Optional[str] = None, ast_runner: Any = None, confine_root: Optional[Union[str, Path]] = None) -> Optional[NormalizedAST]:

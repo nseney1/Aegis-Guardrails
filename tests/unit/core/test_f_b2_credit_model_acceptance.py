@@ -827,6 +827,44 @@ def test_detector_replay_walks_commits_after_merge_and_prefers_ahead_remote_bran
     assert any(d["pattern"] == "eval" and d["disposition"] == "leaked" for d in detections)
 
 
+def _golden_history(tmp_path: Path) -> hg.Repo:
+    """A history with a caught call, a leaked import, a leaked call fixed later and an allowed site."""
+    repo = hg.Repo(tmp_path / "repo", hg.Home(tmp_path / "home"))
+    _write_rule(repo.root, "gate", "no-eval-exec", forbid_calls=["eval", "exec"])
+    _write_rule(repo.root, "gate", "no-pickle", extra_frontmatter="forbid_ast:\n  imports: [pickle]\n")
+    repo.write("src/app.py", "def f(x):\n    return x\n")
+    repo.write("src/util.py", "def g(y):\n    return y\n")
+    repo.commit("initial")
+    repo.branch("feat-a")
+    repo.write("src/app.py", "import pickle\n\ndef f(x):\n    return eval(x)\n")
+    repo.commit("wip with eval and pickle")
+    repo.write("src/app.py", "import pickle\n\ndef f(x):\n    return int(x)\n")
+    repo.commit("drop eval")
+    repo.git("checkout", "-q", "main")
+    repo.git("merge", "--no-ff", "feat-a", "-m", "Merge branch 'feat-a'")
+    repo.write("src/util.py", "def g(y):\n    exec(y)  # aegis: allow[no-eval-exec]: reviewed\n    exec(y + 1)\n")
+    repo.commit("add exec")
+    repo.write("src/util.py", "def g(y):\n    exec(y)  # aegis: allow[no-eval-exec]: reviewed\n    return y\n")
+    repo.commit("fix exec")
+    return repo
+
+
+@needs_git
+def test_replay_keys_of_a_recorded_history_are_unchanged(tmp_path: Path) -> None:
+    """Golden (R-structure-38, R-checks-11): Given a recorded history, When replay runs, Then its
+    (rule, file, pattern) keys, dispositions and commits are the ones recorded before findings
+    replaced the parsed violation messages; an allowed site is never a finding."""
+    repo = _golden_history(tmp_path)
+    subject = {sha: repo.git("log", "-1", "--format=%s", sha) for sha in repo.git("rev-list", "--all").split()}
+    found = {(d["rule"], d["file"], d["pattern"], d["disposition"], subject[d["rev"]],
+              subject.get(d.get("fix_rev") or "", None)) for d in fitness.replay_detector_history(repo.root, persist=False)}
+    assert found == {
+        ("no-eval-exec", "src/app.py", "eval", "caught", "wip with eval and pickle", "Merge branch 'feat-a'"),
+        ("no-pickle", "src/app.py", "pickle", "leaked", "Merge branch 'feat-a'", None),
+        ("no-eval-exec", "src/util.py", "exec", "leaked", "add exec", "fix exec"),
+    }
+
+
 @needs_git
 def test_projecting_credit_never_imports_release_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """One CI-confirmation path (REST): ``project_credits`` does not reach ``release_verify`` (R-trust-67)."""

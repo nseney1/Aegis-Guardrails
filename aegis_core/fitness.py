@@ -60,7 +60,6 @@ DEFAULT_MDE_HORIZON_DAYS = 180.0
 MDE_UNTESTABLE_THRESHOLD = 0.6
 # Below this many days of ledger history the trigger volume says nothing: 180 / (1.24324 / 0.6)^2 = 41.9.
 MIN_OBSERVATION_DAYS = 42.0
-_VIOLATION_PATTERN_RE = re.compile(r"Forbidden (?:call|import|decorator) '([^']+)'")
 _MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)'")
 
 
@@ -457,7 +456,7 @@ def _violations_at_commit(root: Path, commit: str, rules: Sequence[Any], skipped
     """The (rule, file, pattern) hits at ``commit``; a file whose blob, syntax tree or evaluation
     fails is added to ``skipped`` rather than read as clean."""
     from aegis_core import gitsafe
-    from aegis_core.ast.policy import evaluate_forbid_ast_with_overrides, extract_normalized_ast
+    from aegis_core.ast.policy import evaluate_forbid_ast_structured, extract_normalized_ast
 
     py_blobs = _python_blobs_at_commit(root, commit)
     if not py_blobs:
@@ -482,13 +481,11 @@ def _violations_at_commit(root: Path, commit: str, rules: Sequence[Any], skipped
             if not isinstance(spec, dict):
                 continue
             try:
-                violations, _ = evaluate_forbid_ast_with_overrides(norm_ast, spec, rule_id=rule.id, source=source)
+                findings = evaluate_forbid_ast_structured(norm_ast, spec, rule_id=rule.id, source=source)
             except Exception:
                 skipped.add(rel)
                 continue
-            for msg in violations:
-                m = _VIOLATION_PATTERN_RE.search(msg)
-                hits.add((rule.id, rel, m.group(1) if m else msg))
+            hits.update((rule.id, rel, f["pattern"]) for f in findings if not f["unknown"] and f["override"] is None)
     return hits
 
 

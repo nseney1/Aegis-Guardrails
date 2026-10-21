@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from aegis_core import gitsafe
 from aegis_core.ast.policy import (
     ASTExtractionError,
-    evaluate_forbid_ast_delta,
+    _new_findings,
     evaluate_forbid_ast_structured,
     extract_normalized_ast,
 )
@@ -81,7 +81,12 @@ def build_python_security_pack() -> Dict[str, Any]:
     return {"v": PACK_VERSION, "rules": rules, "sha256": bundle_digest(rules)}
 
 
-def _load_base_ast(root_str: str, rel_path: str, base_ref: Any, base_map: Optional[Mapping[str, str]]) -> Optional[NormalizedAST]:
+def _record(finding: Mapping[str, Any], rel_path: str, rule: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"rule_id": finding["rule"], "file": rel_path, "line": finding["line"], "kind": finding["kind"],
+            "pattern": finding["pattern"], "snippet": finding["snippet"], "severity": rule["severity"]}
+
+
+def _load_base_ast(root_str: str, rel_path: str, base_ref: Any, base_map: Optional[Mapping[str, str]]) -> Tuple[Optional[NormalizedAST], str]:
     code: Optional[str] = None
     if base_map is not None and rel_path in base_map:
         code = base_map[rel_path]
@@ -95,11 +100,11 @@ def _load_base_ast(root_str: str, rel_path: str, base_ref: Any, base_map: Option
         except Exception:
             code = None
     if code is None:
-        return None
+        return None, ""
     try:
-        return extract_normalized_ast(rel_path, code=code)
+        return extract_normalized_ast(rel_path, code=code), code
     except ASTExtractionError:
-        return None
+        return None, ""
 
 
 def evaluate_security_pack(
@@ -133,13 +138,15 @@ def evaluate_security_pack(
             continue
         if head_ast is None:
             continue
-        base_ast = _load_base_ast(root_str, rel_path, base_ref, base_map) if (base_ref is not None or base_map is not None) else None
+        base_ast, base_code = _load_base_ast(root_str, rel_path, base_ref, base_map) if (base_ref is not None or base_map is not None) else (None, "")
         is_test = is_test_path(rel_path)
         for rule in PYTHON_SECURITY_RULES:
             rid, spec = rule["id"], rule["forbid_ast"]
-            for hit in evaluate_forbid_ast_delta(spec, head_ast, base_ast, rule_id=rid):
-                (exempted_test_findings if is_test else violations).append({**hit, "file": rel_path, "severity": rule["severity"]})
+            head = evaluate_forbid_ast_structured(head_ast, spec, rule_id=rid)
+            base = evaluate_forbid_ast_structured(base_ast, spec, rule_id=rid, source=base_code) if base_ast is not None else None
+            for hit in _new_findings(head, base):
+                (exempted_test_findings if is_test else violations).append(_record(hit, rel_path, rule))
             if not is_test:
-                _, unv = evaluate_forbid_ast_structured(head_ast, spec, rule_id=rid)
-                unverified_findings.extend({**u, "file": rel_path, "severity": rule["severity"]} for u in unv)
+                unverified_findings.extend(dict(_record(f, rel_path, rule), status="unverified")
+                                           for f in head if f["unknown"] and f["override"] is None)
     return {"passed": not violations, "violations": violations, "exempted_test_findings": exempted_test_findings, "unverified_findings": unverified_findings}

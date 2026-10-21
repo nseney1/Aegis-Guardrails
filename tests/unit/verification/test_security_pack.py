@@ -172,19 +172,125 @@ class TestCallSiteArgsAndPredicates:
         operator is UNKNOWN (advisory), never handed to ``re``."""
         spec = {"calls": [{"name": "f", "where": {"#0": {"matches": "^(a+)+$"}}}]}
         norm = extract_normalized_ast("x.py", code="f('" + "a" * 40 + "!')\n")
-        confirmed, unverified = evaluate_forbid_ast_structured(norm, spec, rule_id="r")
-        assert confirmed == [] and [u["line"] for u in unverified] == [1]
+        found = evaluate_forbid_ast_structured(norm, spec, rule_id="r")
+        assert [(f["line"], f["unknown"]) for f in found] == [(1, True)]
 
     def test_unknown_is_always_advisory(self):
         norm_kw = extract_normalized_ast("x.py", code="import subprocess\nsubprocess.run(cmd, **kwargs)\n")
         norm_star = extract_normalized_ast("x.py", code="import hashlib\nhashlib.new(*args)\n")
-        confirmed, unverified = evaluate_forbid_ast_structured(
+        found = evaluate_forbid_ast_structured(
             norm_kw, {"calls": [{"name": "subprocess.run", "where": {"shell": True}}]}, rule_id="sec-sub")
-        assert confirmed == [] and [u["rule_id"] for u in unverified] == ["sec-sub"]
+        assert [(f["rule"], f["unknown"]) for f in found] == [("sec-sub", True)]
         assert evaluate_forbid_ast(norm_kw, {"calls": [{"name": "subprocess.run", "where": {"shell": True}}]}) == []
-        c_star, u_star = evaluate_forbid_ast_structured(
+        found_star = evaluate_forbid_ast_structured(
             norm_star, {"calls": [{"name": "hashlib.new", "where": {"#0": "'md5'"}}]}, rule_id="sec-hash")
-        assert c_star == [] and len(u_star) == 1
+        assert [f["unknown"] for f in found_star] == [True]
+
+
+_EIGHT_KEYS = {"rule", "kind", "pattern", "path", "line", "snippet", "unknown", "override"}
+_SHELL = {"calls": [{"name": "subprocess.run", "where": {"shell": True}}]}
+_PARITY_CASES = [(label, src, spec) for label, src, spec, _ in PROBE_CASES] + [
+    ("import and alias", "import pickle as p\nfrom marshal import loads\n", {"imports": ["pickle", "marshal"]}),
+    ("decorator", "import functools\n@functools.lru_cache\ndef f():\n    pass\n", {"decorators": ["functools.lru_cache"]}),
+    ("all kinds in spec order", "import pickle\n@app.route('/')\ndef f():\n    eval(x)\n    pickle.loads(b)\n",
+     {"imports": ["pickle"], "calls": ["pickle.loads", {"name": "eval", "builtin": True}], "decorators": ["app.route"]}),
+    ("allow comment ignored", "eval(x)  # aegis: allow: legacy\n", {"calls": ["eval"]}),
+]
+
+
+def _tree(tmp_path: Path, name: str, code: str):
+    """The AST of ``code`` read from a real file, so findings carry its source lines."""
+    path = tmp_path / name / "app.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(code.encode("utf-8"))
+    return extract_normalized_ast(str(path))
+
+
+class TestStructuredFindings:
+    """R-checks-11: one evaluator returns findings; the messages and the delta derive from them."""
+
+    def test_a_changed_argument_expression_is_a_new_finding(self, tmp_path: Path):
+        """Given base `subprocess.run(build_safe(), shell=True)` and a head that only changes the
+        argument expression, When the delta runs, Then the head call is reported (the old key
+        rendered both arguments as <expr>)."""
+        base = _tree(tmp_path, "base", "import subprocess\nsubprocess.run(build_safe(), shell=True)\n")
+        head = _tree(tmp_path, "head", "import subprocess\nsubprocess.run(request.args['cmd'] + x, shell=True)\n")
+        delta = evaluate_forbid_ast_delta(_SHELL, head, base, rule_id="no-shell")
+        assert [(f["kind"], f["line"]) for f in delta] == [("calls", 2)]
+        assert "request.args" in delta[0]["snippet"]
+
+    @pytest.mark.parametrize("head", [
+        "# moved\n\n\nimport subprocess\nsubprocess.run(build_safe(), shell=True)\n",
+        "import subprocess\nif True:\n        subprocess.run(build_safe(),   shell=True)\n",
+    ], ids=["moved", "reindented"])
+    def test_a_legacy_call_that_only_moved_or_was_reindented_is_not_new(self, tmp_path: Path, head: str):
+        base = _tree(tmp_path, "base", "import subprocess\nsubprocess.run(build_safe(), shell=True)\n")
+        assert evaluate_forbid_ast_delta(_SHELL, _tree(tmp_path, "head", head), base, rule_id="no-shell") == []
+
+    def test_an_edit_on_a_continuation_line_keeps_the_key(self, tmp_path: Path):
+        """Residual R1, accepted for 4.4.0: the key is the call's first source line, so a change
+        confined to a later line of a multi-line call is not new. Flip this knowingly."""
+        base = _tree(tmp_path, "base", "import subprocess\nsubprocess.run(\n    safe(), shell=True)\n")
+        head = _tree(tmp_path, "head", "import subprocess\nsubprocess.run(\n    request.args['x'], shell=True)\n")
+        assert evaluate_forbid_ast_delta(_SHELL, head, base, rule_id="no-shell") == []
+
+    def test_two_identical_calls_at_base_and_three_at_head_report_one_head_line_absent_at_base(self, tmp_path: Path):
+        call = "subprocess.run(cmd, shell=True)\n"
+        base = _tree(tmp_path, "base", "import subprocess\n" + call + "x = 1\n" + call)
+        head = _tree(tmp_path, "head", "import subprocess\n" + call + call + "x = 1\n" + call)
+        delta = evaluate_forbid_ast_delta(_SHELL, head, base, rule_id="no-shell")
+        assert len(delta) == 1 and delta[0]["line"] in (3, 5)
+
+    def test_an_allowed_hit_is_kept_as_an_override_and_an_allow_for_another_rule_is_not(self):
+        src = "x = eval(1)  # aegis: allow[no-eval]: reviewed\ny = eval(2)  # aegis: allow[other-rule]: theirs\n"
+        found = evaluate_forbid_ast_structured(extract_normalized_ast("x.py", code=src), {"calls": ["eval"]},
+                                               rule_id="no-eval", source=src)
+        assert isinstance(found, list)
+        assert [(f["line"], f["override"]) for f in found] == [(1, "reviewed"), (2, None)]
+
+    def test_every_finding_has_exactly_the_eight_keys(self):
+        src = ("import pickle\nimport functools\nimport subprocess\n@functools.lru_cache\ndef f():\n    pass\n"
+               "subprocess.run(c, shell=True)\nsubprocess.run(c, **kw)\n")
+        spec = {"imports": ["pickle"], "calls": [{"name": "subprocess.run", "where": {"shell": True}}],
+                "decorators": ["functools.lru_cache"]}
+        found = evaluate_forbid_ast_structured(extract_normalized_ast("x.py", code=src), spec, rule_id="r", source=src)
+        assert isinstance(found, list)
+        assert [set(f) for f in found] == [_EIGHT_KEYS] * 4
+        assert [(f["kind"], f["line"], f["unknown"]) for f in found] == [
+            ("imports", 1, False), ("calls", 7, False), ("calls", 8, True), ("decorators", 0, False)]
+        assert [f["snippet"] for f in found[:3]] == ["import pickle", "subprocess.run(c, shell=True)",
+                                                     "subprocess.run(c, **kw)"]
+
+    @pytest.mark.parametrize("label,src,spec", _PARITY_CASES, ids=[c[0] for c in _PARITY_CASES])
+    def test_the_wrapper_returns_the_messages_derived_from_the_findings(self, label, src, spec):
+        from aegis_core.ast.policy import violation_messages
+
+        norm = extract_normalized_ast("x.py", code=src)
+        assert evaluate_forbid_ast(norm, spec) == violation_messages(evaluate_forbid_ast_structured(norm, spec, source=""))
+
+    def test_an_unparsable_python_file_fails_closed(self):
+        from aegis_core.ast.policy import ASTExtractionError
+
+        with pytest.raises(ASTExtractionError):
+            extract_normalized_ast("bad.py", code="import os\ndef broken(:\n")
+
+    def test_a_hand_built_tree_keys_on_its_target_and_arguments(self):
+        def tree(arg: str) -> NormalizedAST:
+            return NormalizedAST(file_path="generated/no_such_file.py", language="python",
+                                 call_sites=(CallSiteNode(target="os.system", line=4, args={"#0": arg}),))
+
+        found = evaluate_forbid_ast_structured(tree("'ls'"), {"calls": ["os.system"]}, rule_id="r")
+        assert [f["snippet"] for f in found] == ["os.system(#0='ls')"]
+        assert evaluate_forbid_ast_delta({"calls": ["os.system"]}, tree("'ls'"), tree("'ls'")) == []
+        assert [f["line"] for f in evaluate_forbid_ast_delta({"calls": ["os.system"]}, tree("'rm'"), tree("'ls'"))] == [4]
+
+    def test_long_lines_keep_a_bounded_exact_identity(self):
+        prefix = "eval('" + "a" * 300
+        src = f"{prefix}b')\n{prefix}c')\n"
+        found = evaluate_forbid_ast_structured(extract_normalized_ast("x.py", code=src), {"calls": ["eval"]}, source=src)
+        snippets = [f["snippet"] for f in found]
+        assert len(snippets) == 2 and snippets[0] != snippets[1]
+        assert all(len(s) == 213 and s[:200] == prefix[:200] and s[200] == "#" for s in snippets)
 
 
 class TestWhereGrammarIsValidatedAtLoad:

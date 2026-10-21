@@ -561,8 +561,8 @@ class TestBuiltinShadowFollowsPythonScoping:
         from aegis_core.ast.policy import evaluate_forbid_ast_structured
 
         code = "def helper():\n    def eval(x):\n        return x\n    return eval(1)\n\neval(input())\n"
-        confirmed, _ = evaluate_forbid_ast_structured(extract_normalized_ast("mod.py", code=code), _BUILTIN_EVAL, rule_id="r")
-        assert [hit["line"] for hit in confirmed] == [6]
+        found = evaluate_forbid_ast_structured(extract_normalized_ast("mod.py", code=code), _BUILTIN_EVAL, rule_id="r")
+        assert [(hit["line"], hit["unknown"]) for hit in found] == [(6, False)]
 
     def test_the_driver_resolves_bare_names_only(self):
         norm = extract_normalized_ast("mod.py", code="import os\ndef f():\n    pass\nf()\ng()\nos.getcwd()\n")

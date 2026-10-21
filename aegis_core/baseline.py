@@ -559,13 +559,9 @@ class Sources:
                     imports=tree.imports,
                     call_sites=tree.call_sites,
                 )
-                confirmed, _ = evaluate_forbid_ast_structured(
-                    probe, {"calls": [pattern]}, source=""
-                )
-                for hit in confirmed:
-                    ln = hit.get("line", 0)
-                    if isinstance(ln, int) and ln > 0:
-                        found.add(ln)
+                for hit in evaluate_forbid_ast_structured(probe, {"calls": [pattern]}, source=""):
+                    if not hit["unknown"] and hit["line"] > 0:
+                        found.add(hit["line"])
             elif tree is not None and kind == "import":
                 for imp in tree.imports:
                     if _match_ImportNode_against_pattern(imp, pattern):

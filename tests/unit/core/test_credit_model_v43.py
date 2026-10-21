@@ -10,9 +10,10 @@ import pytest
 
 from aegis_core import credit, fitness, sync
 from aegis_core.ast.policy import (
-    evaluate_forbid_ast_with_overrides,
+    evaluate_forbid_ast_structured,
     extract_normalized_ast,
     parse_allow_comments,
+    violation_messages,
 )
 from aegis_core.lifecycle.promotion import suggest
 from aegis_core.rules import load_rules
@@ -143,20 +144,18 @@ def test_parse_allow_comments_and_rule_scoped_overrides(tmp_path: Path) -> None:
     assert norm_ast is not None
 
     # For gate-eval: line 2 is overridden, line 4 has no allow comment so eval remains a violation.
-    v_eval, ov_eval = evaluate_forbid_ast_with_overrides(
-        norm_ast, {"calls": ["eval"]}, rule_id="gate-eval", source=source
-    )
+    f_eval = evaluate_forbid_ast_structured(norm_ast, {"calls": ["eval"]}, rule_id="gate-eval", source=source)
+    ov_eval = [f for f in f_eval if f["override"] is not None]
     assert len(ov_eval) == 1
     assert ov_eval[0]["line"] == 2
-    assert ov_eval[0]["reason"] == "allowed for gate-eval only"
+    assert ov_eval[0]["override"] == "allowed for gate-eval only"
+    v_eval = violation_messages(f_eval)
     assert len(v_eval) == 1 and "eval" in v_eval[0]
 
     # For another-rule checking eval: line 2 targets gate-eval so it is NOT overridden for another-rule.
-    v_other, ov_other = evaluate_forbid_ast_with_overrides(
-        norm_ast, {"calls": ["eval"]}, rule_id="another-rule", source=source
-    )
-    assert ov_other == []
-    assert len(v_other) == 1
+    f_other = evaluate_forbid_ast_structured(norm_ast, {"calls": ["eval"]}, rule_id="another-rule", source=source)
+    assert [f for f in f_other if f["override"] is not None] == []
+    assert len(violation_messages(f_other)) == 1
 
 
 def test_credit_event_writers_and_deduplication(tmp_path: Path) -> None:
@@ -405,3 +404,4 @@ def test_a_4_3_ledger_replayed_twice_supersedes_its_rows_without_double_counting
     first = counts()
     fitness.replay_detector_history(repo.root)
     assert first == counts() == (0, 1, 2)
+
