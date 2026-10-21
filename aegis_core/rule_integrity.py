@@ -179,8 +179,14 @@ def _same_blob(data: bytes, oid: str) -> bool:
     return b"\r\n" in data and gitsafe.blob_id(data.replace(b"\r\n", b"\n"), len(oid)) == oid
 
 
-def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None) -> RuleInventory:
-    blobs = _rule_blobs(root, commit)
+def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None,
+                  cache: Optional[RuleCache] = None) -> RuleInventory:
+    # A commit's listing and a blob's bytes never change; a replaced git seam (tests) reads afresh.
+    if cache is not None and _run is _DEFAULT_RUN:
+        blobs = cache.listing((os.path.realpath(root), commit), lambda: _rule_blobs(root, commit))
+        read = lambda oids: cache.blobs(list(oids), lambda missing: _read_blobs(root, missing))  # noqa: E731
+    else:
+        blobs, read = _rule_blobs(root, commit), lambda oids: _read_blobs(root, oids)
     present = {e.relative_path: e for e in working.entries} if working is not None else {}
     entries: List[RuleInventoryEntry] = []
     missing: List[Tuple[str, str]] = []
@@ -190,7 +196,7 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
             entries.append(local)
         else:
             missing.append((path, oid))
-    contents = _read_blobs(root, (oid for _path, oid in missing))
+    contents = read([oid for _path, oid in missing])
     for path, oid in missing:
         data = contents[oid]
         entries.append(
@@ -556,9 +562,11 @@ def effective(workspace: Any, cache: Optional[RuleCache] = None) -> Effective:
         return Effective(head, None)
 
     def load_base() -> Optional[RuleSet]:
-        base_inventory = _inventory_at(root, anchor.commit, inventory)
+        base_inventory = _inventory_at(root, anchor.commit, inventory, cache)
         if base_inventory.fingerprint == inventory.fingerprint:
             return None  # the working rules are the reviewed ones
+        if cache is not None and _run is _DEFAULT_RUN:
+            return cache.base_rules(root, base_inventory, lambda: load_rules(root, inventory=base_inventory))
         return load_rules(root, inventory=base_inventory)
 
     # A commit's tree never changes, so these inputs fix the parsed BASE set.

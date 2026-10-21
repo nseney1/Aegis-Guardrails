@@ -36,11 +36,12 @@ One policy, applied everywhere:
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import os
 import threading
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.match import first_match, is_test_path, matching_files
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
@@ -513,11 +514,19 @@ class RuleCache:
     """
 
     _MAX_WORKSPACES = 8
+    _MAX_LISTINGS = 16
+    _MAX_BLOB_BYTES = 8 * 1024 * 1024
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: Dict[str, Tuple[str, RuleSet]] = {}
         self._bases: Dict[Tuple[str, ...], Optional[RuleSet]] = {}
+        # What BASE serving reads from git, keyed by ids that never change: the rule listing of a
+        # commit, blob bytes by object id (verified when read) and the RuleSet of a BASE inventory.
+        self._base_sets: Dict[Tuple[str, str], RuleSet] = {}
+        self._listings: "OrderedDict[Tuple[str, str], Dict[str, str]]" = OrderedDict()
+        self._blobs: "OrderedDict[str, bytes]" = OrderedDict()
+        self._blob_bytes = 0
 
     def get(self, workspace: Any) -> RuleSet:
         return self.snapshot(workspace)[1]
@@ -538,20 +547,64 @@ class RuleCache:
             self._entries[key] = (snapshot.fingerprint, ruleset)
         return snapshot, ruleset
 
+    def _memo(self, store: Dict[Any, Any], key: Any, load: Callable[[], Any]) -> Any:
+        with self._lock:
+            if key in store:
+                return store[key]
+        value = load()
+        with self._lock:
+            if key not in store and len(store) >= self._MAX_WORKSPACES:
+                store.pop(next(iter(store)))
+            store[key] = value
+        return value
+
     def base(self, key: Tuple[str, ...], load: Callable[[], Optional[RuleSet]]) -> Optional[RuleSet]:
         """``load()`` memoised on ``key``, which must name every input it reads (aegis_core.rule_integrity
         keys the parsed BASE rules on the workspace, the anchor commit and the working fingerprint)."""
+        return self._memo(self._bases, key, load)
+
+    def base_rules(self, root: str, inventory: RuleInventory, load: Callable[[], RuleSet]) -> RuleSet:
+        """``load()``, the rules parsed from a BASE ``inventory``, once per inventory fingerprint."""
+        return self._memo(self._base_sets, (root, inventory.fingerprint), load)
+
+    def listing(self, key: Tuple[str, str], load: Callable[[], Dict[str, str]]) -> Dict[str, str]:
+        """``load()`` (a commit's ``{path: blob id}``), kept for the last 16 keys."""
         with self._lock:
-            if key in self._bases:
-                return self._bases[key]
-        value = load()
+            if key in self._listings:
+                self._listings.move_to_end(key)
+                return dict(self._listings[key])
+        found = load()
         with self._lock:
-            if key not in self._bases and len(self._bases) >= self._MAX_WORKSPACES:
-                self._bases.pop(next(iter(self._bases)))
-            self._bases[key] = value
-        return value
+            self._listings[key] = dict(found)
+            while len(self._listings) > self._MAX_LISTINGS:
+                self._listings.popitem(last=False)
+        return found
+
+    def blobs(self, oids: Sequence[str], load: Callable[[List[str]], Dict[str, bytes]]) -> Dict[str, bytes]:
+        """The bytes of ``oids``; ``load`` (which verifies them) is asked only for those not kept."""
+        wanted = list(dict.fromkeys(oids))
+        with self._lock:
+            found = {oid: self._blobs[oid] for oid in wanted if oid in self._blobs}
+            for oid in found:
+                self._blobs.move_to_end(oid)
+        missing = [oid for oid in wanted if oid not in found]
+        if missing:
+            read = load(missing)
+            found.update(read)
+            with self._lock:
+                for oid in missing:
+                    if oid in read and oid not in self._blobs and len(read[oid]) <= self._MAX_BLOB_BYTES:
+                        self._blobs[oid] = read[oid]
+                        self._blob_bytes += len(read[oid])
+                while self._blob_bytes > self._MAX_BLOB_BYTES:
+                    self._blob_bytes -= len(self._blobs.popitem(last=False)[1])
+        return found
 
     def invalidate(self) -> None:
         with self._lock:
             self._entries.clear()
             self._bases.clear()
+            self._base_sets.clear()
+            self._listings.clear()
+            self._blobs.clear()
+            self._blob_bytes = 0
