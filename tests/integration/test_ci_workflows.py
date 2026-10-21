@@ -306,3 +306,55 @@ def test_publish_uploads_only_what_pypi_lacks_and_waits_for_it():
     for i in (stage, action):
         assert steps[i].get("if") == f"steps.{plan_id}.outputs.state != 'identical'"
     assert "skip-existing" not in yaml.safe_dump(publish)
+
+
+# --- R-cli-12: CI hygiene ----------------------------------------------------
+
+def _jobs_without_timeout(workflow):
+    """Jobs that run steps and lack an integer timeout-minutes within GitHub's 360 cap. A job that
+    calls a reusable workflow (`uses:`) cannot carry the key; the called jobs carry theirs."""
+    return [name for name, job in workflow["jobs"].items() if "uses" not in job
+            and not (type(job.get("timeout-minutes")) is int and 0 < job["timeout-minutes"] <= 360)]
+
+
+def test_every_job_that_runs_steps_has_a_bounded_timeout():
+    for name in WORKFLOW_FILES:
+        assert _jobs_without_timeout(_load(name)) == [], name
+    jobs = _load("validate.yml")["jobs"]
+    # A limit must never turn a slow green run red on release day.
+    assert jobs["validate"]["timeout-minutes"] >= 45 and jobs["test-windows"]["timeout-minutes"] >= 45
+
+
+def test_a_job_without_a_usable_timeout_is_reported():
+    workflow = {"jobs": {"a": {"runs-on": "x", "timeout-minutes": 10}, "b": {"runs-on": "x"},
+                         "c": {"uses": "./w.yml"}, "d": {"timeout-minutes": "10"}, "e": {"timeout-minutes": 400}}}
+    assert _jobs_without_timeout(workflow) == ["b", "d", "e"]
+
+
+def test_pytest_dumps_the_stacks_of_a_hung_test():
+    with open(os.path.join(REPO_ROOT, "pyproject.toml"), encoding="utf-8") as f:
+        text = f.read()  # Python 3.9 has no tomllib
+    block = re.search(r"^\[tool\.pytest\.ini_options\]\n(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    assert block and re.search(r"^faulthandler_timeout\s*=\s*300\s*$", block.group(1), re.M)
+
+
+def test_one_red_validate_leg_does_not_cancel_the_others():
+    assert _load("validate.yml")["jobs"]["validate"]["strategy"]["fail-fast"] is False
+
+
+def test_windows_runs_the_same_wheel_smoke_as_the_other_legs():
+    runs = [s.get("run", "") for s in _windows_test_job()["steps"]]
+    smoke = [r for r in runs if "wheel_smoke.py" in r]
+    assert len(smoke) == 1
+    assert re.search(r'cd "\$RUNNER_TEMP" && env -u PYTHONPATH python -I "\$SMOKE"', smoke[0]), smoke[0]
+    assert not any(re.search(r"python -c .*import aegis_cli", r) for r in runs), "the import-only smoke is gone"
+
+
+def test_aegis_check_runs_the_installed_wheel_and_is_the_only_check_ci():
+    jobs = _load("validate.yml")["jobs"]
+    cli = [s["run"].strip() for s in jobs["aegis-check"]["steps"] if "aegis_cli.cli" in s.get("run", "")]
+    # -I keeps the checkout off sys.path, so the wheel, not the source tree, is what runs.
+    assert cli and all(re.match(r"python3 -I -m aegis_cli\.cli check(\s|$)", r) for r in cli), cli
+    with_ci = [name for name, job in jobs.items()
+               if any(re.search(r"aegis_cli\.cli check --ci\b", s.get("run", "")) for s in job.get("steps", []))]
+    assert with_ci == ["aegis-check"]
