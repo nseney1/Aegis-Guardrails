@@ -1061,3 +1061,61 @@ def test_a_workspace_path_with_a_newline_keeps_the_answers_of_the_single_calls(r
         assert gitsafe.layout(odd).prefix == "line\nbreak/"
     assert len(git_calls) >= 2  # the combined answer cannot be split by line, so it is asked again
 
+# ── the git executable is resolved once per PATH value (R-structure-10) ─────
+
+@pytest.fixture
+def fresh_git_lookup():
+    gitsafe._reset_for_tests()
+    yield
+    gitsafe._reset_for_tests()
+
+
+def _counting_which(monkeypatch):
+    from aegis_core import pathlookup
+
+    real, asked = pathlookup.which, []
+    monkeypatch.setattr(pathlookup, "which", lambda name, *a, **kw: asked.append(name) or real(name, *a, **kw))
+    return asked
+
+
+def test_twenty_git_calls_with_one_path_look_git_up_once(tmp_path, monkeypatch, fresh_git_lookup):
+    asked = _counting_which(monkeypatch)
+    for _ in range(20):
+        assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    assert asked == ["git"]
+    assert os.path.samefile(gitsafe.git_executable(), shutil.which("git")) and asked == ["git"]
+
+
+def _copy_git(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    real = Path(shutil.which("git"))
+    copy = directory / real.name
+    shutil.copy2(str(real), str(copy))
+    return copy
+
+
+@pytest.mark.skipif(os.name == "nt", reason="copies the git binary; Git for Windows needs its whole tree")
+def test_a_new_path_finds_its_own_git_and_a_deleted_git_fails_loudly(tmp_path, monkeypatch, fresh_git_lookup):
+    copy = _copy_git(tmp_path / "other")
+    monkeypatch.setenv("PATH", str(tmp_path / "other"))
+    assert gitsafe.git_executable() == str(copy)
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    saved = copy.read_bytes()
+    copy.unlink()
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+        gitsafe.run(["--version"], tmp_path)
+    copy.write_bytes(saved)
+    copy.chmod(0o755)
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+
+
+def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp_path, monkeypatch,
+                                                                            fresh_git_lookup):
+    marker = tmp_path / "PWNED"
+    _plant_git(tmp_path / "repo", marker)
+    monkeypatch.chdir(tmp_path / "repo")
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0  # cached under the real PATH
+    monkeypatch.setenv("PATH", ".")
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+        gitsafe.run(["--version"], tmp_path)
+    assert not marker.exists()

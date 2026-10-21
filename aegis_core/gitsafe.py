@@ -82,6 +82,7 @@ __all__ = [
     "common_dir",
     "diff_entries",
     "export_tree",
+    "git_executable",
     "git_path",
     "git_version",
     "head_commit",
@@ -170,13 +171,26 @@ class MergeTreeUnavailable(GitError):
     driver from the repository's own config it would run)."""
 
 
-def _git_executable() -> str:
+_GIT_FOUND: Dict[Tuple[Optional[str], ...], str] = {}
+
+
+def _reset_for_tests() -> None:
+    _GIT_FOUND.clear()
+
+
+def git_executable() -> str:
+    """The git ``run`` starts, looked up once per PATH value; a git removed since raises GitError."""
     # Absolute PATH entries only: an empty or relative entry names the cwd (the
     # repository, where a clone can plant a git), and so does the current directory
     # the standard library's lookup searches first on Windows.
-    found = pathlookup.which("git")
-    if not found:
-        raise GitError("git is not installed or not on PATH")
+    key = (os.environ.get("PATH"), os.environ.get("PATHEXT"))
+    found = _GIT_FOUND.get(key)
+    if not (found and os.path.isfile(found) and os.access(found, os.X_OK)):
+        _GIT_FOUND.clear()
+        found = pathlookup.which("git")
+        if not found:
+            raise GitError("git is not installed or not on PATH")
+        _GIT_FOUND[key] = found
     return found
 
 
@@ -193,7 +207,7 @@ def run(
     A non-zero exit is returned, not raised. Raises GitError when git cannot be started
     or exceeds ``timeout``.
     """
-    argv = [_git_executable(), *_hardening, *args]
+    argv = [git_executable(), *_hardening, *args]
     env = dict(os.environ)
     env.update(_ENV)
     if _env is not None:
