@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -172,13 +173,24 @@ def test_paths_over_the_bounds_fail_with_no_row(bounded, paths):
     assert read_insight_rows(ws, home=home) == []
 
 
-def test_twenty_short_paths_of_512_characters_are_kept(bounded):
+def test_twenty_paths_are_kept(bounded):
     ws, home = bounded
-    paths = [f"src/{'d' * 480}/f{i:02d}.py" for i in range(20)]
-    assert all(len(p) <= 512 for p in paths)
+    paths = [f"src/f{i:02d}.py" for i in range(20)]
     result = _capture(ws, "keep functions small", "s1", paths=paths)
     assert result["status"] == "OK"
     assert result["paths"] == sorted(paths)
+
+
+# On Windows the absolute path passes MAX_PATH (260), does not resolve and is refused by
+# confinement, which runs after the length bound this test is about.
+@pytest.mark.skipif(sys.platform == "win32", reason="an absolute path over MAX_PATH does not resolve on Windows")
+def test_a_path_of_512_characters_is_kept(bounded):
+    ws, home = bounded
+    path = "src/" + "d" * 505 + ".py"
+    assert len(path) == 512
+    result = _capture(ws, "keep functions small", "s1", paths=[path])
+    assert result["status"] == "OK"
+    assert result["paths"] == [path]
 
 
 def test_the_derived_dirty_paths_are_cut_to_twenty_and_counted(bounded):

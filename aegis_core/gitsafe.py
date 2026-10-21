@@ -322,15 +322,17 @@ def _layout(cwd: Path | str) -> Optional[Layout]:
     lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
     if len(lines) == (4 if res.returncode == 0 else 3):
         # An old git echoes the flag it does not know: read as shallow, the side that caches nothing.
+        # git prints C:/x on Windows; normpath gives the separators Path and the callers use.
         top = lines[3].strip() if len(lines) == 4 else ""
-        return Layout(lines[0].strip(), lines[1].rstrip("\r"), lines[2].strip() != "false", top or None)
+        return Layout(lines[0].strip(), lines[1].rstrip("\r"), lines[2].strip() != "false", os.path.normpath(top) if top else None)
     common = _text(["rev-parse", "--git-common-dir"], cwd) if lines else None
     if common is None:
         return None
     # A path holding a newline cannot be split by line: each question alone, as before the combined
     # call, and shallow assumed so that nothing about it is kept beyond the request.
     prefix = _out(["rev-parse", "--show-prefix"], cwd) or b""
-    return Layout(common, os.fsdecode(prefix.rstrip(b"\r\n")), True, _text(["rev-parse", "--show-toplevel"], cwd))
+    top = _text(["rev-parse", "--show-toplevel"], cwd)
+    return Layout(common, os.fsdecode(prefix.rstrip(b"\r\n")), True, os.path.normpath(top) if top else None)
 
 
 def layout(cwd: Path | str) -> Optional[Layout]:
