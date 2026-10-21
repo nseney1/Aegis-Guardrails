@@ -1233,3 +1233,23 @@ def test_a_governance_change_at_a_signed_base_accepts_the_same_review(tmp_path, 
     gh.reviews = [review("human", head, association="MEMBER")]
     rc, payload = ci_event(capsys)
     assert rc == 0 and payload["governance"]["approved"] is True and payload["approval"]["method"] == "review"
+
+
+# ── R-trust-63: a skip marker is a lane finding, not a check --ci gate (the accepted 2.3 gap) ──
+
+@needs_git
+def test_a_skip_marker_is_reported_by_the_lane_gate_and_not_gated_by_check_ci(tmp_path, capsys):
+    from aegis_core import lane_gate
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    repo.write("tests/test_app.py", "def test_app():\n    assert True\n")
+    repo.commit("a test")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("checkout", "-q", "-B", "work")
+    repo.write("tests/test_app.py", "import pytest\n\n\n@pytest.mark.skip\ndef test_app():\n    assert True\n")
+    repo.commit("skip it")
+    lane = lane_gate.check_lane(repo.root, "docs", base="main", paths=["**"])
+    assert [f.kind for f in lane.findings] == ["skip"]
+    rc, payload, _err = ci(repo, capsys)
+    # The gap stays visible: this flips when check --ci gates skip markers (R-trust-63 option B).
+    assert rc == 0 and payload["weakenings"] == [] and payload["governance"]["paths"] == []
