@@ -68,3 +68,71 @@ def test_an_approval_verdict_serializes_with_the_envelope():
     doc = verdict.as_dict("/work")
     assert doc["valid"] is False and doc["code"] == "unsigned" and doc["scope"]["commit"] == "a" * 40
     assert doc["checked_at"].endswith("Z") and doc["source"] and doc["aegis_version"]
+
+
+# ── R-trust-34: one signing flow, one set of refusals ─────────────────────────
+
+needs_signing = pytest.mark.skipif(not hg.signing_ok(), reason="needs git >= 2.34 and ssh-keygen")
+
+
+@pytest.fixture
+def signer_repo(tmp_path, monkeypatch):
+    """A signer on main, a rule edit committed on work, and a user-level SSH signing key."""
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, pub)
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "weaker"))
+    repo.commit("weaken a rule")
+    repo.home.sign_with(str(key))
+    for name, value in repo.home.env.items():
+        monkeypatch.setenv(name, value)
+    for name in ("SSH_AUTH_SOCK", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+    return repo
+
+
+def _run(repo, monkeypatch, capsys, exempt, tty=True, answer="n"):
+    from aegis_cli import approve
+    prompts = []
+    monkeypatch.setattr(approve, "_stdin_is_tty", lambda: tty)
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or answer)
+    argv = ["approve", "--workspace", str(repo.root), "--base", "main", "--json"]
+    if exempt:
+        argv += ["--exempt-test", repo.head(), "--reason", "checked by hand"]
+    before = repo.head()
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert repo.head() == before, "a refusal makes no commit"
+    return rc, json.loads(captured.out), prompts, captured.err
+
+
+@needs_signing
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_both_flows_refuse_uncommitted_governance_changes(signer_repo, monkeypatch, capsys, exempt):
+    signer_repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "dirty"))
+    rc, doc, prompts, _err = _run(signer_repo, monkeypatch, capsys, exempt)
+    assert rc == 1 and doc["status"] == "refused" and doc["code"] == "uncommitted" and prompts == []
+    assert doc["reason"].startswith("governance files have uncommitted changes (rules)")
+
+
+@needs_signing
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_both_flows_refuse_staged_changes_before_any_prompt(signer_repo, monkeypatch, capsys, exempt):
+    signer_repo.write("src/app.py", "def app():\n    return 3\n")
+    signer_repo.git("add", "src/app.py")
+    rc, doc, prompts, _err = _run(signer_repo, monkeypatch, capsys, exempt)
+    assert rc == 1 and doc["code"] == "staged" and prompts == []
+
+
+@needs_signing
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_both_flows_refuse_without_a_terminal(signer_repo, monkeypatch, capsys, exempt):
+    rc, doc, prompts, _err = _run(signer_repo, monkeypatch, capsys, exempt, tty=False)
+    assert rc == 1 and doc["code"] == "no_terminal" and prompts == []
+
+
+@needs_signing
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_both_flows_are_declined_by_anything_but_y(signer_repo, monkeypatch, capsys, exempt):
+    rc, doc, prompts, err = _run(signer_repo, monkeypatch, capsys, exempt, answer="sure")
+    assert rc == 1 and doc["status"] == "declined" and doc["code"] == "declined" and prompts == [""]
+    assert "[y/N]" in err
