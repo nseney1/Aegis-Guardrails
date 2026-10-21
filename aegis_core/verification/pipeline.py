@@ -219,10 +219,11 @@ class AdversarialVerifier(BaseVerifier):
             # The parsed charges: an entry the arbiter cannot judge is not put to the defense.
             spec_predictions=predictions,
         )
-        code_response = generate(code_prompt)
         code_agent_failed = False
         try:
-            raw_claims = self._parse_json(code_response)
+            # A defense that never answered is a review that did not complete: unverified, never an
+            # exit status (T6 is log-only). The Spec Agent's backend failing still stops Layer 2.
+            raw_claims = self._parse_json(generate(code_prompt))
         except Exception:
             raw_claims = []
             code_agent_failed = True

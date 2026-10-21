@@ -338,6 +338,18 @@ class TestLayer2NamesWhyAReviewIsIncomplete:
                         lambda prompt: self.LOW if "Spec Agent" in prompt else "I refuse")
         assert self._reasons(res) == ("unverified", ("code_agent_unparseable",))
 
+    def test_a_code_agent_backend_that_fails_is_named_and_passed_stays_layer1s(self, tmp_path):
+        from aegis_core.inference_provider import LLMCommandError
+
+        def backend(prompt):
+            if "Spec Agent" in prompt:
+                return self.LOW
+            raise LLMCommandError("LLM command exited 7: quota exceeded")
+
+        res = self._run(tmp_path, {"module.py": "def run():\n    return 1\n"}, backend)
+        assert self._reasons(res) == ("unverified", ("code_agent_unparseable",))
+        assert res.passed is True and "Layer 2 (advisory): UNVERIFIED" in res.summary
+
     def test_a_reviewed_source_beside_a_test_and_a_readme_is_ok(self, tmp_path):
         files = {"module.py": "def run():\n    return 1\n", "test_module.py": "def test_run():\n    pass\n",
                  "README.md": "# r\n"}

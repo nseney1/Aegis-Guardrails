@@ -33,6 +33,9 @@ FAKE_LLM = textwrap.dedent(
     if mode == "fail":
         sys.stderr.write("quota exceeded\\n")
         sys.exit(7)
+    if mode == "code-fail" and not spec:
+        sys.stderr.write("quota exceeded\\n")
+        sys.exit(7)
     if mode == "hostile-fail":
         sys.stderr.write("quota\\x1b]0;pwned\\x07 exceeded\\x1b[2K\\x9b31m\\x7f\\n")
         sys.exit(7)
@@ -41,7 +44,7 @@ FAKE_LLM = textwrap.dedent(
             out.write(prompt)
     if mode == "garbage":
         print("Internal Server Error: 500 API Gateway Timeout")
-    elif mode in ("block", "revise", "ship") and spec:
+    elif mode in ("block", "revise", "ship", "code-fail") and spec:
         print(json.dumps([{
             "category": "code_injection", "severity": {"block": "critical", "revise": "high"}.get(mode, "low"),
             "risk": "eval of untrusted input", "mechanism": "code execution",
@@ -469,6 +472,18 @@ class TestLayer2:
         assert "infra_status: unverified (spec_agent_unparseable, code_agent_unparseable, no_predictions)" in out
         assert "SHIP" not in out
         assert "BLOCK" not in out
+
+    def test_a_code_agent_backend_failure_is_unverified_and_leaves_the_exit_code_to_layer1(self, ws, capsys, llm):
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--full", "--llm-cmd", llm("code-fail"), "--plan", "p", "clean.py"]
+        assert _exit_code(argv) == 0
+        captured = capsys.readouterr()
+        assert "Layer 2: ⚠️ UNVERIFIED" in captured.out
+        assert "infra_status: unverified (code_agent_unparseable)" in captured.out
+        assert "Layer 2 failed" not in captured.err
+        (ws / "bad.py").write_text(UNGUARDED_IMPORT, encoding="utf-8")
+        assert _exit_code([*argv[:-1], "bad.py"]) == 1  # Layer 1's failure still fails
+        assert "Layer 2 failed" not in capsys.readouterr().err
 
     def test_an_empty_review_is_unverified_never_ship(self, ws, capsys, llm):
         """R-checks-44: a valid `[]` from the Spec Agent is a review that predicted nothing, not a SHIP."""
