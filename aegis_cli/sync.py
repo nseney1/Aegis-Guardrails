@@ -105,6 +105,10 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
             print("  No decided transitions to open a PR for.")
     if result.refused:
         print(f"  ❌ {result.refused}")
+    from aegis_core.sync import replay_lines
+
+    for line in replay_lines(result.replay):
+        print(f"  {sanitize_display(line, 400)}")
     pending = sum(1 for row in rows if row["suggestion"])
     print(f"Wrote {rel_path} ({len(rows)} rules, {pending} suggested transitions).")
     if pending and not result.applied and not result.refused:
@@ -161,6 +165,8 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         }
         if result.pr is not None:
             payload["pr"] = result.pr
+        if result.replay is not None:
+            payload["replay"] = result.replay.as_dict()
         print(json.dumps(payload, indent=2, default=str))
     else:
         _print_text(args, result, rel_path)
