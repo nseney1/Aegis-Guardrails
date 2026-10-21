@@ -291,12 +291,11 @@ RETRACTED_ENFORCEMENT = (
 
 
 def test_the_docs_say_plain_check_enforces_the_reviewed_rules(quick_start, capsys, monkeypatch):
-    """Plain `aegis check` enforces the reviewed (base) rules: a pull request that deletes a rule
-    and breaks it fails. The docs say so, and still never call CI tamper-proof."""
+    """Plain `aegis check` enforces the reviewed (base) rules where `origin/HEAD` resolves, and the
+    pull request's own rules in CI, where it does not. The docs say both and never call CI tamper-proof."""
     _git(quick_start, "add", "-A")
     _git(quick_start, "commit", "-q", "-m", "aegis")
-    _git(quick_start, "update-ref", "refs/remotes/origin/main", "HEAD")  # what a clone has
-    _git(quick_start, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    _git(quick_start, "branch", "main-base")
     _git(quick_start, "checkout", "-q", "-b", "agent-pr")
     _git(quick_start, "rm", "-q", ".aegis/rules/invariants/no-eval.md")
     (quick_start / "app.py").write_text("def f(x):\n    return eval(x)\n", encoding="utf-8")
@@ -304,15 +303,18 @@ def test_the_docs_say_plain_check_enforces_the_reviewed_rules(quick_start, capsy
     _git(quick_start, "commit", "-q", "-m", "pr")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")
 
+    code, out = _aegis(capsys, "check", "--workspace", str(quick_start))  # CI: no origin/HEAD
+    assert code == 0, out
+    _git(quick_start, "update-ref", "refs/remotes/origin/main", "main-base")  # what a clone has
+    _git(quick_start, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     code, out = _aegis(capsys, "check", "--workspace", str(quick_start))
     assert code == 1 and "forbid_ast:no-eval" in out, out
 
     for doc in (README, HOW):
         text = " ".join(doc.read_text(encoding="utf-8").lower().replace("*", "").replace("`", "").split())
         assert [p for p in RETRACTED_ENFORCEMENT if p in text] == [], doc.name
-        assert "plain aegis check enforces the reviewed rules, not the rules in the pull request itself" in text, doc.name
-        assert "a pull request that deletes a rule and breaks it now fails plain check too" in text, doc.name
-
+        assert "a pull request that deletes a rule and breaks it fails plain check there" in text, doc.name
+        assert "plain check enforces the pull request's own rules and aegis check --ci is what catches" in text, doc.name
 
 def test_the_readme_gives_the_install_remedies_aegis_itself_prints(tmp_path):
     """pip refuses a system install on PEP 668 systems, and pip's scripts directory may not
