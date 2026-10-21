@@ -362,7 +362,9 @@ def _layer1(snapshot: Path, changed: Sequence[str]) -> Dict[str, int]:
     targets = baseline.checkable(snapshot, [p for p in changed if (snapshot / p).is_file()])
     if not targets:
         return {"findings": 0, "files": 0}
-    pairs, _sources = baseline.run_fast(snapshot, targets)
+    # The snapshot is a plain directory: git would answer for whatever repository encloses the temp dir,
+    # so the snapshot's own rules are enforced (CI's check --ci guards their weakening).
+    pairs, _sources = baseline.run_fast(snapshot, targets, reviewed=False)
     return {"findings": sum(1 for _path, evidence in pairs if not evidence.verdict), "files": len(targets)}
 
 

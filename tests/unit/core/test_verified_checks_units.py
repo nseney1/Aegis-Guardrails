@@ -302,6 +302,39 @@ def test_a_branch_with_no_base_is_an_error_not_a_row(tmp_path):
     assert out.status == "error" and hv.rows_of(repo.root, "check") == []
 
 
+NO_EVAL_GATE = "---\nid: no-eval\ntype: invariant\nenforcement: gate\nforbid_ast:\n  calls: [eval]\n---\n# No eval\n"
+
+
+def _unrelated_repository(path: Path) -> Path:
+    path.mkdir(parents=True)
+    for args in (("init", "-q", "-b", "main"), ("-c", "user.email=t@example.com", "-c", "user.name=T",
+                                               "commit", "-q", "--allow-empty", "-m", "home")):
+        subprocess.run(["git", *args], cwd=str(path), check=True, capture_output=True)
+    return path
+
+
+@needs_git
+@pytest.mark.parametrize("enclosed", [False, True], ids=["tmp-outside-git", "tmp-inside-another-repository"])
+def test_a_recorded_snapshot_enforces_its_gate_rules_wherever_the_temp_dir_is(tmp_path, monkeypatch, enclosed):
+    """Given main with a no-eval gate and a work tree calling eval, When ``check --record`` exports
+    the snapshot into a temp dir that sits inside an unrelated repository (a $HOME repository), Then
+    the row still fails: that repository's HEAD holds no rules, so it cannot unbind the gate."""
+    import tempfile
+
+    repo = hv.make_project(tmp_path)
+    repo.git("checkout", "-q", "main")
+    repo.write(".aegis/rules/invariants/no-eval.md", NO_EVAL_GATE)
+    repo.commit("gate")
+    repo.git("checkout", "-q", "-B", "work", "main")
+    repo.write("src/app.py", "x = eval(input())\n")
+    scratch = (_unrelated_repository(tmp_path / "home-repo") if enclosed else tmp_path) / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    out = checkrun.record(repo.root, base="main")
+    assert out.status == "recorded"
+    assert out.row["layer1"]["findings"] >= 1 and out.row["passed"] is False and out.row["exit"] == 1
+
+
 # ── CI selection ─────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("override", [
