@@ -175,6 +175,33 @@ def _unverified_reasons(
     return tuple(reasons)
 
 
+# Lower-case substrings of a declared vendor or a host id. Multi-model hosts (cursor, copilot,
+# windsurf, kiro) map to nothing: their generating model, so their independence, is unknown.
+_VENDOR_KEYS = (
+    ("openai", "openai"), ("codex", "openai"),
+    ("anthropic", "anthropic"), ("claude", "anthropic"),
+    ("google", "google"), ("gemini", "google"), ("antigravity", "google"),
+)
+
+
+def _vendor_of(label: Optional[str]) -> Optional[str]:
+    low = (label or "").strip().lower()
+    return next((vendor for key, vendor in _VENDOR_KEYS if low and key in low), None)
+
+
+def vendor_warning(declared: Optional[str], generator_label: Optional[str]) -> str:
+    """The T6 cross-vendor advisory: the user's declared arbiter vendor against the generating
+    host's label. '' when nothing is declared or the two differ."""
+    if not (declared or "").strip():
+        return ""
+    generator = _vendor_of(generator_label)
+    if generator is None:
+        return "Vendor independence unverified: generating host is unknown."
+    if _vendor_of(declared) == generator:
+        return "Same-vendor arbiter provides prompt isolation only, not model independence."
+    return ""
+
+
 def _compute_verdict(
     divergences: list[Divergence],
     layer1_failures: list[ToolEvidence],

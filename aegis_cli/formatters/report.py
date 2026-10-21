@@ -26,7 +26,7 @@ def _model_text(value: Any) -> str:
     return sanitize_display(str(value)[:_MODEL_TEXT_MAX * 4], max_len=_MODEL_TEXT_MAX)
 
 
-def format_layer2_summary(result: Any) -> str:
+def format_layer2_summary(result: Any, vendor_warning: str = "") -> str:
     """Format Layer 2 arbitration results for CLI output."""
     from aegis_core.verification import Verdict
 
@@ -46,6 +46,8 @@ def format_layer2_summary(result: Any) -> str:
             f"  layer1_verdict: {l1_v or 'PASS'} | infra_status: {infra or 'ok'}"
             f"{f' ({reasons})' if reasons else ''} | llm_predictions: {len(preds)}"
         )
+    if vendor_warning:
+        lines.append(f"  Vendor: {vendor_warning} (the host label is attribution, not authentication)")
 
     if result.divergences:
         lines.append(f"  Divergences ({len(result.divergences)}):")
@@ -64,7 +66,7 @@ def format_layer2_summary(result: Any) -> str:
     return "\n".join(lines)
 
 
-def format_layer2_json(result: Any, verdict: Any) -> dict[str, Any]:
+def format_layer2_json(result: Any, verdict: Any, vendor_warning: str = "") -> dict[str, Any]:
     """JSON summary of a Layer 2 arbitration for `aegis check --format json`; advisory, never the exit status."""
     preds = getattr(result, "llm_predictions", ()) if result else ()
     infra = getattr(result, "infra_status", "ok") if result else "ok"
@@ -83,6 +85,7 @@ def format_layer2_json(result: Any, verdict: Any) -> dict[str, Any]:
             for d in (result.divergences if result else [])
         ],
         "convergences": [c.value for c in (result.convergences if result else [])],
+        "vendor_warning": vendor_warning,
     }
 
 

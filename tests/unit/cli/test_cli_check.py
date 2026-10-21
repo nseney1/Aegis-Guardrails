@@ -637,6 +637,56 @@ class TestLayer2:
         assert payload["layer2"]["advisory"] is True
 
 
+class TestVendorAdvisory:
+    """R-checks-49: a declared arbiter_vendor (user scope) against the generating host's label."""
+
+    SAME = "Same-vendor arbiter provides prompt isolation only, not model independence."
+    UNKNOWN = "Vendor independence unverified"
+
+    @staticmethod
+    def _run(ws, llm, monkeypatch, capsys, config, client, fmt="json"):
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        if config is not None:
+            user = Path.home() / ".aegis"
+            user.mkdir(parents=True, exist_ok=True)
+            (user / "config.json").write_text(config, encoding="utf-8")
+        if client is None:
+            monkeypatch.delenv("AEGIS_CLIENT", raising=False)
+        else:
+            monkeypatch.setenv("AEGIS_CLIENT", client)
+        argv = ["check", "--workspace", str(ws), "--format", fmt, "--llm-cmd", llm("ship"), "--plan", "p", "clean.py"]
+        code = _exit_code(argv)
+        out = capsys.readouterr().out
+        return code, (json.loads(out)["layer2"]["vendor_warning"] if fmt == "json" else out)
+
+    @pytest.mark.parametrize("declared,client,want", [
+        ("claude", "claude-code", SAME),
+        ("anthropic", "claude-code", SAME),
+        ("google", "antigravity", SAME),
+        ("openai", "codex-cli", SAME),
+        ("gemini", "claude-code", ""),
+        ("gemini", None, UNKNOWN),
+        ("claude", "cursor", UNKNOWN),
+        (None, "claude-code", ""),
+    ], ids=["claude", "anthropic", "google", "openai", "cross", "no-host", "multi-model-host", "undeclared"])
+    def test_the_advisory_compares_the_declared_vendor_with_the_host(self, ws, llm, monkeypatch, capsys,
+                                                                     declared, client, want):
+        config = json.dumps({"arbiter_vendor": declared}) if declared else None
+        code, warning = self._run(ws, llm, monkeypatch, capsys, config, client)
+        assert code == 0
+        assert warning.startswith(want) if want == self.UNKNOWN else warning == want
+
+    def test_a_malformed_user_config_never_fails_layer2(self, ws, llm, monkeypatch, capsys):
+        assert self._run(ws, llm, monkeypatch, capsys, "{not json", "claude-code") == (0, "")
+
+    def test_text_prints_the_vendor_line_only_when_there_is_one(self, ws, llm, monkeypatch, capsys):
+        code, out = self._run(ws, llm, monkeypatch, capsys, '{"arbiter_vendor": "claude"}', "claude-code", "text")
+        assert code == 0
+        assert f"  Vendor: {self.SAME}" in out
+        code, out = self._run(ws, llm, monkeypatch, capsys, '{"arbiter_vendor": "gemini"}', "claude-code", "text")
+        assert (code, "Vendor:" in out) == (0, False)
+
+
 class TestDefaultPlanDiscovery:
     """Without --plan/--plan-file, docs/plan.md, .aegis/plan.md or PLAN.md is the plan sent to the model."""
 
