@@ -41,12 +41,15 @@ FAKE_LLM = textwrap.dedent(
             out.write(prompt)
     if mode == "garbage":
         print("Internal Server Error: 500 API Gateway Timeout")
-    elif mode in ("block", "revise") and spec:
+    elif mode in ("block", "revise", "ship") and spec:
         print(json.dumps([{
-            "category": "code_injection", "severity": "critical" if mode == "block" else "high",
+            "category": "code_injection", "severity": {"block": "critical", "revise": "high"}.get(mode, "low"),
             "risk": "eval of untrusted input", "mechanism": "code execution",
             "affected_function": "compute",
         }]))
+    elif mode == "unknown" and spec:
+        print(json.dumps([{"category": "not_a_category", "severity": "high", "risk": "r",
+                           "mechanism": "m", "affected_function": "compute"}]))
     elif mode == "spec-file" and spec:
         with open(sys.argv[2], encoding="utf-8") as reply:
             print(reply.read())
@@ -463,9 +466,29 @@ class TestLayer2:
         assert _exit_code(argv) == 0
         out = capsys.readouterr().out
         assert "Layer 2: ⚠️ UNVERIFIED" in out
-        assert "infra_status: unverified" in out
+        assert "infra_status: unverified (spec_agent_unparseable, code_agent_unparseable, no_predictions)" in out
         assert "SHIP" not in out
         assert "BLOCK" not in out
+
+    def test_an_empty_review_is_unverified_never_ship(self, ws, capsys, llm):
+        """R-checks-44: a valid `[]` from the Spec Agent is a review that predicted nothing, not a SHIP."""
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("empty"), "--plan", "Add compute", "clean.py"]
+        assert _exit_code(argv) == 0
+        out = capsys.readouterr().out
+        assert "Layer 2: ⚠️ UNVERIFIED" in out
+        assert "infra_status: unverified (no_predictions)" in out
+        assert "SHIP" not in out
+
+    def test_dropped_unknown_categories_are_counted_in_text_and_json(self, ws, capsys, llm):
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("unknown"), "--plan", "p", "clean.py"]
+        assert _exit_code(argv) == 0
+        assert "infra_status: unverified (no_predictions, unknown_category:1)" in capsys.readouterr().out
+        assert _exit_code([*argv[:1], "--format", "json", *argv[1:]]) == 0
+        layer2 = json.loads(capsys.readouterr().out)["layer2"]
+        assert layer2["verdict"] is None
+        assert layer2["unverified_reasons"] == ["no_predictions", "unknown_category:1"]
 
     @pytest.mark.parametrize("mode,expected", [("garbage", "UNVERIFIED"), ("block", "BLOCK"), ("ship", "SHIP")],
                              ids=["unreadable", "block", "ship"])
@@ -588,6 +611,19 @@ class TestLayer2:
         assert payload["layer2"]["advisory"] is True
         assert payload["layer2"]["layer1_verdict"] == "PASS"
 
+    def test_json_prediction_rows_carry_the_record_keys_and_no_4_3_aliases(self, ws, capsys, llm):
+        """R-checks-46: claim_type/target/horizon_commits served data that never shipped."""
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--format", "json", "--llm-cmd", llm("block"), "--plan", "p", "clean.py"]
+        assert _exit_code(argv) == 0
+        row, = json.loads(capsys.readouterr().out)["layer2"]["llm_predictions"]
+        assert set(row) == {
+            "id", "verdict_id", "ts", "tree", "backend", "scope", "observable", "window_days", "p",
+            "disposition", "outcome", "resolved_at", "resolving_commit", "category", "severity", "risk",
+            "mechanism", "affected_function",
+        }
+        assert (row["scope"], row["observable"]) == ("compute", "fix_touch_in_window")
+
     def test_json_reports_an_unreadable_spec_reply_as_unverified(self, ws, capsys, llm):
         (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
         argv = ["check", "--workspace", str(ws), "--format", "json", "--llm-cmd", llm("garbage"), "--plan", "p", "clean.py"]
@@ -596,7 +632,59 @@ class TestLayer2:
         assert payload["passed"] is True
         assert payload["layer2"]["verdict"] is None
         assert payload["layer2"]["infra_status"] == "unverified"
+        assert payload["layer2"]["unverified_reasons"] == [
+            "spec_agent_unparseable", "code_agent_unparseable", "no_predictions"]
         assert payload["layer2"]["advisory"] is True
+
+
+class TestVendorAdvisory:
+    """R-checks-49: a declared arbiter_vendor (user scope) against the generating host's label."""
+
+    SAME = "Same-vendor arbiter provides prompt isolation only, not model independence."
+    UNKNOWN = "Vendor independence unverified"
+
+    @staticmethod
+    def _run(ws, llm, monkeypatch, capsys, config, client, fmt="json"):
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        if config is not None:
+            user = Path.home() / ".aegis"
+            user.mkdir(parents=True, exist_ok=True)
+            (user / "config.json").write_text(config, encoding="utf-8")
+        if client is None:
+            monkeypatch.delenv("AEGIS_CLIENT", raising=False)
+        else:
+            monkeypatch.setenv("AEGIS_CLIENT", client)
+        argv = ["check", "--workspace", str(ws), "--format", fmt, "--llm-cmd", llm("ship"), "--plan", "p", "clean.py"]
+        code = _exit_code(argv)
+        out = capsys.readouterr().out
+        return code, (json.loads(out)["layer2"]["vendor_warning"] if fmt == "json" else out)
+
+    @pytest.mark.parametrize("declared,client,want", [
+        ("claude", "claude-code", SAME),
+        ("anthropic", "claude-code", SAME),
+        ("google", "antigravity", SAME),
+        ("openai", "codex-cli", SAME),
+        ("gemini", "claude-code", ""),
+        ("gemini", None, UNKNOWN),
+        ("claude", "cursor", UNKNOWN),
+        (None, "claude-code", ""),
+    ], ids=["claude", "anthropic", "google", "openai", "cross", "no-host", "multi-model-host", "undeclared"])
+    def test_the_advisory_compares_the_declared_vendor_with_the_host(self, ws, llm, monkeypatch, capsys,
+                                                                     declared, client, want):
+        config = json.dumps({"arbiter_vendor": declared}) if declared else None
+        code, warning = self._run(ws, llm, monkeypatch, capsys, config, client)
+        assert code == 0
+        assert warning.startswith(want) if want == self.UNKNOWN else warning == want
+
+    def test_a_malformed_user_config_never_fails_layer2(self, ws, llm, monkeypatch, capsys):
+        assert self._run(ws, llm, monkeypatch, capsys, "{not json", "claude-code") == (0, "")
+
+    def test_text_prints_the_vendor_line_only_when_there_is_one(self, ws, llm, monkeypatch, capsys):
+        code, out = self._run(ws, llm, monkeypatch, capsys, '{"arbiter_vendor": "claude"}', "claude-code", "text")
+        assert code == 0
+        assert f"  Vendor: {self.SAME}" in out
+        code, out = self._run(ws, llm, monkeypatch, capsys, '{"arbiter_vendor": "gemini"}', "claude-code", "text")
+        assert (code, "Vendor:" in out) == (0, False)
 
 
 class TestDefaultPlanDiscovery:

@@ -14,15 +14,13 @@ from aegis_core.verification import (
     ToolEvidence,
     Verdict,
 )
+from aegis_core.stats import wilson_ci
+from aegis_core.verification import arbiter
 from aegis_core.verification.arbiter import (
     arbitrate,
     brier_skill_score,
     calibration_summary,
-    check_vendor_independence,
-    prune_predictions,
     score_predictions,
-    structural_ship_gaps,
-    wilson_ci,
 )
 
 
@@ -62,11 +60,7 @@ class TestSplitArbitrationResult:
         assert isinstance(res.llm_predictions, tuple)
         assert len(res.llm_predictions) == 1
         assert res.llm_predictions[0] == pred
-        # Backward-compatible properties/fields
         assert res.verdict == Verdict.SHIP
-        assert res.decision == "SHIP"
-        assert isinstance(res.confidence, float)
-        assert isinstance(res.rationale, str) and len(res.rationale) > 0
         assert res.predictions == [pred]
         assert isinstance(res.verdict_id, str) and len(res.verdict_id) > 0
 
@@ -82,13 +76,12 @@ class TestSplitArbitrationResult:
         assert res.infra_status == "unverified"
         assert res.llm_predictions == ()
         assert res.verdict == Verdict.BLOCK
-        assert res.decision == "BLOCK"
 
 
 class TestExtendedPredictionSchema:
     """Prediction supports accountable calibration fields and legacy compatibility."""
 
-    def test_prediction_defaults_and_legacy_aliases(self):
+    def test_prediction_defaults(self):
         p = Prediction(
             category=RiskCategory.MISSING_COVERAGE,
             severity=Severity.HIGH,
@@ -101,10 +94,15 @@ class TestExtendedPredictionSchema:
         assert p.observable == "fix_touch_in_window"
         assert 0.0 <= p.p <= 1.0
         assert p.scope == "parse_header"
-        assert p.target == "parse_header"
-        assert p.claim_type == "fix_touch_in_window"
-        assert p.horizon_commits == 10
         assert isinstance(p.id, str) and len(p.id) > 0
+
+    @pytest.mark.parametrize("alias", ["claim_type", "target", "horizon_commits"])
+    def test_the_4_3_alias_fields_are_gone(self, alias):
+        """Nothing persisted predictions in 4.3.x, so no reader needs the aliases (R-checks-46)."""
+        with pytest.raises(TypeError):
+            Prediction(**{alias: 1 if alias == "horizon_commits" else "x"})
+        assert not hasattr(Prediction(), alias)
+        assert alias not in Prediction(affected_function="f").to_dict()
 
     def test_prediction_explicit_accountable_fields(self):
         p = Prediction(
@@ -129,49 +127,10 @@ class TestExtendedPredictionSchema:
         assert p.window_days == 14
         assert p.p == 0.80
         assert p.disposition == "overridden"
-        assert p.target == "aegis_core/verification/arbiter.py"
-        assert p.claim_type == "revert_in_window"
 
 
-class TestStructuralShipGaps:
-    """structural_ship_gaps deterministically flags missing tests and high rule-miss history."""
-
-    def test_flags_changed_source_without_test_and_high_miss_history(self):
-        changed_files = [
-            "aegis_core/new_feature.py",
-            "aegis_core/covered_module.py",
-            "aegis_core/frequent_offender.py",
-        ]
-        all_files = [
-            "aegis_core/new_feature.py",
-            "aegis_core/covered_module.py",
-            "aegis_core/frequent_offender.py",
-            "tests/unit/core/test_covered_module.py",
-            "tests/unit/core/test_frequent_offender.py",
-        ]
-        rule_miss_counts = {
-            "aegis_core/frequent_offender.py": 5,
-            "aegis_core/covered_module.py": 1,
-        }
-
-        gaps = structural_ship_gaps(
-            changed_files,
-            all_files,
-            rule_miss_counts=rule_miss_counts,
-        )
-        by_file = {g["file"]: g for g in gaps}
-
-        assert "aegis_core/new_feature.py" in by_file
-        assert "missing_test" in by_file["aegis_core/new_feature.py"]["reasons"]
-
-        assert "aegis_core/frequent_offender.py" in by_file
-        assert "high_rule_miss_history" in by_file["aegis_core/frequent_offender.py"]["reasons"]
-
-        assert "aegis_core/covered_module.py" not in by_file
-
-
-class TestCalibrationScoringAndPruning:
-    """Calibration math, heeded exclusion, deduplication, thresholds, and 60-day pruning."""
+class TestCalibrationScoring:
+    """Calibration math, heeded exclusion, deduplication and thresholds."""
 
     def test_wilson_ci_matches_reference_formula(self):
         assert wilson_ci(0, 0) == (0.0, 1.0)
@@ -292,65 +251,52 @@ class TestCalibrationScoringAndPruning:
         assert sum_low_base["lift_suppressed"] is True
         assert sum_low_base["brier_skill_score"] is None
 
-    def test_prune_predictions_compacts_records_older_than_60_days(self):
-        now_ts = 1_800_000_000.0
-        old_ts = now_ts - (65 * 86400)
-        recent_ts = now_ts - (10 * 86400)
 
-        records = [
-            {
-                "id": "old-scored",
-                "ts": old_ts,
-                "scope": "a.py",
-                "observable": "fix_touch_in_window",
-                "p": 0.8,
-                "disposition": "logged",
-                "outcome": True,
-            },
-            {
-                "id": "old-unresolved",
-                "ts": old_ts,
-                "scope": "b.py",
-                "observable": "fix_touch_in_window",
-                "p": 0.4,
-                "disposition": "logged",
-                "outcome": None,
-            },
-            {
-                "id": "recent-scored",
-                "ts": recent_ts,
-                "scope": "c.py",
-                "observable": "revert_in_window",
-                "p": 0.2,
-                "disposition": "overridden",
-                "outcome": False,
-            },
-        ]
+class TestDeadSurfaceIsGone:
+    """R-checks-46: the T6 surface nothing called is deleted; what stays behaves as at cdb527b."""
 
-        kept, buckets = prune_predictions(records, now_ts=now_ts, max_age_days=60)
-        kept_ids = [r["id"] for r in kept]
-        assert "old-scored" not in kept_ids
-        assert "old-unresolved" in kept_ids
-        assert "recent-scored" in kept_ids
-        assert buckets["pruned_count"] == 1
-        assert buckets["hits"] == 1
+    @pytest.mark.parametrize("name", [
+        "structural_ship_gaps", "prune_predictions", "PruneResult", "check_vendor_independence", "Z95",
+    ])
+    def test_the_arbiter_no_longer_exposes_dead_names(self, name):
+        assert not hasattr(arbiter, name)
 
+    @pytest.mark.parametrize("kwarg", [
+        "infra_status", "changed_files", "all_files", "rule_miss_counts", "arbiter_vendor", "generator_vendor",
+    ])
+    def test_arbitrate_refuses_the_unpassed_keywords(self, kwarg):
+        with pytest.raises(TypeError):
+            arbitrate([], [], [], **{kwarg: None})
 
-class TestVendorIndependence:
-    """check_vendor_independence warns on same-vendor or unknown vendor pairs."""
+    def test_results_carry_no_unread_fields(self):
+        from aegis_core.verification.pipeline import VerificationPipelineResult
 
-    def test_warns_when_same_vendor_family(self):
-        msg = check_vendor_independence("claude-3-5-sonnet", "claude-code")
-        assert "Same-vendor arbiter provides prompt isolation only, not model independence." in msg
+        res = arbitrate([], [], [])
+        for gone in ("decision", "confidence", "rationale", "structural_gaps", "vendor_warning"):
+            assert not hasattr(res, gone), gone
+        pipe = VerificationPipelineResult([], [], True, Verdict.SHIP, True, "s")
+        for gone in ("layer1_verdict", "infra_status", "llm_predictions"):
+            assert not hasattr(pipe, gone), gone
+        assert not hasattr(Prediction, "from_dict")
 
-    def test_warns_when_vendor_unknown(self):
-        msg = check_vendor_independence(None, "claude-code")
-        assert len(msg) > 0
-        assert "unknown" in msg.lower() or "unverified" in msg.lower()
+    def test_verdict_and_prediction_ids_are_unchanged_for_a_fixed_input(self):
+        """Literals computed with the cdb527b formula: the id must not move when the fields go."""
+        passing = ToolEvidence("call_graph", "m.py", True, "ok")
+        failing = ToolEvidence("call_graph", "m.py", False, "unwired")
+        pred = Prediction(category=RiskCategory.CODE_INJECTION, severity=Severity.HIGH, risk="eval",
+                          mechanism="exec", affected_function="run")
+        assert pred.id == "e8fc8c414303"
+        assert arbitrate([], [], [passing]).verdict_id == "7fdd95ca82a4"
+        assert arbitrate([pred], [], [passing]).verdict_id == "2a61761ee0ff"
+        assert arbitrate([pred], [], [failing]).verdict_id == "ae2130be1c40"
 
-    def test_no_warning_when_cross_vendor(self):
-        msg = check_vendor_independence("gemini-2.5-pro", "claude-code")
-        assert msg == ""
+    @pytest.mark.parametrize("module", ["arbiter.py", "pipeline.py"])
+    def test_call_graph_finds_no_orphan_in_the_trimmed_modules(self, module):
+        from aegis_core.verification import call_graph
+
+        root = Path(__file__).resolve().parents[3]
+        found = call_graph.check(str(root / "aegis_core" / "verification" / module), str(root))
+        assert found.verdict is True, found.detail
 
 
 class TestVerifyCalibrationCli:

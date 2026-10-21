@@ -224,6 +224,21 @@ def resolve_task_plan(args: argparse.Namespace, repo_root: str) -> str | None:
     return None
 
 
+def _vendor_warning(repo_root: str) -> str:
+    """The cross-vendor advisory for the user's declared ``arbiter_vendor`` (user scope only: a
+    repository cannot set it) against ``AEGIS_CLIENT``. An advisory input never fails Layer 2, so
+    an unusable user config reads as nothing declared."""
+    from aegis_core.config import UserConfig, env_client
+    from aegis_core.errors import AegisError
+    from aegis_core.verification.arbiter import vendor_warning
+
+    try:
+        declared = UserConfig.load(repo_root).arbiter_vendor
+    except (AegisError, OSError):
+        declared = None
+    return vendor_warning(declared, env_client())
+
+
 def _usage_error(message: str) -> int:
     print(f"Error: {message}", file=sys.stderr)
     return 2
@@ -806,7 +821,7 @@ def run_verify(args: argparse.Namespace) -> int:
         except Exception:
             pass
 
-    def _emit_json(passed: bool, layer2_result: Any = None) -> None:
+    def _emit_json(passed: bool, layer2_result: Any = None, vendor: str = "") -> None:
         payload = format_layer1_json_payload(passed, target_files, results, summary)
         payload["checkpoint_issues"] = issues
         if applied is not None:
@@ -817,7 +832,7 @@ def run_verify(args: argparse.Namespace) -> int:
                 "blocked": _unbaselinable_rows(applied.blocked),
             }
         if layer2_result is not None:
-            payload["layer2"] = format_layer2_json(layer2_result.arbitration_result, layer2_result.verdict)
+            payload["layer2"] = format_layer2_json(layer2_result.arbitration_result, layer2_result.verdict, vendor)
         print(json.dumps(payload, indent=2))
 
     if not layer2:
@@ -857,8 +872,9 @@ def run_verify(args: argparse.Namespace) -> int:
     unverified = arb is not None and getattr(arb, "infra_status", "ok") != "ok"
     _record_telemetry(tools_pass, "UNVERIFIED" if unverified else pipeline_res.verdict)
     _record_baseline(passed)
+    vendor = _vendor_warning(repo_root)
     if use_json:
-        _emit_json(passed, pipeline_res)
+        _emit_json(passed, pipeline_res, vendor)
     elif pipeline_res.arbitration_result:
-        print(format_layer2_summary(pipeline_res.arbitration_result))
+        print(format_layer2_summary(pipeline_res.arbitration_result, vendor))
     return 0 if passed else 1

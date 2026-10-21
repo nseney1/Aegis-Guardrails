@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Arbiter: Deterministic divergence detector.
 
 Compares Spec Agent predictions against Code Agent claims, with Layer 1
@@ -10,16 +8,15 @@ The Arbiter answers three questions:
 2. Did the Code Agent claim something that Layer 1 tools contradict? (false claim)
 3. Did both agree but Layer 1 shows a problem anyway? (shared blind spot)
 """
-from pathlib import Path
-import time
+from __future__ import annotations
+
 from typing import Any, Optional, Sequence
 
-from aegis_core.match import is_test_path
-from aegis_core.stats import Z95, wilson_ci
+from aegis_core.stats import wilson_ci
 
 from . import (
     ArbitrationResult, Claim, Divergence, Prediction,
-    RiskCategory, Severity, ToolEvidence, Verdict,
+    ReviewGaps, RiskCategory, Severity, ToolEvidence, Verdict,
 )
 
 
@@ -29,19 +26,15 @@ def arbitrate(
     layer1_evidence: list[ToolEvidence],
     *,
     spec_agent_failed: bool = False,
-    infra_status: Optional[str] = None,
-    changed_files: Optional[list[str]] = None,
-    all_files: Optional[Sequence[str]] = None,
-    rule_miss_counts: Optional[dict[str, int]] = None,
-    arbiter_vendor: Optional[str] = None,
-    generator_vendor: Optional[str] = None,
+    gaps: Optional[ReviewGaps] = None,
 ) -> ArbitrationResult:
     """Compare predictions vs claims vs tool evidence.
 
     Divergence detection is pure set operations on RiskCategory enums.
     No natural language comparison. No LLM.
 
-    Returns ArbitrationResult with divergences, convergences, and verdict.
+    Returns ArbitrationResult with divergences, convergences, and verdict. ``gaps`` is what
+    the review left out; None means it was not tracked and adds no reason.
     """
     divergences: list[Divergence] = []
     convergences: list[RiskCategory] = []
@@ -141,25 +134,7 @@ def arbitrate(
     # Verdict logic
     verdict = _compute_verdict(divergences, layer1_failures)
     l1_verdict = "FAIL" if layer1_failures else "PASS"
-    resolved_infra = (
-        infra_status
-        if infra_status is not None
-        else ("unverified" if spec_agent_failed else "ok")
-    )
-    gaps = (
-        structural_ship_gaps(
-            changed_files,
-            all_files or (),
-            rule_miss_counts=rule_miss_counts,
-        )
-        if changed_files is not None
-        else []
-    )
-    vendor_warn = (
-        check_vendor_independence(arbiter_vendor, generator_vendor)
-        if (arbiter_vendor is not None or generator_vendor is not None)
-        else ""
-    )
+    reasons = _unverified_reasons(predictions, spec_agent_failed, gaps)
 
     return ArbitrationResult(
         divergences=divergences,
@@ -169,11 +144,62 @@ def arbitrate(
         predictions=predictions,
         claims=claims,
         layer1_verdict=l1_verdict,
-        infra_status=resolved_infra,
+        infra_status="unverified" if reasons else "ok",
         llm_predictions=tuple(predictions),
-        structural_gaps=gaps,
-        vendor_warning=vendor_warn,
+        unverified_reasons=reasons,
     )
+
+
+def _unverified_reasons(
+    predictions: Sequence[Prediction], spec_agent_failed: bool, gaps: Optional[ReviewGaps],
+) -> tuple[str, ...]:
+    """Why the review cannot be read as complete; empty means it can. These only ever make a
+    run 'unverified', never BLOCK."""
+    reasons = []
+    if spec_agent_failed:
+        reasons.append("spec_agent_unparseable")
+    if gaps is not None and gaps.code_agent_failed:
+        reasons.append("code_agent_unparseable")
+    if not predictions:
+        reasons.append("no_predictions")
+    if gaps is not None:
+        if not gaps.reviewed_files:
+            reasons.append("no_reviewed_files")
+        # Tests, __init__.py and non-Python files are excluded by design: beside a reviewed
+        # file they are not a hole, or every change with a test would read 'unverified'.
+        skipped = gaps.skipped_files
+        if skipped and (not gaps.reviewed_files or any(why == "error" for _, why in skipped)):
+            reasons.append(f"skipped:{len(skipped)}")
+        if gaps.dropped_entries > 0:
+            reasons.append(f"unknown_category:{gaps.dropped_entries}")
+    return tuple(reasons)
+
+
+# Lower-case substrings of a declared vendor or a host id. Multi-model hosts (cursor, copilot,
+# windsurf, kiro) map to nothing: their generating model, so their independence, is unknown.
+_VENDOR_KEYS = (
+    ("openai", "openai"), ("codex", "openai"),
+    ("anthropic", "anthropic"), ("claude", "anthropic"),
+    ("google", "google"), ("gemini", "google"), ("antigravity", "google"),
+)
+
+
+def _vendor_of(label: Optional[str]) -> Optional[str]:
+    low = (label or "").strip().lower()
+    return next((vendor for key, vendor in _VENDOR_KEYS if low and key in low), None)
+
+
+def vendor_warning(declared: Optional[str], generator_label: Optional[str]) -> str:
+    """The T6 cross-vendor advisory: the user's declared arbiter vendor against the generating
+    host's label. '' when nothing is declared or the two differ."""
+    if not (declared or "").strip():
+        return ""
+    generator = _vendor_of(generator_label)
+    if generator is None:
+        return "Vendor independence unverified: generating host is unknown."
+    if _vendor_of(declared) == generator:
+        return "Same-vendor arbiter provides prompt isolation only, not model independence."
+    return ""
 
 
 def _compute_verdict(
@@ -203,45 +229,7 @@ def _compute_verdict(
     return Verdict.SHIP
 
 
-# ── T6: Structural SHIP Gap Report & Calibration ──────────────────────────
-
-
-def structural_ship_gaps(
-    changed_files: Sequence[str],
-    all_files: Sequence[str] = (),
-    rule_miss_counts: Optional[dict[str, int]] = None,
-    *,
-    uncovered_lines: Optional[dict[str, Sequence[int] | set[int]]] = None,
-    high_miss_threshold: int = 3,
-) -> list[dict[str, Any]]:
-    """Deterministically flag changed source files lacking tests, with high rule-miss history, or uncovered lines."""
-    pool = {p.replace("\\", "/") for p in (*all_files, *changed_files)}
-    test_stems: set[str] = set()
-    for p in pool:
-        stem = Path(p).stem
-        if is_test_path(p) or stem.startswith("test_") or stem.endswith("_test"):
-            test_stems.update({stem, stem.removeprefix("test_"), stem.removesuffix("_test")})
-    miss_map = rule_miss_counts or {}
-    uncov_map = uncovered_lines or {}
-    gaps: list[dict[str, Any]] = []
-    for raw_path in changed_files:
-        norm = raw_path.replace("\\", "/")
-        p_obj = Path(norm)
-        if is_test_path(norm) or p_obj.name.startswith("test_") or p_obj.name == "__init__.py":
-            continue
-        reasons = [r for r, cond in (
-            ("missing_test", p_obj.suffix in (".py", ".rs", ".js", ".ts", ".go") and p_obj.stem not in test_stems),
-            ("high_rule_miss_history", miss_map.get(norm, miss_map.get(raw_path, 0)) >= high_miss_threshold),
-            ("uncovered_changed_lines", bool(uncov_map.get(norm, uncov_map.get(raw_path, ())))),
-        ) if cond]
-        if reasons:
-            file_uncov = sorted(uncov_map.get(norm, uncov_map.get(raw_path, ())))
-            gaps.append({
-                "file": norm, "path": norm, "kind": reasons[0], "reasons": reasons,
-                "miss_count": miss_map.get(norm, miss_map.get(raw_path, 0)),
-                "uncovered_lines": file_uncov, "detail": ", ".join(reasons),
-            })
-    return gaps
+# ── T6: Calibration ───────────────────────────────────────────────────────
 
 
 def _extract_prob_outcome(item: Any) -> tuple[float, Optional[bool], str, str, str, str]:
@@ -251,8 +239,8 @@ def _extract_prob_outcome(item: Any) -> tuple[float, Optional[bool], str, str, s
             float(item.p),
             item.outcome,
             str(item.disposition or "logged"),
-            str(item.scope or item.target or item.affected_function or item.id),
-            str(item.observable or item.claim_type or "fix_touch_in_window"),
+            str(item.scope or item.affected_function or item.id),
+            str(item.observable or "fix_touch_in_window"),
             str(item.id),
         )
     if isinstance(item, dict):
@@ -375,79 +363,3 @@ def calibration_summary(records: Sequence[Any], outcomes: Optional[dict[str, boo
         f"precision={s['precision']:.1%} (Wilson 95% CI [{lo:.2f}, {hi:.2f}]) | {bss_str}"
     )
     return CalibrationSummary(s)
-
-
-class PruneResult(dict):
-    def __iter__(self):
-        yield self["kept"]
-        yield self["buckets"]
-
-
-def prune_predictions(records: Sequence[Any], now_ts: Optional[float] = None, max_age_days: int = 60) -> PruneResult:
-    """Compact scored prediction records older than max_age_days into bucket counters."""
-    cutoff = float(now_ts if now_ts is not None else time.time()) - (max_age_days * 86400.0)
-    kept: list[Any] = []
-    pruned_count = 0
-    scored_count = 0
-    hits = 0
-    heeded_count = 0
-    sum_brier = 0.0
-    bins: dict[str, dict[str, int]] = {}
-    for rec in records:
-        p, out, disp, *_ = _extract_prob_outcome(rec)
-        if isinstance(rec, Prediction):
-            rec_ts = float(rec.ts)
-        elif isinstance(rec, dict):
-            rec_ts = float(rec.get("ts", rec.get("resolved_at", 0.0)) or 0.0)
-        else:
-            rec_ts = 0.0
-        if ((out is not None) or (disp == "heeded")) and 0.0 < rec_ts < cutoff:
-            pruned_count += 1
-            if disp == "heeded":
-                heeded_count += 1
-            elif out is not None:
-                scored_count += 1
-                y = 1 if out else 0
-                hits += y
-                sum_brier += (p - y) ** 2
-                idx = min(4, max(0, int(p * 5)))
-                bucket = bins.setdefault(f"{idx * 0.2:.1f}-{(idx + 1) * 0.2:.1f}", {"n": 0, "hits": 0})
-                bucket["n"] += 1
-                bucket["hits"] += y
-        else:
-            kept.append(rec)
-    buckets = {
-        "pruned_count": pruned_count,
-        "scored_count": scored_count,
-        "hits": hits,
-        "heeded_count": heeded_count,
-        "sum_brier": sum_brier,
-        "bins": bins,
-    }
-    return PruneResult(kept=kept, active=kept, buckets=buckets, pruned_count=pruned_count)
-
-
-def _canonical_vendor(raw: Optional[str]) -> str:
-    low = (raw or "").strip().lower()
-    if not low or low == "unknown":
-        return ""
-    vendor_families = (
-        ("anthropic", ("anthropic", "claude")),
-        ("openai", ("openai", "gpt", "codex", "o1", "o3", "o4")),
-        ("google", ("google", "gemini", "antigravity", "agy", "vertex")),
-    )
-    for fam, toks in vendor_families:
-        if any(t in low for t in toks):
-            return fam
-    return low.split("/")[0].split("-")[0]
-
-
-def check_vendor_independence(arbiter_vendor: Optional[str], generator_vendor: Optional[str]) -> str:
-    """Warn when arbiter and generator belong to the same model vendor family or are unknown."""
-    arb_fam = _canonical_vendor(arbiter_vendor)
-    gen_fam = _canonical_vendor(generator_vendor)
-    if not arb_fam or not gen_fam:
-        return "Vendor independence unverified: arbiter or generator vendor is unknown."
-    if arb_fam == gen_fam:
-        return "Same-vendor arbiter provides prompt isolation only, not model independence."
-    return ""

@@ -101,6 +101,7 @@ def fresh_state() -> Dict[str, Any]:
 
 _RATE_LIMITS = {
     "aegis_report_outcome": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
+    "aegis_capture_insight": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
 }
 _tool_call_times: Dict[str, list] = defaultdict(list)
 _rate_limit_lock = threading.Lock()

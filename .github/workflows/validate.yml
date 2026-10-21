@@ -12,11 +12,16 @@ on:
 permissions:
   contents: read
 
+# timeout-minutes: at least twice each job's longest wall-clock time in the last 5 green runs
+# (2026-10-20/21: validate 146 min on macOS 3.9, of which check --ci was about 120; aegis-check
+# 27; test-windows 16; the rest under 1), never below 45 for validate and test-windows, at most
+# GitHub's 360. Lower them only from new measurements: a limit must not turn a slow green run red.
 jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
   dependency-audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,6 +38,7 @@ jobs:
   build-wheel:
     needs: dependency-audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # id-token + attestations are only for the provenance attestation step.
     # When called from publish.yml, the caller job must grant these too.
     permissions:
@@ -82,6 +88,7 @@ jobs:
     needs: [dependency-audit, build-wheel, validate, test-windows]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Verify upstream jobs succeeded
         env:
@@ -103,18 +110,25 @@ jobs:
           path: dist/
       - name: Verify artifact digests
         run: python .github/scripts/verify_dist.py verify dist
-      - name: Install wheel and test runner
+      # Same text as the other test jobs (a workflow test compares them): check --ci reruns the
+      # head commit's trailer snapshot here, which must collect what those jobs collect.
+      - name: Install test dependencies
         run: |
-          pip install pytest==8.3.4 pyyaml==6.0.2
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
           pip install dist/*.whl
+      # -I keeps the checkout off sys.path: the installed wheel is what runs. check --ci runs only
+      # in this job (its id is the required context); each OS leg keeps Layer 1.
       - name: Run Layer 1 Deterministic Verification
-        run: python3 -m aegis_cli.cli check
+        run: python3 -I -m aegis_cli.cli check
       - name: Run CI Governance & Regression Check
-        run: python3 -m aegis_cli.cli check --ci
+        run: python3 -I -m aegis_cli.cli check --ci
 
   validate:
     needs: [build-wheel, dependency-audit]
+    timeout-minutes: 300
     strategy:
+      # One red leg must not cancel the others and hide the per-OS results.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         python-version: ['3.9', '3.11']
@@ -160,9 +174,6 @@ jobs:
       - name: Run Layer 1 Deterministic Verification
         run: python3 -m aegis_cli.cli check
 
-      - name: Run CI Governance & Regression Check
-        run: python3 -m aegis_cli.cli check --ci
-
       - name: Run test suite
         id: test
         run: make test
@@ -182,6 +193,7 @@ jobs:
   test-windows:
     needs: build-wheel
     runs-on: windows-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -214,10 +226,10 @@ jobs:
           pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
           pip install dist/*.whl
 
-      - name: Wheel smoke test (source-isolated)
+      - name: Smoke-test installed wheel (source hidden)
         run: |
-          cd "$RUNNER_TEMP"
-          python -c "import aegis_cli, aegis_sdk; print('Aegis wheel imports cleanly')"
+          SMOKE="$PWD/.github/scripts/wheel_smoke.py"
+          cd "$RUNNER_TEMP" && env -u PYTHONPATH python -I "$SMOKE"
 
       - name: Run Layer 1 Deterministic Verification
         run: python -m aegis_cli.cli check
@@ -241,6 +253,7 @@ jobs:
     needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write

@@ -15,9 +15,13 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
+# timeout-minutes (release runs only, no green-run history to measure): from each job's own bounds.
+# publish waits at most 300 s for PyPI (pypi_state.py WAIT_SECONDS) after the upload. validate
+# calls a reusable workflow, which cannot carry the key: its jobs carry their own.
 jobs:
   guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -41,6 +45,7 @@ jobs:
   publish:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Trusted Publishing (OIDC): PyPI trusts this repo + workflow + environment,
     # so no long-lived API token exists. id-token is only for the upload step.
     environment:
@@ -113,6 +118,7 @@ jobs:
   release-assets:
     needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
