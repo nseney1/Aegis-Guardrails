@@ -1034,12 +1034,17 @@ def read_jsonl(
     errors: str = "strict",
     *,
     tail_bytes: Optional[int] = None,
+    contains: Optional[bytes] = None,
 ) -> JsonlRead:
     """Read a JSONL file; never raises for its content. A missing file reads as empty.
 
     ``errors`` is the UTF-8 error handler: ``"surrogatepass"`` reads what v3 wrote with
     it (a lone surrogate from a non-UTF-8 file name). A symlink, or anything but a
     regular file, is not read: ``error`` says why.
+
+    ``contains`` is a point read: lines without those bytes are dropped before parsing
+    (they are neither rows nor skipped lines; line numbers stay file line numbers). The
+    caller passes bytes every wanted row carries verbatim and re-checks the fields.
     """
     try:
         # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer.
@@ -1064,6 +1069,8 @@ def read_jsonl(
         except OSError as exc:
             return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 
+    if contains is not None and contains not in data:
+        return JsonlRead([], [], [])
     rows: List[Dict[str, Any]] = []
     numbers: List[int] = []
     skipped: List[int] = []
@@ -1073,6 +1080,8 @@ def read_jsonl(
     for index, raw in enumerate(lines):
         if index == last and not raw:
             break  # the file ended with a newline
+        if contains is not None and contains not in raw:
+            continue
         raw = raw.rstrip(b"\r")
         if not raw.strip():
             continue

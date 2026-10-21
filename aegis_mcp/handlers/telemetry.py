@@ -8,6 +8,7 @@ from typing import List, Optional, Set, Tuple
 
 from aegis_core import credit, gitsafe, treeid
 from aegis_core.baseline import envelope
+from aegis_core.errors import PathTraversalError
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import validate_rule_names
 from aegis_mcp.registry import _STATUS_FAIL, _VALID_OUTCOMES, _get_workspace
@@ -151,14 +152,10 @@ def handle_capture_insight(args: dict) -> dict:
         return _fail("'quote' is required and must be a non-empty string.")
 
     raw_paths = args.get("paths")
-    confined_paths: Optional[List[str]] = None
-    if raw_paths is not None:
-        if not isinstance(raw_paths, (list, tuple)) or not all(isinstance(p, str) for p in raw_paths):
-            return _fail("'paths' must be a list of file paths.")
-        try:
-            confined_paths = sorted({PurePath(workspace.confine_path(p)[1]).as_posix() for p in raw_paths if p.strip()})
-        except ValueError as exc:
-            return _fail(str(exc))
+    if raw_paths is not None and (
+        not isinstance(raw_paths, (list, tuple)) or not all(isinstance(p, str) for p in raw_paths)
+    ):
+        return _fail("'paths' must be a list of file paths.")
 
     host = str(args.get("_host") or "mcp")
     session = args.get("_session")
@@ -166,10 +163,12 @@ def handle_capture_insight(args: dict) -> dict:
         row = capture_suggestion(
             workspace.root,
             quote=quote,
-            paths=confined_paths,
+            paths=list(raw_paths) if raw_paths is not None else None,
             host=host,
             session=str(session) if session else None,
         )
+    except PathTraversalError as exc:
+        return _fail(str(exc))
     except Exception as exc:
         return _fail(f"Failed to capture insight: {exc}")
 
