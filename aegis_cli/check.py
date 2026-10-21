@@ -269,6 +269,8 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             print(f"aegis check --ci: FAILED: regression check failed ({len(reg_report.findings)} finding(s), {span})")
         elif trailer_blocking:
             print(f"aegis check --ci: FAILED: Aegis-Check trailer divergence ({span})")
+        elif report.merge_base == report.head:  # a push to the base branch, a dispatch run, a stale branch
+            print(f"aegis check --ci: note: base and head are the same commit; nothing was compared ({span})")
         else:
             print(f"aegis check --ci: PASSED, no rule weakened ({report.rules_checked} binding rule(s) at the merge base, {span})")
     else:
