@@ -11,6 +11,7 @@ import re
 import tempfile
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+import urllib.parse
 
 from aegis_core.fitness import for_rules
 from aegis_core.rules import RuleSet, load_rules
@@ -325,6 +326,30 @@ def _files(root: Path) -> Dict[str, bytes]:
     return found
 
 
+def _local_push_path(url: str) -> Optional[str]:
+    """The path a push URL names on this machine (git's file:// and url_is_local_not_ssh), else None."""
+    if url.startswith("file://"):  # git ignores a host part and decodes %XX
+        rest = urllib.parse.unquote(url[len("file://"):])
+        rest = rest if rest.startswith("/") or "/" not in rest else rest[rest.index("/"):]
+        return rest[1:] if os.name == "nt" and re.match(r"/[A-Za-z]:", rest) else rest
+    colon, slash = url.find(":"), url.find("/")
+    if _URL_SCHEME.match(url) or not (colon < 0 or 0 <= slash < colon or (os.name == "nt" and re.match(r"[A-Za-z]:", url))):
+        return None
+    return url
+
+
+def _inside(path: str, *dirs: str) -> bool:
+    for found in (os.path.abspath(path), os.path.realpath(path)):
+        for folder in dirs:
+            for base in {os.path.abspath(folder), os.path.realpath(folder)}:
+                try:
+                    if os.path.commonpath([os.path.normcase(found), os.path.normcase(base)]) == os.path.normcase(base):
+                        return True
+                except ValueError:  # another drive
+                    continue
+    return False
+
+
 def _pr_plan(root: Path) -> Dict[str, Any]:
     """What the PR is cut from; raises _Refused, naming why, before anything moves."""
     from aegis_core import gitevidence, gitsafe
@@ -359,6 +384,12 @@ def _pr_plan(root: Path) -> Dict[str, Any]:
         scheme = _URL_SCHEME.match(url)
         if scheme and scheme.group(1) not in _PUSH_SCHEMES:  # the scheme only: a URL may hold a token
             raise _Refused(f"{remote} has a push URL using {scheme.group(1)}://, not https, ssh or a local path; "
+                           "push the branch yourself")
+        # git drops -c for a local receiving repository, so its own hooks run: outside this repository
+        # they are the user's, as on any server; inside it the repository chose them.
+        local = _local_push_path(url)
+        if local is not None and _inside(os.path.join(top, local), top, facts.common_dir):
+            raise _Refused(f"{remote} has a push URL inside this repository, whose own hooks the push would run; "
                            "push the branch yourself")
     programs = gitsafe.run(["config", "--show-scope", "--null", "--name-only", "--get-regexp", _PUSH_PROGRAMS], top)
     if programs.returncode not in (0, 1):

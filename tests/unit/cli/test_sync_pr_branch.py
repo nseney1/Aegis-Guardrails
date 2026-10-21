@@ -220,3 +220,31 @@ def test_a_signing_program_from_repository_config_never_runs_on_the_push(tmp_pat
     after = repo.state()
     assert after.pop("branches") != before.pop("branches") and after == before
     assert not (tmp_path / "ran-signer").exists()
+
+
+@pytest.mark.parametrize("where", ["relative-path", "file-url", "git-dir", "second-pushurl"])
+def test_a_local_push_url_inside_the_repository_is_refused_and_its_hooks_never_run(tmp_path, capsys, where):
+    # git drops -c for a local receiving repository, so its own hooks run; inside this work tree or
+    # git dir the repository chose them.
+    repo = hs.make(tmp_path)
+    inner = repo.root / "inner.git"
+    git(repo.root, "init", "-q", "--bare", str(inner))
+    for hooks in (inner / "hooks", repo.root / ".git" / "hooks"):
+        _plant(hooks / "pre-receive", tmp_path / "ran-receiver-hook")
+    url = {"relative-path": "inner.git", "file-url": inner.as_uri(), "git-dir": str(repo.root / ".git"),
+           "second-pushurl": "inner.git"}[where]
+    if where == "second-pushurl":
+        git(repo.root, "remote", "set-url", "--add", "--push", "origin", str(repo.origin))
+        git(repo.root, "remote", "set-url", "--add", "--push", "origin", url)
+    else:
+        git(repo.root, "remote", "set-url", "origin", url)
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_PROBLEMS and payload["pr"]["status"] == "refused" and gh.calls == []
+    assert "inside this repository" in payload["refused"]
+    assert repo.state() == before and repo.origin_branches() == ["main"]
+    assert git(inner, "for-each-ref", "refs/heads") == ""
+    assert not (tmp_path / "ran-receiver-hook").exists()
