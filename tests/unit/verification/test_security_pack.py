@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aegis_core.ast.drivers.python import _call_args, _render_arg, parse_python_ast
+from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.policy import (
     evaluate_forbid_ast,
     evaluate_forbid_ast_delta,
@@ -14,15 +14,9 @@ from aegis_core.ast.policy import (
     extract_normalized_ast,
 )
 from aegis_core.ast.schema import CallSiteNode, NormalizedAST
-from aegis_core.packs import import_pack, validate_pack
 from aegis_core.rule_integrity import _forbid_patterns, _forbid_tokens
 from aegis_core.verification.runner import _forbid_ast_spec_error
-from aegis_core.verification.security_pack import (
-    PYTHON_SECURITY_RULES,
-    build_python_security_pack,
-    evaluate_security_pack,
-    is_test_path,
-)
+from aegis_core.verification.security_pack import PYTHON_SECURITY_RULES, evaluate_security_pack
 
 PACK_SPEC = {
     "calls": [
@@ -381,43 +375,90 @@ class TestDeltaEvaluationAndRunnerIntegrity:
         assert _forbid_tokens(valid_spec["calls"]) == ["os.system", "eval", "subprocess.run"]
 
 
+_SHIPPED = {r["id"]: r for r in PYTHON_SECURITY_RULES}
+# One violating and one clean source per shipped rule: (rule id, positive, its line, negative).
+_RULE_FIXTURES = [
+    ("sec-py-eval-exec", "x = 1\nx = eval(s)\n", 2, "model.eval()\nsession.exec(q)\n"),
+    ("sec-py-pickle-loads", "import pickle\npickle.loads(b)\n", 2, "import json\njson.loads(b)\n"),
+    ("sec-py-yaml-unsafe-load", "import yaml\nyaml.load(f)\n", 2, "import yaml\nyaml.load(f, Loader=yaml.SafeLoader)\n"),
+    ("sec-py-subprocess-shell", "import subprocess\nsubprocess.run(c, shell=True)\n", 2,
+     "import subprocess\nsubprocess.run(['ls'])\n"),
+    ("sec-py-weak-hash-md5-sha1", "import hashlib\nhashlib.md5(b)\n", 2, "import hashlib\nhashlib.md5(b, usedforsecurity=False)\n"),
+    ("sec-py-tempfile-mktemp", "import tempfile\ntempfile.mktemp()\n", 2, "import tempfile\ntempfile.mkstemp()\n"),
+    ("sec-py-requests-verify-false", "import requests\nrequests.get(u, verify=False)\n", 2,
+     "import requests\nrequests.get(u)\n"),
+]
+
+
+def _pack(root: Path, files: dict, changed=None, base=None) -> dict:
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
+    return evaluate_security_pack(root, list(files) if changed is None else changed, base or {})
+
+
 class TestPythonSecurityPack:
-    def test_eight_rules_metadata_and_pack_validation(self, tmp_path: Path):
-        expected_ids = {
-            "sec-py-eval-exec",
-            "sec-py-pickle-loads",
-            "sec-py-yaml-unsafe-load",
-            "sec-py-subprocess-shell",
-            "sec-py-xml-etree",
-            "sec-py-weak-hash-md5-sha1",
-            "sec-py-tempfile-mktemp",
-            "sec-py-requests-verify-false",
-        }
-        assert len(PYTHON_SECURITY_RULES) == 8
-        assert {r["id"] for r in PYTHON_SECURITY_RULES} == expected_ids
+    def test_the_seven_shipped_rules_each_have_a_fixture_and_load_as_gates(self):
+        assert sorted(_SHIPPED) == sorted(rid for rid, *_ in _RULE_FIXTURES)
         for rule in PYTHON_SECURITY_RULES:
-            assert rule["tier"] == "invariant"
-            assert rule["severity"] == "high"
+            assert (rule["severity"], rule["enforcement"]) == ("high", "gate") and "tier" not in rule
             assert _forbid_ast_spec_error(rule["forbid_ast"]) is None
 
-        pack = build_python_security_pack()
-        entries = validate_pack(pack)
-        assert len(entries) == 8
+    @pytest.mark.parametrize("rule_id,positive,line,negative", _RULE_FIXTURES, ids=[f[0] for f in _RULE_FIXTURES])
+    def test_each_shipped_rule_flags_its_positive_fixture_and_not_its_negative(self, tmp_path: Path, rule_id, positive,
+                                                                              line, negative):
+        hit = _pack(tmp_path, {"pos.py": positive, "neg.py": negative})
+        assert [(v["rule_id"], v["file"], v["line"]) for v in hit["violations"]] == [(rule_id, "pos.py", line)]
+        assert hit["unverified_findings"] == [] and hit["passed"] is False
 
-        # Verify pack can also be dry-run imported into an Aegis workspace
-        (tmp_path / ".aegis" / "rules" / "invariants").mkdir(parents=True)
-        res = import_pack(tmp_path, pack, dry_run=True)
-        assert len(res.rules) == 8
+    def test_an_unreadable_file_is_one_unverified_record_never_a_clean_skip(self, tmp_path: Path):
+        report = _pack(tmp_path, {"bad.py": 'import os\nos.system("x")\ndef broken(:\n', "ok.py": 'import os\nos.system("x")\n'})
+        assert [v["file"] for v in report["violations"]] == ["ok.py"]
+        (record,) = report["unverified_findings"]
+        assert {k: record[k] for k in ("rule_id", "file", "line", "kind", "status", "severity")} == {
+            "rule_id": "", "file": "bad.py", "line": 0, "kind": "file", "status": "unverified", "severity": "high"}
+        assert record["reason"].startswith("SyntaxError") and str(tmp_path) not in record["reason"]
 
-    def test_is_test_path_classification(self):
-        assert is_test_path("tests/unit/test_foo.py") is True
-        assert is_test_path("test_example.py") is True
-        assert is_test_path("pkg/foo_test.py") is True
-        assert is_test_path("conftest.py") is True
-        assert is_test_path("src/conftest.py") is True
-        assert is_test_path("src/service.py") is False
+    def test_a_file_it_cannot_decode_is_reported_with_its_codec(self, tmp_path: Path):
+        report = _pack(tmp_path, {"seven.py": b"# -*- coding: utf-7 -*-\nimport os\nos.system('x')\n"})
+        assert [(u["file"], u["kind"]) for u in report["unverified_findings"]] == [("seven.py", "file")]
+        assert "utf-7" in report["unverified_findings"][0]["reason"]
+
+    def test_a_deleted_file_is_absent_not_unverified(self, tmp_path: Path):
+        report = evaluate_security_pack(tmp_path, ["gone.py"], {"gone.py": "import os\nos.system('x')\n"})
+        assert report == {"passed": True, "violations": [], "exempted_test_findings": [], "unverified_findings": []}
+
+    @pytest.mark.parametrize("spelling", [".hidden/evil.py", "./.hidden/evil.py", ".\\.hidden\\evil.py"],
+                             ids=["plain", "dot-slash", "backslashes"])
+    def test_a_dot_directory_is_scanned_however_it_is_spelled(self, tmp_path: Path, spelling: str):
+        report = _pack(tmp_path, {".hidden/evil.py": "import os\nos.system('x')\n"}, changed=[spelling])
+        assert [(v["rule_id"], v["file"]) for v in report["violations"]] == [("sec-py-subprocess-shell", ".hidden/evil.py")]
+
+    @pytest.mark.parametrize("spelling", ["../outside.py", "./../outside.py", "src/../../outside.py", "absolute"],
+                             ids=["parent", "dot-parent", "climbing", "absolute"])
+    def test_a_path_outside_the_workspace_is_never_scanned(self, tmp_path: Path, spelling: str):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (tmp_path / "outside.py").write_bytes(b"import os\nos.system('x')\n")
+        changed = [str(tmp_path / "outside.py") if spelling == "absolute" else spelling]
+        report = evaluate_security_pack(ws, changed, {})
+        assert report["violations"] == [] and report["unverified_findings"] == []
+
+    @pytest.mark.parametrize("src,flagged", [
+        ("import requests\ns = requests.Session()\ns.get(u, verify=False)\n", True),
+        ("import requests\nrequests.get(u, verify=False)\n", True),
+        ("d = {}\nd.get('k', 1)\n", False),
+        ("import requests\ns = requests.Session()\ns.get(u, verify=True)\n", False),
+        ("import hashlib\nhashlib.new('MD5')\n", True),
+        ("import hashlib\nhashlib.new('md5')\n", True),
+        ("import hashlib\nhashlib.md5(b, usedforsecurity=False)\n", False),
+    ], ids=["session-get", "module-get", "dict-get", "verify-true", "new-MD5", "new-md5", "not-for-security"])
+    def test_the_spellings_the_pack_used_to_miss(self, tmp_path: Path, src: str, flagged: bool):
+        assert bool(_pack(tmp_path, {"app.py": src})["violations"]) is flagged
 
     def test_evaluate_security_pack_delta_and_test_exemptions(self, tmp_path: Path):
+        from aegis_core import gitsafe
+
         subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
         subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@e.st"], check=True)
         subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
@@ -431,22 +472,17 @@ class TestPythonSecurityPack:
 
         # Shift legacy line without adding new violation, add a new violation in app.py, and add a hit in tests/
         legacy_file.write_text("# header\nimport tempfile\ntempfile.mktemp()\n", encoding="utf-8")
-        app_file = src_dir / "app.py"
-        app_file.write_text(
-            "import xml.etree.ElementTree as ET\n"
-            "ET.fromstring('<root/>')\n",
-            encoding="utf-8",
-        )
+        (src_dir / "app.py").write_text("import pickle\npickle.loads(blob)\n", encoding="utf-8")
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
         (tests_dir / "test_eval.py").write_text("eval('1+1')\n", encoding="utf-8")
+        changed = ["src/legacy.py", "src/app.py", "tests/test_eval.py"]
+        base = {rel: (lambda b: None if b is None else b.decode("utf-8"))(gitsafe.read_blob(tmp_path, "HEAD", rel))
+                for rel in changed}
 
-        report = evaluate_security_pack(tmp_path, base_ref="HEAD")
+        report = evaluate_security_pack(tmp_path, changed, base)
         assert report["passed"] is False
-        # legacy.py's untouched mktemp is suppressed by delta; app.py's xml.etree is flagged
-        assert [v["rule_id"] for v in report["violations"]] == ["sec-py-xml-etree"]
-        assert report["violations"][0]["file"] == "src/app.py"
+        # legacy.py's untouched mktemp is suppressed by delta; app.py's pickle.loads is flagged
+        assert [(v["rule_id"], v["file"], v["line"]) for v in report["violations"]] == [("sec-py-pickle-loads", "src/app.py", 2)]
         # tests/test_eval.py is not silently dropped: it appears in exempted_test_findings
-        assert len(report["exempted_test_findings"]) == 1
-        assert report["exempted_test_findings"][0]["rule_id"] == "sec-py-eval-exec"
-        assert report["exempted_test_findings"][0]["file"] == "tests/test_eval.py"
+        assert [(f["rule_id"], f["file"]) for f in report["exempted_test_findings"]] == [("sec-py-eval-exec", "tests/test_eval.py")]
