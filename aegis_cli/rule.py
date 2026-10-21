@@ -34,7 +34,7 @@ from aegis_core.lifecycle.promotion import (
     evaluate_demotions,
     evaluate_rule_tiers,
 )
-from aegis_core.lifecycle.selection import prune_rules
+from aegis_core.lifecycle.selection import evidence_line, prune_rules, transition_candidates
 from aegis_core.workspace.layout import is_aegis_workspace
 
 __all__ = [
@@ -169,6 +169,7 @@ def collect_workspace_rules(
             "domain": rule.meta.get("domain", "general"),
             "enforcement": rule.enforcement,
             "score": score,
+            "reported_score": fit.reported_score if fit is not None else None,
             "triggers": fit.triggers if fit is not None else 0,
             "path": rule.path,
         }
@@ -213,7 +214,7 @@ def _run_list(args: argparse.Namespace) -> int:
         tbl.add_column(col, no_wrap=True)
     tbl.add_column("Fitness", justify="right", no_wrap=True)
     for r in rules:
-        score_str = ui.color_fitness(float(r["score"])) if isinstance(r.get("score"), (int, float)) else "—"
+        score_str = ui.color_fitness(float(r["reported_score"])) if isinstance(r.get("reported_score"), (int, float)) else "—"
         if r.get("error"):
             score_str = "error"
         tbl.add_row(sanitize_display(str(r["id"])), ui.color_rule_type(str(r["type"])), str(r["enforcement"]), score_str)
@@ -301,10 +302,13 @@ def _run_demote(args: argparse.Namespace) -> int:
     use_json = getattr(args, "json", False)
 
     if not rule_id:
-        candidates = evaluate_demotions(str(root))
+        candidates, unavailable = transition_candidates(str(root), "demote")
         if use_json:
             print(json.dumps({"candidates": candidates}, indent=2, default=str))
-        elif not candidates:
+            return 0
+        if unavailable:
+            print(f"  ⚠️  {evidence_line(unavailable)}")
+        if not candidates:
             print("  No demotion candidates found.")
         else:
             print(f"  ⚠️  Demotion Candidates ({len(candidates)}):\n")
@@ -703,8 +707,6 @@ class RuleCommand(AegisCommand):
         p_ins_add.add_argument("text", metavar="TEXT", help="Correction insight text (redacted and capped at 300 chars)")
         p_ins_add.add_argument("--paths", nargs="*", default=None, help="Target file paths (default: git dirty set)")
         p_ins_add.add_argument("--kind", default=None, help="Optional insight category or kind")
-        p_ins_add.add_argument("--host", default="cli", help="Host identifier (default: cli)")
-        p_ins_add.add_argument("--session", default=None, help="Optional session identifier (stored as keyed hs)")
         p_ins_add.add_argument("--commit", default=None, help="Optional signed commit SHA carrying Aegis-Approve-Insight")
         p_ins_add.add_argument("--base-ref", dest="base_ref", default=None, help="Optional base branch reference for --commit")
 
@@ -724,7 +726,7 @@ class RuleCommand(AegisCommand):
         p_ins_en.add_argument("--excerpts", action="store_true", default=False,
                               help="Also store redacted <=300 char excerpts on correction cues (default: counters/heartbeats only)")
 
-        p_adj = sub.add_parser("adjudicate", parents=[common], help="Record a human adjudication verdict (tp or fp) for a rule")
+        p_adj = sub.add_parser("adjudicate", parents=[common], help=_ADJUDICATE_HELP, description=_ADJUDICATE_DESCRIPTION)
         p_adj.add_argument("rule_id", metavar="RULE_ID", help="Rule identifier to adjudicate")
         p_adj.add_argument("verdict", choices=["tp", "fp"], metavar="VERDICT", help="Adjudication verdict (tp or fp)")
         p_adj.add_argument("--ref", default=None, help="Optional commit SHA, PR number, or issue reference")
@@ -738,58 +740,78 @@ class RuleCommand(AegisCommand):
         return run_rule(args)
 
 
+_ADJUDICATE_HELP = "Record an adjudication label (tp or fp) in .aegis/adjudications/; it counts after it is merged to the base branch"
+_ADJUDICATE_DESCRIPTION = ("Append a tp or fp label for a rule to .aegis/adjudications/<rule-id>.jsonl. The label counts "
+                           "toward the rule's fitness only after a reviewed pull request merges it to the base branch.")
+
+
 def _run_adjudicate(args: argparse.Namespace) -> int:
-    from aegis_core import credit
+    import hashlib
+
+    from aegis_core.adjudication import ADJUDICATIONS_DIR, RULE_ID
+    from aegis_core.errors import AegisError
+    from aegis_core.storage import append_jsonl
+
+    rule_id = str(args.rule_id)
+    if not RULE_ID.fullmatch(rule_id):
+        return _emit_error(args, f"invalid rule id {sanitize_display(rule_id, 80)!r}: use letters, digits, '.', '_' or '-' (at most 128)")
     root = _resolve_workspace_root(args)
+    directory = root.joinpath(*ADJUDICATIONS_DIR.split("/"))
+    if directory.is_symlink() or directory.parent.is_symlink():
+        return _emit_error(args, f"{ADJUDICATIONS_DIR} is a symlink; refusing to write a label through it")
+    ref, file, line, summary = (getattr(args, k, None) for k in ("ref", "file", "line", "summary"))
+    example = ref or hashlib.sha256(f"{rule_id}|{file or ''}|{'' if line is None else line}|{summary or ''}".encode("utf-8")).hexdigest()[:16]
+    row: Dict[str, Any] = {"example_id": str(example), "verdict": str(args.verdict),
+                           "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    for key in ("ref", "summary", "file", "session", "repo"):
+        if getattr(args, key, None) is not None:
+            row[key] = str(getattr(args, key))
+    if line is not None:
+        row["line"] = int(line)
+    rel = f"{ADJUDICATIONS_DIR}/{rule_id}.jsonl"
     try:
-        row = credit.record_adjudication(
-            root, str(args.rule_id), str(args.verdict), adjudicator="human",
-            ref=getattr(args, "ref", None), summary=getattr(args, "summary", None),
-            file=getattr(args, "file", None), line=getattr(args, "line", None),
-            session=getattr(args, "session", None), repo=getattr(args, "repo", None),
-        )
-    except Exception as exc:
-        return _emit_error(args, str(exc))
+        append_jsonl(directory / f"{rule_id}.jsonl", [row])
+    except (OSError, AegisError) as exc:
+        return _emit_error(args, f"cannot write {rel}: {exc}")
     if getattr(args, "json", False):
-        print(json.dumps(row, indent=2))
+        print(json.dumps({"status": "recorded", "rule": rule_id, "path": rel, "label": row}, indent=2))
     else:
-        print(f"Recorded adjudication ({row['verdict']}) for {row['rule']}")
+        print(f"Recorded a {row['verdict']} label for {sanitize_display(rule_id)} in {rel}; "
+              "it counts after it is merged to the base branch")
     return 0
-
-
-def _normalize_paths_arg(raw_paths: Any) -> Optional[List[str]]:
-    if raw_paths is None:
-        return None
-    seq = [raw_paths] if isinstance(raw_paths, str) else (raw_paths if isinstance(raw_paths, (list, tuple)) else [])
-    items = [p.strip() for elem in seq for p in str(elem).split(",") if p.strip()]
-    return items or None
 
 
 def _run_insight(args: argparse.Namespace) -> int:
     from aegis_core.insights import (
-        add_insight, enable_host_hook, measure_recurrence, record_decision, review_insights, write_proposal,
+        add_insight, measure_recurrence, record_decision, review_insights, write_proposal,
     )
     sub_action = getattr(args, "insight_action", None)
     use_json = bool(getattr(args, "json", False))
     if sub_action == "enable":
+        from aegis_cli.hooks.insights import enable_insight_hook
+        from aegis_cli.hooks.registrar import CODEX_TRUST_STEP
+
         host, excerpts = getattr(args, "host", None), bool(getattr(args, "excerpts", False))
         try:
-            res = enable_host_hook(host, excerpts=excerpts)
+            res = enable_insight_hook(host, excerpts=excerpts)
         except Exception as exc:
             return _emit_error(args, str(exc))
         if use_json:
             print(json.dumps(res, indent=2))
         else:
             print(f"Enabled insight capture for {host} ({'excerpts + heartbeats' if excerpts else 'heartbeats only'}) in {res['config_path']}")
+            if res.get("backup_dir"):
+                print(f"   backup: {res['backup_dir']}")
+        if host == "codex-cli":
+            print(f"   Next: {CODEX_TRUST_STEP}", file=sys.stderr if use_json else sys.stdout)
         return 0
 
     if sub_action == "add":
         root = _resolve_workspace_root(args)
         try:
             row = add_insight(
-                root, getattr(args, "text", ""), paths=_normalize_paths_arg(getattr(args, "paths", None)),
-                kind=getattr(args, "kind", None), host=getattr(args, "host", "cli") or "cli",
-                session=getattr(args, "session", None), commit=getattr(args, "commit", None),
+                root, getattr(args, "text", ""), paths=getattr(args, "paths", None),
+                kind=getattr(args, "kind", None), commit=getattr(args, "commit", None),
                 base_ref=getattr(args, "base_ref", None),
             )
         except Exception as exc:

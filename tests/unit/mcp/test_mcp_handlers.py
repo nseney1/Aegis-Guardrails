@@ -83,6 +83,29 @@ def test_scan_succeeds_when_exposure_ledger_write_fails(mcp_workspace: Path, mon
     assert telemetry_handlers.credit.exposed_rules(mcp_workspace, "codex-cli", "s-readonly") == {"sample-rule"}
 
 
+def test_the_witnessed_set_holds_only_what_this_process_exposed(mcp_workspace: Path, monkeypatch):
+    """Given a scan in session s and a ledger exposure row for another rule with the same host and
+    session, Then the witnessed accessor returns only the scanned rule, the display accessor both,
+    and another host, another session or an unscanned root returns nothing."""
+    credit = telemetry_handlers.credit
+    monkeypatch.setattr(credit, "_EXPOSED", {})
+    handle_scan({"workspace": str(mcp_workspace), "files": ["src/main.py"], "_session": "s", "_host": "codex-cli"})
+    credit.ledger.append_rows(mcp_workspace, [{"v": credit.ledger.LEDGER_VERSION, "ts": "2026-10-19T00:00:00Z",
+                                               "event": "exposure", "rule": "planted-rule", "session": "s",
+                                               "host": "codex-cli", "paths": [], "rev": None}])
+    root = Path(str(mcp_workspace)).resolve()
+    assert credit.exposed_rules(root, "codex-cli", "s") == {"sample-rule", "planted-rule"}
+    assert credit.witnessed_exposed_rules(root, "codex-cli", "s") == {"sample-rule"}
+    assert credit.witnessed_exposed_rules(root, "claude-code", "s") == set()
+    assert credit.witnessed_exposed_rules(root, "codex-cli", "other") == set()
+    assert credit.witnessed_exposed_rules(root / "elsewhere", "codex-cli", "s") == set()
+    credit.record_exposure(root, None, None, ["no-session-rule"], persist=False)
+    assert credit.witnessed_exposed_rules(root, None, None) == {"no-session-rule"}
+    witnessed = credit.witnessed_exposed_rules(root, "codex-cli", "s")
+    witnessed.add("mutated")  # a copy: the caller cannot widen the server's record
+    assert credit.witnessed_exposed_rules(root, "codex-cli", "s") == {"sample-rule"}
+
+
 def test_scan_blocks_path_traversal(mcp_workspace: Path):
     res = handle_scan({"workspace": str(mcp_workspace), "files": ["../outside.py"]})
     assert res["status"] == "FAIL"

@@ -151,12 +151,14 @@ class FakeGh:
     """The gh runner boundary: answers `gh api` GETs from ``routes`` and records every call."""
 
     def __init__(self, default_branch: str = "main", admin: bool = False, rules: Optional[List[Dict[str, Any]]] = None,
-                 rulesets: Optional[List[Dict[str, Any]]] = None, owner: str = "octo") -> None:
+                 rulesets: Optional[List[Dict[str, Any]]] = None, owner: str = "octo",
+                 owner_type: Optional[str] = "User") -> None:
         self.default_branch = default_branch
         self.admin = admin
         self.rules = rules if rules is not None else []
         self.rulesets = rulesets if rulesets is not None else []
         self.owner = owner
+        self.owner_type = owner_type
         self.calls: List[Tuple[Tuple[str, ...], Optional[bytes]]] = []
         self.missing = False
 
@@ -168,8 +170,9 @@ class FakeGh:
         method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
         path = argv[-1] if stdin is None else argv[argv.index("--input") - 1]
         if method == "GET" and path == "repos/{owner}/{repo}":
+            owner = {"login": self.owner, **({} if self.owner_type is None else {"type": self.owner_type})}
             body: Any = {"full_name": f"{self.owner}/proj", "default_branch": self.default_branch,
-                         "owner": {"login": self.owner}, "permissions": {"admin": self.admin, "push": True}}
+                         "owner": owner, "permissions": {"admin": self.admin, "push": True}}
         elif method == "GET" and "/rules/branches/" in path:
             body = self.rules
         elif method == "GET" and path.endswith("/rulesets"):
@@ -189,19 +192,35 @@ class FakeGh:
         return [c for c in self.calls if "--method" in c[0] and c[0][c[0].index("--method") + 1] != "GET"]
 
 
-def pull_request_rule(approvals: int = 1, code_owners: bool = True) -> Dict[str, Any]:
+def pull_request_rule(approvals: int = 1, code_owners: bool = True, dismiss_stale: Any = True,
+                      last_push: bool = False) -> Dict[str, Any]:
     return {"type": "pull_request", "parameters": {"required_approving_review_count": approvals,
-                                                    "require_code_owner_review": code_owners}}
+                                                    "require_code_owner_review": code_owners,
+                                                    "dismiss_stale_reviews_on_push": dismiss_stale,
+                                                    "require_last_push_approval": last_push}}
 
 
-def checks_rule(*contexts: str) -> Dict[str, Any]:
+def checks_rule(*contexts: str, integration_id: Any = human_gate.GITHUB_ACTIONS_APP_ID) -> Dict[str, Any]:
+    """Required checks whose source is pinned to GitHub Actions; ``integration_id=None`` omits the source."""
+    source = {} if integration_id is None else {"integration_id": integration_id}
     return {"type": "required_status_checks", "parameters": {
-        "required_status_checks": [{"context": c} for c in (contexts or ("validate",))]}}
+        "required_status_checks": [{"context": c, **source} for c in (contexts or ("aegis-check",))]}}
+
+
+# The Aegis job a required check must name (the scaffold's shape, without a version pin).
+AEGIS_WORKFLOW = (
+    "name: Aegis\non:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n  aegis-check:\n"
+    "    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n      - run: aegis check --ci\n"
+)
 
 
 CODEOWNERS_FULL = (
     "/.aegis/rules/ @octo\n/.aegis/config.json @octo\n/.aegis/team.json @octo\n/.aegis/baseline.json @octo\n"
+    "/.aegis/adjudications/ @octo\n**/.aegis/rules/ @octo\n**/.aegis/adjudications/ @octo\n"
+    "**/.aegis/config.json @octo\n**/.aegis/team.json @octo\n**/.aegis/baseline.json @octo\n"
     "/allowed_signers @octo\n/CODEOWNERS @octo\n/.github/CODEOWNERS @octo\n/.github/workflows/ @octo\n"
     "conftest.py @octo\npytest.ini @octo\n.pytest.ini @octo\npytest.toml @octo\n.pytest.toml @octo\n"
     "tox.ini @octo\nsetup.cfg @octo\npyproject.toml @octo\nsitecustomize.py @octo\n*.pth @octo\nMakefile @octo\n"
+    "pytest.* @octo\n_pytest.* @octo\npluggy.* @octo\npy.* @octo\niniconfig.* @octo\n"
+    "/pytest/ @octo\n/_pytest/ @octo\n/pluggy/ @octo\n/py/ @octo\n/iniconfig/ @octo\n"
 )

@@ -9,13 +9,23 @@ same key are two reports. A report names at least one rule.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
+from aegis_core import checkrun, credit, treeid
+from aegis_core.telemetry_engine import ledger
 import aegis_mcp.server as server
 from aegis_mcp.tools import execute_tool
+from tests import helpers_humangate as hg
+from tests import helpers_verified as hv
+
+needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+DOCS_RULE = ("---\nid: trap-docs\ntype: trap\nenforcement: advisory\nhypothesis: docs\n"
+             "target_paths:\n  - docs/*.md\n---\n# Docs\n\nBody long enough to be a rule body.\n")
 
 KEY_REQUIRED = (
     "'idempotency_key' is required: send a unique key per report so a retry is never recorded twice."
@@ -264,3 +274,169 @@ def test_row_host_names_the_client_and_an_unknown_client_is_generic(served, clie
     assert response["result"]["isError"] is False, payload
     row, = _rows(served)
     assert row["host"] == host
+
+
+# ── the credited set is the server's own exposure (R-trust-64) ──────────────
+
+def _project(tmp_path, monkeypatch) -> hg.Repo:
+    """``trap-sample`` (src/*.py) and ``trap-docs`` (docs/*.md); the work tree changes both paths."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setattr(credit, "_EXPOSED", {})
+    repo = hv.make_project(tmp_path)
+    repo.write(".aegis/rules/traps/trap-docs.md", DOCS_RULE)
+    repo.write("docs/guide.md", "# guide\n")
+    repo.commit("a docs rule")
+    hv.use_stub_runner(repo.home.path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.write("docs/guide.md", "# guide v2\n")
+    return repo
+
+
+def _scan_as(repo: hg.Repo, files, session: str = "S") -> None:
+    assert hv.mcp_call("aegis_scan", repo.root, session=session, files=list(files)).get("status") != "FAIL"
+
+
+def _check(repo: hg.Repo) -> dict:
+    out = checkrun.record(repo.root, tests=True, base="main")
+    assert out.status == "recorded" and out.row["passed"] is True
+    return out.row
+
+
+def _report_as(repo: hg.Repo, session: str = "S", key: str = "k1") -> dict:
+    return hv.mcp_call("aegis_report_outcome", repo.root, session=session, outcome="success",
+                       rules_used=["trap-sample"], idempotency_key=key)
+
+
+@needs_git
+def test_a_ledger_exposure_row_never_enlarges_the_credited_set(tmp_path, monkeypatch):
+    """Given session S's scan exposed only trap-sample and an exposure row naming trap-docs for S and
+    its host appended straight to the ledger, When S reports a passing check whose change matches
+    both, Then only trap-sample is credited."""
+    repo = _project(tmp_path, monkeypatch)
+    _scan_as(repo, ["src/app.py"])
+    ledger.append_rows(repo.root, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-19T00:00:00Z", "event": "exposure",
+                                    "rule": "trap-docs", "session": "S", "host": "claude-code",
+                                    "paths": ["docs/guide.md"], "rev": None}])
+    assert credit.exposed_rules(repo.root, "claude-code", "S") == {"trap-sample", "trap-docs"}  # display reads both
+    _check(repo)
+    res = _report_as(repo)
+    assert (res["status"], res["credited"]) == ("recorded", ["trap-sample"])
+    assert [r["rule"] for r in hv.rows_of(repo.root, "report")] == ["trap-sample"]
+
+
+@needs_git
+def test_a_rule_the_servers_own_scan_exposed_is_credited(tmp_path, monkeypatch):
+    repo = _project(tmp_path, monkeypatch)
+    _scan_as(repo, ["src/app.py", "docs/guide.md"])
+    _check(repo)
+    assert _report_as(repo)["credited"] == ["trap-docs", "trap-sample"]
+
+
+@needs_git
+def test_a_fresh_server_process_credits_nothing_from_persisted_exposure_rows(tmp_path, monkeypatch):
+    """Given S's exposure rows persisted by an earlier server process, When a new process (no
+    in-process exposure) records S's report, Then it is witnessed, credits nothing and does not fail."""
+    repo = _project(tmp_path, monkeypatch)
+    _scan_as(repo, ["src/app.py", "docs/guide.md"])
+    assert {r["rule"] for r in hv.rows_of(repo.root, "exposure")} == {"trap-sample", "trap-docs"}
+    monkeypatch.setattr(credit, "_EXPOSED", {})
+    _check(repo)
+    res = _report_as(repo)
+    assert (res["status"], res["witness"], res["credited"]) == ("recorded", "aegis", [])
+    assert hv.rows_of(repo.root, "report") == []
+
+
+# ── one tree computation per report, outside the ledger lock (R-trust-53) ────
+
+@needs_git
+def test_one_report_computes_the_work_tree_once(tmp_path, monkeypatch):
+    """Given a passing check for the current tree and an exposed rule, When one report runs, Then
+    the tree is bound once and git add runs once; the credit is unchanged."""
+    repo = _project(tmp_path, monkeypatch)
+    _scan_as(repo, ["src/app.py"])
+    _check(repo)
+    real_bind, real_run = treeid.bind, subprocess.run
+    entered, adds = [], []
+
+    @contextlib.contextmanager
+    def counting_bind(root):
+        entered.append(root)
+        with real_bind(root) as bound:
+            yield bound
+
+    def spying_run(argv, *args, **kwargs):
+        if isinstance(argv, (list, tuple)) and "add" in argv and "-A" in argv:
+            adds.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(treeid, "bind", counting_bind)
+    monkeypatch.setattr(subprocess, "run", spying_run)
+    res = _report_as(repo)
+    assert (res["status"], res["credited"]) == ("recorded", ["trap-sample"])
+    assert (len(entered), len(adds)) == (1, 1)
+
+
+@needs_git
+def test_the_credited_rules_follow_the_check_chosen_under_the_lock(tmp_path, monkeypatch):
+    """Given a second passing check for the same tree appended after the handler bound the tree but
+    before the ledger lock is taken, Then the diff is taken against the base of the check the report
+    chose (the newest) and that check's rules are credited, not the first check's."""
+    repo = _project(tmp_path, monkeypatch)
+    _scan_as(repo, ["src/app.py", "docs/guide.md"])
+    first = _check(repo)
+    second = dict(first, id="e" * 16, base="docs-base")
+    diffed = []
+
+    class Bound:
+        binding = treeid.TreeBinding("ok", first["tree"], "")
+
+        def diff_entries(self, base):
+            diffed.append(base)
+            return [("M", "docs/guide.md")] if base == "docs-base" else [("M", "src/app.py")]
+
+    @contextlib.contextmanager
+    def late_check_bind(root):
+        bound = Bound()
+        ledger.append_rows(repo.root, [second])
+        yield bound
+
+    monkeypatch.setattr(treeid, "bind", late_check_bind)
+    res = _report_as(repo)
+    assert diffed == ["docs-base"]
+    assert (res["check"], res["credited"]) == (second["id"], ["trap-docs"])
+
+
+@needs_git
+@pytest.mark.parametrize("error", [treeid.TreeError("git is not installed or not on PATH"), OSError("no temp dir")])
+def test_a_bind_that_fails_records_one_unwitnessed_claim(tmp_path, monkeypatch, error):
+    repo = _project(tmp_path, monkeypatch)
+    _scan_as(repo, ["src/app.py"])
+    _check(repo)
+
+    @contextlib.contextmanager
+    def failing_bind(root):
+        raise error
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(treeid, "bind", failing_bind)
+    res = _report_as(repo)
+    assert (res["status"], res["witness"], res["credited"], res["scope"]) == ("claimed", "self", [], {"tree": None})
+    claimed, = hv.rows_of(repo.root, "claimed")
+    assert claimed["tree"] is None and hv.rows_of(repo.root, "report") == []
+
+
+@needs_git
+def test_a_failure_while_recording_is_reported_not_raised(tmp_path, monkeypatch):
+    repo = _project(tmp_path, monkeypatch)
+
+    def broken_submit(*_args, **_kwargs):
+        raise RuntimeError("ledger is on fire")
+
+    monkeypatch.setattr(credit, "submit_report", broken_submit)
+    assert _report_as(repo) == {"status": "FAIL", "error": "Failed to record outcome: ledger is on fire"}

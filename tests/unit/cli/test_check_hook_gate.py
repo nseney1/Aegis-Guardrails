@@ -263,6 +263,23 @@ def test_a_workspace_below_the_git_toplevel_checks_its_own_files(repo, monkeypat
     assert [(e["tool"], e["target"]) for e in payload["layer1"] if not e["verdict"]] == [("forbid_ast:no-eval", "app.py")]
 
 
+def test_a_workspace_the_enclosing_repository_does_not_track_enforces_its_own_rules(repo, monkeypatch, capsys):
+    """Given a workspace in a directory the enclosing repository never committed (a project inside
+    a $HOME repository), When plain ``aegis check`` runs on it, Then its own gate rules are enforced:
+    that repository's base holds no reviewed rules for it, which must not mean no rules."""
+    _stage(repo, "README.md", "# home\n")
+    _commit(repo, "home")
+    pkg = repo / "project"
+    (pkg / ".aegis" / "rules" / "invariants").mkdir(parents=True)
+    (pkg / ".aegis" / "rules" / "invariants" / "no-eval.md").write_text(NO_EVAL, encoding="utf-8")
+    (pkg / "app.py").write_text(EVAL, encoding="utf-8")
+    monkeypatch.chdir(pkg)
+
+    assert main(["check", "--format", "json", "app.py"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert ("forbid_ast:no-eval", "app.py") in [(e["tool"], e["target"]) for e in payload["layer1"] if not e["verdict"]]
+
+
 # ── The hook reads from git only what a check can read ──────────────────────
 
 def _staged_oid(repo: Path, rel: str) -> str:

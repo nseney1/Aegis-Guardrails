@@ -527,7 +527,8 @@ def _extinct(repo: Path, rule_id: str) -> Path:
     path = repo / ".aegis" / "rules" / "traps" / f"{rule_id}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"---\nid: {rule_id}\ntype: trap\nhypothesis: h\n---\nBody\n", encoding="utf-8")
-    ledger.append(repo, [{"rule": rule_id, "outcome": "fp", "source": "ci", "key": f"run-{n}"} for n in range(3)])
+    # MIN_N (25) false positives: no archive below the one sample gate (R-evidence-8)
+    ledger.append(repo, [{"rule": rule_id, "outcome": "fp", "source": "ci", "key": f"run-{n}"} for n in range(25)])
     return path
 
 

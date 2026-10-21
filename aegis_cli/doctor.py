@@ -40,16 +40,18 @@ determine), ``checks_ok`` (no blocking check failed; it says nothing about the h
 (how many entries of the shared state are looser than 0700/0600; a count, never names),
 ``findings``, and with ``--fix`` the ``fixes`` it applied and its ``backup_dir``.
 
-The trust tier (``aegis_core.human_gate``, v4.3 §2.2) is printed on every report: A, separation
-of duties; B, solo with signed approvals; C, self-attested. ``--github`` prints what A and B
+The trust tier (``aegis_core.human_gate``, v4.3 §2.2) is printed on every full report: A,
+separation of duties; B, solo with signed approvals; C, self-attested; ``--drivers`` and
+``--release`` print what they ran (``--drivers`` reads no tier, ``--release`` prints the tier it
+read, or why it could not). ``--github`` prints what A and B
 need: the exact ruleset JSON, the CODEOWNERS lines and the signing setup. ``--github --apply
 --tier A|B`` creates that ruleset through ``gh api``, and only after an interactive y/N at a
 terminal: ``--yes`` and ``--json`` never apply, and a ruleset of the same name is never
 touched. ``--release SHA`` (aegis_core.release_verify) asks ``gh attestation verify`` whether the
 CI verdict job attested that exact commit, pinning repository, workflow, digest and ref; a gh
 that is missing or older than 2.93.0 prints ``UNVERIFIED (gh >= 2.93.0 required)`` and exits
-non-zero, and at tier C the report says "attestation present, but the workflow is agent-editable"
-and exits non-zero too (the release claim needs tier A or B).
+non-zero, and at tiers B and C the report says the workflow is agent-editable and exits non-zero too
+(the release claim needs tier A).
 
 Each row lists the ``surfaces`` its config plane covers (CLI, IDE extension, desktop app).
 A row whose host table entry is unverified (``verified_row`` false: Cursor, Copilot, Kiro,

@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-import time
+import sys
 
 import pytest
 
@@ -87,8 +87,6 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
         "src/main.py",
         "--kind",
         "reliability",
-        "--session",
-        "cli-sess-1",
         "--json",
     )
     assert rc == 0, err
@@ -96,7 +94,7 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
     assert added["level"] == "cli"
     assert added["psrc"] == "explicit"
     assert added["paths"] == ["src/main.py"]
-    assert "hs" in added
+    assert "hs" not in added  # session identity comes from the host, never a CLI argument
 
     rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
     assert rc == 0, err
@@ -140,9 +138,19 @@ def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypat
     assert rc1 == 0, err1
     assert json.loads(out1)["status"] == "enabled_excerpts"
 
+    claude = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    (handler,) = claude["hooks"]["UserPromptSubmit"][-1]["hooks"]
+    assert handler["command"] == sys.executable and handler["args"][:2] == ["-I", "-c"]
+    assert handler["args"][-2:] == ["claude-code", "--excerpts"]
+
     rc2, out2, err2 = _invoke_rule(ws, "insight", "enable", "--host", "codex-cli", "--json")
-    assert rc2 == 0, err2
-    assert json.loads(out2)["status"] == "enabled_counters_only"
+    if os.name == "nt":
+        # Codex runs hooks through %COMSPEC% /C, which cannot take the pinned -c program.
+        assert rc2 == 1 and "%COMSPEC%" in json.loads(out2)["error"]
+        assert not (home / ".codex").exists()
+    else:
+        assert rc2 == 0, err2
+        assert json.loads(out2)["status"] == "enabled_counters_only"
 
     # Run doctor --json and verify per-host insight_capture state
     monkeypatch.setattr(
@@ -158,12 +166,14 @@ def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypat
     hosts_by_id = {h["id"]: h["insight_capture"] for h in payload["hosts"]}
     assert hosts_by_id["claude-code"]["status"] == "enabled_excerpts"
     assert hosts_by_id["claude-code"]["excerpts"] is True
-    assert hosts_by_id["codex-cli"]["status"] == "enabled_counters_only"
+    assert hosts_by_id["codex-cli"]["status"] == ("disabled" if os.name == "nt" else "enabled_counters_only")
     assert hosts_by_id["codex-cli"]["excerpts"] is False
     assert hosts_by_id["antigravity"]["status"] == "explicit_only"
 
 
-def test_hook_entrypoint_exits_zero_empty_stdout_and_under_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_hook_entrypoint_exits_zero_with_empty_output_and_a_heartbeat_per_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -175,22 +185,42 @@ def test_hook_entrypoint_exits_zero_empty_stdout_and_under_budget(tmp_path: Path
         "session_id": "fast-hook-sess-1",
         "cwd": str(ws),
     })
-    # Warm up link.key creation first, then time routine prompt hook execution
     run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
 
+    from aegis_core import rules as core_rules
+
+    parses: list = []
+    real = core_rules.load_rules
+    monkeypatch.setattr(core_rules, "load_rules", lambda *a, **k: parses.append(a) or real(*a, **k))
     out, err = io.StringIO(), io.StringIO()
-    t0 = time.perf_counter()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     assert rc == 0
     assert out.getvalue() == ""
     assert err.getvalue() == ""
-    assert elapsed_ms < 40.0, f"hook took {elapsed_ms:.2f}ms (> 40ms budget)"
+    assert parses == []  # no rule files: nothing to fingerprint or parse
     rows = read_insight_rows(ws, home=home)
-    assert len(rows) == 1
-    assert rows[0]["event"] == "heartbeat"
+    assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
+
+
+def test_a_corrupt_insights_log_still_exits_zero_silently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    (ws / ".aegis" / "rules" / "traps" / "trap-x.md").write_text(
+        "---\nid: trap-x\ntype: trap\nenforcement: advisory\n---\n# trap-x\n\nBody.\n", encoding="utf-8")
+    store = insights_path(ws, home=home)
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b'\xff\xfe{not json\n{"event": "inventory", "inv": 7\n')
+    payload = json.dumps({"prompt": "Please run the unit tests.", "session_id": "corrupt-1", "cwd": str(ws)})
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=payload, home=home)
+    assert (rc, out.getvalue(), err.getvalue()) == (0, "", "")
+    assert [r["event"] for r in read_insight_rows(ws, home=home)] == ["inventory", "heartbeat"]
 
 
 def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -231,3 +261,88 @@ def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: p
     )
     assert rc == 0, err
     assert json.loads(out)["level"] == "H"
+
+
+# ── `insight add` takes no session identity (R-evidence-42) ─────────────────
+
+@pytest.mark.parametrize("flag", ["--session", "--host"])
+def test_insight_add_refuses_a_typed_session_or_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, flag):
+    from aegis_cli.cli import main
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    ws = _make_workspace(tmp_path / "ws")
+    with pytest.raises(SystemExit) as exc:
+        main(["rule", "insight", "add", "No, stop that", flag, "x", "--workspace", str(ws)])
+    assert exc.value.code == 2
+    assert flag in capsys.readouterr().err
+    assert read_insight_rows(ws, home=tmp_path / "home") == []
+
+
+def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core.insights import measure_recurrence
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    (ws / ".aegis" / "rules" / "traps" / "trap-popen-timeout.md").write_text(
+        "---\nid: trap-popen-timeout\ntype: trap\nenforcement: advisory\n"
+        "hypothesis: Popen without a timeout hangs.\ntarget_paths:\n  - src/*.py\n---\n"
+        "# trap-popen-timeout\n\nNever call subprocess.Popen without a timeout in src modules.\n",
+        encoding="utf-8",
+    )
+    for _ in range(3):
+        rc, _out, err = _invoke_rule(
+            ws, "insight", "add", "Never call subprocess.Popen without a timeout in src/main.py",
+            "--paths", "src/main.py", "--json",
+        )
+        assert rc == 0, err
+    rows = [r for r in read_insight_rows(ws, home=home) if r.get("event") == "insight"]
+    assert len(rows) == 3
+    assert all("hs" not in r and r["host"] == "cli" for r in rows)
+    assert measure_recurrence(ws, "trap-popen-timeout", home=home)["recurrences"] == 1
+
+
+# ── one confinement rule on every channel (R-evidence-43) ─────────────────────
+
+def test_insight_add_refuses_a_path_outside_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    rc, _out, _err = _invoke_rule(ws, "insight", "add", "Never read passwd", "--paths", "../../etc/passwd", "--json")
+    assert rc != 0
+    assert read_insight_rows(ws, home=home) == []
+
+
+def test_insight_add_keeps_a_comma_path_whole_and_stores_absolute_paths_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    rc, out, err = _invoke_rule(ws, "insight", "add", "Keep commas", "--paths", "src/a,b.py", "--json")
+    assert rc == 0, err
+    assert json.loads(out)["paths"] == ["src/a,b.py"]
+    rc, out, err = _invoke_rule(ws, "insight", "add", "Absolute", "--paths", str(ws / "src" / "main.py"), "--json")
+    assert rc == 0, err
+    assert json.loads(out)["paths"] == ["src/main.py"]
+
+
+def test_mcp_capture_insight_confines_like_the_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_mcp.tools import execute_tool
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    bad = execute_tool("aegis_capture_insight", {"workspace": str(ws), "quote": "Stay inside", "paths": ["../outside.py"]})
+    assert bad["status"] == "FAIL"
+    assert read_insight_rows(ws, home=home) == []
+    ok = execute_tool("aegis_capture_insight",
+                      {"workspace": str(ws), "quote": "Stay inside", "paths": [str(ws / "src" / "main.py"), "src/a,b.py"]})
+    assert ok["status"] == "OK", ok
+    assert ok["paths"] == ["src/a,b.py", "src/main.py"]

@@ -330,6 +330,96 @@ def test_aegis_no_test_with_verified_human_gate_approval_exempts_and_reports_rat
 
 @needs_git
 @needs_signing
+def test_a_signed_exemption_need_not_repeat_the_no_test_reason(tmp_path: Path, keys: Dict[str, Any]):
+    """Given ``Aegis-No-Test: docs only`` on a test-less fix commit and a valid signed exemption whose
+    reason is ``only documentation, reviewed``, When regressions are checked, Then the fix is exempted."""
+    repo = make_calc_repo(tmp_path, signer_pub=keys["human_pub"])
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    fix_oid = repo.commit("fix: add fallback ping\n\nAegis-No-Test: docs only")
+    repo.commit(human_gate.exemption_message(fix_oid, "only documentation, reviewed"), sign_key=keys["human"],
+                allow_empty=True)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert report.passed is True and report.commits[0].status == "exempted", report.findings
+    assert report.findings == ()
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("signer, extra, code", [
+    ("intruder", "", "untrusted_signature"),
+    (None, "", "unsigned"),
+    ("human", "Aegis-Accept: x\n", "accept_reserved"),
+], ids=["untrusted", "unsigned", "accept"])
+def test_a_rejected_exemption_names_its_verdict_code_in_the_report(
+    tmp_path: Path, keys: Dict[str, Any], signer: Any, extra: str, code: str
+):
+    """Given a test-less fix commit and an exemption for it that is signed by a key outside the base
+    allowed_signers, unsigned, or beside a reserved line, When regressions are checked, Then the fix
+    fails and its row and finding name the verdict code, not only no_test_changes."""
+    intruder, _pub = hg.keygen(tmp_path / "keys", "intruder")
+    repo = make_calc_repo(tmp_path, signer_pub=keys["human_pub"])
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    fix_oid = repo.commit("fix: add fallback ping\n\nAegis-No-Test: trivial constant return")
+    sign_key = {"intruder": intruder, "human": keys["human"], None: None}[signer]
+    repo.commit(human_gate.exemption_message(fix_oid, "trivial constant return") + extra, sign_key=sign_key,
+                allow_empty=True)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    item = report.commits[0]
+    assert (item.status, item.reason, item.exempted) == ("failed", "no_test_changes", False)
+    assert item.exemption_code == code and item.as_dict()["exemption_code"] == code
+    assert code in report.findings[0].message
+    assert report.approval is None
+
+
+@needs_git
+def test_a_fix_with_no_exemption_at_all_names_no_exemption_code(tmp_path: Path):
+    repo = make_calc_repo(tmp_path)
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    repo.commit("fix: add fallback ping\n\nAegis-No-Test: trivial constant return")
+    repo.commit("docs: unrelated note\n\nAegis-Exempt-Test: " + "a" * 40 + " some other commit\n", allow_empty=True)
+
+    item = regression.check_ci_regressions(repo.root, "main", "HEAD").commits[0]
+    assert item.status == "failed" and item.as_dict()["exemption_code"] is None
+
+
+@needs_git
+@pytest.mark.parametrize("body", [
+    "Aegis-Accept: whatever\n",
+    "Aegis-Accept: x\nAegis-Exempt-Test: " + "a" * 40 + " another fix\n",
+], ids=["accept-only", "accept-beside-another-exemption"])
+def test_an_unrelated_reserved_line_is_not_a_rejected_exemption_of_the_fix(tmp_path: Path, body: str):
+    """Given a test-less fix commit and a later commit whose Aegis-Accept line sits beside no exemption
+    of that fix, When regressions are checked, Then the fix fails without a rejected-exemption code."""
+    repo = make_calc_repo(tmp_path)
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    repo.commit("fix: add fallback ping\n\nAegis-No-Test: trivial constant return")
+    repo.commit("docs: unrelated note\n\n" + body, allow_empty=True)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    item = report.commits[0]
+    assert (item.status, item.reason, item.exemption_code) == ("failed", "no_test_changes", None)
+    assert "rejected" not in report.findings[0].message
+
+
+@needs_git
+@needs_signing
+def test_the_rejected_exemption_reported_is_the_one_that_names_the_fix(tmp_path: Path, keys: Dict[str, Any]):
+    """Given an unsigned exemption naming a test-less fix and a newer unrelated commit with an
+    Aegis-Accept line, When regressions are checked, Then the fix's code is unsigned, not accept_reserved."""
+    repo = make_calc_repo(tmp_path, signer_pub=keys["human_pub"])
+    repo.write("src/other.py", "def ping() -> str:\n    return 'pong'\n")
+    fix_oid = repo.commit("fix: add fallback ping\n\nAegis-No-Test: trivial constant return")
+    repo.commit(human_gate.exemption_message(fix_oid, "trivial constant return"), allow_empty=True)
+    repo.commit("docs: unrelated note\n\nAegis-Accept: whatever\n", allow_empty=True)
+
+    item = regression.check_ci_regressions(repo.root, "main", "HEAD").commits[0]
+    assert (item.status, item.exemption_code) == ("failed", "unsigned")
+
+
+@needs_git
+@needs_signing
 def test_governance_tree_approval_never_exempts_testless_fix_commit(
     tmp_path: Path, keys: Dict[str, Any]
 ):
@@ -378,9 +468,12 @@ def test_targeted_test_exemption_exempts_only_named_fix_commit(
 
 
 @needs_git
-def test_tree_blobs_is_cached_and_not_recomputed_on_cache_hits(
+def test_performance_invariant_each_commit_tree_is_read_at_most_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    """Performance invariant, not behaviour: the regression check reads each commit's tree once
+    however many fix commits share it. The verdict is the same either way, so only counting the
+    calls to the private tree reader can see a regression here."""
     repo = make_calc_repo(tmp_path)
     repo.write(
         "src/calc.py",
@@ -429,7 +522,7 @@ def test_tree_blobs_is_cached_and_not_recomputed_on_cache_hits(
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert all(count == 1 for count in call_counts.values()), call_counts
+    assert call_counts and all(count == 1 for count in call_counts.values()), call_counts
 
 
 # ── 4. Warning-tier rollout & `aegis check --ci` integration ─────────────────

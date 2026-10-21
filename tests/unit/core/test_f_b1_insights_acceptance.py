@@ -30,6 +30,7 @@ from aegis_core.insights import (
     has_correction_cue,
     insights_path,
     measure_recurrence,
+    read_insight_rows,
     read_link_key,
     record_decision,
     record_hook_prompt,
@@ -41,6 +42,7 @@ from aegis_core.insights import (
 from aegis_core.rules import load_rules
 from aegis_core.scan import scan as scan_workspace
 from aegis_core.scan_compliance import record as record_activity
+from aegis_core.storage import append_jsonl
 from aegis_core.telemetry_engine import ledger
 
 
@@ -77,6 +79,16 @@ def _write_rule(repo: Path, rule_id: str, target_paths: list[str], body: str, *,
     target = folder / f"{rule_id}.md"
     target.write_text(content, encoding="utf-8")
     return target
+
+
+def _hook_insight(repo: Path, text: str, session: str, home: Path) -> Dict[str, Any]:
+    """A keyed-hs insight as the host delivers it: a hook payload, never a typed argument.
+    The hook takes its paths from the dirty set, so src/app.py is made dirty first, as the
+    explicit ``paths=["src/app.py"]`` of the CLI channel did."""
+    (repo / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+    row = record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    assert row.get("event") == "insight", f"no correction cue in {text!r}"
+    return row
 
 
 # ── 1. Redaction & 300-char cap ──────────────────────────────────────────────
@@ -304,14 +316,7 @@ def test_keyed_hs_pseudonymization_and_link_key_creation(tmp_path: Path, monkeyp
     ).hexdigest()[:32]
     assert session_hs("claude-code", native_session, raw_key) == expected_hs
 
-    add_insight(
-        repo,
-        "Don't use bare except blocks in storage handlers.",
-        paths=["src/app.py"],
-        host="claude-code",
-        session=native_session,
-        home=home,
-    )
+    _hook_insight(repo, "Don't use bare except blocks in storage handlers.", native_session, home)
     raw_file = insights_path(repo, home=home).read_text(encoding="utf-8")
     assert native_session not in raw_file
     row = json.loads(raw_file.splitlines()[-1])
@@ -379,52 +384,17 @@ def test_tfidf_clustering_rule_matching_and_rejected_cluster_cooldown(tmp_path: 
     )
 
     # Add insight matching exposed rule in session-exposed-1 -> exposed_and_ignored
-    add_insight(
-        repo,
-        "Do not pass shell=True to subprocess calls in src/app.py",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-exposed-1",
-        home=home,
-    )
+    _hook_insight(repo, "Do not pass shell=True to subprocess calls in src/app.py", "session-exposed-1", home)
 
     # Add insight matching trap-no-eval in session without exposure -> not_exposed
-    add_insight(
-        repo,
-        "Never call eval or exec on dynamic strings in src/app.py",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-unexposed-2",
-        home=home,
-    )
+    _hook_insight(repo, "Never call eval or exec on dynamic strings in src/app.py", "session-unexposed-2", home)
 
     # Add insight matching archived rule -> matches_archived
-    add_insight(
-        repo,
-        "Do not deserialize pickle payloads from untrusted sockets in src/app.py",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-unexposed-3",
-        home=home,
-    )
+    _hook_insight(repo, "Do not deserialize pickle payloads from untrusted sockets in src/app.py", "session-unexposed-3", home)
 
     # Add two similar insights with no matching rule -> cluster together with no_rule
-    ins_a = add_insight(
-        repo,
-        "Stop mutating global os.environ directly inside worker threads",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-4",
-        home=home,
-    )
-    ins_b = add_insight(
-        repo,
-        "Never mutate global os.environ state inside worker threads",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-5",
-        home=home,
-    )
+    ins_a = _hook_insight(repo, "Stop mutating global os.environ directly inside worker threads", "session-4", home)
+    ins_b = _hook_insight(repo, "Never mutate global os.environ state inside worker threads", "session-5", home)
 
     rev = review_insights(repo, home=home)
     classifications = {c["match_status"]: c for c in rev["clusters"]}
@@ -453,26 +423,13 @@ def test_tfidf_clustering_rule_matching_and_rejected_cluster_cooldown(tmp_path: 
     assert all(c["cluster_id"] != cluster_id for c in rev_after_reject["clusters"])
 
     # 1 new insight arrives -> still suppressed (< 2 new insights since rejection)
-    add_insight(
-        repo,
-        "Do not mutate global os.environ variables inside worker threads",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-6",
-        home=home,
-    )
+    _hook_insight(repo, "Do not mutate global os.environ variables inside worker threads", "session-6", home)
     rev_after_one = review_insights(repo, home=home)
     assert not any("os.environ" in " ".join(c.get("excerpts", [])) for c in rev_after_one["clusters"])
 
     # 2nd new insight arrives -> cluster re-surfaces!
-    add_insight(
-        repo,
-        "Avoid mutating global os.environ dictionary in worker threads",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-7",
-        home=home,
-    )
+    # "Don't", not "Avoid": the hook records only prompts with a correction cue.
+    _hook_insight(repo, "Don't mutate global os.environ dictionary in worker threads", "session-7", home)
     rev_after_two = review_insights(repo, home=home)
     resurfaced = [c for c in rev_after_two["clusters"] if c["match_status"] == "no_rule"]
     assert len(resurfaced) == 1
@@ -555,14 +512,8 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
             # In session 1, emit two burst insights back-to-back -> must collapse to 1 episode
             repeats = 2 if s_idx == 1 else 1
             for _ in range(repeats):
-                add_insight(
-                    repo,
-                    "Stop calling recursive directory removal without path confinement check in src/app.py",
-                    paths=["src/app.py"],
-                    host="claude-code",
-                    session=sid,
-                    home=home,
-                )
+                _hook_insight(
+                    repo, "Stop calling recursive directory removal without path confinement check in src/app.py", sid, home)
 
     rec1 = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert rec1["sessions"] == 5
@@ -597,22 +548,8 @@ def test_same_rule_dissimilar_insights_stay_separate_through_rejection_and_resur
         "Never invoke subprocess with shell=True command execution and never call pickle.loads on untrusted socket payloads.",
     )
 
-    ins_shell = add_insight(
-        repo,
-        "Stop invoking subprocess with shell=True command execution",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="sess-shell-1",
-        home=home,
-    )
-    ins_pickle = add_insight(
-        repo,
-        "Never call pickle.loads on untrusted socket payload bytes",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="sess-pickle-1",
-        home=home,
-    )
+    ins_shell = _hook_insight(repo, "Stop invoking subprocess with shell=True command execution", "sess-shell-1", home)
+    ins_pickle = _hook_insight(repo, "Never call pickle.loads on untrusted socket payload bytes", "sess-pickle-1", home)
 
     rev = review_insights(repo, home=home)
     clusters = rev["clusters"]
@@ -642,22 +579,8 @@ def test_same_rule_dissimilar_insights_stay_separate_through_rejection_and_resur
     assert len(rev_after_reject["suppressed_clusters"]) == 1
 
     # Add 2 more insights similar to cluster 1 -> cluster 1 resurfaces alongside cluster 2
-    add_insight(
-        repo,
-        "Do not invoke subprocess with shell=True command execution",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="sess-shell-2",
-        home=home,
-    )
-    add_insight(
-        repo,
-        "Avoid invoking subprocess with shell=True command execution",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="sess-shell-3",
-        home=home,
-    )
+    _hook_insight(repo, "Do not invoke subprocess with shell=True command execution", "sess-shell-2", home)
+    _hook_insight(repo, "Don't invoke subprocess with shell=True command execution", "sess-shell-3", home)
 
     rev_resurfaced = review_insights(repo, home=home)
     assert len(rev_resurfaced["clusters"]) == 2
@@ -683,7 +606,14 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
         "Always check path confinement before recursive directory removal.",
     )
 
-    # Emit 10 heartbeats without session_id (missing hs)
+    # Seed 10 legacy heartbeats without session identity (4.3 wrote one per session-less
+    # prompt); a session-less prompt writes none now (R-structure-a2).
+    rev = load_rules(repo).get("trap-validate-rmtree").digest[:16]
+    legacy = {"v": 1, "ts": "2026-10-20T00:00:00Z", "event": "heartbeat", "host": "claude-code",
+              "revs": {"trap-validate-rmtree": rev}}
+    store = insights_path(repo, home=home)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    append_jsonl(store, [dict(legacy) for _ in range(10)])
     for _ in range(10):
         record_hook_prompt(
             repo,
@@ -691,6 +621,7 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
             {"prompt": "Please run the unit tests.", "cwd": str(repo)},
             home=home,
         )
+    assert len(read_insight_rows(repo, home=home)) == 10
 
     rec_missing = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert rec_missing["status"] == "insufficient_session_identity"
@@ -746,14 +677,7 @@ def test_insights_file_created_with_0600_mode_before_first_write(
 
     saved_umask = os.umask(0o022) if os.name == "posix" else None
     try:
-        add_insight(
-            repo,
-            "Never leave new user insight files world-readable during write.",
-            paths=["src/app.py"],
-            host="claude-code",
-            session="sess-mode-1",
-            home=home,
-        )
+        add_insight(repo, "Never leave new user insight files world-readable during write.", paths=["src/app.py"], home=home)
     finally:
         if saved_umask is not None:
             os.umask(saved_umask)
@@ -795,14 +719,7 @@ def test_ordinary_mcp_aegis_scan_records_exposure_for_review_insights_without_ou
     assert scan_res.get("status") != "FAIL"
     assert ledger.read(repo).rows == []
 
-    add_insight(
-        repo,
-        "Do not pass shell=True to subprocess calls in src/app.py",
-        paths=["src/app.py"],
-        host="claude-code",
-        session="session-exposed-1",
-        home=home,
-    )
+    _hook_insight(repo, "Do not pass shell=True to subprocess calls in src/app.py", "session-exposed-1", home)
 
     rev_in_mem = review_insights(repo, home=home)
     assert len(rev_in_mem["clusters"]) == 1

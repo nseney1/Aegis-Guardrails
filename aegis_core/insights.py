@@ -1,4 +1,18 @@
-"""Human insights closed loop (v4.3 spec §3.5 T8, v4.4 spec §3.4 & §12.2)."""
+"""Human insights closed loop (v4.3 spec §3.5 T8, v4.4 spec §3.4 & §12.2).
+
+The per-prompt hook path (record_hook_prompt) imports only the standard library and the
+L0 transports at module load: credit, human_gate, the ledger, scan_compliance, the rule
+parser and the redaction scanners are imported where review or capture uses them, so a
+prompt that writes nothing pays for none of them. Their public re-exports stay reachable
+through the module ``__getattr__``.
+
+Rows of the user-scope log (compact JSONL, appended under a lock, never rewritten):
+``heartbeat`` {host, hs, cue, inv} on every hook prompt that carries a session id, text
+free, where ``inv`` is the first 16 hex of the rule-bytes fingerprint (absent without rule
+files); ``inventory`` {inv, revs} once per first-seen ``inv``, the only place the hook
+parses rules; ``insight`` and ``decision``. A prompt with no session id and no excerpt
+writes nothing. Old heartbeats that carry their own ``revs`` stay readable.
+"""
 from __future__ import annotations
 
 from collections import Counter
@@ -12,13 +26,10 @@ from pathlib import Path, PurePath
 import re
 import secrets
 import stat
-from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core import credit, gitsafe, human_gate, storage
+from aegis_core import gitsafe, rule_inventory, storage
 from aegis_core.errors import PathTraversalError
-from aegis_core.match import first_match
-from aegis_core.rules import Rule, load_rules
-from aegis_core.scan_compliance import activity_path
 from aegis_core.storage import (
     append_jsonl,
     atomic_write_text,
@@ -26,20 +37,19 @@ from aegis_core.storage import (
     read_jsonl,
     workspace_relative,
 )
-from aegis_core.telemetry_engine import ledger
-from aegis_core.verification.scanners import (
-    MAX_EXCERPT_CHARS,
-    _REDACT_PATTERNS,
-    _is_high_entropy_secret,
-    redact_insight_text,
-    redact_secrets,
-    shannon_entropy,
-)
+from aegis_core.workspace.binding import bounded_walk_up
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
+
+if TYPE_CHECKING:
+    # Bound for linters and type checkers only: at run time these names are served lazily by
+    # __getattr__ below, so a no-cue hook prompt never imports the scanner module.
+    from aegis_core.rules import Rule
+    from aegis_core.verification.scanners import MAX_EXCERPT_CHARS, redact_insight_text
 
 __all__ = [
     "BURST_WINDOW_SECONDS",
     "DECISIONS",
+    "INSIGHT_HOOK_MARKER",
     "INSIGHT_LEVELS",
     "INSIGHT_SCHEMA_VERSION",
     "KEY_SIZE",
@@ -51,21 +61,20 @@ __all__ = [
     "capture_suggestion",
     "create_link_key",
     "dirty_paths",
-    "enable_host_hook",
     "has_correction_cue",
     "host_capture_status",
     "insight_workspace_id",
     "insights_path",
     "measure_recurrence",
+    "merge_insight_hook",
     "read_insight_rows",
     "read_link_key",
     "record_decision",
     "record_hook_prompt",
     "redact_insight_text",
-    "redact_secrets",
+    "remove_insight_hook",
     "review_insights",
     "session_hs",
-    "shannon_entropy",
     "tfidf_cosine",
     "write_proposal",
 ]
@@ -82,6 +91,33 @@ COUNTABLE_LEVELS = frozenset({"H", "cli", "W2", "hook"})
 DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise")
 SUPPORTED_INSIGHT_HOSTS = ("claude-code", "codex-cli")
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_LAZY_NAMES = {
+    "MAX_EXCERPT_CHARS": "aegis_core.verification.scanners",
+    "redact_insight_text": "aegis_core.verification.scanners",
+    "Rule": "aegis_core.rules",
+    "load_rules": "aegis_core.rules",
+    "first_match": "aegis_core.match",
+    "activity_path": "aegis_core.scan_compliance",
+}
+
+
+def __getattr__(name: str) -> Any:
+    source = _LAZY_NAMES.get(name)
+    if source is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    return getattr(importlib.import_module(source), name)
+
+
+def __dir__() -> List[str]:
+    return sorted(set(globals()) | set(_LAZY_NAMES))
+
+
+def _redact(text: str, **kwargs: Any) -> str:
+    from aegis_core.verification.scanners import redact_insight_text
+
+    return redact_insight_text(text, **kwargs)
 
 
 def _utc_now() -> str:
@@ -235,7 +271,10 @@ def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
 
 
 def insight_workspace_id(workspace: Any) -> str:
+    # Keyed to the governed root (the nearest .aegis inside the git boundary), so a hook
+    # running in a subdirectory and `review` at the root share one file.
     root = Path(os.fspath(workspace)).resolve()
+    root = bounded_walk_up(root) or root
     fast = _fast_git_common_and_top(root)
     if fast is not None:
         common, top = fast
@@ -269,24 +308,8 @@ def _append_user_insights(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     _ensure_private_dir(path.parent.parent)
     _ensure_private_dir(path.parent)
     with storage.file_lock(path.with_suffix(".lock")):
-        to_write = list(rows)
-        if path.exists():
-            existing_hb = {
-                (r.get("host"), r.get("hs"))
-                for r in read_jsonl(path).rows
-                if r.get("event") == "heartbeat" and r.get("hs") is not None
-            }
-            to_write = [
-                r for r in to_write
-                if not (
-                    r.get("event") == "heartbeat"
-                    and r.get("hs") is not None
-                    and (r.get("host"), r.get("hs")) in existing_hb
-                )
-            ]
-        if to_write:
-            append_jsonl(path, to_write, mode=0o600)
-            _chmod_quiet(path, 0o600)
+        append_jsonl(path, list(rows), mode=0o600)
+        _chmod_quiet(path, 0o600)
 
 
 def read_insight_rows(workspace: Any, home: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -312,23 +335,9 @@ def has_correction_cue(text: str) -> bool:
 def dirty_paths(workspace: Any) -> List[str]:
     root = Path(os.fspath(workspace)).resolve()
     top = gitsafe.toplevel(root)
-    if top is None:
-        return []
-    head = gitsafe.resolve_commit(top, "HEAD")
-    raw_paths: List[str] = []
-    if head is not None:
-        try:
-            res = gitsafe.run(["diff-index", "--name-status", "-z", head], top, timeout=5.0)
-        except gitsafe.GitError:
-            return []
-        if res.returncode == 0:
-            for _status, path, new_path in gitsafe.parse_name_status_z(res.stdout):
-                raw_paths.append(new_path if new_path is not None else path)
-    untracked = gitsafe.list_files(top, tracked=(head is None), untracked=True)
-    if untracked:
-        raw_paths.extend(untracked)
+    changed = gitsafe.changed_files(top, "working", untracked=True) if top is not None else None
     found: Set[str] = set()
-    for rel_top in raw_paths:
+    for rel_top in changed or ():
         try:
             rel = (top / rel_top).resolve().relative_to(root).as_posix()
         except ValueError:
@@ -343,9 +352,28 @@ def _served_rule_revs(workspace: Any) -> Dict[str, str]:
     if not (root / AEGIS_DIRNAME / "rules").is_dir():
         return {}
     try:
+        from aegis_core.rules import load_rules
+
         return {r.id: r.digest[:16] for r in load_rules(root).served}
     except Exception:
         return {}
+
+
+def _inventory_id(root: Path) -> Optional[str]:
+    """First 16 hex of the rule-bytes fingerprint; None without rule files or when unreadable."""
+    try:
+        found = rule_inventory.inventory_rules(str(root))
+    except Exception:
+        return None
+    return found.fingerprint[:16] if found.entries else None
+
+
+def _known_inventory_revs(path: Path, inv: str) -> Optional[Dict[str, str]]:
+    # Rows are compact JSON, so these bytes are exact and appear only in inventory rows.
+    for row in read_jsonl(path, contains=b'"event":"inventory"').rows:
+        if row.get("event") == "inventory" and row.get("inv") == inv and isinstance(row.get("revs"), dict):
+            return dict(row["revs"])
+    return None
 
 
 def _has_human_approval(workspace: Any, commit: Optional[str], base_ref: Optional[str], text: str = "") -> bool:
@@ -355,16 +383,31 @@ def _has_human_approval(workspace: Any, commit: Optional[str], base_ref: Optiona
     if top is None:
         return False
     try:
+        from aegis_core import human_gate
+
         base = base_ref or gitsafe.resolve_base_ref(top)
         return bool(base and human_gate.verify_insight_approval(top, commit, text, base).ok)
     except Exception:
         return False
 
 
+def _confine_paths(root: Any, paths: Sequence[str]) -> List[str]:
+    """Workspace-relative POSIX paths; PathTraversalError for one that resolves outside."""
+    from aegis_core.workspace.confinement import confine_path_internal
+
+    base = Path(os.fspath(root))
+    return sorted({PurePath(confine_path_internal(base, str(p))[1]).as_posix() for p in paths if str(p).strip()})
+
+
 def _resolve_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List[str], str]:
     if paths is not None and len(paths) > 0:
-        return sorted({PurePath(str(p)).as_posix() for p in paths if str(p).strip()}), "explicit"
+        return _confine_paths(workspace, paths), "explicit"
     return dirty_paths(workspace), "dirty"
+
+
+def _read_rows_of_session(path: Path, hs: str) -> List[Dict[str, Any]]:
+    # hs is 32 lowercase hex, never JSON-escaped, so every row of the session carries it verbatim.
+    return read_jsonl(path, contains=hs.encode("ascii")).rows
 
 
 def _matching_hook_insight(rows: Sequence[Mapping[str, Any]], hs: Optional[str], redacted_quote: str) -> Optional[str]:
@@ -392,6 +435,8 @@ def _build_insight_row(
     host: str,
     hs: Optional[str],
     now: Optional[str] = None,
+    *,
+    revs: Optional[Dict[str, str]] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
@@ -410,7 +455,7 @@ def _build_insight_row(
     for k, v in extra.items():
         if v:
             row[k] = v
-    revs = _served_rule_revs(workspace)
+    revs = _served_rule_revs(workspace) if revs is None else revs
     if revs:
         row["revs"] = revs
     return row
@@ -422,27 +467,19 @@ def add_insight(
     *,
     paths: Optional[Sequence[str]] = None,
     kind: Optional[str] = None,
-    host: str = "cli",
-    session: Optional[str] = None,
     commit: Optional[str] = None,
     base_ref: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    # No session identity: it comes from the host (record_hook_prompt, capture_suggestion),
+    # never from a typed argument, so CLI rows cannot forge distinct recurrence episodes.
     if not isinstance(text, str) or not text.strip():
         raise ValueError("insight text must be a non-empty string")
-    clean = redact_insight_text(text)
+    clean = _redact(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     level = "H" if _has_human_approval(workspace, commit, base_ref, clean) else "cli"
-    hs = _ensure_hs(host, session, home)
     row = _build_insight_row(
-        workspace,
-        level,
-        clean,
-        norm_paths,
-        psrc,
-        host or "cli",
-        hs,
-        kind=str(kind) if kind else None,
+        workspace, level, clean, norm_paths, psrc, "cli", None, kind=str(kind) if kind else None,
     )
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
@@ -459,10 +496,11 @@ def capture_suggestion(
 ) -> Dict[str, Any]:
     if not isinstance(quote, str) or not quote.strip():
         raise ValueError("quote must be a non-empty string")
-    redacted = redact_insight_text(quote)
+    redacted = _redact(quote)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     hs = _ensure_hs(host, session, home)
-    m_hook = _matching_hook_insight(read_insight_rows(workspace, home=home), hs, redacted)
+    path = insights_path(workspace, home=home)
+    m_hook = _matching_hook_insight(_read_rows_of_session(path, hs) if hs else [], hs, redacted)
     row = _build_insight_row(
         workspace,
         "W2" if m_hook else "suggestion",
@@ -473,7 +511,7 @@ def capture_suggestion(
         hs,
         confirmed_by=m_hook,
     )
-    _append_user_insights(insights_path(workspace, home=home), [row])
+    _append_user_insights(path, [row])
     return row
 
 
@@ -522,51 +560,42 @@ def record_hook_prompt(
     prompt_text, payload_session, payload_cwd = _extract_hook_fields(actual_payload)
     if actual_ws is None:
         from aegis_core.config import env_workspace
-        actual_ws = payload_cwd or env_workspace() or os.getcwd()
+        project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
+        actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
     hs = _ensure_hs(host, session or payload_session, home=home)
-    path = insights_path(actual_ws, home=home)
-    existing = read_insight_rows(actual_ws, home=home)
-    revs = _served_rule_revs(actual_ws)
-    now = _utc_now()
-    to_write: List[Dict[str, Any]] = []
-    has_hb = any(
-        r.get("event") == "heartbeat" and r.get("host") == host and hs is not None and r.get("hs") == hs
-        for r in existing
-    )
-    if not has_hb:
-        hb: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host}
-        if hs:
-            hb["hs"] = hs
-        if revs:
-            hb["revs"] = revs
-        to_write.append(hb)
     cue = has_correction_cue(prompt_text)
+    excerpt = _redact(prompt_text) if cue and excerpts else ""
+    if hs is None and not excerpt:
+        # Without session identity a prompt counts toward no session: no heartbeat, no I/O.
+        return {}
+    path = insights_path(actual_ws, home=home)
+    now = _utc_now()
+    resolved = Path(os.fspath(actual_ws)).resolve()
+    root = bounded_walk_up(resolved) or resolved
+    to_write: List[Dict[str, Any]] = []
+    revs: Optional[Dict[str, str]] = None
+    inv = _inventory_id(root)
+    if inv:
+        # Rules are parsed only for a rule set this log has not seen; later rows reuse its revs.
+        revs = _known_inventory_revs(path, inv)
+        if revs is None:
+            revs = _served_rule_revs(root)
+            if hs is not None:
+                to_write.append({"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "inventory", "inv": inv, "revs": revs})
+    hb: Dict[str, Any] = {}
+    if hs is not None:
+        hb = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host, "hs": hs, "cue": cue}
+        if inv:
+            hb["inv"] = inv
+        to_write.append(hb)
     insight_row: Optional[Dict[str, Any]] = None
-    if cue and excerpts:
+    if excerpt:
         insight_row = _build_insight_row(
-            actual_ws,
-            "W2",
-            redact_insight_text(prompt_text),
-            dirty_paths(actual_ws),
-            "dirty",
-            host,
-            hs,
-            now=now,
+            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {},
         )
         to_write.append(insight_row)
-    if to_write:
-        _append_user_insights(path, to_write)
-    if insight_row is not None:
-        return insight_row
-    return {
-        "v": INSIGHT_SCHEMA_VERSION,
-        "ts": now,
-        "event": "heartbeat",
-        "host": host,
-        "hs": hs,
-        "cue": cue,
-        "recorded": False,
-    }
+    _append_user_insights(path, to_write)
+    return insight_row if insight_row is not None else hb
 
 
 _STOPWORDS = frozenset(
@@ -635,6 +664,7 @@ def tfidf_cosine(text_a: str, text_b: str) -> float:
 def _load_md_rules(workspace: Any, folder: Path, *, recursive: bool = False) -> List[Rule]:
     if not folder.is_dir():
         return []
+    from aegis_core.rules import Rule
     from aegis_core.yaml_engine.frontmatter import split_frontmatter
     from aegis_core.yaml_engine.parser import AegisYAMLError, parse_yaml_subset
 
@@ -670,6 +700,10 @@ def _rule_was_exposed(
     cluster_rows: Sequence[Mapping[str, Any]],
     home: Optional[Path] = None,
 ) -> bool:
+    from aegis_core import credit
+    from aegis_core.scan_compliance import activity_path
+    from aegis_core.telemetry_engine import ledger
+
     root = Path(os.fspath(workspace)).resolve()
     link_key = read_link_key(home)
     scan_hs: Set[Tuple[str, str]] = set()
@@ -707,6 +741,8 @@ def _rule_was_exposed(
 
 
 def _paths_overlap_rule(paths: Iterable[str], rule: Rule) -> bool:
+    from aegis_core.match import first_match
+
     plist = [p for p in paths if p]
     if not plist or not rule.target_paths:
         return True
@@ -748,7 +784,7 @@ def record_decision(
         "insight_ids": [str(i) for i in insight_ids if str(i).strip()],
     }
     if reason:
-        row["reason"] = redact_insight_text(str(reason))
+        row["reason"] = _redact(str(reason))
     if rule_id:
         row["rule_id"] = str(rule_id)
     _append_user_insights(insights_path(workspace, home=home), [row])
@@ -914,6 +950,8 @@ def review_insights(
             countable.append((idx, row))
     if not countable:
         return {"clusters": [], "suggestions": suggestions, "suppressed_clusters": [], "neighbours": {}}
+    from aegis_core.rules import load_rules
+
     root = Path(os.fspath(workspace)).resolve()
     layout = WorkspaceLayout(root)
     active = list(load_rules(root).served) if layout.rules_dir.is_dir() else []
@@ -1001,7 +1039,7 @@ def write_proposal(
         if clow and any(ex in clow or (len(clow) >= 25 and clow in ex) for ex in protected):
             raise ValueError("proposal may not contain verbatim W0/W2/suggestion prompt text")
     norm_targets = [PurePath(str(p)).as_posix() for p in target_paths if str(p).strip()] or ["**"]
-    clean_bullets = [redact_insight_text(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    clean_bullets = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
     if not clean_bullets:
         raise ValueError("summary_bullets must contain at least one non-empty item")
     targets_yaml = "\n".join(f"  - {json.dumps(p)}" for p in norm_targets)
@@ -1069,6 +1107,8 @@ def measure_recurrence(
     home: Optional[Path] = None,
     reset_on_rev_change: bool = True,
 ) -> Dict[str, Any]:
+    from aegis_core.rules import load_rules
+
     root = Path(os.fspath(workspace)).resolve()
     rule = load_rules(root).get(rule_id)
     if rule is None:
@@ -1078,8 +1118,16 @@ def measure_recurrence(
     alive: Set[str] = set()
     unidentified_heartbeats = 0
     matching: List[Dict[str, Any]] = []
-    for row in read_insight_rows(root, home=home):
-        revs = row.get("revs") if isinstance(row.get("revs"), Mapping) else {}
+    rows = read_insight_rows(root, home=home)
+    inv_revs = {
+        r["inv"]: r["revs"] for r in rows
+        if r.get("event") == "inventory" and isinstance(r.get("inv"), str) and isinstance(r.get("revs"), Mapping)
+    }
+    for row in rows:
+        # A new heartbeat names its rule set by `inv`; an old one carries its own revs.
+        revs = row.get("revs")
+        if not isinstance(revs, Mapping):
+            revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
         if reset_on_rev_change and revs.get(rule_id) != cur_rev:
             continue
         ev = row.get("event")
@@ -1133,54 +1181,69 @@ def measure_recurrence(
     }
 
 
+#: Marks Aegis's insight handler: in the exec form's args, the Codex string or 4.3's ``-m``.
+INSIGHT_HOOK_MARKER = "aegis_cli.hooks.insights"
+
+
 def _host_config_path(host: str, home: Path) -> Path:
+    # A relative CLAUDE_CONFIG_DIR/CODEX_HOME is ignored, as the hook registrar ignores it.
     if host == "claude-code":
         env_var, default_dir, fname = "CLAUDE_CONFIG_DIR", ".claude", "settings.json"
     else:
         env_var, default_dir, fname = "CODEX_HOME", ".codex", "hooks.json"
-    cfg = os.environ.get(env_var, "").strip()
-    return (Path(cfg) if cfg else (home / default_dir)) / fname
+    cfg = os.environ.get(env_var) or ""
+    return (Path(cfg) if os.path.isabs(cfg) else home / default_dir) / fname
 
 
-def _entry_cmds(entry: Any) -> List[str]:
-    if not isinstance(entry, Mapping):
-        return []
-    hooks = entry.get("hooks") if isinstance(entry.get("hooks"), list) else []
-    return [str(x.get("command") or "") for x in (entry, *hooks) if isinstance(x, Mapping)]
+def _insight_words(handler: Any) -> Optional[List[str]]:
+    """The command words of an Aegis insight handler; None for any other handler."""
+    if not isinstance(handler, Mapping):
+        return None
+    args = handler.get("args")
+    words = [w for w in (handler.get("command"), *(args if isinstance(args, list) else [])) if isinstance(w, str)]
+    return words if any(INSIGHT_HOOK_MARKER in w for w in words) else None
 
 
-def enable_host_hook(host: str, *, excerpts: bool = False, home: Optional[Path] = None) -> Dict[str, Any]:
-    if host not in SUPPORTED_INSIGHT_HOSTS:
-        raise ValueError(f"unsupported host {host!r} for insight hook; supported hosts: {list(SUPPORTED_INSIGHT_HOSTS)}")
-    layout = _user_layout(home)
-    if layout is None:
-        raise OSError("cannot resolve user home directory")
-    create_link_key(layout.home)
-    target = _host_config_path(host, layout.home)
-    data: Dict[str, Any] = {}
-    if target.exists() and not target.is_symlink():
-        try:
-            loaded = json.loads(target.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, ValueError):
-            pass
-    cmd = f"python3 -I -m aegis_cli.hooks.insights --host {host}{' --excerpts' if excerpts else ' --no-excerpts'}"
-    hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
-    data["hooks"] = hooks
-    ups = hooks.get("UserPromptSubmit") if isinstance(hooks.get("UserPromptSubmit"), list) else []
-    hooks["UserPromptSubmit"] = [
-        e for e in ups if not any("aegis_cli.hooks.insights" in c for c in _entry_cmds(e))
-    ] + [{"matcher": "", "hooks": [{"type": "command", "command": cmd}]}]
-    target.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(target, json.dumps(data, indent=2) + "\n")
-    return {
-        "host": host,
-        "status": "enabled_excerpts" if excerpts else "enabled_counters_only",
-        "excerpts": bool(excerpts),
-        "config_path": str(target),
-        "command": cmd,
-    }
+def _strip_insight(groups: List[Any]) -> int:
+    """Drop Aegis insight handlers from ``groups`` in place, and the groups they emptied."""
+    kept: List[Any] = []
+    dropped = 0
+    for group in groups:
+        handlers = group.get("hooks") if isinstance(group, Mapping) else None
+        rest = [h for h in handlers if _insight_words(h) is None] if isinstance(handlers, list) else None
+        if rest is None or len(rest) == len(handlers):
+            kept.append(group)
+            continue
+        dropped += len(handlers) - len(rest)
+        if rest:
+            kept.append(dict(group, hooks=rest))
+    groups[:] = kept
+    return dropped
+
+
+def merge_insight_hook(data: Dict[str, Any], handler: Mapping[str, Any]) -> None:
+    """Put ``handler`` last in UserPromptSubmit, replacing Aegis's earlier one; ValueError
+    for a shape the host would not load."""
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("'hooks' must be a JSON object")
+    groups = hooks.setdefault("UserPromptSubmit", [])
+    if not isinstance(groups, list):
+        raise ValueError("'hooks.UserPromptSubmit' must be a list")
+    _strip_insight(groups)
+    groups.append({"matcher": "", "hooks": [dict(handler)]})
+
+
+def remove_insight_hook(host: str, data: Dict[str, Any]) -> int:
+    """Drop Aegis insight handlers (and the containers they emptied); how many. Never raises."""
+    hooks = data.get("hooks")
+    groups = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
+    dropped = _strip_insight(groups) if host in SUPPORTED_INSIGHT_HOSTS and isinstance(groups, list) else 0
+    if dropped and not groups:
+        del hooks["UserPromptSubmit"]
+        if not hooks:
+            del data["hooks"]
+    return dropped
 
 
 def host_capture_status(host: str, home: Optional[Path] = None) -> Dict[str, Any]:
@@ -1196,17 +1259,16 @@ def host_capture_status(host: str, home: Optional[Path] = None) -> Dict[str, Any
     if layout is None:
         return {"status": "disabled", "excerpts": False}
     target = _host_config_path(host, layout.home)
-    if not target.exists() or target.is_symlink():
-        return {"status": "disabled", "excerpts": False}
+    # is_file follows a link as the host does, and is False for a FIFO, which would hang a read.
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
+        data = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else None
     except (OSError, ValueError):
+        data = None
+    hooks = data.get("hooks") if isinstance(data, Mapping) else None
+    ups = hooks.get("UserPromptSubmit") if isinstance(hooks, Mapping) else None
+    found = [words for g in (ups if isinstance(ups, list) else []) if isinstance(g, Mapping)
+             and isinstance(g.get("hooks"), list) for words in map(_insight_words, g["hooks"]) if words]
+    if not found:
         return {"status": "disabled", "excerpts": False}
-    ups = data.get("hooks", {}).get("UserPromptSubmit") if isinstance(data, Mapping) and isinstance(data.get("hooks"), Mapping) else None
-    if not isinstance(ups, list):
-        return {"status": "disabled", "excerpts": False}
-    for cmd in (c for e in ups for c in _entry_cmds(e)):
-        if "aegis_cli.hooks.insights" in cmd:
-            ex = "--excerpts" in cmd and "--no-excerpts" not in cmd
-            return {"status": "enabled_excerpts" if ex else "enabled_counters_only", "excerpts": ex}
-    return {"status": "disabled", "excerpts": False}
+    ex = "--excerpts" in " ".join(found[0]).split()
+    return {"status": "enabled_excerpts" if ex else "enabled_counters_only", "excerpts": ex}

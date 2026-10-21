@@ -7,7 +7,9 @@ The commit gate itself is `aegis check --hook`, which the installed hook runs.
 attaches a workspace, so the parser below serves its help and a form with global
 options first (``aegis --plain hook run ...``). Agent-side lifecycle phases (pre-invocation,
 session-close, post-session, ...) were cut in v4 (ADR 0005 D15). `safety-gate`
-stays as a manual check of one command (it fails closed: it asks).
+stays as a manual check of one command (it fails closed: it asks); where it differs
+from the pre-tool guard is pinned by the parity table in
+tests/unit/core/test_command_safety.py.
 """
 from __future__ import annotations
 
@@ -68,9 +70,9 @@ _HOME_NOTE = ("Run it from any directory but your home directory, which Aegis ne
 def _uninstall_description() -> str:
     return (
         "Without --host: remove the aegis block from the git pre-commit hook.\n\n"
-        "With --host: remove Aegis's PreToolUse entries from that host's files at --scope (default: both "
-        "scopes) and nothing else, backing each file up first; for Codex also ~/.codex/rules/aegis.rules once "
-        "no Aegis Codex hook is left. " + _HOME_NOTE)
+        "With --host: remove Aegis's PreToolUse entries and its insight capture (UserPromptSubmit) entries "
+        "from that host's files at --scope (default: both scopes) and nothing else, backing each file up first; "
+        "for Codex also ~/.codex/rules/aegis.rules once no Aegis Codex hook is left. " + _HOME_NOTE)
 
 
 def _host_options(parser: Any, host_help: str, scope_help: str) -> None:
@@ -135,11 +137,13 @@ class HookCommand(AegisCommand):
 
         p_hook_uninstall = p_hook_sub.add_parser(
             "uninstall", parents=p_parents,
-            help="Remove the aegis block from the pre-commit hook, or with --host an agent host's PreToolUse hook",
+            help="Remove the aegis block from the pre-commit hook, or with --host an agent host's PreToolUse hook "
+                 "and its insight capture hook",
             description=_uninstall_description(), formatter_class=argparse.RawDescriptionHelpFormatter)
         p_hook_uninstall.add_argument("--force", action="store_true", help="Git hook only: force removal")
         p_hook_uninstall.add_argument("--dry-run", action="store_true", help="Preview without modifying disk")
-        _host_options(p_hook_uninstall, "Remove Aegis's PreToolUse hook entries from this host instead of the git hook",
+        _host_options(p_hook_uninstall, "Remove Aegis's PreToolUse and insight capture hook entries from this host "
+                      "instead of the git hook",
                       "With --host: only this scope (default: both)")
 
         p_h_run = p_hook_sub.add_parser(

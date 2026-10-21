@@ -18,6 +18,11 @@ from aegis_core.ast.schema import (
 from aegis_core.verification import mutation_tester
 
 
+
+# A hang ceiling, not a budget: real node and go start-ups on a loaded Windows runner can take
+# minutes, and these tests check what the drivers produce, not how fast.
+_HANG_CEILING = 600.0
+
 class TestMutationPointApplication:
     """Test applying MutationPoint replacements to source code."""
 
@@ -114,7 +119,7 @@ class TestPolyglotRecipes:
             [node_bin, str(recipe_path), str(sample_ts)],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_HANG_CEILING,
             stdin=subprocess.DEVNULL,
         )
         assert proc.returncode == 0, f"Driver failed with stderr: {proc.stderr}"
@@ -142,7 +147,7 @@ class TestPolyglotRecipes:
 
         registry = ASTDriverRegistry(drivers={".ts": driver_cmd})
         runner = ASTDriverRunner(registry=registry)
-        norm_ast = runner.parse_file(str(sample_ts), workspace_root=str(tmp_path), timeout=30.0)
+        norm_ast = runner.parse_file(str(sample_ts), workspace_root=str(tmp_path), timeout=_HANG_CEILING)
 
         assert norm_ast.file_path == str(sample_ts)
         assert any(d.name == "run" for d in norm_ast.definitions)

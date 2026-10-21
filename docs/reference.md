@@ -155,7 +155,7 @@ Category: Daily Workflow & Verification.
 | --- | --- | --- | --- |
 | `--base` | `REF` |  | The base branch to measure governance changes against (default: origin/main, main, origin/develop, develop) |
 | `--exempt-test` | `COMMIT` |  | Sign a test exemption (Aegis-Exempt-Test) for a specific fix commit |
-| `--reason` | `TEXT` |  | Explanation for --exempt-test (must match the fix commit's Aegis-No-Test reason) |
+| `--reason` | `TEXT` |  | Explanation for --exempt-test (signed into the commit) |
 
 ### `aegis check`
 
@@ -181,7 +181,7 @@ Category: Daily Workflow & Verification.
 | `--card` |  |  | Print the day-0 card: languages, AST drivers, rules by type, the Layer 1 pass rate on the files and the 5 files with the most findings (above 2000 files it samples, and says so). Changes nothing and never reads baseline.json; --json for the machine-readable form |
 | `--write-baseline` |  |  | Record every current Layer 1 finding in .aegis/baseline.json, so that aegis check then fails only on new ones. Findings are fingerprinted by rule, path, matched line and its occurrence, not by line number. A failure that is not about a line (a rule that cannot load, a file that cannot be parsed) is listed and is never recorded |
 | `--prune-baseline` |  |  | Drop the entries of .aegis/baseline.json whose findings are fixed (or whose file is gone). It never adds a finding, and it refuses to run while a check cannot run |
-| `--ci` |  |  | The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, lost coverage of existing files, a forbid_ast pattern no longer covered, a new or unknown key, any applies_to change, or a mandatory rule added past the scan's slot cap). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers. Also runs T5 fix-commit regression checks (advisory at default warning tier; blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail |
+| `--ci` |  |  | The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers. Also runs T5 fix-commit regression checks (advisory at default warning tier; blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail |
 | `--head` | `REF` |  | With --ci: the commit under review (default: the pull request head in $GITHUB_EVENT_PATH, else HEAD) |
 | `--split` | `NAME=GLOB[,GLOB...]` |  | With --partition: one planned lane and the globs of its files; give at least two. They match as rule target_paths do: a glob without '/' matches at any depth |
 | `--base` | `REF` |  | With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, $GITHUB_BASE_REF, origin/main, main, origin/develop or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection |
@@ -299,7 +299,9 @@ Category: Rule Evolution & Intelligence. Subcommands: `adjudicate`, `archive`, `
 
 ### `aegis rule adjudicate`
 
-Record a human adjudication verdict (tp or fp) for a rule
+Record an adjudication label (tp or fp) in .aegis/adjudications/; it counts after it is merged to the base branch
+
+Append a tp or fp label for a rule to .aegis/adjudications/<rule-id>.jsonl. The label counts toward the rule's fitness only after a reviewed pull request merges it to the base branch.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
@@ -385,8 +387,6 @@ Record an explicit human correction insight
 | `text` | `TEXT` |  | Correction insight text (redacted and capped at 300 chars) (required) |
 | `--paths` | `[PATHS ...]` |  | Target file paths (default: git dirty set) |
 | `--kind` | `KIND` |  | Optional insight category or kind |
-| `--host` | `HOST` | `"cli"` | Host identifier (default: cli) |
-| `--session` | `SESSION` |  | Optional session identifier (stored as keyed hs) |
 | `--commit` | `COMMIT` |  | Optional signed commit SHA carrying Aegis-Approve-Insight |
 | `--base-ref` | `BASE_REF` |  | Optional base branch reference for --commit |
 
@@ -499,15 +499,15 @@ Inspect the pre-commit hook and the interpreter it runs
 
 ### `aegis hook uninstall`
 
-Remove the aegis block from the pre-commit hook, or with --host an agent host's PreToolUse hook
+Remove the aegis block from the pre-commit hook, or with --host an agent host's PreToolUse hook and its insight capture hook
 
-Without --host: remove the aegis block from the git pre-commit hook. With --host: remove Aegis's PreToolUse entries from that host's files at --scope (default: both scopes) and nothing else, backing each file up first; for Codex also ~/.codex/rules/aegis.rules once no Aegis Codex hook is left. Run it from any directory but your home directory, which Aegis never takes as a workspace, even for --scope user (which changes only your user files).
+Without --host: remove the aegis block from the git pre-commit hook. With --host: remove Aegis's PreToolUse entries and its insight capture (UserPromptSubmit) entries from that host's files at --scope (default: both scopes) and nothing else, backing each file up first; for Codex also ~/.codex/rules/aegis.rules once no Aegis Codex hook is left. Run it from any directory but your home directory, which Aegis never takes as a workspace, even for --scope user (which changes only your user files).
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
 | `--force` |  |  | Git hook only: force removal |
 | `--dry-run` |  |  | Preview without modifying disk |
-| `--host` | `HOST` |  | Remove Aegis's PreToolUse hook entries from this host instead of the git hook: claude-code, codex-cli, antigravity |
+| `--host` | `HOST` |  | Remove Aegis's PreToolUse and insight capture hook entries from this host instead of the git hook: claude-code, codex-cli, antigravity |
 | `--scope` | one of `user`, `project` |  | With --host: only this scope (default: both) |
 
 ### Removed commands
@@ -547,7 +547,7 @@ Each of these exits with status 2 and prints where to go instead.
 
 ## MCP server: `aegis-mcp`
 
-The server speaks MCP over stdio. Its tools, as `tools/list` returns them:
+The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A write tool declares only `readOnlyHint: false`, so the MCP defaults apply to its other hints:
 
 | Tool | Title |
 | --- | --- |
@@ -720,9 +720,9 @@ Output schema:
 
 ### `aegis_report_outcome`
 
-**Report Outcome** (idempotent)
+**Report Outcome**
 
-Record post-verification rule feedback in the local outcome ledger after running tests or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` before editing files and `aegis_capture_insight` to record user corrections. When a passing `aegis check --record` exists for the current git tree, the server credits rules exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated against the rule inventory, not used as the credit source). Those credits count toward fitness once CI passes on the landing commit. Without a matching check record, it writes at most one unwitnessed claim per session and tree that earns no fitness credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.
+Record post-verification rule feedback in the local outcome ledger after running tests or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` before editing files and `aegis_capture_insight` to record user corrections. When a passing `aegis check --record --tests` row exists for the current git tree, the server credits rules exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated against the rule inventory, not used as the credit source). Those credits count toward fitness once CI passes on the landing commit. Without a matching check record, it writes at most one unwitnessed claim per session and tree that earns no fitness credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -829,7 +829,7 @@ Output schema:
         "aegis",
         "self"
       ],
-      "description": "Attestation tier: 'aegis' when backed by an 'aegis check --record' run for the current tree, or 'self' for unwitnessed claims."
+      "description": "Attestation tier: 'aegis' when backed by a passing 'aegis check --record --tests' row for the current tree, or 'self' for unwitnessed claims."
     },
     "credited": {
       "type": "array",

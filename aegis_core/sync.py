@@ -24,18 +24,22 @@ def _now_iso(now: Optional[datetime]) -> str:
     return (cur if cur.tzinfo else cur.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def build(workspace: Any, ruleset: Optional[RuleSet] = None, now: Optional[datetime] = None, view: Any = None) -> Dict[str, Any]:
+def build(
+    workspace: Any, ruleset: Optional[RuleSet] = None, now: Optional[datetime] = None, view: Any = None,
+    *, verify_ci: bool = False,
+) -> Dict[str, Any]:
     """The derived document for ``workspace`` (written by ``sync``)."""
     from aegis_core.lifecycle.promotion import suggest
     rules = ruleset if ruleset is not None else load_rules(workspace)
     view = view if view is not None else ledger.read(workspace)
     loaded = [r for r in rules.rules if r.ok]
-    fits = for_rules(workspace, loaded, now, view=view)
+    fits = for_rules(workspace, loaded, now, view=view, verify_ci=verify_ci)
     entries: Dict[str, Any] = {}
     for rule in loaded:
         fit = fits[rule.id]
         entry: Dict[str, Any] = {
             "path": rule.path, "sha256": rule.digest, "type": rule.type, "fitness": fit.score,
+            "reported_score": fit.reported_score, "status": fit.status_label,
             "triggers": fit.triggers, "tp": fit.tp, "fp": fit.fp, "last_ts": fit.last_ts,
             "suggestion": None if not fit.evidence_available else suggest(rule, fit, now), "state": fit.state,
             "evidence_available": fit.evidence_available,
@@ -169,7 +173,7 @@ def _default_gh_runner(argv: List[str], cwd: Optional[str] = None) -> Any:
 def sync(
     workspace: Any, apply: bool = False, now: Optional[datetime] = None, *,
     pr: bool = False, gh_runner: Optional[Callable[..., Any]] = None,
-    ci_client: Any = None, workflow: str = "validate.yml",
+    ci_client: Any = None, workflow: Optional[str] = None,
 ) -> SyncResult:
     """Rebuild derived state under the workspace lock; optionally apply transitions or open a PR."""
     from aegis_core import credit
@@ -191,7 +195,7 @@ def sync(
                 client=ci_client if ci_client is not None else credit.GhRestClient(cwd=str(ws.root)),
                 workflow=workflow,
             )
-        derived = build(ws, ruleset, now, ledger.read(ws))
+        derived = build(ws, ruleset, now, ledger.read(ws), verify_ci=True)
         missing = ledger.incomplete(derived["ledger"])
         applied, refused = [], None
         pre_rules = {rid: dict(entry) for rid, entry in derived["rules"].items()}
@@ -202,7 +206,7 @@ def sync(
         elif should_apply:
             applied = _apply(ws, derived)
             if applied:
-                derived = build(ws, load_rules(ws), now)
+                derived = build(ws, load_rules(ws), now, verify_ci=True)
         state_dir(ws.root)
         atomic_write_text(path, json.dumps(derived, indent=2, sort_keys=True) + "\n")
     if pr:

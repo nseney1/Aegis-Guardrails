@@ -79,9 +79,11 @@ def keys(tmp_path):
     return {"human": human, "human_pub": human_pub}
 
 
-def make_repo(tmp_path: Path, signer_pub: Optional[str] = None, origin: bool = True) -> hg.Repo:
-    """main: a gate, an invariant, a trap, sources; ``work`` is checked out. With ``origin`` the
-    remote-tracking refs a clone has (origin/main, origin/HEAD) point at main's tip."""
+def make_repo(tmp_path: Path, signer_pub: Optional[str] = None, origin: bool = True,
+              rules: Optional[Dict[str, str]] = None) -> hg.Repo:
+    """main: a gate, an invariant, a trap, sources (plus ``rules``, path to text); ``work`` is
+    checked out. With ``origin`` the remote-tracking refs a clone has (origin/main, origin/HEAD)
+    point at main's tip."""
     home = hg.Home(tmp_path / "home")
     repo = hg.Repo(tmp_path / "project", home)
     repo.write("README.md", "# project\n")
@@ -91,6 +93,8 @@ def make_repo(tmp_path: Path, signer_pub: Optional[str] = None, origin: bool = T
     repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", "gate", forbid={"calls": ["eval"]}))
     repo.write(rule_path("inv-sample", "invariant"), rule_text("inv-sample", "invariant", "advisory"))
     repo.write(rule_path("trap-sample", "trap"), rule_text("trap-sample", "trap", "advisory", paths=("lib/*.py",)))
+    for path, text in (rules or {}).items():
+        repo.write(path, text)
     if signer_pub is not None:
         repo.write("allowed_signers", hg.allowed_signers_text(signer_pub))
     repo.commit("base")
@@ -306,6 +310,27 @@ def test_forbid_ast_subsumption_uses_prefix_for_imports_and_suffix_for_calls(tmp
 
 
 @needs_git
+@needs_signing
+def test_narrowing_a_call_entry_needs_an_approval_and_the_base_entry_is_served(tmp_path, capsys, keys):
+    run_shell = "{name: subprocess.run, where: {shell: true}}"
+    repo = make_repo(tmp_path, keys["human_pub"], rules={
+        rule_path("gate-run"): rule_text("gate-run", "gate", paths=("lib/*.py",), forbid={"calls": [run_shell]})})
+    reviewed = rule_integrity.effective(repo.root).ruleset.get("gate-run").meta["forbid_ast"]
+    repo.write(rule_path("gate-run"), rule_text("gate-run", "gate", paths=("lib/*.py",), forbid={
+        "calls": ["{name: subprocess.run, where: {shell: never-matches}}"]}))
+    repo.commit("narrow the call entry")
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 1 and codes(payload) == [("forbid_ast", "gate-run")]
+    view = rule_integrity.effective(repo.root)
+    assert view.ruleset.get("gate-run").meta["forbid_ast"] == reviewed
+    assert [(u.id, u.change) for u in view.unreviewed] == [("gate-run", "changed")]
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.commit(f"approve\n\nAegis-Approve: {digest}\n", sign_key=keys["human"], allow_empty=True)
+    rc, payload = ci_json(repo, capsys)
+    assert rc == 0 and payload["approval"]["valid"] is True
+
+
+@needs_git
 def test_adding_a_mandatory_rule_past_the_scan_cap_on_an_overlapping_path_is_a_governance_change(tmp_path, capsys):
     repo = make_repo(tmp_path)  # src/*.py already has the gate and the invariant
     repo.write(rule_path("gate-third", "gate"), rule_text("gate-third", "gate", forbid={"calls": ["exec"]}))
@@ -498,6 +523,106 @@ def test_the_enforcement_ruleset_is_the_base_version(tmp_path):
     (repo.root / rule_path("gate-no-eval")).unlink()
     ruleset = rule_integrity.effective_ruleset(repo.root)
     assert ruleset.get("gate-no-eval") is not None
+
+
+# ── 2b. Layer 1 enforces the reviewed rules too (v4.4 R-trust-44) ───────────
+
+EVAL_APP = "def app():\n    return eval('1')\n"
+
+
+def plain_check(root: Path, capsys) -> Tuple[int, Dict[str, Any]]:
+    os.chdir(root)
+    rc = main(["check", "--format", "json", "src/app.py"])
+    captured = capsys.readouterr()
+    assert captured.out.strip(), captured.err
+    return rc, json.loads(captured.out)
+
+
+def forbid_failures(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    return sorted((e["tool"], e["target"]) for e in payload["layer1"]
+                  if not e["verdict"] and e["tool"].startswith("forbid_ast"))
+
+
+@needs_git
+@pytest.mark.parametrize("weakening", ["narrowed", "deleted"])
+def test_a_branch_that_weakens_a_gate_is_still_held_to_the_reviewed_gate(tmp_path, capsys, weakening):
+    repo = make_repo(tmp_path)
+    if weakening == "deleted":
+        (repo.root / rule_path("gate-no-eval")).unlink()
+    else:
+        repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", "gate", forbid={"calls": ["exec"]}))
+    repo.write("src/app.py", EVAL_APP)
+    rc, payload = plain_check(repo.root, capsys)
+    assert rc == 1 and forbid_failures(payload) == [("forbid_ast:gate-no-eval", "src/app.py")]
+
+
+@needs_git
+def test_a_branch_local_new_gate_does_not_gate_until_it_is_reviewed(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    repo.write(rule_path("gate-no-print"), rule_text("gate-no-print", "gate", forbid={"calls": ["print"]}))
+    repo.write("src/app.py", "def app():\n    print('x')\n    return 1\n")
+    _rc, payload = plain_check(repo.root, capsys)
+    assert forbid_failures(payload) == []
+    assert [(u.id, u.change) for u in rule_integrity.effective(repo.root).unreviewed] == [("gate-no-print", "new")]
+
+
+@needs_git
+def test_a_new_gate_with_a_malformed_forbid_ast_still_fails_closed(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    repo.write(rule_path("gate-bad"), rule_text("gate-bad", "gate", extra="forbid_ast:\n  calls: eval"))
+    rc, payload = plain_check(repo.root, capsys)
+    assert rc == 1 and ("forbid_ast", rule_path("gate-bad")) in forbid_failures(payload)
+
+
+@needs_git
+@pytest.mark.parametrize("layout", ["no-git", "unborn", "local-head"])
+def test_without_a_reviewed_base_the_working_rules_are_enforced(tmp_path, capsys, layout):
+    if layout == "local-head":
+        repo = make_repo(tmp_path, origin=False)
+        root = repo.root
+        assert rule_integrity.resolve_base(root).source == "local-head"
+    else:
+        root = tmp_path / "project"
+        if layout == "unborn":
+            hg.Repo(root, hg.Home(tmp_path / "home"))
+        (root / "src").mkdir(parents=True)
+        (root / rule_path("gate-no-eval")).parent.mkdir(parents=True)
+        (root / rule_path("gate-no-eval")).write_text(rule_text("gate-no-eval", forbid={"calls": ["eval"]}),
+                                                     encoding="utf-8")
+        assert rule_integrity.resolve_base(root) is None
+    (root / "src" / "app.py").write_text(EVAL_APP, encoding="utf-8")
+    rc, payload = plain_check(root, capsys)
+    assert rc == 1 and forbid_failures(payload) == [("forbid_ast:gate-no-eval", "src/app.py")]
+
+
+@needs_git
+def test_an_unreadable_base_fails_the_check_closed(tmp_path, capsys):
+    import zlib
+
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + rule_path("gate-no-eval"))
+    repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", forbid={"calls": ["eval"]}, body="# Reworded\n"))
+    repo.write("src/app.py", EVAL_APP)
+    loose = repo.root / ".git" / "objects" / oid[:2] / oid[2:]
+    os.chmod(str(loose), 0o644)
+    loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
+    rc, payload = plain_check(repo.root, capsys)
+    failed = [e["detail"] for e in payload["layer1"] if not e["verdict"] and e["tool"] == "forbid_ast"]
+    assert rc == 1 and any("the reviewed (base) version of the rules cannot be read, so none is enforced" in d
+                           for d in failed), payload["layer1"]
+
+
+@needs_git
+def test_the_rule_lint_still_reads_the_branch_while_layer_one_enforces_the_base(tmp_path, capsys):
+    from aegis_core.verification.checkpoint_checks import check_paper_gates
+
+    repo = make_repo(tmp_path)
+    repo.write(rule_path("gate-no-eval"), rule_text("gate-no-eval", "gate", "advisory", forbid={"calls": ["eval"]}))
+    repo.write("src/app.py", EVAL_APP)
+    assert rule_path("gate-no-eval") in [i["file"] for i in check_paper_gates(repo.root)]
+    rc, payload = plain_check(repo.root, capsys)
+    assert rc == 1 and forbid_failures(payload) == [("forbid_ast:gate-no-eval", "src/app.py")]
+    assert rule_integrity.effective(repo.root).ruleset.get("gate-no-eval").enforcement == "gate"
 
 
 # ── 3. release verification fails closed ────────────────────────────────────

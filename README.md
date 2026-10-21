@@ -86,6 +86,12 @@ forbid_ast:
 Never call `eval` or `exec` on data. Parse it with `json.loads` or `ast.literal_eval`.
 ```
 
+`aegis check` enforces the **reviewed** rules: a rule is enforced locally once it is in the base (committed, when there is no `origin/HEAD`; on the branch `origin/HEAD` points to, when there is one). Commit `.aegis/` and `AGENTS.md` before you try it; the local ledger in `.aegis/state/` is git-ignored:
+
+```bash
+git add .aegis AGENTS.md && git commit -m "Add Aegis"
+```
+
 An agent that calls `aegis_scan` before editing `app.py` gets this rule (`aegis scan app.py` shows the same thing in a shell). If the change calls `eval` anyway, the check fails, and so does `git commit`, because the pre-commit hook runs the same check on the staged content. With no file arguments, `aegis check` looks only at tracked files: your changes and staged files (on a clean tree, what the branch adds to its base). It skips untracked files, so `git add` a new file first, or name it: `aegis check app.py`.
 
 ```text
@@ -96,7 +102,7 @@ checkpoint: all checks passed
 Layer 1: 1/3 FAILED — forbid_ast:no-eval
 ```
 
-Commit `.aegis/` and `AGENTS.md`; the local ledger in `.aegis/state/` is git-ignored. Run `aegis doctor` to verify your host registrations and enforcement tiers, and add `aegis check` to CI since `git commit --no-verify` skips the local hook:
+Run `aegis doctor` to verify your host registrations and enforcement tiers, and add `aegis check` to CI since `git commit --no-verify` skips the local hook:
 
 ```yaml
 - uses: actions/checkout@v7
@@ -124,7 +130,7 @@ On every host, rules are advisory through the bootstrap and `aegis_scan`, the gi
 
 1. **Bootstrap**: `aegis init` writes a compact bootstrap block into `AGENTS.md` (no rule text) and registers the `aegis` MCP server with your hosts.
 2. **Just-in-time scan**: Before editing, the agent calls `aegis_scan` with the files it will change and receives only matching rules, prioritizing gates and invariants within a token budget.
-3. **Witnessed verification**: The agent edits, runs tests, and reports with `aegis_report_outcome`. `aegis check --record --tests` snapshots the exact git tree so only witnessed passes earn rule credit.
+3. **Witnessed verification**: The agent edits, runs tests, and reports with `aegis_report_outcome`. `aegis check --record --tests` snapshots the exact git tree and runs your tests there, so only witnessed passes earn rule credit.
 4. **Pre-commit & CI enforcement**: `aegis check` runs Layer 1 (deterministic checks and every `forbid_ast` ban) in the pre-commit hook and in CI; `aegis check --full --plan "..." --llm-cmd 'claude -p'` adds an optional cross-vendor model review.
 5. **Evidence-driven promotion**: Outcomes append to a local ledger; `aegis sync` computes rule fitness and suggests promotions for human review.
 
@@ -133,7 +139,7 @@ On every host, rules are advisory through the bootstrap and `aegis_scan`, the gi
 
 - `aegis init` writes a 572-byte bootstrap block into `AGENTS.md`, and the MCP server repeats the same guidance in its `initialize` instructions so editing files cannot strip it.
 - `aegis_scan` returns at most 3 rules by default (gates and invariants first, capped at 2 slots so advisory rules are not starved) within a 2,000-token default budget (`jit.max_tokens` or `AEGIS_MAX_JIT_TOKENS`).
-- An `aegis_report_outcome` call without a matching `aegis check --record` row for that git tree is recorded as `claimed` and earns no rule credit.
+- An `aegis_report_outcome` call without a passing `aegis check --record --tests` row for that git tree is recorded as `claimed` and earns no rule credit; `aegis check --record` without `--tests` checks Layer 1 only and earns none.
 
 </details>
 
@@ -156,14 +162,14 @@ Verify containment with `aegis check --lane docs`: every path changed since the 
 
 ## Rules that earn their place
 
-- **Evidence-backed promotion (`trap` → `invariant` → `gate`)**: Rules start as traps and earn promotion only through CI-witnessed checks and git history replay — never from unwitnessed agent self-reports. Aegis never rewrites a rule file on its own; a human applies promotions with `aegis sync --apply`, `aegis sync --pr`, or `aegis rule promote`.
+- **Evidence-backed promotion (`trap` → `invariant` → `gate`)**: Rules start as traps and earn promotion only through CI-witnessed checks, git history replay and adjudication labels merged to the base branch — never from unwitnessed agent self-reports, and never below 25 verdicts. Aegis never rewrites a rule file on its own; a human applies promotions with `aegis sync --apply`, `aegis sync --pr`, or `aegis rule promote`.
 - **CI weakening & regression gates (`aegis check --ci`)**: Flags any pull request that weakens a gate or invariant relative to the base branch, enforces fail-to-pass regression tests on bug-fix commits, and emits PR-native `--format github|sarif` output.
 - **Closed loop from human corrections (`aegis rule insight`)**: Captures recurring developer corrections via `aegis_capture_insight` and `aegis rule insight` (`add`, `review`, `enable`) and clusters them into draft rule proposals in `.aegis/proposals/`.
 
 <details>
 <summary>Statistical fitness, session-count decay (w = 2^(-delta / H)), and calibration internals</summary>
 
-`aegis sync` computes four sample-size states (`untestable`, `insufficient (n=K)` with no precision number shown until `n >= 25`, `inconclusive`, and `decided`) over CI-confirmed checks, git detector replay (`caught` vs `leaked`), and human-adjudicated labels, weighted by exponential session-count decay (`w = 2^(-delta / H)`) over heartbeat-alive eligible sessions. Inline `# aegis: allow` comments record `contested` overrides (never false positives) and flag rules with high override rates for review. `aegis sync --pr` opens a human-reviewed PR with up to 3 sampled examples per rule and never auto-merges. For Layer-2 reviews, the arbiter logs falsifiable predictions scored by `aegis check --calibration`. Full details are in [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/how-it-works.md) and [Why Aegis is built this way](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/why-aegis.md).
+`aegis sync` computes four sample-size states (`untestable`, `insufficient (n=K)` with no precision number shown and no promotion, demotion or archive until `n >= 25`, `inconclusive`, and `decided`) over CI-confirmed checks, git detector replay (`caught` vs `leaked`), and adjudication labels (`aegis rule adjudicate`, counted only once merged to `.aegis/adjudications/` on the base branch), weighted by exponential session-count decay (`w = 2^(-delta / H)`) over heartbeat-alive eligible sessions. Inline `# aegis: allow` comments record `contested` overrides (never false positives) and flag rules with high override rates for review. `aegis sync --pr` opens a human-reviewed PR with up to 3 sampled examples per rule and never auto-merges. For Layer-2 reviews, the arbiter logs falsifiable predictions scored by `aegis check --calibration`. Full details are in [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/how-it-works.md) and [Why Aegis is built this way](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/why-aegis.md).
 
 </details>
 
@@ -176,17 +182,17 @@ Aegis does not claim enforcement it lacks. `aegis doctor` reports these tiers, i
 | Advisory | AGENTS.md bootstrap, MCP instructions, JIT rules | any agent: it is guidance |
 | Best-effort | per-host pre-tool hooks | everything on a host without `aegis hook install --host`, a Codex hook you have not trusted in `/hooks`, edits made through shell commands, and any call when Aegis itself errors: the hooks fail open. Installed, `aegis doctor` reports Claude Code: blocking (documented; fails open on error) [DOC] (exit 2, documented by Anthropic); Codex CLI: blocking once trusted in /hooks (documented; fails open) [DOC] (exit 2, documented by OpenAI); Antigravity: blocks destructive commands (live); scan gate records only [LIVE] (exit 1, verified live). Antigravity hooks are unavailable on Windows |
 | Local floor | git pre-commit runs aegis check --hook (--no-verify bypasses it) | anyone using `git commit --no-verify` |
-| Authoritative | CI runs aegis check on the exact SHA; a human merges | a pull request that also weakens the rules or the CI workflow it is checked with, unless `aegis check --ci` runs as a required check and a person reviews or signs (`aegis approve`) those changes. `aegis doctor` prints the trust tier (A, B or C) GitHub actually enforces |
+| Authoritative | CI runs aegis check on the exact SHA; a human merges | a pull request that also weakens the rules or the CI workflow it is checked with, unless `aegis check --ci` runs as a required check and a person reviews those changes (tier A); a signed `aegis approve` (tier B) holds only while the pull request leaves `.github/workflows/**` and aegis alone. `aegis doctor` prints the trust tier (A, B or C) GitHub actually enforces |
 
-**CI is the floor.** Agent hooks are guardrails, not a security boundary. Plain `aegis check` enforces the rules in the pull request itself, so a pull request that deletes a rule and breaks it passes it. Run `aegis check --ci` as a required pull-request check: it compares gates and invariants against the base branch and passes a governance weakening only with a signed `aegis approve` commit, while `aegis_scan` serves mandatory rules from the reviewed base commit.
+**CI is the floor.** Agent hooks are guardrails, not a security boundary. Plain `aegis check` enforces the **reviewed** rules: in a clone where `origin/HEAD` resolves, a rule is enforced once it is on that branch, so a pull request that deletes a rule and breaks it fails plain `check` there. Where `origin/HEAD` does not resolve, as in CI's checkout, the base is the checked-out commit itself, so plain `check` enforces the pull request's own rules and `aegis check --ci` is what catches a deleted or weakened rule. Run `aegis check --ci` as a required pull-request check: it compares gates and invariants against the base branch and passes a governance weakening only with a signed `aegis approve` commit (at tier B that holds only while the pull request leaves `.github/workflows/**` and aegis alone), while `aegis_scan` serves mandatory rules from the reviewed base commit.
 
 <details>
 <summary>Trust Tiers (A/B/C) & Solo SSH Signing Ceremony (allowed_signers)</summary>
 
-- **Tier A (Separation of duties)**: GitHub branch protection / rulesets require pull-request reviews from a human `CODEOWNERS` reviewer and required status checks (`aegis check --ci`) before merge.
-- **Tier B (Solo developer with cryptographic signing)**: When one developer owns both the repo and the agent, `aegis approve` signs the governance tree hash (`Aegis-Approve: <hash>`) using your SSH key (`git config gpg.format ssh`), verified by `aegis check --ci` against `.aegis/allowed_signers` on the base branch.
+- **Tier A (Separation of duties)**: GitHub rulesets require a pull-request review from a human `CODEOWNERS` reviewer that is dismissed when new commits are pushed, and the Aegis job (`aegis check --ci`) as a required check with no path filter or condition that could skip it (`aegis doctor --github` prints the ruleset, pinned to GitHub Actions).
+- **Tier B (Solo developer with cryptographic signing)**: When one developer owns both the repo and the agent, `aegis approve` signs the governance tree hash (`Aegis-Approve: <hash>`) using your SSH key (`git config gpg.format ssh`), verified by `aegis check --ci` against `allowed_signers` at the repository root on the base branch. Only SSH signatures count, and Tier B holds only while pull requests leave `.github/workflows/**` and aegis alone, because the required check runs the pull request's own workflow.
 - **Tier C (Self-attested)**: Local hooks and unsigned CI checks; `aegis doctor` reports the active tier read-only (`aegis doctor --github` inspects branch protection).
-- **Hook & sandbox boundaries**: Pre-tool hooks block unscanned edits on Claude Code and trusted Codex CLI (`Antigravity` records only; shell edits pass everywhere; `aegis status --compliance` measures scan-before-edit rates). Aegis does not sandbox processes or make network calls unless you run `aegis check --full --llm-cmd`.
+- **Hook & sandbox boundaries**: Pre-tool hooks block unscanned edits on Claude Code and trusted Codex CLI (`Antigravity` records only; shell edits pass everywhere; `aegis status --compliance` measures scan-before-edit rates). Aegis does not sandbox processes. Its own code opens no network connection; `aegis check --full --llm-cmd` and the commands that start your `gh` (listed in [PRIVACY.md](PRIVACY.md)) are the only ways it reaches one.
 
 </details>
 
@@ -198,7 +204,7 @@ Aegis does not claim enforcement it lacks. `aegis doctor` reports these tiers, i
 
 **What is AGENTS.md?** A markdown instructions file in the repository root that coding agents (Codex CLI, Antigravity, Claude Code) read at session start. Aegis writes only a small bootstrap block into it; rules stay in `.aegis/rules/` and are served just-in-time via `aegis_scan`.
 
-**Does Aegis send my code anywhere?** No. The CLI and MCP server make no network calls, and the ledger stays in `.aegis/state/` on your machine. Only optional Layer 2 (`aegis check --full --llm-cmd ...`) pipes the diff to the command you specify.
+**Does Aegis send my code anywhere?** No. Aegis opens no network connection of its own, and the ledger stays in `.aegis/state/` on your machine. Two things can reach the network, both started by you: `aegis check --full --llm-cmd ...` pipes the diff to the command you name, and the commands listed in [PRIVACY.md](PRIVACY.md) run your own `gh`.
 
 **I used Aegis 3.x. How do I upgrade?** Run `aegis migrate`, then `aegis migrate --apply`, `aegis init --host <your hosts>`, and `aegis doctor --fix`. See the [changelog](https://github.com/nseney1/Aegis-Guardrails/blob/main/CHANGELOG.md#upgrading-from-3x) for details.
 

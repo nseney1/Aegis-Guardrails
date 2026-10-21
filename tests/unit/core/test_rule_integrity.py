@@ -1,7 +1,6 @@
 """aegis_core.rule_integrity beyond the acceptance contract: sad paths, edges and the shape of the output.
 
-Real git repositories in tmp dirs; the only mock is the git read boundary where a corrupt
-object has to be simulated.
+Real git repositories in tmp dirs; a corrupt object is a forged loose object on disk.
 """
 from __future__ import annotations
 
@@ -9,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -20,6 +20,7 @@ from aegis_core.rules import load_rules
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+needs_signing = pytest.mark.skipif(not hg.signing_ok(), reason="needs git >= 2.34 and ssh-keygen")
 DIRS = {"gate": "gates", "invariant": "invariants", "trap": "traps"}
 
 
@@ -51,19 +52,23 @@ def _env(tmp_path, monkeypatch):
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
-    monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
+    for name in ("GITHUB_EVENT_PATH", "GITHUB_BASE_REF", "SSH_AUTH_SOCK", "GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR",
+                 "CODEX_HOME"):
+        monkeypatch.delenv(name, raising=False)
     before = os.getcwd()
     yield
     os.chdir(before)
 
 
-def make_repo(tmp_path: Path, origin: bool = True) -> hg.Repo:
+def make_repo(tmp_path: Path, origin: bool = True, paths: Tuple[str, ...] = ("src/*.py",),
+              signer_pub: Optional[str] = None) -> hg.Repo:
     repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
     repo.write("src/app.py", "x = 1\n")
     repo.write("src/util.py", "y = 2\n")
-    repo.write(path_of("inv-a"), rule_text("inv-a"))
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=paths))
     repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", paths=("src/*.py",)))
+    if signer_pub is not None:
+        repo.write("allowed_signers", hg.allowed_signers_text(signer_pub))
     repo.commit("base")
     if origin:
         repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
@@ -124,12 +129,79 @@ def test_dotted_prefix_for_imports_and_suffix_for_calls_and_decorators(tmp_path)
     assert found.code == "forbid_ast" and "decorator 'app.route'" in found.message
 
 
-def test_a_forbid_ast_option_this_version_cannot_compare_must_be_carried_over(tmp_path):
-    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"imports": ["os"], "where": ["x"]}))
-    dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"imports": ["os"]}))
-    assert codes(weakenings(base, dropped)) == ["forbid_ast"]
-    widened = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"imports": ["os"], "where": ["x", "y"]}))
-    assert weakenings(base, widened) == []
+def test_a_call_entry_where_is_compared_and_a_top_level_key_the_enforcer_rejects_is_not(tmp_path):
+    entry = "{name: eval, where: {x: 1}}"
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [entry], "where": ["x"]}))
+    dropped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": [entry]}))
+    assert weakenings(base, dropped) == []  # verification.runner refuses a top-level where: it bound nothing
+    narrowed = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: 2}}"]}))
+    (found,) = weakenings(base, narrowed)
+    assert found.code == "forbid_ast" and "call 'eval' is no longer forbidden everywhere it was" in found.message
+
+
+RUN_SHELL = "{name: subprocess.run, where: {shell: true}}"
+
+
+@pytest.mark.parametrize("entry", [
+    "{name: subprocess.run, where: {shell: never-matches}}",
+    "{name: subprocess.run, where: {shell: 1}}",
+    "{name: subprocess.run, where: {shell: true, cwd: x}}",
+    "{name: subprocess.run, where: {shell: true}, builtin: true}",
+    "{name: subprocess.run, where: {shell: {not: false}}}",
+    "{name: subprocess.runx, where: {shell: true}}",
+], ids=["never", "one", "addkey", "builtin", "reworded", "rename"])
+def test_each_narrowing_of_a_call_entry_is_one_finding(tmp_path, entry):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [RUN_SHELL]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [entry, "os.system"]}))
+    found = weakenings(base, head)
+    assert [w.code for w in found] == ["forbid_ast"] and "call 'subprocess.run'" in found[0].message
+
+
+def test_a_where_or_builtin_added_to_a_plain_call_narrows_it_and_removing_them_does_not(tmp_path):
+    plain = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": ["eval"]}))
+    where = parsed(tmp_path / "w", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, where: {x: never}}"]}))
+    (found,) = weakenings(plain, where)
+    assert "call 'eval' is no longer forbidden everywhere it was (its where or builtin was narrowed)" in found.message
+    builtin = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", forbid={"calls": ["{name: eval, builtin: true}"]}))
+    assert codes(weakenings(plain, builtin)) == ["forbid_ast"]
+    assert weakenings(builtin, plain) == []
+
+
+@pytest.mark.parametrize("base_entry,entries", [
+    (RUN_SHELL, [RUN_SHELL]),
+    (RUN_SHELL, ["{name: subprocess.run, where: {shell: true}, builtin: false}"]),
+    (RUN_SHELL, ["{name: run, where: {shell: true}}"]),
+    (RUN_SHELL, ["{name: subprocess.run}"]),
+    (RUN_SHELL, ["subprocess.run"]),
+    ("{name: subprocess.run, where: {shell: true, cwd: x}}", [RUN_SHELL]),
+    (RUN_SHELL, [RUN_SHELL, "eval", "{name: exec, builtin: true}"]),
+], ids=["same", "notbuiltin", "broader", "nowhere", "plain", "dropkey", "added"])
+def test_an_equal_or_broader_call_entry_is_not_a_weakening(tmp_path, base_entry, entries):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [base_entry]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [*entries, "os.system"]}))
+    assert weakenings(base, head) == []
+
+
+def test_the_compared_call_keys_are_the_keys_the_enforcer_accepts():
+    from aegis_core.verification.runner import _CALL_SPEC_KEYS
+
+    assert set(rule_integrity._CallEntry._fields) == set(_CALL_SPEC_KEYS)
+
+
+@pytest.mark.parametrize("entry,lost", [
+    ("{name: subprocess.run, where: {shell: true}, unknown: skip}", False),
+    ("{call: subprocess.run, where: {shell: true}}", True),
+], ids=["unknown", "call-alias"])
+def test_a_removed_call_key_is_refused_by_the_enforcer_and_never_counts_as_coverage(tmp_path, entry, lost):
+    """Given a head entry with a key the enforcer no longer accepts, Then the rule fails closed at
+    load (a broken gate blocks every change), and the comparison never reads the key: a ``call:``
+    alias names no call, so the base entry is reported lost."""
+    from aegis_core.verification.runner import _forbid_ast_spec_error
+
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a", forbid={"calls": [RUN_SHELL]}))
+    head = parsed(tmp_path / "h", "inv-a", rule_text("inv-a", forbid={"calls": [entry, "os.system"]}))
+    assert "unknown key" in (_forbid_ast_spec_error(head.meta["forbid_ast"]) or "")
+    assert codes(weakenings(base, head)) == (["forbid_ast"] if lost else [])
 
 
 def test_a_detect_key_must_stay_an_exact_superset(tmp_path):
@@ -171,19 +243,26 @@ def test_an_enforcement_drop_is_a_rank_loss_even_when_the_type_stays(tmp_path):
 # ── reading git ──────────────────────────────────────────────────────────────
 
 @needs_git
-def test_content_that_does_not_hash_to_its_object_id_is_refused(tmp_path, monkeypatch):
+def test_a_forged_base_object_is_refused_by_the_public_loaders(tmp_path):
     repo = make_repo(tmp_path)
     oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
-    real = rule_integrity._run
-
-    def forged(cwd, args, stdin=None):
-        if args[0] == "cat-file":
-            return f"{oid} blob 5\nlies!\n".encode()
-        return real(cwd, args, stdin)
-
-    monkeypatch.setattr(rule_integrity, "_run", forged)
+    # The base blob is read from git only when the working-tree rule no longer hashes to it.
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nA reworded reason.\n"))
+    assert rule_integrity.effective(repo.root).ruleset  # control: the untouched object loads
+    ok = scan_mod.scan(repo.root, ["src/app.py"])
+    assert ok.get("status") != "FAIL" and ok["relevant_rules"]
+    loose = repo.root / ".git" / "objects" / oid[:2] / oid[2:]
+    os.chmod(str(loose), 0o644)
+    loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
     with pytest.raises(IntegrityError, match="does not match the object id"):
-        rule_integrity._read_blobs(str(repo.root), [oid])
+        rule_integrity.effective(repo.root)
+    # A process that read the commit's rules once keeps that verified copy; a new one reads the forgery.
+    assert scan_mod.scan(repo.root, ["src/app.py"]) == ok
+    scan_mod.RULE_CACHE.invalidate()
+    result = scan_mod.scan(repo.root, ["src/app.py"])
+    assert result["status"] == "FAIL"
+    assert "the reviewed (base) version of the rules cannot be read" in result["error"]
+    assert not result.get("relevant_rules")
 
 
 @needs_git
@@ -209,6 +288,42 @@ def test_a_user_base_ref_that_does_not_resolve_falls_back_to_the_next_anchor(tmp
     (cfg / "config.json").write_text(json.dumps({"v": 1, "rules": {"base_ref": "no-such-ref"}}), encoding="utf-8")
     anchor = rule_integrity.resolve_base(repo.root)
     assert anchor is not None and anchor.source == "origin-head"
+
+
+def user_base_ref(tmp_path: Path, ref: str) -> None:
+    cfg = tmp_path / "home" / ".aegis"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "config.json").write_text(json.dumps({"v": 1, "rules": {"base_ref": ref}}), encoding="utf-8")
+
+
+@needs_git
+def test_a_user_base_ref_anchors_at_the_fork_point_not_at_its_moving_tip(tmp_path):
+    repo = make_repo(tmp_path)
+    fork = repo.head()
+    repo.git("checkout", "-q", "main")
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nReworded on main after the fork.\n"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("main moves on"))
+    repo.git("checkout", "-q", "work")
+    repo.write("src/app.py", "x = 5\n")
+    repo.commit("branch work that touches no rule")
+    user_base_ref(tmp_path, "origin/main")
+    anchor = rule_integrity.resolve_base(repo.root)
+    assert anchor is not None and (anchor.source, anchor.commit) == ("user-config", fork)
+    assert list(rule_integrity.effective(repo.root).unreviewed) == []
+
+
+@needs_git
+def test_a_user_base_ref_with_no_common_history_falls_back_to_its_tip_and_says_so(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "--orphan", "island")
+    repo.git("rm", "-rfq", ".")
+    repo.write("a.txt", "x\n")
+    island = repo.commit("island")
+    repo.git("checkout", "-q", "work")
+    user_base_ref(tmp_path, "island")
+    anchor = rule_integrity.resolve_base(repo.root)
+    assert anchor is not None and anchor.commit == island
+    assert "no common history with HEAD, using its tip" in anchor.label
 
 
 @needs_git
@@ -289,6 +404,127 @@ def test_a_tight_token_budget_still_accounts_for_the_integrity_block(tmp_path):
     assert result["unreviewed_rules"][0]["id"] == "inv-evil"
 
 
+# A 200-character file name would pass MAX_PATH under a Windows runner's temp directory.
+_LONG_ID = 120 if os.name == "nt" else 200
+
+
+def long_unreviewed(repo: hg.Repo, count: int) -> List[str]:
+    ids = [f"inv-{i:02d}-" + "x" * (_LONG_ID - 7) for i in range(count)]
+    for rid in ids:
+        repo.write(path_of(rid), rule_text(rid, paths=("docs/*.md",), body="# " + "T" * 90 + "\n\nWhy.\n"))
+    return ids
+
+
+@needs_git
+def test_long_unreviewed_ids_are_trimmed_to_the_token_budget_and_counted(tmp_path):
+    repo = make_repo(tmp_path)
+    long_unreviewed(repo, 10)
+    scan_mod.RULE_CACHE.invalidate()
+    result = scan_mod.scan(str(repo.root), changed_files=["src/app.py"], budget=5, max_tokens=300)
+    assert result["stats"]["estimated_tokens"] <= 300
+    assert result["unreviewed_total"] == 10
+    listed = result.get("unreviewed_rules", [])
+    assert len(listed) < 10 and all(len(item["id"]) <= 80 for item in listed)
+
+
+@needs_git
+def test_a_short_unreviewed_list_that_is_trimmed_still_says_how_many_there_are(tmp_path):
+    repo = make_repo(tmp_path)
+    long_unreviewed(repo, 3)
+    scan_mod.RULE_CACHE.invalidate()
+    tight = scan_mod.scan(str(repo.root), changed_files=["src/app.py"], budget=5, max_tokens=300)
+    assert tight["stats"]["estimated_tokens"] <= 300
+    assert len(tight.get("unreviewed_rules", [])) < 3 and tight["unreviewed_total"] == 3
+    roomy = scan_mod.scan(str(repo.root), changed_files=["src/app.py"], budget=5, max_tokens=40000)
+    assert len(roomy["unreviewed_rules"]) == 3 and "unreviewed_total" not in roomy
+    assert all(len(item["id"]) == 80 and item["id"].endswith("...") for item in roomy["unreviewed_rules"])
+
+
+@needs_git
+def test_with_no_changed_files_the_unreviewed_list_still_fits_the_budget(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    long_unreviewed(repo, 10)
+    scan_mod.RULE_CACHE.invalidate()
+    monkeypatch.setattr(scan_mod, "_git_changed_files", lambda workspace: [])
+    result = scan_mod.scan(str(repo.root), changed_files=None, budget=5, max_tokens=300)
+    assert result["guidance"] == scan_mod.NO_CHANGES_TEXT
+    assert result["stats"]["estimated_tokens"] <= 300 and result["unreviewed_total"] == 10
+
+
+# ── the cost of reading the base (R-trust-45) ───────────────────────────────
+
+def git_calls(monkeypatch) -> List[List[str]]:
+    calls: List[List[str]] = []
+    real = gitsafe.run
+
+    def spy(args, *a, **kw):
+        calls.append(list(args))
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    return calls
+
+
+def parse_count(monkeypatch) -> List[str]:
+    from aegis_core import rules as rules_mod
+
+    parsed_paths: List[str] = []
+    real = rules_mod._parse
+    monkeypatch.setattr(rules_mod, "_parse", lambda entry, *a: parsed_paths.append(entry.relative_path) or real(entry, *a))
+    return parsed_paths
+
+
+@needs_git
+@pytest.mark.parametrize("origin", [True, False], ids=["origin", "local"])
+def test_reading_the_base_of_a_clean_tree_costs_two_git_calls_with_an_origin(tmp_path, monkeypatch, origin):
+    repo = make_repo(tmp_path, origin=origin)
+    calls = git_calls(monkeypatch)
+    view = rule_integrity.effective(repo.root, scan_mod.RuleCache())
+    assert view.anchor is not None and view.anchor.source == ("origin-head" if origin else "local-head")
+    assert view.unreviewed == () and len(calls) <= (2 if origin else 3), calls
+
+
+@needs_git
+def test_the_base_rules_are_parsed_once_per_anchor_and_working_tree(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# Softer\n\nEdited.\n"))
+    cache = scan_mod.RuleCache()
+    first = rule_integrity.effective(repo.root, cache)
+    parsed_paths = parse_count(monkeypatch)
+    second = rule_integrity.effective(repo.root, cache)
+    assert parsed_paths == [] and second == first
+    assert "Edited." in second.ruleset.get("trap-a").body and second.unreviewed == ()
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("move the reviewed base"))
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# Again\n\nEdited twice.\n"))
+    third = rule_integrity.effective(repo.root, cache)
+    assert third.anchor.commit != first.anchor.commit and parsed_paths  # a moved anchor is a new key
+    assert "Edited twice." in third.ruleset.get("trap-a").body
+
+
+@needs_git
+def test_a_binding_edit_is_still_held_to_the_base_when_the_base_is_cached(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", enforcement="advisory"))
+    cache = scan_mod.RuleCache()
+    for _ in range(2):
+        view = rule_integrity.effective(repo.root, cache)
+        assert view.ruleset.get("inv-a").enforcement == "gate"
+        assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+
+
+@needs_git
+def test_a_crlf_working_copy_of_lf_blobs_reads_no_blob_and_lists_nothing(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.git("config", "core.autocrlf", "true")
+    target = repo.root / path_of("inv-a")
+    lf = rule_integrity.effective(repo.root).ruleset.get("inv-a")
+    target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+    calls = git_calls(monkeypatch)
+    view = rule_integrity.effective(repo.root, scan_mod.RuleCache())
+    assert view.unreviewed == () and not [c for c in calls if "cat-file" in c], calls
+    assert rule_integrity.policy_view(view.ruleset.get("inv-a")) == rule_integrity.policy_view(lf)
+
+
 # ── the CI check ─────────────────────────────────────────────────────────────
 
 @needs_git
@@ -301,19 +537,102 @@ def test_the_report_names_the_range_and_counts_the_binding_rules(tmp_path, capsy
 
 
 @needs_git
-def test_deleting_a_file_a_gate_covered_is_not_a_loss_of_coverage(tmp_path, capsys):
+def test_narrowing_target_paths_is_a_loss_of_coverage_even_when_the_dropped_file_is_deleted(tmp_path, capsys):
     repo = make_repo(tmp_path)
     repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/app.py",)))
     repo.commit("narrow to one file")
     rc, payload, _err = ci(repo, capsys)
     assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["coverage"]
-    assert "src/util.py" in payload["weakenings"][0]["message"]
+    assert "'src/*.py'" in payload["weakenings"][0]["message"]
     repo.git("reset", "-q", "--hard", "main")
     repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/app.py",)))
     repo.git("rm", "-q", "src/util.py")
     repo.commit("narrow and remove what it no longer covers")
     rc, payload, _err = ci(repo, capsys)
-    assert rc == 0, payload["weakenings"]
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["coverage"]
+
+
+DEEP = ("src/**/*.py",)
+LISTED = ("src/app.py", "src/util.py")
+
+
+def approve(repo: hg.Repo, key: Path) -> None:
+    from aegis_core import human_gate
+
+    digest = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.commit(f"approve\n\nAegis-Approve: {digest}\n", sign_key=key, allow_empty=True)
+
+
+@needs_git
+def test_narrowing_a_glob_to_the_present_files_is_flagged_although_no_file_loses_the_rule(tmp_path, capsys):
+    repo = make_repo(tmp_path, paths=DEEP)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=LISTED))
+    repo.write("src/evil.py", "import os\n")
+    repo.commit("narrow to what exists, then add a file")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("coverage", "inv-a")]
+    assert "'src/**/*.py'" in payload["weakenings"][0]["message"]
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("move", [False, True], ids=["listed", "moved"])
+def test_a_pattern_rewrite_needs_an_approval_even_when_it_reaches_every_file(tmp_path, capsys, move):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, paths=DEEP if not move else ("src/*.py",), signer_pub=pub)
+    if move:
+        repo.git("mv", "src", "lib")
+        repo.write(path_of("inv-a"), rule_text("inv-a", paths=("lib/*.py",)))
+    else:
+        repo.write("src/new.py", "z = 3\n")
+        repo.write("docs/notes.md", "notes\n")
+        repo.write(path_of("inv-a"), rule_text("inv-a", paths=(*LISTED, "src/new.py", "docs/notes.md")))
+    repo.commit("rewrite the patterns")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["coverage"]
+    approve(repo, key)
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 0 and payload["approval"]["valid"] is True
+
+
+@needs_git
+def test_a_local_narrowing_is_not_served_so_files_that_do_not_exist_yet_stay_covered(tmp_path):
+    repo = make_repo(tmp_path, paths=DEEP)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=LISTED))
+    repo.write("src/evil.py", "import os\n")
+    view = rule_integrity.effective(repo.root)
+    served = view.ruleset.get("inv-a")
+    assert served.applies_to("src/evil.py") and served.applies_to("src/pkg/deep.py")
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+
+
+def test_a_reach_lost_to_a_new_pattern_list_or_to_skipping_tests_is_coverage(tmp_path):
+    everywhere = parsed(tmp_path, "inv-a", rule_text("inv-a", paths=(), forbid={"calls": ["eval"]}))
+    scoped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", paths=("src/**",), forbid={"calls": ["eval"]}))
+    (found,) = weakenings(everywhere, scoped)
+    assert found.code == "coverage" and "'**'" in found.message
+    plain = parsed(tmp_path / "c", "inv-a", rule_text("inv-a", paths=("src/**",)))
+    (found,) = weakenings(plain, scoped)
+    assert found.code == "coverage" and "test files" in found.message
+    assert weakenings(scoped, parsed(tmp_path / "d", "inv-a", rule_text(
+        "inv-a", paths=("src/**", "lib/**"), forbid={"calls": ["eval"]}))) == []
+
+
+@needs_git
+def test_serving_a_broader_pattern_list_lists_no_tree(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/*.py", "lib/*.py")))
+    calls: List[List[str]] = []
+    real = gitsafe.run
+
+    def spy(args, *a, **kw):
+        calls.append(list(args))
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    served = rule_integrity.effective(repo.root).ruleset.get("inv-a")
+    assert served.applies_to("lib/x.py")
+    assert calls and not [c for c in calls if "ls-tree" in c and "--name-only" in c]
 
 
 @needs_git
@@ -407,6 +726,136 @@ def test_the_mandatory_cap_counts_only_rules_that_share_a_real_file(tmp_path, ca
     repo.commit("a third")
     rc, payload, _err = ci(repo, capsys)
     assert rc == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("mandatory_cap", "inv-c")]
+
+
+def cap_repo(tmp_path: Path) -> hg.Repo:
+    """main: gate-a and gate-b on src/*.py (the cap is full there), gate-c on lib/*.py."""
+    repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
+    for path in ("src/app.py", "lib/x.py", "lib/deep/y.py", "docs/a.md"):
+        repo.write(path, "x = 1\n")
+    for rid, paths in (("gate-a", ("src/*.py",)), ("gate-b", ("src/*.py",)), ("gate-c", ("lib/*.py",))):
+        repo.write(path_of(rid, "gate"), rule_text(rid, "gate", paths=paths, forbid={"calls": ["exec"]}))
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    return repo
+
+
+def widen_c(repo: hg.Repo, *paths: str) -> None:
+    repo.write(path_of("gate-c", "gate"), rule_text("gate-c", "gate", paths=("lib/*.py", *paths), forbid={"calls": ["exec"]}))
+
+
+@needs_git
+@pytest.mark.parametrize("added,expected", [
+    (("**/*.py",), [("mandatory_cap", "gate-c")]),
+    (("docs/*.md",), []),
+    (("lib/**/*.py",), []),
+], ids=["crowded", "free", "inside"])
+def test_widening_a_mandatory_rule_is_held_to_the_cap_where_its_reach_is_new(tmp_path, capsys, added, expected):
+    repo = cap_repo(tmp_path)
+    widen_c(repo, *added)
+    repo.commit("widen gate-c")
+    rc, payload, _err = ci(repo, capsys)
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == expected
+    assert rc == (1 if expected else 0)
+    if expected:
+        assert "src/app.py" in payload["weakenings"][0]["message"]
+
+
+@needs_git
+@pytest.mark.parametrize("added,served_paths", [
+    (("**/*.py",), ("lib/*.py",)),
+    (("docs/*.md",), ("lib/*.py", "docs/*.md")),
+], ids=["crowded", "free"])
+def test_a_local_widening_into_a_full_slot_is_not_served(tmp_path, added, served_paths):
+    repo = cap_repo(tmp_path)
+    widen_c(repo, *added)
+    view = rule_integrity.effective(repo.root)
+    assert view.ruleset.get("gate-c").target_paths == served_paths
+    assert [(u.id, u.change) for u in view.unreviewed] == [("gate-c", "changed")]
+
+
+# ── a workspace below the git top level ──────────────────────────────────────
+
+def nested_repo(tmp_path: Path, prefix: str) -> Tuple[hg.Repo, Path]:
+    """A monorepo whose workspace ``prefix`` holds a gate invariant on src/*.py; a sibling
+    ``other/`` workspace holds a rule of its own."""
+    repo = hg.Repo(tmp_path / "mono", hg.Home(tmp_path / "home"))
+    repo.write("README.md", "# mono\n")
+    repo.write(f"{prefix}/src/a.py", "x = 1\n")
+    repo.write(f"{prefix}/{path_of('inv-a')}", rule_text("inv-a"))
+    repo.write(f"other/{path_of('inv-o')}", rule_text("inv-o"))
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    return repo, repo.root / prefix
+
+
+def ci_from(where: Path, capsys) -> Tuple[int, Any, str]:
+    os.chdir(where)
+    rc = main(["check", "--ci", "--base", "main", "--format", "json"])
+    captured = capsys.readouterr()
+    return rc, json.loads(captured.out) if captured.out.strip() else None, captured.err
+
+
+@needs_git
+@pytest.mark.parametrize("prefix", ["pkg", "pkg dir/ü", ""], ids=["nested", "spaced", "flat"])
+def test_a_workspace_below_the_top_level_checks_its_own_binding_rules(tmp_path, capsys, prefix):
+    repo, ws = nested_repo(tmp_path, prefix) if prefix else (make_repo(tmp_path), None)
+    ws = ws or repo.root
+    repo.write(f"{prefix}/{path_of('inv-a')}".lstrip("/"), rule_text("inv-a", enforcement="advisory"))
+    repo.commit("drop the gate to advisory")
+    rc, payload, err = ci_from(ws, capsys)
+    assert rc == 1, err
+    assert payload["rules_checked"] == 1 and [(w["code"], w["rule"]) for w in payload["weakenings"]] == [("rank", "inv-a")]
+
+
+@needs_git
+def test_a_nested_workspace_serves_its_base_rules_and_lists_an_edit_as_changed(tmp_path):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    repo.write(f"pkg/{path_of('inv-a')}", rule_text("inv-a", body="# The title\n\nA softer reason.\n"))
+    view = rule_integrity.effective(ws)
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+    assert "Why this rule exists." in view.ruleset.get("inv-a").body
+    assert view.ruleset.get("inv-o") is None
+
+
+@needs_git
+@pytest.mark.parametrize("move,expected", [
+    (("pkg/src", "pkg/lib"), [("coverage", "inv-a")]),
+    (("pkg/src/a.py", "pkg/src/b.py"), []),
+], ids=["out", "inside"])
+def test_coverage_follows_renames_inside_a_nested_workspace(tmp_path, capsys, move, expected):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    repo.git("mv", *move)
+    repo.commit("move")
+    rc, payload, err = ci_from(ws, capsys)
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == expected, err
+    assert rc == (1 if expected else 0)
+
+
+@needs_git
+def test_a_layout_git_cannot_place_fails_the_ci_check(tmp_path, capsys, monkeypatch):
+    repo, ws = nested_repo(tmp_path, "pkg")
+    real = gitsafe.run
+
+    def refuse(args, *a, **kw):
+        if "--show-prefix" in args:
+            return subprocess.CompletedProcess(list(args), 128, b"", b"fatal: not a git repository")
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    rc, payload, err = ci_from(ws, capsys)
+    assert rc == 1 and payload is None and err.startswith("Error:")
+
+
+def test_a_path_is_relative_to_the_workspace_prefix_only_inside_it():
+    assert gitsafe.relative_to_prefix("", "src/a.py") == "src/a.py"
+    assert gitsafe.relative_to_prefix("pkg dir/ü/", "pkg dir/ü/src/a.py") == "src/a.py"
+    assert gitsafe.relative_to_prefix("pkg/", "pkgx/src/a.py") is None
+    assert gitsafe.relative_to_prefix("pkg/", "other/pkg/a.py") is None
 
 
 def test_the_cap_is_the_one_the_scan_uses():

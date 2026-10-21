@@ -478,6 +478,56 @@ def test_uninstall_removes_only_aegis_entries_and_keeps_the_rest(env):
     assert load(path) == {"model": "x", "hooks": {"PreToolUse": [theirs]}}
 
 
+def test_uninstall_also_removes_the_insight_capture_entry(env):
+    path = env.home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    mine = {"matcher": "", "hooks": [{"type": "command", "command": "echo mine"}]}
+    ours = {"matcher": "", "hooks": [{"type": "command", "command": "/py",
+                                      "args": ["-I", "-c", registrar.INSIGHT_RUNNER, "/root", "--host", "claude-code"]}]}
+    path.write_text(json.dumps({"hooks": {"UserPromptSubmit": [mine, ours]}}), encoding="utf-8")
+    install(env, "claude-code")
+    (result,) = uninstall(env, "claude-code", "user")
+    assert (result.status, result.insight_capture) == ("removed", "removed")
+    assert result.as_dict()["insight_capture"] == "removed"
+    assert load(path) == {"hooks": {"UserPromptSubmit": [mine]}}
+    assert len(backups(env)) == 2
+
+
+def test_install_result_carries_no_insight_capture(env):
+    assert install(env, "claude-code").as_dict()["insight_capture"] is None
+
+
+def test_edit_hook_file_writes_nothing_when_the_edit_changes_nothing(env):
+    path = env.home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"model": "x"}')
+    assert registrar.edit_hook_file(path, lambda data: None, home=env.home) is None
+    assert path.read_bytes() == b'{"model": "x"}' and backups(env) == []
+
+
+def test_edit_hook_file_turns_an_edit_refusal_into_install_error(env):
+    path = env.home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"model": "x"}')
+
+    def refuse(data):
+        raise ValueError("'hooks' must be a JSON object")
+
+    with pytest.raises(InstallError, match="'hooks' must be a JSON object; left unchanged"):
+        registrar.edit_hook_file(path, refuse, home=env.home)
+    assert path.read_bytes() == b'{"model": "x"}' and backups(env) == []
+
+
+def test_edit_hook_file_backs_up_then_replaces(env):
+    path = env.home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"model": "x"}')
+    used = registrar.edit_hook_file(path, lambda data: data.update(effort="high"), home=env.home)
+    assert load(path) == {"model": "x", "effort": "high"}
+    (copy,) = backups(env)
+    assert copy.read_bytes() == b'{"model": "x"}' and copy.parent == used / "user"
+
+
 def test_uninstall_drops_the_containers_it_emptied(env):
     install(env, "claude-code")
     uninstall(env, "claude-code")

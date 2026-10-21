@@ -32,6 +32,7 @@ from pathlib import Path, PurePath
 import posixpath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import rule_integrity
@@ -121,10 +122,7 @@ class _Match:
     fitness: Fitness
 
 
-def _match(rule: Rule, files: List[str], fitness: Fitness) -> Optional[_Match]:
-    matched = tuple(rule.matching_files(files))
-    if not matched:
-        return None
+def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
     exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
     return _Match(rule, matched, exact, fitness)
 
@@ -156,8 +154,16 @@ def _item(m: _Match) -> Dict[str, Any]:
         "hypothesis": rule.meta.get("hypothesis", ""),
         "prediction": rule.meta.get("prediction", ""),
         "matched_files": list(m.files),
-        "fitness": m.fitness.score,
+        "fitness": m.fitness.reported_score,
     }
+
+
+def _fitness_text(fit: Fitness) -> str:
+    if fit.reported_score is not None:
+        return f"{fit.reported_score:.2f}"
+    if fit.evidence_available and not fit.triggers and not fit.verdicts:
+        return "no evidence yet"
+    return fit.status_label or "—"
 
 
 def _text(m: _Match) -> str:
@@ -174,7 +180,7 @@ def _text(m: _Match) -> str:
     if rule.body:
         lines = rule.body.strip().split("\n")[:8]
         out += f"   Detail: {' '.join(line.strip() for line in lines)[:300]}\n"
-    out += f"   Fitness: {m.fitness.score:.2f}\n"
+    out += f"   Fitness: {_fitness_text(m.fitness)}\n"
     return out
 
 
@@ -327,8 +333,9 @@ def scan(
     # Workspace-relative, each file once, as every other surface matches them.
     files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
     stale = stale_rules(ruleset, read_derived(workspace))
-    return _select(ruleset, files, budget, token_budget, stale, lambda served: for_rules(workspace, served),
-                   _integrity_extras(view))
+    # Labels are read only by decision callers: scan ranks without them and spawns no git for them.
+    return _select(ruleset, files, budget, token_budget, stale,
+                   lambda served: for_rules(workspace, served, adjudications=Adjudications()), _integrity_extras(view))
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.
@@ -345,6 +352,18 @@ def _integrity_extras(view: "rule_integrity.Effective") -> Dict[str, Any]:
         if len(view.unreviewed) > _UNREVIEWED_LISTED:
             extras["unreviewed_total"] = len(view.unreviewed)
     return extras
+
+
+def _trim_unreviewed(extras: Dict[str, Any]) -> bool:
+    """Drop the last listed unreviewed rule (branch-local text, bounded by the budget like the rest),
+    keeping the true count; False when none is listed."""
+    listed = extras.pop("unreviewed_rules", None)
+    if not listed:
+        return False
+    extras.setdefault("unreviewed_total", len(listed))
+    if len(listed) > 1:
+        extras["unreviewed_rules"] = listed[:-1]
+    return True
 
 
 def scan_user_layer(
@@ -428,14 +447,19 @@ def _select(
         "estimated_tokens": 0,
         "max_tokens_budget": token_budget,
     }
+    extras = dict(extras or {})
     if not files:
-        payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
-        payload["guidance"] = NO_CHANGES_TEXT
-        payload["stats"]["estimated_tokens"] = _tokens(payload)
-        return payload
+        while True:
+            payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
+            payload["guidance"] = NO_CHANGES_TEXT
+            payload["stats"]["estimated_tokens"] = _tokens(payload)
+            if payload["stats"]["estimated_tokens"] <= token_budget or not _trim_unreviewed(extras):
+                return payload
 
-    fits = fitness_of(served)
-    matches = [m for m in (_match(r, files, fits[r.id]) for r in served) if m is not None]
+    # Fitness reads the ledger and projects credit: only for rules that matched, and only if any did.
+    hits = [(r, f) for r, f in ((r, tuple(r.matching_files(files))) for r in served) if f]
+    fits = fitness_of([r for r, _f in hits]) if hits else {}
+    matches = [_match(r, f, fits[r.id]) for r, f in hits]
     stats["matched"] = len(matches)
     mandatory = _rank([m for m in matches if m.rule.mandatory], mandatory=True)
     advisory = _rank([m for m in matches if not m.rule.mandatory], mandatory=False)
@@ -482,6 +506,8 @@ def _select(
             break
         if shown:
             shown -= 1  # names go before rules do
+        elif _trim_unreviewed(extras):
+            pass  # then the unreviewed list, last entry first
         elif staged:
             entry = staged.pop()
             clamped.insert(0, entry)

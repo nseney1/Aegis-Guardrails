@@ -176,7 +176,41 @@ def _resolve_canonical_test_candidates(root: Path, source_file: Path) -> list[Pa
             candidates.append(test_dir / f"test_{clean_pkg}_{parent_name}_adapters.py")
             candidates.append(test_dir / f"test_{clean_pkg}_{parent_name}_{stem}.py")
 
-    # 3. Domain and legacy suite mappings resolved dynamically
+    # 3. Domain and legacy suite mappings, for the Aegis packages only
+    candidates.extend(_aegis_suite_candidates(test_dir, parts, stem, parent_name))
+
+    # 4. Flat root candidates
+    candidates.append(test_dir / f"test_{stem}.py")
+    candidates.append(test_dir / f"test_{stem}_behavioral.py")
+    candidates.append(test_dir / "test_verification" / f"test_{stem}.py")
+    candidates.append(test_dir / "unit" / "verification" / f"test_{stem}.py")
+
+    expanded: list[Path] = []
+    seen = set()
+    for c in candidates:
+        if c not in seen:
+            expanded.append(c)
+            seen.add(c)
+        if c.parent == test_dir:
+            for domain in ("core", "cli", "mcp", "sdk", "verification"):
+                cand_domain = test_dir / "unit" / domain / c.name
+                if cand_domain not in seen:
+                    expanded.append(cand_domain)
+                    seen.add(cand_domain)
+            for subdir in ("integration", "contract"):
+                cand_sub = test_dir / subdir / c.name
+                if cand_sub not in seen:
+                    expanded.append(cand_sub)
+                    seen.add(cand_sub)
+
+    return expanded
+
+
+def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_name: str) -> List[Path]:
+    """Aegis's own suite files for a source file of the Aegis packages (aegis_*, or the legacy
+    soma_* brand). The map names this repository's layout, so it is valid only inside those
+    packages: anywhere else a suite it names says nothing about the file."""
+    candidates: List[Path] = []
     top_dir = parts[0] if parts else ""
     if top_dir in ("aegis_cli", "soma_cli"):
         candidates.append(test_dir / f"test_cli_{stem}.py")
@@ -188,6 +222,8 @@ def _resolve_canonical_test_candidates(root: Path, source_file: Path) -> list[Pa
         candidates.append(test_dir / f"test_mcp_{stem}.py")
     elif top_dir in ("aegis_sdk", "soma_sdk"):
         candidates.append(test_dir / f"test_sdk_{stem}.py")
+    else:
+        return candidates
 
     if "ast" in parts:
         candidates.append(test_dir / f"test_ast_{stem}.py")
@@ -282,32 +318,7 @@ def _resolve_canonical_test_candidates(root: Path, source_file: Path) -> list[Pa
     if stem == "policy":
         candidates.append(test_dir / "test_forbid_ast_rules.py")
         candidates.append(test_dir / "test_forbid_ast_hardening.py")
-
-    # 4. Flat root candidates
-    candidates.append(test_dir / f"test_{stem}.py")
-    candidates.append(test_dir / f"test_{stem}_behavioral.py")
-    candidates.append(test_dir / "test_verification" / f"test_{stem}.py")
-    candidates.append(test_dir / "unit" / "verification" / f"test_{stem}.py")
-
-    expanded: list[Path] = []
-    seen = set()
-    for c in candidates:
-        if c not in seen:
-            expanded.append(c)
-            seen.add(c)
-        if c.parent == test_dir:
-            for domain in ("core", "cli", "mcp", "sdk", "verification"):
-                cand_domain = test_dir / "unit" / domain / c.name
-                if cand_domain not in seen:
-                    expanded.append(cand_domain)
-                    seen.add(cand_domain)
-            for subdir in ("integration", "contract"):
-                cand_sub = test_dir / subdir / c.name
-                if cand_sub not in seen:
-                    expanded.append(cand_sub)
-                    seen.add(cand_sub)
-
-    return expanded
+    return candidates
 
 
 def check_test_coverage(root: Path) -> list[dict]:
@@ -464,7 +475,7 @@ def check_rule_fitness(root: Path) -> list[dict]:
 
     for rule_id, counts in sorted(ledger.aggregate_rows(view.rows).items()):
         fit = compute(counts, rule=rule_id)
-        if fit.misfire > MISFIRE_THRESHOLD:
+        if fit.has_min_n and fit.misfire > MISFIRE_THRESHOLD:
             issues.append({
                 "check": "rule_fitness",
                 "rule": rule_id,

@@ -96,6 +96,51 @@ def test_a_broken_ledger_never_blocks_the_commit(tmp_path):
     assert _commit(repo).startswith("work")
 
 
+def _plant_trailer_program(repo, tmp_path, config):
+    """Set the repository config ``config`` names, pointing at a program that records it ran."""
+    marker, program = tmp_path / "trailer-ran", tmp_path / "trailer.sh"
+    program.write_bytes(f'#!/bin/sh\necho ran >> "{marker}"\necho planted\n'.encode())
+    program.chmod(0o755)
+    for key in config:
+        repo.git("config", "--local", key, "Aegis-Check" if key.endswith(".key") else str(program))
+    return marker
+
+
+@needs_git
+@pytest.mark.parametrize("config", [
+    pytest.param(("trailer.unrelated.command",), id="any-command"),
+    pytest.param(("trailer.aegis-check.cmd",), id="alias-cmd"),
+    pytest.param(("trailer.x.key", "trailer.x.cmd"), id="key-cmd"),
+])
+def test_the_hook_runs_no_trailer_program_the_repository_names(tmp_path, config):
+    """Given a trailer command in the repository config and a passing check of the staged tree,
+    When the hook adds the trailer, Then the program never runs and the trailer is Aegis's."""
+    repo = _project(tmp_path)
+    marker = _plant_trailer_program(repo, tmp_path, config)
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    body = _commit(repo)
+    assert not marker.exists(), "the hook ran a program the repository's config names"
+    assert body.splitlines()[-1] == f"Aegis-Check: tree={row['tree']} exit=0"
+    assert "planted" not in body
+
+
+@needs_git
+def test_in_a_linked_worktree_the_hook_runs_no_trailer_program_either(tmp_path):
+    repo = _project(tmp_path)
+    repo.git("commit", "-q", "-am", "start")
+    marker = _plant_trailer_program(repo, tmp_path, ("trailer.x.key", "trailer.x.cmd", "trailer.unrelated.command"))
+    linked = tmp_path / "linked"
+    repo.git("worktree", "add", "-q", "-b", "side", str(linked))
+    (linked / "src" / "app.py").write_bytes(b"def app():\n    return 4\n")
+    row = checkrun.record(linked, tests=True, base="main").row
+    hg.git(linked, "-c", "user.email=dev@example.com", "-c", "user.name=Dev", "add", "-A", env=repo.home.env)
+    hg.git(linked, "-c", "user.email=dev@example.com", "-c", "user.name=Dev", "commit", "-q", "-m", "side work",
+           env=repo.home.env)
+    body = hg.git(linked, "log", "-1", "--format=%B", env=repo.home.env)
+    assert not marker.exists()
+    assert body.splitlines()[-1] == f"Aegis-Check: tree={row['tree']} exit=0" and "planted" not in body
+
+
 @needs_git
 def test_install_never_overwrites_a_hook_it_does_not_own(tmp_path):
     repo = hv.make_project(tmp_path)

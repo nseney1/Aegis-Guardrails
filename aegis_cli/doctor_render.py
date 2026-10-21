@@ -298,9 +298,14 @@ def _print_tiers(diag: _Diagnosis) -> None:
 def _print_trust(diag: _Diagnosis) -> None:
     from aegis_cli import doctor as _doc
 
+    from aegis_core import gitsafe
+
     print("")
     for line in diag.trust.text_lines():
         print(_doc._clean(line, 4096))
+    if gitsafe.toplevel(diag.ctx.root) is not None:
+        for line in _ci_workflow_lines(_ci_workflow(diag.ctx.root)):
+            print("  " + _doc._clean(line, 4096))
     modes = diag.modes
     if modes is not None and modes.supported and modes.looser:
         print(f"  Shared state: {modes.looser} of {modes.checked} entries are looser than 0700/0600 "
@@ -343,19 +348,62 @@ def _print_results(results: List[Dict[str, Any]], backup: Optional[Path]) -> Non
 # ── --github: what the trust tiers need, and --apply ────────────────────────
 
 _PLACEHOLDER_CHECK = "aegis"
+# GitHub names a check after the job's name:, expanded, so only a literal name can be required.
+_NO_AEGIS_JOB = ("no job in .github/workflows runs aegis check --ci under a literal name outside a matrix "
+                 "(a templated name: or a matrix has no fixed check name to require)")
+
+
+def _aegis_jobs(root: Path) -> List[str]:
+    """The Aegis jobs of the working tree's workflows: what a ruleset written now should require."""
+    found: List[str] = []
+    for path in sorted(p for p in (root / ".github" / "workflows").glob("*") if p.suffix in (".yml", ".yaml")):
+        with contextlib.suppress(OSError):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            found += [job for job in human_gate.aegis_check_jobs(text) if job not in found]
+    return found
+
+
+def _ci_workflow(root: Path) -> Dict[str, Any]:
+    """The workflow credit confirmation reads (user ``ci.workflow`` or the default) and whether it
+    exists at HEAD. Local only: no network."""
+    from aegis_core import config, credit, gitsafe
+
+    named = config.user_ci_workflow(root)
+    name = named or credit.DEFAULT_WORKFLOW
+    top = gitsafe.toplevel(root)
+    present = False
+    if top is not None:
+        with contextlib.suppress(gitsafe.GitError):
+            present = gitsafe.read_blob(top, "HEAD", f".github/workflows/{name}") is not None
+    return {"name": name, "source": "user-config" if named else "default", "present": present}
+
+
+def _ci_workflow_lines(info: Dict[str, Any]) -> List[str]:
+    where = f".github/workflows/{info['name']}"
+    how = ("(ci.workflow)" if info["source"] == "user-config"
+           else "(default; set ci.workflow in ~/.aegis/config.json to use another workflow)")
+    lines = [f"CI credit: credit looks for runs of {where} {how}"]
+    if not info["present"]:
+        lines.append(f"⚠️  {where} is missing at HEAD, so no credit can be confirmed")
+    return lines
 
 
 def _github_plan(root: Path, report: Any) -> Dict[str, Any]:
-    found = human_gate.workflow_contexts(root)
+    found = _aegis_jobs(root)
     contexts = found or [_PLACEHOLDER_CHECK]
-    owner = (report.evidence.get("repo") or {}).get("full_name") or ""
-    handle = "@" + owner.split("/")[0] if "/" in owner else "@OWNER"
+    repo = report.evidence.get("repo") or {}
+    owner = repo.get("full_name") or ""
+    org = (repo.get("owner") or {}).get("type") == "Organization"
+    handle = "@OWNER-OR-@org/team" if org else ("@" + owner.split("/")[0] if "/" in owner else "@OWNER")
     return {
         "required_checks": contexts,
         "required_checks_from_workflows": bool(found),
         "ruleset": {"A": human_gate.build_ruleset("A", contexts), "B": human_gate.build_ruleset("B", contexts)},
         "codeowners": human_gate.codeowners_lines(handle),
+        "codeowners_note": ("an organization owns this repository, and GitHub ignores a bare @org owner: "
+                            "name a team (@org/team) or people") if org else None,
         "signing_setup": human_gate.signers_setup(),
+        "ci_workflow": _ci_workflow(root),
     }
 
 
@@ -365,17 +413,23 @@ def _print_github(plan: Dict[str, Any], report: Any) -> None:
     print("aegis doctor --github: what the trust tiers need (read-only; nothing below has been applied)\n")
     for line in report.text_lines():
         print(_doc._clean(line, 4096))
+    for line in _ci_workflow_lines(plan["ci_workflow"]):
+        print(_doc._clean(line, 4096))
     checks = ", ".join(plan["required_checks"])
     if plan["required_checks_from_workflows"]:
-        print(f"\nRequired status checks (the jobs in .github/workflows; keep the ones that must pass): {checks}")
+        print(f"\nRequired status checks (the jobs in .github/workflows that run aegis check --ci): {checks}")
     else:
-        print(f"\nNo workflow jobs found: the rulesets below name a placeholder check {checks!r}; replace it with "
-              "your Aegis job, and --apply refuses until a workflow exists.")
+        print(f"\nRequired status checks: none found ({_NO_AEGIS_JOB}); the rulesets below name a placeholder "
+              f"check {checks!r}, and --apply refuses until such a job exists.")
+    print(f"Each check's source is pinned to GitHub Actions (integration_id {human_gate.GITHUB_ACTIONS_APP_ID}): a status "
+          "posted by any other app or token does not satisfy it.")
     for tier, title in (("B", "solo, signed: pull request + required checks, approvals are `aegis approve` signatures"),
                         ("A", "separation of duties: one approving review + code-owner review + required checks")):
         print(f"\nRuleset, tier {tier} ({title}):")
         print(json.dumps(plan["ruleset"][tier], indent=2))
     print("\nCODEOWNERS lines (commit to the default branch; replace the owner with your reviewer):")
+    if plan["codeowners_note"]:
+        print(f"  ({plan['codeowners_note']})")
     for line in plan["codeowners"]:
         print(f"  {line}")
     print("\nSigning setup for tier B (nothing here is run for you):")
@@ -397,8 +451,8 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
                   "interactive y/N answer (--yes does not apply); nothing was changed.", file=sys.stderr)
             return 1
         if not plan["required_checks_from_workflows"]:
-            print("aegis doctor: no workflow jobs found in .github/workflows to require; add the Aegis workflow "
-                  "first. Nothing was changed.", file=sys.stderr)
+            print(f"aegis doctor: {_NO_AEGIS_JOB}; add the Aegis workflow (aegis init --ci) first. Nothing was changed.",
+                  file=sys.stderr)
             return 1
         try:
             exists = human_gate.ruleset_exists(root)
@@ -460,6 +514,7 @@ def _run_drivers_only(root: Path, use_json: bool, fix: bool, yes: bool) -> int:
     with contextlib.redirect_stdout(text) if use_json else contextlib.nullcontext():
         if not use_json:
             print(f"aegis doctor — AST driver health check ({_doc._clean(root, 4096)}):\n")
+            print("Trust tier: not read in this mode (run aegis doctor)")  # --drivers stays local, no gh
         plan = _plan([], _missing_ast_extensions(root), root) if fix else []
         if plan:
             _print_plan(plan, _doc._home())

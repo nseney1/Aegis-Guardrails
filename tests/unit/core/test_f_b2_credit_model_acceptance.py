@@ -34,6 +34,7 @@ from aegis_cli.status import run_status
 from aegis_cli.sync import run_sync
 from aegis_core import credit, fitness, sync
 from aegis_core.verification.runner import run_layer1
+from tests import helpers_adjudication as ha
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -100,19 +101,13 @@ def test_six_inline_allow_overrides_count_as_contested_and_never_demote_a_health
         target_paths=["src/*.py"],
         forbid_calls=["eval"],
     )
-    # Healthy gate with 12 adjudicated true positives across 3 sessions.
-    for i in range(12):
-        credit.record_adjudication(
-            tmp_path,
-            "gate-no-eval",
-            "tp",
-            adjudicator="human",
-            ref=f"PR-{i + 1}",
-            session=f"sess-{(i % 3) + 1}",
-            file="src/app.py",
-            line=i + 1,
-            summary=f"Caught unsafe eval #{i + 1}",
-        )
+    # Healthy gate with 12 adjudicated true positives across 3 sessions, merged at the base (R-evidence-3).
+    ha.write_labels(tmp_path, "gate-no-eval", [
+        {"example_id": f"PR-{i + 1}", "verdict": "tp", "ref": f"PR-{i + 1}", "session": f"sess-{(i % 3) + 1}",
+         "file": "src/app.py", "line": i + 1, "summary": f"Caught unsafe eval #{i + 1}"}
+        for i in range(12)
+    ])
+    ha.merge_to_base(tmp_path)
 
     # Six `# aegis: allow` overrides in source code evaluated by Layer 1.
     src_dir = tmp_path / "src"
@@ -135,6 +130,7 @@ def test_six_inline_allow_overrides_count_as_contested_and_never_demote_a_health
 
     result = sync.sync(tmp_path)
     gate_info = result.derived["rules"]["gate-no-eval"]
+    assert gate_info["adjudicated_n"] == 12
     assert gate_info["contested"] == 6
     assert gate_info["fp"] == 0
     assert gate_info["flagged_for_review"] is True
@@ -151,15 +147,11 @@ def test_small_n_shows_insufficient_and_no_precision_number_in_status(
     """§9 T4 Scenario 2: Given 4 adjudicated labels, when status runs,
     then the rule shows `insufficient (n=4)`, not a precision."""
     _write_rule(tmp_path, "trap", "trap-small-n", target_paths=["src/*.py"])
-    for i in range(4):
-        credit.record_adjudication(
-            tmp_path,
-            "trap-small-n",
-            "tp" if i < 3 else "fp",
-            adjudicator="human",
-            ref=f"adj-{i + 1}",
-            session=f"sess-{i + 1}",
-        )
+    ha.write_labels(tmp_path, "trap-small-n", [
+        {"example_id": f"adj-{i + 1}", "verdict": "tp" if i < 3 else "fp", "session": f"sess-{i + 1}"}
+        for i in range(4)
+    ])
+    ha.merge_to_base(tmp_path)
 
     rc = run_status(argparse.Namespace(_root=tmp_path, plain=True))
     assert rc == 0
@@ -176,6 +168,49 @@ def test_small_n_shows_insufficient_and_no_precision_number_in_status(
     rule_json = next(r for r in payload["rules"] if r["name"] == "trap-small-n")
     assert rule_json["state"] == "insufficient"
     assert rule_json["score"] is None
+
+
+def test_scan_status_and_list_rules_show_no_number_below_min_n_and_agree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R-evidence-8: Given n in (0, 1, MIN_N - 1) verdicts, When scan, status and list_rules
+    run, Then none shows a number (`insufficient (n=N)`, or `no evidence yet` without any
+    ledger row); Given exactly MIN_N, Then the number appears; ranking keeps the raw score."""
+    from aegis_core.fitness import MIN_N
+    from aegis_core.rules import load_rules
+    from aegis_core.scan import RULE_CACHE, scan
+    from aegis_core.telemetry_engine import ledger
+    from aegis_mcp.registry import list_rules
+
+    counts = {"trap-none": None, "trap-zero": 0, "trap-one": 1, "trap-low": MIN_N - 1, "trap-at": MIN_N}
+    for rid, n in counts.items():
+        _write_rule(tmp_path, "trap", rid, target_paths=["src/*.py"])
+        if n is None:
+            continue
+        rows = [{"rule": rid, "outcome": "tp", "source": "ci", "key": f"{rid}-{i}"} for i in range(n)]
+        ledger.append(tmp_path, rows or [{"rule": rid, "outcome": "trigger", "source": "ci", "key": f"{rid}-t"}])
+    RULE_CACHE.invalidate()
+    raw = fitness.for_rules(tmp_path, load_rules(tmp_path).served)
+
+    result = scan(tmp_path, ["src/app.py"], budget=10, max_tokens=100000)
+    shown = {r["name"]: r["fitness"] for r in result["relevant_rules"]}
+    assert shown == {"trap-none": None, "trap-zero": None, "trap-one": None, "trap-low": None,
+                     "trap-at": raw["trap-at"].score}
+    assert raw["trap-at"].score > 0.8
+    assert "Fitness: no evidence yet" in result["guidance"]
+    for rid in ("trap-zero", "trap-one", "trap-low"):
+        assert f"Fitness: insufficient (n={counts[rid]})" in result["guidance"]
+    assert f"Fitness: {raw['trap-at'].score:.2f}" in result["guidance"]
+    assert [r["name"] for r in result["relevant_rules"]] == sorted(raw, key=lambda rid: (-raw[rid].score, rid))
+
+    assert run_status(argparse.Namespace(_root=tmp_path, json=True)) == 0
+    status_scores = {r["name"]: r["score"] for r in json.loads(capsys.readouterr().out)["rules"]}
+    assert {rid: status_scores[rid] for rid in counts} == shown
+
+    listed = {r["id"]: r["fitness"] for r in list_rules(tmp_path)["rules"]}
+    assert {rid: listed[rid]["reported_score"] for rid in counts} == shown
+    assert {rid: listed[rid]["score"] for rid in counts} == {rid: raw[rid].score for rid in counts}
+    assert listed["trap-low"]["status"] == f"insufficient (n={MIN_N - 1})"
 
 
 # ── 3. A quiet trap decays (with v4.4 §12.9 scope_basis & immunities) ────────
@@ -269,7 +304,7 @@ def test_detector_replay_classifies_caught_and_leaked_and_deduplicates_per_branc
     """§3 T4 Detector Replay:
     - Pattern in intermediate commit and removed before merge -> `caught` (weight 0.5).
     - Pattern in merged commit that was later reverted/fixed -> `leaked` (weight 1.0).
-    - Deduplicated by `(rule, file, pattern, branch)`."""
+    - Deduplicated by `(rule, file, pattern, introducing commit)` (R-evidence-10)."""
     home = hg.Home(tmp_path / "home")
     repo = hg.Repo(tmp_path / "repo", home)
     _write_rule(
@@ -364,19 +399,13 @@ def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_m
     whose body contains the evidence report and up to 3 sampled examples, via injectable
     `gh` runner, and never auto-merges."""
     _write_rule(tmp_path, "trap", "trap-decided", created="2026-01-01", target_paths=["src/*.py"])
-    for i in range(25):
-        credit.record_adjudication(
-            tmp_path,
-            "trap-decided",
-            "tp",
-            adjudicator="human",
-            ref=f"PR-{100 + i}",
-            session=f"sess-{(i % 4) + 1}",
-            repo=f"repo-{(i % 2) + 1}",
-            file="src/app.py",
-            line=10 + i,
-            summary=f"Prevented bug example #{i + 1}",
-        )
+    ha.write_labels(tmp_path, "trap-decided", [
+        {"example_id": f"PR-{100 + i}", "verdict": "tp", "ref": f"PR-{100 + i}", "session": f"sess-{(i % 4) + 1}",
+         "repo": f"repo-{(i % 2) + 1}", "file": "src/app.py", "line": 10 + i,
+         "summary": f"Prevented bug example #{i + 1}"}
+        for i in range(25)
+    ])
+    ha.merge_to_base(tmp_path)
 
     gh_calls: list[list[str]] = []
 
@@ -415,6 +444,7 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
     unavailable evidence state, and `aegis rule adjudicate` CLI."""
     from aegis_cli.cli import main
     from aegis_core import checkrun, human_gate
+    from aegis_core.rules import load_rules
     from tests import helpers_verified as hv
 
     repo = hv.make_project(tmp_path)
@@ -471,12 +501,14 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
     assert s_res.derived["rules"]["trap-sample"]["tp"] == 1
     assert s_res.derived["rules"]["trap-sample"]["triggers"] == 1
 
-    # 6. CLI `aegis rule adjudicate` adds human adjudication
+    # 6. CLI `aegis rule adjudicate` writes a working-tree label that counts only once merged (R-evidence-3)
     monkeypatch.chdir(repo.root)
     capsys.readouterr()
     assert main(["rule", "adjudicate", "trap-sample", "tp", "--ref", "PR-1", "--summary", "good catch", "--json"]) == 0
     adj_out = json.loads(capsys.readouterr().out)
-    assert adj_out["event"] == "adjudication" and adj_out["verdict"] == "tp"
+    assert (adj_out["status"], adj_out["path"]) == ("recorded", ".aegis/adjudications/trap-sample.jsonl")
+    assert (adj_out["label"]["example_id"], adj_out["label"]["verdict"]) == ("PR-1", "tp")
+    assert fitness.for_rules(repo.root, load_rules(repo.root).served)["trap-sample"].adjudicated_n == 0
 
     # 7. Corrupt ledger line -> evidence unavailable in fitness, status, and sync refuses transitions
     hv.ledger_path(repo.root).open("ab").write(b"{corrupt json line\n")
@@ -490,11 +522,12 @@ def test_end_to_end_claimed_to_recorded_to_landed_to_confirmed_to_scored_and_app
 
 
 @needs_git
-def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_verifies(
+def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_stays_offline(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """1. Repeated `sync.sync()` calls refresh CI on every call (revoking on later failure, querying newly landed commits).
-    2. A fresh `status` process (`_VERIFIED_CI` cleared, no `client` passed) verifies recorded `ci` rows via GitHub REST or attestation."""
+    2. A fresh `status` process (`_VERIFIED_CI` cleared, no `client` passed) stays offline (R-trust-52): it makes no
+       `gh` call and shows the rule without the CI-confirmed credit, which lives in the sync-derived document."""
     from aegis_core import checkrun, human_gate, rules
     from tests import helpers_verified as hv
 
@@ -516,21 +549,23 @@ def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_v
     s1 = sync.sync(repo.root, ci_client=hv.FakeCI([r1_ok]))
     assert s1.derived["rules"]["trap-sample"]["tp"] == 1
 
-    # Fresh status process (empty _VERIFIED_CI) verifies recorded ci row via default_gh_runner
+    # Fresh status process (empty _VERIFIED_CI) reads no GitHub and counts no unverified ci credit
     credit._VERIFIED_CI.clear()
     credit._UNAVAILABLE_CI.clear()
-    monkeypatch.setattr(
-        human_gate,
-        "default_gh_runner",
-        lambda argv, stdin=None, cwd=None: subprocess.CompletedProcess(
-            argv, 0, json.dumps({"workflow_runs": [r1_ok]}).encode("utf-8"), b"",
-        ),
-    )
+    gh_calls: list = []
+
+    def counting_gh(argv, stdin=None, cwd=None, timeout=None):
+        gh_calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [r1_ok]}), "")
+
+    monkeypatch.setattr(human_gate, "default_gh_runner", counting_gh)
     capsys.readouterr()
     run_status(argparse.Namespace(_root=repo.root, plain=True))
     status_out = capsys.readouterr().out
-    assert "insufficient (n=1)" in status_out
-    assert "no evidence" not in status_out
+    assert gh_calls == []
+    assert "insufficient (n=1)" not in status_out
+    assert any(line.split()[:2] == ["trap-sample", "0"] for line in status_out.splitlines())
+    assert s1.derived["rules"]["trap-sample"]["tp"] == 1
 
     # Later failed CI rerun on c1 -> second sync revokes c1 credit even though c1 was already in _VERIFIED_CI
     r1_fail = hv.ci_run(c1, "failure", run_id=11, attempt=2, run_started_at="2026-10-17T10:05:00Z")
@@ -586,11 +621,12 @@ def test_check_ci_trailer_independently_reruns_snapshot_without_local_ledger(
 
 
 @needs_git
-def test_detector_replay_ignores_unmerged_head_and_reconciles_leaked_to_caught_after_fix(
+def test_detector_replay_ignores_unmerged_head_and_keeps_a_landed_finding_leaked_after_a_fix(
     tmp_path: Path,
 ) -> None:
     """`replay_detector_history` walks the target protected branch (`main`), ignoring unmerged feature
-    commits on `HEAD`, and reconciles a previously recorded `leaked` finding to `caught` after a later fix."""
+    commits on `HEAD`; a finding that landed stays `leaked` after a later fix (spec T4.1: "later removed
+    by a fix or revert" is leaked), which the re-replay records as its `fix_rev` (R-evidence-10)."""
     from aegis_core import rules
 
     home = hg.Home(tmp_path / "home")
@@ -628,25 +664,16 @@ def test_detector_replay_ignores_unmerged_head_and_reconciles_leaked_to_caught_a
     repo.commit("fix: replace eval with int on main")
     repo.git("checkout", "work")
 
-    # Re-running replay / sync reconciles the earlier `leaked` finding for `eval` to `caught`
+    # Re-running replay supersedes the earlier row of the same unit: still `leaked`, now with its fix
     second_replay = fitness.replay_detector_history(repo.root)
-    patterns_2 = {d["pattern"]: d["disposition"] for d in second_replay}
-    assert patterns_2 == {"eval": "caught"}
+    patterns_2 = {d["pattern"]: (d["disposition"], d["rev"]) for d in second_replay}
+    assert patterns_2 == {"eval": ("leaked", first_replay[0]["rev"])}
+    assert second_replay[0]["fix_rev"] is not None and first_replay[0]["fix_rev"] is None
     fit_2 = fitness.for_rules(repo.root, rules.load_rules(repo.root).served)["no-eval-exec"]
-    assert fit_2.leaked == 0 and fit_2.caught == 1
+    assert fit_2.leaked == 1 and fit_2.caught == 0
 
 
-@needs_git
-def test_trailer_rerun_executes_unchanged_tests_and_works_in_fresh_credit_only_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When a commit modifies `src/app.py` (breaking an existing unchanged test) and adds a new passing
-    test file, trailer verification runs all snapshot tests (catching the broken unchanged test) and works
-    in a fresh Python process that imports only `aegis_core.credit`."""
-    import sys
-    from aegis_core import checkrun
-    from tests import helpers_verified as hv
-
+def _trailer_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> hg.Repo:
     home = hg.Home(tmp_path / "home")
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home.path))
@@ -654,21 +681,63 @@ def test_trailer_rerun_executes_unchanged_tests_and_works_in_fresh_credit_only_p
     repo.write("src/app.py", "def value():\n    return 1\n")
     repo.write("tests/test_existing.py", "from src.app import value\n\ndef test_existing():\n    assert value() == 1\n")
     repo.commit("initial")
-
-    # Branch and make a commit that breaks `test_existing.py` (without touching it) and adds `test_new.py`
     repo.branch("work")
-    repo.write("src/app.py", "def value():\n    return 2\n")
-    repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
+    return repo
+
+
+def _trailer_commit(repo: hg.Repo, value: int) -> str:
+    from tests import helpers_verified as hv
+
+    repo.write("src/app.py", f"def value():\n    return {value}\n")
     tree = hv.tree_now(repo.root)
-    repo.commit(f"feat: break existing test while adding passing test\n\n{credit.format_trailer(tree, 0)}")
+    repo.commit(f"feat: value {value}\n\n{credit.format_trailer(tree, 0)}")
+    return tree
 
-    # 1. Layer 2 `checkrun.verify_commit_trailers` runs all snapshot tests and catches the broken unchanged test
-    v_res = checkrun.verify_commit_trailers(repo.root, "main", "HEAD")
-    assert len(v_res) == 1
-    assert v_res[0]["result"] == "void"
-    assert v_res[0]["failed"] is True
 
-    # 2. Layer 1 `credit.verify_commit_trailers` requires an explicit `rerun_fn` (no import-order hook or subprocess spawn)
+@needs_git
+def test_only_the_head_commit_trailer_is_rerun(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec T1 compares the head commit's trailer: three trailer commits cost one rerun, for the head."""
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    trees = [_trailer_commit(repo, value) for value in (2, 3, 4)]
+    asked = []
+
+    def spy(commit: str, tree: str) -> dict:
+        asked.append((commit, tree))
+        return {"tree": tree, "exit": 0}
+
+    res = credit.verify_commit_trailers(repo.root, "main", "HEAD", rerun_fn=spy)
+    assert asked == [(repo.head(), trees[-1])]
+    assert [(r["commit"], r["result"]) for r in res] == [(repo.head(), "agree")]
+
+
+@needs_git
+def test_a_head_without_a_trailer_or_on_the_base_reruns_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    _trailer_commit(repo, 2)
+    asked = []
+
+    def spy(commit: str, tree: str) -> dict:
+        asked.append(commit)
+        return {"tree": tree, "exit": 0}
+
+    repo.git("checkout", "-q", "main")
+    repo.write("other.txt", "x\n")
+    repo.commit("main moves on")
+    repo.git("merge", "-q", "--no-ff", "--no-edit", "work")  # the head is a merge commit with no trailer
+    assert credit.verify_commit_trailers(repo.root, "work", "HEAD", rerun_fn=spy) == []
+    assert credit.verify_commit_trailers(repo.root, "main", "main", rerun_fn=spy) == []
+    assert asked == []
+
+
+@needs_git
+def test_trailer_verification_works_in_a_fresh_credit_only_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``credit.verify_commit_trailers`` takes an explicit ``rerun_fn`` and never imports ``checkrun``."""
+    import sys
+
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    _trailer_commit(repo, 2)
     code = (
         "import json, sys\n"
         "from aegis_core import credit\n"
@@ -685,6 +754,27 @@ def test_trailer_rerun_executes_unchanged_tests_and_works_in_fresh_credit_only_p
     assert len(parsed) == 1
     assert parsed[0]["result"] == "void"
     assert parsed[0]["failed"] is True
+
+
+@needs_git
+def test_the_trailer_rerun_runs_the_whole_suite_with_the_record_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A head that breaks an unchanged test while its trailer claims a pass is caught: the rerun runs
+    ``python -m pytest`` on the snapshot, as ``aegis check --record --tests`` does."""
+    from aegis_core import checkrun
+    from tests import helpers_verified as hv
+
+    if not hv.hermetic_pytest_ok():
+        pytest.skip("pytest is not importable by the hermetic interpreter (user-site install)")
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    repo.write("pytest.ini", "[pytest]\npythonpath = .\n")
+    repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
+    _trailer_commit(repo, 2)
+    v_res = checkrun.verify_commit_trailers(repo.root, "main", "HEAD")
+    assert len(v_res) == 1
+    assert v_res[0]["result"] == "void"
+    assert v_res[0]["failed"] is True
 
 
 @needs_git
@@ -725,3 +815,19 @@ def test_detector_replay_walks_commits_after_merge_and_prefers_ahead_remote_bran
 
     detections = fitness.replay_detector_history(repo.root)
     assert any(d["pattern"] == "eval" and d["disposition"] == "leaked" for d in detections)
+
+
+@needs_git
+def test_projecting_credit_never_imports_release_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One CI-confirmation path (REST): ``project_credits`` does not reach ``release_verify`` (R-trust-67)."""
+    import sys
+
+    repo = _trailer_repo(tmp_path, monkeypatch)
+    code = (
+        "import sys\n"
+        "from aegis_core import credit\n"
+        "credit.project_credits(sys.argv[1], verify_ci=True)\n"  # no ci row: nothing asks gh
+        "print('aegis_core.release_verify' in sys.modules)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code, str(repo.root)], capture_output=True, text=True, check=True)
+    assert proc.stdout.strip() == "False"

@@ -1,8 +1,8 @@
 from pathlib import Path
-"""Tests for apply_decay integration in the --local promotion path.
+"""Promotion candidates in the --local path come from ledger fitness.
 
-Verifies that the --local promotion path also applies exponential decay
-before evaluating candidates, consistent with the --tier-check path.
+Evidence decays only by eligible exposure sessions, never by calendar days (R-evidence-15),
+consistently with the --tier-check path.
 """
 import os
 import sys

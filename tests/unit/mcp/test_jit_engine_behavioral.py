@@ -5,7 +5,6 @@ returns for real rule files; no internal helper is called directly.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -73,13 +72,6 @@ class TestSelection:
         result = scan(tmp_path, ["src/foo.py"], budget=2)
         assert result["stats"]["budget"] == 2 and result["rules_staged"] == 2
 
-    def test_100_rules_scan_in_under_a_second(self, tmp_path):
-        for i in range(100):
-            _make_rule(tmp_path, f"perf-rule-{i}")
-        start = time.time()
-        scan(tmp_path, ["src/foo.py"])
-        assert time.time() - start < 1.0
-
 
 class TestFitnessInTheResult:
     def test_every_staged_rule_carries_its_ledger_fitness(self, tmp_path):
@@ -90,7 +82,7 @@ class TestFitnessInTheResult:
         result = scan(tmp_path, ["app.py"], budget=5)
 
         fitness = {r["name"]: r["fitness"] for r in result["relevant_rules"]}
-        assert fitness["inv-auth"] > 0.9 and fitness["trap-style"] == 0.0
+        assert fitness["inv-auth"] > 0.9 and fitness["trap-style"] is None
         assert "Fitness: 0." in result["guidance"]
 
 

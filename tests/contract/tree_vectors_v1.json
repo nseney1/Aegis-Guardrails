@@ -1,0 +1,54 @@
+{
+  "tree_algo": "v1",
+  "generated_from": "cdb527b",
+  "git_version": "git version 2.43.0",
+  "repository": {
+    "config": {"core.autocrlf": "false", "core.filemode": "true"},
+    "environment": {"GIT_CONFIG_NOSYSTEM": "1", "HOME": "an empty temporary directory", "USERPROFILE": "the same directory"}
+  },
+  "identity": {
+    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+0000",
+    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+0000"
+  },
+  "base": {"message": "base", "files": [{"path": "seed.txt", "data": "seed\n", "mode": "0644"}]},
+  "fixtures": [
+    {
+      "name": "plain",
+      "files": [{"path": "a.txt", "data": "hello\n", "mode": "0644"}, {"path": "sub/b.py", "data": "print(1)\n", "mode": "0644"}],
+      "expected": {"tree_algo": "v1", "status": "ok", "tree": "f4129718ad737f226c6a194ee6b9860fe96366b4", "reason": "", "gitlinks": []}
+    },
+    {
+      "name": "crlf",
+      "files": [{"path": "crlf.txt", "data": "one\r\ntwo\r\n", "mode": "0644"}],
+      "expected": {"tree_algo": "v1", "status": "ok", "tree": "bfc654107416a8581d0ff66effcd3c87c006fc3c", "reason": "", "gitlinks": []}
+    },
+    {
+      "name": "executable",
+      "posix_only": true,
+      "files": [{"path": "run.sh", "data": "#!/bin/sh\necho hi\n", "mode": "0755"}],
+      "expected": {"tree_algo": "v1", "status": "ok", "tree": "854e5374d5feee7e4efbb2c51437035af955255c", "reason": "", "gitlinks": []}
+    },
+    {
+      "name": "state-excluded",
+      "files": [{"path": "x.txt", "data": "x\n", "mode": "0644"}, {"path": ".aegis/state/ledger.jsonl", "data": "{}\n", "mode": "0644"}],
+      "expected": {"tree_algo": "v1", "status": "ok", "tree": "a822cc2d8c3bf904ac9faf19c2a90fc5fa119727", "reason": "", "gitlinks": []}
+    },
+    {
+      "name": "submodule-clean",
+      "files": [],
+      "submodule": {"path": "vendor/lib", "message": "lib", "commit": "c50de7f08785c040a7c499c010b608ee793dd563",
+                    "files": [{"path": "lib.py", "data": "x=1\n", "mode": "0644"}]},
+      "after_add": [],
+      "expected": {"tree_algo": "v1", "status": "ok", "tree": "c307a64c608fdee50c72d49d2eb23d92f071a6fa", "reason": "", "gitlinks": ["vendor/lib"]}
+    },
+    {
+      "name": "submodule-dirty",
+      "files": [],
+      "submodule": {"path": "vendor/lib", "message": "lib", "commit": "c50de7f08785c040a7c499c010b608ee793dd563",
+                    "files": [{"path": "lib.py", "data": "x=1\n", "mode": "0644"}]},
+      "after_add": [{"path": "vendor/lib/lib.py", "data": "x=2\n", "mode": "0644"}],
+      "expected": {"tree_algo": "v1", "status": "partial", "tree": "c307a64c608fdee50c72d49d2eb23d92f071a6fa",
+                   "reason": "submodule(s) differ from the recorded commit: vendor/lib", "gitlinks": ["vendor/lib"]}
+    }
+  ]
+}

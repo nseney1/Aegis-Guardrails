@@ -6,12 +6,14 @@ Zero external dependencies (pure stdlib). Target latency < 0.05ms.
 """
 from __future__ import annotations
 
+from collections import ChainMap
 from dataclasses import dataclass, field
 import fnmatch
 import os
+import posixpath
 import re
 import shlex
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 # ── Canonical Reason Strings (1:1 Parity with aegis_cli/hooks.py) ─────────────
 
@@ -77,6 +79,19 @@ EXEC_FLAGS_WITH_ARG = frozenset({
     "-a"
 })
 
+# Wrappers that run the rest of the line after their own options.
+OPTION_WRAPPER_FLAGS_WITH_ARG: Dict[str, frozenset] = {
+    "ionice": frozenset({"-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "setsid": frozenset(),
+    "busybox": frozenset(),
+}
+
+SU_COMMAND_FLAGS = frozenset({"-c", "--command", "--session-command"})
+SU_FLAGS_WITH_ARG = SU_COMMAND_FLAGS | {
+    "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-w", "--whitelist-environment"
+}
+
 GIT_GLOBAL_FLAGS_WITH_ARG = frozenset({
     "-C", "-c", "--exec-path", "--config-env", "--work-tree", "--namespace", "--git-dir"
 })
@@ -89,6 +104,7 @@ ENV_VAR_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*=")
 WIN_DRIVE_RE = re.compile(r'([a-zA-Z]:)\\([\s*?$"]|$)')
 RM_DANGEROUS_TARGETS = frozenset({"/", "~", "/home", "$home", "/root", "$root", ".", "..", "*"})
 GLOB_CHARS = frozenset({"*", "?", "[", "]"})
+_DELIMITER_PIECE = re.compile(r"&&|\|\||\|&|[;&|\n\r]")
 
 
 @dataclass(frozen=True)
@@ -115,6 +131,7 @@ class UnwrappedCommand:
     positional_args: list[str]
     has_sudo: bool = False
     env_vars: dict[str, str] = field(default_factory=dict)
+    tail: list[str] = field(default_factory=list)  # raw tokens after a git/gh subcommand
 
 
 # ── String Pre-processing & Subshell Scanner ──────────────────────────────────
@@ -302,6 +319,51 @@ def tokenize_command(cmd: str) -> list[str]:
     return list(lex)
 
 
+_COMMENT_CONTEXTS = ("", "(", "$(")  # where a word starting with # is a comment
+_WORD_BREAKS = " \t\n;&|()"
+
+
+def strip_shell_comments(cmd: str) -> str:
+    """``cmd`` without its shell comments, so a quote inside one (``# it's``) cannot
+    unbalance the lexer. A ``#`` starts a comment only where a word starts, outside
+    quotes, backticks and ``${...}`` (``a#b``, ``$#``, ``${#x}``, ``"a # b"`` stay);
+    the comment runs up to, not including, its newline, which still ends the command.
+    Unbalanced quotes are left for the lexer to fail on."""
+    if "#" not in cmd:
+        return cmd
+    out: List[str] = []
+    stack: List[str] = []  # open ' $' " ` ( $( ${
+    word_start = True
+    index = 0
+    while index < len(cmd):
+        char, pair = cmd[index], cmd[index:index + 2]
+        top = stack[-1] if stack else ""
+        step = 1
+        if top in ("'", "$'"):
+            if char == "\\" and top == "$'":
+                step = 2
+            elif char == "'":
+                stack.pop()
+        elif char == "\\":
+            step = 2
+        elif char == "#" and word_start and top in _COMMENT_CONTEXTS:
+            end = cmd.find("\n", index)
+            index = len(cmd) if end == -1 else end
+            continue
+        elif pair in ("$(", "${") or (pair == "$'" and top != '"'):
+            stack.append(pair)
+            step = 2
+        elif (char == top and char in "\"`") or (char == "}" and top == "${") or (char == ")" and top in ("(", "$(")):
+            stack.pop()
+        elif char == "`" or (top != '"' and char in "'\"("):
+            stack.append(char)
+        out.append(cmd[index:index + step])
+        if pair != "\\\n":  # a line continuation joins the words around it
+            word_start = char in _WORD_BREAKS or pair == "$("
+        index += step
+    return "".join(out)
+
+
 def decompose_command(tokens: list[str]) -> list[Pipeline]:
     """Split token stream into Pipelines by sequence delimiters (; , &&, ||, &, newline)."""
     seq_delims = {";", "&&", "||", "&", "\n", "\r", "\r\n"}
@@ -322,19 +384,56 @@ def decompose_command(tokens: list[str]) -> list[Pipeline]:
             pipelines.append(Pipeline(stages=list(curr_pipeline_stages)))
             curr_pipeline_stages = []
 
-    for tok in tokens:
-        if tok in seq_delims:
-            flush_pipeline()
-        elif tok in ("|", "|&"):
-            flush_stage()
-        else:
-            curr_stage_tokens.append(tok)
+    for token in tokens:
+        # shlex returns a run of adjacent delimiters (";\n", "\n\n", "&&\n", ";;") as one
+        # token; split it back so the command after the run starts a new stage.
+        pieces = _DELIMITER_PIECE.findall(token) if token and not token.strip("|;&\n\r") else (token,)
+        for tok in pieces:
+            if tok in seq_delims:
+                flush_pipeline()
+            elif tok in ("|", "|&"):
+                flush_stage()
+            else:
+                curr_stage_tokens.append(tok)
 
     flush_pipeline()
     return pipelines
 
 
 # ── Wrapper & Keyword Unwrapping Automaton ────────────────────────────────────
+
+def _consume_option(tokens: list[str], idx: int, with_arg: frozenset) -> tuple[str, str | None, int]:
+    """The option at ``tokens[idx]`` as ``(spelling, value, next index)``: ``--name=value``,
+    ``--name value``, or a ``-xyz`` bundle, which ends at its first letter that takes a
+    value (the rest of the token, else the next token)."""
+    tok = tokens[idx]
+    following = tokens[idx + 1] if idx + 1 < len(tokens) else None
+    if tok.startswith("--"):
+        name, eq, value = tok.partition("=")
+        if eq or name not in with_arg:
+            return name, value if eq else None, idx + 1
+        return name, following, idx + 2
+    for pos in range(1, len(tok)):
+        if "-" + tok[pos] in with_arg:
+            if pos + 1 < len(tok):
+                return "-" + tok[pos], tok[pos + 1:], idx + 1
+            return "-" + tok[pos], following, idx + 2
+    return tok, None, idx + 1
+
+
+def _su_command(tokens: list[str], idx: int) -> str | None:
+    """The command ``su`` runs: the last -c/--command value anywhere after it (su passes
+    arguments after ``--`` to the shell, so the scan does not stop there)."""
+    command = None
+    while idx < len(tokens):
+        if tokens[idx].startswith("-"):
+            spelling, value, idx = _consume_option(tokens, idx, SU_FLAGS_WITH_ARG)
+            if spelling in SU_COMMAND_FLAGS:
+                command = value
+        else:
+            idx += 1
+    return command
+
 
 def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, str | None]:
     """Peel keywords, wrappers (with full option consumption), env vars, and expansions.
@@ -383,10 +482,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
                     idx += 1
                     break
                 if stok.startswith("-"):
-                    idx += 1
-                    if "=" not in stok and stok in SUDO_FLAGS_WITH_ARG:
-                        if idx < len(tokens):
-                            idx += 1
+                    _, _, idx = _consume_option(tokens, idx, SUDO_FLAGS_WITH_ARG)
                 else:
                     break
             continue
@@ -400,10 +496,10 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
                     idx += 1
                     break
                 if etok.startswith("-"):
-                    idx += 1
-                    if "=" not in etok and etok in ENV_FLAGS_WITH_ARG:
-                        if idx < len(tokens):
-                            idx += 1
+                    spelling, value, idx = _consume_option(tokens, idx, ENV_FLAGS_WITH_ARG)
+                    if spelling in ("-S", "--split-string"):
+                        # The value is a command line; the words after it stay words.
+                        return None, " ".join([value or ""] + [shlex.quote(t) for t in tokens[idx:]]).strip()
                 elif ENV_VAR_RE.match(etok):
                     k, _, v = etok.partition("=")
                     env_vars[k] = v
@@ -515,6 +611,21 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
                     break
             continue
 
+        # 7e. option-only wrappers: skip their options, the program follows
+        if base in OPTION_WRAPPER_FLAGS_WITH_ARG:
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                _, _, idx = _consume_option(tokens, idx, OPTION_WRAPPER_FLAGS_WITH_ARG[base])
+            continue
+
+        # 7f. su: the su stage itself (sudo su is still sudo) and the command it runs
+        if base == "su":
+            su_stage = UnwrappedCommand("su", None, [], [], has_sudo=has_sudo, env_vars=env_vars)
+            return su_stage, _su_command(tokens, idx + 1)
+
         # 8. eval builtin (evaluates remaining tokens as inner command)
         if base == "eval":
             if idx + 1 < len(tokens):
@@ -561,6 +672,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
         subcommand: str | None = None
         flags: list[str] = []
         pos_args: list[str] = []
+        tail: list[str] = []
 
         while idx < len(tokens):
             arg = tokens[idx]
@@ -579,6 +691,7 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
             else:
                 if subcommand is None and binary in ("git", "gh"):
                     subcommand = arg.lower()
+                    tail = tokens[idx + 1:]
                 else:
                     pos_args.append(arg)
             idx += 1
@@ -590,12 +703,21 @@ def unwrap_command_stage(tokens: list[str]) -> tuple[UnwrappedCommand | None, st
             positional_args=pos_args,
             has_sudo=has_sudo,
             env_vars=env_vars,
+            tail=tail,
         ), None
 
     return None, None
 
 
 # ── Domain-Specific Command Evaluators ────────────────────────────────────────
+
+def _long_option(flag: str, full: str) -> bool:
+    """Whether ``flag`` spells the long option ``full``: git (parse-options) and GNU rm
+    accept any unique prefix (``--har`` is ``--hard``). The bare ``--`` never matches; an
+    ambiguous prefix the tool rejects may match, which only stops a failing command."""
+    name = flag.split("=", 1)[0]
+    return len(name) > 2 and full.startswith(name)
+
 
 def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
     flags = [f.lstrip("\\") for f in cmd.flags]
@@ -604,22 +726,24 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
     for f in flags:
         if f in ("-c", "--exec-path", "--config-env") or f.startswith(("--exec-path=", "--config-env=")):
             return SafetyEvaluation(True, REASON_GIT_CONFIG)
+    if any(var.startswith("GIT_CONFIG") and var != "GIT_CONFIG_NOSYSTEM" for var in cmd.env_vars):
+        return SafetyEvaluation(True, REASON_GIT_CONFIG)
 
     sub = cmd.subcommand
     if not sub:
         return SafetyEvaluation(False)
+    values = _GIT_SHORT_VALUES.get(sub, "")
 
     if sub == "branch":
         for f in flags:
-            if f in ("--delete", "--force"):
+            if _long_option(f, "--delete") or _long_option(f, "--force"):
                 return SafetyEvaluation(True, REASON_GIT_BRANCH)
-            if f.startswith("-") and not f.startswith("--"):
-                letters = f[1:]
-                if any(c in letters for c in "dDMf"):
-                    return SafetyEvaluation(True, REASON_GIT_BRANCH)
+            if any(c in _short_letters(f, values) for c in "dDMf"):
+                return SafetyEvaluation(True, REASON_GIT_BRANCH)
 
     elif sub == "push":
-        if any(f in ("-f", "--force", "--force-with-lease") for f in flags):
+        if any("f" in _short_letters(f, values) or _long_option(f, "--force") or _long_option(f, "--force-with-lease")
+               for f in flags):
             return SafetyEvaluation(True, REASON_GIT_PUSH_FORCE)
         for arg in cmd.positional_args:
             if arg.startswith("+"):
@@ -628,21 +752,21 @@ def evaluate_git(cmd: UnwrappedCommand) -> SafetyEvaluation:
                 return SafetyEvaluation(True, REASON_PROTECTED_BRANCH)
 
     elif sub == "reset":
-        if any(f == "--hard" for f in flags):
+        if any(_long_option(f, "--hard") for f in flags):
             return SafetyEvaluation(True, REASON_GIT_RESET_HARD)
 
     elif sub == "checkout":
-        if any(f in ("-f", "--force") for f in flags):
+        if any("f" in _short_letters(f, values) or _long_option(f, "--force") for f in flags):
             return SafetyEvaluation(True, REASON_GIT_CHECKOUT_FORCE)
 
     elif sub == "clean":
         for f in flags:
-            if f == "--force" or (f.startswith("-") and not f.startswith("--") and "f" in f[1:]):
+            if _long_option(f, "--force") or "f" in _short_letters(f, values):
                 return SafetyEvaluation(True, REASON_GIT_CLEAN_FORCE)
 
     elif sub == "add":
         for f in flags:
-            if f in ("-A", "--all"):
+            if "A" in _short_letters(f, values) or _long_option(f, "--all"):
                 return SafetyEvaluation(True, REASON_GIT_ADD_BULK)
         for arg in cmd.positional_args:
             if arg in (".", "./", "*"):
@@ -678,7 +802,7 @@ def evaluate_rm(cmd: UnwrappedCommand) -> SafetyEvaluation:
     has_r = False
 
     for f in flags:
-        if f == "--recursive":
+        if _long_option(f, "--recursive"):
             has_r = True
         elif f.startswith("-") and not f.startswith("--"):
             body = f[1:]
@@ -730,7 +854,7 @@ def evaluate_system_binary(cmd: UnwrappedCommand) -> SafetyEvaluation:
 
     if b == "dd":
         all_items = cmd.positional_args + cmd.flags
-        if any(item.startswith("if=") for item in all_items):
+        if any(item.startswith("if=") or _writes_a_device(item) for item in all_items):
             return SafetyEvaluation(True, REASON_DD)
 
     if b == "chmod":
@@ -868,7 +992,11 @@ class CommandAnalyzer:
 # anything it cannot parse. The guard below decides what `aegis hook run pre-tool`
 # BLOCKS, so it fails open: an empty, absent or unparseable command is never a match,
 # and only the irreversible operations of BLOCK_SET block. It reuses the lexer and the
-# wrapper unwrapping, not the evaluators.
+# wrapper unwrapping, not the evaluators. The two policies are kept on purpose; where
+# they differ, and why, is pinned by the parity table in
+# tests/unit/core/test_command_safety.py, which a change to either must update. A
+# lexer helper serves both unless that table says why not (strip_shell_comments, the
+# git alias expansion and the heredoc SQL check are guard-only).
 
 GUARD_BLOCK = "block"
 GUARD_RECORD = "record"
@@ -916,8 +1044,14 @@ _SQL_DESTRUCTIVE = ("DROP TABLE", "DROP DATABASE", "DELETE FROM", "TRUNCATE TABL
 # ``<<\EOF``), matched where _split_heredocs finds an unquoted ``<<`` that is not a
 # ``<<<`` here-string.
 _HEREDOC = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3")
-# A heredoc these read is a script they run, so its body is checked as commands.
-_HEREDOC_SHELLS = SHELL_INTERPRETERS | {"ssh", "ash", "mksh"}
+# A heredoc these read is a script they run, so its body is checked as commands
+# (su without -c starts a shell that reads it).
+_HEREDOC_SHELLS = SHELL_INTERPRETERS | {"ssh", "ash", "mksh", "su"}
+# A heredoc these read is SQL, so its body is checked for destructive SQL (record tier).
+_SQL_CLIENTS = frozenset({
+    "psql", "pgcli", "mysql", "mycli", "mariadb", "sqlite3", "sqlcmd", "sqlplus", "duckdb", "usql", "cqlsh",
+    "clickhouse-client", "snowsql",
+})
 
 BLOCK_SET: Tuple[GuardRule, ...] = (
     GuardRule(
@@ -960,9 +1094,20 @@ RECORD_SET: Tuple[GuardRule, ...] = (
 _GUARD: Dict[str, GuardRule] = {rule.id: rule for rule in BLOCK_SET + RECORD_SET}
 
 
-def _short_letters(flag: str) -> str:
-    """The letters of a bundled short option (``-fu`` -> ``fu``); "" for anything else."""
-    return flag[1:] if flag.startswith("-") and not flag.startswith("--") else ""
+#: The short options that take a value, for the git subcommands whose bundles the guard
+#: or the gate reads (from ``git <subcommand> -h``); -t takes one only when it is stuck.
+_GIT_SHORT_VALUES: Dict[str, str] = {"push": "o", "checkout": "bBt", "clean": "e", "branch": "ut"}
+
+
+def _short_letters(flag: str, takes_value: str = "") -> str:
+    """The option letters of a bundled short option (``-fu`` -> ``fu``); "" for anything
+    else. The bundle ends at its first letter in ``takes_value``, as in git's
+    parse-options: the rest of the token is that option's value (``-ofeature`` -> ``o``)."""
+    letters = flag[1:] if flag.startswith("-") and not flag.startswith("--") else ""
+    for index, letter in enumerate(letters):
+        if letter in takes_value:
+            return letters[:index + 1]
+    return letters
 
 
 def _pushes_to_protected(refspec: str) -> bool:
@@ -970,29 +1115,55 @@ def _pushes_to_protected(refspec: str) -> bool:
     return destination.rsplit("/", 1)[-1] in _PROTECTED_BRANCHES
 
 
+def _clean_dry_run(args: List[str]) -> bool:
+    """Whether git clean's ``args`` (every word after ``clean``) ask for a dry run, and no
+    more often than git does: ``-e``/``--exclude`` take the next word as their value
+    (``-en``, ``-e -n`` and ``-e .env`` exclude n, -n and .env), a ``-n`` after ``--`` is a
+    pathspec, and ``--no-dry-run`` cancels one."""
+    dry_run = value_next = False
+    for flag in args:
+        if flag == "--":  # git takes "-e --" as a value; ending here never finds a dry run
+            break
+        if value_next:
+            value_next = False
+        elif _long_option(flag, "--no-dry-run"):
+            return False
+        elif flag.startswith("--"):
+            dry_run = dry_run or _long_option(flag, "--dry-run")
+            value_next = _long_option(flag, "--exclude") and "=" not in flag
+        else:
+            before, excluded, value = _short_letters(flag).partition("e")
+            dry_run = dry_run or "n" in before
+            value_next = bool(excluded) and not value
+    return dry_run
+
+
+#: The git subcommands _guard_git has rules for; keep the two in step.
+_GUARD_GIT_SUBCOMMANDS = frozenset({"push", "reset", "clean", "merge", "add"})
+
+
 def _guard_git(cmd: UnwrappedCommand) -> List[GuardRule]:
     flags = [f.lstrip("\\") for f in cmd.flags]
-    letters = "".join(_short_letters(f) for f in flags)
     sub = cmd.subcommand
+    letters = "".join(_short_letters(f, _GIT_SHORT_VALUES.get(sub or "", "")) for f in flags)
     found: List[GuardRule] = []
     if sub == "push":
-        if "f" in letters or any(f == "--force" or f.split("=", 1)[0] == "--force-with-lease" for f in flags):
+        if "f" in letters or any(_long_option(f, "--force") or _long_option(f, "--force-with-lease") for f in flags):
             found.append(_GUARD["git-push-force"])
         if any(arg.startswith("+") for arg in cmd.positional_args):
             found.append(_GUARD["git-push-refspec"])
         if any(_pushes_to_protected(arg) for arg in cmd.positional_args):
             found.append(_GUARD["git-push-protected"])
-    elif sub == "reset" and "--hard" in flags:
+    elif sub == "reset" and any(_long_option(f, "--hard") for f in flags):
         found.append(_GUARD["git-reset-hard"])
     elif sub == "clean":
-        forced = "f" in letters or "--force" in flags
-        dry_run = "n" in letters or "--dry-run" in flags
-        if forced and not dry_run:
+        if ("f" in letters or any(_long_option(f, "--force") for f in flags)) and not _clean_dry_run(cmd.tail):
             found.append(_GUARD["git-clean-force"])
     elif sub == "merge" and not any(f in ("--abort", "--quit", "--continue") for f in flags):
         found.append(_GUARD["git-merge"])
     elif sub == "add" and (
-        "A" in letters or "--all" in flags or any(arg in (".", "./", "*") for arg in cmd.positional_args)
+        "A" in letters or any(_long_option(f, "--all") for f in flags)
+        or any(arg in (".", "./", "*") for arg in cmd.positional_args)
     ):
         found.append(_GUARD["git-add-bulk"])
     return found
@@ -1013,9 +1184,15 @@ def _dangerous_rm_target(arg: str) -> bool:
 
 
 def _writes_a_device(arg: str) -> bool:
-    if not arg.startswith("of=/dev/"):
+    """Whether a dd operand writes a device, its path resolved lexically first
+    (``of=//dev/sda`` and ``of=/tmp/../dev/sda`` write /dev/sda; ``of=/dev//null`` is
+    /dev/null). The slash run is collapsed because normpath keeps a leading ``//``;
+    posixpath, so Windows does not turn ``/`` into ``\\``."""
+    if not arg.startswith("of=/"):
         return False
-    device = arg[len("of="):]
+    device = posixpath.normpath("/" + arg[len("of="):].lstrip("/"))
+    if not device.startswith("/dev/"):
+        return False
     return device not in _HARMLESS_DEVICES and not device.startswith(_HARMLESS_DEVICE_DIRS)
 
 
@@ -1029,7 +1206,7 @@ def _guard_stage(cmd: UnwrappedCommand) -> List[GuardRule]:
             found.append(_GUARD["gh-pr-merge"])
     elif binary == "rm":
         flags = [f.lstrip("\\") for f in cmd.flags]
-        recursive = "--recursive" in flags or any(c in "rR" for f in flags for c in _short_letters(f))
+        recursive = any(_long_option(f, "--recursive") or "r" in _short_letters(f).lower() for f in flags)
         if recursive and any(_dangerous_rm_target(arg) for arg in cmd.positional_args):
             found.append(_GUARD["rm-recursive-dangerous"])
     elif binary.startswith("mkfs"):
@@ -1045,29 +1222,44 @@ def _guard_stage(cmd: UnwrappedCommand) -> List[GuardRule]:
     return found
 
 
-def _feeds_a_shell(line: str, command_start: int, operator: int) -> bool:
-    """Whether the heredoc whose operator is at ``line[operator]`` goes to a shell (or
-    ssh): the command it belongs to, or a later stage of that command's pipeline on the
-    same line (``cat <<EOF | bash``)."""
+def _reader_stages(line: str, command_start: int, operator: int) -> List[CommandStage]:
+    """The stages that may read the heredoc whose operator is at ``line[operator]``: the
+    command it belongs to and the rest of that command's pipeline on the same line
+    (``cat <<EOF | bash``)."""
     for text in (line[command_start:], line[command_start:operator]):
         try:
-            pipelines = decompose_command(tokenize_command(text))
+            pipelines = decompose_command(tokenize_command(strip_shell_comments(text)))
         except ValueError:  # an unbalanced quote that closes on a later line
             continue
-        for stage in pipelines[0].stages if pipelines else []:
-            unwrapped, _ = unwrap_command_stage(stage.raw_tokens)
-            if unwrapped is not None and unwrapped.binary.split("<<", 1)[0] in _HEREDOC_SHELLS:
-                return True
-        return False
+        return pipelines[0].stages if pipelines else []
+    return []
+
+
+def _feeds_a_shell(stages: List[CommandStage]) -> bool:
+    for stage in stages:
+        unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
+        if inner is None and unwrapped is not None and unwrapped.binary.split("<<", 1)[0] in _HEREDOC_SHELLS:
+            return True
     return False
 
 
-def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, str, bool, bool]]:
-    """``(strip_tabs, delimiter, feeds_a_shell, is_quoted)`` for each heredoc operator on
+def _feeds_sql(stages: List[CommandStage]) -> bool:
+    """Whether any word of the reading stages names a SQL client (``docker exec -i db
+    psql``): a heuristic for a record-tier rule, so it errs towards recording."""
+    for stage in stages:
+        for token in stage.raw_tokens:
+            name = os.path.basename(token.split("<<", 1)[0].lstrip("\\")).lower()
+            if (name[:-4] if name.endswith(".exe") else name) in _SQL_CLIENTS:
+                return True
+    return False
+
+
+def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, str, bool, bool, bool]]:
+    """``(strip_tabs, delimiter, feeds_a_shell, feeds_sql, is_quoted)`` for each heredoc operator on
     ``line`` outside quotes and comments, in order. ``open_quotes`` is the stack of quotes
     and ``$(``/``(`` substitutions still open from earlier lines (a ``<<`` inside a
     substitution counts, even within double quotes); it is updated in place."""
-    found: List[Tuple[bool, str, bool, bool]] = []
+    found: List[Tuple[bool, str, bool, bool, bool]] = []
     command_start = 0
     index = 0
     while index < len(line):
@@ -1113,10 +1305,12 @@ def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, st
                 index += 2
                 continue
             is_quoted = bool(heredoc.group(2) or heredoc.group(3))
+            stages = _reader_stages(line, command_start, index)
             found.append((
                 heredoc.group(1) == "-",
                 heredoc.group(4),
-                _feeds_a_shell(line, command_start, index),
+                _feeds_a_shell(stages),
+                _feeds_sql(stages),
                 is_quoted,
             ))
             index = heredoc.end()
@@ -1125,8 +1319,9 @@ def _heredoc_operators(line: str, open_quotes: List[str]) -> List[Tuple[bool, st
     return found
 
 
-def _split_heredocs(text: str) -> Tuple[str, List[str]]:
-    """``text`` without the body lines of its heredocs, and the bodies/substitutions a shell runs.
+def _scan_heredocs(text: str) -> Tuple[str, List[str], List[str]]:
+    """``text`` without the body lines of its heredocs, the bodies/substitutions a shell
+    runs, and the bodies a SQL client reads (never put among the scripts).
 
     A body is data for the command that reads it (Claude Code passes commit messages
     this way), unless that command is a shell or ssh (``bash <<'EOF'``, ``bash -s``,
@@ -1137,17 +1332,18 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
     operator. An unterminated heredoc swallows the rest, as the shell would.
     """
     if "<<" not in text:
-        return text, []
+        return text, [], []
     lines = text.split("\n")
     kept: List[str] = []
     scripts: List[str] = []
+    sql_bodies: List[str] = []
     open_quotes: List[str] = []
     index = 0
     while index < len(lines):
         line = lines[index]
         kept.append(line)
         index += 1
-        for strip_tabs, delimiter, feeds_a_shell, is_quoted in _heredoc_operators(line, open_quotes):
+        for strip_tabs, delimiter, feeds_a_shell, feeds_sql, is_quoted in _heredoc_operators(line, open_quotes):
             body: List[str] = []  # several heredocs on one line are read in order
             while index < len(lines):
                 raw = lines[index].rstrip("\r")
@@ -1157,38 +1353,150 @@ def _split_heredocs(text: str) -> Tuple[str, List[str]]:
                 body.append(raw)
             if feeds_a_shell:
                 scripts.append("\n".join(body))
-            elif not is_quoted:
+                continue
+            if feeds_sql:
+                sql_bodies.append("\n".join(body))
+            if not is_quoted:
                 body_text = "\n".join(body)
                 if "$" in body_text or "`" in body_text:
                     scripts.extend(extract_subshell_commands(body_text))
-    return "\n".join(kept), scripts
+    return "\n".join(kept), scripts, sql_bodies
+
+
+def _split_heredocs(text: str) -> Tuple[str, List[str]]:
+    kept, scripts, _ = _scan_heredocs(text)
+    return kept, scripts
 
 
 split_heredocs = _split_heredocs
 
 
-def _guard_scan(cmd: str, depth: int, found: List[GuardRule]) -> bool:
-    """Add the guard rules ``cmd`` matches to ``found``; False when it cannot be parsed
-    (or nests deeper than MAX_DEPTH), which contributes nothing."""
+def _git_aliases(cmd: UnwrappedCommand) -> Dict[str, str]:
+    """The aliases a git invocation defines for itself (``-c alias.NAME=VALUE``,
+    ``--config-env alias.NAME=VAR``, ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``,
+    ``GIT_CONFIG_PARAMETERS``), by lowercase name: git compares config names without case."""
+    settings: List[str] = []
+    try:  # 'key'='value' or 'key=value' words, which shlex joins into key=value
+        settings.extend(shlex.split(cmd.env_vars.get("GIT_CONFIG_PARAMETERS", "")))
+    except ValueError:
+        pass
+    following = cmd.flags[1:] + [""]
+    for flag, after in zip(cmd.flags, following):
+        if flag == "-c":
+            settings.append(after)
+        elif flag == "--config-env" or flag.startswith("--config-env="):
+            name, _, var = (flag.partition("=")[2] or after).partition("=")
+            if var in cmd.env_vars:  # a variable exported earlier is not visible here
+                settings.append(f"{name}={cmd.env_vars[var]}")
+    for var, key in cmd.env_vars.items():
+        value = cmd.env_vars.get("GIT_CONFIG_VALUE_" + var[len("GIT_CONFIG_KEY_"):])
+        if var.startswith("GIT_CONFIG_KEY_") and value is not None:
+            settings.append(f"{key}={value}")
+    aliases: Dict[str, str] = {}
+    for key, sep, value in (setting.partition("=") for setting in settings):
+        if sep and key.lower().startswith("alias."):
+            aliases[key[len("alias."):].lower()] = value
+    return aliases
+
+
+# How many ``!`` alias scripts one command may have scanned. git runs a script each time
+# its alias is invoked, so a script that reruns aliases it inherits (``alias.p='!git p; git
+# p'``) would be rescanned for every stage at every nesting level; past this many, a script
+# contributes nothing (fail-open, like MAX_DEPTH).
+_MAX_ALIAS_SCRIPTS = 16
+
+
+@dataclass
+class _GuardScan:
+    """The rules one classify_command call has found, and the ``!`` alias scripts it may
+    still scan."""
+
+    found: List[GuardRule] = field(default_factory=list)
+    alias_scripts: int = _MAX_ALIAS_SCRIPTS
+
+
+def _guard_git_alias(
+    cmd: UnwrappedCommand, depth: int, scan: _GuardScan, inherited: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Classify the expansion of an alias defined on the same command line
+    (``git -c alias.p='push -f' p``), or by the git whose ``!`` alias script runs this one
+    (``inherited``; this git's own settings come later, so they win). _guard_git has
+    already matched the literal subcommand, so a built-in still wins as it does in git;
+    ``seen`` stops a cycle.
+
+    Each link's words replace the alias name in front of the words after it. Those are
+    kept on a stack, last word first, so a link costs only its own words: rebuilding the
+    whole command per link would re-read the tail once per link. Only a link naming a
+    subcommand _guard_git has rules for is rebuilt and judged.
+
+    git also reads -c and --config-env in a link's words, which can define the aliases
+    the rest of the chain expands; they come after this git's own settings."""
+    # Chained, not copied per git stage; link definitions go in the first map.
+    aliases = ChainMap({}, _git_aliases(cmd), *([inherited] if inherited else []))
+    # --config-env in a link reads the stage's variables, never its GIT_CONFIG_* ones again.
+    config_env = {var: value for var, value in cmd.env_vars.items() if not var.startswith("GIT_CONFIG")}
+    rest = cmd.tail[::-1]
+    sub = cmd.subcommand
+    seen = set()
+    while sub in aliases and sub not in seen:
+        seen.add(sub)
+        value = aliases[sub]
+        if value.startswith("!"):
+            # git runs it with sh -c, the arguments appended, and hands its -c settings to
+            # every git the script runs through GIT_CONFIG_PARAMETERS.
+            if scan.alias_scripts > 0:
+                scan.alias_scripts -= 1
+                arguments = [shlex.quote(t) for t in reversed(rest)]
+                _guard_scan(" ".join([value[1:]] + arguments), depth + 1, scan, aliases)
+            return
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            return
+        rest.extend(reversed(words))
+        options: List[str] = []  # read as unwrap_command_stage reads what precedes a subcommand
+        while rest and rest[-1].startswith("-"):
+            options.append(rest.pop())
+            if "=" not in options[-1] and options[-1] in GIT_GLOBAL_FLAGS_WITH_ARG and rest:
+                options.append(rest.pop())
+        if not rest:
+            return
+        if options:
+            aliases.maps[0].update(_git_aliases(UnwrappedCommand(cmd.binary, None, options, [], env_vars=config_env)))
+        word = rest.pop()
+        sub = word.lower()
+        if sub in _GUARD_GIT_SUBCOMMANDS:
+            expanded, _ = unwrap_command_stage([cmd.binary, *options, word, *reversed(rest)])
+            if expanded is not None:
+                scan.found.extend(_guard_git(expanded))
+
+
+def _guard_scan(cmd: str, depth: int, scan: _GuardScan, aliases: Optional[Mapping[str, str]] = None) -> bool:
+    """Add the guard rules ``cmd`` matches to ``scan.found``; False when it cannot be
+    parsed (or nests deeper than MAX_DEPTH), which contributes nothing. ``aliases`` are the
+    git aliases ``cmd`` inherits when it is a ``!`` alias's script."""
     if depth >= MAX_DEPTH:
         return False
     text, scripts = _split_heredocs(cmd)
+    text = strip_shell_comments(text)  # after the split: a body apostrophe is not a quote
     try:
         tokens = tokenize_command(text)
     except ValueError:
         return False
     for script in scripts:
-        _guard_scan(script, depth + 1, found)
+        _guard_scan(script, depth + 1, scan, aliases)
     if any(c in text for c in ("$", "`", "(", "<", ">")):
         for sub in extract_subshell_commands(text):
-            _guard_scan(sub, depth + 1, found)
+            _guard_scan(sub, depth + 1, scan, aliases)
     for pipeline in decompose_command(tokens):
         for stage in pipeline.stages:
             unwrapped, inner = unwrap_command_stage(stage.raw_tokens)
             if inner:
-                _guard_scan(inner, depth + 1, found)
-            elif unwrapped is not None:
-                found.extend(_guard_stage(unwrapped))
+                _guard_scan(inner, depth + 1, scan, aliases)
+            if unwrapped is not None:
+                scan.found.extend(_guard_stage(unwrapped))
+                if unwrapped.binary == "git":
+                    _guard_git_alias(unwrapped, depth, scan, aliases)
     return True
 
 
@@ -1197,15 +1505,17 @@ def classify_command(command: object) -> Optional[GuardRule]:
     first RECORD_SET rule, else None.
 
     Fail-open: an empty or non-string command, one the lexer cannot parse, an
-    unresolvable globbed binary and nesting beyond MAX_DEPTH are never a match.
+    unresolvable globbed binary, nesting beyond MAX_DEPTH and a ``!`` alias script past
+    the first _MAX_ALIAS_SCRIPTS are never a match.
     """
     if not isinstance(command, str) or not command.strip():
         return None
-    found: List[GuardRule] = []
-    if not _guard_scan(command, 0, found):
+    scan = _GuardScan()
+    if not _guard_scan(command, 0, scan):
         return None
-    text, _ = _split_heredocs(command)
-    upper = text.upper()
+    found = scan.found
+    text, scripts, sql_bodies = _scan_heredocs(command)
+    upper = "\n".join([text, *scripts, *sql_bodies]).upper()
     if any(pattern in upper for pattern in _SQL_DESTRUCTIVE):
         found.append(_GUARD["sql-destructive"])
     blocked = next((rule for rule in found if rule.tier == GUARD_BLOCK), None)
@@ -1225,6 +1535,7 @@ __all__ = [
     "decompose_command",
     "extract_subshell_commands",
     "split_heredocs",
+    "strip_shell_comments",
     "tokenize_command",
     "unwrap_command_stage",
     "REASON_CHMOD_777",

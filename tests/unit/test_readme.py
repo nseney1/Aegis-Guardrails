@@ -216,9 +216,17 @@ def quick_start(tmp_path, monkeypatch):
     return repo
 
 
+def _commit_as_the_quick_start_says(repo: Path) -> None:
+    """Plain `aegis check` enforces the reviewed rules, so the quick start commits `.aegis/` first."""
+    assert 'git add .aegis AGENTS.md && git commit -m "Add Aegis"' in README.read_text(encoding="utf-8")
+    _git(repo, "add", ".aegis", "AGENTS.md")
+    _git(repo, "commit", "-q", "-m", "Add Aegis")
+
+
 def test_the_quick_start_check_fails_as_shown_once_the_new_file_is_tracked(quick_start, capsys):
     """`aegis check` with no files skips untracked ones, so the README must say how to
     include a new file (git add it, or name it); then the check fails as the README shows."""
+    _commit_as_the_quick_start_says(quick_start)
     (quick_start / "app.py").write_text('x = eval("1")\n', encoding="utf-8")
 
     code, out = _aegis(capsys, "check", "--workspace", str(quick_start))
@@ -250,6 +258,7 @@ def test_the_quick_start_no_eval_rule_allows_method_calls_via_builtin_true(quick
         text = doc.read_text(encoding="utf-8")
         assert "builtin: true" in text, f"{doc.name} no-eval example is missing builtin: true"
 
+    _commit_as_the_quick_start_says(quick_start)
     (quick_start / "app.py").write_text("def infer(model):\n    model.eval()\n    return 1\n", encoding="utf-8")
     _git(quick_start, "add", "app.py")
     code, out = _aegis(capsys, "check", "--workspace", str(quick_start))
@@ -281,11 +290,12 @@ RETRACTED_ENFORCEMENT = (
 )
 
 
-def test_the_docs_do_not_call_ci_tamper_proof(quick_start, capsys, monkeypatch):
-    """CI judges a pull request by the rules in that pull request: one that deletes a rule
-    and breaks it passes. Until v4.3 protects the reviewed rules, the docs must say so."""
+def test_the_docs_say_plain_check_enforces_the_reviewed_rules(quick_start, capsys, monkeypatch):
+    """Plain `aegis check` enforces the reviewed (base) rules where `origin/HEAD` resolves, and the
+    pull request's own rules in CI, where it does not. The docs say both and never call CI tamper-proof."""
     _git(quick_start, "add", "-A")
     _git(quick_start, "commit", "-q", "-m", "aegis")
+    _git(quick_start, "branch", "main-base")
     _git(quick_start, "checkout", "-q", "-b", "agent-pr")
     _git(quick_start, "rm", "-q", ".aegis/rules/invariants/no-eval.md")
     (quick_start / "app.py").write_text("def f(x):\n    return eval(x)\n", encoding="utf-8")
@@ -293,14 +303,18 @@ def test_the_docs_do_not_call_ci_tamper_proof(quick_start, capsys, monkeypatch):
     _git(quick_start, "commit", "-q", "-m", "pr")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")
 
+    code, out = _aegis(capsys, "check", "--workspace", str(quick_start))  # CI: no origin/HEAD
+    assert code == 0, out
+    _git(quick_start, "update-ref", "refs/remotes/origin/main", "main-base")  # what a clone has
+    _git(quick_start, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     code, out = _aegis(capsys, "check", "--workspace", str(quick_start))
-    assert code == 0, f"CI now catches a pull request that drops a rule: update the docs\n{out}"
+    assert code == 1 and "forbid_ast:no-eval" in out, out
 
     for doc in (README, HOW):
-        text = " ".join(doc.read_text(encoding="utf-8").lower().split())
+        text = " ".join(doc.read_text(encoding="utf-8").lower().replace("*", "").replace("`", "").split())
         assert [p for p in RETRACTED_ENFORCEMENT if p in text] == [], doc.name
-        assert "rules in the pull request itself" in text, doc.name
-
+        assert "a pull request that deletes a rule and breaks it fails plain check there" in text, doc.name
+        assert "plain check enforces the pull request's own rules and aegis check --ci is what catches" in text, doc.name
 
 def test_the_readme_gives_the_install_remedies_aegis_itself_prints(tmp_path):
     """pip refuses a system install on PEP 668 systems, and pip's scripts directory may not

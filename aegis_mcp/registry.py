@@ -122,6 +122,17 @@ _VIEW_PROPERTY = {
 }
 _RULE_TYPE_PROPERTY = {"type": "string", "enum": list(CANONICAL_RULE_TYPES)}
 
+
+def _read(title: str) -> dict:
+    return {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False, "title": title}
+
+
+def _write(title: str) -> dict:
+    # Only readOnlyHint is declared: hosts treat annotations as untrusted hints and no host is
+    # documented to skip the prompt for a self-declared non-destructive write, so a write tool
+    # claims nothing beyond "not read-only" and the MCP defaults apply.
+    return {"readOnlyHint": False, "title": title}
+
 TOOL_DEFINITIONS = [
     {
         "name": "aegis_scan",
@@ -137,13 +148,7 @@ TOOL_DEFINITIONS = [
             "`unreviewed_rules`, while `stale_rules` lists rules edited since the last `aegis sync`. "
             "Fails closed (`status: 'FAIL'`) if any rule file cannot be loaded."
         ),
-        "annotations": {
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-            "title": "Scan JIT Rules",
-        },
+        "annotations": _read("Scan JIT Rules"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -319,20 +324,14 @@ TOOL_DEFINITIONS = [
             "Record post-verification rule feedback in the local outcome ledger after running tests "
             "or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` "
             "before editing files and `aegis_capture_insight` to record user corrections. When a "
-            "passing `aegis check --record` exists for the current git tree, the server credits rules "
+            "passing `aegis check --record --tests` row exists for the current git tree, the server credits rules "
             "exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated "
             "against the rule inventory, not used as the credit source). Those credits count "
             "toward fitness once CI passes on the landing commit. Without a matching check record, it "
             "writes at most one unwitnessed claim per session and tree that earns no fitness credit. "
             "Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds."
         ),
-        "annotations": {
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-            "title": "Report Outcome",
-        },
+        "annotations": _write("Report Outcome"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -417,8 +416,8 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "enum": ["aegis", "self"],
                     "description": (
-                        "Attestation tier: 'aegis' when backed by an 'aegis check --record' "
-                        "run for the current tree, or 'self' for unwitnessed claims."
+                        "Attestation tier: 'aegis' when backed by a passing 'aegis check --record --tests' "
+                        "row for the current tree, or 'self' for unwitnessed claims."
                     ),
                 },
                 "credited": {
@@ -491,13 +490,7 @@ TOOL_DEFINITIONS = [
             "and `domain` hints, and writes nothing to disk: save the drafted markdown to "
             "`.aegis/rules/<type_dir>/<id>.md` yourself as directed by `instruction`."
         ),
-        "annotations": {
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-            "title": "Create Rule",
-        },
+        "annotations": _read("Create Rule"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -569,13 +562,7 @@ TOOL_DEFINITIONS = [
             "markdown under `.aegis/rules/` (`ignored`). Pass `rule_type` to filter `rules` and "
             "`stale_rules` to one category, or `view` (`'summary'` or `'ids'`) to compact the payload."
         ),
-        "annotations": {
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False,
-            "title": "List Rules",
-        },
+        "annotations": _read("List Rules"),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -659,13 +646,7 @@ TOOL_DEFINITIONS = [
             "from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a "
             "matching user prompt captured by a host hook in the same session."
         ),
-        "annotations": {
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": False,
-            "openWorldHint": False,
-            "title": "Capture Insight",
-        },
+        "annotations": _write("Capture Insight"),
         "inputSchema": {
             "type": "object",
             "properties": {

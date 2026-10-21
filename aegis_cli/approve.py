@@ -1,9 +1,10 @@
 """aegis approve: sign a human approval of the governance files a branch changed (v4.3 §2.2).
 
 Makes one signed, empty commit whose message carries ``Aegis-Approve: <governance tree hash>``
-(``aegis_core.human_gate``). The hash covers the governance files as committed at HEAD, so the
-approval names exactly the state the person saw, and any later governance change voids it. CI
-checks it against ``allowed_signers`` on the base branch.
+(``aegis_core.human_gate``). The hash covers the governance files as committed at HEAD and the
+tests deleted since the base branch, so the approval names exactly the state the person saw, and
+any later governance change (another deleted test included) voids it. CI checks it against
+``allowed_signers`` on the base branch.
 
 What it will not do:
 
@@ -13,7 +14,9 @@ What it will not do:
 - run without a terminal and a typed ``y``: an approval is something a person looks at;
 - use a signing program, key or format from the repository's config: they come from the
   user-level git config, which a clone cannot set;
-- create, copy or read a key: git and ssh-keygen sign, Aegis only runs them.
+- create a key or sign with one itself: git and ssh-keygen sign, Aegis only runs them. Aegis reads
+  at most the first 64 KiB of a key file to classify its protection (plain, passphrase, hardware);
+  it never copies, prints or stores it.
 
 A signing key that is a plain, readable file with no passphrase is allowed to sign but flagged:
 an agent running as you can use it too, so such an approval does not show a human was there.
@@ -99,7 +102,7 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
                        f"({', '.join(dirty)}): commit them first, then approve the committed state")
 
     try:
-        digest = human_gate.governance_tree_hash(top, "HEAD")
+        digest = human_gate.governance_tree_hash(top, "HEAD", base=merge_base)
         before = human_gate.governance_tree_hash(top, merge_base)
         entries = gitsafe.diff_entries(top, merge_base, "HEAD")
     except (human_gate.HumanGateError, gitsafe.GitError) as exc:
@@ -195,7 +198,7 @@ def _approve_test_exemption(root: Path, base: Optional[str], exempt_commit: str,
         commit = human_gate.signed_empty_commit(top, human_gate.exemption_message(fix_commit, clean_reason))
     except human_gate.HumanGateError as exc:
         raise _Refused("sign_failed", str(exc)) from exc
-    verdict = human_gate.verify_test_exemption(top, commit, fix_commit, base_ref, expected_reason=clean_reason)
+    verdict = human_gate.verify_test_exemption(top, commit, fix_commit, base_ref)
     return {"commit": commit, "exempt_commit": fix_commit, "reason": clean_reason, "base": base_ref,
             "verified": verdict.valid, "verification": {"code": verdict.code, "reason": verdict.reason},
             "key_custody": custody.status, "warnings": warnings}
@@ -256,7 +259,7 @@ class ApproveCommand(AegisCommand):
         parser.add_argument("--exempt-test", metavar="COMMIT", default=None,
                             help="Sign a test exemption (Aegis-Exempt-Test) for a specific fix commit")
         parser.add_argument("--reason", metavar="TEXT", default=None,
-                            help="Explanation for --exempt-test (must match the fix commit's Aegis-No-Test reason)")
+                            help="Explanation for --exempt-test (signed into the commit)")
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_approve(args)

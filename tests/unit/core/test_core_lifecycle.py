@@ -65,10 +65,12 @@ class TestSuggestions:
     def test_a_misfiring_rule_is_demoted_or_archived_at_the_bottom(self, workspace: Path):
         _rule(workspace, "traps", "t", "trap")
         _rule(workspace, "invariants", "i", "invariant")
-        misfire = dict(tp=0, fp=3, misfire=0.53)
+        misfire = dict(tp=0, fp=25, misfire=0.9)
         assert _suggestion(workspace, "i", Fitness("i", **misfire)) == "demote"
         assert _suggestion(workspace, "t", Fitness("t", **misfire)) == "archive"
-        assert _suggestion(workspace, "t", Fitness("t", tp=1, fp=4, misfire=0.43)) is None
+        assert _suggestion(workspace, "t", Fitness("t", tp=10, fp=15, misfire=0.43)) is None
+        # the same bound below MIN_N (25) verdicts moves nothing (R-evidence-8)
+        assert _suggestion(workspace, "i", Fitness("i", tp=0, fp=3, misfire=0.53)) is None
 
     def test_protected_expired_and_broken_rules_get_no_suggestion(self, workspace: Path):
         _rule(workspace, "traps", "providence", "trap")

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aegis_core.fitness import for_rules
 from aegis_core.rules import load_rules
@@ -25,8 +25,10 @@ __all__ = [
     "ARCHIVE_DIR",
     "archive_rule",
     "evaluate_archives",
+    "evidence_line",
     "prune_rules",
     "run_rule_selection",
+    "transition_candidates",
 ]
 
 ARCHIVE_DIR = ".archive"
@@ -36,26 +38,46 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def evaluate_archives(workspace: Workspace | Path | str, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    """Rules whose evidence supports archiving (``promotion.suggest``)."""
+def _candidate(wanted: str, rule: Any, fit: Any, now: Optional[datetime]) -> Dict[str, Any]:
+    if wanted == "archive":
+        return {"rule_id": rule.id, "type": rule.type, "triggers": fit.triggers, "tp": fit.tp, "fp": fit.fp,
+                "fitness": fit.score, "misfire": fit.misfire}
+    from aegis_core.taxonomy import RULE_TYPES
+    from .parsers import rule_age_days
+    # The shape of promotion.evaluate_demotions, so the CLI's --json is the same either way.
+    return {"rule_id": rule.id, "from_type": rule.type, "to_type": RULE_TYPES[rule.type].demotes_to,
+            "triggers": fit.triggers, "tp": fit.tp, "fp": fit.fp, "fitness": fit.score, "misfire": fit.misfire,
+            "age_days": rule_age_days(rule, now)}
+
+
+def transition_candidates(
+    workspace: Workspace | Path | str, wanted: str, now: Optional[datetime] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """The rules whose evidence supports ``wanted`` ("archive" or "demote") and, when the CI-confirmed
+    evidence was cut short, why. One projection answers both, so a listing can say why without asking
+    gh again. The candidates are listed either way: acting on one re-checks the evidence and refuses."""
     from .promotion import suggest
 
+    if wanted not in ("archive", "demote"):
+        raise ValueError(f"wanted must be 'archive' or 'demote', not {wanted!r}")
     ws = literal_workspace(workspace)
     rules = list(load_rules(ws).served)
-    fits = for_rules(ws, rules, now)
-    return [
-        {
-            "rule_id": rule.id,
-            "type": rule.type,
-            "triggers": fits[rule.id].triggers,
-            "tp": fits[rule.id].tp,
-            "fp": fits[rule.id].fp,
-            "fitness": fits[rule.id].score,
-            "misfire": fits[rule.id].misfire,
-        }
-        for rule in rules
-        if suggest(rule, fits[rule.id], now) == "archive"
-    ]
+    fits = for_rules(ws, rules, now, verify_ci=True)
+    cut = next((f for f in fits.values() if not f.evidence_available), None)
+    error = None if cut is None else (cut.evidence_error or "the evidence is unavailable")
+    return [_candidate(wanted, rule, fits[rule.id], now) for rule in rules
+            if suggest(rule, fits[rule.id], now) == wanted], error
+
+
+def evidence_line(error: str) -> str:
+    """One bounded, printable line naming why the evidence is unavailable."""
+    text = "".join(ch if ch.isprintable() else " " for ch in error)
+    return f"Evidence unavailable: {text[:300]}"
+
+
+def evaluate_archives(workspace: Workspace | Path | str, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Rules whose evidence supports archiving (``promotion.suggest``)."""
+    return transition_candidates(workspace, "archive", now)[0]
 
 
 def _park(path: Path, dest_dir: Path) -> Path:
@@ -74,11 +96,18 @@ def _park(path: Path, dest_dir: Path) -> Path:
     return dest
 
 
-def _still_misfiring(ws: Workspace, rule_id: str, view: Any) -> bool:
+def _archive_refusal(ws: Workspace, rule_id: str, view: Any) -> Optional[str]:
+    """Why ``rule_id`` may not be archived now, or None. Credit cut short by a failed CI read
+    would make a sound rule look like it misfires, so unavailable evidence refuses."""
     from .promotion import suggest
 
     rule = load_rules(ws).get(rule_id)
-    return rule is not None and suggest(rule, for_rules(ws, [rule], view=view)[rule_id]) == "archive"
+    fit = for_rules(ws, [rule], view=view, verify_ci=True)[rule_id] if rule is not None else None
+    if fit is not None and not fit.evidence_available:
+        return f"Rule '{rule_id}' was not archived: its evidence is unavailable ({fit.evidence_error})"
+    if fit is None or suggest(rule, fit) != "archive":
+        return f"Rule '{rule_id}' no longer has evidence that supports archiving it"
+    return None
 
 
 def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False) -> Dict[str, Any]:
@@ -107,8 +136,9 @@ def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool 
                 "status": "ineligible",
                 "message": f"Rule '{clean}' was not archived: the ledger is incomplete ({view.incomplete})",
             }
-        if not _still_misfiring(ws, clean, view):
-            return {"status": "ineligible", "message": f"Rule '{clean}' no longer has evidence that supports archiving it"}
+        refusal = _archive_refusal(ws, clean, view)
+        if refusal:
+            return {"status": "ineligible", "message": refusal}
         dest = _park(path, archive_dir)
         append_jsonl(ws.layout.lifecycle_log, [{
             "timestamp": _utc_timestamp(),
@@ -124,7 +154,9 @@ def run_rule_selection(workspace: Workspace | Path | str | None = None, execute:
     if not ws.rules_dir.exists():
         print("No rules directory found.")
         return 0
-    candidates = evaluate_archives(ws)
+    candidates, unavailable = transition_candidates(ws, "archive")
+    if unavailable:
+        print(evidence_line(unavailable))
     if not candidates:
         print("No rules to archive.")
         return 0

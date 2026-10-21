@@ -44,10 +44,11 @@ def test_corrupt_counts_never_raise_and_stay_bounded(bad):
     for n in (bad, 10, 0):
         value = wilson_lower_bound(bad, n)
         assert isinstance(value, float) and 0.0 <= value <= 1.0 and not math.isnan(value)
-    fit = compute({"tp": bad, "fp": bad, "triggers": 3, "last_ts": "garbage"}, half_life_days=30)
+    fit = compute({"tp": bad, "fp": bad, "triggers": 3, "last_ts": "garbage"})
     assert 0.0 <= fit.score <= 1.0 and 0.0 <= fit.misfire <= 1.0
 
 
 def test_a_future_trigger_time_does_not_raise_fitness():
     totals = {"tp": 20, "fp": 0, "last_ts": "2099-01-01T00:00:00Z"}
-    assert compute(totals, half_life_days=30).score == compute(totals).score
+    # Calendar time never decays a rule (R-evidence-15), so a future timestamp changes nothing.
+    assert compute(totals).score == compute({**totals, "last_ts": None}).score

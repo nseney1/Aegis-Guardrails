@@ -5,9 +5,11 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 
 import pytest
 
+from aegis_core import insights as core_insights
 from aegis_core.errors import PathTraversalError
 from aegis_core.insights import (
     KEY_SIZE,
@@ -15,7 +17,6 @@ from aegis_core.insights import (
     capture_suggestion,
     create_link_key,
     dirty_paths,
-    enable_host_hook,
     has_correction_cue,
     host_capture_status,
     insight_workspace_id,
@@ -150,7 +151,6 @@ def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Pat
     )
     assert res["event"] == "heartbeat"
     assert res["cue"] is True
-    assert res["recorded"] is False
 
     rows = read_insight_rows(repo, home=home)
     assert len(rows) == 1
@@ -169,6 +169,86 @@ def test_tfidf_cosine_and_dirty_paths(tmp_path: Path):
     sim_diff = tfidf_cosine("validate path confinement before deletion", "configure oauth2 bearer token refresh")
     assert sim_same > sim_diff
     assert sim_same > 0.3
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
+                   cwd=str(cwd), check=True, capture_output=True)
+
+
+def _stat_dirty(path: Path) -> None:
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+
+def test_dirty_paths_never_runs_a_submodule_clean_filter(tmp_path: Path):
+    # R-evidence-43: the submodule's own config must not choose a program dirty_paths runs.
+    sub_src = tmp_path / "subsrc"
+    sub_src.mkdir()
+    _git(sub_src, "init", "-q")
+    (sub_src / "f.txt").write_text("data\n", encoding="utf-8")
+    _git(sub_src, "add", ".")
+    _git(sub_src, "commit", "-q", "-m", "sub")
+    repo = _make_repo(tmp_path / "repo")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_src), "sub")
+    _git(repo, "commit", "-q", "-m", "add sub")
+    marker = tmp_path / "marker"
+    script = tmp_path / "filt.py"
+    script.write_text(
+        f"import sys\nopen({str(marker)!r}, 'w').close()\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    modules = repo / ".git" / "modules" / "sub"
+    _git(repo, "config", "-f", str(modules / "config"), "filter.evil.clean",
+         f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}"')
+    (modules / "info").mkdir(exist_ok=True)
+    (modules / "info" / "attributes").write_text("* filter=evil\n", encoding="utf-8")
+    _stat_dirty(repo / "sub" / "f.txt")
+    (repo / "app.py").write_text("a = 2\n", encoding="utf-8")
+
+    assert dirty_paths(repo) == ["app.py"]
+    assert not marker.exists()
+
+
+def test_dirty_paths_skips_deleted_touched_and_state_files(tmp_path: Path):
+    repo = _make_repo(tmp_path / "repo")
+    (repo / "gone.py").write_text("g = 1\n", encoding="utf-8")
+    (repo / "same.py").write_text("s = 1\n", encoding="utf-8")
+    (repo / ".aegis" / "state").mkdir()
+    (repo / ".aegis" / "state" / "x.json").write_text("{}\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".")
+    _git(repo, "commit", "-q", "-m", "more")
+    (repo / "gone.py").unlink()
+    _stat_dirty(repo / "same.py")
+    (repo / ".aegis" / "state" / "x.json").write_text('{"a": 1}\n', encoding="utf-8")
+
+    assert dirty_paths(repo) == []
+
+
+def test_add_insight_confines_explicit_paths_to_the_workspace(tmp_path: Path):
+    home = tmp_path / "home"
+    repo = _make_repo(tmp_path / "repo")
+    with pytest.raises(PathTraversalError):
+        add_insight(repo, "Never touch passwd", paths=["../../etc/passwd"], home=home)
+    with pytest.raises(PathTraversalError):
+        add_insight(repo, "Never touch passwd", paths=["src/ok.py", str(tmp_path / "outside.py")], home=home)
+    assert read_insight_rows(repo, home=home) == []
+
+    row = add_insight(repo, "Keep commas", paths=["src/a,b.py", str(repo.resolve() / "app.py"), " "], home=home)
+    assert row["paths"] == ["app.py", "src/a,b.py"]
+
+
+def test_add_insight_refuses_a_symlink_that_escapes(tmp_path: Path):
+    home = tmp_path / "home"
+    repo = _make_repo(tmp_path / "repo")
+    (tmp_path / "secret.py").write_text("s = 1\n", encoding="utf-8")
+    try:
+        (repo / "link.py").symlink_to(tmp_path / "secret.py")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(PathTraversalError):
+        capture_suggestion(repo, "Do not follow links", paths=["link.py"], home=home)
+    assert read_insight_rows(repo, home=home) == []
 
 
 def test_add_insight_level_h_requires_explicit_commit_and_matching_insight_hash(
@@ -219,3 +299,252 @@ def test_add_insight_level_h_requires_explicit_commit_and_matching_insight_hash(
     assert ins_ok["level"] == "H"
     assert ins_wrong_text["level"] == "cli"
     assert ins_no_commit["level"] == "cli"
+
+
+def _ours(command: str = "python3 -I -m aegis_cli.hooks.insights --host claude-code") -> dict:
+    return {"matcher": "", "hooks": [{"type": "command", "command": command}]}
+
+
+def test_merge_insight_hook_replaces_ours_and_keeps_foreign_entries():
+    foreign = {"matcher": "", "hooks": [{"type": "command", "command": "echo mine"}]}
+    shared = {"matcher": "", "hooks": [{"type": "command", "command": "echo shared"},
+                                       {"type": "command", "command": "/py", "args": ["-c", "aegis_cli.hooks.insights"]}]}
+    data = {"model": "x", "hooks": {"UserPromptSubmit": [_ours(), foreign, shared]}}
+    handler = {"type": "command", "command": "/py", "args": ["-I", "-c", "from aegis_cli.hooks.insights import main"]}
+    core_insights.merge_insight_hook(data, handler)
+    assert data == {"model": "x", "hooks": {"UserPromptSubmit": [
+        foreign, {"matcher": "", "hooks": [{"type": "command", "command": "echo shared"}]},
+        {"matcher": "", "hooks": [handler]}]}}
+    assert core_insights.INSIGHT_HOOK_MARKER == "aegis_cli.hooks.insights"
+
+
+@pytest.mark.parametrize("data, where", [
+    ({"hooks": ["x"]}, "hooks"),
+    ({"hooks": {"UserPromptSubmit": {}}}, "UserPromptSubmit"),
+])
+def test_merge_insight_hook_refuses_a_wrong_shape(data, where):
+    with pytest.raises(ValueError, match=where):
+        core_insights.merge_insight_hook(data, {"type": "command", "command": "/py"})
+
+
+def test_remove_insight_hook_counts_ours_and_drops_emptied_containers():
+    data = {"hooks": {"UserPromptSubmit": [_ours(), _ours("/py -c 'from aegis_cli.hooks.insights import main'")],
+                      "Stop": []}}
+    assert core_insights.remove_insight_hook("claude-code", data) == 2
+    assert data == {"hooks": {"Stop": []}}
+    data = {"hooks": {"UserPromptSubmit": [_ours()]}}
+    assert core_insights.remove_insight_hook("codex-cli", data) == 1 and data == {}
+
+
+@pytest.mark.parametrize("data", [
+    {}, {"hooks": ["x"]}, {"hooks": {"UserPromptSubmit": {}}}, {"hooks": {"UserPromptSubmit": ["x", {"hooks": 3}]}},
+])
+def test_remove_insight_hook_never_raises_on_odd_shapes(data):
+    before = repr(data)
+    assert core_insights.remove_insight_hook("claude-code", data) == 0
+    assert repr(data) == before
+
+
+def test_host_capture_status_ignores_a_relative_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text(
+        '{"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "/py", "args": ["-c", "aegis_cli.hooks.insights", "--excerpts"]}]}]}}',
+        encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/dir")
+    assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True}
+
+
+# ── One workspace, one insights file, whatever the hook's cwd (R-evidence-39) ──
+
+@pytest.fixture
+def hook_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    (home / ".aegis").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AEGIS_WORKSPACE"):
+        monkeypatch.delenv(name, raising=False)
+    return home
+
+
+def _insight_texts(workspace: Path, home: Path) -> list:
+    return sorted(r["text"] for r in read_insight_rows(workspace, home=home) if r.get("event") == "insight")
+
+
+def test_a_hook_in_a_subdirectory_writes_the_governed_roots_file(tmp_path: Path, hook_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    (repo / "src").mkdir()
+    record_hook_prompt("claude-code", {"prompt": "No, stop breaking the parser", "session_id": "s1",
+                                       "cwd": str(repo / "src")}, home=hook_home)
+    record_hook_prompt("claude-code", {"prompt": "Don't touch the lockfile again", "session_id": "s2",
+                                       "cwd": str(repo)}, home=hook_home)
+    assert insights_path(repo / "src", home=hook_home) == insights_path(repo, home=hook_home)
+    assert _insight_texts(repo, hook_home) == ["Don't touch the lockfile again", "No, stop breaking the parser"]
+    assert len(list((hook_home / ".aegis" / "insights").glob("*.jsonl"))) == 1
+
+
+def test_an_ungoverned_repository_under_home_keeps_the_cwds_own_id(hook_home: Path):
+    # A walk-up that went past the git top would reach ~/.aegis, the user plane every user has.
+    proj = hook_home / "proj"
+    proj.mkdir()
+    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    (proj / "sub").mkdir()
+    record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(proj / "sub")}, home=hook_home)
+    assert insight_workspace_id(proj / "sub") != insight_workspace_id(hook_home)
+    assert _insight_texts(proj / "sub", hook_home) == ["No, wrong file"]
+
+
+def test_claude_project_dir_wins_over_the_payload_cwd(tmp_path: Path, hook_home: Path, monkeypatch):
+    repo, other = _make_repo(tmp_path / "repo"), _make_repo(tmp_path / "other")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
+    record_hook_prompt("claude-code", {"prompt": "No, revert that", "cwd": str(other)}, home=hook_home)
+    assert _insight_texts(repo, hook_home) == ["No, revert that"]
+    assert _insight_texts(other, hook_home) == []
+
+
+def test_a_relative_claude_project_dir_is_ignored(tmp_path: Path, hook_home: Path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "repo")
+    record_hook_prompt("claude-code", {"prompt": "No, revert that", "cwd": str(repo)}, home=hook_home)
+    assert _insight_texts(repo, hook_home) == ["No, revert that"]
+
+
+def test_a_cwd_that_does_not_exist_falls_back_to_itself(tmp_path: Path, hook_home: Path):
+    missing = _make_repo(tmp_path / "repo") / "gone"
+    record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(missing)}, home=hook_home)
+    assert _insight_texts(missing, hook_home) == ["No, wrong file"]
+
+
+# ── a heartbeat per identified prompt, revisions through inventory rows (R-evidence-40) ──
+
+_RULE_MD = (
+    "---\nid: {rid}\ntype: trap\nenforcement: advisory\nhypothesis: Popen hangs.\n"
+    "target_paths:\n  - '*.py'\n---\n# {rid}\n\nNever call subprocess.Popen without a timeout.{extra}\n"
+)
+
+
+def _put_rule(repo: Path, rid: str, extra: str = "") -> None:
+    (repo / ".aegis" / "rules" / "traps" / f"{rid}.md").write_text(_RULE_MD.format(rid=rid, extra=extra), encoding="utf-8")
+
+
+def _prompt(repo: Path, home: Path, text: str = "Please run the tests.", session: str = "s-hb", **kw):
+    return record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home, **kw)
+
+
+def _events(repo: Path, home: Path, event: str):
+    return [r for r in read_insight_rows(repo, home=home) if r.get("event") == event]
+
+
+@pytest.fixture
+def hb_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+def test_a_session_counts_alive_for_a_rule_created_between_its_prompts(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _prompt(repo, hb_home)
+    _put_rule(repo, "trap-mid")
+    _prompt(repo, hb_home)
+    rec = measure_recurrence(repo, "trap-mid", home=hb_home)
+    assert (rec["sessions"], rec["status"]) == (1, "ok")
+
+
+def test_counters_only_cue_prompts_store_a_text_free_heartbeat_each(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    for _ in range(2):
+        _prompt(repo, hb_home, "No, stop breaking the build!", excerpts=False)
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
+    assert all(r["cue"] is True and "text" not in r for r in rows)
+
+
+def test_an_unchanged_rule_set_writes_one_inventory_row(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-inv")
+    for _ in range(500):
+        _prompt(repo, hb_home)
+    (inv,) = _events(repo, hb_home, "inventory")
+    beats = _events(repo, hb_home, "heartbeat")
+    assert len(beats) == 500
+    assert all(b["inv"] == inv["inv"] and "revs" not in b for b in beats)
+    assert set(inv["revs"]) == {"trap-inv"}
+    lines = insights_path(repo, home=hb_home).read_bytes().splitlines()
+    assert max(len(line) for line in lines if b'"heartbeat"' in line) <= 200
+
+    _put_rule(repo, "trap-inv", extra=" Revised.")
+    _prompt(repo, hb_home)
+    assert len(_events(repo, hb_home, "inventory")) == 2
+
+
+def test_a_heartbeat_whose_inv_has_no_inventory_row_is_not_alive(tmp_path: Path, hb_home: Path):
+    from aegis_core.rules import load_rules
+    from aegis_core.storage import append_jsonl
+
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-orphan")
+    rev = load_rules(repo).get("trap-orphan").digest[:16]
+    base = {"v": 1, "ts": "2026-10-20T00:00:00Z", "event": "heartbeat", "host": "claude-code"}
+    path = insights_path(repo, home=hb_home)
+    path.parent.mkdir(parents=True)
+    append_jsonl(path, [dict(base, hs="a" * 32, cue=False, inv="0" * 16)])
+    assert measure_recurrence(repo, "trap-orphan", home=hb_home)["sessions"] == 0
+    append_jsonl(path, [dict(base, hs="b" * 32, revs={"trap-orphan": rev})])
+    assert measure_recurrence(repo, "trap-orphan", home=hb_home)["sessions"] == 1
+
+
+def test_a_workspace_without_rule_files_writes_heartbeats_without_inv(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _prompt(repo, hb_home)
+    _prompt(repo, hb_home)
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["heartbeat", "heartbeat"]
+    assert all("inv" not in r and "revs" not in r for r in rows)
+
+
+# ── no session identity, no heartbeat (R-structure-a2) ────────────────────────
+
+def _hook_entry(repo: Path, home: Path, stdin: str):
+    import contextlib
+    import io
+
+    from aegis_cli.hooks.insights import run_insight_hook
+
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = run_insight_hook(["--host", "claude-code", "--workspace", str(repo), "--excerpts"], stdin=stdin, home=home)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_a_prompt_without_a_session_writes_nothing(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-nosess")
+    for stdin in ("", '{"prompt": "Please run the tests."}', '{"prompt": "Run the linter.", "session_id": "  "}'):
+        assert _hook_entry(repo, hb_home, stdin) == (0, "", "")
+    assert not (hb_home / ".aegis" / "insights").exists()
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_a_cue_prompt_without_a_session_writes_only_its_insight(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-nosess")
+    record_hook_prompt("claude-code", {"prompt": "No, stop breaking the build!", "cwd": str(repo)}, home=hb_home)
+    (row,) = read_insight_rows(repo, home=hb_home)
+    assert row["event"] == "insight" and "hs" not in row and set(row["revs"]) == {"trap-nosess"}
+    _prompt(repo, hb_home)
+    _prompt(repo, hb_home)
+    assert len(_events(repo, hb_home, "heartbeat")) == 2
+
+
+def test_a_corrupt_log_and_no_session_still_exit_zero_silently(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    store = insights_path(repo, home=hb_home)
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"\xff{garbage\n")
+    assert _hook_entry(repo, hb_home, '{"prompt": "No, wrong file again"}') == (0, "", "")
+    assert [r["event"] for r in read_insight_rows(repo, home=hb_home)] == ["insight"]

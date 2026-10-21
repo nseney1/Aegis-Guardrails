@@ -135,6 +135,7 @@ def test_two_copies_of_one_line_are_two_findings_with_different_fingerprints(rep
 
 def test_an_aliased_call_is_found_the_way_the_gate_found_it(repo: Path):
     write(repo, ".aegis/rules/invariants/no-subprocess.md", CALLS_SUBPROCESS)
+    commit(repo, "the reviewed rule")  # Layer 1 enforces the base version
     write(repo, "run.py", "import subprocess as sp\n\n\ndef go():\n    sp.run(['ls'])\n    return 1\n")
     found = [f for f in _collect(repo, ["run.py"]).findings if f.rule == "forbid_ast:no-subprocess"]
     assert [(f.line, f.text) for f in found] == [(5, "sp.run(['ls'])")]
@@ -142,6 +143,7 @@ def test_an_aliased_call_is_found_the_way_the_gate_found_it(repo: Path):
 
 def test_a_forbidden_import_is_a_finding_at_each_import_line(repo: Path):
     write(repo, ".aegis/rules/invariants/no-pickle.md", NO_PICKLE)
+    commit(repo, "the reviewed rule")  # Layer 1 enforces the base version
     write(repo, "io_.py", "import json\nimport pickle\nfrom pickle import loads\n")
     found = [f for f in _collect(repo, ["io_.py"]).findings if f.rule == "forbid_ast:no-pickle"]
     assert [(f.line, f.text) for f in found] == [(2, "import pickle"), (3, "from pickle import loads")]
@@ -149,6 +151,7 @@ def test_a_forbidden_import_is_a_finding_at_each_import_line(repo: Path):
 
 def test_a_decorator_violation_has_no_line_so_it_cannot_be_baselined(repo: Path):
     write(repo, ".aegis/rules/invariants/no-cache.md", NO_DECORATOR)
+    commit(repo, "the reviewed rule")  # Layer 1 enforces the base version
     write(repo, "cached.py", "from functools import lru_cache\n\n\n@lru_cache\ndef f():\n    return 1\n")
     result = _collect(repo, ["cached.py"])
     assert [f for f in result.findings if f.rule == "forbid_ast:no-cache"] == []

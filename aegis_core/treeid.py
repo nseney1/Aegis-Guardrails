@@ -242,7 +242,10 @@ class BoundTree:
             self.run(["update-index", "--no-skip-worktree", "-z", "--stdin"],
                      stdin=b"".join(os.fsencode(p) + b"\0" for p in marked))
         prefix = str(destination).rstrip("/\\") + os.sep
-        res = self.run(["checkout-index", "-a", "-f", f"--prefix={prefix}"])
+        # The flags gitsafe.export_tree uses, on this command only: in _STABLE_CONFIG they would reach
+        # the tree recipe's `add -A` and change tree ids (tree_algo v1).
+        res = self.run(["-c", "core.autocrlf=false", "-c", "core.symlinks=false", "-c", "core.sparseCheckout=false",
+                        "checkout-index", "-a", "-f", f"--prefix={prefix}"])
         if res.returncode != 0:
             raise TreeError(f"git checkout-index failed: {res.stderr.decode('utf-8', 'replace').strip()[:300]}")
 

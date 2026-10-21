@@ -51,7 +51,7 @@ A release goes to `main` only after all of these hold for the exact commit being
 
 1. An independent review of the release pull request.
 2. CI green on that commit: `python3 .github/scripts/ci_green.py <sha>` exits 0 (it needs the `gh` CLI).
-3. `aegis check` passes Layer 1, and Layer 2 passes with a model from a different vendor than the one that wrote the change (`aegis check --full --plan-file <plan> --llm-cmd "<command>"`).
+3. `aegis check` passes Layer 1. A Layer 2 review with a model from a different vendor than the one that wrote the change (`aegis check --full --plan-file <plan> --llm-cmd "<command>"`) is advisory: since 4.3.4 its verdict is logged and never changes the exit status, so it informs the release review but does not gate it.
 
 For 4.0 to 4.2 the author lets the agent merge, tag and publish once these hold; otherwise a person merges to `main`. Publishing a GitHub Release runs `.github/workflows/publish.yml`, which ships the wheel CI already built and tested. The [CHANGELOG](CHANGELOG.md) entry describes what changed for users, and its date is set when the release is cut.
 

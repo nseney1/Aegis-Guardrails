@@ -8,7 +8,9 @@ every call here:
 
 - runs ``git`` as an argv list (no shell) with a timeout;
 - passes ``-c core.fsmonitor=false -c core.hooksPath=<devnull> -c protocol.allow=never
-  -c core.sshCommand=false -c credential.helper=`` (command-line config beats repo config);
+  -c core.sshCommand=false -c credential.helper= -c log.showSignature=false`` and points the
+  signature programs (``gpg.program``, ``gpg.openpgp.program``, ``gpg.x509.program``) at
+  <devnull> (command-line config beats repo config);
 - sets ``GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 LC_ALL=C``.
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
@@ -16,12 +18,13 @@ every call here:
 - uses plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
   ``check-ref-format``, ``hash-object``, ``version`` and ``config`` (reads only). It
-  writes in three places only, never to the work tree, the index, a branch or a tag:
+  writes in four places only, never to the work tree, the index, a branch or a tag:
   ``hash-object -w`` stores a blob, ``update-ref --no-deref --stdin`` creates, swaps
   or deletes one ref under compare-and-swap, always under ``refs/aegis/`` (the team's
   leases; ``update_ref`` refuses any other name), and ``merge-tree --write-tree``
   stores the objects of a trial merge that nothing references (git's gc collects
-  them). ``diff-index`` without ``--cached``, ``ls-files --others`` and
+  them), and ``interpret-trailers --in-place`` edits the prepare-commit-msg hook's message
+  file, with no repository config read (its ``trailer.*`` commands). ``diff-index`` without ``--cached``, ``ls-files --others`` and
   ``hash-object --stdin-paths`` read the working tree, which is where an fsmonitor or
   a clean filter would run; they are needed (no plumbing lists changed or untracked
   files otherwise, and only git knows its line-ending conversion). The forced
@@ -48,7 +51,6 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
-import posixpath
 import re
 import shutil
 import stat
@@ -70,6 +72,7 @@ __all__ = [
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
+    "add_trailer",
     "blob_id",
     "blob_oid",
     "changed_files",
@@ -88,9 +91,11 @@ __all__ = [
     "read_blobs",
     "read_object",
     "read_ref",
+    "relative_to_prefix",
     "resolve_base_ref",
     "resolve_commit",
     "run",
+    "show_prefix",
     "toplevel",
     "tree_blobs",
     "update_ref",
@@ -107,11 +112,20 @@ MERGE_TREE_MIN_VERSION = (2, 38)
 #: The only ref hierarchy update_ref writes: never a branch, a tag or a remote ref.
 _WRITABLE_REFS = "refs/aegis/"
 _ACMR = "--diff-filter=ACMR"
+# git takes a signature's format from its armor, so a PGP or X.509 signature runs gpg.program
+# or gpg.x509.program, which repository config can set (log.showSignature makes plain ``git
+# log`` check them). Aegis checks SSH signatures only, through the gpg.ssh.program human_gate
+# pins. <devnull>, not a bare ``false``: git looks a bare name up on PATH, where a relative or
+# empty entry finds a program planted in the work tree.
 _HARDENING_KEEP_HOOKS_PATH = (
     "-c", "core.fsmonitor=false",
     "-c", "protocol.allow=never",
     "-c", "core.sshCommand=false",
     "-c", "credential.helper=",
+    "-c", "log.showSignature=false",
+    "-c", f"gpg.program={os.devnull}",
+    "-c", f"gpg.openpgp.program={os.devnull}",
+    "-c", f"gpg.x509.program={os.devnull}",
 )
 _HARDENING = ("-c", f"core.hooksPath={os.devnull}", *_HARDENING_KEEP_HOOKS_PATH)
 _ENV = {
@@ -194,6 +208,19 @@ def run(
         raise GitError(f"cannot run git: {exc}") from exc
 
 
+def add_trailer(message_file: Path | str, trailer: str) -> bool:
+    """Put ``trailer`` in a commit message file, replacing its key; False when git cannot. No repository
+    config is read (its ``trailer.*`` commands are programs; a linked worktree's hook inherits GIT_DIR)."""
+    target = os.path.abspath(message_file)  # git hands a hook a relative .git/COMMIT_EDITMSG
+    try:
+        with tempfile.TemporaryDirectory(prefix="aegis-trailer-") as scratch:
+            res = run(["interpret-trailers", "--in-place", "--if-exists", "replace", "--trailer", trailer, target],
+                      scratch, _env={"GIT_DIR": scratch, "GIT_COMMON_DIR": scratch})
+    except OSError as exc:
+        raise GitError(f"cannot make a directory for git: {exc}") from exc
+    return res.returncode == 0
+
+
 def _completed(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[subprocess.CompletedProcess]:
     """The completed call, or None (git is missing or timed out)."""
     try:
@@ -228,6 +255,25 @@ def toplevel(cwd: Path | str) -> Optional[Path]:
     """The work tree root containing ``cwd``, or None outside a work tree."""
     text = _text(["rev-parse", "--show-toplevel"], cwd)
     return Path(text) if text else None
+
+
+def show_prefix(cwd: Path | str) -> str:
+    """``cwd`` below the work tree root (``rev-parse --show-prefix``): POSIX, ending in ``/``,
+    ``""`` at the top level. Raises GitError when git cannot place ``cwd``: tree listings and
+    diffs name top-level paths, so guessing a frame would silently drop or misplace them."""
+    res = run(["rev-parse", "--show-prefix"], cwd)
+    if res.returncode != 0:
+        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
+        raise GitError(f"git rev-parse --show-prefix failed: {detail}")
+    return os.fsdecode(res.stdout.rstrip(b"\r\n"))
+
+
+def relative_to_prefix(prefix: str, path: str) -> Optional[str]:
+    """A top-level ``path`` relative to the directory at ``prefix`` (from ``show_prefix``), or
+    None when it lies outside that directory."""
+    if not prefix:
+        return path
+    return path[len(prefix):] if path.startswith(prefix) and len(path) > len(prefix) else None
 
 
 def common_dir(cwd: Path | str) -> Optional[Path]:
@@ -282,8 +328,10 @@ def head_commit(cwd: Path | str) -> Optional[str]:
 
 
 def merge_base(cwd: Path | str, a: str, b: str = "HEAD") -> Optional[str]:
-    """The best common ancestor of two commits, or None."""
-    first, second = resolve_commit(cwd, a), resolve_commit(cwd, b)
+    """The best common ancestor of two commits, or None. A full object id goes to git as is
+    (two of them cost one call); anything else is resolved first, ``a`` before ``b``."""
+    first = a if isinstance(a, str) and _OID.match(a) else resolve_commit(cwd, a)
+    second = (b if isinstance(b, str) and _OID.match(b) else resolve_commit(cwd, b)) if first else None
     if not first or not second:
         return None
     return _text(["merge-base", first, second], cwd)
@@ -509,8 +557,8 @@ def list_files(
     tracked: bool = True,
     untracked: bool = True,
 ) -> Optional[List[str]]:
-    """Repo-relative files git knows about under ``paths`` (all when empty): tracked
-    ones and/or untracked, not ignored ones. None when git cannot answer."""
+    """Files git knows about under ``paths`` (all when empty), relative to ``cwd`` (the workspace,
+    not the repository top): tracked and/or untracked, not ignored. None when git cannot answer."""
     args = ["ls-files", "-z"]
     if tracked:
         args.append("--cached")
@@ -680,16 +728,23 @@ def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
     return records
 
 
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
 def _safe_export_target(destination: Path, rel_path: str) -> Optional[Path]:
+    # On Windows ":" makes a part drive-relative (D:x) or a stream; on POSIX a:b.py is a plain file.
     if not isinstance(rel_path, str) or not rel_path:
         return None
-    cleaned = rel_path.replace("\\", "/")
-    if cleaned.startswith("/"):
+    parts = rel_path.replace("\\", "/").split("/")
+    if any(part in ("", ".", "..") or (_on_windows() and ":" in part) for part in parts):
         return None
-    norm = posixpath.normpath(cleaned)
-    if not norm or norm in (".", "..") or norm.startswith(("../", "/")):
+    target = destination.joinpath(*parts)
+    base = os.path.abspath(destination)
+    try:
+        return target if os.path.commonpath([os.path.abspath(target), base]) == base else None
+    except ValueError:  # another drive
         return None
-    return destination.joinpath(*norm.split("/"))
 
 
 def export_tree(

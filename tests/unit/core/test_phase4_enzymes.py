@@ -29,7 +29,8 @@ fitness:
 Test body
 """
     (traps_dir / "test-cell.md").write_text(cell_content, encoding="utf-8")
-    ledger.append(tmp_path, [{"rule": "test-cell", "outcome": "fp", "source": "ci", "key": f"k{n}"} for n in range(3)])
+    # MIN_N (25) false positives: the one sample gate before any archive (R-evidence-8).
+    ledger.append(tmp_path, [{"rule": "test-cell", "outcome": "fp", "source": "ci", "key": f"k{n}"} for n in range(25)])
 
     # Run check mode (dry run)
     rc = run_rule_selection(workspace=tmp_path, execute=False)

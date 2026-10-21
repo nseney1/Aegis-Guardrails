@@ -36,6 +36,22 @@ def _rows(derived: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [dict(entry, id=rule_id) for rule_id, entry in sorted(derived["rules"].items())]
 
 
+def _fitness_column(row: Dict[str, Any]) -> str:
+    shown = row.get("reported_score")
+    return f"{shown:.2f}" if isinstance(shown, (int, float)) else str(row.get("status") or "—")
+
+
+def _inert_expiry(root: Any) -> bool:
+    """Whether the repository config sets the day expiry that fitness no longer reads (R-evidence-15)."""
+    from aegis_core.config import DEFAULT_EXPIRY_DAYS, ConfigError, RepoConfig
+
+    try:
+        config = RepoConfig.load(root)
+    except ConfigError:
+        return False
+    return config.expiry_days != DEFAULT_EXPIRY_DAYS or bool(config.expiry_per_type)
+
+
 def _status(result: Any) -> str:
     if result.refused:
         return "refused"
@@ -57,7 +73,7 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
             tbl.add_column(column, no_wrap=True)
         for row in rows:
             tbl.add_row(
-                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])), f"{row['fitness']:.2f}",
+                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])), _fitness_column(row),
                 str(row["triggers"]), f"{row['tp']:g}", f"{row['fp']:g}", row["suggestion"] or "—",
             )
         for line in tbl.render(ui).splitlines():
@@ -71,6 +87,10 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
     missing = ledger_incomplete(result.derived["ledger"])
     if missing:
         print(f"  {LEDGER_WARNING.format(sanitize_display(missing, 300))}")
+    cut = next((row for row in rows if row.get("evidence_available") is False), None)
+    if cut is not None:
+        reason = str(cut.get("evidence_error") or "the evidence is unavailable")
+        print(f"  ⚠️  Evidence unavailable, so nothing is suggested: {sanitize_display(reason, 300)}")
     for action in result.applied:
         detail = f" ({action['from_type']} -> {action['to_type']})" if action.get("to_type") else ""
         print(f"  {action['action']} {sanitize_display(action['rule'])}: {action['status']}{detail}")
@@ -143,6 +163,9 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         print(json.dumps(payload, indent=2, default=str))
     else:
         _print_text(args, result, rel_path)
+        if _inert_expiry(root):
+            print("  ℹ️  expiry.days and expiry.per_type in .aegis/config.json no longer change fitness: "
+                  "rules decay by exposed sessions (half_life_sessions), never by calendar days")
         if claimed["claimed"]:
             print(f"  {claimed['label']}: {claimed['claimed']} report(s) from {claimed['sessions']} session(s), "
                   "no rule's evidence")

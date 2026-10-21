@@ -42,6 +42,7 @@ import aegis_core.lifecycle.selection as selection
 from aegis_core.lifecycle.creation import create_rule
 from aegis_core.lifecycle.promotion import demote_rule, evaluate_rule_tiers, evaluate_demotions, promote_rule
 from aegis_core.lifecycle.selection import evaluate_archives, run_rule_selection
+from aegis_core.fitness import MIN_N
 from aegis_core.telemetry_engine import ledger
 from aegis_core.yaml_engine.frontmatter import parse_frontmatter
 
@@ -67,9 +68,10 @@ def _evidence(ws: Path, rule_id: str, tp: int = 0, fp: int = 0) -> None:
 
 
 def _misfiring(path: Path, rule_id: str, rule_type: str = "trap") -> Path:
-    """A rule the ledger is confident fires wrongly: 3 false positives, no true positive."""
+    """A rule the ledger is confident fires wrongly: MIN_N false positives (the one sample gate,
+    R-evidence-8), no true positive."""
     _rule(path, rule_id, rule_type, "gate" if rule_type in ("invariant", "gate") else "advisory")
-    _evidence(path.parents[3], rule_id, fp=3)
+    _evidence(path.parents[3], rule_id, fp=MIN_N)
     return path
 
 
@@ -491,7 +493,7 @@ def test_archiving_acts_on_the_evidence_as_it_is_under_the_lock(
     """The rule is judged unlocked; true positives recorded before the lock must win."""
     ws = _ws(tmp_path)
     rule = _misfiring(_rules(ws) / "traps" / "revived.md", "revived")
-    _rival_on_first_lock(monkeypatch, lambda: _evidence(ws, "revived", tp=10), module=selection)
+    _rival_on_first_lock(monkeypatch, lambda: _evidence(ws, "revived", tp=MIN_N), module=selection)
 
     assert run_rule_selection(ws, execute=True) == 0
 

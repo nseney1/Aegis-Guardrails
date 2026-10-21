@@ -1,13 +1,13 @@
 """Paired interleaved performance regression check (v4.3 spec §3 T7)."""
 from __future__ import annotations
 
-import json, os, shlex, shutil, statistics, tempfile, time
+import os, shlex, shutil, statistics, tempfile, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, pathlookup
+from aegis_core.config import read_user_config
 from aegis_core.verification import test_runner
-from aegis_core.workspace.layout import UserLayout
 
 MIN_ROUNDS = 15
 DEFAULT_THRESHOLD = 0.05
@@ -43,32 +43,18 @@ def evaluate_paired_samples(
     }
 
 
-def _is_within(path: Path, root: Path) -> bool:
-    real_p, real_r = os.path.realpath(path), os.path.realpath(root)
-    return real_p == real_r or real_p.startswith(real_r.rstrip(os.sep) + os.sep)
-
-
 def _load_user_perf_command(workspace_root: Path, user_config_path: Path | str | None = None) -> list[str] | None:
     """Read perf.command from user-scope config only; never from repository config."""
-    if user_config_path is not None:
-        cfg_file = Path(user_config_path)
-    else:
-        layout = UserLayout.current()
-        if layout is None:
-            return None
-        cfg_file = layout.config_file
-    if not cfg_file.is_file() or _is_within(cfg_file, workspace_root):
-        return None
-    try:
-        raw = json.loads(cfg_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(raw, Mapping):
+    raw = read_user_config(workspace_root, path=user_config_path)
+    if raw is None:
         return None
     perf = raw.get("perf")
     cmd = perf.get("command") if isinstance(perf, Mapping) else raw.get("perf.command")
     if isinstance(cmd, str) and cmd.strip():
-        return shlex.split(cmd, posix=os.name != "nt")
+        try:
+            return shlex.split(cmd, posix=os.name != "nt")
+        except ValueError:  # unbalanced quotes: unusable, like any other bad value
+            return None
     if isinstance(cmd, list) and cmd and all(isinstance(x, str) and x.strip() for x in cmd):
         return [x.strip() for x in cmd]
     return None
@@ -92,6 +78,17 @@ def _invoke_sample(cmd_runner: Callable[..., Any], argv: list[str], cwd: Path, t
     return elapsed, None
 
 
+def _default_runner(ws_root: Path) -> Callable[..., Any]:
+    """``run_external_cmd`` with a bare ``argv[0]`` found only in an absolute PATH entry outside the
+    workspace (an empty or relative entry names the repository); an explicit path runs as written."""
+    def run(argv: Sequence[str], cwd: Path, env: Mapping[str, str] | None = None, timeout: int = 60) -> dict[str, Any]:
+        exe = pathlookup.which(argv[0], outside=ws_root) if os.path.basename(argv[0]) == argv[0] else argv[0]
+        if exe is None:
+            return {"missing_binary": True, "stderr": f"{argv[0]} not found in an absolute PATH entry outside the workspace"}
+        return test_runner.run_external_cmd([exe, *argv[1:]], cwd=cwd, env=env, timeout=timeout)
+    return run
+
+
 def run_perf_check(
     workspace_root: Path | str,
     base_ref: str = "HEAD~1",
@@ -103,7 +100,7 @@ def run_perf_check(
     user_config_path: Path | str | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
-    """Run paired interleaved benchmark rounds on a temporary base worktree vs head."""
+    """Run paired interleaved benchmark rounds on an export of merge-base(base_ref, HEAD) vs the working tree."""
     if rounds < MIN_ROUNDS:
         raise ValueError(f"perf check requires at least {MIN_ROUNDS} rounds (got {rounds})")
     ws_root = Path(workspace_root).resolve()
@@ -116,19 +113,18 @@ def run_perf_check(
     if not argv:
         return {"status": "unverified", "reason": "no perf.command configured in user-scope config", "regressed": False, "noisy": False}
 
-    cmd_runner = runner or test_runner.run_external_cmd
-    git_fn = getattr(gitsafe, "run_git", gitsafe.run)
+    cmd_runner = runner or _default_runner(ws_root)
+    # What the branch changed: merge-base(base, HEAD), never the base tip; only resolved oids reach git.
+    commit = gitsafe.merge_base(ws_root, base_ref, "HEAD")
+    if commit is None:
+        why = "and HEAD share no history (a shallow clone needs fetch-depth: 0)" if gitsafe.resolve_commit(ws_root, base_ref) else "does not resolve to a commit"
+        return {"status": "unverified", "reason": f"{base_ref} {why}", "regressed": False, "noisy": False}
     tmp_base = Path(tempfile.mkdtemp(prefix="aegis-perf-base-"))
-    worktree_added = False
     try:
-        commit = gitsafe.resolve_commit(ws_root, base_ref) or base_ref
-        try:
-            wt_res = git_fn(["worktree", "add", "--detach", str(tmp_base), commit], ws_root)
-            worktree_added = getattr(wt_res, "returncode", 1) == 0
+        try:  # an export: repository filters off, no worktree registered
+            gitsafe.export_tree(ws_root, commit, tmp_base)
         except gitsafe.GitError:
-            worktree_added = False
-        if not worktree_added and runner is None:
-            return {"status": "unverified", "reason": f"failed to create detached worktree for {base_ref}", "regressed": False, "noisy": False}
+            return {"status": "unverified", "reason": f"cannot export the merge-base of {base_ref}", "regressed": False, "noisy": False}
 
         base_samples: list[float] = []
         head_samples: list[float] = []
@@ -144,7 +140,4 @@ def run_perf_check(
         result["command"] = argv
         return result
     finally:
-        if worktree_added:
-            try: git_fn(["worktree", "remove", "--force", str(tmp_base)], ws_root)
-            except gitsafe.GitError: pass
         shutil.rmtree(tmp_base, ignore_errors=True)

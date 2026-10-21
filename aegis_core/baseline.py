@@ -750,12 +750,15 @@ def checkable(root: Any, files: Iterable[str]) -> List[str]:
     return out
 
 
-def run_fast(root: Any, files: Sequence[str]) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
+def run_fast(root: Any, files: Sequence[str], *,
+             reviewed: bool = True) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
     """Layer 1 as ``aegis check`` runs it by default (no model, no mutation testing) on
-    ``files`` of the working tree, each piece of evidence paired with its file."""
+    ``files`` of the working tree, each piece of evidence paired with its file. ``reviewed``
+    as in ``runner.run_layer1``."""
     from aegis_core.verification import runner
 
     base = os.fspath(root)
     pairs = run_grouped(
-        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True), files, root=base)
+        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed),
+        files, root=base)
     return pairs, Sources(base)

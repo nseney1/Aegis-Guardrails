@@ -3,17 +3,19 @@
 The ladder is trap -> invariant -> gate. Candidates come from the one estimator
 (aegis_core.fitness, Wilson lower bound at 90%):
 
+- nothing moves below fitness.MIN_N (25) verdicts: the one sample gate (R-evidence-8);
 - promote: at least 20 verdicts, fitness >= 0.85, created at least 30 days ago;
 - demote (or archive, for a rule with no lower tier): the Wilson lower bound of the
   false-positive rate is above 0.5.
 
-Boundary values below are Wilson bounds: 20/20 tp -> 0.881, 19/20 -> 0.804,
-24/25 -> 0.839; 3/3 fp -> 0.526, 5/6 -> 0.498, 4/5 -> 0.435.
+Boundary values below are Wilson bounds: 25/25 tp -> 0.902, 19/20 -> 0.804,
+24/25 -> 0.839; 25/25 fp -> 0.902, 19/25 fp -> 0.599, 3/3 fp -> 0.526 (below the gate).
 """
 from __future__ import annotations
 
 from tests.helpers_rule import make_cell, write_evidence
 
+from aegis_core.fitness import MIN_N
 from aegis_core.lifecycle.promotion import evaluate_demotions, evaluate_promotions
 from aegis_core.lifecycle.selection import evaluate_archives
 
@@ -41,10 +43,10 @@ def _ids(candidates):
 
 class TestPromotion:
     def test_a_proven_trap_is_a_promotion_candidate(self, tmp_path):
-        _trap(_ws(tmp_path), "proven", tp=20)
+        _trap(_ws(tmp_path), "proven", tp=MIN_N)
         (candidate,) = evaluate_promotions(tmp_path)
         assert (candidate["rule_id"], candidate["from_type"], candidate["to_type"]) == ("proven", "trap", "invariant")
-        assert candidate["triggers"] == 20 and candidate["fitness"] > 0.85
+        assert candidate["triggers"] == MIN_N and candidate["fitness"] > 0.85
 
     def test_an_invariant_promotes_to_gate(self, tmp_path):
         _invariant(_ws(tmp_path), "inv", tp=30)
@@ -60,7 +62,7 @@ class TestPromotion:
         assert evaluate_promotions(tmp_path) == []
 
     def test_bare_triggers_are_not_failures(self, tmp_path):
-        _trap(_ws(tmp_path), "relevant", tp=20, triggers=60)
+        _trap(_ws(tmp_path), "relevant", tp=MIN_N, triggers=60)
         assert _ids(evaluate_promotions(tmp_path)) == ["relevant"]
 
     def test_age_29_is_too_young_and_30_is_old_enough(self, tmp_path):
@@ -76,21 +78,23 @@ class TestPromotion:
 
 class TestDemotionAndArchive:
     def test_a_misfiring_invariant_is_demoted_to_trap(self, tmp_path):
-        _invariant(_ws(tmp_path), "noisy", tp=6, fp=14)
+        _invariant(_ws(tmp_path), "noisy", tp=6, fp=19)
         (candidate,) = evaluate_demotions(tmp_path)
         assert (candidate["rule_id"], candidate["from_type"], candidate["to_type"]) == ("noisy", "invariant", "trap")
         assert candidate["misfire"] > 0.5
 
     def test_a_misfiring_trap_is_archived_not_demoted(self, tmp_path):
-        _trap(_ws(tmp_path), "noisy-trap", fp=3)
+        _trap(_ws(tmp_path), "noisy-trap", fp=MIN_N)
         assert evaluate_demotions(tmp_path) == []
         assert _ids(evaluate_archives(tmp_path)) == ["noisy-trap"]
 
-    def test_three_straight_false_positives_clear_the_bound_and_five_of_six_do_not(self, tmp_path):
+    def test_three_straight_false_positives_are_below_the_sample_gate(self, tmp_path):
+        """3/3 fp clears the misfire bound (0.526) but not MIN_N: no transition below the gate."""
         _ws(tmp_path)
         _invariant(tmp_path, "three-of-three", fp=3)
         _invariant(tmp_path, "five-of-six", tp=1, fp=5)
-        assert _ids(evaluate_demotions(tmp_path)) == ["three-of-three"]
+        _invariant(tmp_path, "all-of-min-n", fp=MIN_N)
+        assert _ids(evaluate_demotions(tmp_path)) == ["all-of-min-n"]
 
     def test_a_healthy_rule_and_a_rule_without_evidence_are_kept(self, tmp_path):
         """v3 demoted rules with no triggers for 90 days; no evidence is not misfiring."""
@@ -111,8 +115,10 @@ class TestMisfireBoundary:
         _trap(_ws(tmp_path), "edge")
         rule = load_rules(tmp_path).get("edge")
 
-        assert suggest(rule, Fitness("edge", misfire=MISFIRE_THRESHOLD)) is None
-        assert suggest(rule, Fitness("edge", misfire=MISFIRE_THRESHOLD + 0.0001)) == "archive"
+        assert suggest(rule, Fitness("edge", fp=MIN_N, misfire=MISFIRE_THRESHOLD)) is None
+        assert suggest(rule, Fitness("edge", fp=MIN_N, misfire=MISFIRE_THRESHOLD + 0.0001)) == "archive"
+        # the same bound below the sample gate moves nothing
+        assert suggest(rule, Fitness("edge", fp=MIN_N - 1, misfire=0.9)) is None
 
 
 def _damage_ledger(ws):
@@ -141,7 +147,7 @@ class TestIncompleteLedger:
     def test_aegis_rule_archive_moves_nothing(self, tmp_path, capsys):
         from aegis_core.lifecycle.selection import prune_rules
 
-        _trap(_ws(tmp_path), "noisy-trap", fp=3)
+        _trap(_ws(tmp_path), "noisy-trap", fp=MIN_N)
         _damage_ledger(tmp_path)
 
         assert prune_rules(tmp_path, execute=True) == 0
