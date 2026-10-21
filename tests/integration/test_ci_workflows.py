@@ -358,3 +358,23 @@ def test_aegis_check_runs_the_installed_wheel_and_is_the_only_check_ci():
     with_ci = [name for name, job in jobs.items()
                if any(re.search(r"aegis_cli\.cli check --ci\b", s.get("run", "")) for s in job.get("steps", []))]
     assert with_ci == ["aegis-check"]
+
+
+# --- R-trust-43: at tier A check --ci reads the pull request's reviews ------------------------
+
+def _check_ci_steps(job):
+    return [s for s in job.get("steps", []) if re.search(r"\bcheck --ci\b", s.get("run", ""))]
+
+
+def _scaffold():
+    from aegis_core import scaffolding
+    return yaml.safe_load(scaffolding.ci_workflow())
+
+
+@pytest.mark.parametrize("load", [lambda: _load("validate.yml"), _scaffold], ids=["validate", "scaffold"])
+def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
+    job = load()["jobs"]["aegis-check"]
+    assert job.get("permissions") == {"contents": "read", "pull-requests": "read"}
+    steps = _check_ci_steps(job)
+    assert len(steps) == 1, steps
+    assert steps[0].get("env") == {"GH_TOKEN": "${{ github.token }}"}

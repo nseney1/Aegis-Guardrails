@@ -973,3 +973,263 @@ def test_reading_the_range_never_writes_to_the_repository(tmp_path, capsys):
 
 def test_gitsafe_is_how_git_is_run():
     assert rule_integrity.gitsafe is gitsafe
+
+
+# ── R-trust-43: at tier A a non-author's approving review of the head commit approves ──
+
+class ReviewGh(hg.FakeGh):
+    """FakeGh plus the pull request reviews endpoint; ``fail`` maps a path fragment to a failing GhResult."""
+
+    def __init__(self, reviews: Optional[List[Dict[str, Any]]] = None, fail: Optional[Dict[str, Any]] = None,
+                 **kw: Any) -> None:
+        kw.setdefault("rules", [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True)])
+        super().__init__(**kw)
+        self.reviews = reviews if reviews is not None else []
+        self.fail = fail or {}
+
+    def __call__(self, argv, stdin=None, cwd=None):
+        from aegis_core import human_gate
+        if self.missing:
+            return None
+        path = tuple(argv)[-1]
+        for fragment, result in self.fail.items():
+            if fragment in path:
+                self.calls.append((tuple(argv), stdin))
+                return result
+        if "/pulls/" in path:
+            self.calls.append((tuple(argv), stdin))
+            return human_gate.GhResult(0, json.dumps(self.reviews), "")
+        return super().__call__(argv, stdin, cwd)
+
+    @property
+    def review_calls(self) -> List[str]:
+        return [c[0][-1] for c in self.calls if "/pulls/" in c[0][-1]]
+
+
+def review(login: str, sha: str, state: str = "APPROVED", association: str = "COLLABORATOR") -> Dict[str, Any]:
+    return {"user": {"login": login}, "state": state, "commit_id": sha, "author_association": association}
+
+
+def tier_a_repo(tmp_path: Path, codeowners: Optional[str] = hg.CODEOWNERS_FULL, signer: bool = False) -> hg.Repo:
+    """make_repo with the base's CODEOWNERS (and an allowed_signers key) committed on main."""
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    if codeowners is not None:
+        repo.write(".github/CODEOWNERS", codeowners)
+    if signer:
+        repo.write("allowed_signers", hg.allowed_signers_text(hg.hardware_public_key()))
+    repo.commit("protect", allow_empty=True)
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("checkout", "-q", "-B", "work")
+    return repo
+
+
+def pull_event(tmp_path: Path, monkeypatch, base: str, head: str, number: Any = 7, login: Any = "agent",
+               name: str = "pull_request") -> None:
+    event = tmp_path / "event.json"
+    pull = {"number": number, "user": {"login": login}, "base": {"sha": base}, "head": {"sha": head}}
+    event.write_text(json.dumps({"number": number, "pull_request": pull}), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", name)
+
+
+def reviewed_weakening(tmp_path: Path, monkeypatch, gh: ReviewGh, **event: Any) -> Tuple[hg.Repo, str]:
+    """A tier A repo whose pull request deletes the binding rule inv-a, run as a pull_request job."""
+    from aegis_core import human_gate
+    repo = tier_a_repo(tmp_path)
+    base = repo.head()
+    (repo.root / path_of("inv-a")).unlink()
+    head = repo.commit("drop the rule")
+    pull_event(tmp_path, monkeypatch, base, event.pop("head", head), **event)
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    return repo, head
+
+
+def ci_event(capsys, *extra: str) -> Tuple[int, Any]:
+    rc = main(["check", "--ci", "--format", "json", *extra])
+    out = capsys.readouterr().out
+    return rc, json.loads(out) if out.strip() else None
+
+
+@needs_git
+def test_tier_a_a_non_author_approving_review_of_the_head_approves_a_weakening(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["status"] == "pass", payload
+    assert payload["approval"]["valid"] is True and payload["approval"]["method"] == "review"
+    assert payload["approval"]["signer"] == "human" and payload["approval"]["scope"]["commit"] == head
+    assert gh.review_calls == ["repos/{owner}/{repo}/pulls/7/reviews?per_page=100"]
+    assert gh.posts == []
+    assert main(["check", "--ci"]) == 0
+    assert "approved by review of human" in capsys.readouterr().out
+
+
+@needs_git
+@pytest.mark.parametrize("rule", [
+    hg.pull_request_rule(approvals=1, code_owners=False, dismiss_stale=True),
+    hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=False),
+    hg.pull_request_rule(approvals=0, code_owners=True, dismiss_stale=True),
+], ids=["no-code-owner-review", "stale-kept", "no-approval"])
+def test_a_review_under_a_tier_b_or_c_ruleset_approves_nothing_and_reviews_are_never_read(
+        tmp_path, capsys, monkeypatch, rule):
+    gh = ReviewGh(rules=[rule])
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+    assert gh.review_calls == []
+
+
+@needs_git
+@pytest.mark.parametrize("codeowners", [None, "/src/ @octo\n"], ids=["none", "partial"])
+def test_a_base_codeowners_that_does_not_own_the_change_reads_no_review(tmp_path, capsys, monkeypatch, codeowners):
+    from aegis_core import human_gate
+    gh = ReviewGh()
+    repo = tier_a_repo(tmp_path, codeowners=codeowners)
+    base = repo.head()
+    (repo.root / path_of("inv-a")).unlink()
+    head = repo.commit("drop the rule")
+    gh.reviews = [review("human", head, association="OWNER")]
+    pull_event(tmp_path, monkeypatch, base, head)
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None and gh.review_calls == []
+
+
+def _old_sha() -> str:
+    return "0123456789abcdef0123456789abcdef01234567"
+
+
+@needs_git
+@pytest.mark.parametrize("make_reviews", [
+    lambda head: [review("human", _old_sha())],
+    lambda head: [review("agent", head)],
+    lambda head: [review("Agent", head)],
+    lambda head: [review("human", head, association="NONE")],
+    lambda head: [review("human", head, association="CONTRIBUTOR")],
+    lambda head: [review("human", head), review("human", head, state="CHANGES_REQUESTED")],
+    lambda head: [review("human", head, state="DISMISSED")],
+    lambda head: [review("human", head, state="COMMENTED")],
+    lambda head: [review(f"user{i}", head, state="COMMENTED") for i in range(100)],
+    lambda head: [{"state": "APPROVED", "commit_id": head, "author_association": "OWNER"}],
+    lambda head: {"message": "not a list"},
+], ids=["old-sha", "author", "author-case", "none-assoc", "contributor", "later-change-request", "dismissed",
+        "commented", "full-page", "no-user", "not-a-list"])
+def test_a_review_that_does_not_approve_this_head_as_a_reviewer_fails(tmp_path, capsys, monkeypatch, make_reviews):
+    gh = ReviewGh()
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = make_reviews(head)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+def test_a_full_first_page_fails_closed_even_when_it_holds_an_approval(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head)] + [review(f"user{i}", head, state="COMMENTED") for i in range(99)]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+@pytest.mark.parametrize("fail", [
+    {"/rules/branches/": (1, "", "gh: Not Found (HTTP 404)")},
+    {"repos/{owner}/{repo}": (4, "", "To get started with GitHub CLI, please run:  gh auth login")},
+    {"/pulls/": (1, "", "gh: Resource not accessible by integration (HTTP 403)")},
+    {"/pulls/": (0, "not json", "")},
+    {"/rules/branches/": (0, "not json", "")},
+], ids=["rules-404", "unauthenticated", "http-403", "reviews-bad-json", "rules-bad-json"])
+def test_gh_that_cannot_answer_fails_closed(tmp_path, capsys, monkeypatch, fail):
+    from aegis_core import human_gate
+    gh = ReviewGh(fail={k: human_gate.GhResult(*v) for k, v in fail.items()})
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+def test_without_gh_the_review_path_fails_closed(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    gh.missing = True
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+@pytest.mark.parametrize("event", [
+    {"number": -1}, {"number": 0}, {"number": True}, {"number": "7"},
+    {"login": "a/b"}, {"login": "x?y"}, {"login": ""}, {"login": None},
+    {"head": "short"}, {"name": "push"}, {"name": "pull_request_target"}, {"name": ""},
+], ids=["negative", "zero", "bool", "string", "slash", "query", "empty-login", "no-login", "short-sha",
+        "push", "target", "no-event"])
+def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, monkeypatch, event):
+    gh = ReviewGh()
+    if event.get("head") == "short":
+        repo = tier_a_repo(tmp_path)
+        base = repo.head()
+        (repo.root / path_of("inv-a")).unlink()
+        head = repo.commit("drop the rule")
+        event = {"head": head[:7]}
+        from aegis_core import human_gate
+        pull_event(tmp_path, monkeypatch, base, **event)
+        monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+        os.chdir(repo.root)
+    else:
+        _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, **event)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None and gh.calls == []
+
+
+@needs_git
+def test_a_review_of_the_event_head_does_not_approve_another_head(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    repo.write("src/app.py", "x = 2\n")
+    later = repo.commit("a later commit the review never saw")
+    rc, payload = ci_event(capsys, "--head", later)
+    assert rc == 1 and payload["approval"] is None and gh.calls == []
+
+
+@needs_git
+@needs_signing
+def test_a_signed_approval_still_passes_with_no_gh_call(tmp_path, capsys, monkeypatch):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    gh = ReviewGh()
+    from aegis_core import human_gate
+    repo = make_repo(tmp_path, signer_pub=pub)
+    base = repo.head()
+    (repo.root / path_of("inv-a")).unlink()
+    repo.commit("drop the rule")
+    approve(repo, key)
+    pull_event(tmp_path, monkeypatch, base, repo.head())
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["approval"]["method"] == "signature" and gh.calls == []
+
+
+@needs_git
+def test_a_governance_change_at_a_signed_base_accepts_the_same_review(tmp_path, capsys, monkeypatch):
+    from aegis_core import human_gate
+    gh = ReviewGh()
+    repo = tier_a_repo(tmp_path, signer=True)
+    base = repo.head()
+    repo.write(".github/workflows/ci.yml", "name: CI\n")
+    head = repo.commit("a workflow")
+    pull_event(tmp_path, monkeypatch, base, head)
+    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["governance"]["enforced"] is True and payload["approval"] is None
+    gh.reviews = [review("human", head, association="MEMBER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["governance"]["approved"] is True and payload["approval"]["method"] == "review"

@@ -217,6 +217,9 @@ permissions:
 jobs:
   aegis-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read  # aegis check --ci reads a pull request's reviews (tier A approval)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -228,6 +231,8 @@ jobs:
       - run: pip install aegis-guardrails=={version}
       - run: aegis check
       - run: aegis check --ci
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
 """
 
 

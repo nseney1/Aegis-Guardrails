@@ -34,6 +34,7 @@ __all__ = [
     "HumanGateError",
     "INSIGHT_APPROVE_TRAILER",
     "KeyCustody",
+    "PullRequest",
     "RULESET_NAME",
     "SCHEMA",
     "SOURCE",
@@ -49,6 +50,7 @@ __all__ = [
     "detect_tier",
     "exemption_message",
     "find_approval",
+    "find_review_approval",
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
@@ -937,6 +939,7 @@ class Approval(NamedTuple):
     reason: str
     commit: str
     signer: Optional[str] = None
+    source: str = "signature"  # or "review": tier A's approving review (find_review_approval)
 
     @property
     def ok(self) -> bool:
@@ -957,6 +960,8 @@ class Approval(NamedTuple):
             "code": self.code,
             "reason": self.reason,
             "signer": self.signer,
+            # not "source": that key names the producer in every envelope
+            "method": self.source,
         }
 
 
@@ -1195,6 +1200,65 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
                                     _APPROVE_MISMATCH, _APPROVE_OK)
         if verdict.valid:
             return verdict
+    return None
+
+
+class PullRequest(NamedTuple):
+    """The pull request a CI job checks, as the caller validated it from the Actions event file."""
+    number: int
+    author: str
+    head: str
+
+
+_REVIEWER_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+_REVIEW_PAGE = 100
+
+
+def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequence[str],
+                         gh: Optional[GhRunner] = None) -> Optional[Approval]:
+    """Tier A's approval of a flagged change: a reviewer's latest review of ``pull`` approves its head
+    commit, the reviewer is not its author and has write-level association. It counts only while the
+    default branch's ruleset makes that review the merge gate (an approval required, code-owner review,
+    stale approvals dismissed on push) and the CODEOWNERS at ``base`` owns every one of ``paths``
+    (repository-relative); the reviews are read only then. Read-only gh GETs; None whenever anything
+    cannot be read or does not hold, so a missing gh, token or permission fails closed."""
+    runner: GhRunner = gh if gh is not None else default_gh_runner
+    top = _top(root)
+    repo, why = _gh_json(runner, "repos/{owner}/{repo}", top)
+    branch = repo.get("default_branch") if why is None and isinstance(repo, dict) else None
+    if not isinstance(branch, str) or not branch:
+        return None
+    rules, why = _gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(branch, safe=""), top)
+    facts = _ruleset_facts(rules) if why is None else None
+    if not facts or facts["required_approving_review_count"] < 1 or not facts["require_code_owner_review"] \
+            or not facts["dismiss_stale_reviews_on_push"]:
+        return None
+    owner = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
+    org = owner.get("login") if owner.get("type") == "Organization" and isinstance(owner.get("login"), str) else None
+    text: Optional[str] = None
+    for location in _CODEOWNERS_LOCATIONS:  # GitHub reads the first one present
+        blob = _blob(top, base, location)
+        if blob is not None:
+            text = blob.decode("utf-8", "replace")
+            break
+    if text is None or codeowners_coverage(text, location, repo_paths=paths, org_login=org)[1]:
+        return None
+    reviews, why = _gh_json(runner, f"repos/{{owner}}/{{repo}}/pulls/{pull.number}/reviews?per_page={_REVIEW_PAGE}", top)
+    # A full page may hide later reviews (a change request, a dismissal), so it never approves.
+    if why is not None or not isinstance(reviews, list) or len(reviews) >= _REVIEW_PAGE:
+        return None
+    latest: Dict[str, Dict[str, Any]] = {}
+    for item in reviews:
+        user = item.get("user") if isinstance(item, dict) else None
+        login = user.get("login") if isinstance(user, dict) else None
+        if isinstance(login, str) and login:
+            latest[login.lower()] = item  # the list is oldest first: keep each reviewer's last word
+    for login, item in latest.items():
+        if (item.get("state") == "APPROVED" and str(item.get("commit_id") or "").lower() == pull.head.lower()
+                and login != pull.author.lower() and item.get("author_association") in _REVIEWER_ASSOCIATIONS):
+            name = item["user"]["login"]
+            return Approval(True, "ok", f"an approving review of the head commit by {name}, not its author",
+                            pull.head.lower(), name, "review")
     return None
 
 

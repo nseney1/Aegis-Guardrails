@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 from aegis_cli.base import AegisCommand, CommandCategory
@@ -122,18 +123,48 @@ def run_check(args: argparse.Namespace) -> int:
 
 # ── --ci: the rule weakening check ───────────────────────────────────────────
 
-def _event_shas() -> tuple[str | None, str | None]:
-    """(base, head) commit ids of the pull request this CI job runs for, from the event file
-    GitHub Actions names in $GITHUB_EVENT_PATH; (None, None) anywhere else."""
+_LOGIN = re.compile(r"[A-Za-z0-9-]{1,39}")
+_FULL_SHA = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+
+
+def _event_pull() -> dict:
+    """The ``pull_request`` object of the event file GitHub Actions names in $GITHUB_EVENT_PATH; {} anywhere else."""
     path = os.environ.get("GITHUB_EVENT_PATH")
     if not path:
-        return None, None
+        return {}
     try:
         with open(path, encoding="utf-8") as handle:
             pull = json.load(handle).get("pull_request") or {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return pull if isinstance(pull, dict) else {}
+
+
+def _event_shas() -> tuple[str | None, str | None]:
+    """(base, head) commit ids of the pull request this CI job runs for; (None, None) anywhere else."""
+    try:
+        pull = _event_pull()
         return pull["base"]["sha"], pull["head"]["sha"]
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (KeyError, TypeError):
         return None, None
+
+
+def _event_pull_request():
+    """The pull request of a ``pull_request`` run, for tier A's review approval: its number, author and
+    full head commit id, each checked; None for any other event or any value in doubt (no gh call then)."""
+    from aegis_core import human_gate
+
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        return None
+    try:
+        pull = _event_pull()
+        number, login, sha = pull["number"], pull["user"]["login"], pull["head"]["sha"]
+    except (KeyError, TypeError):
+        return None
+    if type(number) is not int or number < 1 or not isinstance(login, str) or not _LOGIN.fullmatch(login) \
+            or not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha):
+        return None
+    return human_gate.PullRequest(number, login, sha.lower())
 
 
 def _escape_annotation(text: str, prop: bool = False) -> str:
@@ -243,14 +274,17 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         elif trailer_blocking:
             print(f"aegis check --ci: FAILED: Aegis-Check trailer divergence ({span})")
         else:
-            signer = report.approval.signer or "a key in the base allowed_signers"
+            approval = report.approval
+            signer = (f"review of {approval.signer}" if approval.source == "review"
+                      else approval.signer or "a key in the base allowed_signers")
             print(f"aegis check --ci: PASSED, {done} approved by {sanitize_display(signer, 120)} ({span})")
         for item in report.weakenings:
             print(sanitize_display(f"  [{item.code}] {item.rule} ({item.path}): {item.message}", 400))
         for path, category in report.governance_paths if gated else ():
             print(sanitize_display(f"  [governance:{category}] {path}", 400))
         if not report.passed:
-            print(f"  A {what} passes only with a signed approval: aegis approve (a key listed in allowed_signers on the base branch).")
+            print(f"  A {what} passes only with a signed approval: aegis approve (a key listed in allowed_signers on the base "
+                  "branch), or at tier A with an approving review of the head commit by someone other than its author.")
     if note:
         print(sanitize_display(f"  note: {note}", 400))
     if reg_report is not None:
@@ -312,7 +346,7 @@ def _run_ci(args: argparse.Namespace) -> int:
     force_gate = bool(getattr(args, "strict", False) or getattr(args, "require_regression", False))
     reg_tier = "gate" if force_gate else None
     try:
-        report = rule_integrity.check_ci(root, base, head)
+        report = rule_integrity.check_ci(root, base, head, pull_request=_event_pull_request())
         reg_report = regression.check_ci_regressions(root, base, head, tier=reg_tier)
         trailer_checks = checkrun.verify_commit_trailers(root, base, head)
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
@@ -457,7 +491,8 @@ class CheckCommand(AegisCommand):
             "a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's "
             "slot cap), or a change to the governance set (when the base lists a signing key). A "
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
-            "branch's allowed_signers. Also runs T5 fix-commit regression checks (advisory at default warning tier; "
+            "branch's allowed_signers or, at tier A on a pull_request run, a non-author's approving review of the "
+            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs T5 fix-commit regression checks (advisory at default warning tier; "
             'blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail',
         )
         parser.add_argument(
