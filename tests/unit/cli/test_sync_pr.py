@@ -98,27 +98,21 @@ def test_sync_pr_no_transitions_does_not_invoke_gh(
     assert gh_calls == []
 
 
-def test_sync_pr_gh_failure_returns_exit_problems_and_never_calls_merge(
+def test_sync_pr_without_a_remote_is_refused_and_never_calls_gh(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _write_rule(tmp_path, "trap", "r-promote")
-    _seed_decided_promotion(tmp_path, "r-promote")
+    _seed_decided_promotion(tmp_path, "r-promote")  # a reviewed base, but no remote to push a branch to
     gh_calls: list[list[str]] = []
 
-    def failing_gh(argv: list[str], cwd: str | None = None) -> object:
+    def gh(argv: list[str], cwd: str | None = None) -> object:
         gh_calls.append(list(argv))
+        raise AssertionError("gh must not be called when the PR is refused")
 
-        class _Res:
-            returncode = 1
-            stdout = ""
-            stderr = "gh: not authenticated"
-
-        return _Res()
-
-    rc = run_sync(argparse.Namespace(_root=tmp_path, pr=True, json=False), gh_runner=failing_gh)
+    rule = tmp_path / ".aegis" / "rules" / "traps" / "r-promote.md"
+    before = rule.read_bytes()
+    rc = run_sync(argparse.Namespace(_root=tmp_path, pr=True, json=False), gh_runner=gh)
     assert rc == EXIT_PROBLEMS
     out = capsys.readouterr().out
-    assert "PR creation failed: gh: not authenticated" in out
-    assert len(gh_calls) == 1
-    assert gh_calls[0][:2] == ["pr", "create"]
-    assert not any("merge" in call for call in gh_calls)
+    assert "no pull request opened: no usable remote named 'origin'" in out
+    assert gh_calls == [] and rule.read_bytes() == before

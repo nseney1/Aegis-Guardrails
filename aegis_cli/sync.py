@@ -25,7 +25,6 @@ __all__ = ["SyncCommand", "run_sync"]
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
 EXIT_USAGE = 2
-_APPLIED_OK = frozenset({"promoted", "demoted", "archived"})
 LEDGER_WARNING = (
     "⚠️  The ledger is incomplete ({}): fitness counts only the rows that could be read, "
     "so moves that rely on it (sync --apply, rule archive, tier changes) are refused"
@@ -98,7 +97,7 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
     if result.pr is not None:
         pr_status = result.pr.get("status")
         if pr_status == "opened" and result.pr.get("url"):
-            print(f"  Opened PR: {result.pr['url']}")
+            print(f"  Opened PR: {result.pr['url']} (branch {result.pr.get('branch')})")
         elif pr_status == "failed" and result.pr.get("error"):
             print(f"  ❌ PR creation failed: {result.pr['error']}")
         elif pr_status == "no_transitions":
@@ -142,7 +141,9 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         return EXIT_PROBLEMS
 
     rel_path = result.path.relative_to(root).as_posix()
-    failed = [a for a in result.applied if a["status"] not in _APPLIED_OK]
+    from aegis_core.sync import MOVED_STATUSES
+
+    failed = [a for a in result.applied if a["status"] not in MOVED_STATUSES]
     pr_failed = bool(result.pr and result.pr.get("status") == "failed")
     rc = EXIT_PROBLEMS if (result.refused or result.derived["errors"] or failed or pr_failed) else EXIT_OK
     from aegis_core.credit import claimed_summary

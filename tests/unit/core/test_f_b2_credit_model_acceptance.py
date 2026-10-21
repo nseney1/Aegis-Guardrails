@@ -407,6 +407,12 @@ def test_sync_pr_writes_transitions_with_three_examples_to_label_and_never_auto_
         for i in range(25)
     ])
     ha.merge_to_base(tmp_path)
+    origin = tmp_path.parent / f"{tmp_path.name}-origin.git"
+    ha._git(tmp_path.parent, "init", "-q", "--bare", str(origin))
+    for args in (("config", "user.email", "dev@example.com"), ("config", "user.name", "Dev"),
+                 ("remote", "add", "origin", str(origin)), ("push", "-q", "origin", "main"),
+                 ("remote", "set-head", "origin", "main")):
+        ha._git(tmp_path, *args)
     for n in range(4):
         credit.record_detection(tmp_path, "trap-decided", "src/app.py", f"call-{n}", disposition="leaked",
                                 rev=f"{n:040x}")
@@ -433,9 +439,9 @@ def test_sync_pr_writes_transitions_with_three_examples_to_label_and_never_auto_
     assert "Prevented bug example" not in body  # labelled rows are not samples to label
     listed = [line for line in body.splitlines() if line.startswith("  ") and "`call-" in line]
     assert len(listed) == 3 and "`call-0`" not in body  # the three newest detections
-    # Exactly one gh call (`pr create`), never `pr merge`.
+    # Exactly one gh call (`pr create`) for the pushed lifecycle branch, never `pr merge`.
     assert len(gh_calls) == 1
-    assert gh_calls[0][:2] == ["pr", "create"]
+    assert gh_calls[0][:2] == ["pr", "create"] and payload["pr"]["branch"] in gh_calls[0]
     assert not any("merge" in call for call in gh_calls)
 
 

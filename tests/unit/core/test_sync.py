@@ -378,55 +378,52 @@ def test_the_table_shows_state_n_and_weight_and_no_score_below_the_minimum(tmp_p
     assert "**Score**" not in body
 
 
+def _null_rows(text: str) -> list:
+    return [json.loads(line) for line in text.splitlines() if '"verdict": null' in line]
+
+
 def test_a_decided_promotion_body_states_the_evidence_and_three_examples_to_label(tmp_path: Path) -> None:
     from aegis_core import adjudication, fitness
-    from aegis_core.rules import load_rules
+    from tests import helpers_syncpr as hs
 
-    ws = _labelled(tmp_path, "trap-ok", 25)
-    _detections(ws, "trap-ok", 5)
-    gh_calls = []
-
-    def fake_gh(argv, cwd=None):
-        gh_calls.append(list(argv))
-        return type("R", (), {"returncode": 0, "stdout": "https://example.invalid/pr/1\n", "stderr": ""})()
-
-    result = sync.sync(ws, pr=True, gh_runner=fake_gh)
+    repo = hs.make(tmp_path, rule="trap-ok", detections=5)
+    gh = hs.FakeGh(repo.origin)
+    result = sync.sync(repo.root, pr=True, gh_runner=gh)
     assert result.pr["status"] == "opened", result.pr
     body = result.pr["body"]
-    base = adjudication.read_adjudications(ws).base
+    base = adjudication.read_adjudications(repo.root).base
     for text in ("decided", "n = 25", "weight 1.00", "P(precision < 0.7)", f"`{base}`",
                  "score = Wilson lower bound x weight", "Compliance", "Censored**: n/a"):
         assert text in body, text
     assert "posterior" not in body.lower()
-    rows = [json.loads(line) for line in (ws / ".aegis" / "adjudications" / "trap-ok.jsonl").read_text(
-        encoding="utf-8").splitlines()]
-    examples = [r for r in rows if r.get("verdict") is None]
+    examples = _null_rows(hs.git(repo.root, "show", f"{result.pr['branch']}:.aegis/adjudications/trap-ok.jsonl"))
     assert len(examples) == 3 and {r["file"] for r in examples} == {"src/m4.py", "src/m3.py", "src/m2.py"}
     assert all(set(r) == {"example_id", "verdict", "file", "pattern", "rev"} for r in examples)
     assert all(r["example_id"] in body for r in examples)
-    assert fitness.for_rules(ws, load_rules(ws).served)["trap-ok"].adjudicated_n == 25  # null rows count for nothing
-    assert sync.read_derived(ws)["rules"]
+    hs.git(repo.root, "checkout", "-q", result.pr["branch"])  # as if the PR were merged: null rows count for nothing
+    assert fitness.for_rules(repo.root, load_rules(repo.root).served)["trap-ok"].adjudicated_n == 25
 
 
-def test_one_detection_gives_one_example_none_gives_no_file_and_a_rerun_adds_nothing(tmp_path: Path) -> None:
-    from tests import helpers_adjudication as ha
+def test_one_detection_gives_one_example_none_gives_none_and_a_rerun_adds_nothing(tmp_path: Path) -> None:
+    from tests import helpers_syncpr as hs
 
-    ws = _labelled(tmp_path, "trap-one", 25)
-    _rule(ws, "trap", "trap-none")
-    ha.write_labels(ws, "trap-none", ha.labels("trap-none", count=25, sessions=4, repos=2))
-    ha.merge_to_base(ws)
-    _detections(ws, "trap-one", 1)
-    ok = lambda argv, cwd=None: type("R", (), {"returncode": 0, "stdout": "u\n", "stderr": ""})()  # noqa: E731
-    body = sync.sync(ws, pr=True, gh_runner=ok).pr["body"]
-    one = ws / ".aegis" / "adjudications" / "trap-one.jsonl"
-    assert sum(1 for line in one.read_text(encoding="utf-8").splitlines() if '"verdict": null' in line) == 1
-    assert "no replay examples" in body
-    none_rows = (ws / ".aegis" / "adjudications" / "trap-none.jsonl").read_text(encoding="utf-8")
-    assert '"verdict": null' not in none_rows
-    ha._git(ws, "checkout", "-q", "--", ".aegis/rules")  # the transitions again, the examples kept
-    ha._git(ws, "clean", "-qfd", "--", ".aegis/rules")
-    sync.sync(ws, pr=True, gh_runner=ok)
-    assert sum(1 for line in one.read_text(encoding="utf-8").splitlines() if '"verdict": null' in line) == 1
+    repo = hs.make(tmp_path, rule="trap-one", detections=1)
+    first = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+    store = ".aegis/adjudications/trap-one.jsonl"
+    rows = hs.git(repo.root, "show", f"{first['branch']}:{store}")
+    assert len(_null_rows(rows)) == 1
+    hs.git(repo.root, "checkout", "-q", first["branch"], "--", store)  # the examples reach main, not the move
+    hs.git(repo.root, "commit", "-q", "-m", "examples to label")
+    hs.git(repo.root, "push", "-q", "origin", "main")
+    second = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+    assert second["status"] == "opened" and len(_null_rows(hs.git(repo.root, "show", f"{second['branch']}:{store}"))) == 1
+    assert store not in hs.git(repo.root, "diff", "--name-only", "main", second["branch"])
+
+    (tmp_path / "other").mkdir()
+    bare = hs.make(tmp_path / "other", rule="trap-none", detections=0)
+    third = sync.sync(bare.root, pr=True, gh_runner=hs.FakeGh(bare.origin)).pr
+    assert "no replay examples" in third["body"]
+    assert ".aegis/adjudications" not in hs.git(bare.root, "diff", "--name-only", "main", third["branch"])
 
 
 def test_derived_entries_carry_no_samples_and_an_older_file_with_them_still_reads(ws: Path) -> None:

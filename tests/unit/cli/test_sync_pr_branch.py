@@ -1,0 +1,167 @@
+"""`aegis sync --pr` puts the transitions in the PR (R-evidence-13): a branch cut from the protected
+branch, one commit holding exactly the moves and the examples to label, a push to the origin, then
+`gh pr create --head`; the user's branch, index and tree end as they began, in every failure too.
+
+Real git with a local bare origin and a throwaway HOME; gh is a fake; nothing reaches the network.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+
+import pytest
+
+from aegis_cli.sync import EXIT_OK, EXIT_PROBLEMS, run_sync
+from tests import helpers_syncpr as hs
+from tests.helpers_syncpr import git
+
+pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
+
+@pytest.fixture(autouse=True)
+def _isolated(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _run(repo: hs.Repo, gh: hs.FakeGh, capsys) -> tuple:
+    rc = run_sync(argparse.Namespace(_root=repo.root, pr=True, json=True), gh_runner=gh)
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_the_pr_holds_exactly_the_transition_and_the_user_branch_is_untouched(tmp_path, capsys):
+    repo = hs.make(tmp_path)
+    for hook in ("pre-commit", "pre-push", "post-checkout", "reference-transaction"):
+        script = repo.root / ".git" / "hooks" / hook
+        script.write_text(f"#!/bin/sh\ntouch '{tmp_path / ('ran-' + hook)}'\n", encoding="utf-8")
+        script.chmod(0o755)
+    before, main_before = repo.state(), git(repo.origin, "rev-parse", "main")
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_OK, payload
+    pr = payload["pr"]
+    assert pr["status"] == "opened" and pr["branch"].startswith("aegis/lifecycle-")
+    assert [c[:2] for c in gh.calls] == [["pr", "create"]] and not any("merge" in c for c in gh.calls)
+    assert gh.flag("--head") == pr["branch"] and gh.flag("--base") == "main"
+    assert pr["branch"] in gh.origin_at_create  # pushed before the PR was asked for
+    changed = git(repo.root, "diff", "--no-renames", "--name-status", "main", pr["branch"]).splitlines()
+    assert sorted(changed) == sorted([
+        "A\t.aegis/rules/invariants/trap-decided.md", "D\t.aegis/rules/traps/trap-decided.md",
+        "M\t.aegis/adjudications/trap-decided.jsonl"])
+    added = git(repo.root, "diff", "main", pr["branch"], "--", ".aegis/adjudications")
+    assert added.count('"verdict": null') == 2
+    assert git(repo.origin, "rev-parse", "main") == main_before
+    after = repo.state()
+    assert after.pop("branches").splitlines() == sorted(before.pop("branches").splitlines() + [f"refs/heads/{pr['branch']}"])
+    assert after == before  # HEAD, branch, status, every rule and label byte
+    assert not list(tmp_path.glob("ran-*"))  # no hook ran
+    second = run_sync(argparse.Namespace(_root=repo.root, json=True))
+    entry = next(r for r in json.loads(capsys.readouterr().out)["rules"] if r["id"] == "trap-decided")
+    assert second == EXIT_OK and entry["path"] == ".aegis/rules/traps/trap-decided.md"
+
+
+@pytest.mark.parametrize("shape", ["no-origin", "dirty-rules", "dirty-labels", "detached", "feature-branch",
+                                   "repo-ssh-command", "option-remote", "not-git"])
+def test_a_failed_precondition_refuses_before_anything_moves(tmp_path, capsys, shape):
+    repo = hs.make(tmp_path)
+    if shape == "no-origin":  # the remote is gone; the reviewed refs (and so the labels) remain
+        git(repo.root, "config", "--remove-section", "remote.origin")
+    elif shape == "dirty-rules":
+        repo.rule_path.write_bytes(repo.rule_path.read_bytes() + b"\nEdited.\n")
+    elif shape == "dirty-labels":
+        (repo.root / ".aegis" / "adjudications" / "new.jsonl").write_bytes(b"{}\n")
+    elif shape == "detached":
+        git(repo.root, "checkout", "-q", "--detach")
+    elif shape == "feature-branch":
+        git(repo.root, "checkout", "-q", "-b", "feature")
+    elif shape == "repo-ssh-command":
+        git(repo.root, "config", "core.sshCommand", f"touch {tmp_path / 'ran-ssh'}")
+    elif shape == "option-remote":
+        git(repo.root, "config", "branch.main.remote", f"--receive-pack=touch {tmp_path / 'ran-ssh'}")
+    elif shape == "not-git":  # no BASE for labels: 25 tp outcome rows make the promotion
+        from aegis_core.telemetry_engine import ledger
+
+        shutil.rmtree(repo.root / ".git")
+        ledger.append(repo.root, [{"rule": repo.rule, "outcome": "tp", "source": "ci", "key": f"k{n}"} for n in range(25)])
+    before = repo.state() if shape != "not-git" else None
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_PROBLEMS and payload["pr"]["status"] == "refused" and gh.calls == []
+    assert payload["applied"] == [] and payload["refused"]
+    reason = payload["refused"]
+    expected = {"no-origin": "origin", "dirty-rules": "uncommitted", "dirty-labels": "uncommitted",
+                "detached": "detached", "feature-branch": "main", "repo-ssh-command": "core.sshcommand",
+                "option-remote": "no usable remote", "not-git": "git work tree"}[shape]
+    assert expected in reason.lower(), reason
+    if before is not None:
+        assert repo.state() == before
+    assert repo.origin_branches() == ["main"] and not (tmp_path / "ran-ssh").exists()
+
+
+def test_when_every_move_is_refused_no_branch_is_made_and_gh_is_not_asked(tmp_path, capsys):
+    repo = hs.make(tmp_path)
+    blocker = repo.root / ".aegis" / "rules" / "invariants" / "trap-decided.md" / "keep.txt"
+    blocker.parent.mkdir(parents=True)
+    blocker.write_bytes(b"a directory where the promoted rule would go\n")
+    git(repo.root, "add", "-A")
+    git(repo.root, "commit", "-q", "-m", "block the move")
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert payload["pr"]["status"] == "no_transitions" and gh.calls == []
+    assert [a["status"] for a in payload["applied"]] == ["target_exists"] and rc == EXIT_PROBLEMS
+    assert repo.state() == before and repo.origin_branches() == ["main"]
+
+
+def test_a_rejected_push_deletes_the_local_branch_and_leaves_everything_as_it_was(tmp_path, capsys):
+    repo = hs.make(tmp_path)
+    hook = repo.origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'rejected by policy' >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_PROBLEMS and payload["pr"]["status"] == "failed" and gh.calls == []
+    assert "rejected by policy" in payload["pr"]["error"]
+    assert repo.state() == before and repo.origin_branches() == ["main"]
+
+
+def test_a_gh_failure_after_the_push_keeps_and_names_the_pushed_branch(tmp_path, capsys):
+    repo = hs.make(tmp_path)
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin, returncode=1)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    pr = payload["pr"]
+    assert rc == EXIT_PROBLEMS and pr["status"] == "failed" and pr["branch"] in repo.origin_branches()
+    assert pr["branch"] in pr["error"] and "could not create the pull request" in pr["error"]
+    assert {k: v for k, v in repo.state().items() if k != "branches"} == {
+        k: v for k, v in before.items() if k != "branches"}
+    assert git(repo.root, "symbolic-ref", "--short", "HEAD") == "main"
+
+
+def test_a_branch_name_already_taken_gets_the_next_one(tmp_path, capsys, monkeypatch):
+    from aegis_core import sync as core_sync
+
+    repo = hs.make(tmp_path)
+    monkeypatch.setattr(core_sync, "_lifecycle_stamp", lambda: "20261021T000000Z")
+    git(repo.root, "branch", "aegis/lifecycle-20261021T000000Z")
+    gh = hs.FakeGh(repo.origin)
+    rc, payload = _run(repo, gh, capsys)
+    assert rc == EXIT_OK and payload["pr"]["branch"] == "aegis/lifecycle-20261021T000000Z-2"
