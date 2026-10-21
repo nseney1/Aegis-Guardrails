@@ -1,7 +1,7 @@
 """A repository for `aegis sync --pr` (R-evidence-13): real git, a local bare origin, a fake gh.
 
 ``make`` builds ``main`` holding one trap rule with 25 tp labels merged at the reviewed BASE (a
-decided promotion), pushes it to a bare repository next to it and points origin/HEAD at it, as a
+decided promotion; fp labels make it a decided archive), pushes it to a bare repository next to it and points origin/HEAD at it, as a
 clone would have it. Nothing reaches the network: the origin is a directory, and ``FakeGh`` stands
 in for gh, recording each call and the branches the origin holds when ``pr create`` runs.
 """
@@ -38,9 +38,11 @@ class Repo:
         rules = self.root / ".aegis"
         files = {p.relative_to(self.root).as_posix(): p.read_bytes() for p in sorted(rules.rglob("*"))
                  if p.is_file() and "state" not in p.relative_to(rules).parts}
+        audit = rules / "state" / "lifecycle.jsonl"  # machine-local: only a move that happened here is logged
         return {"head": git(self.root, "rev-parse", "HEAD"), "branch": git(self.root, "symbolic-ref", "-q", "HEAD",
                                                                            check=False),
                 "status": git(self.root, "status", "--porcelain"), "files": files,
+                "lifecycle": audit.read_bytes() if audit.is_file() else None,
                 "branches": git(self.root, "for-each-ref", "--format=%(refname)", "refs/heads")}
 
     def origin_branches(self) -> List[str]:
@@ -48,7 +50,7 @@ class Repo:
         return [line for line in out.splitlines() if line]
 
 
-def make(tmp_path: Path, rule: str = "trap-decided", labels: int = 25, detections: int = 2) -> Repo:
+def make(tmp_path: Path, rule: str = "trap-decided", labels: int = 25, detections: int = 2, verdict: str = "tp") -> Repo:
     from aegis_core import credit
 
     root, origin = tmp_path / "repo", tmp_path / "origin.git"
@@ -66,7 +68,7 @@ def make(tmp_path: Path, rule: str = "trap-decided", labels: int = 25, detection
     store = root / ".aegis" / "adjudications" / f"{rule}.jsonl"
     store.parent.mkdir(parents=True)
     store.write_bytes(b"".join(json.dumps({
-        "example_id": f"{rule}-{n}", "verdict": "tp", "session": f"s{n % 4}", "repo": f"r{n % 2}",
+        "example_id": f"{rule}-{n}", "verdict": verdict, "session": f"s{n % 4}", "repo": f"r{n % 2}",
         "ts": f"2026-09-{1 + n % 28:02d}T00:00:00Z"}).encode("utf-8") + b"\n" for n in range(labels)))
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "base")

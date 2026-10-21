@@ -248,3 +248,17 @@ def test_a_local_push_url_inside_the_repository_is_refused_and_its_hooks_never_r
     assert repo.state() == before and repo.origin_branches() == ["main"]
     assert git(inner, "for-each-ref", "refs/heads") == ""
     assert not (tmp_path / "ran-receiver-hook").exists()
+
+
+def test_an_archive_in_the_pr_leaves_no_local_audit_row_for_a_move_made_only_on_the_branch(tmp_path, capsys):
+    repo = hs.make(tmp_path, rule="trap-noisy", verdict="fp")
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_OK and [(a["action"], a["status"]) for a in payload["applied"]] == [("archive", "archived")]
+    changed = git(repo.root, "diff", "--no-renames", "--name-status", "main", payload["pr"]["branch"]).splitlines()
+    assert "D\t.aegis/rules/traps/trap-noisy.md" in changed
+    after = repo.state()
+    assert after.pop("branches") != before.pop("branches") and after == before  # lifecycle.jsonl included

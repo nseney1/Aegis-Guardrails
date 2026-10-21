@@ -119,13 +119,13 @@ class SyncResult:
     replay: Any = None  # fitness.ReplayReport: what detector replay walked and could not read
 
 
-def _apply(workspace: Any, derived: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _apply(workspace: Any, derived: Dict[str, Any], *, audit: bool = True) -> List[Dict[str, Any]]:
     from aegis_core.lifecycle.promotion import demote_rule, promote_rule
     from aegis_core.lifecycle.selection import archive_rule
     actions = {
         "promote": lambda rid: promote_rule(workspace, rid, force=True),
         "demote": lambda rid: demote_rule(workspace, rid),
-        "archive": lambda rid: archive_rule(workspace, rid),
+        "archive": lambda rid: archive_rule(workspace, rid, audit=audit),
     }
     applied = []
     for rule_id, entry in sorted(derived["rules"].items()):
@@ -528,7 +528,7 @@ def sync(
                 refused = f"no pull request opened: {exc}"
             else:
                 try:
-                    applied = _apply(ws, derived)
+                    applied = _apply(ws, derived, audit=False)  # the moves exist only on the branch
                     moved = [a for a in applied if a.get("status") in MOVED_STATUSES]
                     examples = {a["rule"]: _write_examples(root, a["rule"], _example_rows(ws.root, a["rule"]))
                                 for a in moved}
