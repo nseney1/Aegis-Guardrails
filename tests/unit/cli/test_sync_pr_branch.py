@@ -77,7 +77,8 @@ def test_the_pr_holds_exactly_the_transition_and_the_user_branch_is_untouched(tm
 
 
 @pytest.mark.parametrize("shape", ["no-origin", "dirty-rules", "dirty-labels", "detached", "feature-branch",
-                                   "repo-ssh-command", "option-remote", "not-git"])
+                                   "repo-ssh-command", "option-remote", "not-git", "ahead-of-origin",
+                                   "no-tracking-ref"])
 def test_a_failed_precondition_refuses_before_anything_moves(tmp_path, capsys, shape):
     repo = hs.make(tmp_path)
     if shape == "no-origin":  # the remote is gone; the reviewed refs (and so the labels) remain
@@ -94,6 +95,12 @@ def test_a_failed_precondition_refuses_before_anything_moves(tmp_path, capsys, s
         git(repo.root, "config", "core.sshCommand", f"touch {tmp_path / 'ran-ssh'}")
     elif shape == "option-remote":
         git(repo.root, "config", "branch.main.remote", f"--receive-pack=touch {tmp_path / 'ran-ssh'}")
+    elif shape == "ahead-of-origin":  # the PR would carry this commit, which no one reviewed
+        (repo.root / "src" / "app.py").write_bytes(b"x = 2\n")
+        git(repo.root, "commit", "-q", "-am", "local only")
+    elif shape == "no-tracking-ref":  # never fetched: Aegis cannot tell what the branch's remote holds
+        git(repo.root, "remote", "add", "upstream", str(repo.origin))
+        git(repo.root, "config", "branch.main.remote", "upstream")
     elif shape == "not-git":  # no BASE for labels: 25 tp outcome rows make the promotion
         from aegis_core.telemetry_engine import ledger
 
@@ -109,7 +116,8 @@ def test_a_failed_precondition_refuses_before_anything_moves(tmp_path, capsys, s
     reason = payload["refused"]
     expected = {"no-origin": "origin", "dirty-rules": "uncommitted", "dirty-labels": "uncommitted",
                 "detached": "detached", "feature-branch": "main", "repo-ssh-command": "core.sshcommand",
-                "option-remote": "no usable remote", "not-git": "git work tree"}[shape]
+                "option-remote": "no usable remote", "not-git": "git work tree",
+                "ahead-of-origin": "push your commits first", "no-tracking-ref": "fetch first"}[shape]
     assert expected in reason.lower(), reason
     if before is not None:
         assert repo.state() == before
@@ -123,6 +131,7 @@ def test_when_every_move_is_refused_no_branch_is_made_and_gh_is_not_asked(tmp_pa
     blocker.write_bytes(b"a directory where the promoted rule would go\n")
     git(repo.root, "add", "-A")
     git(repo.root, "commit", "-q", "-m", "block the move")
+    git(repo.root, "push", "-q", "origin", "main")
     before = repo.state()
     gh = hs.FakeGh(repo.origin)
 

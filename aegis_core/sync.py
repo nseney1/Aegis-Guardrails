@@ -395,6 +395,13 @@ def _pr_plan(root: Path) -> Dict[str, Any]:
         if local is not None and _inside(os.path.join(top, local), top, facts.common_dir):
             raise _Refused(f"{remote} has a push URL inside this repository, whose own hooks the push would run; "
                            "push the branch yourself")
+    # The branch is cut from HEAD: a commit the remote does not hold would ride along in the PR.
+    tracking = gitsafe.resolve_commit(top, f"refs/remotes/{remote}/{protected}")
+    if tracking is None:
+        raise _Refused(f"there is no {remote}/{protected} to compare {protected} with; fetch first (Aegis never fetches)")
+    if tracking != facts.head:
+        raise _Refused(f"{protected} is not at {remote}/{protected}; push your commits first, or fetch and update "
+                       f"{protected} (Aegis never fetches), so the PR carries only the transitions")
     programs = gitsafe.run(["config", "--show-scope", "--null", "--name-only", "--get-regexp", _PUSH_PROGRAMS], top)
     if programs.returncode not in (0, 1):
         raise _Refused("git cannot say which config scope sets the push settings (git 2.26 or newer needed)")
