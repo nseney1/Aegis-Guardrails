@@ -2,7 +2,7 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
-## [4.3.4] - Unreleased
+## [4.3.4] - 2026-10-20
 
 4.3.4 is a security and repair release. It fixes the user harms of 4.3.0-4.3.3 and the trust claims the 4.3 review found forgeable. **4.3.3 never reached PyPI**: its publish run failed on a Windows wall-clock test (`test_100_rules_scan_in_under_a_second`, 1.5 s against a 1.0 s limit) and never uploaded, so PyPI goes from 4.3.2 to 4.3.4.
 
