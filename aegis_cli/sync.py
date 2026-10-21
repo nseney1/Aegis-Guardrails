@@ -36,9 +36,9 @@ def _rows(derived: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [dict(entry, id=rule_id) for rule_id, entry in sorted(derived["rules"].items())]
 
 
-def _fitness_column(row: Dict[str, Any]) -> str:
+def _score_column(row: Dict[str, Any]) -> str:
     shown = row.get("reported_score")
-    return f"{shown:.2f}" if isinstance(shown, (int, float)) else str(row.get("status") or "—")
+    return f"{shown:.2f}" if isinstance(shown, (int, float)) else ""  # no number below the sample minimum
 
 
 def _inert_expiry(root: Any) -> bool:
@@ -69,12 +69,13 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
     rows = _rows(result.derived)
     if rows:
         tbl = Table(ctx=ui)
-        for column in ("Rule", "Type", "Fitness", "Triggers", "TP", "FP", "Suggestion"):
+        for column in ("Rule", "Type", "State", "n", "Weight", "Score", "Suggestion"):
             tbl.add_column(column, no_wrap=True)
         for row in rows:
             tbl.add_row(
-                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])), _fitness_column(row),
-                str(row["triggers"]), f"{row['tp']:g}", f"{row['fp']:g}", row["suggestion"] or "—",
+                sanitize_display(str(row["id"])), ui.color_rule_type(str(row["type"])),
+                str(row.get("status") or row.get("state") or "—"), str(row.get("n", "")),
+                f"{float(row.get('effective_weight', 1.0)):.2f}", _score_column(row), row["suggestion"] or "—",
             )
         for line in tbl.render(ui).splitlines():
             print(f"  {line}")

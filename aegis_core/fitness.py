@@ -151,7 +151,6 @@ class Fitness:
     sessions_count: int = 0
     repos_count: int = 0
     days_span: float = 0.0
-    samples: Tuple[Dict[str, Any], ...] = ()
     suggestion: Optional[str] = None
     evidence_available: bool = True
     evidence_error: Optional[str] = None
@@ -192,7 +191,7 @@ def compute(
     observed_days: Optional[float] = None, min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0,
     half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS, epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
-    repos_count: int = 0, days_span: float = 0.0, samples: Sequence[Mapping[str, Any]] = (), silence_lr: float = 1.0,
+    repos_count: int = 0, days_span: float = 0.0, silence_lr: float = 1.0,
     evidence_available: bool = True, evidence_error: Optional[str] = None,
 ) -> Fitness:
     base_tp, base_fp = _num(totals.get("tp", 0) or 0), _num(totals.get("fp", 0) or 0)
@@ -254,7 +253,7 @@ def compute(
         prior_disclosure=prior_disclosure, mde=mde, eligible_sessions=int(eligible_sessions),
         decay_factor=round(decay, 6), effective_weight=effective_weight, archive_candidate=archive_candidate,
         silence_lr=round(float(silence_lr), 6), sessions_count=int(sessions_count), repos_count=int(repos_count),
-        days_span=round(float(days_span), 2), samples=tuple(dict(s) for s in list(samples)[:3]), suggestion=suggestion,
+        days_span=round(float(days_span), 2), suggestion=suggestion,
         evidence_available=evidence_available, evidence_error=evidence_error, min_n=int(min_n),
     )
 
@@ -277,7 +276,6 @@ def _collect_t4_events_for_rules(
             "contested": 0,
             "sessions": set(),
             "repos": set(),
-            "samples": [],
             "post_reinforce_exposures": {},
             "last_ts": None,
             "first_seen": None,
@@ -329,27 +327,6 @@ def _collect_t4_events_for_rules(
                 b["leaked"] += 1
             if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
                 b["last_ts"] = ts
-            sample_item = {
-                "kind": "detection",
-                "disposition": disp,
-                "file": raw.get("file"),
-                "pattern": raw.get("pattern"),
-                "branch": raw.get("branch"),
-                "rev": raw.get("rev"),
-            }
-            replaced = False
-            for idx, s_item in enumerate(b["samples"]):
-                if (
-                    s_item.get("kind") == "detection"
-                    and s_item.get("file") == raw.get("file")
-                    and s_item.get("pattern") == raw.get("pattern")
-                    and s_item.get("rev") == raw.get("rev")
-                ):
-                    b["samples"][idx] = sample_item
-                    replaced = True
-                    break
-            if not replaced and len(b["samples"]) < 3:
-                b["samples"].append(sample_item)
         elif ev == "override":
             b["contested"] += 1
         elif ev == "exposure" and raw.get("session"):
@@ -365,7 +342,6 @@ def _collect_t4_events_for_rules(
         rule_obj = rule_map[rid]
         stamps: List[datetime] = []
         reinforced: Optional[datetime] = None
-        label_samples: List[Dict[str, Any]] = []
         for label in labels_by_rule.get(rid, ()):
             b["adjudicated_tp" if label["verdict"] == "tp" else "adjudicated_fp"] += 1
             b["sessions"].update([label["session"]] if label.get("session") else [])
@@ -375,10 +351,6 @@ def _collect_t4_events_for_rules(
                 stamps.append(stamp)
                 if label["verdict"] == "tp" and (reinforced is None or stamp > reinforced):
                     reinforced = stamp
-            if len(label_samples) < 3:
-                label_samples.append({"kind": "adjudication", "verdict": label["verdict"], "ref": label.get("ref"),
-                                      "file": label.get("file"), "line": label.get("line"), "summary": label.get("summary") or ""})
-        b["samples"] = (label_samples + b["samples"])[:3]
         scoped_or_trap = bool(getattr(rule_obj, "target_paths", None)) or getattr(rule_obj, "type", "") == "trap"
         # A merged tp label reinforces the rule as of its ts: only exposures after it decay it.
         windows = [[r for r in records if reinforced is None or (r[2] is not None and r[2] > reinforced)]
@@ -450,7 +422,7 @@ def for_rules(
             pinned=bool(meta.get("pin") is True or meta.get("pinned") is True), contested=int(t4.get("contested", 0)),
             caught=int(t4.get("caught", 0)), leaked=int(t4.get("leaked", 0)), adjudicated_tp=int(t4.get("adjudicated_tp", 0)),
             adjudicated_fp=int(t4.get("adjudicated_fp", 0)), sessions_count=len(t4.get("sessions", ())),
-            repos_count=len(t4.get("repos", ())), days_span=float(t4.get("days_span", 0.0)), samples=t4.get("samples", ()),
+            repos_count=len(t4.get("repos", ())), days_span=float(t4.get("days_span", 0.0)),
             evidence_available=proj_credits.available, evidence_error=proj_credits.error,
         )
     return out

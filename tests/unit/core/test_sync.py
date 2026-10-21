@@ -334,3 +334,107 @@ def test_a_young_rule_is_not_promoted_however_good_its_evidence(tmp_path: Path) 
     _rule(tmp_path, "trap", "young", created=created)
     _report(tmp_path, "young", "tp", 40)
     assert sync.sync(tmp_path).derived["rules"]["young"]["suggestion"] is None
+
+
+# ── state, n and weight; no number below the minimum; examples to label (R-evidence-14) ──
+
+def _labelled(tmp_path: Path, rule_id: str, count: int) -> Path:
+    from tests import helpers_adjudication as ha
+
+    _rule(tmp_path, "trap", rule_id)
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / ".gitignore").write_text(".aegis/state/\n", encoding="utf-8")
+    ha.write_labels(tmp_path, rule_id, ha.labels(rule_id, count=count, sessions=4, repos=2))
+    ha.merge_to_base(tmp_path)
+    return tmp_path
+
+
+def _detections(ws: Path, rule_id: str, count: int) -> None:
+    from aegis_core import credit
+
+    for n in range(count):
+        credit.record_detection(ws, rule_id, f"src/m{n}.py", "eval", disposition="leaked", rev=f"{n:040x}",
+                                ts=f"2026-10-0{n + 1}T00:00:00Z")
+
+
+def test_the_table_shows_state_n_and_weight_and_no_score_below_the_minimum(tmp_path: Path, capsys) -> None:
+    import argparse
+
+    from aegis_cli.sync import run_sync
+
+    ws = _labelled(tmp_path, "trap-four", 4)
+    assert run_sync(argparse.Namespace(_root=ws, json=False)) == 0
+    out = capsys.readouterr().out
+    header = next((line for line in out.splitlines() if "Rule" in line and "Type" in line), "")
+    assert [c for c in ("Rule", "Type", "State", "n", "Weight", "Score", "Suggestion") if c in header] == [
+        "Rule", "Type", "State", "n", "Weight", "Score", "Suggestion"]
+    assert "Fitness" not in header and "TP" not in header
+    row = next(line for line in out.splitlines() if "trap-four" in line)
+    assert "insufficient (n=4)" in row and "1.00" in row
+    entry = sync.build(ws)["rules"]["trap-four"]
+    assert (entry["n"], entry["reported_score"], entry["state"]) == (4, None, "insufficient")
+    body = sync.format_pr_body({"trap-four": entry}, [{"rule": "trap-four", "action": "promote"}])
+    assert "insufficient (n=4)" in body and "interval" not in body and "P(precision" not in body
+    assert "**Score**" not in body
+
+
+def test_a_decided_promotion_body_states_the_evidence_and_three_examples_to_label(tmp_path: Path) -> None:
+    from aegis_core import adjudication, fitness
+    from aegis_core.rules import load_rules
+
+    ws = _labelled(tmp_path, "trap-ok", 25)
+    _detections(ws, "trap-ok", 5)
+    gh_calls = []
+
+    def fake_gh(argv, cwd=None):
+        gh_calls.append(list(argv))
+        return type("R", (), {"returncode": 0, "stdout": "https://example.invalid/pr/1\n", "stderr": ""})()
+
+    result = sync.sync(ws, pr=True, gh_runner=fake_gh)
+    assert result.pr["status"] == "opened", result.pr
+    body = result.pr["body"]
+    base = adjudication.read_adjudications(ws).base
+    for text in ("decided", "n = 25", "weight 1.00", "P(precision < 0.7)", f"`{base}`",
+                 "score = Wilson lower bound x weight", "Compliance", "Censored**: n/a"):
+        assert text in body, text
+    assert "posterior" not in body.lower()
+    rows = [json.loads(line) for line in (ws / ".aegis" / "adjudications" / "trap-ok.jsonl").read_text(
+        encoding="utf-8").splitlines()]
+    examples = [r for r in rows if r.get("verdict") is None]
+    assert len(examples) == 3 and {r["file"] for r in examples} == {"src/m4.py", "src/m3.py", "src/m2.py"}
+    assert all(set(r) == {"example_id", "verdict", "file", "pattern", "rev"} for r in examples)
+    assert all(r["example_id"] in body for r in examples)
+    assert fitness.for_rules(ws, load_rules(ws).served)["trap-ok"].adjudicated_n == 25  # null rows count for nothing
+    assert sync.read_derived(ws)["rules"]
+
+
+def test_one_detection_gives_one_example_none_gives_no_file_and_a_rerun_adds_nothing(tmp_path: Path) -> None:
+    from tests import helpers_adjudication as ha
+
+    ws = _labelled(tmp_path, "trap-one", 25)
+    _rule(ws, "trap", "trap-none")
+    ha.write_labels(ws, "trap-none", ha.labels("trap-none", count=25, sessions=4, repos=2))
+    ha.merge_to_base(ws)
+    _detections(ws, "trap-one", 1)
+    ok = lambda argv, cwd=None: type("R", (), {"returncode": 0, "stdout": "u\n", "stderr": ""})()  # noqa: E731
+    body = sync.sync(ws, pr=True, gh_runner=ok).pr["body"]
+    one = ws / ".aegis" / "adjudications" / "trap-one.jsonl"
+    assert sum(1 for line in one.read_text(encoding="utf-8").splitlines() if '"verdict": null' in line) == 1
+    assert "no replay examples" in body
+    none_rows = (ws / ".aegis" / "adjudications" / "trap-none.jsonl").read_text(encoding="utf-8")
+    assert '"verdict": null' not in none_rows
+    ha._git(ws, "checkout", "-q", "--", ".aegis/rules")  # the transitions again, the examples kept
+    ha._git(ws, "clean", "-qfd", "--", ".aegis/rules")
+    sync.sync(ws, pr=True, gh_runner=ok)
+    assert sum(1 for line in one.read_text(encoding="utf-8").splitlines() if '"verdict": null' in line) == 1
+
+
+def test_derived_entries_carry_no_samples_and_an_older_file_with_them_still_reads(ws: Path) -> None:
+    derived = sync.sync(ws).derived
+    assert all(entry["samples"] == [] for entry in derived["rules"].values())
+    path = ws / ".aegis" / "state" / "derived.json"
+    older = dict(derived, rules={rid: dict(e, samples=[{"kind": "adjudication", "verdict": "tp"}])
+                                 for rid, e in derived["rules"].items()})
+    path.write_text(json.dumps(older), encoding="utf-8")
+    assert sync.read_derived(ws) == older
+    assert sync.stale_rules(load_rules(ws), sync.read_derived(ws)) == []
