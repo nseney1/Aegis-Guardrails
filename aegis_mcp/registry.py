@@ -255,7 +255,10 @@ TOOL_DEFINITIONS = [
                 },
                 "unreviewed_total": {
                     "type": "integer",
-                    "description": "Total count of unreviewed gate or invariant rules across the workspace.",
+                    "description": (
+                        "Total count of unreviewed gate or invariant rules; present only when "
+                        "unreviewed_rules does not list them all (more than 10, or trimmed to the token budget)."
+                    ),
                 },
                 "rules_base": {
                     "type": ["object", "string", "null"],
@@ -340,8 +343,9 @@ TOOL_DEFINITIONS = [
                     "enum": list(_VALID_OUTCOMES),
                     "description": (
                         "Verification result for the rules in this change: 'success'/'tp'/'pass' "
-                        "record a true positive ('tp'), 'failure'/'fp'/'fail' record a false "
-                        "positive ('fp'), and 'partial' records a neutral trigger ('trigger')."
+                        "claim a true positive, which earns credit only after CI confirms the landing "
+                        "commit; 'failure'/'fp'/'fail' are kept as the claim and, like 'partial', read "
+                        "as a neutral trigger, never a false positive."
                     ),
                 },
                 "idempotency_key": {
@@ -365,25 +369,18 @@ TOOL_DEFINITIONS = [
                 },
                 "tests_passed": {
                     "type": "boolean",
-                    "description": (
-                        "Optional boolean recording whether the project's test suite passed "
-                        "during verification."
-                    ),
+                    "description": "Optional boolean. Accepted for compatibility; ignored, never stored.",
                 },
                 "rework_count": {
                     "type": "integer",
                     "default": 0,
-                    "description": (
-                        "Optional non-negative integer count of edit-and-retest cycles before "
-                        "verification succeeded (default: 0)."
-                    ),
+                    "description": "Optional integer. Accepted for compatibility; ignored, never stored.",
                 },
                 "notes": {
                     "type": "string",
                     "maxLength": 4096,
                     "description": (
-                        "Optional free-text context describing how the rules helped or failed "
-                        "(max 4096 chars)."
+                        "Optional text (max 4096 chars). Accepted for compatibility; ignored, never stored."
                     ),
                 },
                 "files": {
@@ -424,8 +421,8 @@ TOOL_DEFINITIONS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Rule IDs credited in the outcome ledger (empty for unwitnessed "
-                        "'claimed' or 'rate_limited' reports)."
+                        "Rule IDs the report was attached to (empty for 'claimed' or 'rate_limited' "
+                        "reports); they count as evidence only after CI confirms the landing commit."
                     ),
                 },
                 "credited_count": {
@@ -446,7 +443,7 @@ TOOL_DEFINITIONS = [
                 "recorded": {
                     "type": "boolean",
                     "description": (
-                        "False when status='rate_limited' or when an unwitnessed claim for "
+                        "Present when status='claimed': False when an unwitnessed claim for "
                         "the same session and tree was already recorded."
                     ),
                 },
@@ -504,9 +501,9 @@ TOOL_DEFINITIONS = [
                 "rule_type": dict(
                     _RULE_TYPE_PROPERTY,
                     description=(
-                        "Optional target rule category ('invariant' or 'gate' for blocking "
-                        "checks; 'trap', 'boundary', 'persona', or 'contract' for advisory "
-                        "guidance). Determines the target subdirectory under .aegis/rules/."
+                        "Optional rule category ('invariant' or 'gate' for blocking checks; "
+                        "'trap', 'boundary', 'persona', or 'contract' for advisory guidance), "
+                        "passed to the draft prompt as a hint."
                     ),
                 ),
                 "domain": {
@@ -643,7 +640,7 @@ TOOL_DEFINITIONS = [
             "call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty "
             "git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted "
             "records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded "
-            "from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a "
+            "from `aegis rule insight review` rule proposals until corroborated (`level: 'W2'`) by a "
             "matching user prompt captured by a host hook in the same session. Capped at 50 captures "
             "per session and rate-limited to 5 calls per 60 seconds."
         ),
@@ -685,7 +682,7 @@ TOOL_DEFINITIONS = [
                 },
                 "id": {
                     "type": "string",
-                    "description": "Content-addressed insight identifier ('ins-<12-hex>').",
+                    "description": "Random insight identifier ('ins-<12 hex>'), new on every call.",
                 },
                 "level": {
                     "type": "string",
