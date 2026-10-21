@@ -34,7 +34,7 @@ from aegis_core.lifecycle.promotion import (
     evaluate_demotions,
     evaluate_rule_tiers,
 )
-from aegis_core.lifecycle.selection import prune_rules
+from aegis_core.lifecycle.selection import evidence_line, prune_rules, transition_candidates
 from aegis_core.workspace.layout import is_aegis_workspace
 
 __all__ = [
@@ -302,10 +302,13 @@ def _run_demote(args: argparse.Namespace) -> int:
     use_json = getattr(args, "json", False)
 
     if not rule_id:
-        candidates = evaluate_demotions(str(root))
+        candidates, unavailable = transition_candidates(str(root), "demote")
         if use_json:
             print(json.dumps({"candidates": candidates}, indent=2, default=str))
-        elif not candidates:
+            return 0
+        if unavailable:
+            print(f"  ⚠️  {evidence_line(unavailable)}")
+        if not candidates:
             print("  No demotion candidates found.")
         else:
             print(f"  ⚠️  Demotion Candidates ({len(candidates)}):\n")

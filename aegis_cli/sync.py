@@ -87,6 +87,10 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str) -> None:
     missing = ledger_incomplete(result.derived["ledger"])
     if missing:
         print(f"  {LEDGER_WARNING.format(sanitize_display(missing, 300))}")
+    cut = next((row for row in rows if row.get("evidence_available") is False), None)
+    if cut is not None:
+        reason = str(cut.get("evidence_error") or "the evidence is unavailable")
+        print(f"  ⚠️  Evidence unavailable, so nothing is suggested: {sanitize_display(reason, 300)}")
     for action in result.applied:
         detail = f" ({action['from_type']} -> {action['to_type']})" if action.get("to_type") else ""
         print(f"  {action['action']} {sanitize_display(action['rule'])}: {action['status']}{detail}")

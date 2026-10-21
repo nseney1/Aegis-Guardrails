@@ -398,3 +398,37 @@ def test_direct_archive_still_acts_on_complete_evidence(tmp_path, monkeypatch):
 
     assert archive_rule(repo.root, "trap-sample")["status"] == "archived"
     assert not (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").exists()
+
+
+@needs_git
+@pytest.mark.parametrize("argv", [["sync"], ["rule", "archive", "--dry-run"], ["rule", "demote"]],
+                         ids=["sync", "rule-archive", "rule-demote"])
+def test_text_output_says_why_the_evidence_is_unavailable(tmp_path, monkeypatch, capsys, argv):
+    """Given a landed check with a ``ci`` row to verify and a gh that always fails, When ``sync``,
+    ``rule archive`` or ``rule demote`` prints text, Then it names the reason once, not only that the
+    evidence is unavailable (the reason used to reach only --json and derived.json)."""
+    from aegis_cli.cli import main
+
+    repo, commit = _misfiring(tmp_path, monkeypatch)
+    _ci_confirmable(repo, commit)
+    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh(fail=True))
+
+    main(argv)
+    out = capsys.readouterr().out
+    assert out.count("CI verification stopped") == 1, out
+    assert "commit(s) were not verified" in out
+
+
+@needs_git
+@pytest.mark.parametrize("argv", [["sync"], ["rule", "archive", "--dry-run"], ["rule", "demote"]],
+                         ids=["sync", "rule-archive", "rule-demote"])
+def test_text_output_names_no_reason_when_the_evidence_is_complete(tmp_path, monkeypatch, capsys, argv):
+    from aegis_cli.cli import main
+
+    repo, commit = _misfiring(tmp_path, monkeypatch)
+    _ci_confirmable(repo, commit)
+    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, run_id=10)]))
+
+    main(argv)
+    out = capsys.readouterr().out
+    assert "CI verification stopped" not in out and "evidence unavailable" not in out.lower()
