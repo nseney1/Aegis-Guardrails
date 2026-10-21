@@ -216,6 +216,8 @@ AEGIS_WORKFLOW = (
 
 CODEOWNERS_FULL = (
     "/.aegis/rules/ @octo\n/.aegis/config.json @octo\n/.aegis/team.json @octo\n/.aegis/baseline.json @octo\n"
+    "/.aegis/adjudications/ @octo\n**/.aegis/rules/ @octo\n**/.aegis/adjudications/ @octo\n"
+    "**/.aegis/config.json @octo\n**/.aegis/team.json @octo\n**/.aegis/baseline.json @octo\n"
     "/allowed_signers @octo\n/CODEOWNERS @octo\n/.github/CODEOWNERS @octo\n/.github/workflows/ @octo\n"
     "conftest.py @octo\npytest.ini @octo\n.pytest.ini @octo\npytest.toml @octo\n.pytest.toml @octo\n"
     "tox.ini @octo\nsetup.cfg @octo\npyproject.toml @octo\nsitecustomize.py @octo\n*.pth @octo\nMakefile @octo\n"
