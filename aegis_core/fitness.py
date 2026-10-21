@@ -20,7 +20,7 @@ from aegis_core.stats import (
     clopper_pearson_upper,
     regularized_incomplete_beta,
 )
-from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, WILSON_CONFIDENCE_Z_SCORES
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, RULE_TYPES, WILSON_CONFIDENCE_Z_SCORES
 
 __all__ = [
     "DEFAULT_ARCHIVE_EPSILON",
@@ -29,6 +29,7 @@ __all__ = [
     "Fitness",
     "MAX_PRIOR_MASS",
     "MDE_UNTESTABLE_THRESHOLD",
+    "MIN_AGE_DAYS_FOR_PROMOTION",
     "MIN_N",
     "MIN_OBSERVATION_DAYS",
     "ReplayReport",
@@ -46,6 +47,7 @@ __all__ = [
     "regularized_incomplete_beta",
     "replay_detector_history",
     "replay_detector_history_report",
+    "rule_age_days",
     "session_decay_factor",
     "wilson_interval",
     "wilson_lower_bound",
@@ -62,6 +64,8 @@ DEFAULT_MDE_HORIZON_DAYS = 180.0
 MDE_UNTESTABLE_THRESHOLD = 0.6
 # Below this many days of ledger history the trigger volume says nothing: 180 / (1.24324 / 0.6)^2 = 41.9.
 MIN_OBSERVATION_DAYS = 42.0
+# A rule must have been tried this long before evidence may promote it.
+MIN_AGE_DAYS_FOR_PROMOTION = 30
 _MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)'")
 
 
@@ -117,6 +121,30 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+def rule_age_days(rule: Any, now: Optional[datetime] = None) -> int:
+    """Days since the rule's ``created`` date (0 when it has none or it cannot be read)."""
+    created = (getattr(rule, "meta", None) or {}).get("created")
+    if isinstance(created, datetime):
+        created_dt = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    elif isinstance(created, str) and created:
+        text = created.strip()
+        text = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            created_dt = datetime.fromisoformat(text) if "T" in text else datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return 0
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+    elif hasattr(created, "isoformat"):  # a date
+        created_dt = datetime(created.year, created.month, created.day, tzinfo=timezone.utc)
+    else:
+        return 0
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return max(0, (current - created_dt).days)
+
+
 def session_decay_factor(eligible_sessions: int, half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS) -> float:
     return 1.0 if (eligible_sessions <= 0 or not half_life_sessions or half_life_sessions <= 0) else float(2.0 ** (-float(eligible_sessions) / float(half_life_sessions)))
 
@@ -170,7 +198,7 @@ class Fitness:
     @property
     def reported_score(self) -> Optional[float]:
         """The number surfaces may show: None until a sample is large enough to mean something."""
-        if not self.evidence_available or not self.verdicts or self.state in ("insufficient", "untestable", "evidence_unavailable"):
+        if not self.evidence_available or not self.verdicts or self.state in ("insufficient", "untestable"):
             return None
         return self.score
 
@@ -195,8 +223,12 @@ def compute(
     half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS, epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
     repos_count: int = 0, days_span: float = 0.0, silence_lr: float = 1.0,
-    evidence_available: bool = True, evidence_error: Optional[str] = None,
+    evidence_available: bool = True, evidence_error: Optional[str] = None, age_days: Optional[float] = None,
 ) -> Fitness:
+    """The one decision engine (R-evidence-7): a rule's state and the transition its evidence
+    supports. ``promote``, ``demote`` and ``archive`` appear only in state ``decided``, and never
+    without the evidence (``evidence_available``) or below ``min_n``. ``age_days`` (None: not
+    gated) below MIN_AGE_DAYS_FOR_PROMOTION blocks promotion."""
     base_tp, base_fp = _num(totals.get("tp", 0) or 0), _num(totals.get("fp", 0) or 0)
     adj_n = int(adjudicated_tp) + int(adjudicated_fp)
     # Spec T4: labels are the only fp source. A leaked finding is a true alarm that landed (a
@@ -227,18 +259,22 @@ def compute(
     flagged_for_review = bool(contested > 0 and (contested >= 3 or override_rate >= 0.25))
     archive_candidate = bool(rule_type == "trap" and not pinned and eligible_sessions > 0 and effective_weight < epsilon)
     enough_n = n >= min_n
-    demote_ready = bool(enough_n and (misfire > 0.5 or p_below_07 >= 0.9 or cp_hi < 0.7))
+    # The posterior alone: without a prior, the Wilson and Clopper-Pearson terms never demote a
+    # rule it keeps (checked over every (tp, fp) in 0..85).
+    demote_ready = bool(enough_n and p_below_07 >= 0.9)
+    spec = RULE_TYPES.get(rule_type)
+    movable = bool(spec is not None and spec.promotes_to and (age_days is None or age_days >= MIN_AGE_DAYS_FOR_PROMOTION))
     if adj_n > 0:
         enough_pos = (adjudicated_tp >= 25 and adjudicated_fp == 0) or (adj_n >= 42 and adjudicated_fp <= 1 and cp_lo >= 0.88)
         enough_div = (sessions_count == 0 or sessions_count >= 3) and (repos_count >= 2 or days_span >= 14.0 or (repos_count == 0 and days_span == 0.0))
-        promote_ready = bool(enough_n and rule_type == "trap" and enough_pos and enough_div)
+        promote_ready = bool(enough_n and movable and enough_pos and enough_div)
     else:
-        promote_ready = bool(enough_n and rule_type == "trap" and n >= 20 and score >= 0.85)
+        promote_ready = bool(enough_n and movable and n >= 20 and score >= 0.85)
     suggestion: Optional[str] = None
-    if not evidence_available:
-        state, suggestion = "evidence_unavailable", None
+    if not evidence_available:  # a flag, not a state: nothing is decided on evidence cut short
+        state = "inconclusive" if enough_n else "insufficient"
     elif demote_ready:
-        state, suggestion = "decided", ("demote" if rule_type in ("gate", "invariant") else "archive")
+        state, suggestion = "decided", ("demote" if spec is not None and spec.demotes_to else "archive")
     elif promote_ready:
         state, suggestion = "decided", "promote"
     elif archive_candidate:
@@ -439,6 +475,7 @@ def for_rules(
             adjudicated_fp=int(t4.get("adjudicated_fp", 0)), sessions_count=len(t4.get("sessions", ())),
             repos_count=len(t4.get("repos", ())), days_span=float(t4.get("days_span", 0.0)),
             evidence_available=proj_credits.available, evidence_error=proj_credits.error,
+            age_days=rule_age_days(rule, now),
         )
     return out
 

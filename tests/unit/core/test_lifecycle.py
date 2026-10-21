@@ -106,17 +106,20 @@ class TestDemotionAndArchive:
 
 
 class TestMisfireBoundary:
-    def test_a_misfire_bound_at_the_threshold_is_not_misfiring_and_just_above_is(self, tmp_path):
-        from aegis_core.fitness import Fitness
-        from aegis_core.lifecycle.constants import MISFIRE_THRESHOLD
+    def test_the_engine_decides_the_misfire_and_suggest_never_redecides_from_a_bound(self, tmp_path):
+        """The boundary is the posterior P(precision < 0.7) >= 0.9 over at least MIN_N verdicts:
+        15 tp / 11 fp gives 0.920 (archive), 16 / 11 gives 0.897 (kept). A misfire bound handed
+        to suggest without the engine's decision moves nothing."""
+        from aegis_core.fitness import Fitness, compute
         from aegis_core.lifecycle.promotion import suggest
         from aegis_core.rules import load_rules
 
         _trap(_ws(tmp_path), "edge")
         rule = load_rules(tmp_path).get("edge")
 
-        assert suggest(rule, Fitness("edge", fp=MIN_N, misfire=MISFIRE_THRESHOLD)) is None
-        assert suggest(rule, Fitness("edge", fp=MIN_N, misfire=MISFIRE_THRESHOLD + 0.0001)) == "archive"
+        assert suggest(rule, compute({"tp": 15, "fp": 11}, rule="edge")) == "archive"
+        assert suggest(rule, compute({"tp": 16, "fp": 11}, rule="edge")) is None
+        assert suggest(rule, Fitness("edge", fp=MIN_N, misfire=0.9)) is None
         # the same bound below the sample gate moves nothing
         assert suggest(rule, Fitness("edge", fp=MIN_N - 1, misfire=0.9)) is None
 
@@ -152,7 +155,8 @@ class TestIncompleteLedger:
 
         assert prune_rules(tmp_path, execute=True) == 0
 
-        assert "not archived: Rule 'noisy-trap' was not archived: the ledger is incomplete" in capsys.readouterr().out
+        # Partial evidence decides nothing, so there is no candidate to refuse.
+        assert capsys.readouterr().out == "Evidence unavailable: 1 unreadable line(s)\nNo rules to archive.\n"
         assert (tmp_path / ".aegis" / "rules" / "traps" / "noisy-trap.md").is_file()
 
     def test_tier_changes_are_reported_but_not_written(self, tmp_path):

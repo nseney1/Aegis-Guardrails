@@ -130,8 +130,8 @@ def test_checkpoint_fails_closed_and_uses_weighted_outcomes(tmp_path):
     issues = check_rule_fitness(tmp_path)
     assert any("line 51 is not a JSON object row" in issue["message"] for issue in issues)
     assert [issue["message"] for issue in issues if issue.get("rule") == "weighted"] == [
-        "Rule 'weighted' misfires: 25 of 25 verdicts are false positives (misfire bound 0.90 > 0.5); "
-        "aegis sync suggests demoting or archiving it"
+        "Rule 'weighted' misfires: 25 of 25 verdicts are false positives, and the fitness engine decided it "
+        "(P(precision < 0.7) = 1.00); aegis sync suggests demoting or archiving it"
     ]
 
 

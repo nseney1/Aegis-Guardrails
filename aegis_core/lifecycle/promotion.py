@@ -24,7 +24,6 @@ from .constants import (
     DEMOTION_PATH,
     MIN_AGE_DAYS_FOR_PROMOTION,
     MIN_PROMOTION_VERDICTS,
-    MISFIRE_THRESHOLD,
     PROMOTION_PATH,
     PROMOTION_THRESHOLD,
     PROTECTED_RULES,
@@ -51,49 +50,13 @@ def _protected(rule_id: str) -> bool:
     return rule_id in PROTECTED_RULES or base in PROTECTED_RULES
 
 
-def _promotable(fit: Fitness) -> bool:
-    if not fit.has_min_n:
-        return False
-    if fit.adjudicated_n > 0:
-        return fit.suggestion == "promote"
-    return fit.verdicts >= MIN_PROMOTION_VERDICTS and fit.score >= PROMOTION_THRESHOLD
-
-
-def _misfiring(fit: Fitness) -> bool:
-    """Confident (Wilson lower bound or Beta posterior P(p < 0.7) >= 0.90) over at least MIN_N verdicts
-    that the rule misfires."""
-    if not fit.has_min_n:
-        return False
-    if fit.adjudicated_n > 0:
-        return fit.misfire > MISFIRE_THRESHOLD or fit.p_below_demote >= 0.9
-    return fit.misfire > MISFIRE_THRESHOLD
-
-
 def suggest(rule: Rule, fit: Fitness, now: Optional[datetime] = None) -> Optional[str]:
-    """The transition a rule's ledger evidence supports: promote, demote, archive or None.
-
-    No promotion, demotion or archive by misfire below fitness.MIN_N verdicts.
-
-    - promote: it has a next tier, at least MIN_PROMOTION_VERDICTS verdicts (or T4
-      adjudicated promotion criteria), fitness of at least PROMOTION_THRESHOLD and is
-      MIN_AGE_DAYS_FOR_PROMOTION days old;
-    - demote (archive when it has no lower tier): it misfires, i.e. the Wilson lower
-      bound of its false-positive rate exceeds MISFIRE_THRESHOLD (or adjudicated
-      P(precision < 0.7) >= 0.90);
-    - archive: a non-pinned trap whose session-decay effective weight falls below epsilon.
-
-    Rules that are broken, expired or protected get no suggestion.
-    """
+    """The transition a rule's evidence supports: ``fit.suggestion``, the one decision of
+    aegis_core.fitness.compute (promote, demote, archive or None). Rules that are broken,
+    expired, untyped or protected never move by evidence and get None."""
     if not rule.served or rule.type is None or _protected(rule.id):
         return None
-    spec = RULE_TYPES[rule.type]
-    if _misfiring(fit):
-        return "demote" if spec.demotes_to else "archive"
-    if not spec.demotes_to and fit.archive_candidate:
-        return "archive"
-    if spec.promotes_to and _promotable(fit) and rule_age_days(rule, now) >= MIN_AGE_DAYS_FOR_PROMOTION:
-        return "promote"
-    return None
+    return fit.suggestion
 
 
 def _evaluate(workspace: Workspace | Path | str, wanted: str, now: Optional[datetime]) -> List[Dict[str, Any]]:
