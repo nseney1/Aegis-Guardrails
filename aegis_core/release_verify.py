@@ -326,7 +326,9 @@ def release_approved(commit: str, repository: str, branch: str, gh: GhRun) -> Tu
     if not isinstance(reviews, list):
         return False, why or "GitHub listed no reviews"
     for review in reviews:
-        login = _field(review, "user", "login") if isinstance(review, dict) else None
+        if not isinstance(review, dict):
+            continue
+        login = _field(review, "user", "login")
         if (review.get("state") == "APPROVED" and isinstance(login, str) and login and isinstance(author, str)
                 and login != author and isinstance(head, str) and review.get("commit_id") == head):
             return True, ""

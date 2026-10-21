@@ -512,6 +512,7 @@ _REVIEW_CASES = {
     "rc1": (1, "", "HTTP 502"),
     "notjson": (0, "not json", ""),
     "object": {"state": "APPROVED"},
+    "not-objects": [1, "APPROVED", None, ["APPROVED"]],
 }
 
 
@@ -521,6 +522,26 @@ def test_without_an_independent_approval_on_the_head_it_is_not_approved(tmp_path
     report, _gh, _commit = _approval(tmp_path, reviews=_REVIEW_CASES[case])
     assert (report.verified, report.attested, report.code, report.status) == (False, True, "not_approved", "failed")
     assert report.tier == "A" and report.text_lines()[0].startswith("NOT VERIFIED:")
+
+
+@needs_git
+def test_a_review_entry_that_is_not_an_object_is_skipped_not_fatal(tmp_path):
+    report, _gh, _commit = _approval(tmp_path, reviews=[1, DEFAULT_REVIEWS[0]])
+    assert report.verified and report.code == "verified"
+
+
+@needs_git
+def test_the_cli_prints_the_json_report_for_a_malformed_reviews_answer(tmp_path, monkeypatch, capsys):
+    from aegis_core import human_gate
+
+    repo = make_repo(tmp_path, tier="A")
+    commit, tree, digest = facts(repo)
+    release = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""), reviews=[1])
+    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh("A", release))
+    rc, out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", commit, "--json")
+    payload = json.loads(out)
+    assert rc == 1 and (payload["code"], payload["status"], payload["verified"]) == ("not_approved", "failed", False)
+    assert "Error" not in err
 
 
 _PULL_CASES = {
