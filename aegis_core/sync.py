@@ -517,8 +517,9 @@ def sync(
     with locked(ws.root):
         ruleset = load_rules(ws)
         loaded_ok = [r for r in ruleset.rules if r.ok]
+        stored = (read_derived(ws) or {}).get("replay")
         try:
-            replay = replay_detector_history_report(ws.root, loaded_ok)
+            replay = replay_detector_history_report(ws.root, loaded_ok, since=stored if isinstance(stored, dict) else None)
         except (gitsafe.GitError, OSError, ValueError) as exc:  # partial evidence is said, never fatal
             replay = ReplayReport([], errors=(str(exc) or type(exc).__name__,))
         if ci_client is not None or any(r.get("event") == "report" for r in credit.read_rows(ws.root)):
@@ -562,6 +563,8 @@ def sync(
             applied = _apply(ws, derived)
             if applied:
                 derived = build(ws, load_rules(ws), now, verify_ci=True)
+        if replay.tip:  # build() writes the document from scratch: where the next replay may start
+            derived["replay"] = {"tip": replay.tip, "rules": replay.rules, "branch": replay.branch}
         state_dir(ws.root)
         atomic_write_text(path, json.dumps(derived, indent=2, sort_keys=True) + "\n")
     if pr and pr_info is None:

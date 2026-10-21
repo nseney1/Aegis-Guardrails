@@ -866,6 +866,30 @@ def test_replay_keys_of_a_recorded_history_are_unchanged(tmp_path: Path) -> None
 
 
 @needs_git
+def test_sync_stores_where_replay_stopped_and_a_second_sync_appends_nothing(tmp_path: Path, monkeypatch) -> None:
+    """R-evidence-12: Given a synced history, When sync runs again with no new commit, Then it
+    resumes from the stored tip and the ledger is unchanged; a 4.3.3 document without the key
+    replays everything."""
+    repo = _golden_history(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    sync.sync(repo.root)
+    replay = sync.read_derived(repo.root)["replay"]
+    assert (replay["tip"], replay["branch"]) == (repo.git("rev-parse", "main"), "main")
+    rows = credit.read_rows(repo.root)
+    walked = []
+    real = fitness._violations_at_commit
+    monkeypatch.setattr(fitness, "_violations_at_commit", lambda root, sha, *a: walked.append(sha) or real(root, sha, *a))
+    assert sync.sync(repo.root).replay.detections == [] and walked == []
+    assert credit.read_rows(repo.root) == rows and sync.read_derived(repo.root)["replay"] == replay
+    path = repo.root / ".aegis" / "state" / "derived.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc.pop("replay")
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    sync.sync(repo.root)
+    assert len(set(walked)) == len(repo.git("rev-list", "main").split()) and credit.read_rows(repo.root) == rows
+
+
+@needs_git
 def test_projecting_credit_never_imports_release_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """One CI-confirmation path (REST): ``project_credits`` does not reach ``release_verify`` (R-trust-67)."""
     import sys

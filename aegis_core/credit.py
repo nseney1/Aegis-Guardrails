@@ -27,7 +27,7 @@ __all__ = [
     "GhRestClient", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "required_workflow",
-    "record_adjudication", "record_detection", "record_exposure", "record_override",
+    "record_adjudication", "record_detection", "record_detections", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
     "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
 ]
@@ -367,33 +367,41 @@ def record_detection(
     rev: Optional[str] = None, branch: str = "main", fix_rev: Optional[str] = None,
     weight: Optional[float] = None, ts: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if disposition not in ("caught", "leaked"):
-        raise ValueError(f"disposition must be 'caught' or 'leaked', got {disposition!r}")
-    eff_weight = float(weight) if weight is not None else (0.5 if disposition == "caught" else 1.0)
-    b_name = branch or "main"
+    return record_detections(root, [{"rule": rule, "file": file, "pattern": pattern, "disposition": disposition,
+                                      "rev": rev, "branch": branch, "fix_rev": fix_rev, "weight": weight, "ts": ts}])[0]
+
+
+def record_detections(root: Any, findings: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """A ``detection`` row per finding (``rule``, ``file``, ``pattern``, ``disposition``, optional ``rev``,
+    ``branch``, ``fix_rev``, ``weight``, ``ts``) under one ledger lock, one read and one append. A
+    finding whose unit (rule, file, pattern, rev) already ends in the same disposition, fix and weight
+    writes nothing; returns each finding's row, written or existing, in order."""
     with ledger_locked(root):
-        latest = None
+        latest: Dict[Tuple[Any, ...], Mapping[str, Any]] = {}
         # One unit per introducing commit (rev), as replay and fitness key it: a re-replay supersedes it.
         for ex in _of(read_rows(root), "detection"):
-            if (ex.get("rule") or ex.get("for_rule")) == rule and ex.get("file") == file and ex.get("pattern") == pattern and ex.get("rev") == rev:
-                latest = ex
-        if (latest is not None and latest.get("disposition") == disposition
-                and latest.get("fix_rev") == fix_rev and float(latest.get("weight") or 0.0) == eff_weight):
-            return _normalize_event_row(latest)
-        row = {
-            "v": ledger.LEDGER_VERSION,
-            "ts": ts or _now(),
-            "event": "detection",
-            "rule": rule,
-            "file": file,
-            "pattern": pattern,
-            "disposition": disposition,
-            "branch": b_name,
-            "rev": rev,
-            "fix_rev": fix_rev,
-            "weight": eff_weight,
-        }
-        return _normalize_event_row(ledger.append_rows(root, [row])[0])
+            latest[(ex.get("rule") or ex.get("for_rule"), ex.get("file"), ex.get("pattern"), ex.get("rev"))] = ex
+        out: List[Any] = []
+        fresh: List[Dict[str, Any]] = []
+        for f in findings:
+            disposition = f.get("disposition")
+            if disposition not in ("caught", "leaked"):
+                raise ValueError(f"disposition must be 'caught' or 'leaked', got {disposition!r}")
+            weight = float(f["weight"]) if f.get("weight") is not None else (0.5 if disposition == "caught" else 1.0)
+            unit = (f["rule"], f["file"], f["pattern"], f.get("rev"))
+            prev = latest.get(unit)
+            if (prev is not None and prev.get("disposition") == disposition
+                    and prev.get("fix_rev") == f.get("fix_rev") and float(prev.get("weight") or 0.0) == weight):
+                out.append(prev)
+                continue
+            row = {"v": ledger.LEDGER_VERSION, "ts": f.get("ts") or _now(), "event": "detection", "rule": f["rule"],
+                   "file": f["file"], "pattern": f["pattern"], "disposition": disposition,
+                   "branch": f.get("branch") or "main", "rev": f.get("rev"), "fix_rev": f.get("fix_rev"), "weight": weight}
+            latest[unit] = row
+            out.append(len(fresh))
+            fresh.append(row)
+        written = ledger.append_rows(root, fresh) if fresh else []
+        return [_normalize_event_row(written[r] if isinstance(r, int) else r) for r in out]
 
 
 def record_adjudication(
