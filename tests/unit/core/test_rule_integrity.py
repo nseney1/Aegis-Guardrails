@@ -1006,8 +1006,10 @@ class ReviewGh(hg.FakeGh):
         return [c[0][-1] for c in self.calls if "/pulls/" in c[0][-1]]
 
 
-def review(login: str, sha: str, state: str = "APPROVED", association: str = "COLLABORATOR") -> Dict[str, Any]:
-    return {"user": {"login": login}, "state": state, "commit_id": sha, "author_association": association}
+def review(login: str, sha: str, state: str = "APPROVED", association: str = "COLLABORATOR",
+           kind: Optional[str] = "User") -> Dict[str, Any]:
+    user = {"login": login, **({} if kind is None else {"type": kind})}
+    return {"user": user, "state": state, "commit_id": sha, "author_association": association}
 
 
 def tier_a_repo(tmp_path: Path, codeowners: Optional[str] = hg.CODEOWNERS_FULL, signer: bool = False) -> hg.Repo:
@@ -1117,8 +1119,10 @@ def _old_sha() -> str:
     lambda head: [review(f"user{i}", head, state="COMMENTED") for i in range(100)],
     lambda head: [{"state": "APPROVED", "commit_id": head, "author_association": "OWNER"}],
     lambda head: {"message": "not a list"},
+    lambda head: [review("helper[bot]", head, kind="Bot")],
+    lambda head: [review("helper", head, kind=None)],
 ], ids=["old-sha", "author", "author-case", "none-assoc", "contributor", "later-change-request", "dismissed",
-        "commented", "full-page", "no-user", "not-a-list"])
+        "commented", "full-page", "no-user", "not-a-list", "bot", "untyped"])
 def test_a_review_that_does_not_approve_this_head_as_a_reviewer_fails(tmp_path, capsys, monkeypatch, make_reviews):
     gh = ReviewGh()
     _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)

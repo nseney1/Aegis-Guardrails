@@ -1254,8 +1254,10 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
         if isinstance(login, str) and login:
             latest[login.lower()] = item  # the list is oldest first: keep each reviewer's last word
     for login, item in latest.items():
+        # A person's review only: an app or bot account may act for the agent.
         if (item.get("state") == "APPROVED" and str(item.get("commit_id") or "").lower() == pull.head.lower()
-                and login != pull.author.lower() and item.get("author_association") in _REVIEWER_ASSOCIATIONS):
+                and login != pull.author.lower() and item.get("author_association") in _REVIEWER_ASSOCIATIONS
+                and item["user"].get("type") == "User"):
             name = item["user"]["login"]
             return Approval(True, "ok", f"an approving review of the head commit by {name}, not its author",
                             pull.head.lower(), name, "review")

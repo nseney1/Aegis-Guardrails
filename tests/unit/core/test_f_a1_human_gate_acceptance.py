@@ -211,7 +211,8 @@ def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_pa
     base = repo.commit("protect")
     head = "a" * 40
     pull = human_gate.PullRequest(3, "agent", head)
-    approving = [{"user": {"login": "human"}, "state": "APPROVED", "commit_id": head, "author_association": "OWNER"}]
+    approving = [{"user": {"login": "human", "type": "User"}, "state": "APPROVED", "commit_id": head,
+                  "author_association": "OWNER"}]
     paths = [".aegis/rules/traps/trap-sample.md"]
     gh = _ReviewsGh(approving, rules=[hg.pull_request_rule()])
     verdict = human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh)
