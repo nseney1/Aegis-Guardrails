@@ -427,6 +427,32 @@ def test_one_detection_gives_one_example_none_gives_none_and_a_rerun_adds_nothin
     assert ".aegis/adjudications" not in hs.git(bare.root, "diff", "--name-only", "main", third["branch"])
 
 
+def test_an_example_already_labelled_is_never_listed_and_takes_no_slot(tmp_path: Path) -> None:
+    import re
+
+    from tests import helpers_syncpr as hs
+
+    repo = hs.make(tmp_path, rule="trap-held", detections=4)
+    store = ".aegis/adjudications/trap-held.jsonl"
+    first = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+    listed = re.findall(r"^  \d\. `([0-9a-f]{12})`", first["body"], re.M)
+    assert len(listed) == 3
+    rows = hs.git(repo.root, "show", f"{first['branch']}:{store}").replace(
+        f'"example_id": "{listed[0]}", "verdict": null', f'"example_id": "{listed[0]}", "verdict": "tp"')
+    (repo.root / store).write_bytes(rows.encode("utf-8") + b"\n")  # merged, and the newest one labelled
+    hs.git(repo.root, "commit", "-q", "-am", "label one example")
+    hs.git(repo.root, "push", "-q", "origin", "main")
+
+    second = sync.sync(repo.root, pr=True, gh_runner=hs.FakeGh(repo.origin)).pr
+
+    assert second["status"] == "opened", second
+    again = re.findall(r"^  \d\. `([0-9a-f]{12})`", second["body"], re.M)
+    assert listed[0] not in again and again[:2] == listed[1:] and len(again) == 3
+    held = [json.loads(line) for line in hs.git(repo.root, "show", f"{second['branch']}:{store}").splitlines()]
+    ids = [r["example_id"] for r in held if "example_id" in r and r["example_id"] in again + listed]
+    assert sorted(ids) == sorted(set(ids)) and set(ids) == set(again) | {listed[0]}  # one new row, no duplicate
+
+
 def test_derived_entries_carry_no_samples_and_an_older_file_with_them_still_reads(ws: Path) -> None:
     derived = sync.sync(ws).derived
     assert all(entry["samples"] == [] for entry in derived["rules"].values())

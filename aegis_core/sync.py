@@ -226,7 +226,7 @@ def format_pr_body(pre_rules: Dict[str, Dict[str, Any]], applied: List[Dict[str,
 
 
 def _example_rows(ws: Any, rule_id: str) -> List[Dict[str, Any]]:
-    """Up to three of the rule's replay detections, newest first, one per (file, pattern, rev)."""
+    """The rule's replay detections, newest first, one per (file, pattern, rev)."""
     from aegis_core import credit
 
     found: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -234,14 +234,15 @@ def _example_rows(ws: Any, rule_id: str) -> List[Dict[str, Any]]:
         if row.get("event") != "detection" or row.get("rule") != rule_id:
             continue
         key = (str(row.get("file") or ""), str(row.get("pattern") or ""), str(row.get("rev") or ""))
-        if key not in found and len(found) < _EXAMPLES:
+        if key not in found:
             digest = hashlib.sha256("\0".join((rule_id, *key)).encode("utf-8", "surrogatepass")).hexdigest()[:12]
             found[key] = {"example_id": digest, "verdict": None, "file": key[0], "pattern": key[1], "rev": key[2]}
     return list(found.values())
 
 
 def _write_examples(root: Path, rule_id: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Append the rows whose example_id the rule's label file does not hold yet; returns them all."""
+    """The newest three of ``rows`` the label file holds no tp or fp label for: appends those it does
+    not hold at all and returns them, every one still ``verdict: null`` (spec 4.2 step 4)."""
     from aegis_core.adjudication import ADJUDICATIONS_DIR, RULE_ID
     from aegis_core.errors import PathTraversalError
 
@@ -252,7 +253,7 @@ def _write_examples(root: Path, rule_id: str, rows: List[Dict[str, Any]]) -> Lis
     if directory.is_symlink() or directory.parent.is_symlink() or path.is_symlink():
         raise PathTraversalError(f"{ADJUDICATIONS_DIR} is a symlink; refusing to write examples through it")
     existing = path.read_bytes() if path.is_file() else b""
-    held = set()
+    held, labelled = set(), set()
     for line in existing.splitlines():
         try:
             row = json.loads(line)
@@ -260,13 +261,16 @@ def _write_examples(root: Path, rule_id: str, rows: List[Dict[str, Any]]) -> Lis
             continue
         if isinstance(row, dict):
             held.add(row.get("example_id"))
-    fresh = [r for r in rows if r["example_id"] not in held]
+            if row.get("verdict") in ("tp", "fp"):  # adjudication's reader: a later null row does not unlabel
+                labelled.add(row.get("example_id"))
+    shown = [r for r in rows if r["example_id"] not in labelled][:_EXAMPLES]
+    fresh = [r for r in shown if r["example_id"] not in held]
     if fresh:
         directory.mkdir(parents=True, exist_ok=True)
         tail = b"" if not existing or existing.endswith(b"\n") else b"\n"
         added = b"".join(json.dumps(r).encode("utf-8") + b"\n" for r in fresh)
         atomic_write_bytes(path, existing + tail + added)
-    return rows
+    return shown
 
 
 def _default_gh_runner(argv: List[str], cwd: Optional[str] = None) -> Any:
