@@ -45,6 +45,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.bootstrap": 0,
     "aegis_core.storage": 0,
     "aegis_core.gitsafe": 0,
+    # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
+    "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
     "aegis_core.config": 0,
