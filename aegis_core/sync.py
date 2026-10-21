@@ -285,7 +285,9 @@ _PUSH_PROGRAMS = (r"^(core\.(sshcommand|askpass|gitproxy)|credential\..*|protoco
 # Only https, ssh and local file transport: any other scheme makes git start git-remote-<scheme>.
 _PUSH_HARDENING = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", "-c", "core.askPass=",
                    "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
-                   "-c", "protocol.file.allow=always", "-c", "protocol.ext.allow=never", "-c", f"gpg.program={os.devnull}")
+                   "-c", "protocol.file.allow=always", "-c", "protocol.ext.allow=never", "-c", f"gpg.program={os.devnull}",
+                   "-c", f"gpg.openpgp.program={os.devnull}", "-c", f"gpg.ssh.program={os.devnull}",
+                   "-c", f"gpg.x509.program={os.devnull}")
 _PUSH_SCHEMES = ("https", "ssh", "git+ssh", "ssh+git", "file")  # git compares them case-sensitively
 _URL_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://")
 _PUSH_TIMEOUT = 60.0
@@ -425,7 +427,8 @@ def _open_pr(plan: Dict[str, Any], branch: str, commit: str, title: str, body: s
     info: Dict[str, Any] = {"url": None, "branch": branch, "title": title, "body": body}
     top, remote = plan["top"], plan["remote"]
     try:
-        _git(top, ["push", "--porcelain", "--no-verify", remote, f"refs/heads/{branch}:refs/heads/{branch}"],
+        # --no-signed: push.gpgSign would run the signing program gpg.format and gpg.*.program choose.
+        _git(top, ["push", "--porcelain", "--no-verify", "--no-signed", remote, f"refs/heads/{branch}:refs/heads/{branch}"],
              timeout=_PUSH_TIMEOUT, _hardening=_PUSH_HARDENING)
     except gitsafe.GitError as exc:
         gitsafe.run(["update-ref", "-d", f"refs/heads/{branch}", commit], top)

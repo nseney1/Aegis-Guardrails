@@ -201,3 +201,22 @@ def test_a_push_url_scheme_that_picks_a_remote_helper_is_refused_and_the_helper_
     assert "xyz://" in payload["refused"] and "host/repo" not in payload["refused"]  # a URL may hold a token
     assert repo.state() == before and repo.origin_branches() == ["main"]
     assert not (tmp_path / "ran-helper").exists()
+
+
+def test_a_signing_program_from_repository_config_never_runs_on_the_push(tmp_path, capsys):
+    repo = hs.make(tmp_path)
+    git(repo.origin, "config", "receive.certNonceSeed", "seed")  # the origin accepts signed pushes
+    _plant(tmp_path / "signer", tmp_path / "ran-signer")
+    for key, value in (("push.gpgSign", "true"), ("gpg.format", "ssh"), ("gpg.ssh.program", str(tmp_path / "signer")),
+                       ("user.signingKey", "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA")):
+        git(repo.root, "config", key, value)
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    assert rc == EXIT_OK and payload["pr"]["status"] == "opened", payload["pr"]
+    assert payload["pr"]["branch"] in repo.origin_branches()
+    after = repo.state()
+    assert after.pop("branches") != before.pop("branches") and after == before
+    assert not (tmp_path / "ran-signer").exists()
