@@ -1253,3 +1253,133 @@ def test_a_skip_marker_is_reported_by_the_lane_gate_and_not_gated_by_check_ci(tm
     rc, payload, _err = ci(repo, capsys)
     # The gap stays visible: this flips when check --ci gates skip markers (R-trust-63 option B).
     assert rc == 0 and payload["weakenings"] == [] and payload["governance"]["paths"] == []
+
+
+# ── R-trust-13 (a): check --ci --no-exec reads git objects only ──────────────────
+
+def _ledger_spies(monkeypatch) -> List[str]:
+    """Every way to the ledger, recorded: its site, its rows and a void row."""
+    from aegis_core import credit, storage
+    from aegis_core.telemetry_engine import ledger
+    seen: List[str] = []
+    for module, name in ((storage, "ledger_site"), (ledger, "ledger_site"), (credit, "read_rows"),
+                         (credit, "record_void")):
+        real = getattr(module, name)
+
+        def spy(*a, _real=real, _name=name, **kw):
+            seen.append(_name)
+            return _real(*a, **kw)
+        monkeypatch.setattr(module, name, spy)
+    return seen
+
+
+def trailer_repo(tmp_path: Path, sentinel: Path) -> hg.Repo:
+    """A pull request whose head adds a conftest.py that writes ``sentinel`` and carries a matching
+    Aegis-Check trailer, so a full check --ci reruns the head snapshot's tests. The user-scope test
+    command runs that conftest.py itself (this machine's pytest may live outside the hermetic run)."""
+    import sys
+    aegis_home = tmp_path / "home" / ".aegis"
+    aegis_home.mkdir(parents=True, exist_ok=True)
+    (aegis_home / "config.json").write_text(json.dumps({"v": 1, "tests": {"command": [sys.executable, "conftest.py"]}}),
+                                            encoding="utf-8")
+    repo = make_repo(tmp_path)
+    repo.write("tests/test_app.py", "def test_app():\n    assert True\n")
+    repo.write("conftest.py", f"open({str(sentinel)!r}, 'w').close()\n")
+    repo.git("add", "-A")
+    tree = repo.git("write-tree")
+    repo.commit(f"tests\n\nAegis-Check: tree={tree} exit=0\n")
+    return repo
+
+
+@needs_git
+def test_no_exec_runs_no_repository_code_and_never_touches_the_ledger(tmp_path, capsys, monkeypatch):
+    sentinel = tmp_path / "sentinel"
+    repo = trailer_repo(tmp_path, sentinel)
+    seen = _ledger_spies(monkeypatch)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--base", "main"])
+    out = capsys.readouterr().out
+    assert rc == 0 and not sentinel.exists()
+    assert "note: --no-exec: the regression and Aegis-Check trailer checks were not run" in out
+    assert seen == [] and not (repo.root / ".git" / "aegis").exists()
+    rc, payload, _err = ci(repo, capsys, "--no-exec")
+    assert rc == 0 and payload["skipped"] == ["regression", "trailer_checks"] and "trailer_checks" not in payload
+    assert "regression" not in payload and seen == [] and not sentinel.exists()
+    for fmt in ("sarif", "github"):
+        assert main(["check", "--ci", "--no-exec", "--base", "main", "--format", fmt]) == 0
+    assert "--no-exec" in capsys.readouterr().out and seen == [] and not sentinel.exists()
+
+
+@needs_git
+def test_without_no_exec_the_same_range_runs_the_head_snapshot(tmp_path, capsys):
+    sentinel = tmp_path / "sentinel"
+    repo = trailer_repo(tmp_path, sentinel)
+    rc, payload, _err = ci(repo, capsys)
+    assert sentinel.exists(), "the control must prove the harness executes the pull request's code"
+    assert "skipped" not in payload and payload["trailer_checks"]
+
+
+@needs_git
+@needs_signing
+def test_no_exec_still_fails_an_unapproved_gate_deletion_and_passes_a_signed_one(tmp_path, capsys):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, signer_pub=pub)
+    (repo.root / path_of("inv-a")).unlink()
+    repo.commit("drop the rule")
+    rc, payload, _err = ci(repo, capsys, "--no-exec")
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["deleted"]
+    approve(repo, key)
+    rc, payload, _err = ci(repo, capsys, "--no-exec")
+    assert rc == 0 and payload["approval"]["valid"] is True
+
+
+@needs_git
+@pytest.mark.parametrize("path,text", [
+    (".github/workflows/aegis.yml", "name: Aegis\non: [pull_request]\njobs: {}\n"),
+    ("allowed_signers", None),
+    ("CODEOWNERS", "* @someone-else\n"),
+], ids=["workflow", "signers", "codeowners"])
+def test_no_exec_fails_an_unapproved_change_to_what_defines_enforcement(tmp_path, capsys, path, text):
+    repo = make_repo(tmp_path, signer_pub=hg.hardware_public_key())
+    repo.write(path, text if text is not None else hg.allowed_signers_text(hg.hardware_public_key(), "ssh-ed25519 " + "A" * 68))
+    repo.commit("rewrite enforcement")
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--base", "main"])
+    out = capsys.readouterr().out
+    assert rc == 1 and "FAILED: governance change without approval" in out
+    assert f"] {path}" in out
+
+
+@needs_git
+@pytest.mark.parametrize("flag", ["--coverage", "--perf", "--strict"])
+def test_no_exec_refuses_the_flags_that_run_code(tmp_path, capsys, flag):
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", flag, "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "--no-exec" in err and flag in err
+
+
+@needs_git
+def test_no_exec_refuses_a_required_regression_gate(tmp_path, capsys):
+    import argparse
+    from aegis_cli.check import run_check
+    repo = make_repo(tmp_path)
+    args = argparse.Namespace(ci=True, no_exec=True, require_regression=True, base="main", workspace=str(repo.root))
+    assert run_check(args) == 2 and "--require-regression" in capsys.readouterr().err
+
+
+@needs_git
+def test_no_exec_without_ci_is_a_usage_error(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--no-exec"])
+    assert rc == 2 and "--ci" in capsys.readouterr().err
+
+
+@needs_git
+def test_no_exec_with_an_unresolvable_base_still_fails(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--base", "no-such-branch"])
+    assert rc == 1 and "cannot resolve the base" in capsys.readouterr().err

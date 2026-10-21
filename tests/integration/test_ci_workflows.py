@@ -378,3 +378,55 @@ def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
     steps = _check_ci_steps(job)
     assert len(steps) == 1, steps
     assert steps[0].get("env") == {"GH_TOKEN": "${{ github.token }}"}
+
+
+# --- R-trust-13 (c)-(f): a base-sourced, no-exec governance check ----------------------------
+# xfail(strict) until aegis-governance.yml lands after the author's pull_request_target spike.
+
+GOVERNANCE_WORKFLOW = "aegis-governance.yml"
+_AFTER_SPIKE = pytest.mark.xfail(strict=True, raises=FileNotFoundError,
+                                 reason="R-trust-13 c-f: aegis-governance.yml lands only after the author's spike")
+_BASE_SHA = "${{ github.event.pull_request.base.sha }}"
+
+
+def _permission_maps(workflow):
+    yield workflow.get("permissions")
+    for job in workflow["jobs"].values():
+        if "permissions" in job:
+            yield job["permissions"]
+
+
+@_AFTER_SPIKE
+def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_target():
+    """N3: the base-sourced job counts as the required Aegis check under its literal name."""
+    from aegis_core import human_gate
+    text = _read(GOVERNANCE_WORKFLOW)
+    assert set(_triggers(yaml.safe_load(text))) == {"pull_request_target"}
+    assert human_gate.aegis_check_jobs(text) == ["aegis-governance"]
+
+
+@_AFTER_SPIKE
+def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
+    """N4 (static): base.sha checkout without credentials, the head only as data, read-only token,
+    no secret, nothing that builds, installs, caches or tests the checkout."""
+    text = _read(GOVERNANCE_WORKFLOW)
+    workflow = yaml.safe_load(text)
+    assert set(_triggers(workflow)) == {"pull_request_target"}
+    for perms in _permission_maps(workflow):
+        assert isinstance(perms, dict), "permissions must be explicit maps"
+        writes = {k for k, v in perms.items() if v != "read"}
+        assert writes <= {"checks"} and all(perms[k] == "write" for k in writes), perms
+    assert "secrets." not in text
+    steps = [s for job in workflow["jobs"].values() for s in job.get("steps", [])]
+    checkouts = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+    assert checkouts and all((s.get("with") or {}).get("ref") == _BASE_SHA for s in checkouts)
+    assert all((s.get("with") or {}).get("persist-credentials") is False for s in checkouts)
+    for step in steps:
+        with_ = step.get("with") or {}
+        for value in (with_.get("ref"), with_.get("repository"), step.get("run")):
+            assert "github.event.pull_request.head" not in str(value or ""), step
+        run = step.get("run", "")
+        assert not re.search(r"\bmake\b|pytest|pip3? install|python3? -m pip|setup\.py", run), step
+        assert not step.get("uses", "").startswith("actions/cache"), step
+    runs = [s.get("run", "") for s in steps]
+    assert any(re.fullmatch(r"python3 -m aegis_cli\.cli check --ci --no-exec", r.strip()) for r in runs), runs
