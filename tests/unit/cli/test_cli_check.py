@@ -33,9 +33,6 @@ FAKE_LLM = textwrap.dedent(
     if mode == "fail":
         sys.stderr.write("quota exceeded\\n")
         sys.exit(7)
-    if mode == "code-fail" and not spec:
-        sys.stderr.write("quota exceeded\\n")
-        sys.exit(7)
     if mode == "hostile-fail":
         sys.stderr.write("quota\\x1b]0;pwned\\x07 exceeded\\x1b[2K\\x9b31m\\x7f\\n")
         sys.exit(7)
@@ -44,6 +41,9 @@ FAKE_LLM = textwrap.dedent(
             out.write(prompt)
     if mode == "garbage":
         print("Internal Server Error: 500 API Gateway Timeout")
+    if mode == "code-fail" and not spec:
+        sys.stderr.write("quota exceeded\\n")
+        sys.exit(7)
     elif mode in ("block", "revise", "ship", "code-fail") and spec:
         print(json.dumps([{
             "category": "code_injection", "severity": {"block": "critical", "revise": "high"}.get(mode, "low"),
@@ -473,18 +473,6 @@ class TestLayer2:
         assert "SHIP" not in out
         assert "BLOCK" not in out
 
-    def test_a_code_agent_backend_failure_is_unverified_and_leaves_the_exit_code_to_layer1(self, ws, capsys, llm):
-        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
-        argv = ["check", "--workspace", str(ws), "--full", "--llm-cmd", llm("code-fail"), "--plan", "p", "clean.py"]
-        assert _exit_code(argv) == 0
-        captured = capsys.readouterr()
-        assert "Layer 2: ⚠️ UNVERIFIED" in captured.out
-        assert "infra_status: unverified (code_agent_unparseable)" in captured.out
-        assert "Layer 2 failed" not in captured.err
-        (ws / "bad.py").write_text(UNGUARDED_IMPORT, encoding="utf-8")
-        assert _exit_code([*argv[:-1], "bad.py"]) == 1  # Layer 1's failure still fails
-        assert "Layer 2 failed" not in capsys.readouterr().err
-
     def test_an_empty_review_is_unverified_never_ship(self, ws, capsys, llm):
         """R-checks-44: a valid `[]` from the Spec Agent is a review that predicted nothing, not a SHIP."""
         (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
@@ -566,6 +554,13 @@ class TestLayer2:
     def test_failing_backend_is_an_explicit_error(self, ws, capsys, llm):
         (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
         argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("fail"), "--plan", "Add compute", "clean.py"]
+        assert _exit_code(argv) == 1
+        assert "Layer 2 failed: LLM command exited 7: quota exceeded" in capsys.readouterr().err
+
+    def test_a_code_agent_backend_failure_is_the_same_explicit_error(self, ws, capsys, llm):
+        # A model command that fails is a setup error the user must see, whichever agent's call it was.
+        (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
+        argv = ["check", "--workspace", str(ws), "--llm-cmd", llm("code-fail"), "--plan", "Add compute", "clean.py"]
         assert _exit_code(argv) == 1
         assert "Layer 2 failed: LLM command exited 7: quota exceeded" in capsys.readouterr().err
 
