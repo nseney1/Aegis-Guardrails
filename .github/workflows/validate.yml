@@ -103,9 +103,11 @@ jobs:
           path: dist/
       - name: Verify artifact digests
         run: python .github/scripts/verify_dist.py verify dist
-      - name: Install wheel and test runner
+      # Same text as the other test jobs (a workflow test compares them): check --ci reruns the
+      # head commit's trailer snapshot here, which must collect what those jobs collect.
+      - name: Install test dependencies
         run: |
-          pip install pytest==8.3.4 pyyaml==6.0.2
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
           pip install dist/*.whl
       - name: Run Layer 1 Deterministic Verification
         run: python3 -m aegis_cli.cli check

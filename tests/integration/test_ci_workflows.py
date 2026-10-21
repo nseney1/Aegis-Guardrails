@@ -193,12 +193,33 @@ def test_windows_test_job_runs_the_whole_suite_and_fails_on_failure():
         assert "|| true" not in step["run"] and "--deselect" not in step["run"]
 
 
-def test_windows_test_job_installs_like_the_linux_test_job():
-    def install_run(job):
-        return next(s["run"] for s in job["steps"] if s.get("name") == "Install test dependencies")
-    jobs = _load("validate.yml")["jobs"]
-    assert install_run(_windows_test_job()) == install_run(jobs["validate"])
+# The jobs that run the suite: the matrix, Windows, and aegis-check, whose `check --ci` reruns the
+# head commit's trailer snapshot and must be able to collect what the others collect (R-trust-a3).
+TEST_JOBS = ("validate", "test-windows", "aegis-check")
+INSTALL_STEP = "Install test dependencies"
+
+
+def _install_step(job):
+    return next((s for s in job.get("steps", []) if s.get("name") == INSTALL_STEP), None)
+
+
+def _divergent_installs(jobs):
+    """Test jobs whose install step is missing or differs from the validate job's text."""
+    want = (_install_step(jobs["validate"]) or {}).get("run")
+    return [name for name in TEST_JOBS if want is None or (_install_step(jobs[name]) or {}).get("run") != want]
+
+
+def test_the_test_jobs_install_identical_test_dependencies():
+    assert _divergent_installs(_load("validate.yml")["jobs"]) == []
     assert "build-wheel" in str(_windows_test_job().get("needs"))
+
+
+def test_a_package_dropped_from_one_install_copy_fails_the_comparison():
+    jobs = _load("validate.yml")["jobs"]
+    step = _install_step(jobs["aegis-check"])
+    assert step is not None and " hypothesis==" in step["run"]
+    step["run"] = step["run"].replace(" hypothesis==6.126.0", "")
+    assert _divergent_installs(jobs) == ["aegis-check"]
 
 
 def test_windows_test_job_isolates_home_and_userprofile():
