@@ -123,14 +123,49 @@ def _scan(ws: Path) -> Dict:
 
 # ── (a) and (b): git spawns per scan ────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="7 git spawns outside git today; R-structure-4 brings it to 1")
 def test_a_scan_outside_git_starts_one_git_process(plain_ws, monkeypatch):
     _scan(plain_ws)
     assert len(_count(monkeypatch, lambda: _scan(plain_ws)).git()) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="15 git spawns (one ls-tree) on a warm scan in git with an origin today (19 without; "
-                   "M4 measured 17 on its fixture); R-structure-4/8")
+def _mcp_scan(ws: Path, session: str = "s1") -> Dict:
+    from aegis_mcp.handlers.core import handle_scan
+
+    result = handle_scan({"workspace": str(ws), "files": ["src/foo.py"], "_session": session, "_host": "claude-code"})
+    assert result.get("status") != "FAIL" and result["relevant_rules"], result
+    return result
+
+
+def test_an_mcp_scan_with_a_session_outside_git_starts_one_git_process(plain_ws, monkeypatch):
+    _mcp_scan(plain_ws)
+    assert len(_count(monkeypatch, lambda: _mcp_scan(plain_ws)).git()) == 1
+
+
+_OBJECT_READS = {"ls-tree", "cat-file", "rev-list", "merge-base"}
+
+
+@pytest.mark.parametrize("how", ["core", "mcp"])
+def test_a_warm_scan_asks_no_object_question_it_already_answered(git_ws, monkeypatch, how):
+    run = (lambda: _scan(git_ws)) if how == "core" else (lambda: _mcp_scan(git_ws))
+    run()
+    spawned = _count(monkeypatch, run).git()
+    assert len(spawned) <= 4, spawned
+    assert not [argv for argv in spawned if _OBJECT_READS & set(argv)], spawned
+
+
+def test_a_commit_between_two_scans_serves_the_new_base(git_ws, monkeypatch):
+    first = _scan(git_ws)
+    rule = git_ws / ".aegis" / "rules" / "traps" / "perf-rule-0.md"
+    rule.write_text(rule.read_text(encoding="utf-8").replace("Guidance", "Reviewed again"), encoding="utf-8")
+    _git(git_ws, "commit", "-qam", "reword a rule")
+    _git(git_ws, "update-ref", "refs/remotes/origin/main", "HEAD")
+    second = _scan(git_ws)
+    assert second["rules_base"]["commit"] != first["rules_base"]["commit"]
+    assert second["rules_base"]["commit"] == subprocess.run(
+        ["git", "-C", str(git_ws), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    assert "unreviewed_rules" not in second
+
+
 def test_a_warm_scan_in_git_starts_at_most_four_and_no_tree_reads(git_ws, monkeypatch):
     _scan(git_ws)
     spawned = _count(monkeypatch, lambda: _scan(git_ws)).git()

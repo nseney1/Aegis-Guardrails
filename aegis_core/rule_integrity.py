@@ -6,7 +6,7 @@ import hashlib
 import os
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe, governance
+from aegis_core import gitevidence, gitsafe, governance
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
@@ -80,27 +80,37 @@ def _user_base_ref(root: str) -> Optional[str]:
     return None
 
 
+def _origin_merge_base(root: str) -> str:
+    # Constant refs need no option guard, and one merge-base resolves both: a failure (no
+    # origin/HEAD, no common history, not a repository) means no origin anchor.
+    try:
+        res = gitsafe.run(["merge-base", "refs/remotes/origin/HEAD", "HEAD"], root)
+    except gitsafe.GitError:
+        return ""
+    return os.fsdecode(res.stdout.strip()) if res.returncode == 0 else ""
+
+
 def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
     root = workspace_root(workspace)
+    # Inside a request (a scan) every reader shares one set of repository facts and the merge base
+    # is kept by object id across requests; a lone call asks git only the question it needs.
+    shared = gitsafe.in_memo()
+    facts = gitevidence.repo_facts(root) if shared else None
+    if shared and facts is None:
+        return None
     ref = _user_base_ref(root)
     if ref:
         tip = gitsafe.resolve_commit(root, ref)
         if tip:
             # The fork point, as check --ci and the origin/HEAD anchor compare: a rule the ref changed
             # after the branch forked is not an edit of this branch.
-            fork = gitsafe.merge_base(root, tip, "HEAD")
+            fork = gitevidence.merge_base_with(facts, tip) if shared else gitsafe.merge_base(root, tip, "HEAD")
             note = "" if fork else "; no common history with HEAD, using its tip"
             return BaseAnchor(ref, fork or tip, "user-config", True, f"rules.base_ref {ref} (user config{note})")
-    # Constant refs need no option guard, and one merge-base resolves both: a failure (no
-    # origin/HEAD, no common history, not a repository) means no origin anchor.
-    try:
-        res = gitsafe.run(["merge-base", "refs/remotes/origin/HEAD", "HEAD"], root)
-    except gitsafe.GitError:
-        res = None
-    reviewed = os.fsdecode(res.stdout.strip()) if res is not None and res.returncode == 0 else ""
+    reviewed = gitevidence.merge_base_with(facts) if shared else _origin_merge_base(root)
     if reviewed:
         return BaseAnchor("origin/HEAD", reviewed, "origin-head", True, "merge-base of HEAD and origin/HEAD")
-    head = gitsafe.head_commit(root)
+    head = facts.head if facts is not None else gitsafe.head_commit(root)
     if head:
         return BaseAnchor("HEAD", head, "local-head", False, LOCAL_HEAD_LABEL)
     return None

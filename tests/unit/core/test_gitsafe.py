@@ -984,3 +984,80 @@ def test_a_snapshot_rerun_of_a_leading_dash_revision_fails_without_reaching_git(
     git_calls.clear()
     assert checkrun.rerun_commit_snapshot(repo, "--output=x", "main") == {"tree": "", "exit": 1}
     assert not any("--output=x" in arg for call in git_calls for arg in call)
+
+
+# ── one request's repository facts: memo and layout (R-structure-4) ─────────
+
+def test_a_memo_scope_asks_git_once_for_the_top_level_and_the_common_dir(repo: Path, git_calls):
+    (repo / "sub").mkdir()
+    git_calls.clear()
+    with gitsafe.memo():
+        for _ in range(3):
+            assert gitsafe.toplevel(repo / "sub") == repo.resolve()
+            assert gitsafe.common_dir(repo / "sub") == repo / "sub" / ".." / ".git"
+            assert gitsafe.toplevel(str(repo / "sub")) == repo.resolve()
+    assert len(git_calls) == 1, git_calls
+    git_calls.clear()
+    assert gitsafe.toplevel(repo / "sub") == repo.resolve()
+    assert gitsafe.common_dir(repo / "sub") == repo / "sub" / ".." / ".git"
+    assert len(git_calls) == 2  # outside a scope every question is asked
+
+
+def test_a_nested_memo_shares_the_outer_one_and_every_exit_path_clears_it(repo: Path, git_calls):
+    git_calls.clear()
+    with gitsafe.memo():
+        gitsafe.toplevel(repo)
+        with gitsafe.memo():
+            gitsafe.toplevel(repo)
+        gitsafe.toplevel(repo)  # the inner exit did not clear the outer scope
+    assert len(git_calls) == 1
+    with pytest.raises(RuntimeError):
+        with gitsafe.memo():
+            gitsafe.toplevel(repo)
+            raise RuntimeError("the body fails")
+    with gitsafe.memo():
+        gitsafe.toplevel(repo)
+    assert len(git_calls) == 3
+
+
+def test_memoized_answers_none_once_and_computes_every_time_outside_a_scope():
+    produced = []
+    with gitsafe.memo():
+        assert [gitsafe.memoized(("k",), lambda: produced.append(1)) for _ in range(3)] == [None, None, None]
+    assert produced == [1]
+    gitsafe.memoized(("k",), lambda: produced.append(2))
+    gitsafe.memoized(("k",), lambda: produced.append(3))
+    assert produced == [1, 2, 3]
+
+
+def test_layout_names_the_common_dir_prefix_shallowness_and_top_level(repo: Path, tmp_path: Path):
+    (repo / "sub").mkdir()
+    assert gitsafe.layout(repo) == gitsafe.Layout(".git", "", False, str(repo.resolve()))
+    assert gitsafe.layout(repo / "sub") == gitsafe.Layout("../.git", "sub/", False, str(repo.resolve()))
+    inside = gitsafe.layout(repo / ".git")  # git places it, but no work tree contains it
+    assert inside is not None and inside.top is None and inside.common_dir == "."
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if gitsafe.toplevel(plain) is None:  # not inside some enclosing repository
+        assert gitsafe.layout(plain) is None
+
+
+def test_a_bare_repository_has_a_common_dir_and_no_top_level(repo: Path, tmp_path: Path):
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(repo), str(bare))
+    assert gitsafe.toplevel(bare) is None
+    assert gitsafe.common_dir(bare) == Path(os.path.abspath(bare)) / "."
+    assert gitsafe.layout(bare).shallow is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids a newline in a path")
+def test_a_workspace_path_with_a_newline_keeps_the_answers_of_the_single_calls(repo: Path, git_calls):
+    odd = repo / "line\nbreak"
+    odd.mkdir()
+    git_calls.clear()
+    with gitsafe.memo():
+        assert gitsafe.toplevel(odd) == repo.resolve()
+        assert gitsafe.common_dir(odd) == odd / ".." / ".git"
+        assert gitsafe.layout(odd).prefix == "line\nbreak/"
+    assert len(git_calls) >= 2  # the combined answer cannot be split by line, so it is asked again
+

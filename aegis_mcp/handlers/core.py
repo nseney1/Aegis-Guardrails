@@ -112,6 +112,14 @@ def _scan_user_layer(args: dict) -> dict:
 
 def handle_scan(args: dict) -> dict:
     """Express the JIT rules for the given files (or the git diff when none are given)."""
+    from aegis_core import gitsafe
+
+    # Its own scope: recording the scan and its exposures asks where the ledger is after scan() returns.
+    with gitsafe.memo():
+        return _handle_scan(args)
+
+
+def _handle_scan(args: dict) -> dict:
     if args.get("_unbound"):
         return _scan_user_layer(args)
     try:
