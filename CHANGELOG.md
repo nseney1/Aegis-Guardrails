@@ -27,6 +27,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - **Tier detection can no longer be satisfied by settings an agent controls.** Tier B requires each required check's source pinned to an app (`aegis doctor --github` pins GitHub Actions), and Tier A reports an unpinned source as a caveat; Tier A requires `dismiss_stale_reviews_on_push`; the required check must be the Aegis job (read from the base branch's workflows) with no path filter and no condition that could skip it or let it pass without running `check --ci`; a bare `@org` CODEOWNERS owner does not count for an organization-owned repository. `ssh-keygen` is found only outside the repository.
 - **`forbid_ast` rules can no longer be emptied by their own predicates.** The `where` grammar is four forms validated at load; a rule using a removed operator, an empty `where`, `unknown` or `call` fails closed at load instead of passing every file.
 - **Scanner fences.** Scanner presets and a bare `perf.command` program are found only outside the workspace; a repository `.gitleaks.toml` makes the gitleaks preset `unverified` instead of configuring it; SARIF is read only inside the workspace; a malformed SARIF file or a scan that did not demonstrably complete is `unverified`; the secret scanner no longer skips lines over 4,096 characters, finds Tier A tokens after a data-URL prefix and after `_`, `-`, `/` or `+`, and masks the secret-shaped values on a finding's line (a URL password that starts with a placeholder word such as `test` stays visible).
+- **Credit and release evidence no longer rest on state the agent writes.** A Layer-1-only `aegis check --record` row earns no `witness: aegis` credit or `exit=0` trailer; credit's approval lookup accepts a ledger row's base only when it is a full commit id on the protected branch's history; credit no longer falls back to `gh attestation verify` with ledger- and local-derived pins; `aegis doctor --release` pins the source ref to the default branch GitHub reports (failing closed with `default_branch_unknown` or `source_ref_mismatch`) and, at Tier A, reports `not_approved` unless the merged pull request was approved on its head by someone other than its author.
+- **Local `aegis check` enforces the reviewed rules.** Plain `aegis check` and the pre-commit hook enforce the base version of `forbid_ast` rules: a branch can no longer weaken or delete a gate locally, a gate new on the branch blocks only once it reaches the base, and a malformed new gate still fails closed. In CI, where `origin/HEAD` is not set, the base is the checked-out commit.
 
 ### Changed behaviour
 
@@ -60,6 +62,13 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `Aegis-Exempt-Test` trailers must name the full commit id (short prefixes stop verifying); the signed reason no longer has to repeat the no-test reason word for word; a rejected exemption names its verdict in the `check --ci` report, and only when its `Aegis-Exempt-Test` line names that fix (an unrelated `Aegis-Accept:` line no longer shows up as a rejected exemption).
 - `--perf` benchmarks the merge-base through an export instead of `git worktree add`, and a base that does not resolve is `unverified`.
 - A bare mention of a PEM header no longer gates; key material is required. Placeholder suppression matches whole words.
+- `aegis check --ci` reruns only the head commit's `Aegis-Check` trailer, with the same recipe and 1,800 s timeout as `aegis check --record --tests`; a timeout or git failure is `unbound`, never a failed job.
+- Credit is voided when `aegis check --lane`'s integrity gate fails (`lane_integrity`) and when its landing commit is reverted (`reverted`); a later CI success still supersedes a CI-failure void.
+- New user-scope key `ci.workflow` names the workflow whose runs confirm credit (default `validate.yml`, so a repository that used `aegis init --ci` with `aegis.yml` can now confirm credit); `aegis doctor` and `doctor --github` print it and warn when it is missing at HEAD, and `aegis init --ci` says how to set it.
+- `aegis doctor --release` makes one more read-only `gh api` GET (the repository's default branch) and, at Tier A, two GETs of the merged pull request and its reviews; git failures become a `git_failed` JSON report, and every doctor report shows the trust tier or why it is unknown.
+- A bare `pytest` or an absolute interpreter in `tests.command` runs hermetically under the documented flags (the interpreter's own site dirs, not the user site); `aegis check --record --tests` prints a hint when that interpreter has no pytest. On Windows the test-run group is killed with `%SystemRoot%\System32\taskkill.exe`; descendants left after a normal exit are not swept.
+- The insight hook writes a text-free heartbeat with a cue flag on every prompt that carries a session id, plus one inventory row per rule-set change; a prompt without a session id writes nothing. It no longer runs a submodule's clean filter for dirty paths, and deleted or merely touched files are not dirty. `aegis rule insight add --paths a,b` no longer splits on commas.
+- `check_test_coverage` applies Aegis's own test-name map only to `aegis_*` and `soma_*` packages, so other repositories now see the "Missing test file" warnings it used to hide.
 
 ### Fixed
 
@@ -74,6 +83,9 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - When an approved change is blocked by a failing regression or trailer check, the `check --ci` headline names that check instead of "without approval".
 - `builtin: true` shadowing follows Python scoping, and a call site with no argument information makes `where` unknown instead of a match or a pass.
 - `gitsafe.merge_base` resolves a full commit id once instead of twice, and `checkrun`'s snapshot rerun validates its revision first.
+- A scan's `unreviewed_rules` list fits the token budget (`unreviewed_total` gives the true count; long ids are clipped to 80 characters); a scan that matches no rule reads no ledger; reading the reviewed base takes two git calls and parsed base rules are cached; a CRLF checkout of LF rule files takes the fast path.
+- Insight paths that resolve outside the workspace are refused on the CLI, the MCP tool and the core API alike; captures parse only the log rows they need.
+- `find_approval` reads commit messages in one batch instead of about four git calls per commit.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -87,9 +99,11 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Breaking: `aegis_core.human_gate.workflow_contexts` is removed in favour of `aegis_check_jobs`; `human_gate.verify_test_exemption` and `find_test_exemption` lose their `expected_reason` argument.
 - Breaking: `aegis_core.fitness.decay_factor` is removed and `fitness.compute` loses `half_life_days`.
 - Breaking: `aegis_core.verification.scanners.ingest_sarif` takes a parsed document and drops `base_sarif` and `diff_text`; `build_preset_argv` and `run_preset_scanner` drop `config_path`.
+- Breaking: `aegis_core.release_verify.verify_release` loses `environ`, `workflow` and `expected_run`; `aegis_core.credit.project_credits` loses `attestation_runner`; `aegis_core.credit.check_ci_divergence` takes a parsed trailer only.
 
 ### Corrections
 
+- The 4.3.0 entry's `< 40ms` insight-hook latency was never measured: the capture hook takes about 66 ms per prompt at 58 rules (a bare interpreter starts in about 9 ms).
 - The 4.3.0 entry's "4 KB line chunking" for the secret scanner never existed: the scanner skipped lines over 4,096 characters until 4.3.4.
 
 ## [4.3.3] - 2026-10-17
