@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 
 import pytest
 
@@ -29,6 +31,11 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GIT_CONFIG_GLOBAL"):
         monkeypatch.delenv(name, raising=False)
+
+
+def _writable_retry(func, path, _exc_info) -> None:
+    os.chmod(path, stat.S_IWRITE)  # git writes object files read-only; Windows will not delete those
+    func(path)
 
 
 def _run(repo: hs.Repo, gh: hs.FakeGh, capsys) -> tuple:
@@ -90,7 +97,7 @@ def test_a_failed_precondition_refuses_before_anything_moves(tmp_path, capsys, s
     elif shape == "not-git":  # no BASE for labels: 25 tp outcome rows make the promotion
         from aegis_core.telemetry_engine import ledger
 
-        shutil.rmtree(repo.root / ".git")
+        shutil.rmtree(repo.root / ".git", onerror=_writable_retry)
         ledger.append(repo.root, [{"rule": repo.rule, "outcome": "tp", "source": "ci", "key": f"k{n}"} for n in range(25)])
     before = repo.state() if shape != "not-git" else None
     gh = hs.FakeGh(repo.origin)
