@@ -271,3 +271,28 @@ def test_an_archive_in_the_pr_leaves_no_local_audit_row_for_a_move_made_only_on_
     assert "D\t.aegis/rules/traps/trap-noisy.md" in changed
     after = repo.state()
     assert after.pop("branches") != before.pop("branches") and after == before  # lifecycle.jsonl included
+
+
+def test_a_push_that_times_out_after_the_remote_took_it_names_the_branch_the_remote_may_hold(
+        tmp_path, capsys, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = hs.make(tmp_path)
+    real = gitsafe.run
+
+    def acknowledgement_lost(args, cwd, **kwargs):
+        res = real(args, cwd, **kwargs)
+        if list(args[:1]) == ["push"]:
+            raise gitsafe.GitError("git push timed out after 60s")
+        return res
+
+    monkeypatch.setattr(gitsafe, "run", acknowledgement_lost)
+    before = repo.state()
+    gh = hs.FakeGh(repo.origin)
+
+    rc, payload = _run(repo, gh, capsys)
+
+    pushed = [b for b in repo.origin_branches() if b != "main"]
+    assert rc == EXIT_PROBLEMS and payload["pr"]["status"] == "failed" and gh.calls == [] and len(pushed) == 1
+    assert "timed out" in payload["pr"]["error"] and f"may already hold the branch {pushed[0]}" in payload["pr"]["error"]
+    assert repo.state() == before

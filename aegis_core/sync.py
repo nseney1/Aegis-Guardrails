@@ -312,9 +312,12 @@ def _git(top: str, args: List[str], **kwargs: Any) -> str:
 
     res = gitsafe.run(args, top, **kwargs)
     if res.returncode != 0:
-        detail = " ".join((res.stderr or res.stdout).decode("utf-8", "replace").split())[:300]
-        raise gitsafe.GitError(f"git {args[0]} failed: {detail}")
+        raise gitsafe.GitError(f"git {args[0]} failed: {_detail(res)}")
     return os.fsdecode(res.stdout.strip())
+
+
+def _detail(res: Any) -> str:
+    return " ".join((res.stderr or res.stdout).decode("utf-8", "replace").split())[:300]
 
 
 def _files(root: Path) -> Dict[str, bytes]:
@@ -470,11 +473,16 @@ def _open_pr(plan: Dict[str, Any], branch: str, commit: str, title: str, body: s
     top, remote = plan["top"], plan["remote"]
     try:
         # --no-signed: push.gpgSign would run the signing program gpg.format and gpg.*.program choose.
-        _git(top, ["push", "--porcelain", "--no-verify", "--no-signed", remote, f"refs/heads/{branch}:refs/heads/{branch}"],
-             timeout=_PUSH_TIMEOUT, _hardening=_PUSH_HARDENING)
-    except gitsafe.GitError as exc:
+        res = gitsafe.run(["push", "--porcelain", "--no-verify", "--no-signed", remote,
+                           f"refs/heads/{branch}:refs/heads/{branch}"], top, timeout=_PUSH_TIMEOUT, _hardening=_PUSH_HARDENING)
+    except gitsafe.GitError as exc:  # git never answered: the remote may have taken the branch before that
+        error: Optional[str] = (f"push to {remote} did not finish ({exc}); {remote} may already hold the branch {branch}: "
+                                "check it there before running sync --pr again")
+    else:
+        error = None if res.returncode == 0 else f"push to {remote} failed: git push failed: {_detail(res)}"
+    if error:
         gitsafe.run(["update-ref", "-d", f"refs/heads/{branch}", commit], top)
-        return dict(info, status="failed", branch=None, error=f"push to {remote} failed: {exc}")
+        return dict(info, status="failed", branch=None, error=error)
     res = gh_runner(["pr", "create", "--head", branch, "--base", plan["protected"], "--title", title, "--body", body],
                     cwd=cwd)
     rc = getattr(res, "returncode", 0)
