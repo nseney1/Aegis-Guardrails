@@ -98,6 +98,8 @@ aegis_core = ["ast/drivers/templates/*", "benchmark_corpus/corpus.json"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 addopts = "--import-mode=importlib"
+# Dumps every thread's stack when a test hangs this long; it does not abort the run.
+faulthandler_timeout = 300
 # pytest < 9 silently skips an async test when no async plugin is installed;
 # make that an error so a missing plugin can't hide tests on CI again.
 # Matched by message: pytest 9 removed the warning class (it fails instead).

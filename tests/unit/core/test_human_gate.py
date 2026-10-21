@@ -874,6 +874,8 @@ _NOT_DIRECT = "does not run aegis check --ci as the whole of a step's run:"
     ("", "      - run: |\n          aegis check --ci\n        if: false\n", "", _STEP_CONDITION.format("false")),
     ("", "      - run: aegis check --ci\n        continue-on-error: true\n", "", "runs aegis check --ci in a step that sets continue-on-error"),
     ("", "      - run: aegis check --ci || true\n", "", _NOT_DIRECT),
+    ("", "      - run: python3 -I -m aegis_cli.cli check --ci || true\n", "", _NOT_DIRECT),
+    ("", "      - run: python3 -X dev -m aegis_cli.cli check --ci\n", "", _NOT_DIRECT),
     ("", "      - run: aegis check --ci || :\n", "", _NOT_DIRECT),
     ("", "      - run: aegis check --ci || exit 0\n", "", _NOT_DIRECT),
     ("", "      - run: aegis check --ci; true\n", "", _NOT_DIRECT),
@@ -891,7 +893,7 @@ _NOT_DIRECT = "does not run aegis check --ci as the whole of a step's run:"
     ("", None, "defaults: {run: {shell: cat {0}}}\n", "runs aegis check --ci under a custom shell ({run: {shell: cat {0}}})"),
 ], ids=["if-push", "if-draft", "if-title", "if-always-and", "if-folded", "if-quoted-key", "needs", "job-continue",
         "job-continue-expr", "merge-key", "name-quoted-key", "step-if", "step-if-after-run", "step-if-after-block", "step-continue",
-        "or-true", "or-colon", "or-exit", "semi-true", "semi-exit", "pipe", "echo", "printf", "comment", "quoted",
+        "or-true", "isolated-or-true", "other-flag", "or-colon", "or-exit", "semi-true", "semi-exit", "pipe", "echo", "printf", "comment", "quoted",
         "set-e-off", "heredoc", "folded", "step-shell", "default-shell", "inline-default-shell"])
 def test_an_aegis_job_that_can_be_skipped_or_cannot_fail_is_not_the_required_check(tmp_path, job_keys, step, top, why):
     """Given a base-branch Aegis job, required by name, that a condition can skip or whose aegis step
@@ -913,8 +915,9 @@ def test_an_aegis_job_that_can_be_skipped_or_cannot_fail_is_not_the_required_che
      "      - name: Gate\n        if: always()\n        continue-on-error: false\n        run: aegis check --ci  # the gate\n"),
     ("", "      - run: |\n          aegis check --ci --base main\n"),
     ("", "      - run: python3 -m aegis_cli.cli check --ci\n        shell: bash\n"),
+    ("", "      - run: python3 -I -m aegis_cli.cli check --ci\n"),
     ("", "      - run: echo aegis check --ci\n      - run: aegis check --ci\n"),
-], ids=["plain", "if-always", "needs-always-expr", "needs-always-tight", "continue-false", "block", "module-bash",
+], ids=["plain", "if-always", "needs-always-expr", "needs-always-tight", "continue-false", "block", "module-bash", "module-isolated",
         "decoy-then-real"])
 def test_an_unconditional_aegis_job_that_can_fail_is_the_required_check(tmp_path, job_keys, step):
     workflow = _gate_workflow(job_keys, step)
