@@ -642,7 +642,7 @@ def test_a_ledger_base_off_the_protected_branch_cannot_choose_the_signers(tmp_pa
     repo.git("checkout", "-q", "work")
     case.approve(case.agent, base=evil)
     landed = case.land()
-    forged = case.forge("forged", base=evil)
+    forged = case.forge("forged", base=evil, tests={"exit": 0, "passed": 3, "failed": 0})
     assert case.lookup(forged) is False
     stamp = "2026-10-20T00:00:00Z"
     ledger.append_rows(repo.root, [
@@ -848,11 +848,39 @@ def test_a_run_that_collected_no_tests_is_never_a_passing_check():
     assert credit.passing_check(rows, SHA) is None
 
 
+@pytest.mark.parametrize("tests_field", [
+    None, {}, "passed", {"exit": 1, "passed": 2, "failed": 1}, {"exit": 0, "passed": 0}, {"exit": 0, "passed": 3,
+                                                                                          "timed_out": True},
+], ids=["layer1-only", "empty", "not-a-mapping", "failing", "nothing-passed", "timed-out"])
+def test_a_check_row_without_a_passing_tests_run_earns_no_credit(tests_field):
+    """Given a 4.3.x Layer-1-only (or untested) check row, a report naming it and a verified CI
+    success, When credit is derived, Then nothing counts: such rows no longer credit (W4.5.1)."""
+    check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", "passed": True, "tests": tests_field}
+    if tests_field is None:
+        del check["tests"]
+    rows = [check, {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"},
+            {"event": "ci", "commit": "c" * 40, "ci_conclusion": "success"}]
+    credits = credit.derive(rows, landed=lambda tree: "c" * 40, verified_ci={"c" * 40: "success"})
+    assert [(c.counts, c.reason) for c in credits] == [(False, "no_tests")]
+    assert credit.confirmed_outcome_rows(credits) == []
+
+
+def test_a_check_row_with_a_passing_tests_run_still_confirms():
+    check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", "passed": True,
+             "tests": {"exit": 0, "passed": 3, "failed": 0}}
+    rows = [check, {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"},
+            {"event": "ci", "commit": "c" * 40, "ci_conclusion": "success"}]
+    credits = credit.derive(rows, landed=lambda tree: "c" * 40, verified_ci={"c" * 40: "success"})
+    assert [(c.state, c.counts, c.result) for c in credits] == [("confirmed", True, "tp")]
+
+
 # ── derivation edges ─────────────────────────────────────────────────────────
+
+TESTED = {"exit": 0, "passed": 3, "failed": 0}
 
 def test_derive_is_pure_and_needs_a_report_to_name_a_rule():
     check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", "passed": True, "cmd_digest": "d",
-             "env_class": "e"}
+             "env_class": "e", "tests": TESTED}
     report = {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"}
     ci = {"event": "ci", "commit": "c" * 40, "ci_conclusion": "success"}
     rows = [check, report, report, ci]
@@ -879,7 +907,7 @@ def test_derive_is_pure_and_needs_a_report_to_name_a_rule():
 def test_the_credit_sign_is_tp_only_for_a_tp_claim_on_a_passed_check(claimed, fields, expected):
     """Given a confirmed landing, When the report claims ``claimed`` for a check with ``fields``,
     Then the credit is ``tp`` only for a tp claim on a passed, complete check, else a trigger."""
-    check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", **fields}
+    check = {"event": "check", "id": "c1", "tree": SHA, "witness": "aegis", "tests": TESTED, **fields}
     report = {"event": "report", "check": "c1", "for_rule": "r", "ts": "t"}
     if claimed is not None:
         report["result"] = claimed

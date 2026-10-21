@@ -100,6 +100,17 @@ def _passed(check: Mapping[str, Any]) -> bool:
     return check.get("passed") is True and not check.get("partial")
 
 
+def _tested(check: Mapping[str, Any]) -> bool:
+    """Whether ``check`` holds a tests run that is evidence (TestsRun.evidence: exit 0 in time, a test
+    passed). A Layer-1-only row, 4.3.x included, says nothing about the tests and never credits."""
+    tests = check.get("tests")
+    if not isinstance(tests, dict):
+        return False
+    exit_code, passed = tests.get("exit"), tests.get("passed")
+    return (type(exit_code) is int and exit_code == 0 and not tests.get("timed_out")
+            and type(passed) is int and passed > 0)
+
+
 def _sign(claimed: Any, check: Mapping[str, Any]) -> str:
     """Spec T4: a report confirms a passed check as tp or withdraws to a trigger, never fp. The
     stored ``result`` stays the agent's claim (ReportConflict compares it); only the read is signed."""
@@ -654,7 +665,9 @@ def derive(
         is_flaky = (check.get("tree"), check.get("cmd_digest"), check.get("env_class")) in flaky
         categories = tuple(check.get("protected") or ())
         counts = state == "confirmed" and not is_flaky
-        if counts and check.get("protected_changed") and not (approved and approved(identity[0], categories)):
+        if counts and not _tested(check):
+            counts, reason = False, "no_tests"
+        elif counts and check.get("protected_changed") and not (approved and approved(identity[0], categories)):
             counts, reason = False, "protected_changed"
         elif is_flaky and not reason:
             reason = "flaky"
