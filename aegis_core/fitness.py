@@ -603,10 +603,15 @@ def _utc_stamp(iso: str) -> Optional[str]:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if moment.tzinfo else None
 
 
+# Raise whenever replay or forbid_ast evaluation semantics change: it is part of the digest stored with
+# replay.tip, so a tip recorded by another evaluator is never resumed from and history is walked again.
+REPLAY_FORMAT = 1
+
+
 def _rules_digest(rules: Sequence[Any]) -> str:
     entries = sorted([*_rule_key(r), str(getattr(r, "digest", "") or ""),
                       json.dumps(list(getattr(r, "target_paths", None) or ()), default=str)] for r in rules)
-    return hashlib.sha256(json.dumps(entries).encode("utf-8", "surrogatepass")).hexdigest()
+    return hashlib.sha256(json.dumps([REPLAY_FORMAT, entries]).encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _target_rev(root: Path, facts: Any, branch: str) -> Optional[str]:

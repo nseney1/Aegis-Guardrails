@@ -591,6 +591,19 @@ def test_e4_an_edited_rule_replays_everything(tmp_path: Path) -> None:
 
 
 @needs_git
+def test_a_tip_stored_under_another_replay_format_is_not_resumed_from(tmp_path: Path, monkeypatch) -> None:
+    """Given a complete replay stored by an evaluator of another format (F5, w6 review), When the same
+    history is replayed again, Then it walks everything instead of trusting the old tip."""
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    assert first.tip == repo.head()
+    monkeypatch.setattr(fitness, "REPLAY_FORMAT", getattr(fitness, "REPLAY_FORMAT", 1) + 1, raising=False)
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first), persist=False)
+    assert again.rules != first.rules
+    assert _units(again.detections) == _from_scratch(repo.root) != {}
+
+
+@needs_git
 @pytest.mark.parametrize("tip", ["not-hex", "0" * 40, None], ids=["non-hex", "unknown-oid", "missing"])
 def test_a_forged_or_missing_stored_tip_replays_everything(tmp_path: Path, tip) -> None:
     repo = _small_history(tmp_path)
