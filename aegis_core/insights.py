@@ -1125,9 +1125,10 @@ def _under(prefix: str, paths: Sequence[str]) -> bool:
 
 
 def _proposal_targets(members: Sequence[Sequence[str]], rows: Sequence[Mapping[str, Any]]) -> List[str]:
-    """At most 3 directory prefixes (a top-level file stands for itself) as ``<prefix>**``, scored
-    members-under x (ln((1+N)/(1+df)) + 1) over every insight row with paths; the best (ties:
-    deeper, then by name), then the best for the members still uncovered."""
+    """At most 3 directory prefixes as ``<prefix>**``, scored members-under x
+    (ln((1+N)/(1+df)) + 1) over every insight row with paths; the best (ties: deeper, then by
+    name), then the best for the members still uncovered. A top-level file is kept as its bare
+    name, which (a pattern without ``/``) matches every file of that name in any directory."""
     candidates: Set[str] = set()
     for path in {p for ps in members for p in ps}:
         parts = path.split("/")
