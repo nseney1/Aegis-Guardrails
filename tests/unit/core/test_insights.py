@@ -96,15 +96,16 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
     monkeypatch.setenv("USERPROFILE", str(home))
     repo = _make_repo(tmp_path / "repo")
 
+    seed = add_insight(repo, "Hung child processes stalled the nightly job", paths=["app.py"], kind="reliability",
+                       home=home)
     write_proposal(
         repo,
         proposal_id="trap-timeout-required",
-        rule_type="trap",
-        target_paths=["*.py"],
-        category="reliability",
+        insight_ids=[seed["id"]],
         summary_bullets=["Always pass an explicit timeout parameter to subprocess and network requests."],
         home=home,
     )
+    record_decision(repo, cluster_id="cluster-seed", decision="noise", insight_ids=[seed["id"]], home=home)
 
     ins1 = add_insight(
         repo,
@@ -564,8 +565,9 @@ def lint_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _propose(repo: Path, home: Path, bullet: str, pid: str = "trap-lint") -> Path:
-    return write_proposal(repo, proposal_id=pid, target_paths=["*.py"], category="correctness",
-                          summary_bullets=[bullet], home=home)
+    member = add_insight(repo, "Keep this member text apart from every bullet", paths=["app.py"], kind="correctness",
+                         home=home)
+    return write_proposal(repo, proposal_id=pid, insight_ids=[member["id"]], summary_bullets=[bullet], home=home)
 
 
 def _hook_prompt(repo: Path, home: Path, text: str, session: str = "s-lint") -> dict:
