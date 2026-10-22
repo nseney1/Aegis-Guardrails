@@ -212,7 +212,10 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
         lines.append("")
     cov = report_dict.get("coverage")
     if isinstance(cov, dict):
-        lines.append(f"### Diff Coverage: {'PASS' if cov.get('passed', True) else 'FAIL'} ({float(cov.get('coverage', 1.0)) * 100.0:.1f}%)")
+        ratio, measured = cov.get("ratio"), cov.get("status") == "reported"
+        figure = "n/a" if ratio is None else f"{float(ratio) * 100.0:.1f}%"
+        lines.append(f"### Diff Coverage (report only): {figure} of {cov.get('executable_lines', 0)} changed executable lines"
+                     if measured else f"### Diff Coverage: UNVERIFIED ({cov.get('reason', '')})")
         for path, ranges in sorted((cov.get("uncovered_ranges") or {}).items()):
             lines.append(f"- `{path}`: uncovered lines {', '.join(f'{s}-{e}' if s != e else str(s) for s, e in ranges)}")
         lines.append("")

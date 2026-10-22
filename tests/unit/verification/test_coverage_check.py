@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -11,12 +13,14 @@ from aegis_cli.formatters.report import (
     format_github_step_summary,
     format_sarif_report,
 )
-from aegis_core import events
-from aegis_core.verification.coverage_check import (
-    evaluate_diff_coverage,
-    parse_changed_lines,
-    run_diff_coverage,
-)
+from aegis_core import checkrun, events
+from aegis_core.verification import coverage_check
+from aegis_core.verification.coverage_check import parse_changed_lines, run_diff_coverage
+from tests import helpers_humangate as hg
+
+
+def hdr(path: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
 
 
 class TestDiffCoverage:
@@ -44,81 +48,232 @@ class TestDiffCoverage:
         changed = parse_changed_lines(diff_text)
         assert changed == {"aegis_core/foo.py": {11, 12, 13, 28}}
 
-    def test_evaluate_diff_coverage_pass_fail_and_zero_changed(self):
-        changed = {"aegis_core/foo.py": {10, 11, 12, 13, 20}}
-        # 4 of 5 covered = 80% -> passes at threshold 0.80
-        res_pass = evaluate_diff_coverage(
-            changed,
-            {"aegis_core/foo.py": {10, 11, 12, 13}},
-            threshold=0.80,
-        )
-        assert res_pass["passed"] is True
-        assert res_pass["coverage"] == pytest.approx(0.80)
-        assert res_pass["uncovered_ranges"]["aegis_core/foo.py"] == [(20, 20)]
+    # R-checks-32: every body line inside a hunk is content, whatever it starts with.
 
-        # 3 of 5 covered = 60% -> fails at threshold 0.80 with contiguous range [12, 13]
-        res_fail = evaluate_diff_coverage(
-            changed,
-            {"aegis_core/foo.py": {10, 11, 20}},
-            threshold=0.80,
-        )
-        assert res_fail["passed"] is False
-        assert res_fail["coverage"] == pytest.approx(0.60)
-        assert res_fail["uncovered_ranges"]["aegis_core/foo.py"] == [(12, 13)]
+    def test_an_added_line_starting_with_plus_plus_stays_in_its_file(self):
+        diff = hdr("a.py") + "@@ -0,0 +5,3 @@\n+a = 1\n+++ x\n+c = 3\n@@ -20,0 +22,1 @@\n+z = 9\n"
+        assert parse_changed_lines(diff) == {"a.py": {5, 6, 7, 22}}
 
-        # 0 executable changed lines -> passes with 1.0
-        res_empty = evaluate_diff_coverage({}, {}, threshold=0.80)
-        assert res_empty["passed"] is True
-        assert res_empty["coverage"] == pytest.approx(1.0)
+    def test_added_lines_that_look_like_headers_are_counted(self):
+        diff = hdr("a.py") + "@@ -0,0 +5,4 @@\n+a = 1\n+++x\n++++ b/x\n+d = 4"
+        assert parse_changed_lines(diff) == {"a.py": {5, 6, 7, 8}}
 
-    def test_run_diff_coverage_ignores_repo_root_coverage_json(self, tmp_path: Path):
-        # Create a poisoned repo-root coverage.json claiming 100% coverage
-        (tmp_path / "coverage.json").write_text(
-            json.dumps({
-                "files": {
-                    "aegis_core/foo.py": {
-                        "executed_lines": [1, 2, 3, 4, 5],
-                        "missing_lines": [],
-                    }
-                }
-            }),
-            encoding="utf-8",
-        )
+    def test_a_removed_line_starting_with_dash_dash_does_not_reset_the_hunk(self):
+        diff = hdr("a.py") + "@@ -5,1 +5,2 @@\n--- old\n+new1 = 1\n+new2 = 2"
+        assert parse_changed_lines(diff) == {"a.py": {5, 6}}
 
-        # Fake runner writes real coverage (0% covered) only into the state_dir json_path
-        def fake_runner(cmd, *, cwd=None, env=None, json_path=None):
-            assert env is not None
-            assert "COVERAGE_FILE" in env
-            assert ".aegis" in env["COVERAGE_FILE"]
-            if json_path:
-                Path(json_path).write_text(
-                    json.dumps({
-                        "files": {
-                            "aegis_core/foo.py": {
-                                "executed_lines": [1],
-                                "missing_lines": [2, 3, 4, 5],
-                            }
-                        }
-                    }),
-                    encoding="utf-8",
-                )
-            return 0
+    @pytest.mark.parametrize("separator", ["diff --git a/b.py b/b.py\n", ""], ids=["git-header", "bare"])
+    def test_a_lookalike_hunk_does_not_hide_the_next_files_headers(self, separator):
+        diff = (hdr("a.py") + "@@ -1,1 +1,2 @@\n-+++ b/evil.py\n++++ b/evil.py\n+--- a/z\n"
+                + separator + "--- a/b.py\n+++ b/b.py\n@@ -0,0 +1,1 @@\n+x = 1\n")
+        assert parse_changed_lines(diff) == {"a.py": {1, 2}, "b.py": {1}}
 
-        res = run_diff_coverage(
-            tmp_path,
-            base_ref="HEAD~1",
-            threshold=0.80,
-            runner=fake_runner,
-            diff_text=(
-                "--- a/aegis_core/foo.py\n"
-                "+++ b/aegis_core/foo.py\n"
-                "@@ -1,0 +1,5 @@\n"
-                "+a = 1\n+b = 2\n+c = 3\n+d = 4\n+e = 5\n"
-            ),
-        )
-        assert res["passed"] is False
-        assert res["coverage"] == pytest.approx(0.20)
-        assert res["uncovered_ranges"]["aegis_core/foo.py"] == [(2, 5)]
+    def test_countless_headers_deletions_and_no_newline_markers_keep_the_numbering(self):
+        diff = (hdr("a.py") + "@@ -3 +3 @@\n-a\n+b\n"
+                "@@ -5,2 +4,0 @@\n-gone1\n--- gone2\n"
+                "@@ -8,1 +7,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+                "@@ -10,0 +9,3 @@\n+a\x0cb\n+c\x1cd\n+e\n")
+        assert parse_changed_lines(diff) == {"a.py": {3, 7, 9, 10, 11}}
+
+
+
+# ── R-checks-33: coverage is a report, never a verdict ───────────────────────
+
+needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+
+
+@pytest.fixture
+def cov_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_STEP_SUMMARY",
+                 "GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    before = os.getcwd()
+    yield home
+    os.chdir(before)
+
+
+def cov_repo(tmp_path: Path) -> hg.Repo:
+    """``main``: pkg/a.py and pkg/b.py; ``work`` checked out, adding lines 3-7 to pkg/a.py (7 a comment)."""
+    repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
+    repo.write("pkg/__init__.py", "")
+    repo.write("pkg/a.py", "x = 1\ny = 2\n")
+    repo.write("pkg/b.py", "z = 1\n")
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE)
+    repo.commit("base")
+    repo.branch("work")
+    repo.write("pkg/a.py", "x = 1\ny = 2\nif x:\n    y = 3\nz = 4\nw = 5\n# a comment\n")
+    repo.commit("feat: more lines")
+    return repo
+
+
+A_REPORT = {"pkg/a.py": {"executed_lines": [1, 2, 3, 4], "missing_lines": [5, 6]}}
+
+
+def fake_coverage(monkeypatch: pytest.MonkeyPatch, files=None, *, run=None, json_text=None) -> list:
+    """Stand in for ``python -m coverage`` at the process boundary: ``json -o PATH`` writes the report
+    (``files``, or ``json_text`` verbatim, or nothing when both are None); ``run`` is the run's result."""
+    calls: list = []
+
+    def fake(argv, cwd=None, env=None, timeout=60):
+        calls.append({"argv": list(argv), "env": dict(env or {}), "cwd": str(cwd), "timeout": timeout})
+        if "json" in argv[3:4]:
+            target = Path(argv[argv.index("-o") + 1])
+            if json_text is not None:
+                target.write_bytes(json_text.encode("utf-8"))
+            elif files is not None:
+                target.write_bytes(json.dumps({"files": files}).encode("utf-8"))
+            return {"returncode": 0 if files is not None or json_text is not None else 1, "stdout": "",
+                    "stderr": "", "timed_out": False}
+        return run or {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(coverage_check, "run_external_cmd", fake)
+    return calls
+
+
+def user_command(home: Path, command) -> None:
+    (home / ".aegis").mkdir(parents=True, exist_ok=True)
+    (home / ".aegis" / "config.json").write_text(json.dumps({"v": 1, "tests": {"command": command}}), encoding="utf-8")
+
+
+@needs_git
+class TestReportOnlyCoverage:
+    def test_a_measured_run_reports_exact_counts_and_ranges_and_no_verdict(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert res == {"status": "reported", "reason": "", "covered_lines": 2, "executable_lines": 4, "ratio": 0.5,
+                       "uncovered_ranges": {"pkg/a.py": [[5, 6]]}, "unmeasured": []}
+        run, dump = (c["argv"] for c in calls)
+        assert run[:4] == [sys.executable, "-m", "coverage", "run"] and run[5:] == [
+            "-m", "pytest", "-p", "no:cacheprovider", "-o", "addopts="]
+        rcfile = run[4].partition("=")[2]
+        assert run[4].startswith("--rcfile=") and dump[4] == run[4]
+        state = (repo.root / ".aegis" / "state").resolve()
+        assert Path(rcfile).resolve().parent.parent == state
+        assert Path(calls[0]["env"]["COVERAGE_FILE"]).resolve().parent.parent == state
+        assert calls[0]["timeout"] == checkrun.DEFAULT_TIMEOUT_S
+        assert [p.name for p in state.iterdir()] == [".gitignore"], "the scratch directory is removed"
+
+    def test_a_missing_coverage_module_is_unverified_not_zero_percent(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        err = "Traceback (most recent call last):\n  ...\n/usr/bin/python3: No module named coverage\n"
+        fake_coverage(monkeypatch, None, run={"returncode": 1, "stdout": "", "stderr": err, "timed_out": False})
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert res["status"] == "unverified" and res["ratio"] is None
+        assert "No module named coverage" in res["reason"] and len(res["reason"]) <= 200
+
+    def test_a_timed_out_run_is_unverified(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        fake_coverage(monkeypatch, A_REPORT, run={"returncode": 124, "stdout": "", "stderr": "", "timed_out": True})
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["ratio"]) == ("unverified", None) and "timed out" in res["reason"]
+
+    def test_a_truncated_report_is_unverified_without_raising(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        fake_coverage(monkeypatch, json_text='{"files": {"pkg/a.py": {"executed_')
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["ratio"]) == ("unverified", None)
+
+    @pytest.mark.parametrize("base", ["no-such-ref", "--foo", "--output=x", "orphan"])
+    def test_a_base_git_cannot_diff_is_unverified_and_runs_nothing(self, tmp_path, cov_env, monkeypatch, base):
+        repo = cov_repo(tmp_path)
+        repo.git("checkout", "-q", "--orphan", "orphan")
+        repo.git("rm", "-rfq", ".")
+        repo.write("other.py", "o = 1\n")
+        repo.commit("unrelated")
+        repo.git("checkout", "-q", "work")
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, base, "HEAD")
+        assert res["status"] == "unverified" and res["reason"] == f"cannot diff {base}..HEAD"
+        assert calls == [] and not (repo.root / "x").exists()
+
+    def test_a_test_command_that_is_not_pytest_is_unverified(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        user_command(cov_env, "make test")
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["reason"], calls) == ("unverified", "tests.command is not pytest-based", [])
+
+    @pytest.mark.parametrize("command", ["pytest -x tests/unit", "python -m pytest -x tests/unit",
+                                         ["/opt/venv/bin/python3", "-m", "pytest", "-x", "tests/unit"]])
+    def test_the_user_scope_test_command_gives_the_pytest_arguments(self, tmp_path, cov_env, monkeypatch, command):
+        repo = cov_repo(tmp_path)
+        user_command(cov_env, command)
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        assert run_diff_coverage(repo.root, "main", "HEAD")["status"] == "reported"
+        assert calls[0]["argv"][5:] == ["-m", "pytest", "-x", "tests/unit", "-p", "no:cacheprovider", "-o", "addopts="]
+
+    def test_the_repositorys_coverage_json_and_coveragerc_are_never_read(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        repo.write("coverage.json", json.dumps({"files": {"pkg/a.py": {"executed_lines": [3, 4, 5, 6], "missing_lines": []}}}))
+        repo.write(".coveragerc", "[report]\nexclude_lines =\n    .*\n")
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["ratio"], res["covered_lines"]) == (0.5, 2)
+        rcfile = Path(calls[0]["argv"][4].partition("=")[2])
+        assert rcfile.name != ".coveragerc" and rcfile.parent.parent.name == "state"
+
+    def test_a_linked_state_directory_writes_nothing_outside_and_is_unverified(self, tmp_path, cov_env, monkeypatch):
+        from conftest import symlink_or_skip
+
+        repo = cov_repo(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        symlink_or_skip(outside, repo.root / ".aegis" / "state", target_is_directory=True)
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert res["status"] == "unverified" and calls == []
+        assert list(outside.iterdir()) == []
+
+    def test_a_module_the_tests_never_import_is_unmeasured_and_not_counted(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        repo.write("pkg/new.py", "n = 1\nm = 2\n")
+        repo.commit("feat: a module nobody imports")
+        fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["unmeasured"], res["executable_lines"], res["ratio"]) == (["pkg/new.py"], 4, 0.5)
+
+    def test_no_changed_python_line_is_reported_with_no_ratio_and_runs_nothing(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "HEAD", "HEAD")
+        assert (res["status"], res["ratio"], res["executable_lines"], calls) == ("reported", None, 0, [])
+
+    def test_only_the_branchs_own_changes_are_demanded(self, tmp_path, cov_env, monkeypatch):
+        """Forked history: main also changed pkg/b.py after the fork; the merge-base diff leaves it out."""
+        repo = cov_repo(tmp_path)
+        repo.git("checkout", "-q", "main")
+        repo.write("pkg/b.py", "z = 1\nq = 2\n")
+        repo.commit("main moves on")
+        repo.git("checkout", "-q", "work")
+        fake_coverage(monkeypatch, {**A_REPORT, "pkg/b.py": {"executed_lines": [], "missing_lines": [1, 2]}})
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["executable_lines"], list(res["uncovered_ranges"])) == (4, ["pkg/a.py"])
+
+    def test_a_removed_dash_dash_line_does_not_drop_the_lines_added_after_it(self, tmp_path, cov_env, monkeypatch):
+        """R-checks-32 at report level: the hunk is "--- old" plus five added lines; one of five ran."""
+        repo = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
+        repo.write("pkg/foo.py", "a\nb\nc\nd\n-- old\n")
+        repo.commit("base")
+        repo.branch("work")
+        repo.write("pkg/foo.py", "a\nb\nc\nd\nv = 1\nw = 2\nx = 3\ny = 4\nz = 5\n")
+        repo.commit("feat: replace the old line")
+        fake_coverage(monkeypatch, {"pkg/foo.py": {"executed_lines": [5], "missing_lines": [6, 7, 8, 9]}})
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["ratio"], res["uncovered_ranges"]) == (pytest.approx(0.20), {"pkg/foo.py": [[6, 9]]})
+
+    def test_checkrun_pytest_args(self):
+        assert checkrun.pytest_args(["pytest", "-x"]) == ["-x"]
+        assert checkrun.pytest_args(["py.test"]) == []
+        assert checkrun.pytest_args(["python3", "-m", "pytest", "-q"]) == ["-q"]
+        assert checkrun.pytest_args(["make", "test"]) is None
+        assert checkrun.pytest_args(["python", "-m", "unittest"]) is None
+        assert checkrun.pytest_args([]) is None
 
 
 class TestSarifAndGitHubFormatters:
@@ -273,6 +428,36 @@ class TestCheckCliIntegration:
         assert rc == 2
         err = capsys.readouterr().err
         assert "invalid choice: 'sarif' (only applies with --ci)" in err
+
+    @needs_git
+    def test_ci_coverage_is_reported_and_never_changes_the_exit_code(self, tmp_path, cov_env, capsys, monkeypatch):
+        """Given a failing ratio, then an unmeasurable run, When check --ci --coverage runs, Then both exit 0;
+        the first prints the figure and the second UNVERIFIED, in the text and in the step summary."""
+        from aegis_cli.cli import main
+
+        repo = cov_repo(tmp_path)
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        os.chdir(repo.root)
+        fake_coverage(monkeypatch, A_REPORT)
+        rc = main(["check", "--ci", "--coverage", "--base", "main"])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "  coverage (report only): 50.0% of 4 changed executable lines (0 file(s) not measured)" in out
+        text = summary.read_text(encoding="utf-8")
+        assert "### Diff Coverage (report only): 50.0% of 4 changed executable lines" in text and "PASS (" not in text
+        summary.unlink()
+
+        missing = {"returncode": 1, "stdout": "", "stderr": "python3: No module named coverage\n", "timed_out": False}
+        fake_coverage(monkeypatch, None, run=missing)
+        rc = main(["check", "--ci", "--coverage", "--base", "main"])
+        out = capsys.readouterr().out
+        assert rc == 0 and "  coverage: UNVERIFIED (python3: No module named coverage)" in out
+        assert "### Diff Coverage: UNVERIFIED (python3: No module named coverage)" in summary.read_text(encoding="utf-8")
+        rc = main(["check", "--ci", "--coverage", "--base", "main", "--format", "json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0 and payload["status"] == "pass"
+        assert payload["coverage"]["status"] == "unverified" and "passed" not in payload["coverage"]
 
     def test_ci_format_sarif_and_github_step_summary(self, tmp_path: Path, capsys, monkeypatch):
         import argparse

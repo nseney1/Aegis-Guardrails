@@ -40,8 +40,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
@@ -59,6 +60,7 @@ __all__ = [
     "parse_junit",
     "parse_junit_cases",
     "plan_command",
+    "pytest_args",
     "record",
     "rerun_commit_snapshot",
     "user_test_command",
@@ -156,6 +158,17 @@ def plan_command(logical: Optional[Sequence[str]], junit: Optional[Path] = None)
         if junit is not None:
             argv.append(f"--junitxml={junit}")
     return argv, words
+
+
+def pytest_args(words: Sequence[str]) -> Optional[List[str]]:
+    """The arguments a pytest-based command gives pytest (after ``-m pytest``, or after a first word
+    ``pytest``/``py.test``); None for any other command."""
+    first = os.path.basename(words[0].replace("\\", "/")) if words else ""
+    if _PYTEST_NAME.fullmatch(first):
+        return list(words[1:])
+    rest = list(words[1:])
+    at = rest.index("-m") if "-m" in rest else -1
+    return rest[at + 2:] if _PYTHON_NAME.fullmatch(first) and at >= 0 and rest[at + 1:at + 2] == ["pytest"] else None
 
 
 def command_digest(logical: Sequence[str]) -> str:
@@ -389,8 +402,8 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
                 return CheckOutcome("error", None, "the repository has no commit yet", binding)
             base_ref = base or gitsafe.resolve_base_ref(top)
             if not base_ref:
-                return CheckOutcome("error", None, "no base branch found (origin/main, main, origin/develop, "
-                                    "develop); pass --base", binding)
+                return CheckOutcome("error", None, "no base branch found (origin/$GITHUB_BASE_REF, the branch "
+                                    "origin/HEAD names, main, master or develop); pass --base", binding)
             base_commit = gitsafe.merge_base(top, base_ref, "HEAD")
             if not base_commit:
                 return CheckOutcome("error", None, f"HEAD shares no history with {base_ref}: fetch with "
@@ -495,10 +508,22 @@ def rerun_commit_snapshot(
 def verify_commit_trailers(
     root: object, base: str, head: str = "HEAD", *,
     rerun_fn: Optional[ Any ] = None, timeout: Optional[float] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Verify the ``Aegis-Check`` trailer of the head commit by rerunning its snapshot with the
-    ``record --tests`` recipe (``DEFAULT_TIMEOUT_S`` unless ``timeout`` is given)."""
+    ``record --tests`` recipe (``DEFAULT_TIMEOUT_S`` unless ``timeout`` is given). ``progress`` gets one
+    line before and one after each rerun (there are at most two)."""
     from aegis_core import credit
 
     runner = rerun_fn or (lambda c, _t: rerun_commit_snapshot(root, c, base, timeout=timeout))
-    return credit.verify_commit_trailers(root, base, head, rerun_fn=runner)
+    say, done = progress or (lambda _line: None), []  # type: Callable[[str], None], List[Mapping[str, Any]]
+
+    def reported(commit: str, tree: str) -> Mapping[str, Any]:
+        say(f"Aegis-Check rerun {len(done) + 1} of up to 2: tests.command on commit {commit[:10]} (the whole tree)")
+        started = time.monotonic()
+        done.append(runner(commit, tree))
+        say(f"Aegis-Check rerun {len(done)} of up to 2: {done[-1].get('reason') or 'exit %s' % done[-1].get('exit')} "
+            f"after {time.monotonic() - started:.1f}s")
+        return done[-1]
+
+    return credit.verify_commit_trailers(root, base, head, rerun_fn=reported)

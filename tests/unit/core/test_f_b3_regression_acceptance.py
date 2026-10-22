@@ -14,8 +14,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
      but is reported in the non-failing ``untested_changes`` report.
 2. Evidence: fail-to-pass on a temporary snapshot:
    - Overlaying the changed test files onto ``base`` source in a hermetic temporary directory and
-     running pytest requires at least one test nodeid that FAILS on ``base`` (assertion/test
-     failure, not collection syntax error) and PASSES on ``head``.
+     running pytest requires at least one test nodeid that FAILS on ``base`` (a test failure, or its
+     module failing collection there) and PASSES on ``head``.
    - A tautological ``assert True`` test passes on ``base`` and therefore fails T5
      (``reason="passed_on_base"``).
    - A ``fix:`` commit with no test file changes fails T5 (``reason="no_test_changes"``).
@@ -28,8 +28,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
 4. Rollout at warning tier in ``aegis check --ci``:
    - Default ``warning`` tier reports findings in ``regression`` in ``--format json`` and emits
      ``::warning`` annotations in ``--format github`` while exiting 0 when rules are intact.
-   - At ``gate`` tier (``--strict`` or user config ``regression.tier="gate"``), unapproved
-     regression failures exit 1 and emit ``::error`` annotations.
+   - No setting raises the tier in 4.4.0 (gate status is earned through T4): ``--ci --strict``
+     is a usage error (exit 2) and a user config ``regression.tier="gate"`` is ignored.
 """
 from __future__ import annotations
 
@@ -468,12 +468,12 @@ def test_targeted_test_exemption_exempts_only_named_fix_commit(
 
 
 @needs_git
-def test_performance_invariant_each_commit_tree_is_read_at_most_once(
+def test_performance_invariant_only_the_head_tree_is_read_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Performance invariant, not behaviour: the regression check reads each commit's tree once
-    however many fix commits share it. The verdict is the same either way, so only counting the
-    calls to the private tree reader can see a regression here."""
+    """Performance invariant, not behaviour: the PR-level check reads one tree, the head's, however
+    many fix commits there are. The verdict is the same either way, so only counting the calls to the
+    private tree reader can see a regression here."""
     repo = make_calc_repo(tmp_path)
     repo.write(
         "src/calc.py",
@@ -522,7 +522,7 @@ def test_performance_invariant_each_commit_tree_is_read_at_most_once(
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert call_counts and all(count == 1 for count in call_counts.values()), call_counts
+    assert call_counts == {report.head: 1}, call_counts
 
 
 # ── 4. Warning-tier rollout & `aegis check --ci` integration ─────────────────
@@ -558,20 +558,26 @@ def test_check_ci_starts_at_warning_tier_and_emits_warning_annotations_without_f
 
 
 @needs_git
-def test_check_ci_in_strict_or_gate_mode_fails_on_unapproved_regression(
+def test_check_ci_strict_is_refused_and_a_gate_config_stays_at_warning(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
     repo = make_calc_repo(tmp_path)
     repo.write("src/calc.py", "def add(a: int, b: int) -> int:\n    return a + b\n")
     repo.commit("fix: addition fix without test")
 
-    rc, out, _err = run_ci(repo, capsys, "--strict", "--format", "json")
-    assert rc == 1
+    rc, out, err = run_ci(repo, capsys, "--strict", "--format", "json")
+    assert rc == 2 and out == "" and "--strict" in err
+
+    user_cfg = tmp_path / "home" / ".aegis"
+    user_cfg.mkdir(parents=True, exist_ok=True)
+    (user_cfg / "config.json").write_text(json.dumps({"v": 1, "regression": {"tier": "gate"}}), encoding="utf-8")
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    assert rc == 0
     payload = json.loads(out)
-    assert payload["status"] == "fail"
-    assert payload["regression"]["tier"] == "gate"
+    assert payload["status"] == "pass"
+    assert payload["regression"]["tier"] == "warning"
     assert payload["regression"]["passed"] is False
-    assert payload["regression"]["blocking"] is True
+    assert payload["regression"]["blocking"] is False
 
 
 @needs_git
@@ -656,7 +662,7 @@ def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Pat
     )
     oid = repo.commit("fix: rename readme and fix addition operator")
 
-    meta = regression._commit_meta(str(repo.root), oid, "main")
+    (meta,) = regression._commits_meta(str(repo.root), "main", oid)
     assert "src/calc.py" in meta.changed_files
     assert "tests/test_calc.py" in meta.present_files
     assert "GUIDE.md" in meta.present_files

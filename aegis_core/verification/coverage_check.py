@@ -1,144 +1,146 @@
-"""Opt-in diff coverage verification over changed lines (v4.3 T9)."""
+"""Opt-in diff coverage over changed lines (v4.3 spec T9): a report, never a verdict.
+
+The figure is the share of the executable lines changed from merge-base(base, head) to head that the
+user-scope test command (``tests.command``, pytest-based only) executes under ``coverage``. Whatever keeps
+it from being measured is ``unverified`` with a reason, never 0% and never 100%, and it never changes the
+exit code. The tests run with the caller's environment on purpose (the project's dependencies need it):
+the figure is report-only, so forging it gains nothing. Scratch files live in a private directory under
+the confined state directory, and the repository's ``.coveragerc`` and ``coverage.json`` are never read.
+"""
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Callable, Optional
+import tempfile
+from typing import Any, Optional
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, storage
+from aegis_core.errors import PathTraversalError
 from aegis_core.verification.test_runner import run_external_cmd
-from aegis_core.workspace.layout import WorkspaceLayout as AegisLayout
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_GIT_TIMEOUT_S = 120.0
+_JSON_TIMEOUT_S = 60.0
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_ESCAPE_RE = re.compile(rb'\\([0-7]{3}|[abfnrtv"\\])')
+_ESCAPES = {b"a": b"\a", b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r", b"t": b"\t", b"v": b"\v", b'"': b'"', b"\\": b"\\"}
 
 
-def _to_ranges(lines: list[int]) -> list[tuple[int, int]]:
-    if not lines:
-        return []
-    ordered = sorted(set(lines))
-    ranges: list[tuple[int, int]] = []
-    start = prev = ordered[0]
-    for ln in ordered[1:]:
-        if ln == prev + 1:
-            prev = ln
-        else:
-            ranges.append((start, prev))
-            start = prev = ln
-    ranges.append((start, prev))
-    return ranges
+def _unquote_git_path(token: str) -> str:
+    """A header path git C-quoted (``"b/caf\\303\\251.py"``) as its name; an unquoted token is returned as
+    is, and an escape git never writes stays literal."""
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        return token
+    raw = _ESCAPE_RE.sub(lambda m: bytes([int(m[1], 8) & 0xFF]) if m[1][:1].isdigit() else _ESCAPES[m[1]],
+                         token[1:-1].encode("utf-8", "surrogateescape"))
+    try:
+        return os.fsdecode(raw)
+    except UnicodeError:
+        return raw.decode("utf-8", "replace")
+
+
+def _to_ranges(lines: Any) -> list[list[int]]:
+    runs = itertools.groupby(enumerate(sorted(set(lines))), lambda pair: pair[1] - pair[0])
+    return [[group[0][1], group[-1][1]] for group in (list(items) for _key, items in runs)]
 
 
 def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
-    """Parse unified diff (e.g. git diff-tree -p -U0) into {rel_path: set[int]}."""
+    """``{path: added line numbers}`` of a unified diff (``git diff-tree -p -U0``). Inside a hunk every
+    line is content, whatever it starts with; file headers are read only between hunks."""
     changed: dict[str, set[int]] = {}
     current_file: Optional[str] = None
-    cur_line: Optional[int] = None
-    for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
-            target = raw[4:].strip()
-            current_file = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target).replace("\\", "/")
-            cur_line = None
-        elif raw.startswith("--- ") or raw.startswith("diff --git "):
-            cur_line = None
-        elif (m := _HUNK_RE.match(raw)):
-            if current_file is None:
-                cur_line = None
-            else:
-                count = int(m.group(2)) if m.group(2) is not None else 1
-                cur_line = int(m.group(1)) if count > 0 else None
-        elif current_file is not None and cur_line is not None:
-            if raw.startswith("+") and not raw.startswith("+++"):
-                changed.setdefault(current_file, set()).add(cur_line)
-                cur_line += 1
+    cur_line, old_left, new_left = 0, 0, 0
+    for raw in diff_text.split("\n"):
+        hunk = _HUNK_RE.match(raw)
+        if raw.startswith("diff --git "):
+            current_file, old_left, new_left = None, 0, 0
+        elif hunk:  # a missing count is 1; a hunk with no file before it is skipped
+            old_left, cur_line, new_left = (1 if g is None else int(g) for g in hunk.groups())
+            old_left, new_left = (old_left, new_left) if current_file is not None else (0, 0)
+        elif old_left > 0 or new_left > 0:
+            if raw.startswith("+"):
+                changed.setdefault(current_file, set()).add(cur_line)  # type: ignore[arg-type]
+                cur_line, new_left = cur_line + 1, new_left - 1
+            elif raw.startswith("-"):
+                old_left -= 1
             elif raw.startswith(" "):
-                cur_line += 1
+                cur_line, old_left, new_left = cur_line + 1, old_left - 1, new_left - 1
+        elif raw.startswith("+++ "):
+            target = _unquote_git_path(raw[4:].strip())
+            current_file = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target).replace("\\", "/")
     return changed
 
 
-def evaluate_diff_coverage(
-    changed_lines: dict[str, set[int]],
-    executed_lines_by_file: dict[str, Any],
-    threshold: float = 0.80,
-    executable_lines_by_file: Optional[dict[str, set[int]]] = None,
-) -> dict[str, Any]:
-    """Evaluate fraction of executable changed lines covered against threshold."""
-    files_map = executed_lines_by_file
-    if "files" in files_map and isinstance(files_map["files"], dict) and "files" not in changed_lines:
-        files_map = files_map["files"]
-    norm_cov = {k.replace("\\", "/"): v for k, v in files_map.items()}
-    norm_exec = {k.replace("\\", "/"): set(v) for k, v in (executable_lines_by_file or {}).items()}
-    total_exec = 0
-    total_cov = 0
-    uncovered_by_file: dict[str, list[int]] = {}
-    uncovered_ranges: dict[str, list[tuple[int, int]]] = {}
-    for raw_path, raw_lines in sorted(changed_lines.items()):
-        rel = raw_path.replace("\\", "/")
-        lines = set(raw_lines)
-        entry = norm_cov.get(rel, norm_cov.get(raw_path))
-        if isinstance(entry, dict):
-            exec_set = set(entry.get("executed_lines", ()))
-            miss_set = set(entry.get("missing_lines", ()))
-            candidates = lines & (exec_set | miss_set) if (exec_set or miss_set) else lines
-        else:
-            exec_set = set(entry or ())
-            candidates = (lines & norm_exec[rel]) if rel in norm_exec else lines
-        covered = candidates & exec_set
-        uncovered = sorted(candidates - exec_set)
-        total_exec += len(candidates)
-        total_cov += len(covered)
-        if uncovered:
-            uncovered_by_file[rel] = uncovered
-            uncovered_ranges[rel] = _to_ranges(uncovered)
-    ratio = 1.0 if total_exec == 0 else (total_cov / total_exec)
-    return {
-        "passed": bool(ratio >= threshold),
-        "coverage": ratio,
-        "ratio": ratio,
-        "threshold": threshold,
-        "covered_lines": total_cov,
-        "executable_lines": total_exec,
-        "uncovered_by_file": uncovered_by_file,
-        "uncovered_ranges": uncovered_ranges,
-    }
+def changed_lines(root: Any, base: str, head: str) -> Optional[dict[str, set[int]]]:
+    """Added lines of the ``.py`` files changed from merge-base(base, head) to head; None when git cannot say."""
+    try:
+        merge, tip = gitsafe.merge_base(root, base, head), gitsafe.resolve_commit(root, head)
+        res = gitsafe.run(["diff-tree", "-r", "-p", "-U0", "--no-ext-diff", "--no-textconv", merge, tip], root,
+                          timeout=_GIT_TIMEOUT_S) if merge and tip else None
+    except gitsafe.GitError:
+        return None
+    if res is None or res.returncode != 0:
+        return None
+    return {k: v for k, v in parse_changed_lines(res.stdout.decode("utf-8", "replace")).items() if k.endswith(".py")}
 
 
-def run_diff_coverage(
-    workspace_root: str | Path,
-    base_ref: str = "HEAD~1",
-    threshold: float = 0.80,
-    runner: Optional[Callable[..., Any]] = None,
-    diff_text: Optional[str] = None,
-    timeout: int = 120,
-) -> dict[str, Any]:
-    """Run pytest under coverage into isolated state_dir and evaluate diff coverage."""
-    root = Path(workspace_root).resolve()
-    state_dir = AegisLayout(root).state_dir
-    state_dir.mkdir(parents=True, exist_ok=True)
-    cov_data = state_dir / f".coverage.{os.getpid()}"
-    cov_json = state_dir / f"coverage_{os.getpid()}.json"
-    for p in (cov_data, cov_json):
-        if p.exists():
-            p.unlink()
-    env = {**os.environ, "COVERAGE_FILE": str(cov_data)}
-    if sys.version_info >= (3, 12):
-        env["COVERAGE_CORE"] = "sysmon"
-    if diff_text is None:
-        res = gitsafe.run(["diff-tree", "-p", "-U0", base_ref, "HEAD"], cwd=root)
-        raw_out = res.stdout if res.returncode == 0 else b""
-        diff_text = raw_out.decode("utf-8", "replace") if isinstance(raw_out, bytes) else (raw_out or "")
-    changed = {k: v for k, v in parse_changed_lines(diff_text).items() if k.endswith(".py")}
-    cmd = [sys.executable, "-m", "coverage", "run", "-m", "pytest", "-q"]
-    if runner is not None:
-        runner(cmd, cwd=str(root), env=env, json_path=str(cov_json))
-    else:
-        run_external_cmd(cmd, cwd=str(root), env=env, timeout=timeout)
-        run_external_cmd([sys.executable, "-m", "coverage", "json", "-o", str(cov_json)], cwd=str(root), env=env, timeout=timeout)
-    payload = json.loads(cov_json.read_text(encoding="utf-8")) if cov_json.exists() else {}
-    return evaluate_diff_coverage(changed, payload, threshold=threshold)
+def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: Optional[dict] = None,
+            unmeasured: Optional[list] = None) -> dict[str, Any]:
+    return {"status": status, "reason": " ".join(reason.split())[:200], "covered_lines": covered,
+            "executable_lines": total, "ratio": covered / total if total else None,
+            "uncovered_ranges": ranges or {}, "unmeasured": unmeasured or []}
 
 
-verify_coverage_threshold = run_diff_coverage
+def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
+    """Measure the changed lines of ``base..head`` (see the module docstring)."""
+    from aegis_core import checkrun  # lazy: checkrun sits in the checkrun/regression/verification import cycle
 
+    root = Path(root).resolve()
+    args = checkrun.pytest_args(checkrun.user_test_command(root) or list(checkrun.DEFAULT_COMMAND))
+    if args is None:
+        return _result("unverified", "tests.command is not pytest-based")
+    changed = changed_lines(root, base, head)
+    if changed is None:
+        return _result("unverified", f"cannot diff {base}..{head}")
+    if not changed:
+        return _result("reported", "no Python line changed")
+    try:
+        scratch = tempfile.TemporaryDirectory(dir=storage.state_dir(root))
+    except (PathTraversalError, OSError) as exc:
+        return _result("unverified", f"cannot use the state directory: {exc}")
+    with scratch as tmp:
+        rcfile, report = Path(tmp) / "empty.coveragerc", Path(tmp) / "coverage.json"
+        storage.atomic_write_bytes(rcfile, b"")
+        env = {**os.environ, "COVERAGE_FILE": str(Path(tmp) / ".coverage")}
+        if sys.version_info >= (3, 12):
+            env["COVERAGE_CORE"] = "sysmon"
+        coverage = [sys.executable, "-m", "coverage"]
+        run = run_external_cmd([*coverage, "run", f"--rcfile={rcfile}", "-m", "pytest", *args, "-p", "no:cacheprovider",
+                                "-o", "addopts="], cwd=root, env=env, timeout=checkrun.DEFAULT_TIMEOUT_S)
+        if run.get("timed_out"):
+            return _result("unverified", "the coverage run timed out")
+        dump = run_external_cmd([*coverage, "json", f"--rcfile={rcfile}", "-o", str(report)], cwd=root, env=env,
+                                timeout=_JSON_TIMEOUT_S)
+        try:
+            files = {str(k).replace("\\", "/"): v for k, v in json.loads(report.read_text(encoding="utf-8"))["files"].items()}
+            covered = total = 0
+            ranges: dict[str, list[list[int]]] = {}
+            unmeasured: list[str] = []
+            for path, lines in sorted(changed.items()):
+                if not isinstance(files.get(path), dict):
+                    unmeasured.append(path)
+                    continue
+                executed = set(files[path].get("executed_lines") or ())
+                candidates = lines & (executed | set(files[path].get("missing_lines") or ()))
+                covered, total = covered + len(candidates & executed), total + len(candidates)
+                if candidates - executed:
+                    ranges[path] = _to_ranges(candidates - executed)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            last = (run.get("stderr") or dump.get("stderr") or "").strip().splitlines()
+            return _result("unverified", "the coverage json timed out" if dump.get("timed_out")
+                           else last[-1] if last else "coverage wrote no readable report")
+    reason = "" if run.get("returncode") == 0 else f"pytest exited {run.get('returncode')}"
+    return _result("reported", reason, covered, total, ranges, unmeasured)

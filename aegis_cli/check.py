@@ -154,12 +154,12 @@ def _event_shas() -> tuple[str | None, str | None]:
 
 
 def _event_pull_request():
-    """The pull request of a ``pull_request`` run, for tier A's review approval: its number, author,
-    full head commit id and base branch, each checked; None for any other event or any value in doubt
-    (no gh call then)."""
+    """The pull request of a ``pull_request`` or ``pull_request_target`` run (the base-sourced governance
+    job), for tier A's review approval: its number, author, full head commit id and base branch, each
+    checked; None for any other event or any value in doubt (no gh call then)."""
     from aegis_core import human_gate
 
-    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+    if os.environ.get("GITHUB_EVENT_NAME") not in ("pull_request", "pull_request_target"):
         return None
     try:
         pull = _event_pull()
@@ -184,7 +184,6 @@ _NOT_EXECUTED = ("regression", "trailer_checks")
 def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
                        skipped=()) -> dict:
     reg_blocking = bool(reg_report is not None and reg_report.blocking)
-    cov_blocking = bool(cov_report is not None and not cov_report.get("passed", True))
     perf_blocking = bool(perf_report is not None and not perf_report.get("passed", True))
     trailer_blocking = bool(trailer_checks and any(t.get("failed") for t in trailer_checks))
     document = report.as_dict(root)
@@ -198,7 +197,7 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
         document["trailer_checks"] = trailer_checks
     if skipped:
         document["skipped"] = list(skipped)
-    if reg_blocking or cov_blocking or perf_blocking or trailer_blocking:
+    if reg_blocking or perf_blocking or trailer_blocking:
         document["status"] = "fail"
     return document
 
@@ -225,6 +224,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
               skipped=()) -> None:
     from aegis_cli import sanitize_display
     from aegis_cli.formatters.report import format_sarif_report
+    from aegis_core import regression
 
     reg_blocking = bool(reg_report is not None and reg_report.blocking)
     trailer_blocking = bool(trailer_checks and any(t.get("failed") for t in trailer_checks))
@@ -258,9 +258,10 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             reg_level = "error" if reg_report.tier == "gate" else "warning"
             reg_title = "regression check failed" if reg_report.tier == "gate" else "regression check warning"
             for finding in reg_report.findings:
+                unverified = finding.code in regression.UNVERIFIED_CODES
                 print(
-                    f"::{reg_level} file={_escape_annotation(finding.path, True)},"
-                    f"title={_escape_annotation(reg_title, True)}"
+                    f"::{'warning' if unverified else reg_level} file={_escape_annotation(finding.path, True)},"
+                    f"title={_escape_annotation('regression check unverified' if unverified else reg_title, True)}"
                     f"::{_escape_annotation(f'{finding.code}: {finding.message}')}"
                 )
     short = lambda sha: sha[:10]  # noqa: E731
@@ -305,9 +306,10 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         print(sanitize_display(f"  note: {note}", 400))
     if reg_report is not None:
         if reg_report.findings and reg_report.tier != "gate":
-            print('  regression tier: warning (advisory; blocking at gate tier via --strict or regression.tier="gate")')
+            print("  regression tier: warning (advisory in 4.4.0; no setting makes it block)")
         for finding in reg_report.findings:
-            tag = "FAIL" if reg_report.tier == "gate" else "WARN"
+            tag = ("UNVERIFIED" if finding.code in regression.UNVERIFIED_CODES
+                   else "FAIL" if reg_report.tier == "gate" else "WARN")
             print(sanitize_display(f"  [{tag}:regression/{finding.code}] ({finding.path}): {finding.message}", 400))
         if reg_report.total_fix_commits > 0 and reg_report.exempted_count > 0:
             rate_pct = f"{reg_report.exemption_rate * 100:.1f}%"
@@ -330,6 +332,13 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     for t_chk in trailer_checks or ():
         if t_chk.get("failed"):
             print(sanitize_display(f"  [FAIL:trailer-divergence] {t_chk['commit'][:10]}: {t_chk.get('reason', '')}", 400))
+    if cov_report is not None and cov_report.get("status") == "reported":
+        ratio = cov_report.get("ratio")
+        print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
+                               f"{cov_report.get('executable_lines', 0)} changed executable lines "
+                               f"({len(cov_report.get('unmeasured') or ())} file(s) not measured)", 400))
+    elif cov_report is not None:
+        print(sanitize_display(f"  coverage: UNVERIFIED ({cov_report.get('reason', '')})", 400))
     if skipped:
         print("  note: --no-exec: the regression and Aegis-Check trailer checks were not run")
 
@@ -337,7 +346,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
 def _run_ci(args: argparse.Namespace) -> int:
     """`aegis check --ci`: 0 nothing weakened or every weakening approved, 1 otherwise, 2 usage."""
     from aegis_cli import sanitize_display
-    from aegis_core import checkrun, credit, gitsafe, regression, rule_integrity
+    from aegis_core import checkrun, gitsafe, regression, rule_integrity
 
     stray = [flag for flag, given in (
         ("FILES", bool(getattr(args, "files", None))), ("--full", bool(getattr(args, "full", False))),
@@ -345,17 +354,18 @@ def _run_ci(args: argparse.Namespace) -> int:
         ("--hook", bool(getattr(args, "hook", False))),
         ("--dry-run", bool(getattr(args, "dry_run", False))), ("--llm-cmd", getattr(args, "llm_cmd", None) is not None),
         ("--paths", getattr(args, "paths", None) is not None), ("--base-policy", bool(getattr(args, "base_policy", False))),
-        ("--split", bool(getattr(args, "split", None))),
+        ("--split", bool(getattr(args, "split", None))), ("--strict", bool(getattr(args, "strict", False))),
     ) if given]
-    if stray:
-        print(f"Error: --ci does not combine with {', '.join(stray)}: it compares the committed rules of two commits",
-              file=sys.stderr)
-        return 2
     no_exec = bool(getattr(args, "no_exec", False))
     runs_code = [flag for flag, attr in (("--coverage", "coverage"), ("--perf", "perf"), ("--strict", "strict"),
                                          ("--require-regression", "require_regression")) if getattr(args, attr, False)]
+    # --no-exec's own refusal is checked first so that its message names it.
     if no_exec and runs_code:
         print(f"Error: --no-exec does not combine with {', '.join(runs_code)}: they run the repository's code",
+              file=sys.stderr)
+        return 2
+    if stray:
+        print(f"Error: --ci does not combine with {', '.join(stray)}: it compares the committed rules of two commits",
               file=sys.stderr)
         return 2
     fmt = "json" if getattr(args, "json", False) else str(getattr(args, "format", None) or "text").lower()
@@ -368,12 +378,12 @@ def _run_ci(args: argparse.Namespace) -> int:
         print("Error: --ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
               file=sys.stderr)
         return 1
-    force_gate = bool(getattr(args, "strict", False) or getattr(args, "require_regression", False))
-    reg_tier = "gate" if force_gate else None
     try:
         report = rule_integrity.check_ci(root, base, head, pull_request=_event_pull_request())
-        reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, tier=reg_tier)
-        trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head)
+        # The reruns can take long; progress goes to stderr so the json and github stdout stay unchanged.
+        progress = lambda line: print(f"aegis check --ci: {sanitize_display(line, 300)}", file=sys.stderr, flush=True)  # noqa: E731
+        reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, progress=progress)
+        trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head, progress=progress)
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
         print(f"Error: {sanitize_display(str(exc), 400)}", file=sys.stderr)
         return 1
@@ -381,7 +391,7 @@ def _run_ci(args: argparse.Namespace) -> int:
     cov_report = None
     if getattr(args, "coverage", False):
         from aegis_core.verification.coverage_check import run_diff_coverage
-        cov_report = run_diff_coverage(root, base_ref=base)
+        cov_report = run_diff_coverage(root, base, head)
 
     perf_report = None
     if getattr(args, "perf", False):
@@ -394,11 +404,10 @@ def _run_ci(args: argparse.Namespace) -> int:
 
     _print_ci(report, fmt, root, reg_report, cov_report=cov_report, perf_report=perf_report, trailer_checks=trailer_checks,
               skipped=_NOT_EXECUTED if no_exec else ())
-    cov_ok = True if cov_report is None else bool(cov_report.get("passed", True))
     perf_ok = True if perf_report is None else bool(perf_report.get("passed", True))
     trailer_ok = not any(t.get("failed") for t in trailer_checks)
     reg_ok = reg_report is None or not reg_report.blocking
-    overall_passed = report.passed and reg_ok and cov_ok and perf_ok and trailer_ok
+    overall_passed = report.passed and reg_ok and perf_ok and trailer_ok
     return 0 if overall_passed else 1
 
 
@@ -518,9 +527,10 @@ class CheckCommand(AegisCommand):
             "a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's "
             "slot cap), or a change to the governance set (when the base lists a signing key). A "
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
-            "branch's allowed_signers or, at tier A on a pull_request run, a non-author's approving review of the "
-            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs T5 fix-commit regression checks (advisory at default warning tier; "
-            'blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail',
+            "branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's "
+            "approving review of the "
+            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, "
+            "a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
         )
         parser.add_argument(
             "--head",
@@ -541,8 +551,8 @@ class CheckCommand(AegisCommand):
             metavar="REF",
             default=None,
             help="With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). "
-            "With --lane: the base branch (default: origin/$GITHUB_BASE_REF, $GITHUB_BASE_REF, origin/main, "
-            "main, origin/develop or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: "
+            "With --lane: the base branch (default: origin/$GITHUB_BASE_REF, then the branch origin/HEAD names, "
+            "then main, master or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: "
             "read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: "
             "absent at base) and check what changed since REF; the working tree's baseline is then not consulted, "
             "and a REF that does not resolve is an error. Without --base the working tree's baseline is used and "
@@ -574,7 +584,9 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--coverage",
             action="store_true",
-            help="With --ci: run pytest with diff coverage over changed lines",
+            help="With --ci: report the share of the executable lines changed since merge-base(--base, --head) "
+            "that the user-scope tests.command (pytest-based) runs under coverage. A report only: it never changes "
+            "the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
         )
         parser.add_argument(
             "--perf",
