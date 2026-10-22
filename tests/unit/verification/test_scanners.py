@@ -210,6 +210,7 @@ class TestLongLinesAreScanned:
         assert finding.snippet == f"TOKEN = '{scanners.mask_secret(raw)}'"
         assert finding.fingerprint == scanners.sarif_fingerprint("github-pat", "app.py", finding.snippet)
 
+    @pytest.mark.timing
     def test_scan_cost_stays_linear_in_line_length(self):
         """No absolute budget. A 4x longer line costs about 4x when linear and 16x when quadratic,
         so the bound of 8 leaves room for a loaded Windows runner on both sides."""
@@ -219,6 +220,7 @@ class TestLongLinesAreScanned:
         ratio = _best_of(5, scan, 200_000) / max(_best_of(5, scan, 50_000), 1e-9)
         assert ratio < 8, f"quadrupling the line multiplied the scan time by {ratio:.1f}"
 
+    @pytest.mark.timing
     def test_the_ratio_check_catches_a_quadratic_cost(self):
         def quadratic(n):
             sum(1 for _ in range(n // 100) for _ in range(n // 100))

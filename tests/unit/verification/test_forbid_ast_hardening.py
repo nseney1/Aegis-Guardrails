@@ -807,6 +807,48 @@ def _generated(*blocks: list[str]) -> str:
     return "\n".join(line for block in blocks for line in block) + "\n"
 
 
+# Timing asserts complexity, never a runner's speed (R-cli-10): t(2N) / t(N), each the best of 3,
+# is about 2 when linear and about 4 when quadratic. The ceiling only tells a hang from a slow run.
+_HANG_CEILING_S = 60.0
+
+
+def _best_of(runs: int, fn, clock=time.perf_counter) -> float:
+    best = float("inf")
+    for _ in range(runs):
+        start = clock()
+        fn()
+        took = clock() - start
+        assert took < _HANG_CEILING_S, f"one run took {took:.0f}s: a hang, not a slow runner"
+        best = min(best, took)
+    return best
+
+
+def _doubling_ratio(run, n: int, clock=time.perf_counter) -> float:
+    return _best_of(3, lambda: run(2 * n), clock) / max(_best_of(3, lambda: run(n), clock), 1e-9)
+
+
+class TestTheScalingCheck:
+    @pytest.mark.timing
+    def test_a_quadratic_evaluator_fails_the_ratio(self, monkeypatch):
+        import aegis_core.ast.policy as policy
+
+        real = policy._eval_call_entry
+
+        def quadratic(raw_call, sites, *rest):
+            sum(1 for _ in sites for _ in sites)
+            return real(raw_call, sites, *rest)
+
+        monkeypatch.setattr(policy, "_eval_call_entry", quadratic)
+        trees = {n: extract_normalized_ast("mod.py", code="f()\n" * (800 * n)) for n in (1, 2)}
+        ratio = _doubling_ratio(lambda n: evaluate_forbid_ast(trees[n], {"calls": ["g"]}), 1)
+        assert ratio >= 3, f"a quadratic stand-in doubled to only {ratio:.1f}x"
+
+    def test_a_hang_hits_the_ceiling(self):
+        clock = iter([0.0, _HANG_CEILING_S + 1]).__next__
+        with pytest.raises(AssertionError, match="a hang"):
+            _best_of(1, lambda: None, clock)
+
+
 FAN_OUT_SHAPES = [
     pytest.param(
         [f"from m{i} import x{i} as n" for i in range(1500)], ["n()"] * 15000,
@@ -832,15 +874,18 @@ FAN_OUT_SHAPES = [
 class TestBindingFanOutStaysLinear:
     """A name bound N times and referenced M times costs about N + M, not N * M."""
 
+    @pytest.mark.timing
     @pytest.mark.parametrize("bindings, uses", FAN_OUT_SHAPES)
-    def test_generated_file_is_checked_within_budget(self, bindings, uses):
-        code = _generated(bindings, ["import subprocess as n"], uses, ["n.run(['ls'])"])
+    def test_generated_file_cost_scales_linearly(self, bindings, uses):
         spec = {"calls": ["subprocess.run", "os.system"], "decorators": ["functools.lru_cache"]}
-        start = time.perf_counter()
-        violations = _violations(code, spec)
-        elapsed = time.perf_counter() - start
-        assert violations == ["Forbidden call 'subprocess.run' matched rule forbid_ast.calls"]
-        assert elapsed < 5.0, f"forbid_ast took {elapsed:.1f}s on a {len(code) // 1024} KiB file"
+
+        def run(half_steps: int) -> None:  # 1: half of each block, 2: all of it
+            code = _generated(bindings[: len(bindings) * half_steps // 2], ["import subprocess as n"],
+                              uses[: len(uses) * half_steps // 2], ["n.run(['ls'])"])
+            assert _violations(code, spec) == ["Forbidden call 'subprocess.run' matched rule forbid_ast.calls"]
+
+        ratio = _doubling_ratio(run, 1)
+        assert ratio < 3, f"doubling the bindings and uses multiplied the cost by {ratio:.1f}"
 
 
 # Reference semantics, written out longhand: a reference ``head + rest`` (the head ends at
@@ -1279,17 +1324,17 @@ class TestRustCallSites:
             "Forbidden call 'helper' matched rule forbid_ast.calls"
         ]
 
-    def test_a_large_generated_file_is_parsed_within_budget(self):
+    @pytest.mark.timing
+    def test_a_large_generated_file_parses_in_linear_time(self):
         from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
 
-        calls = 50_000
-        src = "fn main() {\n" + "".join(f"    helper({i});\n" for i in range(calls)) + "}\nfn helper(x: u32) {}\n"
-        start = time.perf_counter()
-        data = parse_rust_source(src, "m.rs")
-        elapsed = time.perf_counter() - start
-        assert len(data["call_sites"]) == calls
-        assert data["call_sites"][-1]["line"] == calls + 1
-        assert elapsed < 5.0, f"rust driver took {elapsed:.1f}s on a {len(src) // 1024} KiB file"
+        def run(calls: int) -> None:
+            src = "fn main() {\n" + "".join(f"    helper({i});\n" for i in range(calls)) + "}\nfn helper(x: u32) {}\n"
+            data = parse_rust_source(src, "m.rs")
+            assert len(data["call_sites"]) == calls and data["call_sites"][-1]["line"] == calls + 1
+
+        ratio = _doubling_ratio(run, 12_500)
+        assert ratio < 3, f"doubling the calls multiplied the parse time by {ratio:.1f}"
 
     def test_control_flow_keywords_are_not_calls(self):
         from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source

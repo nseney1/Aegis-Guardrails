@@ -213,14 +213,18 @@ def test_property_agrees_with_the_backtracking_reference() -> None:
     ],
     ids=["7-stars", "12-stars", "dstar-chain", "star-dstar-chain", "qmark-star"],
 )
+@pytest.mark.timing
 def test_wildcard_heavy_patterns_match_in_linear_time(pattern: str, path: str) -> None:
     """A rule's target_paths and a file name both come from the repository, which may be
-    hostile: no pattern may freeze the single-threaded MCP server or the commit hook."""
-    started = time.perf_counter()
-    found = matches(pattern, path)
-    elapsed = time.perf_counter() - started
-    assert found is fnmatch.fnmatchcase(path, pattern) is False
-    assert elapsed < 0.5, f"{elapsed:.2f}s"
+    hostile: no pattern may freeze the single-threaded MCP server or the commit hook. The best
+    of 3 runs is judged, so one descheduled run on a loaded runner cannot fail it."""
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        found = matches(pattern, path)
+        best = min(best, time.perf_counter() - started)
+        assert found is fnmatch.fnmatchcase(path, pattern) is False
+    assert best < 0.5, f"{best:.2f}s"
 
 
 def test_property_a_literal_pattern_matches_only_itself_or_its_basename() -> None:
