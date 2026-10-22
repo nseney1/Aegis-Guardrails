@@ -1020,3 +1020,78 @@ def test_an_unconfirmed_suggestion_or_an_unknown_id_never_enters_a_proposal(revi
         with pytest.raises(ValueError, match="not a counted insight"):
             write_proposal(repo, proposal_id="trap-close", insight_ids=[kept["id"], extra], home=home)
     assert not (repo / ".aegis" / "proposals").exists()
+
+
+# ── review M1: the signed re-run of a cli insight counts once ──────────────────
+
+SIGNED_TEXT = "Never call subprocess.Popen without a timeout in the cli modules"
+
+
+def _signed_rerun(repo: Path, home: Path, row: Dict[str, Any], **changes: Any) -> Dict[str, Any]:
+    """The H row ``insight add --commit SHA`` appends for ``row``'s typed text; the signature
+    itself is the signed-commit tests' subject."""
+    h_row = {**row, "id": f"ins-{os.urandom(6).hex()}", "level": "H", **changes}
+    append_jsonl(insights_path(repo, home=home), [h_row])
+    return h_row
+
+
+def _counted_ids(repo: Path, home: Path) -> list:
+    return sorted(i for c in review_insights(repo, home=home)["clusters"] for i in c["insight_ids"])
+
+
+def test_a_signed_rerun_supersedes_its_cli_row_in_review_and_proposals(review_repo):
+    """Given `insight add T` (cli) and the documented re-run with --commit (H, same text, paths
+    and kind), When the insights are reviewed and proposed, Then one correction counts once: the
+    H row, and the superseded cli row is not a counted insight."""
+    repo, home = review_repo
+    cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, cli)
+    cluster, = review_insights(repo, home=home)["clusters"]
+    assert (cluster["count"], cluster["insight_ids"], cluster["levels"]) == (1, [signed["id"]], ["H"])
+    with pytest.raises(ValueError, match=f"not a counted insight: {cli['id']}"):
+        write_proposal(repo, proposal_id="trap-popen", insight_ids=[cli["id"], signed["id"]], home=home)
+    assert not (repo / ".aegis" / "proposals").exists()
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=cluster["insight_ids"], home=home))
+    assert (meta["count"], meta["insight_ids"]) == (1, [signed["id"]])
+
+
+def test_two_identical_cli_adds_without_a_signed_rerun_still_count_twice(review_repo):
+    """Sad path: with no H row nothing is superseded, so two identical cli adds count as two, as
+    before (a cli row carries no session, so they are one unattributed recurrence episode)."""
+    repo, home = review_repo
+    ids = sorted(add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)["id"]
+                 for _ in range(2))
+    cluster, = review_insights(repo, home=home)["clusters"]
+    assert (cluster["count"], sorted(cluster["insight_ids"])) == (2, ids)
+    assert _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=ids, home=home))["count"] == 2
+
+
+@pytest.mark.parametrize("changes", [
+    {"text": "Always pass an explicit timeout to every subprocess call in the cli"},
+    {"paths": ["src/other.py"]},
+    {"kind": "processes"},
+], ids=["text", "paths", "kind"])
+def test_an_h_row_that_differs_supersedes_nothing(review_repo, changes):
+    repo, home = review_repo
+    cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, cli, **changes)
+    assert _counted_ids(repo, home) == sorted([cli["id"], signed["id"]])
+
+
+def test_an_h_row_supersedes_only_the_cli_adds_before_it(review_repo):
+    repo, home = review_repo
+    first = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, first)
+    later = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    assert _counted_ids(repo, home) == sorted([signed["id"], later["id"]])
+
+
+def test_a_signed_rerun_is_one_recurrence_not_two(review_repo):
+    """Given a cli insight matching an insight-born rule and its H re-run an hour later (two
+    episodes if both counted), When recurrence is measured, Then it is one unattributed episode."""
+    repo, home = review_repo
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    cli = add_insight(repo, RMTREE_TEXT, paths=["src/app.py"], home=home)
+    _signed_rerun(repo, home, cli, ts=_shift(cli["ts"], 3600))
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)
