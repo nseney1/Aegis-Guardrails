@@ -696,6 +696,16 @@ def run_layer1(
     return results
 
 
+def _same_blob(data: bytes, oid: str) -> bool:
+    """Whether ``data`` is the blob ``oid``, line endings aside: with core.autocrlf (Git for Windows'
+    default) a checkout holds CRLF where the commit holds LF, and both scans read lines either way."""
+    from aegis_core import gitsafe
+
+    if gitsafe.blob_id(data, len(oid)) == oid:
+        return True
+    return b"\r\n" in data and gitsafe.blob_id(data.replace(b"\r\n", b"\n"), len(oid)) == oid
+
+
 def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
                   contents: Optional[dict[str, bytes]] = None) -> dict[str, str]:
     """What the T7 delta subtracts for each of ``rels`` (relative to ``work_root``, which holds
@@ -736,7 +746,7 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
                 kept.pop(rel, None)
                 continue
             kept[rel] = entry[1]
-            if gitsafe.blob_id(current[rel], len(entry[1])) == entry[1]:
+            if _same_blob(current[rel], entry[1]):
                 unchanged.append(rel)  # the same here: what changed it, if anything, is further back
         pending = unchanged
     blobs = gitsafe.read_blobs(git_root, kept.values())

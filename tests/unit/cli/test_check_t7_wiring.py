@@ -286,6 +286,35 @@ def test_the_hook_and_the_record_take_a_binary_file_and_note_one_over_the_size_c
     assert (rc, row["passed"], row["layer1"]) == (0, True, {"findings": 0, "files": 2})
 
 
+def test_a_crlf_checkout_of_a_committed_change_is_judged_against_the_same_base_as_an_lf_one(repo, capsys):
+    """Given a branch commit that adds pickle.loads, when the file is checked out with core.autocrlf=true
+    (Git for Windows' default) instead of LF, then the delta still finds what the branch added."""
+    _write(repo / "src" / "a.py", "def f(x):\n    return x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "a")
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _write(repo / "src" / "a.py", "import pickle\n\n\ndef f(x):\n    return pickle.loads(x)\n")
+    _git(repo, "commit", "-q", "-am", "feat")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+    try:
+        _git(repo, "config", "core.autocrlf", "true")
+    except subprocess.CalledProcessError:
+        pytest.skip("git cannot set core.autocrlf here")
+    (repo / "src" / "a.py").unlink()
+    _git(repo, "checkout", "--", "src/a.py")
+    assert b"\r\n" in (repo / "src" / "a.py").read_bytes()
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+
+
+def test_a_file_whose_only_change_is_its_line_endings_is_not_judged_whole(repo, capsys):
+    """Sad path: a CRLF copy of a committed legacy file is the committed text, so its legacy hit is not new."""
+    (repo / "src" / "legacy.py").write_bytes(LEGACY.replace("\n", "\r\n").encode("utf-8"))
+    code, payload, _ = _check(repo, capsys, "src/legacy.py")
+    assert (code, _failed(payload)) == (0, [])
+
+
 def test_a_file_the_branch_added_and_committed_is_judged_whole(repo, capsys):
     _git(repo, "checkout", "-q", "-b", "work")
     _write(repo / "src" / "load.py", "import pickle\n\n\ndef load(blob):\n    return pickle.loads(blob)\n")
