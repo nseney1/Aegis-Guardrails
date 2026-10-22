@@ -24,6 +24,7 @@ from aegis_core.insights import (
 )
 from aegis_core.rules import load_rules
 from aegis_core.scan_compliance import activity_path, record as record_activity
+from aegis_core.storage import append_jsonl
 from aegis_core.telemetry_engine import ledger
 import aegis_mcp.server as server
 
@@ -249,3 +250,109 @@ def test_an_unreadable_ledger_site_still_records_the_exposure_in_memory_with_one
     assert "aegis-mcp: exposure record not written: no ledger site" in capsys.readouterr().err
     assert credit.witnessed_exposed_rules(repo, "codex-cli", "s-1") == {"trap-r0"}
 
+
+
+# ── R-evidence-37: a capture annotates the hook row it corroborates, never counts ──────
+
+HOOK_PROMPT = "No, stop rewriting the parser module without running its tests again!"
+QUOTE = "stop rewriting the parser module"
+
+
+def _rows(repo: Path, home: Path) -> List[Dict[str, Any]]:
+    return [json.loads(line) for line in insights_path(repo, home=home).read_bytes().splitlines() if line.strip()]
+
+
+def _capture(repo: Path, home: Path, quote: str, session: str = "agent-uuid-1", host: str = "claude-code"):
+    from aegis_core.insights import capture_suggestion
+
+    return capture_suggestion(repo, quote, paths=["src/app.py"], host=host, session=session, home=home)
+
+
+def _counted(review: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [{"count": c["count"], "corroborated": c.get("corroborated")} for c in review["clusters"]]
+
+
+def test_rows_carry_their_source(tmp_path: Path, home: Path):
+    from aegis_core.insights import add_insight
+
+    repo = _repo(tmp_path, {})
+    _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    add_insight(repo, "Never skip the parser tests in src/app.py", paths=["src/app.py"], home=home)
+    _capture(repo, home, "prefer small parser functions")
+    assert [r.get("source") for r in _rows(repo, home) if r["event"] == "insight"] == ["hook", "cli", "mcp"]
+
+
+def test_a_corroborated_capture_stays_a_suggestion_and_the_correction_counts_once(tmp_path: Path, home: Path):
+    repo = _repo(tmp_path, {})
+    hook = _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    cap = _capture(repo, home, QUOTE)
+    assert (cap["level"], cap["corroborated_by"], cap["source"]) == ("suggestion", hook["id"], "mcp")
+    assert "confirmed_by" not in cap
+    review = review_insights(repo, home=home)
+    assert _counted(review) == [{"count": 1, "corroborated": [cap["id"]]}]
+    assert review["suggestions"] == []
+
+
+def test_four_chained_captures_still_count_once(tmp_path: Path, home: Path):
+    repo = _repo(tmp_path, {})
+    _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    quotes = [QUOTE, "rewriting the parser module", "the parser module without", "parser modul"]  # 12 chars
+    caps = [_capture(repo, home, q, session=f"agent-{i}") for i, q in enumerate(quotes)]
+    assert {c["level"] for c in caps} == {"suggestion"}
+    assert _counted(review_insights(repo, home=home)) == [{"count": 1, "corroborated": [c["id"] for c in caps]}]
+
+
+def test_a_capture_made_before_its_hook_prompt_counts_nothing_and_is_annotated_later(tmp_path: Path, home: Path):
+    repo = _repo(tmp_path, {})
+    cap = _capture(repo, home, QUOTE)
+    assert cap["level"] == "suggestion" and "corroborated_by" not in cap
+    before = review_insights(repo, home=home)
+    assert before["clusters"] == [] and [s["id"] for s in before["suggestions"]] == [cap["id"]]
+    _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    assert _counted(review_insights(repo, home=home)) == [{"count": 1, "corroborated": [cap["id"]]}]
+
+
+@pytest.mark.parametrize("case", ["11-chars", "other-host", "31-min-ago"])
+def test_a_capture_outside_the_join_is_never_corroborated(tmp_path: Path, home: Path, case: str):
+    repo = _repo(tmp_path, {})
+    if case == "31-min-ago":
+        append_jsonl(insights_path(repo, home=home), [{
+            "v": 1, "ts": _stamp(-(JOIN_WINDOW_S + 60)), "event": "insight", "id": "ins-0000000000aa",
+            "level": "W2", "text": HOOK_PROMPT.lower(), "paths": ["src/app.py"], "psrc": "dirty",
+            "host": "claude-code", "source": "hook"}])
+    else:
+        _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    quote = "parser modu" if case == "11-chars" else QUOTE
+    cap = _capture(repo, home, quote, host="codex-cli" if case == "other-host" else "claude-code")
+    assert cap["level"] == "suggestion" and "corroborated_by" not in cap
+    review = review_insights(repo, home=home)
+    assert [c["count"] for c in review["clusters"]] == [1]
+    assert review["clusters"][0].get("corroborated") == []
+    assert [s["id"] for s in review["suggestions"]] == [cap["id"]]
+
+
+def test_a_4_3_upgraded_w2_row_is_read_as_a_suggestion_and_never_counted(tmp_path: Path, home: Path):
+    repo = _repo(tmp_path, {})
+    hook = _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    legacy = {"v": 1, "ts": _stamp(), "event": "insight", "id": "ins-0000000000bb", "level": "W2",
+              "text": QUOTE, "paths": ["src/app.py"], "psrc": "explicit", "host": "claude-code",
+              "hs": "f" * 32, "confirmed_by": hook["id"]}
+    append_jsonl(insights_path(repo, home=home), [legacy])
+    review = review_insights(repo, home=home)
+    assert _counted(review) == [{"count": 1, "corroborated": [legacy["id"]]}]
+    assert review["clusters"][0]["insight_ids"] == [hook["id"]]
+
+
+def test_a_server_capture_with_its_own_session_is_corroborated_by_the_hosts_hook_prompt(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _repo(tmp_path, {})
+    monkeypatch.setattr(server, "_canonical_workspace", str(repo))
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                           "params": {"clientInfo": {"name": "claude-code", "version": "1.0"}}})
+    hook = _hook(repo, home, HOOK_PROMPT, "host-session-1")
+    res = _call(1, "aegis_capture_insight", {"quote": QUOTE, "paths": ["src/app.py"]})
+    assert set(res) == {"status", "id", "level", "text", "paths", "psrc"}
+    assert res["level"] == "suggestion"
+    stored, = [r for r in _rows(repo, home) if r.get("id") == res["id"]]
+    assert (stored["level"], stored["corroborated_by"], stored["source"]) == ("suggestion", hook["id"], "mcp")

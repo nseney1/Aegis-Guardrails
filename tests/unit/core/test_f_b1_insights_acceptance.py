@@ -3,7 +3,7 @@
 Covers the §9 T8 acceptance criteria:
 1. Redaction of secrets, PII, paths, IPs, and high-entropy tokens + 300-char cap + benign identifier preservation.
 2. Correction-cue detection precision/recall and user-scope hook storage (heartbeat vs cue-gated insight).
-3. 'Agent insights don't count': MCP aegis_capture_insight suggestions do not count toward proposals/debits and never enter aegis_scan; upgraded to W2 only when substring of hook prompt in same hs.
+3. 'Agent insights don't count': MCP aegis_capture_insight suggestions never count and never enter aegis_scan; a hook prompt of the same host within the join window that contains the quote annotates, never upgrades.
 4. Keyed hs pseudonymization (HMAC-SHA256 with ~/.aegis/link.key, POSIX mode 0600, O_EXCL, 32 random bytes).
 5. Stdlib TF-IDF top-3 neighbour clustering, exposure-joined rule matching, and rejected-cluster cooldown (>= 2 new insights).
 6. Closed-template proposals in .aegis/proposals/<id>.md (never loaded by load_rules, no verbatim W0/W2 text) and post-activation recurrence measurement over heartbeat-alive sessions (burst collapse, 95% UCB, >= 3 alarm, per-rev reset).
@@ -263,26 +263,31 @@ def test_agent_suggestions_do_not_count_and_never_enter_scan_or_proposals(tmp_pa
     scan_dump = json.dumps(scan_res)
     assert "newline parameter" not in scan_dump
 
-    # Now if a hook-captured prompt in the SAME hs session contains the quote, it upgrades to W2
-    record_hook_prompt(
+    # A hook-captured prompt of the same host containing the quote corroborates the captures:
+    # they stay suggestions and annotate the one hook row, which alone counts.
+    hook = record_hook_prompt(
         repo,
         "claude-code",
         {
             "prompt": "Stop! Never use write_text with newline parameter in Python 3.9, it breaks!",
-            "session_id": "confirmed-sess-1",
+            "session_id": "host-sess-1",
             "cwd": str(repo),
         },
         home=home,
     )
-    upgraded = capture_suggestion(
+    corroborated = capture_suggestion(
         repo,
         quote="Never use write_text with newline parameter in Python 3.9",
         paths=["src/app.py"],
         host="claude-code",
-        session="confirmed-sess-1",
+        session="server-uuid-1",
         home=home,
     )
-    assert upgraded["level"] == "W2"
+    assert corroborated["level"] == "suggestion"
+    assert corroborated["corroborated_by"] == hook["id"]
+    review = review_insights(repo, home=home)
+    assert [(c["count"], len(c["corroborated"])) for c in review["clusters"]] == [(1, 4)]
+    assert review["suggestions"] == []
 
 
 # ── 4. Keyed hs pseudonymization & link.key ──────────────────────────────────
@@ -760,3 +765,22 @@ def test_human_level_h_insight_requires_content_bound_signed_commit(
     assert add_insight(repo.root, text_b, commit=insight_commit, base_ref="main", home=home)["level"] == "cli"
     assert add_insight(repo.root, text_a, commit=None, base_ref="main", home=home)["level"] == "cli"
 
+
+
+def test_a_4_3_upgraded_w2_capture_never_counts_as_a_recurrence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    repo = _init_git_repo(tmp_path / "repo")
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], "Always check path confinement before recursive directory removal.")
+    hb = record_hook_prompt(repo, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(repo)},
+                            home=home)
+    rev = load_rules(repo).get("trap-validate-rmtree").digest[:16]
+    append_jsonl(insights_path(repo, home=home), [{
+        "v": 1, "ts": hb["ts"], "event": "insight", "id": "ins-0000000000cc", "level": "W2",
+        "text": "stop calling recursive directory removal without path confinement check", "paths": ["src/app.py"],
+        "psrc": "explicit", "host": "claude-code", "hs": hb["hs"], "confirmed_by": "ins-000000000001",
+        "revs": {"trap-validate-rmtree": rev}}])
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["sessions"], rec["recurrences"]) == (1, 0)

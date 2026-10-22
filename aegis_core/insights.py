@@ -439,32 +439,54 @@ def _capture_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List
     return found[:MAX_CAPTURE_PATHS], "dirty", max(0, len(found) - MAX_CAPTURE_PATHS)
 
 
+_CORROBORATE_MIN_CHARS = 12
+
+
+def _row_source(row: Mapping[str, Any]) -> Optional[str]:
+    """Who wrote an insight row: 'hook', 'cli' or 'mcp'. A 4.3.x row has no ``source``: a W2
+    row is the hook's unless a capture's corroboration (``confirmed_by``) upgraded it."""
+    source, level = row.get("source"), row.get("level")
+    if source is not None:
+        return source if source in ("hook", "cli", "mcp") else None
+    if level in ("W2", "hook"):
+        return "mcp" if row.get("confirmed_by") else "hook"
+    return {"H": "cli", "cli": "cli", "suggestion": "mcp"}.get(level) if isinstance(level, str) else None
+
+
+def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optional[str]:
+    """The level a row counts at: an agent capture is a suggestion until a human confirms it."""
+    source = _row_source(row)
+    if source == "hook":
+        return "W2"
+    if source == "cli":
+        return "H" if row.get("level") == "H" else "cli"
+    if source == "mcp":
+        return "cli" if str(row.get("id") or "") in confirmed_ids else "suggestion"
+    return None
+
+
+def _corroborating_hook(rows: Iterable[Mapping[str, Any]], host: str, ts: Any, quote: str) -> Optional[str]:
+    """The id of a hook prompt of ``host`` within JOIN_WINDOW_S of ``ts`` that contains ``quote``."""
+    needle, when = quote.strip().lower(), _parse_ts(ts)
+    if len(needle) < _CORROBORATE_MIN_CHARS or not host or when is None:
+        return None
+    for r in rows:
+        r_ts = _parse_ts(r.get("ts"))
+        if (r.get("event") == "insight" and _row_source(r) == "hook" and r.get("host") == host
+                and r_ts is not None and abs((r_ts - when).total_seconds()) <= JOIN_WINDOW_S
+                and needle in str(r.get("text") or "").lower()):
+            return str(r.get("id") or "")
+    return None
+
+
 def _is_capture(row: Mapping[str, Any], hs: Optional[str]) -> bool:
-    # Captures are 'suggestion' rows, or 'W2' rows a hook prompt confirmed; hook prompts write
-    # W2 rows without confirmed_by and never count. No hs is one shared bucket.
-    return (row.get("event") == "insight" and row.get("hs") == hs
-            and (row.get("level") == "suggestion" or (row.get("level") == "W2" and bool(row.get("confirmed_by")))))
+    # No hs is one shared bucket.
+    return row.get("event") == "insight" and row.get("hs") == hs and _row_source(row) == "mcp"
 
 
 def _read_rows_of_session(path: Path, hs: str) -> List[Dict[str, Any]]:
     # hs is 32 lowercase hex, never JSON-escaped, so every row of the session carries it verbatim.
     return read_jsonl(path, contains=hs.encode("ascii")).rows
-
-
-def _matching_hook_insight(rows: Sequence[Mapping[str, Any]], hs: Optional[str], redacted_quote: str) -> Optional[str]:
-    if not hs or not redacted_quote or len(redacted_quote.strip()) < 4:
-        return None
-    needle = redacted_quote.strip().lower()
-    for r in rows:
-        if (
-            r.get("event") == "insight"
-            and r.get("level") in ("W2", "hook")
-            and r.get("hs") == hs
-            and isinstance(r.get("text"), str)
-            and needle in r["text"].lower()
-        ):
-            return str(r.get("id") or "")
-    return None
 
 
 def _build_insight_row(
@@ -520,7 +542,7 @@ def add_insight(
     norm_paths, psrc = _resolve_paths(workspace, paths)
     level = "H" if _has_human_approval(workspace, commit, base_ref, clean) else "cli"
     row = _build_insight_row(
-        workspace, level, clean, norm_paths, psrc, "cli", None, kind=str(kind) if kind else None,
+        workspace, level, clean, norm_paths, psrc, "cli", None, source="cli", kind=str(kind) if kind else None,
     )
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
@@ -550,17 +572,22 @@ def capture_suggestion(
         rows = _read_rows_of_session(path, hs) if hs else read_jsonl(path, contains=b'"level":"suggestion"').rows
         if sum(1 for r in rows if _is_capture(r, hs)) >= MAX_CAPTURES_PER_SESSION:
             raise CaptureLimitReached(f"capture limit reached: at most {MAX_CAPTURES_PER_SESSION} insights per session")
-        m_hook = _matching_hook_insight(rows, hs, redacted)
+        # Rows are compact JSON, so a hook row written since 4.4 carries these bytes; review
+        # recomputes corroboration over every row (4.3.x hook rows included), so this is a note.
+        now = _utc_now()
+        hooks = read_jsonl(path, contains=b'"source":"hook"').rows
         row = _build_insight_row(
             workspace,
-            "W2" if m_hook else "suggestion",
+            "suggestion",
             redacted,
             norm_paths,
             psrc,
             host or "mcp",
             hs,
+            now,
             revs=revs,
-            confirmed_by=m_hook,
+            source="mcp",
+            corroborated_by=_corroborating_hook(hooks, host or "mcp", now, redacted),
             paths_dropped=dropped,
         )
         _append_user_insights(path, [row])
@@ -643,7 +670,7 @@ def record_hook_prompt(
     insight_row: Optional[Dict[str, Any]] = None
     if excerpt:
         insight_row = _build_insight_row(
-            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {},
+            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {}, source="hook",
         )
         to_write.append(insight_row)
     _append_user_insights(path, to_write)
@@ -894,6 +921,7 @@ def _build_cluster_entry(
     rejections: Sequence[Tuple[int, Dict[str, Any]]],
     neighbours: Mapping[str, List[Dict[str, Any]]],
     exposures: _Exposures,
+    corroborated: Mapping[str, List[str]],
 ) -> Tuple[Dict[str, Any], bool]:
     m_rows = [countable[m][1] for m in members]
     m_row_idxs = [countable[m][0] for m in members]
@@ -936,6 +964,7 @@ def _build_cluster_entry(
         "matched_rule": matched_id,
         "similarity": round(best_score, 4),
         "neighbours": {mid: neighbours.get(mid, []) for mid in m_ids},
+        "corroborated": [sid for mid in m_ids for sid in corroborated.get(mid, ())],
     }
     return info, is_sup
 
@@ -959,25 +988,25 @@ def review_insights(
         for idx, r in enumerate(all_rows)
         if r.get("event") == "decision" and r.get("decision") == "reject"
     ]
-    hook_rows = [r for r in all_rows if r.get("event") == "insight" and r.get("level") in ("W2", "hook")]
+    # Review is the authority on corroboration: recomputed here, read-only, whatever the order
+    # of capture and prompt. A corroborated suggestion annotates its hook row and never counts.
+    hook_rows = [r for r in all_rows if r.get("event") == "insight" and _row_source(r) == "hook"
+                 and str(r.get("id") or "") not in noise_ids]
     suggestions: List[Dict[str, Any]] = []
     countable: List[Tuple[int, Dict[str, Any]]] = []
-    seen_hook_ids: Set[str] = set()
+    corroborated: Dict[str, List[str]] = {}
     for idx, row in enumerate(all_rows):
         ins_id = str(row.get("id") or f"row-{idx}")
         if row.get("event") != "insight" or ins_id in noise_ids:
             continue
-        level = row.get("level")
+        level = _effective_level(row, set())
         if level == "suggestion":
-            m_hook = _matching_hook_insight(hook_rows, row.get("hs"), str(row.get("text") or ""))
-            if not m_hook:
+            m_hook = _corroborating_hook(hook_rows, str(row.get("host") or ""), row.get("ts"), str(row.get("text") or ""))
+            if m_hook:
+                corroborated.setdefault(m_hook, []).append(ins_id)
+            else:
                 suggestions.append(row)
-                continue
-            if m_hook in seen_hook_ids:
-                continue
-        if level in COUNTABLE_LEVELS or level == "suggestion":
-            if level in ("W2", "hook") and ins_id:
-                seen_hook_ids.add(ins_id)
+        elif level in COUNTABLE_LEVELS:
             countable.append((idx, row))
     if not countable:
         return {"clusters": [], "suggestions": suggestions, "suppressed_clusters": [], "neighbours": {}}
@@ -1026,6 +1055,7 @@ def review_insights(
             rejections,
             neighbours,
             exposures,
+            corroborated,
         )
         if is_sup:
             suppressed.append(info)
@@ -1169,7 +1199,7 @@ def measure_recurrence(
                 alive.add(hs_val.strip())
             else:
                 unidentified_heartbeats += 1
-        elif ev == "insight" and row.get("level") in COUNTABLE_LEVELS and _paths_overlap_rule(row.get("paths") or [], rule):
+        elif ev == "insight" and _effective_level(row, set()) in COUNTABLE_LEVELS and _paths_overlap_rule(row.get("paths") or [], rule):
             itoks = _tokenize(str(row.get("text") or ""))
             if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
                 matching.append(row)

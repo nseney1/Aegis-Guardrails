@@ -639,10 +639,11 @@ TOOL_DEFINITIONS = [
             "immediately, or `aegis_report_outcome` to report whether existing rules helped. Each "
             "call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty "
             "git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted "
-            "records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded "
-            "from `aegis rule insight review` rule proposals until corroborated (`level: 'W2'`) by a "
-            "matching user prompt captured by a host hook in the same session. Capped at 50 captures "
-            "per session and rate-limited to 5 calls per 60 seconds."
+            "records stay at `level: 'suggestion'`: invisible to `aegis_scan`, never counted by "
+            "`aegis rule insight review` and never upgraded to `level: 'W2'`, not even by a later "
+            "capture in the same session. A user prompt that a host hook captured on the same host "
+            "within 30 minutes and that contains the quote only annotates the record as corroborated. "
+            "Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds."
         ),
         "annotations": _write("Capture Insight"),
         "inputSchema": {
@@ -686,11 +687,8 @@ TOOL_DEFINITIONS = [
                 },
                 "level": {
                     "type": "string",
-                    "enum": ["suggestion", "W2"],
-                    "description": (
-                        "Corroboration tier: 'suggestion' initially, or 'W2' when matched "
-                        "to a hook-captured user prompt in the same session."
-                    ),
+                    "enum": ["suggestion"],
+                    "description": "Always 'suggestion': an agent capture never counts and is never upgraded.",
                 },
                 "text": {
                     "type": "string",

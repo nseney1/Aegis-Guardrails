@@ -39,7 +39,7 @@ def test_aegis_capture_insight_schema_and_annotations():
     assert schema["additionalProperties"] is False
 
 
-def test_aegis_capture_insight_records_suggestion_and_upgrades_on_hook_match(
+def test_aegis_capture_insight_records_suggestion_and_is_corroborated_never_upgraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     home = tmp_path / "home"
@@ -71,29 +71,35 @@ def test_aegis_capture_insight_records_suggestion_and_upgrades_on_hook_match(
     assert rev["clusters"] == []
     assert len(rev["suggestions"]) == 1
 
-    # 2. Hook captures a prompt in session 'mcp-sess-2' containing the quote -> upgrades to W2
-    record_hook_prompt(
+    # 2. The host's hook records a prompt containing the quote; the server's own session id
+    # differs. The capture is corroborated (same host, inside the join window) and stays a
+    # suggestion: only the hook row counts.
+    hook = record_hook_prompt(
         ws,
         "claude-code",
         {
             "prompt": "No, stop using raw os.system calls in src/service.py!",
-            "session_id": "mcp-sess-2",
+            "session_id": "host-session-2",
             "cwd": str(ws),
         },
         home=home,
     )
-    res_upgraded = execute_tool(
+    res_corroborated = execute_tool(
         "aegis_capture_insight",
         {
             "workspace": str(ws),
             "_host": "claude-code",
-            "_session": "mcp-sess-2",
+            "_session": "server-uuid-2",
             "quote": "stop using raw os.system calls in src/service.py",
             "paths": ["src/service.py"],
         },
     )
-    assert res_upgraded["status"] == "OK"
-    assert res_upgraded["level"] == "W2"
+    assert res_corroborated["status"] == "OK"
+    assert res_corroborated["level"] == "suggestion"
+    stored, = [r for r in read_insight_rows(ws, home=home) if r.get("id") == res_corroborated["id"]]
+    assert stored["corroborated_by"] == hook["id"] and "confirmed_by" not in stored
+    rev = review_insights(ws, home=home)
+    assert [(c["insight_ids"], c["corroborated"]) for c in rev["clusters"]] == [([hook["id"]], [stored["id"]])]
 
 
 def test_aegis_capture_insight_rejects_invalid_arguments_and_path_traversal(
