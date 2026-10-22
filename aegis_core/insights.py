@@ -559,7 +559,8 @@ def add_insight(
         raise ValueError("insight text must be a non-empty string")
     clean = _redact(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
-    level = "H" if _has_human_approval(workspace, commit, base_ref, clean) else "cli"
+    # The human signs the hash of what they typed; only the redacted text is stored.
+    level = "H" if _has_human_approval(workspace, commit, base_ref, text) else "cli"
     row = _build_insight_row(
         workspace, level, clean, norm_paths, psrc, "cli", None, source="cli", kind=str(kind) if kind else None,
     )
@@ -1101,61 +1102,101 @@ _SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 _VERBATIM_MIN_CHARS = 25
 
 
+def _under(prefix: str, paths: Sequence[str]) -> bool:
+    return any(p == prefix or (prefix.endswith("/") and p.startswith(prefix)) for p in paths)
+
+
+def _proposal_targets(members: Sequence[Sequence[str]], rows: Sequence[Mapping[str, Any]]) -> List[str]:
+    """At most 3 directory prefixes (a top-level file stands for itself) as ``<prefix>**``, scored
+    members-under x (ln((1+N)/(1+df)) + 1) over every insight row with paths; the best (ties:
+    deeper, then by name), then the best for the members still uncovered."""
+    candidates: Set[str] = set()
+    for path in {p for ps in members for p in ps}:
+        parts = path.split("/")
+        candidates.update(["/".join(parts[:i]) + "/" for i in range(1, len(parts))] or [path])
+    corpus = [[str(p) for p in r["paths"]] for r in rows if r.get("event") == "insight" and r.get("paths")]
+
+    def score(prefix: str) -> float:
+        df = sum(1 for ps in corpus if _under(prefix, ps))
+        return sum(1 for ps in members if _under(prefix, ps)) * (math.log((1 + len(corpus)) / (1 + df)) + 1)
+
+    chosen: List[str] = []
+    uncovered = list(members)
+    for prefix in sorted(candidates, key=lambda c: (-score(c), -c.count("/"), c)):
+        if len(chosen) == 3 or not uncovered:
+            break
+        if any(_under(prefix, ps) for ps in uncovered):
+            chosen.append(prefix)
+            uncovered = [ps for ps in uncovered if not _under(prefix, ps)]
+    return [c + "**" if c.endswith("/") else c for c in chosen]
+
+
 def write_proposal(
     workspace: Any,
     *,
     proposal_id: str,
-    rule_type: str = "trap",
-    target_paths: Sequence[str],
-    category: str,
-    summary_bullets: Sequence[str],
-    insight_ids: Sequence[str] = (),
-    enforcement: str = "advisory",
+    insight_ids: Sequence[str],
+    summary_bullets: Sequence[str] = (),
+    kind: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Path:
+    """The closed-template proposal (spec T8 Propose): an advisory trap whose kind (the reviewer's,
+    else the one its counted insights share), count, ids and target_paths come from the insights."""
     clean_id = proposal_id.strip()
     if not _SAFE_ID_RE.match(clean_id):
         raise ValueError(f"invalid proposal_id {proposal_id!r}")
     # Only human text is protected: an agent capture must not be able to veto a proposal. A
     # short prompt ("no", "revert") protects only a bullet equal to it.
     rows = read_insight_rows(workspace, home=home)
-    confirmed = set(_confirmed(rows))
+    confirmed = _confirmed(rows)
+    confirmed_ids = set(confirmed)
+    levels = {id(r): _effective_level(r, confirmed_ids) for r in rows if r.get("event") == "insight"}
     protected = [
         str(r.get("text") or "").strip().lower()
         for r in rows
-        if r.get("event") == "insight" and _effective_level(r, confirmed) in ("H", "cli", "W2")
-        and str(r.get("text") or "").strip()
+        if levels.get(id(r)) in ("H", "cli", "W2") and str(r.get("text") or "").strip()
     ]
-    for cand in (category, *summary_bullets):
+    for cand in (kind or "", *summary_bullets):
         clow = str(cand).strip().lower()
         if clow and any(ex == clow or (len(ex) >= _VERBATIM_MIN_CHARS and ex in clow)
                         or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
             raise ValueError("proposal may not contain verbatim H/cli/W2 prompt text")
-    norm_targets = [PurePath(str(p)).as_posix() for p in target_paths if str(p).strip()] or ["**"]
-    clean_bullets = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
-    if not clean_bullets:
-        raise ValueError("summary_bullets must contain at least one non-empty item")
-    targets_yaml = "\n".join(f"  - {json.dumps(p)}" for p in norm_targets)
-    refs_yaml = "\n".join(f"  - {json.dumps(str(i).strip())}" for i in insight_ids if str(i).strip())
-    hyp = f"Prevent recurring {category.strip()} issues in {', '.join(norm_targets[:3])}."
+    ids = list(dict.fromkeys(str(i).strip() for i in insight_ids if str(i).strip()))
+    counted = {str(r.get("id")): r for r in rows if levels.get(id(r)) in COUNTABLE_LEVELS}
+    missing = [i for i in ids if i not in counted]
+    if not ids or missing:
+        raise ValueError(f"not a counted insight: {', '.join(missing) or 'none given'}")
+    members = [counted[i] for i in ids]
+    kinds = sorted({str(k) for k in (confirmed.get(i) if _row_source(r) == "mcp" else r.get("kind")
+                                     for i, r in zip(ids, members)) if k})
+    chosen_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else (kinds[0] if len(kinds) == 1 else "")
+    if not chosen_kind:
+        raise ValueError(f"the insights share no single kind ({', '.join(kinds) or 'none'}); pass --kind")
+    member_paths = [[str(p) for p in r.get("paths") or []] for r in members]
+    if not any(member_paths):
+        raise ValueError("the insights carry no paths, so the proposal would target every file; "
+                         "record them with aegis rule insight add --paths")
+    targets = _proposal_targets([ps for ps in member_paths if ps], rows)
+    clean_kind = _redact(chosen_kind, max_len=64)
+    bullets = [f"{len(members)} counted correction(s) of kind `{clean_kind.replace('`', '')}`."]
+    bullets += [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    hyp = f"Prevent recurring {clean_kind} issues in {', '.join(targets)}."
     lines = [
         "---",
         f"id: {clean_id}",
-        f"type: {rule_type.strip() or 'trap'}",
+        "type: trap",
         "status: proposal",
-        f"enforcement: {enforcement.strip() or 'advisory'}",
-        f"category: {json.dumps(category.strip())}",
+        "enforcement: advisory",
+        f"kind: {json.dumps(clean_kind)}",
+        f"count: {len(members)}",
         f"hypothesis: {json.dumps(hyp)}",
-        f"target_paths:\n{targets_yaml}",
-    ]
-    if refs_yaml:
-        lines.append(f"insight_ids:\n{refs_yaml}")
-    lines.extend([
+        "target_paths:\n" + "\n".join(f"  - {json.dumps(p)}" for p in targets),
+        "insight_ids:\n" + "\n".join(f"  - {json.dumps(i)}" for i in ids),
         "---",
         f"# Proposal: {clean_id}\n",
         "## Guidance\n",
-        "\n".join(f"- {b}" for b in clean_bullets) + "\n",
-    ])
+        "\n".join(f"- {b}" for b in bullets) + "\n",
+    ]
     prop_dir = WorkspaceLayout(Path(os.fspath(workspace)).resolve()).aegis_dir / "proposals"
     prop_dir.mkdir(parents=True, exist_ok=True)
     target = prop_dir / f"{clean_id}.md"

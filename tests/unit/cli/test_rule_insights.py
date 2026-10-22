@@ -112,8 +112,6 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
         cid,
         "--proposal-id",
         "trap-subprocess-timeout",
-        "--category",
-        "reliability",
         "--summary",
         "Require an explicit timeout on subprocess invocations.",
         "--json",
@@ -121,7 +119,9 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
     assert rc == 0, err
     dec = json.loads(out)
     assert dec["decision"] == "propose"
-    assert (ws / ".aegis" / "proposals" / "trap-subprocess-timeout.md").is_file()
+    proposal = (ws / ".aegis" / "proposals" / "trap-subprocess-timeout.md").read_text(encoding="utf-8")
+    assert 'kind: "reliability"' in proposal and "count: 1" in proposal and '  - "src/**"' in proposal
+    assert "category" not in proposal
 
     # The decision takes effect: the proposed cluster leaves the review list (its id now names
     # the proposal it matches; the decision finds it by its members).
@@ -269,6 +269,66 @@ def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: p
     )
     assert rc == 0, err
     assert json.loads(out)["level"] == "H"
+
+
+def test_insight_add_prints_the_approval_trailer_for_the_typed_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """R-evidence-44: Given `insight add`, Then text mode prints the exact Aegis-Approve-Insight line
+    for the text as typed (not its redacted form) with the sign-then-re-run recipe, and --json
+    carries it as approval_trailer, which the stored row does not."""
+    from aegis_core.human_gate import INSIGHT_APPROVE_TRAILER, insight_text_hash
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    text = "Never log the reviewer address alice@example.com from src/main.py"
+    line = f"{INSIGHT_APPROVE_TRAILER}: {insight_text_hash(text)}"
+
+    rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py")
+    assert rc == 0, err
+    assert f"  {line}\n" in out and "--commit SHA" in out
+
+    rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py", "--json")
+    assert rc == 0, err
+    added = json.loads(out)
+    assert added["approval_trailer"] == line and "alice@example.com" not in added["text"]
+    assert all("approval_trailer" not in row for row in read_insight_rows(ws, home=home))
+
+
+def test_a_signed_trailer_over_the_typed_text_gives_h_even_when_redaction_changes_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    text = "Never log the reviewer address alice@example.com from src/app.py"
+    sha = repo.commit(f"chore: approve insight\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: "
+                      f"{human_gate.insight_text_hash(text)}\n", sign_key=human_key, allow_empty=True)
+
+    for typed, level in ((text, "H"), (text.replace("Never", "Do not"), "cli")):
+        rc, out, err = _invoke_rule(repo.root, "insight", "add", typed, "--paths", "src/app.py", "--commit", sha,
+                                    "--base-ref", "main", "--json")
+        assert rc == 0, err
+        row = json.loads(out)
+        assert row["level"] == level and "alice@example.com" not in row["text"]
+
+
+def test_review_no_longer_takes_a_category(tmp_path: Path):
+    parser = argparse.ArgumentParser(prog="aegis rule")
+    RuleCommand().configure_parser(parser)
+    with pytest.raises(SystemExit) as exc, contextlib.redirect_stderr(io.StringIO()):
+        parser.parse_args(["insight", "review", "--decision", "propose", "--cluster", "c", "--category", "x"])
+    assert exc.value.code == 2
 
 
 # ── `insight add` takes no session identity (R-evidence-42) ─────────────────
@@ -450,12 +510,12 @@ def test_a_proposal_that_cannot_be_written_records_no_decision_and_keeps_the_clu
     assert json.loads(out)["clusters"] == []
 
 
-def test_a_reject_stores_its_reason_and_the_proposal_category_defaults_to_the_shared_kind(review_ws):
+def test_a_reject_stores_its_reason_and_the_proposal_kind_is_the_shared_kind(review_ws):
     ws, home, cluster = review_ws
     rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--cluster", cluster["cluster_id"],
                                  "--proposal-id", "trap-popen", "--summary", "Require timeouts on child processes.")
     assert rc == 0, err
-    assert 'category: "reliability"' in (ws / ".aegis" / "proposals" / "trap-popen.md").read_text(encoding="utf-8")
+    assert 'kind: "reliability"' in (ws / ".aegis" / "proposals" / "trap-popen.md").read_text(encoding="utf-8")
     rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
     hidden, = json.loads(out)["suppressed_clusters"]
     rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "reject", "--cluster", hidden["cluster_id"],
