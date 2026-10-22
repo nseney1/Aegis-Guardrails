@@ -68,6 +68,11 @@ def _emit_error(args: argparse.Namespace, msg: str) -> int:
     return 1
 
 
+def _usage_error(args: argparse.Namespace, msg: str) -> int:
+    _emit_error(args, msg)
+    return 2
+
+
 class _WorkspaceArg(argparse.Action):
     """Keep the operator's ``--workspace`` verbatim.
 
@@ -711,14 +716,20 @@ class RuleCommand(AegisCommand):
         p_ins_add.add_argument("--base-ref", dest="base_ref", default=None, help="Optional base branch reference for --commit")
 
         p_ins_rev = ins_sub.add_parser("review", parents=[common], help="Cluster and review insights or record a decision")
-        p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise"],
-                               default=None, help="Record a review decision for a cluster")
-        p_ins_rev.add_argument("--cluster", dest="cluster_id", default=None, help="Cluster ID for --decision")
+        p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise", "confirm"],
+                               default=None, help="Record a review decision: for the cluster --cluster names "
+                                                  "(reject also needs --reason), or confirm the suggestions --insight names")
+        p_ins_rev.add_argument("--cluster", dest="cluster_id", default=None, help="Cluster ID for --decision (as review lists it)")
+        p_ins_rev.add_argument("--insight", dest="insight_ids", action="append", default=None, metavar="ID",
+                               help="Unconfirmed suggestion ID for --decision confirm (repeatable)")
+        p_ins_rev.add_argument("--kind", default=None, help="Insight kind recorded with --decision confirm")
         p_ins_rev.add_argument("--proposal-id", dest="proposal_id", default=None, help="Proposal ID when --decision propose")
-        p_ins_rev.add_argument("--category", default="correctness", help="Proposal category when --decision propose")
+        p_ins_rev.add_argument("--category", default=None,
+                               help="Proposal category when --decision propose (default: the one kind the cluster's "
+                                    "human insights share, else correctness)")
         p_ins_rev.add_argument("--summary", default=None, help="Closed-template summary bullet when --decision propose")
         p_ins_rev.add_argument("--rule", dest="rule_id", default=None, help="Target rule ID for merge-into-rule or recurrence check")
-        p_ins_rev.add_argument("--reason", default=None, help="Optional reason for the decision")
+        p_ins_rev.add_argument("--reason", default=None, help="Reason for the decision (required with reject)")
 
         p_ins_en = ins_sub.add_parser("enable", parents=[common], help="Opt-in enable UserPromptSubmit insight capture for a host")
         p_ins_en.add_argument("--host", required=True, choices=["claude-code", "codex-cli"],
@@ -821,32 +832,46 @@ def _run_insight(args: argparse.Namespace) -> int:
 
     if sub_action == "review":
         root = _resolve_workspace_root(args)
-        decision = getattr(args, "decision", None)
+        decision, cid = getattr(args, "decision", None), getattr(args, "cluster_id", None)
+        confirm_ids = list(getattr(args, "insight_ids", None) or [])
+        if decision == "confirm" and not confirm_ids:
+            return _usage_error(args, "--decision confirm needs --insight ID")
+        if decision and decision != "confirm" and not cid:
+            return _usage_error(args, f"--decision {decision} needs --cluster ID")
+        if decision == "reject" and not (getattr(args, "reason", None) or "").strip():
+            return _usage_error(args, "--decision reject needs --reason")
         rev = review_insights(root)
+        if decision == "confirm":
+            pending = [str(s.get("id")) for s in rev["suggestions"]]
+            unknown = [i for i in confirm_ids if i not in pending]
+            if unknown:
+                return _emit_error(args, f"not an unconfirmed suggestion: {sanitize_display(', '.join(unknown))}; "
+                                         f"unconfirmed suggestions: {sanitize_display(', '.join(pending), 400) or 'none'}")
+        elif decision:
+            known = rev["clusters"] + rev["suppressed_clusters"]
+            target = next((c for c in known if c["cluster_id"] == cid), None)
+            if target is None:
+                return _emit_error(args, f"unknown cluster {sanitize_display(cid)!r}; clusters: "
+                                         f"{', '.join(c['cluster_id'] for c in known) or 'none'}")
         if decision:
-            cid = getattr(args, "cluster_id", None)
-            target_cluster = next((c for c in rev["clusters"] if c["cluster_id"] == cid), None) if cid else (rev["clusters"][0] if rev["clusters"] else None)
-            cid = cid or (target_cluster["cluster_id"] if target_cluster else None)
-            if not cid:
-                return _emit_error(args, "no cluster available to record decision; pass --cluster")
-            ins_ids = target_cluster["insight_ids"] if target_cluster else []
+            ins_ids = confirm_ids if decision == "confirm" else target["insight_ids"]
             try:
                 dec_row = record_decision(
-                    root, cluster_id=cid, decision=decision, insight_ids=ins_ids,
+                    root, cluster_id=cid or "", decision=decision, insight_ids=ins_ids, kind=getattr(args, "kind", None),
                     reason=getattr(args, "reason", None), rule_id=getattr(args, "rule_id", None),
                 )
                 if decision == "propose":
                     prop_id = getattr(args, "proposal_id", None) or f"trap-{cid.replace('cluster-', '')}"
                     summary = getattr(args, "summary", None) or f"Address recurring correction cluster {cid}."
-                    paths = (target_cluster.get("paths") if target_cluster else None) or ["**"]
+                    kinds = target.get("kinds") or []
                     dec_row["proposal_path"] = str(write_proposal(
-                        root, proposal_id=prop_id, target_paths=paths,
-                        category=getattr(args, "category", "correctness") or "correctness",
+                        root, proposal_id=prop_id, target_paths=target.get("paths") or ["**"],
+                        category=getattr(args, "category", None) or (kinds[0] if len(kinds) == 1 else "correctness"),
                         summary_bullets=[summary], insight_ids=ins_ids,
                     ))
             except Exception as exc:
                 return _emit_error(args, str(exc))
-            print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {cid}")
+            print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {cid or ', '.join(ins_ids)}")
             return 0
 
         if rule_id := getattr(args, "rule_id", None):
@@ -861,6 +886,9 @@ def _run_insight(args: argparse.Namespace) -> int:
             print(f"Insight Review: {len(clusters)} cluster(s), {len(suggestions)} unconfirmed agent suggestion(s)")
             for c in clusters:
                 print(f"  [{c['cluster_id']}] count={c['count']} status={c['match_status']} rule={c.get('matched_rule') or 'none'}")
+                for ins_id, text in zip(c["insight_ids"], c["excerpts"]):
+                    near = ", ".join(f"{n['id']} ({n['similarity']:.2f})" for n in rev["neighbours"].get(ins_id, []))
+                    print(f"    {sanitize_display(ins_id)}: {sanitize_display(text, 60)} | neighbours: {sanitize_display(near or 'none', 200)}")
         return 0
 
     return _emit_error(args, "Specify an insight action: add, review, or enable")

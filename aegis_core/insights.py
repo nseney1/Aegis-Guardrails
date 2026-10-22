@@ -102,7 +102,9 @@ _HS_DOMAIN = b"aegis-hs/v1"
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 INSIGHT_LEVELS = ("H", "cli", "W2", "hook", "suggestion")
 COUNTABLE_LEVELS = frozenset({"H", "cli", "W2", "hook"})
-DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise")
+DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
+# The latest of these decides whether a cluster is listed; noise and confirm name insights.
+_RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
 SUPPORTED_INSIGHT_HOSTS = ("claude-code", "codex-cli")
 # aegis_capture_insight is reachable by the agent: its cost is bounded per call and per session.
 MAX_CAPTURES_PER_SESSION = 50
@@ -465,6 +467,16 @@ def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optiona
     return None
 
 
+def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
+    """{insight id: kind or None} of the suggestions a human confirmed."""
+    found: Dict[str, Optional[str]] = {}
+    for r in rows:
+        if r.get("event") == "decision" and r.get("decision") == "confirm":
+            kind = r.get("kind") if isinstance(r.get("kind"), str) else None
+            found.update({str(i): kind or found.get(str(i)) for i in r.get("insight_ids") or []})
+    return found
+
+
 def _corroborating_hook(rows: Iterable[Mapping[str, Any]], host: str, ts: Any, quote: str) -> Optional[str]:
     """The id of a hook prompt of ``host`` within JOIN_WINDOW_S of ``ts`` that contains ``quote``."""
     needle, when = quote.strip().lower(), _parse_ts(ts)
@@ -824,25 +836,29 @@ def _cluster_signature_id(tokens: Sequence[str], matched_id: Optional[str]) -> s
 def record_decision(
     workspace: Any,
     *,
-    cluster_id: str,
+    cluster_id: str = "",
     decision: str,
     insight_ids: Sequence[str],
     reason: Optional[str] = None,
     rule_id: Optional[str] = None,
+    kind: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    """``confirm`` names the suggestions a human confirms (and their ``kind``); every other
+    decision names a cluster."""
     if decision not in DECISIONS:
         raise ValueError(f"decision must be one of {list(DECISIONS)}, got {decision!r}")
-    if not isinstance(cluster_id, str) or not cluster_id.strip():
+    ids = [str(i) for i in insight_ids if str(i).strip()]
+    if decision == "confirm" and not ids:
+        raise ValueError("confirm needs at least one insight id")
+    if decision != "confirm" and (not isinstance(cluster_id, str) or not cluster_id.strip()):
         raise ValueError("cluster_id must be a non-empty string")
-    row: Dict[str, Any] = {
-        "v": INSIGHT_SCHEMA_VERSION,
-        "ts": _utc_now(),
-        "event": "decision",
-        "cluster_id": cluster_id.strip(),
-        "decision": decision,
-        "insight_ids": [str(i) for i in insight_ids if str(i).strip()],
-    }
+    row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": _utc_now(), "event": "decision"}
+    if cluster_id and cluster_id.strip():
+        row["cluster_id"] = cluster_id.strip()
+    row.update(decision=decision, insight_ids=ids)
+    if kind:
+        row["kind"] = str(kind)
     if reason:
         row["reason"] = _redact(str(reason))
     if rule_id:
@@ -918,10 +934,10 @@ def _build_cluster_entry(
     countable: Sequence[Tuple[int, Dict[str, Any]]],
     ins_tokens: Sequence[Sequence[str]],
     ins_best_rule: Sequence[Optional[_RuleMatch]],
-    rejections: Sequence[Tuple[int, Dict[str, Any]]],
-    neighbours: Mapping[str, List[Dict[str, Any]]],
+    decisions: Sequence[Tuple[int, Dict[str, Any]]],
     exposures: _Exposures,
     corroborated: Mapping[str, List[str]],
+    levels: Mapping[str, Tuple[str, Optional[str]]],
 ) -> Tuple[Dict[str, Any], bool]:
     m_rows = [countable[m][1] for m in members]
     m_row_idxs = [countable[m][0] for m in members]
@@ -944,26 +960,25 @@ def _build_cluster_entry(
         else:
             status = "matches_archived"
     cid = _cluster_signature_id(c_tokens, matched_id)
-    latest_rej = max(
-        (
-            d_idx
-            for d_idx, d_row in rejections
-            if d_row.get("cluster_id") == cid or set(d_row.get("insight_ids") or []).intersection(m_ids)
-        ),
-        default=None,
-    )
-    is_sup = latest_rej is not None and sum(1 for r_idx in m_row_idxs if r_idx > latest_rej) < REJECTION_RESURFACE_COUNT
+    # The id hashes the top tokens, so a decision also finds its cluster by a shared member.
+    latest = max(((d_idx, d_row) for d_idx, d_row in decisions
+                  if d_row.get("cluster_id") == cid or set(d_row.get("insight_ids") or []).intersection(m_ids)),
+                 key=lambda d: d[0], default=None)
+    # propose and merge-into-rule hide a cluster until a later decision; snooze and reject until
+    # REJECTION_RESURFACE_COUNT members are newer than the decision.
+    is_sup = latest is not None and (latest[1].get("decision") in ("propose", "merge-into-rule")
+                                     or sum(1 for r_idx in m_row_idxs if r_idx > latest[0]) < REJECTION_RESURFACE_COUNT)
     info = {
         "cluster_id": cid,
         "insight_ids": m_ids,
         "count": len(m_ids),
         "paths": sorted(c_paths),
         "excerpts": [str(r.get("text") or "") for r in m_rows],
-        "levels": sorted({str(r.get("level") or "") for r in m_rows}),
+        "levels": sorted({levels[mid][0] for mid in m_ids}),
+        "kinds": sorted({str(levels[mid][1]) for mid in m_ids if levels[mid][1]}),
         "match_status": status,
         "matched_rule": matched_id,
         "similarity": round(best_score, 4),
-        "neighbours": {mid: neighbours.get(mid, []) for mid in m_ids},
         "corroborated": [sid for mid in m_ids for sid in corroborated.get(mid, ())],
     }
     return info, is_sup
@@ -983,11 +998,9 @@ def review_insights(
         for x in (r.get("insight_ids") or [])
         if x
     }
-    rejections = [
-        (idx, r)
-        for idx, r in enumerate(all_rows)
-        if r.get("event") == "decision" and r.get("decision") == "reject"
-    ]
+    decisions = [(idx, r) for idx, r in enumerate(all_rows)
+                 if r.get("event") == "decision" and r.get("decision") in _RULING_DECISIONS]
+    confirmed = _confirmed(all_rows)
     # Review is the authority on corroboration: recomputed here, read-only, whatever the order
     # of capture and prompt. A corroborated suggestion annotates its hook row and never counts.
     hook_rows = [r for r in all_rows if r.get("event") == "insight" and _row_source(r) == "hook"
@@ -995,19 +1008,24 @@ def review_insights(
     suggestions: List[Dict[str, Any]] = []
     countable: List[Tuple[int, Dict[str, Any]]] = []
     corroborated: Dict[str, List[str]] = {}
+    levels: Dict[str, Tuple[str, Optional[str]]] = {}
     for idx, row in enumerate(all_rows):
         ins_id = str(row.get("id") or f"row-{idx}")
         if row.get("event") != "insight" or ins_id in noise_ids:
             continue
-        level = _effective_level(row, set())
-        if level == "suggestion":
+        level = _effective_level(row, set(confirmed))
+        if _row_source(row) == "mcp":
+            # Confirming a corroborated capture would count its correction a second time.
             m_hook = _corroborating_hook(hook_rows, str(row.get("host") or ""), row.get("ts"), str(row.get("text") or ""))
             if m_hook:
                 corroborated.setdefault(m_hook, []).append(ins_id)
-            else:
+                continue
+            if level == "suggestion":
                 suggestions.append(row)
-        elif level in COUNTABLE_LEVELS:
+                continue
+        if level in COUNTABLE_LEVELS:
             countable.append((idx, row))
+            levels[ins_id] = (level, confirmed.get(ins_id) if _row_source(row) == "mcp" else row.get("kind"))
     if not countable:
         return {"clusters": [], "suggestions": suggestions, "suppressed_clusters": [], "neighbours": {}}
     from aegis_core.rules import load_rules
@@ -1052,10 +1070,10 @@ def review_insights(
             countable,
             ins_tokens,
             ins_best_rule,
-            rejections,
-            neighbours,
+            decisions,
             exposures,
             corroborated,
+            levels,
         )
         if is_sup:
             suppressed.append(info)
@@ -1092,10 +1110,12 @@ def write_proposal(
         raise ValueError(f"invalid proposal_id {proposal_id!r}")
     # Only human text is protected: an agent capture must not be able to veto a proposal. A
     # short prompt ("no", "revert") protects only a bullet equal to it.
+    rows = read_insight_rows(workspace, home=home)
+    confirmed = set(_confirmed(rows))
     protected = [
         str(r.get("text") or "").strip().lower()
-        for r in read_insight_rows(workspace, home=home)
-        if r.get("event") == "insight" and _effective_level(r, set()) in ("H", "cli", "W2")
+        for r in rows
+        if r.get("event") == "insight" and _effective_level(r, confirmed) in ("H", "cli", "W2")
         and str(r.get("text") or "").strip()
     ]
     for cand in (category, *summary_bullets):

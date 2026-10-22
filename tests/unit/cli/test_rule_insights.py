@@ -123,6 +123,14 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
     assert dec["decision"] == "propose"
     assert (ws / ".aegis" / "proposals" / "trap-subprocess-timeout.md").is_file()
 
+    # The decision takes effect: the proposed cluster leaves the review list (its id now names
+    # the proposal it matches; the decision finds it by its members).
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert rc == 0, err
+    after = json.loads(out)
+    assert after["clusters"] == []
+    assert [c["insight_ids"] for c in after["suppressed_clusters"]] == [[added["id"]]]
+
 
 def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
@@ -346,3 +354,93 @@ def test_mcp_capture_insight_confines_like_the_cli(tmp_path: Path, monkeypatch: 
                       {"workspace": str(ws), "quote": "Stay inside", "paths": [str(ws / "src" / "main.py"), "src/a,b.py"]})
     assert ok["status"] == "OK", ok
     assert ok["paths"] == ["src/a,b.py", "src/main.py"]
+
+
+# ── R-evidence-38: decisions need their target, and take effect ─────────────────
+
+@pytest.fixture
+def review_ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    ws = _make_workspace(tmp_path / "ws")
+    for text in ("Never call subprocess.Popen without a timeout in src/main.py",
+                 "Always pass a timeout to subprocess.Popen calls in src/main.py"):
+        rc, _out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py", "--kind", "reliability")
+        assert rc == 0, err
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert rc == 0, err
+    cluster, = json.loads(out)["clusters"]
+    return ws, home, cluster
+
+
+def _decision_rows(ws: Path, home: Path) -> list:
+    return [r for r in read_insight_rows(ws, home=home) if r.get("event") == "decision"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["--decision", "snooze"],
+    ["--decision", "reject", "--reason", "later"],
+    ["--decision", "reject", "--cluster", "CID"],
+    ["--decision", "confirm"],
+], ids=["no-cluster", "reject-no-cluster", "reject-no-reason", "confirm-no-insight"])
+def test_a_decision_without_its_target_or_reason_is_a_usage_error(review_ws, argv):
+    ws, home, cluster = review_ws
+    rc, _out, err = _invoke_rule(ws, "insight", "review", *[cluster["cluster_id"] if a == "CID" else a for a in argv])
+    assert rc == 2
+    assert "--cluster" in err or "--reason" in err or "--insight" in err
+    assert _decision_rows(ws, home) == []
+
+
+def test_an_unknown_cluster_writes_nothing_and_lists_the_valid_ids(review_ws):
+    ws, home, cluster = review_ws
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--cluster", "cluster-typo", "--json")
+    assert rc == 1
+    assert cluster["cluster_id"] in json.loads(out)["error"]
+    assert _decision_rows(ws, home) == []
+    assert not (ws / ".aegis" / "proposals").exists()
+
+
+def test_an_unknown_insight_to_confirm_writes_nothing_and_lists_the_valid_ids(review_ws):
+    from aegis_core.insights import capture_suggestion
+
+    ws, home, _cluster = review_ws
+    cap = capture_suggestion(ws, "Prefer pathlib joins over string concatenation", paths=["src/main.py"],
+                             host="claude-code", session="agent", home=home)
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "confirm", "--insight", "ins-nope", "--json")
+    assert rc == 1
+    assert cap["id"] in json.loads(out)["error"]
+    assert _decision_rows(ws, home) == []
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--decision", "confirm", "--insight", cap["id"],
+                                "--kind", "style", "--json")
+    assert rc == 0, err
+    assert (json.loads(out)["insight_ids"], json.loads(out)["kind"]) == ([cap["id"]], "style")
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert [cap["id"]] in [c["insight_ids"] for c in json.loads(out)["clusters"]]
+
+
+def test_a_reject_stores_its_reason_and_the_proposal_category_defaults_to_the_shared_kind(review_ws):
+    ws, home, cluster = review_ws
+    rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--cluster", cluster["cluster_id"],
+                                 "--proposal-id", "trap-popen", "--summary", "Require timeouts on child processes.")
+    assert rc == 0, err
+    assert 'category: "reliability"' in (ws / ".aegis" / "proposals" / "trap-popen.md").read_text(encoding="utf-8")
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    hidden, = json.loads(out)["suppressed_clusters"]
+    rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "reject", "--cluster", hidden["cluster_id"],
+                                 "--reason", "covered by trap-popen")
+    assert rc == 0, err
+    assert [r.get("reason") for r in _decision_rows(ws, home)] == [None, "covered by trap-popen"]
+
+
+def test_text_review_lists_each_insight_once_with_its_neighbours(review_ws):
+    ws, home, cluster = review_ws
+    rc, out, err = _invoke_rule(ws, "insight", "review")
+    assert rc == 0, err
+    for ins_id in cluster["insight_ids"]:
+        member_lines = [line for line in out.splitlines() if line.strip().startswith(f"{ins_id}:")]
+        assert len(member_lines) == 1
+        other, = [i for i in cluster["insight_ids"] if i != ins_id]
+        assert f"neighbours: {other}" in member_lines[0]

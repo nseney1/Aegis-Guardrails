@@ -784,3 +784,87 @@ def test_a_4_3_upgraded_w2_capture_never_counts_as_a_recurrence(tmp_path: Path, 
         "revs": {"trap-validate-rmtree": rev}}])
     rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert (rec["sessions"], rec["recurrences"]) == (1, 0)
+
+
+# ── R-evidence-38: review decisions take effect ─────────────────────────────────
+
+ENV_TEXTS = (
+    "Stop mutating global os.environ directly inside worker threads",
+    "Never mutate global os.environ state inside worker threads",
+    "Do not mutate global os.environ variables inside worker threads",
+    "Don't mutate global os.environ dictionary in worker threads",
+)
+
+
+@pytest.fixture
+def review_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    return _init_git_repo(tmp_path / "repo"), home
+
+
+@pytest.mark.parametrize("decision", ["snooze", "reject", "propose", "merge-into-rule"])
+def test_a_decided_cluster_leaves_the_review_and_only_snooze_or_reject_resurface(review_repo, decision):
+    repo, home = review_repo
+    first = [_hook_insight(repo, text, f"s-{i}", home)["id"] for i, text in enumerate(ENV_TEXTS[:2])]
+    cluster, = review_insights(repo, home=home)["clusters"]
+    assert sorted(cluster["insight_ids"]) == sorted(first)
+    record_decision(repo, cluster_id=cluster["cluster_id"], decision=decision, insight_ids=cluster["insight_ids"],
+                    reason="not now", home=home)
+    hidden = review_insights(repo, home=home)
+    assert hidden["clusters"] == []
+    assert [sorted(c["insight_ids"]) for c in hidden["suppressed_clusters"]] == [sorted(first)]
+    _hook_insight(repo, ENV_TEXTS[2], "s-2", home)
+    assert review_insights(repo, home=home)["clusters"] == []
+    _hook_insight(repo, ENV_TEXTS[3], "s-3", home)
+    after = review_insights(repo, home=home)
+    if decision in ("snooze", "reject"):
+        assert [c["count"] for c in after["clusters"]] == [4]
+    else:
+        assert after["clusters"] == [] and [c["count"] for c in after["suppressed_clusters"]] == [4]
+
+
+def test_a_confirmed_suggestion_counts_as_cli_and_an_unconfirmed_one_does_not(review_repo):
+    repo, home = review_repo
+    s1 = capture_suggestion(repo, ENV_TEXTS[1], paths=["src/app.py"], host="claude-code", session="agent", home=home)
+    s2 = capture_suggestion(repo, "Prefer pathlib joins over string concatenation", paths=["src/app.py"],
+                            host="claude-code", session="agent", home=home)
+    assert review_insights(repo, home=home)["clusters"] == []
+    record_decision(repo, decision="confirm", insight_ids=[s1["id"]], kind="concurrency", home=home)
+    review = review_insights(repo, home=home)
+    assert [(c["insight_ids"], c["levels"], c["kinds"]) for c in review["clusters"]] == [([s1["id"]], ["cli"], ["concurrency"])]
+    assert [s["id"] for s in review["suggestions"]] == [s2["id"]]
+    with pytest.raises(ValueError, match="verbatim"):
+        write_proposal(repo, proposal_id="trap-env", target_paths=["src/*.py"], category="concurrency",
+                       summary_bullets=[ENV_TEXTS[1]], home=home)
+
+
+def test_confirming_a_corroborated_suggestion_does_not_count_the_correction_twice(review_repo):
+    repo, home = review_repo
+    hook = _hook_insight(repo, ENV_TEXTS[1], "host-s", home)
+    cap = capture_suggestion(repo, "mutate global os.environ state", paths=["src/app.py"], host="claude-code",
+                             session="agent", home=home)
+    record_decision(repo, decision="confirm", insight_ids=[cap["id"]], home=home)
+    assert [(c["insight_ids"], c["corroborated"]) for c in review_insights(repo, home=home)["clusters"]] == [
+        ([hook["id"]], [cap["id"]])]
+
+
+def test_neighbours_are_emitted_once_per_insight(review_repo):
+    repo, home = review_repo
+    ids = [_hook_insight(repo, text, f"s-{i}", home)["id"] for i, text in enumerate(ENV_TEXTS[:2])]
+    review = review_insights(repo, home=home)
+    assert sorted(review["neighbours"]) == sorted(ids)
+    assert all("neighbours" not in c for c in review["clusters"])
+
+
+def test_record_decision_refuses_a_confirm_without_insights_and_a_missing_cluster(review_repo):
+    repo, home = review_repo
+    with pytest.raises(ValueError, match="insight"):
+        record_decision(repo, decision="confirm", insight_ids=[], home=home)
+    with pytest.raises(ValueError, match="cluster_id"):
+        record_decision(repo, decision="snooze", insight_ids=["ins-1"], home=home)
+    assert read_insight_rows(repo, home=home) == []
