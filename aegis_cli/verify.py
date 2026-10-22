@@ -239,6 +239,32 @@ def _vendor_warning(repo_root: str) -> str:
     return vendor_warning(declared, env_client())
 
 
+def _append_step_summary(document: dict, root: str) -> None:
+    """Append the Markdown summary of ``document`` to $GITHUB_STEP_SUMMARY when it is set: appended, as
+    every step of the job does, never read back; one stderr note when it cannot be written."""
+    from aegis_cli.formatters.report import format_github_step_summary
+    from aegis_core.config import env_github_step_summary
+
+    summary_path = env_github_step_summary()
+    if not summary_path:
+        return
+    md = format_github_step_summary(document, workspace_root=root)
+    try:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(md)
+    except OSError as exc:
+        print(f"note: the step summary could not be written ({type(exc).__name__})", file=sys.stderr)
+
+
+def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool, root: str) -> None:
+    """``--format github|sarif`` for Layer 1: one report on stdout, and the step summary."""
+    from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, layer1_report_document
+
+    document = layer1_report_document(passed, owned, issues, strict)
+    print(format_sarif_report(document, workspace_root=root) if fmt == "sarif" else "\n".join(github_annotation_lines(document)))
+    _append_step_summary(document, root)
+
+
 def _usage_error(message: str) -> int:
     print(f"Error: {message}", file=sys.stderr)
     return 2
@@ -629,6 +655,13 @@ def run_verify(args: argparse.Namespace) -> int:
     layer2 = bool(getattr(args, "full", False)) or plan is not None or plan_file is not None
     if hook and layer2:
         return _usage_error("--hook runs Layer 1 only; drop --full, --plan and --plan-file")
+    fmt = str(getattr(args, "format", None) or "text").lower()
+    report_fmt = fmt if fmt in ("github", "sarif") else ""
+    if report_fmt and (layer2 or getattr(args, "dry_run", False)):
+        named = "--dry-run" if getattr(args, "dry_run", False) else next(
+            flag for flag, given in (("--full", getattr(args, "full", False)), ("--plan", plan is not None),
+                                     ("--plan-file", plan_file is not None)) if given)
+        return _usage_error(f"--format {report_fmt} reports a Layer 1 check; it does not combine with {named}")
     if plan is not None and not plan.strip():
         return _usage_error("Layer 2 needs a task plan: --plan is empty")
     if plan_file is not None and not plan_file.strip():
@@ -678,8 +711,8 @@ def run_verify(args: argparse.Namespace) -> int:
         if not task_plan:
             return _usage_error("Layer 2 needs a task plan: pass --plan or --plan-file (or add docs/plan.md)")
 
-    fmt = str(getattr(args, "format", None) or "text").lower()
     use_json = bool(getattr(args, "json", False) or fmt == "json")
+    machine = use_json or bool(report_fmt)  # stdout holds exactly one report
     strict = bool(getattr(args, "strict", False))
     mode = "Layer 1 + Layer 2" if layer2 else "Layer 1"
 
@@ -720,7 +753,7 @@ def run_verify(args: argparse.Namespace) -> int:
 
     # ── Layer 1: workspace checkpoint, then the per-file tools ────────────
     issues, blocking = run_checkpoint(Path(repo_root), strict=strict)
-    if not use_json:
+    if not machine:
         _print_checkpoint(issues, strict)
 
     if not target_files:
@@ -732,7 +765,9 @@ def run_verify(args: argparse.Namespace) -> int:
             summary = "Layer 1: 0 files changed (clean repository)"
         # Say so: a Layer 2 run that reviewed nothing must not read like a Layer 1-only pass.
         layer2_summary = "Layer 2: no changed files to review"
-        if use_json:
+        if report_fmt:
+            _emit_report(report_fmt, not blocking, [], issues, strict, repo_root)
+        elif use_json:
             payload = format_layer1_json_payload(not blocking, [], [], summary)
             payload["checkpoint_issues"] = issues
             if held.active:
@@ -784,7 +819,7 @@ def run_verify(args: argparse.Namespace) -> int:
     else:
         n = len(target_files)
         summary = f"Layer 1: no check applies to the {n} target file{'' if n == 1 else 's'} (0 checks run, PASSED)"
-    if not use_json:
+    if not machine:
         for r in results:
             if not r.verdict:
                 print(f"🔴 {r.tool}: {r.target} — {r.detail}")
@@ -838,7 +873,10 @@ def run_verify(args: argparse.Namespace) -> int:
     if not layer2:
         _record_telemetry(tools_pass, "PASS" if tools_pass else "FAIL")
         _record_baseline(layer1_pass)
-        if use_json:
+        if report_fmt:  # baseline.apply keeps one item per pair, in order
+            _emit_report(report_fmt, layer1_pass, [(path, e) for (path, _), e in zip(pairs, results)], issues, strict,
+                         repo_root)
+        elif use_json:
             _emit_json(layer1_pass)
         return 0 if layer1_pass else 1
 

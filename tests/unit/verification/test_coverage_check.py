@@ -554,13 +554,13 @@ class TestCheckCliIntegration:
         parser = argparse.ArgumentParser()
         cmd = CheckCommand()
         cmd.configure_parser(parser)
-        args = parser.parse_args(["--format", "sarif"])
+        args = parser.parse_args(["--card", "--format", "sarif"])
         args._root = tmp_path
 
         rc = cmd.execute(args)
         assert rc == 2
         err = capsys.readouterr().err
-        assert "--format sarif only applies with --ci" in err
+        assert "--format sarif" in err and "--ci" in err
 
     @needs_git
     def test_ci_coverage_is_reported_and_never_changes_the_exit_code(self, tmp_path, cov_env, capsys, monkeypatch):

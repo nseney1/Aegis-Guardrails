@@ -20,6 +20,7 @@ __all__ = [
     "github_annotation_lines",
     "governance_note",
     "layer1_findings",
+    "layer1_report_document",
     "perf_line",
 ]
 
@@ -180,6 +181,19 @@ def layer1_findings(document: dict[str, Any], workspace_root: Optional[str | Pat
     return found
 
 
+def layer1_report_document(passed: bool, owned: list, checkpoint_issues: list, strict: bool) -> dict[str, Any]:
+    """The document ``check FILES --format github|sarif`` reports: each piece of Layer 1 evidence under
+    its workspace-relative file (``owned``: (path or None, ToolEvidence)) with its lines, and each
+    checkpoint issue as a line-less finding (an error when it blocks)."""
+    from aegis_cli.checkpoint import is_blocking
+
+    return {"passed": passed,
+            "layer1": [{"tool": e.tool, "target": path or e.target, "verdict": bool(e.verdict), "detail": e.detail,
+                        "lines": list(e.lines)} for path, e in owned],
+            "findings": [{"rule": f"checkpoint:{issue.get('check', '')}", "message": issue.get("message", ""),
+                          "level": "error" if is_blocking(issue, strict) else "warning"} for issue in checkpoint_issues]}
+
+
 def _split(document: dict[str, Any], workspace_root: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """(anchored, line-less) findings of either document kind."""
     found = ci_findings(document, workspace_root) + layer1_findings(document, workspace_root)
@@ -262,6 +276,12 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
                         f"{figure} of {cov.get('executable_lines', 0)} changed executable lines (report only)"))
     elif isinstance(cov, dict):
         out.append(line("warning", "coverage unverified", cov.get("reason", "")))
+    for row in document.get("layer1", ()):  # a Layer 1 report: only the first evidence line is annotated
+        if not row["verdict"]:
+            lines = row.get("lines") or ()
+            out.append(line("error", row["tool"], row["detail"], row["target"], lines[0] if lines else 0))
+    for issue in document.get("findings", ()):
+        out.append(line(issue.get("level", "error"), issue["rule"], issue["message"]))
     return out
 
 

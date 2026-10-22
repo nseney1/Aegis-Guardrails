@@ -114,13 +114,17 @@ def _run_record(args: argparse.Namespace) -> int:
 
 
 def _format_refusal(args: argparse.Namespace) -> str:
-    """Why ``--format`` cannot apply to this run, or "": the one rule for every mode."""
+    """Why ``--format`` cannot apply to this run, or "": the one rule for every mode. github and sarif
+    report a --ci run or a plain Layer 1 check; a mode of its own has a report of its own."""
     fmt = str(getattr(args, "format", None) or "text").lower()
     if fmt not in ("github", "sarif"):
         return ""
     if getattr(args, "json", False):
         return f"--json does not combine with --format {fmt}: stdout holds one report"
-    return "" if getattr(args, "ci", False) else f"--format {fmt} only applies with --ci"
+    own = _given(args, (("--record", "record", False), ("--lane", "lane", None), ("--partition", "partition", False),
+                        ("--card", "card", False), ("--write-baseline", "write_baseline", False),
+                        ("--prune-baseline", "prune_baseline", False)))
+    return f"--format {fmt} reports --ci or a plain Layer 1 check, not {own[0]}" if own and not getattr(args, "ci", False) else ""
 
 
 def run_check(args: argparse.Namespace) -> int:
@@ -253,32 +257,18 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
     return document
 
 
-def _write_step_summary_if_configured(document: dict, root: str) -> None:
-    from aegis_cli.formatters.report import format_github_step_summary
-    from aegis_core.config import env_github_step_summary
-
-    summary_path = env_github_step_summary()
-    if not summary_path:
-        return
-    md = format_github_step_summary(document, workspace_root=root)
-    try:  # appended, as every step of the job does; never read back or rewritten
-        with open(summary_path, "a", encoding="utf-8") as handle:
-            handle.write(md)
-    except OSError as exc:
-        print(f"note: the step summary could not be written ({type(exc).__name__})", file=sys.stderr)
-
-
 def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
               skipped=(), scanner_results=None) -> list:
     """Print the ``check --ci`` result in ``fmt`` and append the step summary; return the blocking causes."""
     from aegis_cli import sanitize_display
     from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, governance_note, perf_line
+    from aegis_cli.verify import _append_step_summary
     from aegis_core import regression
 
     document = _build_ci_document(report, root, reg_report, cov_report, perf_report, trailer_checks=trailer_checks,
                                   skipped=skipped, scanner_results=scanner_results)
     blocking = document["blocking"]
-    _write_step_summary_if_configured(document, root)
+    _append_step_summary(document, root)
 
     if fmt == "sarif":
         print(format_sarif_report(document, workspace_root=root))
@@ -530,8 +520,8 @@ class CheckCommand(AegisCommand):
             "fixed environment; exit 5 or zero passed tests is never evidence",
         )
         parser.add_argument("--format", choices=("text", "json", "github", "sarif"), default="text",
-                            help="Output format. github|sarif: workflow-command annotations or SARIF 2.1.0, with --ci "
-                            "only; neither combines with --json")
+                            help="Output format. github|sarif: workflow-command annotations or SARIF 2.1.0 for --ci or "
+                            "a plain Layer 1 check (also appended to $GITHUB_STEP_SUMMARY); neither combines with --json")
         # One mode at a time. run_verify refuses every option a mode would otherwise ignore.
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument(
