@@ -803,28 +803,46 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _resolve_directory(path: Path | str) -> Path:
+    """``path`` with its directory resolved and its last component kept as written."""
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if absolute.name in ("", ".."):
+        return absolute.resolve()
+    return absolute.parent.resolve() / absolute.name
+
+
 def atomic_write_bytes(
     path: Path | str,
     data: bytes,
     max_retries: int = STORAGE_MAX_RETRIES,
     initial_delay: float = STORAGE_INITIAL_DELAY_SECONDS,
     mode: Optional[int] = None,
+    *,
+    follow_links: bool = True,
 ) -> None:
     """Replace ``path`` with ``data`` atomically: readers see the old or the new bytes.
 
     The parent directory is created if missing. ``mode`` sets the permission bits
     exactly (the umask does not apply); without it an existing file keeps its bits and
-    a new one gets ``0o666 & ~umask``. The temporary file is removed on failure.
+    a new one gets ``0o666 & ~umask``. The temporary file is removed on failure. With
+    ``follow_links=False`` a symlink at ``path`` is replaced, never followed, and lends
+    the new file none of its target's bits (directories above it are still resolved).
     """
-    target = Path(path).resolve()
+    # A caller that checked the name with lstat passes follow_links=False: rename(2)
+    # replaces a link at the destination instead of following it, so a link swapped in
+    # after the check is overwritten as itself, never its target.
+    target = Path(path).resolve() if follow_links else _resolve_directory(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     keep_mode: Optional[int] = None if mode is None else stat.S_IMODE(mode)
     if keep_mode is None:
         try:
-            keep_mode = stat.S_IMODE(os.stat(target).st_mode)
+            st: Optional[os.stat_result] = os.stat(target) if follow_links else os.lstat(target)
         except FileNotFoundError:
-            if _in_shared_state(target):
-                keep_mode = _PRIVATE_FILE_MODE
+            st = None
+        if st is not None and not stat.S_ISLNK(st.st_mode):
+            keep_mode = stat.S_IMODE(st.st_mode)
+        elif _in_shared_state(target):
+            keep_mode = _PRIVATE_FILE_MODE
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_CLOEXEC
     # A file that ends with set bits starts private, so it is never looser in between.

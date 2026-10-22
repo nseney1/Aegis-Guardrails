@@ -736,17 +736,17 @@ def _apply(plan: List[_Change], home: Optional[Path], root: Path) -> Tuple[List[
             if change.kind == "remove_keys":
                 atomic_bytes = _without_keys(current, change.keys)
                 _current_bytes(change.path, change.sha256)  # compare before replace
-                atomic_write_bytes(change.path, atomic_bytes)
+                atomic_write_bytes(change.path, atomic_bytes, follow_links=False)
             elif change.kind == "remove_list_items":
                 edited = _without_list_items(current, change.items)
                 _current_bytes(change.path, change.sha256)
-                atomic_write_bytes(change.path, edited)
+                atomic_write_bytes(change.path, edited, follow_links=False)
             elif change.kind == "remove_lines":
                 kept = _without_lines(current, change.lines)
                 if kept is None:  # the plan said "edit"; deleting would be a change nobody confirmed
                     raise _Refused("only the legacy block would be left; re-run aegis doctor")
                 _current_bytes(change.path, change.sha256)
-                atomic_write_bytes(change.path, kept)
+                atomic_write_bytes(change.path, kept, follow_links=False)
             elif change.kind == "delete_file":
                 _current_bytes(change.path, change.sha256)
                 os.unlink(change.path)
