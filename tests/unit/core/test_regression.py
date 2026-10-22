@@ -342,29 +342,202 @@ def test_batched_metadata_keeps_each_commits_paths(tmp_path: Path):
 
 
 @needs_git
-def test_collection_error_on_base_does_not_count_as_fail_to_pass(tmp_path: Path):
-    """A test file that fails collection on base (top-level ImportError) is not a valid fail-to-pass test."""
+def test_a_module_that_fails_collection_on_base_counts_as_fail_to_pass(tmp_path: Path):
+    """R-evidence-27: a test module whose top-level import of a new symbol fails on base fails there, so a
+    test in it that passes at head is fail-to-pass. (The old rule rejected this but accepted the same
+    test with a lazy import, so it only ever blocked honest tests.)"""
     repo = make_repo(tmp_path)
     repo.write(
         "src/app.py",
         "def compute(x: int) -> int:\n    return x + 1\n\n"
         "def brand_new_symbol() -> int:\n    return 42\n",
     )
-    # Top-level import of brand_new_symbol causes collection error on base, while the test itself asserts True!
     repo.write(
         "tests/test_app.py",
         "from src.app import brand_new_symbol\n\n"
-        "def test_fake():\n"
-        "    assert True\n",
+        "def test_new_symbol():\n"
+        "    assert brand_new_symbol() == 42\n",
     )
-    repo.commit("fix: try to game fail-to-pass with top-level import error on base")
+    repo.commit("fix: add the missing symbol")
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert report.passed is False
+    assert report.passed is True
     item = report.commits[0]
-    assert item.status == "failed"
-    assert item.reason == "collection_error_on_base"
-    assert item.failed_on_base is False
+    assert (item.status, item.reason, item.failed_on_base, item.passed_on_head) == ("passed", "ok", True, True)
+    assert item.fail_to_pass_tests == ("tests.test_app::test_new_symbol",)
+
+
+# ── Fail-to-pass at PR level: two runs, head against merge base (R-evidence-27) ──
+
+
+def _fix(repo: hg.Repo, message: str, files: Dict[str, str]) -> str:
+    for path, text in files.items():
+        repo.write(path, text)
+    return repo.commit(message)
+
+
+APP = "def compute(x: int) -> int:\n    return x + {}\n"
+TEST_COMPUTE = "from src.app import compute\n\ndef test_compute():\n    assert compute(2) == 3\n"
+
+
+@needs_git
+def test_a_fix_whose_test_imports_a_helper_added_earlier_in_the_pr_passes_in_two_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    _fix(repo, "feat: add clamp helper", {"src/util.py": "def clamp(x: int) -> int:\n    return x\n"})
+    fix = _fix(repo, "fix: clamp negative values", {
+        "src/util.py": "def clamp(x: int) -> int:\n    return max(x, 0)\n",
+        "tests/test_util.py": "from src.util import clamp\n\ndef test_clamp_negative():\n    assert clamp(-1) == 0\n",
+    })
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.commit, c.status, c.fail_to_pass_tests) for c in report.commits] == [
+        (fix, "passed", ("tests.test_util::test_clamp_negative",))]
+    assert len(runs) == 2
+
+
+@needs_git
+def test_two_fixes_one_failing_an_assertion_one_failing_collection_on_base_both_pass_in_two_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """One module that cannot import on base must not hide the other module's base result."""
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_one.py": TEST_COMPUTE})
+    _fix(repo, "fix: add the missing brand_new", {
+        "src/app.py": APP.format(1) + "\ndef brand_new() -> int:\n    return 42\n",
+        "tests/test_two.py": "from src.app import brand_new\n\ndef test_brand_new():\n    assert brand_new() == 42\n",
+    })
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [c.status for c in report.commits] == ["passed", "passed"]
+    assert runs == [("tests/test_one.py", "tests/test_two.py")] * 2
+
+
+@needs_git
+def test_two_tautological_fixes_cost_two_runs_and_pass_on_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    _fix(repo, "fix: one", {"src/app.py": APP.format(1), "tests/test_one.py": "def test_one():\n    assert True\n"})
+    _fix(repo, "fix: two", {"src/app.py": APP.format(2), "tests/test_two.py": "def test_two():\n    assert True\n"})
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.status, c.reason) for c in report.commits] == [("failed", "passed_on_base")] * 2
+    assert len(runs) == 2
+
+
+@needs_git
+def test_a_fix_broken_by_a_later_commit_fails_on_head(tmp_path: Path):
+    """The fix passes at its own commit, but the pull request's head is what lands."""
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    _fix(repo, "feat: compute adds two", {"src/app.py": APP.format(2)})
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.status, c.reason, c.passed_on_head) for c in report.commits] == [("failed", "failed_on_head", False)]
+
+
+@needs_git
+def test_a_test_run_that_times_out_says_timeout(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: compute adds one", {
+        "src/app.py": APP.format(1),
+        "tests/test_slow.py": "import time\n\ndef test_slow():\n    time.sleep(60)\n",
+    })
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD", timeout=1.5)
+    assert [(c.status, c.reason) for c in report.commits] == [("failed", "timeout")]
+    assert report.findings[0].code == "timeout"
+
+
+@needs_git
+def test_a_fix_whose_test_a_later_commit_deletes_collects_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_gone.py": TEST_COMPUTE})
+    (repo.root / "tests" / "test_gone.py").unlink()
+    repo.commit("test: drop the new test")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.status, c.reason) for c in report.commits] == [("failed", "no_tests_collected")]
+    assert runs == []
+
+
+@needs_git
+def test_a_syntax_error_in_one_fixs_test_fails_only_that_fix(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    bad = _fix(repo, "fix: other", {"src/other.py": "y = 1\n", "tests/test_bad.py": "def test_bad(:\n    pass\n"})
+    good = _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_good.py": TEST_COMPUTE})
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert {c.commit: (c.status, c.reason) for c in report.commits} == {
+        bad: ("failed", "failed_on_head"), good: ("passed", "ok")}
+
+
+@needs_git
+def test_accepted_trade_off_a_tautological_fix_sharing_a_real_fixs_test_file_shares_its_credit(tmp_path: Path):
+    """Accepted at warning tier (R-evidence-27): credit is per test file, so the second commit, which only
+    adds `assert True` to the same file, passes on the first commit's fail-to-pass test."""
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    _fix(repo, "fix: other", {"src/other.py": "y = 1\n",
+                              "tests/test_app.py": TEST_COMPUTE + "\ndef test_trivial():\n    assert True\n"})
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.status, c.fail_to_pass_tests) for c in report.commits] == [
+        ("passed", ("tests.test_app::test_compute",))] * 2
+
+
+@needs_git
+def test_no_python_test_to_judge_starts_no_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    _fix(repo, "fix: go handler", {"pkg/handler.go": "package pkg\n", "pkg/handler_test.go": "package pkg\n"})
+    _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1)})
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [c.reason for c in report.commits] == ["tests_not_pytest", "no_test_changes"]
+    assert runs == []
+
+
+def _fake_outcomes(monkeypatch: pytest.MonkeyPatch, head: Any, base: Any) -> list:
+    """Replace the pytest runner: a snapshot holding the head's src/app.py gets ``head``, else ``base``."""
+    seen: list = []
+
+    def fake(snapshot, test_files, *_args, **_kwargs):
+        at_head = (snapshot / "src" / "app.py").read_text(encoding="utf-8") == APP.format(1)
+        seen.append("head" if at_head else "base")
+        passed, failed, errors = head if at_head else base
+        return regression._PytestOutcome(0, False, frozenset(passed), frozenset(failed), frozenset(errors))
+
+    monkeypatch.setattr(regression, "_run_pytest_in_snapshot", fake)
+    return seen
+
+
+@needs_git
+def test_ids_belong_to_their_own_module_and_a_suite_level_error_fails_every_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """tests.test_app_extra is not part of tests/test_app.py, a class id is; a suite-level error on the
+    head run fails every judged commit."""
+    repo = make_repo(tmp_path)
+    plain = _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    extra = _fix(repo, "fix: other", {"src/other.py": "y = 1\n", "tests/test_app_extra.py": TEST_COMPUTE})
+    head = ({"tests.test_app_extra::test_x", "tests.test_app.TestK::test_m"}, set(), set())
+    base = ({"tests.test_app.TestK::test_m"}, {"tests.test_app_extra::test_x"}, set())
+    seen = _fake_outcomes(monkeypatch, head, base)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert sorted(seen) == ["base", "head"]
+    assert {c.commit: (c.status, c.reason) for c in report.commits} == {
+        plain: ("failed", "passed_on_base"), extra: ("passed", "ok")}
+
+    _fake_outcomes(monkeypatch, (head[0], set(), {"<suite:pytest>"}), base)
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert {c.commit: (c.status, c.reason) for c in report.commits} == {
+        plain: ("failed", "failed_on_head"), extra: ("failed", "failed_on_head")}
 
 
 @needs_git

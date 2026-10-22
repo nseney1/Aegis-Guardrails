@@ -14,8 +14,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
      but is reported in the non-failing ``untested_changes`` report.
 2. Evidence: fail-to-pass on a temporary snapshot:
    - Overlaying the changed test files onto ``base`` source in a hermetic temporary directory and
-     running pytest requires at least one test nodeid that FAILS on ``base`` (assertion/test
-     failure, not collection syntax error) and PASSES on ``head``.
+     running pytest requires at least one test nodeid that FAILS on ``base`` (a test failure, or its
+     module failing collection there) and PASSES on ``head``.
    - A tautological ``assert True`` test passes on ``base`` and therefore fails T5
      (``reason="passed_on_base"``).
    - A ``fix:`` commit with no test file changes fails T5 (``reason="no_test_changes"``).
@@ -468,12 +468,12 @@ def test_targeted_test_exemption_exempts_only_named_fix_commit(
 
 
 @needs_git
-def test_performance_invariant_each_commit_tree_is_read_at_most_once(
+def test_performance_invariant_only_the_head_tree_is_read_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Performance invariant, not behaviour: the regression check reads each commit's tree once
-    however many fix commits share it. The verdict is the same either way, so only counting the
-    calls to the private tree reader can see a regression here."""
+    """Performance invariant, not behaviour: the PR-level check reads one tree, the head's, however
+    many fix commits there are. The verdict is the same either way, so only counting the calls to the
+    private tree reader can see a regression here."""
     repo = make_calc_repo(tmp_path)
     repo.write(
         "src/calc.py",
@@ -522,7 +522,7 @@ def test_performance_invariant_each_commit_tree_is_read_at_most_once(
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert call_counts and all(count == 1 for count in call_counts.values()), call_counts
+    assert call_counts == {report.head: 1}, call_counts
 
 
 # ── 4. Warning-tier rollout & `aegis check --ci` integration ─────────────────
