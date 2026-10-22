@@ -332,27 +332,16 @@ class _CommitMeta(NamedTuple):
     present_files: Tuple[str, ...]
 
 
-def _commit_meta(cwd: str, oid: str, default_parent: str) -> _CommitMeta:
-    fmt = "%P%x00%s%x00%(trailers:key=Fixes,valueonly)%x00%(trailers:key=Closes,valueonly)%x00%(trailers:key=Aegis-No-Test,valueonly)%x00%B"
-    raw_log = _git_run(cwd, ["log", "-1", f"--format={fmt}", oid]).decode("utf-8", "replace")
-    parts = (raw_log.split("\0", 5) + [""] * 6)[:6]
-    parent = parts[0].split()[0] if parts[0].strip() else default_parent
-    subject = parts[1].strip()
-    body_after = parts[5].partition("\n")[2]
-    fix_candidates = [
-        *parts[2].splitlines(),
-        *parts[3].splitlines(),
-        *_FIXES_LINE_RE.findall(body_after),
-    ]
-    fixes = list(dict.fromkeys(ln.strip() for ln in fix_candidates if ln.strip()))
-    nt_lines = [ln.strip() for ln in parts[4].splitlines() if ln.strip()]
-    if nt_lines:
-        no_test: Optional[str] = nt_lines[0]
-    else:
-        body_nt = _NO_TEST_LINE_RE.findall(body_after)
-        no_test = body_nt[-1] if body_nt else None
+# One rev-list record per commit: rev-list prints "commit <oid>" before it and a newline after it, both
+# absorbed into the first field. rev-list --format, unlike git log, never verifies a signature.
+_META_FORMAT = ("%H%x00%P%x00%s%x00%(trailers:key=Fixes,valueonly)%x00%(trailers:key=Closes,valueonly)%x00"
+                "%(trailers:key=Aegis-No-Test,valueonly)%x00%B%x00")
+_META_FIELDS = 7
+_OID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_STATUS_RE = re.compile(rb"[A-Z][0-9]*")
 
-    raw_diff = _git_run(cwd, ["diff-tree", "--no-commit-id", "-r", "-z", "--name-status", "--root", oid])
+
+def _paths_of(raw_diff: bytes) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     changed: List[str] = []
     present: List[str] = []
     for status, old_path, new_path in gitsafe.parse_name_status_z(raw_diff):
@@ -369,16 +358,63 @@ def _commit_meta(cwd: str, oid: str, default_parent: str) -> _CommitMeta:
         elif kind != "D":
             if norm_old and norm_old not in present:
                 present.append(norm_old)
-    cleaned_no_test = no_test.strip() if isinstance(no_test, str) else None
-    return _CommitMeta(
-        oid,
-        parent,
-        subject,
-        tuple(fixes),
-        cleaned_no_test,
-        tuple(changed),
-        tuple(present),
-    )
+    return tuple(changed), tuple(present)
+
+
+def _diffs_by_commit(cwd: str, oids: Sequence[str]) -> Dict[str, bytes]:
+    """Each commit's ``--name-status -z`` slice from one ``diff-tree --stdin`` run (a commit with an
+    empty diff is absent). Parsed by position: after an oid come status groups, and a token in a path
+    position is a path even when it looks like an oid."""
+    raw = _git_run(cwd, ["diff-tree", "--stdin", "-r", "-z", "--name-status", "--root"],
+                   stdin="".join(f"{oid}\n" for oid in oids).encode("ascii"))
+    tokens = raw.split(b"\0")
+    wanted = set(oids)
+    slices: Dict[str, List[bytes]] = {}
+    current: Optional[List[bytes]] = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if current is not None and _STATUS_RE.fullmatch(token):
+            width = 3 if token[:1] in (b"R", b"C") else 2
+            group = tokens[index:index + width]
+            if len(group) < width or not all(group[1:]):
+                raise RegressionError("git diff-tree output ended inside a record")
+            current.extend(group)
+            index += width
+        elif token.decode("ascii", "replace") in wanted:
+            current = slices.setdefault(token.decode("ascii"), [])
+            index += 1
+        elif not token and index == len(tokens) - 1:
+            index += 1
+        else:
+            raise RegressionError("git diff-tree printed a record it does not write")
+    return {oid: b"\0".join(parts) + b"\0" for oid, parts in slices.items()}
+
+
+def _commits_meta(cwd: str, merge_commit: str, head_commit: str) -> List[_CommitMeta]:
+    """The non-merge commits of ``merge_commit..head_commit``, oldest first, in two git calls."""
+    raw = _git_run(cwd, ["rev-list", "--reverse", "--no-merges", f"--format={_META_FORMAT}",
+                         f"{merge_commit}..{head_commit}"]).decode("utf-8", "replace")
+    fields = raw.split("\0")
+    if len(fields) % _META_FIELDS != 1 or fields[-1].strip():
+        raise RegressionError("git rev-list printed a record it does not write")
+    records = [fields[i:i + _META_FIELDS] for i in range(0, len(fields) - 1, _META_FIELDS)]
+    oids = [(r[0].split() or [""])[-1] for r in records]
+    if not all(_OID_RE.fullmatch(oid) for oid in oids):
+        raise RegressionError("git rev-list printed a commit id it does not write")
+    diffs = _diffs_by_commit(cwd, oids) if oids else {}
+    metas: List[_CommitMeta] = []
+    for oid, (_head, parents, subject, fixes_tr, closes_tr, nt_tr, message) in zip(oids, records):
+        body_after = message.partition("\n")[2]
+        fix_candidates = [*fixes_tr.splitlines(), *closes_tr.splitlines(), *_FIXES_LINE_RE.findall(body_after)]
+        fixes = tuple(dict.fromkeys(ln.strip() for ln in fix_candidates if ln.strip()))
+        nt_lines = [ln.strip() for ln in nt_tr.splitlines() if ln.strip()]
+        body_nt = _NO_TEST_LINE_RE.findall(body_after)
+        no_test = nt_lines[0] if nt_lines else (body_nt[-1].strip() if body_nt else None)
+        changed, present = _paths_of(diffs.get(oid, b""))
+        parent = parents.split()[0] if parents.strip() else merge_commit
+        metas.append(_CommitMeta(oid, parent, subject.strip(), fixes, no_test, changed, present))
+    return metas
 
 
 class _PytestOutcome(NamedTuple):
@@ -625,11 +661,9 @@ def check_ci_regressions(
     if not merge_commit:
         raise RegressionError(f"{base!r} and {head!r} share no history (fetch with fetch-depth: 0)")
 
-    rev_out = _git_run(root, ["rev-list", "--no-merges", "--reverse", f"{merge_commit}..{head_commit}"])
     fix_metas: List[_CommitMeta] = []
     untested: List[UntestedChange] = []
-    for oid in (o for o in rev_out.decode("ascii", "replace").split() if o):
-        meta = _commit_meta(root, oid, merge_commit)
+    for meta in _commits_meta(root, merge_commit, head_commit):
         if is_fix_commit(meta.subject, meta.fixes, meta.changed_files):
             fix_metas.append(meta)
         else:

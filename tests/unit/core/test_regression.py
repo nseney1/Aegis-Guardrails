@@ -226,6 +226,118 @@ def test_a_fix_with_a_go_test_and_a_python_test_takes_the_python_path(tmp_path: 
     assert runs and all(files == ("tests/test_app.py",) for files in runs)
 
 
+# ── Commit metadata: two git calls, never git log (R-evidence-24) ─────────────
+
+
+def _metadata_calls(monkeypatch: pytest.MonkeyPatch) -> list:
+    from aegis_core import gitsafe
+
+    calls: list = []
+    real = gitsafe.run
+
+    def spy(args, *rest, **kwargs):
+        calls.append(list(args))
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    return calls
+
+
+@needs_git
+def test_thirty_commits_cost_at_most_two_metadata_git_calls_and_no_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Given 30 non-fix commits, When regressions are checked, Then rev-list/diff-tree/log calls number at
+    most 2 (one per commit each before) and none is git log; every commit is still classified."""
+    repo = make_repo(tmp_path)
+    for n in range(30):
+        repo.write(f"src/m{n}.py", f"x = {n}\n")
+        repo.commit(f"feat: module {n}")
+    calls = _metadata_calls(monkeypatch)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    metadata = [c[0] for c in calls if c and c[0] in ("log", "rev-list", "diff-tree")]
+    assert len(metadata) <= 2 and "log" not in metadata, metadata
+    assert [u.source_files for u in report.untested_changes] == [(f"src/m{n}.py",) for n in range(30)]
+
+
+@needs_git
+@posix_only
+def test_a_signed_commit_runs_no_gpg_program_the_repository_configured(tmp_path: Path):
+    """Given a commit with a gpgsig header, log.showSignature=true and a marker-touching gpg.program in the
+    repository config, When regressions are checked, Then the marker is absent and the commit classified."""
+    repo = make_repo(tmp_path)
+    repo.write("src/app.py", "def compute(x: int) -> int:\n    return x + 1\n")
+    repo.commit("fix: change without test")
+    headers, _, message = repo.git("cat-file", "commit", "HEAD").partition("\n\n")
+    signature = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----"
+    forged = repo.git("hash-object", "-t", "commit", "-w", "--stdin", stdin=f"{headers}\n{signature}\n\n{message}\n")
+    repo.git("update-ref", "HEAD", forged)
+    marker = tmp_path / "gpg-ran"
+    program = tmp_path / "fake-gpg"
+    program.write_bytes(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n".encode("utf-8"))
+    program.chmod(0o755)
+    repo.git("config", "log.showSignature", "true")
+    repo.git("config", "gpg.program", str(program))
+    subprocess.run(["git", "log", "-1"], cwd=str(repo.root), capture_output=True, env={**os.environ, **repo.home.env})
+    assert marker.exists(), "the probe must make plain git log run the program"
+    marker.unlink()
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert not marker.exists()
+    assert [(c.commit, c.reason) for c in report.commits] == [(forged, "no_test_changes")]
+
+
+@needs_git
+def test_fix_signals_in_trailers_and_in_body_lines_are_read_as_before(tmp_path: Path):
+    """Fixes:, Closes: and Aegis-No-Test: count as trailers and as body lines outside a trailer block,
+    and a body line that looks like rev-list's record header does not split a record."""
+    repo = make_repo(tmp_path)
+
+    def change(n: int, message: str) -> str:
+        repo.write(f"src/m{n}.py", f"x = {n}\n")
+        return repo.commit(message)
+
+    trailer = change(1, "refactor: one\n\nFixes: #1")
+    in_prose = change(2, "refactor: two\n\nCloses: #8 in prose\n\nA closing paragraph of prose.")
+    nt_line = change(3, "fix: three\n\nWhy it changed.\nAegis-No-Test: covered by the e2e suite\nMore prose.\n")
+    lookalike = change(4, "refactor: four\n\ncommit 0123456789abcdef0123456789abcdef01234567\nFixes: #4")
+    plain = change(5, "refactor: five\n\nNo issue here.")
+    nt_trailer = change(6, "fix: six\n\nAegis-No-Test: trailer reason")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert {c.commit: (c.fixes, c.no_test_reason) for c in report.commits} == {
+        trailer: (("#1",), None),
+        in_prose: (("#8 in prose",), None),
+        nt_line: ((), "covered by the e2e suite"),
+        lookalike: (("#4",), None),
+        nt_trailer: ((), "trailer reason"),
+    }
+    assert [u.commit for u in report.untested_changes] == [plain]
+
+
+@needs_git
+def test_batched_metadata_keeps_each_commits_paths(tmp_path: Path):
+    """A file named by 40 hex characters, an empty commit, a rename (D + A without -M), a deletion and a
+    range starting at the root commit give each commit exactly its own changed and present paths."""
+    repo = make_repo(tmp_path)
+    hexname = "0123456789abcdef0123456789abcdef01234567"
+    repo.write(hexname, "data\n")
+    repo.write("src/x.py", "x = 1\n")
+    first = repo.commit("feat: hex-named file")
+    empty = repo.commit("chore: nothing", allow_empty=True)
+    repo.git("mv", "src/app.py", "src/core.py")
+    moved = repo.commit("refactor: move app")
+    (repo.root / hexname).unlink()
+    gone = repo.commit("chore: drop the hex file")
+
+    metas = regression._commits_meta(str(repo.root), "main", "HEAD")
+    assert [(m.oid, m.changed_files, m.present_files) for m in metas] == [
+        (first, (hexname, "src/x.py"), (hexname, "src/x.py")),
+        (empty, (), ()),
+        (moved, ("src/app.py", "src/core.py"), ("src/core.py",)),
+        (gone, (hexname,), ()),
+    ]
+
+
 # ── Fail-to-pass failure modes ───────────────────────────────────────────────
 
 

@@ -662,7 +662,7 @@ def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Pat
     )
     oid = repo.commit("fix: rename readme and fix addition operator")
 
-    meta = regression._commit_meta(str(repo.root), oid, "main")
+    (meta,) = regression._commits_meta(str(repo.root), "main", oid)
     assert "src/calc.py" in meta.changed_files
     assert "tests/test_calc.py" in meta.present_files
     assert "GUIDE.md" in meta.present_files
