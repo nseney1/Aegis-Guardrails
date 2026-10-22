@@ -1,0 +1,36 @@
+name: Aegis governance
+
+# The governance check that a pull request cannot edit (v4.3 spec 2.1; R-trust-13). pull_request_target
+# runs this file as the base branch has it. It never checks out, installs or runs pull-request code:
+# the base commit is checked out without credentials, the pull request head is fetched as git objects
+# only, and the base's own aegis (check --ci --no-exec) reads those objects. The token is read-only and
+# no secret is used; the check step alone gets it as GH_TOKEN, to read tier A's approving reviews. A
+# private repository's fetch needs credentials this job does not have, so there the job fails rather
+# than passes.
+on:
+  pull_request_target:
+    branches: [main, develop, 'release/**']
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  aegis-governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the pull request head as data
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
+      # Base and head come from the event file; the code that runs is the base checkout's.
+      - name: Aegis governance check (no pull request code runs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m aegis_cli.cli check --ci --no-exec

@@ -1192,11 +1192,11 @@ def test_without_gh_the_review_path_fails_closed(tmp_path, capsys, monkeypatch):
 @pytest.mark.parametrize("event", [
     {"number": -1}, {"number": 0}, {"number": True}, {"number": "7"},
     {"login": "a/b"}, {"login": "x?y"}, {"login": ""}, {"login": None},
-    {"head": "short"}, {"name": "push"}, {"name": "pull_request_target"}, {"name": ""},
+    {"head": "short"}, {"name": "push"}, {"name": ""},
     {"base_ref": _ABSENT}, {"base_ref": None}, {"base_ref": ""}, {"base_ref": "../main"}, {"base_ref": "main?x=1"},
     {"base_ref": "-x"}, {"base_ref": "a b"}, {"base_ref": "x/"}, {"base_ref": "x.lock"}, {"base_ref": ["main"]},
 ], ids=["negative", "zero", "bool", "string", "slash", "query", "empty-login", "no-login", "short-sha",
-        "push", "target", "no-event", "no-base-ref", "null-base-ref", "empty-base-ref", "dotdot-base-ref",
+        "push", "no-event", "no-base-ref", "null-base-ref", "empty-base-ref", "dotdot-base-ref",
         "query-base-ref", "dash-base-ref", "space-base-ref", "slash-end-base-ref", "lock-base-ref", "list-base-ref"])
 def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, monkeypatch, event):
     gh = ReviewGh()
@@ -1409,13 +1409,28 @@ def test_no_exec_fails_an_unapproved_change_to_what_defines_enforcement(tmp_path
 
 
 @needs_git
-@pytest.mark.parametrize("flag", ["--coverage", "--perf", "--strict"])
+@pytest.mark.parametrize("flag", ["--coverage", "--perf"])
 def test_no_exec_refuses_the_flags_that_run_code(tmp_path, capsys, flag):
     repo = make_repo(tmp_path)
     os.chdir(repo.root)
     rc = main(["check", "--ci", "--no-exec", flag, "--base", "main"])
     err = capsys.readouterr().err
     assert rc == 2 and "--no-exec" in err and flag in err
+
+
+@needs_git
+def test_no_exec_never_says_strict_runs_code_and_strict_gets_the_ci_refusal(tmp_path, capsys):
+    """Review F5: --strict runs no code under --ci, where it is a usage error of its own. Given --no-exec
+    --strict, Then exit 2 with --ci's refusal of --strict; given --no-exec --coverage --strict, Then exit
+    2 and the --no-exec refusal names --coverage alone."""
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--strict", "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "--ci does not combine with --strict" in err and "run the repository's code" not in err
+    rc = main(["check", "--ci", "--no-exec", "--coverage", "--strict", "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "Error: --no-exec does not combine with --coverage: they run the repository's code" in err
 
 
 @needs_git

@@ -152,6 +152,10 @@ def run_status(args: argparse.Namespace) -> int:
     fits = for_rules(proj, loaded, view=view)
     derived = read_derived(proj)
     stale = stale_rules(ruleset, derived)
+    from aegis_core.insights import insight_status, insight_status_lines
+
+    # The user-scope insights log, read once and offline; nothing when there is none.
+    insights = insight_status(proj)
 
     # 3. Ledger totals of the host-installed rules (they have no rule file here)
     from aegis_core.fitness import combined_totals, compute
@@ -243,6 +247,7 @@ def run_status(args: argparse.Namespace) -> int:
             "ledger": ledger_health,
             "claimed": claimed,
             "blocked_commands": blocked_cmds,
+            "insights": insights,
             **problems,
         }
         print(json.dumps(payload, indent=2))
@@ -264,6 +269,11 @@ def run_status(args: argparse.Namespace) -> int:
     print(f"  {'Context load:':<16}~{estimated_tokens:,} tokens (pre-JIT max)")
     print(f"  {'Token budget:':<16}{ui.format_budget_bar(estimated_tokens, max_budget)}")
     print(f"  {'Last sync:':<16}{derived.get('synced_at') if derived else 'never (run aegis sync)'}\n")
+    insight_lines = insight_status_lines(insights)
+    for line in insight_lines:
+        print(f"  {sanitize_display(line, 300)}")
+    if insight_lines:
+        print()
     if blocked_cmds["total"]:
         by_host_str = ", ".join(f"{sanitize_display(h)}: {n}" for h, n in sorted(blocked_cmds["by_host"].items()))
         print(f"  {'Blocked cmds:':<16}{blocked_cmds['total']} ({blocked_cmds['label']}: {by_host_str})\n")

@@ -15,7 +15,7 @@ yaml = pytest.importorskip("yaml")
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 GITHUB = os.path.join(REPO_ROOT, ".github")
 WORKFLOWS = os.path.join(GITHUB, "workflows")
-WORKFLOW_FILES = ("validate.yml", "publish.yml")
+WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml")
 SHA_REF = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 PINNED_LINE = re.compile(r"uses:\s*[^@\s]+@[0-9a-f]{40}\s+#\s*v\d+\.\d+\.\d+\s*$")
 
@@ -381,11 +381,8 @@ def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
 
 
 # --- R-trust-13 (c)-(f): a base-sourced, no-exec governance check ----------------------------
-# xfail(strict) until aegis-governance.yml lands after the author's pull_request_target spike.
 
 GOVERNANCE_WORKFLOW = "aegis-governance.yml"
-_AFTER_SPIKE = pytest.mark.xfail(strict=True, raises=FileNotFoundError,
-                                 reason="R-trust-13 c-f: aegis-governance.yml lands only after the author's spike")
 _BASE_SHA = "${{ github.event.pull_request.base.sha }}"
 
 
@@ -396,7 +393,6 @@ def _permission_maps(workflow):
             yield job["permissions"]
 
 
-@_AFTER_SPIKE
 def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_target():
     """N3: the base-sourced job counts as the required Aegis check under its literal name."""
     from aegis_core import human_gate
@@ -405,19 +401,24 @@ def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_tar
     assert human_gate.aegis_check_jobs(text) == ["aegis-governance"]
 
 
-@_AFTER_SPIKE
 def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
-    """N4 (static): base.sha checkout without credentials, the head only as data, read-only token,
-    no secret, nothing that builds, installs, caches or tests the checkout."""
+    """N4 (static): base.sha checkout without credentials, the head only as data, a read-only token
+    (contents and pull-requests, the latter for tier A's review lookup) handed as GH_TOKEN to the check
+    step only, no secret, nothing that builds, installs, caches or tests the checkout."""
     text = _read(GOVERNANCE_WORKFLOW)
     workflow = yaml.safe_load(text)
     assert set(_triggers(workflow)) == {"pull_request_target"}
+    assert workflow.get("permissions") == {"contents": "read", "pull-requests": "read"}
     for perms in _permission_maps(workflow):
         assert isinstance(perms, dict), "permissions must be explicit maps"
-        writes = {k for k, v in perms.items() if v != "read"}
-        assert writes <= {"checks"} and all(perms[k] == "write" for k in writes), perms
+        assert set(perms.items()) <= {("contents", "read"), ("pull-requests", "read")}, perms
     assert "secrets." not in text
+    assert "env" not in workflow and all("env" not in job for job in workflow["jobs"].values())
     steps = [s for job in workflow["jobs"].values() for s in job.get("steps", [])]
+    (check_step,) = [s for s in steps if re.search(r"\bcheck --ci\b", s.get("run", ""))]
+    assert check_step.get("env") == {"GH_TOKEN": "${{ github.token }}"}
+    assert [s for s in steps if re.search(r"GH_TOKEN|GITHUB_TOKEN|github\.token", str(s.get("env") or ""))] == [check_step]
+    assert text.count("github.token") == 1
     checkouts = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
     assert checkouts and all((s.get("with") or {}).get("ref") == _BASE_SHA for s in checkouts)
     assert all((s.get("with") or {}).get("persist-credentials") is False for s in checkouts)

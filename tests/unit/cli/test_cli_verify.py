@@ -325,7 +325,7 @@ class TestResolveTargetFilesFallbacks:
         assert args._no_diff_base is True
 
     def test_resolve_target_files_clean_tree_branch_diff_fallback(self, tmp_path, monkeypatch):
-        """Without GITHUB_BASE_REF the base is origin/main, main, origin/develop or develop."""
+        """Without GITHUB_BASE_REF the base is the branch origin/HEAD names, then main, develop or master."""
         from aegis_cli.verify import resolve_target_files
 
         monkeypatch.delenv("GITHUB_BASE_REF", raising=False)

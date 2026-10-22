@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -449,6 +450,23 @@ def test_only_filter_drivers_outside_the_repository_config_clean_content(
     assert gitsafe.changed_files(repo, "working") == ["a.py"]
 
 
+def _switched_off(driver: str) -> list:
+    return ["-c", f"filter.{driver}.clean=", "-c", f"filter.{driver}.smudge=", "-c", f"filter.{driver}.process=",
+            "-c", f"filter.{driver}.required=false"]
+
+
+def test_filter_overrides_name_the_repository_drivers_or_with_scope_all_every_driver(tmp_path: Path, git_config):
+    git_config(global_=_STRIP_TRAILING_SPACES + "[filter \"a=b\"]\n\tclean = cat\n")
+    repo = _repo(tmp_path / "repo")
+    _git(repo, "config", "filter.mine.clean", "cat")
+    assert gitsafe.TRUSTED_SCOPES == frozenset({"system", "global", "command"})
+
+    assert gitsafe.filter_overrides(repo) == tuple(_switched_off("mine"))  # the user's a=b is not named
+    assert gitsafe.filter_overrides(repo, scope="all") is None  # a=b cannot be switched off
+    _git(tmp_path, "config", "--global", "--remove-section", "filter.a=b")
+    assert gitsafe.filter_overrides(repo, scope="all") == (*_switched_off("strip"), *_switched_off("mine"))
+
+
 def test_a_symlink_whose_stat_changed_but_target_did_not_is_unchanged(repo: Path):
     link = repo / "link.py"
     try:
@@ -716,7 +734,7 @@ def test_the_fallback_export_keeps_a_posix_file_name_with_a_colon(tmp_path: Path
     (root / "src").mkdir()
     (root / "src" / "x.py").write_bytes(b"x\n")
     _commit(root)
-    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)  # checkout-index is not tried
+    monkeypatch.setattr(gitsafe, "filter_overrides", lambda cwd, scope="untrusted": None)  # checkout-index is not tried
     dest = tmp_path / "dest"
     gitsafe.export_tree(root, "HEAD", dest)
     assert (dest / "a:b.py").read_bytes() == b"colon\n" and (dest / "src" / "x.py").read_bytes() == b"x\n"
@@ -738,7 +756,7 @@ def test_with_windows_rules_a_drive_or_stream_name_is_skipped(tmp_path: Path, mo
         (root / "a:b.py").write_bytes(b"colon\n")
     _commit(root)
     monkeypatch.setattr(gitsafe, "_on_windows", lambda: True)
-    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)
+    monkeypatch.setattr(gitsafe, "filter_overrides", lambda cwd, scope="untrusted": None)
     dest = tmp_path / "out" / "dest"
     overlay = {"D:evil.py": b"x", "D:/x/evil.py": b"x", "x:stream": b"x", "ok.py": b"y"}
     gitsafe.export_tree(root, "HEAD", dest, overlay=overlay)
@@ -872,6 +890,85 @@ def test_resolve_base_ref_prefers_the_pull_request_base(repo: Path):
     assert gitsafe.resolve_base_ref(repo, environ={}) == "develop"
 
 
+# ── The default base: the branch origin/HEAD names, then the legacy list (R-trust-21) ──
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GITHUB_BASE_REF", "AEGIS_WORKSPACE", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return home
+
+
+def _gitflow(tmp_path: Path):
+    """``develop`` holds a rule change ``main`` lacks; ``feature`` (checked out, off develop) touches
+    only src/; origin/HEAD names origin/develop and origin/main exists too. Returns (repo, develop)."""
+    from tests import helpers_humangate as hg
+    from tests import helpers_verified as hv
+
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.git("checkout", "-q", "-b", "develop", "main")
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("hypothesis: sample", "hypothesis: sharper"))
+    develop = repo.commit("develop sharpens a rule")
+    repo.git("checkout", "-q", "-b", "feature")
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("feature")
+    repo.git("update-ref", "refs/remotes/origin/main", "main")
+    repo.git("update-ref", "refs/remotes/origin/develop", develop)
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+    return repo, develop
+
+
+def test_the_default_base_is_the_branch_origin_head_names(tmp_path: Path, fake_home):
+    from aegis_core import checkrun
+
+    repo, develop = _gitflow(tmp_path)
+    assert gitsafe.resolve_base_ref(repo.root, environ={}) == "origin/develop"
+
+    out = checkrun.record(repo.root)
+    assert out.status == "recorded", out.reason
+    assert out.row["base"] == develop == gitsafe.merge_base(repo.root, "develop")
+    assert out.row["protected_changed"] is False  # develop's rule change is not the feature's
+
+
+def test_the_pull_request_base_still_wins_over_origin_head(tmp_path: Path, fake_home):
+    repo, _ = _gitflow(tmp_path)
+    assert gitsafe.resolve_base_ref(repo.root, environ={"GITHUB_BASE_REF": "main"}) == "origin/main"
+
+
+@pytest.mark.parametrize("target", ["refs/remotes/origin/gone", "refs/heads/develop"])
+def test_an_origin_head_that_names_no_remote_branch_is_skipped(repo: Path, target: str):
+    _git(repo, "branch", "develop")
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", target)
+    assert gitsafe.resolve_base_ref(repo, environ={}) == "main"
+
+
+def test_a_master_only_repository_without_a_remote_measures_against_master(tmp_path: Path, fake_home,
+                                                                            monkeypatch, capsys):
+    import json
+
+    from aegis_cli.cli import main
+    from aegis_core import checkrun
+    from tests import helpers_verified as hv
+
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.git("branch", "-m", "main", "master")
+    assert gitsafe.resolve_base_ref(repo.root, environ={}) == "master"
+
+    out = checkrun.record(repo.root)
+    assert out.status == "recorded", out.reason
+
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    assert main(["approve", "--json"]) == 1
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["code"] == "nothing"  # it got past the base: governance did not change since master
+
+
 # ── Ratchet: no git subprocess outside gitsafe ───────────────────────────────
 
 _SPAWNERS = {
@@ -892,31 +989,152 @@ def _is_git_command_line(node: ast.AST) -> bool:
     )
 
 
+def _calls_git_executable(node: ast.AST) -> bool:
+    """argv[0] of a git call through a lookup: ``git_executable()``, ``gitsafe.git_executable()`` or a copy."""
+    func = node.func if isinstance(node, ast.Call) else None
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+    return name.endswith("git_executable")
+
+
+# treeid spawns git itself: it needs a scrubbed environment and a private index, which gitsafe.run
+# cannot give (SECURITY.md, Repository trust). Its argv heads are gitsafe.git_executable() calls.
+_GIT_EXECUTABLE_HEADS_ALLOWED = {"aegis_core/gitsafe.py", "aegis_core/treeid.py"}
+
+
+def _git_spawn_offenders(rel: str, source: str) -> list:
+    tree = ast.parse(source)
+    # `binary in ("git", "gh")` names git without running it
+    membership = {
+        id(comparator)
+        for node in ast.walk(tree) if isinstance(node, ast.Compare)
+        for op, comparator in zip(node.ops, node.comparators) if isinstance(op, (ast.In, ast.NotIn))
+    }
+    offenders = []
+    for node in ast.walk(tree):
+        # an argv list or tuple whose program is git
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _is_git_program(node.elts[0]) \
+                and id(node) not in membership:
+            offenders.append(f"{rel}:{node.lineno} builds a git argv")
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _calls_git_executable(node.elts[0]) \
+                and rel not in _GIT_EXECUTABLE_HEADS_ALLOWED:
+            offenders.append(f"{rel}:{node.lineno} builds a git argv from git_executable()")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and (node.func.value.id, node.func.attr) in _SPAWNERS \
+                and node.args and _is_git_command_line(node.args[0]):
+            offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
+    return offenders
+
+
 def test_no_git_subprocess_outside_gitsafe():
     offenders = []
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel == "aegis_core/gitsafe.py":
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            # `binary in ("git", "gh")` names git without running it
-            membership = {
-                id(comparator)
-                for node in ast.walk(tree) if isinstance(node, ast.Compare)
-                for op, comparator in zip(node.ops, node.comparators) if isinstance(op, (ast.In, ast.NotIn))
-            }
-            for node in ast.walk(tree):
-                # an argv list or tuple whose program is git
-                if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _is_git_program(node.elts[0]) \
-                        and id(node) not in membership:
-                    offenders.append(f"{rel}:{node.lineno} builds a git argv")
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                        and isinstance(node.func.value, ast.Name) \
-                        and (node.func.value.id, node.func.attr) in _SPAWNERS \
-                        and node.args and _is_git_command_line(node.args[0]):
-                    offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
+            if rel != "aegis_core/gitsafe.py":
+                offenders += _git_spawn_offenders(rel, path.read_text(encoding="utf-8"))
     assert offenders == []
+
+
+def test_the_ratchet_flags_a_git_argv_headed_by_a_git_executable_call():
+    source = "import subprocess\nfrom aegis_core import gitsafe\nsubprocess.run([gitsafe.git_executable(), 'status'])\n"
+    assert _git_spawn_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:3 builds a git argv from git_executable()"]
+    assert _git_spawn_offenders("aegis_core/treeid.py", source) == []
+
+
+# ── The docstring is the list of what gitsafe's git calls write (R-trust-28) ──
+
+_WRITERS = {
+    "update-ref", "merge-tree", "read-tree", "checkout-index", "update-index", "write-tree", "commit-tree",
+    "mktree", "mktag", "add", "commit", "checkout", "reset", "tag", "branch", "gc", "prune", "repack",
+    "pack-refs", "fetch", "pull", "push", "clone", "init", "stash", "apply",
+}
+
+
+def _first_strings(tree: ast.AST) -> list:
+    """The first string element of every list literal (the subcommand of an argv list)."""
+    return [next((e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)), None)
+            for node in ast.walk(tree) if isinstance(node, ast.List)]
+
+
+def test_the_module_docstring_names_every_git_command_that_writes():
+    tree = ast.parse((ROOT / "aegis_core" / "gitsafe.py").read_text(encoding="utf-8"))
+    firsts = _first_strings(tree)
+    detected = _WRITERS.intersection(firsts)
+    assert {"update-ref", "merge-tree", "read-tree", "checkout-index"} <= detected  # the detector sees them
+    if "hash-object" in firsts and "-w" in firsts:
+        detected.add("hash-object -w")
+    doc = gitsafe.__doc__ or ""
+    assert sorted(name for name in detected if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", doc)) == []
+
+
+def _repository_state(repo: Path) -> dict:
+    work_tree = {p.relative_to(repo).as_posix(): p.read_bytes() for p in sorted(repo.rglob("*"))
+                 if p.is_file() and ".git" not in p.relative_to(repo).parts}
+    refs = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    return {"work tree": work_tree, "index": (repo / ".git" / "index").read_bytes(), "refs": refs,
+            "HEAD": (repo / ".git" / "HEAD").read_bytes()}
+
+
+def test_export_tree_leaves_the_repository_work_tree_index_and_refs_alone(repo: Path, tmp_path: Path):
+    (repo / "a.py").write_bytes(b"a = 2\n")                     # modified, unstaged
+    (repo / "staged.py").write_bytes(b"s = 1\n")
+    _git(repo, "add", "staged.py")                              # staged
+    before = _repository_state(repo)
+
+    gitsafe.export_tree(repo, "HEAD", tmp_path / "plain")
+    gitsafe.export_tree(repo, "HEAD", tmp_path / "overlaid", overlay={"b.py": b"b = 9\n"})
+
+    assert _repository_state(repo) == before
+    assert (tmp_path / "plain" / "a.py").read_bytes() == b"a = 1\n"
+    assert (tmp_path / "overlaid" / "b.py").read_bytes() == b"b = 9\n"
+
+
+# Read plumbing, the hardened `log`, and the named writers: the signed approval commit
+# (human_gate), the Aegis-Check trailer's write-tree (hooks/commitmsg) and add_trailer.
+_RUN_ALLOWED = {
+    "cat-file", "config", "diff-index", "diff-tree", "for-each-ref", "ls-files", "ls-tree", "merge-base",
+    "rev-list", "rev-parse", "symbolic-ref", "check-ref-format", "version", "log", "commit", "interpret-trailers",
+    "write-tree",
+}
+# `aegis sync --pr` (SECURITY.md, the git row) reads its remote's push URLs and the committer
+# identity, writes its own aegis/lifecycle-* branch, and pushes that one branch.
+_RUN_ALLOWED_IN = {"aegis_core/sync.py": {"remote", "var", "update-ref", "push"}}
+
+
+def _run_subcommand_offenders(rel: str, source: str) -> list:
+    """``gitsafe.run([...])`` calls whose subcommand (after leading ``-c <setting>`` pairs) is not
+    allowed. Wrappers that pass ``list(args)`` (regression._git_run, rule_integrity, sync._git) are
+    out of this detector's reach."""
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "gitsafe"
+                and node.args and isinstance(node.args[0], ast.List)):
+            continue
+        elts = node.args[0].elts
+        while len(elts) > 1 and isinstance(elts[0], ast.Constant) and elts[0].value == "-c":
+            elts = elts[2:]
+        head = elts[0].value if elts and isinstance(elts[0], ast.Constant) else None
+        if isinstance(head, str) and head not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
+            offenders.append(f"{rel}:{node.lineno} runs git {head}")
+    return offenders
+
+
+def test_gitsafe_run_callers_use_only_allowed_subcommands():
+    offenders = []
+    for pkg in ("aegis_core", "aegis_cli", "aegis_mcp"):
+        for path in sorted((ROOT / pkg).rglob("*.py")):
+            offenders += _run_subcommand_offenders(path.relative_to(ROOT).as_posix(), path.read_text(encoding="utf-8"))
+    assert offenders == []
+
+
+def test_the_subcommand_ratchet_flags_a_worktree_add():
+    source = "gitsafe.run(['worktree', 'add', 'x'], root)\ngitsafe.run(['-c', 'a=b', 'worktree', 'add'], root)\n"
+    assert _run_subcommand_offenders("aegis_core/x.py", source) == [
+        "aegis_core/x.py:1 runs git worktree", "aegis_core/x.py:2 runs git worktree"]
+    assert _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], top)\n") == []
+    assert _run_subcommand_offenders("aegis_core/x.py", "gitsafe.run(['push', 'origin'], top)\n") != []
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──

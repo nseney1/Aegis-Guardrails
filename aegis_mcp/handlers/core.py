@@ -77,8 +77,10 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
 
 
 def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List[str]] = None) -> None:
-    """Remember which rules this server session was shown: aegis_report_outcome credits only those."""
+    """Remember which rules this server session was shown, at each rule's rev: aegis_report_outcome
+    credits only those, and insight review joins a correction to them by host, time and rev."""
     from aegis_core import credit
+    from aegis_core.scan import RULE_CACHE
     from aegis_core.storage import ledger_site
 
     names = [item.get("name") for key in ("relevant_rules", "invariant_warnings")
@@ -86,16 +88,19 @@ def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List
     rule_ids = [n for n in names if isinstance(n, str)]
     host = str(args.get("_host") or "")
     session = str(args.get("_session") or "")
+    error: Optional[Exception] = None
+    revs: Dict[str, str] = {}
     try:
+        revs = {rule.id: rule.digest[:16] for rule in RULE_CACHE.get(workspace).served}
         persist = bool(session) and (not args.get("_binding") or ledger_site(workspace.root, create=False).shared)
-    except Exception as exc:  # telemetry only: never fail the scan
-        credit.record_exposure(workspace.root, host, session, rule_ids, paths=files, persist=False)
-        print(f"aegis-mcp: exposure record not written: {exc}", file=sys.stderr)
-        return
+    except Exception as exc:  # no row without its rev; the in-memory record still lets reports credit
+        persist, error = False, exc
     try:
-        credit.record_exposure(workspace.root, host, session, rule_ids, paths=files, persist=persist)
+        credit.record_exposure(workspace.root, host, session, rule_ids, paths=files, revs=revs, persist=persist)
     except Exception as exc:  # telemetry only: never fail the scan
-        print(f"aegis-mcp: exposure record not written: {exc}", file=sys.stderr)
+        error = exc
+    if error is not None:
+        print(f"aegis-mcp: exposure record not written: {error}", file=sys.stderr)
 
 
 def _scan_user_layer(args: dict) -> dict:

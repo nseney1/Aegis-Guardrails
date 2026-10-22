@@ -53,12 +53,14 @@ __all__ = [
     "INSIGHT_HOOK_MARKER",
     "INSIGHT_LEVELS",
     "INSIGHT_SCHEMA_VERSION",
+    "JOIN_WINDOW_S",
     "KEY_SIZE",
     "MAX_CAPTURES_PER_SESSION",
     "MAX_CAPTURE_PATHS",
     "MAX_CAPTURE_PATH_CHARS",
     "MAX_EXCERPT_CHARS",
     "RECURRENCE_ALARM_COUNT",
+    "RECURRENCE_DENOMINATOR",
     "REJECTION_RESURFACE_COUNT",
     "SUPPORTED_INSIGHT_HOSTS",
     "add_insight",
@@ -67,6 +69,9 @@ __all__ = [
     "dirty_paths",
     "has_correction_cue",
     "host_capture_status",
+    "insight_born_rules",
+    "insight_status",
+    "insight_status_lines",
     "insight_workspace_id",
     "insights_path",
     "measure_recurrence",
@@ -87,12 +92,26 @@ KEY_SIZE = 32
 INSIGHT_SCHEMA_VERSION = 1
 REJECTION_RESURFACE_COUNT = 2
 RECURRENCE_ALARM_COUNT = 3
+# In-scope filtering needs the MCP and hook sessions to join (v4.5); until then the rate's
+# denominator is every alive session, and every recurrence line says so.
+RECURRENCE_DENOMINATOR = "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"
 BURST_WINDOW_SECONDS = 300
+# How far apart (seconds) an insight and an exposure, or a capture and the hook prompt that
+# corroborates it, may be and still join. Nothing links aegis-mcp's session (a uuid minted per
+# initialize) to the host's session id the hook sees, so the join is same host, this window and
+# the rule's rev. Known limits: record_exposure writes one row per (session, rule, scope basis),
+# so the window runs from a session's first exposure of a rule and a correction later than this
+# after it reads not_exposed; an exposure that was not persisted has no timestamp and lives in
+# another process than the review, so it never counts; a CLI-added insight (host "cli") never
+# joins an agent host's exposure.
+JOIN_WINDOW_S = 1800
 _HS_DOMAIN = b"aegis-hs/v1"
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 INSIGHT_LEVELS = ("H", "cli", "W2", "hook", "suggestion")
 COUNTABLE_LEVELS = frozenset({"H", "cli", "W2", "hook"})
-DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise")
+DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
+# The latest of these decides whether a cluster is listed; noise and confirm name insights.
+_RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
 SUPPORTED_INSIGHT_HOSTS = ("claude-code", "codex-cli")
 # aegis_capture_insight is reachable by the agent: its cost is bounded per call and per session.
 MAX_CAPTURES_PER_SESSION = 50
@@ -429,32 +448,64 @@ def _capture_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List
     return found[:MAX_CAPTURE_PATHS], "dirty", max(0, len(found) - MAX_CAPTURE_PATHS)
 
 
+_CORROBORATE_MIN_CHARS = 12
+
+
+def _row_source(row: Mapping[str, Any]) -> Optional[str]:
+    """Who wrote an insight row: 'hook', 'cli' or 'mcp'. A 4.3.x row has no ``source``: a W2
+    row is the hook's unless a capture's corroboration (``confirmed_by``) upgraded it."""
+    source, level = row.get("source"), row.get("level")
+    if source is not None:
+        return source if source in ("hook", "cli", "mcp") else None
+    if level in ("W2", "hook"):
+        return "mcp" if row.get("confirmed_by") else "hook"
+    return {"H": "cli", "cli": "cli", "suggestion": "mcp"}.get(level) if isinstance(level, str) else None
+
+
+def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optional[str]:
+    """The level a row counts at: an agent capture is a suggestion until a human confirms it."""
+    source = _row_source(row)
+    if source == "hook":
+        return "W2"
+    if source == "cli":
+        return "H" if row.get("level") == "H" else "cli"
+    if source == "mcp":
+        return "cli" if str(row.get("id") or "") in confirmed_ids else "suggestion"
+    return None
+
+
+def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
+    """{insight id: kind or None} of the suggestions a human confirmed."""
+    found: Dict[str, Optional[str]] = {}
+    for r in rows:
+        if r.get("event") == "decision" and r.get("decision") == "confirm":
+            kind = r.get("kind") if isinstance(r.get("kind"), str) else None
+            found.update({str(i): kind or found.get(str(i)) for i in r.get("insight_ids") or []})
+    return found
+
+
+def _corroborating_hook(rows: Iterable[Mapping[str, Any]], host: str, ts: Any, quote: str) -> Optional[str]:
+    """The id of a hook prompt of ``host`` within JOIN_WINDOW_S of ``ts`` that contains ``quote``."""
+    needle, when = quote.strip().lower(), _parse_ts(ts)
+    if len(needle) < _CORROBORATE_MIN_CHARS or not host or when is None:
+        return None
+    for r in rows:
+        r_ts = _parse_ts(r.get("ts"))
+        if (r.get("event") == "insight" and _row_source(r) == "hook" and r.get("host") == host
+                and r_ts is not None and abs((r_ts - when).total_seconds()) <= JOIN_WINDOW_S
+                and needle in str(r.get("text") or "").lower()):
+            return str(r.get("id") or "")
+    return None
+
+
 def _is_capture(row: Mapping[str, Any], hs: Optional[str]) -> bool:
-    # Captures are 'suggestion' rows, or 'W2' rows a hook prompt confirmed; hook prompts write
-    # W2 rows without confirmed_by and never count. No hs is one shared bucket.
-    return (row.get("event") == "insight" and row.get("hs") == hs
-            and (row.get("level") == "suggestion" or (row.get("level") == "W2" and bool(row.get("confirmed_by")))))
+    # No hs is one shared bucket.
+    return row.get("event") == "insight" and row.get("hs") == hs and _row_source(row) == "mcp"
 
 
 def _read_rows_of_session(path: Path, hs: str) -> List[Dict[str, Any]]:
     # hs is 32 lowercase hex, never JSON-escaped, so every row of the session carries it verbatim.
     return read_jsonl(path, contains=hs.encode("ascii")).rows
-
-
-def _matching_hook_insight(rows: Sequence[Mapping[str, Any]], hs: Optional[str], redacted_quote: str) -> Optional[str]:
-    if not hs or not redacted_quote or len(redacted_quote.strip()) < 4:
-        return None
-    needle = redacted_quote.strip().lower()
-    for r in rows:
-        if (
-            r.get("event") == "insight"
-            and r.get("level") in ("W2", "hook")
-            and r.get("hs") == hs
-            and isinstance(r.get("text"), str)
-            and needle in r["text"].lower()
-        ):
-            return str(r.get("id") or "")
-    return None
 
 
 def _build_insight_row(
@@ -510,7 +561,7 @@ def add_insight(
     norm_paths, psrc = _resolve_paths(workspace, paths)
     level = "H" if _has_human_approval(workspace, commit, base_ref, clean) else "cli"
     row = _build_insight_row(
-        workspace, level, clean, norm_paths, psrc, "cli", None, kind=str(kind) if kind else None,
+        workspace, level, clean, norm_paths, psrc, "cli", None, source="cli", kind=str(kind) if kind else None,
     )
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
@@ -540,17 +591,22 @@ def capture_suggestion(
         rows = _read_rows_of_session(path, hs) if hs else read_jsonl(path, contains=b'"level":"suggestion"').rows
         if sum(1 for r in rows if _is_capture(r, hs)) >= MAX_CAPTURES_PER_SESSION:
             raise CaptureLimitReached(f"capture limit reached: at most {MAX_CAPTURES_PER_SESSION} insights per session")
-        m_hook = _matching_hook_insight(rows, hs, redacted)
+        # Rows are compact JSON, so a hook row written since 4.4 carries these bytes; review
+        # recomputes corroboration over every row (4.3.x hook rows included), so this is a note.
+        now = _utc_now()
+        hooks = read_jsonl(path, contains=b'"source":"hook"').rows
         row = _build_insight_row(
             workspace,
-            "W2" if m_hook else "suggestion",
+            "suggestion",
             redacted,
             norm_paths,
             psrc,
             host or "mcp",
             hs,
+            now,
             revs=revs,
-            confirmed_by=m_hook,
+            source="mcp",
+            corroborated_by=_corroborating_hook(hooks, host or "mcp", now, redacted),
             paths_dropped=dropped,
         )
         _append_user_insights(path, [row])
@@ -633,7 +689,7 @@ def record_hook_prompt(
     insight_row: Optional[Dict[str, Any]] = None
     if excerpt:
         insight_row = _build_insight_row(
-            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {},
+            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {}, source="hook",
         )
         to_write.append(insight_row)
     _append_user_insights(path, to_write)
@@ -736,50 +792,31 @@ def _load_md_rules(workspace: Any, folder: Path, *, recursive: bool = False) -> 
     return items
 
 
-def _rule_was_exposed(
-    workspace: Any,
-    rule: Rule,
-    cluster_rows: Sequence[Mapping[str, Any]],
-    home: Optional[Path] = None,
-) -> bool:
-    from aegis_core import credit
-    from aegis_core.scan_compliance import activity_path
-    from aegis_core.telemetry_engine import ledger
+_Exposures = Dict[str, List[Tuple[str, datetime, Optional[str]]]]
 
-    root = Path(os.fspath(workspace)).resolve()
-    link_key = read_link_key(home)
-    scan_hs: Set[Tuple[str, str]] = set()
-    exposed_hs: Set[Tuple[str, str]] = set()
-    for a in read_jsonl(activity_path(root)).rows:
-        sh, ss = str(a.get("host") or ""), str(a.get("session") or "")
-        if a.get("event") == "scan" and ss:
-            shs = session_hs(sh, ss, link_key, home=home)
-            if shs:
-                scan_hs.add((sh, shs))
-                if rule.id in credit.exposed_rules(root, sh, ss):
-                    exposed_hs.add((sh, shs))
-    for erow in credit.read_rows(root):
-        eh, es = str(erow.get("host") or ""), str(erow.get("session") or "")
-        rev = erow.get("rev")
-        rev_mismatch = isinstance(rev, str) and bool(rev) and not rule.digest.startswith(rev)
-        if erow.get("event") == "exposure" and (erow.get("rule") or erow.get("for_rule")) == rule.id and not rev_mismatch and es:
-            ehs = session_hs(eh, es, link_key, home=home)
-            if ehs:
-                exposed_hs.add((eh, ehs))
-    for lrow in ledger.read(root).rows:
-        meta = lrow.get("meta") if isinstance(lrow.get("meta"), Mapping) else {}
-        rev = meta.get("rev")
-        if lrow.get("rule") != rule.id or (isinstance(rev, str) and rev and not rule.digest.startswith(rev)):
-            continue
-        lh, ls = str(lrow.get("host") or ""), str(lrow.get("session") or "")
-        lhs = session_hs(lh, ls, link_key, home=home) if ls else None
-        if lhs and (
-            rule.id in credit.exposed_rules(root, lh, ls)
-            or (lh, lhs) in scan_hs
-            or lrow.get("outcome") in ("trigger", "tp", "fp")
-        ):
-            exposed_hs.add((lh, lhs))
-    return any((str(ins.get("host") or ""), str(ins.get("hs") or "")) in exposed_hs for ins in cluster_rows)
+
+def _exposure_index(root: Path) -> _Exposures:
+    """{rule: [(host, ts, rev)]} from one pass over the ledger's exposure rows."""
+    from aegis_core import credit
+
+    index: _Exposures = {}
+    for row in credit.read_rows(root):
+        rule_id, ts, rev = row.get("rule"), _parse_ts(row.get("ts")), row.get("rev")
+        if row.get("event") == "exposure" and isinstance(rule_id, str) and ts is not None:
+            index.setdefault(rule_id, []).append(
+                (str(row.get("host") or ""), ts, rev if isinstance(rev, str) and rev else None))
+    return index
+
+
+def _rule_was_exposed(rule: Rule, cluster_rows: Sequence[Mapping[str, Any]], exposures: _Exposures) -> bool:
+    # A None rev is a row written before exposures carried one: it matches any revision.
+    shown = [(host, ts) for host, ts, rev in exposures.get(rule.id, ()) if rev is None or rule.digest.startswith(rev)]
+    for ins in cluster_rows:
+        host, ts = str(ins.get("host") or ""), _parse_ts(ins.get("ts"))
+        if host and ts is not None and any(
+                h == host and abs((e_ts - ts).total_seconds()) <= JOIN_WINDOW_S for h, e_ts in shown):
+            return True
+    return False
 
 
 def _paths_overlap_rule(paths: Iterable[str], rule: Rule) -> bool:
@@ -806,25 +843,29 @@ def _cluster_signature_id(tokens: Sequence[str], matched_id: Optional[str]) -> s
 def record_decision(
     workspace: Any,
     *,
-    cluster_id: str,
+    cluster_id: str = "",
     decision: str,
     insight_ids: Sequence[str],
     reason: Optional[str] = None,
     rule_id: Optional[str] = None,
+    kind: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    """``confirm`` names the suggestions a human confirms (and their ``kind``); every other
+    decision names a cluster."""
     if decision not in DECISIONS:
         raise ValueError(f"decision must be one of {list(DECISIONS)}, got {decision!r}")
-    if not isinstance(cluster_id, str) or not cluster_id.strip():
+    ids = [str(i) for i in insight_ids if str(i).strip()]
+    if decision == "confirm" and not ids:
+        raise ValueError("confirm needs at least one insight id")
+    if decision != "confirm" and (not isinstance(cluster_id, str) or not cluster_id.strip()):
         raise ValueError("cluster_id must be a non-empty string")
-    row: Dict[str, Any] = {
-        "v": INSIGHT_SCHEMA_VERSION,
-        "ts": _utc_now(),
-        "event": "decision",
-        "cluster_id": cluster_id.strip(),
-        "decision": decision,
-        "insight_ids": [str(i) for i in insight_ids if str(i).strip()],
-    }
+    row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": _utc_now(), "event": "decision"}
+    if cluster_id and cluster_id.strip():
+        row["cluster_id"] = cluster_id.strip()
+    row.update(decision=decision, insight_ids=ids)
+    if kind:
+        row["kind"] = str(kind)
     if reason:
         row["reason"] = _redact(str(reason))
     if rule_id:
@@ -896,15 +937,14 @@ def _cluster_countable_insights(
 
 
 def _build_cluster_entry(
-    root: Path,
     members: Sequence[int],
     countable: Sequence[Tuple[int, Dict[str, Any]]],
     ins_tokens: Sequence[Sequence[str]],
     ins_best_rule: Sequence[Optional[_RuleMatch]],
-    rejections: Sequence[Tuple[int, Dict[str, Any]]],
-    neighbours: Mapping[str, List[Dict[str, Any]]],
-    *,
-    home: Optional[Path] = None,
+    decisions: Sequence[Tuple[int, Dict[str, Any]]],
+    exposures: _Exposures,
+    corroborated: Mapping[str, List[str]],
+    levels: Mapping[int, Tuple[str, Optional[str]]],
 ) -> Tuple[Dict[str, Any], bool]:
     m_rows = [countable[m][1] for m in members]
     m_row_idxs = [countable[m][0] for m in members]
@@ -921,32 +961,32 @@ def _build_cluster_entry(
     else:
         matched_id, best_score = best_m.rule.id, best_m.similarity
         if best_m.kind == "active":
-            status = "exposed_and_ignored" if _rule_was_exposed(root, best_m.rule, m_rows, home=home) else "not_exposed"
+            status = "exposed_and_ignored" if _rule_was_exposed(best_m.rule, m_rows, exposures) else "not_exposed"
         elif best_m.kind == "proposal":
             status = "matches_proposal"
         else:
             status = "matches_archived"
     cid = _cluster_signature_id(c_tokens, matched_id)
-    latest_rej = max(
-        (
-            d_idx
-            for d_idx, d_row in rejections
-            if d_row.get("cluster_id") == cid or set(d_row.get("insight_ids") or []).intersection(m_ids)
-        ),
-        default=None,
-    )
-    is_sup = latest_rej is not None and sum(1 for r_idx in m_row_idxs if r_idx > latest_rej) < REJECTION_RESURFACE_COUNT
+    # The id hashes the top tokens, so a decision also finds its cluster by a shared member.
+    latest = max(((d_idx, d_row) for d_idx, d_row in decisions
+                  if d_row.get("cluster_id") == cid or set(d_row.get("insight_ids") or []).intersection(m_ids)),
+                 key=lambda d: d[0], default=None)
+    # propose and merge-into-rule hide a cluster until a later decision; snooze and reject until
+    # REJECTION_RESURFACE_COUNT members are newer than the decision.
+    is_sup = latest is not None and (latest[1].get("decision") in ("propose", "merge-into-rule")
+                                     or sum(1 for r_idx in m_row_idxs if r_idx > latest[0]) < REJECTION_RESURFACE_COUNT)
     info = {
         "cluster_id": cid,
         "insight_ids": m_ids,
         "count": len(m_ids),
         "paths": sorted(c_paths),
         "excerpts": [str(r.get("text") or "") for r in m_rows],
-        "levels": sorted({str(r.get("level") or "") for r in m_rows}),
+        "levels": sorted({levels[i][0] for i in m_row_idxs}),
+        "kinds": sorted({str(levels[i][1]) for i in m_row_idxs if levels[i][1]}),
         "match_status": status,
         "matched_rule": matched_id,
         "similarity": round(best_score, 4),
-        "neighbours": {mid: neighbours.get(mid, []) for mid in m_ids},
+        "corroborated": [sid for mid in m_ids for sid in corroborated.get(mid, ())],
     }
     return info, is_sup
 
@@ -965,31 +1005,35 @@ def review_insights(
         for x in (r.get("insight_ids") or [])
         if x
     }
-    rejections = [
-        (idx, r)
-        for idx, r in enumerate(all_rows)
-        if r.get("event") == "decision" and r.get("decision") == "reject"
-    ]
-    hook_rows = [r for r in all_rows if r.get("event") == "insight" and r.get("level") in ("W2", "hook")]
+    decisions = [(idx, r) for idx, r in enumerate(all_rows)
+                 if r.get("event") == "decision" and r.get("decision") in _RULING_DECISIONS]
+    confirmed = _confirmed(all_rows)
+    # Review is the authority on corroboration: recomputed here, read-only, whatever the order
+    # of capture and prompt. A corroborated suggestion annotates its hook row and never counts.
+    hook_rows = [r for r in all_rows if r.get("event") == "insight" and _row_source(r) == "hook"
+                 and str(r.get("id") or "") not in noise_ids]
     suggestions: List[Dict[str, Any]] = []
     countable: List[Tuple[int, Dict[str, Any]]] = []
-    seen_hook_ids: Set[str] = set()
+    corroborated: Dict[str, List[str]] = {}
+    levels: Dict[int, Tuple[str, Optional[str]]] = {}
+    confirmed_ids = set(confirmed)
     for idx, row in enumerate(all_rows):
         ins_id = str(row.get("id") or f"row-{idx}")
         if row.get("event") != "insight" or ins_id in noise_ids:
             continue
-        level = row.get("level")
-        if level == "suggestion":
-            m_hook = _matching_hook_insight(hook_rows, row.get("hs"), str(row.get("text") or ""))
-            if not m_hook:
+        level = _effective_level(row, confirmed_ids)
+        if _row_source(row) == "mcp":
+            # Confirming a corroborated capture would count its correction a second time.
+            m_hook = _corroborating_hook(hook_rows, str(row.get("host") or ""), row.get("ts"), str(row.get("text") or ""))
+            if m_hook:
+                corroborated.setdefault(m_hook, []).append(ins_id)
+                continue
+            if level == "suggestion":
                 suggestions.append(row)
                 continue
-            if m_hook in seen_hook_ids:
-                continue
-        if level in COUNTABLE_LEVELS or level == "suggestion":
-            if level in ("W2", "hook") and ins_id:
-                seen_hook_ids.add(ins_id)
+        if level in COUNTABLE_LEVELS:
             countable.append((idx, row))
+            levels[idx] = (level, confirmed.get(ins_id) if _row_source(row) == "mcp" else row.get("kind"))
     if not countable:
         return {"clusters": [], "suggestions": suggestions, "suppressed_clusters": [], "neighbours": {}}
     from aegis_core.rules import load_rules
@@ -1026,16 +1070,18 @@ def review_insights(
     ins_best_rule = _match_insights_to_rules(countable, ins_vecs, rule_entries, rule_vecs)
     clusters: List[Dict[str, Any]] = []
     suppressed: List[Dict[str, Any]] = []
+    # One ledger read per review, and none when no cluster matches an active rule.
+    exposures = _exposure_index(root) if any(m is not None and m.kind == "active" for m in ins_best_rule) else {}
     for members in _cluster_countable_insights(countable, ins_vecs, ins_best_rule):
         info, is_sup = _build_cluster_entry(
-            root,
             members,
             countable,
             ins_tokens,
             ins_best_rule,
-            rejections,
-            neighbours,
-            home=home,
+            decisions,
+            exposures,
+            corroborated,
+            levels,
         )
         if is_sup:
             suppressed.append(info)
@@ -1052,6 +1098,7 @@ def review_insights(
 
 
 _SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+_VERBATIM_MIN_CHARS = 25
 
 
 def write_proposal(
@@ -1069,17 +1116,21 @@ def write_proposal(
     clean_id = proposal_id.strip()
     if not _SAFE_ID_RE.match(clean_id):
         raise ValueError(f"invalid proposal_id {proposal_id!r}")
+    # Only human text is protected: an agent capture must not be able to veto a proposal. A
+    # short prompt ("no", "revert") protects only a bullet equal to it.
+    rows = read_insight_rows(workspace, home=home)
+    confirmed = set(_confirmed(rows))
     protected = [
         str(r.get("text") or "").strip().lower()
-        for r in read_insight_rows(workspace, home=home)
-        if r.get("event") == "insight"
-        and r.get("level") in ("W0", "W2", "hook", "suggestion")
+        for r in rows
+        if r.get("event") == "insight" and _effective_level(r, confirmed) in ("H", "cli", "W2")
         and str(r.get("text") or "").strip()
     ]
     for cand in (category, *summary_bullets):
         clow = str(cand).strip().lower()
-        if clow and any(ex in clow or (len(clow) >= 25 and clow in ex) for ex in protected):
-            raise ValueError("proposal may not contain verbatim W0/W2/suggestion prompt text")
+        if clow and any(ex == clow or (len(ex) >= _VERBATIM_MIN_CHARS and ex in clow)
+                        or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
+            raise ValueError("proposal may not contain verbatim H/cli/W2 prompt text")
     norm_targets = [PurePath(str(p)).as_posix() for p in target_paths if str(p).strip()] or ["**"]
     clean_bullets = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
     if not clean_bullets:
@@ -1123,23 +1174,78 @@ def _wilson_ucb95(k: int, n: int) -> float:
 
 
 def _count_recurrence_episodes(matching: Sequence[Mapping[str, Any]]) -> int:
-    episodes = 0
-    seen_hs: Set[str] = set()
-    last_ts: Optional[datetime] = None
+    """Insights closer than BURST_WINDOW_SECONDS to the one before are one episode."""
+    stamps = sorted(ts for ts in (_parse_ts(r.get("ts")) for r in matching) if ts is not None)
+    gaps = sum(1 for a, b in zip(stamps, stamps[1:]) if (b - a).total_seconds() > BURST_WINDOW_SECONDS)
+    return len(matching) - len(stamps) + (gaps + 1 if stamps else 0)
+
+
+def _session_rates(alive: Set[str], matching: Sequence[Mapping[str, Any]]) -> Tuple[int, int]:
+    """(alive sessions with a recurrence, episodes inside alive sessions)."""
+    by_session: Dict[str, List[Mapping[str, Any]]] = {}
     for ins in matching:
-        hs_val = ins.get("hs")
-        if isinstance(hs_val, str) and hs_val.strip():
-            clean_hs = hs_val.strip()
-            if clean_hs not in seen_hs:
-                seen_hs.add(clean_hs)
-                episodes += 1
-        else:
-            ts = _parse_ts(ins.get("ts"))
-            if ts is not None and last_ts is not None and abs((ts - last_ts).total_seconds()) <= BURST_WINDOW_SECONDS:
-                continue
-            last_ts = ts
-            episodes += 1
-    return episodes
+        if ins.get("hs") in alive:
+            by_session.setdefault(str(ins["hs"]), []).append(ins)
+    return len(by_session), sum(_count_recurrence_episodes(rows) for rows in by_session.values())
+
+
+def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str], reset_on_rev_change: bool) -> Dict[str, Any]:
+    cur_rev = rule.digest[:16]
+    rule_tokens = _tokenize(f"{rule.id} {rule.meta.get('hypothesis', '')} {rule.body}")
+    burst = {str(i) for i in rule.meta.get("insight_ids") or [] if isinstance(i, (str, int))}
+    inv_revs = {
+        r["inv"]: r["revs"] for r in rows
+        if r.get("event") == "inventory" and isinstance(r.get("inv"), str) and isinstance(r.get("revs"), Mapping)
+    }
+    # The window opens at the first row that names the rule's current rev (its first inventory
+    # row); the baseline is the same measurement over the sessions before it.
+    window_open = not reset_on_rev_change
+    alive: Set[str] = set()
+    before: Set[str] = set()
+    unidentified_heartbeats = 0
+    matching: List[Mapping[str, Any]] = []
+    earlier: List[Mapping[str, Any]] = []
+    for row in rows:
+        # A new heartbeat names its rule set by `inv`; an old one carries its own revs.
+        revs = row.get("revs")
+        if not isinstance(revs, Mapping):
+            revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
+        in_rev = not reset_on_rev_change or revs.get(rule.id) == cur_rev
+        window_open = window_open or in_rev
+        if window_open and not in_rev:
+            continue
+        ev, hs_val = row.get("event"), row.get("hs")
+        if ev == "heartbeat":
+            if isinstance(hs_val, str) and hs_val.strip():
+                (alive if window_open else before).add(hs_val)
+            elif window_open:
+                unidentified_heartbeats += 1
+        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS
+              and _paths_overlap_rule(row.get("paths") or [], rule)):
+            itoks = _tokenize(str(row.get("text") or ""))
+            if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
+                if window_open:
+                    matching.append(row)
+                elif str(row.get("id") or "") not in burst:
+                    earlier.append(row)
+    recurrent, episodes = _session_rates(alive, matching)
+    unattributed = _count_recurrence_episodes([r for r in matching if not r.get("hs")])
+    base_recurrent, _ = _session_rates(before, earlier)
+    n_sess = len(alive)
+    if n_sess:
+        status = "not_working" if episodes >= RECURRENCE_ALARM_COUNT else "ok"
+    elif unidentified_heartbeats or matching:
+        status = "insufficient_session_identity"
+    else:
+        status = "no_prompt_traffic"
+    return {
+        "rule": rule.id, "rev": cur_rev, "sessions": n_sess, "unidentified_heartbeats": unidentified_heartbeats,
+        "recurrences": episodes, "recurrent_sessions": recurrent, "unattributed_recurrences": unattributed,
+        "rate": round(recurrent / n_sess, 6) if n_sess else 0.0, "rate_ucb95": _wilson_ucb95(recurrent, n_sess),
+        "alarm": bool(n_sess) and episodes >= RECURRENCE_ALARM_COUNT, "status": status,
+        "baseline_rate": round(base_recurrent / len(before), 6) if before else None,
+        "baseline_sessions": len(before), "denominator": RECURRENCE_DENOMINATOR,
+    }
 
 
 def measure_recurrence(
@@ -1149,78 +1255,53 @@ def measure_recurrence(
     home: Optional[Path] = None,
     reset_on_rev_change: bool = True,
 ) -> Dict[str, Any]:
+    """Alive sessions with a matching human insight over all alive sessions (at most 1), its 95%
+    upper bound, and the episodes the alarm counts."""
     from aegis_core.rules import load_rules
 
     root = Path(os.fspath(workspace)).resolve()
     rule = load_rules(root).get(rule_id)
     if rule is None:
         raise ValueError(f"unknown rule {rule_id!r}")
-    cur_rev = rule.digest[:16]
-    rule_tokens = _tokenize(f"{rule.id} {rule.meta.get('hypothesis', '')} {rule.body}")
-    alive: Set[str] = set()
-    unidentified_heartbeats = 0
-    matching: List[Dict[str, Any]] = []
     rows = read_insight_rows(root, home=home)
-    inv_revs = {
-        r["inv"]: r["revs"] for r in rows
-        if r.get("event") == "inventory" and isinstance(r.get("inv"), str) and isinstance(r.get("revs"), Mapping)
-    }
-    for row in rows:
-        # A new heartbeat names its rule set by `inv`; an old one carries its own revs.
-        revs = row.get("revs")
-        if not isinstance(revs, Mapping):
-            revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
-        if reset_on_rev_change and revs.get(rule_id) != cur_rev:
-            continue
-        ev = row.get("event")
-        if ev == "heartbeat":
-            hs_val = row.get("hs")
-            if isinstance(hs_val, str) and hs_val.strip():
-                alive.add(hs_val.strip())
-            else:
-                unidentified_heartbeats += 1
-        elif ev == "insight" and row.get("level") in COUNTABLE_LEVELS and _paths_overlap_rule(row.get("paths") or [], rule):
-            itoks = _tokenize(str(row.get("text") or ""))
-            if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
-                matching.append(row)
-    episodes = _count_recurrence_episodes(matching)
-    n_sess = len(alive)
-    if not n_sess:
-        if unidentified_heartbeats > 0 or episodes > 0:
-            return {
-                "rule": rule_id,
-                "rev": cur_rev,
-                "sessions": 0,
-                "unidentified_heartbeats": unidentified_heartbeats,
-                "recurrences": episodes,
-                "rate": 0.0,
-                "rate_ucb95": 1.0,
-                "alarm": False,
-                "status": "insufficient_session_identity",
-            }
-        return {
-            "rule": rule_id,
-            "rev": cur_rev,
-            "sessions": 0,
-            "unidentified_heartbeats": 0,
-            "recurrences": 0,
-            "rate": 0.0,
-            "rate_ucb95": 1.0,
-            "alarm": False,
-            "status": "no_prompt_traffic",
-        }
-    alarm = episodes >= RECURRENCE_ALARM_COUNT
+    return _measure(rule, rows, set(_confirmed(rows)), reset_on_rev_change)
+
+
+def insight_born_rules(workspace: Any) -> List[Rule]:
+    """The served rules whose frontmatter names the insights they came from."""
+    from aegis_core.rules import load_rules
+
+    root = Path(os.fspath(workspace)).resolve()
+    try:
+        served = load_rules(root).served if WorkspaceLayout(root).rules_dir.is_dir() else ()
+    except Exception:  # a display surface: an unloadable rule set has no insight-born rules to show
+        return []
+    return [r for r in served if isinstance(r.meta.get("insight_ids"), list) and r.meta["insight_ids"]]
+
+
+def insight_status(workspace: Any, *, home: Optional[Path] = None) -> Dict[str, Any]:
+    """What ``aegis status`` and ``aegis sync`` say about insights; {} without an insights log."""
+    rows = read_insight_rows(workspace, home=home)
+    if not rows:
+        return {}
+    confirmed = set(_confirmed(rows))
     return {
-        "rule": rule_id,
-        "rev": cur_rev,
-        "sessions": n_sess,
-        "unidentified_heartbeats": unidentified_heartbeats,
-        "recurrences": episodes,
-        "rate": round(episodes / n_sess, 6),
-        "rate_ucb95": _wilson_ucb95(episodes, n_sess),
-        "alarm": alarm,
-        "status": "not_working" if alarm else "ok",
+        "rules": [_measure(rule, rows, confirmed, True) for rule in insight_born_rules(workspace)],
+        "unconfirmed_suggestions": sum(1 for r in rows if r.get("event") == "insight"
+                                       and _effective_level(r, confirmed) == "suggestion"),
+        "denominator": RECURRENCE_DENOMINATOR,
     }
+
+
+def insight_status_lines(summary: Mapping[str, Any]) -> List[str]:
+    lines = [
+        f"recurrence {r['rule']}: {r['status']}, rate {r['rate']:.2f} ({r['recurrent_sessions']}/{r['sessions']} "
+        f"sessions), 95% bound {r['rate_ucb95']:.2f}; {summary['denominator']}"
+        for r in summary.get("rules") or ()
+    ]
+    if summary.get("unconfirmed_suggestions"):
+        lines.append(f"{summary['unconfirmed_suggestions']} unconfirmed agent suggestions (not counted)")
+    return lines
 
 
 #: Marks Aegis's insight handler: in the exec form's args, the Codex string or 4.3's ``-m``.

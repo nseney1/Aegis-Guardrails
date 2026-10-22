@@ -165,8 +165,9 @@ def test_with_no_base_branch_the_whole_first_parent_history_counts(baseline, tmp
     monkeypatch.delenv("GITHUB_BASE_REF", raising=False)
     clone = tmp_path / "clone"
     _git(tmp_path, "clone", "-q", "--no-local", "-b", "feature", str(baseline["repo"]), str(clone))
-    for ref in ("refs/remotes/origin/main", "refs/remotes/origin/HEAD"):
-        _git(clone, "update-ref", "-d", ref, check=False)
+    _git(clone, "update-ref", "-d", "refs/remotes/origin/main", check=False)
+    # --no-deref: deleting through the symref would remove origin/feature and leave origin/HEAD dangling.
+    _git(clone, "update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD", check=False)
     found = team.merge_metrics(clone)
     assert (found["count"], found["overlapping_merge"], found["conflicting_merge"]) == (24, 8, 7)
     assert (found["range"]["base"], found["range"]["base_commit"]) == (None, None)

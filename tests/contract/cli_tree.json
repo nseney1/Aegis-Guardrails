@@ -529,7 +529,7 @@
             "flags": [
               "--ci"
             ],
-            "help": "The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs T5 fix-commit regression checks (advisory at default warning tier; blocking at gate tier via --strict or user config regression.tier=\"gate\"). Exit 0 pass, 1 fail",
+            "help": "The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -565,7 +565,7 @@
             "flags": [
               "--base"
             ],
-            "help": "With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, $GITHUB_BASE_REF, origin/main, main, origin/develop or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection",
+            "help": "With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, then the branch origin/HEAD names, then main, develop or master, each as origin/<name> before <name>). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection",
             "kind": "store",
             "metavar": "REF",
             "nargs": null,
@@ -603,7 +603,7 @@
             "flags": [
               "--no-exec"
             ],
-            "help": "With --ci: read git objects only and run none of the repository's code: the T5 regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage, --perf and --strict",
+            "help": "With --ci: read git objects only and run none of the repository's code: the T5 regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage and --perf",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -616,7 +616,7 @@
             "flags": [
               "--coverage"
             ],
-            "help": "With --ci: run pytest with diff coverage over changed lines",
+            "help": "With --ci: report the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs under coverage. A report only: it never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -2792,14 +2792,15 @@
                       "reject",
                       "snooze",
                       "merge-into-rule",
-                      "noise"
+                      "noise",
+                      "confirm"
                     ],
                     "default": null,
                     "dest": "decision",
                     "flags": [
                       "--decision"
                     ],
-                    "help": "Record a review decision for a cluster",
+                    "help": "Record a review decision: for the cluster --cluster names (reject also needs --reason), or confirm the suggestions --insight names",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2811,7 +2812,31 @@
                     "flags": [
                       "--cluster"
                     ],
-                    "help": "Cluster ID for --decision",
+                    "help": "Cluster ID for --decision (as review lists it)",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "insight_ids",
+                    "flags": [
+                      "--insight"
+                    ],
+                    "help": "Unconfirmed suggestion ID for --decision confirm (repeatable)",
+                    "kind": "append",
+                    "metavar": "ID",
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "kind",
+                    "flags": [
+                      "--kind"
+                    ],
+                    "help": "Insight kind recorded with --decision confirm",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2830,12 +2855,12 @@
                     "required": false
                   },
                   {
-                    "default": "correctness",
+                    "default": null,
                     "dest": "category",
                     "flags": [
                       "--category"
                     ],
-                    "help": "Proposal category when --decision propose",
+                    "help": "Proposal category when --decision propose (default: the one kind the cluster's human insights share, else correctness)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2871,7 +2896,7 @@
                     "flags": [
                       "--reason"
                     ],
-                    "help": "Optional reason for the decision",
+                    "help": "Reason for the decision (required with reject)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -3847,7 +3872,7 @@
                 "flags": [
                   "--base"
                 ],
-                "help": "Count merges since this commit (default: the branch base, as for aegis check --lane: origin/main, main, origin/develop or develop; with none, the whole first-parent history)",
+                "help": "Count merges since this commit (default: the branch base, as for aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, develop or master; with none, the whole first-parent history)",
                 "kind": "store",
                 "metavar": "REF",
                 "nargs": null,
