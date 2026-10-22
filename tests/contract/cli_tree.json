@@ -452,7 +452,7 @@
             "flags": [
               "--format"
             ],
-            "help": "Output format (github, with --ci only: workflow-command annotations)",
+            "help": "Output format. github|sarif: workflow-command annotations or SARIF 2.1.0 for --ci or a plain Layer 1 check (also appended to $GITHUB_STEP_SUMMARY); neither combines with --json",
             "kind": "store",
             "metavar": null,
             "nargs": null,
@@ -491,6 +491,19 @@
               "--card"
             ],
             "help": "Print the day-0 card: languages, AST drivers, rules by type, the Layer 1 pass rate on the files and the 5 files with the most findings (above 2000 files it samples, and says so). Changes nothing and never reads baseline.json; --json for the machine-readable form",
+            "kind": "store_true",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "const": true,
+            "default": false,
+            "dest": "calibration",
+            "flags": [
+              "--calibration"
+            ],
+            "help": "Report how well the logged Layer 2 predictions (.aegis/state/arbiter_predictions.jsonl, one row per prediction of aegis check --full, no model text) came true, per backend and observable kind: the resolved count, hits, a Wilson interval and, from 100 resolved, a Brier skill score. Read-only and log-only: no verdict or exit code depends on it",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -616,7 +629,7 @@
             "flags": [
               "--coverage"
             ],
-            "help": "With --ci: report the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs under coverage. A report only: it never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
+            "help": "With --ci only: report-only diff coverage, the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -629,7 +642,7 @@
             "flags": [
               "--perf"
             ],
-            "help": "With --ci: run performance regression check",
+            "help": "With --ci only: a paired, interleaved benchmark of the merge-base export against the checked-out tree (the user-scope perf.command, or pytest-benchmark when it is installed). A regression fails the run; a run that measured nothing says UNVERIFIED and does not block",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,

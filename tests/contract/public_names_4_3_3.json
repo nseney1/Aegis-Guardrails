@@ -1176,8 +1176,10 @@
   "aegis_core.rule_integrity.Path",
   "aegis_core.rule_integrity.UserLayout",
   "aegis_core.verification.scanners.HOOK_REDACTION_PATTERNS",
+  "aegis_core.verification.scanners.build_preset_argv",
   "aegis_core.verification.scanners.redact_hook_text",
   "aegis_core.verification.scanners.redact_payload",
-  "aegis_core.verification.scanners.redact_secrets"
+  "aegis_core.verification.scanners.redact_secrets",
+  "aegis_core.verification.scanners.run_preset_scanner"
  ]
 }

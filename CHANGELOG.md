@@ -18,6 +18,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`aegis check --ci --coverage` reads no repository coverage configuration.** It runs the user-scope `tests.command` (pytest-based only) with an empty rcfile in a private state directory and never reads the repository's `.coveragerc` or `coverage.json`. It still runs the repository's tests, as `--coverage` always has.
 - **A short agent capture no longer blocks insight proposals.** The verbatim lint protects only human, `cli` and hook text, with a 25-character floor both ways and an exact match for short prompts; a one-character `aegis_capture_insight` quote blocked every proposal.
 
+- **`aegis check` runs the security pack and the secret scan.** The 7-rule Python security pack and the known-format secret scan had no caller; they now run in every `aegis check` (also `--hook` and `--record`) on what a change introduces, judged against the diff base. Test paths are exempt but reported, `# aegis: allow[rule]` and `# gitleaks:allow` are honoured, and a baseline never grandfathers these rows. A planted secret on a changed line fails Layer 1. On this repository Layer 1 over 147 files went from about 2 s to about 11 s (measured on a loaded machine).
+- **The step summary renders pull-request text as inert data.** Finding text from the pull request is placed in code spans, so it cannot inject Markdown, links or images into the job summary.
+
 ### Changed behaviour
 
 - **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
@@ -47,6 +50,20 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis rule insight review --decision` gains `confirm --insight ID [--kind K]`: a confirmed suggestion counts at level `cli`. Snooze, propose and merge-into-rule now hide a cluster; snooze and reject resurface it after 2 new insights. A `propose` whose proposal cannot be written (an invalid `--proposal-id`, or a `--summary` quoting a human prompt) exits 1 and records no decision.
 - `aegis status` and `aegis sync` (text, and JSON `insights`) print each insight-born rule's recurrence, labelled `sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)`, and `N unconfirmed agent suggestions (not counted)`.
 - Insight rows gain add-only `source` and `corroborated_by` fields, and exposure rows carry each rule's digest prefix as `rev`.
+
+- **`aegis check --ci` prints one verdict.** It never prints PASSED with exit 1: `FAILED: <first cause>` matches the JSON status, the new JSON `blocking` list (causes in priority order) and the exit code, and perf, coverage and `Aegis-Check` trailer results show in the text, GitHub and step-summary outputs. The text adds `scanners: none configured`, or the scanner results with a security-suppression count and its merge-base delta.
+- The step summary is appended to, not rewritten.
+- SARIF logs hold only schema keys and anchored findings: a finding without a line (weakenings, governance, regressions) is never given one and goes to the annotations and the step summary; approved weakenings are notes, not errors; a failed run prints a valid empty log.
+- `aegis check --ci --perf` no longer crashes on an UNVERIFIED reason, uses pytest-benchmark by default when it is installed, and reports UNVERIFIED when `--head` is not the checkout. An UNVERIFIED perf or scanner result never blocks.
+- Aegis-Check trailers that 4.3.x recorded on commits adding calls the security pack flags no longer match a 4.4.0 rerun: re-record the trailer on in-flight pull requests.
+- The pre-tool hook starts one git process per edit instead of two and reads the activity log once on an unscanned edit; its decisions, exit codes, messages and events rows are unchanged.
+
+### Added
+
+- `aegis check FILES --format github|sarif` reports Layer 1 findings (reverses a 4.0 removal).
+- The user-scope `scanners` key (`["ruff", "gitleaks"]`) runs those presets in `aegis check --ci`, from PATH outside the repository; only findings new against the merge base fail.
+- `aegis check --calibration` is a registered flag. Layer 2 predictions are stamped and kept in `.aegis/state/arbiter_predictions.jsonl` with no model text; dispositions and outcomes are computed from git when the file is read, and scores are per backend and observable kind.
+- `aegis init --ci` writes an `aegis-sarif` job with a gated code-scanning upload. It is a separate job, so `security-events: write` never reaches the job that hands `GH_TOKEN` to the test reruns.
 
 ### Fixed
 
@@ -80,6 +97,11 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis rule insight review --decision` needs `--cluster` (or `--insight` for `confirm`), and `reject` needs `--reason` (exit 2). An unknown cluster or suggestion id lists the valid ids and writes nothing (exit 1). JSON review output emits neighbours once; the per-cluster `neighbours` key is removed.
 - Breaking: tree identity makes a tree unbindable when the repository's or a checked-out submodule's own config defines a filter driver whose name `git -c` cannot carry (containing `=` or bytes that are not UTF-8), or when checked-out submodules nest more than 16 deep.
 
+- Breaking: `aegis check --coverage` and `--perf` outside `--ci` exit 2, and `--json` with `--format github|sarif` is a usage error (exit 2).
+- Breaking: `perf.command` is read only from `perf.command` under `perf` in `~/.aegis/config.json`; a dotted top-level key is ignored, and the perf JSON loses `advisory`.
+- Breaking: SARIF alert fingerprints are now stable under line moves and unique per run, so GitHub reopens existing Aegis alerts once.
+- Breaking: JSON `llm_predictions` rows carry `scope` `{path, symbol}` and `observable` `{kind, selector}` and drop `resolved_at` and `resolving_commit`; an observable that is not such an object is void.
+
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
 - Breaking: `aegis_core.fitness.Fitness.samples` and the `samples=` parameter of `aegis_core.fitness.compute` are removed.
@@ -91,6 +113,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - Breaking: `aegis_core.regression.VALID_TIERS` and the `tier=` argument of `aegis_core.regression.check_ci_regressions` are removed.
 - Breaking: `aegis_core.verification.coverage_check.evaluate_diff_coverage` and `aegis_core.verification.coverage_check.verify_coverage_threshold` are removed, and `run_diff_coverage(root, base, head)` takes no other parameter.
+
+- Breaking: `aegis_core.verification.scanners.build_preset_argv` and `aegis_core.verification.scanners.run_preset_scanner` are removed (use `run_preset`), and `ingest_sarif` loses `base_fingerprints=`.
+- Breaking: `aegis_cli.formatters.report.format_github_annotations` and `aegis_cli.formatters.report.SarifReport` are removed; `format_sarif_report` returns a plain `str`.
+- Breaking: `aegis_core.verification.arbiter.brier_skill_score`, `score_predictions`, `calibration_summary` and `CalibrationSummary` are removed (use `calibration`); `Prediction` loses `resolved_at` and `resolving_commit`; `perf_check.run_perf_check` loses `command=`.
 
 ### Corrections
 
