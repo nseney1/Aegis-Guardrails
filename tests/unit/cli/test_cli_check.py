@@ -110,6 +110,7 @@ def _shallow_clone_of_a_branch_without_main(origin: Path, tmp_path: Path) -> Pat
     (origin / "CHANGELOG.md").write_text("- x\n", encoding="utf-8")
     _git(origin, "add", "CHANGELOG.md")
     _git(origin, "commit", "-q", "-m", "feature")
+    _git(origin, "checkout", "-q", "main")  # a single-branch clone of feature then gets no origin/HEAD
     clone = tmp_path / "ci-checkout"
     subprocess.run(
         ["git", "clone", "-q", "--depth", "1", "--branch", "feature", "--single-branch", origin.as_uri(), str(clone)],
