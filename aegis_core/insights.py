@@ -1072,6 +1072,7 @@ def review_insights(
 
 
 _SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+_VERBATIM_MIN_CHARS = 25
 
 
 def write_proposal(
@@ -1089,17 +1090,19 @@ def write_proposal(
     clean_id = proposal_id.strip()
     if not _SAFE_ID_RE.match(clean_id):
         raise ValueError(f"invalid proposal_id {proposal_id!r}")
+    # Only human text is protected: an agent capture must not be able to veto a proposal. A
+    # short prompt ("no", "revert") protects only a bullet equal to it.
     protected = [
         str(r.get("text") or "").strip().lower()
         for r in read_insight_rows(workspace, home=home)
-        if r.get("event") == "insight"
-        and r.get("level") in ("W0", "W2", "hook", "suggestion")
+        if r.get("event") == "insight" and _effective_level(r, set()) in ("H", "cli", "W2")
         and str(r.get("text") or "").strip()
     ]
     for cand in (category, *summary_bullets):
         clow = str(cand).strip().lower()
-        if clow and any(ex in clow or (len(clow) >= 25 and clow in ex) for ex in protected):
-            raise ValueError("proposal may not contain verbatim W0/W2/suggestion prompt text")
+        if clow and any(ex == clow or (len(ex) >= _VERBATIM_MIN_CHARS and ex in clow)
+                        or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
+            raise ValueError("proposal may not contain verbatim H/cli/W2 prompt text")
     norm_targets = [PurePath(str(p)).as_posix() for p in target_paths if str(p).strip()] or ["**"]
     clean_bullets = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
     if not clean_bullets:
