@@ -53,6 +53,7 @@ __all__ = [
     "INSIGHT_HOOK_MARKER",
     "INSIGHT_LEVELS",
     "INSIGHT_SCHEMA_VERSION",
+    "JOIN_WINDOW_S",
     "KEY_SIZE",
     "MAX_CAPTURES_PER_SESSION",
     "MAX_CAPTURE_PATHS",
@@ -88,6 +89,15 @@ INSIGHT_SCHEMA_VERSION = 1
 REJECTION_RESURFACE_COUNT = 2
 RECURRENCE_ALARM_COUNT = 3
 BURST_WINDOW_SECONDS = 300
+# How far apart (seconds) an insight and an exposure, or a capture and the hook prompt that
+# corroborates it, may be and still join. Nothing links aegis-mcp's session (a uuid minted per
+# initialize) to the host's session id the hook sees, so the join is same host, this window and
+# the rule's rev. Known limits: record_exposure writes one row per (session, rule, scope basis),
+# so the window runs from a session's first exposure of a rule and a correction later than this
+# after it reads not_exposed; an exposure that was not persisted has no timestamp and lives in
+# another process than the review, so it never counts; a CLI-added insight (host "cli") never
+# joins an agent host's exposure.
+JOIN_WINDOW_S = 1800
 _HS_DOMAIN = b"aegis-hs/v1"
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 INSIGHT_LEVELS = ("H", "cli", "W2", "hook", "suggestion")
@@ -736,50 +746,31 @@ def _load_md_rules(workspace: Any, folder: Path, *, recursive: bool = False) -> 
     return items
 
 
-def _rule_was_exposed(
-    workspace: Any,
-    rule: Rule,
-    cluster_rows: Sequence[Mapping[str, Any]],
-    home: Optional[Path] = None,
-) -> bool:
-    from aegis_core import credit
-    from aegis_core.scan_compliance import activity_path
-    from aegis_core.telemetry_engine import ledger
+_Exposures = Dict[str, List[Tuple[str, datetime, Optional[str]]]]
 
-    root = Path(os.fspath(workspace)).resolve()
-    link_key = read_link_key(home)
-    scan_hs: Set[Tuple[str, str]] = set()
-    exposed_hs: Set[Tuple[str, str]] = set()
-    for a in read_jsonl(activity_path(root)).rows:
-        sh, ss = str(a.get("host") or ""), str(a.get("session") or "")
-        if a.get("event") == "scan" and ss:
-            shs = session_hs(sh, ss, link_key, home=home)
-            if shs:
-                scan_hs.add((sh, shs))
-                if rule.id in credit.exposed_rules(root, sh, ss):
-                    exposed_hs.add((sh, shs))
-    for erow in credit.read_rows(root):
-        eh, es = str(erow.get("host") or ""), str(erow.get("session") or "")
-        rev = erow.get("rev")
-        rev_mismatch = isinstance(rev, str) and bool(rev) and not rule.digest.startswith(rev)
-        if erow.get("event") == "exposure" and (erow.get("rule") or erow.get("for_rule")) == rule.id and not rev_mismatch and es:
-            ehs = session_hs(eh, es, link_key, home=home)
-            if ehs:
-                exposed_hs.add((eh, ehs))
-    for lrow in ledger.read(root).rows:
-        meta = lrow.get("meta") if isinstance(lrow.get("meta"), Mapping) else {}
-        rev = meta.get("rev")
-        if lrow.get("rule") != rule.id or (isinstance(rev, str) and rev and not rule.digest.startswith(rev)):
-            continue
-        lh, ls = str(lrow.get("host") or ""), str(lrow.get("session") or "")
-        lhs = session_hs(lh, ls, link_key, home=home) if ls else None
-        if lhs and (
-            rule.id in credit.exposed_rules(root, lh, ls)
-            or (lh, lhs) in scan_hs
-            or lrow.get("outcome") in ("trigger", "tp", "fp")
-        ):
-            exposed_hs.add((lh, lhs))
-    return any((str(ins.get("host") or ""), str(ins.get("hs") or "")) in exposed_hs for ins in cluster_rows)
+
+def _exposure_index(root: Path) -> _Exposures:
+    """{rule: [(host, ts, rev)]} from one pass over the ledger's exposure rows."""
+    from aegis_core import credit
+
+    index: _Exposures = {}
+    for row in credit.read_rows(root):
+        rule_id, ts, rev = row.get("rule"), _parse_ts(row.get("ts")), row.get("rev")
+        if row.get("event") == "exposure" and isinstance(rule_id, str) and ts is not None:
+            index.setdefault(rule_id, []).append(
+                (str(row.get("host") or ""), ts, rev if isinstance(rev, str) and rev else None))
+    return index
+
+
+def _rule_was_exposed(rule: Rule, cluster_rows: Sequence[Mapping[str, Any]], exposures: _Exposures) -> bool:
+    # A None rev is a row written before exposures carried one: it matches any revision.
+    shown = [(host, ts) for host, ts, rev in exposures.get(rule.id, ()) if rev is None or rule.digest.startswith(rev)]
+    for ins in cluster_rows:
+        host, ts = str(ins.get("host") or ""), _parse_ts(ins.get("ts"))
+        if host and ts is not None and any(
+                h == host and abs((e_ts - ts).total_seconds()) <= JOIN_WINDOW_S for h, e_ts in shown):
+            return True
+    return False
 
 
 def _paths_overlap_rule(paths: Iterable[str], rule: Rule) -> bool:
@@ -896,15 +887,13 @@ def _cluster_countable_insights(
 
 
 def _build_cluster_entry(
-    root: Path,
     members: Sequence[int],
     countable: Sequence[Tuple[int, Dict[str, Any]]],
     ins_tokens: Sequence[Sequence[str]],
     ins_best_rule: Sequence[Optional[_RuleMatch]],
     rejections: Sequence[Tuple[int, Dict[str, Any]]],
     neighbours: Mapping[str, List[Dict[str, Any]]],
-    *,
-    home: Optional[Path] = None,
+    exposures: _Exposures,
 ) -> Tuple[Dict[str, Any], bool]:
     m_rows = [countable[m][1] for m in members]
     m_row_idxs = [countable[m][0] for m in members]
@@ -921,7 +910,7 @@ def _build_cluster_entry(
     else:
         matched_id, best_score = best_m.rule.id, best_m.similarity
         if best_m.kind == "active":
-            status = "exposed_and_ignored" if _rule_was_exposed(root, best_m.rule, m_rows, home=home) else "not_exposed"
+            status = "exposed_and_ignored" if _rule_was_exposed(best_m.rule, m_rows, exposures) else "not_exposed"
         elif best_m.kind == "proposal":
             status = "matches_proposal"
         else:
@@ -1026,16 +1015,17 @@ def review_insights(
     ins_best_rule = _match_insights_to_rules(countable, ins_vecs, rule_entries, rule_vecs)
     clusters: List[Dict[str, Any]] = []
     suppressed: List[Dict[str, Any]] = []
+    # One ledger read per review, and none when no cluster matches an active rule.
+    exposures = _exposure_index(root) if any(m is not None and m.kind == "active" for m in ins_best_rule) else {}
     for members in _cluster_countable_insights(countable, ins_vecs, ins_best_rule):
         info, is_sup = _build_cluster_entry(
-            root,
             members,
             countable,
             ins_tokens,
             ins_best_rule,
             rejections,
             neighbours,
-            home=home,
+            exposures,
         )
         if is_sup:
             suppressed.append(info)

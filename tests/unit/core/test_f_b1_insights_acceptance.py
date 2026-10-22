@@ -41,7 +41,6 @@ from aegis_core.insights import (
 )
 from aegis_core.rules import load_rules
 from aegis_core.scan import scan as scan_workspace
-from aegis_core.scan_compliance import record as record_activity
 from aegis_core.storage import append_jsonl
 from aegis_core.telemetry_engine import ledger
 
@@ -361,29 +360,14 @@ def test_tfidf_clustering_rule_matching_and_rejected_cluster_cooldown(tmp_path: 
         archived=True,
     )
 
-    # Record exposure of trap-no-shell-true in session-exposed-1
-    record_activity(
-        repo,
-        "scan",
-        host="claude-code",
-        session="session-exposed-1",
-        files=["src/app.py"],
-    )
-    ledger.append(
-        repo,
-        [
-            {
-                "rule": "trap-no-shell-true",
-                "outcome": "trigger",
-                "source": "mcp",
-                "host": "claude-code",
-                "session": "session-exposed-1",
-                "meta": {"rev": r1_rev, "paths": ["src/app.py"]},
-            }
-        ],
-    )
+    # A persisted exposure of trap-no-shell-true at its rev, on the same host as the hook (the
+    # MCP server's session id never equals the host's, so the join is host + window + rev).
+    from aegis_core import credit
 
-    # Add insight matching exposed rule in session-exposed-1 -> exposed_and_ignored
+    credit.record_exposure(repo, "claude-code", "mcp-server-uuid", ["trap-no-shell-true"],
+                           revs={"trap-no-shell-true": r1_rev[:16]})
+
+    # Add insight matching the exposed rule on the same host within the window -> exposed_and_ignored
     _hook_insight(repo, "Do not pass shell=True to subprocess calls in src/app.py", "session-exposed-1", home)
 
     # Add insight matching trap-no-eval in session without exposure -> not_exposed

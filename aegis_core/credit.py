@@ -289,7 +289,10 @@ def record_exposure(
     root: Any, host: Optional[str], session: Optional[str], rules: Iterable[str], *,
     paths: Optional[Iterable[str]] = None, rev: Optional[str] = None, scope_basis: Optional[str] = None,
     heartbeat: Optional[bool] = None, ts: Optional[str] = None, persist: bool = True,
+    revs: Optional[Mapping[str, str]] = None,
 ) -> List[Dict[str, Any]]:
+    """``revs`` names each rule's own revision (``rev`` is the fallback): insight review joins an
+    exposure to a correction only at the rule's current revision."""
     rule_list = [r for r in dict.fromkeys(rules) if isinstance(r, str) and r]
     key = (str(root), host or "", session or "")
     if key not in _EXPOSED and len(_EXPOSED) >= _MAX_EXPOSED_SESSIONS:
@@ -317,7 +320,7 @@ def record_exposure(
                 "session": s_id,
                 "host": h_id,
                 "paths": path_list,
-                "rev": rev,
+                "rev": (revs or {}).get(rule_id, rev),
             }
             if scope_basis is not None:
                 row["scope_basis"] = str(scope_basis)

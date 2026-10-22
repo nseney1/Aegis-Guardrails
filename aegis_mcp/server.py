@@ -323,6 +323,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "initialize":
         params = params if isinstance(params, dict) else {}
+        # One id per initialize: it never equals the host's session id that the insight hook
+        # sees, so insight joins go by host, time window and rule rev (insights.JOIN_WINDOW_S).
         _session_id = uuid.uuid4().hex
         _client_platform, _client_name, _client_version = _identify(params)
         capabilities = params.get("capabilities")
