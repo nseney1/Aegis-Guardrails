@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -960,6 +961,101 @@ def test_the_ratchet_flags_a_git_argv_headed_by_a_git_executable_call():
     source = "import subprocess\nfrom aegis_core import gitsafe\nsubprocess.run([gitsafe.git_executable(), 'status'])\n"
     assert _git_spawn_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:3 builds a git argv from git_executable()"]
     assert _git_spawn_offenders("aegis_core/treeid.py", source) == []
+
+
+# ── The docstring is the list of what gitsafe's git calls write (R-trust-28) ──
+
+_WRITERS = {
+    "update-ref", "merge-tree", "read-tree", "checkout-index", "update-index", "write-tree", "commit-tree",
+    "mktree", "mktag", "add", "commit", "checkout", "reset", "tag", "branch", "gc", "prune", "repack",
+    "pack-refs", "fetch", "pull", "push", "clone", "init", "stash", "apply",
+}
+
+
+def _first_strings(tree: ast.AST) -> list:
+    """The first string element of every list literal (the subcommand of an argv list)."""
+    return [next((e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)), None)
+            for node in ast.walk(tree) if isinstance(node, ast.List)]
+
+
+def test_the_module_docstring_names_every_git_command_that_writes():
+    tree = ast.parse((ROOT / "aegis_core" / "gitsafe.py").read_text(encoding="utf-8"))
+    firsts = _first_strings(tree)
+    detected = _WRITERS.intersection(firsts)
+    assert {"update-ref", "merge-tree", "read-tree", "checkout-index"} <= detected  # the detector sees them
+    if "hash-object" in firsts and "-w" in firsts:
+        detected.add("hash-object -w")
+    doc = gitsafe.__doc__ or ""
+    assert sorted(name for name in detected if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", doc)) == []
+
+
+def _repository_state(repo: Path) -> dict:
+    work_tree = {p.relative_to(repo).as_posix(): p.read_bytes() for p in sorted(repo.rglob("*"))
+                 if p.is_file() and ".git" not in p.relative_to(repo).parts}
+    refs = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    return {"work tree": work_tree, "index": (repo / ".git" / "index").read_bytes(), "refs": refs,
+            "HEAD": (repo / ".git" / "HEAD").read_bytes()}
+
+
+def test_export_tree_leaves_the_repository_work_tree_index_and_refs_alone(repo: Path, tmp_path: Path):
+    (repo / "a.py").write_bytes(b"a = 2\n")                     # modified, unstaged
+    (repo / "staged.py").write_bytes(b"s = 1\n")
+    _git(repo, "add", "staged.py")                              # staged
+    before = _repository_state(repo)
+
+    gitsafe.export_tree(repo, "HEAD", tmp_path / "plain")
+    gitsafe.export_tree(repo, "HEAD", tmp_path / "overlaid", overlay={"b.py": b"b = 9\n"})
+
+    assert _repository_state(repo) == before
+    assert (tmp_path / "plain" / "a.py").read_bytes() == b"a = 1\n"
+    assert (tmp_path / "overlaid" / "b.py").read_bytes() == b"b = 9\n"
+
+
+# Read plumbing, the hardened `log`, and the named writers: the signed approval commit
+# (human_gate), the Aegis-Check trailer's write-tree (hooks/commitmsg) and add_trailer.
+_RUN_ALLOWED = {
+    "cat-file", "config", "diff-index", "diff-tree", "for-each-ref", "ls-files", "ls-tree", "merge-base",
+    "rev-list", "rev-parse", "symbolic-ref", "check-ref-format", "version", "log", "commit", "interpret-trailers",
+    "write-tree",
+}
+# `aegis sync --pr` (SECURITY.md, the git row) reads its remote's push URLs and the committer
+# identity, writes its own aegis/lifecycle-* branch, and pushes that one branch.
+_RUN_ALLOWED_IN = {"aegis_core/sync.py": {"remote", "var", "update-ref", "push"}}
+
+
+def _run_subcommand_offenders(rel: str, source: str) -> list:
+    """``gitsafe.run([...])`` calls whose subcommand (after leading ``-c <setting>`` pairs) is not
+    allowed. Wrappers that pass ``list(args)`` (regression._git_run, rule_integrity, sync._git) are
+    out of this detector's reach."""
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "gitsafe"
+                and node.args and isinstance(node.args[0], ast.List)):
+            continue
+        elts = node.args[0].elts
+        while len(elts) > 1 and isinstance(elts[0], ast.Constant) and elts[0].value == "-c":
+            elts = elts[2:]
+        head = elts[0].value if elts and isinstance(elts[0], ast.Constant) else None
+        if isinstance(head, str) and head not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
+            offenders.append(f"{rel}:{node.lineno} runs git {head}")
+    return offenders
+
+
+def test_gitsafe_run_callers_use_only_allowed_subcommands():
+    offenders = []
+    for pkg in ("aegis_core", "aegis_cli", "aegis_mcp"):
+        for path in sorted((ROOT / pkg).rglob("*.py")):
+            offenders += _run_subcommand_offenders(path.relative_to(ROOT).as_posix(), path.read_text(encoding="utf-8"))
+    assert offenders == []
+
+
+def test_the_subcommand_ratchet_flags_a_worktree_add():
+    source = "gitsafe.run(['worktree', 'add', 'x'], root)\ngitsafe.run(['-c', 'a=b', 'worktree', 'add'], root)\n"
+    assert _run_subcommand_offenders("aegis_core/x.py", source) == [
+        "aegis_core/x.py:1 runs git worktree", "aegis_core/x.py:2 runs git worktree"]
+    assert _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], top)\n") == []
+    assert _run_subcommand_offenders("aegis_core/x.py", "gitsafe.run(['push', 'origin'], top)\n") != []
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──

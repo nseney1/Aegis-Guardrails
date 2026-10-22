@@ -1,4 +1,5 @@
-"""Every git subprocess Aegis runs (D20, host-matrix §3.7, v4.3 spec §10.1).
+"""Every git subprocess Aegis runs, except treeid's (scrubbed environment, private index;
+SECURITY.md). D20, host-matrix §3.7, v4.3 spec §10.1.
 
 A repository's own config is attacker-controlled: ``core.fsmonitor`` names a program
 that ``git status``/``git diff`` run, hooks run on many commands, a clean filter
@@ -15,24 +16,27 @@ every call here:
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
   Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
-- uses plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
+- reads with plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
-  ``check-ref-format``, ``hash-object``, ``version`` and ``config`` (reads only). It
-  writes in four places only, never to the work tree, the index, a branch or a tag:
-  ``hash-object -w`` stores a blob, ``update-ref --no-deref --stdin`` creates, swaps
-  or deletes one ref under compare-and-swap, always under ``refs/aegis/`` (the team's
-  leases; ``update_ref`` refuses any other name), and ``merge-tree --write-tree``
-  stores the objects of a trial merge that nothing references (git's gc collects
-  them), and ``interpret-trailers --in-place`` edits the prepare-commit-msg hook's message
-  file, with no repository config read (its ``trailer.*`` commands). ``diff-index`` without ``--cached``, ``ls-files --others`` and
-  ``hash-object --stdin-paths`` read the working tree, which is where an fsmonitor or
-  a clean filter would run; they are needed (no plumbing lists changed or untracked
-  files otherwise, and only git knows its line-ending conversion). The forced
-  ``core.fsmonitor=false`` keeps them inert, every filter driver the repository's own
-  config defines is switched off for them (a driver from the user's or the system's
-  config, git-lfs say, still runs, as in any git command the user types), and
-  ``diff-index`` does not look inside a dirty submodule, where it would run ``git
-  status`` under the submodule's own config.
+  ``check-ref-format``, ``hash-object``, ``version`` and ``config``. It never writes to the
+  work tree, the index, a branch or a tag; it writes with ``hash-object -w`` (a blob),
+  ``update-ref --no-deref --stdin`` (one ref under compare-and-swap, always under
+  ``refs/aegis/``: the team's leases), ``merge-tree --write-tree`` (a trial merge's objects,
+  referenced by nothing, which git's gc collects), ``read-tree`` into a private index in a fresh
+  0700 temporary directory and ``checkout-index -a -f --prefix`` below the caller's scratch
+  directory (``export_tree``), and ``interpret-trailers --in-place`` (the prepare-commit-msg
+  message file, no repository config read: its ``trailer.*`` commands are programs).
+  Callers write more through ``run``: the signed approval ``commit``, the Aegis-Check
+  trailer's ``write-tree``, and ``aegis sync --pr``'s commit, branch and push (SECURITY.md).
+
+``diff-index`` without ``--cached``, ``ls-files --others`` and ``hash-object --stdin-paths``
+read the working tree, where an fsmonitor or a clean filter would run; they are needed (no
+plumbing lists changed or untracked files otherwise, and only git knows its line-ending
+conversion). The forced ``core.fsmonitor=false`` keeps them inert, every filter driver the
+repository's own config defines is switched off for them (``filter_overrides``; one from the
+user's or the system's config, git-lfs say, runs as in any git command the user types), and
+``diff-index`` does not look inside a dirty submodule, where it would run ``git status`` under
+the submodule's own config.
 
 Blob content read through ``cat-file`` is checked against the object id it was asked
 for, so a replaced or corrupted object is an error rather than silent input.
@@ -784,36 +788,21 @@ def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
     """Parse NUL-delimited ``--name-status -z`` (or ``--raw -z``) output into
     ``(status, path, new_path)`` records without desynchronizing on 3-token ``R*``/``C*`` records.
     """
-    if not raw:
-        return []
     fields = raw.split(b"\0")
     records: List[Tuple[str, str, Optional[str]]] = []
     index = 0
-    total = len(fields)
-    while index < total:
-        token = fields[index]
-        if not token:
-            index += 1
-            continue
-        parts = token.split()
+    while index < len(fields):
+        parts = fields[index].split()
         if not parts:
             index += 1
             continue
         status = parts[-1].decode("ascii", "replace")
-        kind = status[:1]
-        if kind in ("R", "C"):
-            if index + 2 >= total or not fields[index + 1] or not fields[index + 2]:
-                break
-            old_path = os.fsdecode(fields[index + 1])
-            new_path = os.fsdecode(fields[index + 2])
-            records.append((status, old_path, new_path))
-            index += 3
-        else:
-            if index + 1 >= total or not fields[index + 1]:
-                break
-            path = os.fsdecode(fields[index + 1])
-            records.append((status, path, None))
-            index += 2
+        width = 3 if status[:1] in ("R", "C") else 2  # a rename or copy names two paths
+        paths = fields[index + 1:index + width]
+        if len(paths) < width - 1 or not all(paths):
+            break
+        records.append((status, os.fsdecode(paths[0]), os.fsdecode(paths[1]) if width == 3 else None))
+        index += width
     return records
 
 
