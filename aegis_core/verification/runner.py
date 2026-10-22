@@ -591,7 +591,7 @@ def run_layer1(
             verdict=False,
             detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
         ))
-    owned: set[tuple[str, int]] = set()  # sites a user forbid_ast rule judged: the pack defers to it
+    owned: set[tuple[str, int, str]] = set()  # (file, line, pattern) a user forbid_ast rule judged
     if forbid_rules:
         ast_cache: dict[str, object] = {}
         checked_paths: list[str] = []
@@ -627,7 +627,7 @@ def run_layer1(
                     if not isinstance(norm_ast, ASTExtractionError):
                         try:
                             findings = evaluate_forbid_ast_structured(norm_ast, forbid_spec, rule_id=rule_id)
-                            owned.update((rel_path, f["line"]) for f in findings if not f["unknown"])
+                            owned.update((rel_path, f["line"], f["pattern"]) for f in findings if not f["unknown"])
                         except ASTExtractionError as exc:  # decorators had to be re-read from disk
                             norm_ast = exc
                 except Exception as exc:
@@ -754,13 +754,14 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
 
 
 def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
-                 owned: set[tuple[str, int]], contents: Optional[dict[str, bytes]] = None) -> list[ToolEvidence]:
+                 owned: set[tuple[str, int, str]], contents: Optional[dict[str, bytes]] = None) -> list[ToolEvidence]:
     """T7 on ``rels``: the Python security pack and the Tier A secret scan, each against the file's
     text before the change, so only what it introduces fails (spec T7, D-delta: user forbid_ast rules
     keep whole-file judgment). Test-path hits and undecidable sites are reported on a passing row; an
     ``# aegis: allow`` hit passes unrecorded (no credit for pack rows); an unreadable file and any
-    failure to run fail closed. A site a user forbid_ast rule judged, failed or allowed (the seeded
-    no-eval rule), is that rule's: the pack neither reports it twice nor second-guesses its allow.
+    failure to run fail closed. A call a user forbid_ast rule judged at a site, failed or allowed (the
+    seeded no-eval rule's eval), is that rule's: the pack neither reports it twice nor second-guesses
+    its allow. Another call on the same line (``pickle.loads(eval(s))``) stays the pack's.
     ``contents`` holds the bytes of files not on disk under ``work_root`` (non-Python only)."""
     from aegis_core.verification import scanners, security_pack
 
@@ -774,7 +775,7 @@ def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Opti
     hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
     notes: dict[str, list[str]] = {}
     for hit in pack.get("violations", ()):
-        if (hit["file"], hit["line"]) not in owned:
+        if (hit["file"], hit["line"], hit["pattern"]) not in owned:
             hits.setdefault((f"security_pack:{hit['rule_id']}", hit["file"]), []).append(hit)
     for hit in pack.get("unverified_findings", ()):
         if hit["kind"] == "file":
@@ -1122,7 +1123,7 @@ def _layer1_on_snapshot(
             tool="forbid_ast", target=rule_path, verdict=False,
             detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
         ))
-    owned: set[tuple[str, int]] = set()  # sites a user forbid_ast rule judged: the pack defers to it
+    owned: set[tuple[str, int, str]] = set()  # (file, line, pattern) a user forbid_ast rule judged
     for rel, size in too_large.items():
         why = _not_read(size)
         covering = [rule for rule, _spec in forbid_rules if rule.applies_to(rel)]
@@ -1155,7 +1156,7 @@ def _layer1_on_snapshot(
             if failure is None:
                 try:
                     findings = evaluate_forbid_ast_structured(norm_ast, forbid_spec, rule_id=rule.id)
-                    owned.update((rel, f["line"]) for f in findings if not f["unknown"])
+                    owned.update((rel, f["line"], f["pattern"]) for f in findings if not f["unknown"])
                 except ASTExtractionError as exc:  # decorators had to be re-read from the file
                     failure = exc
                 except Exception as exc:

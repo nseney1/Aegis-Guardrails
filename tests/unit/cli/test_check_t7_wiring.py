@@ -149,6 +149,39 @@ def test_an_eval_the_seeded_no_eval_rule_already_names_is_reported_once(repo, ca
     assert _failed(payload) == [("forbid_ast:no-eval", "src/calc.py")]
 
 
+def _seed_no_eval(repo: Path) -> None:
+    _write(repo / ".aegis" / "rules" / "invariants" / "no-eval.md", (REPO / "rules" / "no-eval.md").read_text(encoding="utf-8"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "seed no-eval")  # gate rules bind from the reviewed base
+
+
+def test_another_banned_call_on_a_line_the_no_eval_rule_fails_is_still_reported(repo, capsys):
+    _seed_no_eval(repo)
+    _write(repo / "src" / "a.py", "import pickle\n\n\ndef f(s):\n    return pickle.loads(eval(s))\n")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert code == 1
+    assert _failed(payload) == [("forbid_ast:no-eval", "src/a.py"), ("security_pack:sec-py-pickle-loads", "src/a.py")]
+
+
+def test_an_allow_for_the_no_eval_rule_does_not_silence_another_banned_call_on_its_line(repo, capsys):
+    """Adversarial: `# aegis: allow[no-eval]` covers that rule's eval at the site, not pickle.loads beside it."""
+    _seed_no_eval(repo)
+    _write(repo / "src" / "a.py",
+           "import pickle\n\n\ndef f(s):\n    return pickle.loads(eval(s))  # aegis: allow[no-eval] parsing trusted config\n")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+
+
+def test_the_pack_does_not_second_guess_the_no_eval_rules_allow_for_the_same_eval(repo, capsys):
+    _seed_no_eval(repo)
+    _write(repo / "src" / "a.py", "def f(s):\n    return eval(s)  # aegis: allow[no-eval] parsing trusted config\n")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (0, [])
+
+
 def test_a_failure_to_run_the_scan_fails_the_check_closed(repo, capsys, monkeypatch):
     import aegis_core.verification.security_pack as pack
 
