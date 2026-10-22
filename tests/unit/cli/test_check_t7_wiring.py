@@ -348,6 +348,59 @@ def test_a_file_whose_only_change_is_its_line_endings_is_not_judged_whole(repo, 
     assert (code, _failed(payload)) == (0, [])
 
 
+def test_a_pure_rename_of_a_legacy_file_is_judged_against_its_old_path(repo, capsys):
+    """Given `git mv` of a file holding a legacy hit, when check, the hook and the record run, uncommitted
+    and committed (--base main), then the hit is not introduced by the change."""
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _git(repo, "mv", "src/legacy.py", "src/renamed.py")
+    code, payload, _ = _check(repo, capsys, "src/renamed.py")
+    assert (code, _failed(payload)) == (0, [])
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (0, [])
+    _git(repo, "commit", "-q", "-m", "mv")
+    code, payload, _ = _check(repo, capsys, "--base", "main")
+    assert (code, _failed(payload)) == (0, [])
+    rc, row, _ = _record(repo, capsys)
+    assert (rc, row["layer1"]["findings"]) == (0, 0)
+
+
+def test_a_renamed_yaml_keeps_its_committed_token_and_a_copy_of_it_does_not(repo, capsys):
+    """The hook's T7-only files take the same rename rule. A copy is not a rename: of two identical files
+    from one removed path, one is the rename and the other introduces the token again (multiset)."""
+    _write(repo / "conf" / "old.yaml", f"token: {_token()}\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "legacy token")
+    _write(repo / "src" / "later.py", "X = 1\n")  # HEAD~1, the last base candidate, holds the token too
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "later")
+    _git(repo, "mv", "conf/old.yaml", "conf/new.yaml")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (0, [])
+    (repo / "conf" / "copy.yaml").write_bytes((repo / "conf" / "new.yaml").read_bytes())
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    failed = _failed(payload)
+    assert code == 1 and len(failed) == 1 and failed[0][0] == "secret_scan:github-pat"
+    assert failed[0][1] in ("conf/copy.yaml", "conf/new.yaml")
+
+
+def test_a_copy_of_a_legacy_file_is_judged_whole(repo, capsys):
+    (repo / "src" / "copy.py").write_bytes((repo / "src" / "legacy.py").read_bytes())
+    code, payload, _ = _check(repo, capsys, "src/copy.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-tempfile-mktemp", "src/copy.py")])
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-tempfile-mktemp", "src/copy.py")])
+
+
+def test_a_rename_that_also_adds_a_banned_call_still_fails(repo, capsys):
+    """Sad path: a rename with edits is not an exact rename, so the file is judged whole."""
+    _git(repo, "mv", "src/legacy.py", "src/renamed.py")
+    _write(repo / "src" / "renamed.py", LEGACY + "\n\ndef load(blob):\n    import pickle\n    return pickle.loads(blob)\n")
+    code, payload, _ = _check(repo, capsys, "src/renamed.py")
+    assert code == 1 and ("security_pack:sec-py-pickle-loads", "src/renamed.py") in _failed(payload)
+
+
 def test_a_file_the_branch_added_and_committed_is_judged_whole(repo, capsys):
     _git(repo, "checkout", "-q", "-b", "work")
     _write(repo / "src" / "load.py", "import pickle\n\n\ndef load(blob):\n    return pickle.loads(blob)\n")
