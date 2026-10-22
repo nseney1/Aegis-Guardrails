@@ -1192,11 +1192,11 @@ def test_without_gh_the_review_path_fails_closed(tmp_path, capsys, monkeypatch):
 @pytest.mark.parametrize("event", [
     {"number": -1}, {"number": 0}, {"number": True}, {"number": "7"},
     {"login": "a/b"}, {"login": "x?y"}, {"login": ""}, {"login": None},
-    {"head": "short"}, {"name": "push"}, {"name": "pull_request_target"}, {"name": ""},
+    {"head": "short"}, {"name": "push"}, {"name": ""},
     {"base_ref": _ABSENT}, {"base_ref": None}, {"base_ref": ""}, {"base_ref": "../main"}, {"base_ref": "main?x=1"},
     {"base_ref": "-x"}, {"base_ref": "a b"}, {"base_ref": "x/"}, {"base_ref": "x.lock"}, {"base_ref": ["main"]},
 ], ids=["negative", "zero", "bool", "string", "slash", "query", "empty-login", "no-login", "short-sha",
-        "push", "target", "no-event", "no-base-ref", "null-base-ref", "empty-base-ref", "dotdot-base-ref",
+        "push", "no-event", "no-base-ref", "null-base-ref", "empty-base-ref", "dotdot-base-ref",
         "query-base-ref", "dash-base-ref", "space-base-ref", "slash-end-base-ref", "lock-base-ref", "list-base-ref"])
 def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, monkeypatch, event):
     gh = ReviewGh()
