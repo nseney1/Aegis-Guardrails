@@ -9,6 +9,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 ### Security
 
 - **`aegis_capture_insight` is bounded.** It allows 5 calls per 60 seconds and 50 captures per session, and refuses more than 20 `paths` or a path longer than 512 characters; the dirty-path default keeps the first 20 and records `paths_dropped`. Hook rows do not count toward the cap.
+- **`aegis check --ci --no-exec` runs no repository code.** It reads git objects only: it skips the regression and `Aegis-Check` trailer reruns, never reads or writes the ledger, says what it skipped (JSON `skipped`), and refuses `--coverage`, `--perf`, `--strict` and `--require-regression`.
+- **A reviewed weakening can pass at tier A.** On a pull-request run, `aegis check --ci` accepts a flagged weakening or governance change when a person other than the author approved the head commit in their latest review, the default branch's ruleset requires an approval, code-owner review and stale-review dismissal, and the base `CODEOWNERS` owns every flagged path. It makes read-only `gh api` GETs, refuses reviews by bots and apps, and fails closed on any doubt. The `aegis-check` job in `validate.yml` and in the scaffolded `aegis.yml` grants `pull-requests: read` and sets `GH_TOKEN` on the `check --ci` step; the JSON approval object gains `method` (`signature` or `review`).
 
 ### Changed behaviour
 
@@ -21,6 +23,15 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Layer 2 reports a review that did not happen as `unverified` with named reasons (`no_predictions`, `no_reviewed_files`, `skipped:N`, `unknown_category:N`, `spec_agent_unparseable`, `code_agent_unparseable`) in text and in JSON `unverified_reasons`, instead of SHIP. Exit codes are unchanged: Layer 2 is log-only.
 - `aegis check --full` prints a one-line vendor advisory (JSON `vendor_warning`) when the user-scope `arbiter_vendor` is declared.
 - CI: every job has a timeout, the `validate` matrix no longer fails fast, Windows runs the wheel smoke, pytest dumps the stacks of a test hung for 300 seconds, and `aegis-check` runs the installed wheel (`python3 -I`) with the same test dependencies as the other test jobs. `check --ci` runs only in `aegis-check`, and tier detection accepts `python3 -I -m aegis_cli.cli check --ci` as the whole of a step.
+- **No rule is promoted without adjudicated labels** merged at the reviewed base: 25 with no false positive, or 42 with one, from at least 3 sessions and 2 repositories or 14 days. Local and CI-confirmed verdicts alone never promote.
+- `aegis sync`, `aegis rule promote`, `aegis status`, `aegis rule archive` and `derived.json` show the one transition `Fitness.compute` decides. Demotion needs P(precision < 0.7) >= 0.9, so Wilson-only and small-sample demotions stop; a rule whose CI evidence cannot be read reads `insufficient` or `inconclusive` with `evidence_available: false` instead of the `evidence_unavailable` state.
+- `aegis rule promote --tier-check` no longer changes an enforcement tier from ledger counts.
+- `# aegis: allow[rule]` sites are no longer baselined, counted or reported as new, and the baseline keeps the rule's `where` clauses.
+- `aegis check` prints `note:` rows (and JSON rows) for `forbid_ast` sites it could not decide and for test files a rule does not check, with "(N unverified, see notes)"; exit codes and `passed` are unchanged.
+- The Python security pack ships 7 rules (the XML rule is removed). It reports unparseable files as unverified, scans dot-directories, and flags `Session().get(verify=False)` and `hashlib.new('MD5')`.
+- A `check --ci` run whose base and head are the same commit prints "nothing was compared" instead of PASSED; the pull-request run is the gate.
+- `aegis init` points at `aegis doctor --github` for the `CODEOWNERS` lines and the ruleset; it writes no `CODEOWNERS`.
+- `aegis approve --exempt-test` refuses while governance files have uncommitted changes, as `aegis approve` already did.
 
 ### Fixed
 
@@ -31,13 +42,18 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Detector replay reports how many commits it walked, how many files it skipped (`replay UNVERIFIED`) and that CI runs are not evaluated, and reports a git failure as `replay UNVERIFIED: ...` while still writing `derived.json`; `--json` gains `replay`.
 - A Layer 2 reply entry that is not a JSON object is dropped and counted instead of failing the run.
 - MCP tool text names `aegis rule insight review` (not the missing `aegis insights review`), calls insight ids random, says `failure`, `fp` and `fail` read as a neutral trigger, and marks `tests_passed`, `rework_count` and `notes` as ignored and never stored.
+- A changed argument expression in a `forbid_ast` call (for example `build_safe()` to `request.args['cmd'] + x`) is now reported as new; a pure move or re-indent is not.
+- `aegis sync` replays detector history with batched reads, about 2 git processes per commit (was 19), and resumes from `replay.tip` in `derived.json` when only single-parent commits follow it.
+- `aegis approve` signs with a passphrase-protected SSH key that is not in an agent: `ssh-keygen` asks for the passphrase at the terminal. In 4.3.4 it fell back to an `ssh-askpass` program and failed when none was installed.
 
-### Breaking (internal `aegis_core` API; `aegis_sdk` is unchanged)
+### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
 - Breaking: `aegis_core.fitness.Fitness.samples` and the `samples=` parameter of `aegis_core.fitness.compute` are removed.
 - Breaking: `aegis_core.verification.arbiter` loses `structural_ship_gaps`, `prune_predictions`, `PruneResult`, `check_vendor_independence` and `Z95` (and the `Path` and `is_test_path` names it imported); `arbitrate` loses `infra_status`, `changed_files`, `all_files`, `rule_miss_counts`, `arbiter_vendor` and `generator_vendor` and takes `gaps=`.
 - Breaking: `aegis_core.verification` loses `Prediction.claim_type`, `target`, `horizon_commits` and `Prediction.from_dict`, and `ArbitrationResult.decision`, `confidence`, `rationale`, `structural_gaps` and `vendor_warning`; `aegis_core.verification.pipeline` loses `VerificationPipelineResult.layer1_verdict`, `infra_status` and `llm_predictions`, and `Arbiter.arbitrate` no longer takes `**kwargs`. `AdversarialVerifier.verify` and `extract_target_data` return four values, and `adversarial_verify.parse_predictions` and `parse_claims` return `(items, dropped)`.
 - Breaking: `aegis check --full --json` prediction rows no longer carry `claim_type`, `target` or `horizon_commits`.
+- Breaking: `aegis_cli.status.collect_status`, `aegis_core.ast.policy.evaluate_forbid_ast_with_overrides`, `aegis_core.verification.security_pack.build_python_security_pack` and `is_test_path`, and the `aegis_core.lifecycle.constants` names `MIN_PROMOTION_VERDICTS`, `PROMOTION_THRESHOLD`, `TIER_UP`, `TIER_DOWN_MISFIRE` and `MISFIRE_THRESHOLD` are removed. `evaluate_forbid_ast_structured` returns a findings list, and `evaluate_security_pack` takes `(root, changed_files, base_sources)`.
+- Breaking: `aegis_cli.approve.datetime` and `aegis_cli.approve.timezone` are no longer importable (`aegis_cli.approve` no longer imports them).
 
 ### Corrections
 

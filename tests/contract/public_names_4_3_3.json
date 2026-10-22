@@ -1162,6 +1162,8 @@
   ]
  },
  "removed": [
+  "aegis_cli.approve.datetime",
+  "aegis_cli.approve.timezone",
   "aegis_cli.hooks.redaction.HOOK_REDACTION_PATTERNS",
   "aegis_cli.hooks.redaction.redact_payload",
   "aegis_cli.verify.verdict_to_exit_code",

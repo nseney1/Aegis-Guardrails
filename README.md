@@ -162,7 +162,7 @@ Verify containment with `aegis check --lane docs`: every path changed since the 
 
 ## Rules that earn their place
 
-- **Evidence-backed promotion (`trap` → `invariant` → `gate`)**: Rules start as traps and earn promotion only through CI-witnessed checks, git history replay and adjudication labels merged to the base branch — never from unwitnessed agent self-reports, and never below 25 verdicts. Aegis never rewrites a rule file on its own; a human applies promotions with `aegis sync --apply`, `aegis sync --pr`, or `aegis rule promote`.
+- **Evidence-backed promotion (`trap` → `invariant` → `gate`)**: Rules start as traps and earn promotion only through adjudication labels merged to the base branch (25 with no false positive, or 42 with one, from at least 3 sessions and 2 repositories or 14 days). CI-witnessed checks and git history replay add evidence but never promote on their own, and unwitnessed agent self-reports never count. Aegis never rewrites a rule file on its own; a human applies promotions with `aegis sync --apply`, `aegis sync --pr`, or `aegis rule promote`.
 - **CI weakening & regression gates (`aegis check --ci`)**: Flags any pull request that weakens a gate or invariant relative to the base branch, enforces fail-to-pass regression tests on bug-fix commits, and emits PR-native `--format github|sarif` output.
 - **Closed loop from human corrections (`aegis rule insight`)**: Captures recurring developer corrections via `aegis_capture_insight` and `aegis rule insight` (`add`, `review`, `enable`) and clusters them into draft rule proposals in `.aegis/proposals/`.
 
