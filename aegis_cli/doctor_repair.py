@@ -574,6 +574,7 @@ class _Refused(Exception):
 
 
 def _backup_root(home: Path) -> Path:
+    from aegis_cli.install_hosts import _private_dirs
     from aegis_core.workspace.layout import UserLayout
 
     layout = UserLayout(home)
@@ -582,7 +583,9 @@ def _backup_root(home: Path) -> Path:
             raise _Refused(f"{path} is a symlink; Aegis keeps backups only in a real directory")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     target = layout.backups_dir / stamp
-    target.mkdir(parents=True, mode=0o700)
+    # mkdir(parents=True) modes only the leaf; existing directories are never re-moded.
+    _private_dirs(layout.backups_dir)
+    target.mkdir(mode=0o700)
     return target
 
 

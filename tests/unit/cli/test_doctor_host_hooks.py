@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Dict, List
 
 import pytest
@@ -535,6 +536,47 @@ def test_a_plugin_file_with_other_entries_loses_only_the_v3_ones(env):
     env.fix()
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "governance-monitor": {"PreInvocation": []}, "mine": {"PreToolUse": [keep]}}
+
+
+def _stale_plugin(env: Env) -> Path:
+    return env.write_json(plugin(env), {"governance-monitor": {"PreInvocation": [handler("soma hook pre-invocation")]}})
+
+
+def _bits(path: Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_fix_makes_every_backup_directory_it_creates_owner_only(env):
+    """R-cli-40: Given a fresh HOME with no ~/.aegis and umask 022, When doctor --fix --yes backs a
+    file up, Then ~/.aegis, ~/.aegis/backups and the run's directory are all 0700, the manifest is
+    0600 and the mode of HOME itself is unchanged."""
+    _stale_plugin(env)
+    home_mode = _bits(env.home)
+    old = os.umask(0o022)
+    try:
+        fixed = env.fix()
+    finally:
+        os.umask(old)
+    assert [(f["action"], f["status"]) for f in fixed["fixes"]] == [("delete_file", "applied")]
+    (backup,) = env.backups()
+    aegis = env.home / ".aegis"
+    assert [_bits(aegis), _bits(aegis / "backups"), _bits(backup)] == [0o700, 0o700, 0o700]
+    assert _bits(backup / "manifest.json") == 0o600
+    assert _bits(env.home) == home_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_fix_refuses_a_symlinked_backups_directory_and_writes_nothing_through_it(env):
+    path = _stale_plugin(env)
+    outside = env.tmp / "outside-backups"
+    outside.mkdir()
+    (env.home / ".aegis").mkdir()
+    (env.home / ".aegis" / "backups").symlink_to(outside, target_is_directory=True)
+    fixed = env.fix()
+    assert [f["status"] for f in fixed["fixes"]] == ["failed"]
+    assert "symlink" in fixed["fixes"][0]["reason"]
+    assert list(outside.iterdir()) == [] and path.is_file()
 
 
 def test_fix_skips_a_hook_file_that_changed_after_the_check(env, monkeypatch):
