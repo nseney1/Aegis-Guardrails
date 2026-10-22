@@ -892,31 +892,57 @@ def _is_git_command_line(node: ast.AST) -> bool:
     )
 
 
+def _calls_git_executable(node: ast.AST) -> bool:
+    """argv[0] of a git call through a lookup: ``git_executable()``, ``gitsafe.git_executable()`` or a copy."""
+    func = node.func if isinstance(node, ast.Call) else None
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+    return name.endswith("git_executable")
+
+
+# treeid spawns git itself: it needs a scrubbed environment and a private index, which gitsafe.run
+# cannot give (SECURITY.md, Repository trust). Its argv heads are gitsafe.git_executable() calls.
+_GIT_EXECUTABLE_HEADS_ALLOWED = {"aegis_core/gitsafe.py", "aegis_core/treeid.py"}
+
+
+def _git_spawn_offenders(rel: str, source: str) -> list:
+    tree = ast.parse(source)
+    # `binary in ("git", "gh")` names git without running it
+    membership = {
+        id(comparator)
+        for node in ast.walk(tree) if isinstance(node, ast.Compare)
+        for op, comparator in zip(node.ops, node.comparators) if isinstance(op, (ast.In, ast.NotIn))
+    }
+    offenders = []
+    for node in ast.walk(tree):
+        # an argv list or tuple whose program is git
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _is_git_program(node.elts[0]) \
+                and id(node) not in membership:
+            offenders.append(f"{rel}:{node.lineno} builds a git argv")
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _calls_git_executable(node.elts[0]) \
+                and rel not in _GIT_EXECUTABLE_HEADS_ALLOWED:
+            offenders.append(f"{rel}:{node.lineno} builds a git argv from git_executable()")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and (node.func.value.id, node.func.attr) in _SPAWNERS \
+                and node.args and _is_git_command_line(node.args[0]):
+            offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
+    return offenders
+
+
 def test_no_git_subprocess_outside_gitsafe():
     offenders = []
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel == "aegis_core/gitsafe.py":
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            # `binary in ("git", "gh")` names git without running it
-            membership = {
-                id(comparator)
-                for node in ast.walk(tree) if isinstance(node, ast.Compare)
-                for op, comparator in zip(node.ops, node.comparators) if isinstance(op, (ast.In, ast.NotIn))
-            }
-            for node in ast.walk(tree):
-                # an argv list or tuple whose program is git
-                if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _is_git_program(node.elts[0]) \
-                        and id(node) not in membership:
-                    offenders.append(f"{rel}:{node.lineno} builds a git argv")
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                        and isinstance(node.func.value, ast.Name) \
-                        and (node.func.value.id, node.func.attr) in _SPAWNERS \
-                        and node.args and _is_git_command_line(node.args[0]):
-                    offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
+            if rel != "aegis_core/gitsafe.py":
+                offenders += _git_spawn_offenders(rel, path.read_text(encoding="utf-8"))
     assert offenders == []
+
+
+def test_the_ratchet_flags_a_git_argv_headed_by_a_git_executable_call():
+    source = "import subprocess\nfrom aegis_core import gitsafe\nsubprocess.run([gitsafe.git_executable(), 'status'])\n"
+    assert _git_spawn_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:3 builds a git argv from git_executable()"]
+    assert _git_spawn_offenders("aegis_core/treeid.py", source) == []
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──
