@@ -20,7 +20,8 @@ import re
 import shutil
 import sys
 import tempfile
-from typing import Any, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
+import time
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from aegis_core import checkrun, gitsafe, governance, human_gate, match
 from aegis_core.config import _is_within
@@ -437,7 +438,7 @@ def _resolve_commit_exemption(root: str, head_commit: str, base_commit: str, met
 
 
 def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: str, tests: Iterable[str],
-                  timeout: float) -> Tuple[_PytestOutcome, _PytestOutcome]:
+                  timeout: float, progress: Callable[[str], None]) -> Tuple[_PytestOutcome, _PytestOutcome]:
     """(head run, base run) of the ``tests`` present at head, on the head and on the merge base with the
     head's copies of those tests overlaid; no run when none is present."""
     head_tree = _tree_blobs(root, head_commit)
@@ -450,9 +451,14 @@ def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: st
     try:
         os.chmod(scratch, 0o700)
         runs = []
-        for name, commit, layer in (("head", head_commit, None), ("base", merge_commit, overlay)):
+        for k, (name, label, commit, layer) in enumerate(
+                (("head", "the pull request head", head_commit, None), ("base", "the merge base", merge_commit, overlay)), 1):
             gitsafe.export_tree(root, commit, scratch / f"{name}_snap", overlay=layer, timeout=_GIT_TIMEOUT_S)
+            progress(f"T5 regression run {k} of 2: pytest on {label} {commit[:10]} ({len(present)} test file(s))")
+            started = time.monotonic()
             runs.append(_run_pytest_in_snapshot(scratch / f"{name}_snap", present, workspace, scratch / f"{name}_run", timeout))
+            outcome = "timed out" if runs[-1].timed_out else f"pytest exit {runs[-1].exit_code}"
+            progress(f"T5 regression run {k} of 2: {outcome} after {time.monotonic() - started:.1f}s")
     except gitsafe.GitError as exc:
         raise RegressionError(str(exc)) from exc
     finally:
@@ -523,7 +529,10 @@ def check_ci_regressions(
     head: str = "HEAD",
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> RegressionReport:
+    """``progress`` gets one line before and one after each pytest run (``aegis check --ci`` prints them
+    on stderr)."""
     root = workspace_root(workspace)
     workspace_path = Path(root).resolve()
     base_commit = gitsafe.resolve_commit(root, base)
@@ -547,7 +556,8 @@ def check_ci_regressions(
                 untested.append(UntestedChange(meta.oid, meta.subject, src))
     # One PR-level pass judges every fix commit's Python tests at once.
     judged = [p for m in fix_metas for p in m.present_files if is_python_test_file(p)]
-    runs = _run_pr_level(root, workspace_path, merge_commit, head_commit, judged, timeout) if judged else (_NO_RUN, _NO_RUN)
+    runs = (_run_pr_level(root, workspace_path, merge_commit, head_commit, judged, timeout, progress or (lambda _line: None))
+            if judged else (_NO_RUN, _NO_RUN))
     results = [_evaluate_fix_commit(root, meta, head_commit, base_commit, runs) for meta in fix_metas]
     evaluated = tuple(res for res, _finding in results)
     return RegressionReport(base_commit, head_commit, merge_commit, DEFAULT_TIER, evaluated,

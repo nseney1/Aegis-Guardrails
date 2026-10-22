@@ -249,3 +249,75 @@ def test_a_rejected_exemption_shows_its_code_and_approve_agrees_with_ci(
     assert commit["exemption_code"] == "untrusted_signature"
     _rc, out, _err = run_ci(repo, capsys)
     assert "no_test_changes" in out and "untrusted_signature" in out
+
+
+# ── X-t5-progress: the pytest reruns say what they are doing, on stderr only ─
+
+
+def _fake_pytest_and_rerun(monkeypatch: pytest.MonkeyPatch) -> list:
+    from aegis_core import checkrun, gitsafe, regression
+
+    reruns: list = []
+
+    def fake_pytest(snapshot, test_files, *_args, **_kwargs):
+        return regression._PytestOutcome(0, False, frozenset(), frozenset(), frozenset())
+
+    def fake_rerun(root, commit, base_ref, *, timeout=None):
+        reruns.append(commit)
+        tree = gitsafe.run(["rev-parse", f"{commit}^{{tree}}"], root).stdout.decode("ascii").strip()
+        return {"tree": tree, "exit": 0}
+
+    monkeypatch.setattr(regression, "_run_pytest_in_snapshot", fake_pytest)
+    monkeypatch.setattr(checkrun, "rerun_commit_snapshot", fake_rerun)
+    return reruns
+
+
+def _trailer_fix(repo: hg.Repo) -> str:
+    repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
+    repo.write("tests/test_app.py", "def test_app():\n    assert True\n")
+    repo.git("add", "-A")
+    tree = repo.git("write-tree")
+    return repo.commit(f"fix: app adds one\n\nAegis-Check: tree={tree} exit=0\n")
+
+
+@needs_git
+def test_each_pytest_run_prints_a_start_and_an_end_line_on_stderr(tmp_path: Path, capsys: pytest.CaptureFixture[str],
+                                                                  monkeypatch: pytest.MonkeyPatch):
+    """Given a fix commit with a Python test and an Aegis-Check trailer, When check --ci runs with the
+    pytest runs faked, Then stderr has one line before and one after each of the 2 T5 runs and the 1
+    trailer rerun (step, run k of n, commit, test files; outcome, elapsed), and stdout is only the JSON."""
+    import re
+
+    repo = make_repo(tmp_path)
+    head = _trailer_fix(repo)
+    reruns = _fake_pytest_and_rerun(monkeypatch)
+    rc, out, err = run_ci(repo, capsys, "--format", "json")
+    payload = json.loads(out)
+    assert rc == 0 and payload["status"] == "pass" and reruns == [head]
+    base = payload["scope"]["merge_base"]
+    progress = [line for line in err.splitlines() if line.startswith("aegis check --ci: ")]
+    expected = [
+        rf"aegis check --ci: T5 regression run 1 of 2: pytest on the pull request head {head[:10]} \(1 test file\(s\)\)",
+        r"aegis check --ci: T5 regression run 1 of 2: pytest exit 0 after \d+\.\ds",
+        rf"aegis check --ci: T5 regression run 2 of 2: pytest on the merge base {base[:10]} \(1 test file\(s\)\)",
+        r"aegis check --ci: T5 regression run 2 of 2: pytest exit 0 after \d+\.\ds",
+        rf"aegis check --ci: Aegis-Check rerun 1 of up to 2: tests.command on commit {head[:10]} \(the whole tree\)",
+        r"aegis check --ci: Aegis-Check rerun 1 of up to 2: exit 0 after \d+\.\ds",
+    ]
+    assert len(progress) == len(expected), progress
+    for pattern, line in zip(expected, progress):
+        assert re.fullmatch(pattern, line), (pattern, line)
+    assert "run 1 of 2" not in out
+
+    rc, out, err = run_ci(repo, capsys, "--format", "github")
+    assert rc == 0 and "run 1 of 2" not in out and len(err.splitlines()) == 6
+
+
+@needs_git
+def test_no_exec_runs_nothing_and_prints_no_progress(tmp_path: Path, capsys: pytest.CaptureFixture[str],
+                                                    monkeypatch: pytest.MonkeyPatch):
+    repo = make_repo(tmp_path)
+    _trailer_fix(repo)
+    reruns = _fake_pytest_and_rerun(monkeypatch)
+    rc, _out, err = run_ci(repo, capsys, "--no-exec")
+    assert rc == 0 and reruns == [] and "aegis check --ci: " not in err

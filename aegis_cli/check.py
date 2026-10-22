@@ -380,8 +380,10 @@ def _run_ci(args: argparse.Namespace) -> int:
         return 1
     try:
         report = rule_integrity.check_ci(root, base, head, pull_request=_event_pull_request())
-        reg_report = None if no_exec else regression.check_ci_regressions(root, base, head)
-        trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head)
+        # The reruns can take long; progress goes to stderr so the json and github stdout stay unchanged.
+        progress = lambda line: print(f"aegis check --ci: {sanitize_display(line, 300)}", file=sys.stderr, flush=True)  # noqa: E731
+        reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, progress=progress)
+        trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head, progress=progress)
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
         print(f"Error: {sanitize_display(str(exc), 400)}", file=sys.stderr)
         return 1

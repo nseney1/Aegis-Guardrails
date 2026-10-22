@@ -40,8 +40,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
@@ -507,10 +508,22 @@ def rerun_commit_snapshot(
 def verify_commit_trailers(
     root: object, base: str, head: str = "HEAD", *,
     rerun_fn: Optional[ Any ] = None, timeout: Optional[float] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Verify the ``Aegis-Check`` trailer of the head commit by rerunning its snapshot with the
-    ``record --tests`` recipe (``DEFAULT_TIMEOUT_S`` unless ``timeout`` is given)."""
+    ``record --tests`` recipe (``DEFAULT_TIMEOUT_S`` unless ``timeout`` is given). ``progress`` gets one
+    line before and one after each rerun (there are at most two)."""
     from aegis_core import credit
 
     runner = rerun_fn or (lambda c, _t: rerun_commit_snapshot(root, c, base, timeout=timeout))
-    return credit.verify_commit_trailers(root, base, head, rerun_fn=runner)
+    say, done = progress or (lambda _line: None), []  # type: Callable[[str], None], List[Mapping[str, Any]]
+
+    def reported(commit: str, tree: str) -> Mapping[str, Any]:
+        say(f"Aegis-Check rerun {len(done) + 1} of up to 2: tests.command on commit {commit[:10]} (the whole tree)")
+        started = time.monotonic()
+        done.append(runner(commit, tree))
+        say(f"Aegis-Check rerun {len(done)} of up to 2: {done[-1].get('reason') or 'exit %s' % done[-1].get('exit')} "
+            f"after {time.monotonic() - started:.1f}s")
+        return done[-1]
+
+    return credit.verify_commit_trailers(root, base, head, rerun_fn=reported)
