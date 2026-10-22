@@ -1172,6 +1172,7 @@
   "aegis_core.insights.redact_secrets",
   "aegis_core.insights.shannon_entropy",
   "aegis_core.regression.UserLayout",
+  "aegis_core.regression.VALID_TIERS",
   "aegis_core.rule_integrity.Path",
   "aegis_core.rule_integrity.UserLayout",
   "aegis_core.verification.scanners.HOOK_REDACTION_PATTERNS",

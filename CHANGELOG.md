@@ -12,6 +12,12 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`aegis check --ci --no-exec` runs no repository code.** It reads git objects only: it skips the regression and `Aegis-Check` trailer reruns, never reads or writes the ledger, says what it skipped (JSON `skipped`), and refuses `--coverage`, `--perf` and `--strict`.
 - **A reviewed weakening can pass at tier A.** On a pull-request run, `aegis check --ci` accepts a flagged weakening or governance change when a person other than the author approved the head commit in their latest review, the rules of the pull request's base branch require an approval, code-owner review, stale-review dismissal and approval of the most recent push by someone other than its pusher, and the base `CODEOWNERS` owns every flagged path. A missing or unusual base branch name means no review approval and no `gh` call; `aegis doctor --github` builds its ruleset for the default branch only, so pull requests into other branches still need a signed approval. It makes read-only `gh api` GETs, refuses reviews by bots and apps, and fails closed on any doubt. The `aegis-check` job in `validate.yml` and in the scaffolded `aegis.yml` grants `pull-requests: read` and sets `GH_TOKEN` on the `check --ci` step; the JSON approval object gains `method` (`signature` or `review`).
 
+- **A base-sourced governance check.** The new `aegis-governance` workflow runs only on `pull_request_target`. It checks out the base commit without credentials, fetches the pull request head as git objects only, and runs the base branch's own `aegis check --ci --no-exec`: no pull-request code is checked out, installed or run, and no secret is used. Its token reads contents and pull requests, and `GH_TOKEN` reaches the check step only, so tier A approving reviews count there too. As with the `aegis-check` step, the check step has no condition (the register planned a pull-request-only `if`); the trigger alone limits it to pull requests. GitHub runs `pull_request_target` workflows from the default branch, so it takes effect once 4.4.0 is on `main`; add `aegis-governance` as a required check after that.
+- **Tree identity runs no program the repository chose.** `aegis check --record` and `aegis_report_outcome` switch off every filter driver that the repository's or a checked-out submodule's own config defines, read submodules without the work tree's `GIT_*` variables and with replace refs ignored, and turn off remote protocols, credential helpers and `core.sshCommand`.
+- **T5 reads commit metadata without `git log`.** Two git calls (`rev-list` and `diff-tree`) replace it, so a configured `gpg.program` never runs.
+- **`aegis check --ci --coverage` reads no repository coverage configuration.** It runs the user-scope `tests.command` (pytest-based only) with an empty rcfile in a private state directory and never reads the repository's `.coveragerc` or `coverage.json`. It still runs the repository's tests, as `--coverage` always has.
+- **A short agent capture no longer blocks insight proposals.** The verbatim lint protects only human, `cli` and hook text, with a 25-character floor both ways and an exact match for short prompts; a one-character `aegis_capture_insight` quote blocked every proposal.
+
 ### Changed behaviour
 
 - **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
@@ -33,6 +39,15 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis init` points at `aegis doctor --github` for the `CODEOWNERS` lines and the ruleset; it writes no `CODEOWNERS`.
 - `aegis approve --exempt-test` refuses while governance files have uncommitted changes, as `aegis approve` already did.
 
+- **T5 is a warning-tier report in 4.4.0.** It judges fix commits once against the pull-request head in at most 2 pytest runs, whatever the number of fix commits (at most 2 x the timeout). A test module that fails to collect on base now counts as fail-to-pass, a fix that a later commit in the pull request breaks fails, and a timed-out run says `timeout`.
+- **Coverage is a report.** `aegis check --ci --coverage` never changes the exit code. A run that cannot be measured prints `coverage: UNVERIFIED (<reason>)`, never 0% or 100%. It diffs merge-base(base, head) to head.
+- `aegis check --ci` prints a progress line on stderr before and after each T5 pytest run and each `Aegis-Check` trailer rerun. stdout is unchanged, and `--no-exec` prints none.
+- The default base branch (`check --record`, `check --lane`, `approve`, the `check --ci` fallback, insights, `team metrics`, `verify`) is `origin/$GITHUB_BASE_REF`, then the branch `origin/HEAD` names, then `main`, `develop` or `master`, each as `origin/<name>` before `<name>`. A repository whose only branch is `master` now has a base.
+- User and system clean filters (git-lfs, for example) now run during tree identity, as in any git command you type, so such trees can equal their commit's tree and earn T1 credit. A driver name that the repository's or a submodule's own config defines is still switched off, in every scope.
+- `aegis rule insight review --decision` gains `confirm --insight ID [--kind K]`: a confirmed suggestion counts at level `cli`. Snooze, propose and merge-into-rule now hide a cluster; snooze and reject resurface it after 2 new insights.
+- `aegis status` and `aegis sync` (text, and JSON `insights`) print each insight-born rule's recurrence, labelled `sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)`, and `N unconfirmed agent suggestions (not counted)`.
+- Insight rows gain add-only `source` and `corroborated_by` fields, and exposure rows carry each rule's digest prefix as `rev`.
+
 ### Fixed
 
 - A warm scan in a git repository starts 3 git processes (was 9, and 13 for an MCP scan); the first scan starts 4, and a scan outside git starts 1 (was 7).
@@ -48,6 +63,23 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis sync` replays detector history with batched reads, about 2 git processes per commit (was 19), and resumes from `replay.tip` in `derived.json` when only single-parent commits follow it.
 - `aegis approve` signs with a passphrase-protected SSH key that is not in an agent: `ssh-keygen` asks for the passphrase at the terminal. In 4.3.4 it fell back to an `ssh-askpass` program and failed when none was installed.
 
+- T5 judges a fix to a module named like a document (`src/security.py`, `app/history.py`, `src/doc/parser.py`); it skipped them as docs.
+- A fix whose only tests are Go, TypeScript, JavaScript or Rust is reported as `[UNVERIFIED:regression/tests_not_pytest]` (a GitHub warning), not as a fix without a test.
+- Diff coverage attributes every added line of a hunk, including lines that look like `+++` or `---` headers, and reads C-quoted paths (non-ASCII, tab, quote, backslash).
+- The recurrence rate is alive sessions with a recurrence over heartbeat-alive sessions, so it is at most 1; sessions without a heartbeat are not counted, and the baseline excludes the triggering burst.
+- The proposal category defaults to the single kind the cluster's human insights share, and text review lists each insight with its top-3 neighbours.
+- Tree identity reports a tree as unbindable, instead of raising, when git times out or is missing.
+
+### Breaking (command line, JSON and MCP)
+
+- Breaking: `aegis check --ci --strict` exits 2 as a usage error; `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
+- Breaking: the JSON `coverage` block loses `passed`, `coverage`, `threshold` and `uncovered_by_file`. It has `status` (`reported` or `unverified`), `reason`, `covered_lines`, `executable_lines`, `ratio` (null when nothing was measured), `uncovered_ranges` and `unmeasured`.
+- Breaking: the fail-to-pass reason `collection_error_on_base` is gone; the reason `timeout` and the status `unverifiable` with reason `tests_not_pytest` are added.
+- Breaking: MCP `aegis_capture_insight` captures stay at level `suggestion` and never become `W2`. A same-host hook prompt containing the quote (12 characters or more) within 30 minutes only annotates the capture with `corroborated_by`, and the correction counts once.
+- Breaking: "exposed and ignored" needs a persisted exposure by the same host within 30 minutes at the rule's current rev. Agent outcome reports, scan rows and in-memory exposures no longer count, and insights added with `aegis rule insight add` (host `cli`) never join an agent's exposure.
+- Breaking: `aegis rule insight review --decision` needs `--cluster` (or `--insight` for `confirm`), and `reject` needs `--reason` (exit 2). An unknown cluster or suggestion id lists the valid ids and writes nothing (exit 1). JSON review output emits neighbours once; the per-cluster `neighbours` key is removed.
+- Breaking: tree identity makes a tree unbindable when the repository's or a checked-out submodule's own config defines a filter driver whose name `git -c` cannot carry (containing `=` or bytes that are not UTF-8), or when checked-out submodules nest more than 16 deep.
+
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
 - Breaking: `aegis_core.fitness.Fitness.samples` and the `samples=` parameter of `aegis_core.fitness.compute` are removed.
@@ -56,6 +88,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis check --full --json` prediction rows no longer carry `claim_type`, `target` or `horizon_commits`.
 - Breaking: `aegis_cli.status.collect_status`, `aegis_core.ast.policy.evaluate_forbid_ast_with_overrides`, `aegis_core.verification.security_pack.build_python_security_pack` and `is_test_path`, and the `aegis_core.lifecycle.constants` names `MIN_PROMOTION_VERDICTS`, `PROMOTION_THRESHOLD`, `TIER_UP`, `TIER_DOWN_MISFIRE` and `MISFIRE_THRESHOLD` are removed. `evaluate_forbid_ast_structured` returns a findings list, and `evaluate_security_pack` takes `(root, changed_files, base_sources)`.
 - Breaking: `aegis_cli.approve.datetime` and `aegis_cli.approve.timezone` are no longer importable (`aegis_cli.approve` no longer imports them).
+
+- Breaking: `aegis_core.regression.VALID_TIERS` and the `tier=` argument of `aegis_core.regression.check_ci_regressions` are removed.
+- Breaking: `aegis_core.verification.coverage_check.evaluate_diff_coverage` and `aegis_core.verification.coverage_check.verify_coverage_threshold` are removed, and `run_diff_coverage(root, base, head)` takes no other parameter.
 
 ### Corrections
 

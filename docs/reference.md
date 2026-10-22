@@ -181,14 +181,14 @@ Category: Daily Workflow & Verification.
 | `--card` |  |  | Print the day-0 card: languages, AST drivers, rules by type, the Layer 1 pass rate on the files and the 5 files with the most findings (above 2000 files it samples, and says so). Changes nothing and never reads baseline.json; --json for the machine-readable form |
 | `--write-baseline` |  |  | Record every current Layer 1 finding in .aegis/baseline.json, so that aegis check then fails only on new ones. Findings are fingerprinted by rule, path, matched line and its occurrence, not by line number. A failure that is not about a line (a rule that cannot load, a file that cannot be parsed) is listed and is never recorded |
 | `--prune-baseline` |  |  | Drop the entries of .aegis/baseline.json whose findings are fixed (or whose file is gone). It never adds a finding, and it refuses to run while a check cannot run |
-| `--ci` |  |  | The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs T5 fix-commit regression checks (advisory at default warning tier; blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail |
+| `--ci` |  |  | The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail |
 | `--head` | `REF` |  | With --ci: the commit under review (default: the pull request head in $GITHUB_EVENT_PATH, else HEAD) |
 | `--split` | `NAME=GLOB[,GLOB...]` |  | With --partition: one planned lane and the globs of its files; give at least two. They match as rule target_paths do: a glob without '/' matches at any depth |
-| `--base` | `REF` |  | With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, $GITHUB_BASE_REF, origin/main, main, origin/develop or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection |
+| `--base` | `REF` |  | With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, then the branch origin/HEAD names, then main, develop or master, each as origin/<name> before <name>). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection |
 | `--paths` | `GLOB [GLOB ...]` |  | With --lane: the lane's globs instead of its live lease (self-attested). They match as rule target_paths do: a glob without '/' matches at any depth, so CHANGELOG.md also admits docs/CHANGELOG.md. They never allow .aegis/** or .github/workflows/** |
 | `--base-policy` |  |  | With --lane: take lanes.<lane> and shared from .aegis/team.json at the base tip, never the candidate; refuses --paths. Only then is the result 'witnessed: base policy', and only then may .aegis/** and .github/workflows/** change |
 | `--no-exec` |  |  | With --ci: read git objects only and run none of the repository's code: the T5 regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage, --perf and --strict |
-| `--coverage` |  |  | With --ci: run pytest with diff coverage over changed lines |
+| `--coverage` |  |  | With --ci: report the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs under coverage. A report only: it never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason |
 | `--perf` |  |  | With --ci: run performance regression check |
 
 ### `aegis scan`
@@ -254,7 +254,7 @@ Claims and denials from the events log, and for each first-parent merge since --
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--base` | `REF` |  | Count merges since this commit (default: the branch base, as for aegis check --lane: origin/main, main, origin/develop or develop; with none, the whole first-parent history) |
+| `--base` | `REF` |  | Count merges since this commit (default: the branch base, as for aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, develop or master; with none, the whole first-parent history) |
 
 ### `aegis team release`
 
@@ -406,13 +406,15 @@ Cluster and review insights or record a decision
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise` |  | Record a review decision for a cluster |
-| `--cluster` | `CLUSTER_ID` |  | Cluster ID for --decision |
+| `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise`, `confirm` |  | Record a review decision: for the cluster --cluster names (reject also needs --reason), or confirm the suggestions --insight names |
+| `--cluster` | `CLUSTER_ID` |  | Cluster ID for --decision (as review lists it) |
+| `--insight` | `ID` |  | Unconfirmed suggestion ID for --decision confirm (repeatable) |
+| `--kind` | `KIND` |  | Insight kind recorded with --decision confirm |
 | `--proposal-id` | `PROPOSAL_ID` |  | Proposal ID when --decision propose |
-| `--category` | `CATEGORY` | `"correctness"` | Proposal category when --decision propose |
+| `--category` | `CATEGORY` |  | Proposal category when --decision propose (default: the one kind the cluster's human insights share, else correctness) |
 | `--summary` | `SUMMARY` |  | Closed-template summary bullet when --decision propose |
 | `--rule` | `RULE_ID` |  | Target rule ID for merge-into-rule or recurrence check |
-| `--reason` | `REASON` |  | Optional reason for the decision |
+| `--reason` | `REASON` |  | Reason for the decision (required with reject) |
 
 ### `aegis rule list`
 
@@ -1062,7 +1064,7 @@ Output schema:
 
 **Capture Insight**
 
-Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) for rule curation. Use this tool when the user corrects your approach or states a recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file immediately, or `aegis_report_outcome` to report whether existing rules helped. Each call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded from `aegis rule insight review` rule proposals until corroborated (`level: 'W2'`) by a matching user prompt captured by a host hook in the same session. Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds.
+Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) for rule curation. Use this tool when the user corrects your approach or states a recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file immediately, or `aegis_report_outcome` to report whether existing rules helped. Each call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted records stay at `level: 'suggestion'`: invisible to `aegis_scan`, never counted by `aegis rule insight review` and never upgraded to `level: 'W2'`, not even by a later capture in the same session. A user prompt that a host hook captured on the same host within 30 minutes and that contains the quote only annotates the record as corroborated. Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -1118,10 +1120,9 @@ Output schema:
     "level": {
       "type": "string",
       "enum": [
-        "suggestion",
-        "W2"
+        "suggestion"
       ],
-      "description": "Corroboration tier: 'suggestion' initially, or 'W2' when matched to a hook-captured user prompt in the same session."
+      "description": "Always 'suggestion': an agent capture never counts and is never upgraded."
     },
     "text": {
       "type": "string",
