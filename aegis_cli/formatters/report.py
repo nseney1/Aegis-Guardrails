@@ -112,6 +112,7 @@ def format_layer1_json_payload(
                 "target": r.target,
                 "verdict": bool(r.verdict),
                 "detail": r.detail,
+                "lines": list(r.lines),
             }
             for r in results
         ],

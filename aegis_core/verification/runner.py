@@ -794,7 +794,8 @@ def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Opti
         if tool == "security_pack":
             detail = f"security_pack: cannot verify {rel}: {found[0]['reason']}"
         else:
-            detail = "; ".join(f"{h['pattern']} introduced by this change at line {h['line']}" for h in found)
+            # No line number: SARIF fingerprints hash the message, and the lines are in ``lines``.
+            detail = "; ".join(dict.fromkeys(f"{h['pattern']} introduced by this change" for h in found))
         out.append(ToolEvidence(tool=tool, target=rel, verdict=False, detail=detail,
                                 lines=sorted({h["line"] for h in found if h["line"] > 0})))
     out.extend(ToolEvidence(tool="security_pack", target=rel, verdict=True, detail="; ".join(items))

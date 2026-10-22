@@ -79,7 +79,7 @@ def test_a_banned_call_the_change_introduces_fails_and_a_legacy_one_it_only_move
     assert code == 1
     assert _failed(payload) == [("security_pack:sec-py-pickle-loads", "src/load.py")]
     row = next(r for r in payload["layer1"] if r["tool"] == "security_pack:sec-py-pickle-loads")
-    assert "line 5" in row["detail"]
+    assert row["lines"] == [5] and row["detail"] == "pickle.loads introduced by this change"
 
 
 def test_a_changed_file_under_a_dot_directory_is_checked(repo, capsys):
