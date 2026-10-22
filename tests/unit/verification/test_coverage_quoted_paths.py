@@ -53,3 +53,34 @@ def test_a_real_diff_of_a_non_ascii_file_attributes_its_lines(tmp_path: Path, mo
                          env={**os.environ, **repo.home.env}).stdout
     assert b'"b/\\303\\251.py"' in raw
     assert parse_changed_lines(raw.decode("utf-8", "replace")) == {"é.py": {1, 2}}
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_coverage_of_a_non_ascii_file_counts_its_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """End to end (R-checks-32 with R-checks-33): a fake coverage run reports lines 1 and 2 of é.py missing,
+    so both are executable and uncovered; never a vacuous pass over an empty denominator."""
+    import json
+
+    from aegis_core.verification import coverage_check
+
+    home = tmp_path / "home"
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    repo = hg.Repo(tmp_path / "project", hg.Home(home))
+    repo.write("README.md", "# x\n")
+    repo.commit("base")
+    repo.branch("work")
+    repo.write("é.py", "a = 1\nb = 2\n")
+    repo.commit("add")
+
+    def fake(argv, cwd=None, env=None, timeout=60):
+        if argv[3] == "json":
+            report = {"files": {"é.py": {"executed_lines": [], "missing_lines": [1, 2]}}}
+            Path(argv[argv.index("-o") + 1]).write_bytes(json.dumps(report).encode("utf-8"))
+        return {"returncode": 0, "stdout": "", "stderr": "", "timed_out": False}
+
+    monkeypatch.setattr(coverage_check, "run_external_cmd", fake)
+    res = coverage_check.run_diff_coverage(repo.root, "main", "HEAD")
+    assert (res["status"], res["executable_lines"], res["covered_lines"], res["ratio"]) == ("reported", 2, 0, 0.0)
+    assert res["uncovered_ranges"] == {"é.py": [[1, 2]]}

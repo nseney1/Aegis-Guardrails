@@ -59,6 +59,7 @@ __all__ = [
     "parse_junit",
     "parse_junit_cases",
     "plan_command",
+    "pytest_args",
     "record",
     "rerun_commit_snapshot",
     "user_test_command",
@@ -156,6 +157,17 @@ def plan_command(logical: Optional[Sequence[str]], junit: Optional[Path] = None)
         if junit is not None:
             argv.append(f"--junitxml={junit}")
     return argv, words
+
+
+def pytest_args(words: Sequence[str]) -> Optional[List[str]]:
+    """The arguments a pytest-based command gives pytest (after ``-m pytest``, or after a first word
+    ``pytest``/``py.test``); None for any other command."""
+    first = os.path.basename(words[0].replace("\\", "/")) if words else ""
+    if _PYTEST_NAME.fullmatch(first):
+        return list(words[1:])
+    rest = list(words[1:])
+    at = rest.index("-m") if "-m" in rest else -1
+    return rest[at + 2:] if _PYTHON_NAME.fullmatch(first) and at >= 0 and rest[at + 1:at + 2] == ["pytest"] else None
 
 
 def command_digest(logical: Sequence[str]) -> str:

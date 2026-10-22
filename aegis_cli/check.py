@@ -184,7 +184,6 @@ _NOT_EXECUTED = ("regression", "trailer_checks")
 def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
                        skipped=()) -> dict:
     reg_blocking = bool(reg_report is not None and reg_report.blocking)
-    cov_blocking = bool(cov_report is not None and not cov_report.get("passed", True))
     perf_blocking = bool(perf_report is not None and not perf_report.get("passed", True))
     trailer_blocking = bool(trailer_checks and any(t.get("failed") for t in trailer_checks))
     document = report.as_dict(root)
@@ -198,7 +197,7 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
         document["trailer_checks"] = trailer_checks
     if skipped:
         document["skipped"] = list(skipped)
-    if reg_blocking or cov_blocking or perf_blocking or trailer_blocking:
+    if reg_blocking or perf_blocking or trailer_blocking:
         document["status"] = "fail"
     return document
 
@@ -333,6 +332,13 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     for t_chk in trailer_checks or ():
         if t_chk.get("failed"):
             print(sanitize_display(f"  [FAIL:trailer-divergence] {t_chk['commit'][:10]}: {t_chk.get('reason', '')}", 400))
+    if cov_report is not None and cov_report.get("status") == "reported":
+        ratio = cov_report.get("ratio")
+        print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
+                               f"{cov_report.get('executable_lines', 0)} changed executable lines "
+                               f"({len(cov_report.get('unmeasured') or ())} file(s) not measured)", 400))
+    elif cov_report is not None:
+        print(sanitize_display(f"  coverage: UNVERIFIED ({cov_report.get('reason', '')})", 400))
     if skipped:
         print("  note: --no-exec: the regression and Aegis-Check trailer checks were not run")
 
@@ -340,7 +346,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
 def _run_ci(args: argparse.Namespace) -> int:
     """`aegis check --ci`: 0 nothing weakened or every weakening approved, 1 otherwise, 2 usage."""
     from aegis_cli import sanitize_display
-    from aegis_core import checkrun, credit, gitsafe, regression, rule_integrity
+    from aegis_core import checkrun, gitsafe, regression, rule_integrity
 
     stray = [flag for flag, given in (
         ("FILES", bool(getattr(args, "files", None))), ("--full", bool(getattr(args, "full", False))),
@@ -383,7 +389,7 @@ def _run_ci(args: argparse.Namespace) -> int:
     cov_report = None
     if getattr(args, "coverage", False):
         from aegis_core.verification.coverage_check import run_diff_coverage
-        cov_report = run_diff_coverage(root, base_ref=base)
+        cov_report = run_diff_coverage(root, base, head)
 
     perf_report = None
     if getattr(args, "perf", False):
@@ -396,11 +402,10 @@ def _run_ci(args: argparse.Namespace) -> int:
 
     _print_ci(report, fmt, root, reg_report, cov_report=cov_report, perf_report=perf_report, trailer_checks=trailer_checks,
               skipped=_NOT_EXECUTED if no_exec else ())
-    cov_ok = True if cov_report is None else bool(cov_report.get("passed", True))
     perf_ok = True if perf_report is None else bool(perf_report.get("passed", True))
     trailer_ok = not any(t.get("failed") for t in trailer_checks)
     reg_ok = reg_report is None or not reg_report.blocking
-    overall_passed = report.passed and reg_ok and cov_ok and perf_ok and trailer_ok
+    overall_passed = report.passed and reg_ok and perf_ok and trailer_ok
     return 0 if overall_passed else 1
 
 
@@ -576,7 +581,9 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--coverage",
             action="store_true",
-            help="With --ci: run pytest with diff coverage over changed lines",
+            help="With --ci: report the share of the executable lines changed since merge-base(--base, --head) "
+            "that the user-scope tests.command (pytest-based) runs under coverage. A report only: it never changes "
+            "the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
         )
         parser.add_argument(
             "--perf",
