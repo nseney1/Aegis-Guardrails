@@ -536,8 +536,11 @@ class TestOneForbidAstEvaluation:
 
     def test_each_file_and_rule_is_evaluated_once_however_many_sites(self, tmp_path, monkeypatch):
         import aegis_core.ast.policy as policy
+        from aegis_core.verification import security_pack
 
         ws = _no_eval_ws(tmp_path, {"mod.py": "x = eval(1)\n" * 5000})
+        # The built-in security pack (R-checks-29) makes its own passes per pack rule; this counts the user rule's.
+        monkeypatch.setattr(security_pack, "evaluate_security_pack", lambda *a, **k: {})
         passes = []
         real = policy._eval_call_entry
         monkeypatch.setattr(policy, "_eval_call_entry", lambda *a, **k: passes.append(1) or real(*a, **k))

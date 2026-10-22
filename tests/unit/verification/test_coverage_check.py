@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import sys
 
 import pytest
 
 from aegis_cli.formatters.report import (
-    format_github_annotations,
+    ci_findings,
     format_github_step_summary,
     format_sarif_report,
+    github_annotation_lines,
+    layer1_findings,
 )
 from aegis_core import checkrun, events
 from aegis_core.verification import coverage_check
@@ -316,26 +319,16 @@ class TestReportOnlyCoverage:
 class TestSarifAndGitHubFormatters:
     """SARIF 2.1.0 and GitHub annotations / step-summary formatting."""
 
+    @staticmethod
+    def _layer1_doc(path: str, line: int = 14) -> dict:
+        """A Layer 1 report document: one failed forbid_ast row and one checkpoint issue (no line)."""
+        return {"passed": False,
+                "layer1": [{"tool": "forbid_ast:no-eval", "target": path, "verdict": False,
+                            "detail": "Forbidden eval() call", "lines": [line, line + 3]}],
+                "findings": [{"rule": "repo-gate", "message": "Unanchored repository-level gate failure", "level": "error"}]}
+
     def test_sarif_report_valid_schema_and_routes_lineless_to_step_summary(self, tmp_path: Path):
-        report_dict = {
-            "findings": [
-                {
-                    "rule": "no-eval",
-                    "path": str(tmp_path / "aegis_core/bad.py"),
-                    "line": 14,
-                    "col": 5,
-                    "message": "Forbidden eval() call",
-                    "level": "error",
-                },
-                {
-                    "rule": "repo-gate",
-                    "path": "",
-                    "line": 0,
-                    "message": "Unanchored repository-level gate failure",
-                    "level": "error",
-                },
-            ]
-        }
+        report_dict = self._layer1_doc(str(tmp_path / "aegis_core/bad.py"))
 
         sarif_raw = format_sarif_report(report_dict, workspace_root=tmp_path)
         sarif = json.loads(sarif_raw)
@@ -346,41 +339,144 @@ class TestSarifAndGitHubFormatters:
         loc = results[0]["locations"][0]["physicalLocation"]
         assert loc["artifactLocation"]["uri"] == "aegis_core/bad.py"
         assert loc["region"]["startLine"] == 14
-        assert loc["region"]["startColumn"] == 5
+        assert loc["region"]["startColumn"] == 1
         assert "primaryLocationLineHash" in results[0]["partialFingerprints"]
 
-        # Line-less finding must be routed to step_summary, never emitted with startLine: 0
+        # Line-less finding must be routed to the step summary, never emitted with startLine: 0
         assert all(
             r["locations"][0]["physicalLocation"]["region"]["startLine"] >= 1
             for r in results
         )
-        assert "Unanchored repository-level gate failure" in sarif["step_summary"]
+        assert "Unanchored repository-level gate failure" in format_github_step_summary(report_dict, tmp_path)
 
-    def test_github_annotations_and_step_summary(self):
-        report_dict = {
-            "findings": [
-                {
-                    "rule": "no-eval",
-                    "path": "aegis_core/bad.py",
-                    "line": 14,
-                    "col": 5,
-                    "message": "Forbidden eval() call",
-                    "level": "error",
-                }
-            ]
-        }
-        annotations = format_github_annotations(report_dict)
-        assert any(
-            line.startswith("::error ")
-            and "file=aegis_core/bad.py" in line
-            and "line=14" in line
-            and "col=5" in line
-            and "title=no-eval" in line
-            for line in annotations
-        )
-        summary_md = format_github_step_summary(report_dict)
+    def test_github_step_summary_lists_anchored_findings(self):
+        summary_md = format_github_step_summary(self._layer1_doc("aegis_core/bad.py"))
         assert "aegis_core/bad.py" in summary_md
         assert "no-eval" in summary_md
+
+    def test_ci_findings_read_the_fixed_keys_and_name_no_invented_line(self):
+        doc = {"weakenings": [{"code": "rule-deleted", "rule": "inv-a", "path": ".aegis/rules/invariants/inv-a.md",
+                               "message": "deleted"}],
+               "regression": {"tier": "warning", "findings": [{"code": "no_test_changes", "commit": "c" * 40,
+                                                                "path": "src/a.py", "message": "no test"}]},
+               "trailer_checks": [{"commit": "d" * 40, "failed": True, "reason": "diverged"}]}
+        found = ci_findings(doc)
+        assert [(f["rule_id"], f["uri"], f["line"], f["level"]) for f in found] == [
+            ("inv-a", ".aegis/rules/invariants/inv-a.md", 0, "error"), ("no_test_changes", "src/a.py", 0, "warning"),
+            ("trailer-divergence", "", 0, "error")]
+        assert all(set(f) == {"rule_id", "uri", "line", "col", "message", "level"} for f in found)
+        approved = ci_findings({**doc, "approval": {"valid": True}})
+        assert approved[0]["level"] == "note"
+
+    def test_layer1_findings_anchor_at_the_first_line_relative_to_the_workspace(self, tmp_path):
+        from aegis_core.verification import ToolEvidence
+
+        e = ToolEvidence(tool="import_guard", target=str(tmp_path / "src" / "a" / "x.py"), verdict=False,
+                         detail="unapproved import", lines=[3])
+        doc = {"layer1": [{"tool": e.tool, "target": e.target, "verdict": e.verdict, "detail": e.detail, "lines": e.lines}]}
+        (found,) = layer1_findings(doc, workspace_root=tmp_path)
+        assert (found["uri"], found["line"], found["rule_id"]) == ("src/a/x.py", 3, "import_guard")
+
+    def test_every_exported_formatter_name_resolves(self):
+        import aegis_cli.formatters.report as report
+
+        assert all(hasattr(report, name) for name in report.__all__)
+        namespace: dict = {}
+        exec("from aegis_cli.formatters.report import *", namespace)
+        assert set(report.__all__) <= set(namespace)
+
+    def test_the_formatter_modules_have_no_orphan_function(self):
+        from aegis_core.verification import call_graph
+
+        repo = Path(__file__).resolve().parents[3]
+        for rel in ("aegis_cli/formatters/report.py", "aegis_core/verification/perf_check.py"):
+            result = call_graph.check(str(repo / rel), str(repo), exclude_names={"main"})
+            assert result.verdict, (rel, result.detail)
+
+    def test_hostile_text_makes_exactly_one_workflow_command_each(self):
+        nasty = "a%b\rc\nd:e,f"
+        doc = {"weakenings": [{"code": "rule-deleted", "rule": nasty, "path": f"rules/{nasty}.md", "message": nasty}],
+               "trailer_checks": [{"commit": "d" * 40, "failed": True, "reason": nasty}]}
+        lines = github_annotation_lines(doc)
+        assert len(lines) == 2 and all(line.startswith("::error ") for line in lines)
+        assert "file=rules/a%25b%0Dc%0Ad%3Ae%2Cf.md," in lines[0]
+        assert lines[0].endswith("::rule-deleted: a%25b%0Dc%0Ad:e,f: a%25b%0Dc%0Ad:e,f")
+
+
+class TestSarifIsSchemaValidAndHonest:
+    """R-checks-36: the SARIF log holds only schema keys, anchored findings only, stable fingerprints."""
+
+    DOC = {"passed": False,
+           "layer1": [{"tool": "no-eval", "target": "pkg/bad.py", "verdict": False, "detail": "Forbidden eval() call",
+                       "lines": [14]}],
+           "findings": [{"rule": "repo-gate", "message": "Unanchored repository-level gate failure", "level": "error"}]}
+
+    @staticmethod
+    def _report(approved: bool = False):
+        from aegis_core import human_gate, rule_integrity
+
+        head = "b" * 40
+        return rule_integrity.CiReport("main", head, "a" * 40, 1,
+                                       (rule_integrity.Weakening("rule-deleted", "inv-a", "rules/inv-a.md", "deleted"),),
+                                       human_gate.Approval(True, "ok", "", head, "Human") if approved else None)
+
+    def test_the_log_has_only_schema_keys_and_line_less_findings_go_to_the_summary(self, tmp_path):
+        text = format_sarif_report(self.DOC)
+        assert type(text) is str
+        log = json.loads(text)
+        assert set(log) == {"$schema", "version", "runs"}
+        (result,) = log["runs"][0]["results"]
+        assert (result["ruleId"], result["locations"][0]["physicalLocation"]["region"]["startLine"]) == ("no-eval", 14)
+        assert "Unanchored repository-level gate failure" not in text
+        assert "Unanchored repository-level gate failure" in format_github_step_summary(self.DOC)
+
+    def test_a_weakening_without_a_line_is_no_result_and_an_approved_one_is_no_failure(self, tmp_path, capsys, monkeypatch):
+        from aegis_cli import check
+
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        check._print_ci(self._report(), "sarif", str(tmp_path))
+        assert json.loads(capsys.readouterr().out)["runs"][0]["results"] == []
+        assert "rules/inv-a.md" in summary.read_text(encoding="utf-8")
+        summary.unlink()
+        check._print_ci(self._report(approved=True), "sarif", str(tmp_path))
+        assert json.loads(capsys.readouterr().out)["runs"][0]["results"] == []
+        text = summary.read_text(encoding="utf-8")
+        assert "PASSED" in text and "rules/inv-a.md" not in text
+        check._print_ci(self._report(approved=True), "github", str(tmp_path))
+        assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("::")] == [
+            "::notice file=rules/inv-a.md,title=weakening approved::rule-deleted: inv-a: deleted"]
+
+    @staticmethod
+    def _prints(*rows) -> list:
+        doc = {"layer1": [{"tool": rule, "target": path, "verdict": False, "detail": message, "lines": [line]}
+                          for rule, path, line, message in rows]}
+        return [r["partialFingerprints"]["primaryLocationLineHash"] for r in json.loads(format_sarif_report(doc))["runs"][0]["results"]]
+
+    def test_fingerprints_survive_line_moves_and_tell_duplicates_apart(self):
+        one = ("no-eval", "pkg/bad.py", 14, "m")
+        assert self._prints(one) == self._prints(("no-eval", "pkg/bad.py", 20, "m"))
+        a, b = self._prints(one, ("no-eval", "pkg/bad.py", 40, "m"))
+        assert a != b
+        assert self._prints(("no-eval", "pkg/bad.py", 21, "m"), ("no-eval", "pkg/bad.py", 47, "m")) == [a, b]
+        assert sorted(self._prints(("no-eval", "pkg/bad.py", 40, "m"), one)) == sorted([a, b])
+        for other in (("other", "pkg/bad.py", 14, "m"), ("no-eval", "pkg/good.py", 14, "m"), ("no-eval", "pkg/bad.py", 14, "n")):
+            assert self._prints(other) != self._prints(one)
+        assert self._prints(("no-eval", "pkg\\bad.py", 14, "m")) == self._prints(one)
+        assert re.fullmatch(r"[0-9a-f]{16}", a)
+
+    @needs_git
+    def test_an_error_path_still_prints_a_valid_empty_log(self, tmp_path, capsys, monkeypatch):
+        from aegis_cli.cli import main
+
+        repo = cov_repo(tmp_path)
+        os.chdir(repo.root)
+        rc = main(["check", "--ci", "--base", "no-such-ref", "--format", "sarif"])
+        out, err = capsys.readouterr()
+        assert rc == 1 and err.startswith("Error:")
+        log = json.loads(out)
+        assert set(log) == {"$schema", "version", "runs"} and log["runs"][0]["results"] == []
+        assert log["runs"][0]["invocations"][0]["executionSuccessful"] is False
 
 
 class TestStatusBlockedCommands:
@@ -458,13 +554,13 @@ class TestCheckCliIntegration:
         parser = argparse.ArgumentParser()
         cmd = CheckCommand()
         cmd.configure_parser(parser)
-        args = parser.parse_args(["--format", "sarif"])
+        args = parser.parse_args(["--card", "--format", "sarif"])
         args._root = tmp_path
 
         rc = cmd.execute(args)
         assert rc == 2
         err = capsys.readouterr().err
-        assert "invalid choice: 'sarif' (only applies with --ci)" in err
+        assert "--format sarif" in err and "--ci" in err
 
     @needs_git
     def test_ci_coverage_is_reported_and_never_changes_the_exit_code(self, tmp_path, cov_env, capsys, monkeypatch):

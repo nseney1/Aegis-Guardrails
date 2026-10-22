@@ -54,6 +54,10 @@ class RiskCategory(Enum):
     PLATFORM_INCOMPATIBLE = "platform_incompatible"  # Code fails on non-host OS
 
 
+#: What a prediction says will happen within its window, which Aegis can check in git (spec T6).
+OBSERVABLE_KINDS = ("revert", "fix_attributed", "ci_fail_implicating", "detector_fires")
+
+
 class Severity(Enum):
     CRITICAL = "critical"    # Ship blocker
     HIGH = "high"            # Should fix before ship
@@ -80,14 +84,12 @@ class Prediction:
     ts: float = 0.0
     tree: str = ""
     backend: str = ""
-    scope: str = ""
-    observable: str = "fix_touch_in_window"
+    scope: dict = field(default_factory=dict)       # {path, symbol}: the path is Aegis's, never the model's
+    observable: dict = field(default_factory=dict)  # {kind, selector}: kind in OBSERVABLE_KINDS, else void
     window_days: int = 14
     p: float = 0.5
     disposition: str = "logged"
-    outcome: Optional[bool] = None
-    resolved_at: Optional[float] = None
-    resolving_commit: str = ""
+    outcome: Optional[str] = None                   # hit, miss or void, computed by Aegis
 
     def __post_init__(self) -> None:
         if isinstance(self.category, str):
@@ -100,17 +102,19 @@ class Prediction:
                 self.severity = Severity(self.severity)
             except ValueError:
                 pass
-        self.scope = self.scope or self.affected_function
-        if not self.id:
+        self.scope = {"path": "", "symbol": self.affected_function, **(self.scope or {})}
+        self.observable = {"kind": "", "selector": "", **(self.observable or {})}
+        if not self.id:  # a provisional id; stamp() gives the one a log row carries
             cat_val = getattr(self.category, "value", str(self.category))
-            self.id = hashlib.sha256(f"{self.verdict_id}:{cat_val}:{self.scope}:{self.risk}".encode("utf-8")).hexdigest()[:12]
+            key = f"{self.verdict_id}:{cat_val}:{self.scope['symbol']}:{self.risk}"
+            self.id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id, "verdict_id": self.verdict_id, "ts": self.ts, "tree": self.tree, "backend": self.backend,
-            "scope": self.scope, "observable": self.observable, "window_days": self.window_days, "p": self.p,
-            "disposition": self.disposition, "outcome": self.outcome, "resolved_at": self.resolved_at,
-            "resolving_commit": self.resolving_commit, "category": getattr(self.category, "value", str(self.category)),
+            "scope": dict(self.scope), "observable": dict(self.observable), "window_days": self.window_days,
+            "p": self.p, "disposition": self.disposition, "outcome": self.outcome,
+            "category": getattr(self.category, "value", str(self.category)),
             "severity": getattr(self.severity, "value", str(self.severity)), "risk": self.risk,
             "mechanism": self.mechanism, "affected_function": self.affected_function,
         }
@@ -208,6 +212,17 @@ PREDICTION_SCHEMA = {
             "affected_function": {
                 "type": "string",
                 "description": "Function name from the provided signatures"
+            },
+            "p": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": "Probability that the observable happens within 14 days of landing"
+            },
+            "observable": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": list(OBSERVABLE_KINDS)},
+                    "selector": {"type": "string", "description": "The file or test the observable is about"}
+                }
             }
         }
     }
@@ -248,6 +263,7 @@ CLAIM_SCHEMA = {
 
 __all__ = [
     "CLAIM_SCHEMA",
+    "OBSERVABLE_KINDS",
     "PREDICTION_SCHEMA",
     "ArbitrationResult",
     "Claim",

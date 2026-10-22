@@ -13,6 +13,7 @@ In the repository, under `.aegis/state/` (git-ignored by `aegis init`):
 - `ledger.jsonl`: outcome rows: rule id, outcome, source, host, session id, time, and the checked file paths and verdict.
 - `activity.jsonl`: MCP scan and edit events (file paths, host, session id, client name and version), read by `aegis status --compliance`.
 - `gate_events.jsonl`: decisions of `aegis hook safety-gate`, with the command text cut to 200 characters and known secret patterns redacted.
+- `arbiter_predictions.jsonl`: Layer 2 predictions from `aegis check --full`: id, verdict id, time, tree, backend (the program's base name), scope (path and symbol), category, observable (kind and selector), window in days, probability, severity, disposition and outcome. It holds no risk, mechanism or other model text.
 - `derived.json`: the fitness view `aegis sync` writes. `migrate-backup-*/`: the files `aegis migrate --apply` replaced.
 
 In your home directory:

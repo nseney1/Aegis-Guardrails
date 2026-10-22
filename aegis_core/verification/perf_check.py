@@ -1,7 +1,8 @@
 """Paired interleaved performance regression check (v4.3 spec §3 T7)."""
 from __future__ import annotations
 
-import os, shlex, shutil, statistics, tempfile, time
+import importlib.util
+import os, shlex, shutil, statistics, sys, tempfile, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -36,46 +37,55 @@ def evaluate_paired_samples(
     regressed = (not noisy) and (head_min > limit * base_min) and (head_med > limit * base_med)
     status = "unverified" if noisy else ("fail" if regressed else "pass")
     return {
-        "status": status, "regressed": regressed, "noisy": noisy, "advisory": noisy,
+        "status": status, "regressed": regressed, "noisy": noisy,
         "rounds": min(len(base_samples), len(head_samples)), "threshold": threshold,
         "aa_drift": aa_drift, "base_min": base_min, "head_min": head_min,
         "base_median": base_med, "head_median": head_med,
     }
 
 
-def _load_user_perf_command(workspace_root: Path, user_config_path: Path | str | None = None) -> list[str] | None:
-    """Read perf.command from user-scope config only; never from repository config."""
-    raw = read_user_config(workspace_root, path=user_config_path)
-    if raw is None:
-        return None
+_BENCHMARK_ARGV = ("-m", "pytest", "--benchmark-only", "-q", "-p", "no:cacheprovider", "-o", "addopts=")
+
+
+def _perf_argv(workspace_root: Path, user_config_path: Path | str | None) -> tuple[list[str] | None, str]:
+    """(argv, "") from user-scope ``perf.command`` (never repository config), else the pytest-benchmark
+    argv when the plugin is importable; (None, reason) otherwise."""
+    raw = read_user_config(workspace_root, path=user_config_path) or {}
     perf = raw.get("perf")
-    cmd = perf.get("command") if isinstance(perf, Mapping) else raw.get("perf.command")
+    cmd = perf.get("command") if isinstance(perf, Mapping) else None
     if isinstance(cmd, str) and cmd.strip():
         try:
-            return shlex.split(cmd, posix=os.name != "nt")
-        except ValueError:  # unbalanced quotes: unusable, like any other bad value
-            return None
+            return shlex.split(cmd, posix=os.name != "nt"), ""
+        except ValueError:  # unbalanced quotes
+            return None, "perf.command cannot be parsed"
     if isinstance(cmd, list) and cmd and all(isinstance(x, str) and x.strip() for x in cmd):
-        return [x.strip() for x in cmd]
-    return None
+        return [x.strip() for x in cmd], ""
+    if importlib.util.find_spec("pytest_benchmark") is not None:
+        return [sys.executable, *_BENCHMARK_ARGV], ""
+    return None, "no perf.command configured and pytest-benchmark is not installed"
+
+
+def _unverified(reason: str) -> dict[str, Any]:
+    return {"status": "unverified", "reason": reason, "regressed": False, "noisy": False, "passed": True}
 
 
 def _invoke_sample(cmd_runner: Callable[..., Any], argv: list[str], cwd: Path, timeout: int) -> tuple[float | None, str | None]:
     t0 = time.perf_counter()
-    res = cmd_runner(argv, cwd=cwd, timeout=timeout)
+    try:
+        res = cmd_runner(argv, cwd=cwd, timeout=timeout)
+    except Exception as exc:  # the type only: a message can embed paths
+        return None, f"{argv[0]} could not run ({type(exc).__name__})"
     elapsed = time.perf_counter() - t0
-    if isinstance(res, (int, float)):
-        return float(res), None
-    if isinstance(res, Mapping):
-        if res.get("missing_binary"):
-            return None, str(res.get("stderr") or f"{argv[0]} binary not found")
-        if res.get("timed_out"):
-            return None, f"{argv[0]} timed out"
-        if res.get("returncode", 0) != 0:
-            return None, str(res.get("stderr") or f"{argv[0]} exited {res.get('returncode')}")
-        dur = res.get("duration_s")
-        return (float(dur) if isinstance(dur, (int, float)) else elapsed), None
-    return elapsed, None
+    if not isinstance(res, Mapping):
+        return None, f"{argv[0]} gave no run result"
+    if res.get("missing_binary"):
+        return None, str(res.get("stderr") or f"{argv[0]} binary not found")
+    if res.get("timed_out"):
+        return None, f"{argv[0]} timed out"
+    if res.get("returncode", 0) != 0:
+        return None, str(res.get("stderr") or f"{argv[0]} exited {res.get('returncode')}")
+    dur = res.get("duration_s")
+    return (float(dur) if isinstance(dur, (int, float)) else elapsed), None
 
 
 def _default_runner(ws_root: Path) -> Callable[..., Any]:
@@ -94,37 +104,32 @@ def run_perf_check(
     base_ref: str = "HEAD~1",
     rounds: int = MIN_ROUNDS,
     threshold: float = DEFAULT_THRESHOLD,
-    command: Sequence[str] | str | None = None,
     runner: Callable[..., Any] | None = None,
     *,
     user_config_path: Path | str | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
-    """Run paired interleaved benchmark rounds on an export of merge-base(base_ref, HEAD) vs the working tree."""
+    """Run paired interleaved benchmark rounds on an export of merge-base(base_ref, HEAD) vs the working tree.
+    Anything that keeps it from measuring is ``unverified``; only ``rounds < MIN_ROUNDS`` raises."""
     if rounds < MIN_ROUNDS:
         raise ValueError(f"perf check requires at least {MIN_ROUNDS} rounds (got {rounds})")
     ws_root = Path(workspace_root).resolve()
-    if isinstance(command, str) and command.strip():
-        argv: list[str] | None = shlex.split(command, posix=os.name != "nt")
-    elif isinstance(command, Sequence) and command:
-        argv = [str(x) for x in command]
-    else:
-        argv = _load_user_perf_command(ws_root, user_config_path=user_config_path)
+    argv, why_not = _perf_argv(ws_root, user_config_path)
     if not argv:
-        return {"status": "unverified", "reason": "no perf.command configured in user-scope config", "regressed": False, "noisy": False}
+        return _unverified(why_not)
 
     cmd_runner = runner or _default_runner(ws_root)
     # What the branch changed: merge-base(base, HEAD), never the base tip; only resolved oids reach git.
     commit = gitsafe.merge_base(ws_root, base_ref, "HEAD")
     if commit is None:
         why = "and HEAD share no history (a shallow clone needs fetch-depth: 0)" if gitsafe.resolve_commit(ws_root, base_ref) else "does not resolve to a commit"
-        return {"status": "unverified", "reason": f"{base_ref} {why}", "regressed": False, "noisy": False}
+        return _unverified(f"{base_ref} {why}")
     tmp_base = Path(tempfile.mkdtemp(prefix="aegis-perf-base-"))
     try:
         try:  # an export: repository filters off, no worktree registered
             gitsafe.export_tree(ws_root, commit, tmp_base)
         except gitsafe.GitError:
-            return {"status": "unverified", "reason": f"cannot export the merge-base of {base_ref}", "regressed": False, "noisy": False}
+            return _unverified(f"cannot export the merge-base of {base_ref}")
 
         base_samples: list[float] = []
         head_samples: list[float] = []
@@ -133,11 +138,11 @@ def run_perf_check(
             for label, target_cwd in order:
                 sample, err = _invoke_sample(cmd_runner, argv, target_cwd, timeout)
                 if err is not None or sample is None:
-                    return {"status": "unverified", "reason": err or "sample failed", "regressed": False, "noisy": False}
+                    return _unverified(err or "sample failed")
                 (base_samples if label == "base" else head_samples).append(sample)
 
         result = evaluate_paired_samples(base_samples, head_samples, threshold=threshold)
-        result["command"] = argv
+        result.update(command=argv, passed=result["status"] != "fail")
         return result
     finally:
         shutil.rmtree(tmp_base, ignore_errors=True)

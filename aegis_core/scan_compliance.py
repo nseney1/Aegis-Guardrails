@@ -44,6 +44,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path, PurePath
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.storage import append_jsonl, locked, read_jsonl, read_tail_bytes
@@ -76,6 +77,7 @@ GATE_TAIL_BYTES = 4 * 1024 * 1024
 #: How far ahead of the reader's clock a row may be and still count.
 FUTURE_SKEW_SECONDS = 300
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_CANONICAL_TS = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z", re.ASCII)
 
 HEURISTIC = (
     "Each aegis-mcp session (one server process) records the files it scanned. Edits are the "
@@ -109,6 +111,16 @@ def _stamp(moment: datetime) -> str:
 def _parse_ts(value: Any) -> Optional[datetime]:
     if not isinstance(value, str):
         return None
+    # The writers' spelling is read without strptime, whose first call imports _strptime and
+    # builds locale tables on every hook run; anything else (and an impossible date) is left
+    # to strptime, so the same stamps count.
+    found = _CANONICAL_TS.fullmatch(value)
+    if found:
+        year, month, day, hour, minute, second = map(int, found.groups())
+        try:
+            return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        except ValueError:
+            pass
     try:
         return datetime.strptime(value, _TS_FORMAT).replace(tzinfo=timezone.utc)
     except ValueError:

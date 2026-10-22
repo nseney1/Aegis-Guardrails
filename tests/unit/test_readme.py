@@ -298,7 +298,9 @@ def test_the_docs_say_plain_check_enforces_the_reviewed_rules(quick_start, capsy
     _git(quick_start, "branch", "main-base")
     _git(quick_start, "checkout", "-q", "-b", "agent-pr")
     _git(quick_start, "rm", "-q", ".aegis/rules/invariants/no-eval.md")
-    (quick_start / "app.py").write_text("def f(x):\n    return eval(x)\n", encoding="utf-8")
+    # The allow keeps the built-in security pack (aegis check runs it too) out of a test of rule binding.
+    (quick_start / "app.py").write_text("def f(x):\n    return eval(x)  # aegis: allow[sec-py-eval-exec]: not under test\n",
+                                        encoding="utf-8")
     _git(quick_start, "add", "app.py")
     _git(quick_start, "commit", "-q", "-m", "pr")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")

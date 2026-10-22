@@ -32,6 +32,7 @@ MODES = {
     "--write-baseline": ["--write-baseline"],
     "--prune-baseline": ["--prune-baseline"],
     "--ci": ["--ci"],
+    "--calibration": ["--calibration"],
 }
 TS = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
@@ -105,7 +106,7 @@ REFUSED = [
 ]
 
 
-@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline"])
+@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline", "--calibration"])
 @pytest.mark.parametrize("extra, flag", REFUSED)
 def test_a_new_mode_refuses_the_options_it_would_ignore(repo: Path, capsys, mode, extra, flag):
     # FILES first: after --split argparse would read them as part of the mode's own arguments.
@@ -116,21 +117,21 @@ def test_a_new_mode_refuses_the_options_it_would_ignore(repo: Path, capsys, mode
     assert not (repo / ".aegis" / "baseline.json").exists()  # refused before anything was done
 
 
-@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline"])
+@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline", "--calibration"])
 def test_a_new_mode_names_every_refused_option_at_once(repo: Path, capsys, mode):
     rc, _, err = _run(capsys, "src/app.py", "--full", "--strict", *MODES[mode])
     assert rc == 2
     assert f"{mode} does not combine with FILES, --full, --strict" in err
 
 
-@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline"])
+@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline", "--calibration"])
 def test_base_belongs_to_lane_and_a_plain_check_only(repo: Path, capsys, mode):
     rc, _, err = _run(capsys, *MODES[mode], "--base", "main")
     assert rc == 2
     assert f"{mode} does not combine with --base" in err
 
 
-@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline"])
+@pytest.mark.parametrize("mode", ["--partition", "--card", "--write-baseline", "--prune-baseline", "--calibration"])
 @pytest.mark.parametrize("flag, argv", [("--paths", ["--paths", "a/**"]), ("--base-policy", ["--base-policy"])])
 def test_lane_options_stay_with_lane(repo: Path, capsys, mode, flag, argv):
     rc, _, err = _run(capsys, *MODES[mode], *argv)
@@ -238,7 +239,8 @@ def test_help_documents_each_mode(capsys):
     rc, out, _ = _run(capsys, "--help")
     assert rc == 0
     flat = " ".join(out.split())
-    for flag in ("--partition", "--split NAME=GLOB[,GLOB...]", "--card", "--write-baseline", "--prune-baseline"):
+    for flag in ("--partition", "--split NAME=GLOB[,GLOB...]", "--card", "--write-baseline", "--prune-baseline",
+                 "--calibration"):
         assert flag in flat
     assert "self-attested" in flat and "base@" in flat
     assert "baseline: absent at base" in flat

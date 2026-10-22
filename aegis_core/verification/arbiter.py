@@ -231,135 +231,50 @@ def _compute_verdict(
 
 # ── T6: Calibration ───────────────────────────────────────────────────────
 
-
-def _extract_prob_outcome(item: Any) -> tuple[float, Optional[bool], str, str, str, str]:
-    """Return (p, outcome, disposition, scope, observable, pred_id) from Prediction or dict."""
-    if isinstance(item, Prediction):
-        return (
-            float(item.p),
-            item.outcome,
-            str(item.disposition or "logged"),
-            str(item.scope or item.affected_function or item.id),
-            str(item.observable or "fix_touch_in_window"),
-            str(item.id),
-        )
-    if isinstance(item, dict):
-        out = item.get("outcome", item.get("correct"))
-        return (
-            float(item.get("p", item.get("confidence", 0.5))),
-            None if out is None else bool(out),
-            str(item.get("disposition", "logged")),
-            str(item.get("scope") or item.get("target") or item.get("affected_function") or item.get("id") or ""),
-            str(item.get("observable") or item.get("claim_type") or "fix_touch_in_window"),
-            str(item.get("id", "")),
-        )
-    if isinstance(item, (tuple, list)) and len(item) >= 2:
-        return (float(item[0]), bool(item[1]), "logged", "", "fix_touch_in_window", "")
-    return (0.5, None, "logged", "", "fix_touch_in_window", "")
+# Only predictions whose advice did not change the code are scored: a heeded one is a treatment effect.
+_SCORED_DISPOSITIONS = ("landed_unchanged", "overridden")
 
 
-def brier_skill_score(predictions_or_probs: Sequence[Any], outcomes: Optional[Sequence[Any]] = None) -> float:
-    """Compute Brier Skill Score (1 - BS / BS_climatology)."""
-    if outcomes is not None:
-        pairs = [
-            (float(p), 1.0 if bool(y) else 0.0)
-            for p, y in zip(predictions_or_probs, outcomes)
-            if y is not None
-        ]
-    else:
-        pairs = [
-            (p, 1.0 if out else 0.0)
-            for p, out, disp, *_ in map(_extract_prob_outcome, predictions_or_probs)
-            if disp in ("logged", "overridden") and out is not None
-        ]
-    if not pairs:
-        return 0.0
-    n = len(pairs)
-    bs = sum((p - y) ** 2 for p, y in pairs) / n
-    base_rate = sum(y for _, y in pairs) / n
-    bs_clim = base_rate * (1.0 - base_rate)
-    if bs_clim <= 1e-12:
-        return 0.0
-    return 1.0 - (bs / bs_clim)
+def stamp(predictions: Sequence[Prediction], *, tree: str, backend: str, ts: float) -> list[Prediction]:
+    """``predictions`` as one run logs them: the reviewed tree, the backend (a program name), the time,
+    a verdict id per run and an id per prediction, unique per run and index, the same when one run is
+    stamped again."""
+    import dataclasses
+    import hashlib
+
+    verdict_id = hashlib.sha256(f"{tree}:{backend}:{ts}".encode("utf-8")).hexdigest()[:12]
+    return [dataclasses.replace(p, verdict_id=verdict_id, tree=tree, backend=backend, ts=ts,
+                                id=hashlib.sha256(f"{verdict_id}:{i}".encode("utf-8")).hexdigest()[:12])
+            for i, p in enumerate(predictions)]
 
 
-def score_predictions(records: Sequence[Any], outcomes: Optional[dict[str, bool]] = None) -> dict[str, Any]:
-    """Score predictions excluding 'heeded' and deduplicating by (scope, observable)."""
-    n_heeded = 0
-    raw_eligible: list[tuple[float, bool, str, str, Any]] = []
-    for idx, rec in enumerate(records):
-        p, out, disp, scope, obs, pid = _extract_prob_outcome(rec)
-        if out is None and outcomes is not None:
-            if pid and pid in outcomes:
-                out = bool(outcomes[pid])
-            elif scope and scope in outcomes:
-                out = bool(outcomes[scope])
-        if disp == "heeded":
-            n_heeded += 1
-        elif disp in ("logged", "overridden") and out is not None:
-            raw_eligible.append((p, bool(out), scope or f"__anon_{idx}", obs, rec))
-
-    seen_keys: set[tuple[str, str]] = set()
-    deduped: list[tuple[float, bool, str, str, Any]] = []
-    for entry in raw_eligible:
-        dedup_key = (entry[2], entry[3])
-        if dedup_key not in seen_keys:
-            seen_keys.add(dedup_key)
-            deduped.append(entry)
-
-    n_effective = len(deduped)
-    hits = sum(1 for _, out, *_ in deduped if out)
-    precision = (hits / n_effective) if n_effective > 0 else 0.0
-    brier = (
-        sum((p - (1.0 if out else 0.0)) ** 2 for p, out, *_ in deduped) / n_effective
-        if n_effective > 0
-        else None
-    )
-    raw_bss = (
-        brier_skill_score([p for p, *_ in deduped], [out for _, out, *_ in deduped])
-        if n_effective > 0
-        else 0.0
-    )
-    lift_suppressed = bool(n_effective < 100 or precision < 0.05)
-    return {
-        "status": f"insufficient (n={n_effective}/25)" if n_effective < 25 else "ok",
-        "n_total": len(records),
-        "n_heeded_excluded": n_heeded,
-        "n_raw": len(raw_eligible),
-        "n_effective": n_effective,
-        "hits": hits,
-        "k": hits,
-        "precision": precision,
-        "accuracy": precision,
-        "base_rate": precision,
-        "wilson_ci": wilson_ci(hits, n_effective),
-        "brier_score": brier,
-        "brier_skill_score": None if lift_suppressed else raw_bss,
-        "raw_brier_skill_score": raw_bss,
-        "lift_suppressed": lift_suppressed,
-        "scored_predictions": [e[4] for e in deduped],
-    }
-
-
-class CalibrationSummary(dict):
-    def __str__(self) -> str:
-        return str(self.get("summary", super().__str__()))
-
-    def __contains__(self, item: object) -> bool:
-        return super().__contains__(item) or (isinstance(item, str) and item in str(self.get("summary", "")))
-
-
-def calibration_summary(records: Sequence[Any], outcomes: Optional[dict[str, bool]] = None) -> CalibrationSummary:
-    """Build calibration summary with sample-size gates, Wilson 95% CI, and Brier skill score."""
-    s = score_predictions(records, outcomes=outcomes)
-    lo, hi = s["wilson_ci"]
-    bss = s["brier_skill_score"]
-    if bss is not None:
-        bss_str = f"brier_skill_score={bss:.3f}"
-    else:
-        bss_str = "brier_skill_score=suppressed (requires n_effective>=100 and base_rate>=5%)"
-    s["summary"] = (
-        f"status: {s['status']} | n_effective={s['n_effective']} (n_raw={s['n_raw']}, heeded_excluded={s['n_heeded_excluded']}) | "
-        f"precision={s['precision']:.1%} (Wilson 95% CI [{lo:.2f}, {hi:.2f}]) | {bss_str}"
-    )
-    return CalibrationSummary(s)
+def calibration(rows: Sequence[dict]) -> dict[str, dict[str, Any]]:
+    """Calibration per ``backend/kind`` over the rows Aegis resolved (disposition landed_unchanged or
+    overridden, outcome hit or miss; void is never scored), each id once: ``{n, hits, wilson_ci,
+    brier_skill_score (None below n = 100), status}``. Raises ValueError for a row whose p is not a
+    probability."""
+    groups: dict[str, list[tuple[float, bool]]] = {}
+    seen: set = set()
+    for row in rows:
+        if row.get("disposition") not in _SCORED_DISPOSITIONS or row.get("outcome") not in ("hit", "miss"):
+            continue
+        if row.get("id") in seen:
+            continue
+        seen.add(row.get("id"))
+        p = row.get("p")
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
+            raise ValueError(f"prediction {str(row.get('id'))[:12]!r} has p {p!r}, not a probability")
+        observable = row.get("observable")
+        kind = observable.get("kind") if isinstance(observable, dict) else None
+        groups.setdefault(f"{row.get('backend') or 'unknown'}/{kind or 'unknown'}", []).append(
+            (float(p), row["outcome"] == "hit"))
+    out: dict[str, dict[str, Any]] = {}
+    for key, pairs in sorted(groups.items()):
+        n, hits = len(pairs), sum(1 for _, y in pairs if y)
+        bss = None
+        climatology = (hits / n) * (1.0 - hits / n)
+        if n >= 100 and climatology > 1e-12:  # skill against always predicting the base rate
+            bss = 1.0 - (sum((p - (1.0 if y else 0.0)) ** 2 for p, y in pairs) / n) / climatology
+        out[key] = {"n": n, "hits": hits, "wilson_ci": list(wilson_ci(hits, n)), "brier_skill_score": bss,
+                    "status": f"insufficient (n={n}/25)" if n < 25 else "ok"}
+    return out

@@ -12,6 +12,7 @@ from aegis_core.scaffolding import (
     CI_WORKFLOW_PATH,
     DEFAULT_RULE_PRESET,
     RULE_PRESETS,
+    _RUNS_AEGIS_CHECK,
     _declare_type,
     _runs_aegis_check,
     _workflow_files,
@@ -122,3 +123,37 @@ class TestCiWorkflowHelpers:
         assert _runs_aegis_check(wf_file) is True
         assert _runs_aegis_check(other_file) is False
         assert _runs_aegis_check(tmp_path / "missing.yml") is False
+
+
+class TestCiWorkflowSarifUpload:
+    """R-checks-41: the generated workflow uploads the SARIF log only where code scanning can take it,
+    from a job of its own that holds the write permission and runs none of the pull request's code."""
+
+    @staticmethod
+    def _doc():
+        yaml = pytest.importorskip("yaml")
+        return yaml.safe_load(ci_workflow())
+
+    def test_the_gate_is_unchanged_and_only_the_upload_job_may_write_security_events(self):
+        doc = self._doc()
+        gate, sarif = doc["jobs"]["aegis-check"], doc["jobs"]["aegis-sarif"]
+        runs = [step.get("run", "") for step in gate["steps"]]
+        assert runs[-2:] == ["aegis check", "aegis check --ci"] and _RUNS_AEGIS_CHECK.search(ci_workflow())
+        assert "security-events" not in gate["permissions"] and "security-events" not in doc.get("permissions", {})
+        assert sarif["permissions"] == {"contents": "read", "security-events": "write"}
+        (upload,) = [step for step in sarif["steps"] if "upload-sarif" in step.get("uses", "")]
+        assert "head.repo.full_name == github.repository" in upload["if"]
+        assert "!github.event.repository.private" in upload["if"] and "always()" in upload["if"]
+
+    def test_the_sarif_step_cannot_fail_the_run_and_runs_no_ci_check_with_a_token(self):
+        steps = self._doc()["jobs"]["aegis-sarif"]["steps"]
+        runs = [step.get("run", "") for step in steps]
+        sarif = runs.index("aegis check --format sarif > aegis.sarif")
+        assert steps[sarif]["continue-on-error"] is True
+        assert sarif < [i for i, step in enumerate(steps) if "upload-sarif" in step.get("uses", "")][0]
+        assert not [r for r in runs if "--ci" in r] and not [step for step in steps if "env" in step]
+
+    def test_the_rendered_expressions_are_github_expressions(self):
+        text = ci_workflow()
+        assert "${{ always() && hashFiles('aegis.sarif') != ''" in text
+        assert "${ always()" not in text.replace("${{ always()", "")

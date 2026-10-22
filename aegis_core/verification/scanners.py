@@ -14,6 +14,7 @@ import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from aegis_core import gitsafe, pathlookup
+from aegis_core.config import _is_within
 from aegis_core.verification import test_runner
 
 # Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear); above
@@ -54,7 +55,9 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0-9+/=]+|\bsha(?:1|256|384|512)-[A-Za-z0-9+/=]{16,})")
 _HASH_FIELD_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:sha1|sha256|sha384|sha512|md5|integrity|checksum|digest|hash|commit|oid|etag|fingerprint)(?:$|[^a-z0-9])")
 _PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
-_SUPPRESSION_RE = re.compile(r"#\s*(?:noqa|nosec|gitleaks:allow)\b", re.IGNORECASE)
+# Markers that silence a security finding: a noqa list naming an S (bandit) code, counted once per
+# list; nosec; gitleaks:allow. A plain noqa or a style code is not a security suppression.
+_SUPPRESSION_RE = re.compile(r"#[\t ]*(?:noqa:[A-Za-z0-9\t ,]{0,200}?\bS[0-9]+|nosec\b|gitleaks:allow\b)", re.IGNORECASE)
 
 _NB = r"(?<![A-Za-z0-9])"
 _PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
@@ -349,28 +352,85 @@ def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] |
     return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
 
 
-def _count_repo_suppressions(workspace_root: Path | str | None) -> int:
+_ALLOW_RE = re.compile(r"#[\t ]*gitleaks:allow\b", re.IGNORECASE)
+
+
+def _secret_keys(text: str, path: str) -> list[tuple[Finding, tuple[str, str, int]]]:
+    """Tier A findings of ``text`` not on a ``# gitleaks:allow`` line, each with its key: the rule, the
+    unmasked normalized line and that line's occurrence index (in memory only, never shown)."""
+    lines = text.splitlines()  # scan_secrets_text numbers lines this way
+    seen: collections.Counter = collections.Counter()
+    occurrence = []
+    for line in lines:
+        norm = " ".join(line.split())
+        occurrence.append(seen[norm])
+        seen[norm] += 1
+    return [(f, (f.rule_id, " ".join(lines[f.line - 1].split()), occurrence[f.line - 1]))
+            for f in scan_secrets_text(text, path) if not _ALLOW_RE.search(lines[f.line - 1])]
+
+
+def scan_secrets_delta(workspace_root: Path | str, files: Iterable[str], base_sources: Mapping[str, str | None]) -> list[Finding]:
+    """The Tier A findings of ``files`` (relative to ``workspace_root``) that the text ``base_sources``
+    holds for each did not already hold, as a multiset: a touched legacy line does not block, a copied
+    or rotated secret does. A ``# gitleaks:allow`` line is not judged (suppression_count reports it)."""
+    root = Path(workspace_root)
+    out: list[Finding] = []
+    for rel in files:
+        path = root.joinpath(*rel.split("/"))
+        try:
+            raw = b"" if path.is_symlink() or not path.is_file() else path.read_bytes()
+        except OSError:
+            continue
+        if not raw or b"\0" in raw[:4096]:
+            continue
+        head = _secret_keys(raw.decode("utf-8", "replace"), rel)
+        pool = collections.Counter(key for _f, key in _secret_keys(base_sources.get(rel) or "", rel)) if head else {}
+        for finding, key in head:
+            if pool.get(key, 0) > 0:
+                pool[key] -= 1
+            else:
+                out.append(finding)
+    return out
+
+
+def _count_repo_suppressions(root: Path, files: Iterable[str]) -> int:
     count = 0
-    if workspace_root is None:
-        return count
-    root = Path(workspace_root).resolve()
-    ignore_file = root / ".gitleaksignore"
-    if ignore_file.is_file():
+    for rel in files:
+        path = root.joinpath(*rel.split("/"))
         try:
-            lines = ignore_file.read_text(encoding="utf-8", errors="replace").splitlines()
-            count += sum(1 for ln in lines if ln.strip() and not ln.lstrip().startswith("#"))
-        except OSError:
-            pass
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or any(k.startswith(".") or k in ("__pycache__", "node_modules") for k in p.relative_to(root).parts):
-            continue
-        try:
-            data = p.read_bytes()
-            if b"\0" not in data[:4096]:
-                count += len(_SUPPRESSION_RE.findall(data.decode("utf-8", "replace")))
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 << 20:
+                continue
+            data = path.read_bytes()
         except OSError:
             continue
+        if b"\0" in data[:4096]:
+            continue
+        text = data.decode("utf-8", "replace")
+        if rel == ".gitleaksignore":
+            count += sum(1 for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
+        else:
+            count += len(_SUPPRESSION_RE.findall(text))
     return count
+
+
+def suppression_count(root: Path | str, merge_base: str | None) -> dict[str, Any]:
+    """In-repository security suppressions (markers and ``.gitleaksignore`` entries) over the files git
+    tracks under ``root``, files over 1 MiB and binaries skipped: ``{"count", "delta"}``, the delta
+    against the export of ``merge_base`` (None when it cannot be exported). A signal; it never blocks."""
+    import tempfile
+
+    root = Path(root).resolve()
+    head = _count_repo_suppressions(root, gitsafe.list_files(root, untracked=False) or [])
+    with tempfile.TemporaryDirectory(prefix="aegis-supp-base-") as tmp:
+        export = Path(tmp) / "base"
+        try:
+            prefix = gitsafe.show_prefix(root)
+            gitsafe.export_tree(root, merge_base or "", export)
+        except gitsafe.GitError:
+            return {"count": head, "delta": None}
+        base_root = export.joinpath(*prefix.strip("/").split("/")) if prefix else export
+        files = [p.relative_to(base_root).as_posix() for p in base_root.rglob("*")] if base_root.is_dir() else []
+        return {"count": head, "delta": head - _count_repo_suppressions(base_root, files)}
 
 
 def _sarif_artifact(uri: str, root: Path | None) -> tuple[str, Path | None]:
@@ -418,11 +478,9 @@ def ingest_sarif(
     doc: Mapping[str, Any],
     *,
     workspace_root: Path | str | None = None,
-    base_fingerprints: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Ingest a parsed SARIF 2.1.0 document: fingerprints, base subtraction, suppressions. Scanner
-    output is untrusted: a document that is not understood is ``unverified``, never raised."""
-    base_fps: set[str] = set(base_fingerprints or ())
+    """Ingest a parsed SARIF 2.1.0 document: findings, fingerprints, suppressions. Scanner output is
+    untrusted: a document that is not understood is ``unverified``, never raised."""
     root_path = Path(workspace_root).resolve() if workspace_root else None
     all_findings: list[Finding] = []
     sarif_supps = 0
@@ -458,80 +516,65 @@ def ingest_sarif(
                                             "error" if level == "error" else "warning", _mask_tier_a(msg)))
     except _SarifError as exc:
         return _sarif_unverified(f"SARIF is malformed: {exc}")
-    delta = [f for f in all_findings if f.fingerprint not in base_fps]
     return {
-        "status": "fail" if delta else "pass",
-        "findings": delta,
+        "status": "fail" if all_findings else "pass",
+        "findings": all_findings,
         "total_raw": len(all_findings),
-        "delta_count": len(delta),
-        "base_subtracted": len(all_findings) - len(delta),
-        "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root),
+        "suppression_count": sarif_supps,
     }
-
-
-def _is_within_dir(path: Path, directory: Path) -> bool:
-    real_p, real_d = os.path.realpath(path), os.path.realpath(directory)
-    return real_p == real_d or real_p.startswith(real_d.rstrip(os.sep) + os.sep)
 
 
 class UntrustedScannerConfig(ValueError):
     """A preset would read a scanner config the repository controls."""
 
 
-def build_preset_argv(
-    preset: str,
-    target_path: Path | str = ".",
-    *,
-    user_config_dir: Path | str | None = None,
-) -> list[str]:
-    target = Path(target_path).resolve()
-    if preset == "ruff":
-        return ["ruff", "check", "--isolated", "--select", "S", "--ignore", "S603,S607", "--output-format", "sarif", str(target)]
+#: The presets ``check --ci`` runs for the user-scope ``scanners`` key; the target directory goes last.
+PRESET_ARGV: dict[str, tuple[str, ...]] = {
+    "ruff": ("ruff", "check", "--isolated", "--select", "S", "--ignore", "S603,S607", "--output-format", "sarif"),
+    "gitleaks": ("gitleaks", "detect", "--no-git", "--redact", "--report-format", "sarif", "--report-path", "-",
+                 "--source"),
+}
+
+
+def _preset_argv(preset: str, target: Path) -> list[str]:
+    argv = [*PRESET_ARGV[preset], str(target)]
     if preset == "gitleaks":
         from aegis_core.workspace.layout import UserLayout
-        argv = ["gitleaks", "detect", "--no-git", "--redact", "--report-format", "sarif", "--report-path", "-", "--source", str(target)]
+
         ul = UserLayout.current()
-        user_dir = Path(user_config_dir).resolve() if user_config_dir else (ul.aegis_dir.resolve() if ul else None)
-        if user_dir is not None and not _is_within_dir(user_dir, target):
+        user_dir = ul.aegis_dir.resolve() if ul else None
+        if user_dir is not None and not _is_within(user_dir, target):
             cand = (user_dir / "gitleaks.toml").resolve()
-            if _is_within_dir(cand, user_dir) and not _is_within_dir(cand, target) and cand.is_file():
+            if _is_within(cand, user_dir) and not _is_within(cand, target) and cand.is_file():
                 argv.extend(["--config", str(cand)])
         # Without --config gitleaks reads <source>/.gitleaks.toml: a repository allowlist would
         # silence the scan. lexists, so a dangling link or a case-folded name counts too.
         if "--config" not in argv and os.path.lexists(target / ".gitleaks.toml"):
             raise UntrustedScannerConfig("the repository has its own .gitleaks.toml; set ~/.aegis/gitleaks.toml to scan it")
-        return argv
-    raise ValueError(f"Unsupported scanner preset: {preset!r}")
+    return argv
 
 
-def _run_found_program(argv: Sequence[str], cwd: Path | str, env: Mapping[str, str] | None = None, timeout: int | float = 60) -> dict[str, Any]:
-    """``run_external_cmd`` on the ``argv[0]`` found in an absolute PATH entry outside ``cwd``: the
-    scanner runs with the repository as its cwd, where an empty or relative entry would find a
-    program the repository planted, and its silence would read as a clean scan."""
-    exe = pathlookup.which(str(argv[0]), outside=cwd)
+def _run_found_program(argv: Sequence[str], cwd: Path | str, env: Mapping[str, str] | None = None, timeout: int | float = 60,
+                       outside: Path | str | None = None) -> dict[str, Any]:
+    """``run_external_cmd`` on the ``argv[0]`` found in an absolute PATH entry outside ``outside`` (the
+    workspace; default ``cwd``): an empty or relative entry would find a program the repository
+    planted, and its silence would read as a clean scan."""
+    exe = pathlookup.which(str(argv[0]), outside=outside or cwd)
     if exe is None:
         return {"returncode": 127, "stdout": "", "stderr": f"{argv[0]} not found in an absolute PATH entry outside the workspace",
                 "missing_binary": True, "timed_out": False, "duration_s": 0.0}
     return test_runner.run_external_cmd([exe, *argv[1:]], cwd=cwd, env=env, timeout=timeout)
 
 
-def run_preset_scanner(
-    preset: str,
-    workspace_root: Path | str,
-    *,
-    user_config_dir: Path | str | None = None,
-    base_fingerprints: Iterable[str] | None = None,
-    timeout: int = 60,
-    runner: Callable[..., dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def _scan_once(preset: str, target: Path, runner: Callable[..., dict[str, Any]], timeout: int) -> dict[str, Any]:
+    """One preset run over ``target``: ingest_sarif's report, or ``unverified``."""
     try:
-        argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir)
+        argv = _preset_argv(preset, target)
     except UntrustedScannerConfig as exc:
-        return {"status": "unverified", "reason": str(exc), "findings": [], "argv": []}
-    res = (runner or _run_found_program)(argv, cwd=Path(workspace_root), timeout=timeout)
+        return _sarif_unverified(str(exc))
+    res = runner(argv, cwd=target, timeout=timeout)
     if res.get("missing_binary") or res.get("timed_out"):
-        reason = res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found")
-        return {"status": "unverified", "reason": reason, "findings": [], "argv": argv}
+        return _sarif_unverified(res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found"))
     # pass needs positive evidence: a SARIF run on stdout and an exit code its findings explain.
     stdout, stderr = str(res.get("stdout") or "").strip(), str(res.get("stderr") or "").strip()
     try:
@@ -541,10 +584,79 @@ def run_preset_scanner(
     runs = doc.get("runs") if isinstance(doc, dict) else None
     if not (isinstance(runs, list) and runs and all(isinstance(run, dict) for run in runs)):
         why = "produced no SARIF output" if not stdout else "printed output that is not a SARIF run"
-        return {**_sarif_unverified(stderr or f"{argv[0]} {why}"), "argv": argv}
-    report = ingest_sarif(doc, workspace_root=workspace_root, base_fingerprints=base_fingerprints or ())
+        return _sarif_unverified(stderr or f"{argv[0]} {why}")
+    report = ingest_sarif(doc, workspace_root=target)
     rc = res.get("returncode")
-    if report["status"] == "pass" and not (rc == 0 or (rc == 1 and report["total_raw"] > 0)):
-        return {**_sarif_unverified(stderr or f"{argv[0]} exited {rc} without findings to explain it"), "argv": argv}
-    return {**report, "argv": argv}
+    # Judged on the raw findings: a crash after reporting what the base also holds is not a clean scan.
+    report["unexplained"] = "" if rc == 0 or (rc == 1 and report["total_raw"] > 0) else \
+        stderr or f"{argv[0]} exited {rc} without findings to explain it"
+    if report["status"] == "pass" and report["unexplained"]:
+        return _sarif_unverified(report["unexplained"])
+    return report
 
+
+def _line_keys(findings: Sequence[Finding], root: Path) -> list[str]:
+    """One key per finding: baseline's fingerprint over the unmasked, normalized line it names and that
+    line's occurrence index, so a rotated secret under the same mask is new and a moved line is not.
+    The keys stay in memory; only masked snippets are ever shown."""
+    from aegis_core import baseline  # lazily: baseline reaches this package through runner
+
+    keys, texts = [], {}  # type: list[str], dict[str, list[str]]
+    for f in findings:
+        if f.path not in texts:
+            real = Path(os.path.realpath(root / f.path))
+            try:
+                readable = bool(f.path) and _is_within(real, root) and real.is_file() and real.stat().st_size <= 1 << 20
+                texts[f.path] = baseline.split_lines(real.read_bytes().decode("utf-8", "replace")) if readable else []
+            except OSError:
+                texts[f.path] = []
+        lines = texts[f.path]
+        text = lines[f.line - 1] if 1 <= f.line <= len(lines) else f.snippet
+        keys.append(baseline.fingerprint(f.rule_id, f.path, baseline.normalize_text(text), baseline.occurrence_index(lines, f.line)))
+    return keys
+
+
+def run_preset(
+    name: str,
+    root: Path | str,
+    merge_base: str | None,
+    *,
+    timeout: int = 60,
+    runner: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run preset ``name`` on the work tree at ``root`` and, when that finds anything, on an export of
+    ``merge_base``: ``fail`` only for findings the base does not hold (a multiset), ``unverified`` when
+    either scan cannot be completed or understood. Never raises for scanner output."""
+    import tempfile
+
+    if name not in PRESET_ARGV:
+        raise ValueError(f"Unsupported scanner preset: {name!r}")
+    head_root = Path(root).resolve()
+    run = runner or (lambda argv, cwd, timeout: _run_found_program(argv, cwd, timeout=timeout, outside=head_root))
+    head = _scan_once(name, head_root, run, timeout)
+    result: dict[str, Any] = {"name": name, "status": head["status"], "findings": [], "subtracted": 0}
+    if head["status"] == "unverified":
+        return {**result, "reason": head["reason"]}
+    if not head["findings"]:
+        return result
+    with tempfile.TemporaryDirectory(prefix="aegis-scan-base-") as tmp:
+        export = Path(tmp).resolve() / "base"
+        try:
+            prefix = gitsafe.show_prefix(head_root)  # the export holds the whole repository
+            gitsafe.export_tree(head_root, merge_base or "", export)
+        except gitsafe.GitError:
+            return {**result, "status": "unverified", "reason": "the merge base cannot be exported"}
+        base_root = export.joinpath(*prefix.strip("/").split("/")) if prefix else export
+        base = _scan_once(name, base_root, run, timeout) if base_root.is_dir() else {"status": "pass", "findings": []}
+        if base["status"] == "unverified":
+            return {**result, "status": "unverified", "reason": f"the merge-base scan: {base['reason']}"}
+        pool = collections.Counter(_line_keys(base["findings"], base_root))
+    new = []
+    for finding, key in zip(head["findings"], _line_keys(head["findings"], head_root)):
+        if pool[key] > 0:
+            pool[key] -= 1
+        else:
+            new.append(finding)
+    if not new and head["unexplained"]:
+        return {**result, "status": "unverified", "reason": head["unexplained"]}
+    return {**result, "status": "fail" if new else "pass", "findings": new, "subtracted": len(head["findings"]) - len(new)}

@@ -12,6 +12,7 @@ import textwrap
 from typing import Optional
 
 from . import (
+    OBSERVABLE_KINDS,
     RiskCategory,
     Severity,
     Prediction,
@@ -107,6 +108,8 @@ def build_spec_prompt(
         ## Required Output Schema
         Return a JSON array matching this schema. Each object MUST have these keys:
         category, severity, risk, mechanism, affected_function
+        Also give "p", your probability (0 to 1) that the observable happens within 14 days of the change
+        landing, and "observable": {{"kind": one of {', '.join(OBSERVABLE_KINDS)}, "selector": the file or test}}.
 
         ```json
         {schema_json}
@@ -203,6 +206,7 @@ def parse_predictions(raw: list[dict]) -> tuple[list[Prediction], int]:
             dropped += 1
             continue
 
+        p, observable = entry.get("p"), entry.get("observable")
         predictions.append(
             Prediction(
                 category=category,
@@ -210,6 +214,10 @@ def parse_predictions(raw: list[dict]) -> tuple[list[Prediction], int]:
                 risk=entry.get("risk", ""),
                 mechanism=entry.get("mechanism", ""),
                 affected_function=entry.get("affected_function", ""),
+                # An unknown kind is kept as given and resolves to void; the scope path is Aegis's to set.
+                observable={k: observable[k] for k in ("kind", "selector") if isinstance(observable.get(k), str)}
+                if isinstance(observable, dict) else {},
+                p=float(p) if isinstance(p, (int, float)) and not isinstance(p, bool) and 0 <= p <= 1 else 0.5,
             )
         )
     return predictions, dropped

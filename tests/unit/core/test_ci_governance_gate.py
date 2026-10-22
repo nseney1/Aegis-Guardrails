@@ -362,7 +362,8 @@ def test_the_text_annotations_and_sarif_agree_with_the_exit_code(tmp_path, capsy
     assert any("file=allowed_signers" in e for e in errors) and "PASSED" not in out
     rc, out, _err = run_ci(repo, capsys, "--format", "sarif")
     results = json.loads(out)["runs"][0]["results"]
-    assert rc == 1 and sorted(r["ruleId"] for r in results) == ["governance:signers", "governance:workflows"]
+    # Governance findings carry no line, so they stay out of SARIF (R-checks-36) and reach the annotations above.
+    assert rc == 1 and results == []
     approve(repo, keys["human"])
     rc, out, _err = run_ci(repo, capsys, "--format", "github")
     notices = [line for line in out.splitlines() if line.startswith("::notice")]

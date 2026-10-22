@@ -369,7 +369,7 @@ def _stamp(moment: Optional[datetime]) -> str:
     return (moment or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _layer1(snapshot: Path, changed: Sequence[str]) -> Dict[str, int]:
+def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, int]:
     from aegis_core import baseline
 
     targets = baseline.checkable(snapshot, [p for p in changed if (snapshot / p).is_file()])
@@ -377,7 +377,8 @@ def _layer1(snapshot: Path, changed: Sequence[str]) -> Dict[str, int]:
         return {"findings": 0, "files": 0}
     # The snapshot is a plain directory: git would answer for whatever repository encloses the temp dir,
     # so the snapshot's own rules are enforced (CI's check --ci guards their weakening).
-    pairs, _sources = baseline.run_fast(snapshot, targets, reviewed=False)
+    # git_root and base give the export its history, so the T7 delta judges it as aegis check does.
+    pairs, _sources = baseline.run_fast(snapshot, targets, reviewed=False, git_root=os.fspath(git_root), diff_base=base)
     return {"findings": sum(1 for _path, evidence in pairs if not evidence.verdict), "files": len(targets)}
 
 
@@ -411,7 +412,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
             entries = bound.diff_entries(base_commit)
             changed = [path for status, path in entries if status != "D"]
             protected = governance.touches_governance(changed, [path for status, path in entries if status == "D"])
-            layer1, run, logical = _snapshot_check(workspace, bound.export, changed, tests, timeout)
+            layer1, run, logical = _snapshot_check(workspace, bound.export, changed, tests, timeout, top, base_commit)
     except treeid.TreeError as exc:
         return CheckOutcome("error", None, str(exc))
     except gitsafe.GitError as exc:
@@ -450,15 +451,15 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
     return CheckOutcome("recorded", row, "", binding, hint)
 
 
-def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tests: bool,
-                    timeout: Optional[float]) -> Tuple[Dict[str, int], Optional[TestsRun], List[str]]:
+def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tests: bool, timeout: Optional[float],
+                    top: Path, base_commit: str) -> Tuple[Dict[str, int], Optional[TestsRun], List[str]]:
     """Export a tree with ``export_fn`` and run Layer 1 and, with ``tests``, the user's test command
     on it: the one recipe ``record`` and the trailer rerun share, so CI falsifies the same check."""
     scratch = Path(tempfile.mkdtemp(prefix="aegis-check-"))
     try:
         snapshot = scratch / "snapshot"
         export_fn(snapshot)
-        layer1 = _layer1(snapshot, changed)
+        layer1 = _layer1(snapshot, changed, top, base_commit)
         run: Optional[TestsRun] = None
         logical = list(DEFAULT_COMMAND)
         if tests:
@@ -495,7 +496,7 @@ def rerun_commit_snapshot(
             return {"tree": "", "inconclusive": True, "reason": f"found no merge-base with {commit[:12]}"}
         changed = [p for s, _o, _n, p in gitsafe.diff_entries(top, base_commit, commit) if s != "D"]
         layer1, run, _logical = _snapshot_check(
-            workspace, lambda dest: gitsafe.export_tree(top, commit, dest), changed, True, timeout)
+            workspace, lambda dest: gitsafe.export_tree(top, commit, dest), changed, True, timeout, top, base_commit)
     except gitsafe.GitError as exc:
         return {"tree": "", "inconclusive": True, "reason": f"git could not answer: {exc}"}
     if run is not None and run.timed_out:

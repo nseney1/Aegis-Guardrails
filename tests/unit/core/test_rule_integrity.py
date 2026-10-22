@@ -786,7 +786,7 @@ def test_unrelated_histories_fail_instead_of_passing(tmp_path, capsys):
 
 
 @needs_git
-@pytest.mark.parametrize("flag", [["--format", "github"], ["--head", "HEAD"]])
+@pytest.mark.parametrize("flag", [["--lane", "x", "--format", "github"], ["--head", "HEAD"]])
 def test_ci_only_options_are_refused_elsewhere(tmp_path, capsys, flag):
     repo = make_repo(tmp_path)
     os.chdir(repo.root)
