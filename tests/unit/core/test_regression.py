@@ -79,6 +79,17 @@ def make_repo(tmp_path: Path, signer_pub: str | None = None) -> hg.Repo:
         ("docs/architecture.rst", False, False, True, False),
         ("CHANGELOG.md", False, False, True, False),
         ("LICENSE", False, False, True, False),
+        ("CHANGES", False, False, True, False),
+        ("doc/guide.md", False, False, True, False),
+        ("NOTICE.txt", False, False, True, False),
+        ("SECURITY.md", False, False, True, False),
+        ("web/templates/index.html", False, False, True, False),
+        ("src/security.py", True, False, False, False),
+        ("app/history.py", True, False, False, False),
+        ("pkg/changes.py", True, False, False, False),
+        ("src/license.py", True, False, False, False),
+        ("lib/notice.go", True, False, False, False),
+        ("src/doc/parser.py", True, False, False, False),
         ("pyproject.toml", False, False, False, True),
         (".github/workflows/ci.yml", False, False, False, True),
         (".aegis/config.json", False, False, False, True),
@@ -136,6 +147,19 @@ def test_is_fix_commit_requires_both_fix_signal_and_source_file():
     assert is_fix_commit("fix(ci): pipeline", ["#12"], ["src/app.py"]) is False
     assert is_fix_commit("fix: docs only", ["#12"], ["README.md", "pyproject.toml"]) is False
     assert is_fix_commit("feat: new feature", [], ["src/app.py"]) is False
+
+
+@needs_git
+def test_a_fix_to_a_module_named_like_a_document_is_judged(tmp_path: Path):
+    """R-evidence-25: Given a fix commit touching only src/security.py, When regressions are checked,
+    Then it is a fix commit failing with no_test_changes (it used to be read as documentation)."""
+    repo = make_repo(tmp_path)
+    repo.write("src/security.py", "def harden() -> bool:\n    return True\n")
+    oid = repo.commit("fix: harden security module")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.commit, c.status, c.reason) for c in report.commits] == [(oid, "failed", "no_test_changes")]
+    assert report.commits[0].source_files == ("src/security.py",)
 
 
 # ── Fail-to-pass failure modes ───────────────────────────────────────────────

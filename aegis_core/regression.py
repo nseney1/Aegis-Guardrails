@@ -50,6 +50,7 @@ _GIT_TIMEOUT_S = 60.0
 EXEMPT_SCOPES = frozenset({"ci", "build", "docs", "deps", "release", "chore", "tests", "test", "doc"})
 _DOC_DIRS = frozenset({"docs", "doc"})
 _DOC_EXTENSIONS = frozenset({".md", ".rst", ".txt", ".adoc", ".html", ".pdf", ".png", ".svg", ".jpg", ".jpeg", ".gif"})
+_DOC_TEXT_EXTENSIONS = frozenset({"", ".md", ".rst", ".txt", ".adoc"})
 _DOC_BASENAMES = frozenset({
     "readme", "changelog", "changes", "history", "license", "copying",
     "authors", "contributors", "code_of_conduct", "security", "notice", "patents",
@@ -97,7 +98,10 @@ def is_doc_file(path: str) -> bool:
     if not parts:
         return False
     stem, ext = posixpath.splitext(parts[-1])
-    return any(p in _DOC_DIRS for p in parts[:-1]) or stem in _DOC_BASENAMES or parts[-1] in _DOC_BASENAMES or ext in _DOC_EXTENSIONS
+    # A document name only counts with a text extension (src/security.py is code), and only a
+    # top-level docs/ or doc/ directory holds documentation (src/doc/parser.py is code).
+    return ((len(parts) > 1 and parts[0] in _DOC_DIRS) or (stem in _DOC_BASENAMES and ext in _DOC_TEXT_EXTENSIONS)
+            or ext in _DOC_EXTENSIONS)
 
 
 def is_config_file(path: str) -> bool:
