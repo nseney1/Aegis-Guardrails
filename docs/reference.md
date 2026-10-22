@@ -409,9 +409,8 @@ Cluster and review insights or record a decision
 | `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise`, `confirm` |  | Record a review decision: for the cluster --cluster names (reject also needs --reason), or confirm the suggestions --insight names |
 | `--cluster` | `CLUSTER_ID` |  | Cluster ID for --decision (as review lists it) |
 | `--insight` | `ID` |  | Unconfirmed suggestion ID for --decision confirm (repeatable) |
-| `--kind` | `KIND` |  | Insight kind recorded with --decision confirm |
+| `--kind` | `KIND` |  | Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the cluster's insights share) |
 | `--proposal-id` | `PROPOSAL_ID` |  | Proposal ID when --decision propose |
-| `--category` | `CATEGORY` |  | Proposal category when --decision propose (default: the one kind the cluster's human insights share, else correctness) |
 | `--summary` | `SUMMARY` |  | Closed-template summary bullet when --decision propose |
 | `--rule` | `RULE_ID` |  | Target rule ID for merge-into-rule or recurrence check |
 | `--reason` | `REASON` |  | Reason for the decision (required with reject) |
