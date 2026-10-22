@@ -422,6 +422,34 @@ def test_an_unknown_insight_to_confirm_writes_nothing_and_lists_the_valid_ids(re
     assert [cap["id"]] in [c["insight_ids"] for c in json.loads(out)["clusters"]]
 
 
+@pytest.mark.parametrize("extra,error", [
+    (["--proposal-id", "Bad ID!"], "invalid proposal_id"),
+    (["--summary", "Never call subprocess.Popen without a timeout in src/main.py"], "verbatim"),
+], ids=["bad-proposal-id", "verbatim-summary"])
+def test_a_proposal_that_cannot_be_written_records_no_decision_and_keeps_the_cluster(review_ws, extra, error):
+    """Review F2: Given a cluster, When --decision propose fails to write its proposal (an invalid id, or
+    a summary quoting a human prompt), Then it exits 1, writes no decision row and no proposal, and the
+    next review still lists the cluster; a corrected propose then records the decision and hides it."""
+    ws, home, cluster = review_ws
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--cluster", cluster["cluster_id"],
+                                 *extra, "--json")
+    assert rc == 1 and error in json.loads(out)["error"]
+    assert _decision_rows(ws, home) == []
+    assert list((ws / ".aegis").glob("proposals/*")) == []
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert rc == 0, err
+    after = json.loads(out)
+    assert [c["insight_ids"] for c in after["clusters"]] == [cluster["insight_ids"]]
+    assert after["suppressed_clusters"] == []
+
+    rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--cluster", cluster["cluster_id"],
+                                 "--proposal-id", "trap-popen-timeout", "--summary", "Require timeouts on child processes.")
+    assert rc == 0, err
+    assert [r["decision"] for r in _decision_rows(ws, home)] == ["propose"]
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert json.loads(out)["clusters"] == []
+
+
 def test_a_reject_stores_its_reason_and_the_proposal_category_defaults_to_the_shared_kind(review_ws):
     ws, home, cluster = review_ws
     rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--cluster", cluster["cluster_id"],

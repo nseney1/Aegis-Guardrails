@@ -856,19 +856,23 @@ def _run_insight(args: argparse.Namespace) -> int:
         if decision:
             ins_ids = confirm_ids if decision == "confirm" else target["insight_ids"]
             try:
-                dec_row = record_decision(
-                    root, cluster_id=cid or "", decision=decision, insight_ids=ins_ids, kind=getattr(args, "kind", None),
-                    reason=getattr(args, "reason", None), rule_id=getattr(args, "rule_id", None),
-                )
+                proposal_path = None
+                # A propose row hides the cluster, so it is written only once the proposal exists.
                 if decision == "propose":
                     prop_id = getattr(args, "proposal_id", None) or f"trap-{cid.replace('cluster-', '')}"
                     summary = getattr(args, "summary", None) or f"Address recurring correction cluster {cid}."
                     kinds = target.get("kinds") or []
-                    dec_row["proposal_path"] = str(write_proposal(
+                    proposal_path = str(write_proposal(
                         root, proposal_id=prop_id, target_paths=target.get("paths") or ["**"],
                         category=getattr(args, "category", None) or (kinds[0] if len(kinds) == 1 else "correctness"),
                         summary_bullets=[summary], insight_ids=ins_ids,
                     ))
+                dec_row = record_decision(
+                    root, cluster_id=cid or "", decision=decision, insight_ids=ins_ids, kind=getattr(args, "kind", None),
+                    reason=getattr(args, "reason", None), rule_id=getattr(args, "rule_id", None),
+                )
+                if proposal_path is not None:
+                    dec_row["proposal_path"] = proposal_path
             except Exception as exc:
                 return _emit_error(args, str(exc))
             print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {cid or ', '.join(ins_ids)}")
