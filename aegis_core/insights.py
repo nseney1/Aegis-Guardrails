@@ -484,6 +484,23 @@ def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
     return found
 
 
+def _superseded(rows: Sequence[Mapping[str, Any]]) -> Set[int]:
+    """The ``id()`` of every cli row that a later H row with the same text, paths and kind
+    restates: the documented H recipe re-runs ``insight add`` with ``--commit``, and one
+    correction must not count twice."""
+    signed: Set[Tuple[str, Tuple[str, ...], str]] = set()
+    found: Set[int] = set()
+    for r in reversed(rows):
+        if r.get("event") != "insight" or _row_source(r) != "cli":
+            continue
+        key = (str(r.get("text") or ""), tuple(sorted(str(p) for p in r.get("paths") or [])), str(r.get("kind") or ""))
+        if r.get("level") == "H":
+            signed.add(key)
+        elif key in signed:
+            found.add(id(r))
+    return found
+
+
 def _corroborating_hook(rows: Iterable[Mapping[str, Any]], host: str, ts: Any, quote: str) -> Optional[str]:
     """The id of a hook prompt of ``host`` within JOIN_WINDOW_S of ``ts`` that contains ``quote``."""
     needle, when = quote.strip().lower(), _parse_ts(ts)
@@ -1018,9 +1035,10 @@ def review_insights(
     corroborated: Dict[str, List[str]] = {}
     levels: Dict[int, Tuple[str, Optional[str]]] = {}
     confirmed_ids = set(confirmed)
+    superseded = _superseded(all_rows)
     for idx, row in enumerate(all_rows):
         ins_id = str(row.get("id") or f"row-{idx}")
-        if row.get("event") != "insight" or ins_id in noise_ids:
+        if row.get("event") != "insight" or ins_id in noise_ids or id(row) in superseded:
             continue
         level = _effective_level(row, confirmed_ids)
         if _row_source(row) == "mcp":
@@ -1162,7 +1180,8 @@ def write_proposal(
                         or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
             raise ValueError("proposal may not contain verbatim H/cli/W2 prompt text")
     ids = list(dict.fromkeys(str(i).strip() for i in insight_ids if str(i).strip()))
-    counted = {str(r.get("id")): r for r in rows if levels.get(id(r)) in COUNTABLE_LEVELS}
+    superseded = _superseded(rows)
+    counted = {str(r.get("id")): r for r in rows if levels.get(id(r)) in COUNTABLE_LEVELS and id(r) not in superseded}
     missing = [i for i in ids if i not in counted]
     if not ids or missing:
         raise ValueError(f"not a counted insight: {', '.join(missing) or 'none given'}")
@@ -1241,6 +1260,7 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
     # The window opens at the first row that names the rule's current rev (its first inventory
     # row); the baseline is the same measurement over the sessions before it.
     window_open = not reset_on_rev_change
+    superseded = _superseded(rows)
     alive: Set[str] = set()
     before: Set[str] = set()
     unidentified_heartbeats = 0
@@ -1261,7 +1281,7 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
                 (alive if window_open else before).add(hs_val)
             elif window_open:
                 unidentified_heartbeats += 1
-        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS
+        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS and id(row) not in superseded
               and _paths_overlap_rule(row.get("paths") or [], rule)):
             itoks = _tokenize(str(row.get("text") or ""))
             if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
