@@ -3,18 +3,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 from aegis_cli import sanitize_display
 
 __all__ = [
-    "format_github_annotations",
+    "ci_findings",
     "format_github_step_summary",
     "format_layer1_json_payload",
     "format_layer2_json",
     "format_layer2_summary",
     "format_sarif_report",
+    "github_annotation_lines",
+    "governance_note",
+    "layer1_findings",
+    "perf_line",
 ]
 
 _MODEL_TEXT_MAX = 300
@@ -112,102 +117,156 @@ def format_layer1_json_payload(
     }
 
 
-def _rel_uri(raw_path: str, workspace_root: Optional[str | Path] = None) -> str:
-    if not raw_path:
-        return ""
-    norm = str(raw_path).replace("\\", "/")
-    if workspace_root is not None:
-        for r in (str(Path(workspace_root).resolve()), str(workspace_root)):
-            prefix = r.replace("\\", "/").rstrip("/") + "/"
-            if prefix != "/" and norm.startswith(prefix):
-                norm = norm[len(prefix):]
-                break
-    while norm.startswith("./"):
-        norm = norm[2:]
-    return norm.lstrip("/")
-
-
-def _normalize_findings(
-    report_dict: dict[str, Any],
-    workspace_root: Optional[str | Path] = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split report_dict entries into (anchored_findings, lineless_findings)."""
-    raw_items: list[dict[str, Any]] = [i for i in report_dict.get("findings", []) if isinstance(i, dict)]
-    for w in report_dict.get("weakenings", []):
-        if isinstance(w, dict):
-            raw_items.append({"rule": w.get("rule") or w.get("code") or "rule-weakening", "path": w.get("path", ""),
-                              "line": w.get("line", 1 if w.get("path") else 0), "col": w.get("col", 1),
-                              "message": f"{w.get('code', '')}: {w.get('message', '')}".strip(": "), "level": "error"})
-    gov = report_dict.get("governance")
-    if isinstance(gov, dict) and gov.get("enforced") and not gov.get("approved"):
-        for entry in gov.get("paths", []):
-            if isinstance(entry, dict):
-                path = str(entry.get("path") or "")
-                raw_items.append({"rule": f"governance:{entry.get('category', '')}", "path": path,
-                                  "line": 1 if path else 0, "col": 1, "level": "error",
-                                  "message": f"governance change without approval: {path}"})
-    reg = report_dict.get("regression")
-    if isinstance(reg, dict):
-        reg_level = "error" if reg.get("tier") == "gate" else "warning"
-        for rf in reg.get("findings", []):
-            if isinstance(rf, dict):
-                raw_items.append({"rule": rf.get("code", "regression"), "path": rf.get("path", ""),
-                                  "line": rf.get("line", 1 if rf.get("path") else 0), "col": rf.get("col", 1),
-                                  "message": rf.get("message", ""), "level": reg_level})
-    for t_chk in report_dict.get("trailer_checks", []):
-        if isinstance(t_chk, dict) and t_chk.get("failed"):
-            raw_items.append({"rule": "trailer-divergence", "path": "", "line": 0, "level": "error",
-                              "message": f"{str(t_chk.get('commit', ''))[:10]}: {t_chk.get('reason', '')}"})
-    for scan in report_dict.get("scanners", []):
-        for sf in scan.get("findings", []):
-            raw_items.append({"rule": f"scanner/{scan['name']}:{sf.get('rule_id', '')}", "path": sf.get("path", ""),
-                              "line": sf.get("line", 0), "message": sf.get("message", ""), "level": "error"})
-        if scan.get("status") == "unverified":
-            raw_items.append({"rule": f"scanner/{scan['name']}", "path": "", "line": 0, "level": "warning",
-                              "message": f"UNVERIFIED: {scan.get('reason', '')}"})
-    for l1 in report_dict.get("layer1", []):
-        if isinstance(l1, dict) and not l1.get("verdict", True):
-            lines = l1.get("lines") or []
-            raw_items.append({"rule": l1.get("tool", "layer1"), "path": l1.get("target", ""),
-                              "line": l1.get("line", lines[0] if lines else 0), "col": 1,
-                              "message": l1.get("detail", "Layer 1 failure"), "level": "error"})
-    for gate in report_dict.get("gates", []):
-        if isinstance(gate, dict) and gate.get("status") == "FAIL":
-            raw_items.append({"rule": str(gate.get("gate", "gate")), "path": str(gate.get("path", "")),
-                              "line": int(gate.get("line", 0) or 0), "col": int(gate.get("col", 1) or 1),
-                              "message": str(gate.get("detail", "Gate failure")), "level": "error"})
-
-    anchored, lineless = [], []
-    for item in raw_items:
-        uri = _rel_uri(str(item.get("path") or item.get("file") or ""), workspace_root)
+def _rel_uri(raw_path: Any, workspace_root: Optional[str | Path] = None) -> str:
+    path = str(raw_path or "")
+    if path and workspace_root is not None and os.path.isabs(path):
         try:
-            line_no = int(item.get("line", item.get("startLine", 0)) or 0)
-        except (TypeError, ValueError):
-            line_no = 0
-        try:
-            col_no = max(1, int(item.get("col", item.get("column", item.get("startColumn", 1))) or 1))
-        except (TypeError, ValueError):
-            col_no = 1
-        rule_id = str(item.get("rule") or item.get("rule_id") or item.get("code") or item.get("id") or "aegis-rule")
-        lvl_raw = str(item.get("level") or item.get("severity") or "error").lower()
-        entry = {"rule_id": rule_id, "uri": uri, "line": line_no, "col": col_no,
-                 "message": str(item.get("message") or item.get("detail") or ""),
-                 "level": "warning" if lvl_raw in ("warn", "warning", "medium", "low") else "error"}
-        (anchored if (uri and line_no >= 1) else lineless).append(entry)
-    return anchored, lineless
+            path = os.path.relpath(path, workspace_root)
+        except ValueError:  # another drive on Windows
+            pass
+    return path.replace("\\", "/")
 
 
-def _esc_prop(val: str) -> str:
-    return val.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A").replace(":", "%3A").replace(",", "%2C")
+def _finding(rule_id: str, path: Any, line: int, message: str, level: str, root: Any) -> dict[str, Any]:
+    return {"rule_id": rule_id, "uri": _rel_uri(path, root), "line": line, "col": 1, "message": message, "level": level}
 
 
-def _esc_msg(val: str) -> str:
-    return val.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+def ci_findings(document: dict[str, Any], workspace_root: Optional[str | Path] = None) -> list[dict[str, Any]]:
+    """The findings of a ``check --ci`` document, from the fixed keys its producers write. Weakening,
+    governance, regression, trailer and perf findings name no line; scanner findings are anchored."""
+    from aegis_core import regression
+
+    found = []
+    approved = bool((document.get("approval") or {}).get("valid"))
+    for w in document.get("weakenings", ()):
+        found.append(_finding(w["rule"], w["path"], 0, f"{w['code']}: {w['message']}",
+                              "note" if approved else "error", workspace_root))
+    gov = document.get("governance") or {}
+    for entry in gov.get("paths", ()) if gov.get("enforced") and not gov.get("approved") else ():
+        found.append(_finding(f"governance:{entry['category']}", entry["path"], 0,
+                              f"governance change without approval: {entry['path']}", "error", workspace_root))
+    reg = document.get("regression") or {}
+    for rf in reg.get("findings", ()):
+        level = "error" if reg.get("tier") == "gate" and rf["code"] not in regression.UNVERIFIED_CODES else "warning"
+        found.append(_finding(rf["code"], rf["path"], 0, rf["message"], level, workspace_root))
+    for t_chk in document.get("trailer_checks", ()):
+        if t_chk.get("failed"):
+            found.append(_finding("trailer-divergence", "", 0, f"{t_chk['commit'][:10]}: {t_chk.get('reason', '')}",
+                                  "error", workspace_root))
+    perf = document.get("perf") or {}
+    if perf.get("status") == "fail":
+        found.append(_finding("performance-regression", "", 0, perf_line(perf).strip(), "error", workspace_root))
+    for scan in document.get("scanners", ()):
+        for sf in scan["findings"]:
+            found.append(_finding(f"scanner/{scan['name']}:{sf['rule_id']}", sf["path"], sf["line"], sf["message"],
+                                  "error", workspace_root))
+        if scan["status"] == "unverified":
+            found.append(_finding(f"scanner/{scan['name']}", "", 0, f"UNVERIFIED: {scan.get('reason', '')}",
+                                  "warning", workspace_root))
+    return found
+
+
+def layer1_findings(document: dict[str, Any], workspace_root: Optional[str | Path] = None) -> list[dict[str, Any]]:
+    """The findings of a Layer 1 report: each failed check, anchored at its first line when it names
+    lines, and each checkpoint issue (``findings`` rows), which names none."""
+    found = []
+    for row in document.get("layer1", ()):
+        if not row["verdict"]:
+            lines = row.get("lines") or ()
+            found.append(_finding(row["tool"], row["target"], lines[0] if lines else 0, row["detail"], "error", workspace_root))
+    for issue in document.get("findings", ()):
+        found.append(_finding(issue["rule"], "", 0, issue["message"], issue.get("level", "error"), workspace_root))
+    return found
+
+
+def _split(document: dict[str, Any], workspace_root: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(anchored, line-less) findings of either document kind."""
+    found = ci_findings(document, workspace_root) + layer1_findings(document, workspace_root)
+    return ([f for f in found if f["uri"] and f["line"] >= 1], [f for f in found if not (f["uri"] and f["line"] >= 1)])
+
+
+def perf_line(perf: dict[str, Any]) -> str:
+    """The text line of a ``--perf`` result: ``[PASS|FAIL|UNVERIFIED:perf] ...``."""
+    tag = {"pass": "PASS", "fail": "FAIL"}.get(perf.get("status"), "UNVERIFIED")
+    if tag == "UNVERIFIED":
+        return f"  [UNVERIFIED:perf] {perf.get('reason', '')}"
+    return (f"  [{tag}:perf] head {perf['head_min']:.4f}s / {perf['head_median']:.4f}s (min / median) against the merge "
+            f"base's {perf['base_min']:.4f}s / {perf['base_median']:.4f}s over {perf['rounds']} paired rounds, threshold "
+            f"{perf['threshold'] * 100:g} percent")
+
+
+def governance_note(document: dict[str, Any]) -> str:
+    """Why a changed governance set is not enforced (no signing key at the base), or ""."""
+    gov = document.get("governance") or {}
+    cats = ", ".join(gov.get("categories") or ())
+    return (f"governance files changed ({cats}) but the base lists no key in allowed_signers, "
+            "so no approval can be required (tier C: detection only)") if cats and not gov.get("enforced") else ""
+
+
+def _escape_annotation(text: str, prop: bool = False) -> str:
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return text.replace(":", "%3A").replace(",", "%2C") if prop else text
+
+
+def github_annotation_lines(document: dict[str, Any]) -> list[str]:
+    """GitHub workflow commands for a ``check --ci`` document, one line each with every value escaped;
+    titles are constants. An approved weakening or governance change is a ``::notice``, never an error."""
+    from aegis_core import regression
+
+    esc = _escape_annotation
+
+    def line(level: str, title: str, message: str, path: str = "", number: int = 0) -> str:
+        where = (f"file={esc(path, True)}," if path else "") + (f"line={number}," if number else "")
+        return f"::{level} {where}title={esc(title, True)}::{esc(message)}"
+
+    out = []
+    approved = bool((document.get("approval") or {}).get("valid"))
+    level, title = ("notice", "weakening approved") if approved else ("error", "weakening without approval")
+    for w in document.get("weakenings", ()):
+        out.append(line(level, title, f"{w['code']}: {w['rule']}: {w['message']}", w["path"]))
+    gov = document.get("governance") or {}
+    level, title = ("notice", "governance change approved") if gov.get("approved") else ("error", "governance change without approval")
+    for entry in gov.get("paths", ()) if gov.get("enforced") else ():
+        message = f"governance:{entry['category']}: {entry['path']} changed; it passes only with a signed approval (aegis approve)"
+        out.append(line(level, title, message, entry["path"]))
+    note = governance_note(document)
+    if note:
+        out.append(line("warning", "governance change not enforced", note))
+    reg = document.get("regression") or {}
+    gate = reg.get("tier") == "gate"
+    for rf in reg.get("findings", ()):
+        if rf["code"] in regression.UNVERIFIED_CODES:
+            level, title = "warning", "regression check unverified"
+        else:
+            level, title = ("error", "regression check failed") if gate else ("warning", "regression check warning")
+        out.append(line(level, title, f"{rf['code']}: {rf['message']}", rf["path"]))
+    for scan in document.get("scanners", ()):
+        for sf in scan["findings"]:
+            out.append(line("error", f"scanner/{scan['name']}", f"{sf['rule_id']}: {sf['message']}", sf["path"], sf["line"]))
+        if scan["status"] == "unverified":
+            out.append(line("warning", "scanner unverified", f"{scan['name']}: {scan.get('reason', '')}"))
+    for t_chk in document.get("trailer_checks", ()):
+        if t_chk.get("failed"):
+            out.append(line("error", "Aegis-Check trailer divergence", f"{t_chk['commit'][:10]}: {t_chk.get('reason', '')}"))
+    perf = document.get("perf")
+    if isinstance(perf, dict) and perf.get("status") == "fail":
+        out.append(line("error", "performance regression", perf_line(perf).strip()))
+    elif isinstance(perf, dict) and perf.get("status") != "pass":
+        out.append(line("warning", "performance unverified", perf.get("reason", "")))
+    cov = document.get("coverage")
+    if isinstance(cov, dict) and cov.get("status") == "reported":
+        ratio = cov.get("ratio")
+        figure = "n/a" if ratio is None else f"{ratio * 100:.1f} percent"
+        out.append(line("notice", "diff coverage",
+                        f"{figure} of {cov.get('executable_lines', 0)} changed executable lines (report only)"))
+    elif isinstance(cov, dict):
+        out.append(line("warning", "coverage unverified", cov.get("reason", "")))
+    return out
 
 
 def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> str:
     """Render a Markdown job summary for $GITHUB_STEP_SUMMARY."""
-    anchored, lineless = _normalize_findings(report_dict, workspace_root=workspace_root)
+    anchored, lineless = _split(report_dict, workspace_root)
     status = report_dict.get("status")
     passed = report_dict.get("passed", status == "pass" if status is not None else not (anchored or lineless))
     lines = [f"## Aegis Check Summary: {'PASSED' if passed else 'FAILED'}", ""]
@@ -238,16 +297,6 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
     return "\n".join(lines).strip() + "\n"
 
 
-def format_github_annotations(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> list[str]:
-    """Emit GitHub Actions ::error / ::warning workflow commands."""
-    anchored, lineless = _normalize_findings(report_dict, workspace_root=workspace_root)
-    out = [f"::{f['level']} file={_esc_prop(f['uri'])},line={f['line']},col={f['col']},title={_esc_prop(f['rule_id'])}::{_esc_msg(f['message'])}" for f in anchored]
-    for f in lineless:
-        file_part = f"file={_esc_prop(f['uri'])}," if f["uri"] else ""
-        out.append(f"::{f['level']} {file_part}title={_esc_prop(f['rule_id'])}::{_esc_msg(f['message'])}")
-    return out
-
-
 class SarifReport(str):
     _data: dict[str, Any]
 
@@ -265,7 +314,7 @@ class SarifReport(str):
 
 def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> SarifReport:
     """Format verification results as valid SARIF 2.1.0, routing line-less findings to step_summary."""
-    anchored, _ = _normalize_findings(report_dict, workspace_root=workspace_root)
+    anchored, _ = _split(report_dict, workspace_root)
     rules_seen: dict[str, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
     for f in anchored:

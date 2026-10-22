@@ -196,11 +196,6 @@ def _event_pull_request():
     return human_gate.PullRequest(number, login, sha.lower(), ref)
 
 
-def _escape_annotation(text: str, prop: bool = False) -> str:
-    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-    return text.replace(":", "%3A").replace(",", "%2C") if prop else text
-
-
 # What --no-exec leaves out: both rerun the pull request's code (snapshot tests, fix-commit tests).
 _NOT_EXECUTED = ("regression", "trailer_checks")
 
@@ -273,20 +268,11 @@ def _write_step_summary_if_configured(document: dict, root: str) -> None:
         print(f"note: the step summary could not be written ({type(exc).__name__})", file=sys.stderr)
 
 
-def _perf_line(perf: dict) -> str:
-    tag = {"pass": "PASS", "fail": "FAIL"}.get(perf.get("status"), "UNVERIFIED")
-    if tag == "UNVERIFIED":
-        return f"  [UNVERIFIED:perf] {perf.get('reason', '')}"
-    return (f"  [{tag}:perf] head {perf['head_min']:.4f}s / {perf['head_median']:.4f}s (min / median) against the merge "
-            f"base's {perf['base_min']:.4f}s / {perf['base_median']:.4f}s over {perf['rounds']} paired rounds, threshold "
-            f"{perf['threshold'] * 100:g} percent")
-
-
 def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
               skipped=(), scanner_results=None) -> list:
     """Print the ``check --ci`` result in ``fmt`` and append the step summary; return the blocking causes."""
     from aegis_cli import sanitize_display
-    from aegis_cli.formatters.report import format_sarif_report
+    from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, governance_note, perf_line
     from aegis_core import regression
 
     document = _build_ci_document(report, root, reg_report, cov_report, perf_report, trailer_checks=trailer_checks,
@@ -300,51 +286,11 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     if fmt == "json":
         print(json.dumps(document, indent=2))
         return blocking
-    approved = bool(report.weakenings) and report.passed
     gated = report.governance_gated
-    cats = ", ".join(report.governance_categories)
-    note = (f"governance files changed ({cats}) but the base lists no key in allowed_signers, "
-            "so no approval can be required (tier C: detection only)") if cats and not gated else ""
+    note = governance_note(document)
     if fmt == "github":
-        level, title = ("notice", "weakening approved") if approved else ("error", "weakening without approval")
-        for item in report.weakenings:
-            print(f"::{level} file={_escape_annotation(item.path, True)},title={_escape_annotation(title, True)}"
-                  f"::{_escape_annotation(f'{item.code}: {item.rule}: {item.message}')}")
-        level, title = ("notice", "governance change approved") if report.passed else ("error", "governance change without approval")
-        for path, category in report.governance_paths if gated else ():
-            print(f"::{level} file={_escape_annotation(path, True)},title={_escape_annotation(title, True)}"
-                  f"::{_escape_annotation(f'governance:{category}: {path} changed; it passes only with a signed approval (aegis approve)')}")
-        if note:
-            print(f"::warning title={_escape_annotation('governance change not enforced', True)}::{_escape_annotation(note)}")
-        if reg_report is not None:
-            reg_level = "error" if reg_report.tier == "gate" else "warning"
-            reg_title = "regression check failed" if reg_report.tier == "gate" else "regression check warning"
-            for finding in reg_report.findings:
-                unverified = finding.code in regression.UNVERIFIED_CODES
-                print(
-                    f"::{'warning' if unverified else reg_level} file={_escape_annotation(finding.path, True)},"
-                    f"title={_escape_annotation('regression check unverified' if unverified else reg_title, True)}"
-                    f"::{_escape_annotation(f'{finding.code}: {finding.message}')}"
-                )
-        for result in scanner_results or ():
-            for f in result["findings"]:
-                print(f"::error file={_escape_annotation(f.path, True)},line={f.line},"
-                      f"title={_escape_annotation('scanner/' + result['name'], True)}::{_escape_annotation(f'{f.rule_id}: {f.message}')}")
-            if result["status"] == "unverified":
-                print(f"::warning title=scanner unverified::{_escape_annotation(result['name'] + ': ' + result['reason'])}")
-        for t_chk in trailer_checks or ():  # titles are constants and carry no path
-            if t_chk.get("failed"):
-                print(f"::error title=Aegis-Check trailer divergence::{_escape_annotation(t_chk['commit'][:10] + ': ' + t_chk.get('reason', ''))}")
-        if perf_report is not None and perf_report.get("status") == "fail":
-            print(f"::error title=performance regression::{_escape_annotation(_perf_line(perf_report).strip())}")
-        elif perf_report is not None and perf_report.get("status") != "pass":
-            print(f"::warning title=performance unverified::{_escape_annotation(perf_report.get('reason', ''))}")
-        if cov_report is not None and cov_report.get("status") == "reported":
-            ratio = cov_report.get("ratio")
-            print(f"::notice title=diff coverage::{'n/a' if ratio is None else f'{ratio * 100:.1f} percent'} of "
-                  f"{cov_report.get('executable_lines', 0)} changed executable lines (report only)")
-        elif cov_report is not None:
-            print(f"::warning title=coverage unverified::{_escape_annotation(cov_report.get('reason', ''))}")
+        for line in github_annotation_lines(document):
+            print(line)
     span = f"{report.merge_base[:10]}..{report.head[:10]}"
     if not report.weakenings and not gated:
         if blocking:
@@ -414,7 +360,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         since = "no merge-base count" if supp["delta"] is None else f"{supp['delta']:+d} since the merge base"
         print(f"scanners: {supp['count']} security suppression(s) in tracked files ({since})")
     if perf_report is not None:
-        print(sanitize_display(_perf_line(perf_report), 400))
+        print(sanitize_display(perf_line(perf_report), 400))
     if cov_report is not None and cov_report.get("status") == "reported":
         ratio = cov_report.get("ratio")
         print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "

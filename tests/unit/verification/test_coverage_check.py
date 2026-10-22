@@ -9,9 +9,11 @@ import sys
 import pytest
 
 from aegis_cli.formatters.report import (
-    format_github_annotations,
+    ci_findings,
     format_github_step_summary,
     format_sarif_report,
+    github_annotation_lines,
+    layer1_findings,
 )
 from aegis_core import checkrun, events
 from aegis_core.verification import coverage_check
@@ -316,26 +318,16 @@ class TestReportOnlyCoverage:
 class TestSarifAndGitHubFormatters:
     """SARIF 2.1.0 and GitHub annotations / step-summary formatting."""
 
+    @staticmethod
+    def _layer1_doc(path: str, line: int = 14) -> dict:
+        """A Layer 1 report document: one failed forbid_ast row and one checkpoint issue (no line)."""
+        return {"passed": False,
+                "layer1": [{"tool": "forbid_ast:no-eval", "target": path, "verdict": False,
+                            "detail": "Forbidden eval() call", "lines": [line, line + 3]}],
+                "findings": [{"rule": "repo-gate", "message": "Unanchored repository-level gate failure", "level": "error"}]}
+
     def test_sarif_report_valid_schema_and_routes_lineless_to_step_summary(self, tmp_path: Path):
-        report_dict = {
-            "findings": [
-                {
-                    "rule": "no-eval",
-                    "path": str(tmp_path / "aegis_core/bad.py"),
-                    "line": 14,
-                    "col": 5,
-                    "message": "Forbidden eval() call",
-                    "level": "error",
-                },
-                {
-                    "rule": "repo-gate",
-                    "path": "",
-                    "line": 0,
-                    "message": "Unanchored repository-level gate failure",
-                    "level": "error",
-                },
-            ]
-        }
+        report_dict = self._layer1_doc(str(tmp_path / "aegis_core/bad.py"))
 
         sarif_raw = format_sarif_report(report_dict, workspace_root=tmp_path)
         sarif = json.loads(sarif_raw)
@@ -346,41 +338,68 @@ class TestSarifAndGitHubFormatters:
         loc = results[0]["locations"][0]["physicalLocation"]
         assert loc["artifactLocation"]["uri"] == "aegis_core/bad.py"
         assert loc["region"]["startLine"] == 14
-        assert loc["region"]["startColumn"] == 5
+        assert loc["region"]["startColumn"] == 1
         assert "primaryLocationLineHash" in results[0]["partialFingerprints"]
 
-        # Line-less finding must be routed to step_summary, never emitted with startLine: 0
+        # Line-less finding must be routed to the step summary, never emitted with startLine: 0
         assert all(
             r["locations"][0]["physicalLocation"]["region"]["startLine"] >= 1
             for r in results
         )
-        assert "Unanchored repository-level gate failure" in sarif["step_summary"]
+        assert "Unanchored repository-level gate failure" in format_github_step_summary(report_dict, tmp_path)
 
-    def test_github_annotations_and_step_summary(self):
-        report_dict = {
-            "findings": [
-                {
-                    "rule": "no-eval",
-                    "path": "aegis_core/bad.py",
-                    "line": 14,
-                    "col": 5,
-                    "message": "Forbidden eval() call",
-                    "level": "error",
-                }
-            ]
-        }
-        annotations = format_github_annotations(report_dict)
-        assert any(
-            line.startswith("::error ")
-            and "file=aegis_core/bad.py" in line
-            and "line=14" in line
-            and "col=5" in line
-            and "title=no-eval" in line
-            for line in annotations
-        )
-        summary_md = format_github_step_summary(report_dict)
+    def test_github_step_summary_lists_anchored_findings(self):
+        summary_md = format_github_step_summary(self._layer1_doc("aegis_core/bad.py"))
         assert "aegis_core/bad.py" in summary_md
         assert "no-eval" in summary_md
+
+    def test_ci_findings_read_the_fixed_keys_and_name_no_invented_line(self):
+        doc = {"weakenings": [{"code": "rule-deleted", "rule": "inv-a", "path": ".aegis/rules/invariants/inv-a.md",
+                               "message": "deleted"}],
+               "regression": {"tier": "warning", "findings": [{"code": "no_test_changes", "commit": "c" * 40,
+                                                                "path": "src/a.py", "message": "no test"}]},
+               "trailer_checks": [{"commit": "d" * 40, "failed": True, "reason": "diverged"}]}
+        found = ci_findings(doc)
+        assert [(f["rule_id"], f["uri"], f["line"], f["level"]) for f in found] == [
+            ("inv-a", ".aegis/rules/invariants/inv-a.md", 0, "error"), ("no_test_changes", "src/a.py", 0, "warning"),
+            ("trailer-divergence", "", 0, "error")]
+        assert all(set(f) == {"rule_id", "uri", "line", "col", "message", "level"} for f in found)
+        approved = ci_findings({**doc, "approval": {"valid": True}})
+        assert approved[0]["level"] == "note"
+
+    def test_layer1_findings_anchor_at_the_first_line_relative_to_the_workspace(self, tmp_path):
+        from aegis_core.verification import ToolEvidence
+
+        e = ToolEvidence(tool="import_guard", target=str(tmp_path / "src" / "a" / "x.py"), verdict=False,
+                         detail="unapproved import", lines=[3])
+        doc = {"layer1": [{"tool": e.tool, "target": e.target, "verdict": e.verdict, "detail": e.detail, "lines": e.lines}]}
+        (found,) = layer1_findings(doc, workspace_root=tmp_path)
+        assert (found["uri"], found["line"], found["rule_id"]) == ("src/a/x.py", 3, "import_guard")
+
+    def test_every_exported_formatter_name_resolves(self):
+        import aegis_cli.formatters.report as report
+
+        assert all(hasattr(report, name) for name in report.__all__)
+        namespace: dict = {}
+        exec("from aegis_cli.formatters.report import *", namespace)
+        assert set(report.__all__) <= set(namespace)
+
+    def test_the_formatter_modules_have_no_orphan_function(self):
+        from aegis_core.verification import call_graph
+
+        repo = Path(__file__).resolve().parents[3]
+        for rel in ("aegis_cli/formatters/report.py", "aegis_core/verification/perf_check.py"):
+            result = call_graph.check(str(repo / rel), str(repo), exclude_names={"main"})
+            assert result.verdict, (rel, result.detail)
+
+    def test_hostile_text_makes_exactly_one_workflow_command_each(self):
+        nasty = "a%b\rc\nd:e,f"
+        doc = {"weakenings": [{"code": "rule-deleted", "rule": nasty, "path": f"rules/{nasty}.md", "message": nasty}],
+               "trailer_checks": [{"commit": "d" * 40, "failed": True, "reason": nasty}]}
+        lines = github_annotation_lines(doc)
+        assert len(lines) == 2 and all(line.startswith("::error ") for line in lines)
+        assert "file=rules/a%25b%0Dc%0Ad%3Ae%2Cf.md," in lines[0]
+        assert lines[0].endswith("::rule-deleted: a%25b%0Dc%0Ad:e,f: a%25b%0Dc%0Ad:e,f")
 
 
 class TestStatusBlockedCommands:
