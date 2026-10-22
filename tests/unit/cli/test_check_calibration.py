@@ -84,12 +84,46 @@ def test_with_no_log_nothing_is_logged_and_nothing_is_created(repo, capsys):
     assert rc == 0 and (doc["status"], doc["n"], doc["logged"]) == ("insufficient (n=0/25)", 0, 0)
 
 
-def test_rows_are_scored_per_backend_and_kind_and_only_hit_or_miss_counts(repo, capsys):
-    rows = [_row(id="a1"), _row(id="a2", outcome="miss"), _row(id="a3", outcome="void"),
-            _row(id="b1", backend="gemini"), _row(id="b2", backend="gemini", outcome="false")]
-    state = repo / ".aegis" / "state"
-    state.mkdir(parents=True)
-    _log(repo).write_bytes("".join(json.dumps(r) + "\n" for r in rows).encode("utf-8"))
+T0 = 1_700_000_000  # a fixed past: every window below has closed
+DAY = 86400
+
+
+def _dated(root: Path, monkeypatch, path: str, text: str, message: str, at: int) -> str:
+    """Commit ``text`` at ``path`` dated ``at``; the tree the commit holds."""
+    monkeypatch.setenv("GIT_AUTHOR_DATE", f"@{at} +0000")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{at} +0000")
+    write(root, path, text)
+    commit(root, message)
+    monkeypatch.delenv("GIT_AUTHOR_DATE")
+    monkeypatch.delenv("GIT_COMMITTER_DATE")
+    return git(root, "rev-parse", "HEAD^{tree}")
+
+
+def _landings(root: Path, monkeypatch) -> tuple:
+    """Two reviewed trees that landed: the first reverted inside its window (a hit for `revert`), the
+    second never touched again (a miss)."""
+    reverted = _dated(root, monkeypatch, "worker.py", WORKER.format(n=5), "feat: five", T0)
+    _dated(root, monkeypatch, "worker.py", WORKER.format(n=1), 'Revert "feat: five"', T0 + 3 * DAY)
+    quiet = _dated(root, monkeypatch, "other.py", "Y = 1\n", "feat: other", T0 + 20 * DAY)
+    return reverted, quiet
+
+
+def _write_log(root: Path, rows: list) -> None:
+    (root / ".aegis" / "state").mkdir(parents=True, exist_ok=True)
+    _log(root).write_bytes("".join(json.dumps(r) + "\n" for r in rows).encode("utf-8"))
+
+
+def test_rows_are_scored_per_backend_and_kind_and_only_hit_or_miss_counts(repo, capsys, monkeypatch):
+    reverted, quiet = _landings(repo, monkeypatch)
+    hit = {"tree": reverted, "scope": {"path": "worker.py", "symbol": "work"},
+           "observable": {"kind": "revert", "selector": "worker.py"}, "ts": float(T0 - 60)}
+    miss = {"tree": quiet, "scope": {"path": "other.py", "symbol": ""},
+            "observable": {"kind": "revert", "selector": "other.py"}, "ts": float(T0 + 20 * DAY - 60)}
+    rows = [_row(id="a1", **hit), _row(id="a2", **miss),
+            _row(id="a3", **dict(hit, observable={"kind": "detector_fires", "selector": "worker.py"})),  # void
+            _row(id="b1", backend="gemini", **hit),
+            _row(id="b2", backend="gemini", outcome="hit")]  # its tree never landed: abandoned, whatever it says
+    _write_log(repo, rows)
     rc, out, _ = _run(capsys, "--calibration", "--json")
     groups = json.loads(out)["groups"]
     assert rc == 0 and sorted(groups) == ["claude/revert", "gemini/revert"]
@@ -100,12 +134,25 @@ def test_rows_are_scored_per_backend_and_kind_and_only_hit_or_miss_counts(repo, 
     assert rc == 0 and out.startswith("5 logged | ") and "claude/revert" in out and "n=2" in out
 
 
-def test_a_row_that_cannot_be_scored_is_an_error_not_a_traceback(repo, capsys):
-    (repo / ".aegis" / "state").mkdir(parents=True)
-    _log(repo).write_bytes((json.dumps(_row(p=None)) + "\n").encode("utf-8"))
+def test_a_row_that_cannot_be_scored_is_an_error_not_a_traceback(repo, capsys, monkeypatch):
+    reverted, _quiet = _landings(repo, monkeypatch)
+    _write_log(repo, [_row(p=None, tree=reverted, scope={"path": "worker.py", "symbol": "work"}, ts=float(T0 - 60))])
     rc, out, err = _run(capsys, "--calibration")
     assert (rc, out) == (1, "") and err.startswith("Error: the prediction log holds a row that cannot be scored")
     assert "Traceback" not in err
+
+
+def test_a_hand_written_resolution_is_never_scored(repo, capsys, monkeypatch):
+    """Adversarial (R-checks-48): disposition and outcome are Aegis's, from git; a forged hit row and a
+    landed row that claims the wrong outcome are both scored as git resolves them."""
+    reverted, quiet = _landings(repo, monkeypatch)
+    rows = [_row(id="forged"),  # tree "ttt...": it never landed
+            _row(id="wrong", tree=quiet, scope={"path": "other.py", "symbol": ""}, outcome="hit")]
+    _write_log(repo, rows)
+    rc, out, _ = _run(capsys, "--calibration", "--json")
+    doc = json.loads(out)
+    assert rc == 0 and (doc["logged"], doc["n"]) == (2, 1)
+    assert (doc["groups"]["claude/revert"]["n"], doc["groups"]["claude/revert"]["hits"]) == (1, 0)
 
 
 def test_calibration_is_a_mode_of_its_own(repo, capsys):
