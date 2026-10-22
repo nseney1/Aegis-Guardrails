@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from aegis_core import credit, fitness, sync
+from aegis_core import credit, fitness
 from aegis_core.ast.policy import (
     evaluate_forbid_ast_structured,
     extract_normalized_ast,
