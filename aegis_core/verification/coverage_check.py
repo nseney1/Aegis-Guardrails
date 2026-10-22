@@ -12,7 +12,31 @@ from aegis_core import gitsafe
 from aegis_core.verification.test_runner import run_external_cmd
 from aegis_core.workspace.layout import WorkspaceLayout as AegisLayout
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, '"': 34, "\\": 92}
+
+
+def _unquote_git_path(token: str) -> str:
+    """A header path as git C-quotes it (``"b/caf\\303\\251.py"``) decoded to its name; anything not
+    wrapped in double quotes is returned as is, and an escape git never writes stays literal."""
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        return token
+    raw, body, i = bytearray(), token[1:-1], 0
+    while i < len(body):
+        octal = body[i + 1:i + 4]
+        if body[i] == "\\" and len(octal) == 3 and all(c in "01234567" for c in octal):
+            raw.append(int(octal, 8) & 0xFF)
+            i += 4
+        elif body[i] == "\\" and body[i + 1:i + 2] in _ESCAPES:
+            raw.append(_ESCAPES[body[i + 1]])
+            i += 2
+        else:
+            raw.extend(body[i].encode("utf-8"))
+            i += 1
+    try:
+        return os.fsdecode(bytes(raw))
+    except UnicodeError:
+        return bytes(raw).decode("utf-8", "replace")
 
 
 def _to_ranges(lines: list[int]) -> list[tuple[int, int]]:
@@ -32,29 +56,32 @@ def _to_ranges(lines: list[int]) -> list[tuple[int, int]]:
 
 
 def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
-    """Parse unified diff (e.g. git diff-tree -p -U0) into {rel_path: set[int]}."""
+    """``{path: added line numbers}`` of a unified diff (``git diff-tree -p -U0``). Inside a hunk every
+    line is content, whatever it starts with; file headers are read only between hunks."""
     changed: dict[str, set[int]] = {}
     current_file: Optional[str] = None
-    cur_line: Optional[int] = None
-    for raw in diff_text.splitlines():
-        if raw.startswith("+++ "):
-            target = raw[4:].strip()
-            current_file = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target).replace("\\", "/")
-            cur_line = None
-        elif raw.startswith("--- ") or raw.startswith("diff --git "):
-            cur_line = None
-        elif (m := _HUNK_RE.match(raw)):
+    cur_line, old_left, new_left = 0, 0, 0
+    for raw in diff_text.split("\n"):
+        hunk = _HUNK_RE.match(raw)
+        if raw.startswith("diff --git "):
+            current_file, old_left, new_left = None, 0, 0
+        elif hunk:
+            old_left = int(hunk.group(1)) if hunk.group(1) is not None else 1
+            new_left = int(hunk.group(3)) if hunk.group(3) is not None else 1
+            cur_line = int(hunk.group(2))
             if current_file is None:
-                cur_line = None
-            else:
-                count = int(m.group(2)) if m.group(2) is not None else 1
-                cur_line = int(m.group(1)) if count > 0 else None
-        elif current_file is not None and cur_line is not None:
-            if raw.startswith("+") and not raw.startswith("+++"):
-                changed.setdefault(current_file, set()).add(cur_line)
-                cur_line += 1
+                old_left = new_left = 0
+        elif old_left > 0 or new_left > 0:
+            if raw.startswith("+"):
+                changed.setdefault(current_file, set()).add(cur_line)  # type: ignore[arg-type]
+                cur_line, new_left = cur_line + 1, new_left - 1
+            elif raw.startswith("-"):
+                old_left -= 1
             elif raw.startswith(" "):
-                cur_line += 1
+                cur_line, old_left, new_left = cur_line + 1, old_left - 1, new_left - 1
+        elif raw.startswith("+++ "):
+            target = _unquote_git_path(raw[4:].strip())
+            current_file = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target).replace("\\", "/")
     return changed
 
 

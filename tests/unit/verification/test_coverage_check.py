@@ -19,6 +19,10 @@ from aegis_core.verification.coverage_check import (
 )
 
 
+def hdr(path: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+
+
 class TestDiffCoverage:
     """Diff parsing, coverage evaluation, and isolated .aegis/state coverage execution."""
 
@@ -43,6 +47,33 @@ class TestDiffCoverage:
         )
         changed = parse_changed_lines(diff_text)
         assert changed == {"aegis_core/foo.py": {11, 12, 13, 28}}
+
+    # R-checks-32: every body line inside a hunk is content, whatever it starts with.
+
+    def test_an_added_line_starting_with_plus_plus_stays_in_its_file(self):
+        diff = hdr("a.py") + "@@ -0,0 +5,3 @@\n+a = 1\n+++ x\n+c = 3\n@@ -20,0 +22,1 @@\n+z = 9\n"
+        assert parse_changed_lines(diff) == {"a.py": {5, 6, 7, 22}}
+
+    def test_added_lines_that_look_like_headers_are_counted(self):
+        diff = hdr("a.py") + "@@ -0,0 +5,4 @@\n+a = 1\n+++x\n++++ b/x\n+d = 4"
+        assert parse_changed_lines(diff) == {"a.py": {5, 6, 7, 8}}
+
+    def test_a_removed_line_starting_with_dash_dash_does_not_reset_the_hunk(self):
+        diff = hdr("a.py") + "@@ -5,1 +5,2 @@\n--- old\n+new1 = 1\n+new2 = 2"
+        assert parse_changed_lines(diff) == {"a.py": {5, 6}}
+
+    @pytest.mark.parametrize("separator", ["diff --git a/b.py b/b.py\n", ""], ids=["git-header", "bare"])
+    def test_a_lookalike_hunk_does_not_hide_the_next_files_headers(self, separator):
+        diff = (hdr("a.py") + "@@ -1,1 +1,2 @@\n-+++ b/evil.py\n++++ b/evil.py\n+--- a/z\n"
+                + separator + "--- a/b.py\n+++ b/b.py\n@@ -0,0 +1,1 @@\n+x = 1\n")
+        assert parse_changed_lines(diff) == {"a.py": {1, 2}, "b.py": {1}}
+
+    def test_countless_headers_deletions_and_no_newline_markers_keep_the_numbering(self):
+        diff = (hdr("a.py") + "@@ -3 +3 @@\n-a\n+b\n"
+                "@@ -5,2 +4,0 @@\n-gone1\n--- gone2\n"
+                "@@ -8,1 +7,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+                "@@ -10,0 +9,3 @@\n+a\x0cb\n+c\x1cd\n+e\n")
+        assert parse_changed_lines(diff) == {"a.py": {3, 7, 9, 10, 11}}
 
     def test_evaluate_diff_coverage_pass_fail_and_zero_changed(self):
         changed = {"aegis_core/foo.py": {10, 11, 12, 13, 20}}
