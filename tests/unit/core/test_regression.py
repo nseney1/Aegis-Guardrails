@@ -574,6 +574,39 @@ def test_ids_belong_to_their_own_module_and_a_suite_level_error_fails_every_fix(
 
 
 @needs_git
+def test_a_passing_fix_commit_looks_up_no_exemption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Review F3: Given three fix commits whose tests are fail-to-pass and one fix without a test, When
+    regressions are checked, Then only the failing commit looks up a test exemption, and git rev-list
+    runs once for the metadata plus once for that lookup (each lookup rescans the range)."""
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path)
+    test_one = "def test_one():\n    pass\n"
+    passing = [
+        _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_one.py": test_one}),
+        _fix(repo, "fix: other", {"src/other.py": "y = 1\n", "tests/test_two.py": test_one}),
+        _fix(repo, "fix: third", {"src/third.py": "z = 1\n", "tests/test_three.py": test_one}),
+    ]
+    failing = _fix(repo, "fix: four without a test", {"src/four.py": "w = 1\n"})
+    ids = {"tests.test_one::test_one", "tests.test_two::test_one", "tests.test_three::test_one"}
+    _fake_outcomes(monkeypatch, (ids, set(), set()), (set(), ids, set()))
+    looked_up: list = []
+    real_find = human_gate.find_test_exemption
+
+    def find_spy(root, head, base_ref, fix_commit):
+        looked_up.append(fix_commit)
+        return real_find(root, head, base_ref, fix_commit)
+
+    monkeypatch.setattr(human_gate, "find_test_exemption", find_spy)
+    calls = _metadata_calls(monkeypatch)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert {c.commit: c.status for c in report.commits} == {**{oid: "passed" for oid in passing}, failing: "failed"}
+    assert looked_up == [failing]
+    assert sum(1 for c in calls if c and c[0] == "rev-list") == 2
+
+
+@needs_git
 def test_failing_test_on_head_fails_regression_check(tmp_path: Path):
     repo = make_repo(tmp_path)
     repo.write("src/app.py", "def compute(x: int) -> int:\n    return x - 2\n")

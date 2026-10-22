@@ -503,20 +503,22 @@ def _evaluate_fix_commit(root: str, meta: _CommitMeta, head_commit: str, base_co
     test_files = tuple(p for p in meta.present_files if is_python_test_file(p))
     other_tests = () if test_files else tuple(
         p for p in meta.present_files if is_test_file(p) and posixpath.splitext(p)[1] in _OTHER_LANGUAGE_TESTS)
+    row: Dict[str, Any] = {"source_files": source_files, "test_files": test_files or other_tests, "fixes": meta.fixes,
+                           "no_test_reason": meta.no_test_reason}
+    reason, on_base, on_head, f2p = (("tests_not_pytest", False, False, ()) if other_tests
+                                     else _judge(test_files, *runs) if test_files else ("no_test_changes", False, False, ()))
+    if reason == "ok":
+        return CommitRegression(meta.oid, meta.subject, "passed", "ok", True, True, f2p, **row), None
+    # Only a commit that did not pass needs its exemption: each lookup rescans the whole range.
     approval, rejected = _resolve_commit_exemption(root, head_commit, base_commit, meta)
     nt_note = f" (its test exemption was rejected: {rejected})" if rejected else ""
     if meta.no_test_reason:
         nt_note += f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
-    row: Dict[str, Any] = {"source_files": source_files, "test_files": test_files or other_tests, "fixes": meta.fixes,
-                           "no_test_reason": meta.no_test_reason}
     named = f"fix commit {meta.oid[:10]} ({meta.subject})"
     if other_tests:
         msg = f"{named} changes tests pytest cannot run ({', '.join(other_tests[:5])}): the fail-to-pass check is unverified{nt_note}"
         return (CommitRegression(meta.oid, meta.subject, "unverifiable", "tests_not_pytest", False, False, **row),
                 RegressionFinding("tests_not_pytest", meta.oid, other_tests[0], msg, meta.no_test_reason))
-    reason, on_base, on_head, f2p = _judge(test_files, *runs) if test_files else ("no_test_changes", False, False, ())
-    if reason == "ok":
-        return CommitRegression(meta.oid, meta.subject, "passed", "ok", True, True, f2p, **row), None
     if approval is not None and approval.valid:
         return CommitRegression(meta.oid, meta.subject, "exempted", "exempted", on_base, on_head, f2p, exempted=True,
                                 approval=approval, **row), None
