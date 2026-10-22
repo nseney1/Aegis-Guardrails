@@ -44,6 +44,7 @@ __all__ = [
     "ENV_WORKSPACE",
     "MAX_CONFIG_BYTES",
     "RepoConfig",
+    "SCANNER_PRESETS",
     "UserConfig",
     "env_client",
     "env_github_step_summary",
@@ -54,6 +55,7 @@ __all__ = [
     "read_user_config",
     "scan_window_s",
     "update_repo_config",
+    "user_scanners",
 ]
 
 CONFIG_VERSION = 1
@@ -75,8 +77,11 @@ ENV_LLM_CMD = "AEGIS_LLM_CMD"
 ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
 
 _REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "half_life_sessions", "epsilon"})
-# tests, rules, perf and regression are read through read_user_config by their own consumers.
-_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci"})
+# tests, rules, perf, regression and scanners are read through read_user_config by their own consumers.
+_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci",
+                        "scanners"})
+#: The scanner presets the user-scope ``scanners`` key may name (aegis_core.verification.scanners).
+SCANNER_PRESETS = ("ruff", "gitleaks")
 # Keys a repository might use to smuggle in a command. Only these names (aegis's own
 # vocabulary) are ever echoed in a warning; any other unknown key is only counted,
 # since warnings reach the agent and key names are repo-chosen text.
@@ -487,6 +492,10 @@ class UserConfig:
             ci_workflow = ci_workflow_name(raw_ci.get("workflow")) if isinstance(raw_ci, dict) else None
             if ci_workflow is None:
                 warnings.append(f"ignored 'ci.workflow' in {USER_LABEL}: it must be a bare .yml or .yaml file name")
+        if "scanners" in raw and (not isinstance(raw["scanners"], list)
+                                  or any(name not in SCANNER_PRESETS for name in raw["scanners"])):
+            warnings.append(f"ignored entries of 'scanners' in {USER_LABEL}: it lists preset names "
+                            f"({', '.join(SCANNER_PRESETS)})")
         return cls(drivers=drivers, slots=slots, warnings=tuple(warnings), arbiter_vendor=arbiter_vendor,
                    ci_workflow=ci_workflow)
 
@@ -507,13 +516,22 @@ def user_ci_workflow(workspace_root: Any = None) -> Optional[str]:
     return ci_workflow_name(ci.get("workflow")) if isinstance(ci, dict) else None
 
 
+def user_scanners(workspace_root: Any = None) -> List[str]:
+    """The presets ``scanners`` in the user-scope config names, known names only, in order. The
+    repository never names them: a scanner is a program aegis runs over its code."""
+    names = (read_user_config(workspace_root) or {}).get("scanners")
+    if not isinstance(names, list):
+        return []
+    return list(dict.fromkeys(name for name in names if isinstance(name, str) and name in SCANNER_PRESETS))
+
+
 def read_user_config(
     workspace_root: Any = None, *, user: Optional[UserLayout] = None, path: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """The user-scope config as a dict, or None; never raises.
 
     The one lenient reader for the command-like user keys (``tests.command``,
-    ``rules.base_ref``, ``perf.command``, ``regression.*``): the repository never supplies
+    ``rules.base_ref``, ``perf.command``, ``regression.*``, ``scanners``): the repository never supplies
     them. ``path`` overrides ``~/.aegis/config.json``. None without a home directory, when
     the file lies inside ``workspace_root`` (repository content), and whenever
     UserConfig.load would raise ConfigError (not a regular file, over the size cap, not a

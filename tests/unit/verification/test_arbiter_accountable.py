@@ -16,12 +16,7 @@ from aegis_core.verification import (
 )
 from aegis_core.stats import wilson_ci
 from aegis_core.verification import arbiter
-from aegis_core.verification.arbiter import (
-    arbitrate,
-    brier_skill_score,
-    calibration_summary,
-    score_predictions,
-)
+from aegis_core.verification.arbiter import arbitrate, calibration
 
 
 class TestSplitArbitrationResult:
@@ -34,8 +29,8 @@ class TestSplitArbitrationResult:
             risk="State might not flush",
             mechanism="Missing fsync",
             affected_function="save_state",
-            scope="aegis_core/state.py",
-            observable="fix_touch_in_window",
+            scope={"path": "aegis_core/state.py"},
+            observable={"kind": "revert", "selector": "aegis_core/state.py"},
             p=0.65,
         )
         claim = Claim(
@@ -89,11 +84,11 @@ class TestExtendedPredictionSchema:
             mechanism="Error path skipped",
             affected_function="parse_header",
         )
-        assert p.disposition == "logged"
+        assert p.disposition == "logged" and p.outcome is None
         assert p.window_days == 14
-        assert p.observable == "fix_touch_in_window"
+        assert p.observable == {"kind": "", "selector": ""}  # no kind resolves to void, never scored
         assert 0.0 <= p.p <= 1.0
-        assert p.scope == "parse_header"
+        assert p.scope == {"path": "", "symbol": "parse_header"}  # the path is Aegis's to set
         assert isinstance(p.id, str) and len(p.id) > 0
 
     @pytest.mark.parametrize("alias", ["claim_type", "target", "horizon_commits"])
@@ -110,9 +105,9 @@ class TestExtendedPredictionSchema:
             verdict_id="verd-123",
             ts=1700000000.0,
             tree="abc1234",
-            backend="anthropic/claude-3-5-sonnet",
-            scope="aegis_core/verification/arbiter.py",
-            observable="revert_in_window",
+            backend="claude",
+            scope={"path": "aegis_core/verification/arbiter.py", "symbol": "arbitrate"},
+            observable={"kind": "revert", "selector": "aegis_core/verification/arbiter.py"},
             window_days=14,
             p=0.80,
             disposition="overridden",
@@ -121,9 +116,9 @@ class TestExtendedPredictionSchema:
         assert p.verdict_id == "verd-123"
         assert p.ts == 1700000000.0
         assert p.tree == "abc1234"
-        assert p.backend == "anthropic/claude-3-5-sonnet"
-        assert p.scope == "aegis_core/verification/arbiter.py"
-        assert p.observable == "revert_in_window"
+        assert p.backend == "claude"
+        assert p.scope == {"path": "aegis_core/verification/arbiter.py", "symbol": "arbitrate"}
+        assert p.observable == {"kind": "revert", "selector": "aegis_core/verification/arbiter.py"}
         assert p.window_days == 14
         assert p.p == 0.80
         assert p.disposition == "overridden"
@@ -138,118 +133,37 @@ class TestCalibrationScoring:
         assert 0.48 < lo < 0.49
         assert 0.85 < hi < 0.86
 
-    def test_brier_skill_score_computation(self):
-        probs = [0.9, 0.8, 0.1, 0.2]
-        outcomes = [1, 1, 0, 0]
-        bss = brier_skill_score(probs, outcomes)
-        assert bss > 0.85
+    @staticmethod
+    def _row(i, *, p=0.5, outcome="hit", disposition="landed_unchanged", backend="claude", kind="revert", rid=None):
+        return {"id": rid or f"p-{i}", "backend": backend, "observable": {"kind": kind, "selector": f"m{i}.py"},
+                "p": p, "disposition": disposition, "outcome": outcome}
 
-    def test_filters_heeded_and_deduplicates_scope_observable(self):
-        records = [
-            # Logged and resolved True
-            Prediction(
-                id="p1",
-                scope="aegis_core/a.py",
-                observable="fix_touch_in_window",
-                p=0.8,
-                disposition="logged",
-                outcome=True,
-            ),
-            # Duplicate (scope, observable) — must be deduplicated in n_effective
-            Prediction(
-                id="p2",
-                scope="aegis_core/a.py",
-                observable="fix_touch_in_window",
-                p=0.7,
-                disposition="logged",
-                outcome=True,
-            ),
-            # Overridden and resolved False
-            Prediction(
-                id="p3",
-                scope="aegis_core/b.py",
-                observable="revert_in_window",
-                p=0.6,
-                disposition="overridden",
-                outcome=False,
-            ),
-            # Heeded — must be excluded from accuracy scoring (treatment effect confounder)
-            Prediction(
-                id="p4",
-                scope="aegis_core/c.py",
-                observable="fix_touch_in_window",
-                p=0.9,
-                disposition="heeded",
-                outcome=False,
-            ),
-        ]
+    def test_the_brier_skill_score_needs_100_resolved_and_beats_the_base_rate(self):
+        good = [self._row(i, p=0.9 if i < 20 else 0.1, outcome="hit" if i < 20 else "miss") for i in range(100)]
+        assert calibration(good)["claude/revert"]["brier_skill_score"] > 0.85
+        assert calibration(good[:99])["claude/revert"]["brier_skill_score"] is None
+        flat = [self._row(i, outcome="hit") for i in range(100)]  # no variance: no skill to measure
+        assert calibration(flat)["claude/revert"]["brier_skill_score"] is None
 
-        scored = score_predictions(records)
-        assert scored["n_heeded_excluded"] == 1
-        assert scored["n_raw"] == 3
-        assert scored["n_effective"] == 2
-        assert scored["hits"] == 1
+    def test_heeded_logged_and_void_rows_are_not_scored_and_ids_count_once(self):
+        rows = [self._row(1), self._row(2, rid="p-1"), self._row(3, outcome="miss", disposition="overridden"),
+                self._row(4, disposition="heeded"), self._row(5, disposition="logged"), self._row(6, outcome="void"),
+                self._row(7, outcome=True), self._row(8, disposition="abandoned")]
+        (group,) = calibration(rows).values()
+        assert (group["n"], group["hits"], group["status"]) == (2, 1, "insufficient (n=2/25)")
+        assert len(group["wilson_ci"]) == 2
 
-        summary = calibration_summary(records)
-        assert summary["status"] == "insufficient (n=2/25)"
-        assert "insufficient (n=2/25)" in str(summary)
-        assert summary["brier_skill_score"] is None
-        assert summary["lift_suppressed"] is True
+    def test_the_status_says_ok_from_25_resolved_per_group(self):
+        rows = [self._row(i, outcome="hit" if i % 2 else "miss") for i in range(25)]
+        rows += [self._row(i, backend="gemini", kind="fix_attributed", rid=f"g-{i}") for i in range(3)]
+        groups = calibration(rows)
+        assert (groups["claude/revert"]["status"], groups["gemini/fix_attributed"]["status"]) == (
+            "ok", "insufficient (n=3/25)")
 
-    def test_calibration_summary_thresholds_25_and_100_and_base_rate(self):
-        # 30 effective predictions (< 100): status is ok, but Brier skill / lift is suppressed
-        records_30 = [
-            {
-                "id": f"p-{i}",
-                "scope": f"mod_{i}.py",
-                "observable": "fix_touch_in_window",
-                "p": 0.75 if i % 2 == 0 else 0.25,
-                "disposition": "logged",
-                "outcome": (i % 2 == 0),
-            }
-            for i in range(30)
-        ]
-        sum_30 = calibration_summary(records_30)
-        assert sum_30["n_effective"] == 30
-        assert sum_30["status"] == "ok"
-        assert sum_30["brier_skill_score"] is None
-        assert sum_30["lift_suppressed"] is True
-        assert len(sum_30["wilson_ci"]) == 2
-
-        # 100 effective predictions with base rate >= 5%: Brier skill score reported
-        records_100 = [
-            {
-                "id": f"p-{i}",
-                "scope": f"mod_{i}.py",
-                "observable": "fix_touch_in_window",
-                "p": 0.85 if i < 20 else 0.15,
-                "disposition": "logged",
-                "outcome": (i < 20),
-            }
-            for i in range(100)
-        ]
-        sum_100 = calibration_summary(records_100)
-        assert sum_100["n_effective"] == 100
-        assert sum_100["status"] == "ok"
-        assert sum_100["lift_suppressed"] is False
-        assert sum_100["brier_skill_score"] is not None
-        assert sum_100["brier_skill_score"] > 0.0
-
-        # 100 effective predictions with base rate < 5% (only 2/100 = 2%): suppressed
-        records_low_base = [
-            {
-                "id": f"p-{i}",
-                "scope": f"mod_{i}.py",
-                "observable": "fix_touch_in_window",
-                "p": 0.85 if i < 2 else 0.05,
-                "disposition": "logged",
-                "outcome": (i < 2),
-            }
-            for i in range(100)
-        ]
-        sum_low_base = calibration_summary(records_low_base)
-        assert sum_low_base["lift_suppressed"] is True
-        assert sum_low_base["brier_skill_score"] is None
+    def test_a_p_that_is_not_a_probability_cannot_be_scored(self):
+        for bad in (None, "0.5", 1.5, -0.1, True):
+            with pytest.raises(ValueError):
+                calibration([self._row(1, p=bad)])
 
 
 class TestDeadSurfaceIsGone:
@@ -300,41 +214,21 @@ class TestDeadSurfaceIsGone:
 
 
 class TestVerifyCalibrationCli:
-    """CLI integration test for `aegis verify --calibration`."""
+    """`aegis check --calibration` through the real parser (it was a hand-built Namespace before 4.4.0)."""
 
-    def test_verify_calibration_cli_human_and_json(self, tmp_path: Path, capsys):
-        import argparse
+    def test_calibration_cli_human_and_json(self, tmp_path: Path, capsys):
         import json
-        from aegis_cli.verify import run_verify
+        from aegis_cli.cli import main
 
         ws = tmp_path / "ws"
         state_dir = ws / ".aegis" / "state"
         state_dir.mkdir(parents=True)
-        preds_path = state_dir / "arbiter_predictions.jsonl"
-        preds_path.write_text(
-            json.dumps({
-                "id": "p-1",
-                "scope": "aegis_core/foo.py",
-                "observable": "fix_touch_in_window",
-                "p": 0.75,
-                "disposition": "logged",
-                "outcome": True,
-            })
-            + "\n",
-            encoding="utf-8",
-        )
+        (state_dir / "arbiter_predictions.jsonl").write_bytes((json.dumps({
+            "id": "p-1", "backend": "claude", "observable": {"kind": "revert", "selector": "aegis_core/foo.py"},
+            "p": 0.75, "disposition": "landed_unchanged", "outcome": "hit"}) + "\n").encode("utf-8"))
 
-        args_human = argparse.Namespace(_root=ws, calibration=True, json=False)
-        rc = run_verify(args_human)
-        assert rc == 0
-        out_human = capsys.readouterr().out
-        assert "insufficient (n=1/25)" in out_human
-
-        args_json = argparse.Namespace(_root=ws, calibration=True, json=True)
-        rc_json = run_verify(args_json)
-        assert rc_json == 0
+        assert main(["check", "--workspace", str(ws), "--calibration"]) == 0
+        assert "insufficient (n=1/25)" in capsys.readouterr().out
+        assert main(["check", "--workspace", str(ws), "--calibration", "--json"]) == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["status"] == "insufficient (n=1/25)"
-        assert payload["n_effective"] == 1
-        assert payload["hits"] == 1
-
+        assert (payload["status"], payload["n"], payload["groups"]["claude/revert"]["hits"]) == ("insufficient (n=1/25)", 1, 1)

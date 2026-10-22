@@ -754,15 +754,16 @@ def checkable(root: Any, files: Iterable[str]) -> List[str]:
     return out
 
 
-def run_fast(root: Any, files: Sequence[str], *,
-             reviewed: bool = True) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
+def run_fast(root: Any, files: Sequence[str], *, reviewed: bool = True, git_root: Optional[str] = None,
+             diff_base: Optional[str] = None) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
     """Layer 1 as ``aegis check`` runs it by default (no model, no mutation testing) on
-    ``files`` of the working tree, each piece of evidence paired with its file. ``reviewed``
-    as in ``runner.run_layer1``."""
+    ``files`` of the working tree, each piece of evidence paired with its file. ``reviewed``,
+    ``git_root`` (the history of an exported tree) and ``diff_base`` as in ``runner.run_layer1``."""
     from aegis_core.verification import runner
 
     base = os.fspath(root)
     pairs = run_grouped(
-        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed),
+        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed,
+                                        git_root=git_root, diff_base=diff_base),
         files, root=base)
     return pairs, Sources(base, reviewed=reviewed)

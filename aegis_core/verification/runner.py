@@ -366,6 +366,25 @@ def _discover_functions(filepath: str, target_lines: Optional[set[int]] = None) 
     return list(found)
 
 
+def _diff_base_candidates(repo_root: str, diff_base: Optional[str] = None) -> list[str]:
+    """The commits a changed file is compared with, in order and each once: ``diff_base`` (``REF...HEAD``
+    means its merge base with HEAD), HEAD, the merge base with the pull request's base branch, HEAD~1."""
+    from aegis_core import gitsafe
+
+    bases: list[Optional[str]] = []
+    if diff_base:
+        if diff_base.endswith("...HEAD"):
+            bases.append(gitsafe.merge_base(repo_root, diff_base[: -len("...HEAD")]))
+        else:
+            bases.append(gitsafe.resolve_commit(repo_root, diff_base))
+    bases.append(gitsafe.head_commit(repo_root))
+    pr_base = gitsafe.resolve_base_ref(repo_root)
+    if pr_base:
+        bases.append(gitsafe.merge_base(repo_root, pr_base))
+    bases.append(gitsafe.resolve_commit(repo_root, "HEAD~1"))
+    return list(dict.fromkeys(base for base in bases if base))
+
+
 def _get_modified_lines(filepath: str, repo_root: str, diff_base: Optional[str] = None) -> Optional[set[int]]:
     """1-based lines of ``filepath``'s working copy that are new or changed against a base.
 
@@ -385,23 +404,7 @@ def _get_modified_lines(filepath: str, repo_root: str, diff_base: Optional[str] 
         return None
     rel = Path(os.path.relpath(Path(repo_root) / filepath, repo_root)).as_posix()
 
-    bases: list[Optional[str]] = []
-    if diff_base:
-        if diff_base.endswith("...HEAD"):
-            bases.append(gitsafe.merge_base(repo_root, diff_base[: -len("...HEAD")]))
-        else:
-            bases.append(gitsafe.resolve_commit(repo_root, diff_base))
-    bases.append(gitsafe.head_commit(repo_root))
-    pr_base = gitsafe.resolve_base_ref(repo_root)
-    if pr_base:
-        bases.append(gitsafe.merge_base(repo_root, pr_base))
-    bases.append(gitsafe.resolve_commit(repo_root, "HEAD~1"))
-
-    seen: set[str] = set()
-    for base in bases:
-        if not base or base in seen:
-            continue
-        seen.add(base)
+    for base in _diff_base_candidates(repo_root, diff_base):
         try:
             old = gitsafe.read_blob(repo_root, base, rel)
         except gitsafe.GitError:
@@ -493,8 +496,10 @@ def run_layer1(
     fast_mode: bool = False,
     diff_base: Optional[str] = None,
     reviewed: bool = True,
+    git_root: Optional[str] = None,
 ) -> list[ToolEvidence]:
-    """Run all Layer 1 verification tools.
+    """Run all Layer 1 verification tools. ``git_root`` is where the history lives when ``repo_root``
+    is an export of a tree (``check --record``): the T7 delta reads its base text there.
 
     Args:
         changed_files: List of file paths that were modified
@@ -586,6 +591,7 @@ def run_layer1(
             verdict=False,
             detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
         ))
+    owned: set[tuple[str, int]] = set()  # sites a user forbid_ast rule judged: the pack defers to it
     if forbid_rules:
         ast_cache: dict[str, object] = {}
         checked_paths: list[str] = []
@@ -621,6 +627,7 @@ def run_layer1(
                     if not isinstance(norm_ast, ASTExtractionError):
                         try:
                             findings = evaluate_forbid_ast_structured(norm_ast, forbid_spec, rule_id=rule_id)
+                            owned.update((rel_path, f["line"]) for f in findings if not f["unknown"])
                         except ASTExtractionError as exc:  # decorators had to be re-read from disk
                             norm_ast = exc
                 except Exception as exc:
@@ -642,6 +649,15 @@ def run_layer1(
             results.extend(_exempt_notes(forbid_rules, checked_paths))
         except Exception as exc:
             results.append(_tool_failure("forbid_ast", RULES_RELDIR, exc))
+
+    # ── T7: the security pack and the secret scan, on what the change introduces ──
+    t7_rels = []
+    for filepath in changed_files:
+        full_path = filepath if os.path.isabs(filepath) else os.path.join(repo_root_str, filepath)
+        if os.path.isfile(full_path):
+            t7_rels.append(os.path.relpath(full_path, repo_root_str).replace("\\", "/"))
+    if t7_rels:
+        results.extend(_t7_evidence(git_root or repo_root_str, t7_rels, repo_root_str, diff_base, owned))
 
     # ── Mutation Testing ───────────────────────────────────────────────
     if not fast_mode:
@@ -678,6 +694,92 @@ def run_layer1(
                     ))
 
     return results
+
+
+def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str]) -> dict[str, str]:
+    """What the T7 delta subtracts for each of ``rels`` (relative to ``work_root``, which holds
+    ``git_root``'s workspace or an export of it): walking the diff-base candidates in order, the text
+    at the first one whose content differs from the work file. A file one of them does not hold is
+    new against it and has no entry (judged whole); one equal at every candidate keeps that text.
+    Object ids are compared, so only the texts kept are read. Raises GitError."""
+    from aegis_core import gitsafe
+
+    bases = _diff_base_candidates(git_root, diff_base)
+    if not bases:
+        return {}
+    prefix = gitsafe.show_prefix(git_root)
+    current: dict[str, bytes] = {}
+    for rel in rels:
+        try:
+            current[rel] = (Path(work_root) / rel).read_bytes()
+        except OSError:
+            continue
+    kept: dict[str, str] = {}
+    pending = sorted(current)
+    for base in bases:
+        if not pending:
+            break
+        # A long path list would overflow a command line: past 64 files the whole tree is listed.
+        listed = gitsafe.tree_blobs(git_root, base, paths=[prefix + r for r in pending] if len(pending) <= 64 else ())
+        unchanged = []
+        for rel in pending:
+            entry = listed.get(prefix + rel)
+            if entry is None:
+                kept.pop(rel, None)
+                continue
+            kept[rel] = entry[1]
+            if gitsafe.blob_id(current[rel], len(entry[1])) == entry[1]:
+                unchanged.append(rel)  # the same here: what changed it, if anything, is further back
+        pending = unchanged
+    blobs = gitsafe.read_blobs(git_root, kept.values())
+    return {rel: blobs[oid].decode("utf-8", "replace") for rel, oid in kept.items()}
+
+
+def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
+                 owned: set[tuple[str, int]]) -> list[ToolEvidence]:
+    """T7 on ``rels``: the Python security pack and the Tier A secret scan, each against the file's
+    text before the change, so only what it introduces fails (spec T7, D-delta: user forbid_ast rules
+    keep whole-file judgment). Test-path hits and undecidable sites are reported on a passing row; an
+    ``# aegis: allow`` hit passes unrecorded (no credit for pack rows); an unreadable file and any
+    failure to run fail closed. A site a user forbid_ast rule judged, failed or allowed (the seeded
+    no-eval rule), is that rule's: the pack neither reports it twice nor second-guesses its allow."""
+    from aegis_core.verification import scanners, security_pack
+
+    try:
+        base_sources = _base_sources(git_root, rels, work_root, diff_base)
+        py = [rel for rel in rels if rel.endswith(".py")]
+        pack = security_pack.evaluate_security_pack(work_root, py, base_sources) if py else {}
+        secrets = scanners.scan_secrets_delta(work_root, rels, base_sources)
+    except Exception as exc:
+        return [_tool_failure("security_pack", "changed files", exc)]
+    hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    notes: dict[str, list[str]] = {}
+    for hit in pack.get("violations", ()):
+        if (hit["file"], hit["line"]) not in owned:
+            hits.setdefault((f"security_pack:{hit['rule_id']}", hit["file"]), []).append(hit)
+    for hit in pack.get("unverified_findings", ()):
+        if hit["kind"] == "file":
+            hits.setdefault(("security_pack", hit["file"]), []).append(hit)
+        else:
+            notes.setdefault(hit["file"], []).append(f"unverified (advisory): {hit['rule_id']} line {hit['line']}")
+    for hit in pack.get("exempted_test_findings", ()):
+        notes.setdefault(hit["file"], []).append(f"exempted in a test path: {hit['rule_id']} line {hit['line']}")
+    for f in secrets:
+        if is_test_path(f.path):
+            notes.setdefault(f.path, []).append(f"exempted in a test path: {f.rule_id} line {f.line}")
+        else:  # named by rule and line only: no repository text, masked or not, reaches the detail
+            hits.setdefault((f"secret_scan:{f.rule_id}", f.path), []).append({"line": f.line, "pattern": f.rule_id})
+    out = []
+    for (tool, rel), found in hits.items():
+        if tool == "security_pack":
+            detail = f"security_pack: cannot verify {rel}: {found[0]['reason']}"
+        else:
+            detail = "; ".join(f"{h['pattern']} introduced by this change at line {h['line']}" for h in found)
+        out.append(ToolEvidence(tool=tool, target=rel, verdict=False, detail=detail,
+                                lines=sorted({h["line"] for h in found if h["line"] > 0})))
+    out.extend(ToolEvidence(tool="security_pack", target=rel, verdict=True, detail="; ".join(items))
+               for rel, items in sorted(notes.items()))
+    return out
 
 
 def gate_verdict(results: list[ToolEvidence]) -> bool:
@@ -925,6 +1027,7 @@ def _layer1_on_snapshot(
             tool="forbid_ast", target=rule_path, verdict=False,
             detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
         ))
+    owned: set[tuple[str, int]] = set()  # sites a user forbid_ast rule judged: the pack defers to it
     limit = f"{INDEX_BLOB_LIMIT_BYTES / (1024 * 1024):g} MiB"
     for rel, size in too_large.items():
         why = f"its staged content is {size} bytes, over the {limit} the pre-commit hook reads from git"
@@ -958,6 +1061,7 @@ def _layer1_on_snapshot(
             if failure is None:
                 try:
                     findings = evaluate_forbid_ast_structured(norm_ast, forbid_spec, rule_id=rule.id)
+                    owned.update((rel, f["line"]) for f in findings if not f["unknown"])
                 except ASTExtractionError as exc:  # decorators had to be re-read from the file
                     failure = exc
                 except Exception as exc:
@@ -974,6 +1078,9 @@ def _layer1_on_snapshot(
         results.extend(_exempt_notes(forbid_rules, files))
     except Exception as exc:
         results.append(_tool_failure("forbid_ast", RULES_RELDIR, exc))
+    t7_rels = [rel for rel in files if os.path.isfile(_snapshot_file(snapshot, rel))]
+    if t7_rels:  # the staged text, against HEAD first
+        results.extend(_t7_evidence(repo_root, t7_rels, snapshot, None, owned))
     return results
 
 

@@ -1,6 +1,8 @@
 """Behavioral tests for paired interleaved performance regression check."""
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -51,7 +53,7 @@ class TestEvaluatePairedSamples:
 class TestRunPerfCheck:
     def test_rejects_rounds_below_15(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="15"):
-            perf_check.run_perf_check(tmp_path, rounds=10, command=["python3", "-c", "pass"])
+            perf_check.run_perf_check(tmp_path, rounds=10, user_config_path=_cfg(tmp_path, ["python3", "-c", "pass"]))
 
     def test_reads_command_only_from_user_scope_never_repo_config(self, tmp_path: Path) -> None:
         repo_root = tmp_path / "repo"
@@ -127,6 +129,14 @@ class TestRunPerfCheck:
         # Never writes a persistent baseline file
         assert list(repo_root.rglob("*baseline*")) == []
 
+def _cfg(where: Path, command, *, raw: bytes = b"") -> Path:
+    """A user-scope config file holding ``perf.command`` (``raw`` bytes are written as given)."""
+    path = where / "user_cfg" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw or json.dumps({"v": 1, "perf": {"command": command}}).encode("utf-8"))
+    return path
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
                    cwd=str(repo), check=True, capture_output=True)
@@ -183,13 +193,14 @@ class TestPerfProgramLookup:
         os.symlink(shutil.which("git"), trusted / "git")
         monkeypatch.setenv("PATH", os.pathsep.join([".", str(trusted)]))
 
-        res = perf_check.run_perf_check(bench_repo, base_ref="HEAD", rounds=15, command=["python3", "bench.py"])
+        res = perf_check.run_perf_check(bench_repo, base_ref="HEAD", rounds=15,
+                                        user_config_path=_cfg(tmp_path, ["python3", "bench.py"]))
 
         assert not marker.exists(), "a program the repository planted ran"
         assert res["status"] == "unverified" and "python3 not found" in res["reason"]
 
     def test_a_command_given_as_an_explicit_path_runs_unchanged(self, bench_repo, tmp_path):
-        res = perf_check.run_perf_check(bench_repo, rounds=15, command=[sys.executable, "bench.py"])
+        res = perf_check.run_perf_check(bench_repo, rounds=15, user_config_path=_cfg(tmp_path, [sys.executable, "bench.py"]))
 
         assert res["command"] == [sys.executable, "bench.py"]
         assert (tmp_path / "bench.log").read_text(encoding="utf-8") == "x" * 30
@@ -243,7 +254,7 @@ class TestPerfMergeBase:
     def test_the_base_side_is_the_merge_base_tree(self, forked, base):
         ws, fork = forked
         seen: list = []
-        res = perf_check.run_perf_check(ws, base_ref=fork if base == "FORK" else base, rounds=15, command=["bench"],
+        res = perf_check.run_perf_check(ws, base_ref=fork if base == "FORK" else base, rounds=15, user_config_path=_cfg(ws.parent, ["bench"]),
                                         runner=self._runner(ws, seen))
         assert set(seen[0::2]) == {"0.020"}  # I's bench.txt, not main's tip
         assert set(seen[1::2]) == {1}  # git worktree list: the workspace only, during the run
@@ -257,7 +268,7 @@ class TestPerfMergeBase:
         _git(ws, "commit", "-q", "-m", "unrelated")
         _git(ws, "checkout", "-q", "feature")
         calls: list = []
-        res = perf_check.run_perf_check(ws, base_ref="orphan", rounds=15, command=["bench"],
+        res = perf_check.run_perf_check(ws, base_ref="orphan", rounds=15, user_config_path=_cfg(ws.parent, ["bench"]),
                                         runner=lambda argv, cwd, **kw: calls.append(cwd) or {"returncode": 0})
         assert res["status"] == "unverified" and "share no history" in res["reason"]
         assert calls == []
@@ -270,7 +281,7 @@ class TestPerfMergeBase:
         real_run, argvs = gitsafe.run, []
         monkeypatch.setattr(gitsafe, "run", lambda args, cwd, *a, **k: argvs.append(list(args)) or real_run(args, cwd, *a, **k))
         calls: list = []
-        res = perf_check.run_perf_check(ws, base_ref=base, rounds=15, command=["bench"],
+        res = perf_check.run_perf_check(ws, base_ref=base, rounds=15, user_config_path=_cfg(ws.parent, ["bench"]),
                                         runner=lambda argv, cwd, **kw: calls.append(cwd) or {"returncode": 0})
         assert res["status"] == "unverified" and calls == []
         assert not any(arg == base for argv in argvs for arg in argv)
@@ -287,5 +298,170 @@ class TestPerfMergeBase:
         _git(ws, "commit", "-q", "-m", "attributes")
         _git(ws, "config", "filter.evil.smudge", str(script))
         _git(ws, "config", "filter.evil.required", "true")
-        perf_check.run_perf_check(ws, base_ref="HEAD", rounds=15, command=["bench"], runner=self._runner(ws, []))
+        perf_check.run_perf_check(ws, base_ref="HEAD", rounds=15, user_config_path=_cfg(ws.parent, ["bench"]), runner=self._runner(ws, []))
         assert not marker.exists()
+
+
+# ── R-checks-31: one hardened reader, unverified never a traceback, a pytest-benchmark default ──
+
+BENCH_ARGV = [sys.executable, "-m", "pytest", "--benchmark-only", "-q", "-p", "no:cacheprovider", "-o", "addopts="]
+
+
+def _spy(calls: list):
+    def run(argv, cwd, env=None, timeout=60):
+        calls.append(list(argv))
+        return {"returncode": 0, "duration_s": 0.01}
+    return run
+
+
+@pytest.fixture
+def two_commits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    for n in (1, 2):
+        (root / "a.py").write_bytes(f"a = {n}\n".encode())
+        _git(root, "add", "a.py")
+        _git(root, "commit", "-q", "-m", f"c{n}")
+    return root
+
+
+class TestPerfCommandReading:
+    def test_an_unbalanced_quote_is_unverified_and_nothing_runs(self, two_commits, tmp_path):
+        calls: list = []
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls),
+                                        user_config_path=_cfg(tmp_path, 'pytest "-k foo'))
+        assert (res["status"], res["passed"], calls) == ("unverified", True, [])
+        assert "cannot be parsed" in res["reason"]
+
+    def test_a_bom_prefixed_config_is_honoured(self, two_commits, tmp_path):
+        calls: list = []
+        raw = b"\xef\xbb\xbf" + json.dumps({"v": 1, "perf": {"command": "echo hi"}}).encode("utf-8")
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls), user_config_path=_cfg(tmp_path, None, raw=raw))
+        assert len(calls) == 30 and calls[0] == ["echo", "hi"]
+        assert res["command"] == ["echo", "hi"] and "advisory" not in res
+        assert res["passed"] is (res["status"] != "fail")
+
+    def test_the_dotted_top_level_key_is_not_read(self, two_commits, tmp_path):
+        calls: list = []
+        raw = json.dumps({"v": 1, "perf.command": ["echo", "hi"]}).encode("utf-8")
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls), user_config_path=_cfg(tmp_path, None, raw=raw))
+        assert res["status"] == "unverified" and calls == []
+
+    def test_a_config_over_the_size_cap_is_unverified(self, two_commits, tmp_path):
+        from aegis_core.config import MAX_CONFIG_BYTES
+
+        calls: list = []
+        raw = json.dumps({"v": 1, "perf": {"command": "echo hi"}, "pad": "x" * MAX_CONFIG_BYTES}).encode("utf-8")
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls), user_config_path=_cfg(tmp_path, None, raw=raw))
+        assert (res["status"], calls) == ("unverified", [])
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO")
+    def test_a_fifo_at_the_config_path_never_blocks(self, two_commits, tmp_path):
+        import threading
+
+        fifo = tmp_path / "cfg.fifo"
+        os.mkfifo(fifo)
+        calls: list = []
+        out: dict = {}
+        worker = threading.Thread(target=lambda: out.update(perf_check.run_perf_check(
+            two_commits, rounds=15, runner=_spy(calls), user_config_path=fifo)), daemon=True)
+        worker.start()
+        worker.join(600)  # a hang ceiling, not a timing assertion
+        assert not worker.is_alive(), "reading a FIFO config blocked"
+        assert (out["status"], calls) == ("unverified", [])
+
+    def test_a_home_inside_the_workspace_is_repository_content(self, two_commits, monkeypatch):
+        home = two_commits / "home"
+        (home / ".aegis").mkdir(parents=True)
+        (home / ".aegis" / "config.json").write_bytes(json.dumps({"v": 1, "perf": {"command": "echo pwned"}}).encode())
+        for name in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(name, str(home))
+        calls: list = []
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls))
+        assert (res["status"], calls) == ("unverified", [])
+
+    @pytest.mark.skipif(importlib.util.find_spec("pytest_benchmark") is not None, reason="pytest-benchmark is installed")
+    def test_no_command_and_no_benchmark_plugin_is_unverified(self, two_commits, tmp_path):
+        calls: list = []
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls),
+                                        user_config_path=_cfg(tmp_path, None, raw=b'{"v": 1}'))
+        assert (res["status"], calls) == ("unverified", [])
+        assert res["reason"] == "no perf.command configured and pytest-benchmark is not installed"
+
+    def test_no_command_with_the_benchmark_plugin_runs_the_pytest_benchmark_argv(self, two_commits, tmp_path, monkeypatch):
+        stub = tmp_path / "stubs" / "pytest_benchmark"
+        stub.mkdir(parents=True)
+        (stub / "__init__.py").write_bytes(b"")
+        monkeypatch.syspath_prepend(str(stub.parent))
+        importlib.invalidate_caches()
+        calls: list = []
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls),
+                                        user_config_path=_cfg(tmp_path, None, raw=b'{"v": 1}'))
+        assert res["command"] == BENCH_ARGV and calls[0] == BENCH_ARGV
+
+    def test_a_runner_that_raises_is_unverified(self, two_commits, tmp_path):
+        def boom(argv, cwd, env=None, timeout=60):
+            raise RuntimeError("runner broke")
+        try:
+            res = perf_check.run_perf_check(two_commits, rounds=15, runner=boom, user_config_path=_cfg(tmp_path, ["bench"]))
+        except Exception as exc:  # the defect: a traceback out of check --ci --perf
+            pytest.fail(f"run_perf_check raised {exc!r}")
+        assert (res["status"], res["passed"]) == ("unverified", True)
+        assert "RuntimeError" in res["reason"]
+
+    def test_a_failed_export_is_unverified_whatever_the_runner(self, two_commits, tmp_path, monkeypatch):
+        from aegis_core import gitsafe
+
+        def no_export(*_a, **_k):
+            raise gitsafe.GitError("export failed")
+        monkeypatch.setattr(gitsafe, "export_tree", no_export)
+        calls: list = []
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=_spy(calls), user_config_path=_cfg(tmp_path, ["bench"]))
+        assert (res["status"], calls) == ("unverified", [])
+
+    def test_a_runner_returning_a_bare_number_is_not_a_sample(self, two_commits, tmp_path):
+        res = perf_check.run_perf_check(two_commits, rounds=15, runner=lambda argv, cwd, **kw: 5.0,
+                                        user_config_path=_cfg(tmp_path, ["bench"]))
+        assert res["status"] == "unverified"
+
+
+class TestCheckCiPerf:
+    """`aegis check --ci --perf` never ends in a traceback."""
+
+    @staticmethod
+    def _run(root: Path, capsys, monkeypatch) -> tuple:
+        from aegis_cli.cli import main
+
+        monkeypatch.chdir(root)
+        monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        try:
+            rc = main(["check", "--ci", "--base", "HEAD~1", "--perf", "--format", "json"])
+        except SystemExit as exc:
+            rc = exc.code
+        cap = capsys.readouterr()
+        return rc, cap.out, cap.err
+
+    def test_a_malformed_perf_command_is_unverified_not_a_traceback(self, two_commits, capsys, monkeypatch):
+        cfg = Path(os.environ["HOME"]) / ".aegis" / "config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_bytes(json.dumps({"v": 1, "perf": {"command": 'pytest "-k foo'}}).encode("utf-8"))
+        rc, out, err = self._run(two_commits, capsys, monkeypatch)
+        assert "Traceback" not in err
+        perf = json.loads(out)["perf"]
+        assert (rc, perf["status"]) == (0, "unverified") and "cannot be parsed" in perf["reason"]
+
+    def test_a_perf_check_that_raises_is_unverified_naming_only_the_type(self, two_commits, capsys, monkeypatch):
+        def boom(*_a, **_k):
+            raise RuntimeError("/secret/path/inside")
+        monkeypatch.setattr(perf_check, "run_perf_check", boom)
+        rc, out, err = self._run(two_commits, capsys, monkeypatch)
+        perf = json.loads(out)["perf"]
+        assert (rc, perf["status"], perf["reason"]) == (0, "unverified", "perf check could not run (RuntimeError)")
+        assert "/secret/path" not in out + err
