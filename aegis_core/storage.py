@@ -20,8 +20,9 @@ concurrency guarantees live in one place:
   workspace lock.
 - Shared state is private: its directories are 0o700 and its files 0o600, set explicitly
   (``chmod``/``fchmod``, so the umask does not matter). ``shared_state_modes`` counts the
-  entries that are looser (never naming them) and, with ``fix``, tightens them
-  (v4.4 spec §12.7).
+  entries of ``<git common dir>/aegis`` that are looser (never naming them) and, with
+  ``fix``, tightens them (v4.4 spec §12.7). Outside git there is no shared state: the
+  workspace's ``.aegis/state`` keeps the umask's modes and is neither counted nor changed.
 - ``state_dir(workspace)``: ``.aegis/state``, refused when it (or ``.aegis``, or any
   entry directly inside it: the ledger, the lock, a log, a backup) is a symlink or
   resolves outside the workspace, so machine-local state is never written through a
@@ -374,13 +375,18 @@ def shared_state_modes(workspace: Any, fix: bool = False) -> StateModes:
     """Count the entries of ``<git common dir>/aegis`` looser than 0o700 (directories) and
     0o600 (files); with ``fix`` set them to exactly that. Nothing is created.
 
+    Outside a git repository (or when git cannot run) there is no shared state, so nothing
+    is checked: the workspace-local ``.aegis/state`` is not held to the shared standard.
     A symlink is never followed or changed. Raises what ``shared_state_dir`` raises for an
     unconfined directory. Without POSIX permission bits (Windows) nothing is checked and
     ``supported`` is False.
     """
     if os.name == "nt":
         return StateModes(0, 0, 0, False)
-    top = shared_state_dir(workspace, create=False)
+    common = gitsafe.common_dir(Path(os.fspath(workspace)).resolve())
+    if common is None:
+        return StateModes(0, 0, 0, True)
+    top = _shared_dir(Path(_resolved(common)), create=False)
     if not os.path.lexists(top):
         return StateModes(0, 0, 0, True)
     checked = looser = fixed = 0

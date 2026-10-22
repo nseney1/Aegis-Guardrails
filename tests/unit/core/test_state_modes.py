@@ -85,3 +85,27 @@ def test_tightening_twice_changes_nothing_the_second_time(tmp_path):
     second = storage.shared_state_modes(repo.root, fix=True)
     assert (first.looser, first.fixed) == (1, 1)
     assert (second.looser, second.fixed) == (0, 0)
+
+
+def _modes_below(top: Path) -> dict:
+    return {p.relative_to(top).as_posix(): _mode(p) for p in [top, *top.rglob("*")]}
+
+
+@posix_only
+@pytest.mark.parametrize("fix", [False, True], ids=["count", "fix"])
+def test_outside_git_the_umask_moded_local_state_is_neither_counted_nor_tightened(tmp_path, fix):
+    """R-cli-39: the 0700/0600 standard covers the git common dir only. Given a non-git
+    workspace whose .aegis/state the umask made 0755/0644, When the modes are read (and
+    fixed), Then nothing is counted and no mode changes."""
+    old = os.umask(0o022)
+    try:
+        local = storage.state_dir(tmp_path)
+        with storage.locked(tmp_path):
+            pass
+        storage.append_jsonl(local / "ledger.jsonl", [{"v": 2}])
+    finally:
+        os.umask(old)
+    before = _modes_below(local)
+    assert before["."] == 0o755 and before["ledger.jsonl"] == 0o644
+    assert storage.shared_state_modes(tmp_path, fix=fix) == storage.StateModes(0, 0, 0, True)
+    assert _modes_below(local) == before
