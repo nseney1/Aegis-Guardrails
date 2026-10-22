@@ -267,6 +267,43 @@ class TestReportOnlyCoverage:
         res = run_diff_coverage(repo.root, "main", "HEAD")
         assert (res["ratio"], res["uncovered_ranges"]) == (pytest.approx(0.20), {"pkg/foo.py": [[6, 9]]})
 
+    # Review F4: the changed lines come from git objects, but coverage measures the work tree.
+
+    def test_a_checkout_that_is_not_the_head_is_unverified_and_runs_nothing(self, tmp_path, cov_env, monkeypatch):
+        """Given GitHub's default pull request checkout (a merge of the head into the base), When the head's
+        changed lines are measured, Then the result is unverified, names the head, and nothing runs."""
+        repo = cov_repo(tmp_path)
+        head = repo.head()
+        repo.git("checkout", "-q", "--detach", "main")
+        repo.git("merge", "-q", "--no-ff", "-m", "Merge work into main", "work")
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", head)
+        assert (res["status"], res["ratio"], calls) == ("unverified", None, [])
+        assert res["reason"] == f"the checkout is not {head[:12]}; check out the pull request head"
+
+    @pytest.mark.parametrize("change", ["modified", "staged", "deleted"])
+    def test_a_work_tree_with_tracked_changes_is_unverified_and_runs_nothing(
+        self, tmp_path, cov_env, monkeypatch, change
+    ):
+        repo = cov_repo(tmp_path)
+        if change == "deleted":
+            (repo.root / "pkg" / "b.py").unlink()
+        else:
+            repo.write("pkg/b.py", "z = 1\nforged = 2\n")
+            if change == "staged":
+                repo.git("add", "pkg/b.py")
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["ratio"], calls) == ("unverified", None, [])
+        assert res["reason"] == "the work tree has uncommitted changes to tracked files: pkg/b.py"
+
+    def test_an_untracked_file_does_not_make_the_run_unverified(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        repo.write("scratch.py", "s = 1\n")
+        fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["ratio"]) == ("reported", 0.5)
+
     def test_checkrun_pytest_args(self):
         assert checkrun.pytest_args(["pytest", "-x"]) == ["-x"]
         assert checkrun.pytest_args(["py.test"]) == []
@@ -458,6 +495,31 @@ class TestCheckCliIntegration:
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0 and payload["status"] == "pass"
         assert payload["coverage"]["status"] == "unverified" and "passed" not in payload["coverage"]
+
+    @needs_git
+    def test_ci_coverage_on_a_checkout_that_is_not_the_head_says_unverified_and_exits_0(
+        self, tmp_path, cov_env, capsys, monkeypatch
+    ):
+        """Review F4: Given a dirty tracked file, then a checkout at another commit than --head, When check
+        --ci --coverage runs, Then it prints UNVERIFIED with the mismatch and exits 0 both times."""
+        from aegis_cli.cli import main
+
+        repo = cov_repo(tmp_path)
+        head = repo.head()
+        os.chdir(repo.root)
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        repo.write("pkg/b.py", "z = 2\n")
+        rc = main(["check", "--ci", "--coverage", "--base", "main"])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "  coverage: UNVERIFIED (the work tree has uncommitted changes to tracked files: pkg/b.py)" in out
+        repo.git("checkout", "-q", "--", "pkg/b.py")
+        repo.git("checkout", "-q", "--detach", "main")
+        rc = main(["check", "--ci", "--coverage", "--base", "main", "--head", head])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert f"  coverage: UNVERIFIED (the checkout is not {head[:12]}; check out the pull request head)" in out
+        assert calls == []
 
     def test_ci_format_sarif_and_github_step_summary(self, tmp_path: Path, capsys, monkeypatch):
         import argparse

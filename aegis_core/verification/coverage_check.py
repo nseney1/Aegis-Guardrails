@@ -3,7 +3,8 @@
 The figure is the share of the executable lines changed from merge-base(base, head) to head that the
 user-scope test command (``tests.command``, pytest-based only) executes under ``coverage``. Whatever keeps
 it from being measured is ``unverified`` with a reason, never 0% and never 100%, and it never changes the
-exit code. The tests run with the caller's environment on purpose (the project's dependencies need it):
+exit code; that includes a work tree that is not a clean checkout of head (GitHub's default pull request
+checkout is a merge commit). The tests run with the caller's environment on purpose (the project's dependencies need it):
 the figure is report-only, so forging it gains nothing. Scratch files live in a private directory under
 the confined state directory, and the repository's ``.coveragerc`` and ``coverage.json`` are never read.
 """
@@ -87,6 +88,33 @@ def changed_lines(root: Any, base: str, head: str) -> Optional[dict[str, set[int
     return {k: v for k, v in parse_changed_lines(res.stdout.decode("utf-8", "replace")).items() if k.endswith(".py")}
 
 
+def _z_names(root: Path, args: list[str]) -> Optional[list[str]]:
+    try:
+        res = gitsafe.run(args, root, timeout=_GIT_TIMEOUT_S)
+    except gitsafe.GitError:
+        return None
+    return None if res.returncode != 0 else [os.fsdecode(p) for p in res.stdout.split(b"\0") if p]
+
+
+def _checkout_mismatch(root: Path, head: str) -> Optional[str]:
+    """Why the work tree ``coverage run`` measures is not ``head``'s tree, or None. Untracked files do not
+    count: a checkout routinely holds some (a virtualenv, build output), and the figure is a report."""
+    tip = gitsafe.resolve_commit(root, head)
+    if not tip or gitsafe.head_commit(root) != tip:
+        return f"the checkout is not {(tip or head)[:12]}; check out the pull request head"
+    edited = gitsafe.changed_files(root, "working")
+    # changed_files lists no deletion: ls-files reads the index against the work tree, diff-index a `git rm`.
+    gone = _z_names(root, ["ls-files", "-z", "--deleted", "--"])
+    removed = _z_names(root, ["diff-index", "--cached", "-z", "--name-only", "--no-renames", "--diff-filter=D", tip, "--"])
+    if edited is None or gone is None or removed is None:
+        return "cannot tell whether the work tree matches the checkout"
+    dirty = list(dict.fromkeys([*edited, *gone, *removed]))
+    if not dirty:
+        return None
+    more = f" and {len(dirty) - 3} more" if len(dirty) > 3 else ""
+    return f"the work tree has uncommitted changes to tracked files: {', '.join(dirty[:3])}{more}"
+
+
 def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: Optional[dict] = None,
             unmeasured: Optional[list] = None) -> dict[str, Any]:
     return {"status": status, "reason": " ".join(reason.split())[:200], "covered_lines": covered,
@@ -107,6 +135,9 @@ def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
         return _result("unverified", f"cannot diff {base}..{head}")
     if not changed:
         return _result("reported", "no Python line changed")
+    mismatch = _checkout_mismatch(root, head)
+    if mismatch is not None:
+        return _result("unverified", mismatch)
     try:
         scratch = tempfile.TemporaryDirectory(dir=storage.state_dir(root))
     except (PathTraversalError, OSError) as exc:
