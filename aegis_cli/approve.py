@@ -83,7 +83,8 @@ def _preflight(root: Path, base: Optional[str]) -> Tuple[Path, str, str]:
         raise _Refused("no_head", "the repository has no commit yet")
     base_ref = base or gitsafe.resolve_base_ref(top)
     if not base_ref:
-        raise _Refused("no_base", "no base branch found (origin/main, main, origin/develop, develop); pass --base")
+        raise _Refused("no_base", "no base branch found (origin/$GITHUB_BASE_REF, the branch origin/HEAD "
+                                     "names, main, develop or master); pass --base")
     merge_base = gitsafe.merge_base(top, base_ref, "HEAD")
     if not merge_base:
         raise _Refused("no_base", f"HEAD shares no history with {base_ref}: fetch with fetch-depth 0")

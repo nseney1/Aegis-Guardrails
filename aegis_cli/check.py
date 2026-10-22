@@ -552,7 +552,7 @@ class CheckCommand(AegisCommand):
             default=None,
             help="With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). "
             "With --lane: the base branch (default: origin/$GITHUB_BASE_REF, then the branch origin/HEAD names, "
-            "then main, master or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: "
+            "then main, develop or master, each as origin/<name> before <name>). A shallow clone fails: fetch with fetch-depth 0. Without --lane: "
             "read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: "
             "absent at base) and check what changed since REF; the working tree's baseline is then not consulted, "
             "and a REF that does not resolve is an error. Without --base the working tree's baseline is used and "

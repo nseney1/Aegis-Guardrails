@@ -403,7 +403,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
             base_ref = base or gitsafe.resolve_base_ref(top)
             if not base_ref:
                 return CheckOutcome("error", None, "no base branch found (origin/$GITHUB_BASE_REF, the branch "
-                                    "origin/HEAD names, main, master or develop); pass --base", binding)
+                                    "origin/HEAD names, main, develop or master); pass --base", binding)
             base_commit = gitsafe.merge_base(top, base_ref, "HEAD")
             if not base_commit:
                 return CheckOutcome("error", None, f"HEAD shares no history with {base_ref}: fetch with "

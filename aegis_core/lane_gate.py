@@ -394,8 +394,8 @@ def _commit_range(top: Path, base: Optional[str]) -> Tuple[str, str, str, str]:
         raise LaneGateError(f"{NEEDS_HISTORY} (this is a shallow clone)")
     ref = base if base is not None else gitsafe.resolve_base_ref(top)
     if ref is None:
-        raise LaneGateError(f"{NEEDS_HISTORY} (no base branch: none of origin/$GITHUB_BASE_REF, origin/main, "
-                            "main, origin/develop or develop exists; pass --base)")
+        raise LaneGateError(f"{NEEDS_HISTORY} (no base branch: none of origin/$GITHUB_BASE_REF, the branch "
+                            "origin/HEAD names, main, develop or master exists; pass --base)")
     base_commit = gitsafe.resolve_commit(top, ref)
     if not base_commit:
         raise LaneGateError(f"{NEEDS_HISTORY} (cannot resolve the base {ref!r})")

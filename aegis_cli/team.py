@@ -337,7 +337,8 @@ class TeamCommand(AegisCommand):
         )
         metrics.add_argument("--base", default=None, metavar="REF",
                              help="Count merges since this commit (default: the branch base, as for "
-                                  "aegis check --lane: origin/main, main, origin/develop or develop; "
+                                  "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
+                                  "develop or master; "
                                   "with none, the whole first-parent history)")
 
     def execute(self, args: argparse.Namespace) -> int:
