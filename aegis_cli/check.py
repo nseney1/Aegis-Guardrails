@@ -357,11 +357,17 @@ def _run_ci(args: argparse.Namespace) -> int:
         ("--split", bool(getattr(args, "split", None))), ("--strict", bool(getattr(args, "strict", False))),
     ) if given]
     no_exec = bool(getattr(args, "no_exec", False))
-    runs_code = [flag for flag, attr in (("--coverage", "coverage"), ("--perf", "perf"), ("--strict", "strict"),
-                                         ("--require-regression", "require_regression")) if getattr(args, attr, False)]
-    # --no-exec's own refusal is checked first so that its message names it.
+    runs_code = [flag for flag, attr in (("--coverage", "coverage"), ("--perf", "perf")) if getattr(args, attr, False)]
+    # --no-exec's own refusals are checked first so that their messages name it; --strict runs nothing
+    # and gets --ci's refusal below.
     if no_exec and runs_code:
         print(f"Error: --no-exec does not combine with {', '.join(runs_code)}: they run the repository's code",
+              file=sys.stderr)
+        return 2
+    # No flag sets require_regression (ignored otherwise); a hand-built Namespace asking for the regression
+    # reruns that --no-exec skips is still refused.
+    if no_exec and getattr(args, "require_regression", False):
+        print("Error: --no-exec does not combine with --require-regression: --no-exec skips the regression reruns",
               file=sys.stderr)
         return 2
     if stray:
@@ -579,7 +585,7 @@ class CheckCommand(AegisCommand):
             action="store_true",
             help="With --ci: read git objects only and run none of the repository's code: the T5 regression "
             "and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. "
-            "Refuses --coverage, --perf and --strict",
+            "Refuses --coverage and --perf",
         )
         parser.add_argument(
             "--coverage",

@@ -1409,13 +1409,28 @@ def test_no_exec_fails_an_unapproved_change_to_what_defines_enforcement(tmp_path
 
 
 @needs_git
-@pytest.mark.parametrize("flag", ["--coverage", "--perf", "--strict"])
+@pytest.mark.parametrize("flag", ["--coverage", "--perf"])
 def test_no_exec_refuses_the_flags_that_run_code(tmp_path, capsys, flag):
     repo = make_repo(tmp_path)
     os.chdir(repo.root)
     rc = main(["check", "--ci", "--no-exec", flag, "--base", "main"])
     err = capsys.readouterr().err
     assert rc == 2 and "--no-exec" in err and flag in err
+
+
+@needs_git
+def test_no_exec_never_says_strict_runs_code_and_strict_gets_the_ci_refusal(tmp_path, capsys):
+    """Review F5: --strict runs no code under --ci, where it is a usage error of its own. Given --no-exec
+    --strict, Then exit 2 with --ci's refusal of --strict; given --no-exec --coverage --strict, Then exit
+    2 and the --no-exec refusal names --coverage alone."""
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--strict", "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "--ci does not combine with --strict" in err and "run the repository's code" not in err
+    rc = main(["check", "--ci", "--no-exec", "--coverage", "--strict", "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "Error: --no-exec does not combine with --coverage: they run the repository's code" in err
 
 
 @needs_git

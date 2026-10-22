@@ -603,7 +603,7 @@
             "flags": [
               "--no-exec"
             ],
-            "help": "With --ci: read git objects only and run none of the repository's code: the T5 regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage, --perf and --strict",
+            "help": "With --ci: read git objects only and run none of the repository's code: the T5 regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage and --perf",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
