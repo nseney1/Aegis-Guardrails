@@ -24,6 +24,11 @@ FAKE_LLM = textwrap.dedent(f"""\
         print(json.dumps([{{"category": "code_injection", "severity": "high", "risk": {RISK!r},
                            "mechanism": "MECHANISM-TEXT", "affected_function": "work", "p": 0.3,
                            "observable": {{"kind": "revert", "selector": "worker.py"}}}}]))
+    elif "Spec Agent" in prompt and sys.argv[1] in ("quoted", "partly"):
+        kind = "revert" if sys.argv[1] == "partly" else "QUOTED-KIND api_key=1"
+        print(json.dumps([{{"category": "code_injection", "severity": "high", "risk": "r", "mechanism": "m",
+                           "affected_function": "QUOTED-DIFF api_key=1", "p": 0.3,
+                           "observable": {{"kind": kind, "selector": "QUOTED-SELECTOR api_key=1"}}}}]))
     else:
         print("[]")
 """)
@@ -127,6 +132,20 @@ def test_a_layer2_run_logs_stamped_rows_without_model_text(repo, capsys, llm):
     assert b"SECRET-RISK-TEXT" not in raw and b"MECHANISM-TEXT" not in raw
     rc, out, _ = _run(capsys, "--calibration", "--json")
     assert rc == 0 and (json.loads(out)["logged"], json.loads(out)["n"]) == (2, 0)
+
+
+@pytest.mark.parametrize("mode,kind", [("quoted", ""), ("partly", "revert")])
+def test_model_text_in_the_symbol_selector_or_kind_is_not_logged(repo, capsys, llm, mode, kind):
+    """Adversarial: the model's affected_function, selector and kind are kept only when they name a
+    function the change defines, a changed path and a known observable kind; otherwise they are empty."""
+    write(repo, "worker.py", WORKER.format(n=2))
+    rc, _out, _err = _run(capsys, "--full", "--plan", "X", "--llm-cmd", llm(mode), "worker.py")
+    assert rc == 0
+    raw = _log(repo).read_bytes()
+    (row,) = [json.loads(line) for line in raw.splitlines()]
+    assert row["scope"] == {"path": "", "symbol": ""}
+    assert row["observable"] == {"kind": kind, "selector": ""}
+    assert b"QUOTED" not in raw and b"api_key" not in raw
 
 
 def test_runs_without_predictions_log_nothing(repo, capsys, llm):
