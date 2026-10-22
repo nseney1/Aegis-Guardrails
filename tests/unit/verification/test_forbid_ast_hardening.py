@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import gc
 import time
 
 import pytest
@@ -817,9 +818,17 @@ _HANG_CEILING_S = 60.0
 def _best_of(runs: int, fn, clock=time.perf_counter) -> float:
     best = float("inf")
     for _ in range(runs):
-        start = clock()
-        fn()
-        took = clock() - start
+        # As timeit does: a collection pass costs more as the heap grows, which adds a superlinear
+        # term that belongs to the collector, not to the code under test (4.6x against 4.2x here).
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            start = clock()
+            fn()
+            took = clock() - start
+        finally:
+            if enabled:
+                gc.enable()
         assert took < _HANG_CEILING_S, f"one run took {took:.0f}s: a hang, not a slow runner"
         best = min(best, took)
     return best
