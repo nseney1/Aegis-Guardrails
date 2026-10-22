@@ -433,3 +433,41 @@ def test_backups_and_their_manifest_are_owner_only(env):
     for path in files:
         assert path.stat().st_mode & 0o077 == 0, f"{path.name} is {oct(path.stat().st_mode & 0o777)}"
     assert backup.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_private_config_swapped_for_a_symlink_after_the_check_stays_owner_only(env, tmp_path, monkeypatch):
+    """Review L4: Given a 0600 ~/.claude.json checked as a regular file, When it is swapped for a
+    symlink just before the replacing write under umask 022, Then the replacement keeps the 0600
+    the check saw (not the 0644 of a new file) and the link's target is spared."""
+    from conftest import symlink_or_skip
+    from aegis_core import storage
+
+    claude = env.claude_user_registration(
+        mcpServers={"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
+                    "soma": {"command": "soma-mcp"}})
+    claude.chmod(0o600)
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b'{"keep": true}\n')
+    victim.chmod(0o644)
+    real_write = storage.atomic_write_bytes
+    swapped = []
+
+    def swap_then_write(path, data, *args, **kwargs):
+        if Path(path) == claude and not swapped:
+            os.unlink(claude)
+            symlink_or_skip(victim, claude)
+            swapped.append(path)
+        return real_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "atomic_write_bytes", swap_then_write)
+    saved = os.umask(0o022)
+    try:
+        payload = env.fix()
+    finally:
+        os.umask(saved)
+    assert swapped, "the swap happened before the write"
+    assert {f["status"] for f in payload["fixes"]} == {"applied"}
+    assert not claude.is_symlink() and "soma" not in json.loads(claude.read_text(encoding="utf-8"))["mcpServers"]
+    assert claude.stat().st_mode & 0o777 == 0o600
+    assert victim.read_bytes() == b'{"keep": true}\n' and victim.stat().st_mode & 0o777 == 0o644
