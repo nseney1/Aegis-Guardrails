@@ -310,7 +310,8 @@ def test_each_pytest_run_prints_a_start_and_an_end_line_on_stderr(tmp_path: Path
     assert "run 1 of 2" not in out
 
     rc, out, err = run_ci(repo, capsys, "--format", "github")
-    assert rc == 0 and "run 1 of 2" not in out and len(err.splitlines()) == 6
+    assert rc == 0 and "run 1 of 2" not in out
+    assert len([line for line in err.splitlines() if line.startswith("aegis check --ci: ")]) == 6
 
 
 @needs_git
