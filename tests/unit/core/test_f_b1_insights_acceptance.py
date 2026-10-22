@@ -445,14 +445,13 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
 
     # Write closed-template proposal -> lives in .aegis/proposals/<id>.md, never loaded by load_rules,
     # and never contains verbatim W0/W2 text.
+    member = add_insight(repo, "Recursive deletes need a confinement check first", paths=["src/app.py"],
+                         kind="filesystem_safety", home=home)
     prop_path = write_proposal(
         repo,
         proposal_id="trap-validate-rmtree",
-        rule_type="trap",
-        target_paths=["src/*.py"],
-        category="filesystem_safety",
         summary_bullets=["Validate path confinement before recursive directory deletion."],
-        insight_ids=["ins-1"],
+        insight_ids=[member["id"]],
         home=home,
     )
     assert prop_path == repo / ".aegis" / "proposals" / "trap-validate-rmtree.md"
@@ -466,11 +465,8 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
         write_proposal(
             repo,
             proposal_id="trap-bad-verbatim",
-            rule_type="trap",
-            target_paths=["src/*.py"],
-            category="filesystem_safety",
             summary_bullets=[verbatim_w2],
-            insight_ids=["ins-1"],
+            insight_ids=[member["id"]],
             home=home,
         )
 
@@ -839,8 +835,7 @@ def test_a_confirmed_suggestion_counts_as_cli_and_an_unconfirmed_one_does_not(re
     assert [(c["insight_ids"], c["levels"], c["kinds"]) for c in review["clusters"]] == [([s1["id"]], ["cli"], ["concurrency"])]
     assert [s["id"] for s in review["suggestions"]] == [s2["id"]]
     with pytest.raises(ValueError, match="verbatim"):
-        write_proposal(repo, proposal_id="trap-env", target_paths=["src/*.py"], category="concurrency",
-                       summary_bullets=[ENV_TEXTS[1]], home=home)
+        write_proposal(repo, proposal_id="trap-env", insight_ids=[s1["id"]], summary_bullets=[ENV_TEXTS[1]], home=home)
 
 
 def test_confirming_a_corroborated_suggestion_does_not_count_the_correction_twice(review_repo):
@@ -955,3 +950,73 @@ def test_a_row_without_an_id_is_reviewed_without_error(review_repo):
         "paths": ["src/app.py"], "psrc": "explicit", "host": "cli"}])
     cluster, = review_insights(repo, home=home)["clusters"]
     assert (cluster["count"], cluster["levels"]) == (1, ["cli"])
+
+
+# ── R-evidence-44: the closed proposal template ──────────────────────────────
+
+def _frontmatter(path: Path) -> Dict[str, Any]:
+    from aegis_core.yaml_engine.frontmatter import parse_frontmatter
+
+    return parse_frontmatter(path.read_text(encoding="utf-8"))
+
+
+def _confirmed_group(repo: Path, home: Path, paths_per_member, kind: str = "api-validation") -> list:
+    ids = [capture_suggestion(repo, f"Validate request bodies at the boundary, case {n}", paths=paths,
+                              host="claude-code", session="agent", home=home)["id"]
+           for n, paths in enumerate(paths_per_member)]
+    record_decision(repo, decision="confirm", insight_ids=ids, kind=kind, home=home)
+    return ids
+
+
+def test_a_proposal_names_its_kind_count_ids_and_the_idf_weighted_common_directory(review_repo):
+    """Given a confirmed group of 3 insights under src/api/ and two unrelated insights elsewhere
+    under src/, When a proposal is written, Then it is a trap/advisory with the group's kind, a
+    count of 3, its ids and target_paths src/api/** (src/ is common to more insights, so it
+    weighs less), and no category."""
+    repo, home = review_repo
+    for n in range(2):
+        add_insight(repo, f"Keep the helper module small, note {n}", paths=["src/util.py"], home=home)
+    ids = _confirmed_group(repo, home, [["src/api/a.py"], ["src/api/b.py"], ["src/api/a.py", "src/api/b.py"]])
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-api-bodies", insight_ids=ids, home=home))
+    assert (meta["type"], meta["enforcement"], meta["kind"], meta["count"]) == ("trap", "advisory", "api-validation", 3)
+    assert meta["insight_ids"] == ids and meta["target_paths"] == ["src/api/**"]
+    assert "category" not in meta
+
+
+def test_members_in_separate_directories_get_one_prefix_each_and_a_top_level_file_stands_for_itself(review_repo):
+    repo, home = review_repo
+    ids = _confirmed_group(repo, home, [["src/api/a.py"], ["src/api/b.py"], ["lib/x.py"], ["setup.py"]])
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-spread", insight_ids=ids, home=home))
+    assert meta["target_paths"] == ["src/api/**", "lib/**", "setup.py"]
+    assert meta["count"] == 4
+
+
+def test_a_group_without_paths_asks_for_them_and_writes_nothing(review_repo):
+    repo, home = review_repo
+    ids = _confirmed_group(repo, home, [None, None])
+    with pytest.raises(ValueError, match="--paths"):
+        write_proposal(repo, proposal_id="trap-nowhere", insight_ids=ids, home=home)
+    assert not (repo / ".aegis" / "proposals").exists()
+
+
+def test_a_group_without_one_kind_needs_an_explicit_kind(review_repo):
+    repo, home = review_repo
+    first = add_insight(repo, "Close every file handle you open", paths=["src/app.py"], kind="resources", home=home)
+    second = add_insight(repo, "Close sockets on every error path", paths=["src/app.py"], kind="network", home=home)
+    with pytest.raises(ValueError, match="--kind"):
+        write_proposal(repo, proposal_id="trap-close", insight_ids=[first["id"], second["id"]], home=home)
+    assert not (repo / ".aegis" / "proposals").exists()
+    path = write_proposal(repo, proposal_id="trap-close", insight_ids=[first["id"], second["id"]], kind="resources",
+                          home=home)
+    assert _frontmatter(path)["kind"] == "resources"
+
+
+def test_an_unconfirmed_suggestion_or_an_unknown_id_never_enters_a_proposal(review_repo):
+    repo, home = review_repo
+    kept = add_insight(repo, "Close every file handle you open", paths=["src/app.py"], kind="resources", home=home)
+    agent = capture_suggestion(repo, "Close every file handle", paths=["src/app.py"], host="claude-code",
+                               session="agent", home=home)
+    for extra in (agent["id"], "ins-000000000000"):
+        with pytest.raises(ValueError, match="not a counted insight"):
+            write_proposal(repo, proposal_id="trap-close", insight_ids=[kept["id"], extra], home=home)
+    assert not (repo / ".aegis" / "proposals").exists()

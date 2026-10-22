@@ -1011,6 +1011,25 @@ def test_doctor_reports_how_many_entries_are_looser_without_naming_them(tmp_path
     assert payload["state_modes"]["looser"] == 1 and "ledger.jsonl" not in json.dumps(payload["state_modes"])
 
 @posix_only
+def test_doctor_counts_nothing_looser_in_a_workspace_outside_git(tmp_path, monkeypatch):
+    """R-cli-39: Given a non-git workspace whose local state the umask made 0755/0644, When
+    doctor runs, Then it reports no looser entry (the standard covers the git common dir only)."""
+    from aegis_cli import doctor
+    ws = tmp_path / "ws"
+    (ws / ".aegis" / "rules" / "traps").mkdir(parents=True)
+    old = os.umask(0o022)
+    try:
+        storage.append_jsonl(storage.state_dir(ws) / "ledger.jsonl", [{"v": 2}])
+        with storage.locked(ws): pass
+    finally:
+        os.umask(old)
+    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: None)
+    args = argparse.Namespace(workspace=str(ws), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out): doctor.run_doctor(args)
+    assert json.loads(out.getvalue())["state_modes"]["looser"] == 0
+
+@posix_only
 @needs_git
 def test_migrate_apply_tightens_the_shared_state(tmp_path):
     from aegis_cli import migrate as cli_migrate

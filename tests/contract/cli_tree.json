@@ -2849,7 +2849,7 @@
                     "flags": [
                       "--kind"
                     ],
-                    "help": "Insight kind recorded with --decision confirm",
+                    "help": "Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the cluster's insights share)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2862,18 +2862,6 @@
                       "--proposal-id"
                     ],
                     "help": "Proposal ID when --decision propose",
-                    "kind": "store",
-                    "metavar": null,
-                    "nargs": null,
-                    "required": false
-                  },
-                  {
-                    "default": null,
-                    "dest": "category",
-                    "flags": [
-                      "--category"
-                    ],
-                    "help": "Proposal category when --decision propose (default: the one kind the cluster's human insights share, else correctness)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,

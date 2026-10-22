@@ -20,6 +20,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - **`aegis check` runs the security pack and the secret scan.** The 7-rule Python security pack and the known-format secret scan had no caller; they now run in every `aegis check` (also `--hook` and `--record`) on what a change introduces, judged against the diff base. Test paths are exempt but reported, `# aegis: allow[rule]` and `# gitleaks:allow` are honoured, and a baseline never grandfathers these rows. A planted secret on a changed line fails Layer 1. On this repository Layer 1 over 147 files went from about 2 s to about 11 s (measured on a loaded machine).
 - **The step summary renders pull-request text as inert data.** Finding text from the pull request is placed in code spans, so it cannot inject Markdown, links or images into the job summary.
+- **`aegis doctor --fix` and Aegis's host-config rewrites never write through a swapped-in symlink.** A file replaced by a symlink after the check is replaced, not followed, and `~/.aegis` and `~/.aegis/backups` are created with mode `0700`.
 
 ### Changed behaviour
 
@@ -64,6 +65,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - The user-scope `scanners` key (`["ruff", "gitleaks"]`) runs those presets in `aegis check --ci`, from PATH outside the repository; only findings new against the merge base fail.
 - `aegis check --calibration` is a registered flag. Layer 2 predictions are stamped and kept in `.aegis/state/arbiter_predictions.jsonl` with no model text; dispositions and outcomes are computed from git when the file is read, and scores are per backend and observable kind.
 - `aegis init --ci` writes an `aegis-sarif` job with a gated code-scanning upload. It is a separate job, so `security-events: write` never reaches the job that hands `GH_TOKEN` to the test reruns.
+- Insight proposals are always an advisory `trap` with `kind`, `count` and `insight_ids`. Their `target_paths` are the insights' common directories weighted by how rare they are, as at most three `<dir>/**` globs (a top-level file stands for itself), never `**`; insights without paths make `propose` exit 1 and point at `aegis rule insight add --paths`.
+- `aegis rule insight add` prints the exact `Aegis-Approve-Insight:` trailer and a sign-then-re-run recipe (JSON `approval_trailer`, not stored), so an insight can reach level H.
 
 ### Fixed
 
@@ -87,6 +90,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - The proposal category defaults to the single kind the cluster's human insights share, and text review lists each insight with its top-3 neighbours.
 - Tree identity reports a tree as unbindable, instead of raising, when git times out or is missing.
 
+- `aegis migrate --apply` says `state modes: tightened N of M loose entries` instead of offering to tighten them, and outside git neither `aegis doctor` nor `aegis migrate` counts or changes the modes of the workspace's `.aegis/state`.
+- `aegis hook uninstall` removes Aegis's prepare-commit-msg hook even when the pre-commit hook is missing, user-owned or refused, and leaves a pre-commit hook that is not UTF-8 unchanged (reported) instead of failing with a codec error.
+- `aegis rule adjudicate` exits 1 and writes nothing for an id that is not a cleanly loading rule (a typo, a case variant, an `.md` name, an archived or broken rule).
+
 ### Breaking (command line, JSON and MCP)
 
 - Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
@@ -101,6 +108,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `perf.command` is read only from `perf.command` under `perf` in `~/.aegis/config.json`; a dotted top-level key is ignored, and the perf JSON loses `advisory`.
 - Breaking: SARIF alert fingerprints are now stable under line moves and unique per run, so GitHub reopens existing Aegis alerts once.
 - Breaking: JSON `llm_predictions` rows carry `scope` `{path, symbol}` and `observable` `{kind, selector}` and drop `resolved_at` and `resolving_commit`; an observable that is not such an object is void.
+- Breaking: `aegis rule insight review --category` is removed. A proposal's kind is the one its insights share, or the `--kind` given with `--decision propose`; with neither, `propose` exits 1 and asks for `--kind`.
+- Breaking: `rule insight add --commit` checks the `Aegis-Approve-Insight` hash against the text as typed, so approvals signed over redacted text no longer verify for texts that redaction changed.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -117,6 +126,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis_core.verification.scanners.build_preset_argv` and `aegis_core.verification.scanners.run_preset_scanner` are removed (use `run_preset`), and `ingest_sarif` loses `base_fingerprints=`.
 - Breaking: `aegis_cli.formatters.report.format_github_annotations` and `aegis_cli.formatters.report.SarifReport` are removed; `format_sarif_report` returns a plain `str`.
 - Breaking: `aegis_core.verification.arbiter.brier_skill_score`, `score_predictions`, `calibration_summary` and `CalibrationSummary` are removed (use `calibration`); `Prediction` loses `resolved_at` and `resolving_commit`; `perf_check.run_perf_check` loses `command=`.
+- Breaking: `aegis_core.insights.write_proposal` no longer takes `rule_type`, `enforcement`, `category` or `target_paths`; it takes the counted `insight_ids`, plus optional `summary_bullets` and `kind`.
 
 ### Corrections
 

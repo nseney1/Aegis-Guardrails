@@ -21,7 +21,7 @@ In your home directory:
 - `~/.aegis/workspaces.json`: the absolute paths of the repositories you ran `aegis init` in, and their hosts.
 - `~/.aegis/link.key`: 32 random bytes (mode `0600` on POSIX) created by `aegis init` to pseudonymize host session IDs into keyed `hs` hashes.
 - `~/.aegis/insights/<workspace-id>.jsonl`: opt-in user-scope insight rows (mode `0600` on POSIX) holding redacted correction excerpts (`<= 300` characters, with PEM blocks, tokens, `key=value` and prose credentials, emails, home paths and IPv4 addresses scrubbed; a prompt is scanned through its first 4,096 characters, and past that only a whole-word head is kept) and text-free session heartbeats.
-- `~/.aegis/backups/`: copies of the host config files `aegis doctor --fix` changed (owner-only permissions; they can contain other servers' settings).
+- `~/.aegis/backups/`: copies of the host config files `aegis doctor --fix` changed (`~/.aegis` and `~/.aegis/backups` are created with mode `0700`; they can contain other servers' settings).
 - The `aegis` entry in each host's own config, written through that host's CLI or config file.
 
 On Windows, `link.key` and insight files inherit access control from their parent directories; Aegis does not set a Windows access control list for them.

@@ -209,7 +209,7 @@ def _replace(path: Path, expected: Optional[bytes], data: bytes, *, dry_run: boo
     if dry_run:
         return
     try:
-        atomic_write_bytes(path, data)
+        atomic_write_bytes(path, data, follow_links=False)
     except OSError as exc:
         raise InstallError(f"{path}: cannot be written ({exc.strerror or exc}); left unchanged") from exc
 
