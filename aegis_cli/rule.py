@@ -761,12 +761,22 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
 
     from aegis_core.adjudication import ADJUDICATIONS_DIR, RULE_ID
     from aegis_core.errors import AegisError
+    from aegis_core.rule_inventory import RuleInventoryError
+    from aegis_core.rules import load_rules
     from aegis_core.storage import append_jsonl
 
     rule_id = str(args.rule_id)
     if not RULE_ID.fullmatch(rule_id):
         return _emit_error(args, f"invalid rule id {sanitize_display(rule_id, 80)!r}: use letters, digits, '.', '_' or '-' (at most 128)")
     root = _resolve_workspace_root(args)
+    try:
+        # Exact match on the typed id (no normalising): a label must name a rule that loads.
+        known = load_rules(root).get(rule_id) is not None
+    except RuleInventoryError as exc:
+        return _emit_error(args, str(exc))
+    if not known:
+        return _emit_error(args, f"no rule {rule_id!r} that loads cleanly in this workspace; "
+                                 "aegis rule list shows the rule ids")
     directory = root.joinpath(*ADJUDICATIONS_DIR.split("/"))
     if directory.is_symlink() or directory.parent.is_symlink():
         return _emit_error(args, f"{ADJUDICATIONS_DIR} is a symlink; refusing to write a label through it")
