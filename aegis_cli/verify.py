@@ -606,15 +606,18 @@ def _run_partition(args: argparse.Namespace, root: str, use_json: bool, source: 
 def _run_calibration(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
     """`aegis check --calibration`: the calibration of the logged Layer 2 predictions per backend and
     observable kind. Read-only; T6 is log-only, so nothing depends on it."""
+    import time
+
     from aegis_core.storage import read_jsonl
+    from aegis_core.verification import records
     from aegis_core.verification.arbiter import calibration
     from aegis_core.workspace.layout import WorkspaceLayout
 
     log = read_jsonl(WorkspaceLayout(Path(root)).predictions_log)
     if log.error:
         return fail(f"cannot read the prediction log: {log.error}", 1)
-    try:
-        groups = calibration(log.rows)
+    try:  # dispositions and outcomes come from git, on read; nothing is written back
+        groups = calibration(records.resolve_rows(root, log.rows, time.time()))
     except (ValueError, TypeError) as exc:
         return fail(f"the prediction log holds a row that cannot be scored: {exc}", 1)
     n = sum(group["n"] for group in groups.values())
