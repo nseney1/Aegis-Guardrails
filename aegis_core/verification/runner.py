@@ -696,12 +696,15 @@ def run_layer1(
     return results
 
 
-def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str]) -> dict[str, str]:
+def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
+                  contents: Optional[dict[str, bytes]] = None) -> dict[str, str]:
     """What the T7 delta subtracts for each of ``rels`` (relative to ``work_root``, which holds
-    ``git_root``'s workspace or an export of it): walking the diff-base candidates in order, the text
-    at the first one whose content differs from the work file. A file one of them does not hold is
-    new against it and has no entry (judged whole); one equal at every candidate keeps that text.
-    Object ids are compared, so only the texts kept are read. Raises GitError."""
+    ``git_root``'s workspace or an export of it; ``contents`` holds the bytes of those read already):
+    walking the diff-base candidates in order, the text at the first one whose content differs from
+    the work file. A file one of them does not hold is new against it and has no entry (judged
+    whole); one equal at every candidate keeps that text. Object ids are compared, so only the texts
+    kept are read; a binary file (NUL in its first 4 KiB, which neither scan reads) needs none.
+    Raises GitError."""
     from aegis_core import gitsafe
 
     bases = _diff_base_candidates(git_root, diff_base)
@@ -710,10 +713,15 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
     prefix = gitsafe.show_prefix(git_root)
     current: dict[str, bytes] = {}
     for rel in rels:
-        try:
-            current[rel] = (Path(work_root) / rel).read_bytes()
-        except OSError:
-            continue
+        if contents is not None and rel in contents:
+            data = contents[rel]
+        else:
+            try:
+                data = (Path(work_root) / rel).read_bytes()
+            except OSError:
+                continue
+        if b"\0" not in data[:4096]:
+            current[rel] = data
     kept: dict[str, str] = {}
     pending = sorted(current)
     for base in bases:
@@ -736,20 +744,21 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
 
 
 def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
-                 owned: set[tuple[str, int]]) -> list[ToolEvidence]:
+                 owned: set[tuple[str, int]], contents: Optional[dict[str, bytes]] = None) -> list[ToolEvidence]:
     """T7 on ``rels``: the Python security pack and the Tier A secret scan, each against the file's
     text before the change, so only what it introduces fails (spec T7, D-delta: user forbid_ast rules
     keep whole-file judgment). Test-path hits and undecidable sites are reported on a passing row; an
     ``# aegis: allow`` hit passes unrecorded (no credit for pack rows); an unreadable file and any
     failure to run fail closed. A site a user forbid_ast rule judged, failed or allowed (the seeded
-    no-eval rule), is that rule's: the pack neither reports it twice nor second-guesses its allow."""
+    no-eval rule), is that rule's: the pack neither reports it twice nor second-guesses its allow.
+    ``contents`` holds the bytes of files not on disk under ``work_root`` (non-Python only)."""
     from aegis_core.verification import scanners, security_pack
 
     try:
-        base_sources = _base_sources(git_root, rels, work_root, diff_base)
+        base_sources = _base_sources(git_root, rels, work_root, diff_base, contents)
         py = [rel for rel in rels if rel.endswith(".py")]
         pack = security_pack.evaluate_security_pack(work_root, py, base_sources) if py else {}
-        secrets = scanners.scan_secrets_delta(work_root, rels, base_sources)
+        secrets = scanners.scan_secrets_delta(work_root, rels, base_sources, contents)
     except Exception as exc:
         return [_tool_failure("security_pack", "changed files", exc)]
     hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -905,16 +914,18 @@ def _snapshot_file(snapshot: str, rel: str) -> str:
     return full
 
 
-def snapshot_index(repo_root: str, paths: list[str], snapshot: str) -> tuple[list[str], dict[str, int]]:
+def snapshot_index(repo_root: str, paths: list[str], snapshot: str,
+                   entries: Optional[dict[str, tuple[str, str]]] = None) -> tuple[list[str], dict[str, int]]:
     """Write the staged content of ``paths`` (relative to ``repo_root``) under ``snapshot``
     at the same relative paths. Return the paths written (regular files only) and the
     size of each staged file larger than INDEX_BLOB_LIMIT_BYTES, whose content is not read.
+    ``entries`` is the index listing (``_index_entries``) when the caller has read it.
 
     The other Python files the index holds next to each one are written empty: Layer 1
     reads only their names (import_guard counts a sibling module as local), so their
     content is never read from git. Raises GitError when git cannot list or read the index.
     """
-    entries = _index_entries(repo_root)
+    entries = _index_entries(repo_root) if entries is None else entries
     staged = [p for p in dict.fromkeys(paths) if entries.get(p, ("", ""))[0] in _INDEX_FILE_MODES]
     sizes = _blob_sizes(repo_root, [entries[p][1] for p in staged])
     too_large = {p: sizes[entries[p][1]] for p in staged if sizes[entries[p][1]] > INDEX_BLOB_LIMIT_BYTES}
@@ -968,6 +979,80 @@ def _not_in_the_commit(rel: str, full_path: str, repo_root: str) -> list[str]:
         if name.endswith(".py") and not name.startswith("_") and name[:-3] in imported
         and not os.path.exists(os.path.join(os.path.dirname(full_path), name))
     )
+
+
+def _not_read(size: int) -> str:
+    limit = f"{INDEX_BLOB_LIMIT_BYTES / (1024 * 1024):g} MiB"
+    return f"its staged content is {size} bytes, over the {limit} the pre-commit hook reads from git"
+
+
+def _identical_work_file(repo_root: str, rel: str, oid: str, size: int) -> Optional[bytes]:
+    """The working-tree bytes of ``rel`` when they are the staged blob ``oid`` (``size`` bytes) byte
+    for byte, else None. Opened without following a final symlink or waiting on a FIFO, typed by the
+    open descriptor, and read once: the bytes compared are the bytes returned."""
+    import stat
+
+    parts = rel.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(os.path.join(repo_root, *parts), flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return None
+        chunks, left = [], size + 1  # one byte more: a file that grew since fstat is not the blob
+        while left > 0:
+            chunk = os.read(fd, left)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    return data if len(data) == size and _git_blob_id(data, len(oid)) == oid else None
+
+
+def _t7_on_index(repo_root: str, rels: list[str], entries: dict[str, tuple[str, str]]) -> list[ToolEvidence]:
+    """T7 on the staged content of ``rels``, files no other Layer 1 check parses (the secret scan
+    reads any type): held in memory in batches of at most INDEX_BLOB_LIMIT_BYTES, never written to
+    the snapshot. A working-tree file that is the staged blob byte for byte is read from disk, once,
+    instead of through git (a large asset would cost about three times its size piped through
+    ``cat-file`` and could meet git's timeout); any other is read from git. A file over the limit is
+    not read, and passing INDEX_NOTE_TOOL evidence says so."""
+    staged = [rel for rel in dict.fromkeys(rels) if entries.get(rel, ("", ""))[0] in _INDEX_FILE_MODES]
+    sizes = _blob_sizes(repo_root, [entries[rel][1] for rel in staged])
+    results: list[ToolEvidence] = []
+    held: dict[str, bytes] = {}
+    from_git: list[str] = []
+    batch_bytes = 0
+    for rel in [*staged, None]:
+        size = sizes[entries[rel][1]] if rel is not None else 0
+        if rel is not None and size > INDEX_BLOB_LIMIT_BYTES:
+            if not is_test_path(rel):
+                results.append(ToolEvidence(tool=INDEX_NOTE_TOOL, target=rel, verdict=True,
+                                            detail=f"{rel} not checked: {_not_read(size)}"))
+            continue
+        if (held or from_git) and (rel is None or batch_bytes + size > INDEX_BLOB_LIMIT_BYTES):
+            blobs = _read_blobs(repo_root, [entries[r][1] for r in from_git])
+            held.update((r, blobs[entries[r][1]]) for r in from_git)
+            results.extend(_t7_evidence(repo_root, sorted(held), repo_root, None, set(), contents=held))
+            held, from_git, batch_bytes = {}, [], 0
+        if rel is None:
+            break
+        data = _identical_work_file(repo_root, rel, entries[rel][1], size)
+        if data is None:
+            from_git.append(rel)
+        else:
+            held[rel] = data
+        batch_bytes += size
+    return results
 
 
 def _layer1_on_snapshot(
@@ -1028,9 +1113,8 @@ def _layer1_on_snapshot(
             detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
         ))
     owned: set[tuple[str, int]] = set()  # sites a user forbid_ast rule judged: the pack defers to it
-    limit = f"{INDEX_BLOB_LIMIT_BYTES / (1024 * 1024):g} MiB"
     for rel, size in too_large.items():
-        why = f"its staged content is {size} bytes, over the {limit} the pre-commit hook reads from git"
+        why = _not_read(size)
         covering = [rule for rule, _spec in forbid_rules if rule.applies_to(rel)]
         for rule in covering:  # a gate rule that cannot read the file must not pass it
             results.append(ToolEvidence(
@@ -1088,10 +1172,12 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
     """Layer 1 in fast mode on the staged content of ``changed_files`` (paths relative to
     ``repo_root``): exactly what ``git commit`` records, whatever the working tree holds.
 
-    Only a file some check can read is read from git: Python, or a type an AST driver
-    handles (forbid_ast skips any other type). A path the index does not hold as a regular
-    file (a deletion, a symlink, a submodule) has no content to check. Raises GitError
-    when git cannot list or read the index, so the caller fails closed.
+    Python and the types an AST driver handles are written to a snapshot for call_graph,
+    import_guard, forbid_ast and T7; every other staged file goes to T7 alone (the secret
+    scan reads any type, as plain ``aegis check`` does) and is never written (_t7_on_index).
+    A path the index does not hold as a regular file (a deletion, a symlink, a submodule)
+    has no content to check. Raises GitError when git cannot list or read the index, so
+    the caller fails closed.
     """
     import tempfile
 
@@ -1110,10 +1196,13 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
                 driven[ext] = True  # read it: call_graph meets the same error and fails closed on it
         return driven[ext]
 
+    entries = _index_entries(repo_root_str)
     with tempfile.TemporaryDirectory(prefix=SNAPSHOT_PREFIX) as snapshot:
-        staged, too_large = snapshot_index(repo_root_str, [rel for rel in changed_files if readable(rel)], snapshot)
+        typed = [rel for rel in changed_files if readable(rel)]
+        staged, too_large = snapshot_index(repo_root_str, typed, snapshot, entries)
         results = _layer1_on_snapshot(staged, repo_root_str, snapshot, ast_runner, too_large)
-        return _without_snapshot(results, snapshot)
+        results = _without_snapshot(results, snapshot)
+    return results + _t7_on_index(repo_root_str, [rel for rel in changed_files if not readable(rel)], entries)
 
 
 if __name__ == '__main__':

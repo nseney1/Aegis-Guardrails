@@ -236,6 +236,56 @@ def test_this_repository_has_no_gate_finding_from_the_wired_scans():
     assert scanners.scan_secrets_delta(REPO, sample, {}) == []
 
 
+def _record(root: Path, capsys) -> tuple:
+    rc = main(["check", "--record", "--workspace", str(root), "--base", "main", "--json"])
+    out = capsys.readouterr().out
+    return rc, json.loads(out)["check"], out
+
+
+def test_a_secret_in_a_changed_yaml_file_fails_check_the_hook_and_the_record_alike(tmp_path, capsys):
+    """Given a non-Python file whose change adds a known-format token, when plain check, the pre-commit
+    hook and the recorded check run, then all three fail it the same way and none prints the token."""
+    project = hv.make_project(tmp_path)
+    token = _token()
+    project.write("config/settings.yaml", f"github:\n  token: {token}\n")
+    code, payload, raw = _check(project.root, capsys, "config/settings.yaml")
+    assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "config/settings.yaml")]) and token not in raw
+    project.git("add", "config/settings.yaml")
+    code, payload, raw = _check(project.root, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "config/settings.yaml")]) and token not in raw
+    rc, row, raw = _record(project.root, capsys)
+    assert (rc, row["passed"], row["layer1"]["findings"]) == (1, False, 1) and token not in raw
+
+
+def test_the_hook_judges_the_staged_yaml_even_when_the_working_copy_was_cleaned_after_git_add(repo, capsys):
+    """Adversarial: what the commit records is the index, so a clean working copy cannot hide a staged token."""
+    _write(repo / "settings.yaml", f"token: {_token()}\n")
+    _git(repo, "add", "settings.yaml")
+    _write(repo / "settings.yaml", "token: none\n")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "settings.yaml")])
+
+
+def test_the_hook_and_the_record_take_a_binary_file_and_note_one_over_the_size_cap(repo, capsys, monkeypatch):
+    """Sad path: a staged binary is read and skipped (as plain check does), a file over the index cap is
+    not read and a passing note says so; neither crashes nor fails the commit."""
+    from aegis_core.verification import runner
+
+    monkeypatch.setattr(runner, "INDEX_BLOB_LIMIT_BYTES", 256)
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "assets").mkdir()
+    (repo / "assets" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\0\0" + _token().encode("ascii") + b"\0" * 64)
+    _write(repo / "data" / "big.yaml", "rows:\n" + "  - x\n" * 60)
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (0, [])
+    notes = [(r["tool"], r["target"], r["verdict"]) for r in payload["layer1"] if r["tool"] == "index"]
+    assert notes == [("index", "data/big.yaml", True)]
+    _git(repo, "commit", "-q", "-m", "assets")
+    rc, row, _ = _record(repo, capsys)
+    assert (rc, row["passed"], row["layer1"]) == (0, True, {"findings": 0, "files": 2})
+
+
 def test_a_file_the_branch_added_and_committed_is_judged_whole(repo, capsys):
     _git(repo, "checkout", "-q", "-b", "work")
     _write(repo / "src" / "load.py", "import pickle\n\n\ndef load(blob):\n    return pickle.loads(blob)\n")

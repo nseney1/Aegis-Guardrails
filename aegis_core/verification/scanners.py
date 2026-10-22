@@ -369,16 +369,21 @@ def _secret_keys(text: str, path: str) -> list[tuple[Finding, tuple[str, str, in
             for f in scan_secrets_text(text, path) if not _ALLOW_RE.search(lines[f.line - 1])]
 
 
-def scan_secrets_delta(workspace_root: Path | str, files: Iterable[str], base_sources: Mapping[str, str | None]) -> list[Finding]:
-    """The Tier A findings of ``files`` (relative to ``workspace_root``) that the text ``base_sources``
-    holds for each did not already hold, as a multiset: a touched legacy line does not block, a copied
-    or rotated secret does. A ``# gitleaks:allow`` line is not judged (suppression_count reports it)."""
+def scan_secrets_delta(workspace_root: Path | str, files: Iterable[str], base_sources: Mapping[str, str | None],
+                       contents: Mapping[str, bytes] | None = None) -> list[Finding]:
+    """The Tier A findings of ``files`` (relative to ``workspace_root``; ``contents`` holds the bytes of
+    those not read from it) that the text ``base_sources`` holds for each did not already hold, as a
+    multiset: a touched legacy line does not block, a copied or rotated secret does. A
+    ``# gitleaks:allow`` line is not judged (suppression_count reports it)."""
     root = Path(workspace_root)
     out: list[Finding] = []
     for rel in files:
         path = root.joinpath(*rel.split("/"))
         try:
-            raw = b"" if path.is_symlink() or not path.is_file() else path.read_bytes()
+            if contents is not None and rel in contents:
+                raw = contents[rel]
+            else:
+                raw = b"" if path.is_symlink() or not path.is_file() else path.read_bytes()
         except OSError:
             continue
         if not raw or b"\0" in raw[:4096]:
