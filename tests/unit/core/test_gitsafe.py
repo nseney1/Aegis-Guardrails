@@ -449,6 +449,23 @@ def test_only_filter_drivers_outside_the_repository_config_clean_content(
     assert gitsafe.changed_files(repo, "working") == ["a.py"]
 
 
+def _switched_off(driver: str) -> list:
+    return ["-c", f"filter.{driver}.clean=", "-c", f"filter.{driver}.smudge=", "-c", f"filter.{driver}.process=",
+            "-c", f"filter.{driver}.required=false"]
+
+
+def test_filter_overrides_name_the_repository_drivers_or_with_scope_all_every_driver(tmp_path: Path, git_config):
+    git_config(global_=_STRIP_TRAILING_SPACES + "[filter \"a=b\"]\n\tclean = cat\n")
+    repo = _repo(tmp_path / "repo")
+    _git(repo, "config", "filter.mine.clean", "cat")
+    assert gitsafe.TRUSTED_SCOPES == frozenset({"system", "global", "command"})
+
+    assert gitsafe.filter_overrides(repo) == tuple(_switched_off("mine"))  # the user's a=b is not named
+    assert gitsafe.filter_overrides(repo, scope="all") is None  # a=b cannot be switched off
+    _git(tmp_path, "config", "--global", "--remove-section", "filter.a=b")
+    assert gitsafe.filter_overrides(repo, scope="all") == (*_switched_off("strip"), *_switched_off("mine"))
+
+
 def test_a_symlink_whose_stat_changed_but_target_did_not_is_unchanged(repo: Path):
     link = repo / "link.py"
     try:
@@ -716,7 +733,7 @@ def test_the_fallback_export_keeps_a_posix_file_name_with_a_colon(tmp_path: Path
     (root / "src").mkdir()
     (root / "src" / "x.py").write_bytes(b"x\n")
     _commit(root)
-    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)  # checkout-index is not tried
+    monkeypatch.setattr(gitsafe, "filter_overrides", lambda cwd, scope="untrusted": None)  # checkout-index is not tried
     dest = tmp_path / "dest"
     gitsafe.export_tree(root, "HEAD", dest)
     assert (dest / "a:b.py").read_bytes() == b"colon\n" and (dest / "src" / "x.py").read_bytes() == b"x\n"
@@ -738,7 +755,7 @@ def test_with_windows_rules_a_drive_or_stream_name_is_skipped(tmp_path: Path, mo
         (root / "a:b.py").write_bytes(b"colon\n")
     _commit(root)
     monkeypatch.setattr(gitsafe, "_on_windows", lambda: True)
-    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)
+    monkeypatch.setattr(gitsafe, "filter_overrides", lambda cwd, scope="untrusted": None)
     dest = tmp_path / "out" / "dest"
     overlay = {"D:evil.py": b"x", "D:/x/evil.py": b"x", "x:stream": b"x", "ok.py": b"y"}
     gitsafe.export_tree(root, "HEAD", dest, overlay=overlay)

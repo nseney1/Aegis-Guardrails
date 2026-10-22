@@ -75,6 +75,7 @@ __all__ = [
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
+    "TRUSTED_SCOPES",
     "add_trailer",
     "blob_id",
     "blob_oid",
@@ -82,6 +83,7 @@ __all__ = [
     "common_dir",
     "diff_entries",
     "export_tree",
+    "filter_overrides",
     "git_executable",
     "git_path",
     "git_version",
@@ -467,31 +469,28 @@ _blob_id = blob_id
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
 # any other scope (the repository's .git/config or config.worktree, or a file either
 # includes) is switched off before git reads working-tree files.
-_TRUSTED_SCOPES = frozenset({"system", "global", "command"})
+TRUSTED_SCOPES = frozenset({"system", "global", "command"})
 _FILTER_COMMANDS = ("clean", "smudge", "process")
 _REGULAR_MODES = frozenset({"100644", "100755"})
 _LINK_MODE = "120000"
 
 
-def _filter_overrides(cwd: Path | str) -> Optional[Tuple[str, ...]]:
-    """``-c`` options that switch off every filter driver the repository's config
-    defines, or None when git cannot list them or a driver's name cannot be given to
-    ``-c`` (it splits at the first ``=``)."""
+def filter_overrides(cwd: Path | str, scope: str = "untrusted") -> Optional[Tuple[str, ...]]:
+    """``-c`` options that switch off every filter driver the repository's config defines
+    (``scope="all"``: every configured driver, whoever wrote it), or None when git cannot
+    list them or a driver's name cannot be given to ``-c`` (it splits at the first ``=``)."""
     listing = ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]
-    res = _completed([listing[0], "--show-scope", *listing[1:]], cwd)
+    res = _completed([listing[0], "--show-scope", *listing[1:]] if scope == "untrusted" else listing, cwd)
     if res is None:
         return None
     if res.returncode == 1:  # no filter driver is configured anywhere
         return ()
-    if res.returncode == 0:
-        fields = res.stdout.split(b"\0")
-        keys = [key for scope, key in zip(fields[0::2], fields[1::2])
-                if key and scope.decode("ascii", "replace") not in _TRUSTED_SCOPES]
-    else:  # git before 2.26 has no --show-scope: switch off every driver
-        res = _completed(listing, cwd)
-        if res is None or res.returncode not in (0, 1):
-            return None
-        keys = [key for key in res.stdout.split(b"\0") if key]
+    if res.returncode != 0:  # git before 2.26 has no --show-scope: switch off every driver
+        return filter_overrides(cwd, "all") if scope == "untrusted" else None
+    fields = res.stdout.split(b"\0")
+    keys = [key for key in fields if key] if scope != "untrusted" else [
+        key for where, key in zip(fields[0::2], fields[1::2])
+        if key and where.decode("ascii", "replace") not in TRUSTED_SCOPES]
     overrides: List[str] = []
     for driver in dict.fromkeys(os.fsdecode(key)[len("filter."):].rpartition(".")[0] for key in keys):
         if not driver:
@@ -555,7 +554,7 @@ def _working_changes(cwd: Path | str, tree: str) -> Optional[List[str]]:
     blobs under core.autocrlf or ``text``). Its own bytes are compared first; only a
     regular file that differs is hashed by git.
     """
-    overrides = _filter_overrides(cwd)
+    overrides = filter_overrides(cwd)
     if overrides is None:
         return None
     hardening = (*_HARDENING, *overrides)
@@ -857,7 +856,7 @@ def export_tree(
     root = toplevel(cwd) or Path(cwd).resolve()
 
     exported = False
-    overrides = _filter_overrides(root)
+    overrides = filter_overrides(root)
     if overrides is not None:
         temp_dir = Path(tempfile.mkdtemp(prefix="aegis-export-"))
         try:
@@ -1204,7 +1203,7 @@ def _repository_merge_drivers(cwd: Path | str) -> Optional[List[str]]:
     names = [
         os.fsdecode(key)[len("merge."):-len(".driver")]
         for scope, key in zip(fields[0::2], fields[1::2])
-        if key and scope.decode("ascii", "replace") not in _TRUSTED_SCOPES
+        if key and scope.decode("ascii", "replace") not in TRUSTED_SCOPES
     ]
     return list(dict.fromkeys(names))
 
@@ -1237,7 +1236,7 @@ def merge_tree_conflicted(cwd: Path | str, p1: str, p2: str) -> bool:
             f"the repository config defines merge driver {', '.join(drivers)}, which git merge-tree would run; "
             "the merge metric is unavailable here"
         )
-    overrides = _filter_overrides(cwd)
+    overrides = filter_overrides(cwd)
     if overrides is None:
         raise MergeTreeUnavailable("cannot switch off the repository's filter drivers; the merge metric is unavailable here")
     hardening = (*_HARDENING, "-c", "merge.renormalize=false", *overrides)

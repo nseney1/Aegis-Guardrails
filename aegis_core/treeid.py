@@ -13,13 +13,16 @@ the repository's index, refs, work tree or object store:
    ``GIT_INDEX_FILE``, so git's racy-timestamp logic judges the same stat data the real one would.
 4. ``ls-files -v`` is audited: an assume-unchanged or skip-worktree entry whose path exists on
    disk lets a file change without git seeing it, so the tree is ``unbindable``.
-5. Every filter driver named by the configuration of the work tree and of each checked-out
-   submodule below it (16 deep at most) is neutralised on the commands that hash content
-   (``filter.<d>.clean=``, ``smudge=``, ``process=``, ``required=false``): a clean filter is a
-   program the repository chose. ``git add`` runs ``git status`` in each submodule under that
-   submodule's own config, and the ``-c`` options reach it, so its drivers are named there too. A
-   driver ``-c`` cannot name (it splits at the first ``=``), a deeper chain or an unreadable config
-   makes the tree ``unbindable``.
+5. Every filter driver that the config of the work tree or of a checked-out submodule below it
+   (16 deep at most) defines outside the user's and the system's config is neutralised on the
+   commands that hash content (``filter.<d>.clean=``, ``smudge=``, ``process=``,
+   ``required=false``): a clean filter is a program the repository chose. A driver of the user's
+   or the system's config (git-lfs, say) runs as in any git command the user types, so the tree is
+   the one a commit records; a name the repository also defines is neutralised everywhere, and a
+   git without ``config --show-scope`` (before 2.26) neutralises every driver. ``git add`` runs
+   ``git status`` in each submodule under that submodule's own config, and the ``-c`` options reach
+   it, so its drivers are named there too. A driver ``-c`` cannot name (it splits at the first
+   ``=``), a deeper chain or an unreadable config makes the tree ``unbindable``.
 6. A private object directory takes the writes, with the real store as its alternate.
 7. ``git add -A -- . ':(exclude,glob)**/.aegis/state/**'`` then ``git write-tree``.
 8. An empty tree is refused when HEAD is not empty (an unreadable work tree must not look clean).
@@ -178,9 +181,23 @@ def _neutralising_flags(drivers: Sequence[str]) -> List[str]:
     return flags
 
 
+def _config_keys(repo: Path, env: Dict[str, str]) -> Optional[List[Tuple[str, str]]]:
+    """``(scope, key)`` of each config entry git reads in ``repo``, or None when it cannot list them.
+    A git before 2.26 has no ``--show-scope``: every scope then reads ``""``, which is not trusted."""
+    listed = _spawn(_stable_flags(), ["config", "--list", "--show-scope", "--name-only", "-z"], repo, env)
+    if listed.returncode == 0:
+        fields = listed.stdout.decode("utf-8", "replace").split("\0")
+        return list(zip(fields[0::2], fields[1::2]))
+    listed = _spawn(_stable_flags(), ["config", "--list", "--name-only", "-z"], repo, env)
+    if listed.returncode != 0:
+        return None
+    return [("", key) for key in listed.stdout.decode("utf-8", "replace").split("\0")]
+
+
 def _filter_drivers(repo: Path, env: Dict[str, str]) -> Tuple[List[str], str]:
-    """The filter drivers named by the configuration of ``repo`` (read under ``env``) and of each
-    checked-out submodule below it, and why that list cannot be relied on (``""`` when it can).
+    """The filter drivers that the configuration of ``repo`` (read under ``env``) and of each
+    checked-out submodule below it defines outside ``gitsafe.TRUSTED_SCOPES``, and why that list
+    cannot be relied on (``""`` when it can).
 
     The ``-c`` options of the outer ``git add`` reach the ``git status`` it runs in a submodule
     (``GIT_CONFIG_PARAMETERS``), so naming a submodule's drivers there switches them off.
@@ -197,14 +214,15 @@ def _filter_drivers(repo: Path, env: Dict[str, str]) -> Tuple[List[str], str]:
         if depth > _MAX_SUBMODULE_DEPTH:
             return drivers, f"submodules are nested more than {_MAX_SUBMODULE_DEPTH} deep"
         here_env = env if depth == 0 else _submodule_environment()
-        config = _spawn(_stable_flags(), ["config", "--list", "--name-only", "-z"], here, here_env)
-        if config.returncode != 0:
+        keys = _config_keys(here, here_env)
+        if keys is None:
             if depth == 0:
                 return drivers, "git config --list failed, so its filter drivers cannot be switched off"
             continue  # git cannot read this submodule's config, so it runs nothing from it
-        for key in config.stdout.decode("utf-8", "replace").split("\0"):
+        for scope, key in keys:
             lowered = key.lower()
-            if lowered.startswith("filter.") and lowered.rsplit(".", 1)[-1] in (*_FILTER_VARS, "required"):
+            if scope not in gitsafe.TRUSTED_SCOPES and lowered.startswith("filter.") \
+                    and lowered.rsplit(".", 1)[-1] in (*_FILTER_VARS, "required"):
                 driver = key[len("filter."):].rsplit(".", 1)[0]
                 if "=" in driver or "\ufffd" in driver:  # -c splits at the first "="; undecodable bytes
                     return drivers, f"filter driver {driver!r} has a name git -c cannot carry: it cannot be switched off"

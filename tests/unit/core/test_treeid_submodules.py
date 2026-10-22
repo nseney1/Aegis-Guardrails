@@ -1,4 +1,5 @@
-"""Tree identity runs no program a repository or one of its submodules chose (R-trust-18).
+"""Tree identity runs no program a repository or one of its submodules chose (R-trust-18), while
+the user's and the system's filter drivers run as in any git command (R-trust-20).
 
 Every repository lives in a temporary directory under a throwaway HOME. The marker filters are
 POSIX shell scripts outside every repository: a marker file means git ran one. Submodule files are
@@ -271,3 +272,90 @@ def test_every_git_call_of_tree_identity_is_hardened(tmp_path, monkeypatch):
         return {value for flag, value in zip(argv, argv[1:]) if flag == "-c"}
 
     assert calls and [argv[1:4] for argv in calls if not HARDENING <= settings(argv)] == []
+
+
+# ── The user's and the system's drivers run, as in any git command (R-trust-20) ──
+
+def _txt_project(tmp_path: Path, driver: str) -> hg.Repo:
+    """``*.txt`` is assigned ``driver`` (defined nowhere yet) and ``notes.txt`` has changed."""
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.write(".gitattributes", f"*.txt filter={driver}\n")
+    repo.write("notes.txt", "one\n")
+    repo.commit("notes")
+    repo.write("notes.txt", "two\n")
+    return repo
+
+
+def _git_tree(root: Path, *flags: str) -> str:
+    """The tree plain git commits for the work tree (through a throwaway index), ``flags`` first."""
+    env = {"GIT_INDEX_FILE": str(root.parent / f"index-{root.name}")}
+    try:
+        hg.git(root, *flags, "read-tree", "HEAD", env=env)
+        hg.git(root, *flags, "add", "-A", env=env)
+        return hg.git(root, *flags, "write-tree", env=env)
+    finally:
+        os.unlink(env["GIT_INDEX_FILE"])
+
+
+@posix_filter
+def test_a_user_clean_filter_runs_so_the_tree_is_the_one_git_commits(tmp_path):
+    repo = _txt_project(tmp_path, "lfsish")
+    marker = tmp_path / "USER_FILTER_RAN"
+    repo.home.config("filter.lfsish.clean", _filter_script(tmp_path, marker, extra="echo cleaned\n"))
+
+    binding = treeid.tree_of(repo.root)
+    assert binding.status == "ok" and marker.exists(), "the user's own filter did not run"
+    assert binding.tree == _git_tree(repo.root)
+    assert binding.tree != _git_tree(repo.root, "-c", "filter.lfsish.clean=")  # the filter changes the tree
+
+
+@posix_filter
+def test_a_clean_filter_the_repository_config_defines_is_still_switched_off(tmp_path):
+    repo = _txt_project(tmp_path, "repof")
+    marker = tmp_path / "REPO_FILTER_RAN"
+    hg.git(repo.root, "config", "filter.repof.clean", _filter_script(tmp_path, marker, extra="echo cleaned\n"))
+
+    binding = treeid.tree_of(repo.root)
+    assert binding.status == "ok" and not marker.exists()
+    assert binding.tree == _git_tree(repo.root, "-c", "filter.repof.clean=")
+
+
+@posix_filter
+def test_a_user_driver_whose_name_holds_an_equals_sign_runs(tmp_path):
+    repo = _txt_project(tmp_path, "a=b")
+    marker = tmp_path / "USER_EQ_FILTER_RAN"
+    repo.home.config("filter.a=b.clean", _filter_script(tmp_path, marker, extra="echo cleaned\n"))
+
+    binding = treeid.tree_of(repo.root)
+    assert binding.status == "ok" and marker.exists()
+    assert binding.tree == _git_tree(repo.root)
+
+
+@posix_filter
+def test_a_driver_the_repository_also_defines_is_switched_off_in_every_scope(tmp_path):
+    repo = _txt_project(tmp_path, "dual")
+    user_marker, repo_marker = tmp_path / "USER_RAN", tmp_path / "REPO_RAN"
+    repo.home.config("filter.dual.clean", _filter_script(tmp_path, user_marker, extra="echo user\n"))
+    hg.git(repo.root, "config", "filter.dual.clean", _filter_script(tmp_path, repo_marker, extra="echo repo\n"))
+
+    binding = treeid.tree_of(repo.root)
+    assert binding.status == "ok" and not user_marker.exists() and not repo_marker.exists()
+    assert binding.tree == _git_tree(repo.root, "-c", "filter.dual.clean=")
+
+
+@posix_filter
+def test_a_git_without_show_scope_switches_off_every_driver(tmp_path, monkeypatch):
+    repo = _txt_project(tmp_path, "lfsish")
+    marker = tmp_path / "USER_FILTER_RAN"
+    repo.home.config("filter.lfsish.clean", _filter_script(tmp_path, marker, extra="echo cleaned\n"))
+    real_run = subprocess.run
+
+    def git_before_2_26(argv, *args, **kwargs):
+        if "--show-scope" in argv:
+            return subprocess.CompletedProcess(argv, 129, b"", b"error: unknown option `show-scope'\n")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", git_before_2_26)
+    binding = treeid.tree_of(repo.root)
+    assert binding.status == "ok" and not marker.exists()
+    assert binding.tree == _git_tree(repo.root, "-c", "filter.lfsish.clean=")
