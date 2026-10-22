@@ -550,18 +550,10 @@ class TestSarifIngest:
             ],
         }
 
-        report = scanners.ingest_sarif(
-            sarif_doc,
-            workspace_root=tmp_path,
-            base_fingerprints={expected_fp1},
-        )
+        report = scanners.ingest_sarif(sarif_doc, workspace_root=tmp_path)
         assert report["status"] == "fail"
         assert report["total_raw"] == 2
-        assert report["base_subtracted"] == 1
-        assert len(report["findings"]) == 1
-        finding = report["findings"][0]
-        assert finding.rule_id == "S307"
-        assert finding.fingerprint == expected_fp2
+        assert [(f.rule_id, f.fingerprint) for f in report["findings"]] == [("S605", expected_fp1), ("S307", expected_fp2)]
         # 3 inline suppressions (noqa, nosec, gitleaks:allow) + 2 .gitleaksignore entries = 5
         assert report["suppression_count"] == 5
 
@@ -631,12 +623,6 @@ class TestSarifIngestStaysInsideWorkspace:
         assert self.SENTINEL not in json.dumps(finding.as_dict())
         assert finding.snippet == "reported message"
 
-    def test_the_base_document_is_confined_the_same_way(self, tree):
-        ws, _ = tree
-        doc = _sarif_for("sub/../../outside.txt")
-        base = [f.fingerprint for f in scanners.ingest_sarif(doc, workspace_root=ws)["findings"]]
-        report = scanners.ingest_sarif(doc, workspace_root=ws, base_fingerprints=base)
-        assert (report["status"], report["base_subtracted"]) == ("pass", 1)
 
     @pytest.mark.parametrize("uri", ["sub/app.py", "./sub/app.py", "ABS", "FILE"])
     def test_an_in_tree_uri_reads_the_reported_line(self, tree, uri):
@@ -695,6 +681,9 @@ _MALFORMED_DOCS = {
 }
 
 
+_CLEAN_SARIF = '{"version": "2.1.0", "runs": [{"results": []}]}'
+
+
 class TestSarifVerdictNeedsACompletedScan:
     """R-checks-17: a scanner result is ``pass`` only when the scan demonstrably ran and its output
     was understood; anything else is ``unverified``, and untrusted output never raises."""
@@ -723,11 +712,16 @@ class TestSarifVerdictNeedsACompletedScan:
         assert (report["status"], report["total_raw"]) == ("pass", 0)
 
     @staticmethod
-    def _run(rc, stdout, stderr="scanner said so", base=()):
+    def _run(rc, stdout, stderr="scanner said so", base_stdout=_CLEAN_SARIF):
+        """run_preset with a runner that answers ``stdout`` on the head and ``base_stdout`` on the base."""
+        root = _git_ws()
+
         def runner(argv, cwd, env=None, timeout=60):
+            if Path(cwd).resolve() != root.resolve():
+                return {"returncode": 1 if base_stdout != _CLEAN_SARIF else 0, "stdout": base_stdout, "stderr": ""}
             res = {"stdout": stdout, "stderr": stderr}
             return res if rc == "none" else {**res, "returncode": rc}
-        return scanners.run_preset_scanner("ruff", Path("."), runner=runner, base_fingerprints=base)
+        return scanners.run_preset("ruff", root, "HEAD", runner=runner)
 
     @pytest.mark.parametrize("rc,stdout", [
         (0, ""), (0, "   \n"), (0, "all good"), (0, "[]"), (0, "null"), (0, "{}"), (0, '{"error":"boom"}'),
@@ -747,7 +741,7 @@ class TestSarifVerdictNeedsACompletedScan:
         assert report["status"] == "unverified" and report["reason"] == "ruff produced no SARIF output"
 
     def test_a_clean_completed_scan_passes(self):
-        assert self._run(0, '{"version": "2.1.0", "runs": [{"results": []}]}')["status"] == "pass"
+        assert self._run(0, _CLEAN_SARIF)["status"] == "pass"
 
     @pytest.mark.parametrize("rc", [0, 1, 2])
     def test_a_new_finding_fails_whatever_the_exit_code(self, rc):
@@ -755,34 +749,48 @@ class TestSarifVerdictNeedsACompletedScan:
         assert report["status"] == "fail" and [f.rule_id for f in report["findings"]] == ["S307"]
 
     def test_the_exit_code_is_judged_on_raw_findings_not_the_base_delta(self):
-        fp = scanners.ingest_sarif(_SARIF_ONE_FINDING)["findings"][0].fingerprint
-        baselined = self._run(1, json.dumps(_SARIF_ONE_FINDING), base=[fp])
-        assert (baselined["status"], baselined["base_subtracted"]) == ("pass", 1)
-        crashed = self._run(2, json.dumps(_SARIF_ONE_FINDING), stderr="crashed", base=[fp])
+        baselined = self._run(1, json.dumps(_SARIF_ONE_FINDING), base_stdout=json.dumps(_SARIF_ONE_FINDING))
+        assert (baselined["status"], baselined["subtracted"], baselined["findings"]) == ("pass", 1, [])
+        crashed = self._run(2, json.dumps(_SARIF_ONE_FINDING), stderr="crashed", base_stdout=json.dumps(_SARIF_ONE_FINDING))
         assert (crashed["status"], crashed["reason"]) == ("unverified", "crashed")
+
+    def test_a_base_scan_that_does_not_complete_is_unverified(self):
+        report = self._run(1, json.dumps(_SARIF_ONE_FINDING), base_stdout="not sarif")
+        assert (report["status"], report["findings"]) == ("unverified", [])
+        assert report["reason"].startswith("the merge-base scan: ")
+
+
+def _git_ws(root: Path | None = None) -> Path:
+    """A one-commit repository (``app.py`` holds ``eval(x)``) under a fresh temporary directory."""
+    import subprocess
+    import tempfile
+
+    root = root or Path(tempfile.mkdtemp(prefix="aegis-scan-test-"))
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "app.py").write_bytes(b"eval(x)\n")
+    for args in (["init", "-q", "-b", "main"], ["add", "-A"],
+                 ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "c"]):
+        subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True,
+                       env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"})
+    return root
 
 
 class TestExternalScannerPresets:
-    def test_ruff_preset_argv_isolated_and_ignores_s603_s607(self, tmp_path: Path) -> None:
-        argv = scanners.build_preset_argv("ruff", tmp_path)
-        assert argv[0] == "ruff"
+    def test_ruff_preset_argv_isolated_and_ignores_s603_s607(self) -> None:
+        argv = scanners.PRESET_ARGV["ruff"]
+        assert argv[:2] == ("ruff", "check")
         assert "--isolated" in argv
-        assert "--select" in argv
-        assert "S" in argv
-        assert "--ignore" in argv
-        assert "S603,S607" in argv
+        assert argv[argv.index("--select") + 1] == "S"
+        assert argv[argv.index("--ignore") + 1] == "S603,S607"
 
-    def test_gitleaks_preset_uses_redact_and_only_user_scope_config(self, tmp_path: Path) -> None:
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
-        user_dir = tmp_path / "user_aegis"
-        user_dir.mkdir()
-        user_cfg = user_dir / "gitleaks.toml"
-        user_cfg.write_bytes(b"# trusted user config\n")
+    def test_the_presets_are_the_names_the_config_key_accepts(self) -> None:
+        from aegis_core.config import SCANNER_PRESETS
 
-        argv_user = scanners.build_preset_argv("gitleaks", repo_dir, user_config_dir=user_dir)
-        assert "--redact" in argv_user
-        assert argv_user[argv_user.index("--config") + 1] == str(user_cfg.resolve())
+        assert tuple(scanners.PRESET_ARGV) == SCANNER_PRESETS
+
+    def test_an_unknown_preset_is_refused(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="bandit"):
+            scanners.run_preset("bandit", tmp_path, "HEAD")
 
     @pytest.fixture
     def home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -796,7 +804,7 @@ class TestExternalScannerPresets:
     def _stub(calls: list):
         def runner(argv, cwd, env=None, timeout=60):
             calls.append(list(argv))
-            return {"returncode": 0, "stdout": '{"version": "2.1.0", "runs": [{"results": []}]}', "stderr": ""}
+            return {"returncode": 0, "stdout": _CLEAN_SARIF, "stderr": ""}
         return runner
 
     @staticmethod
@@ -806,11 +814,20 @@ class TestExternalScannerPresets:
         (repo / ".gitleaks.toml").write_bytes(b'[allowlist]\npaths = [".*"]\n')
         return repo
 
+    def test_gitleaks_preset_uses_redact_and_only_user_scope_config(self, tmp_path: Path, home: Path) -> None:
+        user_cfg = home / ".aegis" / "gitleaks.toml"
+        user_cfg.write_bytes(b"# trusted user config\n")
+        (tmp_path / "repo").mkdir()
+        calls: list = []
+        scanners.run_preset("gitleaks", tmp_path / "repo", "HEAD", runner=self._stub(calls))
+        assert "--redact" in calls[0]
+        assert calls[0][calls[0].index("--config") + 1] == str(user_cfg.resolve())
+
     def test_a_repository_gitleaks_config_without_a_user_config_is_unverified(self, tmp_path, home):
         """R-checks-18: gitleaks would read <source>/.gitleaks.toml when no --config is given, so a
         repository allowlist could silence every finding; the preset refuses to run instead."""
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", self._allow_all_repo(tmp_path), "HEAD", runner=self._stub(calls))
         assert (res["status"], res["findings"], calls) == ("unverified", [], [])
         assert ".gitleaks.toml" in res["reason"]
 
@@ -818,16 +835,18 @@ class TestExternalScannerPresets:
         user_cfg = home / ".aegis" / "gitleaks.toml"
         user_cfg.write_bytes(b"# trusted user config\n")
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", self._allow_all_repo(tmp_path), "HEAD", runner=self._stub(calls))
         assert res["status"] == "pass"
         assert calls[0][calls[0].index("--config") + 1] == str(user_cfg.resolve())
 
-    def test_a_user_config_dir_inside_the_repository_does_not_count(self, tmp_path, home):
+    def test_a_user_config_dir_inside_the_repository_does_not_count(self, tmp_path, monkeypatch):
         repo = self._allow_all_repo(tmp_path)
         (repo / ".aegis").mkdir()
         (repo / ".aegis" / "gitleaks.toml").write_bytes(b"# planted\n")
+        for name in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(name, str(repo))
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", repo, user_config_dir=repo / ".aegis", runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", repo, "HEAD", runner=self._stub(calls))
         assert (res["status"], calls) == ("unverified", [])
 
     def test_a_dangling_repository_config_symlink_still_counts(self, tmp_path, home):
@@ -838,33 +857,39 @@ class TestExternalScannerPresets:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks are unavailable")
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", repo, runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", repo, "HEAD", runner=self._stub(calls))
         assert (res["status"], calls) == ("unverified", [])
 
     def test_with_neither_config_gitleaks_runs_redacted_without_a_config(self, tmp_path, home):
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", tmp_path, "HEAD", runner=self._stub(calls))
         assert res["status"] == "pass"
         assert "--redact" in calls[0] and "--config" not in calls[0]
 
     def test_the_ruff_preset_ignores_a_repository_gitleaks_config(self, tmp_path, home):
         calls: list = []
-        res = scanners.run_preset_scanner("ruff", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        res = scanners.run_preset("ruff", self._allow_all_repo(tmp_path), "HEAD", runner=self._stub(calls))
         assert res["status"] == "pass" and calls[0][0] == "ruff"
 
     def test_missing_binary_returns_unverified_not_pass(self, tmp_path: Path) -> None:
         def fake_missing_runner(argv, cwd, env=None, timeout=60):
-            return {
-                "returncode": 127,
-                "stdout": "",
-                "stderr": f"{argv[0]}: not found",
-                "missing_binary": True,
-                "timed_out": False,
-            }
+            return {"returncode": 127, "stdout": "", "stderr": f"{argv[0]}: not found", "missing_binary": True,
+                    "timed_out": False}
 
-        res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=fake_missing_runner)
+        res = scanners.run_preset("gitleaks", tmp_path, "HEAD", runner=fake_missing_runner)
         assert res["status"] == "unverified"
         assert "not found" in res["reason"].lower()
+
+    def test_the_base_is_scanned_only_when_the_head_has_findings(self, tmp_path, home):
+        calls: list = []
+        scanners.run_preset("ruff", tmp_path, "no-such-commit", runner=self._stub(calls))
+        assert len(calls) == 1
+
+    def test_a_merge_base_that_cannot_be_exported_is_unverified(self, tmp_path, home):
+        root = _git_ws(tmp_path / "ws")
+        res = scanners.run_preset("ruff", root, "no-such-commit",
+                                  runner=lambda argv, cwd, **kw: {"returncode": 1, "stdout": json.dumps(_SARIF_ONE_FINDING)})
+        assert (res["status"], res["findings"]) == ("unverified", [])
 
 
 def _program(path: Path, body: str) -> Path:
@@ -918,7 +943,7 @@ class TestPresetScannerProgramLookup:
         trusted.mkdir()  # holds no scanner: the real one is not installed
         _set_path(monkeypatch, str(repo / "bin") if entry == "REPO_BIN" else entry, str(trusted))
 
-        res = scanners.run_preset_scanner(preset, repo)
+        res = scanners.run_preset(preset, repo, "HEAD")
 
         assert not marker.exists(), "a program the repository planted ran"
         assert res["status"] == "unverified"
@@ -929,10 +954,15 @@ class TestPresetScannerProgramLookup:
         marker = tmp_path / "planted-ran"
         self._plant(repo, preset, marker)
         trusted = tmp_path / "trusted"
-        _program(trusted / preset, f"import json\nprint(json.dumps({_SARIF_ONE_FINDING!r}))\n")
-        _set_path(monkeypatch, "", "bin", str(repo / "bin"), str(trusted))
+        _git_ws(repo)  # the base export holds the same eval(x); the fake reports it on the head only
+        real = os.path.realpath(repo)
+        _program(trusted / preset, "import json, os, sys\n"
+                 f"found = os.path.realpath(sys.argv[-1]) == {real!r}\n"
+                 f"print(json.dumps({_SARIF_ONE_FINDING!r} if found else {{'runs': [{{'results': []}}]}}))\n")
+        import shutil
+        _set_path(monkeypatch, "", "bin", str(repo / "bin"), str(trusted), os.path.dirname(shutil.which("git")))
 
-        res = scanners.run_preset_scanner(preset, repo)
+        res = scanners.run_preset(preset, repo, "HEAD")
 
         assert not marker.exists()
         assert res["status"] == "fail"
@@ -945,5 +975,5 @@ class TestPresetScannerProgramLookup:
             seen.append(list(argv))
             return {"returncode": 0, "stdout": json.dumps(_SARIF_ONE_FINDING), "stderr": ""}
 
-        scanners.run_preset_scanner("ruff", tmp_path, runner=runner)
-        assert [argv[0] for argv in seen] == ["ruff"]
+        scanners.run_preset("ruff", _git_ws(tmp_path / "ws"), "HEAD", runner=runner)
+        assert [argv[0] for argv in seen] == ["ruff", "ruff"]  # the head, then the merge-base export

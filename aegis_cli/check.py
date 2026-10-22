@@ -182,8 +182,9 @@ _NOT_EXECUTED = ("regression", "trailer_checks")
 
 
 def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
-                       skipped=()) -> dict:
+                       skipped=(), scanner_results=None) -> dict:
     reg_blocking = bool(reg_report is not None and reg_report.blocking)
+    scanner_blocking = any(r["status"] == "fail" for r in scanner_results or ())
     perf_blocking = bool(perf_report is not None and not perf_report.get("passed", True))
     trailer_blocking = bool(trailer_checks and any(t.get("failed") for t in trailer_checks))
     document = report.as_dict(root)
@@ -197,7 +198,10 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
         document["trailer_checks"] = trailer_checks
     if skipped:
         document["skipped"] = list(skipped)
-    if reg_blocking or perf_blocking or trailer_blocking:
+    if scanner_results:  # findings without their fingerprint: it hashes the unmasked line
+        document["scanners"] = [{**r, "findings": [{k: v for k, v in f.as_dict().items() if k != "fingerprint"}
+                                                   for f in r["findings"]]} for r in scanner_results]
+    if reg_blocking or perf_blocking or trailer_blocking or scanner_blocking:
         document["status"] = "fail"
     return document
 
@@ -221,15 +225,16 @@ def _write_step_summary_if_configured(document: dict, root: str) -> None:
 
 
 def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
-              skipped=()) -> None:
+              skipped=(), scanner_results=None) -> None:
     from aegis_cli import sanitize_display
     from aegis_cli.formatters.report import format_sarif_report
     from aegis_core import regression
 
     reg_blocking = bool(reg_report is not None and reg_report.blocking)
     trailer_blocking = bool(trailer_checks and any(t.get("failed") for t in trailer_checks))
+    new_scanner = sum(len(r["findings"]) for r in scanner_results or () if r["status"] == "fail")
     document = _build_ci_document(report, root, reg_report, cov_report, perf_report, trailer_checks=trailer_checks,
-                                  skipped=skipped)
+                                  skipped=skipped, scanner_results=scanner_results)
     _write_step_summary_if_configured(document, root)
 
     if fmt == "sarif":
@@ -264,6 +269,12 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
                     f"title={_escape_annotation('regression check unverified' if unverified else reg_title, True)}"
                     f"::{_escape_annotation(f'{finding.code}: {finding.message}')}"
                 )
+        for result in scanner_results or ():
+            for f in result["findings"]:
+                print(f"::error file={_escape_annotation(f.path, True)},line={f.line},"
+                      f"title={_escape_annotation('scanner/' + result['name'], True)}::{_escape_annotation(f'{f.rule_id}: {f.message}')}")
+            if result["status"] == "unverified":
+                print(f"::warning title=scanner unverified::{_escape_annotation(result['name'] + ': ' + result['reason'])}")
     short = lambda sha: sha[:10]  # noqa: E731
     span = f"{short(report.merge_base)}..{short(report.head)}"
     if not report.weakenings and not gated:
@@ -271,6 +282,8 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             print(f"aegis check --ci: FAILED: regression check failed ({len(reg_report.findings)} finding(s), {span})")
         elif trailer_blocking:
             print(f"aegis check --ci: FAILED: Aegis-Check trailer divergence ({span})")
+        elif new_scanner:
+            print(f"aegis check --ci: FAILED: scanner finding ({new_scanner} new, {span})")
         elif report.merge_base == report.head:  # a push to the base branch, a dispatch run, a stale branch
             print(f"aegis check --ci: note: base and head are the same commit; nothing was compared ({span})")
         else:
@@ -290,6 +303,8 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             print(f"aegis check --ci: FAILED: regression check failed ({len(reg_report.findings)} finding(s), {span})")
         elif trailer_blocking:
             print(f"aegis check --ci: FAILED: Aegis-Check trailer divergence ({span})")
+        elif new_scanner:
+            print(f"aegis check --ci: FAILED: scanner finding ({new_scanner} new, {span})")
         else:
             approval = report.approval
             signer = (f"review of {approval.signer}" if approval.source == "review"
@@ -332,6 +347,16 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     for t_chk in trailer_checks or ():
         if t_chk.get("failed"):
             print(sanitize_display(f"  [FAIL:trailer-divergence] {t_chk['commit'][:10]}: {t_chk.get('reason', '')}", 400))
+    if scanner_results is not None and not scanner_results:
+        print("scanners: none configured")
+    for result in scanner_results or ():
+        tag = f"{result['status'].upper()}:scanner/{result['name']}"
+        if result["status"] == "unverified":
+            print(sanitize_display(f"  [{tag}] {result['reason']}", 400))
+        elif result["status"] == "pass":
+            print(f"  [{tag}] no new finding ({result['subtracted']} at the merge base)")
+        for f in result["findings"]:
+            print(sanitize_display(f"  [{tag}] {f.path}:{f.line} {f.rule_id}: {f.message}", 400))
     if cov_report is not None and cov_report.get("status") == "reported":
         ratio = cov_report.get("ratio")
         print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
@@ -408,12 +433,23 @@ def _run_ci(args: argparse.Namespace) -> int:
             perf_report = {"status": "unverified", "reason": f"perf check could not run ({type(exc).__name__})",
                            "regressed": False, "noisy": False, "passed": True}
 
+    from aegis_core.config import user_scanners
+    from aegis_core.verification import scanners
+    scanner_results = []
+    for name in user_scanners(root):
+        try:
+            scanner_results.append(scanners.run_preset(name, root, report.merge_base))
+        except Exception as exc:  # the type only: a message can embed paths
+            scanner_results.append({"name": name, "status": "unverified", "findings": [], "subtracted": 0,
+                                    "reason": f"{name} could not run ({type(exc).__name__})"})
+
     _print_ci(report, fmt, root, reg_report, cov_report=cov_report, perf_report=perf_report, trailer_checks=trailer_checks,
-              skipped=_NOT_EXECUTED if no_exec else ())
+              skipped=_NOT_EXECUTED if no_exec else (), scanner_results=scanner_results)
     perf_ok = True if perf_report is None else bool(perf_report.get("passed", True))
     trailer_ok = not any(t.get("failed") for t in trailer_checks)
     reg_ok = reg_report is None or not reg_report.blocking
-    overall_passed = report.passed and reg_ok and perf_ok and trailer_ok
+    scanners_ok = not any(r["status"] == "fail" for r in scanner_results)
+    overall_passed = report.passed and reg_ok and perf_ok and trailer_ok and scanners_ok
     return 0 if overall_passed else 1
 
 

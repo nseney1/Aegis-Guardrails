@@ -418,11 +418,9 @@ def ingest_sarif(
     doc: Mapping[str, Any],
     *,
     workspace_root: Path | str | None = None,
-    base_fingerprints: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Ingest a parsed SARIF 2.1.0 document: fingerprints, base subtraction, suppressions. Scanner
-    output is untrusted: a document that is not understood is ``unverified``, never raised."""
-    base_fps: set[str] = set(base_fingerprints or ())
+    """Ingest a parsed SARIF 2.1.0 document: findings, fingerprints, suppressions. Scanner output is
+    untrusted: a document that is not understood is ``unverified``, never raised."""
     root_path = Path(workspace_root).resolve() if workspace_root else None
     all_findings: list[Finding] = []
     sarif_supps = 0
@@ -458,13 +456,10 @@ def ingest_sarif(
                                             "error" if level == "error" else "warning", _mask_tier_a(msg)))
     except _SarifError as exc:
         return _sarif_unverified(f"SARIF is malformed: {exc}")
-    delta = [f for f in all_findings if f.fingerprint not in base_fps]
     return {
-        "status": "fail" if delta else "pass",
-        "findings": delta,
+        "status": "fail" if all_findings else "pass",
+        "findings": all_findings,
         "total_raw": len(all_findings),
-        "delta_count": len(delta),
-        "base_subtracted": len(all_findings) - len(delta),
         "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root),
     }
 
@@ -478,20 +473,21 @@ class UntrustedScannerConfig(ValueError):
     """A preset would read a scanner config the repository controls."""
 
 
-def build_preset_argv(
-    preset: str,
-    target_path: Path | str = ".",
-    *,
-    user_config_dir: Path | str | None = None,
-) -> list[str]:
-    target = Path(target_path).resolve()
-    if preset == "ruff":
-        return ["ruff", "check", "--isolated", "--select", "S", "--ignore", "S603,S607", "--output-format", "sarif", str(target)]
+#: The presets ``check --ci`` runs for the user-scope ``scanners`` key; the target directory goes last.
+PRESET_ARGV: dict[str, tuple[str, ...]] = {
+    "ruff": ("ruff", "check", "--isolated", "--select", "S", "--ignore", "S603,S607", "--output-format", "sarif"),
+    "gitleaks": ("gitleaks", "detect", "--no-git", "--redact", "--report-format", "sarif", "--report-path", "-",
+                 "--source"),
+}
+
+
+def _preset_argv(preset: str, target: Path) -> list[str]:
+    argv = [*PRESET_ARGV[preset], str(target)]
     if preset == "gitleaks":
         from aegis_core.workspace.layout import UserLayout
-        argv = ["gitleaks", "detect", "--no-git", "--redact", "--report-format", "sarif", "--report-path", "-", "--source", str(target)]
+
         ul = UserLayout.current()
-        user_dir = Path(user_config_dir).resolve() if user_config_dir else (ul.aegis_dir.resolve() if ul else None)
+        user_dir = ul.aegis_dir.resolve() if ul else None
         if user_dir is not None and not _is_within_dir(user_dir, target):
             cand = (user_dir / "gitleaks.toml").resolve()
             if _is_within_dir(cand, user_dir) and not _is_within_dir(cand, target) and cand.is_file():
@@ -500,38 +496,30 @@ def build_preset_argv(
         # silence the scan. lexists, so a dangling link or a case-folded name counts too.
         if "--config" not in argv and os.path.lexists(target / ".gitleaks.toml"):
             raise UntrustedScannerConfig("the repository has its own .gitleaks.toml; set ~/.aegis/gitleaks.toml to scan it")
-        return argv
-    raise ValueError(f"Unsupported scanner preset: {preset!r}")
+    return argv
 
 
-def _run_found_program(argv: Sequence[str], cwd: Path | str, env: Mapping[str, str] | None = None, timeout: int | float = 60) -> dict[str, Any]:
-    """``run_external_cmd`` on the ``argv[0]`` found in an absolute PATH entry outside ``cwd``: the
-    scanner runs with the repository as its cwd, where an empty or relative entry would find a
-    program the repository planted, and its silence would read as a clean scan."""
-    exe = pathlookup.which(str(argv[0]), outside=cwd)
+def _run_found_program(argv: Sequence[str], cwd: Path | str, env: Mapping[str, str] | None = None, timeout: int | float = 60,
+                       outside: Path | str | None = None) -> dict[str, Any]:
+    """``run_external_cmd`` on the ``argv[0]`` found in an absolute PATH entry outside ``outside`` (the
+    workspace; default ``cwd``): an empty or relative entry would find a program the repository
+    planted, and its silence would read as a clean scan."""
+    exe = pathlookup.which(str(argv[0]), outside=outside or cwd)
     if exe is None:
         return {"returncode": 127, "stdout": "", "stderr": f"{argv[0]} not found in an absolute PATH entry outside the workspace",
                 "missing_binary": True, "timed_out": False, "duration_s": 0.0}
     return test_runner.run_external_cmd([exe, *argv[1:]], cwd=cwd, env=env, timeout=timeout)
 
 
-def run_preset_scanner(
-    preset: str,
-    workspace_root: Path | str,
-    *,
-    user_config_dir: Path | str | None = None,
-    base_fingerprints: Iterable[str] | None = None,
-    timeout: int = 60,
-    runner: Callable[..., dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def _scan_once(preset: str, target: Path, runner: Callable[..., dict[str, Any]], timeout: int) -> dict[str, Any]:
+    """One preset run over ``target``: ingest_sarif's report, or ``unverified``."""
     try:
-        argv = build_preset_argv(preset, workspace_root, user_config_dir=user_config_dir)
+        argv = _preset_argv(preset, target)
     except UntrustedScannerConfig as exc:
-        return {"status": "unverified", "reason": str(exc), "findings": [], "argv": []}
-    res = (runner or _run_found_program)(argv, cwd=Path(workspace_root), timeout=timeout)
+        return _sarif_unverified(str(exc))
+    res = runner(argv, cwd=target, timeout=timeout)
     if res.get("missing_binary") or res.get("timed_out"):
-        reason = res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found")
-        return {"status": "unverified", "reason": reason, "findings": [], "argv": argv}
+        return _sarif_unverified(res.get("stderr") or (f"{argv[0]} timed out" if res.get("timed_out") else f"{argv[0]} not found"))
     # pass needs positive evidence: a SARIF run on stdout and an exit code its findings explain.
     stdout, stderr = str(res.get("stdout") or "").strip(), str(res.get("stderr") or "").strip()
     try:
@@ -541,10 +529,79 @@ def run_preset_scanner(
     runs = doc.get("runs") if isinstance(doc, dict) else None
     if not (isinstance(runs, list) and runs and all(isinstance(run, dict) for run in runs)):
         why = "produced no SARIF output" if not stdout else "printed output that is not a SARIF run"
-        return {**_sarif_unverified(stderr or f"{argv[0]} {why}"), "argv": argv}
-    report = ingest_sarif(doc, workspace_root=workspace_root, base_fingerprints=base_fingerprints or ())
+        return _sarif_unverified(stderr or f"{argv[0]} {why}")
+    report = ingest_sarif(doc, workspace_root=target)
     rc = res.get("returncode")
-    if report["status"] == "pass" and not (rc == 0 or (rc == 1 and report["total_raw"] > 0)):
-        return {**_sarif_unverified(stderr or f"{argv[0]} exited {rc} without findings to explain it"), "argv": argv}
-    return {**report, "argv": argv}
+    # Judged on the raw findings: a crash after reporting what the base also holds is not a clean scan.
+    report["unexplained"] = "" if rc == 0 or (rc == 1 and report["total_raw"] > 0) else \
+        stderr or f"{argv[0]} exited {rc} without findings to explain it"
+    if report["status"] == "pass" and report["unexplained"]:
+        return _sarif_unverified(report["unexplained"])
+    return report
 
+
+def _line_keys(findings: Sequence[Finding], root: Path) -> list[str]:
+    """One key per finding: baseline's fingerprint over the unmasked, normalized line it names and that
+    line's occurrence index, so a rotated secret under the same mask is new and a moved line is not.
+    The keys stay in memory; only masked snippets are ever shown."""
+    from aegis_core import baseline  # lazily: baseline reaches this package through runner
+
+    keys, texts = [], {}  # type: list[str], dict[str, list[str]]
+    for f in findings:
+        if f.path not in texts:
+            real = Path(os.path.realpath(root / f.path))
+            try:
+                readable = bool(f.path) and _is_within_dir(real, root) and real.is_file() and real.stat().st_size <= 1 << 20
+                texts[f.path] = baseline.split_lines(real.read_bytes().decode("utf-8", "replace")) if readable else []
+            except OSError:
+                texts[f.path] = []
+        lines = texts[f.path]
+        text = lines[f.line - 1] if 1 <= f.line <= len(lines) else f.snippet
+        keys.append(baseline.fingerprint(f.rule_id, f.path, baseline.normalize_text(text), baseline.occurrence_index(lines, f.line)))
+    return keys
+
+
+def run_preset(
+    name: str,
+    root: Path | str,
+    merge_base: str | None,
+    *,
+    timeout: int = 60,
+    runner: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run preset ``name`` on the work tree at ``root`` and, when that finds anything, on an export of
+    ``merge_base``: ``fail`` only for findings the base does not hold (a multiset), ``unverified`` when
+    either scan cannot be completed or understood. Never raises for scanner output."""
+    import tempfile
+
+    if name not in PRESET_ARGV:
+        raise ValueError(f"Unsupported scanner preset: {name!r}")
+    head_root = Path(root).resolve()
+    run = runner or (lambda argv, cwd, timeout: _run_found_program(argv, cwd, timeout=timeout, outside=head_root))
+    head = _scan_once(name, head_root, run, timeout)
+    result: dict[str, Any] = {"name": name, "status": head["status"], "findings": [], "subtracted": 0}
+    if head["status"] == "unverified":
+        return {**result, "reason": head["reason"]}
+    if not head["findings"]:
+        return result
+    with tempfile.TemporaryDirectory(prefix="aegis-scan-base-") as tmp:
+        export = Path(tmp).resolve() / "base"
+        try:
+            prefix = gitsafe.show_prefix(head_root)  # the export holds the whole repository
+            gitsafe.export_tree(head_root, merge_base or "", export)
+        except gitsafe.GitError:
+            return {**result, "status": "unverified", "reason": "the merge base cannot be exported"}
+        base_root = export.joinpath(*prefix.strip("/").split("/")) if prefix else export
+        base = _scan_once(name, base_root, run, timeout) if base_root.is_dir() else {"status": "pass", "findings": []}
+        if base["status"] == "unverified":
+            return {**result, "status": "unverified", "reason": f"the merge-base scan: {base['reason']}"}
+        pool = collections.Counter(_line_keys(base["findings"], base_root))
+    new = []
+    for finding, key in zip(head["findings"], _line_keys(head["findings"], head_root)):
+        if pool[key] > 0:
+            pool[key] -= 1
+        else:
+            new.append(finding)
+    if not new and head["unexplained"]:
+        return {**result, "status": "unverified", "reason": head["unexplained"]}
+    return {**result, "status": "fail" if new else "pass", "findings": new, "subtracted": len(head["findings"]) - len(new)}

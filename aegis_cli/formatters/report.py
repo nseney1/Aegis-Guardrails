@@ -154,6 +154,13 @@ def _normalize_findings(
                 raw_items.append({"rule": rf.get("code", "regression"), "path": rf.get("path", ""),
                                   "line": rf.get("line", 1 if rf.get("path") else 0), "col": rf.get("col", 1),
                                   "message": rf.get("message", ""), "level": reg_level})
+    for scan in report_dict.get("scanners", []):
+        for sf in scan.get("findings", []):
+            raw_items.append({"rule": f"scanner/{scan['name']}:{sf.get('rule_id', '')}", "path": sf.get("path", ""),
+                              "line": sf.get("line", 0), "message": sf.get("message", ""), "level": "error"})
+        if scan.get("status") == "unverified":
+            raw_items.append({"rule": f"scanner/{scan['name']}", "path": "", "line": 0, "level": "warning",
+                              "message": f"UNVERIFIED: {scan.get('reason', '')}"})
     for l1 in report_dict.get("layer1", []):
         if isinstance(l1, dict) and not l1.get("verdict", True):
             lines = l1.get("lines") or []
