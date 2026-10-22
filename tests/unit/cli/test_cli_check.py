@@ -127,7 +127,7 @@ class TestInterface:
         [
             ["--no-layer2"], ["--all"], ["--files", "a.py"], ["--pre-commit"], ["--checkpoint-only"],
             ["--layer1-only"], ["--deep"], ["--release"], ["--release-gate"], ["--require-arbitration"],
-            ["--in-band"], ["--provider", "gemini"], ["--format", "sarif"],
+            ["--in-band"], ["--provider", "gemini"],
         ],
         ids=lambda f: f[0] if len(f) == 1 else " ".join(f),
     )

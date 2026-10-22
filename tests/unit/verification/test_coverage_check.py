@@ -464,7 +464,7 @@ class TestCheckCliIntegration:
         rc = cmd.execute(args)
         assert rc == 2
         err = capsys.readouterr().err
-        assert "invalid choice: 'sarif' (only applies with --ci)" in err
+        assert "--format sarif only applies with --ci" in err
 
     @needs_git
     def test_ci_coverage_is_reported_and_never_changes_the_exit_code(self, tmp_path, cov_env, capsys, monkeypatch):

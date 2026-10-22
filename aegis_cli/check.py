@@ -20,11 +20,12 @@
   aegis check --partition --split NAME=GLOB[,GLOB...] --split NAME=...
                                       cross-lane call, def and import edges between planned
                                       lanes (aegis_core.partition); changes nothing
-  aegis check --ci [--base REF] [--head REF] [--no-exec] [--format text|json|github]
+  aegis check --ci [--base REF] [--head REF] [--no-exec] [--format text|json|github|sarif] [--coverage] [--perf]
                                       the CI weakening check (aegis_core.rule_integrity): the
                                       rules that bind lose nothing between merge-base(REF, HEAD)
                                       and HEAD without a signed human approval; --no-exec reads
-                                      git objects only and runs none of the repository's code
+                                      git objects only and runs none of the repository's code; --coverage
+                                      reports diff coverage, --perf benchmarks the merge base against HEAD
 
 --lane, --partition, --card, --write-baseline, --prune-baseline, --record and --ci are modes of
 their own: one at a time, and none takes FILES, --full or a plan.
@@ -51,6 +52,7 @@ _NOT_WITH_RECORD = (
     ("--dry-run", "dry_run", False), ("--plan", "plan", None), ("--plan-file", "plan_file", None),
     ("--llm-cmd", "llm_cmd", None), ("--paths", "paths", None), ("--base-policy", "base_policy", False),
     ("--split", "split", None), ("--ci", "ci", False), ("--head", "head", None), ("FILES", "files", None),
+    ("--coverage", "coverage", False), ("--perf", "perf", False),
 )
 
 
@@ -111,6 +113,16 @@ def _run_record(args: argparse.Namespace) -> int:
     return 0 if row.get("passed") else 1
 
 
+def _format_refusal(args: argparse.Namespace) -> str:
+    """Why ``--format`` cannot apply to this run, or "": the one rule for every mode."""
+    fmt = str(getattr(args, "format", None) or "text").lower()
+    if fmt not in ("github", "sarif"):
+        return ""
+    if getattr(args, "json", False):
+        return f"--json does not combine with --format {fmt}: stdout holds one report"
+    return "" if getattr(args, "ci", False) else f"--format {fmt} only applies with --ci"
+
+
 def run_check(args: argparse.Namespace) -> int:
     """Execute `aegis check`."""
     if getattr(args, "no_exec", False) and not getattr(args, "ci", False):
@@ -119,12 +131,13 @@ def run_check(args: argparse.Namespace) -> int:
     if getattr(args, "tests", False) and not getattr(args, "record", False):
         print("Error: --tests only applies with --record", file=sys.stderr)
         return 2
-    fmt = str(getattr(args, "format", None) or "text").lower()
-    if fmt == "github" and not getattr(args, "ci", False):
-        print("Error: --format github only applies with --ci", file=sys.stderr)
-        return 2
-    if fmt == "sarif" and not getattr(args, "ci", False):
-        print("Error: argument --format: invalid choice: 'sarif' (only applies with --ci)", file=sys.stderr)
+    for flag, attr in (("--coverage", "coverage"), ("--perf", "perf")):
+        if getattr(args, attr, False) and not getattr(args, "ci", False):
+            print(f"Error: {flag} only applies with --ci", file=sys.stderr)
+            return 2
+    refusal = _format_refusal(args)
+    if refusal:
+        print(f"Error: {refusal}", file=sys.stderr)
         return 2
     if getattr(args, "record", False):
         return _run_record(args)
@@ -467,11 +480,17 @@ def _run_ci(args: argparse.Namespace) -> int:
     perf_report = None
     if getattr(args, "perf", False):
         from aegis_core.verification import perf_check
-        try:
-            perf_report = perf_check.run_perf_check(root, base_ref=base)
-        except Exception as exc:  # the type only: str(exc) can embed paths
-            perf_report = {"status": "unverified", "reason": f"perf check could not run ({type(exc).__name__})",
-                           "regressed": False, "noisy": False, "passed": True}
+        checkout, named = gitsafe.head_commit(root), getattr(args, "head", None)
+        asked = gitsafe.resolve_commit(root, named) if named else checkout
+        if asked != checkout:  # perf measures the work tree, as coverage does
+            perf_report = {"status": "unverified", "regressed": False, "noisy": False, "passed": True,
+                           "reason": f"the checkout is not {(asked or str(named))[:12]}; check out the pull request head"}
+        else:
+            try:
+                perf_report = perf_check.run_perf_check(root, base_ref=base)
+            except Exception as exc:  # the type only: str(exc) can embed paths
+                perf_report = {"status": "unverified", "reason": f"perf check could not run ({type(exc).__name__})",
+                               "regressed": False, "noisy": False, "passed": True}
 
     from aegis_core.config import user_scanners
     from aegis_core.verification import scanners
@@ -556,7 +575,8 @@ class CheckCommand(AegisCommand):
             "fixed environment; exit 5 or zero passed tests is never evidence",
         )
         parser.add_argument("--format", choices=("text", "json", "github", "sarif"), default="text",
-                            help="Output format (github, with --ci only: workflow-command annotations)")
+                            help="Output format. github|sarif: workflow-command annotations or SARIF 2.1.0, with --ci "
+                            "only; neither combines with --json")
         # One mode at a time. run_verify refuses every option a mode would otherwise ignore.
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument(
@@ -665,14 +685,16 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--coverage",
             action="store_true",
-            help="With --ci: report the share of the executable lines changed since merge-base(--base, --head) "
-            "that the user-scope tests.command (pytest-based) runs under coverage. A report only: it never changes "
+            help="With --ci only: report-only diff coverage, the share of the executable lines changed since "
+            "merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes "
             "the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
         )
         parser.add_argument(
             "--perf",
             action="store_true",
-            help="With --ci: run performance regression check",
+            help="With --ci only: a paired, interleaved benchmark of the merge-base export against the checked-out "
+            "tree (the user-scope perf.command, or pytest-benchmark when it is installed). A regression fails the "
+            "run; a run that measured nothing says UNVERIFIED and does not block",
         )
 
     def execute(self, args: argparse.Namespace) -> int:
