@@ -1174,7 +1174,12 @@ def write_proposal(
         for r in rows
         if levels.get(id(r)) in ("H", "cli", "W2") and str(r.get("text") or "").strip()
     ]
-    for cand in (kind or "", *summary_bullets):
+    typed_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else ""
+    typed_clean = _redact(typed_kind, max_len=64)
+    written = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    # Stored text is redacted, so a typed copy holding an email or a home path differs from it
+    # raw: the forms the proposal writes (the bullet quotes the kind without backticks) are linted too.
+    for cand in (kind or "", *summary_bullets, typed_clean, typed_clean.replace("`", ""), *written):
         clow = str(cand).strip().lower()
         if clow and any(ex == clow or (len(ex) >= _VERBATIM_MIN_CHARS and ex in clow)
                         or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
@@ -1188,7 +1193,7 @@ def write_proposal(
     members = [counted[i] for i in ids]
     kinds = sorted({str(k) for k in (confirmed.get(i) if _row_source(r) == "mcp" else r.get("kind")
                                      for i, r in zip(ids, members)) if k})
-    chosen_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else (kinds[0] if len(kinds) == 1 else "")
+    chosen_kind = typed_kind or (kinds[0] if len(kinds) == 1 else "")
     if not chosen_kind:
         raise ValueError(f"the insights share no single kind ({', '.join(kinds) or 'none'}); pass --kind")
     member_paths = [[str(p) for p in r.get("paths") or []] for r in members]
@@ -1198,7 +1203,7 @@ def write_proposal(
     targets = _proposal_targets([ps for ps in member_paths if ps], rows)
     clean_kind = _redact(chosen_kind, max_len=64)
     bullets = [f"{len(members)} counted correction(s) of kind `{clean_kind.replace('`', '')}`."]
-    bullets += [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    bullets += written
     hyp = f"Prevent recurring {clean_kind} issues in {', '.join(targets)}."
     lines = [
         "---",
