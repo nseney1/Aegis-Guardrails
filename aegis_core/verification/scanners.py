@@ -56,8 +56,9 @@ _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0
 _HASH_FIELD_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:sha1|sha256|sha384|sha512|md5|integrity|checksum|digest|hash|commit|oid|etag|fingerprint)(?:$|[^a-z0-9])")
 _PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 # Markers that silence a security finding: a noqa list naming an S (bandit) code, counted once per
-# list; nosec; gitleaks:allow. A plain noqa or a style code is not a security suppression.
-_SUPPRESSION_RE = re.compile(r"#[\t ]*(?:noqa:[A-Za-z0-9\t ,]{0,200}?\bS[0-9]+|nosec\b|gitleaks:allow\b)", re.IGNORECASE)
+# list; nosec; gitleaks:allow after #, // or /*. A plain noqa or a style code is not a security suppression.
+_SUPPRESSION_RE = re.compile(r"#[\t ]*(?:noqa:[A-Za-z0-9\t ,]{0,200}?\bS[0-9]+|nosec\b)|(?:#|//|/\*)[\t ]*gitleaks:allow\b",
+                             re.IGNORECASE)
 
 _NB = r"(?<![A-Za-z0-9])"
 _PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
@@ -352,11 +353,12 @@ def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] |
     return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
 
 
-_ALLOW_RE = re.compile(r"#[\t ]*gitleaks:allow\b", re.IGNORECASE)
+# After any comment opener of the languages scanned (#, //, /*), as gitleaks itself honours it.
+_ALLOW_RE = re.compile(r"(?:#|//|/\*)[\t ]*gitleaks:allow\b", re.IGNORECASE)
 
 
 def _secret_keys(text: str, path: str) -> list[tuple[Finding, tuple[str, str, int]]]:
-    """Tier A findings of ``text`` not on a ``# gitleaks:allow`` line, each with its key: the rule, the
+    """Tier A findings of ``text`` not on a ``gitleaks:allow`` line (_ALLOW_RE), each with its key: the rule, the
     unmasked normalized line and that line's occurrence index (in memory only, never shown)."""
     lines = text.splitlines()  # scan_secrets_text numbers lines this way
     seen: collections.Counter = collections.Counter()
