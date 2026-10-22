@@ -352,6 +352,47 @@ def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] |
     return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
 
 
+_ALLOW_RE = re.compile(r"#[\t ]*gitleaks:allow\b", re.IGNORECASE)
+
+
+def _secret_keys(text: str, path: str) -> list[tuple[Finding, tuple[str, str, int]]]:
+    """Tier A findings of ``text`` not on a ``# gitleaks:allow`` line, each with its key: the rule, the
+    unmasked normalized line and that line's occurrence index (in memory only, never shown)."""
+    lines = text.splitlines()  # scan_secrets_text numbers lines this way
+    seen: collections.Counter = collections.Counter()
+    occurrence = []
+    for line in lines:
+        norm = " ".join(line.split())
+        occurrence.append(seen[norm])
+        seen[norm] += 1
+    return [(f, (f.rule_id, " ".join(lines[f.line - 1].split()), occurrence[f.line - 1]))
+            for f in scan_secrets_text(text, path) if not _ALLOW_RE.search(lines[f.line - 1])]
+
+
+def scan_secrets_delta(workspace_root: Path | str, files: Iterable[str], base_sources: Mapping[str, str | None]) -> list[Finding]:
+    """The Tier A findings of ``files`` (relative to ``workspace_root``) that the text ``base_sources``
+    holds for each did not already hold, as a multiset: a touched legacy line does not block, a copied
+    or rotated secret does. A ``# gitleaks:allow`` line is not judged (suppression_count reports it)."""
+    root = Path(workspace_root)
+    out: list[Finding] = []
+    for rel in files:
+        path = root.joinpath(*rel.split("/"))
+        try:
+            raw = b"" if path.is_symlink() or not path.is_file() else path.read_bytes()
+        except OSError:
+            continue
+        if not raw or b"\0" in raw[:4096]:
+            continue
+        head = _secret_keys(raw.decode("utf-8", "replace"), rel)
+        pool = collections.Counter(key for _f, key in _secret_keys(base_sources.get(rel) or "", rel)) if head else {}
+        for finding, key in head:
+            if pool.get(key, 0) > 0:
+                pool[key] -= 1
+            else:
+                out.append(finding)
+    return out
+
+
 def _count_repo_suppressions(root: Path, files: Iterable[str]) -> int:
     count = 0
     for rel in files:
