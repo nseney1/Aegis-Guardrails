@@ -90,7 +90,7 @@ def test_the_json_document_keeps_its_shape_when_nothing_was_compared(tmp_path, c
     assert rc == 0 and payload["status"] == "pass" and NOTE not in out
     assert payload["scope"]["merge_base"] == payload["scope"]["head"] == head
     assert set(payload) == {"source", "aegis_version", "checked_at", "scope", "schema", "status", "rules_checked",
-                            "weakenings", "approval", "governance", "regression"}
+                            "weakenings", "approval", "governance", "regression", "blocking"}
 
 
 @needs_git

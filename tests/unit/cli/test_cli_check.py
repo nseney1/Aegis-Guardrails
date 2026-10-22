@@ -669,10 +669,12 @@ class TestLayer2:
         row, = json.loads(capsys.readouterr().out)["layer2"]["llm_predictions"]
         assert set(row) == {
             "id", "verdict_id", "ts", "tree", "backend", "scope", "observable", "window_days", "p",
-            "disposition", "outcome", "resolved_at", "resolving_commit", "category", "severity", "risk",
+            "disposition", "outcome", "category", "severity", "risk",
             "mechanism", "affected_function",
         }
-        assert (row["scope"], row["observable"]) == ("compute", "fix_touch_in_window")
+        # The reply uses 4.3 string forms: scope becomes {path, symbol}; an observable that is not
+        # a {kind, selector} object is void, never guessed.
+        assert (row["scope"], row["observable"]) == ({"path": "", "symbol": "compute"}, {"kind": "", "selector": ""})
 
     def test_json_reports_an_unreadable_spec_reply_as_unverified(self, ws, capsys, llm):
         (ws / "clean.py").write_text(CLEAN, encoding="utf-8")
