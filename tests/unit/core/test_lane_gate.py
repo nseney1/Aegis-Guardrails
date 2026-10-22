@@ -152,6 +152,17 @@ def test_the_base_defaults_to_the_branch_base(repo: Repo):
     assert result.base == "main"
 
 
+def test_the_base_defaults_to_the_branch_origin_head_names(repo: Repo):
+    _git(repo.root, "branch", "develop", "main")
+    _git(repo.root, "update-ref", "refs/remotes/origin/main", "main")
+    _git(repo.root, "update-ref", "refs/remotes/origin/develop", "develop")
+    _git(repo.root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+    repo.write("docs/guide.md", "better guide\n")
+    repo.commit()
+    result = lane_gate.check_lane(repo.root, "docs", paths=["docs/**"])
+    assert result.base == "origin/develop"
+
+
 def test_a_base_that_does_not_resolve_needs_history(repo: Repo):
     with pytest.raises(lane_gate.LaneGateError) as exc:
         _gate(repo, base="origin/nope", paths=["docs/**"])

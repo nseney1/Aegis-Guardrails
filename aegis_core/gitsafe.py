@@ -1,4 +1,5 @@
-"""Every git subprocess Aegis runs (D20, host-matrix §3.7, v4.3 spec §10.1).
+"""Every git subprocess Aegis runs, except treeid's (scrubbed environment, private index;
+SECURITY.md). D20, host-matrix §3.7, v4.3 spec §10.1.
 
 A repository's own config is attacker-controlled: ``core.fsmonitor`` names a program
 that ``git status``/``git diff`` run, hooks run on many commands, a clean filter
@@ -15,24 +16,29 @@ every call here:
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
   Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
-- uses plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
+- reads with plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
-  ``check-ref-format``, ``hash-object``, ``version`` and ``config`` (reads only). It
-  writes in four places only, never to the work tree, the index, a branch or a tag:
-  ``hash-object -w`` stores a blob, ``update-ref --no-deref --stdin`` creates, swaps
-  or deletes one ref under compare-and-swap, always under ``refs/aegis/`` (the team's
-  leases; ``update_ref`` refuses any other name), and ``merge-tree --write-tree``
-  stores the objects of a trial merge that nothing references (git's gc collects
-  them), and ``interpret-trailers --in-place`` edits the prepare-commit-msg hook's message
-  file, with no repository config read (its ``trailer.*`` commands). ``diff-index`` without ``--cached``, ``ls-files --others`` and
-  ``hash-object --stdin-paths`` read the working tree, which is where an fsmonitor or
-  a clean filter would run; they are needed (no plumbing lists changed or untracked
-  files otherwise, and only git knows its line-ending conversion). The forced
-  ``core.fsmonitor=false`` keeps them inert, every filter driver the repository's own
-  config defines is switched off for them (a driver from the user's or the system's
-  config, git-lfs say, still runs, as in any git command the user types), and
-  ``diff-index`` does not look inside a dirty submodule, where it would run ``git
-  status`` under the submodule's own config.
+  ``check-ref-format``, ``hash-object``, ``version``, ``config`` and ``symbolic-ref`` (the
+  branch ``refs/remotes/origin/HEAD`` names, which ``resolve_base_ref`` tries before the fixed
+  names: repository data, as ``origin/main`` is). It never writes to the work tree, the index,
+  a branch or a tag; it writes with ``hash-object -w`` (a blob),
+  ``update-ref --no-deref --stdin`` (one ref under compare-and-swap, always under
+  ``refs/aegis/``: the team's leases), ``merge-tree --write-tree`` (a trial merge's objects,
+  referenced by nothing, which git's gc collects), ``read-tree`` into a private index in a fresh
+  0700 temporary directory and ``checkout-index -a -f --prefix`` below the caller's scratch
+  directory (``export_tree``), and ``interpret-trailers --in-place`` (the prepare-commit-msg
+  message file, no repository config read: its ``trailer.*`` commands are programs).
+  Callers write more through ``run``: the signed approval ``commit``, the Aegis-Check
+  trailer's ``write-tree``, and ``aegis sync --pr``'s commit, branch and push (SECURITY.md).
+
+``diff-index`` without ``--cached``, ``ls-files --others`` and ``hash-object --stdin-paths``
+read the working tree, where an fsmonitor or a clean filter would run; they are needed (no
+plumbing lists changed or untracked files otherwise, and only git knows its line-ending
+conversion). The forced ``core.fsmonitor=false`` keeps them inert, every filter driver the
+repository's own config defines is switched off for them (``filter_overrides``; one from the
+user's or the system's config, git-lfs say, runs as in any git command the user types), and
+``diff-index`` does not look inside a dirty submodule, where it would run ``git status`` under
+the submodule's own config.
 
 Blob content read through ``cat-file`` is checked against the object id it was asked
 for, so a replaced or corrupted object is an error rather than silent input.
@@ -75,6 +81,7 @@ __all__ = [
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
+    "TRUSTED_SCOPES",
     "add_trailer",
     "blob_id",
     "blob_oid",
@@ -82,6 +89,7 @@ __all__ = [
     "common_dir",
     "diff_entries",
     "export_tree",
+    "filter_overrides",
     "git_executable",
     "git_path",
     "git_version",
@@ -429,15 +437,19 @@ def merge_base(cwd: Path | str, a: str, b: str = "HEAD") -> Optional[str]:
 
 def resolve_base_ref(cwd: Path | str, environ: Optional[dict] = None) -> Optional[str]:
     """The base branch a change is measured against: the first that resolves of
-    ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, ``origin/main``, ``main``,
-    ``origin/develop``, ``develop``. Returns the ref name, or None."""
+    ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, the branch ``refs/remotes/origin/HEAD``
+    names (``origin/<name>``, ``<name>``), ``origin/main``, ``main``, ``origin/develop``,
+    ``develop``, ``origin/master``, ``master``. Returns the ref name, or None."""
     env = os.environ if environ is None else environ
-    candidates: List[str] = []
     base = (env.get("GITHUB_BASE_REF") or "").strip()  # set by GitHub Actions on pull requests
-    if base:
-        candidates += [f"origin/{base}", base]
-    candidates += ["origin/main", "main", "origin/develop", "develop"]
-    for ref in candidates:
+    for ref in [f"origin/{base}", base] if base else []:
+        if resolve_commit(cwd, ref):
+            return ref
+    # Repository data, as origin/main is; a target outside refs/remotes/origin/ names no remote branch.
+    target = _text(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], cwd) or ""
+    name = target[len("refs/remotes/origin/"):] if target.startswith("refs/remotes/origin/") else ""
+    default = [f"origin/{name}", name] if name else []
+    for ref in dict.fromkeys([*default, "origin/main", "main", "origin/develop", "develop", "origin/master", "master"]):
         if resolve_commit(cwd, ref):
             return ref
     return None
@@ -467,31 +479,28 @@ _blob_id = blob_id
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
 # any other scope (the repository's .git/config or config.worktree, or a file either
 # includes) is switched off before git reads working-tree files.
-_TRUSTED_SCOPES = frozenset({"system", "global", "command"})
+TRUSTED_SCOPES = frozenset({"system", "global", "command"})
 _FILTER_COMMANDS = ("clean", "smudge", "process")
 _REGULAR_MODES = frozenset({"100644", "100755"})
 _LINK_MODE = "120000"
 
 
-def _filter_overrides(cwd: Path | str) -> Optional[Tuple[str, ...]]:
-    """``-c`` options that switch off every filter driver the repository's config
-    defines, or None when git cannot list them or a driver's name cannot be given to
-    ``-c`` (it splits at the first ``=``)."""
+def filter_overrides(cwd: Path | str, scope: str = "untrusted") -> Optional[Tuple[str, ...]]:
+    """``-c`` options that switch off every filter driver the repository's config defines
+    (``scope="all"``: every configured driver, whoever wrote it), or None when git cannot
+    list them or a driver's name cannot be given to ``-c`` (it splits at the first ``=``)."""
     listing = ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]
-    res = _completed([listing[0], "--show-scope", *listing[1:]], cwd)
+    res = _completed([listing[0], "--show-scope", *listing[1:]] if scope == "untrusted" else listing, cwd)
     if res is None:
         return None
     if res.returncode == 1:  # no filter driver is configured anywhere
         return ()
-    if res.returncode == 0:
-        fields = res.stdout.split(b"\0")
-        keys = [key for scope, key in zip(fields[0::2], fields[1::2])
-                if key and scope.decode("ascii", "replace") not in _TRUSTED_SCOPES]
-    else:  # git before 2.26 has no --show-scope: switch off every driver
-        res = _completed(listing, cwd)
-        if res is None or res.returncode not in (0, 1):
-            return None
-        keys = [key for key in res.stdout.split(b"\0") if key]
+    if res.returncode != 0:  # git before 2.26 has no --show-scope: switch off every driver
+        return filter_overrides(cwd, "all") if scope == "untrusted" else None
+    fields = res.stdout.split(b"\0")
+    keys = [key for key in fields if key] if scope != "untrusted" else [
+        key for where, key in zip(fields[0::2], fields[1::2])
+        if key and where.decode("ascii", "replace") not in TRUSTED_SCOPES]
     overrides: List[str] = []
     for driver in dict.fromkeys(os.fsdecode(key)[len("filter."):].rpartition(".")[0] for key in keys):
         if not driver:
@@ -555,7 +564,7 @@ def _working_changes(cwd: Path | str, tree: str) -> Optional[List[str]]:
     blobs under core.autocrlf or ``text``). Its own bytes are compared first; only a
     regular file that differs is hashed by git.
     """
-    overrides = _filter_overrides(cwd)
+    overrides = filter_overrides(cwd)
     if overrides is None:
         return None
     hardening = (*_HARDENING, *overrides)
@@ -785,36 +794,21 @@ def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
     """Parse NUL-delimited ``--name-status -z`` (or ``--raw -z``) output into
     ``(status, path, new_path)`` records without desynchronizing on 3-token ``R*``/``C*`` records.
     """
-    if not raw:
-        return []
     fields = raw.split(b"\0")
     records: List[Tuple[str, str, Optional[str]]] = []
     index = 0
-    total = len(fields)
-    while index < total:
-        token = fields[index]
-        if not token:
-            index += 1
-            continue
-        parts = token.split()
+    while index < len(fields):
+        parts = fields[index].split()
         if not parts:
             index += 1
             continue
         status = parts[-1].decode("ascii", "replace")
-        kind = status[:1]
-        if kind in ("R", "C"):
-            if index + 2 >= total or not fields[index + 1] or not fields[index + 2]:
-                break
-            old_path = os.fsdecode(fields[index + 1])
-            new_path = os.fsdecode(fields[index + 2])
-            records.append((status, old_path, new_path))
-            index += 3
-        else:
-            if index + 1 >= total or not fields[index + 1]:
-                break
-            path = os.fsdecode(fields[index + 1])
-            records.append((status, path, None))
-            index += 2
+        width = 3 if status[:1] in ("R", "C") else 2  # a rename or copy names two paths
+        paths = fields[index + 1:index + width]
+        if len(paths) < width - 1 or not all(paths):
+            break
+        records.append((status, os.fsdecode(paths[0]), os.fsdecode(paths[1]) if width == 3 else None))
+        index += width
     return records
 
 
@@ -857,7 +851,7 @@ def export_tree(
     root = toplevel(cwd) or Path(cwd).resolve()
 
     exported = False
-    overrides = _filter_overrides(root)
+    overrides = filter_overrides(root)
     if overrides is not None:
         temp_dir = Path(tempfile.mkdtemp(prefix="aegis-export-"))
         try:
@@ -1204,7 +1198,7 @@ def _repository_merge_drivers(cwd: Path | str) -> Optional[List[str]]:
     names = [
         os.fsdecode(key)[len("merge."):-len(".driver")]
         for scope, key in zip(fields[0::2], fields[1::2])
-        if key and scope.decode("ascii", "replace") not in _TRUSTED_SCOPES
+        if key and scope.decode("ascii", "replace") not in TRUSTED_SCOPES
     ]
     return list(dict.fromkeys(names))
 
@@ -1237,7 +1231,7 @@ def merge_tree_conflicted(cwd: Path | str, p1: str, p2: str) -> bool:
             f"the repository config defines merge driver {', '.join(drivers)}, which git merge-tree would run; "
             "the merge metric is unavailable here"
         )
-    overrides = _filter_overrides(cwd)
+    overrides = filter_overrides(cwd)
     if overrides is None:
         raise MergeTreeUnavailable("cannot switch off the repository's filter drivers; the merge metric is unavailable here")
     hardening = (*_HARDENING, "-c", "merge.renormalize=false", *overrides)
