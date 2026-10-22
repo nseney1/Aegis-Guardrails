@@ -201,11 +201,12 @@ def run(
     stdin: Optional[bytes] = None,
     _hardening: Sequence[str] = _HARDENING,
     _env: Optional[Mapping[str, str]] = None,
+    tty: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run ``git <args>`` hardened as described above; return the completed process (bytes).
 
     A non-zero exit is returned, not raised. Raises GitError when git cannot be started
-    or exceeds ``timeout``.
+    or exceeds ``timeout``. ``tty``: git (and a signing program it runs) reads the caller's stdin.
     """
     argv = [git_executable(), *_hardening, *args]
     env = dict(os.environ)
@@ -218,7 +219,7 @@ def run(
             cwd=str(cwd),
             env=env,
             input=stdin,
-            stdin=None if stdin is not None else subprocess.DEVNULL,
+            stdin=None if stdin is not None or tty else subprocess.DEVNULL,
             capture_output=True,
             timeout=timeout,
             check=False,

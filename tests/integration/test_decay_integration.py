@@ -1,9 +1,8 @@
-"""Integration test: `aegis rule promote --tier-check` re-tiers enforcement from ledger fitness.
+"""Integration test: `aegis rule promote --tier-check` never re-tiers enforcement from ledger numbers.
 
-The tier check reads each rule's fitness from the ledger (aegis_core.fitness) and,
-without --dry-run, rewrites only the `enforcement` key of rules whose evidence moved
-them (an explicit `aegis rule` command). It never writes a fitness block: v3 decayed
-frontmatter counts here, which made every run dirty the rule files.
+An evidence-backed promotion is a type move, which sets the enforcement the new type needs, so
+the tier check changes no rule (decision D-tier-ladder): it reports the rules it evaluated and,
+without --dry-run, why a write would be refused. It never writes a fitness block either.
 """
 from __future__ import annotations
 
@@ -30,27 +29,25 @@ def _no_workspace_pin(monkeypatch):
 
 
 class TestTierCheck:
-    def test_proven_advisory_rule_moves_up_and_only_its_enforcement_changes(self, soma_workspace, capsys):
+    def test_a_proven_advisory_rule_keeps_its_tier_and_its_bytes(self, soma_workspace, capsys):
         rules = soma_workspace / ".aegis" / "rules"
         path = write_cell_with_fitness(rules, "proven", "advisory", 25, 25, 0)
+        before = open(path, "rb").read()
 
         assert _tier_check(soma_workspace) == 0
 
-        meta = _meta(path)
-        assert meta["enforcement"] == "mechanical"
-        assert "fitness" not in meta and "triggers" not in meta
-        assert "proven: advisory → mechanical" in capsys.readouterr().out
+        assert open(path, "rb").read() == before
+        assert _meta(path)["enforcement"] == "advisory"
+        assert "No tier changes required." in capsys.readouterr().out
 
-    def test_a_self_declared_gate_that_misfires_steps_down(self, soma_workspace, capsys):
+    def test_a_self_declared_gate_that_misfires_keeps_its_tier(self, soma_workspace, capsys):
         rules = soma_workspace / ".aegis" / "rules"
-        # 5 of 25 verdicts: MIN_N (R-evidence-8), misfire bound above the gate's 0.3
         path = write_cell_with_fitness(rules, "noisy-gate", "gate", 25, 5, 20)
 
         assert _tier_check(soma_workspace, "--json") == 0
 
-        changes = json.loads(capsys.readouterr().out)["changes"]
-        assert [(c["rule"], c["old_tier"], c["new_tier"]) for c in changes] == [("noisy-gate", "gate", "mechanical")]
-        assert _meta(path)["enforcement"] == "mechanical"
+        assert json.loads(capsys.readouterr().out) == {"evaluated": 1, "changes": []}
+        assert _meta(path)["enforcement"] == "gate"
 
     def test_a_solid_gate_and_the_mandatory_types_keep_their_tier(self, soma_workspace, capsys):
         rules = soma_workspace / ".aegis" / "rules"
@@ -70,7 +67,7 @@ class TestTierCheck:
         assert _tier_check(soma_workspace, "--dry-run") == 0
 
         assert open(path, "rb").read() == before
-        assert "dry-run-rule: advisory → mechanical" in capsys.readouterr().out
+        assert "No tier changes required." in capsys.readouterr().out
 
     def test_consecutive_runs_converge(self, soma_workspace, capsys):
         rules = soma_workspace / ".aegis" / "rules"
@@ -78,7 +75,7 @@ class TestTierCheck:
 
         assert _tier_check(soma_workspace) == 0
         first = open(path, "rb").read()
-        assert _tier_check(soma_workspace) == 0  # mechanical -> gate needs 50 verdicts
+        assert _tier_check(soma_workspace) == 0
 
         assert open(path, "rb").read() == first
 
@@ -92,6 +89,6 @@ class TestTierCheck:
         assert _tier_check(soma_workspace) == 1
 
         out = capsys.readouterr().out
-        assert "proven: advisory → mechanical" in out
+        assert "No tier changes required." in out
         assert "not written: the ledger is incomplete (1 unreadable line(s))" in out
         assert open(path, "rb").read() == before

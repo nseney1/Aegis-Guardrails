@@ -2,10 +2,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import json
 import math
 from pathlib import Path
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import stats as _stats
 from aegis_core.config import DEFAULT_EPSILON, DEFAULT_HALF_LIFE_SESSIONS
@@ -18,7 +20,7 @@ from aegis_core.stats import (
     clopper_pearson_upper,
     regularized_incomplete_beta,
 )
-from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, WILSON_CONFIDENCE_Z_SCORES
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, RULE_TYPES, WILSON_CONFIDENCE_Z_SCORES
 
 __all__ = [
     "DEFAULT_ARCHIVE_EPSILON",
@@ -27,6 +29,7 @@ __all__ = [
     "Fitness",
     "MAX_PRIOR_MASS",
     "MDE_UNTESTABLE_THRESHOLD",
+    "MIN_AGE_DAYS_FOR_PROMOTION",
     "MIN_N",
     "MIN_OBSERVATION_DAYS",
     "ReplayReport",
@@ -44,6 +47,7 @@ __all__ = [
     "regularized_incomplete_beta",
     "replay_detector_history",
     "replay_detector_history_report",
+    "rule_age_days",
     "session_decay_factor",
     "wilson_interval",
     "wilson_lower_bound",
@@ -60,7 +64,8 @@ DEFAULT_MDE_HORIZON_DAYS = 180.0
 MDE_UNTESTABLE_THRESHOLD = 0.6
 # Below this many days of ledger history the trigger volume says nothing: 180 / (1.24324 / 0.6)^2 = 41.9.
 MIN_OBSERVATION_DAYS = 42.0
-_VIOLATION_PATTERN_RE = re.compile(r"Forbidden (?:call|import|decorator) '([^']+)'")
+# A rule must have been tried this long before evidence may promote it.
+MIN_AGE_DAYS_FOR_PROMOTION = 30
 _MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)'")
 
 
@@ -116,6 +121,30 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+def rule_age_days(rule: Any, now: Optional[datetime] = None) -> int:
+    """Days since the rule's ``created`` date (0 when it has none or it cannot be read)."""
+    created = (getattr(rule, "meta", None) or {}).get("created")
+    if isinstance(created, datetime):
+        created_dt = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    elif isinstance(created, str) and created:
+        text = created.strip()
+        text = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            created_dt = datetime.fromisoformat(text) if "T" in text else datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return 0
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+    elif hasattr(created, "isoformat"):  # a date
+        created_dt = datetime(created.year, created.month, created.day, tzinfo=timezone.utc)
+    else:
+        return 0
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return max(0, (current - created_dt).days)
+
+
 def session_decay_factor(eligible_sessions: int, half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS) -> float:
     return 1.0 if (eligible_sessions <= 0 or not half_life_sessions or half_life_sessions <= 0) else float(2.0 ** (-float(eligible_sessions) / float(half_life_sessions)))
 
@@ -169,7 +198,7 @@ class Fitness:
     @property
     def reported_score(self) -> Optional[float]:
         """The number surfaces may show: None until a sample is large enough to mean something."""
-        if not self.evidence_available or not self.verdicts or self.state in ("insufficient", "untestable", "evidence_unavailable"):
+        if not self.evidence_available or not self.verdicts or self.state in ("insufficient", "untestable"):
             return None
         return self.score
 
@@ -194,8 +223,12 @@ def compute(
     half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS, epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
     repos_count: int = 0, days_span: float = 0.0, silence_lr: float = 1.0,
-    evidence_available: bool = True, evidence_error: Optional[str] = None,
+    evidence_available: bool = True, evidence_error: Optional[str] = None, age_days: Optional[float] = None,
 ) -> Fitness:
+    """The one decision engine (R-evidence-7): a rule's state and the transition its evidence
+    supports. ``promote``, ``demote`` and ``archive`` appear only in state ``decided``, and never
+    without the evidence (``evidence_available``) or below ``min_n``. ``age_days`` (None: not
+    gated) below MIN_AGE_DAYS_FOR_PROMOTION blocks promotion."""
     base_tp, base_fp = _num(totals.get("tp", 0) or 0), _num(totals.get("fp", 0) or 0)
     adj_n = int(adjudicated_tp) + int(adjudicated_fp)
     # Spec T4: labels are the only fp source. A leaked finding is a true alarm that landed (a
@@ -226,18 +259,22 @@ def compute(
     flagged_for_review = bool(contested > 0 and (contested >= 3 or override_rate >= 0.25))
     archive_candidate = bool(rule_type == "trap" and not pinned and eligible_sessions > 0 and effective_weight < epsilon)
     enough_n = n >= min_n
-    demote_ready = bool(enough_n and (misfire > 0.5 or p_below_07 >= 0.9 or cp_hi < 0.7))
-    if adj_n > 0:
-        enough_pos = (adjudicated_tp >= 25 and adjudicated_fp == 0) or (adj_n >= 42 and adjudicated_fp <= 1 and cp_lo >= 0.88)
-        enough_div = (sessions_count == 0 or sessions_count >= 3) and (repos_count >= 2 or days_span >= 14.0 or (repos_count == 0 and days_span == 0.0))
-        promote_ready = bool(enough_n and rule_type == "trap" and enough_pos and enough_div)
-    else:
-        promote_ready = bool(enough_n and rule_type == "trap" and n >= 20 and score >= 0.85)
+    # The posterior alone: without a prior, the Wilson and Clopper-Pearson terms never demote a
+    # rule it keeps (checked over every (tp, fp) in 0..85).
+    demote_ready = bool(enough_n and p_below_07 >= 0.9)
+    spec = RULE_TYPES.get(rule_type)
+    movable = bool(spec is not None and spec.promotes_to and (age_days is None or age_days >= MIN_AGE_DAYS_FOR_PROMOTION))
+    # Spec T4: only adjudicated labels promote (local and CI verdicts never do), from enough sessions
+    # and repos or days that absent breadth never passes. With n >= 42 and at most one false positive
+    # the Clopper-Pearson lower bound is already >= 0.88, so it is not a separate term.
+    enough_labels = (adjudicated_tp >= 25 and adjudicated_fp == 0) or (adj_n >= 42 and adjudicated_fp <= 1)
+    enough_breadth = sessions_count >= 3 and (repos_count >= 2 or days_span >= 14.0)
+    promote_ready = bool(enough_n and movable and enough_labels and enough_breadth)
     suggestion: Optional[str] = None
-    if not evidence_available:
-        state, suggestion = "evidence_unavailable", None
+    if not evidence_available:  # a flag, not a state: nothing is decided on evidence cut short
+        state = "inconclusive" if enough_n else "insufficient"
     elif demote_ready:
-        state, suggestion = "decided", ("demote" if rule_type in ("gate", "invariant") else "archive")
+        state, suggestion = "decided", ("demote" if spec is not None and spec.demotes_to else "archive")
     elif promote_ready:
         state, suggestion = "decided", "promote"
     elif archive_candidate:
@@ -438,57 +475,79 @@ def for_rules(
             adjudicated_fp=int(t4.get("adjudicated_fp", 0)), sessions_count=len(t4.get("sessions", ())),
             repos_count=len(t4.get("repos", ())), days_span=float(t4.get("days_span", 0.0)),
             evidence_available=proj_credits.available, evidence_error=proj_credits.error,
+            age_days=rule_age_days(rule, now),
         )
     return out
 
 
-def _python_blobs_at_commit(workspace: Any, commit: str) -> Dict[str, Tuple[str, str]]:
+def _rule_key(rule: Any) -> Tuple[str, str]:
+    spec = (getattr(rule, "meta", {}) or {}).get("forbid_ast")
+    return rule.id, json.dumps(spec, sort_keys=True, default=str)
+
+
+def _blob_texts(root: Path, oids: List[str]) -> Dict[str, Optional[str]]:
+    """The text of each blob, read in one batch; a blob git cannot give back is None (UNVERIFIED)."""
     from aegis_core import gitsafe
 
-    entries = gitsafe.tree_blobs(workspace, commit)  # a GitError makes the replay UNVERIFIED
-    return {
-        path: entry
-        for path, entry in entries.items()
-        if path.endswith(".py")
-    }
+    try:
+        blobs = gitsafe.read_blobs(root, oids) if oids else {}
+    except gitsafe.GitError:  # one bad object fails the batch: find which, one at a time
+        blobs = {}
+        for oid in oids:
+            try:
+                blobs.update(gitsafe.read_blobs(root, [oid]))
+            except gitsafe.GitError:
+                continue
+    return {oid: (blobs[oid].decode("utf-8", "replace") if oid in blobs else None) for oid in oids}
 
 
-def _violations_at_commit(root: Path, commit: str, rules: Sequence[Any], skipped: Set[str]) -> Set[Tuple[str, str, str]]:
-    """The (rule, file, pattern) hits at ``commit``; a file whose blob, syntax tree or evaluation
+def _patterns(rel: str, text: Optional[str], rules: Sequence[Any]) -> Dict[Tuple[str, str], Optional[FrozenSet[str]]]:
+    """The violated patterns of each rule in one blob; None where it cannot be read or evaluated."""
+    from aegis_core.ast.policy import evaluate_forbid_ast_structured, extract_normalized_ast
+
+    try:
+        tree = extract_normalized_ast(rel, code=text) if text else None
+    except Exception:
+        return {_rule_key(r): None for r in rules}
+    out: Dict[Tuple[str, str], Optional[FrozenSet[str]]] = {}
+    for rule in rules:
+        spec = (getattr(rule, "meta", {}) or {}).get("forbid_ast")
+        try:
+            found = evaluate_forbid_ast_structured(tree, spec, rule_id=rule.id, source=text) if tree is not None and isinstance(spec, dict) else []
+        except Exception:
+            out[_rule_key(rule)] = None
+            continue
+        out[_rule_key(rule)] = frozenset(f["pattern"] for f in found if not f["unknown"] and f["override"] is None)
+    return out
+
+
+def _violations_at_commit(root: Path, commit: str, rules: Sequence[Any], skipped: Set[str],
+                          cache: Dict[Tuple[str, Tuple[str, str]], Optional[FrozenSet[str]]]) -> Set[Tuple[str, str, str]]:
+    """The (rule, file, pattern) hits at ``commit``: one tree listing and one batched read of the blobs
+    ``cache`` (keyed by blob and rule) does not hold; a file whose blob, syntax tree or evaluation
     fails is added to ``skipped`` rather than read as clean."""
     from aegis_core import gitsafe
-    from aegis_core.ast.policy import evaluate_forbid_ast_with_overrides, extract_normalized_ast
 
-    py_blobs = _python_blobs_at_commit(root, commit)
-    if not py_blobs:
-        return set()
-    hits: Set[Tuple[str, str, str]] = set()
-    for rel in sorted(py_blobs):
-        applicable = [r for r in rules if r.applies_to(rel)]
-        if not applicable:
-            continue
-        try:
-            blob = gitsafe.read_blob(root, commit, rel)
-            source = blob.decode("utf-8", "replace") if blob else ""
-            norm_ast = extract_normalized_ast(rel, workspace_root=root, code=source) if source else None
-        except Exception:
-            blob, norm_ast = None, None
-        if blob is None or (source and norm_ast is None):
-            skipped.add(rel)
-        if norm_ast is None:
-            continue
+    wanted = {rel: (oid, [r for r in rules if r.applies_to(rel)])
+              for rel, (_mode, oid) in sorted(gitsafe.tree_blobs(root, commit).items()) if rel.endswith(".py")}
+    wanted = {rel: entry for rel, entry in wanted.items() if entry[1]}
+    needed: Dict[str, Tuple[str, Dict[Tuple[str, str], Any]]] = {}
+    for rel, (oid, applicable) in wanted.items():
         for rule in applicable:
-            spec = (getattr(rule, "meta", {}) or {}).get("forbid_ast")
-            if not isinstance(spec, dict):
-                continue
-            try:
-                violations, _ = evaluate_forbid_ast_with_overrides(norm_ast, spec, rule_id=rule.id, source=source)
-            except Exception:
+            if (oid, _rule_key(rule)) not in cache:
+                needed.setdefault(oid, (rel, {}))[1][_rule_key(rule)] = rule
+    texts = _blob_texts(root, list(needed))
+    for oid, (rel, by_key) in needed.items():
+        for key, found in _patterns(rel, texts[oid], list(by_key.values())).items():
+            cache[(oid, key)] = None if texts[oid] is None else found
+    hits: Set[Tuple[str, str, str]] = set()
+    for rel, (oid, applicable) in wanted.items():
+        for rule in applicable:
+            found = cache[(oid, _rule_key(rule))]
+            if found is None:
                 skipped.add(rel)
-                continue
-            for msg in violations:
-                m = _VIOLATION_PATTERN_RE.search(msg)
-                hits.add((rule.id, rel, m.group(1) if m else msg))
+            else:
+                hits.update((rule.id, rel, pattern) for pattern in found)
     return hits
 
 
@@ -503,6 +562,8 @@ class ReplayReport:
     files_skipped: Tuple[str, ...] = ()
     errors: Tuple[str, ...] = ()
     skipped_reason: Optional[str] = None
+    tip: Optional[str] = None  # the commit a complete replay reached: the next one may start there
+    rules: Optional[str] = None  # the digest of the forbid_ast rules it replayed
 
     def as_dict(self) -> Dict[str, Any]:
         return {"branch": self.branch, "commits": self.commits, "files_skipped": list(self.files_skipped),
@@ -542,59 +603,119 @@ def _utc_stamp(iso: str) -> Optional[str]:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if moment.tzinfo else None
 
 
+# Raise whenever replay or forbid_ast evaluation semantics change: it is part of the digest stored with
+# replay.tip, so a tip recorded by another evaluator is never resumed from and history is walked again.
+REPLAY_FORMAT = 1
+
+
+def _rules_digest(rules: Sequence[Any]) -> str:
+    entries = sorted([*_rule_key(r), str(getattr(r, "digest", "") or ""),
+                      json.dumps(list(getattr(r, "target_paths", None) or ()), default=str)] for r in rules)
+    return hashlib.sha256(json.dumps([REPLAY_FORMAT, entries]).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _target_rev(root: Path, facts: Any, branch: str) -> Optional[str]:
+    """origin's ``branch`` unless the local one is ahead of it, else whichever exists."""
+    from aegis_core import gitevidence, gitsafe
+
+    tips = gitevidence.branch_tips(facts, branch)
+    if len(tips) == 2:
+        remote, local = tips
+        return local if remote != local and gitevidence.is_ancestor(facts, remote, local) else remote
+    return tips[0] if tips else gitsafe.resolve_commit(root, branch)
+
+
+def _open_at(root: Path, branch: str, rules: Sequence[Any], old: Sequence[str], merges: Set[str],
+             at_tip: Set[Tuple[str, str, str]]) -> List[Tuple[str, str, str, str]]:
+    """The first-parent findings a replay up to ``old[-1]`` left without a fix (the ledger's latest
+    row per unit) whose hit is still there: a later commit may fix them."""
+    from aegis_core import credit
+
+    ids, line = {r.id for r in rules}, set(old) - merges
+    latest: Dict[Tuple[str, str, str, str], Mapping[str, Any]] = {}
+    for row in credit.read_rows(root):
+        if row.get("event") == "detection":
+            latest[(str(row.get("rule") or ""), str(row.get("file") or ""), str(row.get("pattern") or ""), str(row.get("rev") or ""))] = row
+    return [key for key, row in latest.items()
+            if key[0] in ids and key[3] in line and key[:3] in at_tip and row.get("disposition") == "leaked"
+            and row.get("fix_rev") is None and row.get("branch") == branch]
+
+
 def replay_detector_history_report(
     workspace: Any, rules: Optional[Iterable[Any]] = None, *, branch: Optional[str] = None, persist: bool = True,
+    since: Optional[Mapping[str, Any]] = None,
 ) -> ReplayReport:
     """Replay the forbid_ast rules over the history of the base branch (spec T4.1). Raises
-    gitsafe.GitError when git cannot walk it; a finding carries its evidence commit's time."""
-    from aegis_core import credit, gitsafe
+    gitsafe.GitError when git cannot walk it; a finding carries its evidence commit's time.
+
+    ``since`` is the ``tip``/``rules``/``branch`` of an earlier complete replay (derived.json): when
+    the same rules were replayed on the same branch and only single-parent commits follow that
+    tip, only they are walked, and the findings still open at the tip get the fix a new commit
+    makes. Anything else (no tip, a forged one, a rewritten branch, an edited rule, a merge)
+    walks everything."""
+    from aegis_core import gitevidence, gitsafe
     from aegis_core.rules import load_rules, workspace_root
     root = Path(workspace_root(workspace)).resolve()
     loaded = list(rules) if rules is not None else list(load_rules(root).served)
     forbid_rules = [r for r in loaded if isinstance((getattr(r, "meta", {}) or {}).get("forbid_ast"), Mapping)]
     if not forbid_rules:
         return ReplayReport([], skipped_reason="no forbid_ast rule")
-    target_branch = _base_branch(root, branch)
-    if not target_branch:
-        return ReplayReport([], skipped_reason="no base branch")
-    remote_rev = gitsafe.resolve_commit(root, f"refs/remotes/origin/{target_branch}")
-    local_rev = gitsafe.resolve_commit(root, f"refs/heads/{target_branch}") or gitsafe.resolve_commit(root, target_branch)
-    if remote_rev and local_rev:
-        if remote_rev != local_rev and gitsafe.run(["merge-base", "--is-ancestor", remote_rev, local_rev], root).returncode == 0:
-            target_rev: Optional[str] = local_rev
-        else:
-            target_rev = remote_rev
-    else:
-        target_rev = remote_rev or local_rev
-    if not target_rev:
-        return ReplayReport([], target_branch, skipped_reason=f"no commit on {target_branch}")
+    with gitsafe.memo():
+        target_branch = _base_branch(root, branch)
+        if not target_branch:
+            return ReplayReport([], skipped_reason="no base branch")
+        target_rev = _target_rev(root, gitevidence.repo_facts(root), target_branch)
+        if not target_rev:
+            return ReplayReport([], target_branch, skipped_reason=f"no commit on {target_branch}")
+        digest = _rules_digest(forbid_rules)
+        stored = since if isinstance(since, Mapping) and since.get("rules") == digest and since.get("branch") == target_branch else {}
+        tip = stored.get("tip") if isinstance(stored.get("tip"), str) else None
 
-    def walk(*args: str) -> List[str]:
-        res = gitsafe.run(["rev-list", *args, target_rev], root)
-        if res.returncode != 0:
-            raise gitsafe.GitError(f"git rev-list {target_branch} failed (exit {res.returncode})")
-        return [ln.strip() for ln in res.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+        def walk(*args: str) -> List[str]:
+            res = gitsafe.run(["rev-list", *args, target_rev], root)
+            if res.returncode != 0:
+                raise gitsafe.GitError(f"git rev-list {target_branch} failed (exit {res.returncode})")
+            return [ln.strip() for ln in res.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+
+        if tip == target_rev:
+            return ReplayReport([], target_branch, int(walk("--count")[0]), tip=tip, rules=digest)
+        return _replay(root, forbid_rules, target_branch, walk, tip, digest, persist)
+
+
+def _replay(root: Path, forbid_rules: List[Any], target_branch: str, walk: Callable[..., List[str]],
+            tip: Optional[str], digest: str, persist: bool) -> ReplayReport:
+    from aegis_core import credit, gitsafe
 
     commit_lines = [ln.split() for ln in walk("--parents", "--reverse")]
-    stamps = dict(ln.split(" ", 1) for ln in walk("--format=%H %cI") if not ln.startswith("commit ") and " " in ln)
+    described = dict(ln.split("\0", 1) for ln in walk("--format=%H%x00%cI%x00%s") if not ln.startswith("commit ") and "\0" in ln)
+    stamps = {sha: rest.split("\0", 1)[0] for sha, rest in described.items()}
+    subjects = {sha: rest.split("\0", 1)[-1] for sha, rest in described.items()}
+    shas = walk("--first-parent", "--reverse")
+    parents = {parts[0]: parts[1:] for parts in commit_lines}
+    merge_shas = {sha for sha, ps in parents.items() if len(ps) >= 2}
+    start = 0
+    if tip is not None and tip in shas:
+        old, todo = set(), [tip]
+        while todo:
+            sha = todo.pop()
+            if sha not in old:
+                old.add(sha)
+                todo.extend(parents.get(sha, ()))
+        # Only single-parent commits after the tip: every merge is then old, and so is its finding.
+        start = shas.index(tip) + 1 if not (merge_shas - old) else 0
     skipped: Set[str] = set()
+    cache: Dict[Tuple[str, Tuple[str, str]], Optional[FrozenSet[str]]] = {}
     hits_cache: Dict[str, Set[Tuple[str, str, str]]] = {}
 
     def hits_for(sha: str) -> Set[Tuple[str, str, str]]:
         if sha not in hits_cache:
-            hits_cache[sha] = _violations_at_commit(root, sha, forbid_rules, skipped)
+            hits_cache[sha] = _violations_at_commit(root, sha, forbid_rules, skipped, cache)
         return hits_cache[sha]
 
-    def commit_subject(sha: str) -> str:
-        r = gitsafe.run(["log", "-1", "--format=%s", sha], root)
-        return r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else ""
-
     findings: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
-    merge_commits = [parts for parts in commit_lines if len(parts) >= 3]
-    merge_shas = {parts[0] for parts in merge_commits}
-    for parts in merge_commits:
+    for parts in [] if start else [p for p in commit_lines if len(p) >= 3]:
         merge_sha, p1, p2 = parts[0], parts[1], parts[2]
-        m_branch = _MERGE_BRANCH_RE.search(commit_subject(merge_sha))
+        m_branch = _MERGE_BRANCH_RE.search(subjects.get(merge_sha, ""))
         b_label = m_branch.group(1) if m_branch else f"{target_branch}:{merge_sha[:8]}"
         br_res = gitsafe.run(["rev-list", "--reverse", f"{p1}..{p2}"], root)
         branch_shas = [s.strip() for s in br_res.stdout.decode("utf-8", "replace").splitlines() if s.strip()]
@@ -607,10 +728,15 @@ def replay_detector_history_report(
             for rid, rel, pat in sorted(hits_for(b_sha) - base_hits - merge_hits - fixed_here):
                 fixed_here.add((rid, rel, pat))
                 findings[(rid, rel, pat, b_sha)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "caught", "weight": 0.5, "branch": b_label, "rev": b_sha, "fix_rev": merge_sha}
-    shas = walk("--first-parent", "--reverse")
+    if start:
+        for rid, rel, pat, rev in _open_at(root, target_branch, forbid_rules, shas[:start], merge_shas, hits_for(shas[start - 1])):
+            fix_sha = next((s for s in shas[start:] if (rid, rel, pat) not in hits_for(s)), None)
+            if fix_sha:
+                findings[(rid, rel, pat, rev)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "leaked", "weight": 1.0, "branch": target_branch, "rev": rev, "fix_rev": fix_sha}
     # Spec T4.1: a hit that reached the protected first-parent line landed, whether a later fix or
     # revert removed it (fix_rev) or not: leaked. Only the merge-branch loop above yields caught.
-    for idx, sha in enumerate(shas):
+    for idx in range(start, len(shas)):
+        sha = shas[idx]
         if sha in merge_shas:
             continue
         prev_hits = hits_for(shas[idx - 1]) if idx > 0 else set()
@@ -618,12 +744,12 @@ def replay_detector_history_report(
             fix_sha = next((s for s in shas[idx + 1:] if (rid, rel, pat) not in hits_for(s)), None)
             findings[(rid, rel, pat, sha)] = {"rule": rid, "file": rel, "pattern": pat, "disposition": "leaked", "weight": 1.0, "branch": target_branch, "rev": sha, "fix_rev": fix_sha}
     # The evidence is as old as the commit that introduced (or merged) the hit, never the sync.
-    detections = [dict(i) for i in findings.values()] if not persist else [
-        credit.record_detection(root, i["rule"], i["file"], i["pattern"], disposition=i["disposition"], rev=i.get("rev"), branch=i["branch"], fix_rev=i.get("fix_rev"), weight=i["weight"],
-                                ts=_utc_stamp(stamps.get(i["rev"], "")))
-        for i in findings.values()
-    ]
-    return ReplayReport(detections, target_branch, len(commit_lines), tuple(sorted(skipped)))
+    detections = [dict(i) for i in findings.values()] if not persist else credit.record_detections(
+        root, [dict(i, ts=_utc_stamp(stamps.get(i["rev"], ""))) for i in findings.values()])
+    # Only a complete, persisted replay may be resumed: the next one reads the ledger it wrote.
+    complete = persist and not skipped and bool(shas)
+    return ReplayReport(detections, target_branch, len(commit_lines), tuple(sorted(skipped)),
+                        tip=shas[-1] if complete else None, rules=digest)
 
 
 def replay_detector_history(workspace: Any, rules: Optional[Iterable[Any]] = None, *, branch: Optional[str] = None, persist: bool = True) -> List[Dict[str, Any]]:

@@ -14,7 +14,7 @@ from typing import List, Optional, Sequence, Tuple
 import pytest
 
 from aegis_core import baseline
-from aegis_core.baseline import Baseline, Entry, Finding, Sources
+from aegis_core.baseline import Baseline, Entry, Sources
 from aegis_core.verification import ToolEvidence, runner
 from tests.helpers_checkmodes import commit, git, init_repo, write
 
@@ -329,3 +329,143 @@ def test_a_staged_new_violation_is_not_hidden_by_an_older_one_in_the_working_tre
     pairs = baseline.run_grouped(lambda group: runner.run_layer1_on_index(list(group), str(repo)), ["app.py"])
     result = baseline.apply(pairs, Sources(repo, staged=True), Baseline(frozenset(held), "t", "working-tree"))
     assert [f.text for f in result.new] == ["y = eval(2)"] and not result.passed
+
+
+# ── Allowed sites and the gate's own findings (R-checks-12) ──────────────────
+
+ALLOWED = "x = eval(1)  # aegis: allow[no-eval]: legacy\n"
+EXEC_COMPILE = (
+    "---\nid: no-exec-compile\ntype: invariant\nenforcement: gate\n"
+    "forbid_ast:\n  calls: [exec, compile]\n---\n# No exec or compile\n"
+)
+PICKLE_MARSHAL = (
+    "---\nid: no-pickle-marshal\ntype: invariant\nenforcement: gate\n"
+    "forbid_ast:\n  imports: [pickle, marshal]\n---\n# No pickle or marshal\n"
+)
+SHELL_OR_SYSTEM = (
+    "---\nid: no-shell\ntype: invariant\nenforcement: gate\n"
+    "forbid_ast:\n  calls: [{name: subprocess.run, where: {shell: true}}, os.system]\n---\n# No shell\n"
+)
+
+
+def _no_eval_lines(root: Path, files: Sequence[str]) -> List[List[int]]:
+    return [e.lines for _, e in _layer1(root, files) if e.tool == "forbid_ast:no-eval"]
+
+
+def test_an_allowed_site_is_not_a_line_of_the_check_nor_a_finding(repo: Path):
+    write(repo, "app.py", ALLOWED + "y = eval(2)\n")
+    assert _no_eval_lines(repo, ["app.py"]) == [[2]]
+    assert [(f.rule, f.line) for f in _collect(repo, ["app.py"]).findings] == [("forbid_ast:no-eval", 2)]
+
+
+def test_adding_an_allowed_site_above_a_baselined_one_stays_green(repo: Path):
+    write(repo, "app.py", "y = eval(2)\n")
+    held = _entries(repo, ["app.py"])
+    write(repo, "app.py", ALLOWED + "y = eval(2)\n")
+    result = _apply(repo, ["app.py"], held)
+    assert result.new == () and result.passed
+
+
+def test_an_allow_for_another_rule_keeps_the_site_a_new_finding(repo: Path):
+    write(repo, "app.py", "y = eval(2)\n")
+    held = _entries(repo, ["app.py"])
+    write(repo, "app.py", "x = eval(1)  # aegis: allow[other-rule]: theirs\ny = eval(2)\n")
+    assert _no_eval_lines(repo, ["app.py"]) == [[1, 2]]
+    result = _apply(repo, ["app.py"], held)
+    assert [f.line for f in result.new] == [1] and not result.passed
+
+
+def test_without_allows_every_site_is_a_line(repo: Path):
+    write(repo, "app.py", "x = eval(1)\ny = 2\nz = eval(3)\n")
+    assert _no_eval_lines(repo, ["app.py"]) == [[1, 3]]
+
+
+@pytest.mark.parametrize("rule,source,expected", [
+    (EXEC_COMPILE, "exec(a)  # aegis: allow[no-exec-compile]: reviewed\nexec(b)\ncompile(c, 'f', 'exec')\n", [2, 3]),
+    (PICKLE_MARSHAL, "import pickle  # aegis: allow[no-pickle-marshal]: reviewed\nimport marshal\nfrom pickle import loads\n",
+     [2, 3]),
+], ids=["calls", "imports"])
+def test_a_check_with_several_patterns_finds_the_sites_the_gate_reported(repo: Path, rule, source, expected):
+    rule_id = rule.split("id: ", 1)[1].split("\n", 1)[0]
+    write(repo, f".aegis/rules/invariants/{rule_id}.md", rule)
+    commit(repo, "the reviewed rule")
+    write(repo, "app.py", source)
+    found = [f for f in _collect(repo, ["app.py"]).findings if f.rule == f"forbid_ast:{rule_id}"]
+    assert sorted(f.line for f in found) == expected
+
+
+def test_the_sites_keep_the_rules_where_clause(repo: Path):
+    write(repo, ".aegis/rules/invariants/no-shell.md", SHELL_OR_SYSTEM)
+    commit(repo, "the reviewed rule")
+    write(repo, "run.py", "import os\nimport subprocess\nsubprocess.run(['ls'])\nsubprocess.run(c, shell=True)\nos.system('x')\n")
+    found = [f for f in _collect(repo, ["run.py"]).findings if f.rule == "forbid_ast:no-shell"]
+    assert [(f.line, f.text) for f in found] == [(4, "subprocess.run(c, shell=True)"), (5, "os.system('x')")]
+
+
+def test_a_rule_gone_before_the_baseline_is_written_leaves_the_check_failing(repo: Path):
+    write(repo, ".aegis/rules/invariants/no-exec-compile.md", EXEC_COMPILE)
+    commit(repo, "the reviewed rule")
+    write(repo, "app.py", "exec(a)\ncompile(c, 'f', 'exec')\n")
+    pairs = _layer1(repo, ["app.py"])
+    # Gone from what the gate enforces (the reviewed base), not only from the working tree,
+    # whose copy the sites never read (F1, w6 review).
+    git(repo, "rm", "-q", ".aegis/rules/invariants/no-exec-compile.md")
+    commit(repo, "the rule is removed")
+    result = baseline.collect(pairs, Sources(repo))
+    assert [f for f in result.findings if f.rule == "forbid_ast:no-exec-compile"] == []
+    assert "forbid_ast:no-exec-compile" in [e.tool for e in result.blocked]
+
+
+def test_the_staged_check_reports_the_lines_the_working_tree_check_does(repo: Path):
+    write(repo, "app.py", "a = 1\nb = eval(2)\nc = 3\nd = eval(4)\ne = 5\nf = eval(6)\n")
+    git(repo, "add", "app.py")
+    staged = baseline.run_grouped(lambda group: runner.run_layer1_on_index(list(group), str(repo)), ["app.py"])
+    assert [e.lines for _, e in staged if e.tool == "forbid_ast:no-eval"] == _no_eval_lines(repo, ["app.py"]) == [[2, 4, 6]]
+
+
+# ── The sites come from the rule the gate enforced, never the working tree (F1, w6 review) ──
+
+def _narrowed(rule_type: str) -> str:
+    return EXEC_COMPILE.replace("type: invariant", f"type: {rule_type}").replace(
+        "calls: [exec, compile]", "calls: [{name: exec, where: {'#0': {in: [\"'a'\"]}}}, compile]")
+
+
+@pytest.mark.parametrize("rule_type", ["invariant", "trap"])
+def test_narrowing_the_rule_in_the_working_tree_does_not_hide_a_new_site(repo: Path, rule_type):
+    rule_path = f".aegis/rules/{rule_type}s/no-exec-compile.md"
+    write(repo, rule_path, EXEC_COMPILE.replace("type: invariant", f"type: {rule_type}"))
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\n")
+    commit(repo, "the reviewed rule and two baselined sites")
+    held = _entries(repo, ["app.py"])
+    assert len(held) == 2
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\nexec(payload)\n")
+    write(repo, rule_path, _narrowed(rule_type))  # only exec('a') would still match
+    pairs = _layer1(repo, ["app.py"])
+    assert [e.lines for _, e in pairs if e.tool == "forbid_ast:no-exec-compile"] == [[1, 2, 3]]
+    result = baseline.apply(pairs, Sources(repo), Baseline(frozenset(held), "t", "working-tree"))
+    assert [(f.line, f.text) for f in result.new] == [(3, "exec(payload)")] and not result.passed
+
+
+def test_narrowing_the_staged_rule_does_not_hide_a_new_staged_site(repo: Path):
+    rule_path = ".aegis/rules/invariants/no-exec-compile.md"
+    write(repo, rule_path, EXEC_COMPILE)
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\n")
+    commit(repo, "the reviewed rule and two baselined sites")
+    held = _entries(repo, ["app.py"])
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\nexec(payload)\n")
+    write(repo, rule_path, _narrowed("invariant"))
+    git(repo, "add", "app.py", rule_path)
+    pairs = baseline.run_grouped(lambda group: runner.run_layer1_on_index(list(group), str(repo)), ["app.py"])
+    assert [e.lines for _, e in pairs if e.tool == "forbid_ast:no-exec-compile"] == [[1, 2, 3]]
+    result = baseline.apply(pairs, Sources(repo, staged=True), Baseline(frozenset(held), "t", "working-tree"))
+    assert [(f.line, f.text) for f in result.new] == [(3, "exec(payload)")] and not result.passed
+
+
+def test_a_check_whose_lines_its_sites_do_not_cover_cannot_be_baselined(repo: Path):
+    write(repo, ".aegis/rules/invariants/no-exec-compile.md", EXEC_COMPILE)
+    write(repo, "app.py", "exec(a)\ncompile(c, 'f', 'exec')\n")
+    commit(repo, "the reviewed rule")
+    (evidence,) = [e for _, e in _layer1(repo, ["app.py"]) if e.tool == "forbid_ast:no-exec-compile"]
+    widened = ToolEvidence(evidence.tool, evidence.target, False, evidence.detail, [1, 2, 5])
+    result = baseline.collect([("app.py", widened)], Sources(repo))
+    assert result.findings == () and result.blocked == (widened,)

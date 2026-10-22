@@ -859,6 +859,11 @@ def run_init(args: argparse.Namespace) -> int:
     report.say("  After a session, run: aegis status")
     report.say()
     _report_ci(report, actions)
+    # No CODEOWNERS is written: offline, init cannot tell a valid owner (a user, an organization's team).
+    report.say("  Governance files (rules, workflows, allowed_signers) are protected only by GitHub settings:")
+    report.say("  aegis doctor --github prints the CODEOWNERS lines and the ruleset for this repository;")
+    report.say("  commit the CODEOWNERS lines it prints and apply the ruleset.")
+    report.say()
     if not json_mode:
         try:
             from aegis_cli.pathcheck import build_hint

@@ -1234,3 +1234,34 @@ def test_the_wheel_smoke_expects_the_active_starters_init_seeds():
     node = next(n for n in tree.body if isinstance(n, pyast.Assign)
                 and any(getattr(t, "id", None) == "ACTIVE_STARTERS" for t in n.targets))
     assert tuple(pyast.literal_eval(node.value)) == tuple(ACTIVE_STARTERS)
+
+
+class TestGovernanceHint:
+    """R-trust-42: init writes no CODEOWNERS (it cannot tell a valid owner offline); a real run points at
+    `aegis doctor --github`, the one place the CODEOWNERS lines and the ruleset come from."""
+
+    CODEOWNERS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+
+    def _no_codeowners(self, project: Path) -> None:
+        assert not any((project / p).exists() for p in self.CODEOWNERS)
+
+    def test_a_real_run_prints_the_doctor_github_hint_after_the_ci_floor(self, project, capsys):
+        assert run_init(_args(project)) == 0
+        out = capsys.readouterr().out
+        assert "aegis doctor --github" in out and "CODEOWNERS" in out
+        assert out.index("CI is the floor") < out.index("aegis doctor --github")
+        self._no_codeowners(project)
+
+    def test_json_keeps_its_keys_and_carries_no_hint(self, project, capsys):
+        assert main(["--json", "init", "--workspace", str(project), "--yes", "--no-hooks", "--rules", "minimal"]) == 0
+        out = capsys.readouterr().out
+        assert set(json.loads(out)) == {"source", "aegis_version", "checked_at", "scope", "dry_run", "status",
+                                        "actions", "errors", "warnings"}
+        assert "doctor --github" not in out
+        self._no_codeowners(project)
+
+    def test_a_dry_run_prints_no_hint_and_writes_nothing(self, project, capsys):
+        assert run_init(_args(project, "--dry-run")) == 0
+        assert "doctor --github" not in capsys.readouterr().out
+        assert not (project / ".aegis").exists()
+        self._no_codeowners(project)

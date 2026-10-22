@@ -296,6 +296,45 @@ class TestLayer1:
         assert json.loads(capsys.readouterr().out)["passed"] is False
 
 
+# ── Advisory notes (R-checks-13) ────────────────────────────────────────────
+
+NO_SHELL_RULE = (
+    "---\nid: no-shell\ntype: invariant\nenforcement: gate\nhypothesis: no shell\n"
+    "target_paths: ['*.py']\nforbid_ast:\n  calls: [{name: subprocess.run, where: {shell: true}}]\n---\n# No shell\n"
+)
+DYN = "import subprocess\n\n\ndef main(cmd, kw):\n    return subprocess.run(cmd, **kw)\n"
+
+
+def _dyn_ws(ws: Path) -> Path:
+    (ws / ".aegis" / "rules" / "invariants").mkdir(parents=True)
+    (ws / ".aegis" / "rules" / "invariants" / "no-shell.md").write_text(NO_SHELL_RULE, encoding="utf-8")
+    (ws / "dyn.py").write_text(DYN, encoding="utf-8")
+    return ws
+
+
+class TestAdvisoryNotes:
+    def test_text_names_the_undecidable_site_and_still_passes(self, ws, capsys):
+        assert _exit_code(["check", "--workspace", str(_dyn_ws(ws)), "dyn.py"]) == 0
+        out = capsys.readouterr().out
+        assert "note: forbid_ast:no-shell:" in out and "(1 unverified, see notes)" in out
+
+    def test_json_lists_the_note_and_passes(self, ws, capsys):
+        assert _exit_code(["check", "--workspace", str(_dyn_ws(ws)), "--format", "json", "dyn.py"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["passed"] is True
+        assert [r["target"] for r in payload["layer1"] if r["tool"] == "forbid_ast_unverified"] == ["dyn.py"]
+
+    def test_the_hook_prints_the_same_note_for_the_staged_file(self, ws, capsys):
+        _git_repo(_dyn_ws(ws))
+        _git(ws, "add", "-A")
+        _git(ws, "commit", "-q", "-m", "the reviewed rule")
+        (ws / "dyn.py").write_text(DYN.replace("cmd, **kw", "cmd, **kw  "), encoding="utf-8")
+        _git(ws, "add", "dyn.py")
+        assert _exit_code(["check", "--workspace", str(ws), "--hook"]) == 0
+        out = capsys.readouterr().out
+        assert "note: forbid_ast:no-shell:" in out and "(1 unverified, see notes)" in out
+
+
 # ── --strict and the workspace checkpoint ───────────────────────────────────
 
 class TestStrict:

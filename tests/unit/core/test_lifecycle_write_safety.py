@@ -5,13 +5,13 @@ Invariants under test (docs/adr/0005-evidence-review.md M1):
 - every rule-file write is atomic: when the filesystem refuses the final
   write, the rules directory is byte-identical to before (no truncated rule,
   no stray temp file, no half-finished move);
-- a tier change is metadata only: no generated enforcement artifact;
+- the tier pass writes nothing: ledger numbers never move an enforcement tier (D-tier-ladder);
 - persisted lifecycle timestamps are one valid UTC ISO-8601 form;
 - the existence checks that promote/demote run before taking the
   lock are repeated under it, so a rival create or move that lands in between
   is never overwritten and never crashes the second mover;
-- the tier pass and the archive pass change only the rules that need it and hold
-  the lock per rule, not for the whole pass; archiving re-checks the rule's ledger
+- the archive pass changes only the rules that need it and holds the lock per rule,
+  not for the whole pass; archiving re-checks the rule's ledger
   evidence under the lock, never revisits a hidden directory and never overwrites a
   rule already archived under the same name.
 
@@ -44,7 +44,6 @@ from aegis_core.lifecycle.promotion import demote_rule, evaluate_rule_tiers, eva
 from aegis_core.lifecycle.selection import evaluate_archives, run_rule_selection
 from aegis_core.fitness import MIN_N
 from aegis_core.telemetry_engine import ledger
-from aegis_core.yaml_engine.frontmatter import parse_frontmatter
 
 _UTC_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _KEYS = iter(range(10**9))
@@ -107,14 +106,6 @@ def _scenario_archive(tmp_path: Path):
     return ws, lambda: run_rule_selection(ws, execute=True)
 
 
-def _scenario_tier_escalation(tmp_path: Path):
-    ws = _ws(tmp_path)
-    # 30 of 30 verdicts: Wilson bound 0.92 >= 0.85 over >= 20 verdicts, so advisory -> mechanical.
-    _rule(_rules(ws) / "traps" / "proven.md", "proven", "trap")
-    _evidence(ws, "proven", tp=30)
-    return ws, lambda: evaluate_rule_tiers(ws, execute=True)
-
-
 def _scenario_promote(tmp_path: Path):
     ws = _ws(tmp_path)
     _rule(_rules(ws) / "traps" / "rising.md", "rising", "trap")
@@ -130,7 +121,6 @@ def _scenario_demote(tmp_path: Path):
 _SCENARIOS = {
     "create": _scenario_create,
     "archive": _scenario_archive,
-    "tier_escalation": _scenario_tier_escalation,
     "promote": _scenario_promote,
     "demote": _scenario_demote,
 }
@@ -226,19 +216,17 @@ def test_rule_files_are_never_rewritten_in_place(
     assert in_place == []
 
 
-def test_tier_escalation_is_metadata_only(tmp_path: Path) -> None:
-    """The enforcement tier is rule metadata; forbid_ast is the gate mechanism (defense #21).
+def test_the_tier_pass_never_rewrites_a_rule_from_ledger_numbers(tmp_path: Path) -> None:
+    """30 of 30 verdicts once moved an advisory trap to mechanical; ledger numbers no longer move
+    an enforcement tier (D-tier-ladder), and no enforcement artifact is generated."""
+    ws = _ws(tmp_path)
+    rule = _rule(_rules(ws) / "traps" / "proven.md", "proven", "trap")
+    _evidence(ws, "proven", tp=30)
+    before = rule.read_bytes()
 
-    No generated check/gate script is written and none is recorded on the rule.
-    """
-    ws, operation = _scenario_tier_escalation(tmp_path)
+    assert evaluate_rule_tiers(ws, execute=True) == {"evaluated": 1, "changes": []}
 
-    res = operation()
-
-    assert [(c["rule"], c["old_tier"], c["new_tier"]) for c in res["changes"]] == [("proven", "advisory", "mechanical")]
-    meta = parse_frontmatter((_rules(ws) / "traps" / "proven.md").read_text(encoding="utf-8")) or {}
-    assert meta["enforcement"] == "mechanical"
-    assert "enforcement_artifact" not in meta and "fitness" not in meta
+    assert rule.read_bytes() == before
     assert not (ws / ".aegis" / "enforcement").exists()
 
 
@@ -401,38 +389,6 @@ def test_tier_pass_with_nothing_to_change_does_not_wait_for_the_rules_lock(tmp_p
     assert _snapshot(_rules(ws)) == before
 
 
-def test_tier_pass_keeps_a_concurrent_edit_to_the_rule_it_rewrites(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Rules are read before the lock; the rewrite must start from what is on disk under it."""
-    ws, operation = _scenario_tier_escalation(tmp_path)
-    rule = _rules(ws) / "traps" / "proven.md"
-
-    def edit() -> None:
-        rule.write_text(rule.read_text(encoding="utf-8").replace("Body text.", "Edited concurrently."), encoding="utf-8")
-
-    _rival_on_first_lock(monkeypatch, edit)
-
-    operation()
-
-    text = rule.read_text(encoding="utf-8")
-    assert "Edited concurrently." in text
-    assert (parse_frontmatter(text) or {})["enforcement"] == "mechanical"
-
-
-def test_tier_pass_leaves_a_rule_whose_tier_changed_meanwhile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ws, operation = _scenario_tier_escalation(tmp_path)
-    rule = _rules(ws) / "traps" / "proven.md"
-    _rival_on_first_lock(
-        monkeypatch, lambda: rule.write_text(rule.read_text(encoding="utf-8").replace("advisory", "gate"), encoding="utf-8")
-    )
-
-    assert operation()["changes"] == []
-    assert (parse_frontmatter(rule.read_text(encoding="utf-8")) or {})["enforcement"] == "gate"
-
-
 # ── Archive pass: per-rule lock, re-checked under it, no revisits, no overwrites ──
 
 def _log_actions(ws: Path) -> list[tuple[str, str]]:
@@ -493,7 +449,7 @@ def test_archiving_acts_on_the_evidence_as_it_is_under_the_lock(
     """The rule is judged unlocked; true positives recorded before the lock must win."""
     ws = _ws(tmp_path)
     rule = _misfiring(_rules(ws) / "traps" / "revived.md", "revived")
-    _rival_on_first_lock(monkeypatch, lambda: _evidence(ws, "revived", tp=MIN_N), module=selection)
+    _rival_on_first_lock(monkeypatch, lambda: _evidence(ws, "revived", tp=4 * MIN_N), module=selection)
 
     assert run_rule_selection(ws, execute=True) == 0
 

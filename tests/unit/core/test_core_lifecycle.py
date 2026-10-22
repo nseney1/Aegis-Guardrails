@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from aegis_core.fitness import Fitness
+from aegis_core.fitness import Fitness, compute
 from aegis_core.lifecycle.parsers import find_rule_file, rule_age_days
 from aegis_core.lifecycle.promotion import demote_rule, promote_rule, suggest
 from aegis_core.rules import load_rules
@@ -50,27 +50,35 @@ def _suggestion(ws: Path, rule_id: str, fit: Fitness) -> str | None:
     return suggest(load_rules(ws).get(rule_id), fit, NOW)
 
 
+def _decided(ws: Path, rule_id: str, rule_type: str, tp: int = 0, fp: int = 0, labels: int = 0) -> Fitness:
+    """What the one engine (fitness.compute) decides for the rule's age and these counts."""
+    age = rule_age_days(load_rules(ws).get(rule_id), NOW)
+    return compute({"tp": tp, "fp": fp}, rule=rule_id, rule_type=rule_type, adjudicated_tp=labels,
+                   sessions_count=3 if labels else 0, repos_count=2 if labels else 0, age_days=age)
+
+
 class TestSuggestions:
     def test_strong_evidence_on_an_old_enough_rule_suggests_promotion(self, workspace: Path):
         _rule(workspace, "traps", "t", "trap")
-        assert _suggestion(workspace, "t", Fitness("t", triggers=25, tp=25, fp=0, score=0.89)) == "promote"
+        assert _suggestion(workspace, "t", _decided(workspace, "t", "trap", labels=25)) == "promote"
 
     def test_too_few_verdicts_too_low_a_bound_or_too_young_is_no_promotion(self, workspace: Path):
         _rule(workspace, "traps", "t", "trap")
         _rule(workspace, "traps", "young", "trap", created=(NOW - timedelta(days=5)).strftime("%Y-%m-%d"))
-        assert _suggestion(workspace, "t", Fitness("t", tp=19, fp=0, score=0.9)) is None
-        assert _suggestion(workspace, "t", Fitness("t", tp=30, fp=5, score=0.7)) is None
-        assert _suggestion(workspace, "young", Fitness("young", tp=40, fp=0, score=0.95)) is None
+        assert _suggestion(workspace, "t", _decided(workspace, "t", "trap", labels=19)) is None
+        assert _suggestion(workspace, "t", _decided(workspace, "t", "trap", tp=30, fp=5)) is None
+        assert _suggestion(workspace, "young", _decided(workspace, "young", "trap", labels=40)) is None
 
     def test_a_misfiring_rule_is_demoted_or_archived_at_the_bottom(self, workspace: Path):
         _rule(workspace, "traps", "t", "trap")
         _rule(workspace, "invariants", "i", "invariant")
-        misfire = dict(tp=0, fp=25, misfire=0.9)
-        assert _suggestion(workspace, "i", Fitness("i", **misfire)) == "demote"
-        assert _suggestion(workspace, "t", Fitness("t", **misfire)) == "archive"
-        assert _suggestion(workspace, "t", Fitness("t", tp=10, fp=15, misfire=0.43)) is None
-        # the same bound below MIN_N (25) verdicts moves nothing (R-evidence-8)
-        assert _suggestion(workspace, "i", Fitness("i", tp=0, fp=3, misfire=0.53)) is None
+        assert _suggestion(workspace, "i", _decided(workspace, "i", "invariant", fp=25)) == "demote"
+        assert _suggestion(workspace, "t", _decided(workspace, "t", "trap", fp=25)) == "archive"
+        assert _suggestion(workspace, "t", _decided(workspace, "t", "trap", tp=16, fp=11)) is None
+        # three straight false positives clear the old Wilson bound but not MIN_N (25) verdicts (R-evidence-8)
+        assert _suggestion(workspace, "i", _decided(workspace, "i", "invariant", fp=3)) is None
+        # suggest never re-decides from a bound the engine did not decide on
+        assert _suggestion(workspace, "i", Fitness("i", tp=0, fp=25, misfire=0.9)) is None
 
     def test_protected_expired_and_broken_rules_get_no_suggestion(self, workspace: Path):
         _rule(workspace, "traps", "providence", "trap")
@@ -91,12 +99,22 @@ class TestPromoteAndDemote:
         assert find_rule_file(workspace, "test-v") == (trap, "trap")
         assert find_rule_file(workspace, "../etc/passwd") == (None, None)
 
-    def test_promotion_without_force_needs_ledger_evidence(self, workspace: Path):
+    def test_promotion_without_force_needs_ledger_evidence(self, workspace: Path, monkeypatch):
+        """CI verdicts alone are not enough: labels merged at the reviewed BASE are (R-evidence-4)."""
+        from tests import helpers_adjudication as ha
+
         trap = _rule(workspace, "traps", "promote-me", "trap")
         refused = promote_rule(workspace, "promote-me", force=False)
         assert refused["status"] == "ineligible" and trap.exists()
 
+        monkeypatch.setenv("HOME", str(workspace.parent / "home"))
+        ha.merge_to_base(workspace)
         _report(workspace, "promote-me", tp=25)
+        refused = promote_rule(workspace, "promote-me", force=False)
+        assert refused["status"] == "ineligible" and "adjudicated labels" in refused["message"] and trap.exists()
+
+        ha.write_labels(workspace, "promote-me", ha.labels("promote-me"))
+        ha.merge_to_base(workspace)
         res = promote_rule(workspace, "promote-me", force=False)
 
         assert (res["status"], res["from_type"], res["to_type"]) == ("promoted", "trap", "invariant")

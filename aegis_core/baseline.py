@@ -449,17 +449,20 @@ def run_grouped(
 
 class Sources:
     """The text and syntax trees the findings are read from: the working tree, or the
-    index (``staged``) when the pre-commit hook checks what a commit would record."""
+    index (``staged``) when the pre-commit hook checks what a commit would record.
+    ``reviewed`` as in ``runner.run_layer1``: which version of the gate rules was enforced."""
 
-    def __init__(self, root: Any, staged: bool = False) -> None:
+    def __init__(self, root: Any, staged: bool = False, reviewed: bool = True) -> None:
         self.root = Path(os.fspath(root))
         self.staged = staged
+        self.reviewed = reviewed
         self._texts: Dict[str, Optional[str]] = {}
         self._lines: Dict[str, _Lines] = {}
         self._trees: Dict[str, Any] = {}
-        self._sites: Dict[Tuple[str, str, str], List[int]] = {}
+        self._sites: Dict[Tuple[str, str, str, str], List[int]] = {}
         self._index: Optional[Dict[str, str]] = None
         self._runner: Any = None
+        self._rules: Any = None  # rule id -> the forbid_ast the gate enforced, once; False when unreadable
 
     def _staged_oid(self, path: str) -> Optional[str]:
         if self._index is None:
@@ -535,44 +538,40 @@ class Sources:
         self._trees[path] = tree
         return tree
 
-    def sites(self, path: str, kind: str, pattern: str) -> List[int]:
-        """The lines of ``path`` where a ``forbid_ast`` pattern (``call`` or ``import``) is
-        violated. Matched lines are extracted in a single pass against the file's own
-        imports so aliases resolve exactly as in the gate. A decorator has no line: the
-        answer is empty."""
-        key = (path, kind, pattern)
+    def _forbid_spec(self, rule_id: str) -> Optional[dict]:
+        """The ``forbid_ast`` of ``rule_id`` as the gate enforced it: the runner's own discovery
+        (the reviewed base version), never the working tree's or the index's copy, which the
+        change under check can narrow to hide a new site. None when it is not enforced."""
+        if self._rules is None:
+            from aegis_core.verification import runner
+
+            root = os.fspath(self.root)
+            try:
+                found, _broken = runner._discover_forbid_ast_rules(*((root,) if self.reviewed else (root, False)))
+                self._rules = {rule.id: spec for rule, spec in found}
+            except Exception:
+                self._rules = False
+        spec = self._rules.get(rule_id) if self._rules else None
+        return spec if isinstance(spec, dict) else None
+
+    def sites(self, path: str, kind: str, pattern: str, rule_id: str) -> List[int]:
+        """The lines of ``path`` where the ``forbid_ast`` rule ``rule_id`` reports ``pattern`` as a
+        ``call`` or ``import``: its whole spec on the full tree with the file's allow comments,
+        as the gate evaluated it, so an allowed or benign site is never a finding. A decorator has
+        no line, and a rule that cannot be loaded has no sites: the answer is empty."""
+        key = (path, kind, pattern, rule_id)
         if key in self._sites:
             return self._sites[key]
-        from aegis_core.ast.policy import (
-            _match_ImportNode_against_pattern,
-            evaluate_forbid_ast_structured,
-        )
-        from aegis_core.ast.schema import NormalizedAST
+        from aegis_core.ast.policy import evaluate_forbid_ast_structured
 
-        found: set[int] = set()
-        tree = self._ast(path)
+        spec, tree = self._forbid_spec(rule_id), self._ast(path)
         try:
-            if tree is not None and kind == "call":
-                probe = NormalizedAST(
-                    file_path=tree.file_path,
-                    language=tree.language,
-                    imports=tree.imports,
-                    call_sites=tree.call_sites,
-                )
-                confirmed, _ = evaluate_forbid_ast_structured(
-                    probe, {"calls": [pattern]}, source=""
-                )
-                for hit in confirmed:
-                    ln = hit.get("line", 0)
-                    if isinstance(ln, int) and ln > 0:
-                        found.add(ln)
-            elif tree is not None and kind == "import":
-                for imp in tree.imports:
-                    if _match_ImportNode_against_pattern(imp, pattern):
-                        found.add(imp.line)
+            found = [] if spec is None or tree is None or kind == "decorator" else evaluate_forbid_ast_structured(
+                tree, spec, rule_id=rule_id, source=self.text(path) or "")
         except Exception:
-            found = set()
-        self._sites[key] = sorted(found)
+            found = []
+        self._sites[key] = sorted({f["line"] for f in found if f["kind"] == f"{kind}s" and f["pattern"] == pattern
+                                   and not f["unknown"] and f["override"] is None and f["line"] > 0})
         return self._sites[key]
 
 
@@ -611,13 +610,18 @@ def _findings_of(path: Optional[str], evidence: ToolEvidence, sources: Sources) 
                 found.append(Finding(evidence.tool, path, sources.line_text(path, number),
                                      sources.occurrence(path, number), number, message))
         else:
+            rule_id = evidence.tool.partition(":")[2]
+            covered: set = set()
             for kind, pattern, message in violations:
-                lines = sources.sites(path, kind, pattern)
+                lines = sources.sites(path, kind, pattern, rule_id)
                 if not lines:
                     return None
+                covered.update(lines)
                 for number in lines:
                     found.append(Finding(evidence.tool, path, sources.line_text(path, number),
                                          sources.occurrence(path, number), number, message))
+            if covered != set(evidence.lines):  # sites the gate did not report, or a reported site left out
+                return None
     return found or None
 
 
@@ -761,4 +765,4 @@ def run_fast(root: Any, files: Sequence[str], *,
     pairs = run_grouped(
         lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed),
         files, root=base)
-    return pairs, Sources(base)
+    return pairs, Sources(base, reviewed=reviewed)

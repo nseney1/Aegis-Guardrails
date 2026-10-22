@@ -89,6 +89,10 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # pull-requests: read lets check --ci read the reviews of a pull request (tier A approval).
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Verify upstream jobs succeeded
         env:
@@ -122,6 +126,8 @@ jobs:
         run: python3 -I -m aegis_cli.cli check
       - name: Run CI Governance & Regression Check
         run: python3 -I -m aegis_cli.cli check --ci
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   validate:
     needs: [build-wheel, dependency-audit]

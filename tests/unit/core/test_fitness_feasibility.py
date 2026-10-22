@@ -67,7 +67,8 @@ def test_frontmatter_trigger_rate_is_ignored_and_the_ledger_volume_decides(tmp_p
     _verdicts(tmp_path, "trap-busy", "tp", 120, first_days_ago=60)
     busy = _fit(tmp_path, "trap-busy")
     assert busy.mde == pytest.approx(0.0655, abs=1e-4)
-    assert (busy.state, busy.suggestion) == ("decided", "promote")
+    # testable on its ledger volume; 120 verdicts without labels still promote nothing (R-evidence-4)
+    assert (busy.state, busy.suggestion) == ("inconclusive", None)
 
     _rule(tmp_path, "trap-rare", extra="expected_triggers_per_day: 50\n")
     _verdicts(tmp_path, "trap-rare", "tp", 4, first_days_ago=200)

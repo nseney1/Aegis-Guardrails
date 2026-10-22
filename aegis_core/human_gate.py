@@ -34,6 +34,7 @@ __all__ = [
     "HumanGateError",
     "INSIGHT_APPROVE_TRAILER",
     "KeyCustody",
+    "PullRequest",
     "RULESET_NAME",
     "SCHEMA",
     "SOURCE",
@@ -49,6 +50,8 @@ __all__ = [
     "detect_tier",
     "exemption_message",
     "find_approval",
+    "find_review_approval",
+    "is_branch_name",
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
@@ -557,6 +560,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     approvals = 0
     owners = False
     dismisses = False
+    last_push = False
     contexts: List[str] = []
     unpinned: List[str] = []
     has_pr = False
@@ -571,6 +575,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
             approvals = max(approvals, valid_count)
             owners = owners or params.get("require_code_owner_review") is True
             dismisses = dismisses or params.get("dismiss_stale_reviews_on_push") is True
+            last_push = last_push or params.get("require_last_push_approval") is True
         elif rule.get("type") == "required_status_checks":
             for check in params.get("required_status_checks") or []:
                 if not isinstance(check, dict) or not isinstance(check.get("context"), str):
@@ -586,6 +591,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
         "required_approving_review_count": approvals,
         "require_code_owner_review": owners,
         "dismiss_stale_reviews_on_push": dismisses,
+        "require_last_push_approval": last_push,
         "required_status_checks": contexts,
         "unpinned_status_checks": unpinned,
     }
@@ -937,6 +943,7 @@ class Approval(NamedTuple):
     reason: str
     commit: str
     signer: Optional[str] = None
+    source: str = "signature"  # or "review": tier A's approving review (find_review_approval)
 
     @property
     def ok(self) -> bool:
@@ -957,6 +964,8 @@ class Approval(NamedTuple):
             "code": self.code,
             "reason": self.reason,
             "signer": self.signer,
+            # not "source": that key names the producer in every envelope
+            "method": self.source,
         }
 
 
@@ -1198,6 +1207,83 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
     return None
 
 
+class PullRequest(NamedTuple):
+    """The pull request a CI job checks, as the caller validated it from the Actions event file.
+    ``base_ref``: the branch it merges into (``pull_request.base.ref``), whose rules gate the merge."""
+    number: int
+    author: str
+    head: str
+    base_ref: str
+
+
+_REVIEWER_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+_REVIEW_PAGE = 100
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
+
+
+def is_branch_name(name: Any) -> bool:
+    """Whether ``name`` is a branch name safe to put in a GitHub API path: git's ref-name rules over a
+    conservative character set. Anything else is refused, never escaped into a different request."""
+    return (isinstance(name, str) and _BRANCH_NAME.fullmatch(name) is not None and ".." not in name
+            and "//" not in name and "/." not in name and ".lock/" not in name
+            and not name.endswith(("/", ".", ".lock")))
+
+
+def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequence[str],
+                         gh: Optional[GhRunner] = None) -> Optional[Approval]:
+    """Tier A's approval of a flagged change: some reviewer's latest review of ``pull`` is APPROVED on its
+    head commit, by a person (account type User) other than its author whose ``author_association`` is
+    OWNER, MEMBER or COLLABORATOR. An association is not a permission: write access is not checked here.
+    What makes the review count is the merge gate: the rules GitHub applies to the pull request's own
+    base branch (``pull.base_ref``, never the default branch's) require an approval, code-owner review,
+    stale approvals dismissed on push and the last push approved by someone other than its pusher (so
+    whoever pushed the head cannot be the approving reviewer), and the CODEOWNERS at ``base`` owns every
+    one of ``paths`` (repository-relative); the reviews are read only then. Read-only gh GETs; None whenever anything
+    cannot be read or does not hold (a base branch name in doubt reads nothing), so a missing gh, token
+    or permission fails closed."""
+    if not is_branch_name(pull.base_ref):
+        return None
+    runner: GhRunner = gh if gh is not None else default_gh_runner
+    top = _top(root)
+    repo, why = _gh_json(runner, "repos/{owner}/{repo}", top)
+    if why is not None or not isinstance(repo, dict):
+        return None
+    rules, why = _gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(pull.base_ref, safe=""), top)
+    facts = _ruleset_facts(rules) if why is None else None
+    if not facts or facts["required_approving_review_count"] < 1 or not facts["require_code_owner_review"] \
+            or not facts["dismiss_stale_reviews_on_push"] or not facts["require_last_push_approval"]:
+        return None
+    owner = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
+    org = owner.get("login") if owner.get("type") == "Organization" and isinstance(owner.get("login"), str) else None
+    text: Optional[str] = None
+    for location in _CODEOWNERS_LOCATIONS:  # GitHub reads the first one present
+        blob = _blob(top, base, location)
+        if blob is not None:
+            text = blob.decode("utf-8", "replace")
+            break
+    if text is None or codeowners_coverage(text, location, repo_paths=paths, org_login=org)[1]:
+        return None
+    reviews, why = _gh_json(runner, f"repos/{{owner}}/{{repo}}/pulls/{pull.number}/reviews?per_page={_REVIEW_PAGE}", top)
+    # A full page may hide later reviews (a change request, a dismissal), so it never approves.
+    if why is not None or not isinstance(reviews, list) or len(reviews) >= _REVIEW_PAGE:
+        return None
+    latest: Dict[str, Dict[str, Any]] = {}
+    for item in reviews:
+        user = item.get("user") if isinstance(item, dict) else None
+        login = user.get("login") if isinstance(user, dict) else None
+        if isinstance(login, str) and login:
+            latest[login.lower()] = item  # the list is oldest first: keep each reviewer's last word
+    for login, item in latest.items():
+        # A person's review only: an app or bot account may act for the agent.
+        if (item.get("state") == "APPROVED" and str(item.get("commit_id") or "").lower() == pull.head.lower()
+                and login != pull.author.lower() and item.get("author_association") in _REVIEWER_ASSOCIATIONS
+                and item["user"].get("type") == "User"):
+            name = item["user"]["login"]
+            return Approval(True, "ok", f"an approving review of the head commit by {name}, not its author",
+                            pull.head.lower(), name, "review")
+    return None
+
+
 def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
     """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
     trailer names it (so a refusal can say why); else None."""
@@ -1221,7 +1307,9 @@ def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) ->
     return rejected
 
 
-def signed_empty_commit(root: Any, message: str) -> str:
+def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -> str:
+    """``interactive``: a person at the caller's terminal; ssh-keygen asks there for a key passphrase
+    (with stdin on /dev/null it would try ssh-askpass instead)."""
     top = _top(root)
     config = signing_config(top)
     if config["format"] != "ssh" or not config["key"]:
@@ -1250,6 +1338,7 @@ def signed_empty_commit(root: Any, message: str) -> str:
         ],
         top,
         timeout=SIGN_TIMEOUT_SECONDS,
+        tty=interactive,
     )
     if res.returncode != 0:
         detail = " ".join((res.stderr or res.stdout).decode("utf-8", "replace").split())[:300]

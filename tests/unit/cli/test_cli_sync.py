@@ -37,12 +37,29 @@ def ws(tmp_path, monkeypatch):
     return root
 
 
+@pytest.fixture
+def labelled(tmp_path, monkeypatch):
+    """``ws`` whose trap also has 25 tp labels merged at the reviewed BASE: only labels promote (R-evidence-4)."""
+    from tests import helpers_adjudication as ha
+
+    root = tmp_path / "project"
+    _rule(root, "traps", "trap", "trap-good")
+    _rule(root, "personas", "persona", "persona-quiet")
+    ha.write_labels(root, "trap-good", ha.labels("trap-good"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    ha.merge_to_base(root)
+    ledger.append(root, [{"rule": "trap-good", "outcome": "tp", "source": "ci", "key": f"k{i}"} for i in range(25)])
+    monkeypatch.chdir(root)
+    return root
+
+
 def _rule_files(ws: Path) -> dict:
     rules = ws / ".aegis" / "rules"
     return {p.relative_to(rules).as_posix(): p.read_bytes() for p in sorted(rules.rglob("*.md"))}
 
 
-def test_sync_prints_a_table_of_suggestions_and_writes_derived_state(ws, capsys):
+def test_sync_prints_a_table_of_suggestions_and_writes_derived_state(labelled, capsys):
+    ws = labelled
     before = _rule_files(ws)
 
     rc = main(["sync"])
@@ -57,7 +74,13 @@ def test_sync_prints_a_table_of_suggestions_and_writes_derived_state(ws, capsys)
     assert _rule_files(ws) == before
 
 
-def test_sync_json_is_machine_readable(ws, capsys):
+def test_ci_verdicts_without_labels_suggest_nothing(ws, capsys):
+    assert main(["sync", "--json"]) == 0
+    rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)["rules"]}
+    assert (rows["trap-good"]["suggestion"], rows["trap-good"]["tp"]) == (None, 25)
+
+
+def test_sync_json_is_machine_readable(labelled, capsys):
     rc = main(["sync", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
@@ -76,7 +99,8 @@ def test_sync_json_is_one_two_space_indented_document(ws, capsys):
     assert out == json.dumps(json.loads(out), indent=2) + "\n"
 
 
-def test_apply_moves_the_suggested_rules(ws, capsys):
+def test_apply_moves_the_suggested_rules(labelled, capsys):
+    ws = labelled
     rc = main(["sync", "--apply", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
@@ -85,7 +109,7 @@ def test_apply_moves_the_suggested_rules(ws, capsys):
     assert (ws / ".aegis" / "rules" / "invariants" / "trap-good.md").is_file()
 
 
-def test_apply_text_mode_reports_each_move(ws, capsys):
+def test_apply_text_mode_reports_each_move(labelled, capsys):
     rc = main(["sync", "--apply"])
     out = capsys.readouterr().out
     assert rc == 0

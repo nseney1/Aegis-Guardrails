@@ -23,10 +23,10 @@ from tests import helpers_verified as hv
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
 
 FORGED = [f"{0xbeef + i:040x}" for i in range(6)]
-AMBIENT_TP = 24  # one short of fitness.MIN_N: only the CI-confirmed credit makes it promotable
-# 8 tp + 17 fp are MIN_N verdicts misfiring alone (Wilson lower bound of the fp rate 0.516 > 0.5);
-# 0.493 with the confirmed tp
-AMBIENT_FP_TP, AMBIENT_FP = 8, 17
+AMBIENT_TP = 24  # one short of fitness.MIN_N: the CI-confirmed credit completes the sample, never a promotion
+# 15 tp + 11 fp misfire alone (P(precision < 0.7) = 0.920 >= 0.9 over at least MIN_N verdicts);
+# 0.897 with the confirmed tp
+AMBIENT_FP_TP, AMBIENT_FP = 15, 11
 RULE = ("---\nid: trap-sample\ntype: trap\nenforcement: advisory\nhypothesis: sample\ncreated: '2026-01-01'\n"
         "target_paths:\n  - src/*.py\n---\n# Sample\n\nBody long enough to be a rule body.\n")
 
@@ -114,7 +114,7 @@ def _project(tmp_path: Path, monkeypatch):
 
 
 def _misfiring(tmp_path: Path, monkeypatch):
-    """``trap-sample`` with 8 tp and 17 fp ledger rows and one reported check landed on ``main``, no ``ci``
+    """``trap-sample`` with 15 tp and 11 fp ledger rows and one reported check landed on ``main``, no ``ci``
     row: archived on the ledger alone, kept once CI confirms the landed check."""
     repo, commit = _landed(tmp_path, monkeypatch)
     ledger.append(repo.root, [{"rule": "trap-sample", "outcome": "fp", "source": "ci", "key": f"fp{i}"}
@@ -197,16 +197,18 @@ def test_sync_and_promotion_decisions_verify_ci_through_gh(tmp_path, monkeypatch
     assert _rule_row(capsys)["tp"] == AMBIENT_TP + 1
     assert gh.calls
 
+    # Confirmed verdicts are evidence, not labels: the decision verifies CI and still finds no
+    # promotion without adjudicated labels (R-evidence-4).
     _fresh_process()
     gh.calls.clear()
     assert main(["rule", "promote", "--json"]) == 0
-    assert [c["rule_id"] for c in json.loads(capsys.readouterr().out)["candidates"]] == ["trap-sample"]
+    assert json.loads(capsys.readouterr().out)["candidates"] == []
     assert gh.calls
 
     _fresh_process()
     gh.calls.clear()
     res = promote_rule(repo.root, "trap-sample", force=False)
-    assert (res["status"], res["to_type"]) == ("promoted", "invariant")
+    assert res["status"] == "ineligible" and "adjudicated labels" in res["message"]
     assert gh.calls
 
 
@@ -271,7 +273,7 @@ def test_a_transient_gh_failure_stops_ci_verification_and_decisions_fail_closed(
     gh.calls.clear()  # the next runs GET fails again
     rule = load_rules(repo.root).get("trap-sample")
     fit = fitness.for_rules(repo.root, [rule], verify_ci=True)["trap-sample"]
-    assert (fit.state, fit.suggestion, fit.evidence_available) == ("evidence_unavailable", None, False)
+    assert (fit.state, fit.suggestion, fit.evidence_available) == ("insufficient", None, False)
 
     _fresh_process()
     gh.calls.clear()
@@ -309,7 +311,7 @@ def test_sync_decides_nothing_when_gh_fails_inside_confirm(tmp_path, monkeypatch
     assert (res.applied, res.refused) == ([], None)
     assert (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").is_file()
     row = res.derived["rules"]["trap-sample"]
-    assert (row["evidence_available"], row["state"], row["suggestion"]) == (False, "evidence_unavailable", None)
+    assert (row["evidence_available"], row["state"], row["suggestion"]) == (False, "inconclusive", None)
     assert row["evidence_error"] == (f"CI verification stopped: gh failed while confirming CI for {commit[:12]}; "
                                      "1 landed commit(s) were not verified")
 

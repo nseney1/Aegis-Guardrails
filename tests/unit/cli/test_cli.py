@@ -73,7 +73,7 @@ class TestCLIDispatch:
         ("scan", ["src/app.py"]),
         ("hook", ["status"]),
     ])
-    def test_subcommand_runs_without_crash(self, cmd, extra_args, capsys, monkeypatch):
+    def test_subcommand_runs_without_crash(self, cmd, extra_args, capsys, monkeypatch, tmp_path):
         from aegis_cli import doctor
         from aegis_cli.cli import main
 
@@ -81,6 +81,11 @@ class TestCLIDispatch:
             raise OSError("host CLIs are not run in tests")
 
         monkeypatch.setattr(doctor, "_run_host_cli", no_host_cli)
+        # A workspace of its own: run from the checkout, scan recorded activity in the repository's .aegis/state.
+        (tmp_path / ".aegis").mkdir()
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
         result = main([cmd] + extra_args)
         assert result in (0, 1)
         captured = capsys.readouterr()

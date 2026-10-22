@@ -728,7 +728,9 @@ def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tu
     return tuple(found)
 
 
-def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
+def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None) -> CiReport:
+    """``pull_request`` (a ``human_gate.PullRequest``): with no signed approval, tier A's approving
+    review of that pull request's head may approve instead, and only when the head under check is it."""
     from aegis_core import human_gate
 
     root = workspace_root(workspace)
@@ -783,4 +785,10 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
             approval = human_gate.find_approval(root, head_commit, base_commit)
         except (human_gate.HumanGateError, gitsafe.GitError):
             approval = None
+        if approval is None and pull_request is not None and pull_request.head.lower() == head_commit.lower():
+            flagged = [prefix + w.path for w in found] + ([path for path, _c in paths] if signers else [])
+            try:
+                approval = human_gate.find_review_approval(root, pull_request, base_commit, flagged)
+            except (human_gate.HumanGateError, gitsafe.GitError):
+                approval = None
     return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers)

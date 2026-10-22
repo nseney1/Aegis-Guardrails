@@ -179,3 +179,11 @@ def test_the_label_pattern_leaves_an_approval_hash_without_label_files_unchanged
 
     assert with_pattern[0] == without_pattern[0]
     assert with_pattern[1] != without_pattern[1] and without_pattern[1] == without_pattern[0]
+
+
+def test_the_docstring_says_only_the_lane_gate_reports_skip_markers():
+    """R-trust-63: check --ci and --record see paths only, so the docs must not claim they carry skips."""
+    doc = " ".join(governance.__doc__.split())
+    assert "aegis check --lane" in doc
+    assert "the CI weakening check carry those" not in doc
+    assert "``aegis check --ci`` and ``--record`` neither gate nor withhold credit" in doc
