@@ -154,6 +154,10 @@ def _normalize_findings(
                 raw_items.append({"rule": rf.get("code", "regression"), "path": rf.get("path", ""),
                                   "line": rf.get("line", 1 if rf.get("path") else 0), "col": rf.get("col", 1),
                                   "message": rf.get("message", ""), "level": reg_level})
+    for t_chk in report_dict.get("trailer_checks", []):
+        if isinstance(t_chk, dict) and t_chk.get("failed"):
+            raw_items.append({"rule": "trailer-divergence", "path": "", "line": 0, "level": "error",
+                              "message": f"{str(t_chk.get('commit', ''))[:10]}: {t_chk.get('reason', '')}"})
     for scan in report_dict.get("scanners", []):
         for sf in scan.get("findings", []):
             raw_items.append({"rule": f"scanner/{scan['name']}:{sf.get('rule_id', '')}", "path": sf.get("path", ""),
@@ -226,7 +230,10 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
         for path, ranges in sorted((cov.get("uncovered_ranges") or {}).items()):
             lines.append(f"- `{path}`: uncovered lines {', '.join(f'{s}-{e}' if s != e else str(s) for s, e in ranges)}")
         lines.append("")
-    if not anchored and not lineless and not isinstance(cov, dict):
+    perf = report_dict.get("perf")
+    if isinstance(perf, dict):  # no reason text: it can quote the benchmark's stderr
+        lines.extend([f"### Performance: {({'pass': 'PASS', 'fail': 'FAIL'}).get(perf.get('status'), 'UNVERIFIED')}", ""])
+    if not anchored and not lineless and not isinstance(cov, dict) and not isinstance(perf, dict):
         lines.append("No findings reported.")
     return "\n".join(lines).strip() + "\n"
 
