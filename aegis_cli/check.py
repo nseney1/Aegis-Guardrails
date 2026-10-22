@@ -17,6 +17,8 @@
                                       bind the work tree to a git tree, run Layer 1 (and the user-scope
                                       tests.command) on a snapshot of it, write one ledger check row
   aegis check --card [--json]         the day-0 card (aegis_core.card); changes nothing
+  aegis check --calibration [--json]  the calibration of the logged Layer 2 predictions per backend and
+                                      observable kind (.aegis/state/arbiter_predictions.jsonl); log-only
   aegis check --partition --split NAME=GLOB[,GLOB...] --split NAME=...
                                       cross-lane call, def and import edges between planned
                                       lanes (aegis_core.partition); changes nothing
@@ -27,8 +29,8 @@
                                       git objects only and runs none of the repository's code; --coverage
                                       reports diff coverage, --perf benchmarks the merge base against HEAD
 
---lane, --partition, --card, --write-baseline, --prune-baseline, --record and --ci are modes of
-their own: one at a time, and none takes FILES, --full or a plan.
+--lane, --partition, --card, --write-baseline, --prune-baseline, --calibration, --record and --ci are
+modes of their own: one at a time, and none takes FILES, --full or a plan.
 """
 from __future__ import annotations
 
@@ -52,7 +54,7 @@ _NOT_WITH_RECORD = (
     ("--dry-run", "dry_run", False), ("--plan", "plan", None), ("--plan-file", "plan_file", None),
     ("--llm-cmd", "llm_cmd", None), ("--paths", "paths", None), ("--base-policy", "base_policy", False),
     ("--split", "split", None), ("--ci", "ci", False), ("--head", "head", None), ("FILES", "files", None),
-    ("--coverage", "coverage", False), ("--perf", "perf", False),
+    ("--coverage", "coverage", False), ("--perf", "perf", False), ("--calibration", "calibration", False),
 )
 
 
@@ -123,7 +125,7 @@ def _format_refusal(args: argparse.Namespace) -> str:
         return f"--json does not combine with --format {fmt}: stdout holds one report"
     own = _given(args, (("--record", "record", False), ("--lane", "lane", None), ("--partition", "partition", False),
                         ("--card", "card", False), ("--write-baseline", "write_baseline", False),
-                        ("--prune-baseline", "prune_baseline", False)))
+                        ("--prune-baseline", "prune_baseline", False), ("--calibration", "calibration", False)))
     return f"--format {fmt} reports --ci or a plain Layer 1 check, not {own[0]}" if own and not getattr(args, "ci", False) else ""
 
 
@@ -548,6 +550,14 @@ class CheckCommand(AegisCommand):
             help="Print the day-0 card: languages, AST drivers, rules by type, the Layer 1 pass rate on the "
             "files and the 5 files with the most findings (above 2000 files it samples, and says so). "
             "Changes nothing and never reads baseline.json; --json for the machine-readable form",
+        )
+        mode.add_argument(
+            "--calibration",
+            action="store_true",
+            help="Report how well the logged Layer 2 predictions (.aegis/state/arbiter_predictions.jsonl, one row "
+            "per prediction of aegis check --full, no model text) came true, per backend and observable kind: "
+            "the resolved count, hits, a Wilson interval and, from 100 resolved, a Brier skill score. Read-only "
+            "and log-only: no verdict or exit code depends on it",
         )
         mode.add_argument(
             "--write-baseline",

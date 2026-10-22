@@ -144,6 +144,11 @@ class WorkspaceLayout:
         return self.state_dir / "lifecycle.jsonl"
 
     @property
+    def predictions_log(self) -> Path:
+        # Layer 2 prediction rows (T6, log-only); one writer: aegis check --full. No model text.
+        return self.state_dir / "arbiter_predictions.jsonl"
+
+    @property
     def gate_log(self) -> Path:
         # Safety-gate decisions (`aegis hook safety-gate`); machine-local.
         return self.state_dir / "gate_events.jsonl"

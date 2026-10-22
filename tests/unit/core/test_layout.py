@@ -30,7 +30,9 @@ def test_repository_plane_paths(tmp_path: Path):
 
 def test_every_machine_local_file_lives_under_state(tmp_path: Path):
     layout = WorkspaceLayout(tmp_path)
-    for path in (layout.ledger_file, layout.derived_file, layout.lock_file, layout.lifecycle_log, layout.gate_log):
+    assert layout.predictions_log == layout.state_dir / "arbiter_predictions.jsonl"
+    for path in (layout.ledger_file, layout.derived_file, layout.lock_file, layout.lifecycle_log, layout.gate_log,
+                 layout.predictions_log):
         assert layout.state_dir in path.parents
     assert GITIGNORE_ENTRIES == ("state/",)
 

@@ -284,6 +284,7 @@ _MODE_FLAGS = (
     ("--card", "card"),
     ("--write-baseline", "write_baseline"),
     ("--prune-baseline", "prune_baseline"),
+    ("--calibration", "calibration"),
 )
 
 
@@ -372,6 +373,7 @@ _MODE_WHY = {
     "--card": "it reports on the whole workspace",
     "--write-baseline": "it records the whole workspace's findings",
     "--prune-baseline": "it re-checks the whole workspace against the baseline",
+    "--calibration": "it reports on the whole prediction log",
 }
 
 
@@ -426,6 +428,7 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
         "--write-baseline": _run_write_baseline,
         "--prune-baseline": _run_prune_baseline,
         "--partition": _run_partition,
+        "--calibration": _run_calibration,
     }[flag]
     return runner_for(args, str(root), use_json, source, fail)
 
@@ -600,32 +603,68 @@ def _run_partition(args: argparse.Namespace, root: str, use_json: bool, source: 
     return 0
 
 
-def _run_calibration(args: argparse.Namespace) -> int:
-    """Display Arbiter calibration summary (`aegis verify --calibration`)."""
+def _run_calibration(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
+    """`aegis check --calibration`: the calibration of the logged Layer 2 predictions per backend and
+    observable kind. Read-only; T6 is log-only, so nothing depends on it."""
     from aegis_core.storage import read_jsonl
-    from aegis_core.verification.arbiter import calibration_summary
+    from aegis_core.verification.arbiter import calibration
     from aegis_core.workspace.layout import WorkspaceLayout
 
-    root = Path(_resolve_git_cwd(args)).resolve()
-    state_dir = WorkspaceLayout(root).state_dir
-    rows: list[dict[str, Any]] = []
-    for name in ("predictions.jsonl", "arbiter_predictions.jsonl"):
-        p = state_dir / name
-        if p.exists():
-            rows.extend(read_jsonl(p).rows)
-    summary = calibration_summary(rows)
-    if _wants_json(args):
-        print(json.dumps(dict(summary), indent=2))
-    else:
-        print(str(summary))
+    log = read_jsonl(WorkspaceLayout(Path(root)).predictions_log)
+    if log.error:
+        return fail(f"cannot read the prediction log: {log.error}", 1)
+    try:
+        groups = calibration(log.rows)
+    except (ValueError, TypeError) as exc:
+        return fail(f"the prediction log holds a row that cannot be scored: {exc}", 1)
+    n = sum(group["n"] for group in groups.values())
+    status = f"insufficient (n={n}/25)" if n < 25 else "ok"
+    if use_json:
+        print(json.dumps({"logged": len(log.rows), "n": n, "status": status, "groups": groups}, indent=2))
+        return 0
+    shown = "; ".join(f"{key}: {g['status']}, n={g['n']}, hits={g['hits']}" for key, g in groups.items())
+    print(_shown(f"{len(log.rows)} logged | {shown or status}", 2000))
     return 0
+
+
+def _log_predictions(root: str, predictions: Any, backend: Any, files: list[str]) -> list[str]:
+    """Append one stamped row per Layer 2 prediction to .aegis/state/arbiter_predictions.jsonl, without
+    the model's text (risk, mechanism and the function name can quote the diff). Only in an Aegis
+    workspace; a failure is a warning: logging never changes the verdict or the exit code."""
+    import time
+
+    from aegis_core import storage, treeid
+    from aegis_core.verification.adversarial_verify import extract_signatures
+    from aegis_core.verification.arbiter import stamp
+    from aegis_core.workspace.layout import WorkspaceLayout
+
+    if not predictions or not os.path.isdir(os.path.join(root, AEGIS_DIRNAME)):
+        return []
+    try:
+        try:
+            with treeid.bind(root) as bound:
+                tree = bound.binding.tree or ""
+        except treeid.TreeError:
+            tree = ""
+        defined: dict[str, str] = {}  # function name -> the first changed file that defines it
+        for rel in files:
+            if rel.endswith(".py") and os.path.isfile(os.path.join(root, rel)):
+                for sig in extract_signatures(os.path.join(root, rel)):
+                    defined.setdefault(sig[4:].split("(", 1)[0], rel.replace(os.sep, "/"))
+        rows = []
+        for p in stamp(list(predictions), tree=tree, backend=os.path.basename(backend.argv[0]), ts=time.time()):
+            row = {k: v for k, v in p.to_dict().items() if k not in ("risk", "mechanism", "affected_function")}
+            row["scope"] = {"path": defined.get(p.scope["symbol"], ""), "symbol": p.scope["symbol"]}
+            rows.append(row)
+        storage.state_dir(root)  # refuses a linked .aegis or state directory
+        storage.append_jsonl(WorkspaceLayout(Path(root)).predictions_log, rows)
+    except Exception as exc:
+        return [f"predictions not logged: {type(exc).__name__}: {exc}"]
+    return []
 
 
 def run_verify(args: argparse.Namespace) -> int:
     """Run `aegis check` for *args*. Returns 0, 1 or 2 (see the module docstring)."""
-    if getattr(args, "calibration", False):
-        return _run_calibration(args)
-
     from aegis_core import baseline
     from aegis_core.inference_provider import MISSING_BACKEND, LLMCommandError, resolve_backend
     from aegis_core.verification.pipeline import VerificationPipeline
@@ -905,6 +944,8 @@ def run_verify(args: argparse.Namespace) -> int:
     # T6 is log-only: the Layer 2 verdict is meta text, never the exit status or a rule outcome.
     passed = layer1_pass
     arb = pipeline_res.arbitration_result
+    for warning in _log_predictions(repo_root, getattr(arb, "llm_predictions", ()), backend, target_files):
+        print(f"warning: {_shown(warning, 300)}", file=sys.stderr)
     # arbitrate() still names a verdict (SHIP over a passing Layer 1) for a review that never completed;
     # the ledger says UNVERIFIED, as the text and JSON output do.
     unverified = arb is not None and getattr(arb, "infra_status", "ok") != "ok"
