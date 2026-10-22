@@ -983,7 +983,7 @@ def test_a_proposal_names_its_kind_count_ids_and_the_idf_weighted_common_directo
     assert "category" not in meta
 
 
-def test_members_in_separate_directories_get_one_prefix_each_and_a_top_level_file_stands_for_itself(review_repo):
+def test_members_in_separate_directories_get_one_prefix_each_and_a_top_level_file_its_bare_name(review_repo):
     repo, home = review_repo
     ids = _confirmed_group(repo, home, [["src/api/a.py"], ["src/api/b.py"], ["lib/x.py"], ["setup.py"]])
     meta = _frontmatter(write_proposal(repo, proposal_id="trap-spread", insight_ids=ids, home=home))
