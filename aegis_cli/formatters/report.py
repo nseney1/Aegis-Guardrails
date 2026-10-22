@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -264,6 +265,28 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
     return out
 
 
+def _flat(value: Any) -> str:
+    """One line: every non-printable character (newlines, ANSI, bidi controls) a space, runs collapsed."""
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in str(value)).split())
+
+
+def _md_code(value: Any) -> str:
+    """``value`` as an inline code span, the one Markdown form in which nothing is parsed: fenced by one
+    backtick more than its longest backtick run, padded when it starts or ends with one."""
+    text = _flat(value)
+    if not text:
+        return ""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    pad = " " if text[0] == "`" or text[-1] == "`" else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _table_row(*spans: str) -> str:
+    """A table row with one column per span. A pipe is escaped even inside a span (GFM splits rows first)
+    and a backslash run before it doubled, so no reading of the escapes lets data end a column."""
+    return "| " + " | ".join(re.sub(r"(\\*)\|", lambda m: m.group(1) * 2 + "\\|", span) for span in spans) + " |"
+
+
 def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> str:
     """Render a Markdown job summary for $GITHUB_STEP_SUMMARY."""
     anchored, lineless = _split(report_dict, workspace_root)
@@ -273,22 +296,24 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
     lines = [f"## Aegis Check Summary: {'PASSED' if passed else 'FAILED'}", ""]
     if anchored:
         lines.extend(["### Line-Anchored Findings", "| Rule | Location | Level | Message |", "| :--- | :--- | :--- | :--- |"])
-        lines.extend(f"| `{f['rule_id']}` | `{f['uri']}:{f['line']}:{f['col']}` | {f['level']} | {f['message']} |" for f in anchored)
+        lines.extend(_table_row(_md_code(f["rule_id"]), _md_code(f"{f['uri']}:{f['line']}:{f['col']}"), f["level"],
+                                _md_code(f["message"])) for f in anchored)
         lines.append("")
     if lineless:
         lines.append("### Repository / Unanchored Findings")
         for f in lineless:
-            loc = f" (`{f['uri']}`)" if f["uri"] else ""
-            lines.append(f"- **[{f['rule_id']}]**{loc}: {f['message']}")
+            loc = f" ({_md_code(f['uri'])})" if f["uri"] else ""
+            lines.append(f"- **{_md_code(f['rule_id'])}**{loc}: {_md_code(f['message'])}")
         lines.append("")
     cov = report_dict.get("coverage")
     if isinstance(cov, dict):
         ratio, measured = cov.get("ratio"), cov.get("status") == "reported"
         figure = "n/a" if ratio is None else f"{float(ratio) * 100.0:.1f}%"
         lines.append(f"### Diff Coverage (report only): {figure} of {cov.get('executable_lines', 0)} changed executable lines"
-                     if measured else f"### Diff Coverage: UNVERIFIED ({cov.get('reason', '')})")
+                     if measured else f"### Diff Coverage: UNVERIFIED ({_flat(cov.get('reason', ''))})")
         for path, ranges in sorted((cov.get("uncovered_ranges") or {}).items()):
-            lines.append(f"- `{path}`: uncovered lines {', '.join(f'{s}-{e}' if s != e else str(s) for s, e in ranges)}")
+            spans = ", ".join(f"{int(s)}-{int(e)}" if s != e else str(int(s)) for s, e in ranges)
+            lines.append(f"- {_md_code(path)}: uncovered lines {spans}")
         lines.append("")
     perf = report_dict.get("perf")
     if isinstance(perf, dict):  # no reason text: it can quote the benchmark's stderr
