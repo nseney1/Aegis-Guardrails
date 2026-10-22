@@ -15,6 +15,7 @@ Payload shapes follow the host docs (cited in tests/unit/core/test_hook_events.p
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import gc
 import json
 import os
 from pathlib import Path
@@ -654,3 +655,145 @@ def test_hook_run_overhead_is_under_250_ms(ws, home, covered):
     assert extra < 0.25, (f"Aegis adds {extra * 1000:.0f} ms over a Python start: "
                           f"{[round(t * 1000) for t in sorted(timings)]} vs {[round(t * 1000) for t in sorted(baseline)]}")
     assert [r["result"] for r in events.read(ws, "scan_gate").rows] == ["pass" if covered else "block"] * 13
+
+
+# ── what the busy-log path costs, in counts (X-hook-windows-cost) ────────────
+# Windows multiplies what the hook does besides deciding: every process it starts, file it
+# opens and module it imports. These pin the counts; the test above stays the one clock.
+
+def _counted(monkeypatch, fn):
+    """Run ``fn``; return its result, the argv of every process started and every path
+    opened (os.open and open), in order."""
+    spawns, opens = [], []
+    real_init, real_os_open, real_open = subprocess.Popen.__init__, os.open, open
+
+    def init(self, args, *rest, **kwargs):
+        spawns.append([os.fspath(a) for a in args] if isinstance(args, (list, tuple)) else [str(args)])
+        return real_init(self, args, *rest, **kwargs)
+
+    def os_opener(path, *rest, **kwargs):
+        opens.append(os.fspath(path))
+        return real_os_open(path, *rest, **kwargs)
+
+    def opener(file, *rest, **kwargs):
+        if not isinstance(file, int):
+            opens.append(os.fspath(file))
+        return real_open(file, *rest, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess.Popen, "__init__", init)
+        patch.setattr(os, "open", os_opener)
+        patch.setattr("builtins.open", opener)
+        result = fn()
+    return result, spawns, opens
+
+
+def _busy_write(ws: Path, covered: bool) -> bytes:
+    _busy_log(ws, "src/a.py" if covered else None)
+    return json.dumps(claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")})).encode("utf-8")
+
+
+@pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])
+def test_an_edit_on_a_busy_log_starts_one_git_and_reads_the_log_once(ws, capsys, monkeypatch, covered):
+    """Given the busy log, when an edit is decided, then one process starts (git's layout
+    question, asked once for the event row's worktree and shared state dir), the activity log
+    is opened once, and the outcome is unchanged."""
+    data = _busy_write(ws, covered)
+    code, spawns, opens = _counted(monkeypatch, lambda: pretool.run_pre_tool("claude-code", data, {}))
+    assert code == (0 if covered else 2)
+    assert len(spawns) == 1 and "rev-parse" in spawns[0], spawns
+    log = os.path.normcase(str(scan_compliance.activity_path(ws)))
+    assert sum(1 for p in opens if os.path.normcase(p) == log) == 1, opens
+    assert len(opens) <= 8, opens
+    capsys.readouterr()
+    assert [r["result"] for r in events.read(ws, "scan_gate").rows] == ["pass" if covered else "block"]
+
+
+@pytest.mark.parametrize("stamp, counts", [
+    ("2026-10-16T11:59:00Z", True),   # the writers' spelling
+    ("2026-10-16T11:59:0Z", True),    # unpadded fields: strptime takes them, so the gate does
+    ("2026-02-30T11:59:00Z", False),  # no such day
+    ("2026-10-16T11:59:60Z", False),  # no leap second
+    ("2026-10-16t11:59:00z", True),   # strptime matches literals ignoring case
+    ("\u0662\u0660\u0662\u0666-10-16T11:59:00Z", True),  # and any Unicode decimal digit
+    ("2026-10-16 11:59:00Z", False),
+], ids=["canonical", "unpadded", "no-such-day", "second-60", "lower-case", "arabic-digits", "space"])
+def test_a_scan_rows_time_is_read_as_strptime_reads_it(ws, capsys, stamp, counts):
+    path = scan_compliance.activity_path(ws)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {"v": 1, "ts": stamp, "event": "scan", "host": "claude-code", "session": "s-1", "files": ["src/a.py"]}
+    path.write_bytes((json.dumps(row) + "\n").encode("utf-8"))
+    assert scan_compliance.scan_covers(ws, ["src/a.py"], 3600, NOW) is counts
+    code, _, _ = _run(capsys, "claude-code", claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")}))
+    assert code == (0 if counts else 2)
+
+
+# Measured on Linux, Python 3.12, after this change: 95 modules over a bare start, 22 of them
+# Aegis's. The bounds leave room for another Python version and platform (Windows loads
+# msvcrt, _winapi and nt-only modules), not for a new subsystem on the hook path.
+_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 26
+
+
+@pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])
+def test_the_hook_imports_only_what_the_busy_log_path_needs(ws, home, covered):
+    """Given the busy log, when the hook runs as the hosts run it, then it imports no time
+    parser (strptime's first call imports _strptime and builds locale tables) and no more
+    modules than measured, within a wide margin."""
+    data = _busy_write(ws, covered)
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home), GIT_CONFIG_NOSYSTEM="1")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO), env.get("PYTHONPATH", "")) if p)
+    for key in ("AEGIS_WORKSPACE", "CLAUDE_PROJECT_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        env.pop(key, None)
+    report = "import json, sys; sys.stdout.write(json.dumps(sorted(sys.modules)))"
+    hook = ("from aegis_cli.cli import main; rc = main(['hook', 'run', 'pre-tool', '--host', 'claude-code']); "
+            "import sys; sys.stderr.write('rc=%d\\n' % rc); " + report)
+
+    def modules(code: str, stdin: bytes):
+        proc = subprocess.run([sys.executable, "-c", code], input=stdin, cwd=str(ws), env=env,
+                              capture_output=True, timeout=600, check=False)
+        assert proc.returncode == 0, proc.stderr
+        return set(json.loads(proc.stdout.decode("utf-8"))), proc.stderr
+
+    bare, _ = modules(report, b"")
+    loaded, err = modules(hook, data)
+    assert err.replace(b"\r\n", b"\n").endswith(b"rc=%d\n" % (0 if covered else 2)), err
+    extra = loaded - bare
+    assert "_strptime" not in loaded
+    assert len(extra) <= _HOOK_MODULES_MAX, sorted(extra)
+    assert len([m for m in extra if m.split(".")[0] in ("aegis_cli", "aegis_core")]) <= _HOOK_AEGIS_MODULES_MAX, \
+        sorted(extra)
+    assert not {"aegis_core.rules", "aegis_core.scan", "aegis_core.credit", "aegis_core.fitness"} & loaded
+
+
+@pytest.mark.timing
+def test_the_hooks_cost_does_not_grow_with_the_log(ws, capsys):
+    """Given the busy log, then a log eight times its size (past the tail the gate reads),
+    when the same unscanned edit is decided in-process, the cost grows by far less than 24x
+    (t(8N)/t(N), each the best of 3 with the collector off: about 1 for a bounded read, about
+    8 for a whole-log read, about 64 for a quadratic one)."""
+    data = _busy_write(ws, covered=False)
+    path = scan_compliance.activity_path(ws)
+    small = path.read_bytes()
+    pretool.run_pre_tool("claude-code", data, {})  # imports and the OS file cache
+
+    def best_of_3() -> float:
+        best = float("inf")
+        for _ in range(3):
+            enabled = gc.isenabled()
+            gc.disable()
+            try:
+                started = time.perf_counter()
+                code = pretool.run_pre_tool("claude-code", data, {})
+                took = time.perf_counter() - started
+            finally:
+                if enabled:
+                    gc.enable()
+            assert code == 2 and took < 600
+            best = min(best, took)
+        return best
+
+    one = best_of_3()
+    path.write_bytes(small * 8)
+    eight = best_of_3()
+    capsys.readouterr()
+    assert eight / max(one, 1e-9) < 24, f"eight times the log multiplied the cost by {eight / max(one, 1e-9):.1f}"

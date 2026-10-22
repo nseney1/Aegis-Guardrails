@@ -108,18 +108,21 @@ def append(
     if host is not None and (not isinstance(host, str) or not host):
         raise ValueError("host must be a non-empty string when given")
     root = Path(os.fspath(workspace)).resolve()
-    row: Dict[str, Any] = {
-        "v": EVENTS_VERSION,
-        "ts": datetime.now(timezone.utc).strftime(_TS_FORMAT),
-        "event": kind,
-        "worktree": _worktree(root),
-    }
-    if host is not None:
-        row["host"] = host
-    row["result"] = result
-    row["detail"] = detail
-    with shared_locked(root, EVENTS_LOCK) as lock:
-        append_jsonl(lock.parent / EVENTS_FILE, [row])
+    # The worktree and the shared state dir are one git question: ask it once (the pre-tool
+    # hook appends a row on every edit, and a process start is what Windows makes slowest).
+    with gitsafe.memo():
+        row: Dict[str, Any] = {
+            "v": EVENTS_VERSION,
+            "ts": datetime.now(timezone.utc).strftime(_TS_FORMAT),
+            "event": kind,
+            "worktree": _worktree(root),
+        }
+        if host is not None:
+            row["host"] = host
+        row["result"] = result
+        row["detail"] = detail
+        with shared_locked(root, EVENTS_LOCK) as lock:
+            append_jsonl(lock.parent / EVENTS_FILE, [row])
     return row
 
 
