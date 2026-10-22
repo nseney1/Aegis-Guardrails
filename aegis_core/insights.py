@@ -944,7 +944,7 @@ def _build_cluster_entry(
     decisions: Sequence[Tuple[int, Dict[str, Any]]],
     exposures: _Exposures,
     corroborated: Mapping[str, List[str]],
-    levels: Mapping[str, Tuple[str, Optional[str]]],
+    levels: Mapping[int, Tuple[str, Optional[str]]],
 ) -> Tuple[Dict[str, Any], bool]:
     m_rows = [countable[m][1] for m in members]
     m_row_idxs = [countable[m][0] for m in members]
@@ -981,8 +981,8 @@ def _build_cluster_entry(
         "count": len(m_ids),
         "paths": sorted(c_paths),
         "excerpts": [str(r.get("text") or "") for r in m_rows],
-        "levels": sorted({levels[mid][0] for mid in m_ids}),
-        "kinds": sorted({str(levels[mid][1]) for mid in m_ids if levels[mid][1]}),
+        "levels": sorted({levels[i][0] for i in m_row_idxs}),
+        "kinds": sorted({str(levels[i][1]) for i in m_row_idxs if levels[i][1]}),
         "match_status": status,
         "matched_rule": matched_id,
         "similarity": round(best_score, 4),
@@ -1015,12 +1015,13 @@ def review_insights(
     suggestions: List[Dict[str, Any]] = []
     countable: List[Tuple[int, Dict[str, Any]]] = []
     corroborated: Dict[str, List[str]] = {}
-    levels: Dict[str, Tuple[str, Optional[str]]] = {}
+    levels: Dict[int, Tuple[str, Optional[str]]] = {}
+    confirmed_ids = set(confirmed)
     for idx, row in enumerate(all_rows):
         ins_id = str(row.get("id") or f"row-{idx}")
         if row.get("event") != "insight" or ins_id in noise_ids:
             continue
-        level = _effective_level(row, set(confirmed))
+        level = _effective_level(row, confirmed_ids)
         if _row_source(row) == "mcp":
             # Confirming a corroborated capture would count its correction a second time.
             m_hook = _corroborating_hook(hook_rows, str(row.get("host") or ""), row.get("ts"), str(row.get("text") or ""))
@@ -1032,7 +1033,7 @@ def review_insights(
                 continue
         if level in COUNTABLE_LEVELS:
             countable.append((idx, row))
-            levels[ins_id] = (level, confirmed.get(ins_id) if _row_source(row) == "mcp" else row.get("kind"))
+            levels[idx] = (level, confirmed.get(ins_id) if _row_source(row) == "mcp" else row.get("kind"))
     if not countable:
         return {"clusters": [], "suggestions": suggestions, "suppressed_clusters": [], "neighbours": {}}
     from aegis_core.rules import load_rules

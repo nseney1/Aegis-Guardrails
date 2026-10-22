@@ -946,3 +946,12 @@ def test_insight_born_rules_lists_served_rules_with_insight_ids(review_repo):
     born.write_text(born.read_text(encoding="utf-8").replace("target_paths:", 'insight_ids:\n  - "ins-1"\ntarget_paths:'),
                     encoding="utf-8")
     assert [r.id for r in insight_born_rules(repo)] == ["trap-born"]
+
+
+def test_a_row_without_an_id_is_reviewed_without_error(review_repo):
+    repo, home = review_repo
+    append_jsonl(insights_path(repo, home=home), [{
+        "v": 1, "ts": "2026-10-20T00:00:00Z", "event": "insight", "level": "cli", "text": ENV_TEXTS[0],
+        "paths": ["src/app.py"], "psrc": "explicit", "host": "cli"}])
+    cluster, = review_insights(repo, home=home)["clusters"]
+    assert (cluster["count"], cluster["levels"]) == (1, ["cli"])
