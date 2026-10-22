@@ -287,7 +287,7 @@ def test_insight_add_refuses_a_typed_session_or_host(tmp_path: Path, monkeypatch
     assert read_insight_rows(ws, home=tmp_path / "home") == []
 
 
-def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_three_cli_adds_carry_no_session_and_are_one_unattributed_episode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from aegis_core.insights import measure_recurrence
 
     home = tmp_path / "home"
@@ -310,7 +310,8 @@ def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path
     rows = [r for r in read_insight_rows(ws, home=home) if r.get("event") == "insight"]
     assert len(rows) == 3
     assert all("hs" not in r and r["host"] == "cli" for r in rows)
-    assert measure_recurrence(ws, "trap-popen-timeout", home=home)["recurrences"] == 1
+    rec = measure_recurrence(ws, "trap-popen-timeout", home=home)
+    assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)  # no session: reported, never counted
 
 
 # ── one confinement rule on every channel (R-evidence-43) ─────────────────────
@@ -444,3 +445,106 @@ def test_text_review_lists_each_insight_once_with_its_neighbours(review_ws):
         assert len(member_lines) == 1
         other, = [i for i in cluster["insight_ids"] if i != ins_id]
         assert f"neighbours: {other}" in member_lines[0]
+
+
+# ── R-evidence-41: status and sync report insight-born rules, offline ──────────
+
+LABEL = "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"
+
+
+def _born_rule(ws: Path) -> None:
+    (ws / ".aegis" / "rules" / "traps" / "trap-popen-timeout.md").write_text(
+        "---\nid: trap-popen-timeout\ntype: trap\nenforcement: advisory\nhypothesis: Popen without a timeout hangs.\n"
+        'insight_ids:\n  - "ins-000000000001"\ntarget_paths:\n  - src/*.py\n---\n'
+        "# trap-popen-timeout\n\nNever call subprocess.Popen without a timeout in src modules.\n", encoding="utf-8")
+
+
+def _status_text(ws: Path, *, as_json: bool = False):
+    from aegis_cli.status import run_status
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = run_status(argparse.Namespace(_root=ws, json=as_json, plain=True))
+    return rc, out.getvalue()
+
+
+@pytest.fixture
+def status_ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    return _make_workspace(tmp_path / "ws"), home
+
+
+def test_status_shows_an_insight_born_rules_recurrence_and_the_uncounted_suggestions(status_ws):
+    from aegis_core.insights import capture_suggestion, record_hook_prompt
+
+    ws, home = status_ws
+    _born_rule(ws)
+    record_hook_prompt(ws, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
+                       home=home)
+    capture_suggestion(ws, "prefer short functions", paths=["src/main.py"], host="claude-code", session="a", home=home)
+    rc, out = _status_text(ws)
+    assert rc == 0
+    line, = [x for x in out.splitlines() if "trap-popen-timeout" in x and "recurrence" in x]
+    assert "ok" in line and "0/1 sessions" in line and "95% bound" in line and LABEL in line
+    assert "1 unconfirmed agent suggestions (not counted)" in out
+    rc, out = _status_text(ws, as_json=True)
+    payload = json.loads(out)["insights"]
+    assert [r["rule"] for r in payload["rules"]] == ["trap-popen-timeout"]
+    assert (payload["unconfirmed_suggestions"], payload["denominator"]) == (1, LABEL)
+
+
+def test_status_with_only_suggestions_shows_the_not_counted_line_and_no_recurrence(status_ws):
+    from aegis_core.insights import capture_suggestion
+
+    ws, home = status_ws
+    capture_suggestion(ws, "prefer short functions", paths=["src/main.py"], host="claude-code", session="a", home=home)
+    rc, out = _status_text(ws)
+    assert rc == 0
+    assert "1 unconfirmed agent suggestions (not counted)" in out
+    assert "recurrence" not in out
+
+
+def test_status_and_sync_print_nothing_about_insights_without_an_insights_file(status_ws):
+    from aegis_cli.sync import run_sync
+
+    ws, home = status_ws
+    _born_rule(ws)
+    rc, out = _status_text(ws)
+    assert rc == 0 and "recurrence" not in out and "not counted" not in out
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run_sync(argparse.Namespace(_root=ws, json=False, plain=True)) == 0
+    assert "recurrence" not in buf.getvalue() and "not counted" not in buf.getvalue()
+    assert not (home / ".aegis" / "insights").exists()
+
+
+def test_sync_reports_the_recurrence_line_and_the_json_payload(status_ws):
+    from aegis_cli.sync import run_sync
+    from aegis_core.insights import record_hook_prompt
+
+    ws, home = status_ws
+    _born_rule(ws)
+    record_hook_prompt(ws, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
+                       home=home)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run_sync(argparse.Namespace(_root=ws, json=False, plain=True)) == 0
+    line, = [x for x in buf.getvalue().splitlines() if "recurrence trap-popen-timeout" in x]
+    assert LABEL in line
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run_sync(argparse.Namespace(_root=ws, json=True)) == 0
+    assert [r["rule"] for r in json.loads(buf.getvalue())["insights"]["rules"]] == ["trap-popen-timeout"]
+
+
+def test_review_with_a_rule_prints_its_recurrence_line_in_text_mode(status_ws):
+    ws, home = status_ws
+    _born_rule(ws)
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--rule", "trap-popen-timeout")
+    assert rc == 0, err
+    assert f"recurrence trap-popen-timeout: no_prompt_traffic, rate 0.00 (0/0 sessions), 95% bound 1.00; {LABEL}" in out

@@ -868,3 +868,81 @@ def test_record_decision_refuses_a_confirm_without_insights_and_a_missing_cluste
     with pytest.raises(ValueError, match="cluster_id"):
         record_decision(repo, decision="snooze", insight_ids=["ins-1"], home=home)
     assert read_insight_rows(repo, home=home) == []
+
+
+# ── R-evidence-41: recurrence over heartbeat-alive sessions, a rate at most 1, a baseline ──
+
+RMTREE_BODY = "Always check path confinement before recursive directory removal."
+RMTREE_TEXT = "stop calling recursive directory removal without path confinement check in src/app.py"
+
+
+def _prompt(repo: Path, home: Path, session: str, text: str = "Please run the tests.") -> Dict[str, Any]:
+    return record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+
+
+def _recurrence_row(repo: Path, home: Path, hs: Any, when: str, rid: str = "trap-validate-rmtree") -> None:
+    rev = load_rules(repo).get(rid).digest[:16]
+    row = {"v": 1, "ts": when, "event": "insight", "id": f"ins-{os.urandom(6).hex()}", "level": "W2", "source": "hook",
+           "text": RMTREE_TEXT, "paths": ["src/app.py"], "psrc": "dirty", "host": "claude-code", "revs": {rid: rev}}
+    if hs:
+        row["hs"] = hs
+    append_jsonl(insights_path(repo, home=home), [row])
+
+
+def _shift(stamp: str, seconds: int) -> str:
+    from datetime import datetime, timedelta
+
+    return (datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ") + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_three_episodes_in_one_alive_session_give_a_rate_of_at_most_one_and_the_alarm(review_repo):
+    repo, home = review_repo
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    hb = _prompt(repo, home, "s1")
+    for k in range(3):
+        _recurrence_row(repo, home, hb["hs"], _shift(hb["ts"], 600 * k))
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["sessions"], rec["recurrent_sessions"], rec["recurrences"]) == (1, 1, 3)
+    assert rec["rate"] <= 1.0 and rec["rate"] == 1.0
+    assert (rec["alarm"], rec["status"]) == (True, "not_working")
+    assert 0.0 < rec["rate_ucb95"] <= 1.0
+
+
+def test_recurrences_of_sessions_without_a_heartbeat_are_not_counted(review_repo):
+    repo, home = review_repo
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    hb = _prompt(repo, home, "s1")
+    for k, hs in enumerate(("a" * 32, "b" * 32, "c" * 32)):
+        _recurrence_row(repo, home, hs, _shift(hb["ts"], 600 * k))
+    _recurrence_row(repo, home, None, hb["ts"])
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["sessions"], rec["recurrences"], rec["rate"], rec["alarm"]) == (1, 0, 0.0, False)
+    assert rec["unattributed_recurrences"] == 1
+    assert rec["denominator"] == "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"
+
+
+def test_the_baseline_excludes_the_burst_that_produced_the_rule(review_repo):
+    repo, home = review_repo
+    for f in (repo / ".aegis" / "rules" / "traps").glob("*.md"):
+        f.unlink()
+    burst = _hook_insight(repo, "No, " + RMTREE_TEXT, "s-a", home)
+    _hook_insight(repo, "Stop calling recursive directory removal without a path confinement check", "s-b", home)
+    _prompt(repo, home, "s-c")
+    rule = _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    rule.write_text(rule.read_text(encoding="utf-8").replace(
+        "target_paths:", f'insight_ids:\n  - "{burst["id"]}"\ntarget_paths:'), encoding="utf-8")
+    _prompt(repo, home, "s-d")
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["sessions"], rec["recurrences"]) == (1, 0)
+    assert (rec["baseline_sessions"], rec["baseline_rate"]) == (3, round(1 / 3, 6))
+
+
+def test_insight_born_rules_lists_served_rules_with_insight_ids(review_repo):
+    from aegis_core.insights import insight_born_rules
+
+    repo, home = review_repo
+    _write_rule(repo, "trap-plain", ["src/*.py"], "Body.")
+    born = _write_rule(repo, "trap-born", ["src/*.py"], "Body.")
+    born.write_text(born.read_text(encoding="utf-8").replace("target_paths:", 'insight_ids:\n  - "ins-1"\ntarget_paths:'),
+                    encoding="utf-8")
+    assert [r.id for r in insight_born_rules(repo)] == ["trap-born"]

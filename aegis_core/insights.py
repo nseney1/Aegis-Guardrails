@@ -60,6 +60,7 @@ __all__ = [
     "MAX_CAPTURE_PATH_CHARS",
     "MAX_EXCERPT_CHARS",
     "RECURRENCE_ALARM_COUNT",
+    "RECURRENCE_DENOMINATOR",
     "REJECTION_RESURFACE_COUNT",
     "SUPPORTED_INSIGHT_HOSTS",
     "add_insight",
@@ -68,6 +69,9 @@ __all__ = [
     "dirty_paths",
     "has_correction_cue",
     "host_capture_status",
+    "insight_born_rules",
+    "insight_status",
+    "insight_status_lines",
     "insight_workspace_id",
     "insights_path",
     "measure_recurrence",
@@ -88,6 +92,9 @@ KEY_SIZE = 32
 INSIGHT_SCHEMA_VERSION = 1
 REJECTION_RESURFACE_COUNT = 2
 RECURRENCE_ALARM_COUNT = 3
+# In-scope filtering needs the MCP and hook sessions to join (v4.5); until then the rate's
+# denominator is every alive session, and every recurrence line says so.
+RECURRENCE_DENOMINATOR = "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"
 BURST_WINDOW_SECONDS = 300
 # How far apart (seconds) an insight and an exposure, or a capture and the hook prompt that
 # corroborates it, may be and still join. Nothing links aegis-mcp's session (a uuid minted per
@@ -1166,23 +1173,78 @@ def _wilson_ucb95(k: int, n: int) -> float:
 
 
 def _count_recurrence_episodes(matching: Sequence[Mapping[str, Any]]) -> int:
-    episodes = 0
-    seen_hs: Set[str] = set()
-    last_ts: Optional[datetime] = None
+    """Insights closer than BURST_WINDOW_SECONDS to the one before are one episode."""
+    stamps = sorted(ts for ts in (_parse_ts(r.get("ts")) for r in matching) if ts is not None)
+    gaps = sum(1 for a, b in zip(stamps, stamps[1:]) if (b - a).total_seconds() > BURST_WINDOW_SECONDS)
+    return len(matching) - len(stamps) + (gaps + 1 if stamps else 0)
+
+
+def _session_rates(alive: Set[str], matching: Sequence[Mapping[str, Any]]) -> Tuple[int, int]:
+    """(alive sessions with a recurrence, episodes inside alive sessions)."""
+    by_session: Dict[str, List[Mapping[str, Any]]] = {}
     for ins in matching:
-        hs_val = ins.get("hs")
-        if isinstance(hs_val, str) and hs_val.strip():
-            clean_hs = hs_val.strip()
-            if clean_hs not in seen_hs:
-                seen_hs.add(clean_hs)
-                episodes += 1
-        else:
-            ts = _parse_ts(ins.get("ts"))
-            if ts is not None and last_ts is not None and abs((ts - last_ts).total_seconds()) <= BURST_WINDOW_SECONDS:
-                continue
-            last_ts = ts
-            episodes += 1
-    return episodes
+        if ins.get("hs") in alive:
+            by_session.setdefault(str(ins["hs"]), []).append(ins)
+    return len(by_session), sum(_count_recurrence_episodes(rows) for rows in by_session.values())
+
+
+def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str], reset_on_rev_change: bool) -> Dict[str, Any]:
+    cur_rev = rule.digest[:16]
+    rule_tokens = _tokenize(f"{rule.id} {rule.meta.get('hypothesis', '')} {rule.body}")
+    burst = {str(i) for i in rule.meta.get("insight_ids") or [] if isinstance(i, (str, int))}
+    inv_revs = {
+        r["inv"]: r["revs"] for r in rows
+        if r.get("event") == "inventory" and isinstance(r.get("inv"), str) and isinstance(r.get("revs"), Mapping)
+    }
+    # The window opens at the first row that names the rule's current rev (its first inventory
+    # row); the baseline is the same measurement over the sessions before it.
+    window_open = not reset_on_rev_change
+    alive: Set[str] = set()
+    before: Set[str] = set()
+    unidentified_heartbeats = 0
+    matching: List[Mapping[str, Any]] = []
+    earlier: List[Mapping[str, Any]] = []
+    for row in rows:
+        # A new heartbeat names its rule set by `inv`; an old one carries its own revs.
+        revs = row.get("revs")
+        if not isinstance(revs, Mapping):
+            revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
+        in_rev = not reset_on_rev_change or revs.get(rule.id) == cur_rev
+        window_open = window_open or in_rev
+        if window_open and not in_rev:
+            continue
+        ev, hs_val = row.get("event"), row.get("hs")
+        if ev == "heartbeat":
+            if isinstance(hs_val, str) and hs_val.strip():
+                (alive if window_open else before).add(hs_val)
+            elif window_open:
+                unidentified_heartbeats += 1
+        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS
+              and _paths_overlap_rule(row.get("paths") or [], rule)):
+            itoks = _tokenize(str(row.get("text") or ""))
+            if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
+                if window_open:
+                    matching.append(row)
+                elif str(row.get("id") or "") not in burst:
+                    earlier.append(row)
+    recurrent, episodes = _session_rates(alive, matching)
+    unattributed = _count_recurrence_episodes([r for r in matching if not r.get("hs")])
+    base_recurrent, _ = _session_rates(before, earlier)
+    n_sess = len(alive)
+    if n_sess:
+        status = "not_working" if episodes >= RECURRENCE_ALARM_COUNT else "ok"
+    elif unidentified_heartbeats or matching:
+        status = "insufficient_session_identity"
+    else:
+        status = "no_prompt_traffic"
+    return {
+        "rule": rule.id, "rev": cur_rev, "sessions": n_sess, "unidentified_heartbeats": unidentified_heartbeats,
+        "recurrences": episodes, "recurrent_sessions": recurrent, "unattributed_recurrences": unattributed,
+        "rate": round(recurrent / n_sess, 6) if n_sess else 0.0, "rate_ucb95": _wilson_ucb95(recurrent, n_sess),
+        "alarm": bool(n_sess) and episodes >= RECURRENCE_ALARM_COUNT, "status": status,
+        "baseline_rate": round(base_recurrent / len(before), 6) if before else None,
+        "baseline_sessions": len(before), "denominator": RECURRENCE_DENOMINATOR,
+    }
 
 
 def measure_recurrence(
@@ -1192,78 +1254,53 @@ def measure_recurrence(
     home: Optional[Path] = None,
     reset_on_rev_change: bool = True,
 ) -> Dict[str, Any]:
+    """Alive sessions with a matching human insight over all alive sessions (at most 1), its 95%
+    upper bound, and the episodes the alarm counts."""
     from aegis_core.rules import load_rules
 
     root = Path(os.fspath(workspace)).resolve()
     rule = load_rules(root).get(rule_id)
     if rule is None:
         raise ValueError(f"unknown rule {rule_id!r}")
-    cur_rev = rule.digest[:16]
-    rule_tokens = _tokenize(f"{rule.id} {rule.meta.get('hypothesis', '')} {rule.body}")
-    alive: Set[str] = set()
-    unidentified_heartbeats = 0
-    matching: List[Dict[str, Any]] = []
     rows = read_insight_rows(root, home=home)
-    inv_revs = {
-        r["inv"]: r["revs"] for r in rows
-        if r.get("event") == "inventory" and isinstance(r.get("inv"), str) and isinstance(r.get("revs"), Mapping)
-    }
-    for row in rows:
-        # A new heartbeat names its rule set by `inv`; an old one carries its own revs.
-        revs = row.get("revs")
-        if not isinstance(revs, Mapping):
-            revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
-        if reset_on_rev_change and revs.get(rule_id) != cur_rev:
-            continue
-        ev = row.get("event")
-        if ev == "heartbeat":
-            hs_val = row.get("hs")
-            if isinstance(hs_val, str) and hs_val.strip():
-                alive.add(hs_val.strip())
-            else:
-                unidentified_heartbeats += 1
-        elif ev == "insight" and _effective_level(row, set()) in COUNTABLE_LEVELS and _paths_overlap_rule(row.get("paths") or [], rule):
-            itoks = _tokenize(str(row.get("text") or ""))
-            if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
-                matching.append(row)
-    episodes = _count_recurrence_episodes(matching)
-    n_sess = len(alive)
-    if not n_sess:
-        if unidentified_heartbeats > 0 or episodes > 0:
-            return {
-                "rule": rule_id,
-                "rev": cur_rev,
-                "sessions": 0,
-                "unidentified_heartbeats": unidentified_heartbeats,
-                "recurrences": episodes,
-                "rate": 0.0,
-                "rate_ucb95": 1.0,
-                "alarm": False,
-                "status": "insufficient_session_identity",
-            }
-        return {
-            "rule": rule_id,
-            "rev": cur_rev,
-            "sessions": 0,
-            "unidentified_heartbeats": 0,
-            "recurrences": 0,
-            "rate": 0.0,
-            "rate_ucb95": 1.0,
-            "alarm": False,
-            "status": "no_prompt_traffic",
-        }
-    alarm = episodes >= RECURRENCE_ALARM_COUNT
+    return _measure(rule, rows, set(_confirmed(rows)), reset_on_rev_change)
+
+
+def insight_born_rules(workspace: Any) -> List[Rule]:
+    """The served rules whose frontmatter names the insights they came from."""
+    from aegis_core.rules import load_rules
+
+    root = Path(os.fspath(workspace)).resolve()
+    try:
+        served = load_rules(root).served if WorkspaceLayout(root).rules_dir.is_dir() else ()
+    except Exception:  # a display surface: an unloadable rule set has no insight-born rules to show
+        return []
+    return [r for r in served if isinstance(r.meta.get("insight_ids"), list) and r.meta["insight_ids"]]
+
+
+def insight_status(workspace: Any, *, home: Optional[Path] = None) -> Dict[str, Any]:
+    """What ``aegis status`` and ``aegis sync`` say about insights; {} without an insights log."""
+    rows = read_insight_rows(workspace, home=home)
+    if not rows:
+        return {}
+    confirmed = set(_confirmed(rows))
     return {
-        "rule": rule_id,
-        "rev": cur_rev,
-        "sessions": n_sess,
-        "unidentified_heartbeats": unidentified_heartbeats,
-        "recurrences": episodes,
-        "rate": round(episodes / n_sess, 6),
-        "rate_ucb95": _wilson_ucb95(episodes, n_sess),
-        "alarm": alarm,
-        "status": "not_working" if alarm else "ok",
+        "rules": [_measure(rule, rows, confirmed, True) for rule in insight_born_rules(workspace)],
+        "unconfirmed_suggestions": sum(1 for r in rows if r.get("event") == "insight"
+                                       and _effective_level(r, confirmed) == "suggestion"),
+        "denominator": RECURRENCE_DENOMINATOR,
     }
+
+
+def insight_status_lines(summary: Mapping[str, Any]) -> List[str]:
+    lines = [
+        f"recurrence {r['rule']}: {r['status']}, rate {r['rate']:.2f} ({r['recurrent_sessions']}/{r['sessions']} "
+        f"sessions), 95% bound {r['rate_ucb95']:.2f}; {summary['denominator']}"
+        for r in summary.get("rules") or ()
+    ]
+    if summary.get("unconfirmed_suggestions"):
+        lines.append(f"{summary['unconfirmed_suggestions']} unconfirmed agent suggestions (not counted)")
+    return lines
 
 
 #: Marks Aegis's insight handler: in the exec form's args, the Codex string or 4.3's ``-m``.

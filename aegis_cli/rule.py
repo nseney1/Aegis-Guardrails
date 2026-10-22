@@ -884,6 +884,11 @@ def _run_insight(args: argparse.Namespace) -> int:
         else:
             clusters, suggestions = rev.get("clusters", []), rev.get("suggestions", [])
             print(f"Insight Review: {len(clusters)} cluster(s), {len(suggestions)} unconfirmed agent suggestion(s)")
+            if "recurrence" in rev:
+                from aegis_core.insights import RECURRENCE_DENOMINATOR, insight_status_lines
+
+                for line in insight_status_lines({"rules": [rev["recurrence"]], "denominator": RECURRENCE_DENOMINATOR}):
+                    print(f"  {sanitize_display(line, 300)}")
             for c in clusters:
                 print(f"  [{c['cluster_id']}] count={c['count']} status={c['match_status']} rule={c.get('matched_rule') or 'none'}")
                 for ins_id, text in zip(c["insight_ids"], c["excerpts"]):
