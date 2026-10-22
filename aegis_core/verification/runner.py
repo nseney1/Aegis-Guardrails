@@ -12,7 +12,7 @@ from pathlib import Path
 import posixpath
 import re
 import sys
-from aegis_core.match import is_test_path
+from aegis_core.match import first_match, is_test_path
 from aegis_core.workspace.layout import RULES_RELDIR
 from typing import Any, Optional
 
@@ -439,13 +439,49 @@ def _forbid_evidence(root: str, rule_id: str, rel: str, findings: list[dict[str,
                 credit.record_override(root, rule_id, rel, finding["line"], reason=finding["override"])
             except Exception:
                 pass
+    out: list[ToolEvidence] = []
     violations = violation_messages(findings)
-    if not violations:
-        return []
-    # The sites that produced the messages: an allowed site is a contested override, never a line.
-    lines = sorted({f["line"] for f in findings if not f["unknown"] and f["override"] is None and f["line"] > 0})
-    return [ToolEvidence(tool=f"forbid_ast:{rule_id}", target=rel, verdict=False, detail="; ".join(violations),
-                         lines=lines)]
+    if violations:
+        # The sites that produced the messages: an allowed site is a contested override, never a line.
+        lines = sorted({f["line"] for f in findings if not f["unknown"] and f["override"] is None and f["line"] > 0})
+        out.append(ToolEvidence(tool=f"forbid_ast:{rule_id}", target=rel, verdict=False, detail="; ".join(violations),
+                                lines=lines))
+    unknown = [f for f in findings if f["unknown"] and f["override"] is None]
+    if unknown:
+        out.append(_unverified_note(rule_id, rel, unknown))
+    return out
+
+
+def _unverified_note(rule_id: str, rel: str, unknown: list[dict[str, Any]]) -> ToolEvidence:
+    """Passing evidence that names the sites a rule could not decide: advisory, never silent (spec T7)."""
+    shown = "; ".join(f"line {f['line']}: {f['snippet']}" for f in unknown[:_UNVERIFIED_SHOWN])
+    more = f"; and {len(unknown) - _UNVERIFIED_SHOWN} more" if len(unknown) > _UNVERIFIED_SHOWN else ""
+    return ToolEvidence(
+        tool=UNVERIFIED_NOTE_TOOL, target=rel, verdict=True, lines=sorted({f["line"] for f in unknown}),
+        detail=(f"forbid_ast:{rule_id}: {len(unknown)} site(s) in {rel} could not be decided, so they are reported, "
+                f"not failed (unknown: advisory): {shown}{more}"),
+    )
+
+
+def _forbid_or_failure(root: str, rule_id: str, rel: str, findings: list[dict[str, Any]]) -> list[ToolEvidence]:
+    try:
+        return _forbid_evidence(root, rule_id, rel, findings)
+    except Exception as exc:
+        return [_tool_failure(f"forbid_ast:{rule_id}", rel, exc)]
+
+
+def _exempt_notes(forbid_rules: list[tuple[Any, dict]], paths: list[str]) -> list[ToolEvidence]:
+    """One passing note per rule that skipped test files only because its target_paths do not
+    name tests. Rule.applies_to tests the exemption first, so it is spelled out here."""
+    notes = []
+    for rule, _spec in forbid_rules:
+        skipped = {p for p in paths if rule.skips_tests and is_test_path(p) and first_match(rule.target_paths, p) is not None}
+        if skipped:
+            notes.append(ToolEvidence(
+                tool=EXEMPT_NOTE_TOOL, target=rule.path, verdict=True,
+                detail=f"forbid_ast:{rule.id}: {len(skipped)} test file(s) not checked (target_paths do not name tests)",
+            ))
+    return notes
 
 
 def run_layer1(
@@ -552,6 +588,7 @@ def run_layer1(
         ))
     if forbid_rules:
         ast_cache: dict[str, object] = {}
+        checked_paths: list[str] = []
         for filepath in changed_files:
             full_path = filepath if os.path.isabs(filepath) else os.path.join(repo_root_str, filepath)
             if not os.path.isfile(full_path):
@@ -560,6 +597,7 @@ def run_layer1(
                 rel_path = os.path.relpath(full_path, repo_root_str).replace("\\", "/")
             except ValueError:
                 rel_path = filepath.replace("\\", "/")
+            checked_paths.append(rel_path)
             for rule, forbid_spec in forbid_rules:
                 rule_id = rule.id
                 # Rule.applies_to: target_paths ("**" when a forbid_ast rule names none),
@@ -599,7 +637,11 @@ def run_layer1(
                         )
                     )
                     continue
-                results.extend(_forbid_evidence(repo_root_str, rule_id, rel_path, findings))
+                results.extend(_forbid_or_failure(repo_root_str, rule_id, rel_path, findings))
+        try:
+            results.extend(_exempt_notes(forbid_rules, checked_paths))
+        except Exception as exc:
+            results.append(_tool_failure("forbid_ast", RULES_RELDIR, exc))
 
     # ── Mutation Testing ───────────────────────────────────────────────
     if not fast_mode:
@@ -652,9 +694,11 @@ def format_summary(results: list[ToolEvidence]) -> str:
     passed = sum(1 for r in results if r.verdict)
     failed = sum(1 for r in results if not r.verdict)
     total = len(results)
+    unverified = sum(1 for r in results if r.tool == UNVERIFIED_NOTE_TOOL)
+    notes = f" ({unverified} unverified, see notes)" if unverified else ""
     if failed:
-        return f"Layer 1: {failed}/{total} FAILED — {', '.join(r.tool for r in results if not r.verdict)}"
-    return f"Layer 1: {passed}/{total} PASSED"
+        return f"Layer 1: {failed}/{total} FAILED — {', '.join(r.tool for r in results if not r.verdict)}{notes}"
+    return f"Layer 1: {passed}/{total} PASSED{notes}"
 
 
 # ── Layer 1 on the index (`aegis check --hook`) ────────────────────────────
@@ -670,6 +714,10 @@ SNAPSHOT_PREFIX = "aegis-index-"
 # _layer1_on_snapshot for what that means for its checks).
 INDEX_BLOB_LIMIT_BYTES = 5 * 1024 * 1024
 INDEX_NOTE_TOOL = "index"  # passing evidence that says what the hook did not check
+UNVERIFIED_NOTE_TOOL = "forbid_ast_unverified"  # sites a forbid_ast where clause could not decide
+EXEMPT_NOTE_TOOL = "forbid_ast_exempt"  # test files a forbid_ast rule skipped
+NOTE_TOOLS = frozenset({INDEX_NOTE_TOOL, UNVERIFIED_NOTE_TOOL, EXEMPT_NOTE_TOOL})
+_UNVERIFIED_SHOWN = 5
 
 
 def _git_blob_id(data: bytes, oid_length: int) -> str:
@@ -921,7 +969,11 @@ def _layer1_on_snapshot(
                     tool=tool, target=rel, verdict=False, detail=f"forbid_ast: cannot verify {rel}: {failure.reason}",
                 ))
                 continue
-            results.extend(_forbid_evidence(repo_root, rule.id, rel, findings))
+            results.extend(_forbid_or_failure(repo_root, rule.id, rel, findings))
+    try:
+        results.extend(_exempt_notes(forbid_rules, files))
+    except Exception as exc:
+        results.append(_tool_failure("forbid_ast", RULES_RELDIR, exc))
     return results
 
 
