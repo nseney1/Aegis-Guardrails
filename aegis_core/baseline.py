@@ -449,18 +449,20 @@ def run_grouped(
 
 class Sources:
     """The text and syntax trees the findings are read from: the working tree, or the
-    index (``staged``) when the pre-commit hook checks what a commit would record."""
+    index (``staged``) when the pre-commit hook checks what a commit would record.
+    ``reviewed`` as in ``runner.run_layer1``: which version of the gate rules was enforced."""
 
-    def __init__(self, root: Any, staged: bool = False) -> None:
+    def __init__(self, root: Any, staged: bool = False, reviewed: bool = True) -> None:
         self.root = Path(os.fspath(root))
         self.staged = staged
+        self.reviewed = reviewed
         self._texts: Dict[str, Optional[str]] = {}
         self._lines: Dict[str, _Lines] = {}
         self._trees: Dict[str, Any] = {}
         self._sites: Dict[Tuple[str, str, str, str], List[int]] = {}
         self._index: Optional[Dict[str, str]] = None
         self._runner: Any = None
-        self._rules: Any = None  # the loaded rule set, once; False when it cannot be loaded
+        self._rules: Any = None  # rule id -> the forbid_ast the gate enforced, once; False when unreadable
 
     def _staged_oid(self, path: str) -> Optional[str]:
         if self._index is None:
@@ -537,16 +539,19 @@ class Sources:
         return tree
 
     def _forbid_spec(self, rule_id: str) -> Optional[dict]:
-        """The ``forbid_ast`` of the rule the runner discovered from this root, or None."""
+        """The ``forbid_ast`` of ``rule_id`` as the gate enforced it: the runner's own discovery
+        (the reviewed base version), never the working tree's or the index's copy, which the
+        change under check can narrow to hide a new site. None when it is not enforced."""
         if self._rules is None:
-            from aegis_core.rules import load_rules
+            from aegis_core.verification import runner
 
+            root = os.fspath(self.root)
             try:
-                self._rules = load_rules(self.root)
+                found, _broken = runner._discover_forbid_ast_rules(*((root,) if self.reviewed else (root, False)))
+                self._rules = {rule.id: spec for rule, spec in found}
             except Exception:
                 self._rules = False
-        rule = self._rules.get(rule_id) if self._rules else None
-        spec = rule.meta.get("forbid_ast") if rule is not None and rule.ok else None
+        spec = self._rules.get(rule_id) if self._rules else None
         return spec if isinstance(spec, dict) else None
 
     def sites(self, path: str, kind: str, pattern: str, rule_id: str) -> List[int]:
@@ -606,13 +611,17 @@ def _findings_of(path: Optional[str], evidence: ToolEvidence, sources: Sources) 
                                      sources.occurrence(path, number), number, message))
         else:
             rule_id = evidence.tool.partition(":")[2]
+            covered: set = set()
             for kind, pattern, message in violations:
                 lines = sources.sites(path, kind, pattern, rule_id)
                 if not lines:
                     return None
+                covered.update(lines)
                 for number in lines:
                     found.append(Finding(evidence.tool, path, sources.line_text(path, number),
                                          sources.occurrence(path, number), number, message))
+            if covered != set(evidence.lines):  # sites the gate did not report, or a reported site left out
+                return None
     return found or None
 
 
@@ -756,4 +765,4 @@ def run_fast(root: Any, files: Sequence[str], *,
     pairs = run_grouped(
         lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed),
         files, root=base)
-    return pairs, Sources(base)
+    return pairs, Sources(base, reviewed=reviewed)

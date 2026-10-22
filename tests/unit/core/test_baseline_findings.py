@@ -407,7 +407,10 @@ def test_a_rule_gone_before_the_baseline_is_written_leaves_the_check_failing(rep
     commit(repo, "the reviewed rule")
     write(repo, "app.py", "exec(a)\ncompile(c, 'f', 'exec')\n")
     pairs = _layer1(repo, ["app.py"])
-    (repo / ".aegis" / "rules" / "invariants" / "no-exec-compile.md").unlink()
+    # Gone from what the gate enforces (the reviewed base), not only from the working tree,
+    # whose copy the sites never read (F1, w6 review).
+    git(repo, "rm", "-q", ".aegis/rules/invariants/no-exec-compile.md")
+    commit(repo, "the rule is removed")
     result = baseline.collect(pairs, Sources(repo))
     assert [f for f in result.findings if f.rule == "forbid_ast:no-exec-compile"] == []
     assert "forbid_ast:no-exec-compile" in [e.tool for e in result.blocked]
@@ -418,3 +421,51 @@ def test_the_staged_check_reports_the_lines_the_working_tree_check_does(repo: Pa
     git(repo, "add", "app.py")
     staged = baseline.run_grouped(lambda group: runner.run_layer1_on_index(list(group), str(repo)), ["app.py"])
     assert [e.lines for _, e in staged if e.tool == "forbid_ast:no-eval"] == _no_eval_lines(repo, ["app.py"]) == [[2, 4, 6]]
+
+
+# ── The sites come from the rule the gate enforced, never the working tree (F1, w6 review) ──
+
+def _narrowed(rule_type: str) -> str:
+    return EXEC_COMPILE.replace("type: invariant", f"type: {rule_type}").replace(
+        "calls: [exec, compile]", "calls: [{name: exec, where: {'#0': {in: [\"'a'\"]}}}, compile]")
+
+
+@pytest.mark.parametrize("rule_type", ["invariant", "trap"])
+def test_narrowing_the_rule_in_the_working_tree_does_not_hide_a_new_site(repo: Path, rule_type):
+    rule_path = f".aegis/rules/{rule_type}s/no-exec-compile.md"
+    write(repo, rule_path, EXEC_COMPILE.replace("type: invariant", f"type: {rule_type}"))
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\n")
+    commit(repo, "the reviewed rule and two baselined sites")
+    held = _entries(repo, ["app.py"])
+    assert len(held) == 2
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\nexec(payload)\n")
+    write(repo, rule_path, _narrowed(rule_type))  # only exec('a') would still match
+    pairs = _layer1(repo, ["app.py"])
+    assert [e.lines for _, e in pairs if e.tool == "forbid_ast:no-exec-compile"] == [[1, 2, 3]]
+    result = baseline.apply(pairs, Sources(repo), Baseline(frozenset(held), "t", "working-tree"))
+    assert [(f.line, f.text) for f in result.new] == [(3, "exec(payload)")] and not result.passed
+
+
+def test_narrowing_the_staged_rule_does_not_hide_a_new_staged_site(repo: Path):
+    rule_path = ".aegis/rules/invariants/no-exec-compile.md"
+    write(repo, rule_path, EXEC_COMPILE)
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\n")
+    commit(repo, "the reviewed rule and two baselined sites")
+    held = _entries(repo, ["app.py"])
+    write(repo, "app.py", "exec('a')\ncompile(c, 'f', 'exec')\nexec(payload)\n")
+    write(repo, rule_path, _narrowed("invariant"))
+    git(repo, "add", "app.py", rule_path)
+    pairs = baseline.run_grouped(lambda group: runner.run_layer1_on_index(list(group), str(repo)), ["app.py"])
+    assert [e.lines for _, e in pairs if e.tool == "forbid_ast:no-exec-compile"] == [[1, 2, 3]]
+    result = baseline.apply(pairs, Sources(repo, staged=True), Baseline(frozenset(held), "t", "working-tree"))
+    assert [(f.line, f.text) for f in result.new] == [(3, "exec(payload)")] and not result.passed
+
+
+def test_a_check_whose_lines_its_sites_do_not_cover_cannot_be_baselined(repo: Path):
+    write(repo, ".aegis/rules/invariants/no-exec-compile.md", EXEC_COMPILE)
+    write(repo, "app.py", "exec(a)\ncompile(c, 'f', 'exec')\n")
+    commit(repo, "the reviewed rule")
+    (evidence,) = [e for _, e in _layer1(repo, ["app.py"]) if e.tool == "forbid_ast:no-exec-compile"]
+    widened = ToolEvidence(evidence.tool, evidence.target, False, evidence.detail, [1, 2, 5])
+    result = baseline.collect([("app.py", widened)], Sources(repo))
+    assert result.findings == () and result.blocked == (widened,)
