@@ -18,6 +18,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`aegis check --ci --coverage` reads no repository coverage configuration.** It runs the user-scope `tests.command` (pytest-based only) with an empty rcfile in a private state directory and never reads the repository's `.coveragerc` or `coverage.json`. It still runs the repository's tests, as `--coverage` always has.
 - **A short agent capture no longer blocks insight proposals.** The verbatim lint protects only human, `cli` and hook text, with a 25-character floor both ways and an exact match for short prompts; a one-character `aegis_capture_insight` quote blocked every proposal.
 
+- **`aegis doctor --fix` and Aegis's host-config rewrites never write through a swapped-in symlink.** A file replaced by a symlink after the check is replaced, not followed, and `~/.aegis` and `~/.aegis/backups` are created with mode `0700`.
+
 ### Changed behaviour
 
 - **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
@@ -48,6 +50,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis status` and `aegis sync` (text, and JSON `insights`) print each insight-born rule's recurrence, labelled `sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)`, and `N unconfirmed agent suggestions (not counted)`.
 - Insight rows gain add-only `source` and `corroborated_by` fields, and exposure rows carry each rule's digest prefix as `rev`.
 
+- Insight proposals are always an advisory `trap` with `kind`, `count` and `insight_ids`. Their `target_paths` are the insights' common directories weighted by how rare they are, as at most three `<dir>/**` globs (a top-level file stands for itself), never `**`; insights without paths make `propose` exit 1 and point at `aegis rule insight add --paths`.
+- `aegis rule insight add` prints the exact `Aegis-Approve-Insight:` trailer and a sign-then-re-run recipe (JSON `approval_trailer`, not stored), so an insight can reach level H.
+
 ### Fixed
 
 - A warm scan in a git repository starts 3 git processes (was 9, and 13 for an MCP scan); the first scan starts 4, and a scan outside git starts 1 (was 7).
@@ -70,6 +75,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - The proposal category defaults to the single kind the cluster's human insights share, and text review lists each insight with its top-3 neighbours.
 - Tree identity reports a tree as unbindable, instead of raising, when git times out or is missing.
 
+- `aegis migrate --apply` says `state modes: tightened N of M loose entries` instead of offering to tighten them, and outside git neither `aegis doctor` nor `aegis migrate` counts or changes the modes of the workspace's `.aegis/state`.
+- `aegis hook uninstall` removes Aegis's prepare-commit-msg hook even when the pre-commit hook is missing, user-owned or refused, and leaves a pre-commit hook that is not UTF-8 unchanged (reported) instead of failing with a codec error.
+- `aegis rule adjudicate` exits 1 and writes nothing for an id that is not a cleanly loading rule (a typo, a case variant, an `.md` name, an archived or broken rule).
+
 ### Breaking (command line, JSON and MCP)
 
 - Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
@@ -79,6 +88,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: "exposed and ignored" needs a persisted exposure by the same host within 30 minutes at the rule's current rev (exposure rows written before 4.4.0 carry no rev and match any). Agent outcome reports, scan rows and in-memory exposures no longer count, and insights added with `aegis rule insight add` (host `cli`) never join an agent's exposure.
 - Breaking: `aegis rule insight review --decision` needs `--cluster` (or `--insight` for `confirm`), and `reject` needs `--reason` (exit 2). An unknown cluster or suggestion id lists the valid ids and writes nothing (exit 1). JSON review output emits neighbours once; the per-cluster `neighbours` key is removed.
 - Breaking: tree identity makes a tree unbindable when the repository's or a checked-out submodule's own config defines a filter driver whose name `git -c` cannot carry (containing `=` or bytes that are not UTF-8), or when checked-out submodules nest more than 16 deep.
+
+- Breaking: `aegis rule insight review --category` is removed. A proposal's kind is the one its insights share, or the `--kind` given with `--decision propose`; with neither, `propose` exits 1 and asks for `--kind`.
+- Breaking: `rule insight add --commit` checks the `Aegis-Approve-Insight` hash against the text as typed, so approvals signed over redacted text no longer verify for texts that redaction changed.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -91,6 +103,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - Breaking: `aegis_core.regression.VALID_TIERS` and the `tier=` argument of `aegis_core.regression.check_ci_regressions` are removed.
 - Breaking: `aegis_core.verification.coverage_check.evaluate_diff_coverage` and `aegis_core.verification.coverage_check.verify_coverage_threshold` are removed, and `run_diff_coverage(root, base, head)` takes no other parameter.
+
+- Breaking: `aegis_core.insights.write_proposal` no longer takes `rule_type`, `enforcement`, `category` or `target_paths`; it takes the counted `insight_ids`, plus optional `summary_bullets` and `kind`.
 
 ### Corrections
 

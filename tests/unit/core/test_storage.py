@@ -419,3 +419,77 @@ def test_an_entry_of_the_state_dir_resolving_elsewhere_is_refused(tmp_path: Path
 
     with pytest.raises(PathTraversalError, match="backups: it resolves outside the workspace"):
         state_dir(ws)
+
+
+# ── follow_links=False: a link at the name is replaced, never followed (R-cli-41) ─
+
+def _strays(*directories: Path) -> list:
+    return sorted(p.name for d in directories for p in d.iterdir() if p.name.endswith(".tmp"))
+
+
+def test_by_default_a_write_goes_through_a_link_at_the_name(tmp_path: Path):
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b"old")
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, victim)
+    atomic_write_bytes(link, b"new")
+    assert link.is_symlink() and victim.read_bytes() == b"new"
+
+
+def test_without_following_links_the_link_is_replaced_and_its_target_spared(tmp_path: Path):
+    """Given a symlink at the name, When it is written with follow_links=False, Then the name
+    becomes a regular file holding the data and the link's target keeps its bytes."""
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b"precious")
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, victim)
+    atomic_write_bytes(link, b"new", follow_links=False)
+    assert not link.is_symlink() and link.read_bytes() == b"new"
+    assert victim.read_bytes() == b"precious"
+    assert _strays(tmp_path) == []
+
+
+@posix_only
+def test_a_replaced_link_inherits_none_of_its_targets_bits(tmp_path: Path, umask):
+    umask(0o022)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"#!/bin/sh\n")
+    os.chmod(victim, 0o4755)
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, victim)
+    atomic_write_bytes(link, b"{}", follow_links=False)
+    assert _mode(link) == 0o644
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o4755 and victim.read_bytes() == b"#!/bin/sh\n"
+
+
+def test_a_dangling_link_is_replaced_without_creating_its_target(tmp_path: Path):
+    missing = tmp_path / "nowhere" / "target.json"
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, missing)
+    atomic_write_bytes(link, b"{}", follow_links=False)
+    assert not link.is_symlink() and link.read_bytes() == b"{}"
+    assert not missing.parent.exists()
+
+
+@pytest.mark.parametrize("relative", ["through/config.json", "through/sub/../config.json"],
+                         ids=["direct", "dotdot"])
+def test_a_linked_directory_above_the_name_is_still_written_through(tmp_path: Path, relative: str):
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    try:
+        (tmp_path / "through").symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    atomic_write_bytes(tmp_path / relative, b"{}", follow_links=False)
+    assert (real / "config.json").read_bytes() == b"{}"
+    assert _strays(real, real / "sub", tmp_path) == []
+
+
+@posix_only
+def test_without_following_links_an_existing_regular_file_keeps_its_mode(tmp_path: Path, umask):
+    umask(0o022)
+    target = tmp_path / "rule.md"
+    target.write_bytes(b"old")
+    os.chmod(target, 0o640)
+    atomic_write_bytes(target, b"new", follow_links=False)
+    assert _mode(target) == 0o640 and target.read_bytes() == b"new"

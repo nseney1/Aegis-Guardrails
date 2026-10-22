@@ -722,11 +722,10 @@ class RuleCommand(AegisCommand):
         p_ins_rev.add_argument("--cluster", dest="cluster_id", default=None, help="Cluster ID for --decision (as review lists it)")
         p_ins_rev.add_argument("--insight", dest="insight_ids", action="append", default=None, metavar="ID",
                                help="Unconfirmed suggestion ID for --decision confirm (repeatable)")
-        p_ins_rev.add_argument("--kind", default=None, help="Insight kind recorded with --decision confirm")
+        p_ins_rev.add_argument("--kind", default=None,
+                               help="Insight kind recorded with --decision confirm; with --decision propose, the "
+                                    "proposal's kind (default: the one kind the cluster's insights share)")
         p_ins_rev.add_argument("--proposal-id", dest="proposal_id", default=None, help="Proposal ID when --decision propose")
-        p_ins_rev.add_argument("--category", default=None,
-                               help="Proposal category when --decision propose (default: the one kind the cluster's "
-                                    "human insights share, else correctness)")
         p_ins_rev.add_argument("--summary", default=None, help="Closed-template summary bullet when --decision propose")
         p_ins_rev.add_argument("--rule", dest="rule_id", default=None, help="Target rule ID for merge-into-rule or recurrence check")
         p_ins_rev.add_argument("--reason", default=None, help="Reason for the decision (required with reject)")
@@ -761,12 +760,22 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
 
     from aegis_core.adjudication import ADJUDICATIONS_DIR, RULE_ID
     from aegis_core.errors import AegisError
+    from aegis_core.rule_inventory import RuleInventoryError
+    from aegis_core.rules import load_rules
     from aegis_core.storage import append_jsonl
 
     rule_id = str(args.rule_id)
     if not RULE_ID.fullmatch(rule_id):
         return _emit_error(args, f"invalid rule id {sanitize_display(rule_id, 80)!r}: use letters, digits, '.', '_' or '-' (at most 128)")
     root = _resolve_workspace_root(args)
+    try:
+        # Exact match on the typed id (no normalising): a label must name a rule that loads.
+        known = load_rules(root).get(rule_id) is not None
+    except RuleInventoryError as exc:
+        return _emit_error(args, str(exc))
+    if not known:
+        return _emit_error(args, f"no rule {rule_id!r} that loads cleanly in this workspace; "
+                                 "aegis rule list shows the rule ids")
     directory = root.joinpath(*ADJUDICATIONS_DIR.split("/"))
     if directory.is_symlink() or directory.parent.is_symlink():
         return _emit_error(args, f"{ADJUDICATIONS_DIR} is a symlink; refusing to write a label through it")
@@ -827,7 +836,15 @@ def _run_insight(args: argparse.Namespace) -> int:
             )
         except Exception as exc:
             return _emit_error(args, str(exc))
-        print(json.dumps(row, indent=2) if use_json else f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
+        from aegis_core.human_gate import INSIGHT_APPROVE_TRAILER, insight_text_hash
+
+        trailer = f"{INSIGHT_APPROVE_TRAILER}: {insight_text_hash(getattr(args, 'text', ''))}"
+        if use_json:
+            print(json.dumps({**row, "approval_trailer": trailer}, indent=2))
+        else:
+            print(f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
+            if row["level"] != "H":
+                print(f"To record it at level H, sign a commit carrying this trailer, then re-run with --commit SHA:\n  {trailer}")
         return 0
 
     if sub_action == "review":
@@ -860,12 +877,10 @@ def _run_insight(args: argparse.Namespace) -> int:
                 # A propose row hides the cluster, so it is written only once the proposal exists.
                 if decision == "propose":
                     prop_id = getattr(args, "proposal_id", None) or f"trap-{cid.replace('cluster-', '')}"
-                    summary = getattr(args, "summary", None) or f"Address recurring correction cluster {cid}."
-                    kinds = target.get("kinds") or []
+                    summary = getattr(args, "summary", None)
                     proposal_path = str(write_proposal(
-                        root, proposal_id=prop_id, target_paths=target.get("paths") or ["**"],
-                        category=getattr(args, "category", None) or (kinds[0] if len(kinds) == 1 else "correctness"),
-                        summary_bullets=[summary], insight_ids=ins_ids,
+                        root, proposal_id=prop_id, insight_ids=ins_ids, summary_bullets=[summary] if summary else [],
+                        kind=getattr(args, "kind", None),
                     ))
                 dec_row = record_decision(
                     root, cluster_id=cid or "", decision=decision, insight_ids=ins_ids, kind=getattr(args, "kind", None),

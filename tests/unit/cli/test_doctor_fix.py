@@ -241,6 +241,35 @@ def test_fix_refuses_to_write_through_a_symlink(env, tmp_path):
     assert finding["fixable"] is False and "symlink" in finding["message"]
 
 
+def test_fix_replaces_a_file_swapped_for_a_symlink_after_the_check_and_spares_the_link_target(env, tmp_path, monkeypatch):
+    """R-cli-41: Given ~/.mcp.json checked as a regular file, When it is swapped for a symlink to
+    another file just before the replacing write, Then the write replaces the link itself: the
+    link's target keeps its bytes and no temporary file is left beside it."""
+    from conftest import symlink_or_skip
+    from aegis_core import storage
+
+    mcp = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}, "other": 1})
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b'{"keep": true}\n')
+    real_write = storage.atomic_write_bytes
+    swapped = []
+
+    def swap_then_write(path, data, *args, **kwargs):
+        if Path(path) == mcp and not swapped:
+            os.unlink(mcp)
+            symlink_or_skip(victim, mcp)
+            swapped.append(path)
+        return real_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "atomic_write_bytes", swap_then_write)
+    payload = env.fix()
+    assert swapped, "the swap happened before the write"
+    assert {f["status"] for f in payload["fixes"]} == {"applied"}
+    assert victim.read_bytes() == b'{"keep": true}\n'
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".victim")) == []
+    assert not mcp.is_symlink() and json.loads(mcp.read_text(encoding="utf-8")) == {"mcpServers": {}, "other": 1}
+
+
 def test_fix_refuses_a_hard_linked_file(env, tmp_path):
     target = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
     try:
