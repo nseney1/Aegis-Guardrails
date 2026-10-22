@@ -20,8 +20,9 @@ concurrency guarantees live in one place:
   workspace lock.
 - Shared state is private: its directories are 0o700 and its files 0o600, set explicitly
   (``chmod``/``fchmod``, so the umask does not matter). ``shared_state_modes`` counts the
-  entries that are looser (never naming them) and, with ``fix``, tightens them
-  (v4.4 spec §12.7).
+  entries of ``<git common dir>/aegis`` that are looser (never naming them) and, with
+  ``fix``, tightens them (v4.4 spec §12.7). Outside git there is no shared state: the
+  workspace's ``.aegis/state`` keeps the umask's modes and is neither counted nor changed.
 - ``state_dir(workspace)``: ``.aegis/state``, refused when it (or ``.aegis``, or any
   entry directly inside it: the ledger, the lock, a log, a backup) is a symlink or
   resolves outside the workspace, so machine-local state is never written through a
@@ -374,13 +375,18 @@ def shared_state_modes(workspace: Any, fix: bool = False) -> StateModes:
     """Count the entries of ``<git common dir>/aegis`` looser than 0o700 (directories) and
     0o600 (files); with ``fix`` set them to exactly that. Nothing is created.
 
+    Outside a git repository (or when git cannot run) there is no shared state, so nothing
+    is checked: the workspace-local ``.aegis/state`` is not held to the shared standard.
     A symlink is never followed or changed. Raises what ``shared_state_dir`` raises for an
     unconfined directory. Without POSIX permission bits (Windows) nothing is checked and
     ``supported`` is False.
     """
     if os.name == "nt":
         return StateModes(0, 0, 0, False)
-    top = shared_state_dir(workspace, create=False)
+    common = gitsafe.common_dir(Path(os.fspath(workspace)).resolve())
+    if common is None:
+        return StateModes(0, 0, 0, True)
+    top = _shared_dir(Path(_resolved(common)), create=False)
     if not os.path.lexists(top):
         return StateModes(0, 0, 0, True)
     checked = looser = fixed = 0
@@ -797,28 +803,46 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _resolve_directory(path: Path | str) -> Path:
+    """``path`` with its directory resolved and its last component kept as written."""
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if absolute.name in ("", ".."):
+        return absolute.resolve()
+    return absolute.parent.resolve() / absolute.name
+
+
 def atomic_write_bytes(
     path: Path | str,
     data: bytes,
     max_retries: int = STORAGE_MAX_RETRIES,
     initial_delay: float = STORAGE_INITIAL_DELAY_SECONDS,
     mode: Optional[int] = None,
+    *,
+    follow_links: bool = True,
 ) -> None:
     """Replace ``path`` with ``data`` atomically: readers see the old or the new bytes.
 
     The parent directory is created if missing. ``mode`` sets the permission bits
     exactly (the umask does not apply); without it an existing file keeps its bits and
-    a new one gets ``0o666 & ~umask``. The temporary file is removed on failure.
+    a new one gets ``0o666 & ~umask``. The temporary file is removed on failure. With
+    ``follow_links=False`` a symlink at ``path`` is replaced, never followed, and lends
+    the new file none of its target's bits (directories above it are still resolved).
     """
-    target = Path(path).resolve()
+    # A caller that checked the name with lstat passes follow_links=False: rename(2)
+    # replaces a link at the destination instead of following it, so a link swapped in
+    # after the check is overwritten as itself, never its target.
+    target = Path(path).resolve() if follow_links else _resolve_directory(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     keep_mode: Optional[int] = None if mode is None else stat.S_IMODE(mode)
     if keep_mode is None:
         try:
-            keep_mode = stat.S_IMODE(os.stat(target).st_mode)
+            st: Optional[os.stat_result] = os.stat(target) if follow_links else os.lstat(target)
         except FileNotFoundError:
-            if _in_shared_state(target):
-                keep_mode = _PRIVATE_FILE_MODE
+            st = None
+        if st is not None and not stat.S_ISLNK(st.st_mode):
+            keep_mode = stat.S_IMODE(st.st_mode)
+        elif _in_shared_state(target):
+            keep_mode = _PRIVATE_FILE_MODE
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_CLOEXEC
     # A file that ends with set bits starts private, so it is never looser in between.
