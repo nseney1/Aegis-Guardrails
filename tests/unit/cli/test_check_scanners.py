@@ -198,3 +198,14 @@ def test_a_rotated_key_under_the_same_mask_is_a_new_finding(tmp_path, env, capsy
     (result,) = _doc(out)["scanners"]
     assert (rc, result["status"], len(result["findings"]), result["subtracted"]) == (1, "fail", 1, 0)
     assert old not in out and new not in out
+
+
+def test_the_security_suppressions_a_change_adds_are_reported(tmp_path, env, capsys, monkeypatch):
+    _configure("ruff")
+    _fake(env, "ruff")
+    repo = _repo(tmp_path, "x = 1  # nosec\n", "x = 1  # nosec\ny = 2  # nosec\nz = eval(a)  # noqa: S307\n")
+    rc, out, _ = _ci(repo, capsys, monkeypatch, "--format", "json")
+    (result,) = _doc(out)["scanners"]
+    assert result["suppressions"] == {"count": 3, "delta": 2}
+    rc, out, _ = _ci(repo, capsys, monkeypatch)
+    assert "scanners: 3 security suppression(s) in tracked files (+2 since the merge base)" in out.splitlines()

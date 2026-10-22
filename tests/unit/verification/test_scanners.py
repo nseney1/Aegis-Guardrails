@@ -554,8 +554,8 @@ class TestSarifIngest:
         assert report["status"] == "fail"
         assert report["total_raw"] == 2
         assert [(f.rule_id, f.fingerprint) for f in report["findings"]] == [("S605", expected_fp1), ("S307", expected_fp2)]
-        # 3 inline suppressions (noqa, nosec, gitleaks:allow) + 2 .gitleaksignore entries = 5
-        assert report["suppression_count"] == 5
+        # the document's own suppressions only; in-repository markers are suppression_count's (R-checks-20)
+        assert report["suppression_count"] == 0
 
 
 _SARIF_ONE_FINDING = {
@@ -977,3 +977,64 @@ class TestPresetScannerProgramLookup:
 
         scanners.run_preset("ruff", _git_ws(tmp_path / "ws"), "HEAD", runner=runner)
         assert [argv[0] for argv in seen] == ["ruff", "ruff"]  # the head, then the merge-base export
+
+
+class TestSecuritySuppressionCount:
+    """R-checks-20: the suppression signal counts markers that silence security findings, over the
+    files git tracks, with bounded reads, and reports head minus the merge base."""
+
+    @staticmethod
+    def _git(root: Path, *args: str) -> None:
+        import subprocess
+
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=str(root),
+                       check=True, capture_output=True, env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"})
+
+    def _repo(self, root: Path, files: dict) -> str:
+        root.mkdir(parents=True, exist_ok=True)
+        if not (root / ".git").exists():
+            self._git(root, "init", "-q", "-b", "main")
+        for rel, data in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_bytes(data)
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-q", "-m", "c", "--allow-empty")
+        import subprocess
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, check=True).stdout.decode().strip()
+
+    def test_only_security_markers_in_tracked_files_count(self, tmp_path):
+        root = tmp_path / "ws"
+        base = self._repo(root, {"keep.txt": b"x\n"})
+        self._repo(root, {
+            "app.py": (b"a = eval(x)  # noqa: S307\nb = 1  # nosec\nc = 2  # gitleaks:allow\nimport os  # noqa\n"
+                       b"x=1  # noqa: E501\ny = eval(z)  # noqa: E501, S307\n"),
+            ".gitleaksignore": b"# a comment line\nlegacy/secret.py:generic-api-key:12\n\ndocs/example.md:aws-access-key:5\n",
+        })
+        (root / "venv").mkdir()
+        (root / "venv" / "lib.py").write_bytes(b"x = 1  # noqa: S101\n" * 100)  # untracked: never read
+        assert scanners.suppression_count(root, base) == {"count": 6, "delta": 6}
+
+    def test_the_delta_is_head_minus_the_merge_base(self, tmp_path):
+        root = tmp_path / "ws"
+        base = self._repo(root, {"a.py": b"x = 1  # nosec\n"})
+        self._repo(root, {"a.py": b"x = 1  # nosec\ny = 2  # nosec\nz = 3  # noqa: S105\n"})
+        assert scanners.suppression_count(root, base) == {"count": 3, "delta": 2}
+
+    def test_large_binary_and_unreadable_files_are_skipped_without_raising(self, tmp_path):
+        root = tmp_path / "ws"
+        base = self._repo(root, {"keep.txt": b"x\n"})
+        self._repo(root, {"big.py": b"x = 1  # nosec\n" * (5 * 1024 * 1024 // 15 + 1),
+                          "blob.bin": b"\0\1\2 # nosec\n", "a.py": b"x = 1  # nosec\n", "locked.py": b"y = 1  # nosec\n"})
+        locked = root / "locked.py"
+        locked.chmod(0)
+        try:
+            readable = os.access(locked, os.R_OK)  # root, or Windows, still reads it
+            counted = scanners.suppression_count(root, base)
+        finally:
+            locked.chmod(0o644)
+        assert counted["count"] == (2 if readable else 1)
+
+    def test_a_merge_base_that_cannot_be_exported_has_no_delta(self, tmp_path):
+        root = tmp_path / "ws"
+        self._repo(root, {"a.py": b"x = 1  # nosec\n"})
+        assert scanners.suppression_count(root, "no-such-commit") == {"count": 1, "delta": None}

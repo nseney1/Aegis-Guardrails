@@ -357,6 +357,10 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             print(f"  [{tag}] no new finding ({result['subtracted']} at the merge base)")
         for f in result["findings"]:
             print(sanitize_display(f"  [{tag}] {f.path}:{f.line} {f.rule_id}: {f.message}", 400))
+    if scanner_results:
+        supp = scanner_results[0]["suppressions"]
+        since = "no merge-base count" if supp["delta"] is None else f"{supp['delta']:+d} since the merge base"
+        print(f"scanners: {supp['count']} security suppression(s) in tracked files ({since})")
     if cov_report is not None and cov_report.get("status") == "reported":
         ratio = cov_report.get("ratio")
         print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
@@ -442,6 +446,9 @@ def _run_ci(args: argparse.Namespace) -> int:
         except Exception as exc:  # the type only: a message can embed paths
             scanner_results.append({"name": name, "status": "unverified", "findings": [], "subtracted": 0,
                                     "reason": f"{name} could not run ({type(exc).__name__})"})
+    suppressions = scanners.suppression_count(root, report.merge_base) if scanner_results else None
+    for result in scanner_results:  # one in-repository count, shown with each scanner's result
+        result["suppressions"] = suppressions
 
     _print_ci(report, fmt, root, reg_report, cov_report=cov_report, perf_report=perf_report, trailer_checks=trailer_checks,
               skipped=_NOT_EXECUTED if no_exec else (), scanner_results=scanner_results)

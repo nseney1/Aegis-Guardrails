@@ -14,6 +14,7 @@ import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from aegis_core import gitsafe, pathlookup
+from aegis_core.config import _is_within
 from aegis_core.verification import test_runner
 
 # Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear); above
@@ -54,7 +55,9 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _DATA_URL_OR_SRI_RE = re.compile(r"(?:data:[A-Za-z0-9/+.-]{1,64};base64,[A-Za-z0-9+/=]+|\bsha(?:1|256|384|512)-[A-Za-z0-9+/=]{16,})")
 _HASH_FIELD_RE = re.compile(r"(?i)(?:^|[^a-z0-9])(?:sha1|sha256|sha384|sha512|md5|integrity|checksum|digest|hash|commit|oid|etag|fingerprint)(?:$|[^a-z0-9])")
 _PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
-_SUPPRESSION_RE = re.compile(r"#\s*(?:noqa|nosec|gitleaks:allow)\b", re.IGNORECASE)
+# Markers that silence a security finding: a noqa list naming an S (bandit) code, counted once per
+# list; nosec; gitleaks:allow. A plain noqa or a style code is not a security suppression.
+_SUPPRESSION_RE = re.compile(r"#[\t ]*(?:noqa:[A-Za-z0-9\t ,]{0,200}?\bS[0-9]+|nosec\b|gitleaks:allow\b)", re.IGNORECASE)
 
 _NB = r"(?<![A-Za-z0-9])"
 _PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
@@ -349,28 +352,44 @@ def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] |
     return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
 
 
-def _count_repo_suppressions(workspace_root: Path | str | None) -> int:
+def _count_repo_suppressions(root: Path, files: Iterable[str]) -> int:
     count = 0
-    if workspace_root is None:
-        return count
-    root = Path(workspace_root).resolve()
-    ignore_file = root / ".gitleaksignore"
-    if ignore_file.is_file():
+    for rel in files:
+        path = root.joinpath(*rel.split("/"))
         try:
-            lines = ignore_file.read_text(encoding="utf-8", errors="replace").splitlines()
-            count += sum(1 for ln in lines if ln.strip() and not ln.lstrip().startswith("#"))
-        except OSError:
-            pass
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or any(k.startswith(".") or k in ("__pycache__", "node_modules") for k in p.relative_to(root).parts):
-            continue
-        try:
-            data = p.read_bytes()
-            if b"\0" not in data[:4096]:
-                count += len(_SUPPRESSION_RE.findall(data.decode("utf-8", "replace")))
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 << 20:
+                continue
+            data = path.read_bytes()
         except OSError:
             continue
+        if b"\0" in data[:4096]:
+            continue
+        text = data.decode("utf-8", "replace")
+        if rel == ".gitleaksignore":
+            count += sum(1 for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
+        else:
+            count += len(_SUPPRESSION_RE.findall(text))
     return count
+
+
+def suppression_count(root: Path | str, merge_base: str | None) -> dict[str, Any]:
+    """In-repository security suppressions (markers and ``.gitleaksignore`` entries) over the files git
+    tracks under ``root``, files over 1 MiB and binaries skipped: ``{"count", "delta"}``, the delta
+    against the export of ``merge_base`` (None when it cannot be exported). A signal; it never blocks."""
+    import tempfile
+
+    root = Path(root).resolve()
+    head = _count_repo_suppressions(root, gitsafe.list_files(root, untracked=False) or [])
+    with tempfile.TemporaryDirectory(prefix="aegis-supp-base-") as tmp:
+        export = Path(tmp) / "base"
+        try:
+            prefix = gitsafe.show_prefix(root)
+            gitsafe.export_tree(root, merge_base or "", export)
+        except gitsafe.GitError:
+            return {"count": head, "delta": None}
+        base_root = export.joinpath(*prefix.strip("/").split("/")) if prefix else export
+        files = [p.relative_to(base_root).as_posix() for p in base_root.rglob("*")] if base_root.is_dir() else []
+        return {"count": head, "delta": head - _count_repo_suppressions(base_root, files)}
 
 
 def _sarif_artifact(uri: str, root: Path | None) -> tuple[str, Path | None]:
@@ -460,13 +479,8 @@ def ingest_sarif(
         "status": "fail" if all_findings else "pass",
         "findings": all_findings,
         "total_raw": len(all_findings),
-        "suppression_count": sarif_supps + _count_repo_suppressions(workspace_root),
+        "suppression_count": sarif_supps,
     }
-
-
-def _is_within_dir(path: Path, directory: Path) -> bool:
-    real_p, real_d = os.path.realpath(path), os.path.realpath(directory)
-    return real_p == real_d or real_p.startswith(real_d.rstrip(os.sep) + os.sep)
 
 
 class UntrustedScannerConfig(ValueError):
@@ -488,9 +502,9 @@ def _preset_argv(preset: str, target: Path) -> list[str]:
 
         ul = UserLayout.current()
         user_dir = ul.aegis_dir.resolve() if ul else None
-        if user_dir is not None and not _is_within_dir(user_dir, target):
+        if user_dir is not None and not _is_within(user_dir, target):
             cand = (user_dir / "gitleaks.toml").resolve()
-            if _is_within_dir(cand, user_dir) and not _is_within_dir(cand, target) and cand.is_file():
+            if _is_within(cand, user_dir) and not _is_within(cand, target) and cand.is_file():
                 argv.extend(["--config", str(cand)])
         # Without --config gitleaks reads <source>/.gitleaks.toml: a repository allowlist would
         # silence the scan. lexists, so a dangling link or a case-folded name counts too.
@@ -551,7 +565,7 @@ def _line_keys(findings: Sequence[Finding], root: Path) -> list[str]:
         if f.path not in texts:
             real = Path(os.path.realpath(root / f.path))
             try:
-                readable = bool(f.path) and _is_within_dir(real, root) and real.is_file() and real.stat().st_size <= 1 << 20
+                readable = bool(f.path) and _is_within(real, root) and real.is_file() and real.stat().st_size <= 1 << 20
                 texts[f.path] = baseline.split_lines(real.read_bytes().decode("utf-8", "replace")) if readable else []
             except OSError:
                 texts[f.path] = []
