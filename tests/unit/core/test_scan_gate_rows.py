@@ -181,6 +181,7 @@ def _best_of(times: int, fn) -> float:
     return best
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("others_ago", [10, WINDOW * 3])
 def test_a_full_tail_is_judged_fast(ws: Path, others_ago):
     """The hook runs on every edit and the log is never rotated: a 4 MiB tail, busy or

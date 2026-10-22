@@ -141,6 +141,7 @@ def test_thread_held_lock_times_out_with_exact_error(tmp_path: Path):
     assert info.value.path == str(_lock_path(tmp_path))
 
 
+@pytest.mark.timing
 def test_lock_held_by_another_process_times_out_with_exact_error(tmp_path: Path):
     holder = subprocess.Popen(
         [sys.executable, "-c", _HOLD_UNTIL_EOF, str(tmp_path)],
@@ -161,7 +162,9 @@ def test_lock_held_by_another_process_times_out_with_exact_error(tmp_path: Path)
         f"timed out after 0.3s waiting for the Aegis workspace lock {_lock_path(tmp_path)}: "
         "another aegis process or thread holds it"
     )
-    assert 0.25 <= waited < 5
+    # It waited out its 0.3 s timeout: the lower bound allows for the 15.6 ms tick of the
+    # Windows monotonic clock, the upper one only catches a hang.
+    assert 0.3 - 0.1 <= waited < 5
     # The holder exited, so the lock is free again.
     with locked(tmp_path, timeout=5):
         pass

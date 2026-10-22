@@ -112,20 +112,6 @@ def blocked_commands_summary(workspace: Path | str) -> dict:
     }
 
 
-def collect_status(workspace: Path | str, home: Path | str | None = None) -> dict:
-    """Return structured workspace status including hook-observed blocked_commands."""
-    blocked = blocked_commands_summary(workspace)
-    return {
-        "workspace": str(workspace),
-        "blocked_commands": blocked,
-        "events": {
-            "blocked_commands": blocked["total"],
-            "blocked_commands_source": "hook-observed",
-            "blocked_commands_by_host": dict(blocked["by_host"]),
-        },
-    }
-
-
 def run_status(args: argparse.Namespace) -> int:
     """Show active rules and stats."""
     root = _repo_root(args)

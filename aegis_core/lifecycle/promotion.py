@@ -1,9 +1,10 @@
-"""Promotion, demotion and enforcement-tier transitions, judged by ledger fitness.
+"""Promotion and demotion, as the one decision engine (aegis_core.fitness.compute) decides.
 
 The lifecycle never runs by itself (ADR 0005 D1): ``suggest`` says what a rule's
 evidence supports, ``aegis sync`` records it in ``.aegis/state/derived.json``, and only
 ``aegis sync --apply`` or ``aegis rule promote/demote/archive`` move a rule. Fitness
-comes from aegis_core.fitness (the ledger); rule frontmatter is never read for it.
+comes from aegis_core.fitness (the ledger and the labels merged at the reviewed BASE);
+rule frontmatter is never read for it.
 """
 from __future__ import annotations
 
@@ -13,24 +14,12 @@ from typing import Any, Dict, List, Optional
 
 from aegis_core.fitness import Fitness, for_rules
 from aegis_core.rules import Rule, load_rules
-from aegis_core.storage import atomic_write_and_unlink as _atomic_write_and_unlink, atomic_write_text, locked
+from aegis_core.storage import atomic_write_and_unlink as _atomic_write_and_unlink, locked
 from aegis_core.taxonomy import RULE_TYPE_DIRS, RULE_TYPES
 from aegis_core.telemetry_engine import ledger
 from aegis_core.workspace import literal_workspace
 from aegis_core.workspace.base import Workspace
-from aegis_core.yaml_engine.frontmatter import parse_rule_frontmatter
-from aegis_core.yaml_engine.serializer import dump_frontmatter
-from .constants import (
-    DEMOTION_PATH,
-    MIN_AGE_DAYS_FOR_PROMOTION,
-    MIN_PROMOTION_VERDICTS,
-    MISFIRE_THRESHOLD,
-    PROMOTION_PATH,
-    PROMOTION_THRESHOLD,
-    PROTECTED_RULES,
-    TIER_DOWN_MISFIRE,
-    TIER_UP,
-)
+from .constants import DEMOTION_PATH, MIN_AGE_DAYS_FOR_PROMOTION, PROMOTION_PATH, PROTECTED_RULES
 from .parsers import _transform_frontmatter_type, find_rule_file, rule_age_days, sanitize_rule_id
 
 __all__ = [
@@ -51,49 +40,13 @@ def _protected(rule_id: str) -> bool:
     return rule_id in PROTECTED_RULES or base in PROTECTED_RULES
 
 
-def _promotable(fit: Fitness) -> bool:
-    if not fit.has_min_n:
-        return False
-    if fit.adjudicated_n > 0:
-        return fit.suggestion == "promote"
-    return fit.verdicts >= MIN_PROMOTION_VERDICTS and fit.score >= PROMOTION_THRESHOLD
-
-
-def _misfiring(fit: Fitness) -> bool:
-    """Confident (Wilson lower bound or Beta posterior P(p < 0.7) >= 0.90) over at least MIN_N verdicts
-    that the rule misfires."""
-    if not fit.has_min_n:
-        return False
-    if fit.adjudicated_n > 0:
-        return fit.misfire > MISFIRE_THRESHOLD or fit.p_below_demote >= 0.9
-    return fit.misfire > MISFIRE_THRESHOLD
-
-
 def suggest(rule: Rule, fit: Fitness, now: Optional[datetime] = None) -> Optional[str]:
-    """The transition a rule's ledger evidence supports: promote, demote, archive or None.
-
-    No promotion, demotion or archive by misfire below fitness.MIN_N verdicts.
-
-    - promote: it has a next tier, at least MIN_PROMOTION_VERDICTS verdicts (or T4
-      adjudicated promotion criteria), fitness of at least PROMOTION_THRESHOLD and is
-      MIN_AGE_DAYS_FOR_PROMOTION days old;
-    - demote (archive when it has no lower tier): it misfires, i.e. the Wilson lower
-      bound of its false-positive rate exceeds MISFIRE_THRESHOLD (or adjudicated
-      P(precision < 0.7) >= 0.90);
-    - archive: a non-pinned trap whose session-decay effective weight falls below epsilon.
-
-    Rules that are broken, expired or protected get no suggestion.
-    """
+    """The transition a rule's evidence supports: ``fit.suggestion``, the one decision of
+    aegis_core.fitness.compute (promote, demote, archive or None). Rules that are broken,
+    expired, untyped or protected never move by evidence and get None."""
     if not rule.served or rule.type is None or _protected(rule.id):
         return None
-    spec = RULE_TYPES[rule.type]
-    if _misfiring(fit):
-        return "demote" if spec.demotes_to else "archive"
-    if not spec.demotes_to and fit.archive_candidate:
-        return "archive"
-    if spec.promotes_to and _promotable(fit) and rule_age_days(rule, now) >= MIN_AGE_DAYS_FOR_PROMOTION:
-        return "promote"
-    return None
+    return fit.suggestion
 
 
 def _evaluate(workspace: Workspace | Path | str, wanted: str, now: Optional[datetime]) -> List[Dict[str, Any]]:
@@ -223,9 +176,9 @@ def promote_rule(
                 "tp": fit.tp,
                 "fitness": fit.score,
                 "message": (
-                    f"Rule '{rule_id}' does not meet the promotion threshold "
-                    f"(fitness >= {PROMOTION_THRESHOLD} over >= {MIN_PROMOTION_VERDICTS} verdicts, "
-                    f"{MIN_AGE_DAYS_FOR_PROMOTION} days old)"
+                    f"Rule '{rule_id}' does not meet the promotion threshold: promotion needs adjudicated "
+                    "labels merged at the reviewed base (25 with no false positive, or 42 with at most one) "
+                    f"from 3 sessions and 2 repos or 14 days, on a rule at least {MIN_AGE_DAYS_FOR_PROMOTION} days old"
                 ),
             }
 
@@ -259,44 +212,12 @@ def demote_rule(
     return _move(ws, clean_id, rule_path, current_type, next_type, dry_run, "demoted")
 
 
-_TIERS = ("advisory", "mechanical", "gate")
-
-
-def _next_tier(enforcement: str, fit: Fitness) -> tuple[str, str]:
-    """``(new tier, reason)`` for an advisory/mechanical/gate enforcement tier."""
-    if enforcement not in _TIERS or not fit.has_min_n:
-        return enforcement, ""
-    index = _TIERS.index(enforcement)
-    if index > 0 and fit.misfire > TIER_DOWN_MISFIRE[enforcement]:
-        return _TIERS[index - 1], f"misfire bound {fit.misfire:.2f} > {TIER_DOWN_MISFIRE[enforcement]}"
-    if index + 1 < len(_TIERS):
-        min_verdicts, min_fitness = TIER_UP[enforcement]
-        if fit.verdicts >= min_verdicts and fit.score >= min_fitness:
-            return _TIERS[index + 1], f"fitness {fit.score:.2f} >= {min_fitness} over {fit.verdicts:g} verdicts"
-    return enforcement, ""
-
-
-def _rewrite_enforcement(path: Path, before: str, tier: str) -> bool:
-    """Set ``enforcement: tier`` in the rule file if it still holds ``before``."""
-    try:
-        meta, body = parse_rule_frontmatter(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return False
-    if meta.get("enforcement", "advisory") != before:
-        return False
-    meta["enforcement"] = tier
-    atomic_write_text(path, dump_frontmatter(meta, body=body))
-    return True
-
-
 def evaluate_rule_tiers(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
-    """Evaluate the enforcement tier (advisory -> mechanical -> gate) of each rule from
-    its ledger fitness; with ``execute``, rewrite only the ``enforcement`` key.
-
-    Gates and invariants are always ``gate`` and are not evaluated. While the ledger is
-    incomplete, or its CI evidence could not be read, the changes are reported but not
-    written (``refused`` says why).
-    """
+    """``aegis rule promote --tier-check``: ``{"evaluated": N, "changes": []}``. Evidence no longer
+    moves an enforcement tier on its own: an evidence-backed promotion is a type move, which sets
+    the enforcement the new type needs, so a second mover on the same labels could only
+    double-advance a rule (decision D-tier-ladder). ``refused`` still says why a write would not
+    be made (an incomplete ledger, unavailable evidence)."""
     ws = literal_workspace(workspace)
     rules = [r for r in load_rules(ws).served if not RULE_TYPES[r.type].mandatory]
     view = ledger.read(ws.root)
@@ -305,22 +226,7 @@ def evaluate_rule_tiers(workspace: Workspace | Path | str | None = None, execute
     unavailable = next((f.evidence_error for f in fits.values() if not f.evidence_available), None)
     if execute and not refused and unavailable:
         refused = f"not written: the evidence is unavailable ({unavailable})"
-    if refused:
-        execute = False
-    changes: List[Dict[str, Any]] = []
-    for rule in rules:
-        old = rule.enforcement
-        new, reason = _next_tier(old, fits[rule.id])
-        if new == old:
-            continue
-        if execute:
-            # One rule at a time under the lock, re-checked against the file on disk,
-            # so a concurrent edit or move is never clobbered.
-            with locked(ws.root):
-                if not _rewrite_enforcement(ws.root / rule.path, old, new):
-                    continue
-        changes.append({"rule": rule.id, "old_tier": old, "new_tier": new, "reason": reason})
-    result: Dict[str, Any] = {"evaluated": len(rules), "changes": changes}
+    result: Dict[str, Any] = {"evaluated": len(rules), "changes": []}
     if refused:
         result["refused"] = refused
     return result

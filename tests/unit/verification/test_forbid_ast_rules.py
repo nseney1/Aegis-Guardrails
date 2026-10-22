@@ -277,3 +277,81 @@ class TestMalformedWhereFailsClosedInLayer1:
         evidence = DeterministicVerifier(fast_mode=True).verify(changed_files=["src/app.py"], workspace=ws)
         assert not [e for e in evidence if e.tool == "forbid_ast"]
         assert [e.verdict for e in evidence if e.tool == "forbid_ast:r1"] == ([False] if blocked else [])
+
+
+# ── Advisory notes: undecidable sites and exempted test files (R-checks-13) ──
+
+NO_SHELL = (
+    "---\nid: no-shell\ntype: invariant\nenforcement: gate\nhypothesis: no shell\n"
+    "target_paths:\n  - src/*.py\nforbid_ast:\n  calls: [{name: subprocess.run, where: {shell: true}}]\n---\n# No shell\n"
+)
+
+
+def _shell_ws(tmp_path: Path, calls: list, rule: str = NO_SHELL) -> Path:
+    (tmp_path / ".aegis" / "rules" / "invariants").mkdir(parents=True)
+    (tmp_path / ".aegis" / "rules" / "invariants" / "no-shell.md").write_text(rule, encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    body = "".join(f"    {call}\n" for call in calls)
+    (tmp_path / "src" / "a.py").write_text(f"import subprocess\n\n\ndef main(cmd, kw, flag):\n{body}", encoding="utf-8")
+    return tmp_path
+
+
+def _notes(evidence, tool: str = "forbid_ast_unverified"):
+    return [e for e in evidence if e.tool == tool]
+
+
+class TestAdvisoryNotes:
+    @pytest.mark.parametrize("call", ["subprocess.run(cmd, **kw)", "subprocess.run(cmd, shell=flag)"],
+                             ids=["splat", "variable"])
+    def test_an_undecidable_site_is_a_passing_note_never_a_silent_pass(self, tmp_path: Path, call: str):
+        from aegis_core.verification.runner import UNVERIFIED_NOTE_TOOL, format_summary
+
+        evidence = DeterministicVerifier(fast_mode=True).verify(changed_files=["src/a.py"], workspace=_shell_ws(tmp_path, [call]))
+        assert gate_verdict(evidence) is True
+        (note,) = _notes(evidence, UNVERIFIED_NOTE_TOOL)
+        assert (note.verdict, note.target, note.lines) == (True, "src/a.py", [5])
+        assert "no-shell" in note.detail and "unknown" in note.detail
+        assert "1 unverified, see notes" in format_summary(evidence)
+
+    @pytest.mark.parametrize("call,failing", [("subprocess.run(cmd, shell=False)", False),
+                                              ("subprocess.run(cmd, shell=True)", True),
+                                              ("subprocess.run(cmd, **kw)  # aegis: allow[no-shell]: reviewed", False)],
+                             ids=["decided-safe", "decided-violation", "allowed"])
+    def test_a_decided_or_allowed_site_gets_no_note(self, tmp_path: Path, call: str, failing: bool):
+        evidence = DeterministicVerifier(fast_mode=True).verify(changed_files=["src/a.py"], workspace=_shell_ws(tmp_path, [call]))
+        assert _notes(evidence) == [] and gate_verdict(evidence) is not failing
+
+    def test_eight_undecidable_sites_show_five_and_count_the_rest(self, tmp_path: Path):
+        evidence = DeterministicVerifier(fast_mode=True).verify(
+            changed_files=["src/a.py"], workspace=_shell_ws(tmp_path, ["subprocess.run(cmd, **kw)"] * 8))
+        notes = _notes(evidence)
+        assert len(notes) == 1 and len(notes[0].lines) == 8 and "and 3 more" in notes[0].detail
+
+    @pytest.mark.parametrize("patterns,noted", [("['**']", True), ("['**/*.py']", True), ("['tests/*.py']", False),
+                                                ("['src/*.py']", False)], ids=["all", "py", "names-tests", "src-only"])
+    def test_test_files_a_rule_skips_are_counted_once_per_rule(self, tmp_path: Path, patterns: str, noted: bool):
+        rule = NO_SHELL.replace("target_paths:\n  - src/*.py\n", f"target_paths: {patterns}\n")
+        ws = _shell_ws(tmp_path, ["subprocess.run(cmd)"], rule)
+        (ws / "tests").mkdir()
+        files = [f"tests/test_{n}.py" for n in "abc"]
+        for name in files:
+            (ws / name).write_text("import subprocess\nsubprocess.run('x', shell=True)\n", encoding="utf-8")
+        (ws / "lib.py").write_text("x = 1\n", encoding="utf-8")
+        evidence = DeterministicVerifier(fast_mode=True).verify(changed_files=["src/a.py", "lib.py", *files], workspace=ws)
+        exempt = _notes(evidence, "forbid_ast_exempt")
+        assert [(e.verdict, e.detail) for e in exempt] == (
+            [(True, "forbid_ast:no-shell: 3 test file(s) not checked (target_paths do not name tests)")] if noted else [])
+        assert _notes(evidence) == []
+
+    def test_a_note_that_cannot_be_made_fails_closed(self, tmp_path: Path, monkeypatch):
+        from aegis_core.verification import runner
+
+        def boom(*_args):
+            raise RuntimeError("note writer broke")
+
+        monkeypatch.setattr(runner, "_unverified_note", boom)
+        evidence = DeterministicVerifier(fast_mode=True).verify(
+            changed_files=["src/a.py"], workspace=_shell_ws(tmp_path, ["subprocess.run(cmd, **kw)"]))
+        assert gate_verdict(evidence) is False
+        assert [(e.tool, e.verdict) for e in evidence if not e.verdict] == [("forbid_ast:no-shell", False)]
+        assert "note writer broke" in next(e.detail for e in evidence if not e.verdict)

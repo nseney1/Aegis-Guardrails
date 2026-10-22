@@ -59,7 +59,33 @@ def ws(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_sync_writes_the_derived_view_of_every_rule(ws: Path) -> None:
+@pytest.fixture
+def labelled_ws(tmp_path: Path, monkeypatch) -> Path:
+    """``ws`` whose good trap also has 25 tp labels merged at the reviewed BASE: only labels
+    promote (R-evidence-4). The repository comes first: from then on the ledger lives in git."""
+    from tests import helpers_adjudication as ha
+
+    root = tmp_path / "project"
+    for rule_type, rule_id in (("trap", "trap-good"), ("invariant", "inv-noisy"), ("trap", "trap-noisy"),
+                               ("persona", "persona-new")):
+        _rule(root, rule_type, rule_id)
+    ha.write_labels(root, "trap-good", ha.labels("trap-good"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    ha.merge_to_base(root)
+    _report(root, "trap-good", "tp", 25)
+    _report(root, "inv-noisy", "fp", MIN_N)
+    _report(root, "trap-noisy", "fp", MIN_N)
+    return root
+
+
+def test_ci_verdicts_alone_promote_nothing_and_still_demote(ws: Path) -> None:
+    assert {rid: e["suggestion"] for rid, e in sync.sync(ws).derived["rules"].items()} == {
+        "trap-good": None, "inv-noisy": "demote", "trap-noisy": "archive", "persona-new": None,
+    }
+
+
+def test_sync_writes_the_derived_view_of_every_rule(labelled_ws: Path) -> None:
+    ws = labelled_ws
     before = _rule_bytes(ws)
 
     result = sync.sync(ws)
@@ -73,8 +99,8 @@ def test_sync_writes_the_derived_view_of_every_rule(ws: Path) -> None:
     good = doc["rules"]["trap-good"]
     assert good["path"] == ".aegis/rules/traps/trap-good.md"
     assert good["sha256"] == lf_digest((ws / good["path"]).read_bytes())
-    assert (good["type"], good["triggers"], good["tp"], good["fp"]) == ("trap", 25, 25, 0)
-    assert good["fitness"] == pytest.approx(wilson_lower_bound(25, 25), abs=1e-4)
+    assert (good["type"], good["triggers"], good["tp"], good["fp"]) == ("trap", 25, 25 + 25, 0)
+    assert good["fitness"] == pytest.approx(wilson_lower_bound(50, 50), abs=1e-4)
     assert isinstance(good["last_ts"], str)
     assert {rid: e["suggestion"] for rid, e in doc["rules"].items()} == {
         "trap-good": "promote", "inv-noisy": "demote", "trap-noisy": "archive", "persona-new": None,
@@ -84,7 +110,8 @@ def test_sync_writes_the_derived_view_of_every_rule(ws: Path) -> None:
     assert _rule_bytes(ws) == before
 
 
-def test_apply_moves_rules_through_the_lifecycle_functions_and_records_the_result(ws: Path) -> None:
+def test_apply_moves_rules_through_the_lifecycle_functions_and_records_the_result(labelled_ws: Path) -> None:
+    ws = labelled_ws
     rows_before = len(ledger.read(ws).rows)
 
     result = sync.sync(ws, apply=True)
@@ -319,7 +346,8 @@ def test_apply_refuses_on_any_ledger_damage(ws: Path, damage) -> None:
     assert result.derived["ledger"] != CLEAN_LEDGER
 
 
-def test_a_torn_last_line_is_a_write_in_progress_and_does_not_block_apply(ws: Path) -> None:
+def test_a_torn_last_line_is_a_write_in_progress_and_does_not_block_apply(labelled_ws: Path) -> None:
+    ws = labelled_ws
     with ledger.ledger_path(ws).open("ab") as fh:
         fh.write(b'{"v": 2, "rule": "trap-go')
 
