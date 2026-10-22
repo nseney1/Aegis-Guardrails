@@ -890,6 +890,85 @@ def test_resolve_base_ref_prefers_the_pull_request_base(repo: Path):
     assert gitsafe.resolve_base_ref(repo, environ={}) == "develop"
 
 
+# ── The default base: the branch origin/HEAD names, then the legacy list (R-trust-21) ──
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GITHUB_BASE_REF", "AEGIS_WORKSPACE", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return home
+
+
+def _gitflow(tmp_path: Path):
+    """``develop`` holds a rule change ``main`` lacks; ``feature`` (checked out, off develop) touches
+    only src/; origin/HEAD names origin/develop and origin/main exists too. Returns (repo, develop)."""
+    from tests import helpers_humangate as hg
+    from tests import helpers_verified as hv
+
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.git("checkout", "-q", "-b", "develop", "main")
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("hypothesis: sample", "hypothesis: sharper"))
+    develop = repo.commit("develop sharpens a rule")
+    repo.git("checkout", "-q", "-b", "feature")
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("feature")
+    repo.git("update-ref", "refs/remotes/origin/main", "main")
+    repo.git("update-ref", "refs/remotes/origin/develop", develop)
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+    return repo, develop
+
+
+def test_the_default_base_is_the_branch_origin_head_names(tmp_path: Path, fake_home):
+    from aegis_core import checkrun
+
+    repo, develop = _gitflow(tmp_path)
+    assert gitsafe.resolve_base_ref(repo.root, environ={}) == "origin/develop"
+
+    out = checkrun.record(repo.root)
+    assert out.status == "recorded", out.reason
+    assert out.row["base"] == develop == gitsafe.merge_base(repo.root, "develop")
+    assert out.row["protected_changed"] is False  # develop's rule change is not the feature's
+
+
+def test_the_pull_request_base_still_wins_over_origin_head(tmp_path: Path, fake_home):
+    repo, _ = _gitflow(tmp_path)
+    assert gitsafe.resolve_base_ref(repo.root, environ={"GITHUB_BASE_REF": "main"}) == "origin/main"
+
+
+@pytest.mark.parametrize("target", ["refs/remotes/origin/gone", "refs/heads/develop"])
+def test_an_origin_head_that_names_no_remote_branch_is_skipped(repo: Path, target: str):
+    _git(repo, "branch", "develop")
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", target)
+    assert gitsafe.resolve_base_ref(repo, environ={}) == "main"
+
+
+def test_a_master_only_repository_without_a_remote_measures_against_master(tmp_path: Path, fake_home,
+                                                                            monkeypatch, capsys):
+    import json
+
+    from aegis_cli.cli import main
+    from aegis_core import checkrun
+    from tests import helpers_verified as hv
+
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.git("branch", "-m", "main", "master")
+    assert gitsafe.resolve_base_ref(repo.root, environ={}) == "master"
+
+    out = checkrun.record(repo.root)
+    assert out.status == "recorded", out.reason
+
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    assert main(["approve", "--json"]) == 1
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["code"] == "nothing"  # it got past the base: governance did not change since master
+
+
 # ── Ratchet: no git subprocess outside gitsafe ───────────────────────────────
 
 _SPAWNERS = {

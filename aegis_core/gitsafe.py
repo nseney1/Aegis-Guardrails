@@ -18,8 +18,10 @@ every call here:
   Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
 - reads with plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
-  ``check-ref-format``, ``hash-object``, ``version`` and ``config``. It never writes to the
-  work tree, the index, a branch or a tag; it writes with ``hash-object -w`` (a blob),
+  ``check-ref-format``, ``hash-object``, ``version``, ``config`` and ``symbolic-ref`` (the
+  branch ``refs/remotes/origin/HEAD`` names, which ``resolve_base_ref`` tries before the fixed
+  names: repository data, as ``origin/main`` is). It never writes to the work tree, the index,
+  a branch or a tag; it writes with ``hash-object -w`` (a blob),
   ``update-ref --no-deref --stdin`` (one ref under compare-and-swap, always under
   ``refs/aegis/``: the team's leases), ``merge-tree --write-tree`` (a trial merge's objects,
   referenced by nothing, which git's gc collects), ``read-tree`` into a private index in a fresh
@@ -435,15 +437,19 @@ def merge_base(cwd: Path | str, a: str, b: str = "HEAD") -> Optional[str]:
 
 def resolve_base_ref(cwd: Path | str, environ: Optional[dict] = None) -> Optional[str]:
     """The base branch a change is measured against: the first that resolves of
-    ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, ``origin/main``, ``main``,
-    ``origin/develop``, ``develop``. Returns the ref name, or None."""
+    ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, the branch ``refs/remotes/origin/HEAD``
+    names (``origin/<name>``, ``<name>``), ``origin/main``, ``main``, ``origin/develop``,
+    ``develop``, ``origin/master``, ``master``. Returns the ref name, or None."""
     env = os.environ if environ is None else environ
-    candidates: List[str] = []
     base = (env.get("GITHUB_BASE_REF") or "").strip()  # set by GitHub Actions on pull requests
-    if base:
-        candidates += [f"origin/{base}", base]
-    candidates += ["origin/main", "main", "origin/develop", "develop"]
-    for ref in candidates:
+    for ref in [f"origin/{base}", base] if base else []:
+        if resolve_commit(cwd, ref):
+            return ref
+    # Repository data, as origin/main is; a target outside refs/remotes/origin/ names no remote branch.
+    target = _text(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], cwd) or ""
+    name = target[len("refs/remotes/origin/"):] if target.startswith("refs/remotes/origin/") else ""
+    default = [f"origin/{name}", name] if name else []
+    for ref in dict.fromkeys([*default, "origin/main", "main", "origin/develop", "develop", "origin/master", "master"]):
         if resolve_commit(cwd, ref):
             return ref
     return None
