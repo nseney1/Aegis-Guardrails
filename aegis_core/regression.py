@@ -420,10 +420,12 @@ def _run_pytest_in_snapshot(
     tmp.mkdir(parents=True, exist_ok=True)
     ws, snap = workspace.resolve(), snapshot.resolve()
     ext_dirs = [str(Path(p).resolve()) for p in sys.path if p and Path(p).is_dir() and not _is_within(Path(p).resolve(), ws)]
-    # The snapshot as rootdir makes a test's JUnit classname its dotted path from the tree root.
+    # The snapshot as rootdir makes a test's JUnit classname its dotted path from the tree root. The cwd is
+    # the same string: Windows keeps a cwd as spelled (an 8.3 short TEMP), and pytest cannot relate a test
+    # path under a second spelling to the rootdir, so the classname would come out empty.
     argv = [sys.executable, *_PYTHON_FLAGS, "-c", _SNAPSHOT_RUNNER, str(snap), str(ws), json.dumps(ext_dirs),
             *_PYTEST_FLAGS, f"--rootdir={snap}", f"--junitxml={junit}", "--", *test_files]
-    res = checkrun.run_tests(argv, snapshot, checkrun._hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
+    res = checkrun.run_tests(argv, snap, checkrun._hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
     passed, failed, col_errors = checkrun.parse_junit_cases(junit)
     return _PytestOutcome(res.exit, res.timed_out, frozenset(passed), frozenset(failed), frozenset(col_errors))
 

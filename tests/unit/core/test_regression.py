@@ -429,6 +429,39 @@ def test_two_tautological_fixes_cost_two_runs_and_pass_on_base(tmp_path: Path, m
 
 
 @needs_git
+def test_a_scratch_path_that_resolves_elsewhere_still_attributes_the_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Review F1: Given a temporary directory reached through a link (as a Windows 8.3 short TEMP is a
+    second spelling of its long path), When regressions are checked, Then pytest starts in the very
+    directory string it gets as --rootdir and the fix commit is attributed its fail-to-pass test. Windows
+    keeps a child's cwd string verbatim, so a cwd spelled unlike --rootdir leaves the JUnit classname
+    empty there and every fix reads no_tests_collected."""
+    import tempfile
+
+    from aegis_core import checkrun
+    from conftest import symlink_or_skip
+
+    repo = make_repo(tmp_path)
+    fix = _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    real, link = tmp_path / "real-tmp", tmp_path / "linked-tmp"
+    real.mkdir()
+    symlink_or_skip(real, link, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(link))
+    started: list = []
+    real_run = checkrun.run_tests
+
+    def spy(argv, cwd, *args, **kwargs):
+        started.append((str(cwd), next(a.partition("=")[2] for a in argv if str(a).startswith("--rootdir="))))
+        return real_run(argv, cwd, *args, **kwargs)
+
+    monkeypatch.setattr(checkrun, "run_tests", spy)
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert len(started) == 2 and all(cwd == rootdir for cwd, rootdir in started), started
+    assert [(c.commit, c.status, c.fail_to_pass_tests) for c in report.commits] == [
+        (fix, "passed", ("tests.test_app::test_compute",))]
+
+
+@needs_git
 def test_a_fix_broken_by_a_later_commit_fails_on_head(tmp_path: Path):
     """The fix passes at its own commit, but the pull request's head is what lands."""
     repo = make_repo(tmp_path)
