@@ -1095,3 +1095,44 @@ def test_a_signed_rerun_is_one_recurrence_not_two(review_repo):
     _signed_rerun(repo, home, cli, ts=_shift(cli["ts"], 3600))
     rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)
+
+
+# ── review M2: the verbatim lint sees the bullet as it is written ──────────────
+
+@pytest.mark.parametrize("text", [
+    "Never mail the release notes to carol.reviewer@example.com before the tag exists",
+    "Never read the token cache under /home/carol/.config/tool/cache.json in src/app.py",
+], ids=["email", "home-path"])
+@pytest.mark.parametrize("channel", ["summary", "kind"])
+def test_typed_human_text_with_a_redactable_token_never_enters_a_proposal(review_repo, text, channel):
+    """Given a cli insight whose typed text holds an email or a home path (stored redacted),
+    When that typed text is passed back as the summary or the kind, Then the lint refuses it,
+    although the raw text differs from the stored one, because the written bullet would not."""
+    repo, home = review_repo
+    row = add_insight(repo, text, paths=["src/app.py"], kind="release", home=home)
+    assert row["text"] != text
+    extra = {"summary_bullets": [text]} if channel == "summary" else {"kind": text}
+    with pytest.raises(ValueError, match="verbatim"):
+        write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home, **extra)
+    assert not (repo / ".aegis" / "proposals").exists()
+
+
+def test_a_summary_unlike_any_human_text_is_still_written_redacted(review_repo):
+    repo, home = review_repo
+    row = add_insight(repo, "Never mail the release notes before the tag exists", paths=["src/app.py"],
+                      kind="release", home=home)
+    path = write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home,
+                          summary_bullets=["Ask carol.reviewer@example.com about the release calendar"])
+    body = path.read_text(encoding="utf-8")
+    assert "- Ask [REDACTED_EMAIL] about the release calendar" in body and "carol.reviewer" not in body
+
+
+def test_a_kind_that_equals_human_text_once_its_backticks_go_never_enters_a_proposal(review_repo):
+    """The generated bullet quotes the kind with its backticks removed, so that form is linted too."""
+    repo, home = review_repo
+    text = "Never mail the release notes before the tag exists"
+    row = add_insight(repo, text, paths=["src/app.py"], kind="release", home=home)
+    with pytest.raises(ValueError, match="verbatim"):
+        write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home,
+                       kind="Never mail the `release` notes before the tag exists")
+    assert not (repo / ".aegis" / "proposals").exists()
