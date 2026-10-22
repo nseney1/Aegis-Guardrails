@@ -105,3 +105,11 @@ def test_a_blocking_checkpoint_issue_fails_the_summary(ws, capsys, monkeypatch, 
     text = summary.read_text(encoding="utf-8")
     assert rc == 1 and "FAILED" in text and "No findings reported." not in text
     assert all(line.startswith("::") for line in out.splitlines())
+
+
+@pytest.mark.parametrize("argv", [["src/missing.py"], ["--base", "no-such-ref"]], ids=["missing-file", "bad-base"])
+def test_a_run_that_cannot_be_judged_still_prints_a_valid_sarif_log(ws, capsys, argv):
+    rc, out, err = _check(ws, capsys, *argv, "--format", "sarif")
+    log = json.loads(out)
+    assert rc == 1 and "Error:" in err
+    assert log["runs"][0]["results"] == [] and log["runs"][0]["invocations"][0]["executionSuccessful"] is False

@@ -265,6 +265,16 @@ def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool
     _append_step_summary(document, root)
 
 
+def _unjudged(report_fmt: str, why: str) -> int:
+    """Exit 1 for a run that could not be judged; under --format sarif stdout still holds a valid log that
+    says so (an upload step that always runs never meets an empty file). The error is already on stderr."""
+    if report_fmt == "sarif":
+        from aegis_cli.formatters.report import format_sarif_report
+
+        print(format_sarif_report({}, error=why))
+    return 1
+
+
 def _usage_error(message: str) -> int:
     print(f"Error: {message}", file=sys.stderr)
     return 2
@@ -728,12 +738,12 @@ def run_verify(args: argparse.Namespace) -> int:
     if getattr(args, "ws", None) is None and raw_ws and not os.path.isdir(str(raw_ws)):
         # Workspace.resolve walks up to an existing parent; checking that instead fails open.
         print(f"Error: workspace does not exist: {raw_ws}", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the workspace does not exist")
     ws_obj = getattr(args, "ws", None) or Workspace.resolve(raw_ws)
     repo_root = str(ws_obj.root)
     if not os.path.isdir(repo_root):
         print(f"Error: repo root does not exist: {repo_root}", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the repository root does not exist")
 
     held = baseline.Baseline(frozenset(), None, "none")
     if not getattr(args, "dry_run", False):
@@ -743,7 +753,7 @@ def run_verify(args: argparse.Namespace) -> int:
             return _usage_error(_shown(str(exc), 300))
         except baseline.BaselineError as exc:
             print(f"Error: {_shown(str(exc), 300)}", file=sys.stderr)
-            return 1
+            return _unjudged(report_fmt, _shown(str(exc), 300))
 
     task_plan = None
     if layer2:
@@ -760,17 +770,17 @@ def run_verify(args: argparse.Namespace) -> int:
 
     target_files = resolve_target_files(args)
     if getattr(args, "files", None) and not target_files:
-        return 1
+        return _unjudged(report_fmt, "none of the named files can be checked")
     if getattr(args, "_base_unreadable", False):
         print(f"Error: cannot list what changed since {_shown(str(args.base), 120)}: needs history: fetch with "
               "fetch-depth 0 (no merge base with HEAD)", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the changes since --base cannot be listed")
     staged = hook and not getattr(args, "files", None)
     if staged and getattr(args, "_staged_unreadable", False):
         # Fail closed: a commit whose content cannot be listed is not checked.
         print("Error: cannot read the staged changes (not a git work tree, or git failed); nothing was checked",
               file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the staged changes cannot be read")
     no_diff_base = not target_files and bool(getattr(args, "_no_diff_base", False))
     if layer2 and no_diff_base:
         return _usage_error(
@@ -782,7 +792,7 @@ def run_verify(args: argparse.Namespace) -> int:
         if missing:
             for f in missing:
                 print(f"Error: file not found: {f}", file=sys.stderr)
-            return 1
+            return _unjudged(report_fmt, "a named file is not found")
 
     if getattr(args, "dry_run", False):
         if use_json:
@@ -842,7 +852,7 @@ def run_verify(args: argparse.Namespace) -> int:
                 target_files, root=repo_root)
     except Exception as exc:
         print(f"Error: Layer 1 could not run: {exc}", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "Layer 1 could not run")
     results = [evidence for _path, evidence in pairs]
     applied = None
     if held.active:
@@ -851,7 +861,7 @@ def run_verify(args: argparse.Namespace) -> int:
             applied = baseline.apply(pairs, baseline.Sources(repo_root, staged=staged), held)
         except Exception as exc:  # fail closed: a baseline that cannot be applied excuses nothing
             print(f"Error: the baseline could not be applied: {_shown(str(exc), 300)}", file=sys.stderr)
-            return 1
+            return _unjudged(report_fmt, "the baseline could not be applied")
         results = list(applied.effective)
 
     tools_pass = runner.gate_verdict(results)

@@ -233,6 +233,31 @@ jobs:
       - run: aegis check --ci
         env:
           GH_TOKEN: ${{{{ github.token }}}}
+  # Code scanning annotations, in a job of their own: the write permission never reaches the job that
+  # runs the pull request's tests with a token. Code scanning needs GitHub Advanced Security on a
+  # private repository: remove the private condition there to opt in.
+  aegis-sarif:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install aegis-guardrails=={version}
+      # Exit 1 means findings: the aegis-check job gates on them, so this step never fails the run.
+      - run: aegis check --format sarif > aegis.sarif
+        continue-on-error: true
+      - uses: github/codeql-action/upload-sarif@v4
+        if: ${{{{ always() && hashFiles('aegis.sarif') != '' && !github.event.repository.private && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}}}
+        with:
+          sarif_file: aegis.sarif
+          category: aegis
 """
 
 
