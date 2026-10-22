@@ -101,11 +101,11 @@ def test_a_failed_precondition_refuses_before_anything_moves(tmp_path, capsys, s
     elif shape == "no-tracking-ref":  # never fetched: Aegis cannot tell what the branch's remote holds
         git(repo.root, "remote", "add", "upstream", str(repo.origin))
         git(repo.root, "config", "branch.main.remote", "upstream")
-    elif shape == "not-git":  # no BASE for labels: 25 tp outcome rows make the promotion
+    elif shape == "not-git":  # no BASE for labels: 25 fp outcome rows make an archive
         from aegis_core.telemetry_engine import ledger
 
         shutil.rmtree(repo.root / ".git", onerror=_writable_retry)
-        ledger.append(repo.root, [{"rule": repo.rule, "outcome": "tp", "source": "ci", "key": f"k{n}"} for n in range(25)])
+        ledger.append(repo.root, [{"rule": repo.rule, "outcome": "fp", "source": "ci", "key": f"k{n}"} for n in range(25)])
     before = repo.state() if shape != "not-git" else None
     gh = hs.FakeGh(repo.origin)
 
