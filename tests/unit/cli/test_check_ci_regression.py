@@ -79,6 +79,29 @@ def test_ci_text_format_reports_regression_warnings_and_untested_changes(
 
 
 @needs_git
+def test_a_go_only_fix_is_reported_unverified_and_never_fails(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    """R-evidence-26: Given a fix whose only test is handler_test.go, When check --ci runs, Then it exits
+    0, the text names UNVERIFIED:regression/tests_not_pytest and GitHub gets a warning, never an error."""
+    repo = make_repo(tmp_path)
+    repo.write("pkg/handler.go", "package pkg\n\nfunc Handle() int { return 2 }\n")
+    repo.write("pkg/handler_test.go", "package pkg\n")
+    repo.commit("fix: go handler")
+
+    rc, out, _err = run_ci(repo, capsys)
+    assert rc == 0
+    assert "[UNVERIFIED:regression/tests_not_pytest] (pkg/handler_test.go)" in out
+    rc, out, _err = run_ci(repo, capsys, "--format", "github")
+    annotations = [line for line in out.splitlines() if line.startswith("::")]
+    assert rc == 0 and len(annotations) == 1
+    assert annotations[0].startswith("::warning file=pkg/handler_test.go,title=regression check unverified::tests_not_pytest")
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    payload = json.loads(out)
+    assert rc == 0 and payload["status"] == "pass"
+    assert [f["code"] for f in payload["regression"]["findings"]] == ["tests_not_pytest"]
+    assert payload["regression"]["commits"][0]["status"] == "unverifiable"
+
+
+@needs_git
 def test_ci_github_format_emits_error_when_strict_gate_enabled(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):

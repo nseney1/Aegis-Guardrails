@@ -28,6 +28,7 @@ __all__ = [
     "RegressionReport",
     "SCHEMA",
     "SOURCE",
+    "UNVERIFIED_CODES",
     "UntestedChange",
     "VALID_TIERS",
     "check_ci_regressions",
@@ -55,6 +56,10 @@ _DOC_BASENAMES = frozenset({
     "readme", "changelog", "changes", "history", "license", "copying",
     "authors", "contributors", "code_of_conduct", "security", "notice", "patents",
 })
+# Languages Aegis has AST drivers for: a changed test in one of them is a test pytest cannot run.
+_OTHER_LANGUAGE_TESTS = frozenset({".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs"})
+# Finding codes that say a check could not run, not that a fix failed.
+UNVERIFIED_CODES = frozenset({"tests_not_pytest"})
 _CONFIG_EXTENSIONS = frozenset({".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".conf", ".lock", ".env", ".pth"})
 _CONFIG_BASENAMES = frozenset({
     "makefile", "dockerfile", "containerfile", "justfile", "vagrantfile", "procfile", "manifest.in",
@@ -186,7 +191,7 @@ class CommitRegression:
 
     @property
     def passed(self) -> bool:
-        return self.status in ("passed", "exempted")
+        return self.status in ("passed", "exempted", "unverifiable")
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {
@@ -577,6 +582,18 @@ def _evaluate_fix_commit(
     if meta.no_test_reason:
         nt_note += f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
 
+    other_tests = () if test_files else tuple(
+        p for p in meta.present_files if is_test_file(p) and posixpath.splitext(p)[1] in _OTHER_LANGUAGE_TESTS)
+    if other_tests:
+        msg = (f"fix commit {meta.oid[:10]} ({meta.subject}) changes tests pytest cannot run "
+               f"({', '.join(other_tests[:5])}): the fail-to-pass check is unverified{nt_note}")
+        return (
+            CommitRegression(
+                meta.oid, meta.subject, "unverifiable", "tests_not_pytest", False, False,
+                (), source_files, other_tests, meta.fixes, meta.no_test_reason, False, None,
+            ),
+            RegressionFinding("tests_not_pytest", meta.oid, other_tests[0], msg, meta.no_test_reason),
+        )
     if not test_files:
         if approval is not None and approval.valid:
             return (

@@ -162,6 +162,70 @@ def test_a_fix_to_a_module_named_like_a_document_is_judged(tmp_path: Path):
     assert report.commits[0].source_files == ("src/security.py",)
 
 
+def _count_runs(monkeypatch: pytest.MonkeyPatch) -> list:
+    runs: list = []
+    real = regression._run_pytest_in_snapshot
+
+    def spy(snapshot, test_files, *args, **kwargs):
+        runs.append(tuple(test_files))
+        return real(snapshot, test_files, *args, **kwargs)
+
+    monkeypatch.setattr(regression, "_run_pytest_in_snapshot", spy)
+    return runs
+
+
+@needs_git
+def test_a_fix_with_only_a_go_test_is_unverified_not_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """R-evidence-26: Given a fix changing pkg/handler.go and pkg/handler_test.go, When regressions are
+    checked, Then it is unverifiable/tests_not_pytest, nothing runs, and the report still passes."""
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    repo.write("pkg/handler.go", "package pkg\n\nfunc Handle() int { return 2 }\n")
+    repo.write("pkg/handler_test.go", "package pkg\n\nimport \"testing\"\n\nfunc TestHandle(t *testing.T) {}\n")
+    oid = repo.commit("fix: go handler")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    (item,) = report.commits
+    assert (item.commit, item.status, item.reason) == (oid, "unverifiable", "tests_not_pytest")
+    assert item.passed is True and item.test_files == ("pkg/handler_test.go",)
+    assert runs == []
+    assert report.passed is True and report.blocking is False and report.status == "pass"
+    assert [(f.code, f.path) for f in report.findings] == [("tests_not_pytest", "pkg/handler_test.go")]
+    assert "tests_not_pytest" in regression.UNVERIFIED_CODES
+
+
+@needs_git
+@pytest.mark.parametrize("extra", [None, "tests/data.json", "tests/conftest.py"], ids=["none", "data", "conftest"])
+def test_a_fix_whose_only_test_change_is_not_a_test_stays_no_test_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra
+):
+    """Sad: a Python fix that edits only a fixture or conftest (or nothing) is still no_test_changes."""
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    repo.write("src/app.py", "def compute(x: int) -> int:\n    return x + 1\n")
+    if extra:
+        repo.write(extra, "{}\n" if extra.endswith(".json") else "import pytest\n")
+    repo.commit("fix: compute")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.status, c.reason) for c in report.commits] == [("failed", "no_test_changes")]
+    assert runs == [] and report.passed is False
+
+
+@needs_git
+def test_a_fix_with_a_go_test_and_a_python_test_takes_the_python_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = make_repo(tmp_path)
+    runs = _count_runs(monkeypatch)
+    repo.write("src/app.py", "def compute(x: int) -> int:\n    return x + 1\n")
+    repo.write("pkg/handler_test.go", "package pkg\n")
+    repo.write("tests/test_app.py", "from src.app import compute\n\ndef test_compute():\n    assert compute(2) == 3\n")
+    repo.commit("fix: compute adds one")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.status, c.reason) for c in report.commits] == [("passed", "ok")]
+    assert runs and all(files == ("tests/test_app.py",) for files in runs)
+
+
 # ── Fail-to-pass failure modes ───────────────────────────────────────────────
 
 

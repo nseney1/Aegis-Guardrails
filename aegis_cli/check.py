@@ -225,6 +225,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
               skipped=()) -> None:
     from aegis_cli import sanitize_display
     from aegis_cli.formatters.report import format_sarif_report
+    from aegis_core import regression
 
     reg_blocking = bool(reg_report is not None and reg_report.blocking)
     trailer_blocking = bool(trailer_checks and any(t.get("failed") for t in trailer_checks))
@@ -258,9 +259,10 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             reg_level = "error" if reg_report.tier == "gate" else "warning"
             reg_title = "regression check failed" if reg_report.tier == "gate" else "regression check warning"
             for finding in reg_report.findings:
+                unverified = finding.code in regression.UNVERIFIED_CODES
                 print(
-                    f"::{reg_level} file={_escape_annotation(finding.path, True)},"
-                    f"title={_escape_annotation(reg_title, True)}"
+                    f"::{'warning' if unverified else reg_level} file={_escape_annotation(finding.path, True)},"
+                    f"title={_escape_annotation('regression check unverified' if unverified else reg_title, True)}"
                     f"::{_escape_annotation(f'{finding.code}: {finding.message}')}"
                 )
     short = lambda sha: sha[:10]  # noqa: E731
@@ -307,7 +309,8 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         if reg_report.findings and reg_report.tier != "gate":
             print('  regression tier: warning (advisory; blocking at gate tier via --strict or regression.tier="gate")')
         for finding in reg_report.findings:
-            tag = "FAIL" if reg_report.tier == "gate" else "WARN"
+            tag = ("UNVERIFIED" if finding.code in regression.UNVERIFIED_CODES
+                   else "FAIL" if reg_report.tier == "gate" else "WARN")
             print(sanitize_display(f"  [{tag}:regression/{finding.code}] ({finding.path}): {finding.message}", 400))
         if reg_report.total_fix_commits > 0 and reg_report.exempted_count > 0:
             rate_pct = f"{reg_report.exemption_rate * 100:.1f}%"
