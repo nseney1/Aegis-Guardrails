@@ -3,6 +3,7 @@ session decay, v4.4 §12.9 scope_basis neutrality, and AST allow overrides."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import math
 from pathlib import Path
 
@@ -422,7 +423,8 @@ def git_spawns(monkeypatch):
 
     class Counting(subprocess.Popen):  # type: ignore[misc]
         def __init__(self, args, *rest, **kwargs):
-            if isinstance(args, (list, tuple)) and args and str(args[0]).rsplit("/", 1)[-1].startswith("git"):
+            # basename, not rsplit("/"): on Windows the program is C:\...\git.exe
+            if isinstance(args, (list, tuple)) and args and os.path.basename(str(args[0])).lower().startswith("git"):
                 seen.append(list(args))
             super().__init__(args, *rest, **kwargs)
 

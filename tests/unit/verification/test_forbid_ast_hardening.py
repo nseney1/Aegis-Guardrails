@@ -808,10 +808,10 @@ def _generated(*blocks: list[str]) -> str:
     return "\n".join(line for block in blocks for line in block) + "\n"
 
 
-# Timing asserts complexity, never a runner's speed (R-cli-10): t(4N) / t(N), each the best of 3,
-# is about 4 when linear and about 16 when quadratic, so the bound 8 leaves room for a busy runner
-# either way (a 2x step with a bound of 3 failed on CI at 4.1). The ceiling only tells a hang from a
-# slow run.
+# Timing asserts complexity, never a runner's speed (R-cli-10): t(8N) / t(N), each the best of 3,
+# is about 8 when linear and about 64 when quadratic, so the bound 24 leaves room for a busy runner
+# either way (loaded CI runners measured linear shapes at 4.1x for 2x and 8.9-9.3x for 4x). The
+# ceiling only tells a hang from a slow run.
 _HANG_CEILING_S = 60.0
 
 
@@ -835,7 +835,7 @@ def _best_of(runs: int, fn, clock=time.perf_counter) -> float:
 
 
 def _scaling_ratio(run, n: int, clock=time.perf_counter) -> float:
-    return _best_of(3, lambda: run(4 * n), clock) / max(_best_of(3, lambda: run(n), clock), 1e-9)
+    return _best_of(3, lambda: run(8 * n), clock) / max(_best_of(3, lambda: run(n), clock), 1e-9)
 
 
 class TestTheScalingCheck:
@@ -850,9 +850,9 @@ class TestTheScalingCheck:
             return real(raw_call, sites, *rest)
 
         monkeypatch.setattr(policy, "_eval_call_entry", quadratic)
-        trees = {n: extract_normalized_ast("mod.py", code="f()\n" * (800 * n)) for n in (1, 4)}
+        trees = {n: extract_normalized_ast("mod.py", code="f()\n" * (400 * n)) for n in (1, 8)}
         ratio = _scaling_ratio(lambda n: evaluate_forbid_ast(trees[n], {"calls": ["g"]}), 1)
-        assert ratio >= 8, f"a quadratic stand-in grew only {ratio:.1f}x at four times the size"
+        assert ratio >= 24, f"a quadratic stand-in grew only {ratio:.1f}x at eight times the size"
 
     def test_a_hang_hits_the_ceiling(self):
         clock = iter([0.0, _HANG_CEILING_S + 1]).__next__
@@ -890,13 +890,13 @@ class TestBindingFanOutStaysLinear:
     def test_generated_file_cost_scales_linearly(self, bindings, uses):
         spec = {"calls": ["subprocess.run", "os.system"], "decorators": ["functools.lru_cache"]}
 
-        def run(quarters: int) -> None:  # 1: a quarter of each block, 4: all of it
-            code = _generated(bindings[: len(bindings) * quarters // 4], ["import subprocess as n"],
-                              uses[: len(uses) * quarters // 4], ["n.run(['ls'])"])
+        def run(eighths: int) -> None:  # 1: an eighth of each block, 8: all of it
+            code = _generated(bindings[: len(bindings) * eighths // 8], ["import subprocess as n"],
+                              uses[: len(uses) * eighths // 8], ["n.run(['ls'])"])
             assert _violations(code, spec) == ["Forbidden call 'subprocess.run' matched rule forbid_ast.calls"]
 
         ratio = _scaling_ratio(run, 1)
-        assert ratio < 8, f"four times the bindings and uses multiplied the cost by {ratio:.1f}"
+        assert ratio < 24, f"eight times the bindings and uses multiplied the cost by {ratio:.1f}"
 
 
 # Reference semantics, written out longhand: a reference ``head + rest`` (the head ends at
@@ -1344,8 +1344,8 @@ class TestRustCallSites:
             data = parse_rust_source(src, "m.rs")
             assert len(data["call_sites"]) == calls and data["call_sites"][-1]["line"] == calls + 1
 
-        ratio = _scaling_ratio(run, 6_250)
-        assert ratio < 8, f"four times the calls multiplied the parse time by {ratio:.1f}"
+        ratio = _scaling_ratio(run, 3_125)
+        assert ratio < 24, f"eight times the calls multiplied the parse time by {ratio:.1f}"
 
     def test_control_flow_keywords_are_not_calls(self):
         from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
