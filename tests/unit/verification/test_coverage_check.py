@@ -11,7 +11,6 @@ from aegis_cli.formatters.report import (
     format_github_step_summary,
     format_sarif_report,
 )
-from aegis_cli.status import collect_status
 from aegis_core import events
 from aegis_core.verification.coverage_check import (
     evaluate_diff_coverage,
@@ -230,23 +229,31 @@ class TestStatusBlockedCommands:
             host="cursor",
         )
 
-        status = collect_status(ws, home=tmp_path / "home")
-        assert status["events"]["blocked_commands"] == 3
-        assert status["events"]["blocked_commands_source"] == "hook-observed"
-        assert status["events"]["blocked_commands_by_host"] == {
-            "claude-code": 2,
-            "cursor": 1,
-        }
-
         rc = run_status(argparse.Namespace(_root=ws, json=True))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["blocked_commands"]["total"] == 3
-        assert payload["blocked_commands"]["source"] == "hook-observed"
-        assert payload["blocked_commands"]["by_host"] == {
-            "claude-code": 2,
-            "cursor": 1,
+        assert payload["blocked_commands"] == {
+            "total": 3,
+            "by_host": {"claude-code": 2, "cursor": 1},
+            "source": "hook-observed",
+            "label": "hook-observed",
         }
+
+    def test_status_without_guard_events_reports_zero_blocked_commands(self, tmp_path: Path, capsys):
+        import argparse
+        from aegis_cli.status import run_status
+
+        ws = tmp_path / "ws"
+        (ws / ".aegis" / "rules").mkdir(parents=True)
+        assert run_status(argparse.Namespace(_root=ws, json=True)) == 0
+        assert json.loads(capsys.readouterr().out)["blocked_commands"] == {
+            "total": 0, "by_host": {}, "source": "hook-observed", "label": "hook-observed"}
+
+    def test_status_has_one_reader_of_blocked_commands(self):
+        """run_status is the only status surface; the unreached first-draft collector is gone (R-cli-43)."""
+        import aegis_cli.status as status
+
+        assert [name for name in vars(status) if name.startswith("collect")] == []
 
 
 class TestCheckCliIntegration:
