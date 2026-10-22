@@ -358,3 +358,92 @@ def test_aegis_check_runs_the_installed_wheel_and_is_the_only_check_ci():
     with_ci = [name for name, job in jobs.items()
                if any(re.search(r"aegis_cli\.cli check --ci\b", s.get("run", "")) for s in job.get("steps", []))]
     assert with_ci == ["aegis-check"]
+
+
+# --- R-trust-43: at tier A check --ci reads the pull request's reviews ------------------------
+
+def _check_ci_steps(job):
+    return [s for s in job.get("steps", []) if re.search(r"\bcheck --ci\b", s.get("run", ""))]
+
+
+def _scaffold():
+    from aegis_core import scaffolding
+    return yaml.safe_load(scaffolding.ci_workflow())
+
+
+@pytest.mark.parametrize("load", [lambda: _load("validate.yml"), _scaffold], ids=["validate", "scaffold"])
+def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
+    job = load()["jobs"]["aegis-check"]
+    assert job.get("permissions") == {"contents": "read", "pull-requests": "read"}
+    steps = _check_ci_steps(job)
+    assert len(steps) == 1, steps
+    assert steps[0].get("env") == {"GH_TOKEN": "${{ github.token }}"}
+
+
+# --- R-trust-13 (c)-(f): a base-sourced, no-exec governance check ----------------------------
+# xfail(strict) until aegis-governance.yml lands after the author's pull_request_target spike.
+
+GOVERNANCE_WORKFLOW = "aegis-governance.yml"
+_AFTER_SPIKE = pytest.mark.xfail(strict=True, raises=FileNotFoundError,
+                                 reason="R-trust-13 c-f: aegis-governance.yml lands only after the author's spike")
+_BASE_SHA = "${{ github.event.pull_request.base.sha }}"
+
+
+def _permission_maps(workflow):
+    yield workflow.get("permissions")
+    for job in workflow["jobs"].values():
+        if "permissions" in job:
+            yield job["permissions"]
+
+
+@_AFTER_SPIKE
+def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_target():
+    """N3: the base-sourced job counts as the required Aegis check under its literal name."""
+    from aegis_core import human_gate
+    text = _read(GOVERNANCE_WORKFLOW)
+    assert set(_triggers(yaml.safe_load(text))) == {"pull_request_target"}
+    assert human_gate.aegis_check_jobs(text) == ["aegis-governance"]
+
+
+@_AFTER_SPIKE
+def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
+    """N4 (static): base.sha checkout without credentials, the head only as data, read-only token,
+    no secret, nothing that builds, installs, caches or tests the checkout."""
+    text = _read(GOVERNANCE_WORKFLOW)
+    workflow = yaml.safe_load(text)
+    assert set(_triggers(workflow)) == {"pull_request_target"}
+    for perms in _permission_maps(workflow):
+        assert isinstance(perms, dict), "permissions must be explicit maps"
+        writes = {k for k, v in perms.items() if v != "read"}
+        assert writes <= {"checks"} and all(perms[k] == "write" for k in writes), perms
+    assert "secrets." not in text
+    steps = [s for job in workflow["jobs"].values() for s in job.get("steps", [])]
+    checkouts = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+    assert checkouts and all((s.get("with") or {}).get("ref") == _BASE_SHA for s in checkouts)
+    assert all((s.get("with") or {}).get("persist-credentials") is False for s in checkouts)
+    for step in steps:
+        with_ = step.get("with") or {}
+        for value in (with_.get("ref"), with_.get("repository"), step.get("run")):
+            assert "github.event.pull_request.head" not in str(value or ""), step
+        run = step.get("run", "")
+        assert not re.search(r"\bmake\b|pytest|pip3? install|python3? -m pip|setup\.py", run), step
+        assert not step.get("uses", "").startswith("actions/cache"), step
+    runs = [s.get("run", "") for s in steps]
+    assert any(re.fullmatch(r"python3 -m aegis_cli\.cli check --ci --no-exec", r.strip()) for r in runs), runs
+
+
+# --- R-trust-17: check --ci runs on every event its job runs on ------------------------------
+# A condition on the step (say, pull requests only) would let a push or dispatch run of the same
+# job name pass on the pull request's head commit without comparing anything, and doctor no longer
+# counts such a job as the required Aegis check (human_gate._skip_why). A run with nothing to compare
+# says so instead of PASSED (aegis_cli.check).
+
+@pytest.mark.parametrize("text", [lambda: _read("validate.yml"),
+                                  lambda: __import__("aegis_core.scaffolding", fromlist=["x"]).ci_workflow()],
+                         ids=["validate", "scaffold"])
+def test_the_check_ci_step_has_no_condition_and_stays_the_required_check(text):
+    from aegis_core import human_gate
+    body = text()
+    (step,) = _check_ci_steps(yaml.safe_load(body)["jobs"]["aegis-check"])
+    assert "if" not in step and "continue-on-error" not in step
+    assert human_gate.aegis_check_jobs(body) == ["aegis-check"]

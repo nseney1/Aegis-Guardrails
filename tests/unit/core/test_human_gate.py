@@ -1058,3 +1058,77 @@ def test_a_verification_error_still_names_the_commit_the_caller_gave(tmp_path, m
     monkeypatch.setattr(human_gate, "_read_message", broken)
     verdict = human_gate.verify_approval(repo.root, "HEAD", "0" * 64, "main")
     assert (verdict.valid, verdict.code, verdict.commit) == (False, "unresolved", "HEAD")
+
+
+# ── X-approve-tty: the signing program sees the person's terminal ────────────
+
+posix_tty = pytest.mark.skipif(sys.platform == "win32", reason="a pseudo-terminal and a shell-script ssh-keygen")
+LITERAL_KEY = "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvWg1gnqZq3v3dWJ2t3K0aVf0O8Yy3d6C6pWm3Z1b2c human"
+
+
+def _tty_recording_signer(tmp_path: Path, monkeypatch) -> Path:
+    """A fake ssh-keygen first on PATH that records whether its stdin is a terminal, then fails to sign."""
+    seen = tmp_path / "stdin-seen"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "ssh-keygen"
+    fake.write_text(f"#!/bin/sh\nif [ -t 0 ]; then echo tty > '{seen}'; else echo notty > '{seen}'; fi\nexit 1\n",
+                    encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    return seen
+
+
+def _approve_on_a_pty(repo: hg.Repo, monkeypatch, exempt: bool, tty: bool):
+    import argparse
+    import contextlib
+    import io
+    import pty
+    from aegis_cli import approve
+
+    monkeypatch.setattr(approve, "_stdin_is_tty", lambda: tty)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    args = argparse.Namespace(workspace=str(repo.root), json=True, base=None,
+                              exempt_test=repo.head() if exempt else None, reason="by hand" if exempt else None)
+    master, slave = pty.openpty()
+    saved = os.dup(0)
+    out = io.StringIO()
+    try:
+        os.dup2(slave, 0)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = approve.run_approve(args)
+    finally:
+        os.dup2(saved, 0)
+        for fd in (saved, slave, master):
+            os.close(fd)
+    return rc, json.loads(out.getvalue())
+
+
+@needs_git
+@posix_tty
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_signing_reads_the_terminal_so_a_passphrase_key_can_unlock(tmp_path, monkeypatch, exempt):
+    """Given a terminal on stdin and a y, When approve signs, Then the signing program's stdin is that
+    terminal (OpenSSH asks for a key passphrase there; on /dev/null it falls back to ssh-askpass)."""
+    repo = hg.make_repo(tmp_path)
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "weaker"))
+    repo.commit("weaken a rule")
+    repo.home.sign_with(LITERAL_KEY)
+    seen = _tty_recording_signer(tmp_path, monkeypatch)
+    rc, doc = _approve_on_a_pty(repo, monkeypatch, exempt, tty=True)
+    assert seen.read_text(encoding="utf-8").strip() == "tty"
+    assert rc == 1 and doc["code"] == "sign_failed"
+
+
+@needs_git
+@posix_tty
+@pytest.mark.parametrize("exempt", [False, True], ids=["approve", "exempt"])
+def test_without_a_terminal_neither_flow_runs_the_signing_program(tmp_path, monkeypatch, exempt):
+    repo = hg.make_repo(tmp_path)
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("sample", "weaker"))
+    before = repo.commit("weaken a rule")
+    repo.home.sign_with(LITERAL_KEY)
+    seen = _tty_recording_signer(tmp_path, monkeypatch)
+    rc, doc = _approve_on_a_pty(repo, monkeypatch, exempt, tty=False)
+    assert rc == 1 and doc["code"] == "no_terminal"
+    assert not seen.exists() and repo.head() == before
