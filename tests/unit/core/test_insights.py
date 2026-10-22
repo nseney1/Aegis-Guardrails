@@ -548,3 +548,76 @@ def test_a_corrupt_log_and_no_session_still_exit_zero_silently(tmp_path: Path, h
     store.write_bytes(b"\xff{garbage\n")
     assert _hook_entry(repo, hb_home, '{"prompt": "No, wrong file again"}') == (0, "", "")
     assert [r["event"] for r in read_insight_rows(repo, home=hb_home)] == ["insight"]
+
+
+# ── R-evidence-35: the verbatim lint protects human text only, with a 25-character floor ──
+
+@pytest.fixture
+def lint_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    return _make_repo(tmp_path / "repo"), home
+
+
+def _propose(repo: Path, home: Path, bullet: str, pid: str = "trap-lint") -> Path:
+    return write_proposal(repo, proposal_id=pid, target_paths=["*.py"], category="correctness",
+                          summary_bullets=[bullet], home=home)
+
+
+def _hook_prompt(repo: Path, home: Path, text: str, session: str = "s-lint") -> dict:
+    row = record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    assert row.get("event") == "insight", text
+    return row
+
+
+def test_agent_suggestions_never_block_a_proposal(lint_repo):
+    repo, home = lint_repo
+    capture_suggestion(repo, "e", paths=["app.py"], host="claude-code", session="agent", home=home)
+    capture_suggestion(repo, "Address recurring correction cluster", paths=["app.py"], host="claude-code",
+                       session="agent", home=home)
+    assert _propose(repo, home, "Address recurring correction cluster cluster-ab12cd.").is_file()
+
+
+def test_a_short_hook_prompt_blocks_only_an_identical_bullet(lint_repo):
+    repo, home = lint_repo
+    _hook_prompt(repo, home, "revert")
+    assert _propose(repo, home, "Always revert partial writes when the update fails.").is_file()
+    with pytest.raises(ValueError, match="verbatim H/cli/W2 prompt text"):
+        _propose(repo, home, "Revert", pid="trap-lint-2")
+
+
+def test_a_4_3_upgraded_w2_capture_does_not_protect_its_text(lint_repo):
+    repo, home = lint_repo
+    from aegis_core.storage import append_jsonl
+
+    append_jsonl(insights_path(repo, home=home), [{
+        "v": 1, "ts": "2026-10-20T00:00:00Z", "event": "insight", "id": "ins-0000000000dd", "level": "W2",
+        "text": "revert partial writes when the update fails", "paths": ["app.py"], "psrc": "explicit",
+        "host": "claude-code", "hs": "a" * 32, "confirmed_by": "ins-000000000001"}])
+    assert _propose(repo, home, "Always revert partial writes when the update fails.").is_file()
+
+
+@pytest.mark.parametrize("bullet", [
+    "No, never call shutil.rmtree on unvalidated user paths in src/app.py!",
+    "Remember: no, never call shutil.rmtree on unvalidated user paths in src/app.py! Validate first.",
+    "never call rmtree",
+], ids=["full", "embedded", "short-exact"])
+def test_hook_prompts_still_block_verbatim_bullets(lint_repo, bullet):
+    repo, home = lint_repo
+    _hook_prompt(repo, home, "No, never call shutil.rmtree on unvalidated user paths in src/app.py!")
+    _hook_prompt(repo, home, "never call rmtree", session="s-lint-2")
+    with pytest.raises(ValueError, match="verbatim"):
+        _propose(repo, home, bullet)
+
+
+def test_cli_text_of_25_characters_or_more_is_protected(lint_repo):
+    repo, home = lint_repo
+    text = "Validate symlink confinement before opening state files"
+    add_insight(repo, text, paths=["app.py"], home=home)
+    with pytest.raises(ValueError, match="verbatim H/cli/W2 prompt text"):
+        _propose(repo, home, f"Rule: {text}.")
+    assert not (repo / ".aegis" / "proposals" / "trap-lint.md").exists()

@@ -117,6 +117,7 @@ class SyncResult:
     refused: Optional[str] = None
     pr: Optional[Dict[str, Any]] = None
     replay: Any = None  # fitness.ReplayReport: what detector replay walked and could not read
+    insights: Dict[str, Any] = field(default_factory=dict)  # insights.insight_status: user-local, never in derived.json
 
 
 def _apply(workspace: Any, derived: Dict[str, Any], *, audit: bool = True) -> List[Dict[str, Any]]:
@@ -581,4 +582,7 @@ def sync(
             body = format_pr_body(pre_rules, moved, base=reviewed, examples=examples, replay=replay)
             pr_info = dict(_open_pr(plan, branch, commit, title, body, gh_runner or _default_gh_runner, str(ws.root)),
                            transitions=moved)
-    return SyncResult(derived=derived, path=path, applied=applied, refused=refused, pr=pr_info, replay=replay)
+    from aegis_core.insights import insight_status
+
+    return SyncResult(derived=derived, path=path, applied=applied, refused=refused, pr=pr_info, replay=replay,
+                      insights=insight_status(ws.root))

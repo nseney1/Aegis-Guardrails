@@ -111,6 +111,10 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str, root: Any)
     fetched = base_fetch(root)[0]
     if fetched:
         print(f"  {fetched}")
+    from aegis_core.insights import insight_status_lines
+
+    for line in insight_status_lines(result.insights):
+        print(f"  {sanitize_display(line, 300)}")
     pending = sum(1 for row in rows if row["suggestion"])
     print(f"Wrote {rel_path} ({len(rows)} rules, {pending} suggested transitions).")
     if pending and not result.applied and not result.refused:
@@ -166,6 +170,7 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
             "untargeted": result.derived["untargeted"],
             "ledger": result.derived["ledger"],
             "claimed": claimed,
+            "insights": result.insights,
         }
         if result.pr is not None:
             payload["pr"] = result.pr
