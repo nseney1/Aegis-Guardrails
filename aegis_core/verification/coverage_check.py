@@ -113,7 +113,7 @@ def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
         return _result("unverified", f"cannot use the state directory: {exc}")
     with scratch as tmp:
         rcfile, report = Path(tmp) / "empty.coveragerc", Path(tmp) / "coverage.json"
-        rcfile.write_bytes(b"")
+        storage.atomic_write_bytes(rcfile, b"")
         env = {**os.environ, "COVERAGE_FILE": str(Path(tmp) / ".coverage")}
         if sys.version_info >= (3, 12):
             env["COVERAGE_CORE"] = "sysmon"
