@@ -210,7 +210,7 @@ def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_pa
     repo.write(".github/CODEOWNERS", hg.CODEOWNERS_FULL)
     base = repo.commit("protect")
     head = "a" * 40
-    pull = human_gate.PullRequest(3, "agent", head)
+    pull = human_gate.PullRequest(3, "agent", head, "main")
     approving = [{"user": {"login": "human", "type": "User"}, "state": "APPROVED", "commit_id": head,
                   "author_association": "OWNER"}]
     paths = [".aegis/rules/traps/trap-sample.md"]
@@ -222,6 +222,11 @@ def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_pa
         gh = _ReviewsGh(approving, rules=[rule])
         assert human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh) is None
         assert not any("/pulls/" in c[0][-1] for c in gh.calls) and gh.posts == []
+    # The base branch is the pull request's, checked again here: a name in doubt reads nothing.
+    for ref in ("", "../main", "main?x", "a b", None):
+        gh = _ReviewsGh(approving, rules=[hg.pull_request_rule()])
+        assert human_gate.find_review_approval(repo.root, pull._replace(base_ref=ref), base, paths, gh=gh) is None
+        assert gh.calls == []
 
 
 # ── 1b. an approval is an SSH signature, checked against the base allowed_signers ──

@@ -981,11 +981,12 @@ class ReviewGh(hg.FakeGh):
     """FakeGh plus the pull request reviews endpoint; ``fail`` maps a path fragment to a failing GhResult."""
 
     def __init__(self, reviews: Optional[List[Dict[str, Any]]] = None, fail: Optional[Dict[str, Any]] = None,
-                 **kw: Any) -> None:
+                 branch_rules: Optional[Dict[str, List[Dict[str, Any]]]] = None, **kw: Any) -> None:
         kw.setdefault("rules", [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True)])
         super().__init__(**kw)
         self.reviews = reviews if reviews is not None else []
         self.fail = fail or {}
+        self.branch_rules = branch_rules or {}  # the quoted branch of a rules/branches/ path -> its rules
 
     def __call__(self, argv, stdin=None, cwd=None):
         from aegis_core import human_gate
@@ -999,11 +1000,19 @@ class ReviewGh(hg.FakeGh):
         if "/pulls/" in path:
             self.calls.append((tuple(argv), stdin))
             return human_gate.GhResult(0, json.dumps(self.reviews), "")
+        branch = path.partition("/rules/branches/")[2]
+        if branch in self.branch_rules:
+            self.calls.append((tuple(argv), stdin))
+            return human_gate.GhResult(0, json.dumps(self.branch_rules[branch]), "")
         return super().__call__(argv, stdin, cwd)
 
     @property
     def review_calls(self) -> List[str]:
         return [c[0][-1] for c in self.calls if "/pulls/" in c[0][-1]]
+
+    @property
+    def rules_calls(self) -> List[str]:
+        return [c[0][-1] for c in self.calls if "/rules/branches/" in c[0][-1]]
 
 
 def review(login: str, sha: str, state: str = "APPROVED", association: str = "COLLABORATOR",
@@ -1026,10 +1035,15 @@ def tier_a_repo(tmp_path: Path, codeowners: Optional[str] = hg.CODEOWNERS_FULL, 
     return repo
 
 
+_ABSENT = object()
+
+
 def pull_event(tmp_path: Path, monkeypatch, base: str, head: str, number: Any = 7, login: Any = "agent",
-               name: str = "pull_request") -> None:
+               name: str = "pull_request", base_ref: Any = "main") -> None:
     event = tmp_path / "event.json"
-    pull = {"number": number, "user": {"login": login}, "base": {"sha": base}, "head": {"sha": head}}
+    pull = {"number": number, "user": {"login": login}, "base": {"sha": base, **({} if base_ref is _ABSENT else
+                                                                                 {"ref": base_ref})},
+            "head": {"sha": head}}
     event.write_text(json.dumps({"number": number, "pull_request": pull}), encoding="utf-8")
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     monkeypatch.setenv("GITHUB_EVENT_NAME", name)
@@ -1171,8 +1185,11 @@ def test_without_gh_the_review_path_fails_closed(tmp_path, capsys, monkeypatch):
     {"number": -1}, {"number": 0}, {"number": True}, {"number": "7"},
     {"login": "a/b"}, {"login": "x?y"}, {"login": ""}, {"login": None},
     {"head": "short"}, {"name": "push"}, {"name": "pull_request_target"}, {"name": ""},
+    {"base_ref": _ABSENT}, {"base_ref": None}, {"base_ref": ""}, {"base_ref": "../main"}, {"base_ref": "main?x=1"},
+    {"base_ref": "-x"}, {"base_ref": "a b"}, {"base_ref": "x/"}, {"base_ref": "x.lock"}, {"base_ref": ["main"]},
 ], ids=["negative", "zero", "bool", "string", "slash", "query", "empty-login", "no-login", "short-sha",
-        "push", "target", "no-event"])
+        "push", "target", "no-event", "no-base-ref", "null-base-ref", "empty-base-ref", "dotdot-base-ref",
+        "query-base-ref", "dash-base-ref", "space-base-ref", "slash-end-base-ref", "lock-base-ref", "list-base-ref"])
 def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, monkeypatch, event):
     gh = ReviewGh()
     if event.get("head") == "short":
@@ -1190,6 +1207,35 @@ def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, m
     gh.reviews = [review("human", head, association="OWNER")]
     rc, payload = ci_event(capsys)
     assert rc == 1 and payload["approval"] is None and gh.calls == []
+
+
+TIER_A_RULES = [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=True)]
+
+
+@needs_git
+def test_a_pull_request_into_another_branch_is_judged_by_that_branchs_rules(tmp_path, capsys, monkeypatch):
+    """Given main's rules make the review the merge gate and develop's do not require code-owner review,
+    When the pull request targets develop, Then its review approves nothing and the reviews are never read."""
+    develop = [hg.pull_request_rule(approvals=1, code_owners=False, dismiss_stale=True, last_push=True)]
+    gh = ReviewGh(rules=TIER_A_RULES, branch_rules={"main": TIER_A_RULES, "develop": develop})
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, base_ref="develop")
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+    assert gh.rules_calls == ["repos/{owner}/{repo}/rules/branches/develop"] and gh.review_calls == []
+
+
+@needs_git
+@pytest.mark.parametrize("ref,quoted", [("develop", "develop"), ("release/4.4", "release%2F4.4")])
+def test_a_pull_request_into_a_branch_whose_own_rules_gate_the_review_is_approved(
+        tmp_path, capsys, monkeypatch, ref, quoted):
+    weak = [hg.pull_request_rule(approvals=0, code_owners=False, dismiss_stale=False)]
+    gh = ReviewGh(rules=weak, branch_rules={"main": weak, quoted: TIER_A_RULES})
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, base_ref=ref)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["approval"]["method"] == "review", payload
+    assert gh.rules_calls == [f"repos/{{owner}}/{{repo}}/rules/branches/{quoted}"]
 
 
 @needs_git

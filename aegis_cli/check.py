@@ -154,21 +154,22 @@ def _event_shas() -> tuple[str | None, str | None]:
 
 
 def _event_pull_request():
-    """The pull request of a ``pull_request`` run, for tier A's review approval: its number, author and
-    full head commit id, each checked; None for any other event or any value in doubt (no gh call then)."""
+    """The pull request of a ``pull_request`` run, for tier A's review approval: its number, author,
+    full head commit id and base branch, each checked; None for any other event or any value in doubt
+    (no gh call then)."""
     from aegis_core import human_gate
 
     if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
         return None
     try:
         pull = _event_pull()
-        number, login, sha = pull["number"], pull["user"]["login"], pull["head"]["sha"]
+        number, login, sha, ref = pull["number"], pull["user"]["login"], pull["head"]["sha"], pull["base"]["ref"]
     except (KeyError, TypeError):
         return None
     if type(number) is not int or number < 1 or not isinstance(login, str) or not _LOGIN.fullmatch(login) \
-            or not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha):
+            or not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha) or not human_gate.is_branch_name(ref):
         return None
-    return human_gate.PullRequest(number, login, sha.lower())
+    return human_gate.PullRequest(number, login, sha.lower(), ref)
 
 
 def _escape_annotation(text: str, prop: bool = False) -> str:

@@ -51,6 +51,7 @@ __all__ = [
     "exemption_message",
     "find_approval",
     "find_review_approval",
+    "is_branch_name",
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
@@ -1204,31 +1205,46 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
 
 
 class PullRequest(NamedTuple):
-    """The pull request a CI job checks, as the caller validated it from the Actions event file."""
+    """The pull request a CI job checks, as the caller validated it from the Actions event file.
+    ``base_ref``: the branch it merges into (``pull_request.base.ref``), whose rules gate the merge."""
     number: int
     author: str
     head: str
+    base_ref: str
 
 
 _REVIEWER_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 _REVIEW_PAGE = 100
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
+
+
+def is_branch_name(name: Any) -> bool:
+    """Whether ``name`` is a branch name safe to put in a GitHub API path: git's ref-name rules over a
+    conservative character set. Anything else is refused, never escaped into a different request."""
+    return (isinstance(name, str) and _BRANCH_NAME.fullmatch(name) is not None and ".." not in name
+            and "//" not in name and "/." not in name and ".lock/" not in name
+            and not name.endswith(("/", ".", ".lock")))
 
 
 def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequence[str],
                          gh: Optional[GhRunner] = None) -> Optional[Approval]:
-    """Tier A's approval of a flagged change: a reviewer's latest review of ``pull`` approves its head
-    commit, the reviewer is not its author and has write-level association. It counts only while the
-    default branch's ruleset makes that review the merge gate (an approval required, code-owner review,
-    stale approvals dismissed on push) and the CODEOWNERS at ``base`` owns every one of ``paths``
+    """Tier A's approval of a flagged change: some reviewer's latest review of ``pull`` is APPROVED on its
+    head commit, by a person (account type User) other than its author whose ``author_association`` is
+    OWNER, MEMBER or COLLABORATOR. An association is not a permission: write access is not checked here.
+    What makes the review count is the merge gate: the rules GitHub applies to the pull request's own
+    base branch (``pull.base_ref``, never the default branch's) require an approval, code-owner review and
+    stale approvals dismissed on push, and the CODEOWNERS at ``base`` owns every one of ``paths``
     (repository-relative); the reviews are read only then. Read-only gh GETs; None whenever anything
-    cannot be read or does not hold, so a missing gh, token or permission fails closed."""
+    cannot be read or does not hold (a base branch name in doubt reads nothing), so a missing gh, token
+    or permission fails closed."""
+    if not is_branch_name(pull.base_ref):
+        return None
     runner: GhRunner = gh if gh is not None else default_gh_runner
     top = _top(root)
     repo, why = _gh_json(runner, "repos/{owner}/{repo}", top)
-    branch = repo.get("default_branch") if why is None and isinstance(repo, dict) else None
-    if not isinstance(branch, str) or not branch:
+    if why is not None or not isinstance(repo, dict):
         return None
-    rules, why = _gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(branch, safe=""), top)
+    rules, why = _gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(pull.base_ref, safe=""), top)
     facts = _ruleset_facts(rules) if why is None else None
     if not facts or facts["required_approving_review_count"] < 1 or not facts["require_code_owner_review"] \
             or not facts["dismiss_stale_reviews_on_push"]:
