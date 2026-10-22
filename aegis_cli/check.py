@@ -281,7 +281,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     _write_step_summary_if_configured(document, root)
 
     if fmt == "sarif":
-        print(str(format_sarif_report(document, workspace_root=root)))
+        print(format_sarif_report(document, workspace_root=root))
         return blocking
     if fmt == "json":
         print(json.dumps(document, indent=2))
@@ -373,6 +373,17 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     return blocking
 
 
+def _ci_error(message: str, fmt: str) -> int:
+    """A run that could not be judged: exit 1 with the reason, and in SARIF a valid log that says the run
+    did not complete, so an upload step that always runs never meets an empty or invalid file."""
+    from aegis_cli.formatters.report import format_sarif_report
+
+    print(f"Error: {message}", file=sys.stderr)
+    if fmt == "sarif":
+        print(format_sarif_report({}, error=message))
+    return 1
+
+
 def _run_ci(args: argparse.Namespace) -> int:
     """`aegis check --ci`: 0 nothing weakened or every weakening approved, 1 otherwise, 2 usage."""
     from aegis_cli import sanitize_display
@@ -405,9 +416,8 @@ def _run_ci(args: argparse.Namespace) -> int:
     base = getattr(args, "base", None) or event_base or gitsafe.resolve_base_ref(root)
     head = getattr(args, "head", None) or event_head or "HEAD"
     if not base:
-        print("Error: --ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
-              file=sys.stderr)
-        return 1
+        return _ci_error("--ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
+                         fmt)
     try:
         report = rule_integrity.check_ci(root, base, head, pull_request=_event_pull_request())
         # The reruns can take long; progress goes to stderr so the json and github stdout stay unchanged.
@@ -415,8 +425,7 @@ def _run_ci(args: argparse.Namespace) -> int:
         reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, progress=progress)
         trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head, progress=progress)
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
-        print(f"Error: {sanitize_display(str(exc), 400)}", file=sys.stderr)
-        return 1
+        return _ci_error(sanitize_display(str(exc), 400), fmt)
 
     cov_report = None
     if getattr(args, "coverage", False):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import sys
 
@@ -400,6 +401,82 @@ class TestSarifAndGitHubFormatters:
         assert len(lines) == 2 and all(line.startswith("::error ") for line in lines)
         assert "file=rules/a%25b%0Dc%0Ad%3Ae%2Cf.md," in lines[0]
         assert lines[0].endswith("::rule-deleted: a%25b%0Dc%0Ad:e,f: a%25b%0Dc%0Ad:e,f")
+
+
+class TestSarifIsSchemaValidAndHonest:
+    """R-checks-36: the SARIF log holds only schema keys, anchored findings only, stable fingerprints."""
+
+    DOC = {"passed": False,
+           "layer1": [{"tool": "no-eval", "target": "pkg/bad.py", "verdict": False, "detail": "Forbidden eval() call",
+                       "lines": [14]}],
+           "findings": [{"rule": "repo-gate", "message": "Unanchored repository-level gate failure", "level": "error"}]}
+
+    @staticmethod
+    def _report(approved: bool = False):
+        from aegis_core import human_gate, rule_integrity
+
+        head = "b" * 40
+        return rule_integrity.CiReport("main", head, "a" * 40, 1,
+                                       (rule_integrity.Weakening("rule-deleted", "inv-a", "rules/inv-a.md", "deleted"),),
+                                       human_gate.Approval(True, "ok", "", head, "Human") if approved else None)
+
+    def test_the_log_has_only_schema_keys_and_line_less_findings_go_to_the_summary(self, tmp_path):
+        text = format_sarif_report(self.DOC)
+        assert type(text) is str
+        log = json.loads(text)
+        assert set(log) == {"$schema", "version", "runs"}
+        (result,) = log["runs"][0]["results"]
+        assert (result["ruleId"], result["locations"][0]["physicalLocation"]["region"]["startLine"]) == ("no-eval", 14)
+        assert "Unanchored repository-level gate failure" not in text
+        assert "Unanchored repository-level gate failure" in format_github_step_summary(self.DOC)
+
+    def test_a_weakening_without_a_line_is_no_result_and_an_approved_one_is_no_failure(self, tmp_path, capsys, monkeypatch):
+        from aegis_cli import check
+
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+        check._print_ci(self._report(), "sarif", str(tmp_path))
+        assert json.loads(capsys.readouterr().out)["runs"][0]["results"] == []
+        assert "rules/inv-a.md" in summary.read_text(encoding="utf-8")
+        summary.unlink()
+        check._print_ci(self._report(approved=True), "sarif", str(tmp_path))
+        assert json.loads(capsys.readouterr().out)["runs"][0]["results"] == []
+        text = summary.read_text(encoding="utf-8")
+        assert "PASSED" in text and "rules/inv-a.md" not in text
+        check._print_ci(self._report(approved=True), "github", str(tmp_path))
+        assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("::")] == [
+            "::notice file=rules/inv-a.md,title=weakening approved::rule-deleted: inv-a: deleted"]
+
+    @staticmethod
+    def _prints(*rows) -> list:
+        doc = {"layer1": [{"tool": rule, "target": path, "verdict": False, "detail": message, "lines": [line]}
+                          for rule, path, line, message in rows]}
+        return [r["partialFingerprints"]["primaryLocationLineHash"] for r in json.loads(format_sarif_report(doc))["runs"][0]["results"]]
+
+    def test_fingerprints_survive_line_moves_and_tell_duplicates_apart(self):
+        one = ("no-eval", "pkg/bad.py", 14, "m")
+        assert self._prints(one) == self._prints(("no-eval", "pkg/bad.py", 20, "m"))
+        a, b = self._prints(one, ("no-eval", "pkg/bad.py", 40, "m"))
+        assert a != b
+        assert self._prints(("no-eval", "pkg/bad.py", 21, "m"), ("no-eval", "pkg/bad.py", 47, "m")) == [a, b]
+        assert sorted(self._prints(("no-eval", "pkg/bad.py", 40, "m"), one)) == sorted([a, b])
+        for other in (("other", "pkg/bad.py", 14, "m"), ("no-eval", "pkg/good.py", 14, "m"), ("no-eval", "pkg/bad.py", 14, "n")):
+            assert self._prints(other) != self._prints(one)
+        assert self._prints(("no-eval", "pkg\\bad.py", 14, "m")) == self._prints(one)
+        assert re.fullmatch(r"[0-9a-f]{16}", a)
+
+    @needs_git
+    def test_an_error_path_still_prints_a_valid_empty_log(self, tmp_path, capsys, monkeypatch):
+        from aegis_cli.cli import main
+
+        repo = cov_repo(tmp_path)
+        os.chdir(repo.root)
+        rc = main(["check", "--ci", "--base", "no-such-ref", "--format", "sarif"])
+        out, err = capsys.readouterr()
+        assert rc == 1 and err.startswith("Error:")
+        log = json.loads(out)
+        assert set(log) == {"$schema", "version", "runs"} and log["runs"][0]["results"] == []
+        assert log["runs"][0]["invocations"][0]["executionSuccessful"] is False
 
 
 class TestStatusBlockedCommands:

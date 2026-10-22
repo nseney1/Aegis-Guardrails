@@ -267,6 +267,7 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
 def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> str:
     """Render a Markdown job summary for $GITHUB_STEP_SUMMARY."""
     anchored, lineless = _split(report_dict, workspace_root)
+    lineless = [f for f in lineless if f["level"] != "note"]  # an approved change is no finding
     status = report_dict.get("status")
     passed = report_dict.get("passed", status == "pass" if status is not None else not (anchored or lineless))
     lines = [f"## Aegis Check Summary: {'PASSED' if passed else 'FAILED'}", ""]
@@ -297,30 +298,31 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
     return "\n".join(lines).strip() + "\n"
 
 
-class SarifReport(str):
-    _data: dict[str, Any]
+def _fingerprints(anchored: list[dict[str, Any]]) -> list[str]:
+    """One ``primaryLocationLineHash`` per finding: (uri, rule, occurrence, message), the occurrence
+    counted per (uri, rule, message) in line order. Moving every line keeps each value; two equal
+    findings in one file still differ. One-time effect: alerts from before 4.4.0 reopen."""
+    seen: dict[tuple[str, str, str], int] = {}
+    prints = [""] * len(anchored)
+    for i in sorted(range(len(anchored)), key=lambda i: (anchored[i]["line"], anchored[i]["col"], i)):
+        f = anchored[i]
+        key = (f["uri"], f["rule_id"], f["message"])
+        seen[key] = seen.get(key, -1) + 1
+        joined = "\0".join((f["uri"], f["rule_id"], str(seen[key]), f["message"]))
+        prints[i] = hashlib.sha256(joined.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return prints
 
-    def __new__(cls, text: str, data: dict[str, Any]) -> "SarifReport":
-        obj = super().__new__(cls, text)
-        obj._data = data
-        return obj
 
-    def __getitem__(self, key: Any) -> Any:
-        return self._data[key] if isinstance(key, str) else super().__getitem__(key)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._data.get(key, default)
-
-
-def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> SarifReport:
-    """Format verification results as valid SARIF 2.1.0, routing line-less findings to step_summary."""
-    anchored, _ = _split(report_dict, workspace_root)
+def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None,
+                        error: str = "") -> str:
+    """A SARIF 2.1.0 log of the line-anchored findings; line-less ones go to the step summary only.
+    With ``error`` the run is reported as not completed, with no result."""
+    anchored = [] if error else _split(report_dict, workspace_root)[0]
     rules_seen: dict[str, dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
-    for f in anchored:
+    for f, line_hash in zip(anchored, _fingerprints(anchored)):
         rid = f["rule_id"]
         rules_seen.setdefault(rid, {"id": rid, "shortDescription": {"text": rid}})
-        line_hash = hashlib.sha256(f"{f['uri']}:{f['line']}:{rid}:{f['message']}".encode("utf-8")).hexdigest()[:16]
         results.append({
             "ruleId": rid, "level": f["level"], "message": {"text": f["message"]},
             "locations": [{"physicalLocation": {"artifactLocation": {"uri": f["uri"], "uriBaseId": "%SRCROOT%"},
@@ -329,10 +331,10 @@ def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[st
         })
     from aegis_core._version import __version__
 
-    payload: dict[str, Any] = {
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
-        "runs": [{"tool": {"driver": {"name": "Aegis Guardrails", "version": __version__, "rules": list(rules_seen.values())}},
-                  "results": results}],
-        "step_summary": format_github_step_summary(report_dict, workspace_root=workspace_root),
-    }
-    return SarifReport(json.dumps(payload, indent=2), payload)
+    run: dict[str, Any] = {"tool": {"driver": {"name": "Aegis Guardrails", "version": __version__,
+                                               "rules": list(rules_seen.values())}}, "results": results}
+    if error:
+        run["invocations"] = [{"executionSuccessful": False, "toolExecutionNotifications": [
+            {"level": "error", "message": {"text": error}}]}]
+    return json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [run]},
+                      indent=2)
