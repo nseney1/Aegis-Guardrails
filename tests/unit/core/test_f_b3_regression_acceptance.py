@@ -28,8 +28,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
 4. Rollout at warning tier in ``aegis check --ci``:
    - Default ``warning`` tier reports findings in ``regression`` in ``--format json`` and emits
      ``::warning`` annotations in ``--format github`` while exiting 0 when rules are intact.
-   - At ``gate`` tier (``--strict`` or user config ``regression.tier="gate"``), unapproved
-     regression failures exit 1 and emit ``::error`` annotations.
+   - No setting raises the tier in 4.4.0 (gate status is earned through T4): ``--ci --strict``
+     is a usage error (exit 2) and a user config ``regression.tier="gate"`` is ignored.
 """
 from __future__ import annotations
 
@@ -558,20 +558,26 @@ def test_check_ci_starts_at_warning_tier_and_emits_warning_annotations_without_f
 
 
 @needs_git
-def test_check_ci_in_strict_or_gate_mode_fails_on_unapproved_regression(
+def test_check_ci_strict_is_refused_and_a_gate_config_stays_at_warning(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
     repo = make_calc_repo(tmp_path)
     repo.write("src/calc.py", "def add(a: int, b: int) -> int:\n    return a + b\n")
     repo.commit("fix: addition fix without test")
 
-    rc, out, _err = run_ci(repo, capsys, "--strict", "--format", "json")
-    assert rc == 1
+    rc, out, err = run_ci(repo, capsys, "--strict", "--format", "json")
+    assert rc == 2 and out == "" and "--strict" in err
+
+    user_cfg = tmp_path / "home" / ".aegis"
+    user_cfg.mkdir(parents=True, exist_ok=True)
+    (user_cfg / "config.json").write_text(json.dumps({"v": 1, "regression": {"tier": "gate"}}), encoding="utf-8")
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    assert rc == 0
     payload = json.loads(out)
-    assert payload["status"] == "fail"
-    assert payload["regression"]["tier"] == "gate"
+    assert payload["status"] == "pass"
+    assert payload["regression"]["tier"] == "warning"
     assert payload["regression"]["passed"] is False
-    assert payload["regression"]["blocking"] is True
+    assert payload["regression"]["blocking"] is False
 
 
 @needs_git

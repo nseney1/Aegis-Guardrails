@@ -13,7 +13,7 @@ import tempfile
 from typing import Any, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from aegis_core import checkrun, gitsafe, governance, human_gate, match
-from aegis_core.config import _is_within, read_user_config
+from aegis_core.config import _is_within
 from aegis_core.errors import AegisError
 from aegis_core.rules import workspace_root
 
@@ -30,7 +30,6 @@ __all__ = [
     "SOURCE",
     "UNVERIFIED_CODES",
     "UntestedChange",
-    "VALID_TIERS",
     "check_ci_regressions",
     "is_config_file",
     "is_doc_file",
@@ -44,7 +43,6 @@ __all__ = [
 SCHEMA = "aegis.regression/v1"
 SOURCE = "aegis check --ci"
 DEFAULT_TIER = "warning"
-VALID_TIERS = ("warning", "gate")
 PRUNE_BOX_EXEMPTION_RATE = 0.25
 DEFAULT_TIMEOUT_S = 120.0
 _GIT_TIMEOUT_S = 60.0
@@ -297,15 +295,6 @@ class RegressionReport:
             "untested_changes": [u.as_dict() for u in self.untested_changes],
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
         }
-
-
-def _user_regression_tier(root: str) -> str:
-    data = read_user_config(root)
-    reg = data.get("regression") if data else None
-    tier = reg.get("tier") if isinstance(reg, dict) else None
-    if isinstance(tier, str) and tier.strip().lower() in VALID_TIERS:
-        return tier.strip().lower()
-    return DEFAULT_TIER
 
 
 def _git_run(cwd: str, args: Sequence[str], stdin: Optional[bytes] = None) -> bytes:
@@ -622,7 +611,6 @@ def check_ci_regressions(
     base: str,
     head: str = "HEAD",
     *,
-    tier: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_S,
 ) -> RegressionReport:
     root = workspace_root(workspace)
@@ -637,10 +625,6 @@ def check_ci_regressions(
     if not merge_commit:
         raise RegressionError(f"{base!r} and {head!r} share no history (fetch with fetch-depth: 0)")
 
-    effective_tier = tier.strip().lower() if isinstance(tier, str) and tier.strip() else _user_regression_tier(root)
-    if effective_tier not in VALID_TIERS:
-        effective_tier = DEFAULT_TIER
-
     rev_out = _git_run(root, ["rev-list", "--no-merges", "--reverse", f"{merge_commit}..{head_commit}"])
     fix_metas: List[_CommitMeta] = []
     untested: List[UntestedChange] = []
@@ -653,7 +637,7 @@ def check_ci_regressions(
             if src and not any(is_test_file(p) for p in meta.changed_files):
                 untested.append(UntestedChange(meta.oid, meta.subject, src))
     if not fix_metas:
-        return RegressionReport(base_commit, head_commit, merge_commit, effective_tier, (), (), tuple(untested), None)
+        return RegressionReport(base_commit, head_commit, merge_commit, DEFAULT_TIER, (), (), tuple(untested), None)
 
     tree_cache: Dict[str, Dict[str, Tuple[str, str]]] = {}
     evaluated: List[CommitRegression] = []
@@ -668,7 +652,7 @@ def check_ci_regressions(
         base_commit,
         head_commit,
         merge_commit,
-        effective_tier,
+        DEFAULT_TIER,
         tuple(evaluated),
         tuple(findings),
         tuple(untested),

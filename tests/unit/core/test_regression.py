@@ -326,23 +326,28 @@ def test_hermetic_runner_scrubs_environment(tmp_path: Path, monkeypatch: pytest.
 
 
 @needs_git
-def test_user_config_sets_tier_but_repo_config_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_no_config_or_argument_raises_the_tier_above_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """R-evidence-29: T5 stays at warning until T4 promotes it. Neither the repository's nor the user's
+    regression.tier changes the tier, and the tier= argument is gone."""
     repo = make_repo(tmp_path)
     repo.write("src/app.py", "def compute(x: int) -> int:\n    return x + 1\n")
     repo.commit("fix: change without test")
 
-    # Repo config trying to set tier is ignored
     repo.write(".aegis/config.json", json.dumps({"v": 1, "regression": {"tier": "gate"}}))
-    r1 = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert r1.tier == "warning"
-
-    # User-scope config outside workspace sets tier="gate"
     user_cfg = tmp_path / "home" / ".aegis"
     user_cfg.mkdir(parents=True, exist_ok=True)
     (user_cfg / "config.json").write_text(json.dumps({"v": 1, "regression": {"tier": "gate"}}), encoding="utf-8")
-    r2 = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert r2.tier == "gate"
-    assert r2.blocking is True
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert (report.tier, report.passed, report.blocking, report.status) == ("warning", False, False, "warning")
+    with pytest.raises(TypeError):
+        regression.check_ci_regressions(repo.root, "main", "HEAD", tier="gate")
+    assert not hasattr(regression, "VALID_TIERS")
+
+
+def test_a_gate_tier_report_still_blocks_for_a_future_promotion():
+    failed = regression.CommitRegression("a" * 40, "fix: x", "failed", "no_test_changes", False, False)
+    assert regression.RegressionReport("b", "h", "m", tier="gate", commits=(failed,)).blocking is True
+    assert regression.RegressionReport("b", "h", "m", commits=(failed,)).blocking is False
 
 
 @needs_git

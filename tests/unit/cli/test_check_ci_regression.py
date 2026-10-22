@@ -102,22 +102,55 @@ def test_a_go_only_fix_is_reported_unverified_and_never_fails(tmp_path: Path, ca
 
 
 @needs_git
-def test_ci_github_format_emits_error_when_strict_gate_enabled(
+def test_ci_strict_is_a_usage_error_and_runs_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    """R-evidence-29: Given aegis check --ci --strict, When it runs, Then it exits 2 naming --strict,
+    prints nothing on stdout and starts no process (no git, no pytest)."""
+    import subprocess
+    from aegis_cli.check import CheckCommand
+
+    repo = make_repo(tmp_path)
+    repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
+    repo.commit("fix: fix app without tests")
+    spawned: list = []
+
+    class NoSpawn:
+        def __init__(self, argv, *args, **kwargs):
+            spawned.append(list(argv))
+            raise AssertionError(f"started {argv!r}")
+
+    parser = argparse.ArgumentParser()
+    cmd = CheckCommand()
+    cmd.configure_parser(parser)
+    args = parser.parse_args(["--ci", "--strict", "--base", "main"])
+    args._root = repo.root
+    monkeypatch.setattr(subprocess, "Popen", NoSpawn)
+    rc = cmd.execute(args)
+    captured = capsys.readouterr()
+    assert rc == 2 and spawned == []
+    assert "--ci does not combine with --strict" in captured.err
+    assert captured.out == ""
+
+
+@needs_git
+def test_ci_github_format_emits_a_warning_for_an_untested_fix(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
+    """No setting makes T5 block in 4.4.0: the annotation is a warning and the job passes."""
     repo = make_repo(tmp_path)
     repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
     repo.commit("fix: fix app without tests")
 
-    rc, out, _err = run_ci(repo, capsys, "--strict", "--format", "github")
-    assert rc == 1
-    errors = [line for line in out.splitlines() if line.startswith("::error")]
-    assert len(errors) == 1
-    assert "no_test_changes" in errors[0]
+    rc, out, _err = run_ci(repo, capsys, "--format", "github")
+    assert rc == 0
+    annotations = [line for line in out.splitlines() if line.startswith("::")]
+    assert len(annotations) == 1
+    assert annotations[0].startswith("::warning ") and "no_test_changes" in annotations[0]
 
 
 @needs_git
-def test_require_regression_namespace_attribute_enforces_gate_tier(
+def test_require_regression_namespace_attribute_is_ignored(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
     repo = make_repo(tmp_path)
@@ -136,10 +169,33 @@ def test_require_regression_namespace_attribute_enforces_gate_tier(
     rc = run_check(ns)
     out = capsys.readouterr().out
     payload = json.loads(out)
-    assert rc == 1
-    assert payload["status"] == "fail"
-    assert payload["regression"]["tier"] == "gate"
-    assert payload["regression"]["blocking"] is True
+    assert rc == 0
+    assert payload["status"] == "pass"
+    assert payload["regression"]["tier"] == "warning"
+    assert payload["regression"]["blocking"] is False
+    assert payload["regression"]["passed"] is False
+
+
+@needs_git
+def test_a_user_config_gate_tier_is_ignored_and_the_static_hint_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Given user config regression.tier = "gate" and a fix without a test, When check --ci runs,
+    Then it exits 0 at warning tier and prints the static hint."""
+    repo = make_repo(tmp_path)
+    repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
+    repo.commit("fix: fix app without tests")
+    user_cfg = tmp_path / "home" / ".aegis"
+    user_cfg.mkdir(parents=True, exist_ok=True)
+    (user_cfg / "config.json").write_text(json.dumps({"v": 1, "regression": {"tier": "gate"}}), encoding="utf-8")
+
+    rc, out, _err = run_ci(repo, capsys)
+    assert rc == 0
+    assert "  regression tier: warning (advisory in 4.4.0; no setting makes it block)" in out
+    assert "[WARN:regression/no_test_changes]" in out
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    reg = json.loads(out)["regression"]
+    assert rc == 0 and (reg["tier"], reg["blocking"], reg["status"]) == ("warning", False, "warning")
 
 
 @needs_git
@@ -153,7 +209,7 @@ def test_ci_json_reports_exempted_fix_and_passing_status(
     fix_oid = repo.commit("fix: hotfix without test\n\nAegis-No-Test: verified manually")
     repo.commit(human_gate.exemption_message(fix_oid, "verified manually"), sign_key=human, allow_empty=True)
 
-    rc, out, _err = run_ci(repo, capsys, "--strict", "--format", "json")
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
     assert rc == 0
     payload = json.loads(out)
     assert payload["status"] == "pass"

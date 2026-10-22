@@ -307,7 +307,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         print(sanitize_display(f"  note: {note}", 400))
     if reg_report is not None:
         if reg_report.findings and reg_report.tier != "gate":
-            print('  regression tier: warning (advisory; blocking at gate tier via --strict or regression.tier="gate")')
+            print("  regression tier: warning (advisory in 4.4.0; no setting makes it block)")
         for finding in reg_report.findings:
             tag = ("UNVERIFIED" if finding.code in regression.UNVERIFIED_CODES
                    else "FAIL" if reg_report.tier == "gate" else "WARN")
@@ -348,17 +348,18 @@ def _run_ci(args: argparse.Namespace) -> int:
         ("--hook", bool(getattr(args, "hook", False))),
         ("--dry-run", bool(getattr(args, "dry_run", False))), ("--llm-cmd", getattr(args, "llm_cmd", None) is not None),
         ("--paths", getattr(args, "paths", None) is not None), ("--base-policy", bool(getattr(args, "base_policy", False))),
-        ("--split", bool(getattr(args, "split", None))),
+        ("--split", bool(getattr(args, "split", None))), ("--strict", bool(getattr(args, "strict", False))),
     ) if given]
-    if stray:
-        print(f"Error: --ci does not combine with {', '.join(stray)}: it compares the committed rules of two commits",
-              file=sys.stderr)
-        return 2
     no_exec = bool(getattr(args, "no_exec", False))
     runs_code = [flag for flag, attr in (("--coverage", "coverage"), ("--perf", "perf"), ("--strict", "strict"),
                                          ("--require-regression", "require_regression")) if getattr(args, attr, False)]
+    # --no-exec's own refusal is checked first so that its message names it.
     if no_exec and runs_code:
         print(f"Error: --no-exec does not combine with {', '.join(runs_code)}: they run the repository's code",
+              file=sys.stderr)
+        return 2
+    if stray:
+        print(f"Error: --ci does not combine with {', '.join(stray)}: it compares the committed rules of two commits",
               file=sys.stderr)
         return 2
     fmt = "json" if getattr(args, "json", False) else str(getattr(args, "format", None) or "text").lower()
@@ -371,11 +372,9 @@ def _run_ci(args: argparse.Namespace) -> int:
         print("Error: --ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
               file=sys.stderr)
         return 1
-    force_gate = bool(getattr(args, "strict", False) or getattr(args, "require_regression", False))
-    reg_tier = "gate" if force_gate else None
     try:
         report = rule_integrity.check_ci(root, base, head, pull_request=_event_pull_request())
-        reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, tier=reg_tier)
+        reg_report = None if no_exec else regression.check_ci_regressions(root, base, head)
         trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head)
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
         print(f"Error: {sanitize_display(str(exc), 400)}", file=sys.stderr)
@@ -522,8 +521,8 @@ class CheckCommand(AegisCommand):
             "slot cap), or a change to the governance set (when the base lists a signing key). A "
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
             "branch's allowed_signers or, at tier A on a pull_request run, a non-author's approving review of the "
-            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs T5 fix-commit regression checks (advisory at default warning tier; "
-            'blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail',
+            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, "
+            "a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
         )
         parser.add_argument(
             "--head",
