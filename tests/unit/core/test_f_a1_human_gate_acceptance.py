@@ -203,8 +203,9 @@ class _ReviewsGh(hg.FakeGh):
 @needs_git
 def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_path):
     """Given a base CODEOWNERS that owns the changed rule and a non-author's APPROVED review of the head,
-    When the ruleset requires an approval, code-owner review and stale-review dismissal (tier A), Then the
-    review is the approval; When any of the three is missing, Then it is not, and the reviews are never read."""
+    When the ruleset requires an approval, code-owner review, stale-review dismissal and the last push's
+    approval by someone else (tier A), Then the review is the approval; When any of the four is missing,
+    Then it is not, and the reviews are never read."""
     repo = hg.make_repo(tmp_path)
     repo.git("checkout", "-q", "main")
     repo.write(".github/CODEOWNERS", hg.CODEOWNERS_FULL)
@@ -214,17 +215,23 @@ def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_pa
     approving = [{"user": {"login": "human", "type": "User"}, "state": "APPROVED", "commit_id": head,
                   "author_association": "OWNER"}]
     paths = [".aegis/rules/traps/trap-sample.md"]
-    gh = _ReviewsGh(approving, rules=[hg.pull_request_rule()])
+    gh = _ReviewsGh(approving, rules=[hg.pull_request_rule(last_push=True)])
     verdict = human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh)
     assert verdict is not None and verdict.valid and (verdict.source, verdict.signer, verdict.commit) == ("review", "human", head)
-    for rule in (hg.pull_request_rule(approvals=0), hg.pull_request_rule(code_owners=False),
-                 hg.pull_request_rule(dismiss_stale=False)):
+    # The ruleset doctor --github proposes for tier A is such a merge gate.
+    gh = _ReviewsGh(approving, rules=human_gate.build_ruleset("A", ["aegis-check"])["rules"])
+    assert human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh) is not None
+    absent = hg.pull_request_rule(last_push=True)
+    del absent["parameters"]["require_last_push_approval"]
+    # Without require_last_push_approval whoever pushed the last commit may be the approving reviewer.
+    for rule in (hg.pull_request_rule(approvals=0, last_push=True), hg.pull_request_rule(code_owners=False, last_push=True),
+                 hg.pull_request_rule(dismiss_stale=False, last_push=True), hg.pull_request_rule(last_push=False), absent):
         gh = _ReviewsGh(approving, rules=[rule])
         assert human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh) is None
         assert not any("/pulls/" in c[0][-1] for c in gh.calls) and gh.posts == []
     # The base branch is the pull request's, checked again here: a name in doubt reads nothing.
     for ref in ("", "../main", "main?x", "a b", None):
-        gh = _ReviewsGh(approving, rules=[hg.pull_request_rule()])
+        gh = _ReviewsGh(approving, rules=[hg.pull_request_rule(last_push=True)])
         assert human_gate.find_review_approval(repo.root, pull._replace(base_ref=ref), base, paths, gh=gh) is None
         assert gh.calls == []
 

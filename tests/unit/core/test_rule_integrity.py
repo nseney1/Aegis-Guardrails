@@ -982,7 +982,7 @@ class ReviewGh(hg.FakeGh):
 
     def __init__(self, reviews: Optional[List[Dict[str, Any]]] = None, fail: Optional[Dict[str, Any]] = None,
                  branch_rules: Optional[Dict[str, List[Dict[str, Any]]]] = None, **kw: Any) -> None:
-        kw.setdefault("rules", [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True)])
+        kw.setdefault("rules", [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=True)])
         super().__init__(**kw)
         self.reviews = reviews if reviews is not None else []
         self.fail = fail or {}
@@ -1083,12 +1083,20 @@ def test_tier_a_a_non_author_approving_review_of_the_head_approves_a_weakening(t
     assert "approved by review of human" in capsys.readouterr().out
 
 
+def _without_last_push() -> Dict[str, Any]:
+    rule = hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=True)
+    del rule["parameters"]["require_last_push_approval"]
+    return rule
+
+
 @needs_git
 @pytest.mark.parametrize("rule", [
-    hg.pull_request_rule(approvals=1, code_owners=False, dismiss_stale=True),
-    hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=False),
-    hg.pull_request_rule(approvals=0, code_owners=True, dismiss_stale=True),
-], ids=["no-code-owner-review", "stale-kept", "no-approval"])
+    hg.pull_request_rule(approvals=1, code_owners=False, dismiss_stale=True, last_push=True),
+    hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=False, last_push=True),
+    hg.pull_request_rule(approvals=0, code_owners=True, dismiss_stale=True, last_push=True),
+    hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=False),
+    _without_last_push(),
+], ids=["no-code-owner-review", "stale-kept", "no-approval", "last-pusher-may-approve", "last-push-absent"])
 def test_a_review_under_a_tier_b_or_c_ruleset_approves_nothing_and_reviews_are_never_read(
         tmp_path, capsys, monkeypatch, rule):
     gh = ReviewGh(rules=[rule])

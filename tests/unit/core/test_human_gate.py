@@ -732,6 +732,7 @@ def test_ruleset_variants_differ_in_reviews_only():
     by_type = lambda ruleset: {r["type"]: r.get("parameters", {}) for r in ruleset["rules"]}  # noqa: E731
     assert by_type(a)["pull_request"]["required_approving_review_count"] == 1
     assert by_type(a)["pull_request"]["require_code_owner_review"] is True
+    assert by_type(a)["pull_request"]["require_last_push_approval"] is True  # the review approval needs it
     assert by_type(b)["pull_request"]["required_approving_review_count"] == 0
     assert [c["context"] for c in by_type(a)["required_status_checks"]["required_status_checks"]] == [
         "validate", "test-windows"]
