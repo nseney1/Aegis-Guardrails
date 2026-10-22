@@ -335,7 +335,12 @@ def uninstall_hook(
                 return False
             target_file = real_target
 
-    content = target_file.read_text(encoding="utf-8")
+    try:
+        content = target_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Never a lossy errors="replace" rewrite: it would corrupt the user's own bytes.
+        print(f"Error: {target_file} is not UTF-8 text; left unchanged", file=sys.stderr)
+        return False
     if not any(start_m in content for start_m, _end_m in _MARKERS):
         return False
 
@@ -706,8 +711,9 @@ def run_hook_uninstall(args: Any) -> int:
 
     st = hook_status(ws)
     ok = uninstall_hook(ws, force=force, dry_run=dry_run)
-    if ok:
-        _trailer_hook(st, "uninstall", dry_run=dry_run)
+    # The trailer hook can outlive its pre-commit hook, and commitmsg.uninstall removes only
+    # a file that carries Aegis's markers, so it is removed whatever happened to pre-commit.
+    trailer = _trailer_hook(st, "uninstall", dry_run=dry_run)
     if use_json:
         print(json.dumps({"status": "uninstalled" if ok else "not_found", "success": ok}))
     else:
@@ -715,6 +721,9 @@ def run_hook_uninstall(args: Any) -> int:
             print("✅ aegis pre-commit hook removed")
         else:
             print("ℹ️ No aegis pre-commit hook found to uninstall")
+            if trailer == "removed":
+                print("prepare-commit-msg hook would be removed (dry run)" if dry_run
+                      else "prepare-commit-msg hook removed")
     return 0 if ok else 1
 
 
