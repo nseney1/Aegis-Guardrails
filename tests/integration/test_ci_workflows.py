@@ -402,17 +402,23 @@ def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_tar
 
 
 def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
-    """N4 (static): base.sha checkout without credentials, the head only as data, read-only token,
-    no secret, nothing that builds, installs, caches or tests the checkout."""
+    """N4 (static): base.sha checkout without credentials, the head only as data, a read-only token
+    (contents and pull-requests, the latter for tier A's review lookup) handed as GH_TOKEN to the check
+    step only, no secret, nothing that builds, installs, caches or tests the checkout."""
     text = _read(GOVERNANCE_WORKFLOW)
     workflow = yaml.safe_load(text)
     assert set(_triggers(workflow)) == {"pull_request_target"}
+    assert workflow.get("permissions") == {"contents": "read", "pull-requests": "read"}
     for perms in _permission_maps(workflow):
         assert isinstance(perms, dict), "permissions must be explicit maps"
-        writes = {k for k, v in perms.items() if v != "read"}
-        assert writes <= {"checks"} and all(perms[k] == "write" for k in writes), perms
+        assert set(perms.items()) <= {("contents", "read"), ("pull-requests", "read")}, perms
     assert "secrets." not in text
+    assert "env" not in workflow and all("env" not in job for job in workflow["jobs"].values())
     steps = [s for job in workflow["jobs"].values() for s in job.get("steps", [])]
+    (check_step,) = [s for s in steps if re.search(r"\bcheck --ci\b", s.get("run", ""))]
+    assert check_step.get("env") == {"GH_TOKEN": "${{ github.token }}"}
+    assert [s for s in steps if re.search(r"GH_TOKEN|GITHUB_TOKEN|github\.token", str(s.get("env") or ""))] == [check_step]
+    assert text.count("github.token") == 1
     checkouts = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
     assert checkouts and all((s.get("with") or {}).get("ref") == _BASE_SHA for s in checkouts)
     assert all((s.get("with") or {}).get("persist-credentials") is False for s in checkouts)

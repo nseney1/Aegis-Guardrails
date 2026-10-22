@@ -154,12 +154,12 @@ def _event_shas() -> tuple[str | None, str | None]:
 
 
 def _event_pull_request():
-    """The pull request of a ``pull_request`` run, for tier A's review approval: its number, author,
-    full head commit id and base branch, each checked; None for any other event or any value in doubt
-    (no gh call then)."""
+    """The pull request of a ``pull_request`` or ``pull_request_target`` run (the base-sourced governance
+    job), for tier A's review approval: its number, author, full head commit id and base branch, each
+    checked; None for any other event or any value in doubt (no gh call then)."""
     from aegis_core import human_gate
 
-    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+    if os.environ.get("GITHUB_EVENT_NAME") not in ("pull_request", "pull_request_target"):
         return None
     try:
         pull = _event_pull()
@@ -527,7 +527,8 @@ class CheckCommand(AegisCommand):
             "a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's "
             "slot cap), or a change to the governance set (when the base lists a signing key). A "
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
-            "branch's allowed_signers or, at tier A on a pull_request run, a non-author's approving review of the "
+            "branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's "
+            "approving review of the "
             "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, "
             "a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
         )

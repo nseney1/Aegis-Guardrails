@@ -132,3 +132,70 @@ def test_a_real_comparison_still_says_passed(tmp_path, capsys):
     repo.commit("an ordinary change")
     rc, out, _err = run_ci(repo, capsys, "--base", "main")
     assert rc == 0 and PASSED in out and NOTE not in out
+
+
+# ── R-trust-13 (c)-(f): the base-sourced governance job runs on pull_request_target ─────────────
+
+PULL = {"number": 7, "user": {"login": "agent"}, "base": {"sha": "a" * 40, "ref": "main"}, "head": {"sha": "B" * 40}}
+
+
+def event_file(tmp_path: Path, monkeypatch, name: str, payload) -> None:
+    event = tmp_path / "event.json"
+    event.write_bytes(json.dumps(payload).encode("utf-8"))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", name)
+
+
+@pytest.mark.parametrize("name", ["pull_request", "pull_request_target"])
+def test_a_pull_request_target_run_names_its_pull_request_for_the_review_lookup(tmp_path, monkeypatch, name):
+    from aegis_cli import check
+    from aegis_core import human_gate
+
+    event_file(tmp_path, monkeypatch, name, {"pull_request": PULL})
+    assert check._event_pull_request() == human_gate.PullRequest(7, "agent", "b" * 40, "main")
+
+
+@pytest.mark.parametrize("name", ["push", "workflow_dispatch", "pull_request_review", "PULL_REQUEST_TARGET", ""])
+def test_any_other_event_names_no_pull_request(tmp_path, monkeypatch, name):
+    from aegis_cli import check
+
+    event_file(tmp_path, monkeypatch, name, {"pull_request": PULL})
+    assert check._event_pull_request() is None
+
+
+@pytest.mark.parametrize("pull", [
+    {**PULL, "number": "7"}, {**PULL, "number": 0}, {**PULL, "user": {"login": "two words"}},
+    {**PULL, "head": {"sha": "abc"}}, {**PULL, "base": {"sha": "a" * 40, "ref": "../main"}},
+    {k: v for k, v in PULL.items() if k != "user"}, "not an object",
+], ids=["number-str", "number-zero", "login", "sha", "ref", "no-user", "string"])
+def test_a_malformed_pull_request_target_payload_names_no_pull_request(tmp_path, monkeypatch, pull):
+    from aegis_cli import check
+
+    event_file(tmp_path, monkeypatch, "pull_request_target", {"pull_request": pull})
+    assert check._event_pull_request() is None
+
+
+@needs_git
+def test_no_exec_on_pull_request_target_hands_the_pull_request_to_the_weakening_check(tmp_path, capsys, monkeypatch):
+    """--no-exec runs no repository code, but tier A's review lookup (a GitHub read) still gets the
+    pull request; nothing is flagged here, so no gh call happens."""
+    from aegis_core import human_gate, rule_integrity
+
+    repo = make_repo(tmp_path)
+    base = repo.head()
+    repo.branch("work")
+    repo.write("src/app.py", "x = 2\n")
+    head = repo.commit("an ordinary change")
+    event_file(tmp_path, monkeypatch, "pull_request_target", {"pull_request": {
+        "number": 3, "user": {"login": "agent"}, "base": {"sha": base, "ref": "main"}, "head": {"sha": head}}})
+    seen = []
+    real = rule_integrity.check_ci
+
+    def spy(*args, pull_request=None, **kwargs):
+        seen.append(pull_request)
+        return real(*args, pull_request=pull_request, **kwargs)
+
+    monkeypatch.setattr(rule_integrity, "check_ci", spy)
+    rc, out, _err = run_ci(repo, capsys, "--no-exec")
+    assert rc == 0 and PASSED in out
+    assert seen == [human_gate.PullRequest(3, "agent", head, "main")]
