@@ -41,15 +41,15 @@ def test_the_full_codeowners_covers_every_governance_sample():
 
 def test_every_coverage_sample_is_a_governance_path():
     assert [s for s in human_gate.COVERAGE_SAMPLES if governance.category_of(s) is None] == []
-    assert {"pytest.py", "pytest/__init__.py", "iniconfig.py", "py/__init__.py"} <= set(human_gate.COVERAGE_SAMPLES)
+    assert {"pytest.py", "pytest/__init__.x", "iniconfig.py", "py/__init__.x"} <= set(human_gate.COVERAGE_SAMPLES)
 
 
 def test_a_codeowners_that_owns_only_the_source_init_of_a_runner_package_leaves_it_uncovered():
     """Given CODEOWNERS lines that own ``/pytest/__init__.py`` but not the package directory, When
     coverage is checked, Then a compiled ``__init__`` and the ``__main__`` of that package are uncovered."""
     narrow = hg.CODEOWNERS_FULL.replace("/pytest/ @octo\n", "/pytest/__init__.py @octo\n")
-    _covered, uncovered = human_gate.codeowners_coverage(narrow)
-    assert {"pytest/__init__.pyc", "pytest/__main__.py"} <= set(uncovered)
+    _covered, uncovered = human_gate.codeowners_coverage(narrow, repo_paths=["pytest/__init__.py"])
+    assert {"pytest/__init__.x", "pytest/__main__.x"} <= set(uncovered)
     assert "pytest/__init__.py" not in uncovered
 
 
@@ -79,21 +79,47 @@ def test_the_codeowners_lines_doctor_prints_own_labels_and_a_nested_workspace():
 
 
 def test_the_coverage_samples_include_labels_and_a_nested_workspace():
-    assert {".aegis/adjudications/r.jsonl", "svc/.aegis/rules/gates/x.md", "svc/.aegis/config.json"} <= set(
+    assert {".aegis/adjudications/x", "svc/.aegis/rules/gates/x", "svc/.aegis/config.json"} <= set(
         human_gate.COVERAGE_SAMPLES
     )
+
+
+PER_DIRECTORY = "".join(f"**/.aegis/rules/{d}/ @octo\n" for d in
+                        ("invariants", "traps", "gates", "boundaries", "personas", "contracts"))
+
+
+def test_six_per_directory_rule_owners_cover_the_rules_and_a_missing_one_is_named():
+    """Given a CODEOWNERS that owns the six plural rule directories (not .aegis/rules/ itself) and every
+    other sample, Then nothing is uncovered; without traps/, only the traps samples are."""
+    full = hg.CODEOWNERS_FULL.replace("**/.aegis/rules/ @octo\n", "").replace("/.aegis/rules/ @octo\n", PER_DIRECTORY)
+    assert "/.aegis/rules/ @octo" not in full.replace("**/.aegis/rules/", "")
+    assert human_gate.codeowners_coverage(full)[1] == []
+    _covered, uncovered = human_gate.codeowners_coverage(full.replace("**/.aegis/rules/traps/ @octo\n", ""))
+    assert uncovered == [".aegis/rules/traps/x", "svc/.aegis/rules/traps/x"]
+
+
+@needs_git
+def test_a_codeowners_in_docs_holding_the_printed_lines_reaches_tier_a(tmp_path):
+    repo = _repo_with_governance(tmp_path, codeowners=None)
+    repo.git("checkout", "-q", "main")
+    repo.write("docs/CODEOWNERS", "\n".join(human_gate.codeowners_lines("@octo")) + "\n")
+    repo.commit("codeowners in docs")
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()]))
+    codeowners = report.evidence["codeowners"]
+    assert (codeowners["present"], codeowners["path"], codeowners["uncovered"]) == (True, "docs/CODEOWNERS", [])
+    assert report.tier == "A", report.reasons
 
 
 @pytest.mark.parametrize("text", ["", "# only a comment\n", "*.txt @octo\n", "/src/ @octo\n"])
 def test_a_codeowners_that_misses_the_set_leaves_it_uncovered(text):
     _covered, uncovered = human_gate.codeowners_coverage(text)
-    assert ".aegis/rules/trap/sample.md" in uncovered
+    assert ".aegis/rules/traps/x" in uncovered
 
 
 def test_the_last_matching_entry_wins_and_an_entry_with_no_owner_unprotects():
     text = hg.CODEOWNERS_FULL + "/.aegis/rules/\n"
     _covered, uncovered = human_gate.codeowners_coverage(text)
-    assert ".aegis/rules/trap/sample.md" in uncovered
+    assert ".aegis/rules/traps/x" in uncovered
     assert ".aegis/config.json" not in uncovered
 
 
@@ -101,7 +127,7 @@ def test_a_single_star_does_not_cross_a_directory_as_the_matcher_of_target_paths
     # /.aegis/* covers direct children only on GitHub; the rules live two levels down.
     text = hg.CODEOWNERS_FULL.replace("**/.aegis/rules/ @octo\n", "").replace("/.aegis/rules/ @octo\n", "/.aegis/* @octo\n")
     _covered, uncovered = human_gate.codeowners_coverage(text)
-    assert ".aegis/rules/trap/sample.md" in uncovered
+    assert ".aegis/rules/traps/x" in uncovered
     assert ".aegis/config.json" not in uncovered
 
 

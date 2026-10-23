@@ -23,7 +23,6 @@ from aegis_core import gitsafe, governance, pathlookup
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
 from aegis_core.storage import atomic_write_bytes
-from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
 __all__ = [
     "ALLOWED_SIGNERS",
@@ -87,36 +86,8 @@ _STATEMENTS = {
     "B": "governance changes need a signature from a key listed in allowed_signers on the base branch",
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
-COVERAGE_SAMPLES: Tuple[str, ...] = (
-    f"{RULES_RELDIR}/trap/sample.md",
-    f"{AEGIS_DIRNAME}/config.json",
-    f"{AEGIS_DIRNAME}/team.json",
-    f"{AEGIS_DIRNAME}/baseline.json",
-    f"{AEGIS_DIRNAME}/adjudications/r.jsonl",
-    f"svc/{RULES_RELDIR}/gates/x.md",
-    f"svc/{AEGIS_DIRNAME}/adjudications/r.jsonl",
-    f"svc/{AEGIS_DIRNAME}/config.json",
-    f"svc/{AEGIS_DIRNAME}/team.json",
-    f"svc/{AEGIS_DIRNAME}/baseline.json",
-    "allowed_signers",
-    ".github/workflows/ci.yml",
-    "conftest.py",
-    "pytest.ini",
-    ".pytest.ini",
-    "pytest.toml",
-    ".pytest.toml",
-    "tox.ini",
-    "setup.cfg",
-    "pyproject.toml",
-    "sitecustomize.py",
-    "evil.pth",
-    "Makefile",
-    *(f"{name}.py" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__init__.py" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__init__.pyc" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__main__.py" for name in governance.RUNNER_MODULES),
-)
 _CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+COVERAGE_SAMPLES: Tuple[str, ...] = tuple(dict.fromkeys(governance.coverage_samples() + _CODEOWNERS_LOCATIONS))
 _OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")
 _MAX_CODEOWNERS_LINES = 5000
 _MAX_PATTERN = 300
@@ -343,39 +314,7 @@ def codeowners_coverage(
     return covered, uncovered
 
 
-def codeowners_lines(owner: str = "@OWNER") -> List[str]:
-    paths = [
-        f"/{RULES_RELDIR}/",
-        f"/{AEGIS_DIRNAME}/config.json",
-        f"/{AEGIS_DIRNAME}/team.json",
-        f"/{AEGIS_DIRNAME}/baseline.json",
-        f"/{AEGIS_DIRNAME}/adjudications/",
-        # A workspace below the root has its own .aegis; a leading **/ matches at any depth
-        # (the root included) both here and on GitHub.
-        f"**/{RULES_RELDIR}/",
-        f"**/{AEGIS_DIRNAME}/adjudications/",
-        f"**/{AEGIS_DIRNAME}/config.json",
-        f"**/{AEGIS_DIRNAME}/team.json",
-        f"**/{AEGIS_DIRNAME}/baseline.json",
-        "/allowed_signers",
-        "/CODEOWNERS",
-        "/.github/CODEOWNERS",
-        "/.github/workflows/",
-        "conftest.py",
-        "pytest.ini",
-        ".pytest.ini",
-        "pytest.toml",
-        ".pytest.toml",
-        "tox.ini",
-        "setup.cfg",
-        "pyproject.toml",
-        "sitecustomize.py",
-        "*.pth",
-        "Makefile",
-        *(f"{name}.*" for name in governance.RUNNER_MODULES),
-        *(f"/{name}/" for name in governance.RUNNER_MODULES),
-    ]
-    return [f"{path} {owner}" for path in paths]
+codeowners_lines = governance.codeowners_lines
 
 
 @dataclass(frozen=True)

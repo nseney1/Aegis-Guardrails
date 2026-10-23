@@ -187,3 +187,58 @@ def test_the_docstring_says_only_the_lane_gate_reports_skip_markers():
     assert "aegis check --lane" in doc
     assert "the CI weakening check carry those" not in doc
     assert "``aegis check --ci`` and ``--record`` neither gate nor withhold credit" in doc
+
+
+# ── R-trust-36: one table feeds the samples and the CODEOWNERS lines ─────────
+
+def test_every_coverage_sample_is_in_the_set_and_no_rules_sample_uses_a_singular_directory():
+    from aegis_core.taxonomy import RULE_TYPE_DIRS
+
+    samples = governance.coverage_samples()
+    assert samples and [s for s in samples if governance.category_of(s) is None] == []
+    assert not [s for s in samples if "/trap/" in s]
+    assert {f".aegis/rules/{d}/x" for d in RULE_TYPE_DIRS.values()} <= set(samples)
+    assert ".aegis/rules/x" not in samples and "svc/.aegis/config.json" in samples
+
+
+@pytest.mark.parametrize("location", [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"])
+def test_the_printed_codeowners_lines_cover_every_sample_at_every_location(location):
+    """Given the lines doctor --github prints, When CODEOWNERS sits at any location GitHub reads, Then
+    every sample, the other two locations and a nested allowed_signers or CODEOWNERS have an owner."""
+    from aegis_core import human_gate
+
+    text = "\n".join(governance.codeowners_lines("@o"))
+    covered, uncovered = human_gate.codeowners_coverage(text, location, repo_paths=("sub/allowed_signers",
+                                                                                     "sub/CODEOWNERS"))
+    assert uncovered == [] and set(governance.coverage_samples()) <= set(covered)
+    assert {"docs/CODEOWNERS", "CODEOWNERS", ".github/CODEOWNERS", "sub/allowed_signers"} <= set(covered)
+
+
+def test_the_codeowners_lines_follow_the_table():
+    lines = governance.codeowners_lines("@o")
+    assert lines[:2] == ["**/.aegis/rules/ @o", "**/.aegis/config.json @o"]
+    assert {"allowed_signers @o", "CODEOWNERS @o", "/.github/workflows/ @o", "*.pth @o",
+            "/pytest/__init__.* @o"} <= set(lines)
+    assert len(lines) == sum(len(patterns) for _name, patterns in governance.CATEGORIES)
+
+
+@pytest.mark.skipif(not __import__("shutil").which("git"), reason="needs git")
+def test_the_approval_hash_of_a_fixed_tree_is_the_one_develop_computed(tmp_path, monkeypatch):
+    """Given a tree of governance files, When its approval hash is computed, Then it is the digest the
+    code at develop 35d8ac21 computed for the same tree: deriving the samples and the CODEOWNERS lines
+    from the table leaves every 4.3 approval verifying (D-governance-gate)."""
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(tmp_path / "home"))
+    repo = hg.make_repo(tmp_path)
+    for path, text in {".aegis/config.json": '{"v": 1}\n', "CODEOWNERS": "* @octo\n", "conftest.py": "x = 1\n",
+                       ".github/workflows/ci.yml": "name: CI\n", "svc/.aegis/adjudications/r.jsonl": "{}\n",
+                       "pytest.ini": "[pytest]\n"}.items():
+        repo.write(path, text)
+    repo.commit("governance")
+    if len(repo.head()) != 40:
+        pytest.skip("the recorded digest is of SHA-1 object ids")
+    assert human_gate.governance_tree_hash(repo.root, "HEAD") == (
+        "faf26c6ff1fb848b3ef716fcc2062ce4e82c95b48f84bcd85e5a0f9523790edb")
