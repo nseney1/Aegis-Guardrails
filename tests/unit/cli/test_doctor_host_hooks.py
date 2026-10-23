@@ -622,3 +622,81 @@ def test_text_output_shows_each_hosts_hooks_and_the_known_gaps(env):
     flat = " ".join(out.split())
     for gap in registrar.KNOWN_GAPS:
         assert " ".join(gap.split()) in flat
+
+
+# ── the git pre-commit hook is replaced atomically, never through a link (X-w8-carry i) ──
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and mode bits")
+
+
+def _hook_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from tests.helpers_checkmodes import init_repo
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    root = init_repo(tmp_path / "repo", rules=False)
+    hook = root / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_bytes(b"#!/bin/sh\necho user-check\n")
+    os.chmod(hook, 0o750)
+    return root
+
+
+def _plant(root: Path, tmp_path: Path) -> Path:
+    """A victim outside the repository and a link to it at the old temporary-file name."""
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    os.chmod(victim, 0o600)
+    (root / ".git" / "hooks" / f".pre-commit.tmp.{os.getpid()}").symlink_to(victim)
+    return victim
+
+
+@posix_only
+def test_install_never_writes_through_a_link_at_a_temporary_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_cli.hooks import management
+
+    root = _hook_repo(tmp_path, monkeypatch)
+    victim = _plant(root, tmp_path)
+    assert management.install_hook(root, python="/usr/bin/python3") is True
+    assert victim.read_bytes() == b"precious" and stat.S_IMODE(victim.stat().st_mode) == 0o600
+    hook = root / ".git" / "hooks" / "pre-commit"
+    assert not hook.is_symlink() and stat.S_IMODE(hook.stat().st_mode) == 0o755
+    assert b"echo user-check" in hook.read_bytes() and management.hook_status(root)["managed_by_aegis"]
+
+
+@posix_only
+def test_uninstall_never_writes_through_a_link_at_a_temporary_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_cli.hooks import management
+
+    root = _hook_repo(tmp_path, monkeypatch)
+    assert management.install_hook(root, python="/usr/bin/python3") is True
+    hook = root / ".git" / "hooks" / "pre-commit"
+    os.chmod(hook, 0o750)
+    victim = _plant(root, tmp_path)
+    assert management.uninstall_hook(root) is True
+    assert victim.read_bytes() == b"precious" and stat.S_IMODE(victim.stat().st_mode) == 0o600
+    assert hook.read_bytes() == b"#!/bin/sh\necho user-check\n" and stat.S_IMODE(hook.stat().st_mode) == 0o750
+
+
+def test_a_hook_that_cannot_be_replaced_is_left_as_it_was_with_no_temporary_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_cli.hooks import management
+
+    root = _hook_repo(tmp_path, monkeypatch)
+    hooks = root / ".git" / "hooks"
+    before = (hooks / "pre-commit").read_bytes()
+
+    real_replace = os.replace
+
+    def broken_replace(src, dst):
+        if Path(dst).parent == hooks:  # the backup copy under ~/.aegis/backups is still written
+            raise OSError(5, "Input/output error")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", broken_replace)
+    monkeypatch.setattr(Path, "replace", lambda self, target: broken_replace(self, target))
+    with pytest.raises(OSError, match="Input/output"):
+        management.install_hook(root, python="/usr/bin/python3")
+    assert (hooks / "pre-commit").read_bytes() == before
+    assert sorted(p.name for p in hooks.iterdir() if "tmp" in p.name) == []
