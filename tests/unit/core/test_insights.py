@@ -1,6 +1,7 @@
 """Unit tests for aegis_core.insights edge cases, security boundaries, and clustering."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import stat
@@ -29,7 +30,6 @@ from aegis_core.insights import (
     redact_insight_text,
     review_insights,
     session_hs,
-    tfidf_cosine,
     write_proposal,
 )
 
@@ -105,7 +105,7 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
         summary_bullets=["Always pass an explicit timeout parameter to subprocess and network requests."],
         home=home,
     )
-    record_decision(repo, cluster_id="cluster-seed", decision="noise", insight_ids=[seed["id"]], home=home)
+    record_decision(repo, decision="noise", insight_ids=[seed["id"]], home=home)
 
     ins1 = add_insight(
         repo,
@@ -122,19 +122,18 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
 
     record_decision(
         repo,
-        cluster_id="cluster-noise",
         decision="noise",
         insight_ids=[ins_noise["id"]],
         home=home,
     )
 
     rev = review_insights(repo, home=home)
-    all_clustered_ids = [iid for c in rev["clusters"] for iid in c["insight_ids"]]
-    assert ins_noise["id"] not in all_clustered_ids
-    assert ins1["id"] in all_clustered_ids
-    prop_clusters = [c for c in rev["clusters"] if c["match_status"] == "matches_proposal"]
-    assert len(prop_clusters) == 1
-    assert prop_clusters[0]["matched_rule"] == "trap-timeout-required"
+    reviewed_ids = [e["id"] for e in rev["insights"] + rev["suppressed"]]
+    assert ins_noise["id"] not in reviewed_ids
+    assert ins1["id"] in reviewed_ids
+    prop_matches = [e for e in rev["insights"] if e["match"]["status"] == "matches_proposal"]
+    assert len(prop_matches) == 1
+    assert prop_matches[0]["match"]["rule"] == "trap-timeout-required"
 
 
 def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -159,17 +158,28 @@ def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Pat
     assert "text" not in rows[0]
 
 
-def test_tfidf_cosine_and_dirty_paths(tmp_path: Path):
+def _neighbours_of(review: dict, insight_id: str) -> list:
+    (entry,) = [e for e in review["insights"] if e["id"] == insight_id]
+    return entry["neighbours"]
+
+
+def test_tfidf_neighbours_and_dirty_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo = _make_repo(tmp_path / "repo")
     assert dirty_paths(repo) == []
     (repo / "app.py").write_text("a = 2\n", encoding="utf-8")
     (repo / "new_file.py").write_text("b = 3\n", encoding="utf-8")
     assert dirty_paths(repo) == ["app.py", "new_file.py"]
 
-    sim_same = tfidf_cosine("validate path confinement before deletion", "validate path confinement before deleting")
-    sim_diff = tfidf_cosine("validate path confinement before deletion", "configure oauth2 bearer token refresh")
-    assert sim_same > sim_diff
-    assert sim_same > 0.3
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    texts = ("validate path confinement before deletion", "validate path confinement before deleting",
+             "configure oauth2 bearer token refresh")
+    same, near, other = (add_insight(repo, t, paths=["app.py"], home=home)["id"] for t in texts)
+    (only,) = _neighbours_of(review_insights(repo, home=home), same)  # no shared term: not a neighbour
+    assert only["id"] == near and only["similarity"] > 0.3
+    assert _neighbours_of(review_insights(repo, home=home), other) == []
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -518,7 +528,7 @@ def _hook_entry(repo: Path, home: Path, stdin: str):
 
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        rc = run_insight_hook(["--host", "claude-code", "--workspace", str(repo), "--excerpts"], stdin=stdin, home=home)
+        rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=stdin, home=home)
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -547,7 +557,7 @@ def test_a_corrupt_log_and_no_session_still_exit_zero_silently(tmp_path: Path, h
     store = insights_path(repo, home=hb_home)
     store.parent.mkdir(parents=True)
     store.write_bytes(b"\xff{garbage\n")
-    assert _hook_entry(repo, hb_home, '{"prompt": "No, wrong file again"}') == (0, "", "")
+    assert _hook_entry(repo, hb_home, json.dumps({"prompt": "No, wrong file again", "cwd": str(repo)})) == (0, "", "")
     assert [r["event"] for r in read_insight_rows(repo, home=hb_home)] == ["insight"]
 
 
@@ -571,7 +581,8 @@ def _propose(repo: Path, home: Path, bullet: str, pid: str = "trap-lint") -> Pat
 
 
 def _hook_prompt(repo: Path, home: Path, text: str, session: str = "s-lint") -> dict:
-    row = record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    row = record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)},
+                             workspace=repo, home=home)
     assert row.get("event") == "insight", text
     return row
 
@@ -623,3 +634,284 @@ def test_cli_text_of_25_characters_or_more_is_protected(lint_repo):
     with pytest.raises(ValueError, match="verbatim H/cli/W2 prompt text"):
         _propose(repo, home, f"Rule: {text}.")
     assert not (repo / ".aegis" / "proposals" / "trap-lint.md").exists()
+
+
+# ── R-evidence-45: one hook calling convention, a reachable surface, Rule.applies_to ──
+
+def test_the_old_argument_order_of_record_hook_prompt_is_a_type_error(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    payload = {"prompt": "No, stop breaking the build!", "session_id": "s-old", "cwd": str(repo)}
+    with pytest.raises(TypeError):
+        record_hook_prompt(repo, "claude-code", payload, home=hb_home)
+    with pytest.raises(TypeError):
+        record_hook_prompt("claude-code", payload, session="s-typed", home=hb_home)
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_a_hook_whose_recorder_raises_exits_zero_with_the_error_on_stderr(tmp_path: Path, hb_home: Path,
+                                                                           monkeypatch: pytest.MonkeyPatch):
+    from aegis_cli.hooks import insights as hook
+
+    repo = _make_repo(tmp_path / "repo")
+
+    def broken(*args, **kwargs):
+        raise TypeError("recorder broke")
+
+    monkeypatch.setattr(hook, "record_hook_prompt", broken)
+    payload = json.dumps({"prompt": "No, stop breaking the build!", "session_id": "s-err", "cwd": str(repo)})
+    rc, out, err = _hook_entry(repo, hb_home, payload)
+    assert (rc, out) == (0, "") and "aegis insight hook error: recorder broke" in err
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_hook_stdin_that_is_not_a_json_object_records_no_insight(tmp_path: Path, hb_home: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(repo)
+    for stdin in ("stop doing that", '["No, stop doing that"]', '"No, stop doing that"'):
+        assert _hook_entry(repo, hb_home, stdin) == (0, "", "")
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_a_payload_without_the_prompt_key_stores_a_heartbeat_only(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    for alias in ("user_prompt", "text", "message", "input"):
+        payload = {alias: "No, stop breaking the build!", "session_id": f"s-{alias}", "cwd": str(repo)}
+        assert _hook_entry(repo, hb_home, json.dumps(payload)) == (0, "", "")
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["heartbeat"] * 4
+    assert all(r["cue"] is False and "text" not in r for r in rows)
+
+
+def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    payload = {"prompt": "No, stop breaking the build!", "sessionId": "s-alias", "workspace": str(repo),
+               "cwd": str(repo)}
+    assert _hook_entry(repo, hb_home, json.dumps(payload)) == (0, "", "")
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["insight"] and "hs" not in rows[0]
+
+
+def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
+    """Every Name and Attribute identifier used in the Python files under ``roots``, except
+    ``module_file`` itself and the nodes in ``skip``."""
+    import ast
+
+    seen = set()
+    for root in roots:
+        for path in root.rglob("*.py"):
+            if path.resolve() == module_file.resolve():
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
+                       for n in ast.walk(top)}
+            for node in ast.walk(tree):
+                if id(node) in skipped:
+                    continue
+                if isinstance(node, ast.Name):
+                    seen.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    seen.add(node.attr)
+                elif isinstance(node, ast.alias):
+                    seen.add(node.name.split(".")[-1])
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                    seen.add(node.value)  # monkeypatch.setattr(insights, "NAME", ...)
+    return seen
+
+
+def test_every_name_in_insights_all_is_used_outside_the_module():
+    repo = Path(__file__).resolve().parents[3]
+    roots = [repo / name for name in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests")]
+    used = _defined_names_referenced_outside(Path(core_insights.__file__), roots,
+                                             {"test_every_name_in_insights_all_is_used_outside_the_module"})
+    assert sorted(set(core_insights.__all__) - used) == []
+    assert all(hasattr(core_insights, name) for name in core_insights.__all__)
+
+
+def test_dead_insight_names_are_gone():
+    for name in ("INSIGHT_LEVELS", "tfidf_cosine", "MAX_EXCERPT_CHARS"):
+        assert name not in core_insights.__all__
+        assert not hasattr(core_insights, name), name
+    assert "hook" not in core_insights.COUNTABLE_LEVELS
+
+
+_OVERLAP_TEXT = "Stop touching yaml settings in the release scheduler worker"
+_YAML_BODY = "Never call yaml.load on configuration files; use yaml.safe_load for parsing settings."
+
+
+def _overlap_repo(tmp_path: Path, frontmatter: str) -> Path:
+    repo = _make_repo(tmp_path / "repo")
+    (repo / ".aegis" / "rules" / "traps" / "trap-no-yaml-load.md").write_text(
+        f"---\nid: trap-no-yaml-load\ntype: trap\nenforcement: advisory\n{frontmatter}"
+        f"hypothesis: Prevent recurring defect in trap-no-yaml-load.\n---\n# trap-no-yaml-load\n\n{_YAML_BODY}\n",
+        encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "rule")
+    return repo
+
+
+def _match_of(review: dict, insight_id: str) -> tuple:
+    """(matched rule or None, similarity to the closest rule) of one insight in a review."""
+    for entry in review["insights"] + review["suppressed"]:
+        if entry["id"] == insight_id:
+            return entry["match"]["rule"], entry["match"]["similarity"]
+    raise AssertionError(f"{insight_id} is not in the review")
+
+
+def _similarity(repo: Path, home: Path, text: str) -> float:
+    """The similarity the review reports for ``text`` against the one rule when it matches."""
+    import shutil
+
+    probe = home.parent / "probe-home"
+    shutil.rmtree(probe, ignore_errors=True)
+    probe.mkdir()
+    row = add_insight(repo, text, paths=["src/x.py"], home=probe)
+    return _match_of(review_insights(repo, home=probe), row["id"])[1]
+
+
+def test_a_forbid_ast_rule_does_not_match_an_insight_about_a_test_file(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - '**/*.py'\nforbid_ast:\n  calls: [eval]\n")
+    s = _similarity(repo, hb_home, _OVERLAP_TEXT)
+    assert 0.15 <= s < 0.30, s  # a shared path is needed for this similarity to match
+    src = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    test = add_insight(repo, _OVERLAP_TEXT, paths=["tests/x.py"], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, src["id"])[0] == "trap-no-yaml-load"
+    assert _match_of(review, test["id"])[0] is None
+
+
+def test_a_rule_without_target_paths_overlaps_no_insight_path(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "")
+    from aegis_core.rules import load_rules
+
+    assert load_rules(repo).get("trap-no-yaml-load").target_paths == ()
+    probe = add_insight(repo, _OVERLAP_TEXT, paths=[], home=hb_home)  # no paths: overlaps every rule
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, probe["id"])[0] == "trap-no-yaml-load"
+    assert 0.15 <= _match_of(review, probe["id"])[1] < 0.30
+    assert _match_of(review, row["id"])[0] is None
+
+
+def test_a_rule_scoped_to_src_does_not_overlap_an_insight_about_tests(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    s = _similarity(repo, hb_home, _OVERLAP_TEXT)
+    assert 0.15 <= s < 0.30, s
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["tests/x.py"], home=hb_home)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+
+
+def test_an_insight_without_paths_overlaps_every_rule(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, home=hb_home)  # a clean tree: no dirty paths
+    assert row["paths"] == []
+    match = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert match[0] == "trap-no-yaml-load" and 0.15 <= match[1] < 0.30
+
+
+# ── X-w8-carry j: the private directories get their mode through a descriptor ──
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and mode bits")
+
+
+@posix_only
+def test_a_link_swapped_in_after_the_check_is_never_chmodded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Given ~/.aegis checked as a directory, When a link to another directory replaces it before
+    its mode is set, Then the link's target keeps its mode."""
+    home = tmp_path / "home"
+    aegis = home / ".aegis"
+    aegis.mkdir(parents=True, mode=0o755)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    real_lstat, swapped = os.lstat, []
+
+    def lstat_then_swap(path, *args, **kwargs):
+        found = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == str(aegis) and not swapped:
+            swapped.append(True)
+            os.rename(aegis, tmp_path / "moved")
+            os.symlink(victim, aegis)
+        return found
+
+    monkeypatch.setattr(os, "lstat", lstat_then_swap)
+    try:
+        create_link_key(home)
+    except PathTraversalError:
+        pass
+    assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755
+    assert not (victim / "link.key").exists()
+
+
+@posix_only
+def test_the_private_directories_end_0o700_and_a_linked_one_is_refused(tmp_path: Path):
+    home = tmp_path / "home"
+    (home / ".aegis").mkdir(parents=True, mode=0o755)
+    os.chmod(home / ".aegis", 0o755)
+    create_link_key(home)
+    assert stat.S_IMODE(os.stat(home / ".aegis").st_mode) == 0o700
+    other = tmp_path / "other"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    other.mkdir()
+    (other / ".aegis").symlink_to(victim)
+    with pytest.raises(PathTraversalError):
+        create_link_key(other)
+    assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755 and list(victim.iterdir()) == []
+
+
+# ── R-evidence-b2: the similarity thresholds are named once (hand-set, not measured) ──
+
+def test_the_similarity_thresholds_are_named_constants():
+    from aegis_core.insights import RECURRENCE_SIM, RULE_MATCH_SIM, RULE_MATCH_SIM_WITH_PATH
+
+    assert (RULE_MATCH_SIM_WITH_PATH, RULE_MATCH_SIM, RECURRENCE_SIM) == (0.15, 0.30, 0.12)
+
+
+def test_rule_matching_flips_at_the_shared_path_threshold(tmp_path: Path, hb_home: Path,
+                                                           monkeypatch: pytest.MonkeyPatch):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert rule == "trap-no-yaml-load" and 0 < s < core_insights.RULE_MATCH_SIM
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM_WITH_PATH", s + 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM_WITH_PATH", s - 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
+
+
+def test_rule_matching_flips_at_the_no_shared_path_threshold(tmp_path: Path, hb_home: Path,
+                                                              monkeypatch: pytest.MonkeyPatch):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["docs/x.md"], home=hb_home)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", 0.0001)
+    rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert rule == "trap-no-yaml-load" and s > 0.0001
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", s + 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", s - 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
+
+
+def test_recurrence_counts_an_insight_at_the_recurrence_threshold(tmp_path: Path, hb_home: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-rec")
+    _prompt(repo, hb_home, session="s-rec")
+    (repo / "app.py").write_text("a = 2\n", encoding="utf-8")  # the hook's paths are the dirty set
+    _prompt(repo, hb_home, "No, stop adding a scheduler loop around Popen in app.py", session="s-rec")
+    monkeypatch.setattr(core_insights, "RECURRENCE_SIM", 0.0001)
+    assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 1
+    monkeypatch.setattr(core_insights, "RECURRENCE_SIM", 1.01)
+    assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 0
+
+
+def test_an_insight_without_tokens_matches_nothing_and_raises_nothing(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "")
+    row = add_insight(repo, "the and of", paths=[], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, row["id"]) == (None, 0.0)
+    assert {e["id"]: e["neighbours"] for e in review["insights"]} == {row["id"]: []}

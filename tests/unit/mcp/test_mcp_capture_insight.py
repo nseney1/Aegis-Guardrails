@@ -66,23 +66,22 @@ def test_aegis_capture_insight_records_suggestion_and_is_corroborated_never_upgr
     assert res["paths"] == ["src/service.py"]
     assert res["psrc"] == "explicit"
 
-    # Unconfirmed suggestion never counts in review clusters
+    # An unconfirmed suggestion is never a counted insight
     rev = review_insights(ws, home=home)
-    assert rev["clusters"] == []
+    assert rev["insights"] == [] and rev["suppressed"] == []
     assert len(rev["suggestions"]) == 1
 
     # 2. The host's hook records a prompt containing the quote; the server's own session id
     # differs. The capture is corroborated (same host, inside the join window) and stays a
     # suggestion: only the hook row counts.
     hook = record_hook_prompt(
-        ws,
         "claude-code",
         {
             "prompt": "No, stop using raw os.system calls in src/service.py!",
             "session_id": "host-session-2",
             "cwd": str(ws),
         },
-        home=home,
+        workspace=ws, home=home,
     )
     res_corroborated = execute_tool(
         "aegis_capture_insight",
@@ -99,7 +98,7 @@ def test_aegis_capture_insight_records_suggestion_and_is_corroborated_never_upgr
     stored, = [r for r in read_insight_rows(ws, home=home) if r.get("id") == res_corroborated["id"]]
     assert stored["corroborated_by"] == hook["id"] and "confirmed_by" not in stored
     rev = review_insights(ws, home=home)
-    assert [(c["insight_ids"], c["corroborated"]) for c in rev["clusters"]] == [([hook["id"]], [stored["id"]])]
+    assert [(e["id"], e["corroborated"]) for e in rev["insights"]] == [(hook["id"], [stored["id"]])]
 
 
 def test_aegis_capture_insight_rejects_invalid_arguments_and_path_traversal(
@@ -162,8 +161,8 @@ def test_hook_prompts_never_consume_the_session_cap(bounded, monkeypatch):
     ws, home = bounded
     monkeypatch.setattr(insights_mod, "MAX_CAPTURES_PER_SESSION", 3)
     for i in range(5):
-        record_hook_prompt(ws, "claude-code", {"prompt": f"No, stop doing thing {i} again", "session_id": "s1",
-                                               "cwd": str(ws)}, home=home)
+        record_hook_prompt("claude-code", {"prompt": f"No, stop doing thing {i} again", "session_id": "s1",
+                                           "cwd": str(ws)}, workspace=ws, home=home)
     for i in range(3):
         assert _capture(ws, f"unrelated preference {i}", "s1", paths=["src/service.py"])["status"] == "OK"
     assert _capture(ws, "one too many", "s1", paths=["src/service.py"])["status"] == "FAIL"

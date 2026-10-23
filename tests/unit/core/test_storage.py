@@ -524,3 +524,64 @@ def test_the_mode_is_set_on_the_temporary_file_never_on_a_link_swapped_in_at_its
     atomic_write_bytes(out / "config.json", b"{}", mode=0o644)
     assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o600 and victim.read_bytes() == b"precious"
     assert _mode(moved) == 0o644 and moved.read_bytes() == b"{}"
+
+
+# ── create_private_file: an exclusive 0o600 file, never through a link (R-evidence-45) ──
+
+def test_create_private_file_writes_a_new_file_exclusively(tmp_path: Path, umask):
+    from aegis_core.storage import create_private_file
+
+    umask(0o000)
+    target = tmp_path / "link.key"
+    assert create_private_file(target, b"k" * 32) is True
+    assert target.read_bytes() == b"k" * 32
+    if os.name == "posix":
+        assert _mode(target) == 0o600
+
+
+def test_create_private_file_leaves_an_existing_file_alone(tmp_path: Path):
+    from aegis_core.storage import create_private_file
+
+    target = tmp_path / "link.key"
+    target.write_bytes(b"old")
+    assert create_private_file(target, b"new") is False
+    assert target.read_bytes() == b"old"
+
+
+@pytest.mark.parametrize("dangling", [False, True], ids=["link", "dangling"])
+def test_create_private_file_refuses_a_symlink(tmp_path: Path, dangling: bool):
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.storage import create_private_file
+
+    victim = tmp_path / "victim"
+    if not dangling:
+        victim.write_bytes(b"precious")
+    target = tmp_path / "link.key"
+    _symlink_or_skip(target, victim)
+    with pytest.raises(PathTraversalError):
+        create_private_file(target, b"k" * 32)
+    assert victim.read_bytes() == b"precious" if not dangling else not victim.exists()
+    assert os.path.islink(target)
+
+
+def test_create_private_file_refuses_a_directory(tmp_path: Path):
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.storage import create_private_file
+
+    (tmp_path / "link.key").mkdir()
+    with pytest.raises(PathTraversalError):
+        create_private_file(tmp_path / "link.key", b"k")
+    assert (tmp_path / "link.key").is_dir()
+
+
+def test_create_private_file_removes_a_partial_file_when_the_write_fails(tmp_path: Path, monkeypatch):
+    from aegis_core import storage
+
+    def broken(fd, data):
+        os.write(fd, data[:3])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(storage, "_write_all", broken)
+    with pytest.raises(OSError, match="No space"):
+        storage.create_private_file(tmp_path / "link.key", b"k" * 32)
+    assert list(tmp_path.iterdir()) == []

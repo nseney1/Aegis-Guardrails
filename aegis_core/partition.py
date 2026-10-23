@@ -36,7 +36,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from aegis_core import baseline, events
 from aegis_core.errors import AegisError
 from aegis_core.match import matches, normalize_path
-from aegis_core.workspace.layout import module_ancestors, resolve_module_file
 
 __all__ = ["LIMITS", "MAX_PREDICTED", "SOURCE", "Edge", "Frozen", "PartitionUsage", "Report", "check", "parse_splits"]
 
@@ -120,11 +119,25 @@ class _Facts:
 
 def _ancestors(directory: str) -> List[str]:
     """``directory`` and each directory above it, nearest first, ending with the workspace root ('')."""
-    return module_ancestors(directory)
+    found: List[str] = []
+    while directory and directory != ".":
+        found.append(directory)
+        directory = posixpath.dirname(directory)
+    found.append("")
+    return found
 
 
 def _module_file(files: frozenset, importer: str, segments: Sequence[str], language: str) -> Optional[str]:
-    return resolve_module_file(list(segments), files, importer=importer, language=language)
+    if not segments:
+        return None
+    tail = "/".join(segments)
+    for directory in _ancestors(posixpath.dirname(importer)):
+        base = posixpath.join(directory, tail) if directory else tail
+        options = (f"{base}.py", f"{base}/__init__.py") if language == "python" else (f"{base}.rs", f"{base}/mod.rs")
+        for option in options:
+            if option in files:
+                return option
+    return None
 
 
 def _python_segments(source: str) -> List[str]:

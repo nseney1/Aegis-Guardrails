@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import sys
@@ -715,17 +716,18 @@ class RuleCommand(AegisCommand):
         p_ins_add.add_argument("--commit", default=None, help="Optional signed commit SHA carrying Aegis-Approve-Insight")
         p_ins_add.add_argument("--base-ref", dest="base_ref", default=None, help="Optional base branch reference for --commit")
 
-        p_ins_rev = ins_sub.add_parser("review", parents=[common], help="Cluster and review insights or record a decision")
+        p_ins_rev = ins_sub.add_parser("review", parents=[common],
+                                       help="List insights with their top-3 neighbours or record a decision on some")
         p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise", "confirm"],
-                               default=None, help="Record a review decision: for the cluster --cluster names "
-                                                  "(reject also needs --reason), or confirm the suggestions --insight names")
-        p_ins_rev.add_argument("--cluster", dest="cluster_id", default=None, help="Cluster ID for --decision (as review lists it)")
+                               default=None, help="Record a review decision on the insights --insight names "
+                                                  "(reject also needs --reason; confirm names unconfirmed suggestions)")
         p_ins_rev.add_argument("--insight", dest="insight_ids", action="append", default=None, metavar="ID",
-                               help="Unconfirmed suggestion ID for --decision confirm (repeatable)")
+                               help="Insight ID the decision names, as review lists it (repeatable)")
         p_ins_rev.add_argument("--kind", default=None,
                                help="Insight kind recorded with --decision confirm; with --decision propose, the "
-                                    "proposal's kind (default: the one kind the cluster's insights share)")
-        p_ins_rev.add_argument("--proposal-id", dest="proposal_id", default=None, help="Proposal ID when --decision propose")
+                                    "proposal's kind (default: the one kind the named insights share)")
+        p_ins_rev.add_argument("--proposal-id", dest="proposal_id", default=None,
+                               help="Proposal ID when --decision propose (default: trap- and 8 hex digits of the ids)")
         p_ins_rev.add_argument("--summary", default=None, help="Closed-template summary bullet when --decision propose")
         p_ins_rev.add_argument("--rule", dest="rule_id", default=None, help="Target rule ID for merge-into-rule or recurrence check")
         p_ins_rev.add_argument("--reason", default=None, help="Reason for the decision (required with reject)")
@@ -801,6 +803,11 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_proposal_id(insight_ids: Sequence[str]) -> str:
+    """``trap-`` and 8 hex digits of the sorted ids: the same group names the same proposal."""
+    return "trap-" + hashlib.sha256("\n".join(sorted(set(insight_ids))).encode("utf-8")).hexdigest()[:8]
+
+
 def _run_insight(args: argparse.Namespace) -> int:
     from aegis_core.insights import (
         add_insight, measure_recurrence, record_decision, review_insights, write_proposal,
@@ -849,48 +856,43 @@ def _run_insight(args: argparse.Namespace) -> int:
 
     if sub_action == "review":
         root = _resolve_workspace_root(args)
-        decision, cid = getattr(args, "decision", None), getattr(args, "cluster_id", None)
-        confirm_ids = list(getattr(args, "insight_ids", None) or [])
-        if decision == "confirm" and not confirm_ids:
-            return _usage_error(args, "--decision confirm needs --insight ID")
-        if decision and decision != "confirm" and not cid:
-            return _usage_error(args, f"--decision {decision} needs --cluster ID")
+        decision = getattr(args, "decision", None)
+        ids = list(dict.fromkeys(getattr(args, "insight_ids", None) or []))
+        if decision and not ids:
+            return _usage_error(args, f"--decision {decision} needs --insight ID")
         if decision == "reject" and not (getattr(args, "reason", None) or "").strip():
             return _usage_error(args, "--decision reject needs --reason")
         rev = review_insights(root)
-        if decision == "confirm":
-            pending = [str(s.get("id")) for s in rev["suggestions"]]
-            unknown = [i for i in confirm_ids if i not in pending]
-            if unknown:
-                return _emit_error(args, f"not an unconfirmed suggestion: {sanitize_display(', '.join(unknown))}; "
-                                         f"unconfirmed suggestions: {sanitize_display(', '.join(pending), 400) or 'none'}")
-        elif decision:
-            known = rev["clusters"] + rev["suppressed_clusters"]
-            target = next((c for c in known if c["cluster_id"] == cid), None)
-            if target is None:
-                return _emit_error(args, f"unknown cluster {sanitize_display(cid)!r}; clusters: "
-                                         f"{', '.join(c['cluster_id'] for c in known) or 'none'}")
         if decision:
-            ins_ids = confirm_ids if decision == "confirm" else target["insight_ids"]
+            if decision == "confirm":
+                one, many = "an unconfirmed suggestion", "unconfirmed suggestions"
+                valid = [str(s.get("id")) for s in rev["suggestions"]]
+            else:
+                one, many = "a counted insight", "counted insights"
+                valid = [e["id"] for e in rev["insights"] + rev["suppressed"]]
+            unknown = [i for i in ids if i not in valid]
+            if unknown:
+                return _emit_error(args, f"not {one}: {sanitize_display(', '.join(unknown))}; "
+                                         f"{many}: {sanitize_display(', '.join(valid), 400) or 'none'}")
             try:
                 proposal_path = None
-                # A propose row hides the cluster, so it is written only once the proposal exists.
+                # A propose row hides its insights, so it is written only once the proposal exists.
                 if decision == "propose":
-                    prop_id = getattr(args, "proposal_id", None) or f"trap-{cid.replace('cluster-', '')}"
+                    prop_id = getattr(args, "proposal_id", None) or _default_proposal_id(ids)
                     summary = getattr(args, "summary", None)
                     proposal_path = str(write_proposal(
-                        root, proposal_id=prop_id, insight_ids=ins_ids, summary_bullets=[summary] if summary else [],
+                        root, proposal_id=prop_id, insight_ids=ids, summary_bullets=[summary] if summary else [],
                         kind=getattr(args, "kind", None),
                     ))
                 dec_row = record_decision(
-                    root, cluster_id=cid or "", decision=decision, insight_ids=ins_ids, kind=getattr(args, "kind", None),
+                    root, decision=decision, insight_ids=ids, kind=getattr(args, "kind", None),
                     reason=getattr(args, "reason", None), rule_id=getattr(args, "rule_id", None),
                 )
                 if proposal_path is not None:
                     dec_row["proposal_path"] = proposal_path
             except Exception as exc:
                 return _emit_error(args, str(exc))
-            print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {cid or ', '.join(ins_ids)}")
+            print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {', '.join(ids)}")
             return 0
 
         if rule_id := getattr(args, "rule_id", None):
@@ -901,18 +903,18 @@ def _run_insight(args: argparse.Namespace) -> int:
         if use_json:
             print(json.dumps(rev, indent=2))
         else:
-            clusters, suggestions = rev.get("clusters", []), rev.get("suggestions", [])
-            print(f"Insight Review: {len(clusters)} cluster(s), {len(suggestions)} unconfirmed agent suggestion(s)")
+            print(f"Insight Review: {len(rev['insights'])} insight(s), {len(rev['suppressed'])} hidden by a decision, "
+                  f"{len(rev['suggestions'])} unconfirmed agent suggestion(s)")
             if "recurrence" in rev:
                 from aegis_core.insights import RECURRENCE_DENOMINATOR, insight_status_lines
 
                 for line in insight_status_lines({"rules": [rev["recurrence"]], "denominator": RECURRENCE_DENOMINATOR}):
                     print(f"  {sanitize_display(line, 300)}")
-            for c in clusters:
-                print(f"  [{c['cluster_id']}] count={c['count']} status={c['match_status']} rule={c.get('matched_rule') or 'none'}")
-                for ins_id, text in zip(c["insight_ids"], c["excerpts"]):
-                    near = ", ".join(f"{n['id']} ({n['similarity']:.2f})" for n in rev["neighbours"].get(ins_id, []))
-                    print(f"    {sanitize_display(ins_id)}: {sanitize_display(text, 60)} | neighbours: {sanitize_display(near or 'none', 200)}")
+            for e in rev["insights"]:
+                match = e["match"]
+                near = ", ".join(f"{n['id']} ({n['similarity']:.2f})" for n in e["neighbours"])
+                print(f"  {sanitize_display(e['id'])}: {sanitize_display(e['text'], 60)} | {match['status']}, rule "
+                      f"{sanitize_display(match['rule'] or 'none')} | neighbours: {sanitize_display(near or 'none', 200)}")
         return 0
 
     return _emit_error(args, "Specify an insight action: add, review, or enable")
