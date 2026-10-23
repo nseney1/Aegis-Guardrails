@@ -464,7 +464,7 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
             print(f"aegis doctor: a ruleset named {human_gate.RULESET_NAME!r} already exists; edit it on GitHub "
                   "(--apply only ever creates). Nothing was changed.", file=sys.stderr)
             return 1
-        body = plan["ruleset"][tier or "B"]
+        body = plan["ruleset"][tier]
         print(json.dumps(body, indent=2))
         if not _doc._confirm(f"Create this ruleset on the default branch (tier {tier})? [y/N] "):
             print("No changes made.")

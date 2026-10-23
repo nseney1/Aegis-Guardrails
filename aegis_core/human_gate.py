@@ -252,18 +252,14 @@ def _prefix_ends(segments: List[str], parts: List[str], start: int) -> List[int]
         if seg == "**":
             for end in range(pi, len(parts) + 1):
                 reach.add((si + 1, end))
-        elif pi < len(parts) and _segment_match(seg.replace("**", "*"), parts[pi]):
+        elif pi < len(parts) and _segment_match(seg, parts[pi]):
             reach.add((si + 1, pi + 1))
     return sorted(ends)
 
 
 def _codeowners_match(pattern: str, path: str) -> bool:
-    if (
-        not pattern
-        or len(pattern) > _MAX_PATTERN
-        or pattern[0] == "!"
-        or any(c in pattern for c in "[]\\")
-    ):
+    # A bracket or a backslash never gets here: codeowners_coverage reads such a file as unsupported.
+    if not pattern or len(pattern) > _MAX_PATTERN or pattern[0] == "!":
         return False
     directory = pattern.endswith("/")
     core = pattern.strip("/")
@@ -317,20 +313,11 @@ def codeowners_coverage(
 codeowners_lines = governance.codeowners_lines
 
 
-@dataclass(frozen=True)
-class KeyCustody:
+class KeyCustody(NamedTuple):
     status: str
     detail: str
     degrades: bool
     key: Optional[str] = None
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "status": self.status,
-            "detail": self.detail,
-            "degrades": self.degrades,
-            "key": self.key,
-        }
 
 
 def _user_config(root: Path, key: str) -> Optional[str]:
@@ -473,14 +460,6 @@ class TierReport:
     def statement(self) -> str:
         return _STATEMENTS[self.tier]
 
-    @property
-    def codeowners_complete(self) -> bool:
-        return bool(
-            isinstance(self.evidence.get("codeowners"), Mapping)
-            and self.evidence["codeowners"].get("present")
-            and not self.evidence["codeowners"].get("uncovered")
-        )
-
     def text_lines(self) -> List[str]:
         return [
             f"Trust tier (human_gate): {self.tier} ({self.label}): {self.statement}",
@@ -575,11 +554,41 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     }
 
 
-def detect_tier(
-    root: Any,
-    gh: Optional[GhRunner] = None,
-    environ: Optional[Mapping[str, str]] = None,
-) -> TierReport:
+# Spec 2.2's tier requirements, one row each: (key, the tiers it blocks, unmet when, why). Reasons keep
+# this order; a row for both tiers is one reason, listed once in tier C.
+_TIER_REQUIREMENTS: Tuple[Tuple[str, str, Callable[[Mapping[str, Any]], Any], Any], ...] = (
+    ("ruleset", "AB", lambda n: n["rules"] is None, "the default branch's ruleset was not read"),
+    ("review", "A", lambda n: n["rules"] is not None and n["rules"]["required_approving_review_count"] < 1,
+     "the default branch does not require an approving review"),
+    ("code-owners", "A", lambda n: n["rules"] is not None and not n["rules"]["require_code_owner_review"],
+     "the default branch does not require code-owner review"),
+    ("stale", "A", lambda n: n["rules"] is not None and not n["rules"]["dismiss_stale_reviews_on_push"],
+     "the default branch keeps an approval after new commits are pushed, so a pull request can change after its "
+     "review and still merge (set dismiss_stale_reviews_on_push)"),
+    ("checks", "AB", lambda n: n["rules"] is not None and not n["checks"],
+     "the default branch has no required status checks"),
+    ("unpinned", "B", lambda n: n["unpinned"], lambda n: n["unpinned"]),
+    ("aegis-job", "AB", lambda n: n["workflow"], lambda n: n["workflow"]),
+    ("codeowners", "A", lambda n: not n["codeowners"]["present"], "no CODEOWNERS file on the base branch"),
+    ("uncovered", "A", lambda n: n["codeowners"]["present"] and n["codeowners"]["uncovered"],
+     lambda n: f"CODEOWNERS leaves {len(n['codeowners']['uncovered'])} governance path(s) without an owner"),
+    ("bare-org", "A", lambda n: n["bare_org"],
+     lambda n: f"CODEOWNERS names @{n['org']}, the organization that owns this repository, which GitHub ignores as a "
+               f"code owner: name a team (@{n['org']}/<team>) or people"),
+    ("admin", "A", lambda n: n["admin"] is True,
+     "the gh identity doctor used is an admin: re-run with the token the agent would hold"),
+    ("admin-unknown", "A", lambda n: n["admin"] is None, "whether the gh identity is an admin is unknown"),
+    ("signers", "B", lambda n: n["signers"]["keys"] < 1, f"{ALLOWED_SIGNERS} on the base branch lists no signing key"),
+    ("custody", "B", lambda n: n["custody"].degrades, lambda n: n["custody"].detail),
+)
+
+
+def _unmet(tier: str, need: Mapping[str, Any]) -> List[str]:
+    return [why if isinstance(why, str) else why(need)
+            for _key, tiers, unmet, why in _TIER_REQUIREMENTS if tier in tiers and unmet(need)]
+
+
+def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
     root = Path(root)
     runner: GhRunner = gh if gh is not None else default_gh_runner
     top = gitsafe.toplevel(root)
@@ -682,56 +691,13 @@ def detect_tier(
     evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs),
                                 "path_filtered": sorted(j for j, why in aegis_jobs.items() if why == _PATH_FILTER_WHY)}
     custody = check_key_custody(top)
-    evidence["key_custody"] = custody.as_dict()
+    evidence["key_custody"] = custody._asdict()
 
-    checks = facts["required_status_checks"] if facts else []
     unpinned_why, workflow_why = _required_check_gaps(facts, aegis_jobs)
-    a_missing: List[str] = []
-    if facts is None:
-        a_missing.append("the default branch's ruleset was not read")
-    else:
-        if facts["required_approving_review_count"] < 1:
-            a_missing.append("the default branch does not require an approving review")
-        if not facts["require_code_owner_review"]:
-            a_missing.append("the default branch does not require code-owner review")
-        if not facts["dismiss_stale_reviews_on_push"]:
-            a_missing.append(
-                "the default branch keeps an approval after new commits are pushed, so a pull request can change "
-                "after its review and still merge (set dismiss_stale_reviews_on_push)"
-            )
-        if not checks:
-            a_missing.append("the default branch has no required status checks")
-        elif workflow_why:
-            a_missing.append(workflow_why)
-    if not codeowners["present"]:
-        a_missing.append("no CODEOWNERS file on the base branch")
-    elif codeowners["uncovered"]:
-        a_missing.append(f"CODEOWNERS leaves {len(codeowners['uncovered'])} governance path(s) without an owner")
-    if bare_org:
-        a_missing.append(
-            f"CODEOWNERS names @{org_login}, the organization that owns this repository, which GitHub ignores as a "
-            f"code owner: name a team (@{org_login}/<team>) or people"
-        )
-    if admin is True:
-        a_missing.append(
-            "the gh identity doctor used is a repository admin, who can edit the ruleset (an agent needs its own non-admin identity)"
-        )
-    elif admin is None:
-        a_missing.append("whether the gh identity is an admin is unknown")
-
-    b_missing: List[str] = []
-    if facts is None:
-        b_missing.append("the default branch's ruleset was not read")
-    elif not checks:
-        b_missing.append("the default branch has no required status checks")
-    elif unpinned_why:
-        b_missing.append(unpinned_why)
-    if workflow_why:
-        b_missing.append(workflow_why)
-    if signers["keys"] < 1:
-        b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
-    if custody.degrades:
-        b_missing.append(custody.detail)
+    need = {"rules": facts, "checks": facts["required_status_checks"] if facts else [], "unpinned": unpinned_why,
+            "workflow": workflow_why, "codeowners": codeowners, "bare_org": bare_org, "org": org_login, "admin": admin,
+            "signers": signers, "custody": custody}
+    a_missing, b_missing = _unmet("A", need), _unmet("B", need)
 
     if not a_missing:
         tier = "A"

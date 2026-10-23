@@ -366,8 +366,7 @@ def test_uncovered_governance_files_block_tier_a(tmp_path):
     gh = hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()])
     report = human_gate.detect_tier(repo.root, gh=gh)
     assert report.tier == "C"
-    assert report.evidence["codeowners"]["uncovered"]
-    assert report.codeowners_complete is False
+    assert report.evidence["codeowners"]["present"] and report.evidence["codeowners"]["uncovered"]
 
 
 @needs_git
@@ -384,7 +383,7 @@ def test_tracked_workflow_outside_sample_or_unowned_override_blocks_tier_a(tmp_p
     gh = hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()])
     report = human_gate.detect_tier(repo.root, gh=gh)
     assert report.tier != "A"
-    assert report.codeowners_complete is False
+    assert report.evidence["codeowners"]["present"] and report.evidence["codeowners"]["uncovered"]
     assert ".github/workflows/validate.yml" in report.evidence["codeowners"]["uncovered"]
 
     for override in ("/.github/workflows/validate.yml\n", "!/.github/workflows/validate.yml\n"):
@@ -394,7 +393,7 @@ def test_tracked_workflow_outside_sample_or_unowned_override_blocks_tier_a(tmp_p
         repo.git("checkout", "-q", "work")
         rep2 = human_gate.detect_tier(repo.root, gh=gh)
         assert rep2.tier != "A"
-        assert rep2.codeowners_complete is False
+        assert rep2.evidence["codeowners"]["present"] and rep2.evidence["codeowners"]["uncovered"]
         assert ".github/workflows/validate.yml" in rep2.evidence["codeowners"]["uncovered"]
 
 
@@ -635,6 +634,255 @@ def test_the_report_dict_carries_the_envelope_and_the_evidence(tmp_path):
     assert doc["source"] and doc["aegis_version"] and doc["scope"]["workspace"]
     assert doc["checked_at"].endswith("Z") and len(doc["checked_at"]) == 20
     assert set(doc["evidence"]) >= {"gh", "repo", "rules", "codeowners", "allowed_signers", "key_custody", "identity"}
+
+
+# ── R-trust-39: detect_tier reads one requirement table ──────────────────────
+
+class _GridGh(hg.FakeGh):
+    """FakeGh that can also fail the repository or the rules read, or leave the admin bit out."""
+
+    def __init__(self, *args, unknown_admin=False, rules_fail=False, repo_fail=False, **kw):
+        super().__init__(*args, **kw)
+        self.unknown_admin, self.rules_fail, self.repo_fail = unknown_admin, rules_fail, repo_fail
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        path = list(argv)[-1]
+        if self.repo_fail and path == "repos/{owner}/{repo}":
+            return human_gate.GhResult(1, "", "HTTP 404: Not Found")
+        if self.rules_fail and "/rules/branches/" in path:
+            return human_gate.GhResult(1, "", "HTTP 403: Forbidden")
+        result = super().__call__(argv, stdin, cwd, timeout)
+        if self.unknown_admin and result is not None and path == "repos/{owner}/{repo}":
+            body = json.loads(result.stdout)
+            body["permissions"] = {"push": True}
+            return human_gate.GhResult(0, json.dumps(body), "")
+        return result
+
+
+def _missing_gh() -> hg.FakeGh:
+    gh = hg.FakeGh()
+    gh.missing = True
+    return gh
+
+
+PR, CHK = hg.pull_request_rule, hg.checks_rule
+FULL = hg.CODEOWNERS_FULL
+# name: (gh, repository files, signing key: None, "hardware" or a key kind ssh-keygen makes)
+TIER_GRID = {
+    "a-full": (lambda: _GridGh(rules=[PR(), CHK()]), {}, None),
+    "admin": (lambda: _GridGh(admin=True, rules=[PR(), CHK()]), {}, None),
+    "admin-unknown": (lambda: _GridGh(unknown_admin=True, rules=[PR(), CHK()]), {}, None),
+    "no-owners-review": (lambda: _GridGh(rules=[PR(code_owners=False), CHK()]), {}, None),
+    "approvals-0": (lambda: _GridGh(rules=[PR(approvals=0), CHK()]), {}, None),
+    "no-checks": (lambda: _GridGh(rules=[PR()]), {}, None),
+    "stale-kept": (lambda: _GridGh(rules=[PR(dismiss_stale=False), CHK()]), {}, None),
+    "unpinned-a": (lambda: _GridGh(rules=[PR(), CHK(integration_id=None)]), {}, None),
+    "unpinned-c": (lambda: _GridGh(rules=[CHK(integration_id=None)]), {"codeowners": None}, None),
+    "not-aegis-check": (lambda: _GridGh(rules=[PR(), CHK("other-job")]), {}, None),
+    "rules-unreadable": (lambda: _GridGh(rules_fail=True), {}, None),
+    "repo-unreadable": (lambda: _GridGh(repo_fail=True), {}, None),
+    "gh-missing": (_missing_gh, {}, None),
+    "bare-org": (lambda: _GridGh(rules=[PR(), CHK()], owner="acme", owner_type="Organization"),
+                 {"codeowners": FULL.replace("@octo", "@acme")}, None),
+    "co-partial": (lambda: _GridGh(rules=[PR(), CHK()]), {"codeowners": "/docs/ @octo\n"}, None),
+    "co-absent": (lambda: _GridGh(rules=[PR(), CHK()]), {"codeowners": None}, None),
+    "no-workflow": (lambda: _GridGh(rules=[PR(), CHK()]), {"workflow": None}, None),
+    "b-hardware": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None, "signer": True}, "hardware"),
+    "signers-0": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None}, None),
+    "b-plain-custody": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None, "signer": True}, "plain"),
+    "b-passphrase": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None, "signer": True}, "passphrase"),
+}
+KEYGEN_CASES = {"b-plain-custody", "b-passphrase"}
+
+
+def _tier_case(tmp_path: Path, name: str):
+    """(tier, reasons, digest of the rest of as_dict()) for one grid case; checked_at, the version and
+    the workspace path are left out."""
+    import hashlib
+
+    gh, files, key = TIER_GRID[name]
+    home = hg.Home(tmp_path / "home")
+    pub = None
+    if key == "hardware":
+        pub = hg.hardware_public_key()
+        home.sign_with("key::" + pub)
+    elif key is not None:
+        private, pub = hg.keygen(tmp_path / "keys", "human", passphrase="" if key == "plain" else "pw-123456")
+        home.sign_with(str(private))
+    repo = _repo_with_governance(tmp_path, signer_pub=pub if files.get("signer") else None,
+                                 codeowners=files.get("codeowners", FULL), workflow=files.get("workflow", hg.AEGIS_WORKFLOW))
+    doc = human_gate.detect_tier(repo.root, gh=gh()).as_dict()
+    del doc["checked_at"], doc["aegis_version"]
+    doc["scope"]["workspace"] = "<root>"
+    rest = {k: v for k, v in doc.items() if k not in ("tier", "reasons")}
+    return doc["tier"], doc["reasons"], hashlib.sha256(json.dumps(rest, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+# Recorded at lane/w9-A c12e70cb (after R-trust-36, before the table), admin wording updated.
+GOLDEN_TIERS = {
+    'a-full': ('A', [
+    ], 'ca1674679f2070d4'),
+    'admin': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the gh identity doctor used is an admin: re-run with the token the agent would hold',
+    ], '710e23b64c1a057d'),
+    'admin-unknown': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: whether the gh identity is an admin is unknown',
+    ], '1fed4721f978a121'),
+    'approvals-0': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require an approving review',
+    ], 'f74ddb2d5fa91d75'),
+    'b-hardware': ('B', [
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '1bbf09668d3c52cd'),
+    'b-passphrase': ('B', [
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '159f0c1b3c7187db'),
+    'b-plain-custody': ('C', [
+        'the signing key human is a plain file with no passphrase, readable by this user: an agent running as you can sign with it, so a signature proves nothing',
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], 'b3e430ffe88fa5b6'),
+    'bare-org': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: CODEOWNERS leaves 83 governance path(s) without an owner',
+        'not tier A: CODEOWNERS names @acme, the organization that owns this repository, which GitHub ignores as a code owner: name a team (@acme/<team>) or people',
+    ], '6ae200fb88ec7f12'),
+    'co-absent': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '9224938590e8abd8'),
+    'co-partial': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: CODEOWNERS leaves 82 governance path(s) without an owner',
+    ], '6e109a481cb4f40b'),
+    'gh-missing': ('C', [
+        'GitHub settings could not be read: gh is not installed',
+        "the default branch's ruleset was not read",
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: whether the gh identity is an admin is unknown',
+    ], '231bdf4bdc7ee1f1'),
+    'no-checks': ('C', [
+        'the default branch has no required status checks',
+        'allowed_signers on the base branch lists no signing key',
+    ], '894cb0e48ca45fa4'),
+    'no-owners-review': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require code-owner review',
+    ], '39a9e50b21121dde'),
+    'no-workflow': ('C', [
+        'the required checks do not include the Aegis job: no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix',
+        'allowed_signers on the base branch lists no signing key',
+    ], '02d5e277c56e1b95'),
+    'not-aegis-check': ('C', [
+        'the required checks do not include the Aegis job: require aegis-check',
+        'allowed_signers on the base branch lists no signing key',
+    ], 'b4cd1dff7bfd621b'),
+    'repo-unreadable': ('C', [
+        'GitHub settings could not be read: gh api repos/{owner}/{repo} failed: HTTP 404: Not Found',
+        "the default branch's ruleset was not read",
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: whether the gh identity is an admin is unknown',
+    ], 'c2778e2375913655'),
+    'rules-unreadable': ('C', [
+        "the default branch's rules could not be read: gh api repos/{owner}/{repo}/rules/branches/main failed: HTTP 403: Forbidden",
+        "the default branch's ruleset was not read",
+        'allowed_signers on the base branch lists no signing key',
+    ], 'b15ccacdb770aaaf'),
+    'signers-0': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], 'cb94876a7c0d25f2'),
+    'stale-kept': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+    ], '9d739a9cb376c5da'),
+    'unpinned-a': ('A', [
+    ], '92a6c557f1847a65'),
+    'unpinned-c': ('C', [
+        "the required check(s) aegis-check have no pinned source (integration_id): anyone with write access, including the agent's gh token, can post a passing status; set each check's source to GitHub Actions (app 15368) in the ruleset",
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '63ccbfdd88627974'),
+}
+
+
+@needs_git
+@pytest.mark.parametrize("name", sorted(TIER_GRID))
+def test_the_tier_grid_is_the_one_recorded_before_the_table(tmp_path, name):
+    """Given a FakeGh configuration recorded before detect_tier was rebuilt from one table, When the tier
+    is detected, Then the tier, the reasons in order and the rest of the report are the recorded ones
+    (only the admin reason's wording changed)."""
+    if name in KEYGEN_CASES and not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    assert _tier_case(tmp_path, name) == GOLDEN_TIERS[name]
+
+
+# requirement key -> (the grid case that reports it, a part of the reason)
+REQUIREMENT_CASES = {
+    "ruleset": ("rules-unreadable", "the default branch's ruleset was not read"),
+    "review": ("approvals-0", "does not require an approving review"),
+    "code-owners": ("no-owners-review", "does not require code-owner review"),
+    "stale": ("stale-kept", "set dismiss_stale_reviews_on_push"),
+    "checks": ("no-checks", "the default branch has no required status checks"),
+    "unpinned": ("unpinned-c", "have no pinned source (integration_id)"),
+    "aegis-job": ("not-aegis-check", "the required checks do not include the Aegis job"),
+    "codeowners": ("co-absent", "no CODEOWNERS file on the base branch"),
+    "uncovered": ("co-partial", "governance path(s) without an owner"),
+    "bare-org": ("bare-org", "which GitHub ignores as a code owner"),
+    "admin": ("admin", "the gh identity doctor used is an admin: re-run with the token the agent would hold"),
+    "admin-unknown": ("admin-unknown", "whether the gh identity is an admin is unknown"),
+    "signers": ("signers-0", "allowed_signers on the base branch lists no signing key"),
+    "custody": ("b-plain-custody", "is a plain file with no passphrase"),
+}
+
+
+def test_every_requirement_of_the_tier_table_has_a_case():
+    assert set(REQUIREMENT_CASES) == {row[0] for row in human_gate._TIER_REQUIREMENTS}
+
+
+@needs_git
+@pytest.mark.parametrize("key", sorted(REQUIREMENT_CASES))
+def test_each_requirement_is_reported_by_its_case(tmp_path, key):
+    case, part = REQUIREMENT_CASES[key]
+    if case in KEYGEN_CASES and not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    tier, reasons, _rest = _tier_case(tmp_path, case)
+    assert tier != "A" and [r for r in reasons if part in r], reasons
+
+
+@needs_git
+def test_a_runner_that_returns_none_is_tier_c_with_one_ruleset_reason(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: None)
+    assert report.tier == "C" and report.reasons[0] == "GitHub settings could not be read: gh is not installed"
+    assert [r for r in report.reasons if "ruleset was not read" in r] == ["the default branch's ruleset was not read"]
+
+
+def test_the_dead_tier_surface_is_gone():
+    import inspect
+
+    assert not hasattr(human_gate.TierReport, "codeowners_complete")
+    assert list(inspect.signature(human_gate.detect_tier).parameters) == ["root", "gh"]
+    custody = human_gate.KeyCustody("none", "no key", False)
+    assert custody._asdict() == {"status": "none", "detail": "no key", "degrades": False, "key": None}
+    assert not hasattr(custody, "as_dict")
 
 
 # ── R-cli-28: gh never inspects the repository ───────────────────────────────
