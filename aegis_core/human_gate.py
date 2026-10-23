@@ -55,6 +55,7 @@ __all__ = [
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
+    "resolve_repo",
     "ruleset_exists",
     "signed_empty_commit",
     "signers_setup",
@@ -157,6 +158,32 @@ class GhResult(NamedTuple):
 
 
 GhRunner = Callable[..., Optional[GhResult]]
+# scheme://[userinfo@]host[:port]/path and scp-style [user@]host:path. A port is dropped only where it
+# is the git transport's (ssh, git); an http(s) port names another API endpoint than gh's host.
+_URL_REMOTE = re.compile(r"\A(?P<scheme>https?|ssh|git)://(?:[^/@]*@)?(?P<host>[A-Za-z0-9.-]+)(?::(?P<port>\d+))?/(?P<path>.*)\Z")
+_SCP_REMOTE = re.compile(r"\A(?:[^/@:]+@)?(?P<host>[A-Za-z0-9-][A-Za-z0-9.-]+):(?P<path>[^/].*)\Z")
+_REPO_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_NO_REPO = "no GitHub repository could be resolved from remote.origin.url"
+
+
+def resolve_repo(root: Any) -> Optional[str]:
+    """``owner/repo`` (github.com) or ``host/owner/repo`` (gh's ``[HOST/]OWNER/REPO``) of
+    ``remote.origin.url`` read through gitsafe; None for a path remote, a subgroup, no origin or a git
+    that cannot answer. Userinfo (a token) never reaches the result."""
+    try:
+        res = gitsafe.run(["config", "--get", "remote.origin.url"], Path(root))
+    except gitsafe.GitError:
+        return None
+    url = os.fsdecode(res.stdout).strip() if res.returncode == 0 else ""
+    found = _URL_REMOTE.match(url) or _SCP_REMOTE.match(url)
+    if found is None or (found.re is _URL_REMOTE and found["port"] and found["scheme"].startswith("http")):
+        return None
+    path = found["path"][:-1] if found["path"].endswith("/") else found["path"]
+    parts = (path[:-4] if path.endswith(".git") else path).split("/")
+    if len(parts) != 2 or not all(_REPO_SEGMENT.fullmatch(p) and p.strip(".") for p in parts):
+        return None
+    host = found["host"].lower()
+    return "/".join(parts) if host == "github.com" else "/".join((host, *parts))
 
 
 def default_gh_runner(
@@ -165,14 +192,27 @@ def default_gh_runner(
     cwd: Any = None,
     timeout: float = GH_TIMEOUT_SECONDS,
 ) -> Optional[GhResult]:
+    """Run gh for the repository at ``cwd``. gh never runs inside it: resolving ``{owner}/{repo}``
+    there would start git under the repository's own config, outside gitsafe. It runs in an empty
+    directory below a git ceiling, with the repository passed as ``GH_REPO``."""
     exe = pathlookup.which("gh", outside=cwd)
     if exe is None:
         return None
+    repo = resolve_repo(cwd) if cwd is not None else None
+    if repo is None and any("{owner}" in arg or "{repo}" in arg for arg in argv):
+        return GhResult(125, "", _NO_REPO)
+    try:
+        scratch = tempfile.mkdtemp(prefix="aegis-gh-")
+    except OSError as exc:
+        return GhResult(126, "", f"cannot run gh: {exc}")
+    ceilings = dict.fromkeys((os.path.dirname(scratch), os.path.dirname(os.path.realpath(scratch))))
     env = {
         **os.environ,
         "GH_PROMPT_DISABLED": "1",
         "GH_NO_UPDATE_NOTIFIER": "1",
         "NO_COLOR": "1",
+        "GIT_CEILING_DIRECTORIES": os.pathsep.join(ceilings),
+        **({"GH_REPO": repo} if repo is not None else {}),
     }
     try:
         proc = subprocess.run(
@@ -181,7 +221,7 @@ def default_gh_runner(
             stdin=None if stdin is not None else subprocess.DEVNULL,
             capture_output=True,
             env=env,
-            cwd=None if cwd is None else str(cwd),
+            cwd=scratch,
             timeout=timeout,
             check=False,
         )
@@ -189,6 +229,8 @@ def default_gh_runner(
         return GhResult(124, "", f"gh timed out after {timeout:g}s")
     except OSError as exc:
         return GhResult(126, "", f"cannot run gh: {exc}")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     return GhResult(
         proc.returncode,
         proc.stdout.decode("utf-8", "replace"),

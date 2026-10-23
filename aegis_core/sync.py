@@ -505,7 +505,7 @@ def sync(
 
     ``pr`` never moves a rule in the work tree: the moves and the examples to label go to a new
     ``aegis/lifecycle-*`` branch that is pushed and proposed; nothing is ever merged."""
-    from aegis_core import credit, gitsafe
+    from aegis_core import credit, gitsafe, human_gate
     from aegis_core.fitness import ReplayReport, replay_detector_history_report
     ws = literal_workspace(workspace)
     root = Path(ws.root)
@@ -541,6 +541,9 @@ def sync(
         elif pr and pending:
             try:
                 plan = _pr_plan(root)
+                # The default runner needs GH_REPO from origin (R-cli-28); an injected one names its own.
+                if gh_runner is None and human_gate.resolve_repo(plan["top"]) is None:
+                    raise _Refused("origin is not a GitHub repository, so gh cannot open the pull request")
             except (_Refused, gitsafe.GitError, OSError) as exc:
                 refused = f"no pull request opened: {exc}"
             else:
