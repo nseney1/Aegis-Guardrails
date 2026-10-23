@@ -61,6 +61,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 ### Added
 
+- `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it.
+- `docs/trust-tiers.md` explains what each trust tier (A, B and C) protects and how to set a repository up for it.
 - `aegis check FILES --format github|sarif` reports Layer 1 findings (reverses a 4.0 removal).
 - The user-scope `scanners` key (`["ruff", "gitleaks"]`) runs those presets in `aegis check --ci`, from PATH outside the repository; only findings new against the merge base fail.
 - `aegis check --calibration` is a registered flag. Layer 2 predictions are stamped and kept in `.aegis/state/arbiter_predictions.jsonl` with no model text; dispositions and outcomes are computed from git when the file is read, and scores are per backend and observable kind.
