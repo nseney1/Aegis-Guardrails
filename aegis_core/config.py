@@ -76,7 +76,9 @@ ENV_MAX_JIT_TOKENS = "AEGIS_MAX_JIT_TOKENS"
 ENV_LLM_CMD = "AEGIS_LLM_CMD"
 ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
 
-_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "half_life_sessions", "epsilon"})
+_DECAY_KEYS = ("half_life_sessions", "epsilon")
+# "fitness" and the top-level decay keys are known (warned about, not counted as unknown keys).
+_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", *_DECAY_KEYS})
 # tests, rules, perf, regression and scanners are read through read_user_config by their own consumers.
 _USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci",
                         "scanners"})
@@ -332,35 +334,27 @@ class RepoConfig:
         else:
             warnings.append(f"ignored 'expiry' in {REPO_LABEL}: it must be an object")
 
+        # The decay keys are read under ``expiry`` only; the top-level and ``fitness`` spellings
+        # earlier releases accepted are named in one warning (their values never echoed).
         fitness_raw = raw.get("fitness", {})
-        fitness_map = fitness_raw if isinstance(fitness_raw, Mapping) else {}
+        if not isinstance(fitness_raw, Mapping):
+            warnings.append(f"ignored 'fitness' in {REPO_LABEL}: it must be an object")
+            fitness_raw = {}
+        if any(key in where for where in (raw, fitness_raw) for key in _DECAY_KEYS):
+            warnings.append(f"ignored decay key(s) in {REPO_LABEL} outside 'expiry': use expiry.half_life_sessions "
+                            "and expiry.epsilon")
         expiry_map = expiry if isinstance(expiry, Mapping) else {}
-
-        half_life_sessions = DEFAULT_HALF_LIFE_SESSIONS
-        raw_hl = raw.get("half_life_sessions")
-        if raw_hl is None:
-            raw_hl = fitness_map.get("half_life_sessions")
-        if raw_hl is None:
-            raw_hl = expiry_map.get("half_life_sessions")
-        if raw_hl is not None:
-            parsed_hl = _valid_half_life_sessions(raw_hl)
-            if parsed_hl is not None:
-                half_life_sessions = parsed_hl
-            else:
-                warnings.append(f"ignored 'half_life_sessions' in {REPO_LABEL}: it must be a positive integer")
-
-        epsilon = DEFAULT_EPSILON
-        raw_eps = raw.get("epsilon")
-        if raw_eps is None:
-            raw_eps = fitness_map.get("epsilon")
-        if raw_eps is None:
-            raw_eps = expiry_map.get("epsilon")
-        if raw_eps is not None:
-            parsed_eps = _valid_epsilon(raw_eps)
-            if parsed_eps is not None:
-                epsilon = parsed_eps
-            else:
-                warnings.append(f"ignored 'epsilon' in {REPO_LABEL}: it must be a number between 0 and 1")
+        half_life_sessions, epsilon = DEFAULT_HALF_LIFE_SESSIONS, DEFAULT_EPSILON
+        if "half_life_sessions" in expiry_map:
+            parsed_hl = _valid_half_life_sessions(expiry_map["half_life_sessions"])
+            if parsed_hl is None:
+                warnings.append(f"ignored 'expiry.half_life_sessions' in {REPO_LABEL}: it must be a positive integer")
+            half_life_sessions = parsed_hl or half_life_sessions
+        if "epsilon" in expiry_map:
+            parsed_eps = _valid_epsilon(expiry_map["epsilon"])
+            if parsed_eps is None:
+                warnings.append(f"ignored 'expiry.epsilon' in {REPO_LABEL}: it must be a number between 0 and 1")
+            epsilon = parsed_eps or epsilon
 
         packaged: List[str] = []
         ast = raw.get("ast", {})

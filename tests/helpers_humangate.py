@@ -162,7 +162,8 @@ class FakeGh:
         self.calls: List[Tuple[Tuple[str, ...], Optional[bytes]]] = []
         self.missing = False
 
-    def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None):
+    def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None,
+                 timeout: Optional[float] = None):
         if self.missing:
             return None
         argv = tuple(argv)
@@ -192,6 +193,33 @@ class FakeGh:
         return [c for c in self.calls if "--method" in c[0] and c[0][c[0].index("--method") + 1] != "GET"]
 
 
+def recording_gh(bin_dir: Path) -> Path:
+    """A POSIX ``gh`` stub in ``bin_dir``: appends one JSON line per call to ``$LOG`` (its physical
+    cwd, that directory's listing, ``GH_REPO`` or None, argv), runs ``git status`` where it stands
+    (what ``gh pr create`` does) and prints ``{}``."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "gh"
+    stub.write_bytes(
+        b"#!/bin/sh\n"
+        b"python3 - \"$@\" <<'EOF' >> \"$LOG\"\n"
+        b"import json, os, sys\n"
+        b"print(json.dumps({'cwd': os.getcwd(), 'ls': sorted(os.listdir('.')), "
+        b"'GH_REPO': os.environ.get('GH_REPO'), 'argv': sys.argv[1:]}))\n"
+        b"EOF\n"
+        b"git status >/dev/null 2>&1\n"
+        b"printf '{}\\n'\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def gh_log(path: Path) -> List[Dict[str, Any]]:
+    """The calls ``recording_gh`` logged ([] when it never ran)."""
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def pull_request_rule(approvals: int = 1, code_owners: bool = True, dismiss_stale: Any = True,
                       last_push: bool = False) -> Dict[str, Any]:
     return {"type": "pull_request", "parameters": {"required_approving_review_count": approvals,
@@ -218,7 +246,7 @@ CODEOWNERS_FULL = (
     "/.aegis/rules/ @octo\n/.aegis/config.json @octo\n/.aegis/team.json @octo\n/.aegis/baseline.json @octo\n"
     "/.aegis/adjudications/ @octo\n**/.aegis/rules/ @octo\n**/.aegis/adjudications/ @octo\n"
     "**/.aegis/config.json @octo\n**/.aegis/team.json @octo\n**/.aegis/baseline.json @octo\n"
-    "/allowed_signers @octo\n/CODEOWNERS @octo\n/.github/CODEOWNERS @octo\n/.github/workflows/ @octo\n"
+    "/allowed_signers @octo\n/CODEOWNERS @octo\n/.github/CODEOWNERS @octo\n/docs/CODEOWNERS @octo\n/.github/workflows/ @octo\n"
     "conftest.py @octo\npytest.ini @octo\n.pytest.ini @octo\npytest.toml @octo\n.pytest.toml @octo\n"
     "tox.ini @octo\nsetup.cfg @octo\npyproject.toml @octo\nsitecustomize.py @octo\n*.pth @octo\nMakefile @octo\n"
     "pytest.* @octo\n_pytest.* @octo\npluggy.* @octo\npy.* @octo\niniconfig.* @octo\n"

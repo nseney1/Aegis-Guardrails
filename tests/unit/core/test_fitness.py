@@ -10,13 +10,20 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 
 import pytest
 
-from aegis_core.fitness import Fitness, compute, for_rules, wilson_interval, wilson_lower_bound
+from aegis_core import stats
+from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.rules import load_rules
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
 from aegis_core.telemetry_engine import ledger
+
+# The fitness estimator's 90% interval: aegis_core.stats defaults to 95%.
+wilson_interval = partial(stats.wilson_interval, confidence=DEFAULT_CONFIDENCE_LEVEL)
+wilson_lower_bound = partial(stats.wilson_lower_bound, confidence=DEFAULT_CONFIDENCE_LEVEL)
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -71,7 +78,7 @@ def test_a_rule_without_evidence_has_fitness_zero() -> None:
 def test_calendar_days_never_decay_a_rule(age_days: int) -> None:
     totals = {"triggers": 40, "tp": 40, "fp": 0, "last_ts": _iso(NOW - timedelta(days=age_days))}
     fit = compute(totals, now=NOW)
-    assert (fit.decay_factor, fit.effective_weight) == (1.0, 1.0)
+    assert fit.effective_weight == 1.0
     assert fit.score == pytest.approx(wilson_lower_bound(40, 40), abs=1e-4)
 
 
@@ -86,7 +93,7 @@ def test_the_half_life_and_epsilon_are_defined_once() -> None:
 
 
 def test_the_posterior_decays_with_sessions_and_reverts_to_the_prior() -> None:
-    from aegis_core.fitness import beta_cdf
+    from aegis_core.stats import beta_cdf
 
     def gate(sessions: int) -> Fitness:
         return compute({}, rule_type="gate", adjudicated_fp=5, min_n=5, eligible_sessions=sessions, half_life_sessions=20)

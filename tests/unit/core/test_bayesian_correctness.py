@@ -1,5 +1,5 @@
 """Wilson score interval reference values (the one fitness estimator, aegis_core.fitness)."""
-from aegis_core.fitness import wilson_interval
+from aegis_core.stats import wilson_interval
 
 
 class TestWilsonInterval:

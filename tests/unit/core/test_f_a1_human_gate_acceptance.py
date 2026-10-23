@@ -193,7 +193,7 @@ class _ReviewsGh(hg.FakeGh):
         super().__init__(**kw)
         self.reviews = reviews
 
-    def __call__(self, argv, stdin=None, cwd=None):
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
         if "/pulls/" in argv[-1]:
             self.calls.append((tuple(argv), stdin))
             return human_gate.GhResult(0, json.dumps(self.reviews), "")
@@ -491,7 +491,7 @@ def test_a_genuine_ssh_approval_verifies_in_a_sha256_repository(tmp_path, monkey
 @needs_git
 def test_tier_c_says_self_attested_in_text_and_json(tmp_path):
     repo = hg.make_repo(tmp_path)
-    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None: None)
+    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: None)
     assert report.tier == "C" and report.label == "self-attested"
     assert "self-attested" in report.text_lines()[0]
     doc = report.as_dict()
@@ -502,7 +502,7 @@ def test_tier_c_says_self_attested_in_text_and_json(tmp_path):
 def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
     from aegis_cli import doctor
     repo = hg.make_repo(tmp_path)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: None)
+    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=False, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)
@@ -1003,7 +1003,7 @@ def test_doctor_reports_how_many_entries_are_looser_without_naming_them(tmp_path
     site = storage.ledger_site(repo.root)
     storage.append_jsonl(site.path, [{"v": 2}])
     os.chmod(site.path, 0o644)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: None)
+    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)
@@ -1023,7 +1023,7 @@ def test_doctor_counts_nothing_looser_in_a_workspace_outside_git(tmp_path, monke
         with storage.locked(ws): pass
     finally:
         os.umask(old)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: None)
+    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(ws), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)

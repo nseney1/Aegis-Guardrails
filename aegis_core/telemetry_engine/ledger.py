@@ -69,21 +69,10 @@ __all__ = [
 LEDGER_VERSION = 2
 OUTCOMES = ("tp", "fp", "trigger")
 SOURCES = ("ci", "session", "mcp", "manual", "migrate")
-_CREDIT_EVENTS = frozenset({
-    "exposure",
-    "detection",
-    "check_confirm",
-    "override",
-    "human_label",
-    "claim",
-    "claimed",
-    "transition",
-    "check",
-    "adjudication",
-    "report",
-    "ci",
-    "void",
-})
+# Exactly credit.EVENTS, which credit cannot hand over (credit imports this module); a kind missing
+# here would count as an unusable row (tests/unit/core/test_ledger.py ties the two lists).
+_CREDIT_EVENTS = frozenset({"check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication",
+                            "override"})
 _V1_SIGNALS = {"tp": "tp", "success": "tp", "fp": "fp", "failure": "fp", "trigger": "trigger"}
 _MAX_LEGACY_WEIGHT = Decimal("10")
 

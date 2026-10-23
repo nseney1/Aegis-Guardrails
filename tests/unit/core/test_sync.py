@@ -16,8 +16,10 @@ from pathlib import Path
 import pytest
 
 from aegis_core import sync
-from aegis_core.fitness import MIN_N, wilson_lower_bound
+from aegis_core.fitness import MIN_N
 from aegis_core.rules import lf_digest, load_rules
+from aegis_core.stats import wilson_lower_bound
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
 from aegis_core.telemetry_engine import ledger
 
 OLD = "2026-01-01"  # created long enough ago to be promotable
@@ -100,7 +102,7 @@ def test_sync_writes_the_derived_view_of_every_rule(labelled_ws: Path) -> None:
     assert good["path"] == ".aegis/rules/traps/trap-good.md"
     assert good["sha256"] == lf_digest((ws / good["path"]).read_bytes())
     assert (good["type"], good["triggers"], good["tp"], good["fp"]) == ("trap", 25, 25 + 25, 0)
-    assert good["fitness"] == pytest.approx(wilson_lower_bound(50, 50), abs=1e-4)
+    assert good["fitness"] == pytest.approx(wilson_lower_bound(50, 50, DEFAULT_CONFIDENCE_LEVEL), abs=1e-4)
     assert isinstance(good["last_ts"], str)
     assert {rid: e["suggestion"] for rid, e in doc["rules"].items()} == {
         "trap-good": "promote", "inv-noisy": "demote", "trap-noisy": "archive", "persona-new": None,
