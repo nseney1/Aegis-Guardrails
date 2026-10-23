@@ -9,10 +9,6 @@ from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, WILSON_CONFIDENCE_Z_SC
 __all__ = [
     "Z95",
     "beta_cdf",
-    "beta_ppf",
-    "clopper_pearson_interval",
-    "clopper_pearson_lower",
-    "clopper_pearson_upper",
     "regularized_incomplete_beta",
     "wilson_ci",
     "wilson_interval",
@@ -33,15 +29,10 @@ def _num(value: Any) -> float:
 
 
 def _resolve_z(confidence: float, z: Optional[float]) -> float:
-    if z is not None:
-        return float(z)
-    conf = float(confidence)
-    if conf >= 1.0:
-        return conf
-    rounded = round(conf, 2)
-    if rounded in WILSON_CONFIDENCE_Z_SCORES:
-        return WILSON_CONFIDENCE_Z_SCORES[rounded]
-    return Z95
+    # A z-score passed where the confidence goes (1.645, 1.96) fails here rather than reading as 95%.
+    if not 0.0 < float(confidence) < 1.0:
+        raise ValueError("confidence must be between 0 and 1; pass z= for a z-score")
+    return float(z) if z is not None else WILSON_CONFIDENCE_Z_SCORES.get(round(float(confidence), 2), Z95)
 
 
 def wilson_interval(
@@ -52,10 +43,10 @@ def wilson_interval(
     z: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Two-sided Wilson score confidence interval ``(lower, upper)`` in ``[0, 1]``."""
+    z_val = _resolve_z(confidence, z)
     n = _num(total)
     if n <= 0.0:
         return (0.0, 1.0)
-    z_val = _resolve_z(confidence, z)
     p = min(_num(successes), n) / n
     z2 = z_val * z_val
     denom = 1.0 + z2 / n
@@ -77,9 +68,10 @@ def wilson_lower_bound(
     z: Optional[float] = None,
 ) -> float:
     """Lower bound of the Wilson interval (0.0 when ``total <= 0``)."""
+    z_val = _resolve_z(confidence, z)
     if _num(total) <= 0.0:
         return 0.0
-    return wilson_interval(successes, total, confidence, z=z)[0]
+    return wilson_interval(successes, total, z=z_val)[0]
 
 
 def _betacf(a: float, b: float, x: float) -> float:
@@ -141,82 +133,3 @@ def regularized_incomplete_beta(a: float, b: float, x: float) -> float:
 def beta_cdf(x: float, a: float, b: float) -> float:
     """Cumulative distribution function of Beta(a, b) at x."""
     return regularized_incomplete_beta(a, b, x)
-
-
-def beta_ppf(q: float, a: float, b: float) -> float:
-    """Percent-point function (inverse CDF) of Beta(a, b) via 52-step bisection."""
-    if q <= 0.0:
-        return 0.0
-    if q >= 1.0:
-        return 1.0
-    lo = 0.0
-    hi = 1.0
-    for _ in range(52):
-        mid = 0.5 * (lo + hi)
-        if regularized_incomplete_beta(a, b, mid) < q:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
-
-
-def clopper_pearson_upper(k: float, n: float, alpha: float = 0.05) -> float:
-    """One-sided Clopper-Pearson upper confidence bound at level ``1 - alpha``."""
-    total = _num(n)
-    succ = _num(k)
-    if total <= 0.0 or succ >= total:
-        return 1.0
-    if alpha <= 0.0:
-        return 1.0
-    if alpha >= 1.0:
-        return 0.0
-    if succ <= 0.0:
-        return max(0.0, min(1.0, 1.0 - (alpha ** (1.0 / total))))
-    return max(0.0, min(1.0, beta_ppf(1.0 - alpha, succ + 1.0, total - succ)))
-
-
-def clopper_pearson_lower(k: float, n: float, alpha: float = 0.05) -> float:
-    """One-sided Clopper-Pearson lower confidence bound at level ``1 - alpha``."""
-    total = _num(n)
-    succ = min(_num(k), total)
-    if total <= 0.0 or succ <= 0.0:
-        return 0.0
-    if alpha <= 0.0:
-        return 0.0
-    if alpha >= 1.0:
-        return 1.0
-    if succ >= total:
-        return max(0.0, min(1.0, alpha ** (1.0 / total)))
-    return max(0.0, min(1.0, beta_ppf(alpha, succ, total - succ + 1.0)))
-
-
-def clopper_pearson_interval(
-    tp: float,
-    n: float,
-    alpha: float = 0.10,
-    *,
-    prior: Optional[Tuple[float, float]] = None,
-) -> Tuple[float, float]:
-    """Two-sided Clopper-Pearson confidence interval ``(lower, upper)``."""
-    k = _num(tp)
-    total = _num(n)
-    if prior is not None:
-        a_raw = max(0.0, float(prior[0]))
-        b_raw = max(0.0, float(prior[1]))
-        mass = a_raw + b_raw
-        if mass > 10.0 and mass > 0.0:
-            a0 = a_raw * (10.0 / mass)
-            b0 = b_raw * (10.0 / mass)
-        else:
-            a0 = a_raw
-            b0 = b_raw
-    else:
-        a0 = 0.0
-        b0 = 0.0
-    eff_k = k + a0
-    eff_fail = max(0.0, total - k) + b0
-    if eff_k + eff_fail <= 0.0:
-        return (0.0, 1.0)
-    lo = 0.0 if eff_k <= 0.0 else beta_ppf(alpha / 2.0, eff_k, eff_fail + (1.0 if a0 == 0.0 else 0.0))
-    hi = 1.0 if eff_fail <= 0.0 else beta_ppf(1.0 - alpha / 2.0, eff_k + (1.0 if b0 == 0.0 else 0.0), eff_fail)
-    return (max(0.0, lo), min(1.0, hi))

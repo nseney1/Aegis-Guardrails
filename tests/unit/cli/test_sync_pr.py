@@ -73,7 +73,7 @@ def test_format_pr_body_states_the_evidence_and_lists_the_examples_to_label() ->
     promote, young = body.split("### `r-young`")
     assert "### `r-promote` — **promote** (`trap` -> `invariant`)" in promote
     assert "- **State**: decided; n = 25; weight 0.50" in promote and "- **Score**: 0.81" in promote
-    assert "P(precision < 0.7)**: 0.01; precision 90% interval [0.89, 1.00]" in promote
+    assert "- **P(precision < 0.7)**: 0.01\n" in promote and "interval" not in promote
     assert "prior supplies 28% of the evidence" in promote and "0.75 (3 caught, 1 leaked)" in promote
     assert f"`{'b' * 40}`" in promote and "1. `abc123def456`: `eval` in `src/a.py`" in promote
     assert "insufficient (n=4); n = 4" in young and "Score**" not in young and "interval" not in young
