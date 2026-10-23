@@ -225,15 +225,6 @@ def _protected_branch(root: Any, client: Any) -> Optional[str]:
     return _DEFAULT_BRANCH[key]
 
 
-def _call_landed(landed: Callable[..., Optional[str]], tree: str, head: Optional[str] = None) -> Optional[str]:
-    if isinstance(head, str) and head:
-        try:
-            return landed(tree, head)
-        except TypeError:
-            return landed(tree)
-    return landed(tree)
-
-
 def landed_lookup(
     root: Any, refs: Optional[Sequence[str]] = None, limit: int = _REV_LIMIT,
 ) -> Callable[..., Optional[str]]:
@@ -534,7 +525,8 @@ def confirm(
     for check_id in sorted({r.get("check") for r in _of(rows, "report")}):
         if check_id not in voided_checks and check_id in by_id:
             chk = by_id[check_id]
-            commit = _call_landed(look, str(chk.get("tree")), chk.get("head"))
+            tree, head = str(chk.get("tree")), chk.get("head")
+            commit = look(tree, head) if isinstance(head, str) and head else look(tree)
             if commit:
                 commits.setdefault(commit, []).append(check_id)
     target_branch = branch
@@ -647,7 +639,8 @@ def derive(
             continue
         seen.add(identity)
         tree = str(check.get("tree"))
-        commit = _call_landed(landed, tree, check.get("head"))
+        head = check.get("head")
+        commit = landed(tree, head) if isinstance(head, str) and head else landed(tree)
         ci_row = ci_rows.get(commit) if commit else None
         ledger_conc = str(ci_row.get("ci_conclusion")) if ci_row is not None else None
         unavail = bool(commit and c_root and (c_root, commit) in _UNAVAILABLE_CI)
@@ -739,7 +732,8 @@ def approval_lookup(
             return cache[check_id]
         check = checks.get(check_id)
         base_ref = check.get("base") if check is not None else None
-        commit = _call_landed(look, str(check.get("tree") or ""), check.get("head")) if check is not None else None
+        tree, head = (str(check.get("tree") or ""), check.get("head")) if check is not None else ("", None)
+        commit = None if check is None else look(tree, head) if isinstance(head, str) and head else look(tree)
         tip = protected_tip() if commit and isinstance(base_ref, str) and _OID.fullmatch(base_ref) else None
         ok = False
         if top is not None and tip is not None:
