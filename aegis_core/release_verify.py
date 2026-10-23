@@ -169,28 +169,12 @@ class ReleaseReport:
         }
 
 
-def _invoke_gh(
-    argv: Sequence[str],
-    *,
-    cwd: Any = None,
-    timeout: float = GH_TIMEOUT_SECONDS,
-) -> Optional[Tuple[int, str, str]]:
-    try:
-        res = human_gate.default_gh_runner(argv, cwd=cwd, timeout=timeout)
-    except TypeError:
-        res = human_gate._real_default_gh_runner(argv, cwd=cwd, timeout=timeout)
-    if res is None:
-        return None
-    return res.returncode, res.stdout, res.stderr
-
-
-def default_gh(root: Any, timeout: Optional[float] = None) -> Any:
-    if isinstance(root, (list, tuple)):
-        eff_timeout = GH_TIMEOUT_SECONDS if timeout is None else timeout
-        return _invoke_gh(root, timeout=eff_timeout)
-
-    def run(argv: Sequence[str], call_timeout: float = GH_TIMEOUT_SECONDS) -> Optional[Tuple[int, str, str]]:
-        return _invoke_gh(argv, cwd=root, timeout=call_timeout)
+def default_gh(root: Any) -> GhRun:
+    """The ``GhRun`` for the repository at ``root``: ``human_gate.default_gh_runner``, looked up at each
+    call so a patched runner is the one used."""
+    def run(argv: Sequence[str], timeout: float = GH_TIMEOUT_SECONDS) -> Optional[Tuple[int, str, str]]:
+        res = human_gate.default_gh_runner(argv, cwd=root, timeout=timeout)
+        return None if res is None else (res.returncode, res.stdout, res.stderr)
 
     return run
 
@@ -336,8 +320,6 @@ def release_approved(commit: str, repository: str, branch: str, gh: GhRun) -> Tu
 
 
 def _tier(root: Path, tier_runner: Optional[Callable[..., Any]]) -> Optional[str]:
-    from aegis_core import human_gate
-
     try:
         return human_gate.detect_tier(root, tier_runner).tier
     except Exception:  # noqa: BLE001 - detect_tier reports, it does not raise; this keeps a report a report

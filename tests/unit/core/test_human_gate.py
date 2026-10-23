@@ -563,7 +563,7 @@ def test_no_gh_is_tier_c_with_the_reason_and_no_network_call(tmp_path):
 def test_a_failing_gh_is_tier_c_not_a_crash(tmp_path):
     repo = _repo_with_governance(tmp_path)
 
-    def failing(argv, stdin=None, cwd=None):
+    def failing(argv, stdin=None, cwd=None, timeout=None):
         return human_gate.GhResult(1, "", "HTTP 404: Not Found")
 
     report = human_gate.detect_tier(repo.root, gh=failing)
@@ -574,7 +574,7 @@ def test_a_failing_gh_is_tier_c_not_a_crash(tmp_path):
 @needs_git
 def test_unparseable_gh_output_is_tier_c(tmp_path):
     repo = _repo_with_governance(tmp_path)
-    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None: human_gate.GhResult(0, "<html>", ""))
+    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: human_gate.GhResult(0, "<html>", ""))
     assert report.tier == "C"
 
 

@@ -162,7 +162,8 @@ class FakeGh:
         self.calls: List[Tuple[Tuple[str, ...], Optional[bytes]]] = []
         self.missing = False
 
-    def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None):
+    def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None,
+                 timeout: Optional[float] = None):
         if self.missing:
             return None
         argv = tuple(argv)

@@ -652,17 +652,18 @@ def run_release(repo: hg.Repo, monkeypatch, capsys, path: str, *extra: str, sha:
 
 @needs_git
 @posix_only
-def test_an_old_gh_is_unverified_and_exits_non_zero(tmp_path, monkeypatch, capsys):
+def test_an_old_gh_is_unverified_and_exits_non_zero(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo = make_repo(tmp_path)
     gh_dir = fake_gh(tmp_path / "bin", "2.45.0")
     git_dir = os.path.dirname(shutil.which("git"))
     rc, out, err = run_release(repo, monkeypatch, capsys, f"{gh_dir}{os.pathsep}{git_dir}")
     assert rc not in (0, None)
     assert "UNVERIFIED (gh >= 2.93.0 required)" in out + err
+    assert "gh 2.45.0 is installed" in out + err  # the fake gh on PATH ran, not the conftest stub
 
 
 @needs_git
-def test_no_gh_at_all_is_unverified_and_exits_non_zero(tmp_path, monkeypatch, capsys):
+def test_no_gh_at_all_is_unverified_and_exits_non_zero(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo = make_repo(tmp_path)
     git_dir = os.path.dirname(shutil.which("git"))
     empty = tmp_path / "empty"

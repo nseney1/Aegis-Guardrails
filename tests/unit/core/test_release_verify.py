@@ -677,6 +677,64 @@ def test_verifying_writes_nothing_into_the_repository(tmp_path):
     assert before == after
 
 
+# ── the default gh runner (R-trust-29) ───────────────────────────────────────
+
+class RecordingRunner:
+    """human_gate.default_gh_runner's signature; answers ``result`` (or raises it) and records each call."""
+
+    def __init__(self, result: Any) -> None:
+        self.result, self.calls = result, []
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        self.calls.append((list(argv), cwd, timeout))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def test_a_type_error_inside_the_runner_propagates_and_gh_runs_once(tmp_path, monkeypatch):
+    """Given a gh runner with a bug that raises TypeError, When the release closure runs gh --version,
+    Then the TypeError surfaces after one call: no second gh call with other arguments."""
+    from aegis_core import human_gate
+
+    runner = RecordingRunner(TypeError("runner bug"))
+    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    with pytest.raises(TypeError, match="runner bug"):
+        rv.default_gh(tmp_path)(["--version"], 20.0)
+    assert runner.calls == [(["--version"], tmp_path, 20.0)]
+
+
+def test_the_closure_maps_the_runner_result_and_defaults_to_the_release_timeout(tmp_path, monkeypatch):
+    from aegis_core import human_gate
+
+    runner = RecordingRunner(human_gate.GhResult(0, "gh version 2.93.0 (2026-10-01)\n", "warning"))
+    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    run = rv.default_gh(tmp_path)
+    assert runner.calls == []
+    assert run(["--version"], 20.0) == (0, "gh version 2.93.0 (2026-10-01)\n", "warning")
+    run(["auth", "status"])
+    assert runner.calls[-1] == (["auth", "status"], tmp_path, rv.GH_TIMEOUT_SECONDS)
+
+
+def test_a_missing_gh_is_none_through_the_closure(tmp_path, monkeypatch):
+    from aegis_core import human_gate
+
+    monkeypatch.setattr(human_gate, "default_gh_runner", RecordingRunner(None))
+    assert rv.default_gh(tmp_path)(["--version"], 20.0) is None
+
+
+@needs_git
+def test_without_an_injected_gh_the_conftest_stub_reads_as_gh_missing(tmp_path):
+    report = rv.verify_release(make_repo(tmp_path).root, "HEAD", tier_runner=tier_runner_none)
+    assert (report.code, report.verified, report.status) == ("gh_missing", False, "unverified")
+
+
+def test_default_gh_takes_only_the_repository_root():
+    import inspect
+
+    assert list(inspect.signature(rv.default_gh).parameters) == ["root"]
+
+
 # ── doctor --release, CLI level ─────────────────────────────────────────────
 
 def fake_gh_dir(directory: Path, version: str) -> Path:
@@ -700,7 +758,8 @@ def cli(repo_root: Path, monkeypatch, capsys, path: str, *args: str) -> Tuple[in
 
 
 @needs_git
-def test_the_json_report_carries_the_envelope_and_fails_closed_without_gh(tmp_path, monkeypatch, capsys):
+def test_the_json_report_carries_the_envelope_and_fails_closed_without_gh(tmp_path, monkeypatch, capsys,
+                                                                            real_gh_runner):
     repo = make_repo(tmp_path)
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -716,18 +775,19 @@ def test_the_json_report_carries_the_envelope_and_fails_closed_without_gh(tmp_pa
 
 @needs_git
 @posix_only
-def test_the_cli_with_gh_2_45_prints_unverified(tmp_path, monkeypatch, capsys):
+def test_the_cli_with_gh_2_45_prints_unverified(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo = make_repo(tmp_path)
     gh_dir = fake_gh_dir(tmp_path / "bin", "2.45.0")
     path = f"{gh_dir}{os.pathsep}{os.path.dirname(shutil.which('git'))}"
     rc, out, _err = cli(repo.root, monkeypatch, capsys, path, "--release", repo.head())
     assert rc == 1
     assert out.splitlines()[0] == "UNVERIFIED (gh >= 2.93.0 required)"
+    assert "gh 2.45.0 is installed" in out  # the fake gh on PATH ran, not the conftest stub
 
 
 @needs_git
 @posix_only
-def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, monkeypatch, capsys):
+def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo = make_repo(tmp_path)
     gh_dir = fake_gh_dir(tmp_path / "bin", "2.93.0")
     path = f"{gh_dir}{os.pathsep}{os.path.dirname(shutil.which('git'))}"
