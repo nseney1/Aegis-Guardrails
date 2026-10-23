@@ -79,8 +79,26 @@ def test_scan_succeeds_when_exposure_ledger_write_fails(mcp_workspace: Path, mon
     assert [r["name"] for r in res["relevant_rules"]] == ["sample-rule"]
     assert "Sample hypothesis" in res["guidance"]
     assert "aegis-mcp: exposure record not written: read-only ledger" in capsys.readouterr().err
-    assert telemetry_handlers.credit.session_exposed_rules(mcp_workspace, "s-readonly") == {"sample-rule"}
     assert telemetry_handlers.credit.exposed_rules(mcp_workspace, "codex-cli", "s-readonly") == {"sample-rule"}
+
+
+def test_a_sessionless_read_is_the_hosts_own_exposures_never_another_hosts_session(tmp_path: Path, monkeypatch):
+    """Given an exposure of host claude-code with no session and one of other-host in session codex-cli,
+    When exposed_rules runs without a session, Then the sessionless host reads its own exposure and a
+    host name is never read as another host's session id."""
+    credit = telemetry_handlers.credit
+    monkeypatch.setattr(credit, "_EXPOSED", {})
+    credit.record_exposure(tmp_path, "claude-code", None, ["r-none"], persist=False)
+    credit.record_exposure(tmp_path, "other-host", "codex-cli", ["r-x"], persist=False)
+    assert credit.exposed_rules(tmp_path, "claude-code", None) == {"r-none"}
+    assert credit.exposed_rules(tmp_path, "codex-cli", None) == set()
+    assert credit.exposed_rules(tmp_path, "other-host", "codex-cli") == {"r-x"}
+
+
+def test_the_vestigial_credit_aliases_are_gone():
+    credit = telemetry_handlers.credit
+    assert not hasattr(credit, "record_human_label") and not hasattr(credit, "session_exposed_rules")
+    assert "session_exposed_rules" not in credit.__all__ and "record_adjudication" in credit.__all__
 
 
 def test_the_witnessed_set_holds_only_what_this_process_exposed(mcp_workspace: Path, monkeypatch):

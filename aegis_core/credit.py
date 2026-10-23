@@ -28,7 +28,7 @@ __all__ = [
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "required_workflow",
     "record_adjudication", "record_detection", "record_detections", "record_exposure", "record_override",
-    "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
+    "record_void", "resolve_protected_branch", "select_ci_run", "submit_report",
     "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
@@ -326,16 +326,6 @@ def record_exposure(
 
 
 def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None) -> Set[str]:
-    if session is None:
-        s_id = host or ""
-        found = {r for (r_root, _h_id, r_sess), rules in _EXPOSED.items() if r_root == str(root) and r_sess == s_id for r in rules}
-        if s_id:
-            for row in _of(read_rows(root), "exposure"):
-                if str(row.get("session") or "") == s_id:
-                    rule_id = row.get("rule") or row.get("for_rule")
-                    if isinstance(rule_id, str) and rule_id:
-                        found.add(rule_id)
-        return found
     h_id, s_id = host or "", session or ""
     found = set(_EXPOSED.get((str(root), h_id, s_id), ()))
     if s_id:
@@ -345,9 +335,6 @@ def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None)
                 if isinstance(rule_id, str) and rule_id:
                     found.add(rule_id)
     return found
-
-
-session_exposed_rules = exposed_rules
 
 
 def witnessed_exposed_rules(root: Any, host: Optional[str], session: Optional[str]) -> Set[str]:
@@ -430,9 +417,6 @@ def record_adjudication(
         if line is not None:
             row["line"] = int(line)
         return _normalize_event_row(ledger.append_rows(root, [row])[0])
-
-
-record_human_label = record_adjudication
 
 
 def record_override(
