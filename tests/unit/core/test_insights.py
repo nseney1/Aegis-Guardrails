@@ -860,3 +860,58 @@ def test_the_private_directories_end_0o700_and_a_linked_one_is_refused(tmp_path:
     with pytest.raises(PathTraversalError):
         create_link_key(other)
     assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755 and list(victim.iterdir()) == []
+
+
+# ── R-evidence-b2: the similarity thresholds are named once (hand-set, not measured) ──
+
+def test_the_similarity_thresholds_are_named_constants():
+    from aegis_core.insights import RECURRENCE_SIM, RULE_MATCH_SIM, RULE_MATCH_SIM_WITH_PATH
+
+    assert (RULE_MATCH_SIM_WITH_PATH, RULE_MATCH_SIM, RECURRENCE_SIM) == (0.15, 0.30, 0.12)
+
+
+def test_rule_matching_flips_at_the_shared_path_threshold(tmp_path: Path, hb_home: Path,
+                                                           monkeypatch: pytest.MonkeyPatch):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert rule == "trap-no-yaml-load" and 0 < s < core_insights.RULE_MATCH_SIM
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM_WITH_PATH", s + 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM_WITH_PATH", s - 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
+
+
+def test_rule_matching_flips_at_the_no_shared_path_threshold(tmp_path: Path, hb_home: Path,
+                                                              monkeypatch: pytest.MonkeyPatch):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["docs/x.md"], home=hb_home)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", 0.0001)
+    rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert rule == "trap-no-yaml-load" and s > 0.0001
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", s + 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", s - 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
+
+
+def test_recurrence_counts_an_insight_at_the_recurrence_threshold(tmp_path: Path, hb_home: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-rec")
+    _prompt(repo, hb_home, session="s-rec")
+    (repo / "app.py").write_text("a = 2\n", encoding="utf-8")  # the hook's paths are the dirty set
+    _prompt(repo, hb_home, "No, stop adding a scheduler loop around Popen in app.py", session="s-rec")
+    monkeypatch.setattr(core_insights, "RECURRENCE_SIM", 0.0001)
+    assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 1
+    monkeypatch.setattr(core_insights, "RECURRENCE_SIM", 1.01)
+    assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 0
+
+
+def test_an_insight_without_tokens_matches_nothing_and_raises_nothing(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "")
+    row = add_insight(repo, "the and of", paths=[], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, row["id"]) == (None, 0.0)
+    assert {e["id"]: e["neighbours"] for e in review["insights"]} == {row["id"]: []}

@@ -52,6 +52,9 @@ __all__ = [
     "KEY_SIZE",
     "MAX_CAPTURES_PER_SESSION",
     "RECURRENCE_DENOMINATOR",
+    "RECURRENCE_SIM",
+    "RULE_MATCH_SIM",
+    "RULE_MATCH_SIM_WITH_PATH",
     "SUPPORTED_INSIGHT_HOSTS",
     "add_insight",
     "capture_suggestion",
@@ -94,6 +97,12 @@ BURST_WINDOW_SECONDS = 300
 # another process than the review, so it never counts; a CLI-added insight (host "cli") never
 # joins an agent host's exposure.
 JOIN_WINDOW_S = 1800
+# TF-IDF cosine thresholds, hand-set in 4.3 and not measured (spec T8 asks for a measured one;
+# the measurement is deferred): a rule matches an insight that shares a path with it at
+# RULE_MATCH_SIM_WITH_PATH and any insight at RULE_MATCH_SIM; recurrence counts at RECURRENCE_SIM.
+RULE_MATCH_SIM_WITH_PATH = 0.15
+RULE_MATCH_SIM = 0.30
+RECURRENCE_SIM = 0.12
 _HS_DOMAIN = b"aegis-hs/v1"
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 COUNTABLE_LEVELS = frozenset({"H", "cli", "W2"})
@@ -854,7 +863,8 @@ def _match_insights_to_rules(
         best: Optional[_RuleMatch] = None
         for r_idx, (kind, robj, _) in enumerate(rule_entries):
             sim = _cosine(ins_vecs[i], rule_vecs[r_idx])
-            if ((_paths_overlap_rule(paths_i, robj) and sim >= 0.15) or sim >= 0.30) and (best is None or sim > best.similarity):
+            matched = (_paths_overlap_rule(paths_i, robj) and sim >= RULE_MATCH_SIM_WITH_PATH) or sim >= RULE_MATCH_SIM
+            if matched and (best is None or sim > best.similarity):
                 best = _RuleMatch(kind=kind, rule=robj, similarity=sim)
         matches.append(best)
     return matches
@@ -1159,7 +1169,7 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str])
                 (alive if window_open else before).add(hs_val)
             elif window_open:
                 unidentified_heartbeats += 1
-        elif similarity.get(id(row), 0.0) >= 0.12 and _paths_overlap_rule(row.get("paths") or [], rule):
+        elif similarity.get(id(row), 0.0) >= RECURRENCE_SIM and _paths_overlap_rule(row.get("paths") or [], rule):
             if window_open:
                 matching.append(row)
             elif str(row.get("id") or "") not in burst:
