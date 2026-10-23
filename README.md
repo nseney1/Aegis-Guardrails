@@ -244,3 +244,5 @@ Tier C is the complete local product; tiers B and A harden one thing, the rules 
 - Security issues: report them privately as described in [SECURITY.md](https://github.com/nseney1/Aegis-Guardrails/blob/main/SECURITY.md).
 
 Apache 2.0. Copyright 2026 Nicholas Seney. See [LICENSE](https://github.com/nseney1/Aegis-Guardrails/blob/main/LICENSE) and [NOTICE](https://github.com/nseney1/Aegis-Guardrails/blob/main/NOTICE).
+
+<!-- mcp-name: io.github.nseney1/aegis-guardrails -->
