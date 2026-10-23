@@ -36,7 +36,7 @@ flowchart TD
 | `.aegis/rules/<type>/*.md` | yes | the rules, one file each |
 | `.aegis/team.json` | yes | optional: the `shared` globs any lane may change and committed per-lane paths (section 8) |
 | `.aegis/.gitignore` | yes | ignores `state/` |
-| `.aegis/state/` | no | `ledger.jsonl` (outcomes), `activity.jsonl` (scans and edits per session), `derived.json` (written by `aegis sync`), `lock` |
+| `.aegis/state/` | no | `ledger.jsonl` (outcomes), `activity.jsonl` (scans and edits per session), `arbiter_predictions.jsonl` (Layer 2 predictions, no model text), `derived.json` (written by `aegis sync`), `lock` |
 | `AGENTS.md` | yes | one marked bootstrap block; the rest of the file is yours |
 | `.claude/skills/`, `.agents/skills/` | yes | skill copies written by `aegis skills sync`, each with an Aegis marker line |
 | `refs/aegis/lanes/<lane>` | git ref | a lane's lease, written by `aegis team` |

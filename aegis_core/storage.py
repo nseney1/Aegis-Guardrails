@@ -857,10 +857,13 @@ def atomic_write_bytes(
     try:
         try:
             _write_all(fd, data)
+            # Through the descriptor: a link swapped in at the temporary name is never followed.
+            if keep_mode is not None and os.name == "posix":
+                os.fchmod(fd, keep_mode)
             os.fsync(fd)
         finally:
             os.close(fd)
-        if keep_mode is not None:
+        if keep_mode is not None and os.name != "posix":
             os.chmod(tmp, keep_mode)
         _replace_with_retry(tmp, str(target), max_retries, initial_delay)
     except BaseException:

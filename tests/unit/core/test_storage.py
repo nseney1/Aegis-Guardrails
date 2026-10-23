@@ -493,3 +493,34 @@ def test_without_following_links_an_existing_regular_file_keeps_its_mode(tmp_pat
     os.chmod(target, 0o640)
     atomic_write_bytes(target, b"new", follow_links=False)
     assert _mode(target) == 0o640 and target.read_bytes() == b"new"
+
+
+# ── The temporary file's mode is set through its descriptor (review L3) ─────────
+
+@posix_only
+def test_the_mode_is_set_on_the_temporary_file_never_on_a_link_swapped_in_at_its_name(
+        tmp_path: Path, umask, monkeypatch):
+    """Given a write with an exact mode, When a symlink to another file is swapped in at the
+    temporary name after it was opened, Then the opened file gets the mode and the link's
+    target keeps its own."""
+    from aegis_core import storage
+
+    umask(0o022)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    os.chmod(victim, 0o600)
+    out = tmp_path / "out"
+    out.mkdir()
+    moved = tmp_path / "opened-file"
+    real_write_all = storage._write_all
+
+    def write_then_swap(fd, data):
+        real_write_all(fd, data)
+        tmp, = (p for p in out.iterdir() if p.name.endswith(".tmp"))
+        os.rename(tmp, moved)
+        _symlink_or_skip(tmp, victim)
+
+    monkeypatch.setattr(storage, "_write_all", write_then_swap)
+    atomic_write_bytes(out / "config.json", b"{}", mode=0o644)
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o600 and victim.read_bytes() == b"precious"
+    assert _mode(moved) == 0o644 and moved.read_bytes() == b"{}"
