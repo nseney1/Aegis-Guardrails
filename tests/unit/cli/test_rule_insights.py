@@ -606,8 +606,8 @@ def test_status_shows_an_insight_born_rules_recurrence_and_the_uncounted_suggest
 
     ws, home = status_ws
     _born_rule(ws)
-    record_hook_prompt(ws, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
-                       home=home)
+    record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
+                       workspace=ws, home=home)
     capture_suggestion(ws, "prefer short functions", paths=["src/main.py"], host="claude-code", session="a", home=home)
     rc, out = _status_text(ws)
     assert rc == 0
@@ -651,8 +651,8 @@ def test_sync_reports_the_recurrence_line_and_the_json_payload(status_ws):
 
     ws, home = status_ws
     _born_rule(ws)
-    record_hook_prompt(ws, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
-                       home=home)
+    record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
+                       workspace=ws, home=home)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         assert run_sync(argparse.Namespace(_root=ws, json=False, plain=True)) == 0

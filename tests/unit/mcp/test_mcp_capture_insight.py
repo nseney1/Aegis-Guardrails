@@ -75,14 +75,13 @@ def test_aegis_capture_insight_records_suggestion_and_is_corroborated_never_upgr
     # differs. The capture is corroborated (same host, inside the join window) and stays a
     # suggestion: only the hook row counts.
     hook = record_hook_prompt(
-        ws,
         "claude-code",
         {
             "prompt": "No, stop using raw os.system calls in src/service.py!",
             "session_id": "host-session-2",
             "cwd": str(ws),
         },
-        home=home,
+        workspace=ws, home=home,
     )
     res_corroborated = execute_tool(
         "aegis_capture_insight",
@@ -162,8 +161,8 @@ def test_hook_prompts_never_consume_the_session_cap(bounded, monkeypatch):
     ws, home = bounded
     monkeypatch.setattr(insights_mod, "MAX_CAPTURES_PER_SESSION", 3)
     for i in range(5):
-        record_hook_prompt(ws, "claude-code", {"prompt": f"No, stop doing thing {i} again", "session_id": "s1",
-                                               "cwd": str(ws)}, home=home)
+        record_hook_prompt("claude-code", {"prompt": f"No, stop doing thing {i} again", "session_id": "s1",
+                                           "cwd": str(ws)}, workspace=ws, home=home)
     for i in range(3):
         assert _capture(ws, f"unrelated preference {i}", "s1", paths=["src/service.py"])["status"] == "OK"
     assert _capture(ws, "one too many", "s1", paths=["src/service.py"])["status"] == "FAIL"

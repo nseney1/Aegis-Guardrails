@@ -33,7 +33,6 @@ from aegis_core.errors import PathTraversalError
 from aegis_core.storage import (
     append_jsonl,
     atomic_write_text,
-    fsync_dir,
     read_jsonl,
     workspace_relative,
 )
@@ -44,24 +43,15 @@ if TYPE_CHECKING:
     # Bound for linters and type checkers only: at run time these names are served lazily by
     # __getattr__ below, so a no-cue hook prompt never imports the scanner module.
     from aegis_core.rules import Rule
-    from aegis_core.verification.scanners import MAX_EXCERPT_CHARS, redact_insight_text
+    from aegis_core.verification.scanners import redact_insight_text
 
 __all__ = [
-    "BURST_WINDOW_SECONDS",
     "CaptureLimitReached",
-    "DECISIONS",
     "INSIGHT_HOOK_MARKER",
-    "INSIGHT_LEVELS",
-    "INSIGHT_SCHEMA_VERSION",
     "JOIN_WINDOW_S",
     "KEY_SIZE",
     "MAX_CAPTURES_PER_SESSION",
-    "MAX_CAPTURE_PATHS",
-    "MAX_CAPTURE_PATH_CHARS",
-    "MAX_EXCERPT_CHARS",
-    "RECURRENCE_ALARM_COUNT",
     "RECURRENCE_DENOMINATOR",
-    "REJECTION_RESURFACE_COUNT",
     "SUPPORTED_INSIGHT_HOSTS",
     "add_insight",
     "capture_suggestion",
@@ -84,7 +74,6 @@ __all__ = [
     "remove_insight_hook",
     "review_insights",
     "session_hs",
-    "tfidf_cosine",
     "write_proposal",
 ]
 
@@ -107,8 +96,7 @@ BURST_WINDOW_SECONDS = 300
 JOIN_WINDOW_S = 1800
 _HS_DOMAIN = b"aegis-hs/v1"
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-INSIGHT_LEVELS = ("H", "cli", "W2", "hook", "suggestion")
-COUNTABLE_LEVELS = frozenset({"H", "cli", "W2", "hook"})
+COUNTABLE_LEVELS = frozenset({"H", "cli", "W2"})
 DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
 # The latest of these decides whether a cluster is listed; noise and confirm name insights.
 _RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
@@ -119,7 +107,6 @@ MAX_CAPTURE_PATHS = 20
 MAX_CAPTURE_PATH_CHARS = 512
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _LAZY_NAMES = {
-    "MAX_EXCERPT_CHARS": "aegis_core.verification.scanners",
     "redact_insight_text": "aegis_core.verification.scanners",
     "Rule": "aegis_core.rules",
     "load_rules": "aegis_core.rules",
@@ -197,36 +184,28 @@ def create_link_key(home: Optional[Path] = None) -> Tuple[Path, bool]:
         raise OSError("cannot resolve home directory for link.key")
     _ensure_private_dir(layout.aegis_dir)
     key_path = layout.aegis_dir / "link.key"
-    st = _lstat_or_none(key_path)
-    if st is not None and stat.S_ISLNK(st.st_mode):
-        raise PathTraversalError(f"refusing to use {key_path}: it is a symlink", path=str(key_path))
+    if storage.create_private_file(key_path, secrets.token_bytes(KEY_SIZE)):
+        return key_path, True
     try:
-        fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_FLAGS, 0o600)
-    except FileExistsError:
-        st = os.lstat(key_path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        fd = os.open(str(key_path), os.O_RDONLY | _O_FLAGS | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        if os.path.islink(key_path):  # swapped in since create_private_file looked
+            raise PathTraversalError(f"refusing to use {key_path}: it is a symlink", path=str(key_path)) from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise PathTraversalError(f"refusing to use {key_path}: it is not a regular file", path=str(key_path))
         if st.st_size != KEY_SIZE:
             raise ValueError(f"corrupt {key_path}: expected {KEY_SIZE} bytes, found {st.st_size}")
-        _chmod_quiet(key_path, 0o600)
-        return key_path, False
-    try:
-        view = memoryview(secrets.token_bytes(KEY_SIZE))
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-    except BaseException:
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+    finally:
         os.close(fd)
-        try:
-            os.unlink(key_path)
-        except OSError:
-            pass
-        raise
-    os.close(fd)
-    _chmod_quiet(key_path, 0o600)
-    fsync_dir(layout.aegis_dir)
-    return key_path, True
+    return key_path, False
 
 
 def read_link_key(home: Optional[Path] = None) -> Optional[bytes]:
@@ -457,7 +436,7 @@ def _row_source(row: Mapping[str, Any]) -> Optional[str]:
     source, level = row.get("source"), row.get("level")
     if source is not None:
         return source if source in ("hook", "cli", "mcp") else None
-    if level in ("W2", "hook"):
+    if level == "W2":
         return "mcp" if row.get("confirmed_by") else "hook"
     return {"H": "cli", "cli": "cli", "suggestion": "mcp"}.get(level) if isinstance(level, str) else None
 
@@ -631,54 +610,38 @@ def capture_suggestion(
     return row
 
 
-def _first_str(mapping: Mapping[str, Any], keys: Sequence[str], strip: bool = True) -> Optional[str]:
-    for k in keys:
-        v = mapping.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip() if strip else v
-    return None
-
-
 def _extract_hook_fields(payload: Any) -> Tuple[str, Optional[str], Optional[str]]:
+    """(prompt, session id, cwd) of a host payload: the JSON object Claude Code and Codex send.
+    Anything else, raw text included, is no prompt (at most a text-free heartbeat)."""
     if isinstance(payload, str):
-        s = payload.strip()
-        if s.startswith("{") and s.endswith("}"):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, Mapping):
-                    payload = parsed
-            except ValueError:
-                pass
-    if isinstance(payload, str):
-        return payload, None, None
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return "", None, None
     if not isinstance(payload, Mapping):
         return "", None, None
-    prompt = _first_str(payload, ("prompt", "user_prompt", "text", "message", "input"), strip=False) or ""
-    sess = _first_str(payload, ("session_id", "sessionId", "conversation_id", "conversationId", "session"))
-    cwd = _first_str(payload, ("cwd", "workspace", "working_directory", "project_dir"))
-    return prompt, sess, cwd
+    prompt, sess, cwd = (payload.get(k) for k in ("prompt", "session_id", "cwd"))
+    return (prompt if isinstance(prompt, str) else "",
+            sess.strip() if isinstance(sess, str) and sess.strip() else None,
+            cwd.strip() if isinstance(cwd, str) and cwd.strip() else None)
 
 
 def record_hook_prompt(
-    workspace_or_host: Any,
-    host_or_payload: Any,
-    payload: Any = None,
+    host: str,
+    payload: Any,
     *,
     workspace: Any = None,
     excerpts: bool = True,
-    session: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    if payload is None:
-        host, actual_payload, actual_ws = str(workspace_or_host), host_or_payload, workspace
-    else:
-        host, actual_payload, actual_ws = str(host_or_payload), payload, workspace_or_host
-    prompt_text, payload_session, payload_cwd = _extract_hook_fields(actual_payload)
+    host = str(host)
+    prompt_text, payload_session, payload_cwd = _extract_hook_fields(payload)
+    actual_ws = workspace
     if actual_ws is None:
         from aegis_core.config import env_workspace
         project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
         actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
-    hs = _ensure_hs(host, session or payload_session, home=home)
+    hs = _ensure_hs(host, payload_session, home=home)
     cue = has_correction_cue(prompt_text)
     excerpt = _redact(prompt_text) if cue and excerpts else ""
     if hs is None and not excerpt:
@@ -770,13 +733,6 @@ def _cosine(a: Mapping[str, float], b: Mapping[str, float]) -> float:
     return sum(v * b.get(k, 0.0) for k, v in a.items())
 
 
-def tfidf_cosine(text_a: str, text_b: str) -> float:
-    ta, tb = _tokenize(text_a), _tokenize(text_b)
-    if not ta or not tb:
-        return 0.0
-    return _cosine(*_tfidf_vectors([ta, tb]))
-
-
 def _load_md_rules(workspace: Any, folder: Path, *, recursive: bool = False) -> List[Rule]:
     if not folder.is_dir():
         return []
@@ -838,12 +794,9 @@ def _rule_was_exposed(rule: Rule, cluster_rows: Sequence[Mapping[str, Any]], exp
 
 
 def _paths_overlap_rule(paths: Iterable[str], rule: Rule) -> bool:
-    from aegis_core.match import first_match
-
+    """An insight without paths overlaps every rule; otherwise the rule must apply to one of them."""
     plist = [p for p in paths if p]
-    if not plist or not rule.target_paths:
-        return True
-    return any(rule.applies_to(p) or first_match(rule.target_paths, p) is not None for p in plist)
+    return not plist or any(rule.applies_to(p) for p in plist)
 
 
 class _RuleMatch(NamedTuple):
@@ -1255,7 +1208,7 @@ def _session_rates(alive: Set[str], matching: Sequence[Mapping[str, Any]]) -> Tu
     return len(by_session), sum(_count_recurrence_episodes(rows) for rows in by_session.values())
 
 
-def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str], reset_on_rev_change: bool) -> Dict[str, Any]:
+def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str]) -> Dict[str, Any]:
     cur_rev = rule.digest[:16]
     rule_tokens = _tokenize(f"{rule.id} {rule.meta.get('hypothesis', '')} {rule.body}")
     burst = {str(i) for i in rule.meta.get("insight_ids") or [] if isinstance(i, (str, int))}
@@ -1265,8 +1218,13 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
     }
     # The window opens at the first row that names the rule's current rev (its first inventory
     # row); the baseline is the same measurement over the sessions before it.
-    window_open = not reset_on_rev_change
+    window_open = False
     superseded = _superseded(rows)
+    # One TF-IDF corpus: every counted insight and the rule, as review weighs them.
+    counted = [r for r in rows if r.get("event") == "insight" and id(r) not in superseded
+               and _effective_level(r, confirmed) in COUNTABLE_LEVELS]
+    vecs = _tfidf_vectors([_tokenize(str(r.get("text") or "")) for r in counted] + [rule_tokens])
+    similarity = {id(r): _cosine(v, vecs[-1]) for r, v in zip(counted, vecs)}
     alive: Set[str] = set()
     before: Set[str] = set()
     unidentified_heartbeats = 0
@@ -1277,7 +1235,7 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
         revs = row.get("revs")
         if not isinstance(revs, Mapping):
             revs = inv_revs.get(row["inv"], {}) if isinstance(row.get("inv"), str) else {}
-        in_rev = not reset_on_rev_change or revs.get(rule.id) == cur_rev
+        in_rev = revs.get(rule.id) == cur_rev
         window_open = window_open or in_rev
         if window_open and not in_rev:
             continue
@@ -1287,14 +1245,11 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
                 (alive if window_open else before).add(hs_val)
             elif window_open:
                 unidentified_heartbeats += 1
-        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS and id(row) not in superseded
-              and _paths_overlap_rule(row.get("paths") or [], rule)):
-            itoks = _tokenize(str(row.get("text") or ""))
-            if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:
-                if window_open:
-                    matching.append(row)
-                elif str(row.get("id") or "") not in burst:
-                    earlier.append(row)
+        elif similarity.get(id(row), 0.0) >= 0.12 and _paths_overlap_rule(row.get("paths") or [], rule):
+            if window_open:
+                matching.append(row)
+            elif str(row.get("id") or "") not in burst:
+                earlier.append(row)
     recurrent, episodes = _session_rates(alive, matching)
     unattributed = _count_recurrence_episodes([r for r in matching if not r.get("hs")])
     base_recurrent, _ = _session_rates(before, earlier)
@@ -1320,7 +1275,6 @@ def measure_recurrence(
     rule_id: str,
     *,
     home: Optional[Path] = None,
-    reset_on_rev_change: bool = True,
 ) -> Dict[str, Any]:
     """Alive sessions with a matching human insight over all alive sessions (at most 1), its 95%
     upper bound, and the episodes the alarm counts."""
@@ -1331,7 +1285,7 @@ def measure_recurrence(
     if rule is None:
         raise ValueError(f"unknown rule {rule_id!r}")
     rows = read_insight_rows(root, home=home)
-    return _measure(rule, rows, set(_confirmed(rows)), reset_on_rev_change)
+    return _measure(rule, rows, set(_confirmed(rows)))
 
 
 def insight_born_rules(workspace: Any) -> List[Rule]:
@@ -1353,7 +1307,7 @@ def insight_status(workspace: Any, *, home: Optional[Path] = None) -> Dict[str, 
         return {}
     confirmed = set(_confirmed(rows))
     return {
-        "rules": [_measure(rule, rows, confirmed, True) for rule in insight_born_rules(workspace)],
+        "rules": [_measure(rule, rows, confirmed) for rule in insight_born_rules(workspace)],
         "unconfirmed_suggestions": sum(1 for r in rows if r.get("event") == "insight"
                                        and _effective_level(r, confirmed) == "suggestion"),
         "denominator": RECURRENCE_DENOMINATOR,

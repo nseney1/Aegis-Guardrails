@@ -763,12 +763,3 @@ def run_hook_status(args: Any) -> int:
     if st["unreachable_reason"]:
         print(f"  Reachable:       ❌ {st['unreachable_reason']}")
     return 0
-
-
-def __getattr__(name: str) -> Any:
-    if name in ("enable_insight_hook", "insight_hook_status"):
-        from aegis_cli.hooks import insights
-
-        return getattr(insights, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-

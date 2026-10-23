@@ -85,7 +85,8 @@ def _hook_insight(repo: Path, text: str, session: str, home: Path) -> Dict[str, 
     The hook takes its paths from the dirty set, so src/app.py is made dirty first, as the
     explicit ``paths=["src/app.py"]`` of the CLI channel did."""
     (repo / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
-    row = record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    row = record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)},
+                             workspace=repo, home=home)
     assert row.get("event") == "insight", f"no correction cue in {text!r}"
     return row
 
@@ -192,10 +193,9 @@ def test_correction_cue_detector_precision_and_recall_and_hook_storage(tmp_path:
 
     # Routine prompt via hook -> writes heartbeat only, no prompt text on disk
     record_hook_prompt(
-        repo,
         "claude-code",
         {"prompt": "Please implement the parser for the new command.", "session_id": "sess-routine-1", "cwd": str(repo)},
-        home=home,
+        workspace=repo, home=home,
     )
     store = insights_path(repo, home=home)
     assert store.exists()
@@ -211,14 +211,13 @@ def test_correction_cue_detector_precision_and_recall_and_hook_storage(tmp_path:
 
     # Correction prompt via hook -> writes heartbeat (for new session) + redacted W2 insight row
     record_hook_prompt(
-        repo,
         "claude-code",
         {
             "prompt": "No, don't hardcode token ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD in src/app.py!",
             "session_id": "sess-corr-2",
             "cwd": str(repo),
         },
-        home=home,
+        workspace=repo, home=home,
     )
     rows = [json.loads(line) for line in store.read_text(encoding="utf-8").splitlines() if line.strip()]
     insight_rows = [r for r in rows if r.get("event") == "insight"]
@@ -266,14 +265,13 @@ def test_agent_suggestions_do_not_count_and_never_enter_scan_or_proposals(tmp_pa
     # A hook-captured prompt of the same host containing the quote corroborates the captures:
     # they stay suggestions and annotate the one hook row, which alone counts.
     hook = record_hook_prompt(
-        repo,
         "claude-code",
         {
             "prompt": "Stop! Never use write_text with newline parameter in Python 3.9, it breaks!",
             "session_id": "host-sess-1",
             "cwd": str(repo),
         },
-        home=home,
+        workspace=repo, home=home,
     )
     corroborated = capture_suggestion(
         repo,
@@ -437,10 +435,9 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
     # Capture a W2 hook insight with distinctive verbatim phrasing
     verbatim_w2 = "No, never call shutil.rmtree on unvalidated user paths in src/app.py!"
     record_hook_prompt(
-        repo,
         "claude-code",
         {"prompt": verbatim_w2, "session_id": "sess-prop-1", "cwd": str(repo)},
-        home=home,
+        workspace=repo, home=home,
     )
 
     # Write closed-template proposal -> lives in .aegis/proposals/<id>.md, never loaded by load_rules,
@@ -488,10 +485,9 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
     for s_idx in range(1, 6):
         sid = f"post-act-sess-{s_idx}"
         record_hook_prompt(
-            repo,
             "claude-code",
             {"prompt": "Run the test suite please.", "session_id": sid, "cwd": str(repo)},
-            home=home,
+            workspace=repo, home=home,
         )
         if s_idx <= 3:
             # In session 1, emit two burst insights back-to-back -> must collapse to 1 episode
@@ -512,7 +508,7 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
         rule_file.read_text(encoding="utf-8") + "\nAdditional mechanical guidance for v2.\n",
         encoding="utf-8",
     )
-    rec_reset = measure_recurrence(repo, "trap-validate-rmtree", home=home, reset_on_rev_change=True)
+    rec_reset = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert rec_reset["recurrences"] == 0
     assert rec_reset["alarm"] is False
 
@@ -601,10 +597,9 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
     append_jsonl(store, [dict(legacy) for _ in range(10)])
     for _ in range(10):
         record_hook_prompt(
-            repo,
             "claude-code",
             {"prompt": "Please run the unit tests.", "cwd": str(repo)},
-            home=home,
+            workspace=repo, home=home,
         )
     assert len(read_insight_rows(repo, home=home)) == 10
 
@@ -617,10 +612,9 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
     # Now add 2 identified sessions (hs present) -> sessions must be 2, not 12
     for s_idx in (1, 2):
         record_hook_prompt(
-            repo,
             "claude-code",
             {"prompt": "Please run the unit tests.", "session_id": f"identified-sess-{s_idx}", "cwd": str(repo)},
-            home=home,
+            workspace=repo, home=home,
         )
 
     rec_mixed = measure_recurrence(repo, "trap-validate-rmtree", home=home)
@@ -770,8 +764,8 @@ def test_a_4_3_upgraded_w2_capture_never_counts_as_a_recurrence(tmp_path: Path, 
     monkeypatch.setenv("USERPROFILE", str(home))
     repo = _init_git_repo(tmp_path / "repo")
     _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], "Always check path confinement before recursive directory removal.")
-    hb = record_hook_prompt(repo, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(repo)},
-                            home=home)
+    hb = record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(repo)},
+                            workspace=repo, home=home)
     rev = load_rules(repo).get("trap-validate-rmtree").digest[:16]
     append_jsonl(insights_path(repo, home=home), [{
         "v": 1, "ts": hb["ts"], "event": "insight", "id": "ins-0000000000cc", "level": "W2",
@@ -872,7 +866,8 @@ RMTREE_TEXT = "stop calling recursive directory removal without path confinement
 
 
 def _prompt(repo: Path, home: Path, session: str, text: str = "Please run the tests.") -> Dict[str, Any]:
-    return record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    return record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)},
+                              workspace=repo, home=home)
 
 
 def _recurrence_row(repo: Path, home: Path, hs: Any, when: str, rid: str = "trap-validate-rmtree") -> None:
