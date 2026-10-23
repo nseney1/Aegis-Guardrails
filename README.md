@@ -23,7 +23,7 @@ In one coding session analyzed step by step, 749 of 1,339 agent steps (55.9%) we
 ## How is this different?
 
 - **`AGENTS.md` or `CLAUDE.md` alone** are read by the agent and checked by nothing. Aegis keeps them to a short bootstrap, serves the rules that match each file at edit time, and checks the result.
-- **Agent hooks alone** (such as Claude Code's `PreToolUse`) run only in the host that has them, fail open, and do not see edits made through shell commands. Aegis adds them as an extra layer on three hosts and treats CI as the authority.
+- **Agent hooks alone** (such as Claude Code's `PreToolUse`) run only inside that host. Aegis uses them as an extra layer on three hosts, but its hooks fail open and do not see edits made through shell commands, so CI stays the authority.
 - **A plain git `pre-commit` hook** runs after the agent is done, and `--no-verify` skips it. Aegis installs one too (a plain git hook, not one for the pre-commit framework), tells the agent the rules before it edits, and repeats the check in CI.
 - **semgrep and ast-grep** are general code-pattern engines with their own rule libraries. Aegis's `forbid_ast` is deliberately small (banned imports, calls and decorators; Python, plus packaged drivers for Rust, TypeScript/JavaScript and Go). What differs is delivery, since the rule reaches the agent per file, and governance, since `aegis check --ci` fails a pull request that weakens a rule.
 - **Guardrails AI** validates the inputs and outputs of an LLM inside your application. Aegis governs the coding agent that edits your repository.
