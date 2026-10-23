@@ -160,22 +160,34 @@ def _lstat_or_none(path: Path) -> Optional[os.stat_result]:
         return None
 
 
-def _chmod_quiet(path: Path, mode: int) -> None:
-    if os.name == "posix":
-        try:
-            os.chmod(path, mode)
-        except OSError:
-            pass
-
-
 def _ensure_private_dir(directory: Path) -> None:
-    st = _lstat_or_none(directory)
-    if st is not None:
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            raise PathTraversalError(f"refusing to use {directory}: invalid directory", path=str(directory))
-    else:
-        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    _chmod_quiet(directory, 0o700)
+    """``directory`` (made with its parents if missing) at 0o700. POSIX sets the mode through a
+    descriptor opened without following a link, so a link swapped in is refused, never chmodded."""
+    try:
+        directory.mkdir(parents=True, mode=0o700)
+    except FileExistsError:
+        pass
+    invalid = PathTraversalError(f"refusing to use {directory}: invalid directory", path=str(directory))
+    if os.name != "posix":  # no directory descriptor and no POSIX bits: the lstat check is the guard
+        st = _lstat_or_none(directory)
+        if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise invalid
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY | _O_FLAGS | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        if os.path.islink(directory) or not os.path.isdir(directory):
+            raise invalid from exc
+        raise
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise invalid
+        try:
+            os.fchmod(fd, 0o700)
+        except OSError:  # another user's directory: left as it is, as chmod by name did
+            pass
+    finally:
+        os.close(fd)
 
 
 def create_link_key(home: Optional[Path] = None) -> Tuple[Path, bool]:
@@ -314,8 +326,7 @@ def _append_user_insights(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     _ensure_private_dir(path.parent.parent)
     _ensure_private_dir(path.parent)
     with storage.file_lock(path.with_suffix(".lock")):
-        append_jsonl(path, list(rows), mode=0o600)
-        _chmod_quiet(path, 0o600)
+        append_jsonl(path, list(rows), mode=0o600)  # the mode is set through the descriptor
 
 
 def read_insight_rows(workspace: Any, home: Optional[Path] = None) -> List[Dict[str, Any]]:

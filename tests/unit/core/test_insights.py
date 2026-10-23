@@ -808,3 +808,55 @@ def test_an_insight_without_paths_overlaps_every_rule(tmp_path: Path, hb_home: P
     assert row["paths"] == []
     match = _match_of(review_insights(repo, home=hb_home), row["id"])
     assert match[0] == "trap-no-yaml-load" and 0.15 <= match[1] < 0.30
+
+
+# ── X-w8-carry j: the private directories get their mode through a descriptor ──
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and mode bits")
+
+
+@posix_only
+def test_a_link_swapped_in_after_the_check_is_never_chmodded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Given ~/.aegis checked as a directory, When a link to another directory replaces it before
+    its mode is set, Then the link's target keeps its mode."""
+    home = tmp_path / "home"
+    aegis = home / ".aegis"
+    aegis.mkdir(parents=True, mode=0o755)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    real_lstat, swapped = os.lstat, []
+
+    def lstat_then_swap(path, *args, **kwargs):
+        found = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == str(aegis) and not swapped:
+            swapped.append(True)
+            os.rename(aegis, tmp_path / "moved")
+            os.symlink(victim, aegis)
+        return found
+
+    monkeypatch.setattr(os, "lstat", lstat_then_swap)
+    try:
+        create_link_key(home)
+    except PathTraversalError:
+        pass
+    assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755
+    assert not (victim / "link.key").exists()
+
+
+@posix_only
+def test_the_private_directories_end_0o700_and_a_linked_one_is_refused(tmp_path: Path):
+    home = tmp_path / "home"
+    (home / ".aegis").mkdir(parents=True, mode=0o755)
+    os.chmod(home / ".aegis", 0o755)
+    create_link_key(home)
+    assert stat.S_IMODE(os.stat(home / ".aegis").st_mode) == 0o700
+    other = tmp_path / "other"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    other.mkdir()
+    (other / ".aegis").symlink_to(victim)
+    with pytest.raises(PathTraversalError):
+        create_link_key(other)
+    assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755 and list(victim.iterdir()) == []
