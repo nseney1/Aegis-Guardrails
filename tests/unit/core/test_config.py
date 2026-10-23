@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from aegis_core.config import (
+    DEFAULT_EPSILON,
+    DEFAULT_HALF_LIFE_SESSIONS,
     ENV_VARS,
     ConfigError,
     RepoConfig,
@@ -102,6 +104,67 @@ def test_invalid_values_are_ignored_with_a_warning(ws: Path, data: dict, needle:
     _repo(ws, data)
     config = RepoConfig.load(ws)
     assert any(needle in w for w in config.warnings), config.warnings
+
+
+DECAY_WARNING = ("ignored decay key(s) in .aegis/config.json outside 'expiry': use expiry.half_life_sessions "
+                 "and expiry.epsilon")
+
+
+def test_decay_keys_apply_only_under_expiry_and_the_others_warn_once(ws: Path):
+    """Given every decay spelling at once, When the repo config loads, Then expiry's wins, the rest
+    give exactly one warning that echoes no value, and sibling keys still apply."""
+    _repo(ws, {"v": 1, "epsilon": 0.5, "half_life_sessions": 5, "fitness": {"epsilon": 0.3, "half_life_sessions": 7},
+               "expiry": {"half_life_sessions": 12}, "hosts": ["claude-code"]})
+    config = RepoConfig.load(ws)
+    assert (config.half_life_sessions, config.epsilon, config.hosts) == (12, DEFAULT_EPSILON, ("claude-code",))
+    assert config.warnings == (DECAY_WARNING,)
+    assert not any(value in w for w in config.warnings for value in ("0.5", "0.3", "5", "7"))
+
+
+@pytest.mark.parametrize("data", [{"epsilon": 0.2}, {"half_life_sessions": 9}, {"fitness": {"epsilon": 0.2}},
+                                  {"fitness": {"half_life_sessions": 9}}], ids=["eps", "hl", "fit-eps", "fit-hl"])
+def test_each_spelling_outside_expiry_is_ignored(ws: Path, data: dict):
+    _repo(ws, data)
+    config = RepoConfig.load(ws)
+    assert (config.half_life_sessions, config.epsilon, config.warnings) == (
+        DEFAULT_HALF_LIFE_SESSIONS, DEFAULT_EPSILON, (DECAY_WARNING,))
+
+
+def test_a_fitness_value_that_is_not_an_object_warns_and_never_raises(ws: Path):
+    _repo(ws, {"v": 1, "fitness": "x", "jit": {"max_tokens": 0}})
+    warnings = RepoConfig.load(ws).warnings
+    assert "ignored 'fitness' in .aegis/config.json: it must be an object" in warnings
+    assert any("'jit.max_tokens'" in w for w in warnings) and len(warnings) == 2
+
+
+def test_the_expiry_decay_keys_apply_without_a_warning(ws: Path):
+    _repo(ws, {"expiry": {"half_life_sessions": 20, "epsilon": 0.15}})
+    config = RepoConfig.load(ws)
+    assert (config.half_life_sessions, config.epsilon, config.warnings) == (20, 0.15, ())
+
+
+@pytest.mark.parametrize("value", [2, "x", True], ids=["two", "text", "bool"])
+def test_an_invalid_expiry_decay_value_warns_once_per_key_by_its_qualified_name(ws: Path, value):
+    _repo(ws, {"expiry": {"half_life_sessions": value, "epsilon": value}})
+    config = RepoConfig.load(ws)
+    assert config.epsilon == DEFAULT_EPSILON
+    eps = [w for w in config.warnings if "'expiry.epsilon'" in w]
+    assert eps == ["ignored 'expiry.epsilon' in .aegis/config.json: it must be a number between 0 and 1"]
+    if value != 2:
+        assert config.half_life_sessions == DEFAULT_HALF_LIFE_SESSIONS
+        assert [w for w in config.warnings if "'expiry.half_life_sessions'" in w] == [
+            "ignored 'expiry.half_life_sessions' in .aegis/config.json: it must be a positive integer"]
+
+
+def test_the_decay_defaults_are_set_once_in_config():
+    import inspect
+
+    from aegis_core import fitness
+
+    assert inspect.signature(fitness.session_decay_factor).parameters["half_life_sessions"].default == \
+        DEFAULT_HALF_LIFE_SESSIONS
+    assert inspect.signature(fitness.compute).parameters["epsilon"].default == DEFAULT_EPSILON
+    assert inspect.signature(fitness.compute).parameters["half_life_sessions"].default == DEFAULT_HALF_LIFE_SESSIONS
 
 
 @pytest.mark.parametrize("content, message", [
