@@ -475,15 +475,15 @@ def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
 
 
 def _superseded(rows: Sequence[Mapping[str, Any]]) -> Set[int]:
-    """The ``id()`` of every cli row that a later H row with the same text, paths and kind
-    restates: the documented H recipe re-runs ``insight add`` with ``--commit``, and one
-    correction must not count twice."""
-    signed: Set[Tuple[str, Tuple[str, ...], str]] = set()
+    """The ``id()`` of every cli row that a later H row with the same text and kind restates:
+    the documented H recipe re-runs ``insight add`` with ``--commit``, and one correction must
+    not count twice. Paths are not compared: a re-run without --paths takes the work tree's."""
+    signed: Set[Tuple[str, str]] = set()
     found: Set[int] = set()
     for r in reversed(rows):
         if r.get("event") != "insight" or _row_source(r) != "cli":
             continue
-        key = (str(r.get("text") or ""), tuple(sorted(str(p) for p in r.get("paths") or [])), str(r.get("kind") or ""))
+        key = (str(r.get("text") or ""), str(r.get("kind") or ""))
         if r.get("level") == "H":
             signed.add(key)
         elif key in signed:

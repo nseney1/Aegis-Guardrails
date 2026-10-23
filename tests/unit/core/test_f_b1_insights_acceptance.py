@@ -1043,14 +1043,25 @@ def test_two_identical_cli_adds_without_a_signed_rerun_still_count_twice(review_
 
 @pytest.mark.parametrize("changes", [
     {"text": "Always pass an explicit timeout to every subprocess call in the cli"},
-    {"paths": ["src/other.py"]},
     {"kind": "processes"},
-], ids=["text", "paths", "kind"])
+], ids=["text", "kind"])
 def test_an_h_row_that_differs_supersedes_nothing(review_repo, changes):
     repo, home = review_repo
     cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
     signed = _signed_rerun(repo, home, cli, **changes)
     assert _counted_ids(repo, home) == sorted([cli["id"], signed["id"]])
+
+
+@pytest.mark.parametrize("paths", [[], ["src/other.py"]], ids=["work-tree", "other"])
+def test_an_h_rerun_with_other_paths_still_supersedes_its_cli_row(review_repo, paths):
+    """X-w8-carry k: the re-run without --paths takes its paths from the work tree, so the H row
+    matches its cli row on text and kind alone; it counts once, carrying its own paths."""
+    repo, home = review_repo
+    cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, cli, paths=paths)
+    assert [(e["id"], e["paths"]) for e in review_insights(repo, home=home)["insights"]] == [(signed["id"], paths)]
+    with pytest.raises(ValueError, match=f"not a counted insight: {cli['id']}"):
+        write_proposal(repo, proposal_id="trap-popen", insight_ids=[cli["id"]], home=home)
 
 
 def test_an_h_row_supersedes_only_the_cli_adds_before_it(review_repo):
