@@ -42,7 +42,6 @@ __all__ = [
     "combined_totals",
     "compute",
     "compute_mde_180d",
-    "compute_silence_credit",
     "for_rules",
     "regularized_incomplete_beta",
     "replay_detector_history",
@@ -92,23 +91,6 @@ def compute_mde_180d(trigger_rate_per_day: float, horizon_days: float = DEFAULT_
     if expected_n <= 0.0:
         return 1.0
     return min(1.0, 1.24324 / math.sqrt(expected_n))
-
-
-def compute_silence_credit(
-    rrr: float,
-    *,
-    c: float = 0.1,
-    heartbeat_alive: bool = True,
-    scope_basis: Optional[str] = None,
-    clean_sessions: int = 1,
-) -> float:
-    if not heartbeat_alive or scope_basis == "fallback_unscoped":
-        return 1.0
-    r = _num(rrr)
-    k = max(0, int(clean_sessions))
-    if r <= 0.0 or k == 0:
-        return 1.0
-    return math.exp(float(c) * r * k)
 
 
 def _parse_ts(value: Any) -> Optional[datetime]:
@@ -178,7 +160,6 @@ class Fitness:
     decay_factor: float = 1.0
     effective_weight: float = 1.0
     archive_candidate: bool = False
-    silence_lr: float = 1.0
     sessions_count: int = 0
     repos_count: int = 0
     days_span: float = 0.0
@@ -222,7 +203,7 @@ def compute(
     observed_days: Optional[float] = None, min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0,
     half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS, epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
-    repos_count: int = 0, days_span: float = 0.0, silence_lr: float = 1.0,
+    repos_count: int = 0, days_span: float = 0.0,
     evidence_available: bool = True, evidence_error: Optional[str] = None, age_days: Optional[float] = None,
 ) -> Fitness:
     """The one decision engine (R-evidence-7): a rule's state and the transition its evidence
@@ -291,7 +272,7 @@ def compute(
         p_below_demote=round(p_below_07, 4), prior_mass=round(prior_mass, 4), prior_share=round(prior_share, 4),
         prior_disclosure=prior_disclosure, mde=mde, eligible_sessions=int(eligible_sessions),
         decay_factor=round(decay, 6), effective_weight=effective_weight, archive_candidate=archive_candidate,
-        silence_lr=round(float(silence_lr), 6), sessions_count=int(sessions_count), repos_count=int(repos_count),
+        sessions_count=int(sessions_count), repos_count=int(repos_count),
         days_span=round(float(days_span), 2), suggestion=suggestion,
         evidence_available=evidence_available, evidence_error=evidence_error, min_n=int(min_n),
     )

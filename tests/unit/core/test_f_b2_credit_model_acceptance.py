@@ -17,14 +17,14 @@ Given/When/Then scenarios written before the implementation:
    traps, doubt-served sessions (``scope_basis == "fallback_unscoped"``) are
    neutral (neither silence credit nor decay) per v4.4 §12.9.
 4. Detector replay, feasibility & four sample-size states, asymmetric transitions
-   with prior cap (<= 10 pseudo-labels and disclosure), silence credit with
-   heartbeat gate, and ``aegis sync --pr`` with 3 sampled examples and no auto-merge.
+   with prior cap (<= 10 pseudo-labels and disclosure), and ``aegis sync --pr`` with
+   3 sampled examples and no auto-merge. Silence earns no credit in 4.4.0 (R-evidence-17).
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
-import math
 from pathlib import Path
 import subprocess
 
@@ -32,7 +32,7 @@ import pytest
 
 from aegis_cli.status import run_status
 from aegis_cli.sync import run_sync
-from aegis_core import credit, fitness, sync
+from aegis_core import config, credit, fitness, sync
 from aegis_core.verification.runner import run_layer1
 from tests import helpers_adjudication as ha
 from tests import helpers_humangate as hg
@@ -294,7 +294,36 @@ def test_quiet_trap_decays_over_eligible_sessions_and_respects_pin_and_tier_immu
     assert rules["gate-quiet"]["suggestion"] is None
 
 
-# ── 4. Detector replay, states, prior cap, silence credit, and sync --pr ─────
+def test_quiet_sessions_only_decay_a_traps_score() -> None:
+    """Given a trap with 30 triggers, 28 tp and 2 fp and H = 20, When it is computed after 0, 10, 20,
+    60 and 600 eligible sessions, Then the score never rises and 3H sessions leave 0.125 of it."""
+    scores = [fitness.compute({"triggers": 30, "tp": 28, "fp": 2}, eligible_sessions=s, half_life_sessions=20.0).score
+              for s in (0, 10, 20, 60, 600)]
+    assert scores == sorted(scores, reverse=True)
+    assert scores == pytest.approx([0.8173, 0.5779, 0.4086, 0.1022, 0.0], abs=1e-4)
+    assert scores[3] == pytest.approx(scores[0] * 0.125, abs=1e-3)
+
+
+def test_three_exposed_sessions_are_three_eligible_sessions(tmp_path: Path) -> None:
+    """Given a trap exposed in three sessions (exposure rows carry no heartbeat flag), When fitness is
+    read, Then all three are eligible and the weight is 2^(-3/H) with the configured H."""
+    _write_rule(tmp_path, "trap", "trap-seen")
+    for s in range(3):
+        credit.record_exposure(tmp_path, "claude-code", f"sess-{s}", ["trap-seen"], paths=["src/app.py"])
+    fit = sync.build(tmp_path)["rules"]["trap-seen"]
+    h = config.DEFAULT_HALF_LIFE_SESSIONS
+    assert fit["eligible_sessions"] == 3 and fit["effective_weight"] == pytest.approx(2 ** (-3 / h), abs=1e-6)
+
+
+def test_silence_earns_no_credit_in_4_4_0() -> None:
+    """The silence likelihood ratio had no caller and no RRR source: it is gone, field and keyword too."""
+    assert not hasattr(fitness, "compute_silence_credit") and "compute_silence_credit" not in fitness.__all__
+    assert "silence_lr" not in {f.name for f in dataclasses.fields(fitness.Fitness)}
+    with pytest.raises(TypeError):
+        fitness.compute({"tp": 1}, silence_lr=2.0)
+
+
+# ── 4. Detector replay, states, prior cap and sync --pr ──────────────────────
 
 
 @needs_git
@@ -377,18 +406,6 @@ def test_prior_cap_at_ten_pseudo_labels_and_asymmetric_transitions(tmp_path: Pat
     )
     assert fit_untestable.state == "untestable"
     assert fit_untestable.mde is not None and fit_untestable.mde > 0.6
-
-    # Silence credit: LR = exp(c * RRR) only when heartbeat is alive.
-    assert fitness.compute_silence_credit(0.5, c=0.1, heartbeat_alive=True) == pytest.approx(
-        math.exp(0.05)
-    )
-    assert fitness.compute_silence_credit(0.5, c=0.1, heartbeat_alive=False) == 1.0
-    assert (
-        fitness.compute_silence_credit(
-            0.5, c=0.1, heartbeat_alive=True, scope_basis="fallback_unscoped"
-        )
-        == 1.0
-    )
 
 
 def test_sync_pr_writes_transitions_with_three_examples_to_label_and_never_auto_merges(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import os
-import math
 from pathlib import Path
 
 import pytest
@@ -93,7 +92,7 @@ def test_beta_cdf_ppf_and_clopper_pearson_bounds() -> None:
     assert 0.0 < lo_bad < hi_bad < 0.65
 
 
-def test_cap_prior_mde_silence_credit_and_session_decay() -> None:
+def test_cap_prior_mde_and_session_decay() -> None:
     # Prior mass <= 10 is preserved unchanged.
     assert fitness.cap_prior(4.0, 2.0) == (4.0, 2.0)
     # Prior mass > 10 is scaled down proportionally so alpha + beta == 10.
@@ -108,19 +107,6 @@ def test_cap_prior_mde_silence_credit_and_session_decay() -> None:
     mde_frequent = fitness.compute_mde_180d(1.0)
     assert mde_rare > fitness.MDE_UNTESTABLE_THRESHOLD
     assert mde_frequent < 0.25
-
-    # Silence credit LR = exp(c * RRR) gated by heartbeat and scope_basis.
-    assert fitness.compute_silence_credit(0.8, c=0.1, heartbeat_alive=True) == pytest.approx(
-        math.exp(0.08)
-    )
-    assert fitness.compute_silence_credit(0.8, c=0.1, heartbeat_alive=False) == 1.0
-    assert (
-        fitness.compute_silence_credit(
-            0.8, c=0.1, heartbeat_alive=True, scope_basis="fallback_unscoped"
-        )
-        == 1.0
-    )
-    assert fitness.compute_silence_credit(0.0, c=0.1, heartbeat_alive=True) == 1.0
 
     # Session decay factor w = 2 ** (-delta / H).
     assert fitness.session_decay_factor(0, 20.0) == 1.0
