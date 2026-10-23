@@ -888,16 +888,13 @@ def _hidden(order: Mapping[str, int], near: Mapping[str, Set[str]],
     latest: Dict[str, Tuple[int, Mapping[str, Any]]] = {}
     for d_idx, d_row in decisions:  # in log order: a later decision wins
         latest.update({str(i): (d_idx, d_row) for i in d_row.get("insight_ids") or []})
-    hidden: Set[str] = set()
-    for ins_id, (d_idx, d_row) in latest.items():
-        if ins_id not in order:
-            continue
+    resurfaced: Dict[int, bool] = {}
+    for d_idx, d_row in {v[0]: v for v in latest.values()}.values():  # each deciding row once
         if d_row.get("decision") in ("snooze", "reject"):
             group = {str(i) for i in d_row.get("insight_ids") or []}
-            if sum(1 for other, idx in order.items() if idx > d_idx and near[other] & group) >= REJECTION_RESURFACE_COUNT:
-                continue
-        hidden.add(ins_id)
-    return hidden
+            newer = sum(1 for other, idx in order.items() if idx > d_idx and near[other] & group)
+            resurfaced[d_idx] = newer >= REJECTION_RESURFACE_COUNT
+    return {ins_id for ins_id, (d_idx, _) in latest.items() if ins_id in order and not resurfaced.get(d_idx)}
 
 
 def _match_entry(row: Mapping[str, Any], match: Optional[_RuleMatch], exposures: _Exposures) -> Dict[str, Any]:
