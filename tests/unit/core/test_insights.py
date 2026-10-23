@@ -105,7 +105,7 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
         summary_bullets=["Always pass an explicit timeout parameter to subprocess and network requests."],
         home=home,
     )
-    record_decision(repo, cluster_id="cluster-seed", decision="noise", insight_ids=[seed["id"]], home=home)
+    record_decision(repo, decision="noise", insight_ids=[seed["id"]], home=home)
 
     ins1 = add_insight(
         repo,
@@ -122,19 +122,18 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
 
     record_decision(
         repo,
-        cluster_id="cluster-noise",
         decision="noise",
         insight_ids=[ins_noise["id"]],
         home=home,
     )
 
     rev = review_insights(repo, home=home)
-    all_clustered_ids = [iid for c in rev["clusters"] for iid in c["insight_ids"]]
-    assert ins_noise["id"] not in all_clustered_ids
-    assert ins1["id"] in all_clustered_ids
-    prop_clusters = [c for c in rev["clusters"] if c["match_status"] == "matches_proposal"]
-    assert len(prop_clusters) == 1
-    assert prop_clusters[0]["matched_rule"] == "trap-timeout-required"
+    reviewed_ids = [e["id"] for e in rev["insights"] + rev["suppressed"]]
+    assert ins_noise["id"] not in reviewed_ids
+    assert ins1["id"] in reviewed_ids
+    prop_matches = [e for e in rev["insights"] if e["match"]["status"] == "matches_proposal"]
+    assert len(prop_matches) == 1
+    assert prop_matches[0]["match"]["rule"] == "trap-timeout-required"
 
 
 def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -160,7 +159,8 @@ def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Pat
 
 
 def _neighbours_of(review: dict, insight_id: str) -> list:
-    return review["neighbours"][insight_id]
+    (entry,) = [e for e in review["insights"] if e["id"] == insight_id]
+    return entry["neighbours"]
 
 
 def test_tfidf_neighbours_and_dirty_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -753,9 +753,9 @@ def _overlap_repo(tmp_path: Path, frontmatter: str) -> Path:
 
 def _match_of(review: dict, insight_id: str) -> tuple:
     """(matched rule or None, similarity to the closest rule) of one insight in a review."""
-    for c in review["clusters"] + review["suppressed_clusters"]:
-        if insight_id in c["insight_ids"]:
-            return c["matched_rule"], c["similarity"]
+    for entry in review["insights"] + review["suppressed"]:
+        if entry["id"] == insight_id:
+            return entry["match"]["rule"], entry["match"]["similarity"]
     raise AssertionError(f"{insight_id} is not in the review")
 
 

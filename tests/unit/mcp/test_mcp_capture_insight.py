@@ -66,9 +66,9 @@ def test_aegis_capture_insight_records_suggestion_and_is_corroborated_never_upgr
     assert res["paths"] == ["src/service.py"]
     assert res["psrc"] == "explicit"
 
-    # Unconfirmed suggestion never counts in review clusters
+    # An unconfirmed suggestion is never a counted insight
     rev = review_insights(ws, home=home)
-    assert rev["clusters"] == []
+    assert rev["insights"] == [] and rev["suppressed"] == []
     assert len(rev["suggestions"]) == 1
 
     # 2. The host's hook records a prompt containing the quote; the server's own session id
@@ -98,7 +98,7 @@ def test_aegis_capture_insight_records_suggestion_and_is_corroborated_never_upgr
     stored, = [r for r in read_insight_rows(ws, home=home) if r.get("id") == res_corroborated["id"]]
     assert stored["corroborated_by"] == hook["id"] and "confirmed_by" not in stored
     rev = review_insights(ws, home=home)
-    assert [(c["insight_ids"], c["corroborated"]) for c in rev["clusters"]] == [([hook["id"]], [stored["id"]])]
+    assert [(e["id"], e["corroborated"]) for e in rev["insights"]] == [(hook["id"], [stored["id"]])]
 
 
 def test_aegis_capture_insight_rejects_invalid_arguments_and_path_traversal(

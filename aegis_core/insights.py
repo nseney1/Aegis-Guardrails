@@ -98,7 +98,7 @@ _HS_DOMAIN = b"aegis-hs/v1"
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 COUNTABLE_LEVELS = frozenset({"H", "cli", "W2"})
 DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
-# The latest of these decides whether a cluster is listed; noise and confirm name insights.
+# The latest of these naming an insight decides whether review lists it (noise hides for good).
 _RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
 SUPPORTED_INSIGHT_HOSTS = ("claude-code", "codex-cli")
 # aegis_capture_insight is reachable by the agent: its cost is bounded per call and per session.
@@ -782,15 +782,12 @@ def _exposure_index(root: Path) -> _Exposures:
     return index
 
 
-def _rule_was_exposed(rule: Rule, cluster_rows: Sequence[Mapping[str, Any]], exposures: _Exposures) -> bool:
+def _rule_was_exposed(rule: Rule, row: Mapping[str, Any], exposures: _Exposures) -> bool:
     # A None rev is a row written before exposures carried one: it matches any revision.
-    shown = [(host, ts) for host, ts, rev in exposures.get(rule.id, ()) if rev is None or rule.digest.startswith(rev)]
-    for ins in cluster_rows:
-        host, ts = str(ins.get("host") or ""), _parse_ts(ins.get("ts"))
-        if host and ts is not None and any(
-                h == host and abs((e_ts - ts).total_seconds()) <= JOIN_WINDOW_S for h, e_ts in shown):
-            return True
-    return False
+    host, ts = str(row.get("host") or ""), _parse_ts(row.get("ts"))
+    return bool(host and ts is not None and any(
+        h == host and abs((e_ts - ts).total_seconds()) <= JOIN_WINDOW_S
+        for h, e_ts, rev in exposures.get(rule.id, ()) if rev is None or rule.digest.startswith(rev)))
 
 
 def _paths_overlap_rule(paths: Iterable[str], rule: Rule) -> bool:
@@ -805,16 +802,9 @@ class _RuleMatch(NamedTuple):
     similarity: float
 
 
-def _cluster_signature_id(tokens: Sequence[str], matched_id: Optional[str]) -> str:
-    top = [t for t, _ in Counter(tokens).most_common(4)]
-    sig = hashlib.sha256(("-".join(sorted(top)) if top else "misc").encode("utf-8")).hexdigest()[:8]
-    return f"cluster-{matched_id}-{sig}" if matched_id else f"cluster-{sig}"
-
-
 def record_decision(
     workspace: Any,
     *,
-    cluster_id: str = "",
     decision: str,
     insight_ids: Sequence[str],
     reason: Optional[str] = None,
@@ -822,19 +812,15 @@ def record_decision(
     kind: Optional[str] = None,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """``confirm`` names the suggestions a human confirms (and their ``kind``); every other
-    decision names a cluster."""
+    """A human decision on the insights it names; ``confirm`` names the suggestions a human
+    confirms (and their ``kind``)."""
     if decision not in DECISIONS:
         raise ValueError(f"decision must be one of {list(DECISIONS)}, got {decision!r}")
     ids = [str(i) for i in insight_ids if str(i).strip()]
-    if decision == "confirm" and not ids:
-        raise ValueError("confirm needs at least one insight id")
-    if decision != "confirm" and (not isinstance(cluster_id, str) or not cluster_id.strip()):
-        raise ValueError("cluster_id must be a non-empty string")
-    row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": _utc_now(), "event": "decision"}
-    if cluster_id and cluster_id.strip():
-        row["cluster_id"] = cluster_id.strip()
-    row.update(decision=decision, insight_ids=ids)
+    if not ids:
+        raise ValueError(f"{decision} needs at least one insight id")
+    row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": _utc_now(), "event": "decision",
+                           "decision": decision, "insight_ids": ids}
     if kind:
         row["kind"] = str(kind)
     if reason:
@@ -863,111 +849,50 @@ def _match_insights_to_rules(
     return matches
 
 
-def _should_merge_insights(
-    paths_i: Set[str],
-    paths_j: Set[str],
-    rid_i: Optional[str],
-    rid_j: Optional[str],
-    sim: float,
-) -> bool:
-    if rid_i != rid_j:
-        return False
-    path_overlap = bool(not paths_i or not paths_j or (paths_i & paths_j))
-    return (path_overlap and sim >= 0.22) or sim >= 0.35
+def _neighbours(ids: Sequence[str], vecs: Sequence[Mapping[str, float]]) -> List[List[Dict[str, Any]]]:
+    """Each insight's top 3 others by cosine with a similarity above 0, ties by id."""
+    found: List[List[Dict[str, Any]]] = []
+    for i, vec in enumerate(vecs):
+        ranked = sorted(((_cosine(vec, other), ids[j]) for j, other in enumerate(vecs) if j != i),
+                        key=lambda x: (-x[0], x[1]))[:3]
+        found.append([{"id": nid, "similarity": round(sim, 4)} for sim, nid in ranked if sim > 0.0])
+    return found
 
 
-def _cluster_countable_insights(
-    countable: Sequence[Tuple[int, Dict[str, Any]]],
-    ins_vecs: Sequence[Mapping[str, float]],
-    ins_best_rule: Sequence[Optional[_RuleMatch]],
-) -> List[List[int]]:
-    n_ins = len(countable)
-    parent = list(range(n_ins))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(n_ins):
-        paths_i = set(countable[i][1].get("paths") or [])
-        rid_i = ins_best_rule[i].rule.id if ins_best_rule[i] else None
-        for j in range(i + 1, n_ins):
-            rid_j = ins_best_rule[j].rule.id if ins_best_rule[j] else None
-            sim = _cosine(ins_vecs[i], ins_vecs[j])
-            paths_j = set(countable[j][1].get("paths") or [])
-            if _should_merge_insights(paths_i, paths_j, rid_i, rid_j, sim):
-                ri, rj = find(i), find(j)
-                if ri != rj:
-                    parent[max(ri, rj)] = min(ri, rj)
-    groups: Dict[int, List[int]] = {}
-    for i in range(n_ins):
-        groups.setdefault(find(i), []).append(i)
-    return list(groups.values())
+def _hidden(order: Mapping[str, int], near: Mapping[str, Set[str]],
+            decisions: Sequence[Tuple[int, Mapping[str, Any]]]) -> Set[str]:
+    """The insights the latest ruling decision naming them hides: propose and merge-into-rule
+    until a later decision names them again; snooze and reject until REJECTION_RESURFACE_COUNT
+    insights newer than the decision have a member of its group among their top-3 neighbours."""
+    latest: Dict[str, Tuple[int, Mapping[str, Any]]] = {}
+    for d_idx, d_row in decisions:  # in log order: a later decision wins
+        latest.update({str(i): (d_idx, d_row) for i in d_row.get("insight_ids") or []})
+    hidden: Set[str] = set()
+    for ins_id, (d_idx, d_row) in latest.items():
+        if ins_id not in order:
+            continue
+        if d_row.get("decision") in ("snooze", "reject"):
+            group = {str(i) for i in d_row.get("insight_ids") or []}
+            if sum(1 for other, idx in order.items() if idx > d_idx and near[other] & group) >= REJECTION_RESURFACE_COUNT:
+                continue
+        hidden.add(ins_id)
+    return hidden
 
 
-def _build_cluster_entry(
-    members: Sequence[int],
-    countable: Sequence[Tuple[int, Dict[str, Any]]],
-    ins_tokens: Sequence[Sequence[str]],
-    ins_best_rule: Sequence[Optional[_RuleMatch]],
-    decisions: Sequence[Tuple[int, Dict[str, Any]]],
-    exposures: _Exposures,
-    corroborated: Mapping[str, List[str]],
-    levels: Mapping[int, Tuple[str, Optional[str]]],
-) -> Tuple[Dict[str, Any], bool]:
-    m_rows = [countable[m][1] for m in members]
-    m_row_idxs = [countable[m][0] for m in members]
-    m_ids = [str(r.get("id") or "") for r in m_rows]
-    c_tokens = [t for m in members for t in ins_tokens[m]]
-    c_paths = {p for m in members for p in (countable[m][1].get("paths") or [])}
-    best_m = max(
-        (ins_best_rule[m] for m in members if ins_best_rule[m] is not None),
-        key=lambda x: x.similarity,
-        default=None,
-    )
-    if best_m is None:
-        matched_id, status, best_score = None, "no_rule", 0.0
+def _match_entry(row: Mapping[str, Any], match: Optional[_RuleMatch], exposures: _Exposures) -> Dict[str, Any]:
+    if match is None:
+        return {"status": "no_rule", "rule": None, "similarity": 0.0}
+    if match.kind == "active":
+        status = "exposed_and_ignored" if _rule_was_exposed(match.rule, row, exposures) else "not_exposed"
     else:
-        matched_id, best_score = best_m.rule.id, best_m.similarity
-        if best_m.kind == "active":
-            status = "exposed_and_ignored" if _rule_was_exposed(best_m.rule, m_rows, exposures) else "not_exposed"
-        elif best_m.kind == "proposal":
-            status = "matches_proposal"
-        else:
-            status = "matches_archived"
-    cid = _cluster_signature_id(c_tokens, matched_id)
-    # The id hashes the top tokens, so a decision also finds its cluster by a shared member.
-    latest = max(((d_idx, d_row) for d_idx, d_row in decisions
-                  if d_row.get("cluster_id") == cid or set(d_row.get("insight_ids") or []).intersection(m_ids)),
-                 key=lambda d: d[0], default=None)
-    # propose and merge-into-rule hide a cluster until a later decision; snooze and reject until
-    # REJECTION_RESURFACE_COUNT members are newer than the decision.
-    is_sup = latest is not None and (latest[1].get("decision") in ("propose", "merge-into-rule")
-                                     or sum(1 for r_idx in m_row_idxs if r_idx > latest[0]) < REJECTION_RESURFACE_COUNT)
-    info = {
-        "cluster_id": cid,
-        "insight_ids": m_ids,
-        "count": len(m_ids),
-        "paths": sorted(c_paths),
-        "excerpts": [str(r.get("text") or "") for r in m_rows],
-        "levels": sorted({levels[i][0] for i in m_row_idxs}),
-        "kinds": sorted({str(levels[i][1]) for i in m_row_idxs if levels[i][1]}),
-        "match_status": status,
-        "matched_rule": matched_id,
-        "similarity": round(best_score, 4),
-        "corroborated": [sid for mid in m_ids for sid in corroborated.get(mid, ())],
-    }
-    return info, is_sup
+        status = "matches_proposal" if match.kind == "proposal" else "matches_archived"
+    return {"status": status, "rule": match.rule.id, "similarity": round(match.similarity, 4)}
 
 
-def review_insights(
-    workspace: Any,
-    *,
-    home: Optional[Path] = None,
-    include_suppressed: bool = False,
-) -> Dict[str, Any]:
+def review_insights(workspace: Any, *, home: Optional[Path] = None) -> Dict[str, Any]:
+    """Each counted insight in log order with its rule match and its top-3 neighbours (spec T8:
+    the human groups them by naming ids in a decision); ``suppressed`` holds the ones a decision
+    hides, ``suggestions`` the unconfirmed agent captures."""
     all_rows = read_insight_rows(workspace, home=home)
     noise_ids = {
         str(x)
@@ -1007,7 +932,7 @@ def review_insights(
             countable.append((idx, row))
             levels[idx] = (level, confirmed.get(ins_id) if _row_source(row) == "mcp" else row.get("kind"))
     if not countable:
-        return {"clusters": [], "suggestions": suggestions, "suppressed_clusters": [], "neighbours": {}}
+        return {"insights": [], "suppressed": [], "suggestions": suggestions}
     from aegis_core.rules import load_rules
 
     root = Path(os.fspath(workspace)).resolve()
@@ -1024,49 +949,27 @@ def review_insights(
     all_vecs = _tfidf_vectors(ins_tokens + [toks for _, _, toks in rule_entries])
     n_ins = len(countable)
     ins_vecs, rule_vecs = all_vecs[:n_ins], all_vecs[n_ins:]
-    neighbours = {
-        str(countable[i][1].get("id") or f"row-{countable[i][0]}"): [
-            {"id": nid, "similarity": round(sim, 4)}
-            for sim, nid in sorted(
-                (
-                    (_cosine(ins_vecs[i], ins_vecs[j]), str(countable[j][1].get("id") or f"row-{countable[j][0]}"))
-                    for j in range(n_ins)
-                    if i != j
-                ),
-                key=lambda x: (-x[0], x[1]),
-            )[:3]
-            if sim > 0.0
-        ]
-        for i in range(n_ins)
-    }
-    ins_best_rule = _match_insights_to_rules(countable, ins_vecs, rule_entries, rule_vecs)
-    clusters: List[Dict[str, Any]] = []
+    ids = [str(row.get("id") or f"row-{idx}") for idx, row in countable]
+    near = _neighbours(ids, ins_vecs)
+    matches = _match_insights_to_rules(countable, ins_vecs, rule_entries, rule_vecs)
+    # One ledger read per review, and none when no insight matches an active rule.
+    exposures = _exposure_index(root) if any(m is not None and m.kind == "active" for m in matches) else {}
+    hidden = _hidden({i: idx for i, (idx, _) in zip(ids, countable)},
+                     {i: {n["id"] for n in ns} for i, ns in zip(ids, near)}, decisions)
+    shown: List[Dict[str, Any]] = []
     suppressed: List[Dict[str, Any]] = []
-    # One ledger read per review, and none when no cluster matches an active rule.
-    exposures = _exposure_index(root) if any(m is not None and m.kind == "active" for m in ins_best_rule) else {}
-    for members in _cluster_countable_insights(countable, ins_vecs, ins_best_rule):
-        info, is_sup = _build_cluster_entry(
-            members,
-            countable,
-            ins_tokens,
-            ins_best_rule,
-            decisions,
-            exposures,
-            corroborated,
-            levels,
-        )
-        if is_sup:
-            suppressed.append(info)
-            if include_suppressed:
-                clusters.append(info)
-        else:
-            clusters.append(info)
-    return {
-        "clusters": clusters,
-        "suggestions": suggestions,
-        "suppressed_clusters": suppressed,
-        "neighbours": neighbours,
-    }
+    for ins_id, (idx, row), ns, match in zip(ids, countable, near, matches):
+        (suppressed if ins_id in hidden else shown).append({
+            "id": ins_id,
+            "level": levels[idx][0],
+            "kind": levels[idx][1],
+            "text": str(row.get("text") or ""),
+            "paths": [str(p) for p in row.get("paths") or []],
+            "match": _match_entry(row, match, exposures),
+            "neighbours": ns,
+            "corroborated": corroborated.get(ins_id, []),
+        })
+    return {"insights": shown, "suppressed": suppressed, "suggestions": suggestions}
 
 
 _SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
