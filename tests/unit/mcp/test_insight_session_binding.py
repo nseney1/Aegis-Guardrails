@@ -83,7 +83,7 @@ def _stamp(delta_s: float = 0.0) -> str:
 
 
 def _hook(repo: Path, home: Path, text: str, session: str, host: str = "claude-code") -> Dict[str, Any]:
-    row = record_hook_prompt(repo, host, {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    row = record_hook_prompt(host, {"prompt": text, "session_id": session, "cwd": str(repo)}, workspace=repo, home=home)
     assert row.get("event") == "insight", text
     return row
 
@@ -95,7 +95,7 @@ def _expose(repo: Path, rid: str, *, host: str = "claude-code", session: str = "
 
 
 def _statuses(repo: Path, home: Path) -> Dict[str, str]:
-    return {c["matched_rule"]: c["match_status"] for c in review_insights(repo, home=home)["clusters"]}
+    return {e["match"]["rule"]: e["match"]["status"] for e in review_insights(repo, home=home)["insights"]}
 
 
 def _call(i: int, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -269,7 +269,8 @@ def _capture(repo: Path, home: Path, quote: str, session: str = "agent-uuid-1", 
 
 
 def _counted(review: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [{"count": c["count"], "corroborated": c.get("corroborated")} for c in review["clusters"]]
+    # One entry per counted insight (4.4.0 lists insights, not clusters).
+    return [{"count": 1, "corroborated": e["corroborated"]} for e in review["insights"]]
 
 
 def test_rows_carry_their_source(tmp_path: Path, home: Path):
@@ -307,7 +308,7 @@ def test_a_capture_made_before_its_hook_prompt_counts_nothing_and_is_annotated_l
     cap = _capture(repo, home, QUOTE)
     assert cap["level"] == "suggestion" and "corroborated_by" not in cap
     before = review_insights(repo, home=home)
-    assert before["clusters"] == [] and [s["id"] for s in before["suggestions"]] == [cap["id"]]
+    assert before["insights"] == [] and [s["id"] for s in before["suggestions"]] == [cap["id"]]
     _hook(repo, home, HOOK_PROMPT, "host-session-1")
     assert _counted(review_insights(repo, home=home)) == [{"count": 1, "corroborated": [cap["id"]]}]
 
@@ -326,8 +327,8 @@ def test_a_capture_outside_the_join_is_never_corroborated(tmp_path: Path, home: 
     cap = _capture(repo, home, quote, host="codex-cli" if case == "other-host" else "claude-code")
     assert cap["level"] == "suggestion" and "corroborated_by" not in cap
     review = review_insights(repo, home=home)
-    assert [c["count"] for c in review["clusters"]] == [1]
-    assert review["clusters"][0].get("corroborated") == []
+    assert len(review["insights"]) == 1
+    assert review["insights"][0]["corroborated"] == []
     assert [s["id"] for s in review["suggestions"]] == [cap["id"]]
 
 
@@ -340,7 +341,7 @@ def test_a_4_3_upgraded_w2_row_is_read_as_a_suggestion_and_never_counted(tmp_pat
     append_jsonl(insights_path(repo, home=home), [legacy])
     review = review_insights(repo, home=home)
     assert _counted(review) == [{"count": 1, "corroborated": [legacy["id"]]}]
-    assert review["clusters"][0]["insight_ids"] == [hook["id"]]
+    assert review["insights"][0]["id"] == hook["id"]
 
 
 def test_a_server_capture_with_its_own_session_is_corroborated_by_the_hosts_hook_prompt(
