@@ -659,6 +659,7 @@ def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tu
     return tuple(found)
 
 
+@gitsafe.scrubbed()
 def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None) -> CiReport:
     """``pull_request`` (a ``human_gate.PullRequest``): with no signed approval, tier A's approving
     review of that pull request's head may approve instead, and only when the head under check is it."""

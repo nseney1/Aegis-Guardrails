@@ -106,7 +106,8 @@ def _named(paths: Sequence[str]) -> str:
 
 def _locate(root: Path) -> Tuple[Path, Path, Path]:
     """(work tree top, git directory, real object directory) of the work tree holding ``root``."""
-    top = gitsafe.toplevel(root)
+    with gitsafe.scrubbed():  # the one git call here that runs outside BoundTree.env
+        top = gitsafe.toplevel(root)
     if top is None:
         raise TreeError(f"{root} is not inside a git work tree")
     dotgit = top / ".git"

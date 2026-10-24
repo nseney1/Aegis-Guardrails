@@ -326,6 +326,7 @@ def _tier(root: Path, tier_runner: Optional[Callable[..., Any]]) -> Optional[str
         return None
 
 
+@gitsafe.scrubbed()
 def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner: Optional[Callable[..., Any]] = None,
                    *, source_ref: Optional[str] = None) -> ReleaseReport:
     """Verify the CI-verdict attestation of ``sha`` (a commit id or a ref of the repository in ``root``).

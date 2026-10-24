@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import urllib.parse
 
+from aegis_core import gitsafe
 from aegis_core.fitness import for_rules
 from aegis_core.rules import RuleSet, load_rules
 from aegis_core.storage import atomic_write_bytes, atomic_write_text, locked, read_json_dict, state_dir
@@ -151,6 +152,7 @@ def _number_line(e: Mapping[str, Any]) -> List[str]:
     return lines
 
 
+@gitsafe.scrubbed()
 def base_fetch(root: Any) -> Tuple[Optional[str], Optional[float]]:
     """The line saying when the BASE anchor's refs were last fetched and that age in days; (None,
     None) outside a repository. The line is about any fetch: FETCH_HEAD does not say which remote."""
@@ -502,6 +504,7 @@ def _open_pr(plan: Dict[str, Any], branch: str, commit: str, title: str, body: s
                                              f"pushed to {remote} and is kept)")
 
 
+@gitsafe.scrubbed()
 def sync(
     workspace: Any, apply: bool = False, now: Optional[datetime] = None, *,
     pr: bool = False, gh_runner: Optional[Callable[..., Any]] = None,

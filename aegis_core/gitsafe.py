@@ -113,6 +113,7 @@ __all__ = [
     "resolve_commit",
     "run",
     "run_checked",
+    "scrubbed",
     "show_prefix",
     "toplevel",
     "tree_blobs",
@@ -152,6 +153,15 @@ _ENV = {
     "GIT_NO_REPLACE_OBJECTS": "1",
     "LC_ALL": "C",
 }
+# What ``git rev-parse --local-env-vars`` lists: each points git at another repository, index or
+# object store. Identity, SSH and the config-scope variables (how a HOME is faked) are not here.
+_LOCAL_ENV = frozenset((
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+))
+_SCRUB: "contextvars.ContextVar[bool]" = contextvars.ContextVar("aegis_git_scrub", default=False)
 
 
 class GitError(AegisError):
@@ -219,7 +229,8 @@ def run(
     or exceeds ``timeout``. ``tty``: git (and a signing program it runs) reads the caller's stdin.
     """
     argv = [git_executable(), *_hardening, *args]
-    env = dict(os.environ)
+    scrub = _SCRUB.get()
+    env = {k: v for k, v in os.environ.items() if not (scrub and k.upper() in _LOCAL_ENV)}
     env.update(_ENV)
     if _env is not None:
         env.update(_env)
@@ -238,6 +249,18 @@ def run(
         raise GitError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
     except OSError as exc:
         raise GitError(f"cannot run git: {exc}") from exc
+
+
+@contextmanager
+def scrubbed() -> Iterator[None]:
+    """Inside the block (or a function decorated with ``@scrubbed()``) ``run`` drops the caller's
+    ``_LOCAL_ENV``, so evidence is about the repository at ``cwd``; ``_env`` still wins. Not the
+    default: git hands a hook its index in GIT_INDEX_FILE (and a linked worktree its GIT_DIR)."""
+    token = _SCRUB.set(True)
+    try:
+        yield
+    finally:
+        _SCRUB.reset(token)
 
 
 def run_checked(args: Sequence[str], cwd: Path | str, *, error: Callable[[str], Exception] = GitError,
@@ -322,6 +345,7 @@ def memoized(key: Tuple[Any, ...], produce: Callable[[], Any]) -> Any:
     store = _MEMO.get()
     if store is None:
         return produce()
+    key = (_SCRUB.get(), *key)  # an answer under the caller's GIT_DIR is not the scrubbed one
     if key not in store:
         store[key] = produce()
     return store[key]

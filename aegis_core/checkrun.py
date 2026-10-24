@@ -429,6 +429,7 @@ def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -
     return {"findings": sum(1 for _path, evidence in pairs if not evidence.verdict), "files": len(targets)}
 
 
+@gitsafe.scrubbed()
 def record(root: object, *, tests: bool = False, base: Optional[str] = None, timeout: Optional[float] = None,
            now: Optional[datetime] = None) -> CheckOutcome:
     """Bind the work tree of ``root`` to a tree, run the checks on its snapshot, write one ``check``
@@ -523,6 +524,7 @@ def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tes
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+@gitsafe.scrubbed()
 def rerun_commit_snapshot(
     root: object, commit: str, base_ref: str, *, timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -553,6 +555,7 @@ def rerun_commit_snapshot(
     return {"tree": commit_tree, "exit": run.exit if run is not None and run.exit != 0 else 1}
 
 
+@gitsafe.scrubbed()
 def verify_commit_trailers(
     root: object, base: str, head: str = "HEAD", *,
     rerun_fn: Optional[ Any ] = None, timeout: Optional[float] = None,

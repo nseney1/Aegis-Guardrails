@@ -871,6 +871,7 @@ def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional
     return {"result": "void", "failed": True, "reason": "outcomes still diverge on the same tree after a re-run"}
 
 
+@gitsafe.scrubbed()
 def verify_commit_trailers(
     root: Any, base: str, head: str = "HEAD", *, rerun_fn: Callable[[str, str], Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:

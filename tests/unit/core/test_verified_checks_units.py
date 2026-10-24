@@ -973,3 +973,157 @@ def test_a_report_with_no_tree_is_a_claim_and_the_cap_is_honoured(tmp_path):
                                   rules_for=lambda c: [], cap=1)
     assert first["status"] == "claimed" and second["status"] == "rate_limited"
     assert len(hv.rows_of(tmp_path, "claimed")) == 1
+
+
+# ── evidence ignores the caller's GIT_DIR (R-trust-19) ─────────────────────────
+
+_LOCAL_GIT_ENV = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                  "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+                  "GIT_INDEX_FILE", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR")
+
+
+@pytest.fixture
+def two_repos(tmp_path):
+    """A (work branch: only_in_a.txt and a sharpened rule) and B (work branch: only_in_b.txt)."""
+    a = hv.make_project(tmp_path, name="a")
+    a.write("only_in_a.txt", "a\n")
+    a.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("hypothesis: sample", "hypothesis: sharper"))
+    a.commit("a")
+    b = hv.make_project(tmp_path, name="b")
+    b.write("only_in_b.txt", "b\n")
+    b.commit("b")
+    hv.use_stub_runner(a.home.path)
+    return a, b
+
+
+def _ambient(monkeypatch, b) -> None:
+    monkeypatch.setenv("GIT_DIR", str(b.root / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(b.root))
+
+
+def _git_children(monkeypatch):
+    """The environment of every git child, whichever runner starts it."""
+    seen = []
+    real = subprocess.run
+
+    def spy(argv, *args, **kwargs):
+        if os.path.basename(str(argv[0])).lower() in ("git", "git.exe"):
+            seen.append(dict(kwargs.get("env") or os.environ))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    return seen
+
+
+def _evidence_calls(a):
+    from aegis_core import human_gate, regression, release_verify, rule_integrity, sync
+
+    head = a.head()
+    no_rerun = lambda commit, tree: {"tree": tree, "exit": 0}  # noqa: E731
+
+    def gh(argv, timeout=0):
+        return (0, "gh version 2.93.0 (2026-01-01)\n", "") if argv[:1] == ["--version"] else (1, "", "no")
+
+    return {
+        "treeid.tree_files": lambda: treeid.tree_files(a.root),
+        "treeid.tree_of": lambda: treeid.tree_of(a.root),
+        "checkrun.record": lambda: checkrun.record(a.root),
+        "checkrun.rerun_commit_snapshot": lambda: checkrun.rerun_commit_snapshot(a.root, head, "main", timeout=60),
+        "checkrun.verify_commit_trailers": lambda: checkrun.verify_commit_trailers(a.root, "main", rerun_fn=no_rerun),
+        "credit.verify_commit_trailers": lambda: credit.verify_commit_trailers(a.root, "main", rerun_fn=no_rerun),
+        "rule_integrity.check_ci": lambda: rule_integrity.check_ci(a.root, "main", "HEAD"),
+        "human_gate.find_approval": lambda: human_gate.find_approval(a.root, "HEAD", "main"),
+        "human_gate.find_test_exemption": lambda: human_gate.find_test_exemption(a.root, "HEAD", "main", head),
+        "human_gate.verify_approval": lambda: human_gate.verify_approval(a.root, head, "0" * 64, "main"),
+        "human_gate.verify_insight_approval": lambda: human_gate.verify_insight_approval(a.root, head, "x", "main"),
+        "human_gate.verify_test_exemption": lambda: human_gate.verify_test_exemption(a.root, head, head, "main"),
+        "release_verify.verify_release": lambda: release_verify.verify_release(a.root, head, run=gh,
+                                                                               tier_runner=lambda *x, **k: None),
+        "regression.check_ci_regressions": lambda: regression.check_ci_regressions(a.root, "main", "HEAD"),
+        "sync.base_fetch": lambda: sync.base_fetch(a.root),
+        "sync.sync": lambda: sync.sync(a.root),
+    }
+
+
+_EVIDENCE = [
+    "treeid.tree_files", "treeid.tree_of", "checkrun.record", "checkrun.rerun_commit_snapshot",
+    "checkrun.verify_commit_trailers", "credit.verify_commit_trailers", "rule_integrity.check_ci",
+    "human_gate.find_approval", "human_gate.find_test_exemption", "human_gate.verify_approval",
+    "human_gate.verify_insight_approval", "human_gate.verify_test_exemption", "release_verify.verify_release",
+    "regression.check_ci_regressions", "sync.base_fetch", "sync.sync",
+]
+
+
+@needs_git
+@pytest.mark.parametrize("name", _EVIDENCE)
+def test_no_evidence_git_call_follows_an_exported_git_dir(two_repos, monkeypatch, name):
+    """Given GIT_DIR/GIT_WORK_TREE exported for repository B, when an evidence function runs against A,
+    then no git child it starts is pointed at B (the leak matrix of R-trust-19)."""
+    a, b = two_repos
+    call = _evidence_calls(a)[name]
+    _ambient(monkeypatch, b)
+    seen = _git_children(monkeypatch)
+    try:
+        call()
+    except Exception:  # noqa: BLE001 - the verdict does not matter here, only where git looked
+        pass
+    assert seen, "the function started no git at all"
+    marks = {os.path.normcase(str(b.root)), os.path.normcase(os.path.realpath(b.root))}
+    leaked = sorted({k for env in seen for k, v in env.items()
+                     if k.upper() in _LOCAL_GIT_ENV and any(m in os.path.normcase(v) for m in marks)})
+    assert leaked == []
+
+
+@needs_git
+def test_the_tree_head_base_and_rules_are_the_repository_asked_about(two_repos, monkeypatch):
+    """Given GIT_DIR/GIT_WORK_TREE exported for B, then every tree, head, base and rule read is A's."""
+    from aegis_core import rule_integrity
+
+    a, b = two_repos
+    clean_tree, head, base = treeid.tree_of(a.root).tree, a.head(), a.git("merge-base", "main", "HEAD")
+    assert clean_tree == hv.tree_now(a.root)
+    _ambient(monkeypatch, b)  # from here the helpers' own git would follow it too
+    files = treeid.tree_files(a.root)
+    assert "only_in_a.txt" in files and "only_in_b.txt" not in files
+    assert treeid.tree_of(a.root).tree == clean_tree
+    outcome = checkrun.record(a.root)
+    assert outcome.status == "recorded", outcome.reason
+    assert outcome.row["head"] == head and outcome.row["tree"] == clean_tree and outcome.row["base"] == base
+    report = rule_integrity.check_ci(a.root, "main", "HEAD")
+    assert report.head == head and report.merge_base == base
+
+
+@needs_git
+def test_approve_reads_the_key_from_the_user_config_and_signs_in_the_repository_asked_about(two_repos, monkeypatch):
+    """Given the signing key only in GIT_CONFIG_GLOBAL and GIT_DIR exported for B, when aegis approve
+    runs in A, then the key comes from that file and the signed commit is made in A (spy, no ssh-keygen)."""
+    import argparse
+    import builtins
+
+    from aegis_cli import approve
+    from aegis_core import gitsafe, human_gate
+
+    a, b = two_repos
+    head = a.head()
+    config = a.home.path / "global.gitconfig"
+    config.write_bytes(b"[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    _ambient(monkeypatch, b)
+    with gitsafe.scrubbed():
+        assert human_gate.signing_config(a.root) == {"format": "ssh", "key": "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"}
+    signed = []
+
+    def custody(top):
+        signed.append(("custody", Path(top), human_gate.signing_config(top)["key"]))
+        return human_gate.KeyCustody("agent", "an agent holds the key", False)
+
+    monkeypatch.setattr(human_gate, "check_key_custody", custody)
+    monkeypatch.setattr(human_gate, "signed_empty_commit",
+                        lambda top, message, interactive=False: signed.append(("sign", Path(top), message)) or head)
+    monkeypatch.setattr(approve, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
+    code = approve.run_approve(argparse.Namespace(workspace=str(a.root), json=False, base="main", exempt_test=None,
+                                                  reason=None))
+    assert code == 0
+    assert [(kind, os.path.samefile(top, a.root)) for kind, top, _ in signed] == [("custody", True), ("sign", True)]
+    assert signed[0][2] == "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"
