@@ -398,7 +398,8 @@ def _run_ci(args: argparse.Namespace) -> int:
     fmt = "json" if getattr(args, "json", False) else str(getattr(args, "format", None) or "text").lower()
     root = _resolve_git_cwd(args)
     event_base, event_head = _event_shas()
-    base = getattr(args, "base", None) or event_base or gitsafe.resolve_base_ref(root)
+    with gitsafe.scrubbed():  # the default base is evidence about root, as check_ci's own git is
+        base = getattr(args, "base", None) or event_base or gitsafe.resolve_base_ref(root)
     head = getattr(args, "head", None) or event_head or "HEAD"
     if not base:
         return _ci_error("--ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
