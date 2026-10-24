@@ -6,11 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from aegis_cli import rule, skills_sync
+from aegis_cli import rule
 from aegis_cli.cli import main
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.workspace import binding
-from aegis_core.workspace.layout import UserLayout
 
 MESSAGE = "no home directory can be resolved on this machine (set HOME, or USERPROFILE on Windows)"
 
@@ -65,9 +64,20 @@ def test_missing_home_refuses_before_writes(root, monkeypatch, capsys, failure, 
     assert (_snapshot(root), _snapshot(home)) == before
 
 
-def test_explicit_host_selection_needs_no_home(root, monkeypatch):
-    monkeypatch.setattr(UserLayout, "current", classmethod(lambda cls: None))
-    assert skills_sync._hosts(argparse.Namespace(host=["claude-code"]), root) == (["claude-code"], "")
+@pytest.mark.parametrize("failure", [RuntimeError, KeyError])
+def test_explicit_host_selection_needs_no_home(root, monkeypatch, capsys, failure):
+    def absent(cls):
+        raise failure("no passwd entry")
+
+    monkeypatch.setattr(Path, "home", classmethod(absent))
+    assert main(["skills", "sync", "--host", "claude-code", "--workspace", str(root), "--json"]) == 0
+    out = capsys.readouterr()
+    assert out.err == ""
+    doc = json.loads(out.out)
+    assert doc["status"] == "ok" and doc["dry_run"] is False
+    assert doc["scope"]["hosts"] == ["claude-code"]
+    assert doc["counts"]["created"] > 0 and doc["errors"] == []
+    assert list((root / ".claude" / "skills").glob("*/SKILL.md"))
 
 
 def test_rule_refuses_filesystem_root_with_the_binding_message(root, monkeypatch):
