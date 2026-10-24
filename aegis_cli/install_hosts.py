@@ -77,7 +77,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core import hosts as host_table
 from aegis_core.config import ENV_CLIENT, ENV_WORKSPACE
 from aegis_core.pathlookup import which
-from aegis_core.primitives import DuplicateKeyError, real_key, strict_loads
+from aegis_core.primitives import DuplicateKeyError, real_key, strict_loads, utc_stamp
 from aegis_core.storage import atomic_write_bytes
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
@@ -526,10 +526,6 @@ def remove_mcp_json(path: Union[str, Path], names: Sequence[str], *, key: str = 
 
 # ── Workspace registry ───────────────────────────────────────────────────────
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _stored_key(root: str) -> Optional[str]:
     """The key of a root read from the registry, or None for one the server's reader skips:
     a relative root would resolve against the current directory, and the server cannot
@@ -625,7 +621,7 @@ def _update_registry(home: Union[str, Path], root: Union[str, Path], hosts: Sequ
     entries = data["workspaces"]
     entry = next((e for e in entries if _stored_key(e["root"]) == key), None)
     if entry is None:
-        entries.append({"root": os.path.realpath(os.fspath(root)), "added_at": now or _utc_now(),
+        entries.append({"root": os.path.realpath(os.fspath(root)), "added_at": now or utc_stamp(),
                         "added_by": "aegis init", "hosts": ordered_hosts(hosts)})
         status = "added"
     else:

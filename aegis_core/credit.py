@@ -11,7 +11,7 @@ a revert of its landing commit on the protected branch (``reverted``, found by `
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
 from pathlib import Path
 import re
@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from aegis_core import gitevidence, gitsafe, human_gate
 from aegis_core.errors import AegisError, PathTraversalError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import ledger_locked, read_jsonl
 from aegis_core.telemetry_engine import ledger
 
@@ -272,10 +273,6 @@ _PERSISTED: Set[Tuple[str, str, str, str, Optional[str]]] = set()
 _MAX_PERSISTED = 50_000
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def record_exposure(
     root: Any, host: Optional[str], session: Optional[str], rules: Iterable[str], *,
     paths: Optional[Iterable[str]] = None, rev: Optional[str] = None, scope_basis: Optional[str] = None,
@@ -291,7 +288,7 @@ def record_exposure(
     _EXPOSED.setdefault(key, set()).update(rule_list)
     if not persist or not rule_list:
         return []
-    stamp, s_id, h_id = ts or _now(), session or "", host or ""
+    stamp, s_id, h_id = ts or utc_stamp(), session or "", host or ""
     kept = [(str(root), h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
     if all(k in _PERSISTED for k in kept):
         return []
@@ -375,7 +372,7 @@ def record_detections(root: Any, findings: Iterable[Mapping[str, Any]]) -> List[
                     and prev.get("fix_rev") == f.get("fix_rev") and float(prev.get("weight") or 0.0) == weight):
                 out.append(prev)
                 continue
-            row = {"v": ledger.LEDGER_VERSION, "ts": f.get("ts") or _now(), "event": "detection", "rule": f["rule"],
+            row = {"v": ledger.LEDGER_VERSION, "ts": f.get("ts") or utc_stamp(), "event": "detection", "rule": f["rule"],
                    "file": f["file"], "pattern": f["pattern"], "disposition": disposition,
                    "branch": f.get("branch") or "main", "rev": f.get("rev"), "fix_rev": f.get("fix_rev"), "weight": weight}
             latest[unit] = row
@@ -405,7 +402,7 @@ def record_adjudication(
                     return _normalize_event_row(ex)
         row: Dict[str, Any] = {
             "v": ledger.LEDGER_VERSION,
-            "ts": ts or _now(),
+            "ts": ts or utc_stamp(),
             "event": "adjudication",
             "rule": rule,
             "verdict": norm_verdict,
@@ -428,7 +425,7 @@ def record_override(
                 return _normalize_event_row(ex)
         row: Dict[str, Any] = {
             "v": ledger.LEDGER_VERSION,
-            "ts": ts or _now(),
+            "ts": ts or utc_stamp(),
             "event": "override",
             "rule": rule,
             "file": str(file),
@@ -446,7 +443,7 @@ def record_void(root: Any, check_id: str, reason: str) -> Dict[str, Any]:
         existing = next((r for r in _of(read_rows(root), "void") if r.get("check") == check_id), None)
         if existing is not None:
             return dict(existing)
-        return ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "void", "check": check_id, "reason": reason}])[0]
+        return ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "void", "check": check_id, "reason": reason}])[0]
 
 
 def void_tree(root: Any, tree: str, reason: str) -> int:
@@ -458,7 +455,7 @@ def void_tree(root: Any, tree: str, reason: str) -> int:
         ids = [c["id"] for c in _of(rows, "check") if c.get("tree") == tree and isinstance(c.get("id"), str)]
         fresh = [i for i in dict.fromkeys(ids) if i not in done]
         if fresh:
-            stamp = _now()
+            stamp = utc_stamp()
             ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "void", "check": i,
                                        "reason": reason} for i in fresh])
         return len(fresh)
@@ -548,7 +545,7 @@ def confirm(
         run_attempt = run.get("run_attempt") if run else None
         _VERIFIED_CI[(c_root, commit)] = {"conclusion": conclusion, "workflow": workflow, "branch": target_branch, "run_id": run_id, "run_attempt": run_attempt}
         if latest_ci.get(commit) != (conclusion, run_id, run_attempt):
-            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "ci", "commit": commit, "workflow": workflow, "ci_conclusion": conclusion, "run_id": run_id, "ci_run_attempt": run_attempt}])
+            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "ci", "commit": commit, "workflow": workflow, "ci_conclusion": conclusion, "run_id": run_id, "ci_run_attempt": run_attempt}])
         if conclusion == "success":
             summary["confirmed"] += len(checks)
         elif conclusion in CI_FAILED:
@@ -578,7 +575,7 @@ def submit_report(
                 return {"status": "claimed", "witness": "self", "credited": [], "tree": tree, "recorded": False}
             if used >= limit:
                 return {"status": "rate_limited", "limit": limit, "witness": "self", "credited": []}
-            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "claimed", "witness": "self", "tree": tree, "source": source, "session": session, "host": host, "key": f"claim:{host}/{session}:{tree}", "report_key": namespaced, "result": result}])
+            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "claimed", "witness": "self", "tree": tree, "source": source, "session": session, "host": host, "key": f"claim:{host}/{session}:{tree}", "report_key": namespaced, "result": result}])
             return {"status": "claimed", "witness": "self", "credited": [], "tree": tree, "recorded": True}
         rules = list(dict.fromkeys(rules_for(check)))
         have = {(r.get("rule") or r.get("for_rule")) for r in _of(rows, "report") if r.get("check") == check["id"]}
@@ -586,7 +583,7 @@ def submit_report(
         if used + len(fresh) > limit:
             return {"status": "rate_limited", "limit": limit, "witness": "aegis", "credited": []}
         if fresh:
-            stamp = _now()
+            stamp = utc_stamp()
             ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "witness": "aegis", "check": check["id"], "tree": tree, "rule": rule, "for_rule": rule, "result": result, "source": source, "session": session, "host": host, "key": f"credit:{check['id']}:{rule}", "report_key": namespaced} for rule in fresh])
         return {"status": "recorded", "witness": "aegis", "credited": rules, "check": check["id"], "tree": tree}
 

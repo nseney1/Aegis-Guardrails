@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 import os
@@ -47,7 +47,7 @@ from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.init import _host_option, _unwritable, packaged_dir
 from aegis_core import hosts as host_table
-from aegis_core.primitives import real_key
+from aegis_core.primitives import real_key, utc_stamp
 
 __all__ = ["RESULTS", "Entry", "SkillsCommand", "SyncResult", "TargetResult", "run_skills", "summary", "sync_skills"]
 
@@ -506,7 +506,7 @@ def run_skills(args: argparse.Namespace) -> int:
         print(json.dumps({
             "source": "aegis skills sync",
             "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "checked_at": utc_stamp(),
             "scope": {"workspace": str(root), "hosts": result.hosts, "targets": [t.dir for t in result.targets]},
             "dry_run": result.dry_run,
             "force": result.force,

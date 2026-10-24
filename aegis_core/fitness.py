@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Opti
 
 from aegis_core import stats as _stats
 from aegis_core.config import DEFAULT_EPSILON, DEFAULT_HALF_LIFE_SESSIONS
+from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.stats import _num
 from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, RULE_TYPES, WILSON_CONFIDENCE_Z_SCORES
 
@@ -67,16 +68,6 @@ def compute_mde_180d(trigger_rate_per_day: float, horizon_days: float = DEFAULT_
     if expected_n <= 0.0:
         return 1.0
     return min(1.0, 1.24324 / math.sqrt(expected_n))
-
-
-def _parse_ts(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def rule_age_days(rule: Any, now: Optional[datetime] = None) -> int:
@@ -298,7 +289,7 @@ def _collect_t4_events_for_rules(
             continue
         b = info[rid]
         ts = raw.get("ts")
-        seen_at = _parse_ts(ts)
+        seen_at = parse_utc(ts, lenient=True)
         if seen_at is not None and (b["first_seen"] is None or seen_at < b["first_seen"]):
             b["first_seen"] = seen_at
         ev = raw.get("event")
@@ -346,7 +337,7 @@ def _collect_t4_events_for_rules(
             b["adjudicated_tp" if label["verdict"] == "tp" else "adjudicated_fp"] += 1
             b["sessions"].update([label["session"]] if label.get("session") else [])
             b["repos"].update([label["repo"]] if label.get("repo") else [])
-            stamp = _parse_ts(label.get("ts"))
+            stamp = parse_utc(label.get("ts"), lenient=True)
             if stamp is not None:
                 stamps.append(stamp)
                 if label["verdict"] == "tp" and (reinforced is None or stamp > reinforced):
@@ -549,7 +540,7 @@ def _utc_stamp(iso: str) -> Optional[str]:
         moment = datetime.fromisoformat(iso.strip())
     except ValueError:
         return None
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if moment.tzinfo else None
+    return utc_stamp(moment) if moment.tzinfo else None
 
 
 # Raise whenever replay or forbid_ast evaluation semantics change: it is part of the digest stored with

@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -42,7 +41,7 @@ import stat
 import tempfile
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, primitives
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
 from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
@@ -81,7 +80,6 @@ __all__ = [
     "run_fast",
     "run_grouped",
     "split_lines",
-    "utc_stamp",
     "write",
 ]
 
@@ -682,14 +680,9 @@ def apply(pairs: Sequence[Tuple[Optional[str], ToolEvidence]], sources: Sources,
 
 # ── The files a whole-workspace mode looks at ────────────────────────────────
 
-def utc_stamp(now: Optional[float] = None) -> str:
-    moment = datetime.now(timezone.utc) if now is None else datetime.fromtimestamp(now, timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def envelope(source: str, scope: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
     """The head every machine-readable output of the v4.2 modes carries."""
-    return {"source": source, "aegis_version": __version__, "checked_at": utc_stamp(now), "scope": scope}
+    return {"source": source, "aegis_version": __version__, "checked_at": primitives.utc_stamp(now), "scope": scope}
 
 
 def list_files(root: Any) -> Tuple[List[str], str]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import fnmatch
 import hashlib
 import itertools
@@ -22,6 +22,7 @@ from urllib.parse import quote
 from aegis_core import gitsafe, governance, pathlookup
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
 
 __all__ = [
@@ -207,10 +208,6 @@ def default_gh_runner(
         proc.stdout.decode("utf-8", "replace"),
         proc.stderr.decode("utf-8", "replace"),
     )
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _parse_codeowners(text: str, *, org_login: Optional[str] = None) -> List[Tuple[str, Tuple[str, ...]]]:
@@ -450,7 +447,7 @@ class TierReport:
     caveats: Tuple[str, ...] = ()
     evidence: Mapping[str, Any] = field(default_factory=dict)
     scope: Mapping[str, Any] = field(default_factory=dict)
-    checked_at: str = field(default_factory=_utc_now)
+    checked_at: str = field(default_factory=utc_stamp)
 
     @property
     def label(self) -> str:
@@ -898,7 +895,7 @@ class Approval(NamedTuple):
             "schema": SCHEMA,
             "source": SOURCE,
             "aegis_version": __version__,
-            "checked_at": _utc_now(),
+            "checked_at": utc_stamp(),
             "scope": {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),

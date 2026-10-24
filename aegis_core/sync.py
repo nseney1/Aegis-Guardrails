@@ -15,7 +15,7 @@ import urllib.parse
 
 from aegis_core import gitsafe
 from aegis_core.fitness import for_rules
-from aegis_core.primitives import is_within, key_within
+from aegis_core.primitives import is_within, key_within, utc_stamp
 from aegis_core.rules import RuleSet, load_rules
 from aegis_core.storage import atomic_write_bytes, atomic_write_text, locked, read_json_dict, state_dir
 from aegis_core.telemetry_engine import ledger
@@ -24,11 +24,6 @@ from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR, WorkspaceLa
 
 __all__ = ["DERIVED_VERSION", "MOVED_STATUSES", "SyncResult", "base_fetch", "build", "format_pr_body", "read_derived", "replay_lines", "stale_rules", "sync"]
 DERIVED_VERSION = 1
-
-
-def _now_iso(now: Optional[datetime]) -> str:
-    cur = now or datetime.now(timezone.utc)
-    return (cur if cur.tzinfo else cur.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def build(
@@ -67,7 +62,7 @@ def build(
             entry["expired"] = True
         entries[rule.id] = entry
     return {
-        "v": DERIVED_VERSION, "norm": "lf", "synced_at": _now_iso(now), "rules": entries,
+        "v": DERIVED_VERSION, "norm": "lf", "synced_at": utc_stamp(now), "rules": entries,
         "errors": [{"path": r.path, "error": r.error} for r in rules.errors],
         "ignored": [{"path": i.path, "reason": i.reason} for i in rules.ignored],
         "untargeted": [{"id": r.id, "path": r.path} for r in sorted(rules.served, key=lambda r: r.id) if not r.target_paths],

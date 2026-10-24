@@ -11,6 +11,7 @@ from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
+from aegis_core.primitives import utc_stamp
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -540,13 +541,12 @@ class CiReport:
         return self.approval is not None and self.approval.valid
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
-        from datetime import datetime, timezone
         from aegis_core._version import __version__
 
         return {
             "source": SOURCE,
             "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "checked_at": utc_stamp(),
             "scope": {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),

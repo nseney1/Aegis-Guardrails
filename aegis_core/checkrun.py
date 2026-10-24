@@ -47,7 +47,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Op
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.config import read_user_config
-from aegis_core.primitives import is_within
+from aegis_core.primitives import is_within, utc_stamp
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
 
@@ -408,10 +408,6 @@ def run_pytest_snapshot(snapshot: Path, test_files: Sequence[str], workspace: Pa
 
 # ── The record ───────────────────────────────────────────────────────────────
 
-def _stamp(moment: Optional[datetime]) -> str:
-    return (moment or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, int]:
     from aegis_core import baseline
 
@@ -462,7 +458,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
     except gitsafe.GitError as exc:
         return CheckOutcome("error", None, str(exc))
 
-    stamp = _stamp(now)
+    stamp = utc_stamp(now)  # a naive now is UTC
     layer1_ok = layer1["findings"] == 0
     tests_ok = run is None or run.evidence
     passed = layer1_ok and tests_ok

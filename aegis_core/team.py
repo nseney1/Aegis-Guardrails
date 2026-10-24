@@ -45,7 +45,6 @@ a common path and whether ``git merge-tree`` reports a conflict.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import getpass
 import json
 import os
@@ -62,7 +61,7 @@ from aegis_core import events, gitsafe
 from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _read_capped
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.match import normalize_path, sets_overlap
-from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads
+from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads, utc_stamp
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -133,7 +132,6 @@ _LEASE_KEYS = ("v", "lane", "role", "owner", "claim_id", "gen", "branch", "paths
 # The last second datetime can print (9999-12-31T23:59:59Z), less the longest lease.
 _MAX_TS = 253402300799 - MAX_TTL_S
 _CLAIM_ATTEMPTS = 3
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _SYNTHETIC_MERGE = re.compile(r"\Arefs/(?:remotes/)?pull/[^/]+/merge\Z")
 
 
@@ -429,10 +427,6 @@ def _now(now: Optional[int]) -> int:
     return int(time.time()) if now is None else int(now)
 
 
-def _stamp(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime(_TS_FORMAT)
-
-
 # ── Leases ───────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -601,7 +595,7 @@ def lease_view(lease: Lease, now: int, overlaps: Iterable[str]) -> Dict[str, Any
         "oid": lease.oid,
         "branch": lease.branch,
         "paths": list(lease.paths),
-        "expires_at": _stamp(lease.expires_at),
+        "expires_at": utc_stamp(lease.expires_at),
         "clock_basis": {"clock": "writer_utc", "ts": lease.ts, "ttl_s": lease.ttl_s},
         "expired": lease.expired(now),
         "clock_skew": lease.clock_skew(now),
@@ -796,7 +790,7 @@ def transfer(root: Any, lane: str, expect: str, owner: str, role: Optional[str] 
     current = _expected(repo, read_leases(repo), lane, expect)
     if current.expired(moment):
         raise LeaseRefused(
-            f"expired: lane {lane}'s lease expired at {_stamp(current.expires_at)}; claim or renew it instead",
+            f"expired: lane {lane}'s lease expired at {utc_stamp(current.expires_at)}; claim or renew it instead",
             "expired", lane, current=current.oid, lease=current,
         )
     landed, holder, lease = _write(repo, lane, current.role if role is None else role, owner, current.claim_id,

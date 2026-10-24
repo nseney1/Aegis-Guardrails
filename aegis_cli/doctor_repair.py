@@ -34,7 +34,7 @@ from aegis_cli.doctor_findings import (
     _worktree_ledger_findings,
 )
 from aegis_core import human_gate
-from aegis_core.primitives import strict_loads
+from aegis_core.primitives import strict_loads, utc_stamp
 
 if TYPE_CHECKING:
     from aegis_cli.doctor import _Ctx
@@ -759,6 +759,6 @@ def _write_manifest(backup: Path, files: List[Dict[str, Any]]) -> None:
     from aegis_cli import doctor as _doc
     from aegis_core.storage import atomic_write_bytes
 
-    doc = {"schema": "aegis.doctor.backup/v1", "created_at": _doc._utc_now(), "aegis_version": _doc._aegis_version(),
+    doc = {"schema": "aegis.doctor.backup/v1", "created_at": utc_stamp(), "aegis_version": _doc._aegis_version(),
            "files": files}
     atomic_write_bytes(backup / "manifest.json", (json.dumps(doc, indent=2) + "\n").encode("utf-8"), mode=0o600)

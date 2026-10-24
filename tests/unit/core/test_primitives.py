@@ -179,16 +179,26 @@ def test_strict_loads_lets_recursion_error_through():
 
 # ── UTC timestamps (T20) ─────────────────────────────────────────────────────
 
-@POSIX_ONLY
-@pytest.mark.parametrize("zone", ["America/New_York", "Asia/Tokyo"])
-def test_a_naive_datetime_is_utc_in_every_time_zone(monkeypatch, zone):
-    monkeypatch.setenv("TZ", zone)
+NAIVE = datetime(2026, 10, 19, 12, 0)
+
+
+@pytest.fixture(params=["America/New_York", "Asia/Tokyo"])
+def zone(request):
+    if sys.platform == "win32":
+        pytest.skip("time.tzset is POSIX")
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = request.param
     time.tzset()
-    try:
-        assert utc_stamp(datetime(2026, 10, 19, 12, 0)) == "2026-10-19T12:00:00Z"
-    finally:
-        monkeypatch.undo()
-        time.tzset()
+    yield request.param
+    if old is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = old
+    time.tzset()
+
+
+def test_a_naive_datetime_is_utc_in_every_time_zone(zone):
+    assert utc_stamp(NAIVE) == "2026-10-19T12:00:00Z"
 
 
 def test_aware_datetimes_and_posix_times_are_converted_to_utc():
@@ -364,3 +374,39 @@ def test_the_config_files_are_read_strictly(tmp_path, raw):
     with pytest.raises(config.ConfigError, match="not valid JSON"):
         config.UserConfig.load(None, UserLayout(home))
     assert config.read_user_config(user=UserLayout(home)) is None
+
+
+# ── Stamps at the sites (T20, AC-5) ──────────────────────────────────────────
+
+def test_a_naive_now_is_utc_in_the_compliance_report(tmp_path, zone):
+    from aegis_core import scan_compliance
+
+    assert scan_compliance.report(tmp_path, now=NAIVE)["checked_at"] == "2026-10-19T12:00:00Z"
+
+
+def test_the_baseline_envelope_keeps_its_posix_time_and_its_own_stamp_is_gone():
+    from aegis_core import baseline
+
+    assert baseline.envelope("s", {}, now=0)["checked_at"] == "1970-01-01T00:00:00Z"
+    assert not hasattr(baseline, "utc_stamp") and "utc_stamp" not in baseline.__all__
+
+
+@pytest.mark.parametrize("value, usable", [
+    ("2026-10-19T12:00:00Z", True), ("2026-10-19T12:00:00z", True), ("2026-10-19t12:00:00Z", True),
+    ("\uff12\uff10\uff12\uff16-10-19T12:00:00Z", True), ("2026-10-19T12:00:00.5Z", False),
+    ("2026-10-19T12:00:00+00:00", False), (" 2026-10-19T12:00:00Z", False), ("", False), (7, False),
+    ("2026-13-45T00:00:00Z", False),
+])
+def test_an_events_row_counts_exactly_when_its_time_is_a_strict_stamp(tmp_path, value, usable):
+    import json
+    import subprocess
+
+    from aegis_core import events
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    path = events.events_path(tmp_path, create=True)
+    row = {"v": events.EVENTS_VERSION, "ts": value, "event": events.KINDS[0], "worktree": "w", "result": "r",
+           "detail": {}}
+    path.write_bytes((json.dumps(row) + "\n").encode("utf-8"))
+    assert len(events.read(tmp_path).rows) == (1 if usable else 0)
+    assert (parse_utc(value) is not None) is usable

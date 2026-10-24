@@ -28,7 +28,7 @@ into the default branch holding the commit, approved on its head by someone othe
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 from pathlib import Path
@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import gitsafe, human_gate
 from aegis_core._version import __version__
+from aegis_core.primitives import utc_stamp
 
 __all__ = [
     "GH_MINIMUM",
@@ -80,10 +81,6 @@ _REMOTE = re.compile(
 #: ``runner(argv, timeout)``: run ``gh <argv>`` and return (returncode, stdout, stderr), or None
 #: when gh is not installed. Injectable so a test never reaches a real gh.
 GhRun = Callable[[Sequence[str], float], Optional[Tuple[int, str, str]]]
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def subject_bytes(commit: str, tree: str) -> bytes:
@@ -149,7 +146,7 @@ class ReleaseReport:
             "schema": SCHEMA,
             "source": SOURCE,
             "aegis_version": __version__,
-            "checked_at": _utc_now(),
+            "checked_at": utc_stamp(),
             "scope": {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),

@@ -1186,3 +1186,25 @@ def test_the_process_group_killer_a_caller_patches_is_the_one_a_run_uses(tmp_pat
     checkrun.run_tests([sys.executable, "-c", "pass"], tmp_path, checkrun.hermetic_env(tmp_path), 60.0,
                        tmp_path / "junit.xml", tmp_path / "out.txt")
     assert len(killed) == 1
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="time.tzset is POSIX")
+def test_a_check_row_stamps_a_naive_now_as_utc(tmp_path):
+    """A naive datetime is UTC by rule (R-structure-20); it was read as local time here."""
+    from datetime import datetime
+
+    repo = hv.make_project(tmp_path)
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    try:
+        outcome = checkrun.record(repo.root, now=datetime(2026, 10, 19, 12, 0))
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+    assert outcome.status == "recorded", outcome.reason
+    assert outcome.row["ts"] == outcome.row["checked_at"] == "2026-10-19T12:00:00Z"

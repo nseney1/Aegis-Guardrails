@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import os
 from pathlib import Path
@@ -94,6 +94,7 @@ from aegis_core.lane_ast import (
     skip_forms,
 )
 from aegis_core.match import is_test_path, matches, normalize_path
+from aegis_core.primitives import utc_stamp
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -145,7 +146,6 @@ NOTE_EXEMPTION = (
 _REGULAR = ("100644", "100755")
 _OID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _PARSE_ERRORS = (SyntaxError, ValueError, RecursionError)
 
 
@@ -202,11 +202,6 @@ class PathCheck:
     def as_dict(self) -> Dict[str, Any]:
         return {"path": self.path, "status": self.status, "old_mode": self.old_mode, "new_mode": self.new_mode,
                 "allowed": self.allowed, "glob": self.glob, "source": self.source, "protected": self.protected}
-
-
-def _stamp(epoch: Optional[int] = None) -> str:
-    moment = int(time.time()) if epoch is None else int(epoch)
-    return datetime.fromtimestamp(moment, timezone.utc).strftime(_TS_FORMAT)
 
 
 def _source_label(source: str, base: str) -> str:
@@ -346,7 +341,7 @@ def error_report(workspace: Any, lane: str, message: str, now: Optional[int] = N
     return {
         "source": SOURCE,
         "aegis_version": __version__,
-        "checked_at": _stamp(now),
+        "checked_at": utc_stamp(now),
         "scope": {"workspace": str(workspace), "lane": lane},
         "status": "error",
         "error": message,
@@ -414,7 +409,7 @@ def _lease_paths(top: Path, lane: str, now: int) -> Tuple[str, ...]:
     if lease is not None and not lease.expired(now):
         return lease.paths
     if lease is not None:
-        why = f"its lease expired at {_stamp(lease.expires_at)}"
+        why = f"its lease expired at {utc_stamp(lease.expires_at)}"
     elif found.unreadable_lane(lane) is not None:
         why = "its lease is unreadable"
     else:
@@ -590,6 +585,6 @@ def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional
         merge_base=merge_base, head=head, paths=tuple(lane_paths), paths_source=paths_source,
         shared=tuple(shared), shared_source=shared_source,
         changes=tuple(_contain(entry, allowed) for entry in entries),
-        findings=findings, checked=checked, not_checked=not_checked, checked_at=_stamp(moment), warnings=empty,
+        findings=findings, checked=checked, not_checked=not_checked, checked_at=utc_stamp(moment), warnings=empty,
     )
     return dataclasses.replace(result, warnings=empty + _record(top, result))

@@ -99,7 +99,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import io
 import json
@@ -513,10 +513,6 @@ def _run_host_cli(argv: Sequence[str], cwd: str, timeout: float) -> "subprocess.
     """The one place doctor starts a host CLI: an argv (no shell), no stdin, bounded in time."""
     return subprocess.run(list(argv), cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, errors="replace", timeout=timeout, env=_child_env())
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _aegis_version() -> str:

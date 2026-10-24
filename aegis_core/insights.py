@@ -16,7 +16,7 @@ writes nothing. Old heartbeats that carry their own ``revs`` stay readable.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import hmac
 import json
@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple
 
 from aegis_core import gitsafe, rule_inventory, storage
 from aegis_core.errors import PathTraversalError
-from aegis_core.primitives import real_key
+from aegis_core.primitives import parse_utc, real_key, utc_stamp
 from aegis_core.storage import (
     append_jsonl,
     atomic_write_text,
@@ -106,7 +106,6 @@ RULE_MATCH_SIM_WITH_PATH = 0.15
 RULE_MATCH_SIM = 0.30
 RECURRENCE_SIM = 0.12
 _HS_DOMAIN = b"aegis-hs/v1"
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 COUNTABLE_LEVELS = frozenset({"H", "cli", "W2"})
 DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
 # The latest of these naming an insight decides whether review lists it (noise hides for good).
@@ -145,23 +144,10 @@ def _redact(text: str, **kwargs: Any) -> str:
     return redact_insight_text(text, **kwargs)
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime(_TS_FORMAT)
-
-
 def _user_layout(home: Optional[Path] = None) -> Optional[UserLayout]:
     if home is not None:
         return UserLayout(Path(home))
     return UserLayout.current()
-
-
-def _parse_ts(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.strptime(value, _TS_FORMAT).replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
 
 
 def _lstat_or_none(path: Path) -> Optional[os.stat_result]:
@@ -505,11 +491,11 @@ def _superseded(rows: Sequence[Mapping[str, Any]]) -> Set[int]:
 
 def _corroborating_hook(rows: Iterable[Mapping[str, Any]], host: str, ts: Any, quote: str) -> Optional[str]:
     """The id of a hook prompt of ``host`` within JOIN_WINDOW_S of ``ts`` that contains ``quote``."""
-    needle, when = quote.strip().lower(), _parse_ts(ts)
+    needle, when = quote.strip().lower(), parse_utc(ts)
     if len(needle) < _CORROBORATE_MIN_CHARS or not host or when is None:
         return None
     for r in rows:
-        r_ts = _parse_ts(r.get("ts"))
+        r_ts = parse_utc(r.get("ts"))
         if (r.get("event") == "insight" and _row_source(r) == "hook" and r.get("host") == host
                 and r_ts is not None and abs((r_ts - when).total_seconds()) <= JOIN_WINDOW_S
                 and needle in str(r.get("text") or "").lower()):
@@ -542,7 +528,7 @@ def _build_insight_row(
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "v": INSIGHT_SCHEMA_VERSION,
-        "ts": now or _utc_now(),
+        "ts": now or utc_stamp(),
         "event": "insight",
         "id": f"ins-{secrets.token_hex(6)}",
         "level": level,
@@ -613,7 +599,7 @@ def capture_suggestion(
             raise CaptureLimitReached(f"capture limit reached: at most {MAX_CAPTURES_PER_SESSION} insights per session")
         # Rows are compact JSON, so a hook row written since 4.4 carries these bytes; review
         # recomputes corroboration over every row (4.3.x hook rows included), so this is a note.
-        now = _utc_now()
+        now = utc_stamp()
         hooks = read_jsonl(path, contains=b'"source":"hook"').rows
         row = _build_insight_row(
             workspace,
@@ -679,7 +665,7 @@ def record_hook_prompt(
         # Without session identity a prompt counts toward no session: no heartbeat, no I/O.
         return {}
     path = insights_path(actual_ws, home=home)
-    now = _utc_now()
+    now = utc_stamp()
     to_write: List[Dict[str, Any]] = []
     revs: Optional[Dict[str, str]] = None
     inv = _inventory_id(root)
@@ -804,7 +790,7 @@ def _exposure_index(root: Path) -> _Exposures:
 
     index: _Exposures = {}
     for row in credit.read_rows(root):
-        rule_id, ts, rev = row.get("rule"), _parse_ts(row.get("ts")), row.get("rev")
+        rule_id, ts, rev = row.get("rule"), parse_utc(row.get("ts")), row.get("rev")
         if row.get("event") == "exposure" and isinstance(rule_id, str) and ts is not None:
             index.setdefault(rule_id, []).append(
                 (str(row.get("host") or ""), ts, rev if isinstance(rev, str) and rev else None))
@@ -813,7 +799,7 @@ def _exposure_index(root: Path) -> _Exposures:
 
 def _rule_was_exposed(rule: Rule, row: Mapping[str, Any], exposures: _Exposures) -> bool:
     # A None rev is a row written before exposures carried one: it matches any revision.
-    host, ts = str(row.get("host") or ""), _parse_ts(row.get("ts"))
+    host, ts = str(row.get("host") or ""), parse_utc(row.get("ts"))
     return bool(host and ts is not None and any(
         h == host and abs((e_ts - ts).total_seconds()) <= JOIN_WINDOW_S
         for h, e_ts, rev in exposures.get(rule.id, ()) if rev is None or rule.digest.startswith(rev)))
@@ -848,7 +834,7 @@ def record_decision(
     ids = [str(i) for i in insight_ids if str(i).strip()]
     if not ids:
         raise ValueError(f"{decision} needs at least one insight id")
-    row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": _utc_now(), "event": "decision",
+    row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": utc_stamp(), "event": "decision",
                            "decision": decision, "insight_ids": ids}
     if kind:
         row["kind"] = str(kind)
@@ -1124,7 +1110,7 @@ def _wilson_ucb95(k: int, n: int) -> float:
 
 def _count_recurrence_episodes(matching: Sequence[Mapping[str, Any]]) -> int:
     """Insights closer than BURST_WINDOW_SECONDS to the one before are one episode."""
-    stamps = sorted(ts for ts in (_parse_ts(r.get("ts")) for r in matching) if ts is not None)
+    stamps = sorted(ts for ts in (parse_utc(r.get("ts")) for r in matching) if ts is not None)
     gaps = sum(1 for a, b in zip(stamps, stamps[1:]) if (b - a).total_seconds() > BURST_WINDOW_SECONDS)
     return len(matching) - len(stamps) + (gaps + 1 if stamps else 0)
 
