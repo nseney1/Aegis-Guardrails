@@ -112,6 +112,7 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_cli.base import AegisCommand, CommandCategory
+from aegis_core.pathlookup import is_bare
 from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
 from aegis_core.primitives import is_within, real_key
 
@@ -645,7 +646,7 @@ def _command_exists(command: str, ctx: _Ctx) -> Optional[bool]:
     """
     if os.path.isabs(command):
         return os.path.isfile(command) and (os.name == "nt" or os.access(command, os.X_OK))
-    if os.sep in command or (os.altsep and os.altsep in command):
+    if not is_bare(command):
         return None
     if ctx.which(command) is not None:
         return True

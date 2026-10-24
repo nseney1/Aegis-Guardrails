@@ -145,7 +145,6 @@ NOTE_EXEMPTION = (
 
 _REGULAR = ("100644", "100755")
 _OID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _PARSE_ERRORS = (SyntaxError, ValueError, RecursionError)
 
 
@@ -361,13 +360,13 @@ def _cli_globs(paths: object) -> Tuple[str, ...]:
         raise LaneGateUsage("--paths: give at least one glob")
     out: List[str] = []
     for ordinal, glob in enumerate(paths, 1):
-        if not isinstance(glob, str) or _CONTROL.search(glob):
-            raise LaneGateUsage(f"--paths: glob {ordinal} is not text without control characters")
+        problem = team.glob_problem(glob)
+        if problem:
+            message = {"not_text": "is not text without control characters",
+                       "control": "is not text without control characters", "empty": "is empty",
+                       "climbs": "climbs out of the repository with '..'"}[problem]
+            raise LaneGateUsage(f"--paths: glob {ordinal} {message}")
         clean = normalize_path(glob)
-        if not clean:
-            raise LaneGateUsage(f"--paths: glob {ordinal} is empty")
-        if ".." in clean.split("/"):
-            raise LaneGateUsage(f"--paths: glob {ordinal} climbs out of the repository with '..'")
         if clean not in out:
             out.append(clean)
     return tuple(out)

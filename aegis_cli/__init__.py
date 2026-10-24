@@ -7,6 +7,9 @@ from pathlib import Path
 from aegis_core._version import __version__ as __version__
 
 
+NO_HOME_MESSAGE = "no home directory can be resolved on this machine (set HOME, or USERPROFILE on Windows)"
+
+
 def resolve_root(args, default=None):
     """Resolve project/repo root from args, checking ws then workspace."""
     if hasattr(args, "ws") and getattr(args, "ws", None) is not None:
@@ -31,6 +34,7 @@ def sanitize_display(text: str, max_len: int = 80) -> str:
 
 
 __all__ = [
+    "NO_HOME_MESSAGE",
     "resolve_root",
     "sanitize_display",
 ]

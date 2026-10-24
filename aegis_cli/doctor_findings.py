@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from aegis_core.pathlookup import is_bare
 from aegis_core.primitives import real_key
 
 if TYPE_CHECKING:
@@ -396,7 +397,7 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
             if reg["command"]:
                 cmd = reg["command"][0]
                 why = (f"is a relative path, which {spec.display_name} resolves against the directory it starts "
-                       "the server in" if os.sep in cmd or (os.altsep and os.altsep in cmd) else
+                       "the server in" if not is_bare(cmd) else
                        "is found only through an empty or relative PATH entry or inside the workspace, where "
                        "doctor does not look")
                 add("command_unverifiable", f"the registered command {cmd} {why}, so doctor cannot tell whether "

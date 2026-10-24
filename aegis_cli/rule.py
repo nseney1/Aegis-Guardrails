@@ -28,7 +28,7 @@ from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, validate_rule_bod
 from aegis_core.primitives import utc_stamp
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES
 from aegis_core.workspace.base import Workspace
-from aegis_core.workspace.binding import bounded_walk_up, home_message
+from aegis_core.workspace.binding import bounded_walk_up, denial, denial_message, home_message  # noqa: F401 - pinned name
 from aegis_core.workspace.layout import WorkspaceLayout
 from aegis_core.lifecycle.promotion import (
     promote_rule,
@@ -88,13 +88,6 @@ class _WorkspaceArg(argparse.Action):
         setattr(namespace, "_rule_workspace_arg", values)
 
 
-def _home() -> Path | None:
-    try:
-        return Path.home().resolve()
-    except (RuntimeError, KeyError, OSError):
-        return None
-
-
 def _not_a_workspace(directory: Path) -> WorkspaceNotFoundError:
     return WorkspaceNotFoundError(f"not an Aegis workspace (no .aegis/ in {directory}); run aegis init")
 
@@ -135,10 +128,9 @@ def _resolve_workspace_root(args: argparse.Namespace, require_aegis: bool = Fals
             root = Path(ws_obj.root if ws_obj is not None else Workspace.resolve().root).resolve()
             start = Path.cwd().resolve()
 
-    home = _home()
-    if home is not None and root == home:
-        if start == home:
-            raise WorkspaceNotFoundError(home_message(home))
+    if denial(root):
+        if start == root:
+            raise WorkspaceNotFoundError(denial_message(root))
         raise _not_a_workspace(start)
 
     if (explicit or require_aegis) and not is_aegis_workspace(root):

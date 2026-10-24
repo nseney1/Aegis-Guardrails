@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from aegis_core import primitives
-from aegis_core import baseline, events
+from aegis_core import baseline, events, team
 from aegis_core.errors import AegisError
 from aegis_core.match import matches, normalize_path
 
@@ -44,7 +44,6 @@ SOURCE = "aegis check --partition"
 MAX_PREDICTED = 200  # edges kept in the event: the log is a metric, not an archive
 MIN_LANES = 2
 _NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _USAGE = "--partition needs at least 2 --split NAME=GLOB[,GLOB...]"
 LIMITS = (
     "Edges come from static name resolution through imports: a call on an object, a name reached through a "
@@ -82,12 +81,16 @@ def parse_splits(values: Optional[Iterable[str]]) -> Dict[str, Tuple[str, ...]]:
             raise PartitionUsage(f"--split: lane {name} has no glob")
         globs: List[str] = []
         for raw in rest.split(","):
-            if _CONTROL.search(raw):
-                raise PartitionUsage(f"--split: lane {name} has a glob with a control character")
+            # Check before strip: C1 NEL is whitespace too, but must not disappear.
+            problem = team.glob_problem(raw)
+            if problem != "control":
+                problem = team.glob_problem(raw.strip())
             clean = normalize_path(raw.strip())
-            if not clean:
+            if problem == "control":
+                raise PartitionUsage(f"--split: lane {name} has a glob with a control character")
+            if problem == "empty":
                 raise PartitionUsage(f"--split: lane {name} has an empty glob")
-            if ".." in clean.split("/"):
+            if problem == "climbs":
                 raise PartitionUsage(f"--split: lane {name}: glob {clean!r} climbs out of the workspace with '..'")
             if clean not in globs:
                 globs.append(clean)

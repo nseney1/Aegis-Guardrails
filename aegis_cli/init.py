@@ -27,6 +27,7 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from aegis_cli import NO_HOME_MESSAGE
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/test_worktree_hooks.py
     AEGIS_HOOK_FORMAT,
@@ -63,6 +64,7 @@ from aegis_cli.install_hosts import (
     write_managed_block,
 )
 from aegis_core import scaffolding as _scaffolding
+from aegis_core.workspace.layout import UserLayout
 from aegis_core.scaffolding import (
     ACTIVE_LABEL as _ACTIVE_LABEL,
     ACTIVE_STARTERS,
@@ -692,7 +694,6 @@ def _link_key_step(home: Path, dry_run: bool) -> Step:
     with ``O_EXCL`` here and nowhere else, never replaced or repaired when a file is already
     there. Without it no ``hs`` exists and agy and Claude labels read unknown."""
     from aegis_core.insights import create_link_key
-    from aegis_core.workspace.layout import UserLayout
 
     if os.path.lexists(UserLayout(Path(home)).aegis_dir / "link.key"):
         return Step(LINK_KEY_LABEL, "present")
@@ -721,7 +722,12 @@ def run_init(args: argparse.Namespace) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     yes = bool(getattr(args, "yes", False))
     preset = getattr(args, "rules", None) or "standard"
-    home = Path.home()
+    layout = UserLayout.current()
+    if layout is None:
+        report.error(NO_HOME_MESSAGE)
+        report.finish("refused", {"workspace": str(root), "hosts": []}, dry_run, [])
+        return 1
+    home = layout.home
     path_env = os.environ.get("PATH")
 
     found = detection_evidence(home, path_env)
