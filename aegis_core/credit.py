@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from aegis_core import gitevidence, gitsafe, human_gate
+from aegis_core import ghcli, gitevidence, gitsafe, human_gate
 from aegis_core.errors import AegisError, PathTraversalError
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import ledger_locked, read_jsonl
@@ -184,7 +184,7 @@ def ci_conclusion(run: Optional[Mapping[str, Any]]) -> str:
 
 class GhRestClient:
     def __init__(self, repo: Optional[str] = None, runner: Optional[Callable[..., Any]] = None, cwd: Any = None) -> None:
-        self.repo, self.runner, self.cwd = repo, runner or human_gate.default_gh_runner, cwd
+        self.repo, self.runner, self.cwd = repo, runner or ghcli.default_gh_runner, cwd
 
     def _api(self, path: str) -> Any:
         result = self.runner(["api", f"repos/{self.repo or '{owner}/{repo}'}{path}"], cwd=self.cwd)

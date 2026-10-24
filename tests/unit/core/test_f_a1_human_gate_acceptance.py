@@ -27,7 +27,7 @@ import subprocess
 
 import pytest
 
-from aegis_core import human_gate, lane_gate, storage
+from aegis_core import ghcli, github_ruleset, human_gate, lane_gate, storage
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -196,7 +196,7 @@ class _ReviewsGh(hg.FakeGh):
     def __call__(self, argv, stdin=None, cwd=None, timeout=None):
         if "/pulls/" in argv[-1]:
             self.calls.append((tuple(argv), stdin))
-            return human_gate.GhResult(0, json.dumps(self.reviews), "")
+            return ghcli.GhResult(0, json.dumps(self.reviews), "")
         return super().__call__(argv, stdin, cwd)
 
 
@@ -219,7 +219,7 @@ def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_pa
     verdict = human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh)
     assert verdict is not None and verdict.valid and (verdict.source, verdict.signer, verdict.commit) == ("review", "human", head)
     # The ruleset doctor --github proposes for tier A is such a merge gate.
-    gh = _ReviewsGh(approving, rules=human_gate.build_ruleset("A", ["aegis-check"])["rules"])
+    gh = _ReviewsGh(approving, rules=github_ruleset.build_ruleset("A", ["aegis-check"])["rules"])
     assert human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh) is not None
     absent = hg.pull_request_rule(last_push=True)
     del absent["parameters"]["require_last_push_approval"]
@@ -502,7 +502,7 @@ def test_tier_c_says_self_attested_in_text_and_json(tmp_path):
 def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
     from aegis_cli import doctor
     repo = hg.make_repo(tmp_path)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=False, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)
@@ -521,7 +521,7 @@ def _doctor_github(repo: hg.Repo, monkeypatch, gh: hg.FakeGh, answers=None, tty=
     from aegis_cli import doctor
     if workflow:
         repo.write(".github/workflows/aegis.yml", hg.AEGIS_WORKFLOW if workflow is True else workflow)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     monkeypatch.setattr(doctor, "_stdin_is_tty", lambda: tty)
     replies = iter(answers or [])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
@@ -551,12 +551,12 @@ def test_apply_with_a_terminal_and_a_yes_creates_exactly_the_printed_ruleset(tmp
     assert rc == 0
     ((argv, body),) = gh.posts
     assert argv[:3] == ("api", "--method", "POST") and "rulesets" in argv[3]
-    sent, printed = json.loads(body), human_gate.build_ruleset("B", ["aegis-check"])
+    sent, printed = json.loads(body), github_ruleset.build_ruleset("B", ["aegis-check"])
     assert sent == printed and sent["enforcement"] == "active" and sent["bypass_actors"] == []
 
 @needs_git
 def test_apply_never_overwrites_a_ruleset_of_the_same_name(tmp_path, monkeypatch):
-    repo, gh = hg.make_repo(tmp_path), hg.FakeGh(rulesets=[{"id": 3, "name": human_gate.RULESET_NAME}])
+    repo, gh = hg.make_repo(tmp_path), hg.FakeGh(rulesets=[{"id": 3, "name": github_ruleset.RULESET_NAME}])
     rc, out, err = _doctor_github(repo, monkeypatch, gh, answers=["y"], tty=True, apply=True, tier="B")
     assert rc != 0 and gh.posts == [] and "already exists" in (out + err)
 
@@ -591,7 +591,7 @@ def test_github_json_carries_the_envelope_and_applies_nothing(tmp_path, monkeypa
     rc, out, _err = _doctor_github(repo, monkeypatch, gh, json=True)
     doc = json.loads(out)
     assert rc == 0 and doc["status"] == "printed" and gh.posts == []
-    assert doc["github"]["ruleset"]["B"] == human_gate.build_ruleset("B", doc["github"]["required_checks"])
+    assert doc["github"]["ruleset"]["B"] == github_ruleset.build_ruleset("B", doc["github"]["required_checks"])
     for key in ("source", "aegis_version", "checked_at", "scope"): assert doc[key]
 
 @needs_git
@@ -1003,7 +1003,7 @@ def test_doctor_reports_how_many_entries_are_looser_without_naming_them(tmp_path
     site = storage.ledger_site(repo.root)
     storage.append_jsonl(site.path, [{"v": 2}])
     os.chmod(site.path, 0o644)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)
@@ -1023,7 +1023,7 @@ def test_doctor_counts_nothing_looser_in_a_workspace_outside_git(tmp_path, monke
         with storage.locked(ws): pass
     finally:
         os.umask(old)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(ws), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)

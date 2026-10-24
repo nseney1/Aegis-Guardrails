@@ -10,7 +10,7 @@ import sys
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from aegis_core import primitives
-from aegis_core import human_gate
+from aegis_core import codeowners, github_ruleset, human_gate
 
 if TYPE_CHECKING:
     from aegis_cli.doctor import Registered, _Ctx
@@ -395,8 +395,8 @@ def _github_plan(root: Path, report: Any) -> Dict[str, Any]:
     return {
         "required_checks": contexts,
         "required_checks_from_workflows": bool(found),
-        "ruleset": {"A": human_gate.build_ruleset("A", contexts), "B": human_gate.build_ruleset("B", contexts)},
-        "codeowners": human_gate.codeowners_lines(handle),
+        "ruleset": {"A": github_ruleset.build_ruleset("A", contexts), "B": github_ruleset.build_ruleset("B", contexts)},
+        "codeowners": codeowners.codeowners_lines(handle),
         "codeowners_note": ("an organization owns this repository, and GitHub ignores a bare @org owner: "
                             "name a team (@org/team) or people") if org else None,
         "signing_setup": human_gate.signers_setup(),
@@ -452,13 +452,13 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
                   file=sys.stderr)
             return 1
         try:
-            exists = human_gate.ruleset_exists(root)
+            exists = github_ruleset.ruleset_exists(root)
         except human_gate.HumanGateError as exc:
             print(f"aegis doctor: cannot read the repository's rulesets: {_doc._clean(exc, 1000)}. Nothing was changed.",
                   file=sys.stderr)
             return 1
         if exists:
-            print(f"aegis doctor: a ruleset named {human_gate.RULESET_NAME!r} already exists; edit it on GitHub "
+            print(f"aegis doctor: a ruleset named {github_ruleset.RULESET_NAME!r} already exists; edit it on GitHub "
                   "(--apply only ever creates). Nothing was changed.", file=sys.stderr)
             return 1
         body = plan["ruleset"][tier]
@@ -467,12 +467,12 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
             print("No changes made.")
             return 1
         try:
-            result = human_gate.create_ruleset(root, body)
+            result = github_ruleset.create_ruleset(root, body)
         except human_gate.HumanGateError as exc:
             print(f"aegis doctor: {_doc._clean(exc, 1000)}", file=sys.stderr)
             return 1
         status = "applied"
-        print(f"Created ruleset {human_gate.RULESET_NAME!r}. Re-run aegis doctor to see the tier.")
+        print(f"Created ruleset {github_ruleset.RULESET_NAME!r}. Re-run aegis doctor to see the tier.")
     if use_json:
         print(json.dumps({
             **primitives.envelope(_doc.SOURCE, {"machine": "local", "workspace": str(root), "mode": "github"}, schema=_doc.SCHEMA),

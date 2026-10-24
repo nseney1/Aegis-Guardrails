@@ -4,7 +4,6 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
-import fnmatch
 import hashlib
 import itertools
 import json
@@ -14,13 +13,13 @@ import posixpath
 import re
 import shutil
 import struct
-import subprocess
 import tempfile
-from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
 from aegis_core import primitives
-from aegis_core import gitsafe, governance, pathlookup
+from aegis_core import codeowners as _codeowners
+from aegis_core import ghcli, gitsafe, governance, pathlookup
 from aegis_core.errors import AegisError
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
@@ -28,25 +27,17 @@ from aegis_core.storage import atomic_write_bytes
 __all__ = [
     "ALLOWED_SIGNERS",
     "Approval",
-    "COVERAGE_SAMPLES",
     "GITHUB_ACTIONS_APP_ID",
-    "GhResult",
     "HumanGateError",
     "INSIGHT_APPROVE_TRAILER",
     "KeyCustody",
     "PullRequest",
-    "RULESET_NAME",
     "SCHEMA",
     "SOURCE",
     "TierReport",
     "aegis_check_jobs",
     "approval_message",
-    "build_ruleset",
     "check_key_custody",
-    "codeowners_coverage",
-    "codeowners_lines",
-    "create_ruleset",
-    "default_gh_runner",
     "detect_tier",
     "exemption_message",
     "find_approval",
@@ -55,8 +46,6 @@ __all__ = [
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
-    "resolve_repo",
-    "ruleset_exists",
     "signed_empty_commit",
     "signers_setup",
     "signing_config",
@@ -69,11 +58,9 @@ __all__ = [
 SCHEMA = "aegis.human_gate/v1"
 SOURCE = "aegis human_gate"
 ALLOWED_SIGNERS = "allowed_signers"
-RULESET_NAME = "aegis-human-gate"
 INSIGHT_APPROVE_TRAILER = "Aegis-Approve-Insight"
 # github.com's GitHub Actions app: a required check sourced from it cannot be posted by a token.
 GITHUB_ACTIONS_APP_ID = 15368
-GH_TIMEOUT_SECONDS = 10.0
 SIGN_TIMEOUT_SECONDS = 300.0
 HASH_DOMAIN = b"aegis-governance-tree/v1\n"
 MAX_SCANNED_COMMITS = 500
@@ -87,11 +74,6 @@ _STATEMENTS = {
     "B": "governance changes need a signature from a key listed in allowed_signers on the base branch",
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
-_CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
-COVERAGE_SAMPLES: Tuple[str, ...] = tuple(dict.fromkeys(governance.coverage_samples() + _CODEOWNERS_LOCATIONS))
-_OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")
-_MAX_CODEOWNERS_LINES = 5000
-_MAX_PATTERN = 300
 _ACCEPT_LINE = re.compile(r"^[ \t]*aegis-accept[ \t]*:", re.IGNORECASE | re.MULTILINE)
 _APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 _APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
@@ -121,193 +103,6 @@ _MAX_WORKFLOW_LINES = 5000
 
 class HumanGateError(AegisError):
     """git or the signing program cannot answer, or an input cannot be trusted."""
-
-
-class GhResult(NamedTuple):
-    returncode: int
-    stdout: str
-    stderr: str
-
-
-GhRunner = Callable[..., Optional[GhResult]]
-# scheme://[userinfo@]host[:port]/path and scp-style [user@]host:path. A port is dropped only where it
-# is the git transport's (ssh, git); an http(s) port names another API endpoint than gh's host.
-_URL_REMOTE = re.compile(r"\A(?P<scheme>https?|ssh|git)://(?:[^/@]*@)?(?P<host>[A-Za-z0-9.-]+)(?::(?P<port>\d+))?/(?P<path>.*)\Z")
-_SCP_REMOTE = re.compile(r"\A(?:[^/@:]+@)?(?P<host>[A-Za-z0-9-][A-Za-z0-9.-]+):(?P<path>[^/].*)\Z")
-_REPO_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
-_NO_REPO = "no GitHub repository could be resolved from remote.origin.url"
-
-
-def resolve_repo(root: Any) -> Optional[str]:
-    """``owner/repo`` (github.com) or ``host/owner/repo`` (gh's ``[HOST/]OWNER/REPO``) of
-    ``remote.origin.url`` read through gitsafe; None for a path remote, a subgroup, no origin or a git
-    that cannot answer. Userinfo (a token) never reaches the result."""
-    try:
-        res = gitsafe.run(["config", "--get", "remote.origin.url"], Path(root))
-    except gitsafe.GitError:
-        return None
-    url = os.fsdecode(res.stdout).strip() if res.returncode == 0 else ""
-    found = _URL_REMOTE.match(url) or _SCP_REMOTE.match(url)
-    if found is None or (found.re is _URL_REMOTE and found["port"] and found["scheme"].startswith("http")):
-        return None
-    path = found["path"][:-1] if found["path"].endswith("/") else found["path"]
-    parts = (path[:-4] if path.endswith(".git") else path).split("/")
-    if len(parts) != 2 or not all(_REPO_SEGMENT.fullmatch(p) and p.strip(".") for p in parts):
-        return None
-    host = found["host"].lower()
-    return "/".join(parts) if host == "github.com" else "/".join((host, *parts))
-
-
-def default_gh_runner(
-    argv: Sequence[str],
-    stdin: Optional[bytes] = None,
-    cwd: Any = None,
-    timeout: float = GH_TIMEOUT_SECONDS,
-) -> Optional[GhResult]:
-    """Run gh for the repository at ``cwd``. gh never runs inside it: resolving ``{owner}/{repo}``
-    there would start git under the repository's own config, outside gitsafe. It runs in an empty
-    directory below a git ceiling, with the repository passed as ``GH_REPO``."""
-    exe = pathlookup.which("gh", outside=cwd)
-    if exe is None:
-        return None
-    repo = resolve_repo(cwd) if cwd is not None else None
-    if repo is None and any("{owner}" in arg or "{repo}" in arg for arg in argv):
-        return GhResult(125, "", _NO_REPO)
-    try:
-        scratch = tempfile.mkdtemp(prefix="aegis-gh-")
-    except OSError as exc:
-        return GhResult(126, "", f"cannot run gh: {exc}")
-    ceilings = dict.fromkeys((os.path.dirname(scratch), os.path.dirname(os.path.realpath(scratch))))
-    env = {
-        **os.environ,
-        "GH_PROMPT_DISABLED": "1",
-        "GH_NO_UPDATE_NOTIFIER": "1",
-        "NO_COLOR": "1",
-        "GIT_CEILING_DIRECTORIES": os.pathsep.join(ceilings),
-        **({"GH_REPO": repo} if repo is not None else {}),
-    }
-    try:
-        proc = subprocess.run(
-            [exe, *argv],
-            input=stdin,
-            stdin=None if stdin is not None else subprocess.DEVNULL,
-            capture_output=True,
-            env=env,
-            cwd=scratch,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return GhResult(124, "", f"gh timed out after {timeout:g}s")
-    except OSError as exc:
-        return GhResult(126, "", f"cannot run gh: {exc}")
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    return GhResult(
-        proc.returncode,
-        proc.stdout.decode("utf-8", "replace"),
-        proc.stderr.decode("utf-8", "replace"),
-    )
-
-
-def _parse_codeowners(text: str, *, org_login: Optional[str] = None) -> List[Tuple[str, Tuple[str, ...]]]:
-    # GitHub ignores the bare handle of the organization that owns the repository (it takes a user,
-    # @org/team or an email), so that owner is dropped when the caller knows the owner is one.
-    org_handle = f"@{org_login}".lower() if org_login else None
-    entries: List[Tuple[str, Tuple[str, ...]]] = []
-    for line in text.splitlines()[:_MAX_CODEOWNERS_LINES]:
-        tokens = line.strip().split()
-        if not tokens or tokens[0].startswith("#"):
-            continue
-        owners: List[str] = []
-        for token in tokens[1:]:
-            if token.startswith("#"):
-                break
-            if _OWNER.match(token) and token.lower() != org_handle:
-                owners.append(token)
-        entries.append((tokens[0], tuple(owners)))
-    return entries
-
-
-def _segment_match(pattern: str, text: str) -> bool:
-    return fnmatch.fnmatchcase(text, pattern.replace("**", "*"))
-
-
-def _prefix_ends(segments: List[str], parts: List[str], start: int) -> List[int]:
-    ends = {start} if not segments else set()
-    reach = {(0, start)}
-    seen = set()
-    while reach:
-        si, pi = reach.pop()
-        if (si, pi) in seen:
-            continue
-        seen.add((si, pi))
-        if si == len(segments):
-            ends.add(pi)
-            continue
-        seg = segments[si]
-        if seg == "**":
-            for end in range(pi, len(parts) + 1):
-                reach.add((si + 1, end))
-        elif pi < len(parts) and _segment_match(seg, parts[pi]):
-            reach.add((si + 1, pi + 1))
-    return sorted(ends)
-
-
-def _codeowners_match(pattern: str, path: str) -> bool:
-    # A bracket or a backslash never gets here: codeowners_coverage reads such a file as unsupported.
-    if not pattern or len(pattern) > _MAX_PATTERN or pattern[0] == "!":
-        return False
-    directory = pattern.endswith("/")
-    core = pattern.strip("/")
-    if not core:
-        return False
-    anchored = pattern.startswith("/") or "/" in core
-    segments = core.split("/")
-    parts = path.split("/")
-    starts = [0] if anchored else range(len(parts))
-    for start in starts:
-        for end in _prefix_ends(segments, parts, start):
-            if (end == len(parts) and not directory) or (end > start and directory):
-                return True
-    return False
-
-
-def codeowners_coverage(
-    text: str,
-    location: str = "CODEOWNERS",
-    *,
-    repo_paths: Sequence[str] = (),
-    org_login: Optional[str] = None,
-) -> Tuple[List[str], List[str]]:
-    entries = _parse_codeowners(text, org_login=org_login)
-    covered: List[str] = []
-    uncovered: List[str] = []
-    unsupported = any(any(c in pat for c in "[]\\") for pat, _ in entries)
-    targets = dict.fromkeys(
-        (
-            *COVERAGE_SAMPLES,
-            location.lstrip("/"),
-            *(p.lstrip("/") for p in repo_paths if p and p.lstrip("/")),
-        )
-    )
-    for path in targets:
-        owners: Tuple[str, ...] = ()
-        if not unsupported:
-            for pattern, found in entries:
-                if pattern.startswith("!"):
-                    if not pattern[1:] or _codeowners_match(pattern[1:], path):
-                        owners = ()
-                elif _codeowners_match(pattern, path):
-                    owners = found
-        if owners:
-            covered.append(path)
-        else:
-            uncovered.append(path)
-    return covered, uncovered
-
-
-codeowners_lines = governance.codeowners_lines
 
 
 class KeyCustody(NamedTuple):
@@ -476,19 +271,6 @@ class TierReport:
         }
 
 
-def _gh_json(runner: GhRunner, endpoint: str, cwd: Path) -> Tuple[Any, Optional[str]]:
-    result = runner(["api", "--method", "GET", endpoint], None, cwd)
-    if result is None:
-        return None, "gh is not installed"
-    if result.returncode != 0:
-        detail = " ".join((result.stderr or result.stdout).split())[:200] or f"exit {result.returncode}"
-        return None, f"gh api {endpoint} failed: {detail}"
-    try:
-        return json.loads(result.stdout), None
-    except ValueError:
-        return None, f"gh api {endpoint} did not return JSON"
-
-
 def _signer_keys(text: Optional[bytes]) -> int:
     decoded = (text or b"").decode("utf-8", "replace").splitlines()
     return sum(
@@ -581,9 +363,9 @@ def _unmet(tier: str, need: Mapping[str, Any]) -> List[str]:
             for _key, tiers, unmet, why in _TIER_REQUIREMENTS if tier in tiers and unmet(need)]
 
 
-def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
+def detect_tier(root: Any, gh: Optional[ghcli.GhRunner] = None) -> TierReport:
     root = Path(root)
-    runner: GhRunner = gh if gh is not None else default_gh_runner
+    runner: ghcli.GhRunner = gh if gh is not None else ghcli.default_gh_runner
     top = gitsafe.toplevel(root)
     evidence: Dict[str, Any] = {
         "gh": {"available": None, "error": None},
@@ -605,7 +387,7 @@ def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
 
     reasons: List[str] = []
     caveats: List[str] = []
-    repo_info, why = _gh_json(runner, "repos/{owner}/{repo}", top)
+    repo_info, why = ghcli.gh_json(runner, "repos/{owner}/{repo}", top)
     facts: Optional[Dict[str, Any]] = None
     default_branch: Optional[str] = None
     admin: Optional[bool] = None
@@ -631,7 +413,7 @@ def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
                             "owner": {"login": login, "type": kind} if known else None}
         evidence["identity"] = {"admin": admin}
         if default_branch:
-            rules, why = _gh_json(
+            rules, why = ghcli.gh_json(
                 runner,
                 "repos/{owner}/{repo}/rules/branches/" + quote(default_branch, safe=""),
                 top,
@@ -656,16 +438,16 @@ def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
         "present": False,
         "path": None,
         "covered": [],
-        "uncovered": list(dict.fromkeys((*COVERAGE_SAMPLES, *tracked_gov))),
+        "uncovered": list(dict.fromkeys((*_codeowners.COVERAGE_SAMPLES, *tracked_gov))),
     }
     signers: Dict[str, Any] = {"present": False, "keys": 0}
     bare_org = False
     if base is not None:
-        for location in _CODEOWNERS_LOCATIONS:
+        for location in _codeowners.CODEOWNERS_LOCATIONS:
             blob = _blob(top, base, location)
             if blob is not None:
                 text = blob.decode("utf-8", "replace")
-                covered, uncovered = codeowners_coverage(text, location, repo_paths=tracked_gov, org_login=org_login)
+                covered, uncovered = _codeowners.codeowners_coverage(text, location, repo_paths=tracked_gov, org_login=org_login)
                 codeowners = {
                     "present": True,
                     "path": location,
@@ -673,7 +455,7 @@ def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
                     "uncovered": uncovered,
                 }
                 bare_org = bool(org_login) and any(
-                    o.lower() == f"@{org_login}".lower() for _p, found in _parse_codeowners(text) for o in found
+                    o.lower() == f"@{org_login}".lower() for _p, found in _codeowners.parse_codeowners(text) for o in found
                 )
                 break
         blob = _blob(top, base, ALLOWED_SIGNERS)
@@ -1167,7 +949,7 @@ def is_branch_name(name: Any) -> bool:
 
 
 def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequence[str],
-                         gh: Optional[GhRunner] = None) -> Optional[Approval]:
+                         gh: Optional[ghcli.GhRunner] = None) -> Optional[Approval]:
     """Tier A's approval of a flagged change: some reviewer's latest review of ``pull`` is APPROVED on its
     head commit, by a person (account type User) other than its author whose ``author_association`` is
     OWNER, MEMBER or COLLABORATOR. An association is not a permission: write access is not checked here.
@@ -1180,12 +962,12 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
     or permission fails closed."""
     if not is_branch_name(pull.base_ref):
         return None
-    runner: GhRunner = gh if gh is not None else default_gh_runner
+    runner: ghcli.GhRunner = gh if gh is not None else ghcli.default_gh_runner
     top = _top(root)
-    repo, why = _gh_json(runner, "repos/{owner}/{repo}", top)
+    repo, why = ghcli.gh_json(runner, "repos/{owner}/{repo}", top)
     if why is not None or not isinstance(repo, dict):
         return None
-    rules, why = _gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(pull.base_ref, safe=""), top)
+    rules, why = ghcli.gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(pull.base_ref, safe=""), top)
     facts = _ruleset_facts(rules) if why is None else None
     if not facts or facts["required_approving_review_count"] < 1 or not facts["require_code_owner_review"] \
             or not facts["dismiss_stale_reviews_on_push"] or not facts["require_last_push_approval"]:
@@ -1193,14 +975,14 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
     owner = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
     org = owner.get("login") if owner.get("type") == "Organization" and isinstance(owner.get("login"), str) else None
     text: Optional[str] = None
-    for location in _CODEOWNERS_LOCATIONS:  # GitHub reads the first one present
+    for location in _codeowners.CODEOWNERS_LOCATIONS:  # GitHub reads the first one present
         blob = _blob(top, base, location)
         if blob is not None:
             text = blob.decode("utf-8", "replace")
             break
-    if text is None or codeowners_coverage(text, location, repo_paths=paths, org_login=org)[1]:
+    if text is None or _codeowners.codeowners_coverage(text, location, repo_paths=paths, org_login=org)[1]:
         return None
-    reviews, why = _gh_json(runner, f"repos/{{owner}}/{{repo}}/pulls/{pull.number}/reviews?per_page={_REVIEW_PAGE}", top)
+    reviews, why = ghcli.gh_json(runner, f"repos/{{owner}}/{{repo}}/pulls/{pull.number}/reviews?per_page={_REVIEW_PAGE}", top)
     # A full page may hide later reviews (a change request, a dismissal), so it never approves.
     if why is not None or not isinstance(reviews, list) or len(reviews) >= _REVIEW_PAGE:
         return None
@@ -1285,40 +1067,6 @@ def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -
     if not commit:
         raise HumanGateError("the signed commit was made but HEAD cannot be read")
     return commit
-
-
-def build_ruleset(tier: str, contexts: Iterable[str]) -> Dict[str, Any]:
-    if tier not in ("A", "B"):
-        raise ValueError(f"tier must be 'A' or 'B', got {tier!r}")
-    reviewed = tier == "A"
-    return {
-        "name": RULESET_NAME,
-        "target": "branch",
-        "enforcement": "active",
-        "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
-        "bypass_actors": [],
-        "rules": [
-            {"type": "deletion"},
-            {"type": "non_fast_forward"},
-            {
-                "type": "pull_request",
-                "parameters": {
-                    "required_approving_review_count": 1 if reviewed else 0,
-                    "dismiss_stale_reviews_on_push": True,
-                    "require_code_owner_review": reviewed,
-                    "require_last_push_approval": reviewed,
-                    "required_review_thread_resolution": False,
-                },
-            },
-            {
-                "type": "required_status_checks",
-                "parameters": {
-                    "strict_required_status_checks_policy": False,
-                    "required_status_checks": [{"context": c, "integration_id": GITHUB_ACTIONS_APP_ID} for c in contexts],
-                },
-            },
-        ],
-    }
 
 
 def aegis_check_jobs(text: str) -> List[str]:
@@ -1455,32 +1203,6 @@ def _aegis_job_verdicts(text: str) -> Dict[str, Optional[str]]:
             why = _skip_why(vals) or (None if None in whys else whys[0])
         verdicts[name] = verdicts.get(name) or (f"the Aegis job {name} {why}" if why else None)
     return verdicts
-
-
-def ruleset_exists(root: Any, gh: Optional[GhRunner] = None) -> bool:
-    runner: GhRunner = gh if gh is not None else default_gh_runner
-    listing, why = _gh_json(runner, "repos/{owner}/{repo}/rulesets", Path(root))
-    if why is not None or not isinstance(listing, list):
-        raise HumanGateError(why or "gh api rulesets did not return a list")
-    return any(isinstance(r, dict) and r.get("name") == RULESET_NAME for r in listing)
-
-
-def create_ruleset(root: Any, ruleset: Mapping[str, Any], gh: Optional[GhRunner] = None) -> Dict[str, Any]:
-    runner: GhRunner = gh if gh is not None else default_gh_runner
-    result = runner(
-        ["api", "--method", "POST", "repos/{owner}/{repo}/rulesets", "--input", "-"],
-        json.dumps(ruleset).encode("utf-8"),
-        Path(root),
-    )
-    if result is None:
-        raise HumanGateError("gh is not installed")
-    if result.returncode != 0:
-        raise HumanGateError(f"gh could not create the ruleset: {' '.join(result.stderr.split())[:300]}")
-    try:
-        created = json.loads(result.stdout)
-    except ValueError:
-        created = {}
-    return created if isinstance(created, dict) else {}
 
 
 def signers_setup() -> List[str]:
