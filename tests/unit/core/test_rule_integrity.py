@@ -266,6 +266,23 @@ def test_a_forged_base_object_is_refused_by_the_public_loaders(tmp_path):
 
 
 @needs_git
+def test_content_that_does_not_hash_to_its_object_id_is_refused(tmp_path, monkeypatch):
+    """The lying cat-file is forged at the public git boundary (gitsafe.run), not at a module seam."""
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
+    real = gitsafe.run
+
+    def forged(args, cwd, **kw):
+        if args and args[0] == "cat-file":
+            return subprocess.CompletedProcess(["git", *args], 0, f"{oid} blob 5\nlies!\n".encode("ascii"), b"")
+        return real(args, cwd, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(IntegrityError, match="does not match the object id"):
+        rule_integrity._read_blobs(str(repo.root), [oid])
+
+
+@needs_git
 def test_a_missing_object_is_an_error_not_an_empty_rule(tmp_path):
     repo = make_repo(tmp_path)
     with pytest.raises(IntegrityError, match="cannot read object"):
@@ -612,16 +629,16 @@ def test_a_blob_cache_smaller_than_the_rules_evicts_and_still_serves_them_right(
 
 
 @needs_git
-def test_a_replaced_git_seam_bypasses_the_base_caches(tmp_path, monkeypatch):
+def test_a_spy_at_the_git_boundary_does_not_bypass_the_base_caches(tmp_path, monkeypatch):
+    """R-structure-22 (rewrites the seam test it removes): production code no longer branches on a
+    replaced git runner, so a spy at gitsafe.run sees the cached base serve the second read."""
     repo = make_repo(tmp_path)
-    seen: List[str] = []
-    real = rule_integrity._run
-    monkeypatch.setattr(rule_integrity, "_run", lambda cwd, args, stdin=None: seen.append(args[0]) or real(cwd, args, stdin))
+    calls = git_calls(monkeypatch)
     cache = scan_mod.RuleCache()
     for n in range(2):
         reword(repo, n)
         rule_integrity.effective(repo.root, cache)
-    assert seen.count("ls-tree") == 2 and seen.count("cat-file") == 2
+    assert [c[0] for c in object_reads(calls)] == ["ls-tree", "cat-file"], calls
 
 
 # ── the CI check ─────────────────────────────────────────────────────────────
@@ -1456,3 +1473,138 @@ def test_no_exec_with_an_unresolvable_base_still_fails(tmp_path, capsys):
     os.chdir(repo.root)
     rc = main(["check", "--ci", "--no-exec", "--base", "no-such-branch"])
     assert rc == 1 and "cannot resolve the base" in capsys.readouterr().err
+
+
+# ── R-trust-49: one fingerprint, one key schema, one rank; the JSON shapes stay as they were ──
+
+# The key order of each serialized record at ff3ac4d0 (AC-9): a reader that walks the keys sees the same document.
+WEAKENING_KEYS = ["code", "rule", "path", "message"]
+RULES_BASE_KEYS = ["ref", "commit", "source", "witnessed", "label"]
+UNREVIEWED_KEYS = ["id", "title", "change"]
+
+
+@needs_git
+def test_a_deleted_gate_rule_serializes_its_weakening_in_the_pinned_key_order(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    (repo.root / path_of("inv-a")).unlink()
+    repo.commit("drop the rule")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["deleted"]
+    assert list(payload["weakenings"][0]) == WEAKENING_KEYS
+    assert payload["weakenings"][0]["rule"] == "inv-a" and payload["weakenings"][0]["path"] == path_of("inv-a")
+
+
+@needs_git
+def test_a_scan_serializes_the_base_and_each_unreviewed_rule_in_the_pinned_key_order(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# A branch-local title\n\nReworded.\n"))
+    scan_mod.RULE_CACHE.invalidate()
+    result = scan_mod.scan(str(repo.root), ["src/app.py"])
+    assert list(result["rules_base"]) == RULES_BASE_KEYS
+    assert result["rules_base"]["source"] == "origin-head" and result["rules_base"]["witnessed"] is True
+    assert [list(u) for u in result["unreviewed_rules"]] == [UNREVIEWED_KEYS]
+    assert result["unreviewed_rules"] == [{"id": "inv-a", "title": "A branch-local title", "change": "changed"}]
+
+
+@needs_git
+def test_one_fingerprint_function_decides_a_working_tree_equal_to_base_and_one_that_is_not(tmp_path):
+    from aegis_core import rule_inventory
+
+    repo = make_repo(tmp_path)
+    working = rule_inventory.inventory_rules(repo.root)
+    base = rule_integrity._inventory_at(str(repo.root), repo.head())
+    assert base.fingerprint == rule_inventory.fingerprint(base.entries) == rule_inventory.fingerprint(working.entries)
+    assert working.fingerprint == base.fingerprint
+    view = rule_integrity.effective(repo.root)
+    assert view.unreviewed == () and view.ruleset.fingerprint == load_rules(repo.root).fingerprint
+
+    target = repo.root / path_of("trap-a", "trap")
+    target.write_bytes(target.read_bytes().replace(b"Why this rule", b"why this rule"))
+    edited = rule_inventory.inventory_rules(repo.root)
+    assert edited.fingerprint == rule_inventory.fingerprint(edited.entries) != base.fingerprint
+    assert rule_integrity.effective(repo.root).ruleset.fingerprint == f"{edited.fingerprint}@{repo.head()}"
+
+
+@needs_git
+def test_no_rule_files_give_the_fingerprint_of_no_entries_on_both_sides(tmp_path):
+    from aegis_core import rule_inventory
+
+    repo = hg.Repo(tmp_path / "bare-rules", hg.Home(tmp_path / "home"))
+    repo.write("src/app.py", "x = 1\n")
+    repo.commit("no rules")
+    empty = rule_inventory.fingerprint(())
+    assert rule_inventory.inventory_rules(repo.root).fingerprint == empty
+    assert rule_integrity._inventory_at(str(repo.root), repo.head()).fingerprint == empty
+
+
+def test_weakenings_no_longer_reports_applies_to_and_check_ci_still_does(tmp_path):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a"))
+    scoped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", extra="applies_to:\n  - api-surface"))
+    assert weakenings(base, scoped) == [] and weakenings(scoped, base) == []
+
+
+@needs_git
+def test_applies_to_is_reported_once_per_rule_last_within_a_base_rule_then_for_head_rules(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/app.py",), extra="applies_to:\n  - api-surface"))
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", extra="applies_to:\n  - cli"))
+    repo.commit("scope both rules")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == [
+        ("coverage", "inv-a"), ("applies_to", "inv-a"), ("applies_to", "trap-a")]
+
+
+@needs_git
+def test_a_binding_edit_that_changes_applies_to_and_widens_target_paths_is_still_served_as_reviewed(tmp_path):
+    """The _stricter guard: a widening alone would be merged, but not one that also changes applies_to."""
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/*.py", "lib/*.py"), extra="applies_to:\n  - api-surface"))
+    view = rule_integrity.effective(repo.root)
+    served = view.ruleset.get("inv-a")
+    assert not served.applies_to("lib/x.py") and "applies_to" not in served.meta
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+
+
+@pytest.mark.parametrize("rtype,enforcement,rank", [
+    ("gate", None, 3), ("gate", "advisory", 3), ("invariant", None, 2), ("invariant", "advisory", 2),
+    ("trap", "gate", 2), ("boundary", "gate", 2), ("trap", "mechanical", 1), ("trap", None, 1), (None, None, 1),
+], ids=["gate", "gate-advisory", "invariant", "invariant-advisory", "trap-gate", "boundary-gate", "trap-mech",
+        "trap", "untyped"])
+def test_the_rank_is_three_for_a_gate_two_for_any_other_mandatory_rule_and_one_otherwise(rtype, enforcement, rank):
+    from aegis_core import rules as rules_mod
+
+    meta = {} if enforcement is None else {"enforcement": enforcement}
+    rule = rules_mod.Rule("r", "x.md", rtype, meta, "", "0" * 64)
+    assert rule.rank == rank and rule.mandatory is (rank >= 2)
+
+
+def test_the_duplicated_definitions_are_gone():
+    from aegis_core import rules as rules_mod
+
+    assert not hasattr(rules_mod, "rank_of")
+    assert [name for name in ("renamed_rules", "BENIGN_KEYS", "EXCLUDED_KEYS") if hasattr(rule_integrity, name)] == []
+
+
+# Adding a key to a rule's known keys is a reviewed edit of this literal (aegis_core.rules owns the schema).
+KNOWN_KEYS = frozenset({
+    "type", "enforcement", "target_paths", "forbid_ast", "expired_at", "applies_to",
+    "minimum_mode", "impact_weight", "expiry_days", "expiry_sessions", "detect",
+    "id", "name", "description", "domain", "hypothesis", "prediction", "falsification", "created", "tags",
+    "lineage", "triggers", "persona_name", "origin", "expertise", "expertise_domain", "promotion_threshold",
+    "demotion_threshold",
+})
+
+
+def test_the_known_keys_are_the_pinned_schema_and_only_another_key_is_unknown(tmp_path):
+    from dataclasses import replace
+
+    from aegis_core import rules as rules_mod
+
+    assert rules_mod.KNOWN_KEYS == KNOWN_KEYS and "KNOWN_KEYS" in rules_mod.__all__
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a"))
+    for key in sorted(KNOWN_KEYS):
+        head = replace(base, meta={**base.meta, key: "changed-value"})
+        assert "unknown_key" not in codes(weakenings(base, head)), key
+    invented = replace(base, meta={**base.meta, "exempt_files": ["src"]})
+    assert codes(weakenings(base, invented)) == ["unknown_key"]

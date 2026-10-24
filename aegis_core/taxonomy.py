@@ -212,11 +212,7 @@ SUBPROCESS_DEFAULT_TIMEOUT_SECONDS: float = 10.0
 VERIFY_RUNNER_TIMEOUT_SECONDS: float = 30.0
 
 MCP_DEFAULT_RATE_LIMITS: dict[str, tuple[int, int]] = {
-    "READ": (60, 60),
     "MUTATION": (5, 60),
-    "EXECUTION": (20, 60),
-    "VERIFICATION": (5, 60),
-    "CHECKPOINT": (3, 60),
 }
 
 

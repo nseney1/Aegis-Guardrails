@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Dict, Tuple
 
 import pytest
@@ -217,7 +218,73 @@ def test_ci_json_reports_exempted_fix_and_passing_status(
     assert reg["passed"] is True
     assert reg["exempted_count"] == 1
     assert reg["exemption_rate"] == 1.0
-    assert reg["prune_box_exceeded"] is True
+    assert "prune_box_exceeded" not in reg
+
+
+# R-evidence-30 fix 3: what the regression object carries (exemption_code is R-trust-33's, after the spec).
+REPORT_KEYS = ["schema", "tier", "status", "passed", "blocking", "total_fix_commits", "exempted_count",
+               "exemption_rate", "commits", "findings", "untested_changes"]
+COMMIT_KEYS = ["commit", "subject", "status", "reason", "fail_to_pass_tests", "no_test_reason", "approval",
+               "exemption_code"]
+
+
+@needs_git
+@needs_signing
+def test_the_regression_object_carries_only_the_spec_keys_and_no_prune_box_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Given a passed, a failed and an exempted fix commit, When check --ci runs, Then the JSON regression
+    object and each commit have exactly the kept keys, --format github annotates each finding from its
+    code, path and message, and the text names the exemption rate without a prune-box remark."""
+    human, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, signer_pub=human_pub)
+    repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
+    repo.write("tests/test_app.py", "from src.app import app\n\ndef test_app():\n    assert app(1) == 2\n")
+    repo.commit("fix: app adds one")
+    repo.write("src/other.py", "y = 1\n")
+    repo.commit("fix: other without a test")
+    repo.write("src/third.py", "z = 1\n")
+    exempted = repo.commit("fix: third without a test\n\nAegis-No-Test: verified manually")
+    repo.commit(human_gate.exemption_message(exempted, "verified manually"), sign_key=human, allow_empty=True)
+
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    reg = json.loads(out)["regression"]
+    assert rc == 0 and list(reg) == REPORT_KEYS
+    assert [c["status"] for c in reg["commits"]] == ["passed", "failed", "exempted"]
+    assert [list(c) for c in reg["commits"]] == [COMMIT_KEYS] * 3
+    assert (reg["total_fix_commits"], reg["exempted_count"], reg["exemption_rate"]) == (3, 1, 0.3333)
+    (finding,) = reg["findings"]
+    assert list(finding) == ["code", "commit", "path", "message"] and finding["path"] == "src/other.py"
+
+    rc, out, _err = run_ci(repo, capsys, "--format", "github")
+    annotations = [line for line in out.splitlines() if line.startswith("::")]
+    assert rc == 0 and annotations == [
+        f"::warning file=src/other.py,title=regression check warning::no_test_changes: {finding['message']}"]
+
+    rc, out, _err = run_ci(repo, capsys)
+    assert rc == 0 and "  regression exemptions: 1/3 (33.3%)\n" in out and "prune-box" not in out
+
+
+@needs_git
+def test_a_git_failure_of_the_t5_reads_exits_1_with_the_git_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path)
+    repo.write("src/app.py", "def app(x: int = 1) -> int:\n    return x + 1\n")
+    repo.commit("fix: fix app without tests")
+    real = gitsafe.run
+
+    def failing(args, *rest, **kwargs):
+        if list(args[:2]) == ["rev-list", "--reverse"]:
+            return subprocess.CompletedProcess(["git", *args], 128, b"", b"fatal: unable to read\n tree")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", failing)
+    rc, out, err = run_ci(repo, capsys)
+    assert rc == 1 and "PASSED" not in out
+    assert "Error: git rev-list failed: fatal: unable to read tree" in err and "Traceback" not in err
 
 
 @needs_git
@@ -255,19 +322,19 @@ def test_a_rejected_exemption_shows_its_code_and_approve_agrees_with_ci(
 
 
 def _fake_pytest_and_rerun(monkeypatch: pytest.MonkeyPatch) -> list:
-    from aegis_core import checkrun, gitsafe, regression
+    from aegis_core import checkrun, gitsafe
 
     reruns: list = []
 
     def fake_pytest(snapshot, test_files, *_args, **_kwargs):
-        return regression._PytestOutcome(0, False, frozenset(), frozenset(), frozenset())
+        return checkrun._PytestOutcome(0, False, frozenset(), frozenset(), frozenset())
 
     def fake_rerun(root, commit, base_ref, *, timeout=None):
         reruns.append(commit)
         tree = gitsafe.run(["rev-parse", f"{commit}^{{tree}}"], root).stdout.decode("ascii").strip()
         return {"tree": tree, "exit": 0}
 
-    monkeypatch.setattr(regression, "_run_pytest_in_snapshot", fake_pytest)
+    monkeypatch.setattr(checkrun, "run_pytest_snapshot", fake_pytest)
     monkeypatch.setattr(checkrun, "rerun_commit_snapshot", fake_rerun)
     return reruns
 

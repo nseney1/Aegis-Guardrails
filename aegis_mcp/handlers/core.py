@@ -10,6 +10,7 @@ from aegis_core import hosts
 from aegis_core.scan import scan, scan_user_layer
 from aegis_core.skills.slots import render_scan_result
 from aegis_mcp.registry import _STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, _get_workspace
+from aegis_mcp.registry import remember_bounded
 
 # (workspace root, session, files) -> the stamp of its last scan row. A rescan writes
 # again once that row is older than half of jit.scan_window_s: the scan-before-edit hook
@@ -18,8 +19,9 @@ from aegis_mcp.registry import _STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERN
 # the rows' own wall clock (scan_compliance.utc_now), never a monotonic one: that stops
 # during a suspend, and after a night asleep the row would have left the hook's window
 # while a monotonic age still said it was fresh, so the scan the hook asks for would
-# write nothing.
+# write nothing. Bounded: a forgotten key costs one extra row, never the scan result.
 _RECORDED: Dict[Tuple[str, str, Tuple[str, ...]], datetime] = {}
+_MAX_RECORDED = 1024
 
 
 def _slot_profile(host: Any) -> str:
@@ -73,7 +75,8 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
     except Exception as exc:  # telemetry only: never fail the scan
         print(f"aegis-mcp: scan event not recorded: {exc}", file=sys.stderr)
         return
-    _RECORDED[key] = datetime.strptime(row["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    stamp = datetime.strptime(row["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    remember_bounded(_RECORDED, key, stamp, _MAX_RECORDED)
 
 
 def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List[str]] = None) -> None:

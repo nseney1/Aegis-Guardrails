@@ -28,7 +28,7 @@ One policy, applied everywhere:
   v4 never reads (``enforcement_artifact``) are not rule content: they are removed from
   ``meta`` and listed in ``legacy_keys`` (``aegis migrate`` strips them).
 - A rule with ``expired_at`` is loaded but not served (``Rule.expired``).
-- ``applies_to`` is a known key (v4.4 scopes rules with it). Until then a rule carrying it is
+- ``applies_to`` is a known key (v4.5 scopes rules with it). Until then a rule carrying it is
   served as an unscoped rule: only ``target_paths`` decide where it applies.
 - A ``forbid_ast`` rule without ``target_paths`` applies to every file (``**``).
 - Where a rule applies is ``Rule.applies_to``: its target_paths through the one matcher,
@@ -54,9 +54,9 @@ from aegis_core.yaml_engine.parser import AegisYAMLError, parse_yaml_subset
 __all__ = [
     "DERIVED_KEYS",
     "ENFORCEMENT_KEYS",
+    "KNOWN_KEYS",
     "RETIRED_KEYS",
     "VALID_ENFORCEMENT",
-    "rank_of",
     "Ignored",
     "Rule",
     "RuleCache",
@@ -73,6 +73,15 @@ VALID_ENFORCEMENT = ("advisory", "mechanical", "gate")
 
 # Keys that decide what a rule enforces and where.
 ENFORCEMENT_KEYS = frozenset({"type", "enforcement", "target_paths", "forbid_ast", "expired_at", "applies_to"})
+# Every key a rule may carry: the enforcement keys, the scoring and expiry settings, ``detect`` and the
+# descriptive keys. A branch that adds or changes any other key on a binding rule cannot be judged, so
+# aegis check --ci reports it as a weakening (aegis_core.rule_integrity).
+KNOWN_KEYS = ENFORCEMENT_KEYS | frozenset({
+    "minimum_mode", "impact_weight", "expiry_days", "expiry_sessions", "detect",
+    "id", "name", "description", "domain", "hypothesis", "prediction", "falsification", "created", "tags",
+    "lineage", "triggers", "persona_name", "origin", "expertise", "expertise_domain", "promotion_threshold",
+    "demotion_threshold",
+})
 # Spellings of an enforcement key that v4 does not read, with the key to use instead. A
 # rule using one would apply in the wrong place or nowhere, so it is an error. Compared
 # case-insensitively without "-" and "_" (``targetPaths``, ``Target-Paths``), and any such
@@ -118,17 +127,6 @@ _TIMESTAMP_KEYS = frozenset({"last_trigger_date", "last_triggered"})
 _RULE_SIGNAL_KEYS = ("type", "target_paths", "forbid_ast")
 _NO_FRONTMATTER = "no frontmatter metadata"
 _UNTERMINATED = "unterminated YAML frontmatter (no closing --- line)"
-
-
-def rank_of(rule_type: Optional[str], enforcement: Any) -> int:
-    """How strongly a rule binds: 3 for a ``gate`` type, 2 for an ``invariant`` type or any
-    rule declaring ``enforcement: gate``, 1 otherwise. Rank 2+ rules are the ones git (the
-    reviewed BASE) witnesses (``aegis_core.rule_integrity``) and that never expire."""
-    if rule_type == "gate":
-        return 3
-    if rule_type == "invariant" or enforcement == "gate":
-        return 2
-    return 1
 
 
 def is_derived(key: str, value: Any) -> bool:
@@ -235,8 +233,10 @@ class Rule:
 
     @property
     def rank(self) -> int:
-        """1, 2 or 3: see ``rank_of``."""
-        return rank_of(self.type, self.meta.get("enforcement"))
+        """How strongly the rule binds: 3 for a ``gate`` type, 2 for any other mandatory rule, 1 otherwise.
+        Rank 2+ rules are the ones git (the reviewed BASE) witnesses (``aegis_core.rule_integrity``) and
+        that never expire."""
+        return 3 if self.type == "gate" else 2 if self.mandatory else 1
 
     @property
     def mandatory(self) -> bool:
@@ -378,7 +378,8 @@ def _parse(entry: RuleInventoryEntry, rule_type: Optional[str], directory: str) 
     unknown = _unknown_enforcement_keys(clean)
     if unknown:
         problems.append(f"unknown enforcement-relevant key(s) {', '.join(unknown)}")
-    if clean.get("expired_at") and rank_of(rule_type, enforcement) >= 2:
+    spec = RULE_TYPES.get(rule_type or "")
+    if clean.get("expired_at") and (bool(spec and spec.mandatory) or enforcement == "gate"):
         problems.append("expired_at is not allowed on a rank 2+ rule (a gate, an invariant or enforcement: gate): "
                         "retire it with a reviewed change, not by expiry")
     return Rule(

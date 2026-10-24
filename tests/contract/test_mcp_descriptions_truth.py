@@ -101,8 +101,7 @@ def test_a_rate_limited_report_carries_no_recorded_key_and_the_schema_says_so(tm
     result = credit.submit_report(tmp_path, tree="t" * 40, session="s", host="h", key="k", outcome="tp",
                                   rules_for=lambda check: [], cap=0)
     assert result["status"] == "rate_limited" and "recorded" not in result
-    recorded = _report_schema()["outputSchema"]["properties"]["recorded"]["description"]
-    assert "rate_limited" not in recorded
+    assert "outputSchema" not in _report_schema()  # no result field is described (D-mcp-schema)
 
 
 def test_a_witnessed_failure_is_kept_as_the_claim_and_read_as_a_neutral_trigger(tmp_path):
@@ -119,8 +118,7 @@ def test_a_witnessed_failure_is_kept_as_the_claim_and_read_as_a_neutral_trigger(
     assert derived.result == "trigger" and derived.counts is False
     outcome = _report_schema()["inputSchema"]["properties"]["outcome"]["description"]
     assert "neutral trigger" in outcome and "never a false positive" in outcome
-    credited = _report_schema()["outputSchema"]["properties"]["credited"]["description"]
-    assert "attached to" in credited and "CI" in credited
+    assert "once CI passes on the landing commit" in _report_schema()["description"]
 
 
 def test_ignored_report_fields_are_described_as_ignored_and_never_stored(tmp_path):
@@ -145,5 +143,3 @@ def test_ignored_report_fields_are_described_as_ignored_and_never_stored(tmp_pat
 def test_hints_and_conditional_fields_are_described_as_such():
     rule_type = _tool("aegis_create_rule")["inputSchema"]["properties"]["rule_type"]["description"]
     assert "hint" in rule_type and "Determines the target subdirectory" not in rule_type
-    total = _tool("aegis_scan")["outputSchema"]["properties"]["unreviewed_total"]["description"]
-    assert "present only when" in total

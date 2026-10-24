@@ -21,11 +21,9 @@ import json
 import os
 import re
 import sys
-import threading
 import time
 import traceback
 import uuid
-from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
@@ -41,16 +39,15 @@ from aegis_core.workspace.layout import UserLayout
 
 from .projection import is_error_result
 from .registry import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, TOOL_DEFINITIONS
-from .tools import execute_tool, is_known_tool
+from .tools import SERVER_INJECTED, execute_tool, is_known_tool
 
-# Arguments only the server may set. A client value is dropped before dispatch, so the
-# workspace, the host attribution and the session of a ledger row are never the caller's.
-SERVER_OWNED_KEYS = frozenset({
-    "workspace", "host", "session", "source", "platform",
-    "client_host", "client_name", "client_version",
-    "_host", "_session", "_client_platform", "_client_host", "_client_name", "_client_version",
-    "_binding", "_unbound",
-})
+# Arguments only the server may set: what it injects, plus names no schema declares that a
+# client might still send. A client value is dropped before dispatch, so the workspace, the
+# host attribution and the session of a ledger row are never the caller's.
+SERVER_OWNED_KEYS = SERVER_INJECTED | {
+    "host", "session", "source", "platform", "client_host", "client_name", "client_version",
+    "_client_platform", "_client_host",
+}
 
 # Versions this server speaks, oldest first. 2025-03-26 is left out: it requires
 # receiving JSON-RPC batches, which this server rejects.
@@ -103,8 +100,8 @@ _RATE_LIMITS = {
     "aegis_report_outcome": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
     "aegis_capture_insight": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
 }
-_tool_call_times: Dict[str, list] = defaultdict(list)
-_rate_limit_lock = threading.Lock()
+# One stdio loop per process and no thread in aegis_mcp, so the limiter needs no lock.
+_tool_call_times: Dict[str, list] = {}
 
 
 def strip_server_owned(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -119,14 +116,12 @@ def _check_rate_limit(tool_name: str) -> bool:
         return True
     max_calls, window_seconds = _RATE_LIMITS[tool_name]
     now = time.monotonic()
-    with _rate_limit_lock:
-        recent = [ts for ts in _tool_call_times[tool_name] if now - ts < window_seconds]
-        if len(recent) >= max_calls:
-            _tool_call_times[tool_name] = recent
-            return False
-        recent.append(now)
-        _tool_call_times[tool_name] = recent
-        return True
+    recent = [ts for ts in _tool_call_times.get(tool_name, ()) if now - ts < window_seconds]
+    _tool_call_times[tool_name] = recent
+    if len(recent) >= max_calls:
+        return False
+    recent.append(now)
+    return True
 
 
 def send_response(response: Dict[str, Any]):
@@ -283,19 +278,11 @@ def _unbound_result(binding: WorkspaceBinding) -> Dict[str, Any]:
     return {"status": "not_governed", "error": NOT_GOVERNED_MESSAGE, "binding": binding.as_dict()}
 
 
-def _tool_result(
-    req_id: Any,
-    text: str,
-    is_error: bool,
-    structured: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": is_error}
-    if not is_error and isinstance(structured, dict):
-        payload["structuredContent"] = structured
+def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": req_id,
-        "result": payload,
+        "result": {"content": [{"type": "text", "text": text}], "isError": is_error},
     }
 
 
@@ -391,12 +378,7 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         return _tool_result(req_id, f"Tool execution failed: {exc}", True)
-    return _tool_result(
-        req_id,
-        json.dumps(result),
-        is_error_result(result),
-        structured=result if isinstance(result, dict) else None,
-    )
+    return _tool_result(req_id, json.dumps(result), is_error_result(result))
 
 
 def _start(environ: Optional[Dict[str, str]] = None) -> None:

@@ -1183,10 +1183,18 @@
   "aegis_core.insights.tfidf_cosine",
   "aegis_core.partition.module_ancestors",
   "aegis_core.partition.resolve_module_file",
+  "aegis_core.regression.FrozenSet",
+  "aegis_core.regression.PRUNE_BOX_EXEMPTION_RATE",
+  "aegis_core.regression.SOURCE",
   "aegis_core.regression.UserLayout",
   "aegis_core.regression.VALID_TIERS",
+  "aegis_core.rule_integrity.BENIGN_KEYS",
+  "aegis_core.rule_integrity.ENFORCEMENT_KEYS",
+  "aegis_core.rule_integrity.EXCLUDED_KEYS",
   "aegis_core.rule_integrity.Path",
+  "aegis_core.rule_integrity.Sequence",
   "aegis_core.rule_integrity.UserLayout",
+  "aegis_core.rule_integrity.renamed_rules",
   "aegis_core.verification.scanners.HOOK_REDACTION_PATTERNS",
   "aegis_core.verification.scanners.build_preset_argv",
   "aegis_core.verification.scanners.redact_hook_text",
@@ -1194,6 +1202,8 @@
   "aegis_core.verification.scanners.redact_secrets",
   "aegis_core.verification.scanners.run_preset_scanner",
   "aegis_core.workspace.layout.module_ancestors",
-  "aegis_core.workspace.layout.resolve_module_file"
+  "aegis_core.workspace.layout.resolve_module_file",
+  "aegis_mcp.handlers.telemetry.Set",
+  "aegis_mcp.server.defaultdict"
  ]
 }

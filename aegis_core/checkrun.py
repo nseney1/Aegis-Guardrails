@@ -42,7 +42,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
@@ -63,6 +63,7 @@ __all__ = [
     "pytest_args",
     "record",
     "rerun_commit_snapshot",
+    "run_pytest_snapshot",
     "user_test_command",
     "verify_commit_trailers",
 ]
@@ -361,6 +362,51 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
     return TestsRun(exit=code, timed_out=timed_out, collected=collected, passed=passed, failed=failed,
                     skipped=skipped, deselected=counts.get("deselected", 0), nodeid_digest=digest, duration_s=seconds,
                     pytest_missing=bool(_NO_PYTEST.search(text)))
+
+
+class _PytestOutcome(NamedTuple):
+    exit_code: int
+    timed_out: bool
+    passed_ids: FrozenSet[str]
+    failed_ids: FrozenSet[str]
+    collection_errors: FrozenSet[str]
+
+
+# T5's run (aegis_core.regression): pytest from the interpreter that runs Aegis, isolated (-I -S), on a
+# snapshot. Without --continue-on-collection-errors one module that cannot import on base stops the whole
+# session and hides every other module's base result.
+_SNAPSHOT_PYTHON_FLAGS = ("-I", "-S", "-B", "--check-hash-based-pycs", "always")
+_SNAPSHOT_PYTEST_FLAGS = ("-p", "no:cacheprovider", "-o", "addopts=", "--continue-on-collection-errors")
+_SNAPSHOT_RUNNER = (
+    "import json, os, sys\n"
+    "snap, ws, ext = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), json.loads(sys.argv[3])\n"
+    "within = lambda p, d: os.path.normcase(os.path.abspath(p)) == os.path.normcase(d) or os.path.normcase(os.path.abspath(p)).startswith(os.path.normcase(d) + os.sep)\n"
+    "sys.path[:] = [snap] + [p for p in (*sys.path, *ext) if p and p != snap and (within(p, snap) or not within(p, ws))]\n"
+    "import pytest\n"
+    "raise SystemExit(pytest.main(sys.argv[4:]))\n"
+)
+
+
+def run_pytest_snapshot(snapshot: Path, test_files: Sequence[str], workspace: Path, scratch: Path,
+                        timeout: float) -> _PytestOutcome:
+    """Run pytest on ``test_files`` of ``snapshot`` with the hermetic environment: this interpreter's
+    ``sys.path`` entries stay importable (pytest itself) except those inside ``workspace`` (an editable
+    install of the live tree), so the snapshot's copy of the code is the one imported."""
+    home, tmp, junit = scratch / "home", scratch / "tmp", scratch / "junit.xml"
+    home.mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    ws, snap = workspace.resolve(), snapshot.resolve()
+    base = os.path.realpath(ws)
+    ext_dirs = [d for d in (str(Path(p).resolve()) for p in sys.path if p and Path(p).is_dir())
+                if os.path.realpath(d) != base and not os.path.realpath(d).startswith(base.rstrip(os.sep) + os.sep)]
+    # The snapshot as rootdir makes a test's JUnit classname its dotted path from the tree root. The cwd is
+    # the same string: Windows keeps a cwd as spelled (an 8.3 short TEMP), and pytest cannot relate a test
+    # path under a second spelling to the rootdir, so the classname would come out empty.
+    argv = [sys.executable, *_SNAPSHOT_PYTHON_FLAGS, "-c", _SNAPSHOT_RUNNER, str(snap), str(ws), json.dumps(ext_dirs),
+            *_SNAPSHOT_PYTEST_FLAGS, f"--rootdir={snap}", f"--junitxml={junit}", "--", *test_files]
+    res = run_tests(argv, snap, _hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
+    passed, failed, col_errors = parse_junit_cases(junit)
+    return _PytestOutcome(res.exit, res.timed_out, frozenset(passed), frozenset(failed), frozenset(col_errors))
 
 
 # ── The record ───────────────────────────────────────────────────────────────

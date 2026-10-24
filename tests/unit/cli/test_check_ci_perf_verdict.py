@@ -116,8 +116,8 @@ def test_an_approved_weakening_and_a_blocking_regression_names_the_regression(tm
     head, mb = "b" * 40, "a" * 40
     report = rule_integrity.CiReport("main", head, mb, 1, (rule_integrity.Weakening("rule-deleted", "r", "p.md", "gone"),),
                                      human_gate.Approval(True, "ok", "", head, "Human"))
-    failing = regression.CommitRegression("c" * 40, "fix: x", "failed", "no test", False, False)
-    reg = regression.RegressionReport("main", head, mb, tier="gate", commits=(failing,),
+    failing = regression.CommitRegression("c" * 40, "fix: x", "failed", "no test")
+    reg = regression.RegressionReport(tier="gate", commits=(failing,),
                                       findings=(regression.RegressionFinding("no_test_changes", "c" * 40, "src/a.py", "no test"),))
     blocking = check._print_ci(report, "text", str(tmp_path), reg_report=reg)
     out = capsys.readouterr().out

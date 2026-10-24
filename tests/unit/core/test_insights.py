@@ -363,7 +363,8 @@ def test_host_capture_status_ignores_a_relative_config_dir(tmp_path: Path, monke
         '{"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "/py", "args": ["-c", "aegis_cli.hooks.insights", "--excerpts"]}]}]}}',
         encoding="utf-8")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/dir")
-    assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True}
+    assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True,
+                                                             "capture": "excerpts", "capture_source": "host entry"}
 
 
 # ── One workspace, one insights file, whatever the hook's cwd (R-evidence-39) ──
