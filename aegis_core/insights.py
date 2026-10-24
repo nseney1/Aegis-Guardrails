@@ -665,8 +665,11 @@ def record_hook_prompt(
         project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
         actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
     resolved = Path(os.fspath(actual_ws)).resolve()
-    root = bounded_walk_up(resolved) or resolved
-    mode = effective_capture(excerpts, root, home=home)[0]
+    governed = bounded_walk_up(resolved)
+    root = governed or resolved
+    # Only a governed workspace excludes ~/.aegis/config.json: a session in HOME, or above it,
+    # holds the user file without making it repository content.
+    mode = effective_capture(excerpts, governed, home=home)[0]
     if mode == "off":  # decided before the link key, the log or the rules are touched
         return {}
     hs = _ensure_hs(host, payload_session, home=home)

@@ -92,6 +92,29 @@ def test_off_writes_nothing_and_touches_no_state(env, capsys):
     assert _capture(env) == ("off", "insights.capture")
 
 
+def _tree(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize("where", ["cwd", "project", "parent"])
+def test_off_holds_when_the_session_directory_is_home_or_above_it(env, capsys, monkeypatch, where):
+    """Given capture 'off' and an --excerpts entry, When the session directory is HOME (the payload
+    cwd or CLAUDE_PROJECT_DIR) or a parent of HOME, Then the hook touches nothing, as doctor reports:
+    no governed workspace holds ~/.aegis/config.json, though that directory does."""
+    _user_config(env, {"v": 1, "insights": {"capture": "off"}})
+    argv = _install(env, excerpts=True)
+    cwd = {"cwd": env.home, "project": env.ws, "parent": env.home.parent}[where]
+    if where == "project":
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(env.home))
+    before = _tree(env.home.parent)
+    payload = {"prompt": CUE, "session_id": "s-capture", "cwd": str(cwd)}
+    assert run_insight_hook(argv, stdin=json.dumps(payload), home=env.home) == 0
+    assert capsys.readouterr().err == ""
+    assert _tree(env.home.parent) == before
+    assert not (env.home / ".aegis" / "link.key").exists()
+    assert _capture(env) == ("off", "insights.capture")
+
+
 def test_counters_strips_excerpts_from_an_excerpts_entry(env, capsys):
     _user_config(env, {"v": 1, "insights": {"capture": "counters"}})
     rows = _hook(env, capsys, _install(env, excerpts=True))
