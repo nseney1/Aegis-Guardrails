@@ -983,7 +983,7 @@ def test_a_proposal_names_its_kind_count_ids_and_the_idf_weighted_common_directo
     assert "category" not in meta
 
 
-def test_members_in_separate_directories_get_one_prefix_each_and_a_top_level_file_stands_for_itself(review_repo):
+def test_members_in_separate_directories_get_one_prefix_each_and_a_top_level_file_its_bare_name(review_repo):
     repo, home = review_repo
     ids = _confirmed_group(repo, home, [["src/api/a.py"], ["src/api/b.py"], ["lib/x.py"], ["setup.py"]])
     meta = _frontmatter(write_proposal(repo, proposal_id="trap-spread", insight_ids=ids, home=home))
@@ -1019,4 +1019,120 @@ def test_an_unconfirmed_suggestion_or_an_unknown_id_never_enters_a_proposal(revi
     for extra in (agent["id"], "ins-000000000000"):
         with pytest.raises(ValueError, match="not a counted insight"):
             write_proposal(repo, proposal_id="trap-close", insight_ids=[kept["id"], extra], home=home)
+    assert not (repo / ".aegis" / "proposals").exists()
+
+
+# ── review M1: the signed re-run of a cli insight counts once ──────────────────
+
+SIGNED_TEXT = "Never call subprocess.Popen without a timeout in the cli modules"
+
+
+def _signed_rerun(repo: Path, home: Path, row: Dict[str, Any], **changes: Any) -> Dict[str, Any]:
+    """The H row ``insight add --commit SHA`` appends for ``row``'s typed text; the signature
+    itself is the signed-commit tests' subject."""
+    h_row = {**row, "id": f"ins-{os.urandom(6).hex()}", "level": "H", **changes}
+    append_jsonl(insights_path(repo, home=home), [h_row])
+    return h_row
+
+
+def _counted_ids(repo: Path, home: Path) -> list:
+    return sorted(i for c in review_insights(repo, home=home)["clusters"] for i in c["insight_ids"])
+
+
+def test_a_signed_rerun_supersedes_its_cli_row_in_review_and_proposals(review_repo):
+    """Given `insight add T` (cli) and the documented re-run with --commit (H, same text, paths
+    and kind), When the insights are reviewed and proposed, Then one correction counts once: the
+    H row, and the superseded cli row is not a counted insight."""
+    repo, home = review_repo
+    cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, cli)
+    cluster, = review_insights(repo, home=home)["clusters"]
+    assert (cluster["count"], cluster["insight_ids"], cluster["levels"]) == (1, [signed["id"]], ["H"])
+    with pytest.raises(ValueError, match=f"not a counted insight: {cli['id']}"):
+        write_proposal(repo, proposal_id="trap-popen", insight_ids=[cli["id"], signed["id"]], home=home)
+    assert not (repo / ".aegis" / "proposals").exists()
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=cluster["insight_ids"], home=home))
+    assert (meta["count"], meta["insight_ids"]) == (1, [signed["id"]])
+
+
+def test_two_identical_cli_adds_without_a_signed_rerun_still_count_twice(review_repo):
+    """Sad path: with no H row nothing is superseded, so two identical cli adds count as two, as
+    before (a cli row carries no session, so they are one unattributed recurrence episode)."""
+    repo, home = review_repo
+    ids = sorted(add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)["id"]
+                 for _ in range(2))
+    cluster, = review_insights(repo, home=home)["clusters"]
+    assert (cluster["count"], sorted(cluster["insight_ids"])) == (2, ids)
+    assert _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=ids, home=home))["count"] == 2
+
+
+@pytest.mark.parametrize("changes", [
+    {"text": "Always pass an explicit timeout to every subprocess call in the cli"},
+    {"paths": ["src/other.py"]},
+    {"kind": "processes"},
+], ids=["text", "paths", "kind"])
+def test_an_h_row_that_differs_supersedes_nothing(review_repo, changes):
+    repo, home = review_repo
+    cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, cli, **changes)
+    assert _counted_ids(repo, home) == sorted([cli["id"], signed["id"]])
+
+
+def test_an_h_row_supersedes_only_the_cli_adds_before_it(review_repo):
+    repo, home = review_repo
+    first = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, first)
+    later = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    assert _counted_ids(repo, home) == sorted([signed["id"], later["id"]])
+
+
+def test_a_signed_rerun_is_one_recurrence_not_two(review_repo):
+    """Given a cli insight matching an insight-born rule and its H re-run an hour later (two
+    episodes if both counted), When recurrence is measured, Then it is one unattributed episode."""
+    repo, home = review_repo
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    cli = add_insight(repo, RMTREE_TEXT, paths=["src/app.py"], home=home)
+    _signed_rerun(repo, home, cli, ts=_shift(cli["ts"], 3600))
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)
+
+
+# ── review M2: the verbatim lint sees the bullet as it is written ──────────────
+
+@pytest.mark.parametrize("text", [
+    "Never mail the release notes to carol.reviewer@example.com before the tag exists",
+    "Never read the token cache under /home/carol/.config/tool/cache.json in src/app.py",
+], ids=["email", "home-path"])
+@pytest.mark.parametrize("channel", ["summary", "kind"])
+def test_typed_human_text_with_a_redactable_token_never_enters_a_proposal(review_repo, text, channel):
+    """Given a cli insight whose typed text holds an email or a home path (stored redacted),
+    When that typed text is passed back as the summary or the kind, Then the lint refuses it,
+    although the raw text differs from the stored one, because the written bullet would not."""
+    repo, home = review_repo
+    row = add_insight(repo, text, paths=["src/app.py"], kind="release", home=home)
+    assert row["text"] != text
+    extra = {"summary_bullets": [text]} if channel == "summary" else {"kind": text}
+    with pytest.raises(ValueError, match="verbatim"):
+        write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home, **extra)
+    assert not (repo / ".aegis" / "proposals").exists()
+
+
+def test_a_summary_unlike_any_human_text_is_still_written_redacted(review_repo):
+    repo, home = review_repo
+    row = add_insight(repo, "Never mail the release notes before the tag exists", paths=["src/app.py"],
+                      kind="release", home=home)
+    path = write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home,
+                          summary_bullets=["Ask carol.reviewer@example.com about the release calendar"])
+    body = path.read_text(encoding="utf-8")
+    assert "- Ask [REDACTED_EMAIL] about the release calendar" in body and "carol.reviewer" not in body
+
+
+def test_a_kind_that_equals_human_text_once_its_backticks_go_never_enters_a_proposal(review_repo):
+    """The generated bullet quotes the kind with its backticks removed, so that form is linted too."""
+    repo, home = review_repo
+    text = "Never mail the release notes before the tag exists"
+    row = add_insight(repo, text, paths=["src/app.py"], kind="release", home=home)
+    with pytest.raises(ValueError, match="verbatim"):
+        write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home,
+                       kind="Never mail the `release` notes before the tag exists")
     assert not (repo / ".aegis" / "proposals").exists()

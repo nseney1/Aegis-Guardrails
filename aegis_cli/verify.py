@@ -642,11 +642,14 @@ def _run_calibration(args: argparse.Namespace, root: str, use_json: bool, source
 
 def _log_predictions(root: str, predictions: Any, backend: Any, files: list[str]) -> list[str]:
     """Append one stamped row per Layer 2 prediction to .aegis/state/arbiter_predictions.jsonl, without
-    the model's text (risk, mechanism and the function name can quote the diff). Only in an Aegis
-    workspace; a failure is a warning: logging never changes the verdict or the exit code."""
+    the model's text: risk and mechanism are dropped, and the symbol, the selector and the observable
+    kind are kept only when they name a function the change defines, a changed path and a kind of
+    OBSERVABLE_KINDS (else empty), since any of them can quote the diff. Only in an Aegis workspace;
+    a failure is a warning: logging never changes the verdict or the exit code."""
     import time
 
     from aegis_core import storage, treeid
+    from aegis_core.verification import OBSERVABLE_KINDS
     from aegis_core.verification.adversarial_verify import extract_signatures
     from aegis_core.verification.arbiter import stamp
     from aegis_core.workspace.layout import WorkspaceLayout
@@ -664,10 +667,15 @@ def _log_predictions(root: str, predictions: Any, backend: Any, files: list[str]
             if rel.endswith(".py") and os.path.isfile(os.path.join(root, rel)):
                 for sig in extract_signatures(os.path.join(root, rel)):
                     defined.setdefault(sig[4:].split("(", 1)[0], rel.replace(os.sep, "/"))
+        changed = {rel.replace(os.sep, "/") for rel in files}
         rows = []
         for p in stamp(list(predictions), tree=tree, backend=os.path.basename(backend.argv[0]), ts=time.time()):
             row = {k: v for k, v in p.to_dict().items() if k not in ("risk", "mechanism", "affected_function")}
-            row["scope"] = {"path": defined.get(p.scope["symbol"], ""), "symbol": p.scope["symbol"]}
+            symbol, kind, selector = p.scope.get("symbol"), p.observable.get("kind"), p.observable.get("selector")
+            symbol = symbol if isinstance(symbol, str) and symbol in defined else ""
+            row["scope"] = {"path": defined.get(symbol, ""), "symbol": symbol}
+            row["observable"] = {"kind": kind if kind in OBSERVABLE_KINDS else "",
+                                 "selector": selector if isinstance(selector, str) and selector in changed else ""}
             rows.append(row)
         storage.state_dir(root)  # refuses a linked .aegis or state directory
         storage.append_jsonl(WorkspaceLayout(Path(root)).predictions_log, rows)

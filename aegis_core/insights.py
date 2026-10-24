@@ -484,6 +484,23 @@ def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
     return found
 
 
+def _superseded(rows: Sequence[Mapping[str, Any]]) -> Set[int]:
+    """The ``id()`` of every cli row that a later H row with the same text, paths and kind
+    restates: the documented H recipe re-runs ``insight add`` with ``--commit``, and one
+    correction must not count twice."""
+    signed: Set[Tuple[str, Tuple[str, ...], str]] = set()
+    found: Set[int] = set()
+    for r in reversed(rows):
+        if r.get("event") != "insight" or _row_source(r) != "cli":
+            continue
+        key = (str(r.get("text") or ""), tuple(sorted(str(p) for p in r.get("paths") or [])), str(r.get("kind") or ""))
+        if r.get("level") == "H":
+            signed.add(key)
+        elif key in signed:
+            found.add(id(r))
+    return found
+
+
 def _corroborating_hook(rows: Iterable[Mapping[str, Any]], host: str, ts: Any, quote: str) -> Optional[str]:
     """The id of a hook prompt of ``host`` within JOIN_WINDOW_S of ``ts`` that contains ``quote``."""
     needle, when = quote.strip().lower(), _parse_ts(ts)
@@ -1018,9 +1035,10 @@ def review_insights(
     corroborated: Dict[str, List[str]] = {}
     levels: Dict[int, Tuple[str, Optional[str]]] = {}
     confirmed_ids = set(confirmed)
+    superseded = _superseded(all_rows)
     for idx, row in enumerate(all_rows):
         ins_id = str(row.get("id") or f"row-{idx}")
-        if row.get("event") != "insight" or ins_id in noise_ids:
+        if row.get("event") != "insight" or ins_id in noise_ids or id(row) in superseded:
             continue
         level = _effective_level(row, confirmed_ids)
         if _row_source(row) == "mcp":
@@ -1107,9 +1125,10 @@ def _under(prefix: str, paths: Sequence[str]) -> bool:
 
 
 def _proposal_targets(members: Sequence[Sequence[str]], rows: Sequence[Mapping[str, Any]]) -> List[str]:
-    """At most 3 directory prefixes (a top-level file stands for itself) as ``<prefix>**``, scored
-    members-under x (ln((1+N)/(1+df)) + 1) over every insight row with paths; the best (ties:
-    deeper, then by name), then the best for the members still uncovered."""
+    """At most 3 directory prefixes as ``<prefix>**``, scored members-under x
+    (ln((1+N)/(1+df)) + 1) over every insight row with paths; the best (ties: deeper, then by
+    name), then the best for the members still uncovered. A top-level file is kept as its bare
+    name, which (a pattern without ``/``) matches every file of that name in any directory."""
     candidates: Set[str] = set()
     for path in {p for ps in members for p in ps}:
         parts = path.split("/")
@@ -1156,20 +1175,26 @@ def write_proposal(
         for r in rows
         if levels.get(id(r)) in ("H", "cli", "W2") and str(r.get("text") or "").strip()
     ]
-    for cand in (kind or "", *summary_bullets):
+    typed_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else ""
+    typed_clean = _redact(typed_kind, max_len=64)
+    written = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    # Stored text is redacted, so a typed copy holding an email or a home path differs from it
+    # raw: the forms the proposal writes (the bullet quotes the kind without backticks) are linted too.
+    for cand in (kind or "", *summary_bullets, typed_clean, typed_clean.replace("`", ""), *written):
         clow = str(cand).strip().lower()
         if clow and any(ex == clow or (len(ex) >= _VERBATIM_MIN_CHARS and ex in clow)
                         or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
             raise ValueError("proposal may not contain verbatim H/cli/W2 prompt text")
     ids = list(dict.fromkeys(str(i).strip() for i in insight_ids if str(i).strip()))
-    counted = {str(r.get("id")): r for r in rows if levels.get(id(r)) in COUNTABLE_LEVELS}
+    superseded = _superseded(rows)
+    counted = {str(r.get("id")): r for r in rows if levels.get(id(r)) in COUNTABLE_LEVELS and id(r) not in superseded}
     missing = [i for i in ids if i not in counted]
     if not ids or missing:
         raise ValueError(f"not a counted insight: {', '.join(missing) or 'none given'}")
     members = [counted[i] for i in ids]
     kinds = sorted({str(k) for k in (confirmed.get(i) if _row_source(r) == "mcp" else r.get("kind")
                                      for i, r in zip(ids, members)) if k})
-    chosen_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else (kinds[0] if len(kinds) == 1 else "")
+    chosen_kind = typed_kind or (kinds[0] if len(kinds) == 1 else "")
     if not chosen_kind:
         raise ValueError(f"the insights share no single kind ({', '.join(kinds) or 'none'}); pass --kind")
     member_paths = [[str(p) for p in r.get("paths") or []] for r in members]
@@ -1179,7 +1204,7 @@ def write_proposal(
     targets = _proposal_targets([ps for ps in member_paths if ps], rows)
     clean_kind = _redact(chosen_kind, max_len=64)
     bullets = [f"{len(members)} counted correction(s) of kind `{clean_kind.replace('`', '')}`."]
-    bullets += [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    bullets += written
     hyp = f"Prevent recurring {clean_kind} issues in {', '.join(targets)}."
     lines = [
         "---",
@@ -1241,6 +1266,7 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
     # The window opens at the first row that names the rule's current rev (its first inventory
     # row); the baseline is the same measurement over the sessions before it.
     window_open = not reset_on_rev_change
+    superseded = _superseded(rows)
     alive: Set[str] = set()
     before: Set[str] = set()
     unidentified_heartbeats = 0
@@ -1261,7 +1287,7 @@ def _measure(rule: Rule, rows: Sequence[Mapping[str, Any]], confirmed: Set[str],
                 (alive if window_open else before).add(hs_val)
             elif window_open:
                 unidentified_heartbeats += 1
-        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS
+        elif (ev == "insight" and _effective_level(row, confirmed) in COUNTABLE_LEVELS and id(row) not in superseded
               and _paths_overlap_rule(row.get("paths") or [], rule)):
             itoks = _tokenize(str(row.get("text") or ""))
             if itoks and rule_tokens and _cosine(*_tfidf_vectors([itoks, rule_tokens])) >= 0.12:

@@ -323,6 +323,40 @@ def test_a_signed_trailer_over_the_typed_text_gives_h_even_when_redaction_change
         assert row["level"] == level and "alice@example.com" not in row["text"]
 
 
+def test_the_documented_h_recipe_counts_one_correction_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Review M1: Given `insight add T` (a cli row and the printed trailer), a signed commit
+    carrying that trailer and the re-run with --commit SHA (an H row), When the insights are
+    reviewed, Then one cluster counts the correction once, at level H."""
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    text = "Never log the reviewer address alice@example.com from src/app.py"
+    argv = ("insight", "add", text, "--paths", "src/app.py", "--kind", "logging")
+
+    rc, out, err = _invoke_rule(repo.root, *argv)
+    assert rc == 0, err
+    trailer = out.splitlines()[-1].strip()
+    sha = repo.commit(f"chore: approve insight\n\n{trailer}\n", sign_key=human_key, allow_empty=True)
+    rc, out, err = _invoke_rule(repo.root, *argv, "--commit", sha, "--base-ref", "main", "--json")
+    assert rc == 0, err
+    signed = json.loads(out)
+    assert signed["level"] == "H"
+
+    rc, out, err = _invoke_rule(repo.root, "insight", "review", "--json")
+    assert rc == 0, err
+    assert [(c["count"], c["insight_ids"], c["levels"]) for c in json.loads(out)["clusters"]] == [
+        (1, [signed["id"]], ["H"])]
+
+
 def test_review_no_longer_takes_a_category(tmp_path: Path):
     parser = argparse.ArgumentParser(prog="aegis rule")
     RuleCommand().configure_parser(parser)

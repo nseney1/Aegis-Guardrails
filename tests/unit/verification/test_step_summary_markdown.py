@@ -100,3 +100,17 @@ def test_the_benign_layout_is_unchanged():
     assert "| `no-eval` | `aegis_core/bad.py:14:1` | error | `Forbidden eval() call` |" in summary
     assert "Unanchored repository-level gate failure" in summary
     assert "- `pkg/a.py`: uncovered lines 3-4" in summary
+
+
+def _unverified(reason: str) -> dict:
+    return {"passed": True, "layer1": [], "findings": [], "coverage": {"status": "unverified", "reason": reason}}
+
+
+@pytest.mark.parametrize("value", sorted(HOSTILE.values()) + ["![beacon](x) <img src=x> [approved](y)"],
+                         ids=sorted(HOSTILE) + ["beacon-img-link"])
+def test_the_coverage_unverified_reason_renders_as_data(value):
+    """The reason can be the last line of the pull request's pytest stderr: it is data, not Markdown."""
+    summary = format_github_step_summary(_unverified(value))
+    assert _outside_spans(summary) == _outside_spans(format_github_step_summary(_unverified(HARMLESS)))
+    assert all(ch == "\n" or ch.isprintable() for ch in summary)
+    assert "### Diff Coverage: UNVERIFIED (`harmless`)" in format_github_step_summary(_unverified(HARMLESS))

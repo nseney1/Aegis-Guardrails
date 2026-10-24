@@ -589,15 +589,16 @@ def _backup_root(home: Path) -> Path:
     return target
 
 
-def _current_bytes(path: Path, expected: Optional[str]) -> Optional[bytes]:
-    """The file's bytes if it is still the regular, single-link file doctor checked."""
+def _current_bytes(path: Path, expected: Optional[str]) -> Tuple[Optional[bytes], Optional[int]]:
+    """The file's bytes and permission bits if it is still the regular, single-link file
+    doctor checked."""
     from aegis_cli import doctor as _doc
 
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         if expected is None:
-            return None
+            return None, None
         raise _Refused("it no longer exists")
     refusal = _write_refusal(path, st)
     if refusal:
@@ -606,7 +607,7 @@ def _current_bytes(path: Path, expected: Optional[str]) -> Optional[bytes]:
         data = fh.read()
     if expected is not None and _doc._sha256(data) != expected:
         raise _Refused("it changed since the check; re-run aegis doctor")
-    return data
+    return data, stat.S_IMODE(st.st_mode)
 
 
 def _dump_like(original: bytes, data: Dict[str, Any]) -> bytes:
@@ -725,7 +726,7 @@ def _apply(plan: List[_Change], home: Optional[Path], root: Path) -> Tuple[List[
     for index, change in enumerate(plan, 1):
         action = change.kind
         try:
-            current = _current_bytes(change.path, change.sha256)
+            current, _ = _current_bytes(change.path, change.sha256)
             if current is not None:
                 name = f"{index:02d}-{change.path.name}"
                 # Owner-only whatever the original's bits: a backup of ~/.claude.json holds tokens.
@@ -733,20 +734,22 @@ def _apply(plan: List[_Change], home: Optional[Path], root: Path) -> Tuple[List[
                 manifest.append({"path": str(change.path), "backup": name, "sha256": _doc._sha256(current),
                                  "action": action})
                 _write_manifest(backup, manifest)
+            # The bits the last check saw are passed on: a link swapped in after it lends none,
+            # so without them a 0600 config holding tokens would come back 0o666 & ~umask.
             if change.kind == "remove_keys":
                 atomic_bytes = _without_keys(current, change.keys)
-                _current_bytes(change.path, change.sha256)  # compare before replace
-                atomic_write_bytes(change.path, atomic_bytes, follow_links=False)
+                _, bits = _current_bytes(change.path, change.sha256)  # compare before replace
+                atomic_write_bytes(change.path, atomic_bytes, mode=bits, follow_links=False)
             elif change.kind == "remove_list_items":
                 edited = _without_list_items(current, change.items)
-                _current_bytes(change.path, change.sha256)
-                atomic_write_bytes(change.path, edited, follow_links=False)
+                _, bits = _current_bytes(change.path, change.sha256)
+                atomic_write_bytes(change.path, edited, mode=bits, follow_links=False)
             elif change.kind == "remove_lines":
                 kept = _without_lines(current, change.lines)
                 if kept is None:  # the plan said "edit"; deleting would be a change nobody confirmed
                     raise _Refused("only the legacy block would be left; re-run aegis doctor")
-                _current_bytes(change.path, change.sha256)
-                atomic_write_bytes(change.path, kept, follow_links=False)
+                _, bits = _current_bytes(change.path, change.sha256)
+                atomic_write_bytes(change.path, kept, mode=bits, follow_links=False)
             elif change.kind == "delete_file":
                 _current_bytes(change.path, change.sha256)
                 os.unlink(change.path)

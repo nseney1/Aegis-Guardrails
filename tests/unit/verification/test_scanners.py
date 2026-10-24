@@ -1038,3 +1038,32 @@ class TestSecuritySuppressionCount:
         root = tmp_path / "ws"
         self._repo(root, {"a.py": b"x = 1  # nosec\n"})
         assert scanners.suppression_count(root, "no-such-commit") == {"count": 1, "delta": None}
+
+
+class TestGitleaksAllowInOtherLanguages:
+    """`gitleaks:allow` after any comment opener the scanned languages use (#, // or /*) skips the line in
+    the Layer 1 secret delta and is counted as a suppression; anywhere else it is just text."""
+
+    TOKEN = "ghp_" + "Ab3" * 12  # the GitHub classic PAT shape, built so no token literal sits here
+
+    def _scan(self, tmp_path: Path, line: str) -> list:
+        (tmp_path / "client.ts").write_bytes((line + "\n").encode("utf-8"))
+        return [f.rule_id for f in scanners.scan_secrets_delta(tmp_path, ["client.ts"], {})]
+
+    @pytest.mark.parametrize("marker", ["# gitleaks:allow", "// gitleaks:allow", "//gitleaks:allow",
+                                        "/* gitleaks:allow */", "/*gitleaks:allow*/"])
+    def test_the_marker_after_a_comment_opener_skips_the_line(self, tmp_path, marker):
+        assert self._scan(tmp_path, f'const t = "{self.TOKEN}"; {marker}') == []
+
+    @pytest.mark.parametrize("line", ['const t = "{t}";', 'const t = "{t}"; / gitleaks:allow',
+                                      'const t = "{t}gitleaks:allow";', 'const t = "{t}"; // gitleaks:allowed'])
+    def test_without_a_comment_opener_the_token_still_blocks(self, tmp_path, line):
+        assert self._scan(tmp_path, line.format(t=self.TOKEN)) == ["github-pat"]
+
+    def test_each_marker_is_counted_as_a_suppression(self, tmp_path):
+        root = tmp_path / "ws"
+        files = {"a.ts": b'a = 1; // gitleaks:allow\nb = 2; /* gitleaks:allow */\n', "b.go": b"c := 3 //gitleaks:allow\n"}
+        counter = TestSecuritySuppressionCount()
+        base = counter._repo(root, {"keep.txt": b"x\n"})
+        counter._repo(root, files)
+        assert scanners.suppression_count(root, base) == {"count": 3, "delta": 3}

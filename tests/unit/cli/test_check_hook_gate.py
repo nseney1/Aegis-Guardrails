@@ -315,6 +315,26 @@ def test_a_staged_file_no_check_can_read_is_never_read_from_git(repo, blob_reads
     assert _staged_oid(repo, ".env") not in blob_reads
 
 
+def test_a_crlf_working_copy_of_a_staged_lf_file_is_read_from_disk(repo, blob_reads, capsys):
+    """A core.autocrlf checkout keeps CRLF in the working copy and LF in the staged blob: the bytes
+    are the staged content once their line endings are LF, so the hook reads them from disk."""
+    (repo / ".env").write_bytes(b"API_TOKEN=not-a-real-token\n")
+    _git(repo, "add", ".env")
+    (repo / ".env").write_bytes(b"API_TOKEN=not-a-real-token\r\n")
+
+    assert main(["check", "--hook"]) == 0, capsys.readouterr().out
+    assert _staged_oid(repo, ".env") not in blob_reads
+
+
+def test_a_working_copy_that_differs_beyond_line_endings_is_read_from_git(repo, blob_reads, capsys):
+    (repo / ".env").write_bytes(b"API_TOKEN=not-a-real-token\n")
+    _git(repo, "add", ".env")
+    (repo / ".env").write_bytes(b"API_TOKEN=another-value-here\r\n")
+
+    assert main(["check", "--hook"]) == 0, capsys.readouterr().out
+    assert _staged_oid(repo, ".env") in blob_reads
+
+
 def _oversized_source(runner_module) -> str:
     line = "x = 1\n"
     return line * (runner_module.INDEX_BLOB_LIMIT_BYTES // len(line) + 1)

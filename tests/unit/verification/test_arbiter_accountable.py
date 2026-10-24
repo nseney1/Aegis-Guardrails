@@ -227,8 +227,10 @@ class TestVerifyCalibrationCli:
             "id": "p-1", "backend": "claude", "observable": {"kind": "revert", "selector": "aegis_core/foo.py"},
             "p": 0.75, "disposition": "landed_unchanged", "outcome": "hit"}) + "\n").encode("utf-8"))
 
+        # The stored disposition and outcome are never trusted: outside git nothing landed, so the
+        # forged hit is logged but not scored (git-built landings are in test_check_calibration.py).
         assert main(["check", "--workspace", str(ws), "--calibration"]) == 0
-        assert "insufficient (n=1/25)" in capsys.readouterr().out
+        assert "1 logged | insufficient (n=0/25)" in capsys.readouterr().out
         assert main(["check", "--workspace", str(ws), "--calibration", "--json"]) == 0
         payload = json.loads(capsys.readouterr().out)
-        assert (payload["status"], payload["n"], payload["groups"]["claude/revert"]["hits"]) == ("insufficient (n=1/25)", 1, 1)
+        assert (payload["logged"], payload["n"], payload["status"], payload["groups"]) == (1, 0, "insufficient (n=0/25)", {})
