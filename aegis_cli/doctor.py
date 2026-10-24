@@ -378,7 +378,7 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
     """
     import shlex
     from aegis_core.ast.detect import detect_project_languages, provision_ast_driver_slots
-    from aegis_core.ast.runner import resolve_driver_executable
+    from aegis_core.ast.runner import ASTDriverRunner, resolve_driver_executable
     from aegis_core.errors import PathTraversalError
     from aegis_core.skills.slots import SlotRegistry, SlotResolutionError
 
@@ -432,12 +432,21 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
         return True
 
     all_resolvable = True
+    registry = ASTDriverRunner().registry
     for ext, cmd in sorted(ast_drivers.items()):
-        parts = (
-            shlex.split(cmd)
-            if os.name != "nt"
-            else [p.strip('"') for p in shlex.split(cmd, posix=False)]
-        )
+        plan = registry.plan_driver(ext, workspace_root=ws_root)
+        try:
+            parts = (
+                shlex.split(cmd)
+                if os.name != "nt"
+                else [p.strip('"') for p in shlex.split(cmd, posix=False)]
+            )
+        except ValueError:
+            if plan is None or not plan.unavailable:
+                raise
+            print(f"  ⚠️  AST driver ({ext}): {plan.unavailable}")
+            all_resolvable = False
+            continue
         if not parts:
             continue
         bin_name = parts[0]
@@ -445,7 +454,10 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
         # joined to the workspace root (aegis_core.ast.runner).
         found = resolve_driver_executable(bin_name, workspace=ws_root)
         hits = [] if found else only_skipped(bin_name, outside=ws_root, base=ws_root)
-        if found:
+        if found and plan is not None and plan.unavailable:
+            print(f"  ⚠️  AST driver ({ext}): {plan.unavailable}")
+            all_resolvable = False
+        elif found:
             print(f"  ✅ AST driver ({ext}): {bin_name} resolvable ({found})")
         elif hits:
             print(f"  ⚠️  AST driver ({ext}): executable '{bin_name}' is found only at "
