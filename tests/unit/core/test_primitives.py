@@ -317,3 +317,50 @@ def test_a_root_that_cannot_be_resolved_matches_no_registry_entry_and_removes_no
         ih.register_workspace(home, unresolvable, ["claude-code"])
     assert path.read_bytes() == before
     assert ih.is_denied_root(unresolvable, home) is True
+
+
+# ── Strict JSON readers (T21-d) ──────────────────────────────────────────────
+
+_OVERFLOW = b'{"v": 1, "n": 1e999}'
+
+
+def test_every_strict_reader_refuses_an_overflowing_number_with_its_own_error(tmp_path):
+    from aegis_cli import doctor, install_hosts  # doctor first: doctor_repair is loaded through it
+    from aegis_cli import doctor_repair
+    from aegis_core import baseline, packs, team
+
+    assert doctor.SCHEMA
+
+    with pytest.raises(baseline.BaselineFileError, match="not valid JSON"):
+        baseline.parse(b'{"v": 1, "findings": [], "x": 1e999}')
+    with pytest.raises(team.TeamFileError, match="not valid JSON"):
+        team.parse_team(b'{"v": 1, "shared": [], "x": -1e999}')
+    with pytest.raises(team.LeaseFormatError, match="not a JSON lease"):
+        team.parse_lease(_OVERFLOW, "lane", "0" * 40)
+    with pytest.raises(packs.PackError) as caught:
+        packs.load_pack(b'{"v": 1, "rules": [], "sha256": 1e999}')
+    assert str(caught.value) == "the pack is not valid JSON: 1e999 is not allowed"
+    host = tmp_path / "mcp.json"
+    host.write_bytes(b'{"mcpServers": {}, "n": 1e999}')
+    with pytest.raises(install_hosts.InstallError, match="cannot be written back as JSON"):
+        install_hosts._load_json_object(host)
+    entry = doctor_repair._parse_json(doctor_repair._File(host, raw=host.read_bytes()))
+    assert entry.error == "is not valid JSON (1e999 is not allowed)" and entry.data is None
+
+
+@pytest.mark.parametrize("raw", [_OVERFLOW, b'{"v": 1, "v": 1}', b'{"v": NaN}'], ids=["overflow", "duplicate", "nan"])
+def test_the_config_files_are_read_strictly(tmp_path, raw):
+    from aegis_core import config
+    from aegis_core.workspace.layout import UserLayout
+
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    (ws / ".aegis" / "config.json").write_bytes(raw)
+    with pytest.raises(config.ConfigError, match=r"\.aegis/config\.json is not valid JSON"):
+        config.RepoConfig.load(ws)
+    home = tmp_path / "home"
+    (home / ".aegis").mkdir(parents=True, exist_ok=True)
+    (home / ".aegis" / "config.json").write_bytes(raw)
+    with pytest.raises(config.ConfigError, match="not valid JSON"):
+        config.UserConfig.load(None, UserLayout(home))
+    assert config.read_user_config(user=UserLayout(home)) is None

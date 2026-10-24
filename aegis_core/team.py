@@ -62,7 +62,7 @@ from aegis_core import events, gitsafe
 from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _read_capped
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.match import normalize_path, sets_overlap
-from aegis_core.primitives import is_within
+from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -182,31 +182,6 @@ class LeaseRefused(AegisError):
                              self.warnings))
 
 
-# ── Strict JSON ──────────────────────────────────────────────────────────────
-
-class _DuplicateKey(Exception):
-    pass
-
-
-def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    found: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:
-            raise _DuplicateKey()
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
-
-
-def _strict_json(text: str) -> Any:
-    """Raises _DuplicateKey, or ValueError/RecursionError for anything that is not JSON
-    (NaN and Infinity included)."""
-    return json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant)
-
-
 # ── team.json ────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -247,8 +222,8 @@ def parse_team(data: bytes) -> TeamPolicy:
     except UnicodeDecodeError:
         raise TeamFileError("not valid UTF-8") from None
     try:
-        value = _strict_json(text)
-    except _DuplicateKey:
+        value = strict_loads(text)
+    except DuplicateKeyError:  # before ValueError, which it is
         raise TeamFileError("duplicate key") from None
     except (ValueError, RecursionError):
         raise TeamFileError("not valid JSON") from None
@@ -511,8 +486,8 @@ def parse_lease(data: bytes, lane: str, oid: str) -> Lease:
     if len(data) > MAX_LEASE_BYTES:
         raise LeaseFormatError(f"larger than the {MAX_LEASE_BYTES // 1024} KiB cap")
     try:
-        value = _strict_json(bytes(data).decode("utf-8"))
-    except (_DuplicateKey, UnicodeDecodeError, ValueError, RecursionError):
+        value = strict_loads(bytes(data).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise LeaseFormatError("not a JSON lease") from None
     if not isinstance(value, dict):
         raise LeaseFormatError("not a JSON object")

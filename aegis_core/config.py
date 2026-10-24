@@ -31,7 +31,7 @@ import stat
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.errors import AegisValidationError, PathTraversalError
-from aegis_core.primitives import is_within
+from aegis_core.primitives import is_within, strict_loads
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 __all__ = [
@@ -201,7 +201,7 @@ def _read_json(path: Path, label: str) -> Optional[Dict[str, Any]]:
     if len(data) > MAX_CONFIG_BYTES:
         raise ConfigError(f"{label} is larger than {MAX_CONFIG_BYTES // 1024} KiB")
     try:
-        value = json.loads(data.decode("utf-8-sig"))
+        value = strict_loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ConfigError(f"{label} is not valid JSON") from exc
     if not isinstance(value, dict):

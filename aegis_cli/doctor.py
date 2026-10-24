@@ -778,7 +778,7 @@ from aegis_cli.doctor_repair import (  # noqa: E402
     _Change, _Diagnosis, _File, _Refused, _apply, _backup_root, _claude_config, _claude_dir,
     _claude_project_keys, _claude_user_registered, _current_bytes, _desktop_configs, _diagnose,
     _dump_like, _host_json_path, _missing_ast_extensions, _names, _parse_json, _plan, _probe_claude,
-    _probe_json_host, _read_file, _reject_constant, _server_entry, _state_modes, _strict_pairs,
+    _probe_json_host, _read_file, _server_entry, _state_modes,
     _without_keys, _without_lines, _without_list_items, _write_manifest, _write_refusal,
 )
 

@@ -45,7 +45,7 @@ from aegis_core.fitness import for_rules
 from aegis_core.lifecycle.creation import _require_servable_id
 from aegis_core.lifecycle.parsers import validate_rule_id
 from aegis_core.migrate import _frontmatter_span, _strip_derived
-from aegis_core.primitives import real_key, real_path
+from aegis_core.primitives import real_key, real_path, strict_loads
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, RuleInventoryError
 from aegis_core.rules import Rule, load_rules, workspace_root
 from aegis_core.storage import atomic_write_bytes, locked
@@ -286,19 +286,6 @@ def dump_pack(pack: Mapping[str, Any]) -> bytes:
 
 # ── reading a pack ───────────────────────────────────────────────────────────
 
-def _no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    found: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:  # a second value would let the digest cover one reading and the importer another
-            raise ValueError(f"duplicate key {key!r}")
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not allowed")
-
-
 def _shape_problem() -> str:
     return 'a pack is a JSON object with exactly the keys "v", "rules" and "sha256"'
 
@@ -390,7 +377,7 @@ def load_pack(data: bytes) -> Dict[str, Any]:
     except UnicodeDecodeError:
         raise PackError(["the pack is not valid UTF-8"]) from None
     try:
-        pack = json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+        pack = strict_loads(text)  # a second value would let the digest cover one reading and the importer another
     except RecursionError:
         raise PackError(["the pack is not valid JSON: nested too deeply"]) from None
     except ValueError as exc:

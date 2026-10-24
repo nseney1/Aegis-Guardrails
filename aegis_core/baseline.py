@@ -45,7 +45,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, O
 from aegis_core import gitsafe
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
-from aegis_core.primitives import is_within, safe_parts
+from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
 from aegis_core.storage import atomic_write_text
 from aegis_core.verification import ToolEvidence
 from aegis_core.workspace.layout import AEGIS_DIRNAME
@@ -213,23 +213,6 @@ def render(entries: Iterable[Entry]) -> str:
     return json.dumps(document, indent=2) + "\n"
 
 
-class _DuplicateKey(Exception):
-    pass
-
-
-def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    found: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:
-            raise _DuplicateKey()
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
-
-
 def _path_ok(value: object) -> bool:
     # The part rule of every platform (windows=False): a v1 file that holds a:b.py reads the same anywhere.
     return isinstance(value, str) and not _CONTROL.search(value) and "\\" not in value \
@@ -249,8 +232,8 @@ def parse(data: bytes) -> FrozenSet[Entry]:
     except UnicodeDecodeError:
         raise BaselineFileError("not valid UTF-8") from None
     try:
-        value = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant)
-    except _DuplicateKey:
+        value = strict_loads(text)
+    except DuplicateKeyError:  # before ValueError, which it is
         raise BaselineFileError("duplicate key") from None
     except (ValueError, RecursionError):
         raise BaselineFileError("not valid JSON") from None

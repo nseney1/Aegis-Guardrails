@@ -77,7 +77,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core import hosts as host_table
 from aegis_core.config import ENV_CLIENT, ENV_WORKSPACE
 from aegis_core.pathlookup import which
-from aegis_core.primitives import real_key
+from aegis_core.primitives import DuplicateKeyError, real_key, strict_loads
 from aegis_core.storage import atomic_write_bytes
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
@@ -397,19 +397,6 @@ def has_block_marker(path: Union[str, Path], block_id: str) -> bool:
 
 # ── JSON configs ─────────────────────────────────────────────────────────────
 
-def _reject_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    seen: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in seen:
-            raise ValueError(f"duplicate key {key!r}")
-        seen[key] = value
-    return seen
-
-
-def _reject_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not valid JSON")
-
-
 def _load_json_object(path: Path) -> Tuple[Optional[bytes], Dict[str, Any]]:
     """(raw bytes or None, the JSON object in ``path``); refuses anything it cannot round-trip."""
     raw = _read(path)
@@ -421,16 +408,17 @@ def _load_json_object(path: Path) -> Tuple[Optional[bytes], Dict[str, Any]]:
     if not text.strip():
         return raw, {}
     try:
-        data = json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
+        data = strict_loads(text)
     except json.JSONDecodeError as exc:
         raise InstallError(
             f"{path}: is not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno}); left unchanged. "
             "Comments and trailing commas are not supported: fix the file or move it aside, then re-run."
         ) from exc
     except (ValueError, RecursionError) as exc:
-        message = str(exc)
-        if "duplicate key" not in message:
-            message = f"is not valid JSON ({message})"
+        # NaN, Infinity and a number such as 1e999 (json reads it as inf) could only be written back as
+        # the non-JSON literal Infinity, which the next init would refuse.
+        message = str(exc) if isinstance(exc, DuplicateKeyError) else \
+            f"is not valid JSON ({exc}), which cannot be written back as JSON"
         raise InstallError(f"{path}: {message}; left unchanged. Fix the file, then re-run.") from exc
     if not isinstance(data, dict):
         raise InstallError(f"{path}: must hold a JSON object; left unchanged")
@@ -442,11 +430,6 @@ def _load_json_object(path: Path) -> Tuple[Optional[bytes], Dict[str, Any]]:
         raise InstallError(f"{path}: holds an unpaired surrogate escape "
                            f"({exc.object[exc.start:exc.end].encode('unicode_escape').decode()}) that cannot be "
                            "written back as UTF-8; left unchanged. Fix the file, then re-run.") from exc
-    except ValueError as exc:
-        # json.loads reads a number such as 1e999 as inf without calling parse_constant;
-        # dumped, it would be the non-JSON literal Infinity.
-        raise InstallError(f"{path}: holds a number too large for a float (such as 1e999), which "
-                           "cannot be written back as JSON; left unchanged. Fix the file, then re-run.") from exc
     return raw, data
 
 
