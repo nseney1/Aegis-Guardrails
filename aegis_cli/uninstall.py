@@ -24,16 +24,16 @@ from pathlib import Path
 from typing import List, Optional
 
 from aegis_cli import NO_HOME_MESSAGE
-from aegis_cli.base import CommandCategory, AegisCommand
+from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.init import (
     AGENTS_FILE,
     CLAUDE_FILE,
     CLAUDE_SHIM_ID,
     RemovedOption,
-    Step,
     Report,
-    report_partial,
+    Step,
     hook_refusal,
+    report_partial,
 )
 from aegis_cli.install_hosts import (
     REGISTRY_LABEL,
@@ -48,8 +48,8 @@ from aegis_cli.install_hosts import (
     unregister_workspace,
     workspace_hosts,
 )
-from aegis_core.workspace.layout import UserLayout
 from aegis_core.primitives import real_key
+from aegis_core.workspace.layout import UserLayout
 
 __all__ = ["run_uninstall", "UninstallCommand"]
 

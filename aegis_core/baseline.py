@@ -41,7 +41,7 @@ import stat
 import tempfile
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe, primitives
+from aegis_core import gitsafe
 from aegis_core.errors import AegisError
 from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
 from aegis_core.storage import atomic_write_text

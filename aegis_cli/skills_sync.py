@@ -43,13 +43,13 @@ import stat
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from aegis_core import primitives
 from aegis_cli import NO_HOME_MESSAGE, sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.init import _host_option, _unwritable, packaged_dir
 from aegis_core import hosts as host_table
-from aegis_core.workspace.layout import UserLayout
+from aegis_core import primitives
 from aegis_core.primitives import real_key
+from aegis_core.workspace.layout import UserLayout
 
 __all__ = ["RESULTS", "Entry", "SkillsCommand", "SyncResult", "TargetResult", "run_skills", "summary", "sync_skills"]
 
@@ -507,7 +507,8 @@ def run_skills(args: argparse.Namespace) -> int:
     result = sync_skills(root, hosts, force=bool(args.force), dry_run=bool(args.dry_run))
     if args.json:
         print(json.dumps({
-            **primitives.envelope("aegis skills sync", {"workspace": str(root), "hosts": result.hosts, "targets": [t.dir for t in result.targets]}),
+            **primitives.envelope("aegis skills sync", {"workspace": str(root), "hosts": result.hosts,
+                                                       "targets": [t.dir for t in result.targets]}),
             "dry_run": result.dry_run,
             "force": result.force,
             "status": result.status,

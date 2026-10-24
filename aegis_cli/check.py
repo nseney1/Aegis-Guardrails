@@ -82,7 +82,7 @@ def _run_record(args: argparse.Namespace) -> int:
     """`aegis check --record [--tests]`: 0 recorded and passed, 1 failed or could not run, 2 usage."""
     from aegis_cli import sanitize_display
     from aegis_cli.verify import _resolve_git_cwd, _wants_json
-    from aegis_core import baseline, checkrun
+    from aegis_core import checkrun
 
     clash = _record_conflict(args)
     if clash:

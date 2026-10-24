@@ -22,8 +22,8 @@ so a caller can report such a host as unknown rather than absent.
 """
 from __future__ import annotations
 
-import os
 import ntpath
+import os
 import sys
 from typing import List, NamedTuple, Optional, Union
 
