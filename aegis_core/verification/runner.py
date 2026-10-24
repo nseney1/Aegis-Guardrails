@@ -1032,9 +1032,10 @@ def _not_read(size: int) -> str:
 
 
 def _identical_work_file(repo_root: str, rel: str, oid: str, size: int) -> Optional[bytes]:
-    """The working-tree bytes of ``rel`` when they are the staged blob ``oid`` (``size`` bytes) byte
-    for byte, else None. Opened without following a final symlink or waiting on a FIFO, typed by the
-    open descriptor, and read once: the bytes compared are the bytes returned."""
+    """The staged blob ``oid`` (``size`` bytes) read from the working tree when ``rel`` holds it byte
+    for byte, or once its CRLF line endings are LF (a ``core.autocrlf`` checkout), else None. Opened
+    without following a final symlink or waiting on a FIFO, typed by the open descriptor, and read
+    once: the bytes returned are the bytes compared, and they are the blob's."""
     import stat
 
     parts = rel.split("/")
@@ -1047,9 +1048,10 @@ def _identical_work_file(repo_root: str, rel: str, oid: str, size: int) -> Optio
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+        on_disk = info.st_size
+        if not stat.S_ISREG(info.st_mode) or not size <= on_disk <= 2 * size:
             return None
-        chunks, left = [], size + 1  # one byte more: a file that grew since fstat is not the blob
+        chunks, left = [], on_disk + 1  # one byte more: a file that grew since fstat is not the blob
         while left > 0:
             chunk = os.read(fd, left)
             if not chunk:
@@ -1061,7 +1063,12 @@ def _identical_work_file(repo_root: str, rel: str, oid: str, size: int) -> Optio
     finally:
         os.close(fd)
     data = b"".join(chunks)
-    return data if len(data) == size and _git_blob_id(data, len(oid)) == oid else None
+    if len(data) != on_disk:
+        return None
+    for candidate in (data, data.replace(b"\r\n", b"\n")):
+        if len(candidate) == size and _git_blob_id(candidate, len(oid)) == oid:
+            return candidate
+    return None
 
 
 def _t7_on_index(repo_root: str, rels: list[str], entries: dict[str, tuple[str, str]]) -> list[ToolEvidence]:
