@@ -117,7 +117,7 @@ def _error(message: str) -> None:
 def _terminal_text(text: str) -> str:
     """``text`` line by line without escape or control sequences: rule files are
     repository content, and a terminal would act on them."""
-    return "\n".join(sanitize_display(line, max_len=len(line) + 1) for line in str(text).split("\n"))
+    return "\n".join(sanitize_display(line, max_len=None) for line in str(text).split("\n"))
 
 
 class ScanCommand(AegisCommand):

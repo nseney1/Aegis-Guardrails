@@ -28,6 +28,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from aegis_core import primitives
 from aegis_cli.checkpoint import is_blocking, run_checkpoint
 from aegis_cli.formatters.report import (
     format_layer1_json_payload,
@@ -335,7 +336,7 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
         if use_json:
             print(json.dumps(lane_gate.error_report(root, args.lane, message), indent=2))
         else:
-            print(f"Error: {sanitize_display(message, max_len=len(message))}", file=sys.stderr)
+            print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
         return code
 
     others = _other_options(args)
@@ -353,7 +354,7 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
         print(json.dumps(result.as_dict(), indent=2))
     else:
         for line in result.text_lines():  # warnings included, as "warning: ..." lines
-            print(sanitize_display(line, max_len=len(line)))
+            print(sanitize_display(line, max_len=None))
     if not result.integrity_passed:
         _void_lane_tree(root, result.head)
     return 0 if result.passed else 1
@@ -388,11 +389,9 @@ _MODE_WHY = {
 def _event_warning(root: str, kind: str, result: str, detail: dict) -> list[str]:
     """Append an event; a log that cannot be written is a warning, never a failure."""
     from aegis_core import events
-    from aegis_core.errors import AegisError
 
-    try:
-        events.append(root, kind, result, detail)
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(root, kind, result, detail)
+    if exc is not None:
         return [f"event not recorded: {exc}"]
     return []
 
@@ -407,7 +406,6 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
     """`aegis check --card | --write-baseline | --prune-baseline | --partition`. 0 done,
     1 could not run, 2 usage. Every option the mode would ignore is refused."""
     from aegis_cli import sanitize_display
-    from aegis_core import baseline
 
     use_json = _wants_json(args)
     root = _resolve_git_cwd(args)
@@ -415,11 +413,11 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
 
     def fail(message: str, code: int) -> int:
         if use_json:
-            document = baseline.envelope(source, {"workspace": str(root)})
+            document = primitives.envelope(source, {"workspace": str(root)})
             document.update(status="error", error=message)
             print(json.dumps(document, indent=2))
         else:
-            print(f"Error: {sanitize_display(message, max_len=len(message))}", file=sys.stderr)
+            print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
         return code
 
     for lane_option, given in (("--paths", getattr(args, "paths", None) is not None),
@@ -488,7 +486,7 @@ def _run_write_baseline(args: argparse.Namespace, root: str, use_json: bool, sou
         "mode": "write", "entries": len(entries), "added": added, "removed": removed,
         "files_checked": len(targets), "unbaselinable": len(collected.blocked)})
     if use_json:
-        document = baseline.envelope(source, {"workspace": root})
+        document = primitives.envelope(source, {"workspace": root})
         document.update(status="written", path=baseline.BASELINE_FILE, entries=len(entries), added=added,
                         removed=removed, files_checked=len(targets),
                         unbaselinable=_unbaselinable_rows(collected.blocked), warnings=warnings,
@@ -551,7 +549,7 @@ def _run_prune_baseline(args: argparse.Namespace, root: str, use_json: bool, sou
             "mode": "prune", "entries": len(kept), "added": 0, "removed": len(dropped),
             "files_checked": len(targets), "unbaselinable": len(collected.blocked)})
     if use_json:
-        document = baseline.envelope(source, {"workspace": root})
+        document = primitives.envelope(source, {"workspace": root})
         document.update(status="pruned" if dropped else "unchanged", path=baseline.BASELINE_FILE,
                         entries=len(kept), removed=len(dropped), kept=len(kept), not_added=not_added,
                         files_checked=len(targets), warnings=warnings)

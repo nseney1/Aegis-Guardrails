@@ -44,8 +44,8 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from aegis_core import primitives
 from aegis_core import gitevidence, gitsafe, governance, treeid
-from aegis_core._version import __version__
 from aegis_core.config import read_user_config
 from aegis_core.primitives import is_within, utc_stamp
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
@@ -468,8 +468,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
     digest = command_digest(logical) if tests else command_digest(["layer1"])
     row: Dict[str, Any] = {
         "v": ledger.LEDGER_VERSION, "ts": stamp, "event": "check", "witness": "aegis",
-        "source": "aegis check --record", "aegis_version": __version__, "checked_at": stamp,
-        "scope": {"tree": binding.tree, "base": base_commit},
+        **primitives.envelope("aegis check --record", {"tree": binding.tree, "base": base_commit}, checked_at=stamp),
         "tree": binding.tree, "head": head, "base": base_commit, "tree_algo": treeid.TREE_ALGO,
         "cmd_digest": digest, "layer1": layer1, "tests": run.as_dict() if run is not None else None,
         "env_class": env_class(), "protected_changed": bool(protected), "protected": protected,

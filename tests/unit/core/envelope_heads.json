@@ -1,0 +1,142 @@
+{
+  "benchmark": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "team": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "hook": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "approve": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "package": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "pack": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "tier": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "approval": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "lane": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "lane_error": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "release": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "integrity": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "compliance": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "card": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "partition": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "init": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "skills": [
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "hold": [
+    "status",
+    "root",
+    "source",
+    "confidence",
+    "reason",
+    "message",
+    "details",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "doctor": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "doctor_github": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ],
+  "doctor_drivers": [
+    "schema",
+    "source",
+    "aegis_version",
+    "checked_at",
+    "scope"
+  ]
+}

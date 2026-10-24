@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -41,6 +41,8 @@ import shlex
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from aegis_cli import aegis_import_root
+from aegis_core import primitives
 from aegis_cli import install_hosts as plane
 from aegis_cli.install_hosts import InstallError
 from aegis_core import hosts as host_table
@@ -550,7 +552,7 @@ def install_insight_hook(host: str, excerpts: bool, *, home: Optional[Union[str,
         raise InstallError("Codex insight capture is unavailable on Windows: Codex runs hooks through %COMSPEC% /C, "
                            "which cannot take the quoted -c program the hook needs; nothing was written")
     layout = UserLayout(Path(home)) if home is not None else UserLayout.current()
-    python, root = sys.executable or "", plane._mcp_import_root()
+    python, root = sys.executable or "", aegis_import_root()
     if layout is None or not os.path.isabs(python) or not os.path.isabs(root):
         raise OSError(f"the insight hook needs a home directory and an absolute interpreter and import root "
                       f"(interpreter {python!r}, import root {root!r}); nothing was written")
@@ -812,11 +814,8 @@ def uninstall(host: str, scope: Optional[str] = None, *, home: Union[str, Path],
 
 def _envelope(command: str, host: str, scope: Optional[str], root: Optional[Path],
               results: List[HookResult]) -> Dict[str, Any]:
-    from aegis_core._version import __version__
 
-    return {"source": f"aegis hook {command}", "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": {"host": host, "scope": scope, "workspace": None if root is None else str(root)},
+    return {**primitives.envelope(f"aegis hook {command}", {"host": host, "scope": scope, "workspace": None if root is None else str(root)}),
             "results": [r.as_dict() for r in results]}
 
 

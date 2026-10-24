@@ -19,8 +19,8 @@ import tempfile
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
+from aegis_core import primitives
 from aegis_core import gitsafe, governance, pathlookup
-from aegis_core._version import __version__
 from aegis_core.errors import AegisError
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
@@ -466,11 +466,7 @@ class TierReport:
 
     def as_dict(self) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA,
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": self.checked_at,
-            "scope": dict(self.scope),
+            **primitives.envelope(SOURCE, dict(self.scope), schema=SCHEMA, checked_at=self.checked_at),
             "tier": self.tier,
             "label": self.label,
             "statement": self.statement,
@@ -892,15 +888,11 @@ class Approval(NamedTuple):
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA,
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": utc_stamp(),
-            "scope": {
+            **primitives.envelope(SOURCE, {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
                 "commit": self.commit,
-            },
+            }, schema=SCHEMA),
             "valid": self.valid,
             "code": self.code,
             "reason": self.reason,

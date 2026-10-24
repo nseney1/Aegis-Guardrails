@@ -36,9 +36,8 @@ import re
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import gitevidence, gitsafe, human_gate
-from aegis_core._version import __version__
-from aegis_core.primitives import utc_stamp
 
 __all__ = [
     "GH_MINIMUM",
@@ -143,17 +142,13 @@ class ReleaseReport:
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA,
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": utc_stamp(),
-            "scope": {
+            **primitives.envelope(SOURCE, {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
                 "mode": "release",
                 "commit": self.sha,
                 "repository": self.repository,
-            },
+            }, schema=SCHEMA),
             "status": self.status,
             "verified": self.verified,
             "attested": self.attested,
