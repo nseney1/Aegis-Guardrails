@@ -24,7 +24,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`aegis doctor --fix` keeps a host config's permissions** (for example `0600` on `~/.claude.json`) when the file is swapped for a symlink during the fix, and atomic writes set the temporary file's mode through its open descriptor.
 - **`aegis doctor --fix` and Aegis's host-config rewrites never write through a swapped-in symlink.** A file replaced by a symlink after the check is replaced, not followed, and `~/.aegis` and `~/.aegis/backups` are created with mode `0700`.
 
-- **`gh` never inspects the repository.** Every `gh` call runs from an empty temporary directory, never inside the repository; the repository comes from `remote.origin.url` read through gitsafe and is passed as `GH_REPO`, overriding an exported `GH_REPO`. An origin that names no GitHub repository makes no repository call: the trust tier is C with "no GitHub repository could be resolved from remote.origin.url", and `aegis sync --pr` refuses before any file moves.
+- **`gh` never inspects the repository.** Every `gh` call runs from an empty temporary directory, never inside the repository; the repository comes from `remote.origin.url` read through gitsafe and is passed as `GH_REPO`, overriding an exported `GH_REPO`. An origin that is not `OWNER/REPO` on a host (a local path, a nested group path, or no origin) makes no repository call: the trust tier is C with "no GitHub repository could be resolved from remote.origin.url", and `aegis sync --pr` refuses before any file moves. Any other host becomes gh's host, as before. `aegis sync --pr` also refuses, before moving any file, when the branch's push remote is not origin and has a different URL, since gh opens the pull request in origin's repository; the refusal names both remotes.
 - `aegis hook install` and `uninstall` no longer write through a link planted at a predictable temporary name, and `link.key` and the insight directories get their modes through a descriptor.
 
 ### Changed behaviour
@@ -107,7 +107,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis rule adjudicate` exits 1 and writes nothing for an id that is not a cleanly loading rule (a typo, a case variant, an `.md` name, an archived or broken rule).
 
 - A `CODEOWNERS` that owns the six plural rule directories counts as covered, `docs/CODEOWNERS` is covered by the printed lines, and `exposed_rules` with no session reads the host's own exposures.
-- A signed re-run of `aegis rule insight add` without `--paths` counts the correction once.
+- A signed re-run of `aegis rule insight add` without `--paths` counts the correction once, and supersedes only the one cli insight it restates: another correction with the same text and kind stays in review, can be proposed and counts toward recurrence.
 
 ### Breaking (command line, JSON and MCP)
 
@@ -157,6 +157,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 ### Corrections
 
 - The 4.3.0 entry for the accountable Layer-2 arbiter advertised deterministic structural SHIP gaps, a vendor-family warning and 60-day prediction compaction. None of that code had a caller; 4.4.0 removes it, and the advisory above replaces the warning.
+- 4.3.0 did not document the decay keys `expiry.half_life_sessions` and `expiry.epsilon`.
 - The 4.3.0 entry said decay runs over heartbeat-alive eligible sessions. Exposure rows carry no heartbeat flag, so every exposed session was eligible; silence earns no credit in 4.4.0.
 
 ## [4.3.4] - 2026-10-20
