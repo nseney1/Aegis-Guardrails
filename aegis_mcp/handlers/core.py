@@ -10,8 +10,8 @@ from aegis_core import hosts
 from aegis_core.primitives import parse_utc
 from aegis_core.scan import scan, scan_user_layer
 from aegis_core.skills.slots import render_scan_result
-from aegis_mcp.registry import _STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, _get_workspace
-from aegis_mcp.registry import remember_bounded
+from aegis_mcp.handlers.common import STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, get_workspace
+from aegis_mcp.handlers.common import remember_bounded
 
 # (workspace root, session, files) -> the stamp of its last scan row. A rescan writes
 # again once that row is older than half of jit.scan_window_s: the scan-before-edit hook
@@ -112,9 +112,9 @@ def _scan_user_layer(args: dict) -> dict:
     """Nothing governs this call (H8): the read-only user layer, never a ledger write."""
     files = args.get("files")
     if files is not None and (not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files)):
-        return {"error": "'files' must be a list of file paths", "status": _STATUS_FAIL}
+        return {"error": "'files' must be a list of file paths", "status": STATUS_FAIL}
     res = scan_user_layer(list(files) if files else None)
-    if res.get("status") == _STATUS_FAIL:
+    if res.get("status") == STATUS_FAIL:
         return res
     res = {"status": "not_governed", "message": NOT_GOVERNED_MESSAGE, "reason": args.get("_unbound"), **res}
     return render_scan_result(res, _slot_profile(args.get("_host")), None)
@@ -133,20 +133,20 @@ def _handle_scan(args: dict) -> dict:
     if args.get("_unbound"):
         return _scan_user_layer(args)
     try:
-        workspace = _get_workspace(args)
+        workspace = get_workspace(args)
     except ValueError as exc:
-        return {"error": str(exc), "status": _STATUS_FAIL}
+        return {"error": str(exc), "status": STATUS_FAIL}
     files = args.get("files")
     if files is not None:
         if not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files):
-            return {"error": "'files' must be a list of file paths", "status": _STATUS_FAIL}
+            return {"error": "'files' must be a list of file paths", "status": STATUS_FAIL}
         try:  # [] means "none given" here as in scan(): the git diff, recorded as such
             files = [str(workspace.confine_path(f)[1]) for f in files] or None
         except ValueError as exc:
-            return {"error": str(exc), "status": _STATUS_FAIL}
+            return {"error": str(exc), "status": STATUS_FAIL}
 
     res = scan(workspace, changed_files=files)
-    if res.get("status") == _STATUS_FAIL:
+    if res.get("status") == STATUS_FAIL:
         return res
     _record_scan(workspace, args, files)
     _record_exposure(workspace, args, res, files)

@@ -11,7 +11,7 @@ from aegis_core.primitives import envelope
 from aegis_core.errors import PathTraversalError
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import validate_rule_names
-from aegis_mcp.registry import _STATUS_FAIL, _VALID_OUTCOMES, _get_workspace, remember_bounded
+from aegis_mcp.handlers.common import STATUS_FAIL, VALID_OUTCOMES, get_workspace, remember_bounded
 
 # (workspace root, session, idempotency key) whose edit event is recorded, and the edit rows
 # written per (root, session). The key is the caller's string, so both are bounded: by the
@@ -30,7 +30,7 @@ _RULES_REQUIRED = (
 
 
 def _fail(message: str) -> dict:
-    return {"status": _STATUS_FAIL, "error": message}
+    return {"status": STATUS_FAIL, "error": message}
 
 
 def _credited_rules(workspace, check, bound, host: Optional[str], session: Optional[str]) -> List[str]:
@@ -58,14 +58,14 @@ def _credited_rules(workspace, check, bound, host: Optional[str], session: Optio
 
 def handle_report_outcome(args: dict) -> dict:
     try:
-        workspace = _get_workspace(args)
+        workspace = get_workspace(args)
     except ValueError as exc:
         return _fail(str(exc))
 
     raw_outcome = args.get("outcome")
     outcome = raw_outcome.strip().lower() if isinstance(raw_outcome, str) else None
-    if outcome not in _VALID_OUTCOMES:
-        return _fail(f"Invalid 'outcome': {raw_outcome!r}. Expected one of {list(_VALID_OUTCOMES)}.")
+    if outcome not in VALID_OUTCOMES:
+        return _fail(f"Invalid 'outcome': {raw_outcome!r}. Expected one of {list(VALID_OUTCOMES)}.")
 
     # A generated key would make every retry a new event, so the caller must supply one.
     idempotency_key = args.get("idempotency_key")
@@ -150,7 +150,7 @@ def handle_capture_insight(args: dict) -> dict:
     from aegis_core.insights import CaptureLimitReached, capture_suggestion
 
     try:
-        workspace = _get_workspace(args)
+        workspace = get_workspace(args)
     except ValueError as exc:
         return _fail(str(exc))
 
