@@ -7,13 +7,13 @@ tests/unit/core/test_command_safety.py pins every row where they differ and why.
 """
 from __future__ import annotations
 
-import datetime
 from pathlib import Path
 import re
 import shlex
 from typing import Any
 
 from aegis_cli.hooks.redaction import redact_secrets
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import append_jsonl, state_dir
 from aegis_core.workspace.layout import WorkspaceLayout
 
@@ -55,7 +55,7 @@ def log_gate_event(cmd: str, decision: str, reason: str, workspace: Path) -> Non
     if not layout.aegis_dir.is_dir():
         return
     record = {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timestamp": utc_stamp(),
         "command": redact_secrets(cmd)[:200],
         "decision": decision,
     }

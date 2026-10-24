@@ -37,6 +37,7 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from aegis_core import events, scan_compliance
 from aegis_core.hosts import GENERIC
+from aegis_core.primitives import safe_parts
 from aegis_core.scan import estimate_tokens
 from aegis_core.scan import scan as run_scan
 from aegis_core.skills.slots import render_scan_result
@@ -173,8 +174,7 @@ def load_corpus() -> Corpus:
 
 
 def _check_corpus_path(path: str) -> None:
-    parts = path.split("/")
-    if not path or path.startswith("/") or "\\" in path or ":" in path or any(p in ("", ".", "..") for p in parts):
+    if safe_parts(path, windows=True) is None:  # one corpus, so one rule on every platform
         raise BenchmarkError(f"corpus path {path!r} is not a relative path inside the workspace")
 
 

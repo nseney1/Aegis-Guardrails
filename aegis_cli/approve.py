@@ -169,6 +169,7 @@ def _approve_test_exemption(root: Path, base: Optional[str], exempt_commit: str,
                  {"exempt_commit": fix_commit, "reason": clean_reason, "base": base_ref})
 
 
+@gitsafe.scrubbed()
 def run_approve(args: argparse.Namespace) -> int:
     root = Path(getattr(args, "workspace", None) or getattr(args, "_project_root", None) or Path.cwd())
     use_json = bool(getattr(args, "json", False))

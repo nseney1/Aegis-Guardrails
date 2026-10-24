@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -42,9 +41,10 @@ import stat
 import tempfile
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, primitives
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
+from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
 from aegis_core.storage import atomic_write_text
 from aegis_core.verification import ToolEvidence
 from aegis_core.workspace.layout import AEGIS_DIRNAME
@@ -80,7 +80,6 @@ __all__ = [
     "run_fast",
     "run_grouped",
     "split_lines",
-    "utc_stamp",
     "write",
 ]
 
@@ -212,27 +211,10 @@ def render(entries: Iterable[Entry]) -> str:
     return json.dumps(document, indent=2) + "\n"
 
 
-class _DuplicateKey(Exception):
-    pass
-
-
-def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    found: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:
-            raise _DuplicateKey()
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
-
-
 def _path_ok(value: object) -> bool:
-    if not isinstance(value, str) or not value or _CONTROL.search(value) or "\\" in value:
-        return False
-    return all(part not in ("", ".", "..") for part in value.split("/"))
+    # The part rule of every platform (windows=False): a v1 file that holds a:b.py reads the same anywhere.
+    return isinstance(value, str) and not _CONTROL.search(value) and "\\" not in value \
+        and safe_parts(value, windows=False) is not None
 
 
 def parse(data: bytes) -> FrozenSet[Entry]:
@@ -248,8 +230,8 @@ def parse(data: bytes) -> FrozenSet[Entry]:
     except UnicodeDecodeError:
         raise BaselineFileError("not valid UTF-8") from None
     try:
-        value = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant)
-    except _DuplicateKey:
+        value = strict_loads(text)
+    except DuplicateKeyError:  # before ValueError, which it is
         raise BaselineFileError("duplicate key") from None
     except (ValueError, RecursionError):
         raise BaselineFileError("not valid JSON") from None
@@ -305,10 +287,6 @@ class Baseline:
                 "entries": len(self.entries)}
 
 
-def _within(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
-
-
 def _read_working(root: Path) -> Optional[bytes]:
     """The working tree's baseline bytes, or None when there is no file. A symlink, a file
     that resolves outside the workspace and anything but a regular file are refused (a
@@ -324,7 +302,7 @@ def _read_working(root: Path) -> Optional[bytes]:
         raise BaselineFileError("is a symlink")
     if not stat.S_ISREG(info.st_mode):
         raise BaselineFileError("not a regular file")
-    if not _within(os.path.realpath(path), os.path.realpath(root)):
+    if not is_within(path, root, unresolvable=False):
         raise BaselineFileError("resolves outside the workspace")
     if info.st_size > MAX_BYTES:
         raise BaselineFileError(f"larger than {MAX_BYTES // (1024 * 1024)} MiB")
@@ -482,7 +460,7 @@ class Sources:
                 oid = self._staged_oid(path)
                 return None if oid is None else gitsafe.read_object(self.root, oid, MAX_BYTES)
             full = self.root / path
-            if not _within(os.path.realpath(full), os.path.realpath(self.root)) or os.path.getsize(full) > MAX_BYTES:
+            if not is_within(full, self.root, unresolvable=False) or os.path.getsize(full) > MAX_BYTES:
                 return None
             return full.read_bytes()
         except (OSError, ValueError, gitsafe.GitError):
@@ -702,14 +680,9 @@ def apply(pairs: Sequence[Tuple[Optional[str], ToolEvidence]], sources: Sources,
 
 # ── The files a whole-workspace mode looks at ────────────────────────────────
 
-def utc_stamp(now: Optional[float] = None) -> str:
-    moment = datetime.now(timezone.utc) if now is None else datetime.fromtimestamp(now, timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def envelope(source: str, scope: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
     """The head every machine-readable output of the v4.2 modes carries."""
-    return {"source": source, "aegis_version": __version__, "checked_at": utc_stamp(now), "scope": scope}
+    return {"source": source, "aegis_version": __version__, "checked_at": primitives.utc_stamp(now), "scope": scope}
 
 
 def list_files(root: Any) -> Tuple[List[str], str]:

@@ -101,3 +101,20 @@ def test_the_help_names_every_format_and_says_coverage_is_a_report():
     CheckCommand().configure_parser(parser)
     text = " ".join(parser.format_help().split())
     assert "github|sarif" in text and "SARIF 2.1.0" in text and "report-only diff coverage" in text
+
+
+@needs_git
+def test_the_default_base_is_the_repository_asked_about_with_git_dir_exported_for_another(repo, tmp_path, capsys,
+                                                                                         monkeypatch):
+    """Given A with main and develop and B with only develop, when check --ci runs in A with
+    GIT_DIR/GIT_WORK_TREE exported for B and no --base, then the base is A's main."""
+    repo.git("branch", "develop")
+    main_commit = repo.git("rev-parse", "main")
+    other = hg.make_repo(tmp_path, name="b")
+    other.git("branch", "-m", "main", "develop")
+    monkeypatch.setenv("GIT_DIR", str(other.root / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other.root))
+    rc = _run("check", "--ci", "--no-exec", "--format", "json")
+    scope = json.loads(capsys.readouterr().out)["scope"]
+    assert (scope["base"], scope["merge_base"]) == (main_commit, main_commit)  # develop is A's HEAD
+    assert rc == 0 and os.path.samefile(scope["workspace"], repo.root)

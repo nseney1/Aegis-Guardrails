@@ -74,6 +74,7 @@ packages = [
     "aegis_core.ast",
     "aegis_core.ast.drivers",
     "aegis_core.ast.drivers.templates",
+    "aegis_core.command_safety",
     "aegis_core.lifecycle",
     "aegis_core.outcomes",
     "aegis_core.skills",

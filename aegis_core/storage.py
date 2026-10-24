@@ -57,6 +57,7 @@ from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Se
 
 from aegis_core import gitsafe
 from aegis_core.errors import AegisError, LockTimeoutError, PathTraversalError
+from aegis_core.primitives import is_within, real_path
 from aegis_core.taxonomy import (
     LOCK_MAX_BACKOFF_SECONDS,
     LOCK_RETRY_INTERVAL_SECONDS,
@@ -203,37 +204,6 @@ def _timeout_error(path: Path, timeout: float, kind: str = "workspace") -> LockT
     )
 
 
-_EXTENDED_UNC, _EXTENDED = "\\\\?\\UNC\\", "\\\\?\\"
-
-
-def _resolved(path: Path | str) -> str:
-    """``path`` with every link resolved and without the Windows extended-length prefix.
-
-    realpath, not Path.resolve(): it never raises (3.9 resolve raises RuntimeError on
-    loops) and it resolves Windows junctions, which is_symlink() misses before 3.12.
-    Windows realpath answers in the extended-length form (``\\\\?\\C:\\...``) when the
-    path appears or disappears while it resolves it (another process creating
-    ``.aegis/state``); that prefix is dropped.
-    """
-    real = os.path.realpath(path)
-    if real.startswith(_EXTENDED_UNC):
-        real = "\\\\" + real[len(_EXTENDED_UNC):]
-    elif real.startswith(_EXTENDED):
-        real = real[len(_EXTENDED):]
-    return real
-
-
-def _real(path: Path | str) -> str:
-    """``path`` resolved (``_resolved``) in one spelling per location: normcase folds the
-    case Windows ignores, so two spellings of one location compare equal."""
-    return os.path.normcase(_resolved(path))
-
-
-def _within(path: Path, root: Path) -> bool:
-    real, base = _real(path), _real(root)
-    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
-
-
 def _link_error(path: Path) -> PathTraversalError:
     return PathTraversalError(
         f"refusing to use {path}: it is a symlink; aegis keeps workspace state only inside the workspace",
@@ -265,7 +235,7 @@ def state_dir(workspace: Any) -> Path:
     for path in (layout.aegis_dir, layout.state_dir):
         if path.is_symlink():
             raise _link_error(path)
-    if not _within(layout.state_dir, layout.root):  # a Windows junction is not a symlink
+    if not is_within(layout.state_dir, layout.root, unresolvable=False):  # a Windows junction is not a symlink
         raise _outside_error(layout.state_dir)
     layout.state_dir.mkdir(parents=True, exist_ok=True)
     with os.scandir(layout.state_dir) as entries:
@@ -273,7 +243,7 @@ def state_dir(workspace: Any) -> Path:
             if entry.is_symlink():
                 raise _link_error(Path(entry.path))
             # Every entry, not only directories: a file here always resolves inside it.
-            if not _within(Path(entry.path), layout.root):
+            if not is_within(Path(entry.path), layout.root, unresolvable=False):
                 raise _outside_error(Path(entry.path))
     if not os.path.lexists(layout.state_gitignore):
         atomic_write_bytes(layout.state_gitignore, _STATE_GITIGNORE)
@@ -326,7 +296,7 @@ def _confined(directory: Path, base: Path, link_error, outside_error, entries: b
         raise link_error(directory)
     if not os.path.lexists(directory):
         return
-    if not _within(directory, base):  # a Windows junction is not a symlink
+    if not is_within(directory, base, unresolvable=False):  # a Windows junction is not a symlink
         raise outside_error(directory)
     if not directory.is_dir():
         raise PathTraversalError(f"refusing to use {directory}: it is not a directory", path=str(directory))
@@ -336,7 +306,7 @@ def _confined(directory: Path, base: Path, link_error, outside_error, entries: b
         for entry in found:
             if entry.is_symlink():
                 raise link_error(Path(entry.path))
-            if entry.is_dir(follow_symlinks=False) and not _within(Path(entry.path), base):
+            if entry.is_dir(follow_symlinks=False) and not is_within(Path(entry.path), base, unresolvable=False):
                 raise outside_error(Path(entry.path))
 
 
@@ -357,7 +327,7 @@ def shared_state_dir(workspace: Any, create: bool = True) -> Path:
     common = gitsafe.common_dir(root)
     if common is None:
         return _local_state_dir(root, create)
-    return _shared_dir(Path(_resolved(common)), create)
+    return _shared_dir(Path(real_path(common)), create)
 
 
 class StateModes(NamedTuple):
@@ -389,7 +359,7 @@ def shared_state_modes(workspace: Any, fix: bool = False) -> StateModes:
     common = gitsafe.common_dir(Path(os.fspath(workspace)).resolve())
     if common is None:
         return StateModes(0, 0, 0, True)
-    top = _shared_dir(Path(_resolved(common)), create=False)
+    top = _shared_dir(Path(real_path(common)), create=False)
     if not os.path.lexists(top):
         return StateModes(0, 0, 0, True)
     checked = looser = fixed = 0
@@ -490,7 +460,7 @@ def shared_locked(workspace: Any, name: str, timeout: float = LOCK_TIMEOUT_SECON
     _shared_lock_name(name)
     directory = shared_state_dir(workspace)
     lock_path = directory / name
-    key = os.path.join(_real(directory), name)
+    key = os.path.join(os.path.normcase(real_path(directory)), name)
     with _hold(lock_path, key, timeout, shared=True) as path:
         yield path
 
@@ -521,7 +491,7 @@ def _relative_posix(root: Path, top: Path) -> Optional[str]:
     link to the repository answers as the repository does, and normcase folds the case
     Windows ignores, so the same workspace has one name in every worktree."""
     try:
-        relative = os.path.relpath(os.path.normcase(_resolved(root)), os.path.normcase(_resolved(top)))
+        relative = os.path.relpath(os.path.normcase(real_path(root)), os.path.normcase(real_path(top)))
     except ValueError:
         return None
     return relative.replace(os.sep, "/")
@@ -552,7 +522,7 @@ def workspace_id(workspace: Any) -> Optional[str]:
 def worktree_label(top: Any) -> str:
     """How a work tree's top directory is written in a ledger row's ``worktree``: resolved,
     POSIX spelling."""
-    return Path(_resolved(Path(os.fspath(top)))).as_posix()
+    return Path(real_path(Path(os.fspath(top)))).as_posix()
 
 
 def ledger_site(workspace: Any, create: bool = True) -> LedgerSite:
@@ -575,7 +545,7 @@ def ledger_site(workspace: Any, create: bool = True) -> LedgerSite:
     if common is None or top is None or relative is None:
         local = _local_state_dir(root, create)
         return LedgerSite(local / _LEDGER_FILE, local / _LEDGER_LOCK, False)
-    base = Path(_resolved(common))
+    base = Path(real_path(common))
     state = _shared_dir(base, create) / _LEDGER_STATE_DIRNAME
     _confined_shared(state, base, create)
     directory = state / _id_of(relative)
@@ -601,7 +571,7 @@ def ledger_locked(workspace: Any, timeout: Optional[float] = None) -> Iterator[L
         with locked(workspace, wait):
             yield site
         return
-    key = os.path.join(_real(site.lock.parent), site.lock.name)
+    key = os.path.join(os.path.normcase(real_path(site.lock.parent)), site.lock.name)
     with _hold(site.lock, key, wait, shared=True):
         yield site
 
@@ -718,7 +688,7 @@ def locked(workspace: Any, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[Pa
     # state_dir() confined the directory; the lock file itself is opened by its own
     # name, never through what a link named "lock" points at. One spelling per location:
     # two keys for one lock file would make a nested locked() wait on itself.
-    key = os.path.join(_real(state), lock_path.name)
+    key = os.path.join(os.path.normcase(real_path(state)), lock_path.name)
     with _hold(lock_path, key, timeout, shared=False) as path:
         yield path
 
@@ -735,7 +705,7 @@ def file_lock(lock_path: Path, timeout: float = 5.0) -> Iterator[None]:
     if target.parent.is_symlink():
         raise _link_error(target.parent)
     target.parent.mkdir(parents=True, exist_ok=True)
-    key = f"file:{_real(target)}"
+    key = f"file:{os.path.normcase(real_path(target))}"
     held = _held()
     if key in held:
         yield

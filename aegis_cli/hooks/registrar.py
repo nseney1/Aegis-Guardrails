@@ -509,7 +509,7 @@ def _write_json(path: Path, raw: Optional[bytes], data: Dict[str, Any], backup: 
     plane._replace(path, raw, payload)
     try:
         written = path.read_bytes()
-        reread = json.loads(written.decode("utf-8"), object_pairs_hook=plane._reject_duplicates)
+        reread = plane.strict_loads(written.decode("utf-8"))
         ok = reread == data
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         ok = False

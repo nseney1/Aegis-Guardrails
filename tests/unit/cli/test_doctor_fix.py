@@ -471,3 +471,31 @@ def test_a_private_config_swapped_for_a_symlink_after_the_check_stays_owner_only
     assert not claude.is_symlink() and "soma" not in json.loads(claude.read_text(encoding="utf-8"))["mcpServers"]
     assert claude.stat().st_mode & 0o777 == 0o600
     assert victim.read_bytes() == b'{"keep": true}\n' and victim.stat().st_mode & 0o777 == 0o644
+
+
+# ── Numbers JSON cannot hold (R-structure-21, R-cli-50) ─────────────────────────
+
+def test_fix_leaves_a_host_config_holding_an_overflowing_number_byte_identical(env):
+    """json reads 1e999 as infinity, which written back is the non-JSON literal Infinity: the file is
+    reported as not valid JSON and nothing is planned for it; a control file is fixed as before."""
+    overflow = env.home / ".mcp.json"
+    overflow.write_bytes(b'{\n  "mcpServers": {"soma": {}},\n  "n": 1e999\n}\n')
+    before = overflow.read_bytes()
+    control = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"soma": {}, "db": {"command": "db"}}})
+    payload = env.fix()
+    assert overflow.read_bytes() == before and b"Infinity" not in overflow.read_bytes()
+    # By the path field, never a substring of json.dumps: it doubles every Windows backslash.
+    key = os.path.normcase(os.path.realpath(overflow))
+    about = [f for f in payload["findings"] + payload["fixes"]
+             if isinstance(f.get("path"), str) and os.path.normcase(os.path.realpath(f["path"])) == key]
+    assert [(f.get("code"), f.get("fixable")) for f in about] == [("unreadable_config", False)]
+    assert "not valid JSON" in json.dumps(payload) and "1e999 is not allowed" in json.dumps(payload)
+    assert json.loads(control.read_text()) == {"mcpServers": {"db": {"command": "db"}}}
+
+
+def test_a_non_finite_number_is_never_serialized_into_a_host_config():
+    from aegis_cli import doctor_repair
+
+    with pytest.raises(ValueError):
+        doctor_repair._dump_like(b'{\n  "n": 1\n}\n', {"n": float("inf")})
+    assert doctor_repair._dump_like(b'{\n  "n": 1\n}\n', {"n": 2.5}) == b'{\n  "n": 2.5\n}\n'

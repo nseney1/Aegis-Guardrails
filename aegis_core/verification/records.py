@@ -89,6 +89,7 @@ def resolve(row: Mapping[str, Any], now: float, top: Any, tip: Optional[str], co
     return "hit" if any(landed_at <= when <= end and pattern.match(subject) for when, subject in changes) else "miss"
 
 
+@gitsafe.scrubbed()
 def resolve_rows(root: Any, rows: Sequence[Mapping[str, Any]], now: float) -> List[Dict[str, Any]]:
     """``rows`` with the disposition and outcome of the newest ``MAX_ROWS`` computed from git. What a row
     stores is never trusted (the log is a plain file anyone can edit): every other row, and any row git

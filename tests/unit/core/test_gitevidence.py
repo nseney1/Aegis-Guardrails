@@ -336,3 +336,48 @@ def test_without_git_there_is_no_fetch_age(tmp_path, monkeypatch):
     plain.mkdir()
     monkeypatch.undo()
     assert gitevidence.fetch_age(plain) is None
+
+
+# ── commit_tree and is_ancestor_at: the ARCH-1 migration's cwd-keyed facts ────
+
+def test_a_commits_tree_is_read_once_and_only_a_full_object_id_reaches_git(tmp_path, calls):
+    shape = _forked(tmp_path)
+    tree = _git(Path(shape["root"]), "rev-parse", "HEAD^{tree}")
+    assert gitevidence.commit_tree(shape["root"], shape["head"]) == tree
+    assert gitevidence.commit_tree(shape["root"], shape["head"]) == tree
+    assert len(calls) == 1, calls
+    calls.clear()
+    for bad in ("HEAD", "--all", "abc123", "A" * 40, None):
+        assert gitevidence.commit_tree(shape["root"], bad) is None
+    assert calls == []
+
+
+def test_a_commit_the_repository_lacks_has_no_tree_and_is_asked_again(tmp_path, calls):
+    shape = _forked(tmp_path)
+    missing = "0" * 40
+    assert gitevidence.commit_tree(shape["root"], missing) is None
+    assert gitevidence.commit_tree(shape["root"], missing) is None
+    assert len(calls) == 2, calls
+
+
+def test_a_tree_read_fails_loudly_when_git_cannot_run(tmp_path, monkeypatch):
+    shape = _forked(tmp_path)
+
+    def broken(*args, **kwargs):
+        raise gitsafe.GitError("git timed out")
+
+    monkeypatch.setattr(gitsafe, "run", broken)
+    with pytest.raises(gitsafe.GitError):
+        gitevidence.commit_tree(shape["root"], shape["head"])
+
+
+def test_an_ancestry_asked_by_directory_follows_the_facts_rules(tmp_path, calls):
+    shape = _forked(tmp_path)
+    assert gitevidence.is_ancestor_at(shape["root"], shape["fork"], shape["head"]) is True
+    assert gitevidence.is_ancestor_at(shape["root"], shape["fork"], shape["head"]) is True
+    assert gitevidence.is_ancestor_at(shape["root"], shape["head"], shape["fork"]) is False
+    assert gitevidence.is_ancestor_at(shape["root"], shape["head"], shape["fork"]) is False
+    assert len(calls) == 3, calls  # one yes, remembered; each no asked again
+    calls.clear()
+    assert gitevidence.is_ancestor_at(shape["root"], "refs/heads/main", shape["head"]) is False
+    assert calls == []

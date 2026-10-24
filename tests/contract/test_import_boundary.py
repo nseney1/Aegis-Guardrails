@@ -49,6 +49,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
+    # Path containment, strict JSON and UTC timestamps (stdlib only).
+    "aegis_core.primitives": 0,
     "aegis_core.config": 0,
     # The events log (prune metrics): storage and gitsafe only, so any layer may record.
     "aegis_core.events": 0,

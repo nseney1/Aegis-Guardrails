@@ -28,7 +28,7 @@ into the default branch holding the commit, approved on its head by someone othe
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 from pathlib import Path
@@ -36,8 +36,9 @@ import re
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe, human_gate
+from aegis_core import gitevidence, gitsafe, human_gate
 from aegis_core._version import __version__
+from aegis_core.primitives import utc_stamp
 
 __all__ = [
     "GH_MINIMUM",
@@ -80,10 +81,6 @@ _REMOTE = re.compile(
 #: ``runner(argv, timeout)``: run ``gh <argv>`` and return (returncode, stdout, stderr), or None
 #: when gh is not installed. Injectable so a test never reaches a real gh.
 GhRun = Callable[[Sequence[str], float], Optional[Tuple[int, str, str]]]
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def subject_bytes(commit: str, tree: str) -> bytes:
@@ -149,7 +146,7 @@ class ReleaseReport:
             "schema": SCHEMA,
             "source": SOURCE,
             "aegis_version": __version__,
-            "checked_at": _utc_now(),
+            "checked_at": utc_stamp(),
             "scope": {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
@@ -326,6 +323,7 @@ def _tier(root: Path, tier_runner: Optional[Callable[..., Any]]) -> Optional[str
         return None
 
 
+@gitsafe.scrubbed()
 def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner: Optional[Callable[..., Any]] = None,
                    *, source_ref: Optional[str] = None) -> ReleaseReport:
     """Verify the CI-verdict attestation of ``sha`` (a commit id or a ref of the repository in ``root``).
@@ -352,12 +350,11 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
 
     try:
         commit = gitsafe.resolve_commit(top, sha)
-        res = gitsafe.run(["rev-parse", "--verify", f"{commit}^{{tree}}"], top) if commit and _SHA.match(commit) else None
+        tree = gitevidence.commit_tree(top, commit) if commit and _SHA.match(commit) else None
     except gitsafe.GitError as exc:
         return failed(sha, "git_failed", f"git could not answer: {exc}")
-    if res is None or res.returncode != 0 or not commit:
+    if tree is None or not commit:
         return failed(sha, "bad_commit", f"{sha!r} is not a commit of this repository (fetch it first)")
-    tree = res.stdout.decode("ascii", "replace").strip()
     repository = _repository(top)
     if not repository:
         return failed(sha, "no_repository", "origin is not a github.com repository, so there is nothing to pin "

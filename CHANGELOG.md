@@ -27,6 +27,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`gh` never inspects the repository.** Every `gh` call runs from an empty temporary directory, never inside the repository; the repository comes from `remote.origin.url` read through gitsafe and is passed as `GH_REPO`, overriding an exported `GH_REPO`. An origin that is not `OWNER/REPO` on a host (a local path, a nested group path, or no origin) makes no repository call: the trust tier is C with "no GitHub repository could be resolved from remote.origin.url", and `aegis sync --pr` refuses before any file moves. Any other host becomes gh's host, as before. `aegis sync --pr` also refuses, before moving any file, when the branch's push remote is not origin and has a different URL, since gh opens the pull request in origin's repository; the refusal names both remotes.
 - `aegis hook install` and `uninstall` no longer write through a link planted at a predictable temporary name, and `link.key` and the insight directories get their modes through a descriptor.
 
+- **Evidence git calls ignore your shell's local `GIT_*` variables.** Tree identity, `aegis check --record`, `aegis check --ci`, approvals, `aegis doctor --release` and `aegis sync` run git without the 15 variables `git rev-parse --local-env-vars` lists (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and the rest), so an exported `GIT_DIR` can no longer make them describe another repository. Hooks keep the index git gives them, and `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` still choose your user and system config.
+
 ### Changed behaviour
 
 - **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
@@ -74,6 +76,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - MCP tool descriptions are 2 to 4 sentences and parameter descriptions one line. They keep the routing to sibling tools and the limits the server enforces; no input constraint (`type`, `enum`, `maxLength`, `minItems`, `required`, `additionalProperties`, `default`, `items`) changes.
 - T5 counts a commit as a fix only from a Conventional `fix` subject or a `Fixes:` trailer in the trailer block, with a scope outside `ci, build, docs, deps, release, chore, tests`. A `Closes:` trailer, or a `Fixes:` or `Aegis-No-Test:` line in the body, no longer counts, and `fix(test)` and `fix(doc)` commits are now judged as fixes. The text report's prune-box note is gone.
 
+- `.aegis/config.json`, `~/.aegis/config.json`, `team.json`, `baseline.json`, packs and host configs that hold a number overflowing to infinity (such as `1e999`) are refused like `NaN`, and a duplicate key in a `config.json` is refused (it was last key wins).
+- A naive datetime passed as `now` is read as UTC everywhere; `check --record` and the scan-compliance report used to read it as local time.
+- Tree identity reads the user and system config named by `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` (and honours `GIT_CONFIG_NOSYSTEM`), so a git-lfs filter configured there runs.
+
 ### Added
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
@@ -119,6 +125,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - An `aegis_report_outcome` call that records nothing (`rate_limited`, or a repeated unwitnessed claim) no longer writes an `edit` activity row, and edit rows are capped at 200 per session per server process.
 - The MCP server's report-edit maps and its scan-row map are bounded at 1,024 entries, so a long-lived server no longer grows them without limit.
 - `aegis check --hook` reads staged blobs through gitsafe's one reader: a malformed `cat-file` size is a `GitError` (`git cannot read object <oid>`, exit 1) instead of a `ValueError`, and an unreadable staged object reports the same text.
+
+- `aegis doctor --fix` never writes `Infinity`: a host config holding `1e999` is reported as not valid JSON and left byte-identical.
+- `aegis check FILES` in a repository at the filesystem root no longer treats every file as outside the tree, and a final-component symlink loop is refused where a path must stay inside.
+- A host config swapped for a symlink while `aegis init` writes it keeps its permission bits, and a malformed `cat-file` size in `gitsafe.read_blob` is a `GitError`.
 
 ### Breaking (command line, JSON and MCP)
 
@@ -173,6 +183,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis_core.rules.rank_of` is removed (use `Rule.rank` or `Rule.mandatory`), and the rule key schema is `aegis_core.rules.KNOWN_KEYS`.
 - Breaking: `aegis_core.rule_integrity.renamed_rules`, `aegis_core.rule_integrity.BENIGN_KEYS`, `aegis_core.rule_integrity.EXCLUDED_KEYS`, `aegis_core.rule_integrity.ENFORCEMENT_KEYS` (import it from `aegis_core.rules`) and `aegis_core.rule_integrity.Sequence` are removed. `weakenings()` no longer reports `applies_to` (`check --ci` still does) and takes `renames` (a mapping) as its third parameter instead of `tree`; `BaseAnchor`, `Weakening` and `Unreviewed` lose `as_dict` (use `dataclasses.asdict`), and `Unreviewed` loses `path`.
 - Breaking: `aegis_core.regression.SOURCE`, `aegis_core.regression.PRUNE_BOX_EXEMPTION_RATE` and `aegis_core.regression.FrozenSet` are removed, `aegis_core.regression.__all__` is `RegressionError`, `check_ci_regressions` and `is_source_file`, and `RegressionReport` and `CommitRegression` lose the fields the JSON report dropped.
+
+- Breaking: `aegis_core.checkrun.parse_junit` is removed (it had no caller; `parse_junit_cases` stays), and `aegis_core.baseline.utc_stamp` is removed (use `aegis_core.primitives.utc_stamp`). `aegis_core.primitives` holds the one copy of the path-containment, strict-JSON and UTC-timestamp helpers, and `aegis_core.command_safety` is a package (`lexer`, `analyzer`, `guard`) whose existing imports are unchanged.
 
 ### Corrections
 

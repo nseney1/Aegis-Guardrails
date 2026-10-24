@@ -7,8 +7,10 @@ the repository's index, refs, work tree or object store:
 1. The work tree root is the git top level of the workspace; its git directory is resolved from
    ``<root>/.git`` (a directory, or a ``gitdir:`` file of a linked worktree).
 2. Every ``GIT_*`` variable is scrubbed from the environment (``rev-parse --local-env-vars``,
-   ``GIT_CONFIG_*``, ``GIT_EXTERNAL_DIFF``, ``GIT_SSH*``, ``GIT_TRACE*``, ``GIT_ATTR_SOURCE``,
-   ``GIT_EXEC_PATH`` and the rest), then ``GIT_DIR``/``GIT_WORK_TREE`` are set explicitly.
+   ``GIT_CONFIG_PARAMETERS``/``COUNT``, ``GIT_EXTERNAL_DIFF``, ``GIT_SSH*``, ``GIT_TRACE*``,
+   ``GIT_ATTR_SOURCE``, ``GIT_EXEC_PATH`` and the rest), then ``GIT_DIR``/``GIT_WORK_TREE`` are set
+   explicitly. ``GIT_CONFIG_GLOBAL``, ``GIT_CONFIG_SYSTEM`` and ``GIT_CONFIG_NOSYSTEM`` stay: they
+   name the user's and the system's config files, whose drivers step 5 runs as the user's git does.
 3. The real index is copied, mtime preserved, into a private 0700 directory and used as
    ``GIT_INDEX_FILE``, so git's racy-timestamp logic judges the same stat data the real one would.
 4. ``ls-files -v`` is audited: an assume-unchanged or skip-worktree entry whose path exists on
@@ -54,6 +56,7 @@ __all__ = [
     "TreeBinding",
     "TreeError",
     "bind",
+    "named_paths",
     "tree_files",
     "tree_of",
 ]
@@ -99,14 +102,16 @@ class TreeBinding:
                 "gitlinks": list(self.gitlinks)}
 
 
-def _named(paths: Sequence[str]) -> str:
+def named_paths(paths: Sequence[str]) -> str:
+    """The first five of ``paths``, then how many more."""
     shown = ", ".join(paths[:_NAMED])
     return shown + (f" and {len(paths) - _NAMED} more" if len(paths) > _NAMED else "")
 
 
 def _locate(root: Path) -> Tuple[Path, Path, Path]:
     """(work tree top, git directory, real object directory) of the work tree holding ``root``."""
-    top = gitsafe.toplevel(root)
+    with gitsafe.scrubbed():  # the one git call here that runs outside BoundTree.env
+        top = gitsafe.toplevel(root)
     if top is None:
         raise TreeError(f"{root} is not inside a git work tree")
     dotgit = top / ".git"
@@ -130,8 +135,11 @@ def _locate(root: Path) -> Tuple[Path, Path, Path]:
     return top, gitdir, common / "objects"
 
 
+_CONFIG_SCOPES = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
+
+
 def _scrubbed_environment() -> Dict[str, str]:
-    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_") or k.upper() in _CONFIG_SCOPES}
 
 
 def _submodule_environment() -> Dict[str, str]:
@@ -347,8 +355,8 @@ class BoundTree:
         gitlinks = tuple(sorted(links))
         dirty = [path for path in gitlinks if self._dirty_submodule(path, links[path])]
         if dirty:
-            self.binding = TreeBinding("partial", tree, f"submodule(s) differ from the recorded commit: {_named(dirty)}",
-                                       gitlinks)
+            self.binding = TreeBinding("partial", tree,
+                                       f"submodule(s) differ from the recorded commit: {named_paths(dirty)}", gitlinks)
         else:
             self.binding = TreeBinding("ok", tree, "", gitlinks)
         return self.binding
@@ -378,11 +386,11 @@ class BoundTree:
             elif tag == "S" and os.path.lexists(self.top / path):
                 sparse.append(path)
         if unmerged:
-            return f"unmerged entries (resolve the conflict first): {_named(unmerged)}"
+            return f"unmerged entries (resolve the conflict first): {named_paths(unmerged)}"
         if assume:
-            return f"assume-unchanged entries exist on disk, so git cannot see their changes: {_named(assume)}"
+            return f"assume-unchanged entries exist on disk, so git cannot see their changes: {named_paths(assume)}"
         if sparse:
-            return f"skip-worktree entries exist on disk, so git cannot see their changes: {_named(sparse)}"
+            return f"skip-worktree entries exist on disk, so git cannot see their changes: {named_paths(sparse)}"
         return ""
 
     def _dirty_submodule(self, path: str, recorded: str) -> bool:

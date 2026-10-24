@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import fnmatch
 import hashlib
 import itertools
@@ -22,6 +22,7 @@ from urllib.parse import quote
 from aegis_core import gitsafe, governance, pathlookup
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
 
 __all__ = [
@@ -207,10 +208,6 @@ def default_gh_runner(
         proc.stdout.decode("utf-8", "replace"),
         proc.stderr.decode("utf-8", "replace"),
     )
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _parse_codeowners(text: str, *, org_login: Optional[str] = None) -> List[Tuple[str, Tuple[str, ...]]]:
@@ -450,7 +447,7 @@ class TierReport:
     caveats: Tuple[str, ...] = ()
     evidence: Mapping[str, Any] = field(default_factory=dict)
     scope: Mapping[str, Any] = field(default_factory=dict)
-    checked_at: str = field(default_factory=_utc_now)
+    checked_at: str = field(default_factory=utc_stamp)
 
     @property
     def label(self) -> str:
@@ -898,7 +895,7 @@ class Approval(NamedTuple):
             "schema": SCHEMA,
             "source": SOURCE,
             "aegis_version": __version__,
-            "checked_at": _utc_now(),
+            "checked_at": utc_stamp(),
             "scope": {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
@@ -1032,11 +1029,13 @@ _APPROVE_OK = "good signature by a key in the base allowed_signers"
 _FULL_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
+@gitsafe.scrubbed()
 def verify_approval(root: Any, commit: str, governance_hash: str, base_ref: str) -> Approval:
     return _verify_single_trailer(root, commit, base_ref, _APPROVE_LINE, "Aegis-Approve", governance_hash,
                                   _APPROVE_MISMATCH, _APPROVE_OK)
 
 
+@gitsafe.scrubbed()
 def verify_insight_approval(workspace: Any, commit: str, text: str, base_ref: Optional[str] = None) -> Approval:
     if not isinstance(commit, str) or not commit.strip() or not isinstance(text, str) or not text.strip():
         return _no("invalid_input", "commit and insight text must be non-empty", str(commit or ""))
@@ -1052,6 +1051,7 @@ def verify_insight_approval(workspace: Any, commit: str, text: str, base_ref: Op
     )
 
 
+@gitsafe.scrubbed()
 def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base_ref: str) -> Approval:
     """No reason binding: the signature names the fix's full oid, which already commits to its message."""
     try:
@@ -1126,6 +1126,7 @@ def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]
     return status, fingerprint
 
 
+@gitsafe.scrubbed()
 def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional[str] = None) -> Optional[Approval]:
     """The newest valid ``Aegis-Approve`` commit in ``merge-base(base_ref, head)..head`` (at most
     MAX_SCANNED_COMMITS), or None. One ``git log`` reads every message, so only commits that carry an
@@ -1228,6 +1229,7 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
     return None
 
 
+@gitsafe.scrubbed()
 def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
     """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
     trailer names it (so a refusal can say why); else None."""

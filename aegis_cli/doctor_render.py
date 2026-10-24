@@ -10,6 +10,7 @@ import sys
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from aegis_core import human_gate
+from aegis_core.primitives import utc_stamp
 
 if TYPE_CHECKING:
     from aegis_cli.doctor import Registered, _Ctx
@@ -191,7 +192,7 @@ def _payload(diag: _Diagnosis, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "schema": _doc.SCHEMA,
         "source": _doc.SOURCE,
         "aegis_version": _doc._aegis_version(),
-        "checked_at": _doc._utc_now(),
+        "checked_at": utc_stamp(),
         "scope": {"machine": "local", "workspace": str(ctx.root), "workspace_governed": ctx.governed,
                   "hosts": [s.id for s in ctx.selected], "host_selection": ctx.selection},
         "stale": False,
@@ -479,7 +480,7 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
     if use_json:
         print(json.dumps({
             "schema": _doc.SCHEMA, "source": _doc.SOURCE, "aegis_version": _doc._aegis_version(),
-            "checked_at": _doc._utc_now(), "scope": {"machine": "local", "workspace": str(root), "mode": "github"},
+            "checked_at": utc_stamp(), "scope": {"machine": "local", "workspace": str(root), "mode": "github"},
             "stale": False, "unknown": [], "status": status, "human_gate": report.as_dict(), "github": plan,
             "created": result,
         }, indent=2))
@@ -530,7 +531,7 @@ def _run_drivers_only(root: Path, use_json: bool, fix: bool, yes: bool) -> int:
     failed = check["status"] != "pass" or declined or any(r["status"] != "applied" for r in results)
     if use_json:
         payload = {"schema": _doc.SCHEMA, "source": _doc.SOURCE, "aegis_version": _doc._aegis_version(),
-                   "checked_at": _doc._utc_now(),
+                   "checked_at": utc_stamp(),
                    "scope": {"machine": "local", "workspace": str(root), "checks": ["ast_drivers"]},
                    "stale": False, "unknown": [], "checks_ok": check["status"] == "pass",
                    "checks": [{k: v for k, v in check.items() if k != "text"}]}

@@ -26,6 +26,8 @@ import os
 import sys
 from typing import List, NamedTuple, Optional, Union
 
+from aegis_core.primitives import key_within, real_key
+
 __all__ = ["Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "only_skipped", "which"]
 
 PathLike = Union[str, "os.PathLike[str]"]
@@ -77,18 +79,11 @@ def _programs(directory: str, name: str) -> List[str]:
     return found
 
 
-def _key(path: str) -> Optional[str]:
-    try:
-        return os.path.normcase(os.path.realpath(path))
-    except (OSError, ValueError):
-        return None
-
-
 def _inside(entry: str, fence: str) -> bool:
     """Whether ``entry`` (resolved through links) is ``fence`` or below it. An entry
     that cannot be resolved is treated as inside: it is never searched."""
-    key = _key(entry)
-    return key is None or key == fence or key.startswith(fence.rstrip(os.sep) + os.sep)
+    key = real_key(entry)
+    return key is None or key_within(key, fence)
 
 
 def _search(path: Optional[str]) -> List[str]:
@@ -99,7 +94,7 @@ def _fence(outside: Optional[PathLike]) -> Optional[str]:
     if outside is None:
         return None
     # A fence that cannot be resolved still fences its spelling.
-    return _key(os.fspath(outside)) or os.path.normcase(os.path.abspath(os.fspath(outside)))
+    return real_key(os.fspath(outside)) or os.path.normcase(os.path.abspath(os.fspath(outside)))
 
 
 def which(name: str, path: Optional[str] = None, outside: Optional[PathLike] = None) -> Optional[str]:

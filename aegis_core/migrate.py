@@ -76,6 +76,7 @@ import zlib
 
 from aegis_core import gitsafe
 from aegis_core.errors import PathTraversalError, WorkspaceError
+from aegis_core.primitives import is_within
 from aegis_core.rules import is_legacy_key
 from aegis_core.storage import (
     JsonlRead,
@@ -312,12 +313,6 @@ def _set_type(text: str, rule_type: str) -> str:
     return "".join(lines)
 
 
-def _inside(root: Path, path: Path) -> bool:
-    """True if ``path``, with every symlink resolved, stays inside ``root``."""
-    real, base = os.path.realpath(path), os.path.realpath(root)
-    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
-
-
 def _merge_missing(current: Dict[str, Any], changes: Dict[str, Any]) -> None:
     """Add to ``current`` what ``changes`` has and it lacks: a value already in
     ``current`` wins, nested objects merge, and lists gain only the items they lack."""
@@ -540,7 +535,8 @@ def _read_worktree_ledger(label: str, workspace: Path) -> Optional[_WorktreeLedg
     layout = WorkspaceLayout(workspace)
     source = _WorktreeLedger(label, workspace, layout.ledger_file)
     for directory in (layout.aegis_dir, layout.state_dir):
-        if directory.is_symlink() or (os.path.lexists(directory) and not _inside(workspace, directory)):
+        outside = os.path.lexists(directory) and not is_within(directory, workspace, unresolvable=False)
+        if directory.is_symlink() or outside:
             why = "is a symlink" if directory.is_symlink() else "resolves outside the workspace"
             source.problem = ("skipped", directory.as_posix(),
                               f"{why}; its ledger was not read (aegis migrate reads and writes only inside the workspace)")
@@ -771,7 +767,7 @@ def _plan_moves(
         if source.name.lower() == "readme.md" or any(part.startswith(".") for part in source.relative_to(source_dir).parts):
             continue
         rel = result._rel(source)
-        if source.is_symlink() or not _inside(layout.root, source):
+        if source.is_symlink() or not is_within(source, layout.root, unresolvable=False):
             result.skipped.append({"path": rel, "reason": "a symlink or outside the workspace; not followed"})
             continue
         try:
@@ -790,7 +786,7 @@ def _plan_moves(
             continue
         target = layout.rules_dir / RULE_TYPE_DIRS[rule_type] / source.name
         content, _keys = _strip_derived(_set_type(text, rule_type))
-        if not _inside(layout.root, target.parent):
+        if not is_within(target.parent, layout.root, unresolvable=False):
             result.skipped.append({"path": rel, "reason": f"{result._rel(target.parent)} resolves outside the workspace"})
             continue
         sources.append(source)
@@ -847,7 +843,7 @@ def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
         for path in sorted(layout.rules_dir.rglob("*.md")):
             if path.name == "README.md" or path in moving:
                 continue  # a moved rule is stripped on its way
-            if path.is_symlink() or not _inside(layout.root, path):
+            if path.is_symlink() or not is_within(path, layout.root, unresolvable=False):
                 result.skipped.append({"path": result._rel(path), "reason": "a symlink or outside the workspace; not rewritten"})
                 continue
             try:
@@ -1014,7 +1010,7 @@ def plan(root: Any) -> MigrationPlan:
     layout = WorkspaceLayout(Path(os.fspath(root)).resolve())
     result = MigrationPlan(root=layout.root)
     for directory in (layout.aegis_dir, layout.legacy_soma_dir, layout.state_dir):
-        if directory.is_symlink() or not _inside(layout.root, directory):
+        if directory.is_symlink() or not is_within(directory, layout.root, unresolvable=False):
             why = "is a symlink" if directory.is_symlink() else "resolves outside the workspace"
             result.refusal = f"{result._rel(directory)} {why}; aegis migrate reads and writes only inside the workspace"
             return result

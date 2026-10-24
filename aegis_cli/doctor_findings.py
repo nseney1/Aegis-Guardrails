@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from aegis_core.primitives import real_key
+
 if TYPE_CHECKING:
     from aegis_cli.doctor import _Ctx
     from aegis_cli.doctor_repair import _File
@@ -251,26 +253,12 @@ def _registered_roots(ctx: _Ctx) -> Tuple[Optional[set], List[int]]:
     roots, skipped = set(), []
     for index, entry in enumerate(reg.data["workspaces"]):
         raw = entry.get("root") if isinstance(entry, dict) else None
-        key = _root_key(raw) if isinstance(raw, str) and os.path.isabs(raw) else None
+        key = real_key(raw) if isinstance(raw, str) and os.path.isabs(raw) else None
         if key is None:
             skipped.append(index)
         else:
             roots.add(key)
     return roots, skipped
-
-
-def _root_key(root: Any) -> Optional[str]:
-    """``root`` resolved and case-folded for comparison, or None when it cannot be resolved.
-
-    A NUL byte is refused here, not left to realpath: realpath raises on it everywhere
-    except Windows Python 3.12+, where it returns the path as given (gh-106242)."""
-    text = str(root)
-    if "\x00" in text:
-        return None
-    try:
-        return os.path.normcase(os.path.realpath(text))
-    except (OSError, ValueError):
-        return None
 
 
 # ── Host plane: one row per host ────────────────────────────────────────────
@@ -433,7 +421,7 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
     # The host keeps too little of its instruction file for the bootstrap to arrive whole.
     cut = (budget["within"] is False and info.bootstrap != "missing" and spec.id in _doc._TRUNCATES_TAIL
            and (info.block_end or 0) > budget["budget_bytes"])
-    workspace_registered = None if roots is None else _root_key(ctx.root) in roots
+    workspace_registered = None if roots is None else real_key(ctx.root) in roots
     if roots is None:
         unknown.append("workspace_registered")
     if not ctx.governed and ctx.is_home:

@@ -12,6 +12,7 @@ import posixpath
 import re
 import sys
 from aegis_core.match import first_match, is_test_path
+from aegis_core.primitives import is_within, safe_parts
 from aegis_core.workspace.layout import RULES_RELDIR
 from typing import Any, Optional
 
@@ -895,9 +896,9 @@ def _index_entries(repo_root: str) -> dict[str, tuple[str, str]]:
 
 def _snapshot_file(snapshot: str, rel: str) -> str:
     """Where ``rel`` (a repository path) lives in the snapshot; never outside it."""
-    parts = rel.split("/")
-    full = os.path.normpath(os.path.join(snapshot, *parts))
-    if any(part in ("", ".", "..") for part in parts) or not full.startswith(os.path.normpath(snapshot) + os.sep):
+    parts = safe_parts(rel)  # on Windows a ":" would name a drive or a stream
+    full = os.path.normpath(os.path.join(snapshot, *parts)) if parts is not None else ""
+    if parts is None or not is_within(full, snapshot, unresolvable=False):
         from aegis_core import gitsafe
 
         raise gitsafe.GitError(f"refusing the staged path {rel!r}: it leaves the snapshot")

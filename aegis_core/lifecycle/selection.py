@@ -8,12 +8,13 @@ each move is logged to ``.aegis/state/lifecycle.jsonl``.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from aegis_core.fitness import for_rules
+from aegis_core.primitives import utc_stamp
 from aegis_core.rules import load_rules
 from aegis_core.storage import append_jsonl, locked
 from aegis_core.telemetry_engine import ledger
@@ -32,10 +33,6 @@ __all__ = [
 ]
 
 ARCHIVE_DIR = ".archive"
-
-
-def _utc_timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _candidate(wanted: str, rule: Any, fit: Any, now: Optional[datetime]) -> Dict[str, Any]:
@@ -145,7 +142,7 @@ def archive_rule(
         dest = _park(path, archive_dir)
         if audit:
             append_jsonl(ws.layout.lifecycle_log, [{
-                "timestamp": _utc_timestamp(),
+                "timestamp": utc_stamp(),
                 "rule": clean,
                 "action": "moved_to_archive",
             }])
