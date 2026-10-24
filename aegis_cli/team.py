@@ -18,10 +18,10 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from aegis_core import primitives
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
-from aegis_core._version import __version__
 from aegis_core.primitives import utc_stamp
 
 __all__ = ["TeamCommand", "run_team"]
@@ -33,12 +33,7 @@ ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "metrics")
 
 
 def _envelope(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
-    return {
-        "source": f"aegis team {action}",
-        "aegis_version": __version__,
-        "checked_at": utc_stamp(now),
-        "scope": {"workspace": str(root), **scope},
-    }
+    return primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now)
 
 
 def _emit(payload: Dict[str, Any]) -> None:

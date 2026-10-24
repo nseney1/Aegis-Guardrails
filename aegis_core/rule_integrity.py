@@ -6,12 +6,12 @@ import hashlib
 import os
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
+from aegis_core import primitives
 from aegis_core import gitevidence, gitsafe, governance, rule_inventory
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
-from aegis_core.primitives import utc_stamp
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -541,20 +541,15 @@ class CiReport:
         return self.approval is not None and self.approval.valid
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
-        from aegis_core._version import __version__
-
         return {
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": utc_stamp(),
-            "scope": {
+            **primitives.envelope(SOURCE, {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
                 "mode": "ci",
                 "base": self.base,
                 "head": self.head,
                 "merge_base": self.merge_base,
-            },
+            }),
             "schema": SCHEMA,
             "status": "pass" if self.passed else "fail",
             "rules_checked": self.rules_checked,

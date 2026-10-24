@@ -9,8 +9,8 @@ from pathlib import Path
 import sys
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import human_gate
-from aegis_core.primitives import utc_stamp
 
 if TYPE_CHECKING:
     from aegis_cli.doctor import Registered, _Ctx
@@ -189,12 +189,8 @@ def _payload(diag: _Diagnosis, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
     unknown = [f"{r['id']}.{field}" for r in diag.rows for field in r["unknown"]]
     hosts = [{k: v for k, v in row.items() if k != "advisory"} for row in diag.rows]
     return {
-        "schema": _doc.SCHEMA,
-        "source": _doc.SOURCE,
-        "aegis_version": _doc._aegis_version(),
-        "checked_at": utc_stamp(),
-        "scope": {"machine": "local", "workspace": str(ctx.root), "workspace_governed": ctx.governed,
-                  "hosts": [s.id for s in ctx.selected], "host_selection": ctx.selection},
+        **primitives.envelope(_doc.SOURCE, {"machine": "local", "workspace": str(ctx.root), "workspace_governed": ctx.governed,
+                  "hosts": [s.id for s in ctx.selected], "host_selection": ctx.selection}, schema=_doc.SCHEMA),
         "stale": False,
         "unknown": unknown,
         # Only the checks: a run whose hosts are all unregistered can pass them. The hosts'
@@ -479,8 +475,7 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
         print(f"Created ruleset {human_gate.RULESET_NAME!r}. Re-run aegis doctor to see the tier.")
     if use_json:
         print(json.dumps({
-            "schema": _doc.SCHEMA, "source": _doc.SOURCE, "aegis_version": _doc._aegis_version(),
-            "checked_at": utc_stamp(), "scope": {"machine": "local", "workspace": str(root), "mode": "github"},
+            **primitives.envelope(_doc.SOURCE, {"machine": "local", "workspace": str(root), "mode": "github"}, schema=_doc.SCHEMA),
             "stale": False, "unknown": [], "status": status, "human_gate": report.as_dict(), "github": plan,
             "created": result,
         }, indent=2))
@@ -530,9 +525,7 @@ def _run_drivers_only(root: Path, use_json: bool, fix: bool, yes: bool) -> int:
             print(check["text"], end="")
     failed = check["status"] != "pass" or declined or any(r["status"] != "applied" for r in results)
     if use_json:
-        payload = {"schema": _doc.SCHEMA, "source": _doc.SOURCE, "aegis_version": _doc._aegis_version(),
-                   "checked_at": utc_stamp(),
-                   "scope": {"machine": "local", "workspace": str(root), "checks": ["ast_drivers"]},
+        payload = {**primitives.envelope(_doc.SOURCE, {"machine": "local", "workspace": str(root), "checks": ["ast_drivers"]}, schema=_doc.SCHEMA),
                    "stale": False, "unknown": [], "checks_ok": check["status"] == "pass",
                    "checks": [{k: v for k, v in check.items() if k != "text"}]}
         if fix:

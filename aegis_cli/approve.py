@@ -48,9 +48,9 @@ def _stdin_is_tty() -> bool:
 
 
 def _envelope(root: Path, status: str, **fields: Any) -> Dict[str, Any]:
-    from aegis_core import baseline
+    from aegis_core import primitives
 
-    return {"schema": SCHEMA, **baseline.envelope(SOURCE, {"machine": "local", "workspace": str(root)}),
+    return {**primitives.envelope(SOURCE, {"machine": "local", "workspace": str(root)}, schema=SCHEMA),
             "status": status, **fields}
 
 

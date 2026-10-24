@@ -12,7 +12,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 import os
@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from aegis_core import primitives
 from aegis_cli import sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
 from aegis_core.errors import WorkspaceNotFoundError
@@ -468,14 +469,7 @@ def _plural(count: int, noun: str) -> str:
 
 
 def _pack_envelope(action: str, root: Optional[Path], scope: Dict[str, Any]) -> Dict[str, Any]:
-    from aegis_core._version import __version__
-
-    return {
-        "source": f"aegis rule {action}",
-        "aegis_version": __version__,
-        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "scope": {"workspace": str(root) if root is not None else None, **scope},
-    }
+    return primitives.envelope(f"aegis rule {action}", {"workspace": str(root) if root is not None else None, **scope})
 
 
 def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scope: Dict[str, Any],

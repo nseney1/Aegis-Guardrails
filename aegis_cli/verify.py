@@ -28,6 +28,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from aegis_core import primitives
 from aegis_cli.checkpoint import is_blocking, run_checkpoint
 from aegis_cli.formatters.report import (
     format_layer1_json_payload,
@@ -415,7 +416,7 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
 
     def fail(message: str, code: int) -> int:
         if use_json:
-            document = baseline.envelope(source, {"workspace": str(root)})
+            document = primitives.envelope(source, {"workspace": str(root)})
             document.update(status="error", error=message)
             print(json.dumps(document, indent=2))
         else:
@@ -488,7 +489,7 @@ def _run_write_baseline(args: argparse.Namespace, root: str, use_json: bool, sou
         "mode": "write", "entries": len(entries), "added": added, "removed": removed,
         "files_checked": len(targets), "unbaselinable": len(collected.blocked)})
     if use_json:
-        document = baseline.envelope(source, {"workspace": root})
+        document = primitives.envelope(source, {"workspace": root})
         document.update(status="written", path=baseline.BASELINE_FILE, entries=len(entries), added=added,
                         removed=removed, files_checked=len(targets),
                         unbaselinable=_unbaselinable_rows(collected.blocked), warnings=warnings,
@@ -551,7 +552,7 @@ def _run_prune_baseline(args: argparse.Namespace, root: str, use_json: bool, sou
             "mode": "prune", "entries": len(kept), "added": 0, "removed": len(dropped),
             "files_checked": len(targets), "unbaselinable": len(collected.blocked)})
     if use_json:
-        document = baseline.envelope(source, {"workspace": root})
+        document = primitives.envelope(source, {"workspace": root})
         document.update(status="pruned" if dropped else "unchanged", path=baseline.BASELINE_FILE,
                         entries=len(kept), removed=len(dropped), kept=len(kept), not_added=not_added,
                         files_checked=len(targets), warnings=warnings)

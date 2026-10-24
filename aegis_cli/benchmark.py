@@ -14,11 +14,11 @@ document, with ``source``, ``aegis_version``, ``checked_at`` (UTC) and ``scope``
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import sys
 from typing import Any, Dict, List
 
+from aegis_core import primitives
 from aegis_cli import resolve_root, sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import benchmark
@@ -50,12 +50,7 @@ def _runs(value: str) -> int:
 
 
 def _envelope(root: Any, runs: int) -> Dict[str, Any]:
-    return {
-        "source": "aegis benchmark",
-        "aegis_version": __version__,
-        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "scope": {"workspace": str(root), "runs": runs, "corpus": CORPUS_LABEL},
-    }
+    return primitives.envelope("aegis benchmark", {"workspace": str(root), "runs": runs, "corpus": CORPUS_LABEL})
 
 
 def _text(value: object) -> str:

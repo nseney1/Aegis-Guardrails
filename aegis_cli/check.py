@@ -40,6 +40,7 @@ import os
 import re
 import sys
 
+from aegis_core import primitives
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.verify import run_verify
 
@@ -96,7 +97,7 @@ def _run_record(args: argparse.Namespace) -> int:
     outcome = checkrun.record(root, tests=bool(getattr(args, "tests", False)), base=getattr(args, "base", None))
     row = outcome.row or {}
     if use_json:
-        document = baseline.envelope("aegis check --record", {"workspace": str(root), "tree": row.get("tree"),
+        document = primitives.envelope("aegis check --record", {"workspace": str(root), "tree": row.get("tree"),
                                                               "base": row.get("base")})
         document.update(status=outcome.status, witness=row.get("witness"), reason=outcome.reason, check=row or None,
                         tree=outcome.binding.as_dict() if outcome.binding else None)

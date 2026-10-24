@@ -11,9 +11,12 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from aegis_core._version import __version__
+
 __all__ = [
     "DuplicateKeyError",
     "TS_FORMAT",
+    "envelope",
     "is_within",
     "key_within",
     "parse_utc",
@@ -182,3 +185,16 @@ def parse_utc(value: object, *, lenient: bool = False) -> Optional[datetime]:
         return datetime.strptime(value, TS_FORMAT).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def envelope(source: str, scope: Dict[str, Any], *, schema: Optional[str] = None,
+             now: Union[None, int, float, datetime] = None,
+             checked_at: Optional[str] = None) -> Dict[str, Any]:
+    """The machine-readable head, keeping a caller's already captured stamp verbatim."""
+    if now is not None and checked_at is not None:
+        raise TypeError("give now or checked_at, not both")
+    # A stored stamp is not a request to read the clock again or to reinterpret its text.
+    head = {} if schema is None else {"schema": schema}
+    head.update(source=source, aegis_version=__version__,
+                checked_at=utc_stamp(now) if checked_at is None else checked_at, scope=scope)
+    return head

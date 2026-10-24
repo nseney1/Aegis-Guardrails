@@ -80,8 +80,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import events, gitsafe, team
-from aegis_core._version import __version__
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.lane_ast import (
     COLLECTION_KEYS,
@@ -276,10 +276,7 @@ class LaneCheck:
     def as_dict(self) -> Dict[str, Any]:
         """The ``--json`` document."""
         return {
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": self.checked_at,
-            "scope": {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()},
+            **primitives.envelope(SOURCE, {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()}, checked_at=self.checked_at),
             "status": "pass" if self.passed else "fail",
             "label": self.label,
             "provenance": {"paths": self.paths_source, "shared": self.shared_source},
@@ -339,10 +336,7 @@ class LaneCheck:
 def error_report(workspace: Any, lane: str, message: str, now: Optional[int] = None) -> Dict[str, Any]:
     """The ``--json`` document of a gate that could not run."""
     return {
-        "source": SOURCE,
-        "aegis_version": __version__,
-        "checked_at": utc_stamp(now),
-        "scope": {"workspace": str(workspace), "lane": lane},
+        **primitives.envelope(SOURCE, {"workspace": str(workspace), "lane": lane}, now=now),
         "status": "error",
         "error": message,
     }

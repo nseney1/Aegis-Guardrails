@@ -18,12 +18,12 @@ nothing. With --json, stdout carries only the JSON document.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
 
+from aegis_core import primitives
 from aegis_cli import resolve_root, sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import hosts as host_table
@@ -47,12 +47,7 @@ def _text(value: object) -> str:
 
 
 def _envelope(root: Path, out: Any) -> Dict[str, Any]:
-    return {
-        "source": "aegis package",
-        "aegis_version": __version__,
-        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "scope": {"workspace": str(root), "host": HOST, "out": str(out)},
-    }
+    return primitives.envelope("aegis package", {"workspace": str(root), "host": HOST, "out": str(out)})
 
 
 def _host_problem(chosen: Optional[str]) -> Optional[str]:

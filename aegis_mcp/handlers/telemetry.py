@@ -7,7 +7,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 from aegis_core import credit, gitsafe, treeid
-from aegis_core.baseline import envelope
+from aegis_core.primitives import envelope
 from aegis_core.errors import PathTraversalError
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import validate_rule_names

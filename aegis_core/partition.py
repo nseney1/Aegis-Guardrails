@@ -33,6 +33,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import baseline, events
 from aegis_core.errors import AegisError
 from aegis_core.match import matches, normalize_path
@@ -328,7 +329,7 @@ class Report:
         }
 
     def as_dict(self) -> Dict[str, Any]:
-        document = baseline.envelope(SOURCE, {
+        document = primitives.envelope(SOURCE, {
             "workspace": self.workspace,
             "listing": self.listing,
             "lanes": list(self.lanes),

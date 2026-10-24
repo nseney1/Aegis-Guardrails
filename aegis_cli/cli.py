@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from aegis_core import primitives
 from aegis_cli.registry import get_default_registry
 from aegis_core._version import __version__
 from aegis_core.workspace.layout import LEGACY_SOMA_DIRNAME, is_aegis_workspace
@@ -271,16 +272,12 @@ _WORKSPACE_ERROR_EXIT: Dict[str, int] = {"scan": 2}
 def _print_hold(args: argparse.Namespace, exc: Exception) -> None:
     """A workspace hold: machine-readable with --json, one stderr line otherwise."""
     import json
-    from datetime import datetime, timezone
 
     binding = exc.binding.as_dict()  # type: ignore[attr-defined]
     if getattr(args, "json", False):
         print(json.dumps({
             **binding,
-            "source": f"{PROG} {args.command}",
-            "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": {"command": args.command, "workspace": None},
+            **primitives.envelope(f"{PROG} {args.command}", {"command": args.command, "workspace": None}),
         }, indent=2))
     else:
         print(f"Hold ({binding['reason']}): {binding['message']}", file=sys.stderr)
