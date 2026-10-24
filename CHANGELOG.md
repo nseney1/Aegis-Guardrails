@@ -24,6 +24,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`aegis doctor --fix` keeps a host config's permissions** (for example `0600` on `~/.claude.json`) when the file is swapped for a symlink during the fix, and atomic writes set the temporary file's mode through its open descriptor.
 - **`aegis doctor --fix` and Aegis's host-config rewrites never write through a swapped-in symlink.** A file replaced by a symlink after the check is replaced, not followed, and `~/.aegis` and `~/.aegis/backups` are created with mode `0700`.
 
+- **`gh` never inspects the repository.** Every `gh` call runs from an empty temporary directory, never inside the repository; the repository comes from `remote.origin.url` read through gitsafe and is passed as `GH_REPO`, overriding an exported `GH_REPO`. An origin that is not `OWNER/REPO` on a host (a local path, a nested group path, or no origin) makes no repository call: the trust tier is C with "no GitHub repository could be resolved from remote.origin.url", and `aegis sync --pr` refuses before any file moves. Any other host becomes gh's host, as before. `aegis sync --pr` also refuses, before moving any file, when the branch's push remote is not origin and has a different URL, since gh opens the pull request in origin's repository; the refusal names both remotes.
+- `aegis hook install` and `uninstall` no longer write through a link planted at a predictable temporary name, and `link.key` and the insight directories get their modes through a descriptor.
+
 ### Changed behaviour
 
 - **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
@@ -62,6 +65,12 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Aegis-Check trailers that 4.3.x recorded on commits adding calls the security pack flags no longer match a 4.4.0 rerun: re-record the trailer on in-flight pull requests.
 - The pre-tool hook starts one git process per edit instead of two and reads the activity log once on an unscanned edit; its decisions, exit codes, messages and events rows are unchanged.
 
+- `aegis rule insight review` lists each counted insight with its top-3 neighbours, and you group them: decisions name insights with `--insight ID` (repeatable). A snoozed or rejected group returns once two newer insights have one of its members among their top-3 neighbours; propose and merge-into-rule hide the named insights until a later decision names them; a 4.3 decision row is read through its insight ids. `--decision propose` without `--proposal-id` writes `trap-<first 8 hex of the SHA-256 of the sorted ids>`.
+- Insight-to-rule matching and recurrence follow the rule's own `target_paths` and test-file handling, and recurrence weighs an insight against one TF-IDF corpus of every counted insight and the rule. The similarity thresholds (0.15 with a shared path, 0.30 without, 0.12 for recurrence) are named once and documented as hand-set, never measured.
+- The insight hook reads only `prompt`, `session_id` and `cwd` from a JSON object, stores no excerpt for non-JSON input, and loses its `--workspace` flag.
+- `aegis doctor --github` prints one `CODEOWNERS` line per governance pattern (`allowed_signers` and `CODEOWNERS` lines unanchored, so they also own `docs/CODEOWNERS` and nested copies), and a hand-written `CODEOWNERS` must own those too for tier A. The admin reason reads "the gh identity doctor used is an admin: re-run with the token the agent would hold".
+- A ledger row of kind `check_confirm`, `human_label`, `claim` or `transition` counts as one unusable row, and a non-object `fitness` value in `.aegis/config.json` warns.
+
 ### Added
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
@@ -99,6 +108,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis hook uninstall` removes Aegis's prepare-commit-msg hook even when the pre-commit hook is missing, user-owned or refused, and leaves a pre-commit hook that is not UTF-8 unchanged (reported) instead of failing with a codec error.
 - `aegis rule adjudicate` exits 1 and writes nothing for an id that is not a cleanly loading rule (a typo, a case variant, an `.md` name, an archived or broken rule).
 
+- A `CODEOWNERS` that owns the six plural rule directories counts as covered, `docs/CODEOWNERS` is covered by the printed lines, and `exposed_rules` with no session reads the host's own exposures.
+- A signed re-run of `aegis rule insight add` without `--paths` counts the correction once, and supersedes only the one cli insight it restates: another correction with the same text and kind stays in review, can be proposed and counts toward recurrence.
+
 ### Breaking (command line, JSON and MCP)
 
 - Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
@@ -115,6 +127,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: JSON `llm_predictions` rows carry `scope` `{path, symbol}` and `observable` `{kind, selector}` and drop `resolved_at` and `resolving_commit`; an observable that is not such an object is void.
 - Breaking: `aegis rule insight review --category` is removed. A proposal's kind is the one its insights share, or the `--kind` given with `--decision propose`; with neither, `propose` exits 1 and asks for `--kind`.
 - Breaking: `rule insight add --commit` checks the `Aegis-Approve-Insight` hash against the text as typed, so approvals signed over redacted text no longer verify for texts that redaction changed.
+
+- Breaking: `aegis rule insight review --cluster` is removed with no alias; a decision without `--insight` exits 2, and an unknown id exits 1, lists the valid ids and writes no row. `review --json` returns `insights`, `suppressed` and `suggestions` (each insight with `match`, its top-3 `neighbours`, `level`, `kind`, `paths` and `corroborated`); the `clusters`, `suppressed_clusters` and top-level `neighbours` keys and cluster ids are gone.
+- Breaking: `derived.json` and `aegis sync --json` rule entries lose `precision_lo`, `precision_hi` and `decay_factor`, and the `sync --pr` body drops the precision interval.
+- Breaking: the top-level and `fitness` spellings of `half_life_sessions` and `epsilon` in `.aegis/config.json` no longer apply (one warning); use `expiry.half_life_sessions` and `expiry.epsilon`.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -133,9 +149,18 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis_core.verification.arbiter.brier_skill_score`, `score_predictions`, `calibration_summary` and `CalibrationSummary` are removed (use `calibration`); `Prediction` loses `resolved_at` and `resolving_commit`; `perf_check.run_perf_check` loses `command=`.
 - Breaking: `aegis_core.insights.write_proposal` no longer takes `rule_type`, `enforcement`, `category` or `target_paths`; it takes the counted `insight_ids`, plus optional `summary_bullets` and `kind`.
 
+- Breaking: `aegis_core.credit.record_human_label` and `aegis_core.credit.session_exposed_rules` are removed.
+- Breaking: `aegis_core.fitness.wilson_interval` and `wilson_lower_bound` are removed (import them from `aegis_core.stats`, default confidence 95%, not 90%), and `aegis_core.stats.wilson_interval` and `wilson_lower_bound` raise `ValueError` for a confidence outside (0, 1); pass `z=` for a z-score. Also removed: `aegis_core.fitness.compute_silence_credit`, `compute(silence_lr=)`, the re-exports `beta_cdf`, `beta_ppf`, `regularized_incomplete_beta`, `clopper_pearson_interval`, `clopper_pearson_lower` and `clopper_pearson_upper`, the `Fitness` fields `silence_lr`, `precision_lo`, `precision_hi`, `decay_factor`, `prior_share` and `days_span`, and `aegis_core.stats.beta_ppf` and the Clopper-Pearson functions.
+- Breaking: `aegis_core.human_gate.AEGIS_DIRNAME` and `aegis_core.human_gate.RULES_RELDIR` are removed (import them from `aegis_core.workspace.layout`), as are `TierReport.codeowners_complete`, `detect_tier(environ=)` and `KeyCustody.as_dict` (`KeyCustody` is a `NamedTuple`: use `_asdict()`). `aegis_core.release_verify.default_gh` takes only the root.
+- Breaking: `aegis_core.workspace.layout.module_ancestors`, `aegis_core.workspace.layout.resolve_module_file`, `aegis_core.partition.module_ancestors` and `aegis_core.partition.resolve_module_file` are removed.
+- Breaking: `aegis_core.insights.INSIGHT_LEVELS`, `aegis_core.insights.tfidf_cosine`, `aegis_core.insights.MAX_EXCERPT_CHARS` and `aegis_core.insights.fsync_dir` are removed, seven constants leave `aegis_core.insights.__all__`, `record_hook_prompt` takes `(host, payload, *, workspace=None, excerpts=True, home=None)`, and `record_decision(cluster_id=)`, `review_insights(include_suppressed=)` and `measure_recurrence(reset_on_rev_change=)` are gone (`record_decision` needs at least one insight id).
+- Breaking: `aegis_cli.hooks.insights.SUPPORTED_INSIGHT_HOSTS` and `aegis_cli.hooks.insights.insight_hook_status` are removed, with the `aegis_cli.hooks.management` `__getattr__` shim.
+
 ### Corrections
 
 - The 4.3.0 entry for the accountable Layer-2 arbiter advertised deterministic structural SHIP gaps, a vendor-family warning and 60-day prediction compaction. None of that code had a caller; 4.4.0 removes it, and the advisory above replaces the warning.
+- 4.3.0 did not document the decay keys `expiry.half_life_sessions` and `expiry.epsilon`.
+- The 4.3.0 entry said decay runs over heartbeat-alive eligible sessions. Exposure rows carry no heartbeat flag, so every exposed session was eligible; silence earns no credit in 4.4.0.
 
 ## [4.3.4] - 2026-10-20
 

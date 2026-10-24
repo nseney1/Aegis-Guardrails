@@ -38,9 +38,11 @@ from __future__ import annotations
 from typing import Iterable, List, Optional, Tuple
 
 from aegis_core import match
+from aegis_core.taxonomy import RULE_TYPE_DIRS
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
-__all__ = ["CATEGORIES", "DELETED_TESTS", "RUNNER_MODULES", "category_of", "touches_governance"]
+__all__ = ["CATEGORIES", "DELETED_TESTS", "RUNNER_MODULES", "category_of", "codeowners_lines", "coverage_samples",
+           "touches_governance"]
 
 #: What ``python -m pytest`` imports first from the snapshot root (first on sys.path), so a root
 #: module or package of one of these names replaces the runner. A package counts by any
@@ -108,3 +110,33 @@ def touches_governance(paths: Iterable[str], deleted: Iterable[str] = ()) -> Lis
             found.add(category)
     order = [name for name, _patterns in CATEGORIES] + [DELETED_TESTS]
     return [name for name in order if name in found]
+
+
+def coverage_samples() -> Tuple[str, ...]:
+    """One concrete path per pattern of CATEGORIES, for checking that a CODEOWNERS owns the set:
+    ``<dir>/**`` gives ``<dir>/x`` and any other ``*`` an ``x``; a leading ``**/`` gives the top-level
+    path and the same path in a workspace below it (``svc/``). The rules pattern gives one path per
+    rule-type directory, so six per-directory owners count as well as one ``.aegis/rules/`` owner."""
+    samples: List[str] = []
+    for _name, patterns in CATEGORIES:
+        for pattern in patterns:
+            core = pattern[3:] if pattern.startswith("**/") else pattern
+            if core == f"{RULES_RELDIR}/**":
+                paths = [f"{RULES_RELDIR}/{directory}/x" for directory in RULE_TYPE_DIRS.values()]
+            else:
+                paths = [(core[:-3] + "/x" if core.endswith("/**") else core).replace("*", "x")]
+            samples += paths + ([f"svc/{p}" for p in paths] if core != pattern else [])
+    return tuple(dict.fromkeys(samples))
+
+
+def codeowners_lines(owner: str = "@OWNER") -> List[str]:
+    """CODEOWNERS lines owning every pattern of CATEGORIES, in its order: a pattern with a ``/`` is
+    anchored at the root unless it starts with ``**/`` (any depth, as on GitHub), ``<dir>/**`` is
+    written ``<dir>/``, and a basename pattern stays unanchored, so ``CODEOWNERS`` and
+    ``allowed_signers`` are owned at every depth and in every location GitHub reads."""
+    lines = []
+    for _name, patterns in CATEGORIES:
+        for pattern in patterns:
+            line = pattern[:-2] if pattern.endswith("/**") else pattern
+            lines.append(f"{'/' if '/' in line and not line.startswith('**/') else ''}{line} {owner}")
+    return lines

@@ -1164,13 +1164,25 @@
  "removed": [
   "aegis_cli.approve.datetime",
   "aegis_cli.approve.timezone",
+  "aegis_cli.hooks.insights.SUPPORTED_INSIGHT_HOSTS",
+  "aegis_cli.hooks.insights.insight_hook_status",
   "aegis_cli.hooks.redaction.HOOK_REDACTION_PATTERNS",
   "aegis_cli.hooks.redaction.redact_payload",
   "aegis_cli.verify.verdict_to_exit_code",
+  "aegis_core.credit.record_human_label",
+  "aegis_core.credit.session_exposed_rules",
+  "aegis_core.human_gate.AEGIS_DIRNAME",
+  "aegis_core.human_gate.RULES_RELDIR",
   "aegis_core.human_gate.workflow_contexts",
+  "aegis_core.insights.INSIGHT_LEVELS",
+  "aegis_core.insights.MAX_EXCERPT_CHARS",
   "aegis_core.insights.enable_host_hook",
+  "aegis_core.insights.fsync_dir",
   "aegis_core.insights.redact_secrets",
   "aegis_core.insights.shannon_entropy",
+  "aegis_core.insights.tfidf_cosine",
+  "aegis_core.partition.module_ancestors",
+  "aegis_core.partition.resolve_module_file",
   "aegis_core.regression.UserLayout",
   "aegis_core.regression.VALID_TIERS",
   "aegis_core.rule_integrity.Path",
@@ -1180,6 +1192,8 @@
   "aegis_core.verification.scanners.redact_hook_text",
   "aegis_core.verification.scanners.redact_payload",
   "aegis_core.verification.scanners.redact_secrets",
-  "aegis_core.verification.scanners.run_preset_scanner"
+  "aegis_core.verification.scanners.run_preset_scanner",
+  "aegis_core.workspace.layout.module_ancestors",
+  "aegis_core.workspace.layout.resolve_module_file"
  ]
 }

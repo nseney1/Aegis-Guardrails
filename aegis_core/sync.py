@@ -48,12 +48,10 @@ def build(
             "triggers": fit.triggers, "tp": fit.tp, "fp": fit.fp, "last_ts": fit.last_ts,
             "suggestion": suggest(rule, fit, now), "state": fit.state,
             "evidence_available": fit.evidence_available,
-            "effective_weight": fit.effective_weight, "decay_factor": fit.decay_factor,
-            "eligible_sessions": fit.eligible_sessions, "contested": fit.contested,
-            "override_rate": fit.override_rate, "flagged_for_review": fit.flagged_for_review,
+            "effective_weight": fit.effective_weight, "eligible_sessions": fit.eligible_sessions,
+            "contested": fit.contested, "override_rate": fit.override_rate, "flagged_for_review": fit.flagged_for_review,
             "archive_candidate": fit.archive_candidate, "caught": fit.caught, "leaked": fit.leaked,
-            "adjudicated_n": fit.adjudicated_n, "precision_lo": fit.precision_lo,
-            "precision_hi": fit.precision_hi, "sessions_count": fit.sessions_count,
+            "adjudicated_n": fit.adjudicated_n, "sessions_count": fit.sessions_count,
             "repos_count": fit.repos_count, "n": fit.adjudicated_n or int(fit.verdicts),
             "p_below_demote": fit.p_below_demote,
             # Kept empty for an N-1 reader until v4.5: nothing samples labelled rows any more (R-evidence-14).
@@ -149,8 +147,7 @@ def _number_line(e: Mapping[str, Any]) -> List[str]:
     if e.get("reported_score") is not None:
         lines.append(f"- **Score**: {e['reported_score']:.2f}")
     if e.get("state") in ("decided", "inconclusive"):
-        lines.append(f"- **P(precision < 0.7)**: {e.get('p_below_demote', 0.0):.2f}; precision 90% interval "
-                     f"[{e.get('precision_lo', 0.0):.2f}, {e.get('precision_hi', 1.0):.2f}]")
+        lines.append(f"- **P(precision < 0.7)**: {e.get('p_below_demote', 0.0):.2f}")
     return lines
 
 
@@ -420,6 +417,15 @@ def _pr_plan(root: Path) -> Dict[str, Any]:
             "tree": tree, "crlf": crlf, "files": work}
 
 
+def _remote_url(top: Path, name: str) -> Optional[str]:
+    """``remote.<name>.url`` as resolve_repo reads origin's (no insteadOf), or None. Only an equal
+    URL is known to name origin's repository: the URL is never parsed here, nor shown (it may hold a token)."""
+    from aegis_core import gitsafe
+
+    res = gitsafe.run(["config", "--get", f"remote.{name}.url"], top)
+    return (os.fsdecode(res.stdout.strip()) or None) if res.returncode == 0 else None
+
+
 def _restore(root: Path, before: Dict[str, bytes]) -> None:
     """Put .aegis/rules and .aegis/adjudications back to ``before``, byte for byte."""
     for rel, data in _files(root).items():
@@ -505,7 +511,7 @@ def sync(
 
     ``pr`` never moves a rule in the work tree: the moves and the examples to label go to a new
     ``aegis/lifecycle-*`` branch that is pushed and proposed; nothing is ever merged."""
-    from aegis_core import credit, gitsafe
+    from aegis_core import credit, gitsafe, human_gate
     from aegis_core.fitness import ReplayReport, replay_detector_history_report
     ws = literal_workspace(workspace)
     root = Path(ws.root)
@@ -541,6 +547,17 @@ def sync(
         elif pr and pending:
             try:
                 plan = _pr_plan(root)
+                # The default runner needs GH_REPO from origin (R-cli-28); an injected one names its own.
+                if gh_runner is None:
+                    repo = human_gate.resolve_repo(plan["top"])
+                    if repo is None:
+                        raise _Refused("origin is not a GitHub repository, so gh cannot open the pull request")
+                    # The push goes to the branch's own remote: the PR's head must land in GH_REPO.
+                    if plan["remote"] != "origin" and (
+                            _remote_url(plan["top"], plan["remote"]) != _remote_url(plan["top"], "origin")):
+                        raise _Refused(f"the branch would be pushed to {plan['remote']}, but gh opens the pull request "
+                                       f"in origin's repository ({repo}); set branch.{plan['protected']}.remote to "
+                                       "origin or push the branch yourself")
             except (_Refused, gitsafe.GitError, OSError) as exc:
                 refused = f"no pull request opened: {exc}"
             else:

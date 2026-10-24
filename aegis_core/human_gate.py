@@ -23,7 +23,6 @@ from aegis_core import gitsafe, governance, pathlookup
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
 from aegis_core.storage import atomic_write_bytes
-from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
 __all__ = [
     "ALLOWED_SIGNERS",
@@ -55,6 +54,7 @@ __all__ = [
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
+    "resolve_repo",
     "ruleset_exists",
     "signed_empty_commit",
     "signers_setup",
@@ -86,36 +86,8 @@ _STATEMENTS = {
     "B": "governance changes need a signature from a key listed in allowed_signers on the base branch",
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
-COVERAGE_SAMPLES: Tuple[str, ...] = (
-    f"{RULES_RELDIR}/trap/sample.md",
-    f"{AEGIS_DIRNAME}/config.json",
-    f"{AEGIS_DIRNAME}/team.json",
-    f"{AEGIS_DIRNAME}/baseline.json",
-    f"{AEGIS_DIRNAME}/adjudications/r.jsonl",
-    f"svc/{RULES_RELDIR}/gates/x.md",
-    f"svc/{AEGIS_DIRNAME}/adjudications/r.jsonl",
-    f"svc/{AEGIS_DIRNAME}/config.json",
-    f"svc/{AEGIS_DIRNAME}/team.json",
-    f"svc/{AEGIS_DIRNAME}/baseline.json",
-    "allowed_signers",
-    ".github/workflows/ci.yml",
-    "conftest.py",
-    "pytest.ini",
-    ".pytest.ini",
-    "pytest.toml",
-    ".pytest.toml",
-    "tox.ini",
-    "setup.cfg",
-    "pyproject.toml",
-    "sitecustomize.py",
-    "evil.pth",
-    "Makefile",
-    *(f"{name}.py" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__init__.py" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__init__.pyc" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__main__.py" for name in governance.RUNNER_MODULES),
-)
 _CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+COVERAGE_SAMPLES: Tuple[str, ...] = tuple(dict.fromkeys(governance.coverage_samples() + _CODEOWNERS_LOCATIONS))
 _OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")
 _MAX_CODEOWNERS_LINES = 5000
 _MAX_PATTERN = 300
@@ -157,6 +129,32 @@ class GhResult(NamedTuple):
 
 
 GhRunner = Callable[..., Optional[GhResult]]
+# scheme://[userinfo@]host[:port]/path and scp-style [user@]host:path. A port is dropped only where it
+# is the git transport's (ssh, git); an http(s) port names another API endpoint than gh's host.
+_URL_REMOTE = re.compile(r"\A(?P<scheme>https?|ssh|git)://(?:[^/@]*@)?(?P<host>[A-Za-z0-9.-]+)(?::(?P<port>\d+))?/(?P<path>.*)\Z")
+_SCP_REMOTE = re.compile(r"\A(?:[^/@:]+@)?(?P<host>[A-Za-z0-9-][A-Za-z0-9.-]+):(?P<path>[^/].*)\Z")
+_REPO_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_NO_REPO = "no GitHub repository could be resolved from remote.origin.url"
+
+
+def resolve_repo(root: Any) -> Optional[str]:
+    """``owner/repo`` (github.com) or ``host/owner/repo`` (gh's ``[HOST/]OWNER/REPO``) of
+    ``remote.origin.url`` read through gitsafe; None for a path remote, a subgroup, no origin or a git
+    that cannot answer. Userinfo (a token) never reaches the result."""
+    try:
+        res = gitsafe.run(["config", "--get", "remote.origin.url"], Path(root))
+    except gitsafe.GitError:
+        return None
+    url = os.fsdecode(res.stdout).strip() if res.returncode == 0 else ""
+    found = _URL_REMOTE.match(url) or _SCP_REMOTE.match(url)
+    if found is None or (found.re is _URL_REMOTE and found["port"] and found["scheme"].startswith("http")):
+        return None
+    path = found["path"][:-1] if found["path"].endswith("/") else found["path"]
+    parts = (path[:-4] if path.endswith(".git") else path).split("/")
+    if len(parts) != 2 or not all(_REPO_SEGMENT.fullmatch(p) and p.strip(".") for p in parts):
+        return None
+    host = found["host"].lower()
+    return "/".join(parts) if host == "github.com" else "/".join((host, *parts))
 
 
 def default_gh_runner(
@@ -165,14 +163,27 @@ def default_gh_runner(
     cwd: Any = None,
     timeout: float = GH_TIMEOUT_SECONDS,
 ) -> Optional[GhResult]:
+    """Run gh for the repository at ``cwd``. gh never runs inside it: resolving ``{owner}/{repo}``
+    there would start git under the repository's own config, outside gitsafe. It runs in an empty
+    directory below a git ceiling, with the repository passed as ``GH_REPO``."""
     exe = pathlookup.which("gh", outside=cwd)
     if exe is None:
         return None
+    repo = resolve_repo(cwd) if cwd is not None else None
+    if repo is None and any("{owner}" in arg or "{repo}" in arg for arg in argv):
+        return GhResult(125, "", _NO_REPO)
+    try:
+        scratch = tempfile.mkdtemp(prefix="aegis-gh-")
+    except OSError as exc:
+        return GhResult(126, "", f"cannot run gh: {exc}")
+    ceilings = dict.fromkeys((os.path.dirname(scratch), os.path.dirname(os.path.realpath(scratch))))
     env = {
         **os.environ,
         "GH_PROMPT_DISABLED": "1",
         "GH_NO_UPDATE_NOTIFIER": "1",
         "NO_COLOR": "1",
+        "GIT_CEILING_DIRECTORIES": os.pathsep.join(ceilings),
+        **({"GH_REPO": repo} if repo is not None else {}),
     }
     try:
         proc = subprocess.run(
@@ -181,7 +192,7 @@ def default_gh_runner(
             stdin=None if stdin is not None else subprocess.DEVNULL,
             capture_output=True,
             env=env,
-            cwd=None if cwd is None else str(cwd),
+            cwd=scratch,
             timeout=timeout,
             check=False,
         )
@@ -189,14 +200,13 @@ def default_gh_runner(
         return GhResult(124, "", f"gh timed out after {timeout:g}s")
     except OSError as exc:
         return GhResult(126, "", f"cannot run gh: {exc}")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     return GhResult(
         proc.returncode,
         proc.stdout.decode("utf-8", "replace"),
         proc.stderr.decode("utf-8", "replace"),
     )
-
-
-_real_default_gh_runner = default_gh_runner
 
 
 def _utc_now() -> str:
@@ -242,18 +252,14 @@ def _prefix_ends(segments: List[str], parts: List[str], start: int) -> List[int]
         if seg == "**":
             for end in range(pi, len(parts) + 1):
                 reach.add((si + 1, end))
-        elif pi < len(parts) and _segment_match(seg.replace("**", "*"), parts[pi]):
+        elif pi < len(parts) and _segment_match(seg, parts[pi]):
             reach.add((si + 1, pi + 1))
     return sorted(ends)
 
 
 def _codeowners_match(pattern: str, path: str) -> bool:
-    if (
-        not pattern
-        or len(pattern) > _MAX_PATTERN
-        or pattern[0] == "!"
-        or any(c in pattern for c in "[]\\")
-    ):
+    # A bracket or a backslash never gets here: codeowners_coverage reads such a file as unsupported.
+    if not pattern or len(pattern) > _MAX_PATTERN or pattern[0] == "!":
         return False
     directory = pattern.endswith("/")
     core = pattern.strip("/")
@@ -304,55 +310,14 @@ def codeowners_coverage(
     return covered, uncovered
 
 
-def codeowners_lines(owner: str = "@OWNER") -> List[str]:
-    paths = [
-        f"/{RULES_RELDIR}/",
-        f"/{AEGIS_DIRNAME}/config.json",
-        f"/{AEGIS_DIRNAME}/team.json",
-        f"/{AEGIS_DIRNAME}/baseline.json",
-        f"/{AEGIS_DIRNAME}/adjudications/",
-        # A workspace below the root has its own .aegis; a leading **/ matches at any depth
-        # (the root included) both here and on GitHub.
-        f"**/{RULES_RELDIR}/",
-        f"**/{AEGIS_DIRNAME}/adjudications/",
-        f"**/{AEGIS_DIRNAME}/config.json",
-        f"**/{AEGIS_DIRNAME}/team.json",
-        f"**/{AEGIS_DIRNAME}/baseline.json",
-        "/allowed_signers",
-        "/CODEOWNERS",
-        "/.github/CODEOWNERS",
-        "/.github/workflows/",
-        "conftest.py",
-        "pytest.ini",
-        ".pytest.ini",
-        "pytest.toml",
-        ".pytest.toml",
-        "tox.ini",
-        "setup.cfg",
-        "pyproject.toml",
-        "sitecustomize.py",
-        "*.pth",
-        "Makefile",
-        *(f"{name}.*" for name in governance.RUNNER_MODULES),
-        *(f"/{name}/" for name in governance.RUNNER_MODULES),
-    ]
-    return [f"{path} {owner}" for path in paths]
+codeowners_lines = governance.codeowners_lines
 
 
-@dataclass(frozen=True)
-class KeyCustody:
+class KeyCustody(NamedTuple):
     status: str
     detail: str
     degrades: bool
     key: Optional[str] = None
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "status": self.status,
-            "detail": self.detail,
-            "degrades": self.degrades,
-            "key": self.key,
-        }
 
 
 def _user_config(root: Path, key: str) -> Optional[str]:
@@ -495,14 +460,6 @@ class TierReport:
     def statement(self) -> str:
         return _STATEMENTS[self.tier]
 
-    @property
-    def codeowners_complete(self) -> bool:
-        return bool(
-            isinstance(self.evidence.get("codeowners"), Mapping)
-            and self.evidence["codeowners"].get("present")
-            and not self.evidence["codeowners"].get("uncovered")
-        )
-
     def text_lines(self) -> List[str]:
         return [
             f"Trust tier (human_gate): {self.tier} ({self.label}): {self.statement}",
@@ -597,11 +554,41 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     }
 
 
-def detect_tier(
-    root: Any,
-    gh: Optional[GhRunner] = None,
-    environ: Optional[Mapping[str, str]] = None,
-) -> TierReport:
+# Spec 2.2's tier requirements, one row each: (key, the tiers it blocks, unmet when, why). Reasons keep
+# this order; a row for both tiers is one reason, listed once in tier C.
+_TIER_REQUIREMENTS: Tuple[Tuple[str, str, Callable[[Mapping[str, Any]], Any], Any], ...] = (
+    ("ruleset", "AB", lambda n: n["rules"] is None, "the default branch's ruleset was not read"),
+    ("review", "A", lambda n: n["rules"] is not None and n["rules"]["required_approving_review_count"] < 1,
+     "the default branch does not require an approving review"),
+    ("code-owners", "A", lambda n: n["rules"] is not None and not n["rules"]["require_code_owner_review"],
+     "the default branch does not require code-owner review"),
+    ("stale", "A", lambda n: n["rules"] is not None and not n["rules"]["dismiss_stale_reviews_on_push"],
+     "the default branch keeps an approval after new commits are pushed, so a pull request can change after its "
+     "review and still merge (set dismiss_stale_reviews_on_push)"),
+    ("checks", "AB", lambda n: n["rules"] is not None and not n["checks"],
+     "the default branch has no required status checks"),
+    ("unpinned", "B", lambda n: n["unpinned"], lambda n: n["unpinned"]),
+    ("aegis-job", "AB", lambda n: n["workflow"], lambda n: n["workflow"]),
+    ("codeowners", "A", lambda n: not n["codeowners"]["present"], "no CODEOWNERS file on the base branch"),
+    ("uncovered", "A", lambda n: n["codeowners"]["present"] and n["codeowners"]["uncovered"],
+     lambda n: f"CODEOWNERS leaves {len(n['codeowners']['uncovered'])} governance path(s) without an owner"),
+    ("bare-org", "A", lambda n: n["bare_org"],
+     lambda n: f"CODEOWNERS names @{n['org']}, the organization that owns this repository, which GitHub ignores as a "
+               f"code owner: name a team (@{n['org']}/<team>) or people"),
+    ("admin", "A", lambda n: n["admin"] is True,
+     "the gh identity doctor used is an admin: re-run with the token the agent would hold"),
+    ("admin-unknown", "A", lambda n: n["admin"] is None, "whether the gh identity is an admin is unknown"),
+    ("signers", "B", lambda n: n["signers"]["keys"] < 1, f"{ALLOWED_SIGNERS} on the base branch lists no signing key"),
+    ("custody", "B", lambda n: n["custody"].degrades, lambda n: n["custody"].detail),
+)
+
+
+def _unmet(tier: str, need: Mapping[str, Any]) -> List[str]:
+    return [why if isinstance(why, str) else why(need)
+            for _key, tiers, unmet, why in _TIER_REQUIREMENTS if tier in tiers and unmet(need)]
+
+
+def detect_tier(root: Any, gh: Optional[GhRunner] = None) -> TierReport:
     root = Path(root)
     runner: GhRunner = gh if gh is not None else default_gh_runner
     top = gitsafe.toplevel(root)
@@ -704,56 +691,13 @@ def detect_tier(
     evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs),
                                 "path_filtered": sorted(j for j, why in aegis_jobs.items() if why == _PATH_FILTER_WHY)}
     custody = check_key_custody(top)
-    evidence["key_custody"] = custody.as_dict()
+    evidence["key_custody"] = custody._asdict()
 
-    checks = facts["required_status_checks"] if facts else []
     unpinned_why, workflow_why = _required_check_gaps(facts, aegis_jobs)
-    a_missing: List[str] = []
-    if facts is None:
-        a_missing.append("the default branch's ruleset was not read")
-    else:
-        if facts["required_approving_review_count"] < 1:
-            a_missing.append("the default branch does not require an approving review")
-        if not facts["require_code_owner_review"]:
-            a_missing.append("the default branch does not require code-owner review")
-        if not facts["dismiss_stale_reviews_on_push"]:
-            a_missing.append(
-                "the default branch keeps an approval after new commits are pushed, so a pull request can change "
-                "after its review and still merge (set dismiss_stale_reviews_on_push)"
-            )
-        if not checks:
-            a_missing.append("the default branch has no required status checks")
-        elif workflow_why:
-            a_missing.append(workflow_why)
-    if not codeowners["present"]:
-        a_missing.append("no CODEOWNERS file on the base branch")
-    elif codeowners["uncovered"]:
-        a_missing.append(f"CODEOWNERS leaves {len(codeowners['uncovered'])} governance path(s) without an owner")
-    if bare_org:
-        a_missing.append(
-            f"CODEOWNERS names @{org_login}, the organization that owns this repository, which GitHub ignores as a "
-            f"code owner: name a team (@{org_login}/<team>) or people"
-        )
-    if admin is True:
-        a_missing.append(
-            "the gh identity doctor used is a repository admin, who can edit the ruleset (an agent needs its own non-admin identity)"
-        )
-    elif admin is None:
-        a_missing.append("whether the gh identity is an admin is unknown")
-
-    b_missing: List[str] = []
-    if facts is None:
-        b_missing.append("the default branch's ruleset was not read")
-    elif not checks:
-        b_missing.append("the default branch has no required status checks")
-    elif unpinned_why:
-        b_missing.append(unpinned_why)
-    if workflow_why:
-        b_missing.append(workflow_why)
-    if signers["keys"] < 1:
-        b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
-    if custody.degrades:
-        b_missing.append(custody.detail)
+    need = {"rules": facts, "checks": facts["required_status_checks"] if facts else [], "unpinned": unpinned_why,
+            "workflow": workflow_why, "codeowners": codeowners, "bare_org": bare_org, "org": org_login, "admin": admin,
+            "signers": signers, "custody": custody}
+    a_missing, b_missing = _unmet("A", need), _unmet("B", need)
 
     if not a_missing:
         tier = "A"

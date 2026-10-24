@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import os
-import math
 from pathlib import Path
 
 import pytest
 
-from aegis_core import credit, fitness
+from aegis_core import credit, fitness, stats
 from aegis_core.ast.policy import (
     evaluate_forbid_ast_structured,
     extract_normalized_ast,
@@ -66,34 +65,17 @@ def _write_rule(
     return path
 
 
-def test_beta_cdf_ppf_and_clopper_pearson_bounds() -> None:
-    # Uniform Beta(1, 1) has CDF(x) == x and PPF(p) == p.
+def test_beta_cdf_bounds() -> None:
+    # Uniform Beta(1, 1) has CDF(x) == x.
     for x in (0.1, 0.25, 0.5, 0.75, 0.9):
-        assert fitness.beta_cdf(x, 1.0, 1.0) == pytest.approx(x, abs=1e-6)
-        assert fitness.beta_ppf(x, 1.0, 1.0) == pytest.approx(x, abs=1e-5)
+        assert stats.beta_cdf(x, 1.0, 1.0) == pytest.approx(x, abs=1e-6)
 
     # Boundary conditions.
-    assert fitness.beta_cdf(0.0, 2.0, 3.0) == 0.0
-    assert fitness.beta_cdf(1.0, 2.0, 3.0) == 1.0
-    assert fitness.beta_ppf(0.0, 2.0, 3.0) == 0.0
-    assert fitness.beta_ppf(1.0, 2.0, 3.0) == 1.0
-
-    # Clopper-Pearson 90% CI for 25/25 TP: lower bound >= 0.88, upper == 1.0.
-    lo_25, hi_25 = fitness.clopper_pearson_interval(25.0, 0.0, 0.90)
-    assert lo_25 >= 0.88
-    assert hi_25 == 1.0
-
-    # Clopper-Pearson 90% CI for 42 TP, 1 FP: lower bound >= 0.90.
-    lo_42, hi_42 = fitness.clopper_pearson_interval(42.0, 1.0, 0.90)
-    assert lo_42 >= 0.90
-    assert hi_42 <= 1.0
-
-    # Clopper-Pearson 90% CI for 2 TP, 8 FP (n=10): upper bound < 0.65.
-    lo_bad, hi_bad = fitness.clopper_pearson_interval(2.0, 8.0, 0.90)
-    assert 0.0 < lo_bad < hi_bad < 0.65
+    assert stats.beta_cdf(0.0, 2.0, 3.0) == 0.0
+    assert stats.beta_cdf(1.0, 2.0, 3.0) == 1.0
 
 
-def test_cap_prior_mde_silence_credit_and_session_decay() -> None:
+def test_cap_prior_mde_and_session_decay() -> None:
     # Prior mass <= 10 is preserved unchanged.
     assert fitness.cap_prior(4.0, 2.0) == (4.0, 2.0)
     # Prior mass > 10 is scaled down proportionally so alpha + beta == 10.
@@ -108,19 +90,6 @@ def test_cap_prior_mde_silence_credit_and_session_decay() -> None:
     mde_frequent = fitness.compute_mde_180d(1.0)
     assert mde_rare > fitness.MDE_UNTESTABLE_THRESHOLD
     assert mde_frequent < 0.25
-
-    # Silence credit LR = exp(c * RRR) gated by heartbeat and scope_basis.
-    assert fitness.compute_silence_credit(0.8, c=0.1, heartbeat_alive=True) == pytest.approx(
-        math.exp(0.08)
-    )
-    assert fitness.compute_silence_credit(0.8, c=0.1, heartbeat_alive=False) == 1.0
-    assert (
-        fitness.compute_silence_credit(
-            0.8, c=0.1, heartbeat_alive=True, scope_basis="fallback_unscoped"
-        )
-        == 1.0
-    )
-    assert fitness.compute_silence_credit(0.0, c=0.1, heartbeat_alive=True) == 1.0
 
     # Session decay factor w = 2 ** (-delta / H).
     assert fitness.session_decay_factor(0, 20.0) == 1.0

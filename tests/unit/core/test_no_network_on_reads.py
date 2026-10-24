@@ -167,7 +167,7 @@ def test_read_surfaces_make_no_gh_call_through_the_runner(tmp_path, monkeypatch,
 
 @needs_git
 @pytest.mark.skipif(os.name == "nt", reason="the fake gh is a shebang script")
-def test_read_surfaces_exec_no_gh_found_on_path(tmp_path, monkeypatch, capsys):
+def test_read_surfaces_exec_no_gh_found_on_path(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo, _commit = _project(tmp_path, monkeypatch)
     marker = tmp_path / "gh-calls.log"
     bindir = tmp_path / "fakebin"
@@ -176,7 +176,6 @@ def test_read_surfaces_exec_no_gh_found_on_path(tmp_path, monkeypatch, capsys):
     fake.write_bytes(f'#!/bin/sh\necho "$@" >> "{marker}"\nexit 1\n'.encode("utf-8"))
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
-    monkeypatch.setattr(human_gate, "default_gh_runner", human_gate._real_default_gh_runner)
     for name, run in _surfaces(repo.root, capsys).items():
         _fresh_process()
         run()

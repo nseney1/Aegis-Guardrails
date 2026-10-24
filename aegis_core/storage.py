@@ -33,6 +33,8 @@ concurrency guarantees live in one place:
   target, fsync it, then replace. An existing file keeps its mode; a new file gets
   the mode the umask gives (0o644 typically), not mkstemp's 0o600; ``mode`` sets it
   exactly (a private copy stays private).
+- ``create_private_file``: a new 0o600 file, created exclusively and never through a link
+  (a key file); False when the file already exists.
 - ``append_jsonl``: one ``O_APPEND`` write and one fsync, never through a symlink. A
   torn trailing line left by a crash is terminated first, so it cannot swallow the
   new row.
@@ -83,6 +85,7 @@ __all__ = [
     "atomic_write_and_unlink",
     "atomic_write_bytes",
     "atomic_write_text",
+    "create_private_file",
     "file_lock",
     "fsync_dir",
     "ledger_locked",
@@ -801,6 +804,33 @@ def _write_all(fd: int, data: bytes) -> None:
     while view:
         written = os.write(fd, view)
         view = view[written:]
+
+
+def create_private_file(path: Path | str, data: bytes) -> bool:
+    """Create ``path`` holding ``data``, mode 0o600 whatever the umask, and fsync it; False
+    when a regular file is already there (it is left as it is).
+
+    PathTraversalError for a symlink (dangling or not, or swapped in before the open) and for
+    anything but a regular file. A file this call created is removed again if the write fails.
+    """
+    target = Path(path)
+    try:
+        fd = _open_regular(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _PRIVATE_FILE_MODE)
+    except FileExistsError:
+        return False
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    fsync_dir(target.parent)
+    return True
 
 
 def _resolve_directory(path: Path | str) -> Path:

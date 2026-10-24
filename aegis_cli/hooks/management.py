@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 from aegis_core import command_safety
+from aegis_core.storage import atomic_write_bytes
 
 _AEGIS_HOOK_START = "# >>> aegis pre-commit >>>"
 _AEGIS_HOOK_END = "# <<< aegis pre-commit <<<"
@@ -262,25 +263,9 @@ def install_hook(
         hook_file.unlink()
 
     git_hooks_dir.mkdir(parents=True, exist_ok=True)
-    tmp_file = target_file.parent / f".pre-commit.tmp.{os.getpid()}"
-    try:
-        tmp_file.write_bytes(payload)
-        if os.name != "nt":
-            tmp_file.chmod(0o755)
-        tmp_file.replace(target_file)
-    finally:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except OSError:
-                pass
-
-    if os.name != "nt" and target_file.exists():
-        try:
-            target_file.chmod(target_file.stat().st_mode | 0o755)
-        except OSError:
-            pass
-
+    # An exclusive temporary file whose mode is set through its descriptor, then a rename: a
+    # link planted at a temporary name is never written through.
+    atomic_write_bytes(target_file, payload, mode=0o755 if os.name != "nt" else None)
     return True
 
 
@@ -383,18 +368,7 @@ def uninstall_hook(
         return True
 
     remaining = remaining.replace("\r\n", "\n")
-    tmp_file = target_file.parent / f".pre-commit.tmp.{os.getpid()}"
-    try:
-        tmp_file.write_bytes(remaining.encode("utf-8"))
-        if os.name != "nt":
-            tmp_file.chmod(target_file.stat().st_mode)
-        tmp_file.replace(target_file)
-    finally:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except OSError:
-                pass
+    atomic_write_bytes(target_file, remaining.encode("utf-8"))  # keeps the hook's mode
     return True
 
 
@@ -763,12 +737,3 @@ def run_hook_status(args: Any) -> int:
     if st["unreachable_reason"]:
         print(f"  Reachable:       ❌ {st['unreachable_reason']}")
     return 0
-
-
-def __getattr__(name: str) -> Any:
-    if name in ("enable_insight_hook", "insight_hook_status"):
-        from aegis_cli.hooks import insights
-
-        return getattr(insights, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-

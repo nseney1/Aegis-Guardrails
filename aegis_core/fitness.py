@@ -11,15 +11,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Opti
 
 from aegis_core import stats as _stats
 from aegis_core.config import DEFAULT_EPSILON, DEFAULT_HALF_LIFE_SESSIONS
-from aegis_core.stats import (
-    _num,
-    beta_cdf,
-    beta_ppf,
-    clopper_pearson_interval,
-    clopper_pearson_lower,
-    clopper_pearson_upper,
-    regularized_incomplete_beta,
-)
+from aegis_core.stats import _num
 from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, RULE_TYPES, WILSON_CONFIDENCE_Z_SCORES
 
 __all__ = [
@@ -33,24 +25,15 @@ __all__ = [
     "MIN_N",
     "MIN_OBSERVATION_DAYS",
     "ReplayReport",
-    "beta_cdf",
-    "beta_ppf",
     "cap_prior",
-    "clopper_pearson_interval",
-    "clopper_pearson_lower",
-    "clopper_pearson_upper",
     "combined_totals",
     "compute",
     "compute_mde_180d",
-    "compute_silence_credit",
     "for_rules",
-    "regularized_incomplete_beta",
     "replay_detector_history",
     "replay_detector_history_report",
     "rule_age_days",
     "session_decay_factor",
-    "wilson_interval",
-    "wilson_lower_bound",
 ]
 
 Z = WILSON_CONFIDENCE_Z_SCORES[DEFAULT_CONFIDENCE_LEVEL]
@@ -69,14 +52,6 @@ MIN_AGE_DAYS_FOR_PROMOTION = 30
 _MERGE_BRANCH_RE = re.compile(r"Merge branch '([^']+)'")
 
 
-def wilson_interval(successes: float, n: float, z: float = Z) -> Tuple[float, float]:
-    return _stats.wilson_interval(successes, n, z)
-
-
-def wilson_lower_bound(successes: float, n: float, z: float = Z) -> float:
-    return _stats.wilson_lower_bound(successes, n, z)
-
-
 def cap_prior(alpha0: float, beta0: float, max_mass: float = MAX_PRIOR_MASS) -> Tuple[float, float]:
     a = max(0.0, float(alpha0))
     b = max(0.0, float(beta0))
@@ -92,23 +67,6 @@ def compute_mde_180d(trigger_rate_per_day: float, horizon_days: float = DEFAULT_
     if expected_n <= 0.0:
         return 1.0
     return min(1.0, 1.24324 / math.sqrt(expected_n))
-
-
-def compute_silence_credit(
-    rrr: float,
-    *,
-    c: float = 0.1,
-    heartbeat_alive: bool = True,
-    scope_basis: Optional[str] = None,
-    clean_sessions: int = 1,
-) -> float:
-    if not heartbeat_alive or scope_basis == "fallback_unscoped":
-        return 1.0
-    r = _num(rrr)
-    k = max(0, int(clean_sessions))
-    if r <= 0.0 or k == 0:
-        return 1.0
-    return math.exp(float(c) * r * k)
 
 
 def _parse_ts(value: Any) -> Optional[datetime]:
@@ -167,21 +125,15 @@ class Fitness:
     contested: int = 0
     override_rate: float = 0.0
     flagged_for_review: bool = False
-    precision_lo: float = 0.0
-    precision_hi: float = 1.0
     p_below_demote: float = 0.0
     prior_mass: float = 0.0
-    prior_share: float = 0.0
     prior_disclosure: Optional[str] = None
     mde: Optional[float] = None
     eligible_sessions: int = 0
-    decay_factor: float = 1.0
     effective_weight: float = 1.0
     archive_candidate: bool = False
-    silence_lr: float = 1.0
     sessions_count: int = 0
     repos_count: int = 0
-    days_span: float = 0.0
     suggestion: Optional[str] = None
     evidence_available: bool = True
     evidence_error: Optional[str] = None
@@ -222,7 +174,7 @@ def compute(
     observed_days: Optional[float] = None, min_n: int = DEFAULT_MIN_N, eligible_sessions: int = 0,
     half_life_sessions: Optional[float] = DEFAULT_HALF_LIFE_SESSIONS, epsilon: float = DEFAULT_ARCHIVE_EPSILON, rule_type: str = "trap", pinned: bool = False, contested: int = 0,
     caught: int = 0, leaked: int = 0, adjudicated_tp: int = 0, adjudicated_fp: int = 0, sessions_count: int = 0,
-    repos_count: int = 0, days_span: float = 0.0, silence_lr: float = 1.0,
+    repos_count: int = 0, days_span: float = 0.0,
     evidence_available: bool = True, evidence_error: Optional[str] = None, age_days: Optional[float] = None,
 ) -> Fitness:
     """The one decision engine (R-evidence-7): a rule's state and the transition its evidence
@@ -251,15 +203,14 @@ def compute(
         rate = n / observed_days
     mde = round(compute_mde_180d(rate), 4) if rate is not None else None
     effective_weight = round(decay, 6)
-    score = round(wilson_lower_bound(tp + a0, n + prior_mass) * decay, 4) if n > 0 else 0.0
-    misfire = round(wilson_lower_bound(fp_w, n_w), 4) if n > 0 else 0.0
-    cp_lo, cp_hi = clopper_pearson_interval(tp_w, n_w, alpha=0.10, prior=prior)
-    p_below_07 = beta_cdf(0.7, 1.0 + tp_w + a0, 1.0 + fp_w + b0) if n > 0 else 0.0
+    score = round(_stats.wilson_lower_bound(tp + a0, n + prior_mass, z=Z) * decay, 4) if n > 0 else 0.0
+    misfire = round(_stats.wilson_lower_bound(fp_w, n_w, z=Z), 4) if n > 0 else 0.0
+    p_below_07 = _stats.beta_cdf(0.7, 1.0 + tp_w + a0, 1.0 + fp_w + b0) if n > 0 else 0.0
     override_rate = round(float(contested) / float(max(1, int(contested) + int(triggers))), 4) if contested > 0 else 0.0
     flagged_for_review = bool(contested > 0 and (contested >= 3 or override_rate >= 0.25))
     archive_candidate = bool(rule_type == "trap" and not pinned and eligible_sessions > 0 and effective_weight < epsilon)
     enough_n = n >= min_n
-    # The posterior alone: without a prior, the Wilson and Clopper-Pearson terms never demote a
+    # The posterior alone: without a prior, the Wilson and Clopper-Pearson terms never demoted a
     # rule it keeps (checked over every (tp, fp) in 0..85).
     demote_ready = bool(enough_n and p_below_07 >= 0.9)
     spec = RULE_TYPES.get(rule_type)
@@ -287,12 +238,10 @@ def compute(
         rule=rule, triggers=triggers, tp=tp, fp=fp, last_ts=totals.get("last_ts"), score=score, misfire=misfire,
         state=state, adjudicated_n=adj_n, adjudicated_tp=int(adjudicated_tp), adjudicated_fp=int(adjudicated_fp),
         caught=int(caught), leaked=int(leaked), contested=int(contested), override_rate=override_rate,
-        flagged_for_review=flagged_for_review, precision_lo=round(cp_lo, 4), precision_hi=round(cp_hi, 4),
-        p_below_demote=round(p_below_07, 4), prior_mass=round(prior_mass, 4), prior_share=round(prior_share, 4),
+        flagged_for_review=flagged_for_review, p_below_demote=round(p_below_07, 4), prior_mass=round(prior_mass, 4),
         prior_disclosure=prior_disclosure, mde=mde, eligible_sessions=int(eligible_sessions),
-        decay_factor=round(decay, 6), effective_weight=effective_weight, archive_candidate=archive_candidate,
-        silence_lr=round(float(silence_lr), 6), sessions_count=int(sessions_count), repos_count=int(repos_count),
-        days_span=round(float(days_span), 2), suggestion=suggestion,
+        effective_weight=effective_weight, archive_candidate=archive_candidate,
+        sessions_count=int(sessions_count), repos_count=int(repos_count), suggestion=suggestion,
         evidence_available=evidence_available, evidence_error=evidence_error, min_n=int(min_n),
     )
 
@@ -344,11 +293,11 @@ def _collect_t4_events_for_rules(
     for raw in raw_rows:
         if not isinstance(raw, dict):
             continue
-        rid = str(raw.get("rule") or raw.get("for_rule") or "")
+        rid = str(raw.get("rule") or "")
         if rid not in info:
             continue
         b = info[rid]
-        ts = raw.get("ts") or raw.get("timestamp")
+        ts = raw.get("ts")
         seen_at = _parse_ts(ts)
         if seen_at is not None and (b["first_seen"] is None or seen_at < b["first_seen"]):
             b["first_seen"] = seen_at

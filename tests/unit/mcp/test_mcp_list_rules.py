@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from aegis_core import sync
-from aegis_core.fitness import wilson_lower_bound
+from aegis_core.stats import wilson_lower_bound
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
 from aegis_core.telemetry_engine import ledger
 from aegis_mcp.tools import execute_tool
 
@@ -50,7 +51,7 @@ def test_fitness_comes_from_the_ledger_not_the_frontmatter(workspace):
 
     fitness = rules["inflated"]["fitness"]
     assert {k: fitness[k] for k in ("triggers", "tp", "fp")} == {"triggers": 3, "tp": 2, "fp": 1}
-    assert fitness["score"] == pytest.approx(wilson_lower_bound(2, 3), abs=1e-4)
+    assert fitness["score"] == pytest.approx(wilson_lower_bound(2, 3, DEFAULT_CONFIDENCE_LEVEL), abs=1e-4)
     assert fitness["score"] != 0.99
     assert isinstance(fitness["last_ts"], str)
 

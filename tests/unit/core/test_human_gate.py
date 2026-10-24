@@ -13,10 +13,13 @@ import sys
 import pytest
 
 from aegis_core import human_gate, governance
+# The real runner, taken at import, before the autouse _no_real_gh fixture replaces it for each test.
+from aegis_core.human_gate import default_gh_runner as REAL_GH
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
 needs_signing = pytest.mark.skipif(not hg.signing_ok(), reason="needs git >= 2.34 and ssh-keygen")
+posix_only = pytest.mark.skipif(os.name == "nt", reason="shell stubs")
 
 
 @pytest.fixture(autouse=True)
@@ -38,15 +41,15 @@ def test_the_full_codeowners_covers_every_governance_sample():
 
 def test_every_coverage_sample_is_a_governance_path():
     assert [s for s in human_gate.COVERAGE_SAMPLES if governance.category_of(s) is None] == []
-    assert {"pytest.py", "pytest/__init__.py", "iniconfig.py", "py/__init__.py"} <= set(human_gate.COVERAGE_SAMPLES)
+    assert {"pytest.py", "pytest/__init__.x", "iniconfig.py", "py/__init__.x"} <= set(human_gate.COVERAGE_SAMPLES)
 
 
 def test_a_codeowners_that_owns_only_the_source_init_of_a_runner_package_leaves_it_uncovered():
     """Given CODEOWNERS lines that own ``/pytest/__init__.py`` but not the package directory, When
     coverage is checked, Then a compiled ``__init__`` and the ``__main__`` of that package are uncovered."""
     narrow = hg.CODEOWNERS_FULL.replace("/pytest/ @octo\n", "/pytest/__init__.py @octo\n")
-    _covered, uncovered = human_gate.codeowners_coverage(narrow)
-    assert {"pytest/__init__.pyc", "pytest/__main__.py"} <= set(uncovered)
+    _covered, uncovered = human_gate.codeowners_coverage(narrow, repo_paths=["pytest/__init__.py"])
+    assert {"pytest/__init__.x", "pytest/__main__.x"} <= set(uncovered)
     assert "pytest/__init__.py" not in uncovered
 
 
@@ -76,21 +79,47 @@ def test_the_codeowners_lines_doctor_prints_own_labels_and_a_nested_workspace():
 
 
 def test_the_coverage_samples_include_labels_and_a_nested_workspace():
-    assert {".aegis/adjudications/r.jsonl", "svc/.aegis/rules/gates/x.md", "svc/.aegis/config.json"} <= set(
+    assert {".aegis/adjudications/x", "svc/.aegis/rules/gates/x", "svc/.aegis/config.json"} <= set(
         human_gate.COVERAGE_SAMPLES
     )
+
+
+PER_DIRECTORY = "".join(f"**/.aegis/rules/{d}/ @octo\n" for d in
+                        ("invariants", "traps", "gates", "boundaries", "personas", "contracts"))
+
+
+def test_six_per_directory_rule_owners_cover_the_rules_and_a_missing_one_is_named():
+    """Given a CODEOWNERS that owns the six plural rule directories (not .aegis/rules/ itself) and every
+    other sample, Then nothing is uncovered; without traps/, only the traps samples are."""
+    full = hg.CODEOWNERS_FULL.replace("**/.aegis/rules/ @octo\n", "").replace("/.aegis/rules/ @octo\n", PER_DIRECTORY)
+    assert "/.aegis/rules/ @octo" not in full.replace("**/.aegis/rules/", "")
+    assert human_gate.codeowners_coverage(full)[1] == []
+    _covered, uncovered = human_gate.codeowners_coverage(full.replace("**/.aegis/rules/traps/ @octo\n", ""))
+    assert uncovered == [".aegis/rules/traps/x", "svc/.aegis/rules/traps/x"]
+
+
+@needs_git
+def test_a_codeowners_in_docs_holding_the_printed_lines_reaches_tier_a(tmp_path):
+    repo = _repo_with_governance(tmp_path, codeowners=None)
+    repo.git("checkout", "-q", "main")
+    repo.write("docs/CODEOWNERS", "\n".join(human_gate.codeowners_lines("@octo")) + "\n")
+    repo.commit("codeowners in docs")
+    report = human_gate.detect_tier(repo.root, gh=hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()]))
+    codeowners = report.evidence["codeowners"]
+    assert (codeowners["present"], codeowners["path"], codeowners["uncovered"]) == (True, "docs/CODEOWNERS", [])
+    assert report.tier == "A", report.reasons
 
 
 @pytest.mark.parametrize("text", ["", "# only a comment\n", "*.txt @octo\n", "/src/ @octo\n"])
 def test_a_codeowners_that_misses_the_set_leaves_it_uncovered(text):
     _covered, uncovered = human_gate.codeowners_coverage(text)
-    assert ".aegis/rules/trap/sample.md" in uncovered
+    assert ".aegis/rules/traps/x" in uncovered
 
 
 def test_the_last_matching_entry_wins_and_an_entry_with_no_owner_unprotects():
     text = hg.CODEOWNERS_FULL + "/.aegis/rules/\n"
     _covered, uncovered = human_gate.codeowners_coverage(text)
-    assert ".aegis/rules/trap/sample.md" in uncovered
+    assert ".aegis/rules/traps/x" in uncovered
     assert ".aegis/config.json" not in uncovered
 
 
@@ -98,7 +127,7 @@ def test_a_single_star_does_not_cross_a_directory_as_the_matcher_of_target_paths
     # /.aegis/* covers direct children only on GitHub; the rules live two levels down.
     text = hg.CODEOWNERS_FULL.replace("**/.aegis/rules/ @octo\n", "").replace("/.aegis/rules/ @octo\n", "/.aegis/* @octo\n")
     _covered, uncovered = human_gate.codeowners_coverage(text)
-    assert ".aegis/rules/trap/sample.md" in uncovered
+    assert ".aegis/rules/traps/x" in uncovered
     assert ".aegis/config.json" not in uncovered
 
 
@@ -337,8 +366,7 @@ def test_uncovered_governance_files_block_tier_a(tmp_path):
     gh = hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()])
     report = human_gate.detect_tier(repo.root, gh=gh)
     assert report.tier == "C"
-    assert report.evidence["codeowners"]["uncovered"]
-    assert report.codeowners_complete is False
+    assert report.evidence["codeowners"]["present"] and report.evidence["codeowners"]["uncovered"]
 
 
 @needs_git
@@ -355,7 +383,7 @@ def test_tracked_workflow_outside_sample_or_unowned_override_blocks_tier_a(tmp_p
     gh = hg.FakeGh(rules=[hg.pull_request_rule(), hg.checks_rule()])
     report = human_gate.detect_tier(repo.root, gh=gh)
     assert report.tier != "A"
-    assert report.codeowners_complete is False
+    assert report.evidence["codeowners"]["present"] and report.evidence["codeowners"]["uncovered"]
     assert ".github/workflows/validate.yml" in report.evidence["codeowners"]["uncovered"]
 
     for override in ("/.github/workflows/validate.yml\n", "!/.github/workflows/validate.yml\n"):
@@ -365,7 +393,7 @@ def test_tracked_workflow_outside_sample_or_unowned_override_blocks_tier_a(tmp_p
         repo.git("checkout", "-q", "work")
         rep2 = human_gate.detect_tier(repo.root, gh=gh)
         assert rep2.tier != "A"
-        assert rep2.codeowners_complete is False
+        assert rep2.evidence["codeowners"]["present"] and rep2.evidence["codeowners"]["uncovered"]
         assert ".github/workflows/validate.yml" in rep2.evidence["codeowners"]["uncovered"]
 
 
@@ -560,7 +588,7 @@ def test_no_gh_is_tier_c_with_the_reason_and_no_network_call(tmp_path):
 def test_a_failing_gh_is_tier_c_not_a_crash(tmp_path):
     repo = _repo_with_governance(tmp_path)
 
-    def failing(argv, stdin=None, cwd=None):
+    def failing(argv, stdin=None, cwd=None, timeout=None):
         return human_gate.GhResult(1, "", "HTTP 404: Not Found")
 
     report = human_gate.detect_tier(repo.root, gh=failing)
@@ -571,7 +599,7 @@ def test_a_failing_gh_is_tier_c_not_a_crash(tmp_path):
 @needs_git
 def test_unparseable_gh_output_is_tier_c(tmp_path):
     repo = _repo_with_governance(tmp_path)
-    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None: human_gate.GhResult(0, "<html>", ""))
+    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: human_gate.GhResult(0, "<html>", ""))
     assert report.tier == "C"
 
 
@@ -606,6 +634,429 @@ def test_the_report_dict_carries_the_envelope_and_the_evidence(tmp_path):
     assert doc["source"] and doc["aegis_version"] and doc["scope"]["workspace"]
     assert doc["checked_at"].endswith("Z") and len(doc["checked_at"]) == 20
     assert set(doc["evidence"]) >= {"gh", "repo", "rules", "codeowners", "allowed_signers", "key_custody", "identity"}
+
+
+# ── R-trust-39: detect_tier reads one requirement table ──────────────────────
+
+class _GridGh(hg.FakeGh):
+    """FakeGh that can also fail the repository or the rules read, or leave the admin bit out."""
+
+    def __init__(self, *args, unknown_admin=False, rules_fail=False, repo_fail=False, **kw):
+        super().__init__(*args, **kw)
+        self.unknown_admin, self.rules_fail, self.repo_fail = unknown_admin, rules_fail, repo_fail
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        path = list(argv)[-1]
+        if self.repo_fail and path == "repos/{owner}/{repo}":
+            return human_gate.GhResult(1, "", "HTTP 404: Not Found")
+        if self.rules_fail and "/rules/branches/" in path:
+            return human_gate.GhResult(1, "", "HTTP 403: Forbidden")
+        result = super().__call__(argv, stdin, cwd, timeout)
+        if self.unknown_admin and result is not None and path == "repos/{owner}/{repo}":
+            body = json.loads(result.stdout)
+            body["permissions"] = {"push": True}
+            return human_gate.GhResult(0, json.dumps(body), "")
+        return result
+
+
+def _missing_gh() -> hg.FakeGh:
+    gh = hg.FakeGh()
+    gh.missing = True
+    return gh
+
+
+PR, CHK = hg.pull_request_rule, hg.checks_rule
+FULL = hg.CODEOWNERS_FULL
+# name: (gh, repository files, signing key: None, "hardware" or a key kind ssh-keygen makes)
+TIER_GRID = {
+    "a-full": (lambda: _GridGh(rules=[PR(), CHK()]), {}, None),
+    "admin": (lambda: _GridGh(admin=True, rules=[PR(), CHK()]), {}, None),
+    "admin-unknown": (lambda: _GridGh(unknown_admin=True, rules=[PR(), CHK()]), {}, None),
+    "no-owners-review": (lambda: _GridGh(rules=[PR(code_owners=False), CHK()]), {}, None),
+    "approvals-0": (lambda: _GridGh(rules=[PR(approvals=0), CHK()]), {}, None),
+    "no-checks": (lambda: _GridGh(rules=[PR()]), {}, None),
+    "stale-kept": (lambda: _GridGh(rules=[PR(dismiss_stale=False), CHK()]), {}, None),
+    "unpinned-a": (lambda: _GridGh(rules=[PR(), CHK(integration_id=None)]), {}, None),
+    "unpinned-c": (lambda: _GridGh(rules=[CHK(integration_id=None)]), {"codeowners": None}, None),
+    "not-aegis-check": (lambda: _GridGh(rules=[PR(), CHK("other-job")]), {}, None),
+    "rules-unreadable": (lambda: _GridGh(rules_fail=True), {}, None),
+    "repo-unreadable": (lambda: _GridGh(repo_fail=True), {}, None),
+    "gh-missing": (_missing_gh, {}, None),
+    "bare-org": (lambda: _GridGh(rules=[PR(), CHK()], owner="acme", owner_type="Organization"),
+                 {"codeowners": FULL.replace("@octo", "@acme")}, None),
+    "co-partial": (lambda: _GridGh(rules=[PR(), CHK()]), {"codeowners": "/docs/ @octo\n"}, None),
+    "co-absent": (lambda: _GridGh(rules=[PR(), CHK()]), {"codeowners": None}, None),
+    "no-workflow": (lambda: _GridGh(rules=[PR(), CHK()]), {"workflow": None}, None),
+    "b-hardware": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None, "signer": True}, "hardware"),
+    "signers-0": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None}, None),
+    "b-plain-custody": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None, "signer": True}, "plain"),
+    "b-passphrase": (lambda: _GridGh(rules=[CHK()]), {"codeowners": None, "signer": True}, "passphrase"),
+}
+KEYGEN_CASES = {"b-plain-custody", "b-passphrase"}
+
+
+def _tier_case(tmp_path: Path, name: str):
+    """(tier, reasons, digest of the rest of as_dict()) for one grid case; checked_at, the version and
+    the workspace path are left out."""
+    import hashlib
+
+    gh, files, key = TIER_GRID[name]
+    home = hg.Home(tmp_path / "home")
+    pub = None
+    if key == "hardware":
+        pub = hg.hardware_public_key()
+        home.sign_with("key::" + pub)
+    elif key is not None:
+        private, pub = hg.keygen(tmp_path / "keys", "human", passphrase="" if key == "plain" else "pw-123456")
+        home.sign_with(str(private))
+    repo = _repo_with_governance(tmp_path, signer_pub=pub if files.get("signer") else None,
+                                 codeowners=files.get("codeowners", FULL), workflow=files.get("workflow", hg.AEGIS_WORKFLOW))
+    doc = human_gate.detect_tier(repo.root, gh=gh()).as_dict()
+    del doc["checked_at"], doc["aegis_version"]
+    doc["scope"]["workspace"] = "<root>"
+    rest = {k: v for k, v in doc.items() if k not in ("tier", "reasons")}
+    return doc["tier"], doc["reasons"], hashlib.sha256(json.dumps(rest, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+# Recorded at lane/w9-A c12e70cb (after R-trust-36, before the table), admin wording updated.
+GOLDEN_TIERS = {
+    'a-full': ('A', [
+    ], 'ca1674679f2070d4'),
+    'admin': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the gh identity doctor used is an admin: re-run with the token the agent would hold',
+    ], '710e23b64c1a057d'),
+    'admin-unknown': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: whether the gh identity is an admin is unknown',
+    ], '1fed4721f978a121'),
+    'approvals-0': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require an approving review',
+    ], 'f74ddb2d5fa91d75'),
+    'b-hardware': ('B', [
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '1bbf09668d3c52cd'),
+    'b-passphrase': ('B', [
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '159f0c1b3c7187db'),
+    'b-plain-custody': ('C', [
+        'the signing key human is a plain file with no passphrase, readable by this user: an agent running as you can sign with it, so a signature proves nothing',
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], 'b3e430ffe88fa5b6'),
+    'bare-org': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: CODEOWNERS leaves 83 governance path(s) without an owner',
+        'not tier A: CODEOWNERS names @acme, the organization that owns this repository, which GitHub ignores as a code owner: name a team (@acme/<team>) or people',
+    ], '6ae200fb88ec7f12'),
+    'co-absent': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '9224938590e8abd8'),
+    'co-partial': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: CODEOWNERS leaves 82 governance path(s) without an owner',
+    ], '6e109a481cb4f40b'),
+    'gh-missing': ('C', [
+        'GitHub settings could not be read: gh is not installed',
+        "the default branch's ruleset was not read",
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: whether the gh identity is an admin is unknown',
+    ], '231bdf4bdc7ee1f1'),
+    'no-checks': ('C', [
+        'the default branch has no required status checks',
+        'allowed_signers on the base branch lists no signing key',
+    ], '894cb0e48ca45fa4'),
+    'no-owners-review': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require code-owner review',
+    ], '39a9e50b21121dde'),
+    'no-workflow': ('C', [
+        'the required checks do not include the Aegis job: no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix',
+        'allowed_signers on the base branch lists no signing key',
+    ], '02d5e277c56e1b95'),
+    'not-aegis-check': ('C', [
+        'the required checks do not include the Aegis job: require aegis-check',
+        'allowed_signers on the base branch lists no signing key',
+    ], 'b4cd1dff7bfd621b'),
+    'repo-unreadable': ('C', [
+        'GitHub settings could not be read: gh api repos/{owner}/{repo} failed: HTTP 404: Not Found',
+        "the default branch's ruleset was not read",
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: whether the gh identity is an admin is unknown',
+    ], 'c2778e2375913655'),
+    'rules-unreadable': ('C', [
+        "the default branch's rules could not be read: gh api repos/{owner}/{repo}/rules/branches/main failed: HTTP 403: Forbidden",
+        "the default branch's ruleset was not read",
+        'allowed_signers on the base branch lists no signing key',
+    ], 'b15ccacdb770aaaf'),
+    'signers-0': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], 'cb94876a7c0d25f2'),
+    'stale-kept': ('C', [
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+    ], '9d739a9cb376c5da'),
+    'unpinned-a': ('A', [
+    ], '92a6c557f1847a65'),
+    'unpinned-c': ('C', [
+        "the required check(s) aegis-check have no pinned source (integration_id): anyone with write access, including the agent's gh token, can post a passing status; set each check's source to GitHub Actions (app 15368) in the ruleset",
+        'allowed_signers on the base branch lists no signing key',
+        'not tier A: the default branch does not require an approving review',
+        'not tier A: the default branch does not require code-owner review',
+        'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
+        'not tier A: no CODEOWNERS file on the base branch',
+    ], '63ccbfdd88627974'),
+}
+
+
+@needs_git
+@pytest.mark.parametrize("name", sorted(TIER_GRID))
+def test_the_tier_grid_is_the_one_recorded_before_the_table(tmp_path, name):
+    """Given a FakeGh configuration recorded before detect_tier was rebuilt from one table, When the tier
+    is detected, Then the tier, the reasons in order and the rest of the report are the recorded ones
+    (only the admin reason's wording changed)."""
+    if name in KEYGEN_CASES and not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    assert _tier_case(tmp_path, name) == GOLDEN_TIERS[name]
+
+
+# requirement key -> (the grid case that reports it, a part of the reason)
+REQUIREMENT_CASES = {
+    "ruleset": ("rules-unreadable", "the default branch's ruleset was not read"),
+    "review": ("approvals-0", "does not require an approving review"),
+    "code-owners": ("no-owners-review", "does not require code-owner review"),
+    "stale": ("stale-kept", "set dismiss_stale_reviews_on_push"),
+    "checks": ("no-checks", "the default branch has no required status checks"),
+    "unpinned": ("unpinned-c", "have no pinned source (integration_id)"),
+    "aegis-job": ("not-aegis-check", "the required checks do not include the Aegis job"),
+    "codeowners": ("co-absent", "no CODEOWNERS file on the base branch"),
+    "uncovered": ("co-partial", "governance path(s) without an owner"),
+    "bare-org": ("bare-org", "which GitHub ignores as a code owner"),
+    "admin": ("admin", "the gh identity doctor used is an admin: re-run with the token the agent would hold"),
+    "admin-unknown": ("admin-unknown", "whether the gh identity is an admin is unknown"),
+    "signers": ("signers-0", "allowed_signers on the base branch lists no signing key"),
+    "custody": ("b-plain-custody", "is a plain file with no passphrase"),
+}
+
+
+def test_every_requirement_of_the_tier_table_has_a_case():
+    assert set(REQUIREMENT_CASES) == {row[0] for row in human_gate._TIER_REQUIREMENTS}
+
+
+@needs_git
+@pytest.mark.parametrize("key", sorted(REQUIREMENT_CASES))
+def test_each_requirement_is_reported_by_its_case(tmp_path, key):
+    case, part = REQUIREMENT_CASES[key]
+    if case in KEYGEN_CASES and not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    tier, reasons, _rest = _tier_case(tmp_path, case)
+    assert tier != "A" and [r for r in reasons if part in r], reasons
+
+
+@needs_git
+def test_a_runner_that_returns_none_is_tier_c_with_one_ruleset_reason(tmp_path):
+    repo = _repo_with_governance(tmp_path)
+    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: None)
+    assert report.tier == "C" and report.reasons[0] == "GitHub settings could not be read: gh is not installed"
+    assert [r for r in report.reasons if "ruleset was not read" in r] == ["the default branch's ruleset was not read"]
+
+
+def test_the_dead_tier_surface_is_gone():
+    import inspect
+
+    assert not hasattr(human_gate.TierReport, "codeowners_complete")
+    assert list(inspect.signature(human_gate.detect_tier).parameters) == ["root", "gh"]
+    custody = human_gate.KeyCustody("none", "no key", False)
+    assert custody._asdict() == {"status": "none", "detail": "no key", "degrades": False, "key": None}
+    assert not hasattr(custody, "as_dict")
+
+
+# ── R-cli-28: gh never inspects the repository ───────────────────────────────
+
+PLACEHOLDER = ["api", "--method", "GET", "repos/{owner}/{repo}"]
+NO_REPO = "no GitHub repository could be resolved from remote.origin.url"
+
+
+def _trapped_repo(tmp_path: Path, remote) -> "tuple[hg.Repo, Path]":
+    """A repository whose own core.fsmonitor runs a marker script: plain git status there creates it."""
+    repo = hg.make_repo(tmp_path)
+    marker = tmp_path / "fsmonitor-ran"
+    script = tmp_path / "fsmonitor.sh"
+    script.write_bytes(f"#!/bin/sh\necho ran >> '{marker}'\nexit 1\n".encode("utf-8"))
+    script.chmod(0o755)
+    repo.git("config", "core.fsmonitor", str(script))
+    if remote is not None:
+        repo.git("config", "remote.origin.url", remote)
+    hg.run_git(repo.root, "status", env=repo.home.env)
+    if not marker.exists():
+        pytest.skip("this git does not run a core.fsmonitor hook")
+    marker.unlink()
+    return repo, marker
+
+
+@pytest.fixture
+def gh_stub(tmp_path, monkeypatch):
+    hg.recording_gh(tmp_path / "bin")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("LOG", str(tmp_path / "gh.log"))
+    monkeypatch.delenv("GH_REPO", raising=False)
+    return lambda: hg.gh_log(tmp_path / "gh.log")
+
+
+@needs_git
+@posix_only
+def test_gh_runs_in_an_empty_directory_so_the_repositorys_config_runs_nothing(tmp_path, gh_stub):
+    """Given a repository whose core.fsmonitor runs a marker script, When the real runner runs a
+    placeholder gh api call for it, Then gh ran in an empty directory outside the repository (removed
+    afterwards), the marker never appeared, argv is unchanged and GH_REPO names the origin."""
+    repo, marker = _trapped_repo(tmp_path, "https://github.com/octo/proj.git")
+    assert REAL_GH(PLACEHOLDER, cwd=repo.root) == human_gate.GhResult(0, "{}\n", "")
+    [call] = gh_stub()
+    assert not marker.exists()
+    assert call["ls"] == [] and call["argv"] == PLACEHOLDER and call["GH_REPO"] == "octo/proj"
+    assert not os.path.realpath(call["cwd"]).startswith(os.path.realpath(repo.root) + os.sep)
+    assert not os.path.exists(call["cwd"])
+
+
+@needs_git
+@posix_only
+def test_a_temporary_directory_inside_a_repository_still_finds_no_repository(tmp_path, gh_stub, monkeypatch):
+    """Given the temporary directory is inside the booby-trapped repository, When gh runs, Then git
+    started there stops at the ceiling and the marker does not appear."""
+    import tempfile
+
+    repo, marker = _trapped_repo(tmp_path, "https://github.com/octo/proj.git")
+    (repo.root / "scratch").mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(repo.root / "scratch"))
+    REAL_GH(PLACEHOLDER, cwd=repo.root)
+    assert len(gh_stub()) == 1 and not marker.exists()
+
+
+@needs_git
+@posix_only
+@pytest.mark.parametrize("url, expected", [
+    ("https://github.com/octo/proj.git", "octo/proj"),
+    ("https://github.com/octo/proj", "octo/proj"),
+    ("https://x-access-token:SECRET@github.com/octo/proj.git", "octo/proj"),
+    ("git@github.com:octo/proj.git", "octo/proj"),
+    ("ssh://git@github.com/octo/proj.git", "octo/proj"),
+    ("https://ghe.example.com/octo/proj.git", "ghe.example.com/octo/proj"),
+    ("git@ghe.example.com:octo/proj.git", "ghe.example.com/octo/proj"),
+    ("ssh://git@ghe.example.com:2222/octo/proj.git", "ghe.example.com/octo/proj"),
+], ids=["https-git", "https", "token", "scp", "ssh", "ghes", "ghes-scp", "ghes-port"])
+def test_gh_repo_is_the_origin_resolved_through_gitsafe(tmp_path, gh_stub, url, expected):
+    repo, _marker = _trapped_repo(tmp_path, url)
+    result = REAL_GH(PLACEHOLDER, cwd=repo.root)
+    [call] = gh_stub()
+    assert call["GH_REPO"] == expected and human_gate.resolve_repo(repo.root) == expected
+    assert "SECRET" not in json.dumps(call) + repr(result)
+
+
+@needs_git
+@pytest.mark.parametrize("url, expected", [
+    ("http://github.com/octo/proj.git/", "octo/proj"),
+    ("git://github.com/octo/proj.git", "octo/proj"),
+    ("github.com:octo/proj", "octo/proj"),
+    ("https://GitHub.com/octo/proj", "octo/proj"),
+    ("https://gitlab.com/group/sub/proj.git", None),
+    ("https://ghe.example.com:8443/octo/proj.git", None),
+    ("/srv/git/proj.git", None),
+    ("file:///srv/git/octo/proj.git", None),
+    ("C:/git/octo/proj", None),
+    ("https://github.com/octo/..", None),
+    ("https://github.com/octo/pr oj", None),
+    ("ext::sh -c x%20octo/proj", None),
+], ids=["http-slash", "git-proto", "scp-nouser", "host-case", "subgroup", "https-port", "path", "file", "drive",
+        "dotdot", "space", "ext"])
+def test_resolve_repo_accepts_only_owner_and_repo_on_a_host(tmp_path, url, expected):
+    repo = hg.make_repo(tmp_path)
+    repo.git("config", "remote.origin.url", url)
+    assert human_gate.resolve_repo(repo.root) == expected
+
+
+@needs_git
+@posix_only
+@pytest.mark.parametrize("remote", ["https://gitlab.com/group/sub/proj.git", "/srv/git/proj.git", None, "corrupt"],
+                         ids=["subgroup", "path", "no-origin", "bad-config"])
+def test_a_placeholder_call_without_a_github_origin_runs_no_gh(tmp_path, gh_stub, remote):
+    """Given an origin that names no GitHub repository (or git config cannot answer), When a placeholder
+    call is made, Then it returns rc 125 with the reason and the stub never ran."""
+    repo, _marker = _trapped_repo(tmp_path, None if remote == "corrupt" else remote)
+    if remote == "corrupt":
+        with open(repo.root / ".git" / "config", "ab") as handle:
+            handle.write(b'[remote "origin"\n')
+    assert REAL_GH(PLACEHOLDER, cwd=repo.root) == human_gate.GhResult(125, "", NO_REPO)
+    assert human_gate.resolve_repo(repo.root) is None
+    assert gh_stub() == []
+
+
+@needs_git
+@posix_only
+def test_a_gitlab_origin_is_tier_c_with_the_reason_and_no_gh_call(tmp_path, gh_stub):
+    repo, _marker = _trapped_repo(tmp_path, "https://gitlab.com/group/sub/proj.git")
+    report = human_gate.detect_tier(repo.root, gh=REAL_GH)
+    assert report.tier == "C" and any(NO_REPO in reason for reason in report.reasons), report.reasons
+    assert gh_stub() == []
+
+
+@needs_git
+@posix_only
+def test_a_call_without_placeholders_runs_without_a_repository(tmp_path, gh_stub, monkeypatch):
+    """Given an unresolvable origin, When gh --version runs (with the repository, then with none), Then the
+    stub runs in an empty directory with GH_REPO unset; a resolved origin overrides an ambient GH_REPO and an
+    unresolved one leaves it alone."""
+    repo, _marker = _trapped_repo(tmp_path, "/srv/git/proj.git")
+    assert REAL_GH(["--version"], cwd=repo.root).returncode == 0
+    assert REAL_GH(["--version"]).returncode == 0
+    assert [(c["ls"], c["GH_REPO"], c["argv"]) for c in gh_stub()] == [([], None, ["--version"])] * 2
+    monkeypatch.setenv("GH_REPO", "ambient/repo")
+    REAL_GH(["--version"], cwd=repo.root)
+    repo.git("config", "remote.origin.url", "git@github.com:octo/proj.git")
+    REAL_GH(["--version"], cwd=repo.root)
+    assert [c["GH_REPO"] for c in gh_stub()[2:]] == ["ambient/repo", "octo/proj"]
+
+
+@needs_git
+@posix_only
+def test_the_rest_client_with_a_gitlab_origin_reads_no_ci(tmp_path, gh_stub):
+    from aegis_core import credit
+
+    repo, _marker = _trapped_repo(tmp_path, "https://gitlab.com/group/sub/proj.git")
+    with pytest.raises(credit.CIUnavailable, match="125"):
+        credit.GhRestClient(runner=REAL_GH, cwd=str(repo.root)).runs_for(repo.head())
+    assert gh_stub() == []
+
+
+@needs_git
+@posix_only
+def test_sync_pr_with_a_gitlab_origin_refuses_before_moving_a_file(tmp_path, gh_stub, monkeypatch):
+    """Given a decided promotion whose push URL works but whose origin is not on GitHub, When sync --pr
+    runs with the real gh runner, Then it refuses, the rule did not move and gh never ran."""
+    from aegis_core import sync as core_sync
+    from tests import helpers_syncpr as sp
+
+    repo = sp.make(tmp_path)
+    sp.git(repo.root, "config", "remote.origin.pushurl", str(repo.origin))
+    sp.git(repo.root, "config", "remote.origin.url", "https://gitlab.com/group/sub/proj.git")
+    monkeypatch.setattr(human_gate, "default_gh_runner", REAL_GH)
+    before = repo.state()
+    result = core_sync.sync(repo.root, pr=True)
+    assert result.pr["status"] == "refused" and "origin is not a GitHub repository" in result.pr["reason"]
+    assert repo.state() == before and repo.origin_branches() == ["main"] and gh_stub() == []
 
 
 # ── the governance tree hash ─────────────────────────────────────────────────

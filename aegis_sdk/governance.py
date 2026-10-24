@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from aegis_core.errors import RuleParseError
-from aegis_core.fitness import wilson_interval
+from aegis_core.stats import wilson_interval
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
 from aegis_core.metrics import calculate_coverage, calculate_governance_grade
 from aegis_core.outcomes.engine import _get_changed_files, match_rules_to_changes
 from aegis_core.rule_inventory import RuleInventoryError
@@ -75,7 +76,7 @@ class Governance:
                 "suggestion": entry["suggestion"],
             }
             if bayesian:
-                lower, upper = wilson_interval(entry["tp"], entry["tp"] + entry["fp"])
+                lower, upper = wilson_interval(entry["tp"], entry["tp"] + entry["fp"], DEFAULT_CONFIDENCE_LEVEL)
                 row["bayesian"] = {"lower": round(lower, 4), "upper": round(upper, 4)}
             landscape.append(row)
         return landscape

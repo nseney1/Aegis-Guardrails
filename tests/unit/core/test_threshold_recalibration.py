@@ -3,14 +3,19 @@
 Ported from the v3 bayesian_posterior tests: the interval behaviour they pinned is the
 estimator every lifecycle threshold is now read against.
 """
-from aegis_core.fitness import wilson_interval
-from aegis_core.taxonomy import WILSON_CONFIDENCE_Z_SCORES
+from functools import partial
+
+from aegis_core import stats
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL, WILSON_CONFIDENCE_Z_SCORES
+
+# The fitness estimator's 90% interval: aegis_core.stats defaults to 95%.
+wilson_interval = partial(stats.wilson_interval, confidence=DEFAULT_CONFIDENCE_LEVEL)
 
 
 class TestWilsonBoundaries:
     def test_higher_confidence_widens_the_interval(self):
-        lo90, hi90 = wilson_interval(10, 15, WILSON_CONFIDENCE_Z_SCORES[0.90])
-        lo95, hi95 = wilson_interval(10, 15, WILSON_CONFIDENCE_Z_SCORES[0.95])
+        lo90, hi90 = wilson_interval(10, 15, z=WILSON_CONFIDENCE_Z_SCORES[0.90])
+        lo95, hi95 = wilson_interval(10, 15, z=WILSON_CONFIDENCE_Z_SCORES[0.95])
         assert hi95 - lo95 > hi90 - lo90
 
     def test_all_successes_have_a_high_lower_bound(self):

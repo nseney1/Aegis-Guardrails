@@ -112,7 +112,6 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_cli.base import AegisCommand, CommandCategory
-from aegis_core import human_gate
 from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
 
 __all__ = ["run_doctor", "DoctorCommand", "probe_mcp_launcher", "SCHEMA", "V3_SHIPPED_RULE_SHA256"]

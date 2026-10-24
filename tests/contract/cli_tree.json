@@ -2813,19 +2813,7 @@
                     "flags": [
                       "--decision"
                     ],
-                    "help": "Record a review decision: for the cluster --cluster names (reject also needs --reason), or confirm the suggestions --insight names",
-                    "kind": "store",
-                    "metavar": null,
-                    "nargs": null,
-                    "required": false
-                  },
-                  {
-                    "default": null,
-                    "dest": "cluster_id",
-                    "flags": [
-                      "--cluster"
-                    ],
-                    "help": "Cluster ID for --decision (as review lists it)",
+                    "help": "Record a review decision on the insights --insight names (reject also needs --reason; confirm names unconfirmed suggestions)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2837,7 +2825,7 @@
                     "flags": [
                       "--insight"
                     ],
-                    "help": "Unconfirmed suggestion ID for --decision confirm (repeatable)",
+                    "help": "Insight ID the decision names, as review lists it (repeatable)",
                     "kind": "append",
                     "metavar": "ID",
                     "nargs": null,
@@ -2849,7 +2837,7 @@
                     "flags": [
                       "--kind"
                     ],
-                    "help": "Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the cluster's insights share)",
+                    "help": "Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the named insights share)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2861,7 +2849,7 @@
                     "flags": [
                       "--proposal-id"
                     ],
-                    "help": "Proposal ID when --decision propose",
+                    "help": "Proposal ID when --decision propose (default: trap- and 8 hex digits of the ids)",
                     "kind": "store",
                     "metavar": null,
                     "nargs": null,
@@ -2905,7 +2893,7 @@
                   }
                 ],
                 "description": null,
-                "help": "Cluster and review insights or record a decision"
+                "help": "List insights with their top-3 neighbours or record a decision on some"
               }
             },
             "description": null,
