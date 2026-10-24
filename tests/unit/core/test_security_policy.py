@@ -35,7 +35,9 @@ def test_reporting_uses_private_channel_not_public_issues():
 
 def test_readme_links_to_security_policy():
     readme = read(str(ROOT / "README.md"))
-    assert re.search(r"\]\((\./)?SECURITY\.md\)", readme), "README.md does not link to SECURITY.md"
+    # The README is also the PyPI page, where only an absolute link resolves.
+    assert re.search(r"\]\((\./|https://github\.com/nseney1/Aegis-Guardrails/blob/main/)?SECURITY\.md\)", readme), \
+        "README.md does not link to SECURITY.md"
 
 
 def test_supported_versions_cover_the_current_major_line():

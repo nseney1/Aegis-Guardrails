@@ -43,7 +43,7 @@ The core rules were not written from best-practice lists. They were extracted fr
 
 The itemized rows sum to 473 steps (63% of the waste). The other 276 steps happened before step-level tracking existed and were never itemized; 473 + 276 = 749, which matches the quoted total (both re-derived).
 
-*Source*: the evolution log, `docs/architecture/phylogeny.md` "Phase 2", and `docs/project/METRICS.md` "Aggregate Stats" (both at `v3.3.0`). *Caveat*: one session, one developer, classified by the project's own analysis with no second rater.
+*Source*: the evolution log, `docs/architecture/phylogeny.md` "Phase 2", and `docs/project/METRICS.md` "Aggregate Stats" (both at `v3.3.0`). *Caveat*: one session, one developer, classified by the project's own analysis with no second rater. The same session supplied the rules, so it is the "before" baseline for them and not independent evidence that they work.
 
 **Cross-session patterns.** Comparing sessions across projects showed the failures were systemic. The worst session ran 1,579 steps with 8 architectural pivots, 2 safety incidents and zero subagent delegation, and produced zero working autonomous runs. It added rules on premature abstraction, pivot discipline (the Two-Pivot Halt), delegation floors and real-time loop budgets, which now live in [architectural-tenets](../rules/.oracles/architectural-tenets.md) and [subagent-delegation](../rules/subagent-delegation.md). It also added a desktop-automation safety rule, which v4 no longer ships (ADR 0005 D16). *Source*: the evolution log, "Phase 3". *Caveat*: the author's own projects only.
 
@@ -76,7 +76,7 @@ In v3 the first one was claimed but not delivered: an MCP caller could write tru
 | Waste in the post-mortem session | 749 / 1,339 steps (55.9%) | evolution log, Phase 2 | one session |
 | Waste across 17 governed sessions | 1,317 / 7,015 steps (18.8%) | `METRICS.md` "Aggregate Stats" | observational, one developer |
 | Same project, weak rules vs "full governance" | 27.6% of 547 steps vs 1.1% of 1,325 steps | `METRICS.md` "Live A/B Validation" | two sessions, one project |
-| 66 masked production sessions, ~7 weeks | rules deployed without skills (an installer gap), so the review steps the rules named could not run | `METRICS.md` "Expanded Dataset Analysis" | observational, different model family |
+| 66 masked production sessions, ~7 weeks | rules deployed without skills (an installer gap), so the review steps the rules named could not run; no waste rate was reported for it | `METRICS.md` "Expanded Dataset Analysis" | observational, different model family |
 
 The first two percentages are re-derived from the quoted counts. The A/B percentages are quoted: `METRICS.md` gives them with total steps but not the wasted-step counts. Everything else in the table is quoted.
 
@@ -86,7 +86,7 @@ The first two percentages are re-derived from the quoted counts. The A/B percent
 - Waste classification lacked multi-rater reliability.
 - The full rule lifecycle was never validated end to end against human assessment.
 - The fitness function optimized for precision and ignored recall (false negatives).
-- The "A/B" compares two sessions of the same project (TAB AI) at different times, and the two sessions need not have faced the same task; it is not a controlled experiment.
+- The "A/B" compares two sessions of the same project (TAB AI) at different times, and the two sessions need not have faced the same task; it is not a controlled experiment. They also differ in subagent model tier (Opus against 100% Flash) and credit use (about 100% against about 12%), per `METRICS.md`.
 - Outcome signals in v3 could be written by the agent being measured (review H4), so any fitness number from that period is self-graded.
 - Token figures in the old metrics were estimated with a word-count ratio calibrated for one model family, not measured with a tokenizer. This page quotes none of them.
 
@@ -100,7 +100,7 @@ A multi-lens review graded the code at `9e4d976` (v3.3 plus the first v4 wave) 4
 
 Release Gate 4.5 required a "SHIP" receipt before a release. For v2.0, v2.1, v3.0 and v3.3 the receipt was written by hand by the agent being gated. One contained placeholder predictions `p1` to `p6`; the v3.3.0 receipt claims 8 convergences and lists 5. A hand-written evidence file with `verdict: ship` and the current tree hash passed the gate (review H6). *Source*: ADR 0005 §1, fact 1.
 
-**v4**: receipts and the release gate are deleted (ADR 0005 AD-2, §5). A release needs an independent review, CI green on the exact commit SHA, and `aegis check` passing Layer 1 and a cross-vendor Layer 2 ([CONTRIBUTING](../CONTRIBUTING.md#releases)). Old receipts are treated as unattested, not rewritten. The pre-tag check is `.github/scripts/ci_green.py <sha>`.
+**v4**: receipts and the release gate are deleted (ADR 0005 AD-2, §5). A release needs an independent review, CI green on the exact commit SHA, and `aegis check` passing Layer 1; a cross-vendor Layer 2 review is advisory input to the release review and never gates it ([CONTRIBUTING](../CONTRIBUTING.md#releases)). Old receipts are treated as unattested, not rewritten. The pre-tag check is `.github/scripts/ci_green.py <sha>`.
 
 ### 5.2 The fitness signal was inverted
 
@@ -108,7 +108,7 @@ v3 credited every rule whose paths matched a change with that run's pass or fail
 
 **v4**: promotion is a reviewed change. `aegis sync` rebuilds the scores from the ledger and only *suggests* promotions, demotions and archives; applying one is an explicit step (`aegis sync --apply` or `aegis rule promote`) that shows up in review.
 
-**Not fixed yet**: the score itself. `aegis check`, including the pre-commit hook, still records each run's pass or fail against every rule whose paths match the checked files. The verdict is now split by file, so each rule gets a fraction of it, but a gate that blocks a bad commit is still scored as a miss. Self-reports from MCP clients are labeled `source: "mcp"` and still count toward the score, although AD-2 asks for credit from external signals only. So the score only ranks guidance in scan output and feeds `sync` suggestions; it never moves a rule by itself. Which rule actually helped is an open question, pinned for after v4.2 (ADR 0005 §8b); the per-rule credit model in section 6 is the plan to answer it.
+**Fixed since v4.0**: the score itself. A plain `aegis check`, including the pre-commit hook, now records triggers only, never a true or false positive. Credit comes from signals the agent cannot write: a passing `aegis check --record --tests` row bound to the exact git tree and confirmed by CI on the landing commit, detector replay over merged history, and human labels merged to the base branch. A self-report from an MCP client without a matching check row is recorded as `claimed` and earns nothing. The score ranks guidance in scan output and feeds `sync` suggestions; it never moves a rule by itself, and below 25 verdicts a rule shows no score at all (section 6).
 
 ### 5.3 Rules disabled themselves
 
@@ -120,7 +120,7 @@ v3 wrote fitness numbers back into each rule file's frontmatter at session close
 
 Across about 690 sessions the author's logs show 73 MCP calls, to only 5 of the 17 tools; 12 tools were never called. No rule was ever promoted, demoted or archived in either governed repository (ADR 0005 §5, from the refactor sweep's count of the author's local session logs).
 
-**v4**: the MCP surface is 4 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`), and the CLI shrinks to the commands in ADR 0005 §5. Receipts, the async job engine (the only daemon thread), the claim and bug registries, the agent-side hook phases and the unreachable code are cut with them. Re-derived: the MCP registry lists 4 tools, and the Python in the four `aegis_*` packages went from 39,426 lines in 160 files at `9e4d976` to 25,963 lines in 107 files at `41cd3f0`, the merge of waves A, B and C (34.1% fewer). The low point was 22,188 lines in 109 files at `895bbf5` (43.7% fewer), after the cuts and before later waves added the storage layer, `aegis migrate`, `gitsafe`, the host plane and `aegis doctor`. The docs were cut the same way: this page replaces the evolution log, the metrics log, the research notes and the archive.
+**v4**: the MCP surface is cut to four tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`; `aegis_capture_insight` later made it five), and the CLI shrinks to the commands in ADR 0005 §5. Receipts, the async job engine (the only daemon thread), the claim and bug registries, the agent-side hook phases and the unreachable code are cut with them. Re-derived: the MCP registry lists 4 tools (5 today), and the Python in the four `aegis_*` packages went from 39,426 lines in 160 files at `9e4d976` to 25,963 lines in 107 files at `41cd3f0`, the merge of waves A, B and C (34.1% fewer). The low point was 22,188 lines in 109 files at `895bbf5` (43.7% fewer), after the cuts and before later waves added the storage layer, `aegis migrate`, `gitsafe`, the host plane and `aegis doctor`. The cut did not last: at `35d8ac21` (develop on 2026-10-22) the same packages are 54,125 lines in 150 files, 37% more than at `9e4d976`, so "fewer lines" describes the low point, not today. The docs were cut the same way: this page replaces the evolution log, the metrics log, the research notes and the archive.
 
 ### 5.5 Five resets in about 21 hours
 
@@ -132,7 +132,7 @@ On 2026-10-14 the project rebranded, tagged v2.0.0, v2.1.0 and v3.0.0, then star
 
 A repository's `.aegis/slots.yaml` named AST-driver commands that `aegis check` executed, and its slot values were inlined into the scan output the agent reads (review H5).
 
-**v4**: one `.aegis/config.json`, and repository config cannot name commands or tool slots. Driver commands come only from packaged templates or user-scope config (ADR 0005 §5 "Config" and D10; ADR 0016 status). Every git call goes through `gitsafe`, which switches off what a repository's git config could run. The [repository trust table](../SECURITY.md#repository-trust) lists everything Aegis does run and where it comes from (`tests/unit/core/test_security_policy.py` fails when a module that starts a program has no row there); the one case that runs repository code is `aegis check --full`, which runs the tests that match the change.
+**v4**: one `.aegis/config.json`, and repository config cannot name commands or tool slots. Driver commands come only from packaged templates or user-scope config (ADR 0005 §5 "Config" and D10; ADR 0016 status). Git calls go through `gitsafe`, which switches off what a repository's git config could run; the one other module that starts git, `aegis_core/treeid.py`, applies the same switches itself because it needs a private index. The [repository trust table](../SECURITY.md#repository-trust) lists everything Aegis does run and where it comes from (`tests/unit/core/test_security_policy.py` fails when a module that starts a program has no row there). Repository code runs only where a test or benchmark command does: `aegis check --full`, `aegis check --record --tests`, `aegis check --ci` unless `--no-exec` is given, and `--ci --coverage` and `--ci --perf`.
 
 ```mermaid
 flowchart LR
@@ -210,7 +210,7 @@ The trade Aegis does not make: it does not claim enforcement it lacks. CI on eve
 **Re-derived** (run from the repository root at `895bbf5`):
 
 ```sh
-python3 -c "print(749/1339, 180+110+103+50+30, 749-473, 473/749, 1317/7015, 1-25963/39426, 1-22188/39426)"   # 0.559, 473, 276, 0.632, 0.188, 0.341, 0.437
+python3 -c "print(749/1339, 180+110+103+50+30, 749-473, 473/749, 1317/7015, 1-25963/39426, 1-22188/39426, 54125/39426-1)"   # 0.559, 473, 276, 0.632, 0.188, 0.341, 0.437, 0.373
 git log -1 --format='%h %ci' 2c85f58; git log -1 --format='%h %ci' 6f47f13   # 02:50 and 23:30 on 2026-10-14; 20 h 40 min is their difference
 git show --shortstat --format='%B' 6f47f13                                     # the subject line only; 40 files changed, 4267 insertions, 3272 deletions
 git rev-list --count 9e4d976; git tag --merged 895bbf5 | wc -l               # 850, 94
@@ -218,9 +218,9 @@ git log --reverse --format=%ci 9e4d976 | head -1                               #
 git for-each-ref --format='%(creatordate:iso) %(refname:short)' refs/tags/v3.3.0   # 23:14; 16 min is the difference to 6f47f13 (23:30)
 python3 -c "import aegis_mcp.registry as r; print(len(r.TOOL_DEFINITIONS))"   # 4
 # Python lines and files under aegis_core, aegis_cli, aegis_mcp, aegis_sdk (all lines, blank and comment lines included):
-for rev in 9e4d976 895bbf5 41cd3f0; do
-  git ls-tree -r --name-only $rev -- aegis_core aegis_cli aegis_mcp aegis_sdk | grep -c '\.py$'    # 160, 109, 107 files
+for rev in 9e4d976 895bbf5 41cd3f0 35d8ac21; do
+  git ls-tree -r --name-only $rev -- aegis_core aegis_cli aegis_mcp aegis_sdk | grep -c '\.py$'    # 160, 109, 107, 150 files
   git ls-tree -r --name-only $rev -- aegis_core aegis_cli aegis_mcp aegis_sdk | grep '\.py$' \
-    | while read -r f; do git show "$rev:$f"; done | wc -l                                          # 39426, 22188, 25963 lines
+    | while read -r f; do git show "$rev:$f"; done | wc -l                                          # 39426, 22188, 25963, 54125 lines
 done
 ```

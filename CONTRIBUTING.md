@@ -41,19 +41,19 @@ PYTHONPATH=. python3 tests/contract/test_mcp_contract.py --write
 PYTHONPATH=. python3 tests/contract/gen_reference.py --write
 ```
 
-The last command writes [docs/reference.md](docs/reference.md); never edit that file by hand. Also update `.github/scripts/wheel_smoke.py`, which calls the CLI, the MCP tools and the SDK against the built wheel and runs only in CI.
+The last command writes [docs/reference.md](docs/reference.md); never edit that file by hand. When a change lowers the count of a legacy v3 word, `PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write` records the lower number (the test fails on a lower count too). Removing or renaming a public name pinned in `tests/contract/public_names_4_3_3.json` needs a `removed` entry there and a `Breaking:` line in the CHANGELOG. Also update `.github/scripts/wheel_smoke.py`, which calls the CLI, the MCP tools and the SDK against the built wheel and runs only in CI.
 
 Docs: relative links must resolve (`tests/unit/test_docs_links.py`), the README must not repeat a retracted claim (`tests/unit/core/test_readme_claims.py`), and `rules/`, `skills/`, `docs/` and the README may not contain a path under `/home/` (a CI step greps for it).
 
 ## Releases
 
-A release goes to `main` only after all of these hold for the exact commit being tagged (ADR 0005 AD-10):
+A release goes to `main` only after all of these hold for the exact commit being tagged:
 
 1. An independent review of the release pull request.
 2. CI green on that commit: `python3 .github/scripts/ci_green.py <sha>` exits 0 (it needs the `gh` CLI).
 3. `aegis check` passes Layer 1. A Layer 2 review with a model from a different vendor than the one that wrote the change (`aegis check --full --plan-file <plan> --llm-cmd "<command>"`) is advisory: since 4.3.4 its verdict is logged and never changes the exit status, so it informs the release review but does not gate it.
 
-For 4.0 to 4.2 the author lets the agent merge, tag and publish once these hold; otherwise a person merges to `main`. Publishing a GitHub Release runs `.github/workflows/publish.yml`, which ships the wheel CI already built and tested. The [CHANGELOG](CHANGELOG.md) entry describes what changed for users, and its date is set when the release is cut.
+A maintainer merges the release pull request into `main`, tags `v<version>` (it must equal `aegis_core/_version.py`; `.github/scripts/release_guard.py` refuses a publish otherwise) and publishes the GitHub Release. That runs `.github/workflows/publish.yml`, which ships the wheel CI already built and tested. The [CHANGELOG](CHANGELOG.md) entry describes what changed for users, and its date is set when the release is cut.
 
 ## Writing a rule
 
