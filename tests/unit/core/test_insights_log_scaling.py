@@ -110,7 +110,7 @@ def test_a_write_parses_at_most_25_rows(ws: Path, home: Path, json_parses: list,
     if call == "add_insight":
         add_insight(ws, "Never parse the whole log in src/app.py", paths=["src/app.py"], home=home)
     elif call == "record_decision":
-        record_decision(ws, cluster_id="cluster-x", decision="noise", insight_ids=["ins-1"], home=home)
+        record_decision(ws, decision="noise", insight_ids=["ins-1"], home=home)
     elif call == "capture_suggestion":
         capture_suggestion(ws, QUOTE, paths=["src/app.py"], host="claude-code", session="S1", home=home)
     else:

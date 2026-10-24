@@ -10,14 +10,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from aegis_core import sync
-from aegis_core.fitness import MIN_N, wilson_lower_bound
+from aegis_core.fitness import MIN_N
 from aegis_core.rules import lf_digest, load_rules
+from aegis_core.stats import wilson_lower_bound
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
 from aegis_core.telemetry_engine import ledger
 
 OLD = "2026-01-01"  # created long enough ago to be promotable
@@ -100,7 +103,7 @@ def test_sync_writes_the_derived_view_of_every_rule(labelled_ws: Path) -> None:
     assert good["path"] == ".aegis/rules/traps/trap-good.md"
     assert good["sha256"] == lf_digest((ws / good["path"]).read_bytes())
     assert (good["type"], good["triggers"], good["tp"], good["fp"]) == ("trap", 25, 25 + 25, 0)
-    assert good["fitness"] == pytest.approx(wilson_lower_bound(50, 50), abs=1e-4)
+    assert good["fitness"] == pytest.approx(wilson_lower_bound(50, 50, DEFAULT_CONFIDENCE_LEVEL), abs=1e-4)
     assert isinstance(good["last_ts"], str)
     assert {rid: e["suggestion"] for rid, e in doc["rules"].items()} == {
         "trap-good": "promote", "inv-noisy": "demote", "trap-noisy": "archive", "persona-new": None,
@@ -479,6 +482,75 @@ def test_an_example_already_labelled_is_never_listed_and_takes_no_slot(tmp_path:
     held = [json.loads(line) for line in hs.git(repo.root, "show", f"{second['branch']}:{store}").splitlines()]
     ids = [r["example_id"] for r in held if "example_id" in r and r["example_id"] in again + listed]
     assert sorted(ids) == sorted(set(ids)) and set(ids) == set(again) | {listed[0]}  # one new row, no duplicate
+
+
+# ── w9 review F2: the branch goes where the pull request is opened ───────────
+
+@pytest.fixture
+def recorded_gh(tmp_path: Path, monkeypatch, real_gh_runner):
+    """The real gh runner finding a recording gh stub (no network): returns the calls it logged."""
+    from tests import helpers_humangate as hg
+
+    hg.recording_gh(tmp_path / "bin")
+    (tmp_path / "home").mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(tmp_path / "home"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("LOG", str(tmp_path / "gh.log"))
+    monkeypatch.delenv("GH_REPO", raising=False)
+    return lambda: hg.gh_log(tmp_path / "gh.log")
+
+
+def _track(repo, name: str, url: str, push_to: Path) -> None:
+    """main tracks ``name`` (``url``), whose pushes land in the local bare ``push_to``."""
+    from tests import helpers_syncpr as hs
+
+    hs.git(repo.root, "remote", "add", name, url)
+    hs.git(repo.root, "config", f"remote.{name}.pushurl", str(push_to))
+    hs.git(repo.root, "fetch", "-q", str(push_to), f"+refs/heads/main:refs/remotes/{name}/main")
+    hs.git(repo.root, "config", "branch.main.remote", name)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a shell gh stub")
+def test_sync_pr_refuses_a_push_remote_that_is_not_origins_repository(tmp_path: Path, recorded_gh) -> None:
+    """Given main tracking upstream (main-org/proj) while origin is a fork (fork-user/proj), When sync --pr
+    runs with the real gh runner, Then it refuses before moving a file and names both remotes: the
+    branch would reach upstream while gh opened the pull request in the fork."""
+    from tests import helpers_syncpr as hs
+
+    repo = hs.make(tmp_path)
+    upstream = tmp_path / "upstream.git"
+    hs.git(tmp_path, "clone", "-q", "--bare", str(repo.origin), str(upstream))
+    _track(repo, "upstream", "https://github.com/main-org/proj.git", upstream)
+    hs.git(repo.root, "config", "remote.origin.url", "https://github.com/fork-user/proj.git")
+    hs.git(repo.root, "config", "remote.origin.pushurl", str(repo.origin))
+    before = repo.state()
+
+    result = sync.sync(repo.root, pr=True)
+
+    assert result.pr["status"] == "refused", result.pr
+    assert all(word in result.pr["reason"] for word in ("upstream", "origin", "fork-user/proj")), result.pr["reason"]
+    assert repo.state() == before and recorded_gh() == [] and repo.origin_branches() == ["main"]
+    assert hs.git(upstream, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "main"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a shell gh stub")
+def test_sync_pr_pushes_through_a_second_name_for_origins_repository(tmp_path: Path, recorded_gh) -> None:
+    """Given main tracking mirror, a second remote name with origin's URL, When sync --pr runs with the
+    real gh runner, Then the branch is pushed through mirror and gh opens the PR in origin's repository."""
+    from tests import helpers_syncpr as hs
+
+    repo = hs.make(tmp_path)
+    hs.git(repo.root, "config", "remote.origin.url", "https://github.com/octo/proj.git")
+    hs.git(repo.root, "config", "remote.origin.pushurl", str(tmp_path / "never.git"))
+    _track(repo, "mirror", "https://github.com/octo/proj.git", repo.origin)
+
+    result = sync.sync(repo.root, pr=True)
+
+    assert result.pr["status"] == "opened", result.pr
+    assert [(c["GH_REPO"], c["argv"][:2]) for c in recorded_gh()] == [("octo/proj", ["pr", "create"])]
+    assert result.pr["branch"] in repo.origin_branches() and not (tmp_path / "never.git").exists()
 
 
 def test_derived_entries_carry_no_samples_and_an_older_file_with_them_still_reads(ws: Path) -> None:

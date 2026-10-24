@@ -403,15 +403,14 @@ Opt-in enable UserPromptSubmit insight capture for a host
 
 ### `aegis rule insight review`
 
-Cluster and review insights or record a decision
+List insights with their top-3 neighbours or record a decision on some
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise`, `confirm` |  | Record a review decision: for the cluster --cluster names (reject also needs --reason), or confirm the suggestions --insight names |
-| `--cluster` | `CLUSTER_ID` |  | Cluster ID for --decision (as review lists it) |
-| `--insight` | `ID` |  | Unconfirmed suggestion ID for --decision confirm (repeatable) |
-| `--kind` | `KIND` |  | Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the cluster's insights share) |
-| `--proposal-id` | `PROPOSAL_ID` |  | Proposal ID when --decision propose |
+| `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise`, `confirm` |  | Record a review decision on the insights --insight names (reject also needs --reason; confirm names unconfirmed suggestions) |
+| `--insight` | `ID` |  | Insight ID the decision names, as review lists it (repeatable) |
+| `--kind` | `KIND` |  | Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the named insights share) |
+| `--proposal-id` | `PROPOSAL_ID` |  | Proposal ID when --decision propose (default: trap- and 8 hex digits of the ids) |
 | `--summary` | `SUMMARY` |  | Closed-template summary bullet when --decision propose |
 | `--rule` | `RULE_ID` |  | Target rule ID for merge-into-rule or recurrence check |
 | `--reason` | `REASON` |  | Reason for the decision (required with reject) |

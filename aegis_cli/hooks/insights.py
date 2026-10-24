@@ -7,13 +7,9 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, Optional, Sequence
 
-from aegis_core.insights import (
-    SUPPORTED_INSIGHT_HOSTS,
-    host_capture_status as insight_hook_status,
-    record_hook_prompt,
-)
+from aegis_core.insights import record_hook_prompt
 
-__all__ = ["SUPPORTED_INSIGHT_HOSTS", "enable_insight_hook", "insight_hook_status", "main", "run_insight_hook"]
+__all__ = ["enable_insight_hook", "main", "run_insight_hook"]
 
 
 def enable_insight_hook(host: str, *, excerpts: bool = False, home: Optional[Path] = None) -> Dict[str, Any]:
@@ -27,7 +23,6 @@ def enable_insight_hook(host: str, *, excerpts: bool = False, home: Optional[Pat
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aegis_cli.hooks.insights", add_help=False)
     parser.add_argument("--host", default="claude-code")
-    parser.add_argument("--workspace", default=None)
     parser.add_argument("--excerpts", dest="excerpts", action="store_true", default=True)
     parser.add_argument("--no-excerpts", dest="excerpts", action="store_false")
     return parser
@@ -38,7 +33,7 @@ def run_insight_hook(argv: Optional[Sequence[str]] = None, stdin: Optional[str] 
     try:
         args, _ = _build_parser().parse_known_args(list(argv) if argv is not None else sys.argv[1:])
         raw = stdin if stdin is not None else ("" if sys.stdin.isatty() else sys.stdin.read())
-        record_hook_prompt(args.host, raw, workspace=args.workspace, excerpts=bool(args.excerpts), home=home)
+        record_hook_prompt(args.host, raw, excerpts=bool(args.excerpts), home=home)
     except Exception as exc:
         try:
             sys.stderr.write(f"aegis insight hook error: {exc}\n")

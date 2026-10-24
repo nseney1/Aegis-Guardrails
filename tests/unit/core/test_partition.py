@@ -235,6 +235,51 @@ def test_a_module_that_is_not_in_the_workspace_makes_no_edge(repo: Path):
     assert not any(e[1] == "a/std.py" for e in _edges(partition.check(repo, _splits(**AB), record=False)))
 
 
+
+# ── Module resolution (R-cli-44: pinned across the revert into partition.py) ─
+
+def test_the_nearest_module_shadows_one_higher_up(tmp_path: Path):
+    root = init_repo(tmp_path / "shadow", rules=False)
+    write(root, "pkg/app.py", "from util import helper\n\n\ndef go():\n    return helper()\n")
+    write(root, "pkg/util.py", "def helper():\n    return 1\n")
+    write(root, "util.py", "def helper():\n    return 2\n")
+    commit(root, "base")
+    # The root util.py is in no lane (a slash-free glob would match pkg/util.py too): an edge
+    # exists only if the import resolved to pkg/util.py.
+    report = partition.check(root, _splits(A="pkg/app.py", B="pkg/util.py"), record=False)
+    assert _edges(report, "import") == [("import", "pkg/app.py", 1, "pkg/util.py", "helper")]
+
+
+def test_an_importer_at_the_workspace_root_finds_a_package(tmp_path: Path):
+    root = init_repo(tmp_path / "rooted", rules=False)
+    write(root, "app.py", "from lib import f\n\n\ndef go():\n    return f()\n")
+    write(root, "lib/__init__.py", "def f():\n    return 1\n")
+    commit(root, "base")
+    report = partition.check(root, _splits(A="app.py", B="lib/**"), record=False)
+    assert _edges(report) == [
+        ("import", "app.py", 1, "lib/__init__.py", "f"),
+        ("call", "app.py", 5, "lib/__init__.py", "f"),
+    ]
+
+
+def test_a_rust_module_directory_resolves_through_mod_rs(tmp_path: Path):
+    root = init_repo(tmp_path / "rustmod", rules=False)
+    write(root, "src/a.rs", "use crate::b::work;\n\npub fn run() -> i32 {\n    work(2)\n}\n")
+    write(root, "src/b/mod.rs", "pub fn work(x: i32) -> i32 { x }\n")
+    write(root, ".aegis/config.json", json.dumps({"v": 1, "ast": {"packaged_drivers": ["rs"]}}))
+    commit(root, "base")
+    edges = _edges(partition.check(root, _splits(A="src/a.rs", B="src/b/**"), record=False))
+    assert ("import", "src/a.rs", 1, "src/b/mod.rs", "work") in edges
+    assert ("call", "src/a.rs", 4, "src/b/mod.rs", "work") in edges
+
+
+def test_an_import_that_resolves_to_no_file_makes_no_edge(tmp_path: Path):
+    root = init_repo(tmp_path / "unresolved", rules=False)
+    write(root, "a/x.py", "from missing.mod import f\nimport gone\n\n\ndef go():\n    return f() + gone.g()\n")
+    write(root, "b/y.py", "def f():\n    return 1\n")
+    commit(root, "base")
+    assert _edges(partition.check(root, _splits(A="a/**", B="b/**"), record=False)) == []
+
 # ── FROZEN_SIGNATURES ────────────────────────────────────────────────────────
 
 def _frozen(report):

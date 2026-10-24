@@ -645,6 +645,23 @@ def test_how_it_works_lists_the_scan_window_among_the_repo_config_keys():
     assert "`jit.scan_window_s`" in row and "`jit.max_tokens`" in row
 
 
+def test_how_it_works_lists_the_decay_keys_with_their_defaults_among_the_repo_config_keys():
+    """The two decay keys are read only under ``expiry`` (R-evidence-23); the config row names them."""
+    from aegis_core import config
+
+    row = next(line for line in HOW.read_text(encoding="utf-8").splitlines()
+               if line.startswith("| `.aegis/config.json` |"))
+    assert "`expiry.half_life_sessions`" in row and "`expiry.epsilon`" in row
+    assert f"default {config.DEFAULT_HALF_LIFE_SESSIONS}" in row and f"default {config.DEFAULT_EPSILON}" in row
+
+
+@pytest.mark.parametrize("doc", [README, HOW], ids=["readme", "how"])
+def test_the_decay_sentence_claims_no_heartbeat_gate(doc):
+    """Exposure rows carry no heartbeat flag (R-evidence-17), so no decay sentence may claim one."""
+    decay = [line for line in doc.read_text(encoding="utf-8").splitlines() if "2^(-delta / H)" in line]
+    assert decay and not [line for line in decay if "heartbeat" in line.lower()]
+
+
 def test_how_it_works_describes_the_events_log_the_code_writes(tmp_path):
     """The events log lives in the git common dir (shared by every worktree), and the doc
     names every kind 4.1 writes."""

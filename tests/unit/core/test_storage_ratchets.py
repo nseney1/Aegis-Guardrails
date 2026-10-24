@@ -19,8 +19,6 @@ PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
 # (file, enclosing function) -> what it writes. Adding an entry is a reviewed decision.
 NON_AEGIS_WRITERS = {
     ("aegis_cli/verify.py", "_append_step_summary"): "$GITHUB_STEP_SUMMARY, appended once per run as every job step does (outside the workspace)",
-    ("aegis_cli/hooks/management.py", "install_hook"): "the git pre-commit hook (.git/hooks)",
-    ("aegis_cli/hooks/management.py", "uninstall_hook"): "the git pre-commit hook (.git/hooks)",
     ("aegis_cli/hooks/commitmsg.py", "install"): "the git prepare-commit-msg hook (.git/hooks)",
     ("aegis_core/baseline.py", "Sources._ast"): "a staged non-Python blob copied into a temporary directory for the AST driver",
     ("aegis_core/verification/runner.py", "snapshot_index"): "staged blobs in a temporary directory (aegis check --hook)",

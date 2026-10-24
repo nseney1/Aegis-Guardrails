@@ -5,7 +5,7 @@ Covers the §9 T8 acceptance criteria:
 2. Correction-cue detection precision/recall and user-scope hook storage (heartbeat vs cue-gated insight).
 3. 'Agent insights don't count': MCP aegis_capture_insight suggestions never count and never enter aegis_scan; a hook prompt of the same host within the join window that contains the quote annotates, never upgrades.
 4. Keyed hs pseudonymization (HMAC-SHA256 with ~/.aegis/link.key, POSIX mode 0600, O_EXCL, 32 random bytes).
-5. Stdlib TF-IDF top-3 neighbour clustering, exposure-joined rule matching, and rejected-cluster cooldown (>= 2 new insights).
+5. Stdlib TF-IDF top-3 neighbours per insight (the human groups them), exposure-joined rule matching, and a rejected group's cooldown (>= 2 new insights with a member as a neighbour).
 6. Closed-template proposals in .aegis/proposals/<id>.md (never loaded by load_rules, no verbatim W0/W2 text) and post-activation recurrence measurement over heartbeat-alive sessions (burst collapse, 95% UCB, >= 3 alarm, per-rev reset).
 """
 from __future__ import annotations
@@ -85,7 +85,8 @@ def _hook_insight(repo: Path, text: str, session: str, home: Path) -> Dict[str, 
     The hook takes its paths from the dirty set, so src/app.py is made dirty first, as the
     explicit ``paths=["src/app.py"]`` of the CLI channel did."""
     (repo / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
-    row = record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    row = record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)},
+                             workspace=repo, home=home)
     assert row.get("event") == "insight", f"no correction cue in {text!r}"
     return row
 
@@ -192,10 +193,9 @@ def test_correction_cue_detector_precision_and_recall_and_hook_storage(tmp_path:
 
     # Routine prompt via hook -> writes heartbeat only, no prompt text on disk
     record_hook_prompt(
-        repo,
         "claude-code",
         {"prompt": "Please implement the parser for the new command.", "session_id": "sess-routine-1", "cwd": str(repo)},
-        home=home,
+        workspace=repo, home=home,
     )
     store = insights_path(repo, home=home)
     assert store.exists()
@@ -211,14 +211,13 @@ def test_correction_cue_detector_precision_and_recall_and_hook_storage(tmp_path:
 
     # Correction prompt via hook -> writes heartbeat (for new session) + redacted W2 insight row
     record_hook_prompt(
-        repo,
         "claude-code",
         {
             "prompt": "No, don't hardcode token ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD in src/app.py!",
             "session_id": "sess-corr-2",
             "cwd": str(repo),
         },
-        home=home,
+        workspace=repo, home=home,
     )
     rows = [json.loads(line) for line in store.read_text(encoding="utf-8").splitlines() if line.strip()]
     insight_rows = [r for r in rows if r.get("event") == "insight"]
@@ -254,9 +253,9 @@ def test_agent_suggestions_do_not_count_and_never_enter_scan_or_proposals(tmp_pa
         assert res["level"] == "suggestion"
 
     review = review_insights(repo, home=home)
-    # Suggestions appear only in review['suggestions'], never in countable clusters/proposals
+    # Suggestions appear only in review['suggestions'], never as counted insights or in proposals
     assert len(review["suggestions"]) == 3
-    assert review["clusters"] == []
+    assert review["insights"] == [] and review["suppressed"] == []
 
     # aegis_scan never returns suggestion text
     scan_res = scan_workspace(repo, changed_files=["src/app.py"])
@@ -266,14 +265,13 @@ def test_agent_suggestions_do_not_count_and_never_enter_scan_or_proposals(tmp_pa
     # A hook-captured prompt of the same host containing the quote corroborates the captures:
     # they stay suggestions and annotate the one hook row, which alone counts.
     hook = record_hook_prompt(
-        repo,
         "claude-code",
         {
             "prompt": "Stop! Never use write_text with newline parameter in Python 3.9, it breaks!",
             "session_id": "host-sess-1",
             "cwd": str(repo),
         },
-        home=home,
+        workspace=repo, home=home,
     )
     corroborated = capture_suggestion(
         repo,
@@ -286,7 +284,7 @@ def test_agent_suggestions_do_not_count_and_never_enter_scan_or_proposals(tmp_pa
     assert corroborated["level"] == "suggestion"
     assert corroborated["corroborated_by"] == hook["id"]
     review = review_insights(repo, home=home)
-    assert [(c["count"], len(c["corroborated"])) for c in review["clusters"]] == [(1, 4)]
+    assert [(e["id"], len(e["corroborated"])) for e in review["insights"]] == [(hook["id"], 4)]
     assert review["suggestions"] == []
 
 
@@ -328,9 +326,9 @@ def test_keyed_hs_pseudonymization_and_link_key_creation(tmp_path: Path, monkeyp
     assert "session" not in row and "host_session" not in row
 
 
-# ── 5. TF-IDF clustering, rule matching, and rejected cooldown ───────────────
+# ── 5. TF-IDF neighbours, rule matching, and rejected cooldown ───────────────
 
-def test_tfidf_clustering_rule_matching_and_rejected_cluster_cooldown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_tfidf_neighbours_rule_matching_and_rejected_group_cooldown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -381,48 +379,42 @@ def test_tfidf_clustering_rule_matching_and_rejected_cluster_cooldown(tmp_path: 
     # Add insight matching archived rule -> matches_archived
     _hook_insight(repo, "Do not deserialize pickle payloads from untrusted sockets in src/app.py", "session-unexposed-3", home)
 
-    # Add two similar insights with no matching rule -> cluster together with no_rule
+    # Add two similar insights with no matching rule -> each other's top neighbour, no_rule
     ins_a = _hook_insight(repo, "Stop mutating global os.environ directly inside worker threads", "session-4", home)
     ins_b = _hook_insight(repo, "Never mutate global os.environ state inside worker threads", "session-5", home)
 
     rev = review_insights(repo, home=home)
-    classifications = {c["match_status"]: c for c in rev["clusters"]}
+    classifications = {e["match"]["status"]: e for e in rev["insights"]}
     assert "exposed_and_ignored" in classifications
-    assert classifications["exposed_and_ignored"]["matched_rule"] == "trap-no-shell-true"
+    assert classifications["exposed_and_ignored"]["match"]["rule"] == "trap-no-shell-true"
     assert "not_exposed" in classifications
-    assert classifications["not_exposed"]["matched_rule"] == "trap-no-eval"
+    assert classifications["not_exposed"]["match"]["rule"] == "trap-no-eval"
     assert "matches_archived" in classifications
-    assert classifications["matches_archived"]["matched_rule"] == "trap-archived-pickle"
-    assert "no_rule" in classifications
-    no_rule_cluster = classifications["no_rule"]
-    assert len(no_rule_cluster["insight_ids"]) == 2
-    assert set(no_rule_cluster["insight_ids"]) == {ins_a["id"], ins_b["id"]}
+    assert classifications["matches_archived"]["match"]["rule"] == "trap-archived-pickle"
+    no_rule = {e["id"]: e for e in rev["insights"] if e["match"]["status"] == "no_rule"}
+    assert set(no_rule) == {ins_a["id"], ins_b["id"]}
+    assert no_rule[ins_a["id"]]["neighbours"][0]["id"] == ins_b["id"]
+    assert no_rule[ins_b["id"]]["neighbours"][0]["id"] == ins_a["id"]
 
-    # Reject the no_rule cluster -> disappears from review until >= 2 new insights arrive
-    cluster_id = no_rule_cluster["cluster_id"]
-    record_decision(
-        repo,
-        cluster_id=cluster_id,
-        decision="reject",
-        insight_ids=no_rule_cluster["insight_ids"],
-        reason="Not needed right now",
-        home=home,
-    )
+    # Reject the group the human formed -> it leaves review until >= 2 new insights name a member
+    group = sorted(no_rule)
+    record_decision(repo, decision="reject", insight_ids=group, reason="Not needed right now", home=home)
     rev_after_reject = review_insights(repo, home=home)
-    assert all(c["cluster_id"] != cluster_id for c in rev_after_reject["clusters"])
+    assert not set(group) & {e["id"] for e in rev_after_reject["insights"]}
+    assert sorted(e["id"] for e in rev_after_reject["suppressed"]) == group
 
     # 1 new insight arrives -> still suppressed (< 2 new insights since rejection)
     _hook_insight(repo, "Do not mutate global os.environ variables inside worker threads", "session-6", home)
     rev_after_one = review_insights(repo, home=home)
-    assert not any("os.environ" in " ".join(c.get("excerpts", [])) for c in rev_after_one["clusters"])
+    assert not set(group) & {e["id"] for e in rev_after_one["insights"]}
 
-    # 2nd new insight arrives -> cluster re-surfaces!
+    # 2nd new insight arrives -> the group re-surfaces!
     # "Don't", not "Avoid": the hook records only prompts with a correction cue.
     _hook_insight(repo, "Don't mutate global os.environ dictionary in worker threads", "session-7", home)
     rev_after_two = review_insights(repo, home=home)
-    resurfaced = [c for c in rev_after_two["clusters"] if c["match_status"] == "no_rule"]
-    assert len(resurfaced) == 1
-    assert len(resurfaced[0]["insight_ids"]) >= 2
+    resurfaced = [e["id"] for e in rev_after_two["insights"] if e["match"]["status"] == "no_rule"]
+    assert set(group) <= set(resurfaced) and len(resurfaced) == 4
+    assert rev_after_two["suppressed"] == []
 
 
 # ── 6. Closed-template proposals & recurrence measurement ────────────────────
@@ -437,10 +429,9 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
     # Capture a W2 hook insight with distinctive verbatim phrasing
     verbatim_w2 = "No, never call shutil.rmtree on unvalidated user paths in src/app.py!"
     record_hook_prompt(
-        repo,
         "claude-code",
         {"prompt": verbatim_w2, "session_id": "sess-prop-1", "cwd": str(repo)},
-        home=home,
+        workspace=repo, home=home,
     )
 
     # Write closed-template proposal -> lives in .aegis/proposals/<id>.md, never loaded by load_rules,
@@ -488,10 +479,9 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
     for s_idx in range(1, 6):
         sid = f"post-act-sess-{s_idx}"
         record_hook_prompt(
-            repo,
             "claude-code",
             {"prompt": "Run the test suite please.", "session_id": sid, "cwd": str(repo)},
-            home=home,
+            workspace=repo, home=home,
         )
         if s_idx <= 3:
             # In session 1, emit two burst insights back-to-back -> must collapse to 1 episode
@@ -512,7 +502,7 @@ def test_closed_template_proposals_and_recurrence_alarm(tmp_path: Path, monkeypa
         rule_file.read_text(encoding="utf-8") + "\nAdditional mechanical guidance for v2.\n",
         encoding="utf-8",
     )
-    rec_reset = measure_recurrence(repo, "trap-validate-rmtree", home=home, reset_on_rev_change=True)
+    rec_reset = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert rec_reset["recurrences"] == 0
     assert rec_reset["alarm"] is False
 
@@ -537,42 +527,29 @@ def test_same_rule_dissimilar_insights_stay_separate_through_rejection_and_resur
     ins_pickle = _hook_insight(repo, "Never call pickle.loads on untrusted socket payload bytes", "sess-pickle-1", home)
 
     rev = review_insights(repo, home=home)
-    clusters = rev["clusters"]
-    assert len(clusters) == 2
-    assert {c["matched_rule"] for c in clusters} == {"trap-broad-security"}
-    assert len({c["cluster_id"] for c in clusters}) == 2
+    entries = rev["insights"]
+    assert [e["id"] for e in entries] == [ins_shell["id"], ins_pickle["id"]]
+    assert {e["match"]["rule"] for e in entries} == {"trap-broad-security"}
 
-    cluster_shell = next(c for c in clusters if ins_shell["id"] in c["insight_ids"])
-    cluster_pickle = next(c for c in clusters if ins_pickle["id"] in c["insight_ids"])
-    assert cluster_shell["cluster_id"] != cluster_pickle["cluster_id"]
-
-    # Reject cluster 1 (shell) -> cluster 1 is suppressed while cluster 2 (pickle) remains active
-    record_decision(
-        repo,
-        cluster_id=cluster_shell["cluster_id"],
-        decision="reject",
-        insight_ids=cluster_shell["insight_ids"],
-        reason="Handled by separate lint check",
-        home=home,
-    )
+    # Reject the shell insight -> it is suppressed while the pickle insight remains listed
+    record_decision(repo, decision="reject", insight_ids=[ins_shell["id"]], reason="Handled by separate lint check",
+                    home=home)
 
     rev_after_reject = review_insights(repo, home=home)
-    active_ids_after_reject = [c["cluster_id"] for c in rev_after_reject["clusters"]]
-    assert cluster_pickle["cluster_id"] in active_ids_after_reject
-    assert cluster_shell["cluster_id"] not in active_ids_after_reject
-    assert len(rev_after_reject["clusters"]) == 1
-    assert len(rev_after_reject["suppressed_clusters"]) == 1
+    assert [e["id"] for e in rev_after_reject["insights"]] == [ins_pickle["id"]]
+    assert [e["id"] for e in rev_after_reject["suppressed"]] == [ins_shell["id"]]
 
-    # Add 2 more insights similar to cluster 1 -> cluster 1 resurfaces alongside cluster 2
-    _hook_insight(repo, "Do not invoke subprocess with shell=True command execution", "sess-shell-2", home)
-    _hook_insight(repo, "Don't invoke subprocess with shell=True command execution", "sess-shell-3", home)
+    # Add 2 more insights similar to the shell one -> it resurfaces, its group apart from pickle
+    shell_2 = _hook_insight(repo, "Do not invoke subprocess with shell=True command execution", "sess-shell-2", home)
+    shell_3 = _hook_insight(repo, "Don't invoke subprocess with shell=True command execution", "sess-shell-3", home)
 
     rev_resurfaced = review_insights(repo, home=home)
-    assert len(rev_resurfaced["clusters"]) == 2
-    resurfaced_shell = next(c for c in rev_resurfaced["clusters"] if ins_shell["id"] in c["insight_ids"])
-    resurfaced_pickle = next(c for c in rev_resurfaced["clusters"] if ins_pickle["id"] in c["insight_ids"])
-    assert len(resurfaced_shell["insight_ids"]) == 3
-    assert len(resurfaced_pickle["insight_ids"]) == 1
+    by_id = {e["id"]: e for e in rev_resurfaced["insights"]}
+    assert len(by_id) == 4 and rev_resurfaced["suppressed"] == []
+    shells = {ins_shell["id"], shell_2["id"], shell_3["id"]}
+    for shell in shells:
+        assert {n["id"] for n in by_id[shell]["neighbours"][:2]} == shells - {shell}
+    assert not {n["id"] for n in by_id[ins_pickle["id"]]["neighbours"]} & shells
 
 
 def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and_never_inflates_sessions(
@@ -601,10 +578,9 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
     append_jsonl(store, [dict(legacy) for _ in range(10)])
     for _ in range(10):
         record_hook_prompt(
-            repo,
             "claude-code",
             {"prompt": "Please run the unit tests.", "cwd": str(repo)},
-            home=home,
+            workspace=repo, home=home,
         )
     assert len(read_insight_rows(repo, home=home)) == 10
 
@@ -617,10 +593,9 @@ def test_recurrence_reports_insufficient_session_identity_when_hs_is_missing_and
     # Now add 2 identified sessions (hs present) -> sessions must be 2, not 12
     for s_idx in (1, 2):
         record_hook_prompt(
-            repo,
             "claude-code",
             {"prompt": "Please run the unit tests.", "session_id": f"identified-sess-{s_idx}", "cwd": str(repo)},
-            home=home,
+            workspace=repo, home=home,
         )
 
     rec_mixed = measure_recurrence(repo, "trap-validate-rmtree", home=home)
@@ -707,16 +682,16 @@ def test_ordinary_mcp_aegis_scan_records_exposure_for_review_insights_without_ou
     _hook_insight(repo, "Do not pass shell=True to subprocess calls in src/app.py", "session-exposed-1", home)
 
     rev_in_mem = review_insights(repo, home=home)
-    assert len(rev_in_mem["clusters"]) == 1
-    assert rev_in_mem["clusters"][0]["matched_rule"] == "trap-no-shell-true"
-    assert rev_in_mem["clusters"][0]["match_status"] == "exposed_and_ignored"
+    assert len(rev_in_mem["insights"]) == 1
+    assert rev_in_mem["insights"][0]["match"]["rule"] == "trap-no-shell-true"
+    assert rev_in_mem["insights"][0]["match"]["status"] == "exposed_and_ignored"
 
     # Simulate a fresh CLI process where in-memory _EXPOSED is empty: persisted exposure still matches
     credit._EXPOSED.clear()
     rev_persisted = review_insights(repo, home=home)
-    assert len(rev_persisted["clusters"]) == 1
-    assert rev_persisted["clusters"][0]["matched_rule"] == "trap-no-shell-true"
-    assert rev_persisted["clusters"][0]["match_status"] == "exposed_and_ignored"
+    assert len(rev_persisted["insights"]) == 1
+    assert rev_persisted["insights"][0]["match"]["rule"] == "trap-no-shell-true"
+    assert rev_persisted["insights"][0]["match"]["status"] == "exposed_and_ignored"
 
 
 def test_human_level_h_insight_requires_content_bound_signed_commit(
@@ -770,8 +745,8 @@ def test_a_4_3_upgraded_w2_capture_never_counts_as_a_recurrence(tmp_path: Path, 
     monkeypatch.setenv("USERPROFILE", str(home))
     repo = _init_git_repo(tmp_path / "repo")
     _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], "Always check path confinement before recursive directory removal.")
-    hb = record_hook_prompt(repo, "claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(repo)},
-                            home=home)
+    hb = record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(repo)},
+                            workspace=repo, home=home)
     rev = load_rules(repo).get("trap-validate-rmtree").digest[:16]
     append_jsonl(insights_path(repo, home=home), [{
         "v": 1, "ts": hb["ts"], "event": "insight", "id": "ins-0000000000cc", "level": "W2",
@@ -804,24 +779,24 @@ def review_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize("decision", ["snooze", "reject", "propose", "merge-into-rule"])
-def test_a_decided_cluster_leaves_the_review_and_only_snooze_or_reject_resurface(review_repo, decision):
+def test_a_decided_group_leaves_the_review_and_only_snooze_or_reject_resurface(review_repo, decision):
     repo, home = review_repo
     first = [_hook_insight(repo, text, f"s-{i}", home)["id"] for i, text in enumerate(ENV_TEXTS[:2])]
-    cluster, = review_insights(repo, home=home)["clusters"]
-    assert sorted(cluster["insight_ids"]) == sorted(first)
-    record_decision(repo, cluster_id=cluster["cluster_id"], decision=decision, insight_ids=cluster["insight_ids"],
-                    reason="not now", home=home)
+    assert [e["id"] for e in review_insights(repo, home=home)["insights"]] == first
+    record_decision(repo, decision=decision, insight_ids=first, reason="not now", home=home)
     hidden = review_insights(repo, home=home)
-    assert hidden["clusters"] == []
-    assert [sorted(c["insight_ids"]) for c in hidden["suppressed_clusters"]] == [sorted(first)]
-    _hook_insight(repo, ENV_TEXTS[2], "s-2", home)
-    assert review_insights(repo, home=home)["clusters"] == []
-    _hook_insight(repo, ENV_TEXTS[3], "s-3", home)
+    assert hidden["insights"] == []
+    assert [e["id"] for e in hidden["suppressed"]] == first
+    third = _hook_insight(repo, ENV_TEXTS[2], "s-2", home)["id"]
+    one = review_insights(repo, home=home)
+    assert ([e["id"] for e in one["insights"]], [e["id"] for e in one["suppressed"]]) == ([third], first)
+    fourth = _hook_insight(repo, ENV_TEXTS[3], "s-3", home)["id"]
     after = review_insights(repo, home=home)
+    listed, hidden_ids = [e["id"] for e in after["insights"]], [e["id"] for e in after["suppressed"]]
     if decision in ("snooze", "reject"):
-        assert [c["count"] for c in after["clusters"]] == [4]
+        assert (listed, hidden_ids) == (first + [third, fourth], [])
     else:
-        assert after["clusters"] == [] and [c["count"] for c in after["suppressed_clusters"]] == [4]
+        assert (listed, hidden_ids) == ([third, fourth], first)
 
 
 def test_a_confirmed_suggestion_counts_as_cli_and_an_unconfirmed_one_does_not(review_repo):
@@ -829,10 +804,10 @@ def test_a_confirmed_suggestion_counts_as_cli_and_an_unconfirmed_one_does_not(re
     s1 = capture_suggestion(repo, ENV_TEXTS[1], paths=["src/app.py"], host="claude-code", session="agent", home=home)
     s2 = capture_suggestion(repo, "Prefer pathlib joins over string concatenation", paths=["src/app.py"],
                             host="claude-code", session="agent", home=home)
-    assert review_insights(repo, home=home)["clusters"] == []
+    assert review_insights(repo, home=home)["insights"] == []
     record_decision(repo, decision="confirm", insight_ids=[s1["id"]], kind="concurrency", home=home)
     review = review_insights(repo, home=home)
-    assert [(c["insight_ids"], c["levels"], c["kinds"]) for c in review["clusters"]] == [([s1["id"]], ["cli"], ["concurrency"])]
+    assert [(e["id"], e["level"], e["kind"]) for e in review["insights"]] == [(s1["id"], "cli", "concurrency")]
     assert [s["id"] for s in review["suggestions"]] == [s2["id"]]
     with pytest.raises(ValueError, match="verbatim"):
         write_proposal(repo, proposal_id="trap-env", insight_ids=[s1["id"]], summary_bullets=[ENV_TEXTS[1]], home=home)
@@ -844,24 +819,24 @@ def test_confirming_a_corroborated_suggestion_does_not_count_the_correction_twic
     cap = capture_suggestion(repo, "mutate global os.environ state", paths=["src/app.py"], host="claude-code",
                              session="agent", home=home)
     record_decision(repo, decision="confirm", insight_ids=[cap["id"]], home=home)
-    assert [(c["insight_ids"], c["corroborated"]) for c in review_insights(repo, home=home)["clusters"]] == [
-        ([hook["id"]], [cap["id"]])]
+    assert [(e["id"], e["corroborated"]) for e in review_insights(repo, home=home)["insights"]] == [
+        (hook["id"], [cap["id"]])]
 
 
 def test_neighbours_are_emitted_once_per_insight(review_repo):
     repo, home = review_repo
     ids = [_hook_insight(repo, text, f"s-{i}", home)["id"] for i, text in enumerate(ENV_TEXTS[:2])]
     review = review_insights(repo, home=home)
-    assert sorted(review["neighbours"]) == sorted(ids)
-    assert all("neighbours" not in c for c in review["clusters"])
+    assert [e["id"] for e in review["insights"]] == ids and "neighbours" not in review
+    assert [[n["id"] for n in e["neighbours"]] for e in review["insights"]] == [ids[1:], ids[:1]]
 
 
-def test_record_decision_refuses_a_confirm_without_insights_and_a_missing_cluster(review_repo):
+def test_record_decision_refuses_a_decision_without_insights(review_repo):
     repo, home = review_repo
     with pytest.raises(ValueError, match="insight"):
         record_decision(repo, decision="confirm", insight_ids=[], home=home)
-    with pytest.raises(ValueError, match="cluster_id"):
-        record_decision(repo, decision="snooze", insight_ids=["ins-1"], home=home)
+    with pytest.raises(ValueError, match="insight"):
+        record_decision(repo, decision="snooze", insight_ids=["  "], home=home)
     assert read_insight_rows(repo, home=home) == []
 
 
@@ -872,7 +847,8 @@ RMTREE_TEXT = "stop calling recursive directory removal without path confinement
 
 
 def _prompt(repo: Path, home: Path, session: str, text: str = "Please run the tests.") -> Dict[str, Any]:
-    return record_hook_prompt(repo, "claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)}, home=home)
+    return record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)},
+                              workspace=repo, home=home)
 
 
 def _recurrence_row(repo: Path, home: Path, hs: Any, when: str, rid: str = "trap-validate-rmtree") -> None:
@@ -948,8 +924,8 @@ def test_a_row_without_an_id_is_reviewed_without_error(review_repo):
     append_jsonl(insights_path(repo, home=home), [{
         "v": 1, "ts": "2026-10-20T00:00:00Z", "event": "insight", "level": "cli", "text": ENV_TEXTS[0],
         "paths": ["src/app.py"], "psrc": "explicit", "host": "cli"}])
-    cluster, = review_insights(repo, home=home)["clusters"]
-    assert (cluster["count"], cluster["levels"]) == (1, ["cli"])
+    entry, = review_insights(repo, home=home)["insights"]
+    assert (entry["id"], entry["level"]) == ("row-0", "cli")
 
 
 # ── R-evidence-44: the closed proposal template ──────────────────────────────
@@ -1036,7 +1012,7 @@ def _signed_rerun(repo: Path, home: Path, row: Dict[str, Any], **changes: Any) -
 
 
 def _counted_ids(repo: Path, home: Path) -> list:
-    return sorted(i for c in review_insights(repo, home=home)["clusters"] for i in c["insight_ids"])
+    return sorted(e["id"] for e in review_insights(repo, home=home)["insights"])
 
 
 def test_a_signed_rerun_supersedes_its_cli_row_in_review_and_proposals(review_repo):
@@ -1046,12 +1022,12 @@ def test_a_signed_rerun_supersedes_its_cli_row_in_review_and_proposals(review_re
     repo, home = review_repo
     cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
     signed = _signed_rerun(repo, home, cli)
-    cluster, = review_insights(repo, home=home)["clusters"]
-    assert (cluster["count"], cluster["insight_ids"], cluster["levels"]) == (1, [signed["id"]], ["H"])
+    entry, = review_insights(repo, home=home)["insights"]
+    assert (entry["id"], entry["level"]) == (signed["id"], "H")
     with pytest.raises(ValueError, match=f"not a counted insight: {cli['id']}"):
         write_proposal(repo, proposal_id="trap-popen", insight_ids=[cli["id"], signed["id"]], home=home)
     assert not (repo / ".aegis" / "proposals").exists()
-    meta = _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=cluster["insight_ids"], home=home))
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=[entry["id"]], home=home))
     assert (meta["count"], meta["insight_ids"]) == (1, [signed["id"]])
 
 
@@ -1061,21 +1037,31 @@ def test_two_identical_cli_adds_without_a_signed_rerun_still_count_twice(review_
     repo, home = review_repo
     ids = sorted(add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)["id"]
                  for _ in range(2))
-    cluster, = review_insights(repo, home=home)["clusters"]
-    assert (cluster["count"], sorted(cluster["insight_ids"])) == (2, ids)
+    assert sorted(e["id"] for e in review_insights(repo, home=home)["insights"]) == ids
     assert _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=ids, home=home))["count"] == 2
 
 
 @pytest.mark.parametrize("changes", [
     {"text": "Always pass an explicit timeout to every subprocess call in the cli"},
-    {"paths": ["src/other.py"]},
     {"kind": "processes"},
-], ids=["text", "paths", "kind"])
+], ids=["text", "kind"])
 def test_an_h_row_that_differs_supersedes_nothing(review_repo, changes):
     repo, home = review_repo
     cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
     signed = _signed_rerun(repo, home, cli, **changes)
     assert _counted_ids(repo, home) == sorted([cli["id"], signed["id"]])
+
+
+@pytest.mark.parametrize("paths", [[], ["src/other.py"]], ids=["work-tree", "other"])
+def test_an_h_rerun_with_other_paths_still_supersedes_its_cli_row(review_repo, paths):
+    """X-w8-carry k: the re-run without --paths takes its paths from the work tree, so the H row
+    matches its cli row on text and kind alone; it counts once, carrying its own paths."""
+    repo, home = review_repo
+    cli = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    signed = _signed_rerun(repo, home, cli, paths=paths)
+    assert [(e["id"], e["paths"]) for e in review_insights(repo, home=home)["insights"]] == [(signed["id"], paths)]
+    with pytest.raises(ValueError, match=f"not a counted insight: {cli['id']}"):
+        write_proposal(repo, proposal_id="trap-popen", insight_ids=[cli["id"]], home=home)
 
 
 def test_an_h_row_supersedes_only_the_cli_adds_before_it(review_repo):
@@ -1095,6 +1081,81 @@ def test_a_signed_rerun_is_one_recurrence_not_two(review_repo):
     _signed_rerun(repo, home, cli, ts=_shift(cli["ts"], 3600))
     rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
     assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)
+
+
+# ── w9 review F1: one signed re-run supersedes one cli row, not every one of its text ──
+
+def _two_corrections(repo: Path, home: Path) -> tuple:
+    (repo / "src" / "other.py").write_bytes(b"x = 1\n")
+    first = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    second = add_insight(repo, SIGNED_TEXT, paths=["src/other.py"], kind="timeouts", home=home)
+    return first, second
+
+
+@pytest.mark.parametrize("restated", [0, 1], ids=["first", "second"])
+def test_a_signed_rerun_supersedes_only_the_correction_it_restates(review_repo, restated):
+    """Given two corrections with one text and kind but other paths, When only one is re-run
+    with --commit, Then the other stays a counted insight: it is reviewed and can be proposed."""
+    repo, home = review_repo
+    rows = _two_corrections(repo, home)
+    signed = _signed_rerun(repo, home, rows[restated])
+    other = rows[1 - restated]
+    assert _counted_ids(repo, home) == sorted([signed["id"], other["id"]])
+    with pytest.raises(ValueError, match=f"not a counted insight: {rows[restated]['id']}"):
+        write_proposal(repo, proposal_id="trap-popen", insight_ids=[rows[restated]["id"]], home=home)
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=[signed["id"], other["id"]],
+                                       home=home))
+    assert (meta["count"], sorted(meta["insight_ids"])) == (2, sorted([signed["id"], other["id"]]))
+
+
+def test_a_work_tree_rerun_beside_two_corrections_supersedes_one_of_them(review_repo):
+    """X-w8-carry k with two candidates: a re-run without --paths matches on text and kind, so it
+    still supersedes one cli row, and never both."""
+    repo, home = review_repo
+    rows = _two_corrections(repo, home)
+    signed = _signed_rerun(repo, home, rows[0], paths=[])
+    counted = _counted_ids(repo, home)
+    assert len(counted) == 2 and signed["id"] in counted
+    assert len({r["id"] for r in rows} & set(counted)) == 1
+
+
+def test_one_signed_rerun_of_two_identical_corrections_leaves_one_counted(review_repo):
+    repo, home = review_repo
+    rows = [add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home) for _ in range(2)]
+    signed = _signed_rerun(repo, home, rows[0])
+    counted = _counted_ids(repo, home)
+    assert len(counted) == 2 and signed["id"] in counted and len({r["id"] for r in rows} & set(counted)) == 1
+
+
+def test_two_signed_reruns_of_two_identical_corrections_supersede_both(review_repo):
+    repo, home = review_repo
+    rows = [add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home) for _ in range(2)]
+    signed = [_signed_rerun(repo, home, row)["id"] for row in rows]
+    assert _counted_ids(repo, home) == sorted(signed)
+
+
+def test_an_h_row_before_any_cli_row_supersedes_nothing(review_repo):
+    repo, home = review_repo
+    elsewhere = home.parent / "elsewhere"  # the template row is written to another user's log
+    elsewhere.mkdir()
+    template = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=elsewhere)
+    signed = _signed_rerun(repo, home, template)
+    later = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    assert _counted_ids(repo, home) == sorted([signed["id"], later["id"]])
+
+
+def test_a_signed_rerun_keeps_another_correction_in_the_recurrence_corpus(review_repo):
+    """Given correction a, a different correction b two days later and a's signed re-run a day after
+    that (three episodes apart), When recurrence is measured, Then b and the H row are two episodes."""
+    repo, home = review_repo
+    (repo / "src" / "other.py").write_bytes(b"x = 1\n")
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    a = add_insight(repo, RMTREE_TEXT, paths=["src/app.py"], home=home)
+    b = {**a, "id": f"ins-{os.urandom(6).hex()}", "paths": ["src/other.py"], "ts": _shift(a["ts"], 2 * 86400)}
+    append_jsonl(insights_path(repo, home=home), [b])
+    _signed_rerun(repo, home, a, ts=_shift(a["ts"], 3 * 86400))
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 2)
 
 
 # ── review M2: the verbatim lint sees the bullet as it is written ──────────────
@@ -1136,3 +1197,72 @@ def test_a_kind_that_equals_human_text_once_its_backticks_go_never_enters_a_prop
         write_proposal(repo, proposal_id="trap-notes", insight_ids=[row["id"]], home=home,
                        kind="Never mail the `release` notes before the tag exists")
     assert not (repo / ".aegis" / "proposals").exists()
+
+
+# ── R-evidence-46: each insight with its top-3 neighbours; the human groups them ──
+
+def _ids(entries) -> list:
+    return [e["id"] for e in entries]
+
+
+def test_a_rejected_group_resurfaces_once_two_newer_insights_have_a_member_as_a_neighbour(review_repo):
+    """Given A and B (each other's top neighbour) and an unrelated C, When the human rejects
+    the group A, B with a reason, Then review hides A and B and lists C; one newer insight with
+    A or B among its top-3 neighbours keeps them hidden, the second resurfaces them."""
+    repo, home = review_repo
+    a, b = (add_insight(repo, text, paths=["src/app.py"], home=home)["id"] for text in ENV_TEXTS[:2])
+    c = add_insight(repo, "Prefer pathlib joins over string concatenation for paths", paths=["src/app.py"],
+                    home=home)["id"]
+    review = review_insights(repo, home=home)
+    assert sorted(review) == ["insights", "suggestions", "suppressed"]
+    by_id = {e["id"]: e for e in review["insights"]}
+    assert by_id[a]["neighbours"][0]["id"] == b and by_id[b]["neighbours"][0]["id"] == a
+    record_decision(repo, decision="reject", insight_ids=[a, b], reason="R", home=home)
+    hidden = review_insights(repo, home=home)
+    assert (_ids(hidden["insights"]), sorted(_ids(hidden["suppressed"]))) == ([c], sorted([a, b]))
+
+    n1 = add_insight(repo, ENV_TEXTS[2], paths=["src/app.py"], home=home)["id"]
+    one = review_insights(repo, home=home)
+    assert {a, b} & {n["id"] for n in {e["id"]: e for e in one["insights"]}[n1]["neighbours"]}
+    assert (_ids(one["insights"]), sorted(_ids(one["suppressed"]))) == ([c, n1], sorted([a, b]))
+
+    n2 = add_insight(repo, ENV_TEXTS[3], paths=["src/app.py"], home=home)["id"]
+    two = review_insights(repo, home=home)
+    assert (_ids(two["insights"]), two["suppressed"]) == ([a, b, c, n1, n2], [])
+
+
+def test_review_entries_carry_their_match_and_at_most_three_neighbours(review_repo):
+    repo, home = review_repo
+    ids = [add_insight(repo, text, paths=["src/app.py"], home=home)["id"] for text in ENV_TEXTS]
+    review = review_insights(repo, home=home)
+    assert "clusters" not in review and "suppressed_clusters" not in review and "neighbours" not in review
+    assert _ids(review["insights"]) == ids
+    for entry in review["insights"]:
+        assert entry["match"] == {"status": "no_rule", "rule": None, "similarity": 0.0}
+        assert entry["level"] == "cli" and entry["paths"] == ["src/app.py"] and entry["text"]
+        assert 1 <= len(entry["neighbours"]) <= 3
+        assert all(set(n) == {"id", "similarity"} and n["id"] in ids and n["similarity"] > 0
+                   for n in entry["neighbours"])
+
+
+def test_a_4_3_decision_row_is_read_through_its_insight_ids(review_repo):
+    """No migration: a 4.3 row names its cluster and its members; only the members are read."""
+    repo, home = review_repo
+    a = add_insight(repo, ENV_TEXTS[0], paths=["src/app.py"], home=home)["id"]
+    other = add_insight(repo, "Prefer pathlib joins over string concatenation for paths", paths=["src/app.py"],
+                        home=home)["id"]
+    append_jsonl(insights_path(repo, home=home), [{"v": 1, "ts": "2026-10-20T00:00:00Z", "event": "decision",
+                                                   "cluster_id": f"cluster-{other}", "decision": "propose",
+                                                   "insight_ids": [a]}])
+    review = review_insights(repo, home=home)
+    assert (_ids(review["insights"]), _ids(review["suppressed"])) == ([other], [a])
+
+
+def test_record_decision_takes_no_cluster_id(review_repo):
+    repo, home = review_repo
+    a = add_insight(repo, ENV_TEXTS[0], paths=["src/app.py"], home=home)["id"]
+    with pytest.raises(TypeError):
+        record_decision(repo, cluster_id="cluster-x", decision="noise", insight_ids=[a], home=home)
+    with pytest.raises(ValueError, match="insight"):
+        record_decision(repo, decision="snooze", insight_ids=[], home=home)
+    assert [r["event"] for r in read_insight_rows(repo, home=home)] == ["insight"]

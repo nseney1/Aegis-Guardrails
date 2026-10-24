@@ -894,6 +894,37 @@ def test_derive_is_pure_and_needs_a_report_to_name_a_rule():
     assert credit.confirmed_outcome_rows(credits)[0]["rule"] == "r"
 
 
+def test_a_type_error_inside_a_landed_lookup_propagates_and_is_not_retried():
+    """Given a check row with a head and a landed lookup that raises TypeError internally, When
+    credit is derived, Then the TypeError surfaces after one call (no retry as landed(tree))."""
+    calls = []
+
+    def landed(tree, head=None):
+        calls.append((tree, head))
+        raise TypeError("boom")
+
+    check = {"event": "check", "id": "c1", "tree": SHA, "head": "d" * 40, "passed": True, "tests": TESTED}
+    report = {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"}
+    with pytest.raises(TypeError, match="boom"):
+        credit.derive([check, report], landed=landed)
+    assert calls == [(SHA, "d" * 40)]
+
+
+def test_a_landed_lookup_gets_the_head_once_and_a_row_without_a_head_gets_the_tree_alone():
+    calls = []
+
+    def landed(*args):
+        calls.append(args)
+        return "c" * 40
+
+    rows = [{"event": "check", "id": "c1", "tree": SHA, "head": "d" * 40, "passed": True, "tests": TESTED},
+            {"event": "check", "id": "c2", "tree": "2" * 40, "head": "", "passed": True, "tests": TESTED},
+            {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"},
+            {"event": "report", "check": "c2", "for_rule": "r", "result": "tp", "ts": "t"}]
+    assert [c.commit for c in credit.derive(rows, landed=landed)] == ["c" * 40] * 2
+    assert calls == [(SHA, "d" * 40), ("2" * 40,)]
+
+
 @pytest.mark.parametrize("claimed,fields,expected", [
     ("tp", {"passed": True}, "tp"),
     ("trigger", {"passed": True}, "trigger"),
