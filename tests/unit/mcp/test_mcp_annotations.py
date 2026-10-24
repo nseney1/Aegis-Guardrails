@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Dict, List
 
 import pytest
 
+from aegis_core import credit
 import aegis_mcp.server as server_module
 from aegis_mcp.server import handle_request
 
@@ -94,37 +96,26 @@ def test_read_only_tools_are_never_destructive(tools):
             assert ann["openWorldHint"] is False, name
 
 
-def test_every_input_schema_property_has_a_meaningful_description(tools):
+def test_every_input_schema_property_has_a_short_description(tools):
     for name, tool in tools.items():
-        schema = tool.get("inputSchema", {})
-        props = schema.get("properties", {})
+        props = tool.get("inputSchema", {}).get("properties", {})
         assert props, f"{name}: empty inputSchema properties"
         for prop_name, prop_schema in props.items():
             desc = prop_schema.get("description")
-            assert isinstance(desc, str) and len(desc.strip()) >= 40, (
-                f"{name}.inputSchema.properties.{prop_name} missing or stub description: {desc!r}"
+            limit = 120 if prop_name == "view" else 160
+            assert isinstance(desc, str) and 0 < len(desc.strip()) <= limit, (
+                f"{name}.inputSchema.properties.{prop_name}: {desc!r}"
             )
 
 
-def test_every_tool_declares_valid_output_schema(tools):
-    for name, tool in tools.items():
-        schema = tool.get("outputSchema")
-        assert isinstance(schema, dict), f"{name}: missing outputSchema"
-        assert schema.get("type") == "object", f"{name}: outputSchema.type must be 'object'"
-        assert schema.get("additionalProperties") is False, (
-            f"{name}: outputSchema.additionalProperties must be False"
-        )
-        props = schema.get("properties")
-        assert isinstance(props, dict) and props, f"{name}: empty outputSchema.properties"
-        for prop_name, prop_schema in props.items():
-            assert isinstance(prop_schema, dict), f"{name}.outputSchema.properties.{prop_name} not a dict"
-            desc = prop_schema.get("description")
-            assert isinstance(desc, str) and desc.strip(), (
-                f"{name}.outputSchema.properties.{prop_name} missing description"
-            )
+def test_tools_list_declares_no_output_schema(tools):
+    """D-mcp-schema: no tool declares an outputSchema, so a result key needs no schema edit."""
+    assert [name for name, tool in tools.items() if "outputSchema" in tool] == []
+    assert len(json.dumps(list(tools.values()))) <= 10_642  # 60% of the 4.3.3 list
 
 
-def test_live_tool_calls_emit_structured_content_matching_output_schema(tmp_path, monkeypatch):
+@pytest.fixture
+def governed(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     rules_dir = ws / ".aegis" / "rules" / "invariants"
     rules_dir.mkdir(parents=True)
@@ -133,9 +124,9 @@ def test_live_tool_calls_emit_structured_content_matching_output_schema(tmp_path
         "type: invariant\n"
         "domain: correctness\n"
         "enforcement: gate\n"
-        "hypothesis: Sample hypothesis for outputSchema verification\n"
-        "prediction: Sample prediction for outputSchema verification\n"
-        "falsification: Sample falsification for outputSchema verification\n"
+        "hypothesis: Sample hypothesis for the result shape\n"
+        "prediction: Sample prediction for the result shape\n"
+        "falsification: Sample falsification for the result shape\n"
         "target_paths:\n"
         "  - '**'\n"
         "---\n"
@@ -149,114 +140,114 @@ def test_live_tool_calls_emit_structured_content_matching_output_schema(tmp_path
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setattr(server_module, "_canonical_workspace", str(ws))
     monkeypatch.setattr(server_module, "_session_id", None)
-
     handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
-    listed = handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-    tools_by_name = {t["name"]: t for t in listed["result"]["tools"]}
-
-    calls = [
-        ("aegis_scan", {"files": ["app.py"]}),
-        ("aegis_scan", {"files": ["app.py"], "view": "full"}),
-        ("aegis_scan", {"files": ["app.py"], "view": "summary"}),
-        ("aegis_scan", {"files": ["app.py"], "view": "ids"}),
-        ("aegis_list_rules", {}),
-        ("aegis_list_rules", {"view": "full"}),
-        ("aegis_list_rules", {"view": "summary"}),
-        ("aegis_list_rules", {"view": "ids"}),
-        ("aegis_create_rule", {"description": "Prevent raw SQL string interpolation"}),
-        (
-            "aegis_report_outcome",
-            {"outcome": "success", "rules_used": ["invariant-sample"], "idempotency_key": "k-full", "view": "full"},
-        ),
-        (
-            "aegis_report_outcome",
-            {"outcome": "success", "rules_used": ["invariant-sample"], "idempotency_key": "k-summary", "view": "summary"},
-        ),
-        (
-            "aegis_report_outcome",
-            {"outcome": "success", "rules_used": ["invariant-sample"], "idempotency_key": "k-ids", "view": "ids"},
-        ),
-        (
-            "aegis_capture_insight",
-            {"quote": "Always validate structuredContent against outputSchema", "paths": ["app.py"]},
-        ),
-    ]
-
-    for idx, (tool_name, arguments) in enumerate(calls, start=10):
-        resp = handle_request(
-            {"jsonrpc": "2.0", "id": idx, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
-        )
-        result = resp["result"]
-        assert result["isError"] is False, f"{tool_name} ({arguments}) returned error: {result}"
-        assert "structuredContent" in result, f"{tool_name} ({arguments}) missing structuredContent"
-        structured = result["structuredContent"]
-        parsed_text = json.loads(result["content"][0]["text"])
-        assert structured == parsed_text, f"{tool_name} ({arguments}) structuredContent != parsed content text"
-
-        output_schema = tools_by_name[tool_name]["outputSchema"]
-        declared_props = set(output_schema["properties"])
-        extra_keys = set(structured) - declared_props
-        assert not extra_keys, f"{tool_name} ({arguments}) returned undeclared keys: {sorted(extra_keys)}"
-        for req_key in output_schema.get("required", []):
-            assert req_key in structured, f"{tool_name} ({arguments}) missing required key {req_key!r}"
-
-    err_resp = handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 99,
-            "method": "tools/call",
-            "params": {"name": "aegis_create_rule", "arguments": {"description": ""}},
-        }
-    )
-    assert err_resp["result"]["isError"] is True
-    assert "structuredContent" not in err_resp["result"]
+    return ws
 
 
-def test_write_tool_descriptions_specify_sibling_routing_and_limits(tools):
-    report_desc = tools["aegis_report_outcome"]["description"]
-    assert "aegis_scan" in report_desc
-    assert "aegis_capture_insight" in report_desc
-    assert "200" in report_desc
-    assert "5 calls per 60 seconds" in report_desc
-    assert "aegis check --record" in report_desc
-    assert "unwitnessed" in report_desc
-    for sentence in [s.strip() for s in report_desc.split(".") if s.strip()]:
-        assert len(sentence.split()) <= 45, f"Sentence exceeds 45 words: {sentence!r}"
-
-    insight_desc = tools["aegis_capture_insight"]["description"]
-    assert "aegis_create_rule" in insight_desc
-    assert "aegis_report_outcome" in insight_desc
-    assert "~/.aegis/insights/" in insight_desc
-    assert "level: 'suggestion'" in insight_desc
-    assert "level: 'W2'" in insight_desc
-    assert "debits" not in insight_desc
-    assert "redacts secrets" in insight_desc
-    assert "300 characters" in insight_desc
+def _tool_call(req_id: int, name: str, arguments: dict) -> dict:
+    return handle_request(
+        {"jsonrpc": "2.0", "id": req_id, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+    )["result"]
 
 
-def test_read_tool_descriptions_specify_sibling_routing_and_mechanics(tools):
-    create_desc = tools["aegis_create_rule"]["description"]
-    assert "aegis_list_rules" in create_desc
-    assert "aegis_capture_insight" in create_desc
-    assert "three active workspace rules" in create_desc
-    assert "500 chars" in create_desc
-    assert "writes nothing to disk" in create_desc
-    assert ".aegis/rules/<type_dir>/<id>.md" in create_desc
+_REPORT = {"outcome": "success", "rules_used": ["invariant-sample"]}
 
-    list_desc = tools["aegis_list_rules"]["description"]
-    assert "aegis_scan" in list_desc
-    assert "directory order without recording a scan or exposure event" in list_desc
-    assert "_error" in list_desc
-    assert "_expired: true" in list_desc
-    assert "stale_rules" in list_desc
-    assert "ignored" in list_desc
-    assert "rule_type" in list_desc
-    assert "view" in list_desc
 
-    scan_desc = tools["aegis_scan"]["description"]
-    assert "aegis_list_rules" in scan_desc
-    assert "aegis_report_outcome" in scan_desc
-    assert "at most two slots" in scan_desc
-    assert "unreviewed_rules" in scan_desc
-    assert "pre-edit scan" in scan_desc
-    assert "session rule exposure" in scan_desc
+@pytest.mark.parametrize("name,arguments", [
+    ("aegis_scan", {"files": ["app.py"]}),
+    ("aegis_scan", {"files": ["app.py"], "view": "full"}),
+    ("aegis_scan", {"files": ["app.py"], "view": "summary"}),
+    ("aegis_scan", {"files": ["app.py"], "view": "ids"}),
+    ("aegis_list_rules", {}),
+    ("aegis_list_rules", {"view": "summary"}),
+    ("aegis_list_rules", {"view": "ids"}),
+    ("aegis_create_rule", {"description": "Prevent raw SQL string interpolation"}),
+    ("aegis_report_outcome", dict(_REPORT, idempotency_key="k-full", view="full")),
+    ("aegis_report_outcome", dict(_REPORT, idempotency_key="k-summary", view="summary")),
+    ("aegis_report_outcome", dict(_REPORT, idempotency_key="k-ids", view="ids")),
+    ("aegis_capture_insight", {"quote": "Always keep one payload per answer", "paths": ["app.py"]}),
+])
+def test_a_tool_result_carries_its_payload_once(governed, name, arguments):
+    result = _tool_call(10, name, arguments)
+    assert set(result) == {"content", "isError"}, result
+    assert result["isError"] is False, result
+    assert isinstance(json.loads(result["content"][0]["text"]), dict)
+
+
+def test_an_error_result_has_the_same_two_keys(governed):
+    result = _tool_call(99, "aegis_create_rule", {"description": ""})
+    assert set(result) == {"content", "isError"} and result["isError"] is True
+    assert json.loads(result["content"][0]["text"]) == {
+        "status": "FAIL", "error": "'description' must be a non-empty string."}
+
+
+# The tool an agent could confuse each tool with, or should call next (D-mcp-schema).
+SIBLINGS = {
+    "aegis_scan": ("aegis_report_outcome", "aegis_list_rules"),
+    "aegis_report_outcome": ("aegis_scan", "aegis_capture_insight"),
+    "aegis_list_rules": ("aegis_scan",),
+    "aegis_create_rule": ("aegis_list_rules",),
+    "aegis_capture_insight": ("aegis_report_outcome",),
+}
+
+
+def _description_errors(tools: Dict[str, dict]) -> List[str]:
+    """One line per tool whose description is not 2 to 4 sentences or omits a sibling tool."""
+    errors = []
+    for name in sorted(tools):
+        text = tools[name]["description"]
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        if not 2 <= len(sentences) <= 4:
+            errors.append(f"{name}: {len(sentences)} sentences")
+        errors += [f"{name}: names no {sibling}" for sibling in SIBLINGS.get(name, ()) if sibling not in text]
+    return errors
+
+
+def test_every_description_is_two_to_four_sentences_naming_its_siblings(tools):
+    assert set(SIBLINGS) == set(tools)
+    assert _description_errors(tools) == []
+
+
+def test_the_report_description_states_the_limits_the_code_enforces(tools):
+    text = tools["aegis_report_outcome"]["description"]
+    calls, window = server_module._RATE_LIMITS["aegis_report_outcome"]
+    assert f"{credit.MAX_REPORT_ROWS_PER_SESSION} report rows per session" in text
+    assert f"{calls} calls per {window} seconds" in text
+
+
+def test_tools_list_fits_the_handshake_budget(tools):
+    assert len(json.dumps(list(tools.values()))) <= 6_500
+
+
+@pytest.mark.parametrize("name,description,error", [
+    ("aegis_list_rules", "One. Two. Three. Four. Five; see aegis_scan.", "aegis_list_rules: 5 sentences"),
+    ("aegis_create_rule", "Drafts a rule. It writes nothing.", "aegis_create_rule: names no aegis_list_rules"),
+    ("aegis_scan", "Call aegis_report_outcome and aegis_list_rules.", "aegis_scan: 1 sentences"),
+], ids=["five-sentences", "no-sibling", "one-sentence"])
+def test_the_description_guard_names_the_tool(tools, name, description, error):
+    broken = copy.deepcopy(tools)
+    broken[name]["description"] = description
+    assert _description_errors(broken) == [error]
+
+
+# ── one definition of the server-owned arguments (R-evidence-53) ────────────
+
+# Names no tool schema has ever declared; a client value for them is dropped all the same.
+LEGACY_OWNED = {"host", "session", "source", "platform", "client_host", "client_name", "client_version",
+                "_client_platform", "_client_host"}
+
+
+def test_the_server_owned_keys_are_the_injected_ones_plus_the_legacy_names():
+    from aegis_mcp.tools import SERVER_INJECTED
+
+    assert server_module.SERVER_OWNED_KEYS >= SERVER_INJECTED
+    assert server_module.SERVER_OWNED_KEYS - SERVER_INJECTED == LEGACY_OWNED
+    sent = {"host": "ci", "session": "s", "_session": "s", "_client_name": "x", "workspace": "/", "files": []}
+    assert server_module.strip_server_owned(sent) == {"files": []}
+
+
+def test_the_tools_module_exports_its_dispatch_only():
+    import aegis_mcp.tools as tools
+
+    assert tools.__all__ == ["execute_tool", "is_known_tool"]
+    assert tools.TOOL_DEFINITIONS is server_module.TOOL_DEFINITIONS  # still importable

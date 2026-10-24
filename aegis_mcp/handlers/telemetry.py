@@ -4,17 +4,21 @@ from __future__ import annotations
 from contextlib import ExitStack
 from pathlib import PurePath
 import sys
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from aegis_core import credit, gitsafe, treeid
 from aegis_core.baseline import envelope
 from aegis_core.errors import PathTraversalError
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import validate_rule_names
-from aegis_mcp.registry import _STATUS_FAIL, _VALID_OUTCOMES, _get_workspace
+from aegis_mcp.registry import _STATUS_FAIL, _VALID_OUTCOMES, _get_workspace, remember_bounded
 
-# (workspace root, session, idempotency key) whose edit event is recorded.
-_RECORDED: Set[Tuple[str, str, str]] = set()
+# (workspace root, session, idempotency key) whose edit event is recorded, and the edit rows
+# written per (root, session). The key is the caller's string, so both are bounded: by the
+# report cap per session and by _MAX_RECORDED keys per process.
+_RECORDED: Dict[Tuple[str, str, str], None] = {}
+_EDITS: Dict[Tuple[str, str], int] = {}
+_MAX_RECORDED = 1024
 
 _KEY_REQUIRED = (
     "'idempotency_key' is required: send a unique key per report so a retry is never recorded twice."
@@ -112,7 +116,8 @@ def handle_report_outcome(args: dict) -> dict:
             )
         except Exception as exc:
             return _fail(f"Failed to record outcome: {exc}")
-    if edited and result.get("status") != "rate_limited":  # a capped session writes nothing at all
+    # A report the ledger did not take (capped, or a repeat claim) writes nothing at all.
+    if edited and result.get("status") != "rate_limited" and result.get("recorded") is not False:
         _record_edit(workspace, args, idempotency_key, edited)
     return {**envelope("aegis_report_outcome", {"tree": tree}), **result}
 
@@ -125,7 +130,8 @@ def _record_edit(workspace, args: dict, idempotency_key: str, files: List[str]) 
     if not session:
         return
     key = (str(workspace.root), str(session), idempotency_key)
-    if key in _RECORDED:
+    written = _EDITS.get(key[:2], 0)
+    if key in _RECORDED or written >= credit.MAX_REPORT_ROWS_PER_SESSION:
         return
     try:
         scan_compliance.record(
@@ -136,7 +142,8 @@ def _record_edit(workspace, args: dict, idempotency_key: str, files: List[str]) 
     except Exception as exc:  # telemetry only: the outcome is recorded
         print(f"aegis-mcp: edit event not recorded: {exc}", file=sys.stderr)
         return
-    _RECORDED.add(key)
+    remember_bounded(_RECORDED, key, None, _MAX_RECORDED)
+    remember_bounded(_EDITS, key[:2], written + 1, _MAX_RECORDED)
 
 
 def handle_capture_insight(args: dict) -> dict:

@@ -115,13 +115,8 @@ def test_statistical_and_operational_constants():
     assert 0.90 in WILSON_CONFIDENCE_Z_SCORES
     assert 0.95 in WILSON_CONFIDENCE_Z_SCORES
     assert 0.99 in WILSON_CONFIDENCE_Z_SCORES
-    assert set(MCP_DEFAULT_RATE_LIMITS.keys()) == {
-        "READ",
-        "MUTATION",
-        "EXECUTION",
-        "VERIFICATION",
-        "CHECKPOINT",
-    }
+    # Only the mutation limit is read (aegis_mcp.server._RATE_LIMITS); an unread class is dead text.
+    assert set(MCP_DEFAULT_RATE_LIMITS) == {"MUTATION"}
 
 
 def test_a_type_name_of_any_version_stands_for_its_v4_type():
