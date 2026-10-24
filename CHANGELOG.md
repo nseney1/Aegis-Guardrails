@@ -118,7 +118,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - An `aegis_report_outcome` call that records nothing (`rate_limited`, or a repeated unwitnessed claim) no longer writes an `edit` activity row, and edit rows are capped at 200 per session per server process.
 - The MCP server's report-edit maps and its scan-row map are bounded at 1,024 entries, so a long-lived server no longer grows them without limit.
-- `aegis check --hook` and the T5 snapshot path fail closed with the git error text and exit 1 on a corrupt staged object (`git cannot read object <oid>`) or a malformed `cat-file` size, instead of crashing with a `ValueError`.
+- `aegis check --hook` reads staged blobs through gitsafe's one reader: a malformed `cat-file` size is a `GitError` (`git cannot read object <oid>`, exit 1) instead of a `ValueError`, and an unreadable staged object reports the same text.
 
 ### Breaking (command line, JSON and MCP)
 

@@ -17,7 +17,7 @@ import pytest
 
 from aegis_cli.hooks import registrar
 from aegis_cli.hooks.insights import run_insight_hook
-from aegis_core.config import UserConfig, parse_capture_mode
+from aegis_core.config import MAX_CONFIG_BYTES, UserConfig, parse_capture_mode
 from aegis_core.insights import effective_capture, host_capture_status, insights_path, read_insight_rows
 from aegis_core.workspace.layout import UserLayout
 from aegis_mcp.tools import execute_tool
@@ -92,6 +92,29 @@ def test_off_writes_nothing_and_touches_no_state(env, capsys):
     assert _capture(env) == ("off", "insights.capture")
 
 
+def _tree(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize("where", ["cwd", "project", "parent"])
+def test_off_holds_when_the_session_directory_is_home_or_above_it(env, capsys, monkeypatch, where):
+    """Given capture 'off' and an --excerpts entry, When the session directory is HOME (the payload
+    cwd or CLAUDE_PROJECT_DIR) or a parent of HOME, Then the hook touches nothing, as doctor reports:
+    no governed workspace holds ~/.aegis/config.json, though that directory does."""
+    _user_config(env, {"v": 1, "insights": {"capture": "off"}})
+    argv = _install(env, excerpts=True)
+    cwd = {"cwd": env.home, "project": env.ws, "parent": env.home.parent}[where]
+    if where == "project":
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(env.home))
+    before = _tree(env.home.parent)
+    payload = {"prompt": CUE, "session_id": "s-capture", "cwd": str(cwd)}
+    assert run_insight_hook(argv, stdin=json.dumps(payload), home=env.home) == 0
+    assert capsys.readouterr().err == ""
+    assert _tree(env.home.parent) == before
+    assert not (env.home / ".aegis" / "link.key").exists()
+    assert _capture(env) == ("off", "insights.capture")
+
+
 def test_counters_strips_excerpts_from_an_excerpts_entry(env, capsys):
     _user_config(env, {"v": 1, "insights": {"capture": "counters"}})
     rows = _hook(env, capsys, _install(env, excerpts=True))
@@ -160,8 +183,12 @@ def test_a_user_config_inside_the_workspace_is_ignored(tmp_path, monkeypatch, ca
     assert [r["event"] for r in rows if r["event"] == "insight"] == ["insight"]
 
 
-@pytest.mark.parametrize("body", [b"{not json", b'{"v": 1, "pad": "' + b" " * (64 * 1024) + b'"}', b'{"v": 9}'],
-                         ids=["json", "size", "version"])
+# The size and version bodies would turn capture off: the test fails if the reader took them.
+@pytest.mark.parametrize("body", [
+    b"{not json",
+    b'{"v": 1, "insights": {"capture": "off"}, "pad": "' + b" " * MAX_CONFIG_BYTES + b'"}',
+    b'{"v": 9, "insights": {"capture": "off"}}',
+], ids=["json", "size", "version"])
 def test_an_unusable_user_config_leaves_the_entry_mode(env, capsys, body):
     _user_config(env, body)
     rows = _hook(env, capsys, _install(env, excerpts=True))
