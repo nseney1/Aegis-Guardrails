@@ -58,7 +58,7 @@ import types
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import events, gitsafe
-from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _read_capped
+from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, read_capped
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads, utc_stamp
@@ -269,7 +269,7 @@ def load_team(workspace: Any) -> TeamPolicy:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise TeamFileError("not a regular file")
-        data = _read_capped(fd, MAX_CONFIG_BYTES)
+        data = read_capped(fd, MAX_CONFIG_BYTES)
     except OSError:
         raise TeamFileError("cannot be read") from None
     finally:

@@ -49,6 +49,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
+    # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
+    "aegis_core.ghcli": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
     "aegis_core.config": 0,
@@ -73,15 +75,17 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.lane_ast": 0,
     "aegis_core.lane_gate": 1,
     "aegis_core.scaffolding": 1,
-    # The governance file set (the matcher and the layout) and the trust tier / approvals over it
-    # (gitsafe, storage, pathlookup, governance): v4.3 human_gate.
+    # The governance file set, CODEOWNERS coverage, and trust tiers / approvals over them.
     "aegis_core.governance": 1,
+    "aegis_core.codeowners": 1,
     "aegis_core.human_gate": 1,
     # v4.3 verified checks: the tree identity (gitsafe, pathlookup), the credit state machine over the ledger
-    # (human_gate's gh runner, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
+    # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
     "aegis_core.checkrun": 2,
+    # GitHub ruleset administration uses the transport and trust-policy constants.
+    "aegis_core.github_ruleset": 2,
     # v4.3 T3: rank 2+ rules served from the reviewed BASE (the loader, the inventory, gitsafe), under scan.
     "aegis_core.adjudication": 1,
     "aegis_core.rule_integrity": 1,

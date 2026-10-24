@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from aegis_core import config, credit, human_gate
+from aegis_core import config, credit, ghcli
 from aegis_core.telemetry_engine import ledger
 from tests import helpers_humangate as hg
 from tests import helpers_verified as hv
@@ -42,7 +42,7 @@ class _Gh(hg.FakeGh):
         if "/actions/runs?head_sha=" in path:
             self.calls.append((tuple(argv), stdin))
             sha = path.split("head_sha=", 1)[1].split("&", 1)[0]
-            return human_gate.GhResult(0, json.dumps({"workflow_runs": [r for r in self.runs if r["head_sha"] == sha]}), "")
+            return ghcli.GhResult(0, json.dumps({"workflow_runs": [r for r in self.runs if r["head_sha"] == sha]}), "")
         return super().__call__(argv, stdin, cwd)
 
 
@@ -90,7 +90,7 @@ def _landed_check(tmp_path):
 
 def _project(repo, commit, monkeypatch):
     gh = _Gh([hv.ci_run(commit, workflow="aegis.yml")])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     credit_, = credit.project_credits(repo.root, verify_ci=True).credits
     return credit_.state, credit_.reason
 
@@ -155,7 +155,7 @@ def test_an_explicit_workflow_argument_still_wins(tmp_path):
 def _doctor_github(repo, monkeypatch, capsys, *extra):
     from aegis_cli.cli import main
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", hg.FakeGh())
+    monkeypatch.setattr(ghcli, "default_gh_runner", hg.FakeGh())
     monkeypatch.chdir(repo.root)
     capsys.readouterr()
     assert main(["doctor", "--github", *extra]) == 0

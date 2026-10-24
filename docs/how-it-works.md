@@ -133,6 +133,8 @@ Never call `eval` or `exec` on data. Parse it with `json.loads` or `ast.literal_
 
 Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-only agent, and records the scan as `aegis_scan` does, so it also satisfies the scan-before-edit hook (section 8).
 
+MCP schemas and descriptions live in `aegis_mcp.schemas`; `aegis_mcp.registry` keeps the schema re-exports. Shared handler helpers live in `aegis_mcp.handlers.common`, while inventory and rule-creation prompt logic live in `handlers.governance`.
+
 **Which repository a call governs.** One `aegis-mcp` process can serve sessions in several repos, so every call is bound to a workspace. The first source that names a governed repo (one with `.aegis/`) wins:
 
 1. an operator pin, `AEGIS_WORKSPACE` in the registration; it is strict: a pin that does not resolve, or names a directory without `.aegis/`, is an error, not a fallback, and a pin that disagrees with the workspace the host reports is a hold;
@@ -156,6 +158,8 @@ The CLI reads the same pin. A command run inside another workspace, or in a git 
 - **Security pack and secrets** on what the change introduces: the 7-rule Python security pack and the known-format secret scan run in every `aegis check` (also `--hook` and `--record`), judged against the diff base, so code that was already there is not flagged again. Test paths are exempt but reported, `# aegis: allow[rule]` and `# gitleaks:allow` are honoured, and a baseline never grandfathers these rows. Your own `forbid_ast` rules keep whole-file judgment.
 - **Per changed file**: a call-graph check (code that is defined but never wired in), an import guard (in non-test Python files, every import must be standard library, a module or package in the repository, or inside a `try`/`except ImportError`; a third-party import is flagged even when your dependency file lists it) and every `forbid_ast` rule that applies. A file a `forbid_ast` rule cannot parse fails; it is never skipped. Mutation tests run only with `--full`.
 - **Languages**: Python is parsed in process. Drivers for Rust, TypeScript/JavaScript (needs `node`) and Go (needs `go`) ship in the wheel, and `aegis init` turns them on for the languages it detects (`ast.packaged_drivers`). A repository can only opt in to those packaged drivers; any other driver command comes from `~/.aegis/config.json`, so a cloned repo cannot make Aegis run a program it chose.
+
+The Python mutation check applies Aegis-specific suite aliases only when the source is inside an exact top-level `aegis_cli`, `aegis_core`, `aegis_mcp` or `aegis_sdk` package. Generic filename lookup remains available, including for nested and similarly named packages.
 
 **Layer 2** is optional: `aegis check --full --plan "what the change should do" --llm-cmd 'claude -p'`. The plan comes from `--plan`, `--plan-file`, or else the first of `docs/plan.md`, `.aegis/plan.md` and `PLAN.md` in the repository; without one, Layer 2 refuses to run. Any command that reads a prompt on stdin and prints a reply works (`codex exec --skip-git-repo-check`, a script). Aegis builds two prompts, one after the other: a spec reviewer gets the plan, the function signatures (with their docstrings) and the test names (no implementation) and predicts what could go wrong; a code reviewer gets the full text of each changed non-test Python file (`__init__.py` is skipped), the test output and the Layer 1 results, never the plan, together with those predictions, and answers each with claims backed by evidence. An arbiter compares the two by risk category, using Layer 1 as the tiebreaker, without asking a model to judge, and returns `SHIP`, `REVISE` or `BLOCK`. The verdict is advisory: `aegis check --full` exits on Layer 1 alone, a review that does not complete prints `UNVERIFIED`, and only a model command that cannot run, or a test discovery that fails, still makes the check exit 1. The command runs in an empty temporary directory, never in the repository, so the code under review cannot steer its reviewer through project config; and it comes only from `--llm-cmd` or `AEGIS_LLM_CMD`, never from a file in the repository. **This sends your plan, the source of the changed non-test Python files (whole files, not the diff; `__init__.py` is skipped), the test names and output and the Layer 1 results to whichever vendor the command calls.**
 
@@ -355,6 +359,8 @@ Aegis 4 removed claims the v3 code could not back, such as self-written release 
 - **Release verification** (`aegis doctor --release <sha>`): verifies the GitHub Actions `verdict` attestation with `gh attestation verify` (`gh >= 2.93.0`), failing closed at Tiers B and C (`agent_editable`: the required check runs the pull request's own workflow) or when `gh` is missing or older.
 
 The reasoning and sample-size limits behind these guarantees are in [Why Aegis is built this way](why-aegis.md).
+
+GitHub transport lives in `aegis_core.ghcli`, CODEOWNERS parsing and coverage in `aegis_core.codeowners`, and ruleset administration in `aegis_core.github_ruleset`. `aegis_core.human_gate` keeps tier detection and signed approval verification.
 
 ## 11. Cheat sheet
 

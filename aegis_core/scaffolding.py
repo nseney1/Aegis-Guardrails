@@ -9,7 +9,7 @@ import importlib.resources
 from pathlib import Path
 import re
 import shlex
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from aegis_core._version import __version__
 from aegis_core.storage import atomic_write_bytes
@@ -21,23 +21,20 @@ __all__ = [
     "ACTIVE_STARTERS",
     "ACTIVE_TYPE_DIR",
     "CI_WORKFLOW_LABEL",
-    "CI_WORKFLOW_PATH",
     "DEFAULT_RULE_PRESET",
     "NO_ACTIVE_PRESETS",
     "RULE_PRESETS",
     "SEED_TYPE",
     "SEED_TYPE_DIR",
-    "_CI_WORKFLOW",
-    "_declare_type",
-    "_runs_aegis_check",
-    "_shipped_rules",
-    "_workflow_files",
     "ci_workflow",
+    "declare_type",
     "install_rules",
     "packaged_active_rules",
     "packaged_dir",
     "packaged_rules",
     "preset_rules",
+    "runs_aegis_check",
+    "workflow_files",
 ]
 
 DEFAULT_RULE_PRESET = "standard"
@@ -90,8 +87,8 @@ def packaged_dir(name: str, base: Optional[Path] = None) -> Path:
     return installed
 
 
-def _shipped_rules(locator: Optional[Callable[..., Path]] = None) -> Dict[str, Path]:
-    base = (locator or packaged_dir)("rules")
+def _shipped_rules() -> Dict[str, Path]:
+    base = packaged_dir("rules")
     found: Dict[str, Path] = {}
     for directory in (base, base / ".oracles"):
         if directory.is_dir():
@@ -101,27 +98,27 @@ def _shipped_rules(locator: Optional[Callable[..., Path]] = None) -> Dict[str, P
     return found
 
 
-def packaged_rules(locator: Optional[Callable[..., Path]] = None) -> Dict[str, Path]:
+def packaged_rules() -> Dict[str, Path]:
     """Every shipped guidance rule (``rules/*.md``, ``rules/.oracles/*.md``, through
     ``packaged_dir``) by id: what the persona presets seed. The active starters are not
     among them (see packaged_active_rules)."""
-    return {k: v for k, v in _shipped_rules(locator=locator).items() if k not in ACTIVE_STARTERS}
+    return {k: v for k, v in _shipped_rules().items() if k not in ACTIVE_STARTERS}
 
 
-def packaged_active_rules(locator: Optional[Callable[..., Path]] = None) -> Dict[str, Path]:
+def packaged_active_rules() -> Dict[str, Path]:
     """The shipped active starters (ACTIVE_STARTERS) by id; ValueError when one is missing."""
-    shipped = _shipped_rules(locator=locator)
+    shipped = _shipped_rules()
     missing = [n for n in ACTIVE_STARTERS if n not in shipped]
     if missing:
         raise ValueError(f"packaged rule(s) {', '.join(missing)} not found; reinstall aegis-guardrails")
     return {n: shipped[n] for n in ACTIVE_STARTERS}
 
 
-def preset_rules(preset: str, locator: Optional[Callable[..., Path]] = None) -> List[Path]:
+def preset_rules(preset: str) -> List[Path]:
     """The packaged rule files of ``preset``; ValueError for an unknown preset or a missing rule."""
     if preset not in RULE_PRESETS:
         raise ValueError(f"unknown rule preset {preset!r}; presets: {', '.join(RULE_PRESETS)}")
-    shipped = packaged_rules(locator=locator)
+    shipped = packaged_rules()
     names = RULE_PRESETS[preset]
     if names is None:
         return [shipped[n] for n in sorted(shipped)]
@@ -134,7 +131,7 @@ def preset_rules(preset: str, locator: Optional[Callable[..., Path]] = None) -> 
 _TOP_LEVEL_KEY = re.compile(r"^([A-Za-z_][\w-]*)[ \t]*:")
 
 
-def _declare_type(source: Path, rule_type: str) -> bytes:
+def declare_type(source: Path, rule_type: str) -> bytes:
     """The bytes of ``source`` with its frontmatter declaring ``type: <rule_type>`` and, when
     it names no files, ``target_paths: []``; the rest of the file is kept as it is."""
     text = source.read_bytes().decode("utf-8")
@@ -159,15 +156,8 @@ def _declare_type(source: Path, rule_type: str) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
-def install_rules(
-    rules_dir: Path,
-    preset: str = DEFAULT_RULE_PRESET,
-    dry_run: bool = False,
-    force: bool = False,
-    skip: Sequence[str] = (),
-    rule_type: Optional[str] = None,
-    _preset_fn: Optional[Callable[[str], List[Path]]] = None,
-) -> List[str]:
+def install_rules(rules_dir: Path, preset: str = DEFAULT_RULE_PRESET, dry_run: bool = False, force: bool = False,
+                  skip: Sequence[str] = (), rule_type: Optional[str] = None) -> List[str]:
     """Copy the preset's packaged rules into ``rules_dir`` (flat); return the ids now there.
 
     An existing file is kept unless ``force``; a symlinked destination is never written
@@ -177,7 +167,7 @@ def install_rules(
     """
     rules_dir = Path(rules_dir)
     present: List[str] = []
-    sources = (_preset_fn or preset_rules)(preset)
+    sources = preset_rules(preset)
     for source in sources:
         name = source.stem
         if name in skip:
@@ -188,7 +178,7 @@ def install_rules(
         if dest.exists() and not force:
             present.append(name)
             continue
-        data = _declare_type(source, rule_type) if rule_type else source.read_bytes()
+        data = declare_type(source, rule_type) if rule_type else source.read_bytes()
         if not dry_run:
             atomic_write_bytes(dest, data)
         present.append(name)
@@ -198,7 +188,6 @@ def install_rules(
 # ── The CI floor ─────────────────────────────────────────────────────────────
 
 CI_WORKFLOW_LABEL = ".github/workflows/aegis.yml"
-CI_WORKFLOW_PATH = CI_WORKFLOW_LABEL
 _RUNS_AEGIS_CHECK = re.compile(
     r"(?:aegis|python3?(?:[ \t]+-I)?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?=[ \t]|$)"
 )
@@ -275,7 +264,7 @@ def ci_workflow() -> str:
     return _CI_WORKFLOW.format(version=__version__)
 
 
-def _workflow_files(root: Path) -> List[Path]:
+def workflow_files(root: Path) -> List[Path]:
     """The GitHub Actions workflow files (``.github/workflows/*.yml|yaml``; GitHub reads no
     subdirectory there)."""
     directory = root / ".github" / "workflows"
@@ -286,7 +275,7 @@ def _workflow_files(root: Path) -> List[Path]:
     return [e for e in entries if e.suffix in (".yml", ".yaml") and e.is_file()]
 
 
-def _runs_aegis_check(path: Path) -> bool:
+def runs_aegis_check(path: Path) -> bool:
     try:
         with open(path, "rb") as handle:
             text = handle.read(_WORKFLOW_READ_LIMIT).decode("utf-8", "replace")

@@ -1006,7 +1006,7 @@ class ReviewGh(hg.FakeGh):
         self.branch_rules = branch_rules or {}  # the quoted branch of a rules/branches/ path -> its rules
 
     def __call__(self, argv, stdin=None, cwd=None):
-        from aegis_core import human_gate
+        from aegis_core import ghcli
         if self.missing:
             return None
         path = tuple(argv)[-1]
@@ -1016,11 +1016,11 @@ class ReviewGh(hg.FakeGh):
                 return result
         if "/pulls/" in path:
             self.calls.append((tuple(argv), stdin))
-            return human_gate.GhResult(0, json.dumps(self.reviews), "")
+            return ghcli.GhResult(0, json.dumps(self.reviews), "")
         branch = path.partition("/rules/branches/")[2]
         if branch in self.branch_rules:
             self.calls.append((tuple(argv), stdin))
-            return human_gate.GhResult(0, json.dumps(self.branch_rules[branch]), "")
+            return ghcli.GhResult(0, json.dumps(self.branch_rules[branch]), "")
         return super().__call__(argv, stdin, cwd)
 
     @property
@@ -1068,13 +1068,13 @@ def pull_event(tmp_path: Path, monkeypatch, base: str, head: str, number: Any = 
 
 def reviewed_weakening(tmp_path: Path, monkeypatch, gh: ReviewGh, **event: Any) -> Tuple[hg.Repo, str]:
     """A tier A repo whose pull request deletes the binding rule inv-a, run as a pull_request job."""
-    from aegis_core import human_gate
+    from aegis_core import ghcli
     repo = tier_a_repo(tmp_path)
     base = repo.head()
     (repo.root / path_of("inv-a")).unlink()
     head = repo.commit("drop the rule")
     pull_event(tmp_path, monkeypatch, base, event.pop("head", head), **event)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     os.chdir(repo.root)
     return repo, head
 
@@ -1127,7 +1127,7 @@ def test_a_review_under_a_tier_b_or_c_ruleset_approves_nothing_and_reviews_are_n
 @needs_git
 @pytest.mark.parametrize("codeowners", [None, "/src/ @octo\n"], ids=["none", "partial"])
 def test_a_base_codeowners_that_does_not_own_the_change_reads_no_review(tmp_path, capsys, monkeypatch, codeowners):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
     gh = ReviewGh()
     repo = tier_a_repo(tmp_path, codeowners=codeowners)
     base = repo.head()
@@ -1135,7 +1135,7 @@ def test_a_base_codeowners_that_does_not_own_the_change_reads_no_review(tmp_path
     head = repo.commit("drop the rule")
     gh.reviews = [review("human", head, association="OWNER")]
     pull_event(tmp_path, monkeypatch, base, head)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     os.chdir(repo.root)
     rc, payload = ci_event(capsys)
     assert rc == 1 and payload["approval"] is None and gh.review_calls == []
@@ -1188,8 +1188,8 @@ def test_a_full_first_page_fails_closed_even_when_it_holds_an_approval(tmp_path,
     {"/rules/branches/": (0, "not json", "")},
 ], ids=["rules-404", "unauthenticated", "http-403", "reviews-bad-json", "rules-bad-json"])
 def test_gh_that_cannot_answer_fails_closed(tmp_path, capsys, monkeypatch, fail):
-    from aegis_core import human_gate
-    gh = ReviewGh(fail={k: human_gate.GhResult(*v) for k, v in fail.items()})
+    from aegis_core import ghcli
+    gh = ReviewGh(fail={k: ghcli.GhResult(*v) for k, v in fail.items()})
     _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
     gh.reviews = [review("human", head, association="OWNER")]
     rc, payload = ci_event(capsys)
@@ -1223,9 +1223,9 @@ def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, m
         (repo.root / path_of("inv-a")).unlink()
         head = repo.commit("drop the rule")
         event = {"head": head[:7]}
-        from aegis_core import human_gate
+        from aegis_core import ghcli
         pull_event(tmp_path, monkeypatch, base, **event)
-        monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+        monkeypatch.setattr(ghcli, "default_gh_runner", gh)
         os.chdir(repo.root)
     else:
         _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, **event)
@@ -1279,14 +1279,14 @@ def test_a_review_of_the_event_head_does_not_approve_another_head(tmp_path, caps
 def test_a_signed_approval_still_passes_with_no_gh_call(tmp_path, capsys, monkeypatch):
     key, pub = hg.keygen(tmp_path / "keys", "human")
     gh = ReviewGh()
-    from aegis_core import human_gate
+    from aegis_core import ghcli
     repo = make_repo(tmp_path, signer_pub=pub)
     base = repo.head()
     (repo.root / path_of("inv-a")).unlink()
     repo.commit("drop the rule")
     approve(repo, key)
     pull_event(tmp_path, monkeypatch, base, repo.head())
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     os.chdir(repo.root)
     rc, payload = ci_event(capsys)
     assert rc == 0 and payload["approval"]["method"] == "signature" and gh.calls == []
@@ -1294,14 +1294,14 @@ def test_a_signed_approval_still_passes_with_no_gh_call(tmp_path, capsys, monkey
 
 @needs_git
 def test_a_governance_change_at_a_signed_base_accepts_the_same_review(tmp_path, capsys, monkeypatch):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
     gh = ReviewGh()
     repo = tier_a_repo(tmp_path, signer=True)
     base = repo.head()
     repo.write(".github/workflows/ci.yml", "name: CI\n")
     head = repo.commit("a workflow")
     pull_event(tmp_path, monkeypatch, base, head)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     os.chdir(repo.root)
     rc, payload = ci_event(capsys)
     assert rc == 1 and payload["governance"]["enforced"] is True and payload["approval"] is None

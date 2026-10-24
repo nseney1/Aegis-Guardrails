@@ -44,11 +44,11 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aegis_cli import NO_HOME_MESSAGE, sanitize_display
-from aegis_cli.base import AegisCommand, CommandCategory
-from aegis_cli.init import _host_option, _unwritable, packaged_dir
+from aegis_cli.base import AegisCommand, CommandCategory, host_option, unwritable
 from aegis_core import hosts as host_table
 from aegis_core import primitives
 from aegis_core.primitives import real_key
+from aegis_core.scaffolding import packaged_dir
 from aegis_core.workspace.layout import UserLayout
 
 __all__ = ["RESULTS", "Entry", "SkillsCommand", "SyncResult", "TargetResult", "run_skills", "summary", "sync_skills"]
@@ -383,10 +383,10 @@ def _sync_one(root: Path, target: _Target, skill: _Skill, *, force: bool, dry_ru
     if dry_run:
         # A dry run (init's check pass among them) predicts the write's failure, so init
         # stops before its first write; a real run reports what the OS says instead.
-        unwritable = _unwritable(path.parent)
-        if unwritable:
+        reason = unwritable(path.parent)
+        if reason:
             entry.result, entry.reason = "failed", "write"
-            entry.detail = f"{rel} cannot be written ({unwritable})"
+            entry.detail = f"{rel} cannot be written ({reason})"
         return entry
     from aegis_core.storage import atomic_write_bytes
 
@@ -538,7 +538,7 @@ class SkillsCommand(AegisCommand):
                  "Antigravity), replacing only Aegis's own unedited copies",
         )
         p_sync.add_argument(
-            "--host", type=_host_option, default=None, metavar="HOST[,HOST]|auto",
+            "--host", type=host_option, default=None, metavar="HOST[,HOST]|auto",
             help="Hosts to copy skills for (default: the hosts in .aegis/config.json); "
                  "'auto' takes the ones detected on this machine",
         )

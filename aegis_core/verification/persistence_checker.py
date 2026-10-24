@@ -10,7 +10,6 @@ serialization handlers. Pure deterministic — no LLM judgment.
 
 import ast
 import re
-import sys
 import os
 
 from . import ToolEvidence
@@ -112,26 +111,3 @@ def check(
         verdict=True,
         detail=f"All {len(mutated_set)} mutated keys have serialization paths",
     )
-
-
-if __name__ == '__main__':
-    # A cp1252 stdout can't encode this script's symbols (BUG-038).
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(errors='replace')
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <file> <dict_name> [--exclude key1,key2]")
-        sys.exit(1)
-
-    filepath = sys.argv[1]
-    dict_name = sys.argv[2]
-    exclude = set()
-    if '--exclude' in sys.argv:
-        idx = sys.argv.index('--exclude')
-        if idx + 1 < len(sys.argv):
-            exclude = set(sys.argv[idx + 1].split(','))
-
-    result = check(filepath, dict_name, exclude)
-    icon = "✅" if result.verdict else "🔴"
-    print(f"{icon} {result.tool}: {result.target}")
-    print(f"   {result.detail}")
-    sys.exit(0 if result.verdict else 1)

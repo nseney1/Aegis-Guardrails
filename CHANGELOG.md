@@ -85,6 +85,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis init`, `aegis uninstall` and `aegis skills sync --host auto` refuse before writing when no home directory resolves, with one named reason and exit codes 1, 1 and 2. Skills sync with an explicit host still works.
 - `aegis rule` commands refuse a filesystem root as the workspace. Executable lookup rejects names containing a directory part, including drive-qualified Windows names.
 
+- **Internal:** GitHub transport, CODEOWNERS parsing and ruleset administration live in `aegis_core.ghcli`, `aegis_core.codeowners` and `aegis_core.github_ruleset`; tier detection and approval verification remain in `human_gate`. MCP schemas live in `aegis_mcp.schemas` with their registry re-exports retained, and handlers use public helpers from `handlers.common`. Fitness event folding has separate helpers with unchanged results.
+- **Internal:** init and skills share `aegis_cli.base.host_option` and `unwritable`; scaffolding owns its package-data locator, and lane policy constants live with the gate. Migration, rule-id, bounded-read and private-directory helpers have public names, and the installer shares the workspace registry version while retaining its strict reader policy.
+
 ### Added
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
@@ -142,6 +145,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis init` recognizes GitHub Actions checks launched with `python3 [-I] -m aegis_cli[.cli] check`, including leading shell assignments and attached output redirection. Comments, quoted command mentions and malformed commands do not count as executed checks.
 - `aegis doctor --drivers` warns when the AST driver's execution plan is unavailable, including packaged templates installed inside the workspace, workspace-contained custom scripts and malformed command quoting. It agrees with the day-0 card even when the interpreter resolves; planning failures such as symlink loops remain visible in the text or JSON warning report.
 
+- Test discovery applies Aegis-specific suite aliases only to exact top-level `aegis_cli`, `aegis_core`, `aegis_mcp` and `aegis_sdk` packages. Foreign, nested and legacy-named packages no longer borrow an unrelated Aegis suite; ordinary matching test filenames still work.
+- The full-mode call-graph check no longer rejects `aegis_cli/init.py` for its unused `_shipped_rules` forwarding wrapper.
+
 ### Breaking (command line, JSON and MCP)
 
 - Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
@@ -165,6 +171,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - Breaking: MCP `outputSchema` (on all five tools) and `structuredContent` (on every `tools/call` result) are removed, reversing the first 4.3.3 "Changed" entry. A result is `{content, isError}` and carries its payload once, as JSON text. `tools/list` shrinks from 17,977 bytes to 6,214, and a one-rule `aegis_scan` answer from 1,645 to 898 bytes in a local fixture.
 - Breaking: the `aegis check --ci --json` `regression` object drops `passed_count`, `failed_count`, `prune_box_exceeded` and the report-level `approval`; each commit drops `passed`, `failed_on_base`, `passed_on_head`, `source_files`, `test_files`, `fixes` and `exempted`, and keeps `exemption_code`.
+
+- Breaking: the unused script interfaces of `aegis_core.verification.runner`, `aegis_core.verification.call_graph` and `aegis_core.verification.persistence_checker` are removed; use `aegis check`.
+- The CLI contract's callable type metadata for `init --host` and `skills sync --host` changes from `_host_option` to `host_option`. Their parsing, defaults, help and error messages are unchanged.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -200,6 +209,14 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - Breaking: `aegis_core.baseline.envelope` is removed; use `aegis_core.primitives.envelope`.
 - Breaking: `aegis_core.verification.scanners.scan_secrets_workspace`, `aegis_core.verification.scanners.Finding.rule` and `aegis_core.verification.scanners.Finding.fp` are removed. `Finding.as_dict()` drops the duplicate `rule` key and keeps `rule_id`.
+
+- Breaking: `aegis_core.human_gate.GH_TIMEOUT_SECONDS`, `aegis_core.human_gate.GhResult`, `aegis_core.human_gate.GhRunner`, `aegis_core.human_gate.default_gh_runner` and `aegis_core.human_gate.resolve_repo` move to `aegis_core.ghcli`.
+- Breaking: `aegis_core.human_gate.COVERAGE_SAMPLES`, `aegis_core.human_gate.codeowners_coverage` and `aegis_core.human_gate.codeowners_lines` move to `aegis_core.codeowners`; `aegis_core.human_gate.RULESET_NAME`, `aegis_core.human_gate.build_ruleset`, `aegis_core.human_gate.create_ruleset` and `aegis_core.human_gate.ruleset_exists` move to `aegis_core.github_ruleset`. The incidental `aegis_core.human_gate.Iterable` re-export is removed; use `typing.Iterable`.
+- Breaking: `aegis_mcp.registry.list_rules` and `aegis_mcp.registry.build_rule_create_prompt` move to `aegis_mcp.handlers.governance`; `aegis_mcp.registry.remember_bounded` moves to `aegis_mcp.handlers.common`.
+- Breaking: the incidental re-exports `aegis_mcp.registry.Any`, `aegis_mcp.registry.Optional`, `aegis_mcp.registry.CANONICAL_RULE_TYPES`, `aegis_mcp.registry.DEFAULT_CLIENT_PLATFORM`, `aegis_mcp.registry.NOT_GOVERNED_MESSAGE`, `aegis_mcp.registry.REVIEW_MODES`, `aegis_mcp.registry.RULE_TYPES`, `aegis_mcp.registry.RuleInventoryError`, `aegis_mcp.registry.Workspace`, `aegis_mcp.registry.for_rules`, `aegis_mcp.registry.load_rules`, `aegis_mcp.registry.read_derived`, `aegis_mcp.registry.resolve_workspace` and `aegis_mcp.registry.stale_rules` are removed; import them from their defining modules.
+- Breaking: `aegis_cli.init.CI_WORKFLOW_PATH` and `aegis_core.scaffolding.CI_WORKFLOW_PATH` are removed; use `aegis_core.scaffolding.CI_WORKFLOW_LABEL`. The incidental `aegis_core.scaffolding.Callable` re-export is removed; use `typing.Callable`.
+- Breaking: `aegis_core.lane_ast.COVERED`, `aegis_core.lane_ast.LIMITS` and `aegis_core.lane_ast.PYTEST_CONFIG_FILES` move to `aegis_core.lane_gate`; `aegis_core.lane_gate.COLLECTION_KEYS` is removed in favor of `aegis_core.lane_ast.COLLECTION_KEYS`.
+- Breaking: `aegis_cli.init.DEFAULT_RULE_PRESET`, `aegis_cli.init.NO_ACTIVE_PRESETS`, `aegis_cli.init.SEED_TYPE` and `aegis_cli.init.SEED_TYPE_DIR` remain direct attributes but leave `aegis_cli.init.__all__`.
 
 ### Corrections
 
