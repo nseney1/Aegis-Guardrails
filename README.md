@@ -8,7 +8,7 @@
 
 Aegis gives Claude Code, Codex CLI and Antigravity the project rules for the files they are about to edit, then checks the result with `aegis check` in a git pre-commit hook and in CI. It is a Model Context Protocol (MCP) server (`aegis-mcp`) plus a CLI (`aegis`), with zero runtime dependencies.
 
-Your rules are short markdown files in `.aegis/rules/`, committed with your code. Before an agent edits a file, the `aegis_scan` MCP tool hands it only the rules whose `target_paths` match that file. `aegis check` then runs its deterministic checks, called **Layer 1** here: the AST patterns your rules ban, plus a built-in security pack (seven Python rules, such as unsafe `pickle` loading and shell execution) and a scan for known-format secrets (cloud and API keys, tokens, private keys); the pack and the scan judge only what your change adds. An optional **Layer 2** sends the changed Python files to a model command you name for an advisory review. A local ledger records how each rule fared.
+Your rules are short markdown files in `.aegis/rules/`, committed with your code. Before an agent edits a file, the `aegis_scan` MCP tool hands it only the rules whose `target_paths` match that file. `aegis check` then runs its deterministic checks, called **Layer 1** here: the AST patterns your rules ban, plus a built-in security pack (seven Python rules, such as unsafe `pickle` loading and shell execution) and a scan for known-format secrets (cloud and API keys, tokens, private keys); the pack and the scan judge only what your change adds. An optional **Layer 2** sends your plan, the source of the changed non-test Python files (not the diff; `__init__.py` is skipped), the test output and the Layer 1 results to a model command you name for an advisory review. A local ledger records how each rule fared.
 
 ## Why guardrails for AI coding agents?
 
@@ -24,7 +24,7 @@ In one coding session analyzed step by step, 749 of 1,339 agent steps (55.9%) we
 
 - **`AGENTS.md` or `CLAUDE.md` alone** are read by the agent and checked by nothing. Aegis keeps them to a short bootstrap, serves the rules that match each file at edit time, and checks the result.
 - **Agent hooks alone** (such as Claude Code's `PreToolUse`) run only inside that host. Aegis uses them as an extra layer on three hosts, but its hooks fail open and do not see edits made through shell commands, so CI stays the authority.
-- **A plain git `pre-commit` hook** runs after the agent is done, and `--no-verify` skips it. Aegis installs one too (a plain git hook, not one for the pre-commit framework), tells the agent the rules before it edits, and repeats the check in CI.
+- **A plain git `pre-commit` hook** runs only at commit time, and `--no-verify` skips it. Aegis installs one too (a plain git hook, not one for the pre-commit framework), tells the agent the rules before it edits, and repeats the check in CI.
 - **semgrep and ast-grep** are general code-pattern engines with their own rule libraries. Aegis's `forbid_ast` is deliberately small (banned imports, calls and decorators; Python, plus packaged drivers for Rust, TypeScript/JavaScript and Go). What differs is delivery, since the rule reaches the agent per file, and governance, since `aegis check --ci` fails a pull request that weakens a rule.
 - **Guardrails AI** validates the inputs and outputs of an LLM inside your application. Aegis governs the coding agent that edits your repository.
 
@@ -110,7 +110,7 @@ checkpoint: all checks passed
 Layer 1: 1/3 FAILED — forbid_ast:no-eval
 ```
 
-`checkpoint: all checks passed` is a separate repository-wide hygiene scan (a test file for each source file, hard-coded paths, rule conventions) that only warns unless you pass `--strict`. The `FAILED` line is Layer 1's verdict on your change, and it sets the exit code.
+`checkpoint: all checks passed` comes from a repository-wide hygiene scan (a test file for each source file, hard-coded paths, rule conventions) that warns unless you pass `--strict`; a gate or invariant rule that does not use `enforcement: gate` and a rule file that cannot be loaded always fail. The `FAILED` line is Layer 1's verdict, which includes the checkpoint, and it sets the exit code.
 
 Run `aegis doctor` to verify your host registrations and enforcement tiers. `git commit --no-verify` skips the local hook, so run the same check in CI: `aegis init --ci` writes `.github/workflows/aegis.yml`, whose `aegis-check` job is (job permissions: `contents: read`, `pull-requests: read`):
 
@@ -122,7 +122,7 @@ Run `aegis doctor` to verify your host registrations and enforcement tiers. `git
 - uses: actions/setup-python@v7
   with:
     python-version: "3.12"
-- run: pip install aegis-guardrails
+- run: pip install aegis-guardrails==<version>   # pinned to the version that wrote it
 - run: aegis check
 - run: aegis check --ci     # fails a pull request that weakens a rule; make this job a required check
   env:
@@ -137,7 +137,7 @@ Run `aegis doctor` to verify your host registrations and enforcement tiers. `git
 | **Codex CLI** (`codex-cli`) | `codex mcp add aegis` | `AGENTS.md` (Codex truncates it past 32 KiB) |
 | **Antigravity** (`antigravity`: app, IDE and `agy`) | an `aegis` entry in `~/.gemini/config/mcp_config.json` | `AGENTS.md` (24,000 bytes per file). Antigravity tells the server no workspace, so run `aegis init` once per repo on each machine. |
 | **Kiro** (`kiro`, experimental: IDE and CLI) | an `aegis` entry in `~/.kiro/settings/mcp.json` | `AGENTS.md` |
-| **Cursor, GitHub Copilot, Windsurf** (`cursor`, `copilot`, `windsurf`, experimental) | an `aegis` entry in `~/.cursor/mcp.json`, `~/.copilot/mcp-config.json` or `~/.codeium/windsurf/mcp_config.json` | `AGENTS.md`; no Aegis hooks. Not checked on a real install. |
+| **Cursor, GitHub Copilot, Windsurf** (`cursor`, `copilot`, `windsurf`, experimental) | an `aegis` entry in `~/.cursor/mcp.json`, `~/.copilot/mcp-config.json` or `~/.codeium/windsurf/mcp_config.json` (Windsurf's current vendor docs name `~/.config/devin/mcp_config.json`; Aegis writes the `.codeium` path until a real install shows which one the app reads) | `AGENTS.md` for Cursor (vendor docs); whether Copilot and Windsurf read it is unverified; no Aegis hooks. None checked on a real install. |
 | **Gemini CLI** | Retired: Google refuses the client for individual Code Assist accounts, and Antigravity is the Gemini-family host. `aegis init --host gemini-cli` exits with status 2 and points you to `--host antigravity`. | — |
 
 On every host, rules are advisory through the bootstrap and `aegis_scan`, the git pre-commit hook is the local floor, and CI is the authority. `aegis hook install --host <host>` adds a pre-tool hook that stops destructive commands and edits to files nobody scanned first (`--scope project` writes project hook settings your teammates' hosts will run).
@@ -207,13 +207,13 @@ Aegis does not claim enforcement it lacks. `aegis doctor` reports these tiers, i
 
 ## Trust tiers: keep the agent from weakening your rules
 
-The agent runs as you, so it can edit your rules and the CI that checks them. For a pull request that weakens a rule or changes a governance file (`.aegis/` rules and config, `allowed_signers`, `CODEOWNERS`, workflows, test configuration), `aegis doctor` reports which of three tiers GitHub actually enforces:
+The agent runs as you, so it can edit your rules and the CI that checks them. For a pull request that weakens a rule or changes a governance file (`.aegis/` rules and config, `allowed_signers`, `CODEOWNERS`, workflows, test configuration, a deleted test file), `aegis doctor` reports which of three tiers GitHub actually enforces:
 
 | Tier | For | Such a pull request passes `aegis check --ci` when | Set up with |
 |---|---|---|---|
 | **C, self-attested** (default) | everyone, on any CI | while `allowed_signers` lists no key, a governance-file change passes with a note naming what changed, and a rule weakening fails because nothing can approve it (revert it, or set up tier B) | `aegis init`, `aegis init --ci` |
 | **B, solo and signed** | one maintainer whose agent shares the GitHub account | you sign it with `aegis approve`, using an SSH key the agent cannot use; this holds only while the pull request leaves `.github/workflows/**` and Aegis alone | a protected key, `allowed_signers`, `aegis doctor --github --apply --tier B` |
-| **A, separation of duties** | a second reviewer, or an agent on its own GitHub account | a code owner other than the author approves its head commit | `CODEOWNERS`, a non-admin agent identity, `aegis doctor --github --apply --tier A` |
+| **A, separation of duties** | a second reviewer, or an agent on its own GitHub account | a code owner other than the author approves its head commit. A governance-file change is gated only while `allowed_signers` lists a key; with none it passes with a note, and only the ruleset's code-owner review stops it | `CODEOWNERS`, a non-admin agent identity, a key in `allowed_signers`, `aegis doctor --github --apply --tier A` |
 
 Tier C is the complete local product; tiers B and A harden one thing, the rules themselves. `aegis doctor --github` prints the exact ruleset, `CODEOWNERS` lines and signing setup each tier needs, and changes nothing. Step-by-step setup and the limits of each tier: [Trust tiers](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/trust-tiers.md).
 
@@ -229,7 +229,7 @@ Tier C is the complete local product; tiers B and A harden one thing, the rules 
 
 **What is AGENTS.md?** A markdown instructions file in the repository root that coding agents (Codex CLI, Antigravity, Claude Code) read at session start. Aegis writes only a small bootstrap block into it; rules stay in `.aegis/rules/` and are served just-in-time via `aegis_scan`.
 
-**Does Aegis send my code anywhere?** Not by itself. Aegis opens no network connection of its own, and the ledger stays on your machine, in your git directory. Three things can reach the network, all started by you: `aegis check --full --llm-cmd ...` pipes the source of the changed Python files (not the diff) to the command you name; the commands listed in [PRIVACY.md](https://github.com/nseney1/Aegis-Guardrails/blob/main/PRIVACY.md) run your own `gh`; and `aegis sync --pr` pushes one branch to your remote. Your agent host sends what Aegis returns to its own model provider.
+**Does Aegis send my code anywhere?** Not by itself. Aegis opens no network connection of its own, and the ledger stays on your machine, in your git directory. Three things can reach the network, all started by you: `aegis check --full --llm-cmd ...` pipes your plan, the source of the changed non-test Python files (not the diff; `__init__.py` is skipped), the test output and the Layer 1 results to the command you name; the commands listed in [PRIVACY.md](https://github.com/nseney1/Aegis-Guardrails/blob/main/PRIVACY.md) run your own `gh`; and `aegis sync --pr` pushes one branch to your remote. Your agent host sends what Aegis returns to its own model provider.
 
 **I used Aegis 3.x. How do I upgrade?** Run `aegis migrate`, then `aegis migrate --apply`, `aegis init --host <your hosts>`, and `aegis doctor --fix`. See the [changelog](https://github.com/nseney1/Aegis-Guardrails/blob/main/CHANGELOG.md#upgrading-from-3x) for details.
 
