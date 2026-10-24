@@ -25,7 +25,7 @@ import subprocess
 
 import pytest
 
-from aegis_core import checkrun, credit, human_gate, treeid
+from aegis_core import checkrun, credit, ghcli, treeid
 from aegis_core.telemetry_engine import ledger
 from tests import helpers_humangate as hg
 from tests import helpers_verified as hv
@@ -890,7 +890,7 @@ def test_a_ledger_row_cannot_name_the_workflow_that_confirms_credit(tmp_path, mo
     repo, commit = _reported_commit(tmp_path, monkeypatch)
     repo.git("branch", "-f", "main", commit)
     gh = GitHub([hv.ci_run(commit, "failure", run_id=9), hv.ci_run(commit, workflow="other.yml", run_id=5)])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     ledger.append_rows(repo.root, [_ci_row(commit, workflow="other.yml", run_id=5)])
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert [(c.state, c.counts) for c in proj.credits] == [("landed", False)]
@@ -904,7 +904,7 @@ def test_an_honest_ci_row_still_confirms_through_github(tmp_path, monkeypatch):
     repo, commit = _reported_commit(tmp_path, monkeypatch)
     repo.git("branch", "-f", "main", commit)
     gh = GitHub([hv.ci_run(commit, run_id=9)])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     ledger.append_rows(repo.root, [_ci_row(commit)])
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert [(c.state, c.counts) for c in proj.credits] == [("confirmed", True)]
@@ -920,7 +920,7 @@ def test_the_default_branch_is_githubs_not_the_local_origin_head(tmp_path, monke
     _point_origin_head_at(repo, "feature", commit)
     gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")],
                 repo={"full_name": "octo/proj", "default_branch": github_default})
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     ledger.append_rows(repo.root, [_ci_row(commit)])
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert [c.counts for c in proj.credits] == [counts]
@@ -938,7 +938,7 @@ def test_an_unreadable_default_branch_leaves_credit_landed_with_no_local_fallbac
     repo, commit = _reported_commit(tmp_path, monkeypatch)
     _point_origin_head_at(repo, "feature", commit)
     gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")], repo=reply)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     ledger.append_rows(repo.root, [_ci_row(commit)])
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]
@@ -952,7 +952,7 @@ def test_confirm_records_an_unreadable_default_branch_as_ci_unavailable(tmp_path
     repo, commit = _reported_commit(tmp_path, monkeypatch)
     _point_origin_head_at(repo, "feature", commit)
     gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")], repo=reply)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     summary = credit.confirm(repo.root, client=credit.GhRestClient(cwd=str(repo.root)), workflow=hv.CI_WORKFLOW)
     assert (summary["asked"], summary["confirmed"], len(summary["errors"])) == (0, 0, 1)
     assert hv.rows_of(repo.root, "ci") == []
@@ -965,7 +965,7 @@ def test_confirm_asks_github_for_the_branch_and_the_run_once(tmp_path, monkeypat
     repo, commit = _reported_commit(tmp_path, monkeypatch)
     _point_origin_head_at(repo, "feature", commit)  # the local ref says feature; GitHub says main
     gh = GitHub([hv.ci_run(commit, run_id=9, head_branch="feature")])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     summary = credit.confirm(repo.root, client=credit.GhRestClient(cwd=str(repo.root)), workflow=hv.CI_WORKFLOW)
     assert (summary["asked"], summary["confirmed"]) == (1, 0)
     row, = hv.rows_of(repo.root, "ci")
@@ -987,7 +987,7 @@ def test_a_runs_get_that_fails_after_github_named_the_branch_still_trips_the_bre
             return subprocess.CompletedProcess(argv, 1, "", "rate limited")
         return gh(argv, stdin, cwd, timeout)
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", runs_fail)
+    monkeypatch.setattr(ghcli, "default_gh_runner", runs_fail)
     ledger.append_rows(repo.root, [_ci_row(commit)])
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]
@@ -1020,7 +1020,7 @@ def test_a_failed_rest_read_never_falls_back_to_an_attestation(tmp_path, monkeyp
             return subprocess.CompletedProcess(argv, 1, "", "no attestation")
         return gh(argv, stdin, cwd, timeout)
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    monkeypatch.setattr(ghcli, "default_gh_runner", runner)
     ledger.append_rows(repo.root, [_ci_row(commit)])
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert [(c.state, c.reason, c.counts) for c in proj.credits] == [("landed", "unverified_ci", False)]

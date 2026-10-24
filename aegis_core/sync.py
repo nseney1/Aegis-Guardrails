@@ -270,8 +270,8 @@ def _write_examples(root: Path, rule_id: str, rows: List[Dict[str, Any]]) -> Lis
 
 
 def _default_gh_runner(argv: List[str], cwd: Optional[str] = None) -> Any:
-    from aegis_core.human_gate import default_gh_runner
-    res = default_gh_runner(argv, None, cwd)
+    from aegis_core import ghcli
+    res = ghcli.default_gh_runner(argv, None, cwd)
     return res if res is not None else SimpleNamespace(returncode=127, stdout="", stderr="gh is not installed")
 
 
@@ -502,7 +502,7 @@ def sync(
 
     ``pr`` never moves a rule in the work tree: the moves and the examples to label go to a new
     ``aegis/lifecycle-*`` branch that is pushed and proposed; nothing is ever merged."""
-    from aegis_core import credit, gitsafe, human_gate
+    from aegis_core import credit, ghcli, gitsafe
     from aegis_core.fitness import ReplayReport, replay_detector_history_report
     ws = literal_workspace(workspace)
     root = Path(ws.root)
@@ -540,7 +540,7 @@ def sync(
                 plan = _pr_plan(root)
                 # The default runner needs GH_REPO from origin (R-cli-28); an injected one names its own.
                 if gh_runner is None:
-                    repo = human_gate.resolve_repo(plan["top"])
+                    repo = ghcli.resolve_repo(plan["top"])
                     if repo is None:
                         raise _Refused("origin is not a GitHub repository, so gh cannot open the pull request")
                     # The push goes to the branch's own remote: the PR's head must land in GH_REPO.

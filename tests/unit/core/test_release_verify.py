@@ -476,10 +476,10 @@ def test_a_report_without_gh_says_the_tier_is_unknown(tmp_path):
 
 @needs_git
 def test_doctor_drivers_says_it_did_not_read_the_tier_and_asks_gh_nothing(tmp_path, monkeypatch, capsys):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     asked = []
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, **kw: asked.append(argv))
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, **kw: asked.append(argv))
     repo = make_repo(tmp_path)
     _rc, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--drivers")
     assert "Trust tier: not read in this mode (run aegis doctor)" in out.splitlines() and asked == []
@@ -532,12 +532,12 @@ def test_a_review_entry_that_is_not_an_object_is_skipped_not_fatal(tmp_path):
 
 @needs_git
 def test_the_cli_prints_the_json_report_for_a_malformed_reviews_answer(tmp_path, monkeypatch, capsys):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
     release = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""), reviews=[1])
-    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh("A", release))
+    monkeypatch.setattr(ghcli, "default_gh_runner", TierAndReleaseGh("A", release))
     rc, out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", commit, "--json")
     payload = json.loads(out)
     assert rc == 1 and (payload["code"], payload["status"], payload["verified"]) == ("not_approved", "failed", False)
@@ -623,12 +623,12 @@ def test_a_tree_lookup_that_git_refuses_is_a_bad_commit(tmp_path, monkeypatch):
 
 @needs_git
 def test_the_cli_prints_the_json_envelope_for_a_git_failure(tmp_path, monkeypatch, capsys):
-    from aegis_core import gitsafe, human_gate
+    from aegis_core import ghcli, gitsafe
 
     repo = make_repo(tmp_path)
     head = repo.head()
     release = FakeGh("2.93.0")
-    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh("A", release))
+    monkeypatch.setattr(ghcli, "default_gh_runner", TierAndReleaseGh("A", release))
     _git_tree_lookup(monkeypatch, gitsafe.GitError("git rev-parse timed out after 30s"))
     rc, out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", head, "--json")
     payload = json.loads(out)
@@ -680,7 +680,7 @@ def test_verifying_writes_nothing_into_the_repository(tmp_path):
 # ── the default gh runner (R-trust-29) ───────────────────────────────────────
 
 class RecordingRunner:
-    """human_gate.default_gh_runner's signature; answers ``result`` (or raises it) and records each call."""
+    """ghcli.default_gh_runner's signature; answers ``result`` (or raises it) and records each call."""
 
     def __init__(self, result: Any) -> None:
         self.result, self.calls = result, []
@@ -695,20 +695,20 @@ class RecordingRunner:
 def test_a_type_error_inside_the_runner_propagates_and_gh_runs_once(tmp_path, monkeypatch):
     """Given a gh runner with a bug that raises TypeError, When the release closure runs gh --version,
     Then the TypeError surfaces after one call: no second gh call with other arguments."""
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     runner = RecordingRunner(TypeError("runner bug"))
-    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    monkeypatch.setattr(ghcli, "default_gh_runner", runner)
     with pytest.raises(TypeError, match="runner bug"):
         rv.default_gh(tmp_path)(["--version"], 20.0)
     assert runner.calls == [(["--version"], tmp_path, 20.0)]
 
 
 def test_the_closure_maps_the_runner_result_and_defaults_to_the_release_timeout(tmp_path, monkeypatch):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
-    runner = RecordingRunner(human_gate.GhResult(0, "gh version 2.93.0 (2026-10-01)\n", "warning"))
-    monkeypatch.setattr(human_gate, "default_gh_runner", runner)
+    runner = RecordingRunner(ghcli.GhResult(0, "gh version 2.93.0 (2026-10-01)\n", "warning"))
+    monkeypatch.setattr(ghcli, "default_gh_runner", runner)
     run = rv.default_gh(tmp_path)
     assert runner.calls == []
     assert run(["--version"], 20.0) == (0, "gh version 2.93.0 (2026-10-01)\n", "warning")
@@ -717,9 +717,9 @@ def test_the_closure_maps_the_runner_result_and_defaults_to_the_release_timeout(
 
 
 def test_a_missing_gh_is_none_through_the_closure(tmp_path, monkeypatch):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", RecordingRunner(None))
+    monkeypatch.setattr(ghcli, "default_gh_runner", RecordingRunner(None))
     assert rv.default_gh(tmp_path)(["--version"], 20.0) is None
 
 
@@ -797,30 +797,30 @@ def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, m
 
 
 class TierAndReleaseGh:
-    """``human_gate.default_gh_runner`` for the CLI: ``gh api`` GETs go to the tier detector's
+    """``ghcli.default_gh_runner`` for the CLI: ``gh api`` GETs go to the tier detector's
     fake, the rest to the release fake."""
 
     def __init__(self, tier: str, release: FakeGh) -> None:
         self.tier, self.release = tier_runner(tier), release
 
     def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None, timeout: float = 0.0):
-        from aegis_core import human_gate
+        from aegis_core import ghcli
 
         if list(argv)[:1] == ["api"] and not list(argv)[-1].startswith(f"repos/{REPOSITORY}"):
             return self.tier(argv, stdin, cwd)
         result = self.release(argv, timeout)
-        return None if result is None else human_gate.GhResult(*result)
+        return None if result is None else ghcli.GhResult(*result)
 
 
 @needs_git
 @pytest.mark.parametrize("tier, rc, first", [("A", 0, "VERIFIED:"), ("B", 1, "NOT VERIFIED:")])
 def test_the_cli_says_verified_at_tier_a_only(tmp_path, monkeypatch, capsys, tier, rc, first):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     repo = make_repo(tmp_path, tier=tier)
     commit, tree, digest = facts(repo)
     release = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
-    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh(tier, release))
+    monkeypatch.setattr(ghcli, "default_gh_runner", TierAndReleaseGh(tier, release))
     code, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", commit)
     assert (code, out.splitlines()[0].startswith(first)) == (rc, True), out
     assert f"trust tier: {tier}" in out and release.verify_calls

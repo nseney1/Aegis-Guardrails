@@ -15,7 +15,7 @@ import struct
 import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from aegis_core import human_gate
+from aegis_core import ghcli, human_gate
 
 PRINCIPAL = "human@example.com"
 
@@ -181,8 +181,8 @@ class FakeGh:
         elif method == "POST" and path.endswith("/rulesets"):
             body = {"id": 7, "name": json.loads(stdin or b"{}").get("name")}
         else:
-            return human_gate.GhResult(1, "", f"unexpected gh call {argv}")
-        return human_gate.GhResult(0, json.dumps(body), "")
+            return ghcli.GhResult(1, "", f"unexpected gh call {argv}")
+        return ghcli.GhResult(0, json.dumps(body), "")
 
     @property
     def methods(self) -> List[str]:

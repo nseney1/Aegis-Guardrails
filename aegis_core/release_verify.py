@@ -37,7 +37,7 @@ import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import primitives
-from aegis_core import gitevidence, gitsafe, human_gate
+from aegis_core import ghcli, gitevidence, gitsafe, human_gate
 
 __all__ = [
     "GH_MINIMUM",
@@ -162,10 +162,10 @@ class ReleaseReport:
 
 
 def default_gh(root: Any) -> GhRun:
-    """The ``GhRun`` for the repository at ``root``: ``human_gate.default_gh_runner``, looked up at each
+    """The ``GhRun`` for the repository at ``root``: ``ghcli.default_gh_runner``, looked up at each
     call so a patched runner is the one used."""
     def run(argv: Sequence[str], timeout: float = GH_TIMEOUT_SECONDS) -> Optional[Tuple[int, str, str]]:
-        res = human_gate.default_gh_runner(argv, cwd=root, timeout=timeout)
+        res = ghcli.default_gh_runner(argv, cwd=root, timeout=timeout)
         return None if res is None else (res.returncode, res.stdout, res.stderr)
 
     return run
