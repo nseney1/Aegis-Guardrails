@@ -484,8 +484,11 @@ def test_fix_leaves_a_host_config_holding_an_overflowing_number_byte_identical(e
     control = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"soma": {}, "db": {"command": "db"}}})
     payload = env.fix()
     assert overflow.read_bytes() == before and b"Infinity" not in overflow.read_bytes()
-    touched = [f for f in payload["fixes"] if str(overflow) in json.dumps(f)]
-    assert not [f for f in touched if f["status"] == "applied"]
+    # By the path field, never a substring of json.dumps: it doubles every Windows backslash.
+    key = os.path.normcase(os.path.realpath(overflow))
+    about = [f for f in payload["findings"] + payload["fixes"]
+             if isinstance(f.get("path"), str) and os.path.normcase(os.path.realpath(f["path"])) == key]
+    assert [(f.get("code"), f.get("fixable")) for f in about] == [("unreadable_config", False)]
     assert "not valid JSON" in json.dumps(payload) and "1e999 is not allowed" in json.dumps(payload)
     assert json.loads(control.read_text()) == {"mcpServers": {"db": {"command": "db"}}}
 
