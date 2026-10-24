@@ -54,6 +54,7 @@ __all__ = [
     "TreeBinding",
     "TreeError",
     "bind",
+    "named_paths",
     "tree_files",
     "tree_of",
 ]
@@ -99,7 +100,8 @@ class TreeBinding:
                 "gitlinks": list(self.gitlinks)}
 
 
-def _named(paths: Sequence[str]) -> str:
+def named_paths(paths: Sequence[str]) -> str:
+    """The first five of ``paths``, then how many more."""
     shown = ", ".join(paths[:_NAMED])
     return shown + (f" and {len(paths) - _NAMED} more" if len(paths) > _NAMED else "")
 
@@ -348,8 +350,8 @@ class BoundTree:
         gitlinks = tuple(sorted(links))
         dirty = [path for path in gitlinks if self._dirty_submodule(path, links[path])]
         if dirty:
-            self.binding = TreeBinding("partial", tree, f"submodule(s) differ from the recorded commit: {_named(dirty)}",
-                                       gitlinks)
+            self.binding = TreeBinding("partial", tree,
+                                       f"submodule(s) differ from the recorded commit: {named_paths(dirty)}", gitlinks)
         else:
             self.binding = TreeBinding("ok", tree, "", gitlinks)
         return self.binding
@@ -379,11 +381,11 @@ class BoundTree:
             elif tag == "S" and os.path.lexists(self.top / path):
                 sparse.append(path)
         if unmerged:
-            return f"unmerged entries (resolve the conflict first): {_named(unmerged)}"
+            return f"unmerged entries (resolve the conflict first): {named_paths(unmerged)}"
         if assume:
-            return f"assume-unchanged entries exist on disk, so git cannot see their changes: {_named(assume)}"
+            return f"assume-unchanged entries exist on disk, so git cannot see their changes: {named_paths(assume)}"
         if sparse:
-            return f"skip-worktree entries exist on disk, so git cannot see their changes: {_named(sparse)}"
+            return f"skip-worktree entries exist on disk, so git cannot see their changes: {named_paths(sparse)}"
         return ""
 
     def _dirty_submodule(self, path: str, recorded: str) -> bool:

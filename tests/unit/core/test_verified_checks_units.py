@@ -1127,3 +1127,62 @@ def test_approve_reads_the_key_from_the_user_config_and_signs_in_the_repository_
     assert code == 0
     assert [(kind, os.path.samefile(top, a.root)) for kind, top, _ in signed] == [("custody", True), ("sign", True)]
     assert signed[0][2] == "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"
+
+
+# ── the JUnit reader and one name per function (R-trust-50) ───────────────────
+
+_JUNIT = b"""<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="5"><error message="suite setup">boom</error>
+<testcase classname="tests.test_a" name="test_one"/>
+<testcase classname="tests.test_a" name="test_two"/>
+<testcase classname="tests.test_a" name="test_three"/>
+<testcase classname="tests.test_a" name="test_bad"><failure message="no">x</failure></testcase>
+<testcase classname="tests.test_a" name="test_skip"><skipped message="later"/></testcase>
+</testsuite></testsuites>
+"""
+_SUMMARY = "import sys; print('2 passed, 1 failed in 0.01s'); sys.exit(1)"
+
+
+def test_a_junit_file_is_counted_case_by_case(tmp_path):
+    import hashlib
+
+    junit = tmp_path / "junit.xml"
+    junit.write_bytes(_JUNIT)
+    run = checkrun.run_tests([sys.executable, "-c", _SUMMARY], tmp_path, checkrun.hermetic_env(tmp_path), 60.0, junit,
+                             tmp_path / "out.txt")
+    ids = sorted(f"tests.test_a::{n}" for n in ("test_one", "test_two", "test_three", "test_bad", "test_skip"))
+    assert (run.collected, run.passed, run.failed, run.skipped) == (5, 3, 1, 1)
+    assert run.nodeid_digest == hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+    passed, failed, errors = checkrun.parse_junit_cases(junit)
+    assert passed == {"tests.test_a::test_one", "tests.test_a::test_two", "tests.test_a::test_three"}
+    assert failed == {"tests.test_a::test_bad"} and errors == ["<suite:pytest>"]
+
+
+@pytest.mark.parametrize("junit_bytes", [b"<testsuite><testcase", None], ids=["malformed", "oversized"])
+def test_an_unreadable_junit_file_falls_back_to_the_summary_line(tmp_path, monkeypatch, junit_bytes):
+    junit = tmp_path / "junit.xml"
+    if junit_bytes is None:
+        monkeypatch.setattr(checkrun, "_MAX_JUNIT_BYTES", 64)
+        junit_bytes = _JUNIT
+    junit.write_bytes(junit_bytes)
+    run = checkrun.run_tests([sys.executable, "-c", _SUMMARY], tmp_path, checkrun.hermetic_env(tmp_path), 60.0, junit,
+                             tmp_path / "out.txt")
+    assert (run.collected, run.passed, run.failed, run.nodeid_digest) == (3, 2, 1, None)
+    assert checkrun.parse_junit_cases(junit) == (set(), set(), [])
+
+
+def test_each_function_has_one_name_and_no_public_name_is_unreferenced():
+    for gone in ("parse_junit", "_junit", "_hermetic_env", "_kill_group"):
+        assert not hasattr(checkrun, gone), gone
+    assert "parse_junit" not in checkrun.__all__
+    assert all(hasattr(checkrun, name) for name in checkrun.__all__)
+    assert treeid.named_paths(["a", "b"]) == "a, b" and "named_paths" in treeid.__all__
+    assert treeid.named_paths([str(i) for i in range(7)]) == "0, 1, 2, 3, 4 and 2 more"
+
+
+def test_the_process_group_killer_a_caller_patches_is_the_one_a_run_uses(tmp_path, monkeypatch):
+    killed = []
+    monkeypatch.setattr(checkrun, "kill_group", lambda proc: killed.append(proc.pid))
+    checkrun.run_tests([sys.executable, "-c", "pass"], tmp_path, checkrun.hermetic_env(tmp_path), 60.0,
+                       tmp_path / "junit.xml", tmp_path / "out.txt")
+    assert len(killed) == 1

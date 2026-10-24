@@ -57,7 +57,6 @@ __all__ = [
     "env_class",
     "hermetic_env",
     "kill_group",
-    "parse_junit",
     "parse_junit_cases",
     "plan_command",
     "pytest_args",
@@ -184,7 +183,7 @@ def env_class() -> str:
     return f"{platform.system().lower()}-py{sys.version_info[0]}.{sys.version_info[1]}"
 
 
-def _hermetic_env(
+def hermetic_env(
     home: Union[str, os.PathLike[str]],
     scratch: Optional[Union[str, os.PathLike[str]]] = None,
 ) -> Dict[str, str]:
@@ -208,8 +207,6 @@ def _hermetic_env(
     }
 
 
-hermetic_env = _hermetic_env
-
 
 # ── Running it ───────────────────────────────────────────────────────────────
 
@@ -218,7 +215,7 @@ def _taskkill() -> str:
     return ntpath.join(root if ntpath.isabs(root) else "C:\\Windows", "System32", "taskkill.exe")
 
 
-def _kill_group(proc: "subprocess.Popen[Any]") -> None:
+def kill_group(proc: "subprocess.Popen[Any]") -> None:
     if os.name == "nt":
         # taskkill /T addresses a pid, which is reusable once the root has exited, so an exited
         # root is left alone and its orphans are not swept (documented in the module docstring).
@@ -231,8 +228,6 @@ def _kill_group(proc: "subprocess.Popen[Any]") -> None:
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
-
-kill_group = _kill_group
 
 
 def _tail(path: Path) -> str:
@@ -252,9 +247,19 @@ def _summary(text: str) -> Dict[str, int]:
     return {}
 
 
-def _inspect_junit(
-    path: Path,
-) -> Optional[Tuple[int, int, int, int, str, Set[str], Set[str], List[str]]]:
+@dataclass(frozen=True)
+class _JunitReport:
+    tests: int
+    passed: int
+    failed: int
+    skipped: int
+    digest: str
+    passed_ids: Set[str]
+    failed_ids: Set[str]
+    collection_errors: List[str]
+
+
+def _inspect_junit(path: Path) -> Optional[_JunitReport]:
     try:
         if not path.is_file() or path.stat().st_size > _MAX_JUNIT_BYTES:
             return None
@@ -299,27 +304,16 @@ def _inspect_junit(
                 passed_ids.add(nodeid)
     digest = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8", "replace")).hexdigest()
     passed_count = len(cases) - failed_count - skipped_count
-    return len(cases), passed_count, failed_count, skipped_count, digest, passed_ids, failed_ids, col_errors
-
-
-def _parse_junit(path: Path) -> Optional[Tuple[int, int, int, int, str]]:
-    """``(tests, passed, failed, skipped, nodeid digest)`` from a JUnit file, or None."""
-    inspected = _inspect_junit(path)
-    if inspected is None:
-        return None
-    return inspected[:5]
-
-
-_junit = _parse_junit
-parse_junit = _parse_junit
+    return _JunitReport(len(cases), passed_count, failed_count, skipped_count, digest, passed_ids, failed_ids,
+                        col_errors)
 
 
 def parse_junit_cases(path: Path) -> Tuple[Set[str], Set[str], List[str]]:
     """``(passed_ids, failed_ids, collection_errors)`` from a JUnit file."""
-    inspected = _inspect_junit(path)
-    if inspected is None:
+    report = _inspect_junit(path)
+    if report is None:
         return set(), set(), []
-    return inspected[5], inspected[6], inspected[7]
+    return report.passed_ids, report.failed_ids, report.collection_errors
 
 
 def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float, junit: Path,
@@ -345,15 +339,16 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_group(proc)
+            kill_group(proc)
             code = proc.wait()
         finally:
-            _kill_group(proc)
+            kill_group(proc)
     text = _tail(output)
     counts = _summary(text)
-    parsed = _parse_junit(junit) if junit.is_file() else None
-    if parsed is not None:
-        collected, passed, failed, skipped, digest = parsed
+    report = _inspect_junit(junit) if junit.is_file() else None
+    if report is not None:
+        collected, passed, failed, skipped, digest = (report.tests, report.passed, report.failed, report.skipped,
+                                                      report.digest)
     else:
         passed, failed, skipped = counts.get("passed", 0), counts.get("failed", 0), counts.get("skipped", 0)
         collected = passed + failed + skipped + counts.get("xfailed", 0) + counts.get("xpassed", 0)
@@ -404,7 +399,7 @@ def run_pytest_snapshot(snapshot: Path, test_files: Sequence[str], workspace: Pa
     # path under a second spelling to the rootdir, so the classname would come out empty.
     argv = [sys.executable, *_SNAPSHOT_PYTHON_FLAGS, "-c", _SNAPSHOT_RUNNER, str(snap), str(ws), json.dumps(ext_dirs),
             *_SNAPSHOT_PYTEST_FLAGS, f"--rootdir={snap}", f"--junitxml={junit}", "--", *test_files]
-    res = run_tests(argv, snap, _hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
+    res = run_tests(argv, snap, hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
     passed, failed, col_errors = parse_junit_cases(junit)
     return _PytestOutcome(res.exit, res.timed_out, frozenset(passed), frozenset(failed), frozenset(col_errors))
 
@@ -442,9 +437,8 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
                 return CheckOutcome("unbindable", None, binding.reason, binding)
             links = sorted(bound.symlinks())
             if links:
-                named = ", ".join(links[:5]) + (f" and {len(links) - 5} more" if len(links) > 5 else "")
                 return CheckOutcome("unbindable", None, f"the tree holds symbolic links, which the snapshot refuses: "
-                                    f"{named}", binding)
+                                    f"{treeid.named_paths(links)}", binding)
             top = bound.top
             head = gitsafe.head_commit(top)
             if not head:
@@ -517,7 +511,7 @@ def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tes
             tmp = scratch / "tmp"
             home.mkdir(mode=0o700)
             tmp.mkdir(mode=0o700)
-            run = run_tests(argv, snapshot, _hermetic_env(home, tmp),
+            run = run_tests(argv, snapshot, hermetic_env(home, tmp),
                             DEFAULT_TIMEOUT_S if timeout is None else timeout, junit, scratch / "output.txt")
         return layer1, run, logical
     finally:
