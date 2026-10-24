@@ -372,7 +372,8 @@ def _stamp(moment: Optional[datetime]) -> str:
 def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, int]:
     from aegis_core import baseline
 
-    targets = baseline.checkable(snapshot, [p for p in changed if (snapshot / p).is_file()])
+    # Every changed file, as plain check takes them: the secret scan reads any type.
+    targets = [p for p in changed if (snapshot / p).is_file()]
     if not targets:
         return {"findings": 0, "files": 0}
     # The snapshot is a plain directory: git would answer for whatever repository encloses the temp dir,

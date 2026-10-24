@@ -112,6 +112,7 @@ def format_layer1_json_payload(
                 "target": r.target,
                 "verdict": bool(r.verdict),
                 "detail": r.detail,
+                "lines": list(r.lines),
             }
             for r in results
         ],
@@ -330,7 +331,7 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
         ratio, measured = cov.get("ratio"), cov.get("status") == "reported"
         figure = "n/a" if ratio is None else f"{float(ratio) * 100.0:.1f}%"
         lines.append(f"### Diff Coverage (report only): {figure} of {cov.get('executable_lines', 0)} changed executable lines"
-                     if measured else f"### Diff Coverage: UNVERIFIED ({_flat(cov.get('reason', ''))})")
+                     if measured else f"### Diff Coverage: UNVERIFIED ({_md_code(cov.get('reason', ''))})")
         for path, ranges in sorted((cov.get("uncovered_ranges") or {}).items()):
             spans = ", ".join(f"{int(s)}-{int(e)}" if s != e else str(int(s)) for s, e in ranges)
             lines.append(f"- {_md_code(path)}: uncovered lines {spans}")

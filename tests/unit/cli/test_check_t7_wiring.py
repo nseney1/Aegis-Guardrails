@@ -79,7 +79,7 @@ def test_a_banned_call_the_change_introduces_fails_and_a_legacy_one_it_only_move
     assert code == 1
     assert _failed(payload) == [("security_pack:sec-py-pickle-loads", "src/load.py")]
     row = next(r for r in payload["layer1"] if r["tool"] == "security_pack:sec-py-pickle-loads")
-    assert "line 5" in row["detail"]
+    assert row["lines"] == [5] and row["detail"] == "pickle.loads introduced by this change"
 
 
 def test_a_changed_file_under_a_dot_directory_is_checked(repo, capsys):
@@ -147,6 +147,39 @@ def test_an_eval_the_seeded_no_eval_rule_already_names_is_reported_once(repo, ca
     code, payload, _ = _check(repo, capsys, "src/calc.py")
     assert code == 1
     assert _failed(payload) == [("forbid_ast:no-eval", "src/calc.py")]
+
+
+def _seed_no_eval(repo: Path) -> None:
+    _write(repo / ".aegis" / "rules" / "invariants" / "no-eval.md", (REPO / "rules" / "no-eval.md").read_text(encoding="utf-8"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "seed no-eval")  # gate rules bind from the reviewed base
+
+
+def test_another_banned_call_on_a_line_the_no_eval_rule_fails_is_still_reported(repo, capsys):
+    _seed_no_eval(repo)
+    _write(repo / "src" / "a.py", "import pickle\n\n\ndef f(s):\n    return pickle.loads(eval(s))\n")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert code == 1
+    assert _failed(payload) == [("forbid_ast:no-eval", "src/a.py"), ("security_pack:sec-py-pickle-loads", "src/a.py")]
+
+
+def test_an_allow_for_the_no_eval_rule_does_not_silence_another_banned_call_on_its_line(repo, capsys):
+    """Adversarial: `# aegis: allow[no-eval]` covers that rule's eval at the site, not pickle.loads beside it."""
+    _seed_no_eval(repo)
+    _write(repo / "src" / "a.py",
+           "import pickle\n\n\ndef f(s):\n    return pickle.loads(eval(s))  # aegis: allow[no-eval] parsing trusted config\n")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+
+
+def test_the_pack_does_not_second_guess_the_no_eval_rules_allow_for_the_same_eval(repo, capsys):
+    _seed_no_eval(repo)
+    _write(repo / "src" / "a.py", "def f(s):\n    return eval(s)  # aegis: allow[no-eval] parsing trusted config\n")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (0, [])
 
 
 def test_a_failure_to_run_the_scan_fails_the_check_closed(repo, capsys, monkeypatch):
@@ -234,6 +267,138 @@ def test_this_repository_has_no_gate_finding_from_the_wired_scans():
     pack = evaluate_security_pack(REPO, sample, {})
     assert pack["violations"] == [] and [u for u in pack["unverified_findings"] if u["kind"] == "file"] == []
     assert scanners.scan_secrets_delta(REPO, sample, {}) == []
+
+
+def _record(root: Path, capsys) -> tuple:
+    rc = main(["check", "--record", "--workspace", str(root), "--base", "main", "--json"])
+    out = capsys.readouterr().out
+    return rc, json.loads(out)["check"], out
+
+
+def test_a_secret_in_a_changed_yaml_file_fails_check_the_hook_and_the_record_alike(tmp_path, capsys):
+    """Given a non-Python file whose change adds a known-format token, when plain check, the pre-commit
+    hook and the recorded check run, then all three fail it the same way and none prints the token."""
+    project = hv.make_project(tmp_path)
+    token = _token()
+    project.write("config/settings.yaml", f"github:\n  token: {token}\n")
+    code, payload, raw = _check(project.root, capsys, "config/settings.yaml")
+    assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "config/settings.yaml")]) and token not in raw
+    project.git("add", "config/settings.yaml")
+    code, payload, raw = _check(project.root, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "config/settings.yaml")]) and token not in raw
+    rc, row, raw = _record(project.root, capsys)
+    assert (rc, row["passed"], row["layer1"]["findings"]) == (1, False, 1) and token not in raw
+
+
+def test_the_hook_judges_the_staged_yaml_even_when_the_working_copy_was_cleaned_after_git_add(repo, capsys):
+    """Adversarial: what the commit records is the index, so a clean working copy cannot hide a staged token."""
+    _write(repo / "settings.yaml", f"token: {_token()}\n")
+    _git(repo, "add", "settings.yaml")
+    _write(repo / "settings.yaml", "token: none\n")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "settings.yaml")])
+
+
+def test_the_hook_and_the_record_take_a_binary_file_and_note_one_over_the_size_cap(repo, capsys, monkeypatch):
+    """Sad path: a staged binary is read and skipped (as plain check does), a file over the index cap is
+    not read and a passing note says so; neither crashes nor fails the commit."""
+    from aegis_core.verification import runner
+
+    monkeypatch.setattr(runner, "INDEX_BLOB_LIMIT_BYTES", 256)
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "assets").mkdir()
+    (repo / "assets" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\0\0" + _token().encode("ascii") + b"\0" * 64)
+    _write(repo / "data" / "big.yaml", "rows:\n" + "  - x\n" * 60)
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (0, [])
+    notes = [(r["tool"], r["target"], r["verdict"]) for r in payload["layer1"] if r["tool"] == "index"]
+    assert notes == [("index", "data/big.yaml", True)]
+    _git(repo, "commit", "-q", "-m", "assets")
+    rc, row, _ = _record(repo, capsys)
+    assert (rc, row["passed"], row["layer1"]) == (0, True, {"findings": 0, "files": 2})
+
+
+def test_a_crlf_checkout_of_a_committed_change_is_judged_against_the_same_base_as_an_lf_one(repo, capsys):
+    """Given a branch commit that adds pickle.loads, when the file is checked out with core.autocrlf=true
+    (Git for Windows' default) instead of LF, then the delta still finds what the branch added."""
+    _write(repo / "src" / "a.py", "def f(x):\n    return x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "a")
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _write(repo / "src" / "a.py", "import pickle\n\n\ndef f(x):\n    return pickle.loads(x)\n")
+    _git(repo, "commit", "-q", "-am", "feat")
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+    try:
+        _git(repo, "config", "core.autocrlf", "true")
+    except subprocess.CalledProcessError:
+        pytest.skip("git cannot set core.autocrlf here")
+    (repo / "src" / "a.py").unlink()
+    _git(repo, "checkout", "--", "src/a.py")
+    assert b"\r\n" in (repo / "src" / "a.py").read_bytes()
+    code, payload, _ = _check(repo, capsys, "src/a.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-pickle-loads", "src/a.py")])
+
+
+def test_a_file_whose_only_change_is_its_line_endings_is_not_judged_whole(repo, capsys):
+    """Sad path: a CRLF copy of a committed legacy file is the committed text, so its legacy hit is not new."""
+    (repo / "src" / "legacy.py").write_bytes(LEGACY.replace("\n", "\r\n").encode("utf-8"))
+    code, payload, _ = _check(repo, capsys, "src/legacy.py")
+    assert (code, _failed(payload)) == (0, [])
+
+
+def test_a_pure_rename_of_a_legacy_file_is_judged_against_its_old_path(repo, capsys):
+    """Given `git mv` of a file holding a legacy hit, when check, the hook and the record run, uncommitted
+    and committed (--base main), then the hit is not introduced by the change."""
+    _git(repo, "checkout", "-q", "-b", "feat")
+    _git(repo, "mv", "src/legacy.py", "src/renamed.py")
+    code, payload, _ = _check(repo, capsys, "src/renamed.py")
+    assert (code, _failed(payload)) == (0, [])
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (0, [])
+    _git(repo, "commit", "-q", "-m", "mv")
+    code, payload, _ = _check(repo, capsys, "--base", "main")
+    assert (code, _failed(payload)) == (0, [])
+    rc, row, _ = _record(repo, capsys)
+    assert (rc, row["layer1"]["findings"]) == (0, 0)
+
+
+def test_a_renamed_yaml_keeps_its_committed_token_and_a_copy_of_it_does_not(repo, capsys):
+    """The hook's T7-only files take the same rename rule. A copy is not a rename: of two identical files
+    from one removed path, one is the rename and the other introduces the token again (multiset)."""
+    _write(repo / "conf" / "old.yaml", f"token: {_token()}\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "legacy token")
+    _write(repo / "src" / "later.py", "X = 1\n")  # HEAD~1, the last base candidate, holds the token too
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "later")
+    _git(repo, "mv", "conf/old.yaml", "conf/new.yaml")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (0, [])
+    (repo / "conf" / "copy.yaml").write_bytes((repo / "conf" / "new.yaml").read_bytes())
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    failed = _failed(payload)
+    assert code == 1 and len(failed) == 1 and failed[0][0] == "secret_scan:github-pat"
+    assert failed[0][1] in ("conf/copy.yaml", "conf/new.yaml")
+
+
+def test_a_copy_of_a_legacy_file_is_judged_whole(repo, capsys):
+    (repo / "src" / "copy.py").write_bytes((repo / "src" / "legacy.py").read_bytes())
+    code, payload, _ = _check(repo, capsys, "src/copy.py")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-tempfile-mktemp", "src/copy.py")])
+    _git(repo, "add", "-A")
+    code, payload, _ = _check(repo, capsys, "--hook")
+    assert (code, _failed(payload)) == (1, [("security_pack:sec-py-tempfile-mktemp", "src/copy.py")])
+
+
+def test_a_rename_that_also_adds_a_banned_call_still_fails(repo, capsys):
+    """Sad path: a rename with edits is not an exact rename, so the file is judged whole."""
+    _git(repo, "mv", "src/legacy.py", "src/renamed.py")
+    _write(repo / "src" / "renamed.py", LEGACY + "\n\ndef load(blob):\n    import pickle\n    return pickle.loads(blob)\n")
+    code, payload, _ = _check(repo, capsys, "src/renamed.py")
+    assert code == 1 and ("security_pack:sec-py-pickle-loads", "src/renamed.py") in _failed(payload)
 
 
 def test_a_file_the_branch_added_and_committed_is_judged_whole(repo, capsys):

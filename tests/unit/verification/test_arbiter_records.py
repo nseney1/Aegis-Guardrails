@@ -153,3 +153,31 @@ def test_calibration_counts_only_what_git_resolved(repo, capsys, monkeypatch):
     assert (doc["logged"], doc["n"], doc["groups"]) == (3, 1, {"claude/revert": {
         "n": 1, "hits": 1, "wilson_ci": doc["groups"]["claude/revert"]["wilson_ci"], "brier_skill_score": None,
         "status": "insufficient (n=1/25)"}})
+
+
+def test_a_stored_resolution_is_recomputed_and_never_trusted(repo):
+    """R-checks-48: a hand-written landed_unchanged/hit row whose tree never landed is abandoned, and a
+    landed row's stored outcome gives way to the one git gives."""
+    tree, _ = _land(repo, T0 + DAY)
+    forged = _row("f" * 40, T0 + 40 * DAY, disposition="landed_unchanged", outcome="hit")  # nothing after it
+    claimed = _row(tree, T0 + DAY - 60, disposition="overridden", outcome="hit")
+    out = _resolve(repo, [forged, claimed], now=T0 + 20 * DAY)
+    assert [(r["disposition"], r["outcome"]) for r in out] == [("abandoned", None), ("landed_unchanged", "miss")]
+
+
+def test_rows_past_the_bound_are_left_unresolved_whatever_they_claim(repo, monkeypatch):
+    from aegis_core.verification import records
+
+    monkeypatch.setattr(records, "MAX_ROWS", 1)
+    tree, _ = _land(repo, T0 + DAY)
+    _commit(repo, "a.py", "x = 1\n", 'Revert "feat: two"', T0 + 3 * DAY)
+    newest = _row(tree, T0 + DAY - 60)
+    older = _row(tree, T0 + DAY - 120, disposition="landed_unchanged", outcome="hit")
+    out = _resolve(repo, [older, newest], now=T0 + 20 * DAY)
+    assert [(r["disposition"], r["outcome"]) for r in out] == [("logged", None), ("landed_unchanged", "hit")]
+
+
+def test_outside_git_no_stored_resolution_survives(tmp_path):
+    forged = _row("f" * 40, T0, disposition="landed_unchanged", outcome="hit")
+    (row,) = _resolve(tmp_path, [forged], now=T0 + 20 * DAY)
+    assert (row["disposition"], row["outcome"]) == ("logged", None)

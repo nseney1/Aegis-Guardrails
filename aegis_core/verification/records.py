@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from aegis_core import credit, gitevidence, gitsafe
 
 DAY_S = 86400.0
-MAX_ROWS = 500  # the newest logged rows resolved per read, at most 3 git calls each
+MAX_ROWS = 500  # the newest rows resolved per read, at most 3 git calls each; the rest stay unresolved
 _FIX = re.compile(r"fix(?:\([^)]*\))?!?:", re.IGNORECASE)
 _REVERT = re.compile(r'Revert "')
 _OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
@@ -90,17 +90,18 @@ def resolve(row: Mapping[str, Any], now: float, top: Any, tip: Optional[str], co
 
 
 def resolve_rows(root: Any, rows: Sequence[Mapping[str, Any]], now: float) -> List[Dict[str, Any]]:
-    """``rows`` with the disposition and outcome of the newest ``MAX_ROWS`` still-logged ones computed from
-    git; rows that already carry a resolution, and any row git cannot place, are returned as they are."""
-    out = [dict(row) for row in rows]
+    """``rows`` with the disposition and outcome of the newest ``MAX_ROWS`` computed from git. What a row
+    stores is never trusted (the log is a plain file anyone can edit): every other row, and any row git
+    cannot place, is returned unresolved (``logged``, no outcome), which is never scored."""
+    out = [dict(row, disposition="logged", outcome=None) for row in rows]
     facts = gitevidence.repo_facts(root)
     if facts is None or facts.top is None:
         return out
     tips = gitevidence.branch_tips(facts, gitevidence.protected_branch(facts) or "")
     tip = tips[0] if tips else None
     landed = credit.landed_lookup(root)
-    logged = [i for i, row in enumerate(out) if row.get("disposition") == "logged" and row.get("outcome") is None]
-    newest = sorted(logged, key=lambda i: -float(out[i]["ts"]) if isinstance(out[i].get("ts"), (int, float)) else 0.0)
+    newest = sorted(range(len(out)),
+                    key=lambda i: -float(out[i]["ts"]) if isinstance(out[i].get("ts"), (int, float)) else 0.0)
     for i in newest[:MAX_ROWS]:
         row = out[i]
         try:

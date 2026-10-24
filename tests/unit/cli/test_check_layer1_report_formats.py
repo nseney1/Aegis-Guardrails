@@ -113,3 +113,21 @@ def test_a_run_that_cannot_be_judged_still_prints_a_valid_sarif_log(ws, capsys, 
     log = json.loads(out)
     assert rc == 1 and "Error:" in err
     assert log["runs"][0]["results"] == [] and log["runs"][0]["invocations"][0]["executionSuccessful"] is False
+
+
+@pytest.mark.parametrize("source", [
+    "import pickle\n\n\ndef f(s):\n    return pickle.loads(s)\n",
+    'TOKEN = "ghp_' + "Ab3" * 12 + '"\n',
+], ids=["security-pack", "secret-scan"])
+def test_a_t7_finding_keeps_its_sarif_fingerprint_when_lines_are_inserted_above_it(ws, capsys, source):
+    """Given a pack or secret hit, when three lines are added above it, then its result moves down three
+    lines and keeps its primaryLocationLineHash (GitHub code scanning matches alerts by it)."""
+    def result():
+        rc, out, _ = _check(ws, capsys, "src/new.py", "--format", "sarif")
+        (found,) = json.loads(out)["runs"][0]["results"]
+        return rc, found["locations"][0]["physicalLocation"]["region"]["startLine"], found["partialFingerprints"]
+
+    (ws / "src" / "new.py").write_bytes(source.encode("ascii"))
+    rc, line, prints = result()
+    (ws / "src" / "new.py").write_bytes(("# one\n# two\n# three\n" + source).encode("ascii"))
+    assert result() == (rc, line + 3, prints) and rc == 1

@@ -18,8 +18,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - **`aegis check --ci --coverage` reads no repository coverage configuration.** It runs the user-scope `tests.command` (pytest-based only) with an empty rcfile in a private state directory and never reads the repository's `.coveragerc` or `coverage.json`. It still runs the repository's tests, as `--coverage` always has.
 - **A short agent capture no longer blocks insight proposals.** The verbatim lint protects only human, `cli` and hook text, with a 25-character floor both ways and an exact match for short prompts; a one-character `aegis_capture_insight` quote blocked every proposal.
 
-- **`aegis check` runs the security pack and the secret scan.** The 7-rule Python security pack and the known-format secret scan had no caller; they now run in every `aegis check` (also `--hook` and `--record`) on what a change introduces, judged against the diff base. Test paths are exempt but reported, `# aegis: allow[rule]` and `# gitleaks:allow` are honoured, and a baseline never grandfathers these rows. A planted secret on a changed line fails Layer 1. On this repository Layer 1 over 147 files went from about 2 s to about 11 s (measured on a loaded machine).
-- **The step summary renders pull-request text as inert data.** Finding text from the pull request is placed in code spans, so it cannot inject Markdown, links or images into the job summary.
+- **`aegis check` runs the security pack and the secret scan.** The 7-rule Python security pack and the known-format secret scan had no caller; they now run in every `aegis check` (also `--hook` and `--record`) on what a change introduces, judged against the diff base; the hook and `--record` scan every changed file for secrets (YAML, JSON, `.env` and so on), as plain `check` does, never copying them to the snapshot, and a staged file over 5 MiB gets a "not checked" note. An exact rename (`git mv`) is judged against the file's old text, and a `core.autocrlf=true` checkout against the same base as an LF one. Test paths are exempt but reported, `# aegis: allow[rule]` and `# gitleaks:allow` (also after `//` or `/*`) are honoured, an allow for a user rule never silences a different banned call on the same line, and a baseline never grandfathers these rows. A planted secret on a changed line fails Layer 1. On this repository Layer 1 over 147 files went from about 2 s to about 11 s (measured on a loaded machine).
+- **The step summary renders pull-request text as inert data.** Finding text from the pull request, and the coverage UNVERIFIED reason, are placed in code spans, so they cannot inject Markdown, links or images into the job summary.
+- **A proposal never quotes stored human text.** A `--summary` or `--kind` that repeats a stored human insight is refused even when the typed copy holds the raw email or home path that storage redacted.
+- **`aegis doctor --fix` keeps a host config's permissions** (for example `0600` on `~/.claude.json`) when the file is swapped for a symlink during the fix, and atomic writes set the temporary file's mode through its open descriptor.
 - **`aegis doctor --fix` and Aegis's host-config rewrites never write through a swapped-in symlink.** A file replaced by a symlink after the check is replaced, not followed, and `~/.aegis` and `~/.aegis/backups` are created with mode `0700`.
 
 ### Changed behaviour
@@ -54,6 +56,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - **`aegis check --ci` prints one verdict.** It never prints PASSED with exit 1: `FAILED: <first cause>` matches the JSON status, the new JSON `blocking` list (causes in priority order) and the exit code, and perf, coverage and `Aegis-Check` trailer results show in the text, GitHub and step-summary outputs. The text adds `scanners: none configured`, or the scanner results with a security-suppression count and its merge-base delta.
 - The step summary is appended to, not rewritten.
+- Security-pack and secret findings keep their SARIF fingerprint when lines move: their message no longer names the line, and `--format json` Layer 1 rows gain `lines`.
 - SARIF logs hold only schema keys and anchored findings: a finding without a line (weakenings, governance, regressions) is never given one and goes to the annotations and the step summary; approved weakenings are notes, not errors; a failed run prints a valid empty log.
 - `aegis check --ci --perf` no longer crashes on an UNVERIFIED reason, uses pytest-benchmark by default when it is installed, and reports UNVERIFIED when `--head` is not the checkout. An UNVERIFIED perf or scanner result never blocks.
 - Aegis-Check trailers that 4.3.x recorded on commits adding calls the security pack flags no longer match a 4.4.0 rerun: re-record the trailer on in-flight pull requests.
@@ -65,10 +68,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `docs/trust-tiers.md` explains what each trust tier (A, B and C) protects and how to set a repository up for it.
 - `aegis check FILES --format github|sarif` reports Layer 1 findings (reverses a 4.0 removal).
 - The user-scope `scanners` key (`["ruff", "gitleaks"]`) runs those presets in `aegis check --ci`, from PATH outside the repository; only findings new against the merge base fail.
-- `aegis check --calibration` is a registered flag. Layer 2 predictions are stamped and kept in `.aegis/state/arbiter_predictions.jsonl` with no model text; dispositions and outcomes are computed from git when the file is read, and scores are per backend and observable kind.
+- `aegis check --calibration` is a registered flag. Layer 2 predictions are stamped and kept in `.aegis/state/arbiter_predictions.jsonl` with no model text (a symbol, selector or kind is kept only when Aegis can verify it); every disposition and outcome is computed from git when the file is read and stored values are ignored, and scores are per backend and observable kind.
 - `aegis init --ci` writes an `aegis-sarif` job with a gated code-scanning upload. It is a separate job, so `security-events: write` never reaches the job that hands `GH_TOKEN` to the test reruns.
-- Insight proposals are always an advisory `trap` with `kind`, `count` and `insight_ids`. Their `target_paths` are the insights' common directories weighted by how rare they are, as at most three `<dir>/**` globs (a top-level file stands for itself), never `**`; insights without paths make `propose` exit 1 and point at `aegis rule insight add --paths`.
-- `aegis rule insight add` prints the exact `Aegis-Approve-Insight:` trailer and a sign-then-re-run recipe (JSON `approval_trailer`, not stored), so an insight can reach level H.
+- Insight proposals are always an advisory `trap` with `kind`, `count` and `insight_ids`. Their `target_paths` are the insights' common directories weighted by how rare they are, as at most three `<dir>/**` globs (a top-level file is kept as its bare name, which matches that name in any directory), never `**`; insights without paths make `propose` exit 1 and point at `aegis rule insight add --paths`.
+- `aegis rule insight add` prints the exact `Aegis-Approve-Insight:` trailer and a sign-then-re-run recipe (JSON `approval_trailer`, not stored), so an insight can reach level H. Following the recipe counts the correction once in review, proposals and recurrence: the earlier `cli` row is superseded by the signed one.
 
 ### Fixed
 
@@ -89,7 +92,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - A fix whose only tests are Go, TypeScript, JavaScript or Rust is reported as `[UNVERIFIED:regression/tests_not_pytest]` (a GitHub warning), not as a fix without a test.
 - Diff coverage attributes every added line of a hunk, including lines that look like `+++` or `---` headers, and reads C-quoted paths (non-ASCII, tab, quote, backslash).
 - The recurrence rate is alive sessions with a recurrence over heartbeat-alive sessions, so it is at most 1; sessions without a heartbeat are not counted, and the baseline excludes the triggering burst.
-- The proposal category defaults to the single kind the cluster's human insights share, and text review lists each insight with its top-3 neighbours.
+- A proposal's kind defaults to the single kind the cluster's human insights share, and text review lists each insight with its top-3 neighbours.
 - Tree identity reports a tree as unbindable, instead of raising, when git times out or is missing.
 
 - `aegis migrate --apply` says `state modes: tightened N of M loose entries` instead of offering to tighten them, and outside git neither `aegis doctor` nor `aegis migrate` counts or changes the modes of the workspace's `.aegis/state`.

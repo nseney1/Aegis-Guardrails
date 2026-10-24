@@ -586,7 +586,7 @@ class TestCheckCliIntegration:
         rc = main(["check", "--ci", "--coverage", "--base", "main"])
         out = capsys.readouterr().out
         assert rc == 0 and "  coverage: UNVERIFIED (python3: No module named coverage)" in out
-        assert "### Diff Coverage: UNVERIFIED (python3: No module named coverage)" in summary.read_text(encoding="utf-8")
+        assert "### Diff Coverage: UNVERIFIED (`python3: No module named coverage`)" in summary.read_text(encoding="utf-8")
         rc = main(["check", "--ci", "--coverage", "--base", "main", "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0 and payload["status"] == "pass"
