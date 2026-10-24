@@ -19,6 +19,15 @@ DEFAULT_CLIENT_PLATFORM = "generic"
 _VALID_OUTCOMES = ("success", "partial", "failure", "tp", "fp", "pass", "fail")
 
 
+def remember_bounded(store: dict, key: Any, value: Any, limit: int) -> None:
+    """``store[key] = value`` as its newest entry, then drop the oldest while over ``limit``: a
+    process-lifetime map of a long-lived server stays bounded, and a key in use is evicted last."""
+    store.pop(key, None)
+    store[key] = value
+    while len(store) > limit:
+        del store[next(iter(store))]
+
+
 def _get_workspace(args: Optional[dict] = None) -> Workspace:
     """The workspace a handler acts on.
 

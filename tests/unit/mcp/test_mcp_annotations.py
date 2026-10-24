@@ -228,3 +228,26 @@ def test_the_description_guard_names_the_tool(tools, name, description, error):
     broken = copy.deepcopy(tools)
     broken[name]["description"] = description
     assert _description_errors(broken) == [error]
+
+
+# ── one definition of the server-owned arguments (R-evidence-53) ────────────
+
+# Names no tool schema has ever declared; a client value for them is dropped all the same.
+LEGACY_OWNED = {"host", "session", "source", "platform", "client_host", "client_name", "client_version",
+                "_client_platform", "_client_host"}
+
+
+def test_the_server_owned_keys_are_the_injected_ones_plus_the_legacy_names():
+    from aegis_mcp.tools import SERVER_INJECTED
+
+    assert server_module.SERVER_OWNED_KEYS >= SERVER_INJECTED
+    assert server_module.SERVER_OWNED_KEYS - SERVER_INJECTED == LEGACY_OWNED
+    sent = {"host": "ci", "session": "s", "_session": "s", "_client_name": "x", "workspace": "/", "files": []}
+    assert server_module.strip_server_owned(sent) == {"files": []}
+
+
+def test_the_tools_module_exports_its_dispatch_only():
+    import aegis_mcp.tools as tools
+
+    assert tools.__all__ == ["execute_tool", "is_known_tool"]
+    assert tools.TOOL_DEFINITIONS is server_module.TOOL_DEFINITIONS  # still importable
