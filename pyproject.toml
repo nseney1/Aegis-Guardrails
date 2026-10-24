@@ -44,7 +44,7 @@ aegis-guardrails = "aegis_mcp.server:main"
 [project.optional-dependencies]
 # Layer 2 runs any model through --llm-cmd / AEGIS_LLM_CMD, so there are no
 # vendor SDK extras. Runtime dependencies stay empty.
-dev = ["pytest", "pytest-xdist>=3.5.0", "ruff", "hypothesis>=6.100.0", "coverage", "pyyaml", "anyio", "build"]
+dev = ["pytest", "pytest-xdist>=3.8.0", "ruff", "hypothesis>=6.100.0", "coverage", "pyyaml", "anyio", "build"]
 
 [project.urls]
 Homepage = "https://github.com/nseney1/Aegis-Guardrails"
