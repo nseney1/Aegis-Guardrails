@@ -1,11 +1,13 @@
 """User-plane commands refuse missing homes without a traceback or a partial write."""
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from aegis_cli import init, rule, skills_sync, uninstall
+from aegis_cli import rule, skills_sync
+from aegis_cli.cli import main
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.workspace import binding
 from aegis_core.workspace.layout import UserLayout
@@ -28,29 +30,39 @@ def root(tmp_path, monkeypatch):
     return root
 
 
-@pytest.mark.parametrize("failure", [None, RuntimeError, KeyError])
+def _snapshot(directory):
+    return {p.relative_to(directory).as_posix():
+            ("link", os.readlink(p)) if p.is_symlink() else
+            ("file", p.read_bytes()) if p.is_file() else ("directory",)
+            for p in directory.rglob("*")}
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyError])
 @pytest.mark.parametrize("command,expected", [("init", 1), ("uninstall", 1), ("skills", 2)])
 def test_missing_home_refuses_before_writes(root, monkeypatch, capsys, failure, command, expected):
-    if failure is None:
-        monkeypatch.setattr(UserLayout, "current", classmethod(lambda cls: None))
-    else:
-        def absent(cls):
-            raise failure("no passwd entry")
-        monkeypatch.setattr(Path, "home", classmethod(absent))
-    before = sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
-    args = argparse.Namespace(_project_root=root, workspace=str(root), yes=True, dry_run=True,
-                              json=True, force=False, host="auto" if command == "skills" else None)
-    call = {"init": init.run_init, "uninstall": uninstall.run_uninstall, "skills": skills_sync.run_skills}[command]
-    assert call(args) == expected
+    home = root.parent / "home"
+    (root / "keep.txt").write_bytes(b"workspace content\n")
+    (home / "keep.txt").write_bytes(b"user content\n")
+    before = (_snapshot(root), _snapshot(home))
+
+    def absent(cls):
+        raise failure("no passwd entry")
+
+    monkeypatch.setattr(Path, "home", classmethod(absent))
+    argv = {"init": ["init", "--yes", "--rules", "none-active"],
+            "uninstall": ["uninstall"],
+            "skills": ["skills", "sync", "--host", "auto"]}[command]
+    assert main([*argv, "--workspace", str(root), "--json"]) == expected
     out = capsys.readouterr()
     if command == "skills":
         assert out.err.strip() == "Error: " + MESSAGE + "; name the hosts with --host"
+        assert not out.out
     else:
         doc = json.loads(out.out)
-        assert doc["status"] == "refused" and MESSAGE in doc["errors"]
-        if command == "uninstall":
-            assert "Nothing was changed." in doc["errors"]
-    assert sorted(p.relative_to(root).as_posix() for p in root.rglob("*")) == before
+        assert doc["status"] == "refused" and doc["dry_run"] is False
+        assert doc["errors"] == [MESSAGE] + (["Nothing was changed."] if command == "uninstall" else [])
+        assert not out.err
+    assert (_snapshot(root), _snapshot(home)) == before
 
 
 def test_explicit_host_selection_needs_no_home(root, monkeypatch):
