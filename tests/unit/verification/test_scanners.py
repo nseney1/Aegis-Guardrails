@@ -1149,3 +1149,37 @@ class TestScannerSurfaceAndInventory:
         self.git(root, "add", "link")
         self.git(root, "commit", "-qm", "base")
         assert scanners.suppression_count(root, "HEAD") == {"count": 0, "delta": 0}
+
+    @pytest.mark.parametrize("prefix", ["", "sub"], ids=["root", "subworkspace"])
+    @pytest.mark.parametrize("name, data", [
+        (".gitleaksignore", b"shared-allowlist.txt"),
+        ("link", b"absent # nosec"),
+    ], ids=["allowlist", "marker"])
+    def test_index_symlinks_are_not_working_file_suppressions(self, tmp_path, prefix, name, data):
+        import subprocess
+
+        root = tmp_path / "ws"
+        root.mkdir()
+        workspace = root / prefix
+        workspace.mkdir(exist_ok=True)
+        self.git(root, "init", "-q", "-b", "main")
+        self.git(root, "config", "core.symlinks", "false")
+        oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=data, cwd=str(root),
+                             check=True, capture_output=True).stdout.decode().strip()
+        rel = f"{prefix}/{name}" if prefix else name
+        self.git(root, "update-index", "--add", "--cacheinfo", f"120000,{oid},{rel}")
+        self.git(root, "commit", "-qm", "symlink entry")
+        self.git(root, "checkout-index", "-f", "--", rel)
+        path = workspace / name
+        assert path.is_file() and not path.is_symlink() and path.read_bytes() == data
+        assert self.git(root, "status", "--porcelain") == ""
+        assert scanners.suppression_count(workspace, "HEAD") == {"count": 0, "delta": 0}
+
+        # The index mode controls eligibility; regular entries still use working bytes.
+        self.git(root, "update-index", "--cacheinfo", f"100644,{oid},{rel}")
+        path.write_bytes(data + b"\n" + data + b"\n")
+        assert scanners.suppression_count(workspace, "HEAD") == {"count": 2, "delta": 2}
+
+    def test_unavailable_git_leaves_the_suppression_delta_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+        assert scanners.suppression_count(tmp_path, "HEAD") == {"count": 0, "delta": None}
