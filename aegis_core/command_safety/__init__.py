@@ -1,0 +1,136 @@
+"""aegis_core.command_safety — Structured AST/token command safety analyzer.
+
+Replaces monolithic regular expressions with lexical tokenization, wrapper unwrapping,
+pipeline sequence analysis, and domain-specific command evaluators.
+Zero external dependencies (pure stdlib). Target latency < 0.05ms.
+"""
+from aegis_core.command_safety.lexer import (
+    decompose_command,
+    extract_subshell_commands,
+    split_heredocs,
+    strip_shell_comments,
+    tokenize_command,
+    unwrap_command_stage,
+)
+from aegis_core.command_safety.analyzer import (
+    CommandAnalyzer,
+    SafetyEvaluation,
+    REASON_CHMOD_777,
+    REASON_CMD_DELETE,
+    REASON_DB_DESTRUCTIVE,
+    REASON_DD,
+    REASON_GIT_ADD_BULK,
+    REASON_GIT_BRANCH,
+    REASON_GIT_CHECKOUT_FORCE,
+    REASON_GIT_CLEAN_FORCE,
+    REASON_GIT_CONFIG,
+    REASON_GIT_DIFF,
+    REASON_GIT_MERGE,
+    REASON_GIT_PUSH_FORCE,
+    REASON_GIT_PUSH_REFSPEC,
+    REASON_GIT_RESET_HARD,
+    REASON_KILL_ALL,
+    REASON_MKFS,
+    REASON_PIPE_TO_SHELL,
+    REASON_POWERSHELL_DELETE,
+    REASON_PROTECTED_BRANCH,
+    REASON_HUMAN_REVIEW_GATE,
+    REASON_RMDIR_BYPASS,
+    REASON_RM_RF,
+    REASON_RMTREE,
+    REASON_SUDO,
+    REASON_UNABLE_TO_PARSE,
+    REASON_WINDOWS_FORMAT,
+)
+from aegis_core.command_safety.guard import (
+    BLOCK_SET,
+    GUARD_BLOCK,
+    GUARD_RECORD,
+    RECORD_SET,
+    CodexPrefix,
+    GuardRule,
+    classify_command,
+)
+
+# The single-file module also bound these public names outside __all__; the redundant
+# aliases re-export them, so each `aegis_core.command_safety.<name>` still resolves.
+from aegis_core.command_safety.lexer import (
+    MAX_DEPTH as MAX_DEPTH,
+    REMOTE_FETCHERS as REMOTE_FETCHERS,
+    SHELL_INTERPRETERS as SHELL_INTERPRETERS,
+    SHELL_PREFIX_KEYWORDS as SHELL_PREFIX_KEYWORDS,
+    SUDO_FLAGS_WITH_ARG as SUDO_FLAGS_WITH_ARG,
+    ENV_FLAGS_WITH_ARG as ENV_FLAGS_WITH_ARG,
+    TIME_FLAGS_WITH_ARG as TIME_FLAGS_WITH_ARG,
+    EXEC_FLAGS_WITH_ARG as EXEC_FLAGS_WITH_ARG,
+    OPTION_WRAPPER_FLAGS_WITH_ARG as OPTION_WRAPPER_FLAGS_WITH_ARG,
+    SU_COMMAND_FLAGS as SU_COMMAND_FLAGS,
+    SU_FLAGS_WITH_ARG as SU_FLAGS_WITH_ARG,
+    GIT_GLOBAL_FLAGS_WITH_ARG as GIT_GLOBAL_FLAGS_WITH_ARG,
+    GH_GLOBAL_FLAGS_WITH_ARG as GH_GLOBAL_FLAGS_WITH_ARG,
+    ENV_VAR_RE as ENV_VAR_RE,
+    WIN_DRIVE_RE as WIN_DRIVE_RE,
+    RM_DANGEROUS_TARGETS as RM_DANGEROUS_TARGETS,
+    GLOB_CHARS as GLOB_CHARS,
+    CommandStage as CommandStage,
+    Pipeline as Pipeline,
+    UnwrappedCommand as UnwrappedCommand,
+    decode_ansi_c_quotes as decode_ansi_c_quotes,
+)
+from aegis_core.command_safety.analyzer import (
+    evaluate_git as evaluate_git,
+    evaluate_gh as evaluate_gh,
+    evaluate_rm as evaluate_rm,
+    evaluate_powershell as evaluate_powershell,
+    evaluate_cmd_del as evaluate_cmd_del,
+    evaluate_system_binary as evaluate_system_binary,
+)
+
+# Private, but aegis_cli/hooks/management.py reads command_safety._HEREDOC to find heredoc
+# operators exactly as the lexer does; re-exported so the move to a package changes no
+# caller.
+from aegis_core.command_safety.lexer import _HEREDOC as _HEREDOC
+
+__all__ = [
+    "BLOCK_SET",
+    "GUARD_BLOCK",
+    "GUARD_RECORD",
+    "RECORD_SET",
+    "CodexPrefix",
+    "GuardRule",
+    "classify_command",
+    "CommandAnalyzer",
+    "SafetyEvaluation",
+    "decompose_command",
+    "extract_subshell_commands",
+    "split_heredocs",
+    "strip_shell_comments",
+    "tokenize_command",
+    "unwrap_command_stage",
+    "REASON_CHMOD_777",
+    "REASON_CMD_DELETE",
+    "REASON_DB_DESTRUCTIVE",
+    "REASON_DD",
+    "REASON_GIT_ADD_BULK",
+    "REASON_GIT_BRANCH",
+    "REASON_GIT_CHECKOUT_FORCE",
+    "REASON_GIT_CLEAN_FORCE",
+    "REASON_GIT_CONFIG",
+    "REASON_GIT_DIFF",
+    "REASON_GIT_MERGE",
+    "REASON_GIT_PUSH_FORCE",
+    "REASON_GIT_PUSH_REFSPEC",
+    "REASON_GIT_RESET_HARD",
+    "REASON_KILL_ALL",
+    "REASON_MKFS",
+    "REASON_PIPE_TO_SHELL",
+    "REASON_POWERSHELL_DELETE",
+    "REASON_PROTECTED_BRANCH",
+    "REASON_HUMAN_REVIEW_GATE",
+    "REASON_RMDIR_BYPASS",
+    "REASON_RM_RF",
+    "REASON_RMTREE",
+    "REASON_SUDO",
+    "REASON_UNABLE_TO_PARSE",
+    "REASON_WINDOWS_FORMAT",
+]
