@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import baseline
 from aegis_core.taxonomy import RULE_TYPES
 
@@ -173,7 +174,7 @@ class Card:
     def as_dict(self) -> Dict[str, Any]:
         layer1 = dict(self.layer1)
         top = layer1.pop("top")
-        document = baseline.envelope(SOURCE, {
+        document = primitives.envelope(SOURCE, {
             "workspace": self.workspace,
             "listing": self.listing,
             "files": self.files,

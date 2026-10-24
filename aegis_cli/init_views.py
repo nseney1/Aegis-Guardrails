@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
+from aegis_core import primitives
 from aegis_cli.hooks.management import hook_status, work_tree_warning
 from aegis_cli.install_hosts import display_command
 from aegis_core.scaffolding import (
@@ -90,13 +91,9 @@ class Report:
     def finish(self, status: str, scope: Dict[str, Any], dry_run: bool, actions: Sequence[Step]) -> None:
         if not self.json_mode:
             return
-        from aegis_cli import __version__
 
         print(json.dumps({
-            "source": self.source,
-            "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": scope,
+            **primitives.envelope(self.source, scope),
             "dry_run": dry_run,
             "status": status,
             "actions": [a.as_dict() for a in actions],

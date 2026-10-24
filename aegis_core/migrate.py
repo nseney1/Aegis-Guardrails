@@ -79,6 +79,7 @@ from aegis_core.errors import PathTraversalError, WorkspaceError
 from aegis_core.primitives import is_within
 from aegis_core.rules import is_legacy_key
 from aegis_core.storage import (
+    parse_jsonl,
     JsonlRead,
     atomic_write_bytes,
     atomic_write_text,
@@ -350,39 +351,6 @@ def _record(result: "MigrationPlan", path: Path, data: Optional[bytes] = None) -
 
 # ── Planning ─────────────────────────────────────────────────────────────────
 
-def _jsonl_row(raw: bytes, errors: str) -> Optional[Dict[str, Any]]:
-    try:
-        value = json.loads(raw.decode("utf-8-sig", errors))
-    except (UnicodeDecodeError, ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _jsonl_rows(data: bytes, errors: str) -> JsonlRead:
-    """Parse JSONL ``data`` as storage.read_jsonl parses a file (same lines, numbers, tail)."""
-    rows: List[Dict[str, Any]] = []
-    numbers: List[int] = []
-    skipped: List[int] = []
-    torn = False
-    lines = data.split(b"\n")
-    last = len(lines) - 1
-    for index, raw in enumerate(lines):
-        if index == last and not raw:
-            break
-        raw = raw.rstrip(b"\r")
-        if not raw.strip():
-            continue
-        row = _jsonl_row(raw, errors)
-        if row is not None:
-            rows.append(row)
-            numbers.append(index + 1)
-        elif index == last:
-            torn = True
-        else:
-            skipped.append(index + 1)
-    return JsonlRead(rows, numbers, skipped, torn_tail=torn)
-
-
 def _read_archive(path: Path) -> Tuple[Optional[bytes], JsonlRead]:
     """A v3.3 compaction archive: (its bytes as read, for the plan's fingerprint; its rows).
     A link, a damaged or oversized file reads as no rows with ``error`` set."""
@@ -396,7 +364,7 @@ def _read_archive(path: Path) -> Tuple[Optional[bytes], JsonlRead]:
         return None, JsonlRead([], [], [], error=f"cannot read {path}: {exc}")
     if len(data) > _ARCHIVE_LIMIT:
         return raw, JsonlRead([], [], [], error=f"cannot read {path}: larger than {_ARCHIVE_LIMIT >> 20} MiB")
-    return raw, _jsonl_rows(data, "surrogatepass")
+    return raw, parse_jsonl(data, "surrogatepass")
 
 
 def _ledger_families(layout: WorkspaceLayout) -> List[List[Path]]:

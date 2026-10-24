@@ -23,16 +23,17 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from aegis_cli.base import CommandCategory, AegisCommand
+from aegis_cli import NO_HOME_MESSAGE
+from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.init import (
     AGENTS_FILE,
     CLAUDE_FILE,
     CLAUDE_SHIM_ID,
     RemovedOption,
-    Step,
     Report,
-    report_partial,
+    Step,
     hook_refusal,
+    report_partial,
 )
 from aegis_cli.install_hosts import (
     REGISTRY_LABEL,
@@ -48,6 +49,7 @@ from aegis_cli.install_hosts import (
     workspace_hosts,
 )
 from aegis_core.primitives import real_key
+from aegis_core.workspace.layout import UserLayout
 
 __all__ = ["run_uninstall", "UninstallCommand"]
 
@@ -201,7 +203,13 @@ def run_uninstall(args: argparse.Namespace) -> int:
     report = Report(json_mode, "aegis uninstall")
     ws = getattr(args, "ws", None)
     root = Path(ws.root if ws is not None else (getattr(args, "_project_root", None) or Path.cwd())).resolve()
-    home = Path.home()
+    layout = UserLayout.current()
+    if layout is None:
+        report.error(NO_HOME_MESSAGE)
+        report.error("Nothing was changed.")
+        report.finish("refused", {"workspace": str(root), "hosts": []}, dry_run, [])
+        return 1
+    home = layout.home
     scope = {"workspace": str(root), "hosts": []}
 
     # Every step is checked first; a refusal stops uninstall before anything changes.

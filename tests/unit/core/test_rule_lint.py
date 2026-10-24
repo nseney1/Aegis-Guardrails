@@ -52,7 +52,9 @@ def _md(base: Path, pattern: str) -> list[Path]:
 
 
 CORE = _md(ROOT / "rules", "*.md") + _md(ROOT / "rules" / ".oracles", "*.md")
-WS = _md(ROOT / ".aegis" / "rules", "**/*.md")
+# Rules under a hidden directory (.archive) are out of service, as the loader treats them.
+WS = [p for p in _md(ROOT / ".aegis" / "rules", "**/*.md")
+      if not any(part.startswith(".") for part in p.relative_to(ROOT / ".aegis" / "rules").parts[:-1])]
 ALL = CORE + WS
 META = ROOT / "rules" / "META.md"
 
@@ -121,9 +123,8 @@ def test_workspace_rule_type_schema(p):
 
 
 # A served rule without target_paths applies to no file: scan and check never serve it.
-# This one shipped invariant still has none; its rule file is outside lane b2b-rules,
-# so the gap is logged there for the rules owner. The set must shrink, never grow.
-KNOWN_UNTARGETED = {"invariant-test-canonical-colocality"}
+# The set must shrink, never grow (invariant-test-canonical-colocality was retired to .archive/).
+KNOWN_UNTARGETED: set = set()
 
 
 def test_every_served_workspace_rule_applies_to_some_file():

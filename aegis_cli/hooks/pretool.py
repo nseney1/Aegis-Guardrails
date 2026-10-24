@@ -227,7 +227,7 @@ def run_pre_tool(
                     sys.stderr.flush()
                 if decision.event:
                     events.append(decision.root, decision.event, decision.result, decision.detail, host=host)
-            except BaseException:
+            except BaseException:  # unlike CLI metrics, a hook must not interrupt its host
                 pass  # telemetry and the reason text never change the decision
             return decision.code
     except BaseException:

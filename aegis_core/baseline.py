@@ -41,8 +41,7 @@ import stat
 import tempfile
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe, primitives
-from aegis_core._version import __version__
+from aegis_core import gitsafe
 from aegis_core.errors import AegisError
 from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
 from aegis_core.storage import atomic_write_text
@@ -68,7 +67,6 @@ __all__ = [
     "basename_groups",
     "checkable",
     "collect",
-    "envelope",
     "fingerprint",
     "label_base",
     "list_files",
@@ -679,11 +677,6 @@ def apply(pairs: Sequence[Tuple[Optional[str], ToolEvidence]], sources: Sources,
 
 
 # ── The files a whole-workspace mode looks at ────────────────────────────────
-
-def envelope(source: str, scope: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
-    """The head every machine-readable output of the v4.2 modes carries."""
-    return {"source": source, "aegis_version": __version__, "checked_at": primitives.utc_stamp(now), "scope": scope}
-
 
 def list_files(root: Any) -> Tuple[List[str], str]:
     """The files of the workspace as workspace-relative POSIX paths, sorted, and where the

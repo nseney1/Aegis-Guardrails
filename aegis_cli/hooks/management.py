@@ -9,6 +9,7 @@ import shlex
 import sys
 from typing import Any
 
+from aegis_cli import aegis_import_root
 from aegis_core import command_safety
 from aegis_core.primitives import is_within
 from aegis_core.storage import atomic_write_bytes
@@ -34,12 +35,6 @@ _SHELLS = frozenset({"sh", "bash", "dash", "zsh"})
 _HOOK_RUNNER = "import sys; sys.path.insert(0, sys.argv[1]); from aegis_cli.cli import main; sys.exit(main(sys.argv[2:]))"
 
 
-def _default_import_root() -> str:
-    import aegis_cli
-
-    return str(Path(aegis_cli.__file__).resolve().parent.parent)
-
-
 def _sh_path(path: str) -> str:
     return path.replace("\\", "/") if os.name == "nt" else path
 
@@ -54,7 +49,7 @@ def generate_hook_block(python: str | None = None, import_root: str | None = Non
     hook's own lines after the block run (no exec).
     """
     python = python if python is not None else sys.executable
-    import_root = import_root if import_root is not None else _default_import_root()
+    import_root = import_root if import_root is not None else aegis_import_root()
     # A relative path would resolve against the repository the hook runs in.
     if not os.path.isabs(python):
         raise ValueError(f"hook interpreter must be an absolute path, got {python!r}")

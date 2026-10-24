@@ -65,6 +65,7 @@ from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads, ut
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
+    "glob_problem",
     "CLOCK_SKEW_S",
     "DEFAULT_ROLE",
     "DEFAULT_TTL_S",
@@ -372,16 +373,16 @@ def default_owner() -> str:
     return label[:LABEL_MAX]
 
 
-def _glob_problem(glob: object) -> Optional[str]:
+def glob_problem(glob: object) -> Optional[str]:
     if not isinstance(glob, str):
-        return "is not text"
+        return "not_text"
     if _CONTROL.search(glob):
-        return "has a control character"
+        return "control"
     clean = normalize_path(glob)
     if not clean:
-        return "is empty"
+        return "empty"
     if ".." in clean.split("/"):
-        return "climbs out of the workspace with '..'"
+        return "climbs"
     return None
 
 
@@ -392,9 +393,11 @@ def _claim_paths(paths: object) -> Tuple[str, ...]:
         raise TeamUsageError("paths: give at least one glob")
     out: List[str] = []
     for ordinal, glob in enumerate(paths, 1):
-        problem = _glob_problem(glob)
+        problem = glob_problem(glob)
         if problem:
-            raise TeamUsageError(f"paths: glob {ordinal} {problem}")
+            message = {"not_text": "is not text", "control": "has a control character",
+                       "empty": "is empty", "climbs": "climbs out of the workspace with '..'"}[problem]
+            raise TeamUsageError(f"paths: glob {ordinal} {message}")
         clean = normalize_path(glob)  # type: ignore[arg-type]
         if clean not in out:
             out.append(clean)
@@ -500,7 +503,7 @@ def parse_lease(data: bytes, lane: str, oid: str) -> Lease:
     if value["branch"] is not None and not _label_ok(value["branch"], spaces=False):
         raise LeaseFormatError("branch is not a label")
     paths = value["paths"]
-    if not isinstance(paths, list) or not paths or any(_glob_problem(g) for g in paths):
+    if not isinstance(paths, list) or not paths or any(glob_problem(g) for g in paths):
         raise LeaseFormatError("paths is not a non-empty list of globs")
     if not _whole(value["ts"], 0, _MAX_TS):
         raise LeaseFormatError("ts is not a whole number of epoch seconds")
@@ -639,9 +642,8 @@ class LeaseChange:
 
 
 def _record(root: Path, kind: str, result: str, detail: Dict[str, Any]) -> Tuple[str, ...]:
-    try:
-        events.append(root, kind, result, detail)
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(root, kind, result, detail)
+    if exc is not None:
         return (f"event not recorded: {exc}",)
     return ()
 

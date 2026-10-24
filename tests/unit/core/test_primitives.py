@@ -385,9 +385,10 @@ def test_a_naive_now_is_utc_in_the_compliance_report(tmp_path, zone):
 
 
 def test_the_baseline_envelope_keeps_its_posix_time_and_its_own_stamp_is_gone():
-    from aegis_core import baseline
+    from aegis_core import baseline, primitives
 
-    assert baseline.envelope("s", {}, now=0)["checked_at"] == "1970-01-01T00:00:00Z"
+    assert primitives.envelope("s", {}, now=0)["checked_at"] == "1970-01-01T00:00:00Z"
+    assert not hasattr(baseline, "envelope") and "envelope" not in baseline.__all__
     assert not hasattr(baseline, "utc_stamp") and "utc_stamp" not in baseline.__all__
 
 

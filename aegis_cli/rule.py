@@ -12,7 +12,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 import os
@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from aegis_core import primitives
 from aegis_cli import sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
 from aegis_core.errors import WorkspaceNotFoundError
@@ -27,7 +28,7 @@ from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, validate_rule_bod
 from aegis_core.primitives import utc_stamp
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES
 from aegis_core.workspace.base import Workspace
-from aegis_core.workspace.binding import bounded_walk_up, home_message
+from aegis_core.workspace.binding import bounded_walk_up, denial, denial_message, home_message  # noqa: F401 - pinned name
 from aegis_core.workspace.layout import WorkspaceLayout
 from aegis_core.lifecycle.promotion import (
     promote_rule,
@@ -87,13 +88,6 @@ class _WorkspaceArg(argparse.Action):
         setattr(namespace, "_rule_workspace_arg", values)
 
 
-def _home() -> Path | None:
-    try:
-        return Path.home().resolve()
-    except (RuntimeError, KeyError, OSError):
-        return None
-
-
 def _not_a_workspace(directory: Path) -> WorkspaceNotFoundError:
     return WorkspaceNotFoundError(f"not an Aegis workspace (no .aegis/ in {directory}); run aegis init")
 
@@ -134,10 +128,9 @@ def _resolve_workspace_root(args: argparse.Namespace, require_aegis: bool = Fals
             root = Path(ws_obj.root if ws_obj is not None else Workspace.resolve().root).resolve()
             start = Path.cwd().resolve()
 
-    home = _home()
-    if home is not None and root == home:
-        if start == home:
-            raise WorkspaceNotFoundError(home_message(home))
+    if denial(root):
+        if start == root:
+            raise WorkspaceNotFoundError(denial_message(root))
         raise _not_a_workspace(start)
 
     if (explicit or require_aegis) and not is_aegis_workspace(root):
@@ -457,25 +450,12 @@ _SHOWN_PROBLEMS = 10
 _UNSIGNED = "The pack is unsigned: its sha256 ({short}) shows it was not altered after export, not who made it."
 
 
-def _show(value: object) -> str:
-    """Pack content and rule files are repository or network content: no terminal controls."""
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))
-
-
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 def _pack_envelope(action: str, root: Optional[Path], scope: Dict[str, Any]) -> Dict[str, Any]:
-    from aegis_core._version import __version__
-
-    return {
-        "source": f"aegis rule {action}",
-        "aegis_version": __version__,
-        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "scope": {"workspace": str(root) if root is not None else None, **scope},
-    }
+    return primitives.envelope(f"aegis rule {action}", {"workspace": str(root) if root is not None else None, **scope})
 
 
 def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scope: Dict[str, Any],
@@ -491,11 +471,11 @@ def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scop
     elif problems and header:
         print(f"Error: {header}", file=sys.stderr)
         for problem in problems[:_SHOWN_PROBLEMS]:
-            print(f"  {_show(problem)}", file=sys.stderr)
+            print(f"  {sanitize_display(problem, max_len=None)}", file=sys.stderr)
         if len(problems) > _SHOWN_PROBLEMS:
             print(f"  ... and {len(problems) - _SHOWN_PROBLEMS} more problems", file=sys.stderr)
     else:
-        print(f"Error: {_show(message)}", file=sys.stderr)
+        print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
     return 1
 
 
@@ -554,11 +534,11 @@ def _run_export(args: argparse.Namespace) -> int:
                     "rules": entries, "skipped": skipped})
         print(json.dumps(doc, indent=2))
         return 0
-    print(f"Exported {_plural(len(entries), 'rule')} to {_show(out)}")
+    print(f"Exported {_plural(len(entries), 'rule')} to {sanitize_display(out, max_len=None)}")
     for entry in entries:
         print(f"  {entry['path']}")
     if skipped:
-        print("Skipped: " + ", ".join(f"{_show(s['id'])} ({s['reason']})" for s in skipped))
+        print("Skipped: " + ", ".join(f"{sanitize_display(s['id'], max_len=None)} ({s['reason']})" for s in skipped))
     print(_UNSIGNED.format(short=pack["sha256"][:12]))
     return 0
 
@@ -618,12 +598,12 @@ def _run_import(args: argparse.Namespace) -> int:
     short = result.pack_sha256[:12]
     count = _plural(len(rules), "rule")
     verb = f"Dry run: would import {count}" if result.dry_run else f"Imported {count}"
-    print(f"{verb} from {_show(pack_path)} (sha256 {short}):")
+    print(f"{verb} from {sanitize_display(pack_path, max_len=None)} (sha256 {short}):")
     for rule in rules:
         renamed = f" (renamed from {rule['renamed_from']!r})" if rule["renamed_from"] else ""
         print(f"  {rule['path']}{renamed}")
     for warning in result.warnings:
-        print(f"Warning: {_show(warning)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(warning, max_len=None)}", file=sys.stderr)
     if result.dry_run:
         print("Nothing was written.")
     else:

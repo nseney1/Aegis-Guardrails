@@ -80,6 +80,11 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - A naive datetime passed as `now` is read as UTC everywhere; `check --record` and the scan-compliance report used to read it as local time.
 - Tree identity reads the user and system config named by `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` (and honours `GIT_CONFIG_NOSYSTEM`), so a git-lfs filter configured there runs.
 
+- `aegis status --compliance --json` now includes `aegis_version` in its document head.
+- `aegis check --partition --split` refuses C1 control characters in globs, matching `team claim` and `check --lane`.
+- `aegis init`, `aegis uninstall` and `aegis skills sync --host auto` refuse before writing when no home directory resolves, with one named reason and exit codes 1, 1 and 2. Skills sync with an explicit host still works.
+- `aegis rule` commands refuse a filesystem root as the workspace. Executable lookup rejects names containing a directory part, including drive-qualified Windows names.
+
 ### Added
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
@@ -92,6 +97,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis rule insight add` prints the exact `Aegis-Approve-Insight:` trailer and a sign-then-re-run recipe (JSON `approval_trailer`, not stored), so an insight can reach level H. Following the recipe counts the correction once in review, proposals and recurrence: the earlier `cli` row is superseded by the signed one.
 
 - The user-scope key `insights.capture` in `~/.aegis/config.json` (`off`, `counters` or `excerpts`) narrows what the insight hook's host entry allows and never widens it: the hook runs with the lower of the two. `off` writes nothing, not even heartbeats. A repository `.aegis/config.json`, a user config inside the workspace, or an invalid or unreadable value never changes the mode, and the key does not govern `aegis rule insight add` or `aegis_capture_insight`. `aegis doctor --json` shows `capture` and `capture_source` for each enabled host.
+
+- Internal: document heads share `aegis_core.primitives.envelope`; event writes share `aegis_core.events.try_append`; JSONL parsing, glob validation, bare executable names and workspace refusal messages each have one helper. CLI helpers live in `aegis_cli`, except `aegis_core.primitives.aegis_import_root`, re-exported as `aegis_cli.aegis_import_root` so the core benchmark can use it without importing the CLI.
 
 ### Fixed
 
@@ -129,6 +136,11 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis doctor --fix` never writes `Infinity`: a host config holding `1e999` is reported as not valid JSON and left byte-identical.
 - `aegis check FILES` in a repository at the filesystem root no longer treats every file as outside the tree, and a final-component symlink loop is refused where a path must stay inside.
 - A host config swapped for a symlink while `aegis init` writes it keeps its permission bits, and a malformed `cat-file` size in `gitsafe.read_blob` is a `GitError`.
+
+- An unexpected error while recording an event produces a warning at the team, lane-check, partition and verify sites, as at the other best-effort event sites.
+- Suppression counts use Git index modes for working files and bounded tracked blobs for BASE, excluding symlinks even when `core.symlinks=false` materializes their target text as regular files.
+- `aegis init` recognizes GitHub Actions checks launched with `python3 [-I] -m aegis_cli[.cli] check`, including leading shell assignments and attached output redirection. Comments, quoted command mentions and malformed commands do not count as executed checks.
+- `aegis doctor --drivers` warns when the AST driver's execution plan is unavailable, including packaged templates installed inside the workspace, workspace-contained custom scripts and malformed command quoting. It agrees with the day-0 card even when the interpreter resolves; planning failures such as symlink loops remain visible in the text or JSON warning report.
 
 ### Breaking (command line, JSON and MCP)
 
@@ -185,6 +197,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis_core.regression.SOURCE`, `aegis_core.regression.PRUNE_BOX_EXEMPTION_RATE` and `aegis_core.regression.FrozenSet` are removed, `aegis_core.regression.__all__` is `RegressionError`, `check_ci_regressions` and `is_source_file`, and `RegressionReport` and `CommitRegression` lose the fields the JSON report dropped.
 
 - Breaking: `aegis_core.checkrun.parse_junit` is removed (it had no caller; `parse_junit_cases` stays), and `aegis_core.baseline.utc_stamp` is removed (use `aegis_core.primitives.utc_stamp`). `aegis_core.primitives` holds the one copy of the path-containment, strict-JSON and UTC-timestamp helpers, and `aegis_core.command_safety` is a package (`lexer`, `analyzer`, `guard`) whose existing imports are unchanged.
+
+- Breaking: `aegis_core.baseline.envelope` is removed; use `aegis_core.primitives.envelope`.
+- Breaking: `aegis_core.verification.scanners.scan_secrets_workspace`, `aegis_core.verification.scanners.Finding.rule` and `aegis_core.verification.scanners.Finding.fp` are removed. `Finding.as_dict()` drops the duplicate `rule` key and keeps `rule_id`.
 
 ### Corrections
 

@@ -58,7 +58,7 @@ class CommandBackend:
     def _start(self) -> Tuple[Union[str, List[str]], Optional[str]]:
         """What to start: (args, executable)."""
         program = self.argv[0]
-        if _is_bare(program):
+        if pathlookup.is_bare(program):
             found = pathlookup.which(program)
             if found is None:
                 raise LLMCommandError(f"cannot run LLM command {program}: {os.strerror(errno.ENOENT)}")
@@ -90,11 +90,6 @@ class CommandBackend:
             detail = (proc.stderr or "").strip().splitlines()
             raise LLMCommandError(f"LLM command exited {proc.returncode}: {detail[-1] if detail else 'no stderr'}")
         return proc.stdout
-
-
-def _is_bare(name: str) -> bool:
-    """A name PATH lookup applies to: no directory part and no drive."""
-    return not (os.sep in name or (os.altsep and os.altsep in name) or os.path.splitdrive(name)[0])
 
 
 def _comspec() -> str:

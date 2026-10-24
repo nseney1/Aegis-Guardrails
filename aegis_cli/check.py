@@ -40,6 +40,7 @@ import os
 import re
 import sys
 
+from aegis_core import primitives
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.verify import run_verify
 
@@ -81,7 +82,7 @@ def _run_record(args: argparse.Namespace) -> int:
     """`aegis check --record [--tests]`: 0 recorded and passed, 1 failed or could not run, 2 usage."""
     from aegis_cli import sanitize_display
     from aegis_cli.verify import _resolve_git_cwd, _wants_json
-    from aegis_core import baseline, checkrun
+    from aegis_core import checkrun
 
     clash = _record_conflict(args)
     if clash:
@@ -91,12 +92,12 @@ def _run_record(args: argparse.Namespace) -> int:
     root = _resolve_git_cwd(args)
     use_json = _wants_json(args)
     if not os.path.isdir(root):
-        print(f"Error: workspace does not exist: {sanitize_display(root, max_len=len(root))}", file=sys.stderr)
+        print(f"Error: workspace does not exist: {sanitize_display(root, max_len=None)}", file=sys.stderr)
         return 1
     outcome = checkrun.record(root, tests=bool(getattr(args, "tests", False)), base=getattr(args, "base", None))
     row = outcome.row or {}
     if use_json:
-        document = baseline.envelope("aegis check --record", {"workspace": str(root), "tree": row.get("tree"),
+        document = primitives.envelope("aegis check --record", {"workspace": str(root), "tree": row.get("tree"),
                                                               "base": row.get("base")})
         document.update(status=outcome.status, witness=row.get("witness"), reason=outcome.reason, check=row or None,
                         tree=outcome.binding.as_dict() if outcome.binding else None)

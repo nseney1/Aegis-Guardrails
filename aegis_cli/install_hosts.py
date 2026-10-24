@@ -74,6 +74,7 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from aegis_cli import aegis_import_root
 from aegis_core import hosts as host_table
 from aegis_core.config import ENV_CLIENT, ENV_WORKSPACE
 from aegis_core.pathlookup import which
@@ -597,9 +598,8 @@ def record_init_host(root: Union[str, Path], hosts: Sequence[str]) -> None:
         if spec.verified or spec.registration is None:
             continue
         detail = {"host": spec.id, "verified": False, "surfaces": list(spec.surfaces)}
-        try:
-            events.append(root, "init_host", "experimental", detail, host=spec.id)
-        except Exception as exc:  # events.append documents what it raises; none of it may stop init
+        exc = events.try_append(root, "init_host", "experimental", detail, host=spec.id)
+        if exc is not None:
             print(f"aegis: the init_host event for {spec.id} could not be recorded ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
 
@@ -763,16 +763,6 @@ MCP_SCRIPT = "aegis-mcp"
 MCP_RUNNER = "import sys; sys.path.insert(0, sys.argv[1]); from aegis_mcp.server import main; main()"
 
 
-def _mcp_import_root() -> str:
-    """The directory aegis_cli was imported from: the wheel installs aegis_mcp beside it.
-    Located through aegis_cli, never by looking aegis_mcp up on sys.path, where the
-    current directory (a repository) can come first; aegis_cli does not import aegis_mcp
-    (ADR 0005 AD-3)."""
-    import aegis_cli
-
-    return str(Path(aegis_cli.__file__).resolve().parent.parent)
-
-
 def _installed_script(scripts_dirs: Optional[Sequence[str]]) -> Optional[str]:
     """The aegis-mcp console script pip installed with this interpreter, if any: the
     scheme's scripts directory (a venv's bin/, which pipx and unactivated venvs leave off
@@ -809,7 +799,7 @@ def mcp_command(path: Optional[str] = None, scripts_dirs: Optional[Sequence[str]
     script = _installed_script(scripts_dirs)
     if script:
         return [script]
-    return [sys.executable, "-I", "-c", MCP_RUNNER, _mcp_import_root()]
+    return [sys.executable, "-I", "-c", MCP_RUNNER, aegis_import_root()]
 
 
 # Interpreter options whose value follows them (attached or as the next argument).

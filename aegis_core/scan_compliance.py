@@ -46,6 +46,7 @@ import os
 from pathlib import Path, PurePath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.storage import append_jsonl, locked, read_jsonl, read_tail_bytes
 from aegis_core.workspace.layout import WorkspaceLayout
@@ -405,16 +406,13 @@ def report(workspace: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
         for name, totals in sorted(per_host.items())
     ]
     return {
-        "schema": SCHEMA,
-        "source": "aegis status --compliance",
-        "checked_at": utc_stamp(now or utc_now()),
-        "scope": {
+        **primitives.envelope("aegis status --compliance", {
             "workspace": str(root),
             "hosts": sorted(per_host),
             "sessions": [s.session for s in ordered],
             "since": utc_stamp(ordered[0].first) if ordered else None,
             "until": utc_stamp(max(s.last for s in ordered)) if ordered else None,
-        },
+        }, schema=SCHEMA, now=now or utc_now()),
         "stale": False,
         "metric": "scan_before_edit",
         "heuristic": {"edits": HEURISTIC, "limits": list(LIMITS)},

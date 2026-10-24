@@ -198,6 +198,8 @@ flowchart LR
 
 **Compliance.** `aegis status --compliance` reports each host's scan-before-edit rate from `.aegis/state/activity.jsonl`: per session, how many edited files were scanned first. An edit is a file named in `aegis_report_outcome`, or a file in a commit made during exactly one session. The output states its own limits; a session with no observed edit counts as unknown, never as 0.
 
+With `--json`, the compliance report carries `source`, `aegis_version`, `checked_at` and `scope` before its report fields.
+
 ## 7. Hosts and enforcement
 
 | Host | Registered by `aegis init --host` | How the server learns the repo | Instructions file (size limit) |
@@ -318,9 +320,13 @@ A read-only reviewer claims nothing and never blocks a writer; its verdict appli
 
 Each copy keeps only `name` and `description` in its frontmatter, renders the slots and is otherwise the packaged file byte for byte. Right after the frontmatter it carries the marker `<!-- aegis:skill id=<id> v=1 sha=<12 hex> -->`, where the sha covers the rest of the file with LF line endings. A later sync replaces a copy whose sha still matches (CRLF line endings and a byte order mark are no edit), skips a copy edited since unless `--force`, and leaves a file without the marker alone: it is yours and is never replaced, even with `--force`. Every directory on the way must be a real directory inside the workspace and `SKILL.md` a regular file with one link; `--force` never overrides a link or a path that leaves the workspace. Whether a host then uses a skill is up to the host and cannot be measured.
 
+If no home directory resolves, `aegis init` and `aegis uninstall` exit 1 before writing; `aegis skills sync --host auto` exits 2 and asks for explicit hosts. Supplying a host, such as `--host claude-code`, still allows skills to sync into the workspace.
+
 ### The events log
 
 The commands above record what the prune conditions count in an events log: `<git common dir>/aegis/events.jsonl`, shared by every worktree of the repository (`.aegis/state/events.jsonl` outside git), under its own lock. Each row is `{"v":1,"ts","event","worktree","host"?,"result","detail"}`. It holds `lease_claimed` and `lease_denied` (`aegis team`), `lane_check` (`aegis check --lane`), `scan_gate` and `guard_match` (the hooks), `skills_sync`, `partition_check`, `pack_import`, `init_host`, `benchmark`, `baseline_written`, `baseline_check` and `package`. A hook row holds counts, rule ids and results, never command text or file names. Fitness and `aegis status --compliance` never read it, and it is not the ledger. Rows written on a CI runner are lost with the runner unless you upload them.
+
+Command event writes are best effort: a recording error becomes a warning and does not undo the command's result. Hook event logging keeps its separate guard so a logging failure does not replace the host decision.
 
 ## 9. Adoption tools
 

@@ -111,7 +111,9 @@ import subprocess
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_cli import stdin_is_tty as _stdin_is_tty
 from aegis_cli.base import AegisCommand, CommandCategory
+from aegis_core.pathlookup import is_bare
 from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
 from aegis_core.primitives import is_within, real_key
 
@@ -376,7 +378,7 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
     """
     import shlex
     from aegis_core.ast.detect import detect_project_languages, provision_ast_driver_slots
-    from aegis_core.ast.runner import resolve_driver_executable
+    from aegis_core.ast.runner import ASTDriverRunner, resolve_driver_executable
     from aegis_core.errors import PathTraversalError
     from aegis_core.skills.slots import SlotRegistry, SlotResolutionError
 
@@ -430,12 +432,26 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
         return True
 
     all_resolvable = True
+    registry = ASTDriverRunner().registry
     for ext, cmd in sorted(ast_drivers.items()):
-        parts = (
-            shlex.split(cmd)
-            if os.name != "nt"
-            else [p.strip('"') for p in shlex.split(cmd, posix=False)]
-        )
+        try:
+            plan = registry.plan_driver(ext, workspace_root=ws_root)
+        except Exception as exc:  # like the card, keep a failed plan visible in the diagnostic
+            print(f"  ⚠️  AST driver ({ext}): {type(exc).__name__}: {exc}")
+            all_resolvable = False
+            continue
+        try:
+            parts = (
+                shlex.split(cmd)
+                if os.name != "nt"
+                else [p.strip('"') for p in shlex.split(cmd, posix=False)]
+            )
+        except ValueError:
+            if plan is None or not plan.unavailable:
+                raise
+            print(f"  ⚠️  AST driver ({ext}): {plan.unavailable}")
+            all_resolvable = False
+            continue
         if not parts:
             continue
         bin_name = parts[0]
@@ -443,7 +459,10 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
         # joined to the workspace root (aegis_core.ast.runner).
         found = resolve_driver_executable(bin_name, workspace=ws_root)
         hits = [] if found else only_skipped(bin_name, outside=ws_root, base=ws_root)
-        if found:
+        if found and plan is not None and plan.unavailable:
+            print(f"  ⚠️  AST driver ({ext}): {plan.unavailable}")
+            all_resolvable = False
+        elif found:
             print(f"  ✅ AST driver ({ext}): {bin_name} resolvable ({found})")
         elif hits:
             print(f"  ⚠️  AST driver ({ext}): executable '{bin_name}' is found only at "
@@ -645,7 +664,7 @@ def _command_exists(command: str, ctx: _Ctx) -> Optional[bool]:
     """
     if os.path.isabs(command):
         return os.path.isfile(command) and (os.name == "nt" or os.access(command, os.X_OK))
-    if os.sep in command or (os.altsep and os.altsep in command):
+    if not is_bare(command):
         return None
     if ctx.which(command) is not None:
         return True
@@ -731,13 +750,6 @@ V3_SHIPPED_RULE_SHA256 = frozenset({
     "04946d5d7b525f24284ae51f2d958f8b5fcc4d3ed891e391ceec71f5dd5ddd0f",  # subagent-delegation (3.0)
     "5d54ce9b04be9572698749908558800cbf2d8acdffc15e7b7a651fbf6f39488f",  # subagent-delegation (3.1+)
 })
-
-
-def _stdin_is_tty() -> bool:
-    try:
-        return bool(sys.stdin.isatty())
-    except (AttributeError, ValueError, OSError):
-        return False
 
 
 def _confirm(prompt: str) -> bool:

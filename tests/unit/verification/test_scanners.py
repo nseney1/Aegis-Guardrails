@@ -446,9 +446,6 @@ class TestTierBAndTierCAdvisory:
         assert file_findings[0].path == "pkg/client.py"
         assert file_findings[0].rule_id == "slack-token"
 
-        ws_findings = scanners.scan_secrets_workspace(tmp_path)
-        assert len(ws_findings) == 1
-        assert ws_findings[0].rule_id == "slack-token"
 
 
 class TestKeyValueRedaction:
@@ -1067,3 +1064,122 @@ class TestGitleaksAllowInOtherLanguages:
         base = counter._repo(root, {"keep.txt": b"x\n"})
         counter._repo(root, files)
         assert scanners.suppression_count(root, base) == {"count": 3, "delta": 3}
+
+
+class TestScannerSurfaceAndInventory:
+    """The remaining scanner API and BASE inventory share the same safe file boundary."""
+
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        for key in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(key, str(home))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / "gitconfig"))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        for key in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_findings_have_one_rule_name_and_no_raw_secret(self):
+        secret = _tier_a_samples()["slack-token"]
+        finding, = scanners.scan_secrets_text(secret)
+        doc = finding.as_dict()
+        assert doc["rule_id"] == "slack-token" and "rule" not in doc
+        assert not hasattr(finding, "rule") and not hasattr(finding, "fp")
+        assert secret not in json.dumps(doc)
+
+    def test_no_workspace_scanner_surface(self):
+        assert not hasattr(scanners, "scan_secrets_workspace")
+
+    def test_file_scanner_skips_binary_and_directory(self, tmp_path):
+        path = tmp_path / "bin"
+        path.write_bytes(b"\0" + _tier_a_samples()["slack-token"].encode())
+        assert scanners.scan_secrets_file(path) == []
+        assert scanners.scan_secrets_file(tmp_path) == []
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
+    def test_file_scanner_skips_a_link_to_a_real_secret(self, tmp_path):
+        path = tmp_path / "src"
+        path.write_bytes(_tier_a_samples()["slack-token"].encode())
+        link = tmp_path / "link"
+        link.symlink_to(path)
+        assert len(scanners.scan_secrets_file(path)) == 1
+        assert scanners.scan_secrets_file(link) == []
+
+    def test_no_scanner_walk_or_containment_copies(self):
+        import ast
+        from aegis_core.verification import perf_check, security_pack
+
+        for module in (scanners, perf_check, security_pack):
+            tree = ast.parse(Path(module.__file__).read_bytes())
+            assert not [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                        and node.name.startswith("_is_within")]
+            assert not [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr in ("rglob", "walk")]
+
+    @staticmethod
+    def git(root, *args):
+        import subprocess
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                              cwd=str(root), check=True, capture_output=True).stdout.decode().strip()
+
+    def test_base_inventory_keeps_deleted_files_and_workspace_prefix(self, tmp_path):
+        root = tmp_path / "ws"
+        root.mkdir()
+        self.git(root, "init", "-q", "-b", "main")
+        (root / "sub").mkdir()
+        files = {"sub/a.py": b"x = 1 # nosec\n", "sub/gone.py": b"x = 2 # nosec\n",
+                 "sub/.gitleaksignore": b"# comment\nlegacy-id\n", "other.py": b"# nosec\n" * 5,
+                 "sub/large.py": b"# nosec\n" * ((1 << 20) // 8 + 1), "sub/bin": b"\0# nosec\n"}
+        for rel, data in files.items():
+            (root / rel).write_bytes(data)
+        self.git(root, "add", *files)
+        self.git(root, "commit", "-qm", "base")
+        base = self.git(root, "rev-parse", "HEAD")
+        self.git(root, "rm", "sub/gone.py")
+        (root / "sub" / "a.py").write_bytes(b"x = 1 # nosec\ny = 2 # nosec\n")
+        assert scanners.suppression_count(root / "sub", base) == {"count": 3, "delta": 0}
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
+    def test_base_does_not_count_materialized_symlink_text(self, tmp_path):
+        root = tmp_path / "ws"
+        root.mkdir()
+        self.git(root, "init", "-q", "-b", "main")
+        (root / "link").symlink_to("absent # nosec")
+        self.git(root, "add", "link")
+        self.git(root, "commit", "-qm", "base")
+        assert scanners.suppression_count(root, "HEAD") == {"count": 0, "delta": 0}
+
+    @pytest.mark.parametrize("prefix", ["", "sub"], ids=["root", "subworkspace"])
+    @pytest.mark.parametrize("name, data", [
+        (".gitleaksignore", b"shared-allowlist.txt"),
+        ("link", b"absent # nosec"),
+    ], ids=["allowlist", "marker"])
+    def test_index_symlinks_are_not_working_file_suppressions(self, tmp_path, prefix, name, data):
+        import subprocess
+
+        root = tmp_path / "ws"
+        root.mkdir()
+        workspace = root / prefix
+        workspace.mkdir(exist_ok=True)
+        self.git(root, "init", "-q", "-b", "main")
+        self.git(root, "config", "core.symlinks", "false")
+        oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=data, cwd=str(root),
+                             check=True, capture_output=True).stdout.decode().strip()
+        rel = f"{prefix}/{name}" if prefix else name
+        self.git(root, "update-index", "--add", "--cacheinfo", f"120000,{oid},{rel}")
+        self.git(root, "commit", "-qm", "symlink entry")
+        self.git(root, "checkout-index", "-f", "--", rel)
+        path = workspace / name
+        assert path.is_file() and not path.is_symlink() and path.read_bytes() == data
+        assert self.git(root, "status", "--porcelain") == ""
+        assert scanners.suppression_count(workspace, "HEAD") == {"count": 0, "delta": 0}
+
+        # The index mode controls eligibility; regular entries still use working bytes.
+        self.git(root, "update-index", "--cacheinfo", f"100644,{oid},{rel}")
+        path.write_bytes(data + b"\n" + data + b"\n")
+        assert scanners.suppression_count(workspace, "HEAD") == {"count": 2, "delta": 2}
+
+    def test_unavailable_git_leaves_the_suppression_delta_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+        assert scanners.suppression_count(tmp_path, "HEAD") == {"count": 0, "delta": None}

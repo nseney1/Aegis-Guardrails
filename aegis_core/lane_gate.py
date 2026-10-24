@@ -80,8 +80,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import events, gitsafe, team
-from aegis_core._version import __version__
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.lane_ast import (
     COLLECTION_KEYS,
@@ -145,7 +145,6 @@ NOTE_EXEMPTION = (
 
 _REGULAR = ("100644", "100755")
 _OID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _PARSE_ERRORS = (SyntaxError, ValueError, RecursionError)
 
 
@@ -276,10 +275,7 @@ class LaneCheck:
     def as_dict(self) -> Dict[str, Any]:
         """The ``--json`` document."""
         return {
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": self.checked_at,
-            "scope": {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()},
+            **primitives.envelope(SOURCE, {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()}, checked_at=self.checked_at),
             "status": "pass" if self.passed else "fail",
             "label": self.label,
             "provenance": {"paths": self.paths_source, "shared": self.shared_source},
@@ -339,10 +335,7 @@ class LaneCheck:
 def error_report(workspace: Any, lane: str, message: str, now: Optional[int] = None) -> Dict[str, Any]:
     """The ``--json`` document of a gate that could not run."""
     return {
-        "source": SOURCE,
-        "aegis_version": __version__,
-        "checked_at": utc_stamp(now),
-        "scope": {"workspace": str(workspace), "lane": lane},
+        **primitives.envelope(SOURCE, {"workspace": str(workspace), "lane": lane}, now=now),
         "status": "error",
         "error": message,
     }
@@ -367,13 +360,13 @@ def _cli_globs(paths: object) -> Tuple[str, ...]:
         raise LaneGateUsage("--paths: give at least one glob")
     out: List[str] = []
     for ordinal, glob in enumerate(paths, 1):
-        if not isinstance(glob, str) or _CONTROL.search(glob):
-            raise LaneGateUsage(f"--paths: glob {ordinal} is not text without control characters")
+        problem = team.glob_problem(glob)
+        if problem:
+            message = {"not_text": "is not text without control characters",
+                       "control": "is not text without control characters", "empty": "is empty",
+                       "climbs": "climbs out of the repository with '..'"}[problem]
+            raise LaneGateUsage(f"--paths: glob {ordinal} {message}")
         clean = normalize_path(glob)
-        if not clean:
-            raise LaneGateUsage(f"--paths: glob {ordinal} is empty")
-        if ".." in clean.split("/"):
-            raise LaneGateUsage(f"--paths: glob {ordinal} climbs out of the repository with '..'")
         if clean not in out:
             out.append(clean)
     return tuple(out)
@@ -533,9 +526,8 @@ def _integrity(top: Path, merge_base: str, head: str, entries: Sequence[Tuple[st
 
 
 def _record(top: Path, result: LaneCheck) -> Tuple[str, ...]:
-    try:
-        events.append(top, "lane_check", "pass" if result.passed else "fail", result.event_detail())
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(top, "lane_check", "pass" if result.passed else "fail", result.event_detail())
+    if exc is not None:
         return (f"event not recorded: {exc}",)
     return ()
 
