@@ -87,7 +87,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop (user-scope JSONL, redaction, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,
-    # v4.3 T5: fail-to-pass regression check (gitsafe, checkrun hermetic env, human_gate exemptions).
+    # v4.3 T5: fail-to-pass regression check (gitsafe, checkrun's snapshot pytest runner, human_gate exemptions).
     "aegis_core.regression": 2,
     "aegis_core.scan": 2,
     "aegis_core.scan_compliance": 2,
@@ -248,6 +248,11 @@ def test_the_layer_table_names_only_existing_modules():
 def test_imports_respect_the_package_and_layer_boundaries(edges):
     violations = boundary_violations(edges)
     assert violations == [], "import boundary violations (ADR 0005 AD-3):\n" + "\n".join(violations)
+
+
+def test_checkrun_does_not_import_regression(edges):
+    """R-evidence-30: T5's snapshot runner is checkrun.run_pytest_snapshot; checkrun never imports regression."""
+    assert [e for e in edges if e.source == "aegis_core.checkrun" and e.target == "aegis_core.regression"] == []
 
 
 def test_runtime_imports_only_the_standard_library(edges):

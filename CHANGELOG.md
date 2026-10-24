@@ -72,6 +72,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - A ledger row of kind `check_confirm`, `human_label`, `claim` or `transition` counts as one unusable row, and a non-object `fitness` value in `.aegis/config.json` warns.
 
 - MCP tool descriptions are 2 to 4 sentences and parameter descriptions one line. They keep the routing to sibling tools and the limits the server enforces; no input constraint (`type`, `enum`, `maxLength`, `minItems`, `required`, `additionalProperties`, `default`, `items`) changes.
+- T5 counts a commit as a fix only from a Conventional `fix` subject or a `Fixes:` trailer in the trailer block, with a scope outside `ci, build, docs, deps, release, chore, tests`. A `Closes:` trailer, or a `Fixes:` or `Aegis-No-Test:` line in the body, no longer counts, and `fix(test)` and `fix(doc)` commits are now judged as fixes. The text report's prune-box note is gone.
 
 ### Added
 
@@ -117,6 +118,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - An `aegis_report_outcome` call that records nothing (`rate_limited`, or a repeated unwitnessed claim) no longer writes an `edit` activity row, and edit rows are capped at 200 per session per server process.
 - The MCP server's report-edit maps and its scan-row map are bounded at 1,024 entries, so a long-lived server no longer grows them without limit.
+- `aegis check --hook` and the T5 snapshot path fail closed with the git error text and exit 1 on a corrupt staged object (`git cannot read object <oid>`) or a malformed `cat-file` size, instead of crashing with a `ValueError`.
 
 ### Breaking (command line, JSON and MCP)
 
@@ -140,6 +142,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: the top-level and `fitness` spellings of `half_life_sessions` and `epsilon` in `.aegis/config.json` no longer apply (one warning); use `expiry.half_life_sessions` and `expiry.epsilon`.
 
 - Breaking: MCP `outputSchema` (on all five tools) and `structuredContent` (on every `tools/call` result) are removed, reversing the first 4.3.3 "Changed" entry. A result is `{content, isError}` and carries its payload once, as JSON text. `tools/list` shrinks from 17,977 bytes to 6,214, and a one-rule `aegis_scan` answer from 1,645 to 898 bytes in a local fixture.
+- Breaking: the `aegis check --ci --json` `regression` object drops `passed_count`, `failed_count`, `prune_box_exceeded` and the report-level `approval`; each commit drops `passed`, `failed_on_base`, `passed_on_head`, `source_files`, `test_files`, `fixes` and `exempted`, and keeps `exemption_code`.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -167,6 +170,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - Breaking: `aegis_mcp.tools.__all__` no longer lists `TOOL_DEFINITIONS` (it can still be imported, and `aegis_mcp.registry` defines it), and `aegis_mcp.server.defaultdict` and `aegis_mcp.handlers.telemetry.Set` are no longer importable (unused imports).
 - Breaking: `aegis_core.taxonomy.MCP_DEFAULT_RATE_LIMITS` keeps only `MUTATION`; its `READ`, `EXECUTION`, `VERIFICATION` and `CHECKPOINT` entries were never read.
+- Breaking: `aegis_core.rules.rank_of` is removed (use `Rule.rank` or `Rule.mandatory`), and the rule key schema is `aegis_core.rules.KNOWN_KEYS`.
+- Breaking: `aegis_core.rule_integrity.renamed_rules`, `BENIGN_KEYS`, `EXCLUDED_KEYS`, `ENFORCEMENT_KEYS` (import it from `aegis_core.rules`) and `Sequence` are removed. `weakenings()` no longer reports `applies_to` (`check --ci` still does) and takes `renames` (a mapping) as its third parameter instead of `tree`; `BaseAnchor`, `Weakening` and `Unreviewed` lose `as_dict` (use `dataclasses.asdict`), and `Unreviewed` loses `path`.
+- Breaking: `aegis_core.regression.SOURCE`, `PRUNE_BOX_EXEMPTION_RATE` and `FrozenSet` are removed, `aegis_core.regression.__all__` is `RegressionError`, `check_ci_regressions` and `is_source_file`, and `RegressionReport` and `CommitRegression` lose the fields the JSON report dropped.
 
 ### Corrections
 
@@ -175,6 +181,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - The 4.3.0 entry said decay runs over heartbeat-alive eligible sessions. Exposure rows carry no heartbeat flag, so every exposed session was eligible; silence earns no credit in 4.4.0.
 
 - The 4.3.3 entry on 100% MCP `inputSchema` property coverage still holds: every property keeps a description, now shorter.
+- The 4.3.0 entry said a rule carrying `applies_to` is served unscoped "until v4.4". Scoping by `applies_to` moved to v4.5 with the labels plan.
 
 ## [4.3.4] - 2026-10-20
 
