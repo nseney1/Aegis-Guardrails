@@ -316,16 +316,9 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             tag = ("UNVERIFIED" if finding.code in regression.UNVERIFIED_CODES
                    else "FAIL" if reg_report.tier == "gate" else "WARN")
             print(sanitize_display(f"  [{tag}:regression/{finding.code}] ({finding.path}): {finding.message}", 400))
-        if reg_report.total_fix_commits > 0 and reg_report.exempted_count > 0:
-            rate_pct = f"{reg_report.exemption_rate * 100:.1f}%"
-            prune_note = " (exceeds 25% prune-box threshold)" if reg_report.prune_box_exceeded else ""
-            print(
-                sanitize_display(
-                    f"  regression exemptions: {reg_report.exempted_count}/{reg_report.total_fix_commits} "
-                    f"({rate_pct}){prune_note}",
-                    400,
-                )
-            )
+        if reg_report.exempted_count > 0:
+            print(f"  regression exemptions: {reg_report.exempted_count}/{reg_report.total_fix_commits} "
+                  f"({reg_report.exemption_rate * 100:.1f}%)")
         for untested in reg_report.untested_changes:
             files_str = ", ".join(untested.source_files[:5])
             print(

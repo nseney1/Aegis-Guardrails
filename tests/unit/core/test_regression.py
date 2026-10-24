@@ -149,6 +149,157 @@ def test_is_fix_commit_requires_both_fix_signal_and_source_file():
     assert is_fix_commit("feat: new feature", [], ["src/app.py"]) is False
 
 
+# ── R-evidence-30: the trigger is the spec's, a fix subject or a Fixes trailer ──
+
+
+@pytest.mark.parametrize("scope,is_fix", [("doc", True), ("test", True), ("docs", False), ("tests", False)])
+def test_only_the_spec_scopes_exempt_a_fix_subject(scope: str, is_fix: bool):
+    assert parse_fix_subject(f"fix({scope}): correct docstring") == (is_fix, scope)
+    assert is_fix_commit(f"fix({scope}): correct docstring", [], ["src/x.py"]) is is_fix
+
+
+@needs_git
+def test_a_fixes_line_outside_the_trailer_block_or_a_closes_trailer_is_no_fix_signal(tmp_path: Path):
+    """Given a refactor whose Fixes: line sits in a body paragraph that is not the trailer block, and a
+    chore whose only trailer is Closes:, When regressions are checked, Then neither is a fix commit and
+    both are untested changes."""
+    repo = make_repo(tmp_path)
+    repo.write("src/x.py", "x = 1\n")
+    tidy = repo.commit("refactor: tidy\n\nFixes: #1\n\nA closing paragraph of prose.")
+    repo.write("src/y.py", "y = 1\n")
+    bump = repo.commit("chore: bump\n\nCloses: #2")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert report.total_fix_commits == 0 and report.commits == ()
+    assert [u.commit for u in report.untested_changes] == [tidy, bump]
+
+
+@needs_git
+def test_a_fix_subject_with_a_fixes_trailer_and_its_test_is_a_passing_fix_commit(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    fixed = _fix(repo, "fix: a\n\nFixes: #3", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.commit, c.status, c.reason) for c in report.commits] == [(fixed, "passed", "ok")]
+    assert report.untested_changes == ()
+
+
+@needs_git
+def test_aegis_no_test_is_read_from_its_trailer_only(tmp_path: Path):
+    """Given an Aegis-No-Test line in a prose paragraph and one in the trailer block, When regressions
+    are checked, Then only the trailer is the commit's reason."""
+    repo = make_repo(tmp_path)
+    repo.write("src/x.py", "x = 1\n")
+    prose = repo.commit("fix: one\n\nWhy it changed.\nAegis-No-Test: covered by the e2e suite\nMore prose.\n")
+    repo.write("src/y.py", "y = 1\n")
+    trailer = repo.commit("fix: two\n\nAegis-No-Test: trailer reason")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.commit, c.no_test_reason) for c in report.commits] == [(prose, None), (trailer, "trailer reason")]
+
+
+@needs_git
+def test_a_fix_doc_commit_without_a_test_is_judged_and_a_fix_docs_commit_is_not(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    repo.write("src/x.py", "x = 1\n")
+    doc = repo.commit("fix(doc): correct docstring")
+    repo.write("src/y.py", "y = 1\n")
+    repo.commit("fix(docs): correct docstring")
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.commit, c.status, c.reason) for c in report.commits] == [(doc, "failed", "no_test_changes")]
+    assert (report.tier, report.blocking, report.status) == ("warning", False, "warning")
+
+
+@needs_git
+@needs_signing
+def test_a_failing_fix_with_a_signed_exemption_looks_it_up_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Sad path of the lookup rule: a fix commit that failed looks up its exemption, once, and is exempted."""
+    human, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, signer_pub=human_pub)
+    fix = _fix(repo, "fix: hotfix without test\n\nAegis-No-Test: verified manually", {"src/app.py": APP.format(1)})
+    repo.commit(human_gate.exemption_message(fix, "verified manually"), sign_key=human, allow_empty=True)
+    looked_up: list = []
+    real_find = human_gate.find_test_exemption
+    monkeypatch.setattr(human_gate, "find_test_exemption",
+                        lambda root, head, base_ref, oid: looked_up.append(oid) or real_find(root, head, base_ref, oid))
+
+    report = regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert [(c.commit, c.status) for c in report.commits] == [(fix, "exempted")]
+    assert looked_up == [fix]
+
+
+@needs_git
+@pytest.mark.parametrize("failure", ["raises", "exit"])
+def test_a_git_failure_reaches_the_caller_as_a_git_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str):
+    """GitError propagates; RegressionError is only an unresolvable or unrelated range."""
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1)})
+    real = gitsafe.run
+
+    def failing(args, *rest, **kwargs):
+        if list(args[:2]) == ["rev-list", "--reverse"]:
+            if failure == "raises":
+                raise gitsafe.GitError("git rev-list timed out after 60s")
+            return subprocess.CompletedProcess(["git", *args], 128, b"", b"fatal: bad\n   object  ")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", failing)
+    with pytest.raises(gitsafe.GitError) as info:
+        regression.check_ci_regressions(repo.root, "main", "HEAD")
+    assert not isinstance(info.value, RegressionError)
+    assert str(info.value) == ("git rev-list timed out after 60s" if failure == "raises"
+                               else "git rev-list failed: fatal: bad object")
+
+
+def test_the_t5_snapshot_runner_is_checkrun_s_and_regression_reaches_no_private_name():
+    """checkrun.run_pytest_snapshot runs T5's pytest; regression reaches no private helper of another
+    aegis module, and checkrun does not import regression (no cycle)."""
+    import ast
+
+    from aegis_core import checkrun
+
+    def private_reaches(module) -> list:
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        attrs = [f"{n.value.id}.{n.attr}" for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                 and isinstance(n.value, ast.Name) and n.attr.startswith("_") and not n.attr.startswith("__")
+                 and n.value.id in ("checkrun", "config", "gitsafe", "governance", "human_gate", "match", "rule_integrity")]
+        names = [f"{n.module}.{a.name}" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                 and (n.module or "").startswith("aegis_core") for a in n.names if a.name.startswith("_")]
+        return attrs + names
+
+    def imports_regression(module) -> bool:
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        return any((isinstance(n, ast.ImportFrom) and (n.module == "aegis_core.regression"
+                                                      or (n.module == "aegis_core" and any(a.name == "regression" for a in n.names))))
+                   or (isinstance(n, ast.Import) and any(a.name == "aegis_core.regression" for a in n.names))
+                   for n in ast.walk(tree))
+
+    assert callable(checkrun.run_pytest_snapshot)
+    assert private_reaches(regression) == []
+    assert not imports_regression(checkrun)
+
+
+@pytest.mark.parametrize("body,passed", [("def test_ok():\n    assert True\n", True),
+                                         ("def test_ok():\n    assert False\n", False)], ids=["pass", "fail"])
+def test_the_snapshot_runner_exits_zero_for_a_passing_file_and_non_zero_for_a_failing_one(
+    tmp_path: Path, body: str, passed: bool
+):
+    from aegis_core import checkrun
+
+    snapshot, workspace = tmp_path / "snap", tmp_path / "ws"
+    (snapshot / "tests").mkdir(parents=True)
+    workspace.mkdir()
+    (snapshot / "tests" / "test_x.py").write_bytes(body.encode("utf-8"))
+
+    outcome = checkrun.run_pytest_snapshot(snapshot, ["tests/test_x.py"], workspace, tmp_path / "run", 120.0)
+    assert (outcome.exit_code == 0) is passed and outcome.timed_out is False
+    assert (outcome.passed_ids if passed else outcome.failed_ids) == frozenset({"tests.test_x::test_ok"})
+    assert (outcome.failed_ids if passed else outcome.passed_ids) == frozenset()
+
+
 @needs_git
 def test_a_fix_to_a_module_named_like_a_document_is_judged(tmp_path: Path):
     """R-evidence-25: Given a fix commit touching only src/security.py, When regressions are checked,
@@ -159,18 +310,20 @@ def test_a_fix_to_a_module_named_like_a_document_is_judged(tmp_path: Path):
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert [(c.commit, c.status, c.reason) for c in report.commits] == [(oid, "failed", "no_test_changes")]
-    assert report.commits[0].source_files == ("src/security.py",)
+    assert [(f.code, f.path) for f in report.findings] == [("no_test_changes", "src/security.py")]
 
 
 def _count_runs(monkeypatch: pytest.MonkeyPatch) -> list:
+    from aegis_core import checkrun
+
     runs: list = []
-    real = regression._run_pytest_in_snapshot
+    real = checkrun.run_pytest_snapshot
 
     def spy(snapshot, test_files, *args, **kwargs):
         runs.append(tuple(test_files))
         return real(snapshot, test_files, *args, **kwargs)
 
-    monkeypatch.setattr(regression, "_run_pytest_in_snapshot", spy)
+    monkeypatch.setattr(checkrun, "run_pytest_snapshot", spy)
     return runs
 
 
@@ -187,7 +340,7 @@ def test_a_fix_with_only_a_go_test_is_unverified_not_failed(tmp_path: Path, monk
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     (item,) = report.commits
     assert (item.commit, item.status, item.reason) == (oid, "unverifiable", "tests_not_pytest")
-    assert item.passed is True and item.test_files == ("pkg/handler_test.go",)
+    assert item.passed is True
     assert runs == []
     assert report.passed is True and report.blocking is False and report.status == "pass"
     assert [(f.code, f.path) for f in report.findings] == [("tests_not_pytest", "pkg/handler_test.go")]
@@ -287,9 +440,10 @@ def test_a_signed_commit_runs_no_gpg_program_the_repository_configured(tmp_path:
 
 
 @needs_git
-def test_fix_signals_in_trailers_and_in_body_lines_are_read_as_before(tmp_path: Path):
-    """Fixes:, Closes: and Aegis-No-Test: count as trailers and as body lines outside a trailer block,
-    and a body line that looks like rev-list's record header does not split a record."""
+def test_fix_signals_are_read_from_the_trailer_block_only(tmp_path: Path):
+    """R-evidence-30 (rewrites the body-line reading this test pinned before): Fixes: and Aegis-No-Test:
+    count only in the trailer block and Closes: never does; a body line that looks like rev-list's record
+    header does not split a record."""
     repo = make_repo(tmp_path)
 
     def change(n: int, message: str) -> str:
@@ -299,19 +453,18 @@ def test_fix_signals_in_trailers_and_in_body_lines_are_read_as_before(tmp_path: 
     trailer = change(1, "refactor: one\n\nFixes: #1")
     in_prose = change(2, "refactor: two\n\nCloses: #8 in prose\n\nA closing paragraph of prose.")
     nt_line = change(3, "fix: three\n\nWhy it changed.\nAegis-No-Test: covered by the e2e suite\nMore prose.\n")
-    lookalike = change(4, "refactor: four\n\ncommit 0123456789abcdef0123456789abcdef01234567\nFixes: #4")
+    lookalike = change(4, "refactor: four\n\ncommit 0123456789abcdef0123456789abcdef01234567\n\nFixes: #4")
     plain = change(5, "refactor: five\n\nNo issue here.")
     nt_trailer = change(6, "fix: six\n\nAegis-No-Test: trailer reason")
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert {c.commit: (c.fixes, c.no_test_reason) for c in report.commits} == {
-        trailer: (("#1",), None),
-        in_prose: (("#8 in prose",), None),
-        nt_line: ((), "covered by the e2e suite"),
-        lookalike: (("#4",), None),
-        nt_trailer: ((), "trailer reason"),
+    assert {c.commit: c.no_test_reason for c in report.commits} == {
+        trailer: None,
+        nt_line: None,
+        lookalike: None,
+        nt_trailer: "trailer reason",
     }
-    assert [u.commit for u in report.untested_changes] == [plain]
+    assert [u.commit for u in report.untested_changes] == [in_prose, plain]
 
 
 @needs_git
@@ -363,7 +516,7 @@ def test_a_module_that_fails_collection_on_base_counts_as_fail_to_pass(tmp_path:
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     item = report.commits[0]
-    assert (item.status, item.reason, item.failed_on_base, item.passed_on_head) == ("passed", "ok", True, True)
+    assert (item.status, item.reason) == ("passed", "ok")
     assert item.fail_to_pass_tests == ("tests.test_app::test_new_symbol",)
 
 
@@ -469,7 +622,7 @@ def test_a_fix_broken_by_a_later_commit_fails_on_head(tmp_path: Path):
     _fix(repo, "feat: compute adds two", {"src/app.py": APP.format(2)})
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert [(c.status, c.reason, c.passed_on_head) for c in report.commits] == [("failed", "failed_on_head", False)]
+    assert [(c.status, c.reason, c.fail_to_pass_tests) for c in report.commits] == [("failed", "failed_on_head", ())]
 
 
 @needs_git
@@ -537,15 +690,17 @@ def test_no_python_test_to_judge_starts_no_run(tmp_path: Path, monkeypatch: pyte
 
 def _fake_outcomes(monkeypatch: pytest.MonkeyPatch, head: Any, base: Any) -> list:
     """Replace the pytest runner: a snapshot holding the head's src/app.py gets ``head``, else ``base``."""
+    from aegis_core import checkrun
+
     seen: list = []
 
     def fake(snapshot, test_files, *_args, **_kwargs):
         at_head = (snapshot / "src" / "app.py").read_text(encoding="utf-8") == APP.format(1)
         seen.append("head" if at_head else "base")
         passed, failed, errors = head if at_head else base
-        return regression._PytestOutcome(0, False, frozenset(passed), frozenset(failed), frozenset(errors))
+        return checkrun._PytestOutcome(0, False, frozenset(passed), frozenset(failed), frozenset(errors))
 
-    monkeypatch.setattr(regression, "_run_pytest_in_snapshot", fake)
+    monkeypatch.setattr(checkrun, "run_pytest_snapshot", fake)
     return seen
 
 
@@ -623,7 +778,7 @@ def test_failing_test_on_head_fails_regression_check(tmp_path: Path):
     item = report.commits[0]
     assert item.status == "failed"
     assert item.reason == "failed_on_head"
-    assert item.passed_on_head is False
+    assert item.fail_to_pass_tests == ()
 
 
 @needs_git
@@ -696,9 +851,9 @@ def test_no_config_or_argument_raises_the_tier_above_warning(tmp_path: Path, mon
 
 
 def test_a_gate_tier_report_still_blocks_for_a_future_promotion():
-    failed = regression.CommitRegression("a" * 40, "fix: x", "failed", "no_test_changes", False, False)
-    assert regression.RegressionReport("b", "h", "m", tier="gate", commits=(failed,)).blocking is True
-    assert regression.RegressionReport("b", "h", "m", commits=(failed,)).blocking is False
+    failed = regression.CommitRegression("a" * 40, "fix: x", "failed", "no_test_changes")
+    assert regression.RegressionReport(tier="gate", commits=(failed,)).blocking is True
+    assert regression.RegressionReport(commits=(failed,)).blocking is False
 
 
 @needs_git

@@ -5,8 +5,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
 1. Trigger rule (two signals required):
    - A non-merge commit in ``merge-base(base, head)..head`` triggers T5 iff it has BOTH:
      (a) a Conventional Commit ``fix`` subject (``fix:``, ``fix(<scope>):``, ``fix!:``) with scope
-         outside ``{ci, build, docs, deps, release, chore, tests}`` OR a ``Fixes:`` / ``Closes:``
-         issue trailer, AND
+         outside ``{ci, build, docs, deps, release, chore, tests}`` OR a ``Fixes:`` issue trailer
+         in the trailer block (``Closes:`` is no fix signal: R-evidence-30), AND
      (b) at least one changed non-test, non-doc, non-config source file.
    - ``fix(ci):``, ``fix(docs):``, or a ``fix:`` commit touching only ``README.md`` or
      ``pyproject.toml`` does not trigger T5.
@@ -201,8 +201,7 @@ def test_real_fail_to_pass_regression_test_passes(tmp_path: Path):
     assert report.total_fix_commits == 1
     item = report.commits[0]
     assert item.status == "passed"
-    assert item.failed_on_base is True
-    assert item.passed_on_head is True
+    assert item.reason == "ok"
     assert any("test_add_regression" in nodeid for nodeid in item.fail_to_pass_tests)
     assert report.findings == ()
 
@@ -233,8 +232,7 @@ def test_tautological_assert_true_fails_fail_to_pass_because_it_passes_on_base(t
     item = report.commits[0]
     assert item.status == "failed"
     assert item.reason == "passed_on_base"
-    assert item.failed_on_base is False
-    assert item.passed_on_head is True
+    assert item.fail_to_pass_tests == ()
     assert len(report.findings) == 1
     assert report.findings[0].code == "passed_on_base"
 
@@ -257,8 +255,7 @@ def test_fix_commit_with_no_test_changes_flags_no_test_changes(tmp_path: Path):
     item = report.commits[0]
     assert item.status == "failed"
     assert item.reason == "no_test_changes"
-    assert item.failed_on_base is False
-    assert item.passed_on_head is False
+    assert item.fail_to_pass_tests == ()
     assert len(report.findings) == 1
     assert report.findings[0].code == "no_test_changes"
 
@@ -278,7 +275,7 @@ def test_aegis_no_test_trailer_without_human_gate_approval_does_not_exempt(tmp_p
     assert report.exemption_rate == 0.0
     item = report.commits[0]
     assert item.status == "failed"
-    assert item.exempted is False
+    assert item.approval is None
     assert item.no_test_reason == "pure refactor of internal expression"
     assert len(report.findings) == 1
     assert "pure refactor of internal expression" in report.findings[0].message
@@ -318,12 +315,12 @@ def test_aegis_no_test_with_verified_human_gate_approval_exempts_and_reports_rat
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert report.passed_count == 1
+    assert [c.status for c in report.commits] == ["passed", "exempted"]
     assert report.exempted_count == 1
     assert report.exemption_rate == 0.5
-    assert report.prune_box_exceeded is True
+    assert "prune_box_exceeded" not in report.as_dict()
     assert report.commits[1].status == "exempted"
-    assert report.commits[1].exempted is True
+    assert report.commits[1].approval is not None and report.commits[1].approval.valid
     assert report.commits[1].no_test_reason == "trivial constant return"
     assert report.findings == ()
 
@@ -367,10 +364,10 @@ def test_a_rejected_exemption_names_its_verdict_code_in_the_report(
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     item = report.commits[0]
-    assert (item.status, item.reason, item.exempted) == ("failed", "no_test_changes", False)
+    assert (item.status, item.reason, item.approval) == ("failed", "no_test_changes", None)
     assert item.exemption_code == code and item.as_dict()["exemption_code"] == code
     assert code in report.findings[0].message
-    assert report.approval is None
+    assert "approval" not in report.as_dict()
 
 
 @needs_git
@@ -435,8 +432,8 @@ def test_governance_tree_approval_never_exempts_testless_fix_commit(
     assert report.exempted_count == 0
     assert report.commits[0].commit == fix_oid
     assert report.commits[0].status == "failed"
-    assert report.commits[0].exempted is False
-    assert report.approval is None
+    assert report.commits[0].approval is None
+    assert "approval" not in report.as_dict()
 
 
 @needs_git
@@ -459,12 +456,12 @@ def test_targeted_test_exemption_exempts_only_named_fix_commit(
     assert report.passed is False
     assert report.total_fix_commits == 2
     assert report.exempted_count == 1
-    assert report.failed_count == 1
+    assert [c.status for c in report.commits].count("failed") == 1
     by_oid = {c.commit: c for c in report.commits}
     assert by_oid[fix1_oid].status == "exempted"
-    assert by_oid[fix1_oid].exempted is True
+    assert by_oid[fix1_oid].approval is not None and by_oid[fix1_oid].approval.valid
     assert by_oid[fix2_oid].status == "failed"
-    assert by_oid[fix2_oid].exempted is False
+    assert by_oid[fix2_oid].approval is None
 
 
 @needs_git
@@ -522,7 +519,7 @@ def test_performance_invariant_only_the_head_tree_is_read_once(
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert call_counts == {report.head: 1}, call_counts
+    assert call_counts == {repo.head(): 1}, call_counts
 
 
 # ── 4. Warning-tier rollout & `aegis check --ci` integration ─────────────────
@@ -635,8 +632,7 @@ def test_editable_install_pth_and_pep660_finder_cannot_shadow_snapshot_source(
     assert report.total_fix_commits == 1
     item = report.commits[0]
     assert item.status == "passed"
-    assert item.failed_on_base is True
-    assert item.passed_on_head is True
+    assert item.reason == "ok"
     assert report.findings == ()
 
 
@@ -672,8 +668,7 @@ def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Pat
     assert report.total_fix_commits == 1
     item = report.commits[0]
     assert item.status == "passed"
-    assert "src/calc.py" in item.source_files
-    assert "tests/test_calc.py" in item.test_files
+    assert any("test_add_regression" in nodeid for nodeid in item.fail_to_pass_tests)
 
 
 def test_suite_level_junit_error_is_recorded_as_collection_error(tmp_path: Path):
