@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import posixpath
 import re
-import sys
 from aegis_core.match import first_match, is_test_path
 from aegis_core.primitives import is_within, safe_parts
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -179,7 +178,9 @@ def _find_test_file(filepath: str, repo_root: str) -> Optional[str]:
     Each name is tried in the source package's own test directory (_TEST_HOMES)
     before anywhere else.
     """
-    norm = filepath.replace("\\", "/").replace("soma_", "aegis_")
+    relative = os.path.relpath(filepath, repo_root) if os.path.isabs(filepath) else filepath
+    norm = posixpath.normpath(relative.replace("\\", "/"))
+    aegis_package = norm.split("/", 1)[0] in {"aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk"}
     def _find_in_tests(*names: str) -> Optional[str]:
         for name in names:
             for prefix in ("", "unit/mcp", "unit/core", "unit/cli", "unit/verification", "unit/sdk", "integration"):
@@ -188,31 +189,31 @@ def _find_test_file(filepath: str, repo_root: str) -> Optional[str]:
                     return p
         return None
 
-    if "aegis_mcp/handlers" in norm:
+    if aegis_package and norm.startswith("aegis_mcp/handlers/"):
         found = _find_in_tests("test_mcp_handlers.py")
         if found:
             return found
-    if "aegis_core/outcomes/telemetry.py" in norm:
+    if aegis_package and norm == "aegis_core/outcomes/telemetry.py":
         found = _find_in_tests("test_outcomes_telemetry.py")
         if found:
             return found
-    if "aegis_core/outcomes/engine.py" in norm:
+    if aegis_package and norm == "aegis_core/outcomes/engine.py":
         found = _find_in_tests("test_outcome_engine.py")
         if found:
             return found
-    if "aegis_core/skills/slots.py" in norm:
+    if aegis_package and norm == "aegis_core/skills/slots.py":
         found = _find_in_tests("test_slots.py")
         if found:
             return found
-    if "aegis_core/skills" in norm:
+    if aegis_package and norm.startswith("aegis_core/skills/"):
         found = _find_in_tests("test_skills.py")
         if found:
             return found
 
-    stem = os.path.splitext(os.path.basename(filepath))[0]
+    stem = posixpath.splitext(posixpath.basename(norm))[0]
     test_name = f"test_{stem}.py"
-    parent = os.path.basename(os.path.dirname(filepath))
-    clean_parent = parent[6:] if parent.startswith("aegis_") else (parent[5:] if parent.startswith("soma_") else parent)
+    parent = posixpath.basename(posixpath.dirname(norm))
+    clean_parent = parent[6:] if aegis_package and parent.startswith("aegis_") else parent
 
     candidates = [
         test_name,
@@ -224,14 +225,14 @@ def _find_test_file(filepath: str, repo_root: str) -> Optional[str]:
     ]
 
     # Domain specific mapping
-    if stem == "runner" and clean_parent == "verification":
+    if aegis_package and stem == "runner" and clean_parent == "verification":
         found = _find_in_tests("test_layer1.py", "test_verification/test_layer1.py")
         if found:
             return found
 
     # A same-named test of another package (tests/unit/core/test_scan.py for
     # aegis_cli/scan.py) must not win over the source package's own tests.
-    home = next((d for pkg, d in _TEST_HOMES if f"/{pkg}" in f"/{norm}"), None)
+    home = next((d for pkg, d in _TEST_HOMES if aegis_package and norm.startswith(pkg)), None)
     if home:
         for cand_name in candidates:
             p = os.path.join(repo_root, "tests", home, cand_name)
@@ -1211,23 +1212,3 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
         results = _layer1_on_snapshot(staged, repo_root_str, snapshot, ast_runner, too_large, entries)
         results = _without_snapshot(results, snapshot)
     return results + _t7_on_index(repo_root_str, [rel for rel in changed_files if not readable(rel)], entries)
-
-
-if __name__ == '__main__':
-    # A cp1252 stdout can't encode this script's symbols (BUG-038).
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(errors='replace')
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <repo_root> [file1 file2 ...]")
-        sys.exit(1)
-
-    repo_root = sys.argv[1]
-    changed = sys.argv[2:] if len(sys.argv) > 2 else []
-
-    results = run_layer1(changed, repo_root)
-    for r in results:
-        icon = "✅" if r.verdict else "🔴"
-        print(f"{icon} {r.tool}: {r.target} — {r.detail}")
-
-    print(f"\n{format_summary(results)}")
-    sys.exit(0 if gate_verdict(results) else 1)

@@ -1,23 +1,5 @@
-"""Pure AST test-integrity scanners and zero-dependency pytest config readers for ``aegis_core.lane_gate``.
-
-Scans Python test sources and pytest configuration files without importing or executing
-repository code:
-
-- ``collected_ids``: test ids (``name``, ``Class::name``, ``Outer::Inner::name``: functions
-  and methods named ``test*``, as pytest's default discovery collects them) mapped to
-  whether each is defined unconditionally. A class that defines ``__init__`` or ``__new__``
-  contributes none, nor does a function decorated with ``@pytest.fixture`` (or an alias).
-- ``skip_forms``: occurrences per scope of ``pytest.mark.skip``, ``skipif`` or ``xfail``;
-  ``unittest.skip``, ``skipIf``, ``skipUnless`` or ``expectedFailure``; module- or
-  class-level ``pytestmark`` or ``__test__`` (or either set as an attribute);
-  ``pytest.skip``, ``pytest.xfail`` or ``pytest.importorskip``; ``.skipTest``;
-  ``unittest.SkipTest``; or ``pytest.exit`` and ``os._exit``. Import aliases, star
-  imports and simple assignments are resolved to a fixed point across the module, and
-  surrounding control-flow guards are included in each occurrence key.
-- ``collection_hooks``: watched names in ``conftest.py`` (``collect_ignore``,
-  ``collect_ignore_glob``, ``pytest_*``) or plugin hook definitions when ``hooks_only=True``.
-- ``pytest_settings``: zero-dependency INI and TOML reader for ``COLLECTION_KEYS`` across
-  ``PYTEST_CONFIG_FILES``.
+"""Pure AST test-integrity scanners and zero-dependency pytest config readers.
+See ``aegis_core.lane_gate`` for the checked behavior and its limits.
 """
 from __future__ import annotations
 
@@ -29,9 +11,6 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 __all__ = [
     "COLLECTION_KEYS",
-    "COVERED",
-    "LIMITS",
-    "PYTEST_CONFIG_FILES",
     "collected_ids",
     "collection_hooks",
     "pytest_config_view",
@@ -39,32 +18,7 @@ __all__ = [
     "skip_forms",
 ]
 
-COVERED = ("python",)
 COLLECTION_KEYS = ("addopts", "testpaths", "python_files", "python_classes", "python_functions", "norecursedirs")
-# pytest's own search order; it reads the first that holds a configuration.
-PYTEST_CONFIG_FILES = ("pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini",
-                       "setup.cfg")
-LIMITS = (
-    "Assert weakening is not detected: a test that still exists but checks less passes.",
-    "Only Python test files and pytest's config files are checked; other test files are listed as not checked.",
-    "Test ids follow pytest's default discovery (functions and methods named test*), whatever "
-    "python_functions or python_classes the repository configures.",
-    "Skips reached indirectly are not detected: through a fixture or helper function, a marker imported "
-    "from another module, or getattr or setattr with a string.",
-    "A skip is compared by its own text and the blocks around it (if, while, for, try, with, match, a "
-    "conditional expression, and/or), not by what its condition evaluates to: a condition set elsewhere "
-    "(a module constant such as SLOW = True, an environment variable, a helper) or an earlier "
-    "'if ...: return' can change without a finding.",
-    "A decorator that replaces a test with something pytest does not collect (one that returns None, say) "
-    "is not detected; pytest.fixture is.",
-    "Trimming @pytest.mark.parametrize cases is not detected, nor are tests generated at import time "
-    "(exec, globals(), loops), which have no def to compare, or removed through globals() or vars().",
-    "Of the ways to end the run early only pytest.exit and os._exit are detected, not os.kill, a signal or "
-    "a plugin outside the test files.",
-    "The test command itself (a CI workflow, a Makefile, tox commands) is not read; containment and the "
-    "protection on .github/** cover the workflow.",
-    "Only committed changes are checked: the range is merge-base(base, HEAD)..HEAD.",
-)
 
 
 # ── Python test files ────────────────────────────────────────────────────────

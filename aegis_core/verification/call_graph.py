@@ -13,7 +13,6 @@ Pure deterministic — no LLM judgment.
 import ast
 import os
 import re
-import sys
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -634,18 +633,3 @@ def check(
         verdict=True,
         detail=f"All {len(definitions)} functions have call sites",
     )
-
-
-if __name__ == '__main__':
-    # A cp1252 stdout can't encode this script's symbols (BUG-038).
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(errors='replace')
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <file> <repo_root>")
-        sys.exit(1)
-
-    result = check(sys.argv[1], sys.argv[2])
-    icon = "✅" if result.verdict else "🔴"
-    print(f"{icon} {result.tool}: {result.target}")
-    print(f"   {result.detail}")
-    sys.exit(0 if result.verdict else 1)

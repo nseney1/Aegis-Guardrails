@@ -80,6 +80,7 @@ from aegis_core.config import ENV_CLIENT, ENV_WORKSPACE
 from aegis_core.pathlookup import which
 from aegis_core.primitives import DuplicateKeyError, real_key, strict_loads, utc_stamp
 from aegis_core.storage import atomic_write_bytes
+from aegis_core.workspace.binding import REGISTRY_VERSION
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
 __all__ = [
@@ -104,6 +105,7 @@ __all__ = [
     "merge_mcp_json",
     "parse_hosts",
     "plane_evidence",
+    "private_dirs",
     "read_registry",
     "record_init_host",
     "register_argv",
@@ -124,7 +126,6 @@ SERVER_NAME = "aegis"
 REGISTRY_LABEL = f"~/{AEGIS_DIRNAME}/workspaces.json"
 LEGACY_SERVER_NAME = "soma"
 BLOCK_VERSION = 1
-REGISTRY_VERSION = 1
 CLI_TIMEOUT_SECONDS = 60
 
 
@@ -453,7 +454,7 @@ def _dump(data: Dict[str, Any]) -> bytes:
     return (json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
 
 
-def _private_dirs(directory: Path) -> None:
+def private_dirs(directory: Path) -> None:
     """Create ``directory`` and its missing parents owner-only (0700)."""
     missing = []
     while not os.path.lexists(directory) and directory.parent != directory:
@@ -478,7 +479,7 @@ def _rewrite_config(path: Path, raw: Optional[bytes], data: Dict[str, Any], back
         _writable_dir(copy, creating=True)
         if not dry_run:
             try:
-                _private_dirs(Path(backup_dir))
+                private_dirs(Path(backup_dir))
                 atomic_write_bytes(copy, raw, mode=0o600)
             except OSError as exc:
                 raise InstallError(f"{path}: cannot back it up to {backup_dir} ({exc.strerror or exc}); "

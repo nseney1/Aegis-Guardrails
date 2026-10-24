@@ -123,7 +123,7 @@ def test_mcp_report_head(tmp_path, monkeypatch):
     (root / ".aegis" / "rules" / "traps").mkdir(parents=True)
     (root / ".aegis" / "rules" / "traps" / "trap-x.md").write_bytes(
         b"---\nid: trap-x\ntype: trap\nhypothesis: h\nprediction: p\n---\n# x\n")
-    monkeypatch.setattr(telemetry, "_get_workspace", lambda args: Workspace(root))
+    monkeypatch.setattr(telemetry, "get_workspace", lambda args: Workspace(root))
     doc = telemetry.handle_report_outcome({"outcome": "success", "rules_used": ["trap-x"],
                                           "idempotency_key": "head", "_session": "heads"})
     assert _head(doc) == ["source", "aegis_version", "checked_at", "scope"]

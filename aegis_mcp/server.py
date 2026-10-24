@@ -38,7 +38,8 @@ from aegis_core.workspace.binding import Attested, Registry, WorkspaceBinding, r
 from aegis_core.workspace.layout import UserLayout
 
 from .projection import is_error_result
-from .registry import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, TOOL_DEFINITIONS
+from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE
+from .registry import TOOL_DEFINITIONS
 from .tools import SERVER_INJECTED, execute_tool, is_known_tool
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a

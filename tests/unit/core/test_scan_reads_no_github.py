@@ -6,7 +6,7 @@ can under-credit but never over-credit. With ``verify_ci=True`` a dead ``gh`` co
 projection (circuit breaker), and a cached verdict is re-checked unless it is terminal and names
 the run the newest ``ci`` row names (B14b).
 
-``CountingGh`` replaces ``human_gate.default_gh_runner`` (no shell stub, so Windows and 3.9 safe).
+``CountingGh`` replaces ``ghcli.default_gh_runner`` (no shell stub, so Windows and 3.9 safe).
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from aegis_core import checkrun, credit, fitness, human_gate, rules, scan
+from aegis_core import checkrun, credit, fitness, ghcli, rules, scan
 from aegis_core.telemetry_engine import ledger
 from tests import helpers_humangate as hg
 from tests import helpers_verified as hv
@@ -74,7 +74,7 @@ def _env(tmp_path, monkeypatch):
 
 
 def _gh(monkeypatch, gh: CountingGh) -> CountingGh:
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     return gh
 
 

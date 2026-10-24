@@ -277,24 +277,24 @@ class TestRunnerCoverageEnhancements:
 
     def test_find_test_file_runner_mapping(self):
         from aegis_core.verification.runner import _find_test_file
-        test_file = _find_test_file("soma_core/verification/runner.py", REPO_ROOT)
+        test_file = _find_test_file("aegis_core/verification/runner.py", REPO_ROOT)
         assert test_file is not None
         assert test_file.endswith("test_layer1.py")
 
         # Test decomposed domain mappings
-        mcp_test = _find_test_file("soma_mcp/handlers/governance.py", REPO_ROOT)
+        mcp_test = _find_test_file("aegis_mcp/handlers/governance.py", REPO_ROOT)
         assert mcp_test is not None and mcp_test.endswith("test_mcp_handlers.py")
 
-        telemetry_test = _find_test_file("soma_core/outcomes/telemetry.py", REPO_ROOT)
+        telemetry_test = _find_test_file("aegis_core/outcomes/telemetry.py", REPO_ROOT)
         assert telemetry_test is not None and telemetry_test.endswith("test_outcomes_telemetry.py")
 
-        engine_test = _find_test_file("soma_core/outcomes/engine.py", REPO_ROOT)
+        engine_test = _find_test_file("aegis_core/outcomes/engine.py", REPO_ROOT)
         assert engine_test is not None and engine_test.endswith("test_outcome_engine.py")
 
-        skills_test = _find_test_file("soma_core/skills/__init__.py", REPO_ROOT)
+        skills_test = _find_test_file("aegis_core/skills/__init__.py", REPO_ROOT)
         assert skills_test is not None and skills_test.endswith("test_skills.py")
 
-        slots_test = _find_test_file("soma_core/skills/slots.py", REPO_ROOT)
+        slots_test = _find_test_file("aegis_core/skills/slots.py", REPO_ROOT)
         assert slots_test is not None and slots_test.endswith("test_slots.py")
 
     def test_discover_functions_with_target_lines(self, tmp_path):

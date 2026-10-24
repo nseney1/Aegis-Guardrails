@@ -205,10 +205,10 @@ def test_every_coverage_sample_is_in_the_set_and_no_rules_sample_uses_a_singular
 def test_the_printed_codeowners_lines_cover_every_sample_at_every_location(location):
     """Given the lines doctor --github prints, When CODEOWNERS sits at any location GitHub reads, Then
     every sample, the other two locations and a nested allowed_signers or CODEOWNERS have an owner."""
-    from aegis_core import human_gate
+    from aegis_core import codeowners
 
     text = "\n".join(governance.codeowners_lines("@o"))
-    covered, uncovered = human_gate.codeowners_coverage(text, location, repo_paths=("sub/allowed_signers",
+    covered, uncovered = codeowners.codeowners_coverage(text, location, repo_paths=("sub/allowed_signers",
                                                                                      "sub/CODEOWNERS"))
     assert uncovered == [] and set(governance.coverage_samples()) <= set(covered)
     assert {"docs/CODEOWNERS", "CODEOWNERS", ".github/CODEOWNERS", "sub/allowed_signers"} <= set(covered)

@@ -29,10 +29,10 @@ def _no_real_gh(monkeypatch):
     the network or the developer's gh: without a stand-in the answer is "gh is not installed"
     (tier C). A test of tier detection or ``doctor --github`` installs its own fake runner. The stub
     has the real runner's signature; the fixture's value is the real runner."""
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
-    real = human_gate.default_gh_runner
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
+    real = ghcli.default_gh_runner
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
     return real
 
@@ -41,9 +41,9 @@ def _no_real_gh(monkeypatch):
 def real_gh_runner(monkeypatch, _no_real_gh):
     """The real gh runner, for a test that puts a fake gh on PATH (or leaves none there):
     ``_no_real_gh_on_path`` still finds only a gh under pytest's temporary root."""
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", _no_real_gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", _no_real_gh)
     return _no_real_gh
 
 

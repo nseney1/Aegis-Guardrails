@@ -54,6 +54,7 @@ __all__ = [
     "env_workspace",
     "jit_max_tokens",
     "parse_capture_mode",
+    "read_capped",
     "read_user_config",
     "scan_window_s",
     "update_repo_config",
@@ -164,7 +165,7 @@ def _valid_epsilon(value: Any) -> Optional[float]:
 
 # ── Reading files ────────────────────────────────────────────────────────────
 
-def _read_capped(fd: int, limit: int) -> bytes:
+def read_capped(fd: int, limit: int) -> bytes:
     data = b""
     while len(data) <= limit:
         chunk = os.read(fd, limit + 1 - len(data))
@@ -193,7 +194,7 @@ def _read_json(path: Path, label: str) -> Optional[Dict[str, Any]]:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ConfigError(f"{label} is not a regular file")
-        data = _read_capped(fd, MAX_CONFIG_BYTES)
+        data = read_capped(fd, MAX_CONFIG_BYTES)
     except OSError as exc:
         raise ConfigError(f"cannot read {label}") from exc
     finally:

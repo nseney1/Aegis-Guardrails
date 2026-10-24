@@ -113,7 +113,7 @@ SPAWN_SITES = {
     # The trust tier (`aegis doctor`) reads GitHub settings with `gh api` GETs, and `doctor --github --apply` makes
     # one POST after a typed y/N at a terminal; git signs and verifies approvals through ssh-keygen, which only
     # gitsafe-run git starts.
-    "aegis_core/human_gate.py": ("`gh`",),
+    "aegis_core/ghcli.py": ("`gh`",),
     # `aegis check --record` computes the tree git would commit with `git` under a scrubbed environment and a
     # private index, and runs the test command from the user-scope config (never the repository's) in a snapshot.
     "aegis_core/treeid.py": ("`git`",),

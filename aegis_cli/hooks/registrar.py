@@ -482,7 +482,7 @@ def _backup(path: Path, raw: bytes, backup: Path, dry_run: bool) -> None:
     if dry_run:
         return
     try:
-        plane._private_dirs(backup)
+        plane.private_dirs(backup)
         atomic_write_bytes(copy, raw, mode=0o600)
     except OSError as exc:
         raise InstallError(f"{path}: cannot back it up to {backup} ({exc.strerror or exc}); left unchanged") from exc

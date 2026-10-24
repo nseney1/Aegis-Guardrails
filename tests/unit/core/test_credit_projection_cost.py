@@ -12,7 +12,7 @@ from typing import List
 
 import pytest
 
-from aegis_core import credit, gitevidence, gitsafe, human_gate
+from aegis_core import credit, ghcli, gitevidence, gitsafe
 from aegis_core.telemetry_engine import ledger
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -110,7 +110,7 @@ def test_a_scan_never_asks_gh_about_a_ci_row(repo, monkeypatch):
     from tests.helpers_humangate import RULE
 
     asked = []
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: asked.append(argv))
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None: asked.append(argv))
     rule = repo / ".aegis" / "rules" / "traps" / "trap-sample.md"
     rule.parent.mkdir(parents=True)
     rule.write_text(RULE, encoding="utf-8")
