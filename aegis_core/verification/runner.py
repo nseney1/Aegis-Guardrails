@@ -6,7 +6,6 @@ The output feeds directly into the Arbiter as Layer 1 evidence.
 from __future__ import annotations
 
 import ast
-import hashlib
 import os
 from pathlib import Path
 import posixpath
@@ -876,12 +875,6 @@ NOTE_TOOLS = frozenset({INDEX_NOTE_TOOL, UNVERIFIED_NOTE_TOOL, EXEMPT_NOTE_TOOL}
 _UNVERIFIED_SHOWN = 5
 
 
-def _git_blob_id(data: bytes, oid_length: int) -> str:
-    header = b"blob %d\0" % len(data)
-    digest = hashlib.sha256 if oid_length == 64 else hashlib.sha1
-    return digest(header + data).hexdigest()
-
-
 def _index_entries(repo_root: str) -> dict[str, tuple[str, str]]:
     """Path (relative to ``repo_root``, POSIX) -> (mode, object id) for each merged
     entry of the index under ``repo_root``: the one ``GIT_INDEX_FILE`` names in a hook."""
@@ -898,54 +891,6 @@ def _index_entries(repo_root: str) -> dict[str, tuple[str, str]]:
             continue  # an unmerged entry: git refuses the commit before any hook runs
         entries[os.fsdecode(raw_path)] = (parts[0].decode("ascii"), parts[1].decode("ascii"))
     return entries
-
-
-def _blob_sizes(repo_root: str, oids: list[str]) -> dict[str, int]:
-    """The size of each blob, from the object headers only (no content is read)."""
-    from aegis_core import gitsafe
-
-    wanted = list(dict.fromkeys(oids))
-    if not wanted:
-        return {}
-    res = gitsafe.run(["cat-file", "--batch-check"], repo_root, stdin="".join(f"{oid}\n" for oid in wanted).encode("ascii"))
-    if res.returncode != 0:
-        raise gitsafe.GitError(f"git cat-file failed: {res.stderr.decode('utf-8', 'replace').strip()}")
-    sizes: dict[str, int] = {}
-    for oid, line in zip(wanted, res.stdout.splitlines()):
-        header = line.split()
-        if len(header) != 3 or header[0] != oid.encode("ascii") or header[1] != b"blob" or not header[2].isdigit():
-            raise gitsafe.GitError(f"git cannot read the staged object {oid}")
-        sizes[oid] = int(header[2])
-    if len(sizes) != len(wanted):
-        raise gitsafe.GitError("git did not describe every staged object")
-    return sizes
-
-
-def _read_blobs(repo_root: str, oids: list[str]) -> dict[str, bytes]:
-    """The content of each blob, each checked against its object id."""
-    from aegis_core import gitsafe
-
-    wanted = list(dict.fromkeys(oids))
-    if not wanted:
-        return {}
-    res = gitsafe.run(["cat-file", "--batch"], repo_root, stdin="".join(f"{oid}\n" for oid in wanted).encode("ascii"))
-    if res.returncode != 0:
-        raise gitsafe.GitError(f"git cat-file failed: {res.stderr.decode('utf-8', 'replace').strip()}")
-    out = res.stdout
-    pos = 0
-    blobs: dict[str, bytes] = {}
-    for oid in wanted:
-        end = out.find(b"\n", pos)
-        header = out[pos:end].split() if end >= 0 else []
-        if len(header) != 3 or header[0] != oid.encode("ascii") or header[1] != b"blob":
-            raise gitsafe.GitError(f"git cannot read the staged object {oid}")
-        size = int(header[2])
-        data = out[end + 1:end + 1 + size]
-        if len(data) != size or _git_blob_id(data, len(oid)) != oid:
-            raise gitsafe.GitError(f"git returned content that does not match the staged object {oid}")
-        blobs[oid] = data
-        pos = end + 1 + size + 1
-    return blobs
 
 
 def _snapshot_file(snapshot: str, rel: str) -> str:
@@ -970,9 +915,11 @@ def snapshot_index(repo_root: str, paths: list[str], snapshot: str,
     reads only their names (import_guard counts a sibling module as local), so their
     content is never read from git. Raises GitError when git cannot list or read the index.
     """
+    from aegis_core import gitsafe
+
     entries = _index_entries(repo_root) if entries is None else entries
     staged = [p for p in dict.fromkeys(paths) if entries.get(p, ("", ""))[0] in _INDEX_FILE_MODES]
-    sizes = _blob_sizes(repo_root, [entries[p][1] for p in staged])
+    sizes = gitsafe.blob_sizes(repo_root, [entries[p][1] for p in staged], timeout=gitsafe.GIT_TIMEOUT_SECONDS)
     too_large = {p: sizes[entries[p][1]] for p in staged if sizes[entries[p][1]] > INDEX_BLOB_LIMIT_BYTES}
     written = [p for p in staged if p not in too_large]
     folders = {posixpath.dirname(p) for p in written if p.endswith(".py")}
@@ -986,7 +933,7 @@ def snapshot_index(repo_root: str, paths: list[str], snapshot: str,
     for rel in [*written, None]:
         size = sizes[entries[rel][1]] if rel is not None else 0
         if batch and (rel is None or batch_bytes + size > INDEX_BLOB_LIMIT_BYTES):
-            blobs = _read_blobs(repo_root, [entries[r][1] for r in batch])
+            blobs = gitsafe.read_blobs(repo_root, [entries[r][1] for r in batch], timeout=gitsafe.GIT_TIMEOUT_SECONDS)
             for done in batch:
                 target = _snapshot_file(snapshot, done)
                 os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -1038,6 +985,8 @@ def _identical_work_file(repo_root: str, rel: str, oid: str, size: int) -> Optio
     once: the bytes returned are the bytes compared, and they are the blob's."""
     import stat
 
+    from aegis_core import gitsafe
+
     parts = rel.split("/")
     if any(part in ("", ".", "..") for part in parts):
         return None
@@ -1066,7 +1015,7 @@ def _identical_work_file(repo_root: str, rel: str, oid: str, size: int) -> Optio
     if len(data) != on_disk:
         return None
     for candidate in (data, data.replace(b"\r\n", b"\n")):
-        if len(candidate) == size and _git_blob_id(candidate, len(oid)) == oid:
+        if len(candidate) == size and gitsafe.blob_id(candidate, len(oid)) == oid:
             return candidate
     return None
 
@@ -1078,8 +1027,10 @@ def _t7_on_index(repo_root: str, rels: list[str], entries: dict[str, tuple[str, 
     instead of through git (a large asset would cost about three times its size piped through
     ``cat-file`` and could meet git's timeout); any other is read from git. A file over the limit is
     not read, and passing INDEX_NOTE_TOOL evidence says so."""
+    from aegis_core import gitsafe
+
     staged = [rel for rel in dict.fromkeys(rels) if entries.get(rel, ("", ""))[0] in _INDEX_FILE_MODES]
-    sizes = _blob_sizes(repo_root, [entries[rel][1] for rel in staged])
+    sizes = gitsafe.blob_sizes(repo_root, [entries[rel][1] for rel in staged], timeout=gitsafe.GIT_TIMEOUT_SECONDS)
     results: list[ToolEvidence] = []
     held: dict[str, bytes] = {}
     from_git: list[str] = []
@@ -1092,7 +1043,7 @@ def _t7_on_index(repo_root: str, rels: list[str], entries: dict[str, tuple[str, 
                                             detail=f"{rel} not checked: {_not_read(size)}"))
             continue
         if (held or from_git) and (rel is None or batch_bytes + size > INDEX_BLOB_LIMIT_BYTES):
-            blobs = _read_blobs(repo_root, [entries[r][1] for r in from_git])
+            blobs = gitsafe.read_blobs(repo_root, [entries[r][1] for r in from_git], timeout=gitsafe.GIT_TIMEOUT_SECONDS)
             held.update((r, blobs[entries[r][1]]) for r in from_git)
             results.extend(_t7_evidence(repo_root, sorted(held), repo_root, None, set(), contents=held,
                                         present=entries.__contains__))

@@ -85,6 +85,7 @@ __all__ = [
     "add_trailer",
     "blob_id",
     "blob_oid",
+    "blob_sizes",
     "changed_files",
     "common_dir",
     "diff_entries",
@@ -111,6 +112,7 @@ __all__ = [
     "resolve_base_ref",
     "resolve_commit",
     "run",
+    "run_checked",
     "show_prefix",
     "toplevel",
     "tree_blobs",
@@ -236,6 +238,19 @@ def run(
         raise GitError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
     except OSError as exc:
         raise GitError(f"cannot run git: {exc}") from exc
+
+
+def run_checked(args: Sequence[str], cwd: Path | str, *, error: Callable[[str], Exception] = GitError,
+                timeout: float = GIT_TIMEOUT_SECONDS, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    """``run`` that answers only a zero exit: git that cannot start, times out or exits non-zero raises
+    ``error`` (GitError unless named), with git's stderr whitespace-collapsed and cut to 200 characters."""
+    try:
+        res = run(args, cwd, timeout=timeout, stdin=stdin)
+    except GitError as exc:
+        raise error(str(exc)) from exc
+    if res.returncode != 0:
+        raise error(f"git {args[0]} failed: {' '.join(res.stderr.decode('utf-8', 'replace').split())[:200]}")
+    return res
 
 
 def add_trailer(message_file: Path | str, trailer: str) -> bool:
@@ -473,9 +488,6 @@ def blob_id(data: bytes, oid_length: int = 40) -> str:
     return digest(header + data).hexdigest()
 
 
-_blob_id = blob_id
-
-
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
 # any other scope (the repository's .git/config or config.worktree, or a file either
 # includes) is switched off before git reads working-tree files.
@@ -584,7 +596,7 @@ def _working_changes(cwd: Path | str, tree: str) -> Optional[List[str]]:
         path = os.fsdecode(raw_path)
         if set(old_oid) != {"0"}:  # all zeros: not in the tree, so added
             data, is_file = _work_tree_bytes(root / path, old_mode)
-            if data is not None and _blob_id(data, len(old_oid)) == old_oid:
+            if data is not None and blob_id(data, len(old_oid)) == old_oid:
                 continue
             if is_file and old_mode in _REGULAR_MODES:
                 to_convert[path] = old_oid
@@ -710,9 +722,17 @@ def read_blob(cwd: Path | str, rev: str, path: str) -> Optional[bytes]:
         return None
     size = int(fields[2])
     data = rest[:size]
-    if len(data) != size or _blob_id(data, len(entry.oid)) != entry.oid:
+    if len(data) != size or blob_id(data, len(entry.oid)) != entry.oid:
         raise GitError(f"git returned content for {path} at {rev} that does not match object {entry.oid}")
     return data
+
+
+def _blob_size(header: bytes, oid: str) -> int:
+    """The size a ``cat-file --batch``/``--batch-check`` header line gives blob ``oid``, else GitError."""
+    fields = header.split()
+    if len(fields) != 3 or fields[0].decode("ascii", "replace") != oid or fields[1] != b"blob" or not fields[2].isdigit():
+        raise GitError(f"git cannot read object {oid}")
+    return int(fields[2])
 
 
 def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]:
@@ -720,15 +740,7 @@ def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]
     position = 0
     for oid in wanted:
         end = out.find(b"\n", position)
-        header = out[position:end].split() if end >= 0 else []
-        if (
-            len(header) != 3
-            or header[0].decode("ascii", "replace") != oid
-            or header[1] != b"blob"
-            or not header[2].isdigit()
-        ):
-            raise GitError(f"git cannot read object {oid}")
-        size = int(header[2])
+        size = _blob_size(out[position:end] if end >= 0 else b"", oid)
         data = out[end + 1 : end + 1 + size]
         if len(data) != size or blob_id(data, len(oid)) != oid:
             raise GitError(f"git returned content for {oid} that does not match the object id")
@@ -737,32 +749,27 @@ def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]
     return blobs
 
 
-def read_blobs(
-    cwd: Union[str, os.PathLike[str]],
-    oids: Iterable[str],
-    *,
-    timeout: float = 60.0,
-) -> Dict[str, bytes]:
+def read_blobs(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, bytes]:
     """Batch-read git blob objects via ``cat-file --batch``, verifying each object's type, size, and hash."""
     wanted = list(dict.fromkeys(oids))
     if not wanted:
         return {}
-    stdin = ("\n".join(wanted) + "\n").encode("ascii")
-    res = run(["cat-file", "--batch"], cwd, timeout=timeout, stdin=stdin)
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise GitError(f"git cat-file failed: {detail}")
+    res = run_checked(["cat-file", "--batch"], cwd, timeout=timeout, stdin=("\n".join(wanted) + "\n").encode("ascii"))
     return _parse_cat_file_batch(res.stdout, wanted)
 
 
-def tree_blobs(
-    cwd: Union[str, os.PathLike[str]],
-    rev: str,
-    *,
-    paths: Sequence[str] = (),
-    include_symlinks: bool = False,
-    timeout: float = 60.0,
-) -> Dict[str, Tuple[str, str]]:
+def blob_sizes(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, int]:
+    """The size of each blob from ``cat-file --batch-check`` (no content is read); GitError as ``read_blobs``."""
+    wanted = list(dict.fromkeys(oids))
+    if not wanted:
+        return {}
+    lines = run_checked(["cat-file", "--batch-check"], cwd, timeout=timeout,
+                        stdin=("\n".join(wanted) + "\n").encode("ascii")).stdout.split(b"\n")
+    return {oid: _blob_size(lines[i] if i < len(lines) else b"", oid) for i, oid in enumerate(wanted)}
+
+
+def tree_blobs(cwd: Union[str, os.PathLike[str]], rev: str, *, paths: Sequence[str] = (), include_symlinks: bool = False,
+               timeout: float = 60.0) -> Dict[str, Tuple[str, str]]:
     """List blob entries in ``rev`` via ``ls-tree -r -z --full-tree`` as ``{path: (mode, oid)}``."""
     if not isinstance(rev, str) or not rev or rev.startswith("-"):
         raise GitError(f"invalid revision {rev!r}")
@@ -770,10 +777,7 @@ def tree_blobs(
     if paths:
         args.append("--")
         args.extend(paths)
-    res = run(args, cwd, timeout=timeout)
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise GitError(f"git ls-tree failed: {detail}")
+    res = run_checked(args, cwd, timeout=timeout)
     found: Dict[str, Tuple[str, str]] = {}
     for record in res.stdout.split(b"\0"):
         if not record:
@@ -920,7 +924,7 @@ def _hashed_blob(cwd: Path | str, data: bytes, write: bool) -> str:
     oid = (out or b"").strip().decode("ascii", "replace")
     if not _OID.match(oid):
         raise GitError(f"git hash-object {'-w ' if write else ''}failed in {cwd}")
-    if _blob_id(bytes(data), len(oid)) != oid:
+    if blob_id(bytes(data), len(oid)) != oid:
         raise GitError(f"git named the blob {oid}, which does not hash its content")
     return oid
 
@@ -1148,7 +1152,7 @@ def read_object(cwd: Path | str, oid: str, max_bytes: int) -> bytes:
         raise GitError(f"git cannot read object {oid} in {cwd}")
     head, _, rest = out.partition(b"\n")
     data = rest[:size]
-    if head.split()[1:] != [b"blob", str(size).encode()] or len(data) != size or _blob_id(data, len(oid)) != oid:
+    if head.split()[1:] != [b"blob", str(size).encode()] or len(data) != size or blob_id(data, len(oid)) != oid:
         raise GitError(f"git returned content for {oid} that does not match the object id")
     return data
 
