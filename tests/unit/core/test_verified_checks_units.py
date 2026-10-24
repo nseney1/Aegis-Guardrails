@@ -1017,8 +1017,9 @@ def _git_children(monkeypatch):
 
 def _evidence_calls(a):
     from aegis_core import human_gate, regression, release_verify, rule_integrity, sync
+    from aegis_core.verification import records
 
-    head = a.head()
+    head, logged = a.head(), _logged_row(a)
     no_rerun = lambda commit, tree: {"tree": tree, "exit": 0}  # noqa: E731
 
     def gh(argv, timeout=0):
@@ -1042,15 +1043,36 @@ def _evidence_calls(a):
         "regression.check_ci_regressions": lambda: regression.check_ci_regressions(a.root, "main", "HEAD"),
         "sync.base_fetch": lambda: sync.base_fetch(a.root),
         "sync.sync": lambda: sync.sync(a.root),
+        "credit.project_credits": lambda: credit.project_credits(a.root),
+        "records.resolve_rows": lambda: records.resolve_rows(a.root, [logged], time.time()),
     }
 
+
+def _logged_row(a) -> dict:
+    return {"id": "r-1", "verdict_id": "v", "ts": time.time() - 60, "tree": hv.tree_now(a.root), "backend": "claude",
+            "scope": {"path": "src/app.py", "symbol": "app"}, "observable": {"kind": "revert", "selector": "src/app.py"},
+            "window_days": 14, "p": 0.4, "disposition": "logged", "outcome": None}
+
+
+def _landed_report(a) -> None:
+    """A's passing check of the sharpened rule, reported and landed on main: the projection then
+    reaches the lazily-run landed and approval lookups, not only its eager git."""
+    row = checkrun.record(a.root, tests=True, base="main").row
+    assert credit.submit_report(a.root, tree=row["tree"], session="s", host="h", key="k", outcome="success",
+                                rules_for=lambda c: ["trap-sample"])["status"] == "recorded"
+    a.git("branch", "-f", "main", a.head())
+
+
+# Run before GIT_DIR is exported: what an entry point needs in A to start its git at all.
+_PREPARE = {"credit.project_credits": _landed_report}
 
 _EVIDENCE = [
     "treeid.tree_files", "treeid.tree_of", "checkrun.record", "checkrun.rerun_commit_snapshot",
     "checkrun.verify_commit_trailers", "credit.verify_commit_trailers", "rule_integrity.check_ci",
     "human_gate.find_approval", "human_gate.find_test_exemption", "human_gate.verify_approval",
     "human_gate.verify_insight_approval", "human_gate.verify_test_exemption", "release_verify.verify_release",
-    "regression.check_ci_regressions", "sync.base_fetch", "sync.sync",
+    "regression.check_ci_regressions", "sync.base_fetch", "sync.sync", "credit.project_credits",
+    "records.resolve_rows",
 ]
 
 
@@ -1061,6 +1083,7 @@ def test_no_evidence_git_call_follows_an_exported_git_dir(two_repos, monkeypatch
     then no git child it starts is pointed at B (the leak matrix of R-trust-19)."""
     a, b = two_repos
     call = _evidence_calls(a)[name]
+    _PREPARE.get(name, lambda repo: None)(a)
     _ambient(monkeypatch, b)
     seen = _git_children(monkeypatch)
     try:
@@ -1091,6 +1114,22 @@ def test_the_tree_head_base_and_rules_are_the_repository_asked_about(two_repos, 
     assert outcome.row["head"] == head and outcome.row["tree"] == clean_tree and outcome.row["base"] == base
     report = rule_integrity.check_ci(a.root, "main", "HEAD")
     assert report.head == head and report.merge_base == base
+
+
+@needs_git
+def test_credit_lands_on_the_commit_of_the_repository_asked_about(two_repos, monkeypatch):
+    """Given A's reported check landed on A's main and GIT_DIR/GIT_WORK_TREE exported for B, when
+    credit is projected for A (directly and through the arbiter records), then it lands on A's commit."""
+    from aegis_core.verification import records
+
+    a, b = two_repos
+    _landed_report(a)
+    head, logged = a.head(), _logged_row(a)
+    _ambient(monkeypatch, b)  # from here the test's own git would follow it too
+    credit_, = credit.project_credits(a.root).credits
+    assert credit_.commit == head
+    row, = records.resolve_rows(a.root, [logged], time.time())
+    assert row["disposition"] == "landed_unchanged"
 
 
 @needs_git

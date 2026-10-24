@@ -250,6 +250,7 @@ def landed_lookup(
             index.append((facts, by_tree))
         return index[0]
 
+    @gitsafe.scrubbed()  # a closure runs after its maker returns: the caller's scope may not cover it
     def lookup(tree: str, head: Optional[str] = None) -> Optional[str]:
         key = (tree, head or None)
         if key not in answers:
@@ -686,6 +687,7 @@ def _last_signers_change(top: Path, tip_ref: str) -> Optional[str]:
     return _SIGNERS_CHANGED[key]
 
 
+@gitsafe.scrubbed()
 def approval_lookup(
     root: Any, rows: Sequence[Mapping[str, Any]], landed: Optional[Callable[..., Optional[str]]] = None,
     *, branch: Optional[str] = None,
@@ -708,6 +710,7 @@ def approval_lookup(
             anchor.append(next(((p_branch, r, oid) for r in refs if (oid := gitsafe.resolve_commit(top, r))), None))
         return anchor[0]
 
+    @gitsafe.scrubbed()  # a closure, as landed_lookup's
     def is_approved(check_id: str, _categories: Sequence[str] = ()) -> bool:
         if check_id in cache:
             return cache[check_id]
@@ -752,6 +755,7 @@ def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, A
     return (entry.get("run_id"), entry.get("run_attempt")) == (ci_row.get("run_id"), ci_row.get("ci_run_attempt"))
 
 
+@gitsafe.scrubbed()
 def project_credits(
     root: Any, *, view: Any = None, client: Any = None, workflow: Optional[str] = None,
     landed: Optional[Callable[..., Optional[str]]] = None,
