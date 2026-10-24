@@ -1083,6 +1083,81 @@ def test_a_signed_rerun_is_one_recurrence_not_two(review_repo):
     assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)
 
 
+# ── w9 review F1: one signed re-run supersedes one cli row, not every one of its text ──
+
+def _two_corrections(repo: Path, home: Path) -> tuple:
+    (repo / "src" / "other.py").write_bytes(b"x = 1\n")
+    first = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    second = add_insight(repo, SIGNED_TEXT, paths=["src/other.py"], kind="timeouts", home=home)
+    return first, second
+
+
+@pytest.mark.parametrize("restated", [0, 1], ids=["first", "second"])
+def test_a_signed_rerun_supersedes_only_the_correction_it_restates(review_repo, restated):
+    """Given two corrections with one text and kind but other paths, When only one is re-run
+    with --commit, Then the other stays a counted insight: it is reviewed and can be proposed."""
+    repo, home = review_repo
+    rows = _two_corrections(repo, home)
+    signed = _signed_rerun(repo, home, rows[restated])
+    other = rows[1 - restated]
+    assert _counted_ids(repo, home) == sorted([signed["id"], other["id"]])
+    with pytest.raises(ValueError, match=f"not a counted insight: {rows[restated]['id']}"):
+        write_proposal(repo, proposal_id="trap-popen", insight_ids=[rows[restated]["id"]], home=home)
+    meta = _frontmatter(write_proposal(repo, proposal_id="trap-popen", insight_ids=[signed["id"], other["id"]],
+                                       home=home))
+    assert (meta["count"], sorted(meta["insight_ids"])) == (2, sorted([signed["id"], other["id"]]))
+
+
+def test_a_work_tree_rerun_beside_two_corrections_supersedes_one_of_them(review_repo):
+    """X-w8-carry k with two candidates: a re-run without --paths matches on text and kind, so it
+    still supersedes one cli row, and never both."""
+    repo, home = review_repo
+    rows = _two_corrections(repo, home)
+    signed = _signed_rerun(repo, home, rows[0], paths=[])
+    counted = _counted_ids(repo, home)
+    assert len(counted) == 2 and signed["id"] in counted
+    assert len({r["id"] for r in rows} & set(counted)) == 1
+
+
+def test_one_signed_rerun_of_two_identical_corrections_leaves_one_counted(review_repo):
+    repo, home = review_repo
+    rows = [add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home) for _ in range(2)]
+    signed = _signed_rerun(repo, home, rows[0])
+    counted = _counted_ids(repo, home)
+    assert len(counted) == 2 and signed["id"] in counted and len({r["id"] for r in rows} & set(counted)) == 1
+
+
+def test_two_signed_reruns_of_two_identical_corrections_supersede_both(review_repo):
+    repo, home = review_repo
+    rows = [add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home) for _ in range(2)]
+    signed = [_signed_rerun(repo, home, row)["id"] for row in rows]
+    assert _counted_ids(repo, home) == sorted(signed)
+
+
+def test_an_h_row_before_any_cli_row_supersedes_nothing(review_repo):
+    repo, home = review_repo
+    elsewhere = home.parent / "elsewhere"  # the template row is written to another user's log
+    elsewhere.mkdir()
+    template = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=elsewhere)
+    signed = _signed_rerun(repo, home, template)
+    later = add_insight(repo, SIGNED_TEXT, paths=["src/app.py"], kind="timeouts", home=home)
+    assert _counted_ids(repo, home) == sorted([signed["id"], later["id"]])
+
+
+def test_a_signed_rerun_keeps_another_correction_in_the_recurrence_corpus(review_repo):
+    """Given correction a, a different correction b two days later and a's signed re-run a day after
+    that (three episodes apart), When recurrence is measured, Then b and the H row are two episodes."""
+    repo, home = review_repo
+    (repo / "src" / "other.py").write_bytes(b"x = 1\n")
+    _write_rule(repo, "trap-validate-rmtree", ["src/*.py"], RMTREE_BODY)
+    a = add_insight(repo, RMTREE_TEXT, paths=["src/app.py"], home=home)
+    b = {**a, "id": f"ins-{os.urandom(6).hex()}", "paths": ["src/other.py"], "ts": _shift(a["ts"], 2 * 86400)}
+    append_jsonl(insights_path(repo, home=home), [b])
+    _signed_rerun(repo, home, a, ts=_shift(a["ts"], 3 * 86400))
+    rec = measure_recurrence(repo, "trap-validate-rmtree", home=home)
+    assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 2)
+
+
 # ── review M2: the verbatim lint sees the bullet as it is written ──────────────
 
 @pytest.mark.parametrize("text", [

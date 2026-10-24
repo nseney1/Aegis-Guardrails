@@ -484,19 +484,21 @@ def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
 
 
 def _superseded(rows: Sequence[Mapping[str, Any]]) -> Set[int]:
-    """The ``id()`` of every cli row that a later H row with the same text and kind restates:
-    the documented H recipe re-runs ``insight add`` with ``--commit``, and one correction must
-    not count twice. Paths are not compared: a re-run without --paths takes the work tree's."""
-    signed: Set[Tuple[str, str]] = set()
+    """The ``id()`` of each cli row that a later H row restates: the documented H recipe re-runs
+    ``insight add`` with ``--commit``, and one correction must not count twice. Each H row takes
+    one earlier cli row of its text and kind, the latest with its paths, else the latest (a re-run
+    without --paths takes the work tree's), so it never takes a second correction of that text."""
+    earlier: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {}
     found: Set[int] = set()
-    for r in reversed(rows):
+    for r in rows:
         if r.get("event") != "insight" or _row_source(r) != "cli":
             continue
-        key = (str(r.get("text") or ""), str(r.get("kind") or ""))
-        if r.get("level") == "H":
-            signed.add(key)
-        elif key in signed:
-            found.add(id(r))
+        pool = earlier.setdefault((str(r.get("text") or ""), str(r.get("kind") or "")), [])
+        if r.get("level") != "H":
+            pool.append(r)
+        elif pool:
+            at = next((i for i in range(len(pool) - 1, -1, -1) if pool[i].get("paths") == r.get("paths")), -1)
+            found.add(id(pool.pop(at)))  # by position: rows without an id can be equal dicts
     return found
 
 
