@@ -59,7 +59,7 @@ def generate_script(python: Optional[str] = None, import_root: Optional[str] = N
     import aegis_cli
 
     python = python if python is not None else sys.executable
-    import_root = import_root if import_root is not None else str(Path(aegis_cli.__file__).resolve().parent.parent)
+    import_root = import_root if import_root is not None else aegis_cli.aegis_import_root()
     for label, value in (("interpreter", python), ("import root", import_root)):
         if not os.path.isabs(value):
             raise ValueError(f"hook {label} must be an absolute path, got {value!r}")

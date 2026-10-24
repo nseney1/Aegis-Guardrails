@@ -31,6 +31,7 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from aegis_cli import stdin_is_tty as _stdin_is_tty
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, governance, human_gate
 
@@ -38,13 +39,6 @@ __all__ = ["ApproveCommand", "run_approve"]
 
 SCHEMA = "aegis.approve/v1"
 SOURCE = "aegis approve"
-
-
-def _stdin_is_tty() -> bool:
-    try:
-        return bool(sys.stdin.isatty())
-    except (AttributeError, ValueError, OSError):
-        return False
 
 
 def _envelope(root: Path, status: str, **fields: Any) -> Dict[str, Any]:

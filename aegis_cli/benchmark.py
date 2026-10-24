@@ -53,11 +53,6 @@ def _envelope(root: Any, runs: int) -> Dict[str, Any]:
     return primitives.envelope("aegis benchmark", {"workspace": str(root), "runs": runs, "corpus": CORPUS_LABEL})
 
 
-def _text(value: object) -> str:
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))
-
-
 def _report(result: Dict[str, Any], recorded: bool) -> List[str]:
     corpus, scan, hook, layer1 = result["corpus"], result["scan"], result["hook_run"], result["layer1"]
     lines = [
@@ -89,14 +84,16 @@ def run_benchmark(args: argparse.Namespace) -> int:
         if use_json:
             print(json.dumps({**_envelope(root, runs), "status": "error", "error": str(exc)}, indent=2))
         else:
-            print(f"Error: {_text(exc)}", file=sys.stderr)
+            print(f"Error: {sanitize_display(exc, max_len=None)}", file=sys.stderr)
         return EXIT_FAILED
 
     warnings: List[str] = []
     try:
-        benchmark.record(root, result)
-    except Exception as exc:  # a metric never fails the benchmark (events.append documents what it raises)
-        warnings.append(f"the benchmark event could not be recorded ({type(exc).__name__}: {exc})")
+        error = benchmark.record(root, result)
+    except Exception as exc:  # a malformed metric must not fail the benchmark either
+        error = exc
+    if error is not None:
+        warnings.append(f"the benchmark event could not be recorded ({type(error).__name__}: {error})")
     if use_json:
         doc = _envelope(root, runs)
         doc.update({"status": "ok", "notice": benchmark.NOTICE, "measures": MEASURES, "not_measured": NOT_MEASURED,
@@ -107,7 +104,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     for line in _report(result, recorded=not warnings):
         print(line)
     for warning in warnings:
-        print(f"Warning: {_text(warning)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(warning, max_len=None)}", file=sys.stderr)
     return EXIT_OK
 
 

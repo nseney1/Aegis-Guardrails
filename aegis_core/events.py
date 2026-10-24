@@ -36,6 +36,7 @@ __all__ = [
     "KINDS",
     "EventsRead",
     "append",
+    "try_append",
     "events_path",
     "read",
 ]
@@ -123,6 +124,16 @@ def append(
         with shared_locked(root, EVENTS_LOCK) as lock:
             append_jsonl(lock.parent / EVENTS_FILE, [row])
     return row
+
+
+def try_append(workspace: Any, kind: str, result: str, detail: Dict[str, Any],
+               host: Optional[str] = None) -> Optional[Exception]:
+    """Append a metric, returning its failure; process-control exceptions still propagate."""
+    try:
+        append(workspace, kind, result, detail, host=host)
+    except Exception as exc:  # hooks keep their own BaseException guard to preserve host decisions
+        return exc
+    return None
 
 
 @dataclass(frozen=True)

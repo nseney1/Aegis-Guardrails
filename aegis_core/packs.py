@@ -599,8 +599,7 @@ def import_pack(workspace: Any, pack: Mapping[str, Any], *, rename: bool = False
     detail = {"rules": len(planned), "renamed": sum(1 for i in planned if i.renamed_from),
               "types": dict(sorted(types.items())), "pack_sha256": pack["sha256"]}
     warnings: List[str] = []
-    try:
-        events.append(root, "pack_import", "imported", detail)
-    except Exception as exc:  # a metric never undoes an import
+    exc = events.try_append(root, "pack_import", "imported", detail)
+    if exc is not None:
         warnings.append(f"the pack_import event could not be recorded ({type(exc).__name__}: {exc})")
     return _result(planned, pack, dry_run=False, warnings=warnings)

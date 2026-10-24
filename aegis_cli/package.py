@@ -41,11 +41,6 @@ DEFAULT_OUT = "aegis-claude-plugin"
 NOTICE = "experimental: nothing is published; the directory works only on this machine"
 
 
-def _text(value: object) -> str:
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))
-
-
 def _envelope(root: Path, out: Any) -> Dict[str, Any]:
     return primitives.envelope("aegis package", {"workspace": str(root), "host": HOST, "out": str(out)})
 
@@ -53,7 +48,7 @@ def _envelope(root: Path, out: Any) -> Dict[str, Any]:
 def _host_problem(chosen: Optional[str]) -> Optional[str]:
     if chosen == HOST:
         return None
-    shown = _text(chosen) if chosen else "none given"
+    shown = sanitize_display(chosen, max_len=None) if chosen else "none given"
     message = f"only --host {HOST} is supported (got {shown})"
     try:
         retired = host_table.get(chosen).retired if chosen else None
@@ -94,9 +89,8 @@ def _record(root: Path, out: Path, plan: List[Any]) -> Optional[str]:
     for _path, state in plan:
         counts[state] = counts.get(state, 0) + 1
     detail = {"out": out.as_posix(), "files": len(plan), "counts": counts, "experimental": True}
-    try:
-        events.append(root, "package", "ok", detail, host=HOST)
-    except Exception as exc:  # a metric never fails the package (events.append documents what it raises)
+    exc = events.try_append(root, "package", "ok", detail, host=HOST)
+    if exc is not None:
         return f"the package event could not be recorded ({type(exc).__name__}: {exc})"
     return None
 
@@ -121,7 +115,7 @@ def run_package(args: argparse.Namespace) -> int:
             print(json.dumps({**_envelope(root, out), "status": "error", "experimental": True, "error": str(exc)},
                              indent=2))
         else:
-            print(f"Error: {_text(exc)}", file=sys.stderr)
+            print(f"Error: {sanitize_display(exc, max_len=None)}", file=sys.stderr)
         return EXIT_FAILED
 
     warnings: List[str] = []
@@ -143,13 +137,13 @@ def run_package(args: argparse.Namespace) -> int:
         return EXIT_OK
     verb = {"created": "would create", "updated": "would update"} if dry_run else {}
     for path, state in plan:
-        print(f"  {verb.get(state, state)}: {_text(path)}")
-    print(f"Claude Code plugin at {_text(out)}: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
-    print(NOTICE.capitalize() + ". Try it with: claude --plugin-dir " + _text(out))
+        print(f"  {verb.get(state, state)}: {sanitize_display(path, max_len=None)}")
+    print(f"Claude Code plugin at {sanitize_display(out, max_len=None)}: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
+    print(NOTICE.capitalize() + ". Try it with: claude --plugin-dir " + sanitize_display(out, max_len=None))
     if recorded:
         print("Recorded a package event.")
     for warning in warnings:
-        print(f"Warning: {_text(warning)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(warning, max_len=None)}", file=sys.stderr)
     return EXIT_OK
 
 

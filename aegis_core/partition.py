@@ -542,8 +542,7 @@ def check(root: Any, lanes: Dict[str, Tuple[str, ...]], now: Optional[float] = N
     if not record:
         return report
     warnings: Tuple[str, ...] = ()
-    try:
-        events.append(base, "partition_check", "edges" if edges else "clear", report.event_detail())
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(base, "partition_check", "edges" if edges else "clear", report.event_detail())
+    if exc is not None:
         warnings = (f"event not recorded: {exc}",)
     return Report(**{**report.__dict__, "warnings": warnings}) if warnings else report

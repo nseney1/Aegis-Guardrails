@@ -450,12 +450,6 @@ _SHOWN_PROBLEMS = 10
 _UNSIGNED = "The pack is unsigned: its sha256 ({short}) shows it was not altered after export, not who made it."
 
 
-def _show(value: object) -> str:
-    """Pack content and rule files are repository or network content: no terminal controls."""
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))
-
-
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -477,11 +471,11 @@ def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scop
     elif problems and header:
         print(f"Error: {header}", file=sys.stderr)
         for problem in problems[:_SHOWN_PROBLEMS]:
-            print(f"  {_show(problem)}", file=sys.stderr)
+            print(f"  {sanitize_display(problem, max_len=None)}", file=sys.stderr)
         if len(problems) > _SHOWN_PROBLEMS:
             print(f"  ... and {len(problems) - _SHOWN_PROBLEMS} more problems", file=sys.stderr)
     else:
-        print(f"Error: {_show(message)}", file=sys.stderr)
+        print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
     return 1
 
 
@@ -540,11 +534,11 @@ def _run_export(args: argparse.Namespace) -> int:
                     "rules": entries, "skipped": skipped})
         print(json.dumps(doc, indent=2))
         return 0
-    print(f"Exported {_plural(len(entries), 'rule')} to {_show(out)}")
+    print(f"Exported {_plural(len(entries), 'rule')} to {sanitize_display(out, max_len=None)}")
     for entry in entries:
         print(f"  {entry['path']}")
     if skipped:
-        print("Skipped: " + ", ".join(f"{_show(s['id'])} ({s['reason']})" for s in skipped))
+        print("Skipped: " + ", ".join(f"{sanitize_display(s['id'], max_len=None)} ({s['reason']})" for s in skipped))
     print(_UNSIGNED.format(short=pack["sha256"][:12]))
     return 0
 
@@ -604,12 +598,12 @@ def _run_import(args: argparse.Namespace) -> int:
     short = result.pack_sha256[:12]
     count = _plural(len(rules), "rule")
     verb = f"Dry run: would import {count}" if result.dry_run else f"Imported {count}"
-    print(f"{verb} from {_show(pack_path)} (sha256 {short}):")
+    print(f"{verb} from {sanitize_display(pack_path, max_len=None)} (sha256 {short}):")
     for rule in rules:
         renamed = f" (renamed from {rule['renamed_from']!r})" if rule["renamed_from"] else ""
         print(f"  {rule['path']}{renamed}")
     for warning in result.warnings:
-        print(f"Warning: {_show(warning)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(warning, max_len=None)}", file=sys.stderr)
     if result.dry_run:
         print("Nothing was written.")
     else:

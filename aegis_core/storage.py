@@ -94,6 +94,7 @@ __all__ = [
     "locked",
     "read_json_dict",
     "read_jsonl",
+    "parse_jsonl",
     "read_tail_bytes",
     "StateModes",
     "shared_locked",
@@ -973,14 +974,6 @@ class JsonlRead:
         return len(self.skipped_lines)
 
 
-def _parse_line(raw: bytes, errors: str) -> Optional[Dict[str, Any]]:
-    try:
-        value = json.loads(raw.decode("utf-8-sig", errors))
-    except (UnicodeDecodeError, ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
 def _read_tail_from_fd(fd: int, limit: int) -> bytes:
     if limit <= 0:
         return b""
@@ -1096,6 +1089,11 @@ def read_jsonl(
         except OSError as exc:
             return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 
+    return parse_jsonl(data, errors, contains=contains)
+
+
+def parse_jsonl(data: bytes, errors: str = "strict", *, contains: Optional[bytes] = None) -> JsonlRead:
+    """Parse bytes with the same tolerant line, BOM, skipped-line and tail rules as read_jsonl."""
     if contains is not None and contains not in data:
         return JsonlRead([], [], [])
     rows: List[Dict[str, Any]] = []
@@ -1112,7 +1110,11 @@ def read_jsonl(
         raw = raw.rstrip(b"\r")
         if not raw.strip():
             continue
-        row = _parse_line(raw, errors)
+        try:
+            value = json.loads(raw.decode("utf-8-sig", errors))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            value = None
+        row = value if isinstance(value, dict) else None
         if row is not None:
             rows.append(row)
             numbers.append(index + 1)

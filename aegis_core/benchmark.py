@@ -33,11 +33,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import events, scan_compliance
 from aegis_core.hosts import GENERIC
-from aegis_core.primitives import safe_parts
+from aegis_core.primitives import aegis_import_root, safe_parts
 from aegis_core.scan import estimate_tokens
 from aegis_core.scan import scan as run_scan
 from aegis_core.skills.slots import render_scan_result
@@ -265,7 +265,7 @@ def measure_hook(root: Path, corpus: Corpus, runs: int, clock: Callable[[], floa
             "tool_input": {"file_path": str(root / corpus.hook_file), "content": "x = 1\n"},
             "tool_use_id": "toolu_aegis_benchmark",
         }).encode("utf-8")
-        import_root = str(Path(__file__).resolve().parent.parent)
+        import_root = aegis_import_root()
         argv = [sys.executable, "-I", "-c", HOOK_RUNNER, import_root, "hook", "run", "pre-tool", "--host", "claude-code"]
         env = _hook_env(home)
 
@@ -352,7 +352,6 @@ def event_detail(result: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def record(workspace: Any, result: Mapping[str, Any]) -> Dict[str, Any]:
-    """Append one ``benchmark`` event for ``result`` to ``workspace``'s events log (what
-    events.append raises is the caller's to handle: a metric never fails a benchmark)."""
-    return events.append(workspace, "benchmark", "ok", event_detail(result))
+def record(workspace: Any, result: Mapping[str, Any]) -> Optional[Exception]:
+    """Append one benchmark event, returning a metric failure for the CLI to report."""
+    return events.try_append(workspace, "benchmark", "ok", event_detail(result))

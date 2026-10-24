@@ -407,9 +407,8 @@ def _record(root: Path, result: SyncResult, trigger: str) -> None:
 
     detail = {"trigger": trigger, "hosts": list(result.hosts), "targets": [t.dir for t in result.targets],
               "force": result.force, "counts": result.counts}
-    try:
-        events.append(root, "skills_sync", result.status, detail)
-    except Exception as exc:  # a metric never fails the sync (events.append documents what it raises)
+    exc = events.try_append(root, "skills_sync", result.status, detail)
+    if exc is not None:
         result.warnings.append(f"the skills_sync event could not be recorded ({type(exc).__name__}: {exc})")
 
 

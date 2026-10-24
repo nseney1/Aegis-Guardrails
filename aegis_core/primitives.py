@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -17,6 +18,7 @@ __all__ = [
     "DuplicateKeyError",
     "TS_FORMAT",
     "envelope",
+    "aegis_import_root",
     "is_within",
     "key_within",
     "parse_utc",
@@ -198,3 +200,8 @@ def envelope(source: str, scope: Dict[str, Any], *, schema: Optional[str] = None
     head.update(source=source, aegis_version=__version__,
                 checked_at=utc_stamp(now) if checked_at is None else checked_at, scope=scope)
     return head
+
+
+def aegis_import_root() -> str:
+    """The installed packages' parent, never a lookup on the caller's sys.path."""
+    return str(Path(__file__).resolve().parent.parent)

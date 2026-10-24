@@ -38,6 +38,7 @@ from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/
 )
 from aegis_cli.init_views import (
     Report,
+    SCAFFOLD_LABEL,
     Step,
     _home_label,
     _no_hooks,
@@ -119,7 +120,6 @@ __all__ = [
 
 CONFIG_LABEL = f"{AEGIS_DIRNAME}/config.json"
 GITIGNORE_LABEL = f"{AEGIS_DIRNAME}/.gitignore"
-SCAFFOLD_LABEL = f"{AEGIS_DIRNAME}/"
 AGENTS_FILE = "AGENTS.md"
 CLAUDE_FILE = "CLAUDE.md"
 CLAUDE_SHIM_ID = "agents-import"

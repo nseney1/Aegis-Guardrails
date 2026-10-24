@@ -40,15 +40,9 @@ def _emit(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2))
 
 
-def _text(value: object) -> str:
-    """Repository-chosen text (labels, globs, git's messages) without terminal controls."""
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))  # stripped text is never longer: no cut
-
-
 def _warn(warnings: List[str]) -> None:
     for line in warnings:
-        print(f"Warning: {_text(line)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(line, max_len=None)}", file=sys.stderr)
 
 
 def _view(root: Path, now: int, oid: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -67,10 +61,10 @@ def _lease_lines(lease: Optional[Dict[str, Any]]) -> List[str]:
     state = "expired" if lease["expired"] else "live"
     skew = " (writer clock ahead)" if lease["clock_skew"] else ""
     lines = [
-        f"  {lease['lane']}  {state}  owner {_text(lease['owner'])}  role {_text(lease['role'])}  "
+        f"  {lease['lane']}  {state}  owner {sanitize_display(lease['owner'], max_len=None)}  role {sanitize_display(lease['role'], max_len=None)}  "
         f"gen {lease['gen']}  expires {lease['expires_at']}{skew}",
-        f"    paths: {_text(', '.join(lease['paths']))}",
-        f"    oid: {lease['oid']}" + (f"  branch: {_text(lease['branch'])}" if lease["branch"] else ""),
+        f"    paths: {sanitize_display(', '.join(lease['paths']), max_len=None)}",
+        f"    oid: {lease['oid']}" + (f"  branch: {sanitize_display(lease['branch'], max_len=None)}" if lease["branch"] else ""),
     ]
     if lease["overlaps"]:
         lines.append(f"    overlaps live: {', '.join(lease['overlaps'])}")
@@ -135,7 +129,7 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
     if not result.collected:
         print("nothing to collect")
     for lane, reason in result.kept:
-        print(f"kept {_text(lane)}: {reason}", file=sys.stderr)
+        print(f"kept {sanitize_display(lane, max_len=None)}: {reason}", file=sys.stderr)
     return EXIT_OK
 
 
@@ -156,7 +150,7 @@ def _list(args: argparse.Namespace, root: Path, now: int) -> int:
         for line in _lease_lines(lease):
             print(line)
     for bad in found["unreadable"]:
-        print(f"  {_text(bad['lane'])}  unreadable  oid {bad['oid']}: {_text(bad['error'])}")
+        print(f"  {sanitize_display(bad['lane'], max_len=None)}  unreadable  oid {bad['oid']}: {sanitize_display(bad['error'], max_len=None)}")
     print(team.LEASE_NOTE)
     return EXIT_OK
 
@@ -174,14 +168,14 @@ def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     print(f"Lease events: {counts['claims']} claims, {counts['denials']} denials"
           + (f" ({reasons})" if reasons else "") + f"; {counts['lanes_claimed']} lanes claimed")
     if counts["error"]:
-        print(f"  events log unreadable: {_text(counts['error'])}")
+        print(f"  events log unreadable: {sanitize_display(counts['error'], max_len=None)}")
     since = span["base"] if span["base"] is not None else "the first commit"
     tip = span["tip"][:12] if span["tip"] else "an unborn branch"
-    print(f"First-parent merges on {tip} since {_text(since)}: {merges['count']}")
+    print(f"First-parent merges on {tip} since {sanitize_display(since, max_len=None)}: {merges['count']}")
     print(f"  overlapping (both sides changed a common path): {merges['overlapping_merge']}")
     conflicting = merges["conflicting_merge"]
     if conflicting == "unavailable":
-        conflicting = f"unavailable ({_text(merges['conflicting_unavailable'])})"
+        conflicting = f"unavailable ({sanitize_display(merges['conflicting_unavailable'], max_len=None)})"
     print(f"  conflicting (git merge-tree): {conflicting}")
     if merges["excluded_synthetic"]:
         print(f"  excluded synthetic pull-request merges: {merges['excluded_synthetic']}")
@@ -207,7 +201,7 @@ def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: 
         payload.update({"status": "error", "error": message})
         _emit(payload)
     else:
-        print(f"Error: {_text(message)}", file=sys.stderr)
+        print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
     return code
 
 
@@ -227,7 +221,7 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
         _emit(payload)
         return EXIT_REFUSED
     _warn(list(exc.warnings))
-    print(_text(str(exc)), file=sys.stderr)
+    print(sanitize_display(str(exc), max_len=None), file=sys.stderr)
     for line in _lease_lines(lease):
         print(line, file=sys.stderr)
     return EXIT_REFUSED

@@ -41,6 +41,7 @@ import shlex
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from aegis_cli import aegis_import_root
 from aegis_core import primitives
 from aegis_cli import install_hosts as plane
 from aegis_cli.install_hosts import InstallError
@@ -551,7 +552,7 @@ def install_insight_hook(host: str, excerpts: bool, *, home: Optional[Union[str,
         raise InstallError("Codex insight capture is unavailable on Windows: Codex runs hooks through %COMSPEC% /C, "
                            "which cannot take the quoted -c program the hook needs; nothing was written")
     layout = UserLayout(Path(home)) if home is not None else UserLayout.current()
-    python, root = sys.executable or "", plane._mcp_import_root()
+    python, root = sys.executable or "", aegis_import_root()
     if layout is None or not os.path.isabs(python) or not os.path.isabs(root):
         raise OSError(f"the insight hook needs a home directory and an absolute interpreter and import root "
                       f"(interpreter {python!r}, import root {root!r}); nothing was written")

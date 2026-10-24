@@ -526,9 +526,8 @@ def _integrity(top: Path, merge_base: str, head: str, entries: Sequence[Tuple[st
 
 
 def _record(top: Path, result: LaneCheck) -> Tuple[str, ...]:
-    try:
-        events.append(top, "lane_check", "pass" if result.passed else "fail", result.event_detail())
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(top, "lane_check", "pass" if result.passed else "fail", result.event_detail())
+    if exc is not None:
         return (f"event not recorded: {exc}",)
     return ()
 

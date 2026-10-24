@@ -642,9 +642,8 @@ class LeaseChange:
 
 
 def _record(root: Path, kind: str, result: str, detail: Dict[str, Any]) -> Tuple[str, ...]:
-    try:
-        events.append(root, kind, result, detail)
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(root, kind, result, detail)
+    if exc is not None:
         return (f"event not recorded: {exc}",)
     return ()
 

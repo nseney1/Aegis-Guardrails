@@ -111,6 +111,7 @@ import subprocess
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_cli import stdin_is_tty as _stdin_is_tty
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.pathlookup import is_bare
 from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
@@ -732,13 +733,6 @@ V3_SHIPPED_RULE_SHA256 = frozenset({
     "04946d5d7b525f24284ae51f2d958f8b5fcc4d3ed891e391ceec71f5dd5ddd0f",  # subagent-delegation (3.0)
     "5d54ce9b04be9572698749908558800cbf2d8acdffc15e7b7a651fbf6f39488f",  # subagent-delegation (3.1+)
 })
-
-
-def _stdin_is_tty() -> bool:
-    try:
-        return bool(sys.stdin.isatty())
-    except (AttributeError, ValueError, OSError):
-        return False
 
 
 def _confirm(prompt: str) -> bool:

@@ -92,7 +92,7 @@ def _run_record(args: argparse.Namespace) -> int:
     root = _resolve_git_cwd(args)
     use_json = _wants_json(args)
     if not os.path.isdir(root):
-        print(f"Error: workspace does not exist: {sanitize_display(root, max_len=len(root))}", file=sys.stderr)
+        print(f"Error: workspace does not exist: {sanitize_display(root, max_len=None)}", file=sys.stderr)
         return 1
     outcome = checkrun.record(root, tests=bool(getattr(args, "tests", False)), base=getattr(args, "base", None))
     row = outcome.row or {}
