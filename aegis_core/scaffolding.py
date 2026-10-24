@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.resources
 from pathlib import Path
 import re
+import shlex
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from aegis_core._version import __version__
@@ -198,7 +199,9 @@ def install_rules(
 
 CI_WORKFLOW_LABEL = ".github/workflows/aegis.yml"
 CI_WORKFLOW_PATH = CI_WORKFLOW_LABEL
-_RUNS_AEGIS_CHECK = re.compile(r"\baegis\s+check\b")
+_RUNS_AEGIS_CHECK = re.compile(
+    r"(?:aegis|python3?(?:[ \t]+-I)?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?=[ \t]|$)"
+)
 _WORKFLOW_READ_LIMIT = 1 << 20
 
 _CI_WORKFLOW = """\
@@ -284,4 +287,24 @@ def _runs_aegis_check(path: Path) -> bool:
             text = handle.read(_WORKFLOW_READ_LIMIT).decode("utf-8", "replace")
     except OSError:
         return False
-    return bool(_RUNS_AEGIS_CHECK.search(text))
+    # This is a setup hint, not the required-check verifier: a command after && or ;
+    # still runs a check. Token boundaries keep comments and quoted echo text out.
+    for line in text.splitlines():
+        body = line.strip()
+        run = re.match(r"(?:-[ \t]+)?run:[ \t]*(.*)$", body)
+        if run:
+            body = run.group(1)
+            if len(body) > 1 and body[0] in "\"'" and body[-1] == body[0]:
+                body = body[1:-1]  # YAML quotes around the whole run scalar
+        lexer = shlex.shlex(body, posix=False, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        try:
+            words = list(lexer)
+        except ValueError:  # an incomplete quoted command is not evidence of a runnable check
+            continue
+        starts = [0] + [i + 1 for i, word in enumerate(words)
+                        if word in ("&&", "||", ";", "|", "&")
+                        and (i == 0 or not words[i - 1].endswith("\\"))]
+        if any(_RUNS_AEGIS_CHECK.match(shlex.join(words[start:start + 5])) for start in starts):
+            return True
+    return False

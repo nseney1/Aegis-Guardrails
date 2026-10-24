@@ -157,3 +157,83 @@ class TestCiWorkflowSarifUpload:
         text = ci_workflow()
         assert "${{ always() && hashFiles('aegis.sarif') != ''" in text
         assert "${ always()" not in text.replace("${{ always()", "")
+
+
+class TestInitWorkflowRecognition:
+    """Init reports commands that run a check, including installed Python module entrypoints."""
+
+    @pytest.fixture
+    def project(self, tmp_path, monkeypatch):
+        from aegis_core import hosts
+
+        home = tmp_path / "home"
+        home.mkdir()
+        for key in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(key, str(home))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / "gitconfig"))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        for key in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(hosts, "APP_DIRS", {})
+        root = tmp_path / "ws"
+        root.mkdir()
+        return root
+
+    @staticmethod
+    def init_action(root, capsys):
+        import json
+        from aegis_cli.cli import main
+
+        assert main(["init", "--workspace", str(root), "--yes", "--dry-run", "--no-hooks",
+                     "--rules", "none-active", "--host", "claude-code", "--json"]) == 0
+        doc = json.loads(capsys.readouterr().out)
+        action, = [a for a in doc["actions"] if a["target"] == CI_WORKFLOW_PATH]
+        return action
+
+    @pytest.mark.parametrize("run", [
+        "python3 -m aegis_cli check", "python3 -m aegis_cli.cli check --ci",
+        "python3 -I -m aegis_cli check", "python3 -I -m aegis_cli.cli check --ci",
+        "python -m aegis_cli.cli check", "'python3 -I -m aegis_cli.cli check --ci'",
+        "pip install aegis-guardrails && aegis check", "echo ready; python3 -m aegis_cli check",
+        "|\n          python3 -I -m aegis_cli.cli check --ci",
+    ], ids=["module", "cli-module", "isolated", "isolated-cli", "python", "yaml-quoted", "and", "semicolon", "block"])
+    def test_init_names_a_workflow_running_check(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "present"
+        assert action["detail"] == ".github/workflows/ci.yml runs aegis check"
+
+    @pytest.mark.parametrize("run", [
+        "python3 -m aegis_cli_extra check", "python3 -m aegis_cli.cli.extra check",
+        "python3 -m aegis_cli check-other", "echo python3 -m aegis_cli check",
+        "echo 'aegis check'", "echo 'ready && aegis check'", "# aegis check",
+        "echo ';' aegis check", "echo '&&' python3 -m aegis_cli check",
+        r"echo \; aegis check", r"echo \&\& python3 -m aegis_cli check",
+        "|\n          # python3 -I -m aegis_cli.cli check --ci\n          echo ready",
+    ], ids=["module-near", "submodule-near", "command-near", "echo-module", "echo-bare", "quoted-shell", "comment", "quoted-semicolon", "quoted-and", "escaped-semicolon", "escaped-and", "block-comment"])
+    def test_init_suggests_ci_for_mentions_that_do_not_run_check(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "suggested"
+        assert action["detail"] == "no GitHub Actions workflow runs aegis check; aegis init --ci writes one"
+
+    def test_an_unreadable_workflow_is_not_reported_as_running_check(self, project, capsys, monkeypatch):
+        import builtins
+
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(b"jobs:\n  test:\n    steps:\n      - run: aegis check\n")
+        real_open = builtins.open
+
+        def unreadable(path, *args, **kwargs):
+            if Path(path) == workflow:
+                raise PermissionError("workflow unreadable")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", unreadable)
+        assert self.init_action(project, capsys)["result"] == "suggested"
