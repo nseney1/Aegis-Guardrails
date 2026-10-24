@@ -19,6 +19,7 @@ from .parsers import (
 __all__ = [
     "MAX_RULE_BODY_BYTES",
     "create_rule",
+    "require_servable_id",
     "validate_rule_body",
 ]
 
@@ -108,7 +109,7 @@ def create_rule(
     target_dir = ws.rules_dir / type_plural
 
     slug = generate_slug(hypothesis, id_override)
-    _require_servable_id(slug)
+    require_servable_id(slug)
     file_path = target_dir / f"{slug}.md"
 
     date_str = utc_stamp()
@@ -170,7 +171,7 @@ def create_rule(
     return file_path
 
 
-def _require_servable_id(slug: str) -> None:
+def require_servable_id(slug: str) -> None:
     """Refuse an id whose file the loader would never serve (aegis_core.rules)."""
     if slug.lower() == "readme":
         raise ValueError(f"Invalid rule id {slug!r}: a README.md under .aegis/rules is documentation, never a rule.")

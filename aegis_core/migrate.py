@@ -104,7 +104,7 @@ from aegis_core.workspace.layout import (
     WorkspaceLayout,
 )
 
-__all__ = ["MigrationPlan", "MigrationRefused", "MigrationResult", "apply", "plan"]
+__all__ = ["MigrationPlan", "MigrationRefused", "MigrationResult", "apply", "frontmatter_span", "plan", "strip_derived"]
 
 # A compaction archive larger than this decompressed is reported unreadable, not read.
 _ARCHIVE_LIMIT = 256 * 1024 * 1024
@@ -240,7 +240,7 @@ class MigrationResult:
 
 # ── Frontmatter line editing ─────────────────────────────────────────────────
 
-def _frontmatter_span(lines: List[str]) -> Optional[Tuple[int, int]]:
+def frontmatter_span(lines: List[str]) -> Optional[Tuple[int, int]]:
     if not lines or lines[0].rstrip("\r\n").strip() != "---":
         return None
     for end in range(1, len(lines)):
@@ -253,7 +253,7 @@ def _eol(lines: List[str]) -> str:
     return "\r\n" if lines and lines[0].endswith("\r\n") else "\n"
 
 
-def _strip_derived(text: str) -> Tuple[str, List[str]]:
+def strip_derived(text: str) -> Tuple[str, List[str]]:
     """Remove derived and retired top-level keys (and their nested lines) from the frontmatter.
 
     A ``fitness`` block's ``impact_weight`` is a property, not a counter: it moves to the
@@ -262,10 +262,10 @@ def _strip_derived(text: str) -> Tuple[str, List[str]]:
     from aegis_core.yaml_engine.frontmatter import parse_frontmatter
 
     if text.startswith("\ufeff"):
-        stripped, keys = _strip_derived(text[1:])
+        stripped, keys = strip_derived(text[1:])
         return "\ufeff" + stripped, keys
     lines = text.splitlines(keepends=True)
-    span = _frontmatter_span(lines)
+    span = frontmatter_span(lines)
     if span is None:
         return text, []
     start, end = span
@@ -300,7 +300,7 @@ def _set_type(text: str, rule_type: str) -> str:
     if text.startswith("\ufeff"):
         return "\ufeff" + _set_type(text[1:], rule_type)
     lines = text.splitlines(keepends=True)
-    span = _frontmatter_span(lines)
+    span = frontmatter_span(lines)
     if span is None:
         return text
     start, end = span
@@ -753,7 +753,7 @@ def _plan_moves(
             result.unmapped.append({"path": rel, "type": str(raw_type)})
             continue
         target = layout.rules_dir / RULE_TYPE_DIRS[rule_type] / source.name
-        content, _keys = _strip_derived(_set_type(text, rule_type))
+        content, _keys = strip_derived(_set_type(text, rule_type))
         if not is_within(target.parent, layout.root, unresolvable=False):
             result.skipped.append({"path": rel, "reason": f"{result._rel(target.parent)} resolves outside the workspace"})
             continue
@@ -823,7 +823,7 @@ def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
             in_type_dir = path.parent.parent == layout.rules_dir
             retype = _retype(text, path.parent.name) if in_type_dir else None
             new_text = _set_type(text, retype[1]) if retype else text
-            new_text, keys = _strip_derived(new_text)
+            new_text, keys = strip_derived(new_text)
             if keys or retype:
                 result.strips.append(_RuleStrip(path, keys, new_text, raw, retype))
                 _record(result, path, raw)

@@ -42,9 +42,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import events
 from aegis_core.fitness import for_rules
-from aegis_core.lifecycle.creation import _require_servable_id
+from aegis_core.lifecycle.creation import require_servable_id
 from aegis_core.lifecycle.parsers import validate_rule_id
-from aegis_core.migrate import _frontmatter_span, _strip_derived
+from aegis_core.migrate import frontmatter_span, strip_derived
 from aegis_core.primitives import real_key, real_path, strict_loads
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, RuleInventoryError
 from aegis_core.rules import Rule, load_rules, workspace_root
@@ -173,7 +173,7 @@ def bundle_digest(entries: Sequence[Mapping[str, Any]]) -> str:
 
 def _check_id(rule_id: str) -> None:
     try:
-        _require_servable_id(rule_id)  # README and hidden names are never served
+        require_servable_id(rule_id)  # README and hidden names are never served
     except ValueError as exc:
         raise PackPathError(str(exc)) from None
     try:
@@ -249,7 +249,7 @@ def _export_entry(rule: Rule) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     except PackPathError as exc:
         return None, f"{relative}: {exc}"
     text = rule.raw.decode("utf-8")
-    _stripped, removed = _strip_derived(text)
+    _stripped, removed = strip_derived(text)
     keys = sorted(set(rule.legacy_keys) | set(removed))
     if keys:
         return None, (f"{relative} still has derived or retired keys ({', '.join(keys)}): "
@@ -413,7 +413,7 @@ def _with_id(text: str, new_id: str) -> str:
     if text.startswith("﻿"):
         return "﻿" + _with_id(text[1:], new_id)
     lines = text.splitlines(keepends=True)
-    span = _frontmatter_span(lines)
+    span = frontmatter_span(lines)
     if span is None:
         return text
     start, end = span
