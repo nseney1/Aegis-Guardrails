@@ -249,6 +249,79 @@ def _reinforce(bucket: Dict[str, Any], at: Optional[datetime]) -> None:
     bucket["post_reinforce_exposures"] = {session: records for session, records in kept.items() if records}
 
 
+def _t4_bucket() -> Dict[str, Any]:
+    return {
+        "adjudicated_tp": 0,
+        "adjudicated_fp": 0,
+        "caught": 0,
+        "leaked": 0,
+        "contested": 0,
+        "sessions": set(),
+        "repos": set(),
+        "post_reinforce_exposures": {},
+        "last_ts": None,
+        "first_seen": None,
+    }
+
+
+def _fold_adjudication(b: Dict[str, Any], label: Mapping[str, Any]) -> Optional[datetime]:
+    """Fold a label from the reviewed BASE, never a ledger adjudication row."""
+    b["adjudicated_tp" if label["verdict"] == "tp" else "adjudicated_fp"] += 1
+    b["sessions"].update([label["session"]] if label.get("session") else [])
+    b["repos"].update([label["repo"]] if label.get("repo") else [])
+    stamp = parse_utc(label.get("ts"), lenient=True)
+    return stamp
+
+
+def _fold_detection(
+    b: Dict[str, Any], raw: Mapping[str, Any], rid: str,
+    active_detections: Dict[Tuple[str, str, str, str], str], seen_at: Optional[datetime],
+) -> None:
+    ts = raw.get("ts")
+    disp = str(raw.get("disposition") or "")
+    # One unit per introducing commit (the PR), as replay and credit.record_detection key it.
+    d_key = (rid, str(raw.get("file") or ""), str(raw.get("pattern") or ""), str(raw.get("rev") or ""))
+    prev_disp = active_detections.get(d_key)
+    if prev_disp == "caught":
+        b["caught"] = max(0, b["caught"] - 1)
+    elif prev_disp == "leaked":
+        b["leaked"] = max(0, b["leaked"] - 1)
+    if disp in ("caught", "leaked"):
+        active_detections[d_key] = disp
+    if disp == "caught":
+        b["caught"] += 1
+        _reinforce(b, seen_at)
+    elif disp == "leaked":
+        b["leaked"] += 1
+    if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
+        b["last_ts"] = ts
+
+
+def _finish_t4_bucket(
+    b: Dict[str, Any], rule_obj: Any, labels: Iterable[Mapping[str, Any]], moment: datetime,
+) -> None:
+    stamps: List[datetime] = []
+    reinforced: Optional[datetime] = None
+    for label in labels:
+        stamp = _fold_adjudication(b, label)
+        if stamp is not None:
+            stamps.append(stamp)
+            if label["verdict"] == "tp" and (reinforced is None or stamp > reinforced):
+                reinforced = stamp
+    scoped_or_trap = bool(getattr(rule_obj, "target_paths", None)) or getattr(rule_obj, "type", "") == "trap"
+    # A merged tp label reinforces the rule as of its ts: only exposures after it decay it.
+    windows = [[r for r in records if reinforced is None or (r[2] is not None and r[2] > reinforced)]
+               for records in b["post_reinforce_exposures"].values()]
+    b["eligible_sessions"] = sum(
+        1 for records in windows
+        if records and all(hb for hb, _, _ in records)
+        and (not scoped_or_trap or all(sb in (None, "", "match") for _, sb, _ in records))
+    )
+    b["days_span"] = (max(stamps) - min(stamps)).total_seconds() / 86400.0 if stamps else 0.0
+    # Trigger volume is measured from the ledger, never from branch-editable frontmatter (H6).
+    b["observed_days"] = (moment - b["first_seen"]).total_seconds() / 86400.0 if b["first_seen"] else None
+
+
 def _collect_t4_events_for_rules(
     workspace: Any, rules: Sequence[Any], now: Optional[datetime] = None, *, proj_credits: Any = None,
     adjudications: Any = None, raw_rows: Optional[Sequence[Any]] = None,
@@ -258,21 +331,7 @@ def _collect_t4_events_for_rules(
     from aegis_core.storage import read_jsonl
     from aegis_core.telemetry_engine import ledger
     rule_map = {r.id: r for r in rules}
-    info: Dict[str, Dict[str, Any]] = {
-        r.id: {
-            "adjudicated_tp": 0,
-            "adjudicated_fp": 0,
-            "caught": 0,
-            "leaked": 0,
-            "contested": 0,
-            "sessions": set(),
-            "repos": set(),
-            "post_reinforce_exposures": {},
-            "last_ts": None,
-            "first_seen": None,
-        }
-        for r in rules
-    }
+    info = {r.id: _t4_bucket() for r in rules}
     if raw_rows is None:
         try:
             raw_rows = read_jsonl(ledger.ledger_path(workspace)).rows
@@ -301,23 +360,7 @@ def _collect_t4_events_for_rules(
             if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
                 b["last_ts"] = ts
         elif ev == "detection":
-            disp = str(raw.get("disposition") or "")
-            # One unit per introducing commit (the PR), as replay and credit.record_detection key it.
-            d_key = (rid, str(raw.get("file") or ""), str(raw.get("pattern") or ""), str(raw.get("rev") or ""))
-            prev_disp = active_detections.get(d_key)
-            if prev_disp == "caught":
-                b["caught"] = max(0, b["caught"] - 1)
-            elif prev_disp == "leaked":
-                b["leaked"] = max(0, b["leaked"] - 1)
-            if disp in ("caught", "leaked"):
-                active_detections[d_key] = disp
-            if disp == "caught":
-                b["caught"] += 1
-                _reinforce(b, seen_at)
-            elif disp == "leaked":
-                b["leaked"] += 1
-            if isinstance(ts, str) and ts and (b["last_ts"] is None or ts > b["last_ts"]):
-                b["last_ts"] = ts
+            _fold_detection(b, raw, rid, active_detections, seen_at)
         elif ev == "override":
             b["contested"] += 1
         elif ev == "exposure" and raw.get("session"):
@@ -331,29 +374,7 @@ def _collect_t4_events_for_rules(
     labels_by_rule = getattr(adjudications, "by_rule", None) or {}
     for rid, b in info.items():
         rule_obj = rule_map[rid]
-        stamps: List[datetime] = []
-        reinforced: Optional[datetime] = None
-        for label in labels_by_rule.get(rid, ()):
-            b["adjudicated_tp" if label["verdict"] == "tp" else "adjudicated_fp"] += 1
-            b["sessions"].update([label["session"]] if label.get("session") else [])
-            b["repos"].update([label["repo"]] if label.get("repo") else [])
-            stamp = parse_utc(label.get("ts"), lenient=True)
-            if stamp is not None:
-                stamps.append(stamp)
-                if label["verdict"] == "tp" and (reinforced is None or stamp > reinforced):
-                    reinforced = stamp
-        scoped_or_trap = bool(getattr(rule_obj, "target_paths", None)) or getattr(rule_obj, "type", "") == "trap"
-        # A merged tp label reinforces the rule as of its ts: only exposures after it decay it.
-        windows = [[r for r in records if reinforced is None or (r[2] is not None and r[2] > reinforced)]
-                   for records in b["post_reinforce_exposures"].values()]
-        b["eligible_sessions"] = sum(
-            1 for records in windows
-            if records and all(hb for hb, _, _ in records)
-            and (not scoped_or_trap or all(sb in (None, "", "match") for _, sb, _ in records))
-        )
-        b["days_span"] = (max(stamps) - min(stamps)).total_seconds() / 86400.0 if stamps else 0.0
-        # Trigger volume is measured from the ledger, never from branch-editable frontmatter (H6).
-        b["observed_days"] = (moment - b["first_seen"]).total_seconds() / 86400.0 if b["first_seen"] else None
+        _finish_t4_bucket(b, rule_obj, labels_by_rule.get(rid, ()), moment)
     return info
 
 

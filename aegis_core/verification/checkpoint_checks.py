@@ -274,6 +274,8 @@ def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_
         candidates.append(test_dir / "test_mcp_protocol_hygiene.py")
     if stem == "tools":
         candidates.append(test_dir / "test_mcp_tools_contract.py")
+    if top_dir == "aegis_mcp" and stem == "schemas":
+        candidates.append(test_dir / "unit" / "mcp" / "test_mcp_registry.py")
     if parent_name == "skills" or stem in ("slots", "skills"):
         candidates.append(test_dir / "test_skills.py")
     if parent_name == "handlers" or stem in ("registry", "projection"):
