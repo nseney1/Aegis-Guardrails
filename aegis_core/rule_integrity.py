@@ -67,7 +67,7 @@ def _origin_merge_base(root: str) -> str:
     # Constant refs need no option guard, and one merge-base resolves both: a failure (no
     # origin/HEAD, no common history, not a repository) means no origin anchor.
     try:
-        res = gitsafe.run(["merge-base", "refs/remotes/origin/HEAD", "HEAD"], root)
+        res = gitsafe.run(["merge-base", gitevidence.ORIGIN_HEAD, "HEAD"], root)
     except gitsafe.GitError:
         return ""
     return os.fsdecode(res.stdout.strip()) if res.returncode == 0 else ""

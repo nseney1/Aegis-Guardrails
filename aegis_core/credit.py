@@ -699,13 +699,13 @@ def approval_lookup(
     look = landed or landed_lookup(root)
     checks = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
     cache: Dict[str, bool] = {}
-    anchor: List[Optional[Tuple[str, str]]] = []
+    anchor: List[Optional[Tuple[str, str, str]]] = []
 
-    def protected_tip() -> Optional[Tuple[str, str]]:
+    def protected_tip() -> Optional[Tuple[str, str, str]]:
         if not anchor:
             p_branch = branch if branch is not None else resolve_protected_branch(root)
             refs = (f"refs/remotes/origin/{p_branch}", f"refs/heads/{p_branch}") if p_branch and top else ()
-            anchor.append(next(((p_branch, r) for r in refs if gitsafe.resolve_commit(top, r)), None))
+            anchor.append(next(((p_branch, r, oid) for r in refs if (oid := gitsafe.resolve_commit(top, r))), None))
         return anchor[0]
 
     def is_approved(check_id: str, _categories: Sequence[str] = ()) -> bool:
@@ -718,12 +718,11 @@ def approval_lookup(
         tip = protected_tip() if commit and isinstance(base_ref, str) and _OID.fullmatch(base_ref) else None
         ok = False
         if top is not None and tip is not None:
-            p_branch, tip_ref = tip
+            p_branch, tip_ref, tip_oid = tip
             try:
                 signers = _last_signers_change(top, tip_ref)
-                if (signers is not None
-                        and gitsafe.run(["merge-base", "--is-ancestor", base_ref, tip_ref], top).returncode == 0
-                        and gitsafe.run(["merge-base", "--is-ancestor", signers, base_ref], top).returncode == 0):
+                if (signers is not None and gitevidence.is_ancestor_at(top, base_ref, tip_oid)
+                        and gitevidence.is_ancestor_at(top, signers, base_ref)):
                     gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
                     tips = [commit, f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}", "HEAD"]
                     ok = any(
@@ -882,10 +881,9 @@ def verify_commit_trailers(
     if not mb or not tip or tip == mb:
         return []
     msg = gitsafe.run(["log", "-1", "--format=%B", tip], top)
-    tree_res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{tip}^{{tree}}"], top)
-    if msg.returncode != 0 or tree_res.returncode != 0:
+    commit_tree = gitevidence.commit_tree(top, tip)
+    if msg.returncode != 0 or commit_tree is None:
         return [{"commit": tip, "result": "unbound", "failed": False, "reason": "git could not read the head commit"}]
-    commit_tree = tree_res.stdout.decode("ascii", "replace").strip()
     trailers = [t for line in msg.stdout.decode("utf-8", "replace").splitlines() if (t := parse_trailer(line)) is not None]
     reruns: List[Mapping[str, Any]] = []
 

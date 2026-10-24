@@ -362,12 +362,11 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
 def _void_lane_tree(root: str, head: str) -> None:
     """A failed integrity gate voids the credit of the lane head's tree; bookkeeping never changes
     the gate's exit code, so a failure is one stderr note."""
-    from aegis_core import credit, gitsafe
+    from aegis_core import credit, gitevidence, gitsafe
     from aegis_core.errors import AegisError
 
     try:
-        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{head}^{{tree}}"], root)
-        tree = res.stdout.decode("ascii", "replace").strip() if res.returncode == 0 else ""
+        tree = gitevidence.commit_tree(root, head)
         if not tree:
             raise gitsafe.GitError(f"cannot read the tree of {head[:12]}")
         credit.void_tree(root, tree, "lane_integrity")

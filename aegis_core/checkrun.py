@@ -44,7 +44,7 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
-from aegis_core import gitsafe, governance, treeid
+from aegis_core import gitevidence, gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.config import read_user_config
 from aegis_core.primitives import is_within, utc_stamp
@@ -528,10 +528,9 @@ def rerun_commit_snapshot(
     if commit is None:
         return {"tree": "", "exit": 1}
     try:
-        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}"], top)
-        if res.returncode != 0:
+        commit_tree = gitevidence.commit_tree(top, commit)
+        if commit_tree is None:
             return {"tree": "", "inconclusive": True, "reason": f"could not read the tree of {commit[:12]}"}
-        commit_tree = res.stdout.decode("ascii", "replace").strip()
         base_commit = gitsafe.merge_base(top, base_ref, commit)
         if not base_commit:
             return {"tree": "", "inconclusive": True, "reason": f"found no merge-base with {commit[:12]}"}

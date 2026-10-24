@@ -18,8 +18,8 @@ from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from aegis_core import gitsafe
 
-__all__ = ["RepoFacts", "branch_tips", "commits", "fetch_age", "is_ancestor", "merge_base_with", "protected_branch",
-           "repo_facts"]
+__all__ = ["RepoFacts", "branch_tips", "commit_tree", "commits", "fetch_age", "is_ancestor", "is_ancestor_at",
+           "merge_base_with", "protected_branch", "repo_facts"]
 
 ORIGIN_HEAD = "refs/remotes/origin/HEAD"
 _PROBED = (ORIGIN_HEAD, "refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master")
@@ -61,6 +61,7 @@ class _Lru:
 
 _MERGE_BASES = _Lru(256)
 _COMMITS = _Lru(4)  # a 5,000-commit list is about 1.1 MB
+_TREES = _Lru(1024)
 _ANCESTORS: "set[Tuple[str, str, str]]" = set()
 _MAX_ANCESTORS = 20_000
 
@@ -68,6 +69,7 @@ _MAX_ANCESTORS = 20_000
 def _reset_for_tests() -> None:
     _MERGE_BASES.items.clear()
     _COMMITS.items.clear()
+    _TREES.items.clear()
     _ANCESTORS.clear()
 
 
@@ -186,16 +188,43 @@ def commits(facts: Optional[RepoFacts], tips: Sequence[str], limit: int) -> Tupl
     return result
 
 
+def commit_tree(cwd: Any, commit: Any) -> Optional[str]:
+    """The tree of ``commit`` (a full object id) in the repository at ``cwd``, or None when git names
+    none (or ``commit`` is anything else, which never reaches git). Raises GitError when git cannot
+    run. Only an answer is remembered: a commit's tree never changes, a missing commit may be fetched."""
+    if not (isinstance(commit, str) and _FULL_OID.fullmatch(commit)):
+        return None
+    key = (os.path.realpath(cwd), commit)
+    found = _TREES.get(key)
+    if found is None:
+        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}"], cwd)
+        text = os.fsdecode(res.stdout.strip()) if res.returncode == 0 else ""
+        found = text if _FULL_OID.fullmatch(text) else None
+        if found:
+            _TREES.put(key, found)
+    return found
+
+
 def is_ancestor(facts: Optional[RepoFacts], ancestor: Any, descendant: Any) -> bool:
     """Whether ``ancestor`` is an ancestor of ``descendant``. Only full object ids reach git (a
     ledger row names them, and ledger rows are agent-writable); only a yes is remembered."""
-    if facts is None or not all(isinstance(v, str) and _FULL_OID.fullmatch(v) for v in (ancestor, descendant)):
+    return facts is not None and _ancestry(facts.top or facts.common_dir, _key(facts), ancestor, descendant)
+
+
+def is_ancestor_at(cwd: Any, ancestor: Any, descendant: Any) -> bool:
+    """``is_ancestor`` for a caller that holds no RepoFacts (which cost three git calls to read), in
+    the repository at ``cwd``; the same rules."""
+    return _ancestry(cwd, (os.path.realpath(cwd),), ancestor, descendant)
+
+
+def _ancestry(cwd: Any, where: Tuple[Any, ...], ancestor: Any, descendant: Any) -> bool:
+    if not all(isinstance(v, str) and _FULL_OID.fullmatch(v) for v in (ancestor, descendant)):
         return False
-    key = _key(facts, ancestor, descendant)
+    key = (*where, ancestor, descendant)
     if key in _ANCESTORS:
         return True
     try:
-        res = gitsafe.run(["merge-base", "--is-ancestor", ancestor, descendant], facts.top or facts.common_dir)
+        res = gitsafe.run(["merge-base", "--is-ancestor", ancestor, descendant], cwd)
     except gitsafe.GitError:
         return False
     if res.returncode != 0:
