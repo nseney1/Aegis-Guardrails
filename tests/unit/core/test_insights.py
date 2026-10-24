@@ -817,31 +817,49 @@ posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and m
 
 @posix_only
 def test_a_link_swapped_in_after_the_check_is_never_chmodded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Given ~/.aegis checked as a directory, When a link to another directory replaces it before
-    its mode is set, Then the link's target keeps its mode."""
+    """Given ~/.aegis a directory, When a link to another directory replaces it at the first look
+    before its mode is set (the mkdir that finds it, an lstat or the descriptor open), Then the
+    link is refused and its target keeps its mode."""
     home = tmp_path / "home"
     aegis = home / ".aegis"
     aegis.mkdir(parents=True, mode=0o755)
     victim = tmp_path / "victim"
     victim.mkdir()
     os.chmod(victim, 0o755)
-    real_lstat, swapped = os.lstat, []
+    real_mkdir, real_lstat, real_open, swapped = Path.mkdir, os.lstat, os.open, []
 
-    def lstat_then_swap(path, *args, **kwargs):
-        found = real_lstat(path, *args, **kwargs)
+    def swap(path) -> None:
         if os.fspath(path) == str(aegis) and not swapped:
             swapped.append(True)
             os.rename(aegis, tmp_path / "moved")
             os.symlink(victim, aegis)
+
+    def mkdir_then_swap(self, *args, **kwargs):
+        try:
+            return real_mkdir(self, *args, **kwargs)
+        finally:
+            swap(self)
+
+    def lstat_then_swap(path, *args, **kwargs):
+        found = real_lstat(path, *args, **kwargs)
+        swap(path)
         return found
 
+    def swap_then_open(path, *args, **kwargs):
+        swap(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_swap)
     monkeypatch.setattr(os, "lstat", lstat_then_swap)
+    monkeypatch.setattr(os, "open", swap_then_open)
+    refused = False
     try:
         create_link_key(home)
     except PathTraversalError:
-        pass
+        refused = True
+    assert swapped, "no link was swapped in: the test no longer reaches the step that sets the mode"
     assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755
-    assert not (victim / "link.key").exists()
+    assert not (victim / "link.key").exists() and refused
 
 
 @posix_only
