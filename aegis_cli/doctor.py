@@ -99,7 +99,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import io
 import json
@@ -113,6 +113,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
+from aegis_core.primitives import is_within, real_key
 
 __all__ = ["run_doctor", "DoctorCommand", "probe_mcp_launcher", "SCHEMA", "V3_SHIPPED_RULE_SHA256"]
 
@@ -153,8 +154,8 @@ def _is_home(root: Path) -> bool:
     from aegis_core.workspace.layout import UserLayout
 
     layout = UserLayout.current()
-    key = _root_key(root)
-    return layout is not None and key is not None and key == _root_key(layout.home)
+    key = real_key(root)
+    return layout is not None and key is not None and key == real_key(layout.home)
 
 
 def _setup_command(root: Path) -> str:
@@ -352,8 +353,7 @@ def _check_mcp_launcher(path_env: Optional[str] = None, workspace: Optional[Path
     where = ""
     if len(current) == 1 and workspace is not None:
         # The script's directory, not the script: a version manager's link resolves elsewhere.
-        key, fence = _root_key(Path(current[0]).parent), _root_key(workspace)
-        if key and fence and (key == fence or key.startswith(fence.rstrip(os.sep) + os.sep)):
+        if is_within(Path(current[0]).parent, workspace, unresolvable=True):  # the cautious label
             where = ", inside the workspace"
     if len(current) == 1:
         print(f"  {'⚠️ ' if problems else '✅'} MCP launcher: {current[0]}{where} (what aegis init --host registers)")
@@ -513,10 +513,6 @@ def _run_host_cli(argv: Sequence[str], cwd: str, timeout: float) -> "subprocess.
     """The one place doctor starts a host CLI: an argv (no shell), no stdin, bounded in time."""
     return subprocess.run(list(argv), cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, errors="replace", timeout=timeout, env=_child_env())
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _aegis_version() -> str:
@@ -765,7 +761,7 @@ from aegis_cli.doctor_findings import (  # noqa: E402
     _home_rules_finding, _hook_files, _hook_findings, _hook_row, _hook_tier_text, _host_row, _identity,
     _instruction_files, _instructions, _is_legacy_handler, _key_finding, _legacy_block_findings,
     _legacy_hook_findings, _legacy_items, _legacy_ranges, _level, _list_location, _location, _mcp_findings,
-    _mcp_loads, _path_key, _program_name, _prose, _registered_roots, _removed_host_phases, _root_key,
+    _mcp_loads, _path_key, _program_name, _prose, _registered_roots, _removed_host_phases,
     _runnable, _selection, _tiers, _upgrade_findings, _v3_copy_findings, _workspace_findings,
     _worktree_ledger_findings,
 )
@@ -778,7 +774,7 @@ from aegis_cli.doctor_repair import (  # noqa: E402
     _Change, _Diagnosis, _File, _Refused, _apply, _backup_root, _claude_config, _claude_dir,
     _claude_project_keys, _claude_user_registered, _current_bytes, _desktop_configs, _diagnose,
     _dump_like, _host_json_path, _missing_ast_extensions, _names, _parse_json, _plan, _probe_claude,
-    _probe_json_host, _read_file, _reject_constant, _server_entry, _state_modes, _strict_pairs,
+    _probe_json_host, _read_file, _server_entry, _state_modes,
     _without_keys, _without_lines, _without_list_items, _write_manifest, _write_refusal,
 )
 

@@ -11,6 +11,7 @@ from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
+from aegis_core.primitives import utc_stamp
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
 from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -66,7 +67,7 @@ def _origin_merge_base(root: str) -> str:
     # Constant refs need no option guard, and one merge-base resolves both: a failure (no
     # origin/HEAD, no common history, not a repository) means no origin anchor.
     try:
-        res = gitsafe.run(["merge-base", "refs/remotes/origin/HEAD", "HEAD"], root)
+        res = gitsafe.run(["merge-base", gitevidence.ORIGIN_HEAD, "HEAD"], root)
     except gitsafe.GitError:
         return ""
     return os.fsdecode(res.stdout.strip()) if res.returncode == 0 else ""
@@ -540,13 +541,12 @@ class CiReport:
         return self.approval is not None and self.approval.valid
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
-        from datetime import datetime, timezone
         from aegis_core._version import __version__
 
         return {
             "source": SOURCE,
             "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "checked_at": utc_stamp(),
             "scope": {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
@@ -659,6 +659,7 @@ def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tu
     return tuple(found)
 
 
+@gitsafe.scrubbed()
 def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None) -> CiReport:
     """``pull_request`` (a ``human_gate.PullRequest``): with no signed approval, tier A's approving
     review of that pull request's head may approve instead, and only when the head under check is it."""

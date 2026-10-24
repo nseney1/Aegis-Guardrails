@@ -1,12 +1,13 @@
 """aegis_scan: the rules that apply to the files about to change."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 from pathlib import PurePath
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from aegis_core import hosts
+from aegis_core.primitives import parse_utc
 from aegis_core.scan import scan, scan_user_layer
 from aegis_core.skills.slots import render_scan_result
 from aegis_mcp.registry import _STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, _get_workspace
@@ -75,8 +76,9 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
     except Exception as exc:  # telemetry only: never fail the scan
         print(f"aegis-mcp: scan event not recorded: {exc}", file=sys.stderr)
         return
-    stamp = datetime.strptime(row["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    remember_bounded(_RECORDED, key, stamp, _MAX_RECORDED)
+    stamp = parse_utc(row["ts"])
+    if stamp is not None:
+        remember_bounded(_RECORDED, key, stamp, _MAX_RECORDED)
 
 
 def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List[str]] = None) -> None:

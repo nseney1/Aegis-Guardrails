@@ -77,6 +77,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core import hosts as host_table
 from aegis_core.config import ENV_CLIENT, ENV_WORKSPACE
 from aegis_core.pathlookup import which
+from aegis_core.primitives import DuplicateKeyError, real_key, strict_loads, utc_stamp
 from aegis_core.storage import atomic_write_bytes
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
@@ -192,24 +193,30 @@ def _writable_dir(path: Path, *, creating: bool) -> None:
                            "writable directory); left unchanged")
 
 
-def _preflight(path: Path, expected: Optional[bytes]) -> None:
-    """Every check a write of ``path`` makes before it changes a byte. A dry run (init's
-    check pass) runs exactly these, so whatever the write would refuse is refused first."""
-    if _check_target(path) is not None and _is_read_only(path):
+def _preflight(path: Path, expected: Optional[bytes]) -> Optional[os.stat_result]:
+    """Every check a write of ``path`` makes before it changes a byte, and the lstat it checked
+    (None: missing). A dry run (init's check pass) runs exactly these, so whatever the write
+    would refuse is refused first."""
+    checked = _check_target(path)
+    if checked is not None and _is_read_only(path):
         raise InstallError(f"{path}: is read-only; left unchanged. Make it writable, then re-run.")
     _writable_dir(path, creating=expected is None)
     if _read(path) != expected:
         raise InstallError(f"{path}: changed while Aegis was updating it; left unchanged. Re-run.")
+    return checked
 
 
 def _replace(path: Path, expected: Optional[bytes], data: bytes, *, dry_run: bool = False) -> None:
     """Atomically write ``data`` if ``path`` still holds ``expected`` (None: still missing);
     with ``dry_run`` only check that it could."""
-    _preflight(path, expected)
+    checked = _preflight(path, expected)
     if dry_run:
         return
+    # The checked mode, not the replaced name's: a file swapped for a link after the check would
+    # otherwise come back with a new file's bits (a 0600 config as 0644).
+    mode = None if checked is None else stat.S_IMODE(checked.st_mode)
     try:
-        atomic_write_bytes(path, data, follow_links=False)
+        atomic_write_bytes(path, data, mode=mode, follow_links=False)
     except OSError as exc:
         raise InstallError(f"{path}: cannot be written ({exc.strerror or exc}); left unchanged") from exc
 
@@ -396,19 +403,6 @@ def has_block_marker(path: Union[str, Path], block_id: str) -> bool:
 
 # ── JSON configs ─────────────────────────────────────────────────────────────
 
-def _reject_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    seen: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in seen:
-            raise ValueError(f"duplicate key {key!r}")
-        seen[key] = value
-    return seen
-
-
-def _reject_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not valid JSON")
-
-
 def _load_json_object(path: Path) -> Tuple[Optional[bytes], Dict[str, Any]]:
     """(raw bytes or None, the JSON object in ``path``); refuses anything it cannot round-trip."""
     raw = _read(path)
@@ -420,16 +414,17 @@ def _load_json_object(path: Path) -> Tuple[Optional[bytes], Dict[str, Any]]:
     if not text.strip():
         return raw, {}
     try:
-        data = json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
+        data = strict_loads(text)
     except json.JSONDecodeError as exc:
         raise InstallError(
             f"{path}: is not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno}); left unchanged. "
             "Comments and trailing commas are not supported: fix the file or move it aside, then re-run."
         ) from exc
     except (ValueError, RecursionError) as exc:
-        message = str(exc)
-        if "duplicate key" not in message:
-            message = f"is not valid JSON ({message})"
+        # NaN, Infinity and a number such as 1e999 (json reads it as inf) could only be written back as
+        # the non-JSON literal Infinity, which the next init would refuse.
+        message = str(exc) if isinstance(exc, DuplicateKeyError) else \
+            f"is not valid JSON ({exc}), which cannot be written back as JSON"
         raise InstallError(f"{path}: {message}; left unchanged. Fix the file, then re-run.") from exc
     if not isinstance(data, dict):
         raise InstallError(f"{path}: must hold a JSON object; left unchanged")
@@ -441,11 +436,6 @@ def _load_json_object(path: Path) -> Tuple[Optional[bytes], Dict[str, Any]]:
         raise InstallError(f"{path}: holds an unpaired surrogate escape "
                            f"({exc.object[exc.start:exc.end].encode('unicode_escape').decode()}) that cannot be "
                            "written back as UTF-8; left unchanged. Fix the file, then re-run.") from exc
-    except ValueError as exc:
-        # json.loads reads a number such as 1e999 as inf without calling parse_constant;
-        # dumped, it would be the non-JSON literal Infinity.
-        raise InstallError(f"{path}: holds a number too large for a float (such as 1e999), which "
-                           "cannot be written back as JSON; left unchanged. Fix the file, then re-run.") from exc
     return raw, data
 
 
@@ -542,31 +532,18 @@ def remove_mcp_json(path: Union[str, Path], names: Sequence[str], *, key: str = 
 
 # ── Workspace registry ───────────────────────────────────────────────────────
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _root_key(root: Union[str, Path]) -> str:
-    return os.path.normcase(os.path.realpath(os.fspath(root)))
-
-
 def _stored_key(root: str) -> Optional[str]:
     """The key of a root read from the registry, or None for one the server's reader skips:
     a relative root would resolve against the current directory, and the server cannot
-    resolve a NUL byte (realpath itself returns it as given on Windows Python 3.12+,
-    gh-106242). Such an entry never matches, and stays in the file as it is."""
-    if not os.path.isabs(root) or "\x00" in root:
-        return None
-    try:
-        return _root_key(root)
-    except (OSError, ValueError):
-        return None
+    resolve a NUL byte. Such an entry never matches (a None key equals nothing), and stays
+    in the file as it is."""
+    return real_key(root) if os.path.isabs(root) else None
 
 
 def is_denied_root(root: Union[str, Path], home: Union[str, Path]) -> bool:
     """True for the home directory and a filesystem root: never a workspace (AD-4)."""
-    real = os.path.realpath(os.fspath(root))
-    return _root_key(real) == _root_key(home) or os.path.dirname(real) == real
+    key = real_key(root)  # one that cannot be resolved is never a workspace either
+    return key is None or key == real_key(home) or os.path.dirname(key) == key
 
 
 def _registry_file(home: Union[str, Path]) -> Path:
@@ -644,11 +621,13 @@ def _update_registry(home: Union[str, Path], root: Union[str, Path], hosts: Sequ
                      dry_run: bool, now: Optional[str]) -> str:
     path = _registry_file(home)
     raw, data = _load_registry(path)
-    key = _root_key(root)
+    key = real_key(root)
+    if key is None:
+        raise InstallError(f"{root}: cannot be resolved, so it cannot be registered; left unchanged")
     entries = data["workspaces"]
     entry = next((e for e in entries if _stored_key(e["root"]) == key), None)
     if entry is None:
-        entries.append({"root": os.path.realpath(os.fspath(root)), "added_at": now or _utc_now(),
+        entries.append({"root": os.path.realpath(os.fspath(root)), "added_at": now or utc_stamp(),
                         "added_by": "aegis init", "hosts": ordered_hosts(hosts)})
         status = "added"
     else:
@@ -667,8 +646,8 @@ def unregister_workspace(home: Union[str, Path], root: Union[str, Path], *,
     """Remove ``root`` from the registry; (``removed`` or ``absent``, the remaining entries)."""
     path = _registry_file(home)
     raw, data = _load_registry(path)
-    key = _root_key(root)
-    remaining = [e for e in data["workspaces"] if _stored_key(e["root"]) != key]
+    key = real_key(root)
+    remaining = [e for e in data["workspaces"] if key is None or _stored_key(e["root"]) != key]
     if len(remaining) == len(data["workspaces"]):
         return "absent", remaining
     data["workspaces"] = remaining
@@ -682,8 +661,8 @@ def workspace_hosts(entry: Optional[Dict[str, Any]]) -> List[str]:
 
 
 def find_workspace(registry: Dict[str, Any], root: Union[str, Path]) -> Optional[Dict[str, Any]]:
-    key = _root_key(root)
-    return next((e for e in registry.get("workspaces", []) if _stored_key(e["root"]) == key), None)
+    key = real_key(root)
+    return next((e for e in registry.get("workspaces", []) if key is not None and _stored_key(e["root"]) == key), None)
 
 
 # ── Hosts ────────────────────────────────────────────────────────────────────

@@ -1458,3 +1458,154 @@ def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp
     with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
         gitsafe.run(["--version"], tmp_path)
     assert not marker.exists()
+
+
+# ── scrubbed(): evidence ignores the caller's local GIT_* variables (R-trust-19) ──
+
+_LOCAL_GIT_ENV = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                  "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+                  "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+                  "GIT_SHALLOW_FILE", "GIT_COMMON_DIR")
+_KEPT_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Author", "GIT_COMMITTER_EMAIL": "c@example.com",
+                 "GIT_SSH_COMMAND": "ssh -o BatchMode=yes", "GIT_SSH": "ssh", "GIT_EXEC_PATH": "/opt/git-core",
+                 "GIT_CONFIG_SYSTEM": "/etc/none"}
+
+
+def _env_spy(monkeypatch):
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", fake_run)
+    return seen
+
+
+def test_scrubbed_drops_exactly_the_local_variables_git_lists(fake_home, tmp_path, monkeypatch):
+    """Given the 15 local variables and the identity, SSH and config-scope ones, when git runs inside
+    scrubbed(), then none of the 15 reach it and the rest do unchanged; outside, all of them do."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(fake_home / ".gitconfig"))
+    for name in _LOCAL_GIT_ENV:
+        monkeypatch.setenv(name, str(tmp_path / name.lower()))
+    for name, value in _KEPT_GIT_ENV.items():
+        monkeypatch.setenv(name, value)
+    seen = _env_spy(monkeypatch)
+    with gitsafe.scrubbed():
+        gitsafe.run(["rev-parse", "HEAD"], tmp_path)
+    gitsafe.run(["rev-parse", "HEAD"], tmp_path)
+    inside, outside = seen
+    assert not {k for k in inside if k in _LOCAL_GIT_ENV} - {"GIT_NO_REPLACE_OBJECTS"}
+    assert inside["GIT_NO_REPLACE_OBJECTS"] == "1"  # gitsafe's own setting, not the caller's
+    assert {k: inside[k] for k in _KEPT_GIT_ENV} == _KEPT_GIT_ENV
+    assert inside["GIT_CONFIG_GLOBAL"] == str(fake_home / ".gitconfig")
+    assert all(outside[k] == str(tmp_path / k.lower()) for k in _LOCAL_GIT_ENV if k != "GIT_NO_REPLACE_OBJECTS")
+    assert {k: outside[k] for k in _KEPT_GIT_ENV} == _KEPT_GIT_ENV
+    assert "scrubbed" in gitsafe.__all__
+
+
+def test_scrubbed_matches_names_whatever_their_case(fake_home, tmp_path, monkeypatch):
+    """Windows environment names are case-insensitive: a lower-case git_dir is still GIT_DIR."""
+    monkeypatch.setattr(gitsafe.os, "environ", {"PATH": os.environ["PATH"], "git_dir": str(tmp_path),
+                                                "Git_Index_File": "x", "HOME": str(fake_home)})
+    seen = _env_spy(monkeypatch)
+    with gitsafe.scrubbed():
+        gitsafe.run(["rev-parse", "HEAD"], tmp_path)
+    assert "git_dir" not in seen[0] and "Git_Index_File" not in seen[0] and seen[0]["HOME"] == str(fake_home)
+
+
+def test_an_explicit_index_still_wins_inside_scrubbed(repo, fake_home, tmp_path, monkeypatch):
+    """export_tree's own GIT_INDEX_FILE beats an ambient one pointing at a missing file."""
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "missing" / "index"))
+    dest = tmp_path / "out"
+    with gitsafe.scrubbed():
+        gitsafe.export_tree(repo, "HEAD", dest)
+    assert sorted(p.name for p in dest.iterdir()) == [".gitignore", "a.py", "b.py", "gone.py"]
+
+
+def test_a_hook_index_is_still_read_outside_scrubbed(repo, fake_home, tmp_path, monkeypatch):
+    """GUARD: git hands a hook its index in GIT_INDEX_FILE; the default run keeps it."""
+    index = tmp_path / "hook-index"
+    shutil.copy2(str(repo / ".git" / "index"), str(index))
+    (repo / "staged_only.py").write_bytes(b"x = 1\n")
+    subprocess.run(["git", "add", "staged_only.py"], cwd=str(repo), check=True, capture_output=True,
+                   env=dict(os.environ, GIT_INDEX_FILE=str(index)))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(index))
+    seen = []
+    real = gitsafe.subprocess.run
+
+    def spy(argv, **kwargs):
+        seen.append(kwargs["env"].get("GIT_INDEX_FILE"))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", spy)
+    assert gitsafe.changed_files(repo, "staged") == ["staged_only.py"]
+    assert str(index) in seen
+    monkeypatch.delenv("GIT_INDEX_FILE")
+    assert gitsafe.changed_files(repo, "staged") == []
+
+
+def test_the_scrub_ends_with_its_block_even_on_an_exception_and_nests(fake_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_INDEX_FILE", "ambient")
+    seen = _env_spy(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with gitsafe.scrubbed():
+            raise RuntimeError("boom")
+    gitsafe.run(["status"], tmp_path)
+    with gitsafe.scrubbed():
+        with gitsafe.scrubbed():
+            pass
+        gitsafe.run(["status"], tmp_path)
+    gitsafe.run(["status"], tmp_path)
+    assert [env.get("GIT_INDEX_FILE") for env in seen] == ["ambient", None, "ambient"]
+
+
+def test_scrubbed_decorates_a_function(fake_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_DIR", "ambient")
+    seen = _env_spy(monkeypatch)
+
+    @gitsafe.scrubbed()
+    def evidence():
+        gitsafe.run(["status"], tmp_path)
+
+    evidence()
+    evidence()
+    gitsafe.run(["status"], tmp_path)
+    assert [env.get("GIT_DIR") for env in seen] == [None, None, "ambient"]
+
+
+def test_a_memoized_answer_under_an_ambient_git_dir_is_not_served_to_a_scrubbed_call(fake_home, tmp_path,
+                                                                                    monkeypatch):
+    a, b = _repo(tmp_path / "a"), _repo(tmp_path / "b")
+    monkeypatch.setenv("GIT_DIR", str(b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(b))
+    with gitsafe.memo():
+        ambient = gitsafe.toplevel(a)
+        with gitsafe.scrubbed():
+            scrubbed = gitsafe.toplevel(a)
+        again = gitsafe.toplevel(a)
+    assert os.path.samefile(ambient, b) and os.path.samefile(again, b)
+    assert os.path.samefile(scrubbed, a)
+
+
+# ── read_blob: a malformed size is git's error, as in blob_sizes and read_blobs (w10 carry) ──
+
+@pytest.mark.parametrize("size", [b"12x", b"1.5", b"-1"], ids=["letters", "fraction", "negative"])
+def test_read_blob_refuses_a_cat_file_header_whose_size_is_not_a_number(repo: Path, monkeypatch, size):
+    real = gitsafe.subprocess.run
+
+    def bad_header(argv, **kwargs):
+        res = real(argv, **kwargs)
+        if "cat-file" in argv and res.returncode == 0:
+            oid = res.stdout.split(b" ", 1)[0]
+            return subprocess.CompletedProcess(argv, 0, oid + b" blob " + size + b"\nx", b"")
+        return res
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", bad_header)
+    with pytest.raises(gitsafe.GitError):
+        gitsafe.read_blob(repo, "HEAD", "a.py")
+
+
+def test_read_blob_still_reads_a_blob_and_answers_none_for_a_missing_path(repo: Path):
+    assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
+    assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None

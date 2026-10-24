@@ -397,6 +397,7 @@ def _evaluate_fix_commit(root: str, meta: _CommitMeta, head_commit: str, base_co
                               meta.no_test_reason))
 
 
+@gitsafe.scrubbed()
 def check_ci_regressions(
     workspace: Any,
     base: str,

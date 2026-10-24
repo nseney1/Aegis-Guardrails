@@ -1,10 +1,10 @@
 """Rule creation: one new rule file in its type directory, under the workspace lock."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 
+from aegis_core.primitives import utc_stamp
 from aegis_core.rules import VALID_ENFORCEMENT, load_rules
 from aegis_core.storage import atomic_write_text, locked
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES, RULE_TYPE_DIRS, RULE_TYPES, normalize_review_mode
@@ -111,7 +111,7 @@ def create_rule(
     _require_servable_id(slug)
     file_path = target_dir / f"{slug}.md"
 
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    date_str = utc_stamp()
     type_title = type_lower.capitalize()
     truncated_hypo = hypothesis[:60] + ("..." if len(hypothesis) > 60 else "")
 

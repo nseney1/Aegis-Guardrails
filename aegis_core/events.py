@@ -20,13 +20,13 @@ or ``activity.jsonl``. Rows written on a CI runner are lost with it unless uploa
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from aegis_core import gitsafe
 from aegis_core.errors import PathTraversalError
+from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.storage import append_jsonl, read_jsonl, shared_locked, shared_state_dir
 
 __all__ = [
@@ -58,7 +58,6 @@ KINDS = (
     "baseline_check",
     "package",
 )
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def _kind(kind: object) -> str:
@@ -113,7 +112,7 @@ def append(
     with gitsafe.memo():
         row: Dict[str, Any] = {
             "v": EVENTS_VERSION,
-            "ts": datetime.now(timezone.utc).strftime(_TS_FORMAT),
+            "ts": utc_stamp(),
             "event": kind,
             "worktree": _worktree(root),
         }
@@ -149,19 +148,9 @@ def _is_text(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-def _is_ts(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        datetime.strptime(value, _TS_FORMAT)
-    except ValueError:
-        return False
-    return True
-
-
 def _usable(row: Dict[str, Any]) -> bool:
     return (
-        _is_ts(row.get("ts"))
+        parse_utc(row.get("ts")) is not None
         and row.get("event") in KINDS
         and _is_text(row.get("worktree"))
         and _is_text(row.get("result"))

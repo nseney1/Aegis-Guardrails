@@ -45,7 +45,6 @@ a common path and whether ``git merge-tree`` reports a conflict.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import getpass
 import json
 import os
@@ -59,9 +58,10 @@ import types
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import events, gitsafe
-from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _is_within, _read_capped
+from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _read_capped
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.match import normalize_path, sets_overlap
+from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads, utc_stamp
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -132,7 +132,6 @@ _LEASE_KEYS = ("v", "lane", "role", "owner", "claim_id", "gen", "branch", "paths
 # The last second datetime can print (9999-12-31T23:59:59Z), less the longest lease.
 _MAX_TS = 253402300799 - MAX_TTL_S
 _CLAIM_ATTEMPTS = 3
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _SYNTHETIC_MERGE = re.compile(r"\Arefs/(?:remotes/)?pull/[^/]+/merge\Z")
 
 
@@ -181,31 +180,6 @@ class LeaseRefused(AegisError):
                              self.warnings))
 
 
-# ── Strict JSON ──────────────────────────────────────────────────────────────
-
-class _DuplicateKey(Exception):
-    pass
-
-
-def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    found: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:
-            raise _DuplicateKey()
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
-
-
-def _strict_json(text: str) -> Any:
-    """Raises _DuplicateKey, or ValueError/RecursionError for anything that is not JSON
-    (NaN and Infinity included)."""
-    return json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant)
-
-
 # ── team.json ────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -246,8 +220,8 @@ def parse_team(data: bytes) -> TeamPolicy:
     except UnicodeDecodeError:
         raise TeamFileError("not valid UTF-8") from None
     try:
-        value = _strict_json(text)
-    except _DuplicateKey:
+        value = strict_loads(text)
+    except DuplicateKeyError:  # before ValueError, which it is
         raise TeamFileError("duplicate key") from None
     except (ValueError, RecursionError):
         raise TeamFileError("not valid JSON") from None
@@ -282,7 +256,7 @@ def load_team(workspace: Any) -> TeamPolicy:
     path = root / TEAM_FILE
     if os.path.islink(path):
         raise TeamFileError("is a symlink")
-    if os.path.lexists(path) and not _is_within(path, root):
+    if os.path.lexists(path) and not is_within(path, root, unresolvable=False):
         raise TeamFileError("resolves outside the workspace")
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -453,10 +427,6 @@ def _now(now: Optional[int]) -> int:
     return int(time.time()) if now is None else int(now)
 
 
-def _stamp(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime(_TS_FORMAT)
-
-
 # ── Leases ───────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -510,8 +480,8 @@ def parse_lease(data: bytes, lane: str, oid: str) -> Lease:
     if len(data) > MAX_LEASE_BYTES:
         raise LeaseFormatError(f"larger than the {MAX_LEASE_BYTES // 1024} KiB cap")
     try:
-        value = _strict_json(bytes(data).decode("utf-8"))
-    except (_DuplicateKey, UnicodeDecodeError, ValueError, RecursionError):
+        value = strict_loads(bytes(data).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise LeaseFormatError("not a JSON lease") from None
     if not isinstance(value, dict):
         raise LeaseFormatError("not a JSON object")
@@ -625,7 +595,7 @@ def lease_view(lease: Lease, now: int, overlaps: Iterable[str]) -> Dict[str, Any
         "oid": lease.oid,
         "branch": lease.branch,
         "paths": list(lease.paths),
-        "expires_at": _stamp(lease.expires_at),
+        "expires_at": utc_stamp(lease.expires_at),
         "clock_basis": {"clock": "writer_utc", "ts": lease.ts, "ttl_s": lease.ttl_s},
         "expired": lease.expired(now),
         "clock_skew": lease.clock_skew(now),
@@ -820,7 +790,7 @@ def transfer(root: Any, lane: str, expect: str, owner: str, role: Optional[str] 
     current = _expected(repo, read_leases(repo), lane, expect)
     if current.expired(moment):
         raise LeaseRefused(
-            f"expired: lane {lane}'s lease expired at {_stamp(current.expires_at)}; claim or renew it instead",
+            f"expired: lane {lane}'s lease expired at {utc_stamp(current.expires_at)}; claim or renew it instead",
             "expired", lane, current=current.oid, lease=current,
         )
     landed, holder, lease = _write(repo, lane, current.role if role is None else role, owner, current.claim_id,

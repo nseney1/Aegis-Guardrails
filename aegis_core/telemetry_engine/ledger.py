@@ -33,7 +33,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -44,6 +43,7 @@ import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.errors import PathTraversalError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import append_jsonl, ledger_locked, ledger_site, read_jsonl
 
 __all__ = [
@@ -79,10 +79,6 @@ _MAX_LEGACY_WEIGHT = Decimal("10")
 
 class EventConflictError(ValueError):
     """An idempotency key was already recorded for this rule with a different payload."""
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def ledger_path(workspace: Any) -> Path:
@@ -496,7 +492,7 @@ def append(workspace: Any, events: Iterable[Dict[str, Any]]) -> List[Dict[str, A
         results: List[Dict[str, Any]] = []
         new_rows: List[Dict[str, Any]] = []
         seq = index.last_seq
-        stamp = _utc_now()
+        stamp = utc_stamp()
         for row in planned:
             identity = (row["key"], row["rule"]) if row["key"] else None
             existing = None
@@ -529,7 +525,7 @@ def append_epoch(workspace: Any, note: Dict[str, Any]) -> Dict[str, Any]:
     with ledger_locked(workspace) as site:
         path = site.path
         index = _current_index(path)
-        row = {"v": LEDGER_VERSION, "seq": index.last_seq + 1, "ts": _utc_now(), "epoch": note}
+        row = {"v": LEDGER_VERSION, "seq": index.last_seq + 1, "ts": utc_stamp(), "epoch": note}
         if site.worktree is not None:
             row["worktree"] = site.worktree
         _write(path, [row])

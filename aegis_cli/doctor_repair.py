@@ -34,6 +34,7 @@ from aegis_cli.doctor_findings import (
     _worktree_ledger_findings,
 )
 from aegis_core import human_gate
+from aegis_core.primitives import strict_loads, utc_stamp
 
 if TYPE_CHECKING:
     from aegis_cli.doctor import _Ctx
@@ -92,19 +93,6 @@ def _read_file(path: Path) -> _File:
     return entry
 
 
-def _strict_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in out:
-            raise ValueError(f"duplicate key {key!r}")
-        out[key] = value
-    return out
-
-
-def _reject_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
-
-
 def _parse_json(entry: _File) -> _File:
     if entry.raw is None or entry.error:
         return entry
@@ -112,7 +100,7 @@ def _parse_json(entry: _File) -> _File:
         text = entry.raw.decode("utf-8")
         if text.startswith("\ufeff"):
             raise ValueError("starts with a byte-order mark")
-        entry.data = json.loads(text, object_pairs_hook=_strict_pairs, parse_constant=_reject_constant)
+        entry.data = strict_loads(text)
     except (UnicodeDecodeError, ValueError) as exc:
         entry.error = f"is not valid JSON ({str(exc)[:120]})"
         return entry
@@ -619,7 +607,7 @@ def _dump_like(original: bytes, data: Dict[str, Any]) -> bytes:
         indent = match.group(1) if "\t" in match.group(1) else len(match.group(1))
     else:
         indent = 2 if "\n" in text.strip() else None
-    out = json.dumps(data, indent=indent, ensure_ascii=False)
+    out = json.dumps(data, indent=indent, ensure_ascii=False, allow_nan=False)  # never the literal Infinity
     if "\r\n" in text:
         out = out.replace("\n", "\r\n")
     if text.endswith(("\n", "\r\n")):
@@ -628,7 +616,7 @@ def _dump_like(original: bytes, data: Dict[str, Any]) -> bytes:
 
 
 def _without_keys(raw: bytes, keys: Sequence[Tuple[str, ...]]) -> bytes:
-    data = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant)
+    data = strict_loads(raw.decode("utf-8"))
     for path in keys:
         node = data
         for part in path[:-1]:
@@ -656,7 +644,7 @@ def _without_list_items(raw: bytes, items: Sequence[Tuple[Tuple[Any, ...], int]]
     """The JSON with the listed entries removed from their lists. ``raw`` is byte-identical
     to what doctor checked (sha256), so every path resolves; every list is found before any
     entry goes, so removing one never shifts another's index."""
-    data = json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_pairs, parse_constant=_reject_constant)
+    data = strict_loads(raw.decode("utf-8"))
     targets: Dict[int, Tuple[list, set]] = {}
     for path, index in items:
         node: Any = data
@@ -771,6 +759,6 @@ def _write_manifest(backup: Path, files: List[Dict[str, Any]]) -> None:
     from aegis_cli import doctor as _doc
     from aegis_core.storage import atomic_write_bytes
 
-    doc = {"schema": "aegis.doctor.backup/v1", "created_at": _doc._utc_now(), "aegis_version": _doc._aegis_version(),
+    doc = {"schema": "aegis.doctor.backup/v1", "created_at": utc_stamp(), "aegis_version": _doc._aegis_version(),
            "files": files}
     atomic_write_bytes(backup / "manifest.json", (json.dumps(doc, indent=2) + "\n").encode("utf-8"), mode=0o600)

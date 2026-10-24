@@ -12,7 +12,6 @@ that names no commit, no git repository). ``list`` and ``metrics`` change nothin
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import sys
 import time
@@ -23,6 +22,7 @@ from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
 from aegis_core._version import __version__
+from aegis_core.primitives import utc_stamp
 
 __all__ = ["TeamCommand", "run_team"]
 
@@ -32,15 +32,11 @@ EXIT_USAGE = 2
 ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "metrics")
 
 
-def _stamp(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _envelope(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
     return {
         "source": f"aegis team {action}",
         "aegis_version": __version__,
-        "checked_at": _stamp(now),
+        "checked_at": utc_stamp(now),
         "scope": {"workspace": str(root), **scope},
     }
 
@@ -160,7 +156,7 @@ def _list(args: argparse.Namespace, root: Path, now: int) -> int:
     if not found["leases"] and not found["unreadable"]:
         print(f"There are no leases under {team.LANES_REF}.")
     else:
-        print(f"Leases under {team.LANES_REF} (checked {_stamp(now)}):")
+        print(f"Leases under {team.LANES_REF} (checked {utc_stamp(now)}):")
     for lease in found["leases"]:
         for line in _lease_lines(lease):
             print(line)

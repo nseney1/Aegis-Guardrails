@@ -44,9 +44,10 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
-from aegis_core import gitsafe, governance, treeid
+from aegis_core import gitevidence, gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.config import read_user_config
+from aegis_core.primitives import is_within, utc_stamp
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
 
@@ -57,7 +58,6 @@ __all__ = [
     "env_class",
     "hermetic_env",
     "kill_group",
-    "parse_junit",
     "parse_junit_cases",
     "plan_command",
     "pytest_args",
@@ -184,7 +184,7 @@ def env_class() -> str:
     return f"{platform.system().lower()}-py{sys.version_info[0]}.{sys.version_info[1]}"
 
 
-def _hermetic_env(
+def hermetic_env(
     home: Union[str, os.PathLike[str]],
     scratch: Optional[Union[str, os.PathLike[str]]] = None,
 ) -> Dict[str, str]:
@@ -208,8 +208,6 @@ def _hermetic_env(
     }
 
 
-hermetic_env = _hermetic_env
-
 
 # ── Running it ───────────────────────────────────────────────────────────────
 
@@ -218,7 +216,7 @@ def _taskkill() -> str:
     return ntpath.join(root if ntpath.isabs(root) else "C:\\Windows", "System32", "taskkill.exe")
 
 
-def _kill_group(proc: "subprocess.Popen[Any]") -> None:
+def kill_group(proc: "subprocess.Popen[Any]") -> None:
     if os.name == "nt":
         # taskkill /T addresses a pid, which is reusable once the root has exited, so an exited
         # root is left alone and its orphans are not swept (documented in the module docstring).
@@ -231,8 +229,6 @@ def _kill_group(proc: "subprocess.Popen[Any]") -> None:
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
-
-kill_group = _kill_group
 
 
 def _tail(path: Path) -> str:
@@ -252,9 +248,19 @@ def _summary(text: str) -> Dict[str, int]:
     return {}
 
 
-def _inspect_junit(
-    path: Path,
-) -> Optional[Tuple[int, int, int, int, str, Set[str], Set[str], List[str]]]:
+@dataclass(frozen=True)
+class _JunitReport:
+    tests: int
+    passed: int
+    failed: int
+    skipped: int
+    digest: str
+    passed_ids: Set[str]
+    failed_ids: Set[str]
+    collection_errors: List[str]
+
+
+def _inspect_junit(path: Path) -> Optional[_JunitReport]:
     try:
         if not path.is_file() or path.stat().st_size > _MAX_JUNIT_BYTES:
             return None
@@ -299,27 +305,16 @@ def _inspect_junit(
                 passed_ids.add(nodeid)
     digest = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8", "replace")).hexdigest()
     passed_count = len(cases) - failed_count - skipped_count
-    return len(cases), passed_count, failed_count, skipped_count, digest, passed_ids, failed_ids, col_errors
-
-
-def _parse_junit(path: Path) -> Optional[Tuple[int, int, int, int, str]]:
-    """``(tests, passed, failed, skipped, nodeid digest)`` from a JUnit file, or None."""
-    inspected = _inspect_junit(path)
-    if inspected is None:
-        return None
-    return inspected[:5]
-
-
-_junit = _parse_junit
-parse_junit = _parse_junit
+    return _JunitReport(len(cases), passed_count, failed_count, skipped_count, digest, passed_ids, failed_ids,
+                        col_errors)
 
 
 def parse_junit_cases(path: Path) -> Tuple[Set[str], Set[str], List[str]]:
     """``(passed_ids, failed_ids, collection_errors)`` from a JUnit file."""
-    inspected = _inspect_junit(path)
-    if inspected is None:
+    report = _inspect_junit(path)
+    if report is None:
         return set(), set(), []
-    return inspected[5], inspected[6], inspected[7]
+    return report.passed_ids, report.failed_ids, report.collection_errors
 
 
 def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float, junit: Path,
@@ -345,15 +340,16 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_group(proc)
+            kill_group(proc)
             code = proc.wait()
         finally:
-            _kill_group(proc)
+            kill_group(proc)
     text = _tail(output)
     counts = _summary(text)
-    parsed = _parse_junit(junit) if junit.is_file() else None
-    if parsed is not None:
-        collected, passed, failed, skipped, digest = parsed
+    report = _inspect_junit(junit) if junit.is_file() else None
+    if report is not None:
+        collected, passed, failed, skipped, digest = (report.tests, report.passed, report.failed, report.skipped,
+                                                      report.digest)
     else:
         passed, failed, skipped = counts.get("passed", 0), counts.get("failed", 0), counts.get("skipped", 0)
         collected = passed + failed + skipped + counts.get("xfailed", 0) + counts.get("xpassed", 0)
@@ -377,10 +373,12 @@ class _PytestOutcome(NamedTuple):
 # session and hides every other module's base result.
 _SNAPSHOT_PYTHON_FLAGS = ("-I", "-S", "-B", "--check-hash-based-pycs", "always")
 _SNAPSHOT_PYTEST_FLAGS = ("-p", "no:cacheprovider", "-o", "addopts=", "--continue-on-collection-errors")
+# ``within`` is primitives.key_within over realpath keys: the -I -S child cannot import aegis.
 _SNAPSHOT_RUNNER = (
     "import json, os, sys\n"
     "snap, ws, ext = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), json.loads(sys.argv[3])\n"
-    "within = lambda p, d: os.path.normcase(os.path.abspath(p)) == os.path.normcase(d) or os.path.normcase(os.path.abspath(p)).startswith(os.path.normcase(d) + os.sep)\n"
+    "key = lambda p: os.path.normcase(os.path.realpath(p))\n"
+    "within = lambda p, d: key(p) == key(d) or key(p).startswith(key(d).rstrip(os.sep) + os.sep)\n"
     "sys.path[:] = [snap] + [p for p in (*sys.path, *ext) if p and p != snap and (within(p, snap) or not within(p, ws))]\n"
     "import pytest\n"
     "raise SystemExit(pytest.main(sys.argv[4:]))\n"
@@ -396,24 +394,19 @@ def run_pytest_snapshot(snapshot: Path, test_files: Sequence[str], workspace: Pa
     home.mkdir(parents=True, exist_ok=True)
     tmp.mkdir(parents=True, exist_ok=True)
     ws, snap = workspace.resolve(), snapshot.resolve()
-    base = os.path.realpath(ws)
     ext_dirs = [d for d in (str(Path(p).resolve()) for p in sys.path if p and Path(p).is_dir())
-                if os.path.realpath(d) != base and not os.path.realpath(d).startswith(base.rstrip(os.sep) + os.sep)]
+                if not is_within(d, ws, unresolvable=True)]
     # The snapshot as rootdir makes a test's JUnit classname its dotted path from the tree root. The cwd is
     # the same string: Windows keeps a cwd as spelled (an 8.3 short TEMP), and pytest cannot relate a test
     # path under a second spelling to the rootdir, so the classname would come out empty.
     argv = [sys.executable, *_SNAPSHOT_PYTHON_FLAGS, "-c", _SNAPSHOT_RUNNER, str(snap), str(ws), json.dumps(ext_dirs),
             *_SNAPSHOT_PYTEST_FLAGS, f"--rootdir={snap}", f"--junitxml={junit}", "--", *test_files]
-    res = run_tests(argv, snap, _hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
+    res = run_tests(argv, snap, hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
     passed, failed, col_errors = parse_junit_cases(junit)
     return _PytestOutcome(res.exit, res.timed_out, frozenset(passed), frozenset(failed), frozenset(col_errors))
 
 
 # ── The record ───────────────────────────────────────────────────────────────
-
-def _stamp(moment: Optional[datetime]) -> str:
-    return (moment or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, int]:
     from aegis_core import baseline
@@ -429,6 +422,7 @@ def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -
     return {"findings": sum(1 for _path, evidence in pairs if not evidence.verdict), "files": len(targets)}
 
 
+@gitsafe.scrubbed()
 def record(root: object, *, tests: bool = False, base: Optional[str] = None, timeout: Optional[float] = None,
            now: Optional[datetime] = None) -> CheckOutcome:
     """Bind the work tree of ``root`` to a tree, run the checks on its snapshot, write one ``check``
@@ -441,9 +435,8 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
                 return CheckOutcome("unbindable", None, binding.reason, binding)
             links = sorted(bound.symlinks())
             if links:
-                named = ", ".join(links[:5]) + (f" and {len(links) - 5} more" if len(links) > 5 else "")
                 return CheckOutcome("unbindable", None, f"the tree holds symbolic links, which the snapshot refuses: "
-                                    f"{named}", binding)
+                                    f"{treeid.named_paths(links)}", binding)
             top = bound.top
             head = gitsafe.head_commit(top)
             if not head:
@@ -465,7 +458,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
     except gitsafe.GitError as exc:
         return CheckOutcome("error", None, str(exc))
 
-    stamp = _stamp(now)
+    stamp = utc_stamp(now)  # a naive now is UTC
     layer1_ok = layer1["findings"] == 0
     tests_ok = run is None or run.evidence
     passed = layer1_ok and tests_ok
@@ -516,13 +509,14 @@ def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tes
             tmp = scratch / "tmp"
             home.mkdir(mode=0o700)
             tmp.mkdir(mode=0o700)
-            run = run_tests(argv, snapshot, _hermetic_env(home, tmp),
+            run = run_tests(argv, snapshot, hermetic_env(home, tmp),
                             DEFAULT_TIMEOUT_S if timeout is None else timeout, junit, scratch / "output.txt")
         return layer1, run, logical
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+@gitsafe.scrubbed()
 def rerun_commit_snapshot(
     root: object, commit: str, base_ref: str, *, timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -534,10 +528,9 @@ def rerun_commit_snapshot(
     if commit is None:
         return {"tree": "", "exit": 1}
     try:
-        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}"], top)
-        if res.returncode != 0:
+        commit_tree = gitevidence.commit_tree(top, commit)
+        if commit_tree is None:
             return {"tree": "", "inconclusive": True, "reason": f"could not read the tree of {commit[:12]}"}
-        commit_tree = res.stdout.decode("ascii", "replace").strip()
         base_commit = gitsafe.merge_base(top, base_ref, commit)
         if not base_commit:
             return {"tree": "", "inconclusive": True, "reason": f"found no merge-base with {commit[:12]}"}
@@ -553,6 +546,7 @@ def rerun_commit_snapshot(
     return {"tree": commit_tree, "exit": run.exit if run is not None and run.exit != 0 else 1}
 
 
+@gitsafe.scrubbed()
 def verify_commit_trailers(
     root: object, base: str, head: str = "HEAD", *,
     rerun_fn: Optional[ Any ] = None, timeout: Optional[float] = None,
