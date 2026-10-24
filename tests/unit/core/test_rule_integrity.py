@@ -266,6 +266,23 @@ def test_a_forged_base_object_is_refused_by_the_public_loaders(tmp_path):
 
 
 @needs_git
+def test_content_that_does_not_hash_to_its_object_id_is_refused(tmp_path, monkeypatch):
+    """The lying cat-file is forged at the public git boundary (gitsafe.run), not at a module seam."""
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
+    real = gitsafe.run
+
+    def forged(args, cwd, **kw):
+        if args and args[0] == "cat-file":
+            return subprocess.CompletedProcess(["git", *args], 0, f"{oid} blob 5\nlies!\n".encode("ascii"), b"")
+        return real(args, cwd, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(IntegrityError, match="does not match the object id"):
+        rule_integrity._read_blobs(str(repo.root), [oid])
+
+
+@needs_git
 def test_a_missing_object_is_an_error_not_an_empty_rule(tmp_path):
     repo = make_repo(tmp_path)
     with pytest.raises(IntegrityError, match="cannot read object"):
@@ -612,16 +629,16 @@ def test_a_blob_cache_smaller_than_the_rules_evicts_and_still_serves_them_right(
 
 
 @needs_git
-def test_a_replaced_git_seam_bypasses_the_base_caches(tmp_path, monkeypatch):
+def test_a_spy_at_the_git_boundary_does_not_bypass_the_base_caches(tmp_path, monkeypatch):
+    """R-structure-22 (rewrites the seam test it removes): production code no longer branches on a
+    replaced git runner, so a spy at gitsafe.run sees the cached base serve the second read."""
     repo = make_repo(tmp_path)
-    seen: List[str] = []
-    real = rule_integrity._run
-    monkeypatch.setattr(rule_integrity, "_run", lambda cwd, args, stdin=None: seen.append(args[0]) or real(cwd, args, stdin))
+    calls = git_calls(monkeypatch)
     cache = scan_mod.RuleCache()
     for n in range(2):
         reword(repo, n)
         rule_integrity.effective(repo.root, cache)
-    assert seen.count("ls-tree") == 2 and seen.count("cat-file") == 2
+    assert [c[0] for c in object_reads(calls)] == ["ls-tree", "cat-file"], calls
 
 
 # ── the CI check ─────────────────────────────────────────────────────────────

@@ -233,14 +233,6 @@ class RegressionReport:
         }
 
 
-def _git_run(cwd: str, args: Sequence[str], stdin: Optional[bytes] = None) -> bytes:
-    res = gitsafe.run(list(args), cwd, timeout=_GIT_TIMEOUT_S, stdin=stdin)
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise gitsafe.GitError(f"git {args[0]} failed: {detail}")
-    return res.stdout
-
-
 def _tree_blobs(cwd: str, commit: str) -> Dict[str, Tuple[str, str]]:
     return gitsafe.tree_blobs(cwd, commit, timeout=_GIT_TIMEOUT_S)
 
@@ -267,8 +259,9 @@ def _paths_by_commit(cwd: str, oids: Sequence[str]) -> Dict[str, Tuple[List[str]
     """(changed, present) paths per commit from one ``diff-tree --stdin`` (an empty diff is absent). Read
     by position: an oid, then (status, path) pairs (no rename detection, so a move is a D and an A); a
     token in a path position is a path even if it looks like an oid."""
-    tokens = _git_run(cwd, ["diff-tree", "--stdin", "-r", "-z", "--name-status", "--no-renames", "--root"],
-                      stdin="".join(f"{oid}\n" for oid in oids).encode("ascii")).split(b"\0")
+    tokens = gitsafe.run_checked(["diff-tree", "--stdin", "-r", "-z", "--name-status", "--no-renames", "--root"], cwd,
+                                 timeout=_GIT_TIMEOUT_S, stdin="".join(f"{oid}\n" for oid in oids).encode("ascii")
+                                 ).stdout.split(b"\0")
     if tokens[-1]:
         raise RegressionError("git diff-tree output ended inside a record")
     wanted: Set[str] = set(oids)
@@ -294,8 +287,9 @@ def _paths_by_commit(cwd: str, oids: Sequence[str]) -> Dict[str, Tuple[List[str]
 
 def _commits_meta(cwd: str, merge_commit: str, head_commit: str) -> List[_CommitMeta]:
     """The non-merge commits of ``merge_commit..head_commit``, oldest first, in two git calls."""
-    fields = _git_run(cwd, ["rev-list", "--reverse", "--no-merges", f"--format={_META_FORMAT}",
-                            f"{merge_commit}..{head_commit}"]).decode("utf-8", "replace").split("\0")
+    fields = gitsafe.run_checked(["rev-list", "--reverse", "--no-merges", f"--format={_META_FORMAT}",
+                                  f"{merge_commit}..{head_commit}"], cwd, timeout=_GIT_TIMEOUT_S
+                                 ).stdout.decode("utf-8", "replace").split("\0")
     records = [fields[i:i + _META_FIELDS] for i in range(0, len(fields) - 1, _META_FIELDS)]
     oids = [(r[0].split() or [""])[-1] for r in records]
     if len(fields) % _META_FIELDS != 1 or fields[-1].strip() or not all(_OID_RE.fullmatch(o) for o in oids):

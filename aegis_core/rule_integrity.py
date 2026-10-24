@@ -116,20 +116,6 @@ def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
     return None
 
 
-def _run(cwd: str, args: Sequence[str], stdin: Optional[bytes] = None) -> bytes:
-    try:
-        res = gitsafe.run(list(args), cwd, timeout=_GIT_TIMEOUT, stdin=stdin)
-    except gitsafe.GitError as exc:
-        raise IntegrityError(str(exc)) from exc
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise IntegrityError(f"git {args[0]} failed: {detail}")
-    return res.stdout
-
-
-_DEFAULT_RUN = _run
-
-
 def _prefix(root: str) -> str:
     try:
         return gitsafe.show_prefix(root)
@@ -143,7 +129,9 @@ def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
     if not commit or commit.startswith("-"):
         raise IntegrityError(f"invalid revision {commit!r}")
     found: Dict[str, str] = {}
-    for record in _run(cwd, ["ls-tree", "-r", "-z", commit, "--", RULES_RELDIR]).split(b"\0"):
+    listing = gitsafe.run_checked(["ls-tree", "-r", "-z", commit, "--", RULES_RELDIR], cwd, error=IntegrityError,
+                                  timeout=_GIT_TIMEOUT).stdout
+    for record in listing.split(b"\0"):
         meta, sep, raw_path = record.partition(b"\t")
         fields = meta.split()
         path = os.fsdecode(raw_path)
@@ -154,12 +142,6 @@ def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
 
 def _read_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
     try:
-        if _run is not _DEFAULT_RUN:
-            wanted = list(dict.fromkeys(oids))
-            if not wanted:
-                return {}
-            out = _run(cwd, ["cat-file", "--batch"], stdin=("\n".join(wanted) + "\n").encode("ascii"))
-            return gitsafe._parse_cat_file_batch(out, wanted)
         return gitsafe.read_blobs(cwd, oids, timeout=_GIT_TIMEOUT)
     except gitsafe.GitError as exc:
         raise IntegrityError(str(exc)) from exc
@@ -181,8 +163,8 @@ def _same_blob(data: bytes, oid: str) -> bool:
 
 def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None,
                   cache: Optional[RuleCache] = None) -> RuleInventory:
-    # A commit's listing and a blob's bytes never change; a replaced git seam (tests) reads afresh.
-    if cache is not None and _run is _DEFAULT_RUN:
+    # A commit's listing and a blob's bytes never change.
+    if cache is not None:
         blobs = cache.listing((os.path.realpath(root), commit), lambda: _rule_blobs(root, commit))
         read = lambda oids: cache.blobs(list(oids), lambda missing: _read_blobs(root, missing))  # noqa: E731
     else:
@@ -213,7 +195,8 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
 
 
 def _tree_files(root: str, commit: str) -> List[str]:
-    out = _run(root, ["ls-tree", "-r", "-z", "--name-only", commit])
+    out = gitsafe.run_checked(["ls-tree", "-r", "-z", "--name-only", commit], root, error=IntegrityError,
+                              timeout=_GIT_TIMEOUT).stdout
     return sorted(os.fsdecode(p) for p in out.split(b"\0") if p)
 
 
@@ -565,7 +548,7 @@ def effective(workspace: Any, cache: Optional[RuleCache] = None) -> Effective:
         base_inventory = _inventory_at(root, anchor.commit, inventory, cache)
         if base_inventory.fingerprint == inventory.fingerprint:
             return None  # the working rules are the reviewed ones
-        if cache is not None and _run is _DEFAULT_RUN:
+        if cache is not None:
             return cache.base_rules(root, base_inventory, lambda: load_rules(root, inventory=base_inventory))
         return load_rules(root, inventory=base_inventory)
 
@@ -634,7 +617,8 @@ class CiReport:
 
 def _diff(root: str, base: str, head: str, prefix: Optional[str] = None) -> Tuple[Dict[str, str], List[str]]:
     prefix = _prefix(root) if prefix is None else prefix
-    raw = _run(root, ["diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "-M50%", base, head])
+    raw = gitsafe.run_checked(["diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "-M50%", base, head], root,
+                              error=IntegrityError, timeout=_GIT_TIMEOUT).stdout
     renames: Dict[str, str] = {}
     deleted: List[str] = []
     for status, path, new_path in gitsafe.parse_name_status_z(raw):

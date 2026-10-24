@@ -595,7 +595,7 @@ def test_blob_id_computes_sha1_and_sha256_blob_hashes(repo: Path):
     data = b"a = 1\n"
     expected_sha1 = _git(repo, "rev-parse", "HEAD:a.py").strip()
     assert gitsafe.blob_id(data) == expected_sha1
-    assert gitsafe._blob_id(data, 40) == expected_sha1
+    assert gitsafe.blob_id(data, 40) == expected_sha1
     sha256_id = gitsafe.blob_id(data, 64)
     assert len(sha256_id) == 64 and sha256_id != expected_sha1
 
@@ -626,6 +626,87 @@ def test_read_blobs_batches_and_verifies_hashes(repo: Path, monkeypatch):
     monkeypatch.setattr(gitsafe, "run", forged_run)
     with pytest.raises(gitsafe.GitError, match="does not match the object id"):
         gitsafe.read_blobs(repo, [oid_a])
+
+
+# ── blob_sizes and run_checked: the one batch reader, the one checked call (R-structure-22) ──
+
+def _answering(monkeypatch, stdout: bytes = b"", returncode: int = 0, stderr: bytes = b"") -> None:
+    """``gitsafe.run`` answers every ``cat-file`` with the given reply; anything else runs git."""
+    real_run = gitsafe.run
+
+    def forged(args, cwd, **kwargs):
+        if args and args[0] == "cat-file":
+            return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
+        return real_run(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+
+
+def test_blob_sizes_reads_each_blobs_size_from_its_header(repo: Path):
+    oid_a = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    oid_gone = _git(repo, "rev-parse", "HEAD:gone.py").strip()
+    sizes = {oid: int(_git(repo, "cat-file", "-s", oid)) for oid in (oid_a, oid_gone)}
+    assert gitsafe.blob_sizes(repo, []) == {}
+    assert gitsafe.blob_sizes(repo, [oid_a, oid_gone, oid_a]) == sizes
+
+
+@pytest.mark.parametrize("what", ["missing", "commit"])
+def test_blob_sizes_refuses_an_object_that_is_not_a_blob(repo: Path, what: str):
+    oid = "0" * 40 if what == "missing" else gitsafe.head_commit(repo)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        gitsafe.blob_sizes(repo, [oid])
+
+
+@pytest.mark.parametrize("reply", ["{oid} blob 6x\n", "{oid} blob -6\n", "{oid} blob\n", "", "{other} blob 6\n"],
+                         ids=["suffix", "negative", "short", "empty", "other-oid"])
+def test_a_malformed_size_line_is_a_git_error_not_a_value_error(repo: Path, monkeypatch, reply: str):
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    _answering(monkeypatch, reply.format(oid=oid, other="1" * 40).encode("ascii"))
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        gitsafe.blob_sizes(repo, [oid])
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        gitsafe.read_blobs(repo, [oid])
+
+
+def test_a_failed_batch_call_names_gits_stderr_collapsed_and_capped(repo: Path, monkeypatch):
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    noise = ("fatal:\n  object  store\tbroken " * 20)[:500].encode("ascii")
+    _answering(monkeypatch, returncode=128, stderr=noise)
+    expected = "git cat-file failed: " + " ".join(noise.decode("ascii").split())[:200]
+    for read in (gitsafe.blob_sizes, gitsafe.read_blobs):
+        with pytest.raises(gitsafe.GitError) as info:
+            read(repo, [oid])
+        assert str(info.value) == expected and "\n" not in str(info.value)
+
+
+class _DomainError(Exception):
+    pass
+
+
+def test_run_checked_returns_a_zero_exit_and_raises_the_requested_error_otherwise(repo: Path, monkeypatch):
+    done = gitsafe.run_checked(["rev-parse", "--verify", "HEAD"], repo)
+    assert done.returncode == 0 and done.stdout.strip() == gitsafe.head_commit(repo).encode("ascii")
+    with pytest.raises(_DomainError, match=r"^git rev-parse failed: fatal: "):
+        gitsafe.run_checked(["rev-parse", "--verify", "no-such-ref"], repo, error=_DomainError)
+    with pytest.raises(gitsafe.GitError, match=r"^git rev-parse failed: "):
+        gitsafe.run_checked(["rev-parse", "--verify", "no-such-ref"], repo)
+    long_noise = ("line one\n\n  line two " * 40).encode("ascii")
+    monkeypatch.setattr(gitsafe, "run", lambda args, cwd, **kw: subprocess.CompletedProcess(args, 1, b"", long_noise))
+    with pytest.raises(_DomainError) as info:
+        gitsafe.run_checked(["ls-tree", "HEAD"], repo, error=_DomainError)
+    assert str(info.value) == "git ls-tree failed: " + " ".join(long_noise.decode("ascii").split())[:200]
+
+
+def test_run_checked_turns_a_spawn_failure_into_the_requested_error(repo: Path, monkeypatch):
+    def cannot_start(args, cwd, **kwargs):
+        raise gitsafe.GitError("cannot run git: [Errno 2] No such file or directory")
+
+    monkeypatch.setattr(gitsafe, "run", cannot_start)
+    with pytest.raises(_DomainError, match=r"^cannot run git: \[Errno 2\]") as info:
+        gitsafe.run_checked(["rev-parse", "HEAD"], repo, error=_DomainError)
+    assert isinstance(info.value.__cause__, gitsafe.GitError)
+    with pytest.raises(gitsafe.GitError, match="^cannot run git"):
+        gitsafe.run_checked(["rev-parse", "HEAD"], repo)
 
 
 def test_tree_blobs_lists_blobs_and_filters_paths_and_symlinks(repo: Path):
@@ -1036,6 +1117,40 @@ def test_no_git_subprocess_outside_gitsafe():
     assert offenders == []
 
 
+def _single_reader_offenders(rel: str, source: str) -> list:
+    """A reach into gitsafe's private names, or a ``cat-file --batch``/``--batch-check`` spelled outside
+    gitsafe: the one batch reader is ``gitsafe.read_blobs``/``blob_sizes``, which check what git hands back."""
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "gitsafe" \
+                and node.attr.startswith("_"):
+            offenders.append(f"{rel}:{node.lineno} uses gitsafe.{node.attr}")
+        if isinstance(node, ast.ImportFrom) and node.module == "aegis_core.gitsafe":
+            offenders += [f"{rel}:{node.lineno} imports gitsafe.{a.name}" for a in node.names if a.name.startswith("_")]
+        if isinstance(node, ast.Constant) and node.value in ("--batch", "--batch-check"):
+            offenders.append(f"{rel}:{node.lineno} names cat-file {node.value}")
+    return offenders
+
+
+def test_no_package_module_reaches_gitsafe_private_names():
+    offenders = []
+    for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
+        for path in sorted((ROOT / pkg).rglob("*.py")):
+            rel = path.relative_to(ROOT).as_posix()
+            if rel != "aegis_core/gitsafe.py":
+                offenders += _single_reader_offenders(rel, path.read_text(encoding="utf-8"))
+    assert offenders == []
+
+
+def test_the_single_reader_ratchet_flags_a_private_reach_and_a_batch_spelling():
+    source = ("from aegis_core import gitsafe\nfrom aegis_core.gitsafe import _blob_id\n"
+              "gitsafe._parse_cat_file_batch(b'', [])\ngitsafe.run(['cat-file', '--batch-check'], '.')\n")
+    assert _single_reader_offenders("aegis_core/x.py", source) == [
+        "aegis_core/x.py:2 imports gitsafe._blob_id", "aegis_core/x.py:3 uses gitsafe._parse_cat_file_batch",
+        "aegis_core/x.py:4 names cat-file --batch-check"]
+    assert _single_reader_offenders("aegis_core/x.py", "gitsafe.read_blobs('.', [])\n") == []
+
+
 def test_the_ratchet_flags_a_git_argv_headed_by_a_git_executable_call():
     source = "import subprocess\nfrom aegis_core import gitsafe\nsubprocess.run([gitsafe.git_executable(), 'status'])\n"
     assert _git_spawn_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:3 builds a git argv from git_executable()"]
@@ -1103,12 +1218,13 @@ _RUN_ALLOWED_IN = {"aegis_core/sync.py": {"remote", "var", "update-ref", "push"}
 
 
 def _run_subcommand_offenders(rel: str, source: str) -> list:
-    """``gitsafe.run([...])`` calls whose subcommand (after leading ``-c <setting>`` pairs) is not
-    allowed. Wrappers that pass ``list(args)`` (regression._git_run, rule_integrity, sync._git) are
-    out of this detector's reach."""
+    """``gitsafe.run([...])`` and ``gitsafe.run_checked([...])`` calls whose subcommand (after leading
+    ``-c <setting>`` pairs) is not allowed. Wrappers that pass ``list(args)`` (sync._git) are out of this
+    detector's reach."""
     offenders = []
     for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("run", "run_checked")
                 and isinstance(node.func.value, ast.Name) and node.func.value.id == "gitsafe"
                 and node.args and isinstance(node.args[0], ast.List)):
             continue
@@ -1135,6 +1251,11 @@ def test_the_subcommand_ratchet_flags_a_worktree_add():
         "aegis_core/x.py:1 runs git worktree", "aegis_core/x.py:2 runs git worktree"]
     assert _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], top)\n") == []
     assert _run_subcommand_offenders("aegis_core/x.py", "gitsafe.run(['push', 'origin'], top)\n") != []
+
+
+def test_the_subcommand_ratchet_sees_run_checked_too():
+    source = "gitsafe.run_checked(['worktree', 'add'], root, error=E)\ngitsafe.run_checked(['ls-tree', 'HEAD'], root)\n"
+    assert _run_subcommand_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:1 runs git worktree"]
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──
