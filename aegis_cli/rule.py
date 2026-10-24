@@ -24,6 +24,7 @@ from aegis_cli import sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, validate_rule_body
+from aegis_core.primitives import utc_stamp
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace.binding import bounded_walk_up, home_message
@@ -784,7 +785,7 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
     ref, file, line, summary = (getattr(args, k, None) for k in ("ref", "file", "line", "summary"))
     example = ref or hashlib.sha256(f"{rule_id}|{file or ''}|{'' if line is None else line}|{summary or ''}".encode("utf-8")).hexdigest()[:16]
     row: Dict[str, Any] = {"example_id": str(example), "verdict": str(args.verdict),
-                           "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                           "ts": utc_stamp()}
     for key in ("ref", "summary", "file", "session", "repo"):
         if getattr(args, key, None) is not None:
             row[key] = str(getattr(args, key))
