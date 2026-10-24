@@ -1,25 +1,23 @@
 """Rule integrity: git is the witness (v4.3 spec T3)."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import os
-from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
-from aegis_core import gitevidence, gitsafe, governance
+from aegis_core import gitevidence, gitsafe, governance, rule_inventory
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
-from aegis_core.rules import ENFORCEMENT_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
+from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
 
 __all__ = [
-    "BENIGN_KEYS",
     "BaseAnchor",
     "CiReport",
-    "EXCLUDED_KEYS",
     "Effective",
     "IntegrityError",
     "LOCAL_HEAD_LABEL",
@@ -37,13 +35,6 @@ __all__ = [
 SCHEMA, SOURCE = "aegis.rule_integrity/v1", "aegis check --ci"
 LOCAL_HEAD_LABEL, MANDATORY_SLOT_CAP = "local-head, not review-witnessed", 2
 
-EXCLUDED_KEYS = frozenset({"minimum_mode", "impact_weight", "expiry_days", "expiry_sessions", "expired_at"})
-BENIGN_KEYS = frozenset({
-    "id", "name", "description", "domain", "hypothesis", "prediction", "falsification", "created", "tags",
-    "lineage", "triggers", "persona_name", "origin", "expertise", "expertise_domain", "promotion_threshold", "demotion_threshold",
-})
-_CHECKED_KEYS = frozenset({"detect", "applies_to"})
-_KNOWN_KEYS = ENFORCEMENT_KEYS | EXCLUDED_KEYS | BENIGN_KEYS | _CHECKED_KEYS
 _FORBID_KINDS = ("imports", "calls", "decorators")
 _ENFORCEMENT_ORDER = {name: index for index, name in enumerate(VALID_ENFORCEMENT)}
 _GIT_TIMEOUT, _MD, _MISSING = 60.0, ".md", object()
@@ -60,15 +51,6 @@ class BaseAnchor:
     source: str
     witnessed: bool
     label: str
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "ref": self.ref,
-            "commit": self.commit,
-            "source": self.source,
-            "witnessed": self.witnessed,
-            "label": self.label,
-        }
 
 
 def _user_base_ref(root: str) -> Optional[str]:
@@ -147,13 +129,6 @@ def _read_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
         raise IntegrityError(str(exc)) from exc
 
 
-def _fingerprint(entries: Sequence[RuleInventoryEntry]) -> str:
-    aggregate = hashlib.sha256(b"aegis-rule-inventory-v1\0")
-    for entry in entries:
-        aggregate.update(entry.relative_path.encode("utf-8") + b"\0" + bytes.fromhex(entry.digest) + b"\0")
-    return aggregate.hexdigest()
-
-
 def _same_blob(data: bytes, oid: str) -> bool:
     # A CRLF checkout (core.autocrlf) of an LF blob is the reviewed rule: policy_view ignores line endings.
     if gitsafe.blob_id(data, len(oid)) == oid:
@@ -191,7 +166,7 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
             )
         )
     entries.sort(key=lambda e: e.relative_path)
-    return RuleInventory(tuple(entries), _fingerprint(entries))
+    return RuleInventory(tuple(entries), rule_inventory.fingerprint(entries))
 
 
 def _tree_files(root: str, commit: str) -> List[str]:
@@ -226,19 +201,6 @@ class Weakening:
     rule: str
     path: str
     message: str
-
-    def as_dict(self) -> Dict[str, str]:
-        return {
-            "code": self.code,
-            "rule": self.rule,
-            "path": self.path,
-            "message": self.message,
-        }
-
-
-class _Tree:
-    def __init__(self, renames: Optional[Mapping[str, str]] = None) -> None:
-        self.renames = renames or {}
 
 
 def _dotted_covers(kind: str, broad: str, narrow: str) -> bool:
@@ -368,7 +330,7 @@ def _reach_dropped(base: Rule, head: Rule) -> List[str]:
     return dropped + ([_TEST_FILES] if head.skips_tests and not base.skips_tests else [])
 
 
-def _coverage_lost(base: Rule, head: Rule, tree: _Tree) -> List[str]:
+def _coverage_lost(base: Rule, head: Rule, renames: Mapping[str, str]) -> List[str]:
     dropped = _reach_dropped(base, head)
     if dropped:
         return [
@@ -377,7 +339,7 @@ def _coverage_lost(base: Rule, head: Rule, tree: _Tree) -> List[str]:
             "may lose the rule"
             for p in dropped
         ]
-    lost = {new for old, new in tree.renames.items() if base.applies_to(old) and not head.applies_to(new)}
+    lost = {new for old, new in renames.items() if base.applies_to(old) and not head.applies_to(new)}
     return [f"no longer applies to {path}, which the reviewed version covered" for path in sorted(lost)]
 
 
@@ -385,11 +347,13 @@ def _key_changes(base: Rule, head: Rule) -> List[str]:
     return sorted(
         str(k)
         for k, v in head.meta.items()
-        if k not in _KNOWN_KEYS and not str(k).startswith("_") and base.meta.get(k, _MISSING) != v
+        if k not in KNOWN_KEYS and not str(k).startswith("_") and base.meta.get(k, _MISSING) != v
     )
 
 
-def weakenings(base: Rule, head: Optional[Rule], tree: Optional[_Tree] = None) -> List[Weakening]:
+def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, str]] = None) -> List[Weakening]:
+    """How ``head`` binds less than the reviewed ``base``, in a fixed order. An ``applies_to`` change is
+    not among them: check_ci reports it for a rule of any rank (``_applies_to_changed``)."""
     if head is None or not head.ok:
         why = "the rule is gone from the branch" if head is None else f"the rule no longer loads: {head.error}"
         return [
@@ -427,15 +391,17 @@ def weakenings(base: Rule, head: Optional[Rule], tree: Optional[_Tree] = None) -
         found.append(
             Weakening("detect", base.id, head.path, "detect is not an exact superset of the reviewed version")
         )
-    for message in _coverage_lost(base, head, tree or _Tree()):
+    for message in _coverage_lost(base, head, renames or {}):
         found.append(Weakening("coverage", base.id, head.path, message))
-    if base.meta.get("applies_to") != head.meta.get("applies_to"):
-        found.append(Weakening("applies_to", base.id, head.path, "applies_to changed"))
     return found
 
 
+def _applies_to_changed(reviewed: Optional[Rule], head: Rule) -> bool:
+    return (reviewed.meta.get("applies_to") if reviewed is not None else None) != head.meta.get("applies_to")
+
+
 def _stricter(base: Rule, head: Rule) -> bool:
-    if weakenings(base, head, None):
+    if weakenings(base, head) or _applies_to_changed(base, head):
         return False
     return (
         any(base.meta.get(k) != head.meta.get(k) for k in ("target_paths", "forbid_ast", "enforcement"))
@@ -445,17 +411,11 @@ def _stricter(base: Rule, head: Rule) -> bool:
 
 @dataclass(frozen=True)
 class Unreviewed:
+    """A rank 2+ rule whose branch-local version is not served: one printable line of each text."""
+
     id: str
     title: str
     change: str
-    path: str = ""
-
-    def as_dict(self) -> Dict[str, str]:
-        return {
-            "id": _one_line(self.id),
-            "title": self.title,
-            "change": self.change,
-        }
 
 
 @dataclass(frozen=True)
@@ -484,9 +444,9 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
                 served.append(rule)
             elif rule.id in base_all:
                 served.append(base_all[rule.id])
-                unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
+                unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "changed"))
             else:
-                unreviewed.append(Unreviewed(rule.id, title_of(rule), "new", rule.path))
+                unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "new"))
             continue
         if policy_view(reviewed) == policy_view(rule):
             served.append(rule)
@@ -505,21 +465,15 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
             if merged.mandatory and added:
                 widened.append((len(served), reviewed, added))
             served.append(merged)
-            unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
+            unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "changed"))
         else:
             served.append(reviewed)
-            unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
+            unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "changed"))
     for rule_id, reviewed in binding.items():
         if rule_id not in seen_ok:
             served.append(reviewed)
-            unreviewed.append(
-                Unreviewed(
-                    rule_id,
-                    title_of(reviewed),
-                    "broken" if rule_id in seen_any else "removed",
-                    reviewed.path,
-                )
-            )
+            change = "broken" if rule_id in seen_any else "removed"
+            unreviewed.append(Unreviewed(_one_line(rule_id), title_of(reviewed), change))
     # Widening onto paths that may already hold the cap of mandatory rules would crowd one out of
     # a scan (CI flags it as mandatory_cap): serve the reviewed version until that is approved.
     for index, reviewed, added in widened:
@@ -604,7 +558,7 @@ class CiReport:
             "schema": SCHEMA,
             "status": "pass" if self.passed else "fail",
             "rules_checked": self.rules_checked,
-            "weakenings": [w.as_dict() for w in self.weakenings],
+            "weakenings": [asdict(w) for w in self.weakenings],
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
             "governance": {
                 "categories": list(self.governance_categories),
@@ -615,25 +569,18 @@ class CiReport:
         }
 
 
-def _diff(root: str, base: str, head: str, prefix: Optional[str] = None) -> Tuple[Dict[str, str], List[str]]:
-    prefix = _prefix(root) if prefix is None else prefix
+def _renames(root: str, base: str, head: str, prefix: str) -> Dict[str, str]:
+    """Old path -> new path of each file moved within the workspace between ``base`` and ``head``."""
     raw = gitsafe.run_checked(["diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "-M50%", base, head], root,
                               error=IntegrityError, timeout=_GIT_TIMEOUT).stdout
     renames: Dict[str, str] = {}
-    deleted: List[str] = []
     for status, path, new_path in gitsafe.parse_name_status_z(raw):
-        kind, old = status[:1], gitsafe.relative_to_prefix(prefix, path)
-        if old is None:
-            continue  # outside the workspace (a move into it is an addition)
+        old = gitsafe.relative_to_prefix(prefix, path)
         new = None if new_path is None else gitsafe.relative_to_prefix(prefix, new_path)
-        if kind == "R" and new is not None:
+        # A path outside the workspace has no old name here (a move into it is an addition).
+        if status[:1] == "R" and old is not None and new is not None:
             renames[old] = new
-        elif kind in ("D", "R"):
-            deleted.append(old)
-    return renames, deleted
-
-
-renamed_rules = _diff
+    return renames
 
 
 def _cap_findings(head: RuleSet, base: RuleSet, files: Callable[[], List[str]]) -> List[Weakening]:
@@ -732,24 +679,21 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any
     prefix = _prefix(root)
     base_rules = load_rules(root, inventory=_inventory_at(root, merge))
     head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
-    renames, _deleted = _diff(root, merge, head_commit, prefix)
-    tree = _Tree(renames)
+    renames = _renames(root, merge, head_commit, prefix)
 
     found: List[Weakening] = []
     checked = 0
+    # A binding rule's applies_to finding comes last among its own; then each other rule's, any rank.
     for rule in base_rules.rules:
         if rule.ok and rule.rank >= 2:
             checked += 1
-            found += weakenings(rule, head_rules.get(rule.id), tree)
-    reported = {(w.rule, w.code) for w in found}
+            branch = head_rules.get(rule.id)
+            found += weakenings(rule, branch, renames)
+            if branch is not None and _applies_to_changed(rule, branch):
+                found.append(Weakening("applies_to", rule.id, branch.path, "applies_to changed"))
     for rule in head_rules.rules:
         reviewed = base_rules.get(rule.id)
-        reviewed_applies = reviewed.meta.get("applies_to") if reviewed else None
-        if (
-            rule.ok
-            and (rule.id, "applies_to") not in reported
-            and reviewed_applies != rule.meta.get("applies_to")
-        ):
+        if rule.ok and not (reviewed is not None and reviewed.rank >= 2) and _applies_to_changed(reviewed, rule):
             found.append(Weakening("applies_to", rule.id, rule.path, "applies_to changed"))
     head_files: List[str] = []
 

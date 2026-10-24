@@ -7,7 +7,7 @@ from pathlib import Path
 import stat
 from aegis_core.workspace.layout import WorkspaceLayout
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -145,9 +145,17 @@ def _read_stable_file(path: str, before: os.stat_result) -> bytes:
     return b"".join(chunks)
 
 
+def fingerprint(entries: Iterable[RuleInventoryEntry]) -> str:
+    """The aggregate fingerprint of ``entries``, in their order: the one definition for a working-tree
+    inventory and a commit's (aegis_core.rule_integrity), so equal rules always compare equal."""
+    aggregate = hashlib.sha256(b"aegis-rule-inventory-v1\0")
+    for entry in entries:
+        aggregate.update(entry.relative_path.encode("utf-8") + b"\0" + bytes.fromhex(entry.digest) + b"\0")
+    return aggregate.hexdigest()
+
+
 def _empty_inventory() -> RuleInventory:
-    digest = hashlib.sha256(b"aegis-rule-inventory-v1\0").hexdigest()
-    return RuleInventory(entries=(), fingerprint=digest)
+    return RuleInventory(entries=(), fingerprint=fingerprint(()))
 
 
 def inventory_rules(workspace: str) -> RuleInventory:
@@ -236,17 +244,13 @@ def inventory_rules(workspace: str) -> RuleInventory:
         if _stat_signature(current) != expected:
             raise RuleInventoryError("list", path, "directory changed during inventory")
 
-    aggregate = hashlib.sha256(b"aegis-rule-inventory-v1\0")
-    for entry in entries:
-        aggregate.update(entry.relative_path.encode("utf-8") + b"\0")
-        aggregate.update(bytes.fromhex(entry.digest))
-        aggregate.update(b"\0")
-    return RuleInventory(entries=tuple(entries), fingerprint=aggregate.hexdigest())
+    return RuleInventory(entries=tuple(entries), fingerprint=fingerprint(entries))
 
 
 __all__ = [
     "RuleInventory",
     "RuleInventoryEntry",
     "RuleInventoryError",
+    "fingerprint",
     "inventory_rules",
 ]
