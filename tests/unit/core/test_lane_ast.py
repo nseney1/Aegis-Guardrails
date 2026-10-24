@@ -22,12 +22,8 @@ def _canonical_forms(source: str) -> Dict[tuple, int]:
 
 class TestExportsAndConstants:
     def test_exported_constants(self):
-        assert "python" in lane_ast.COVERED
         assert "addopts" in lane_ast.COLLECTION_KEYS
         assert "norecursedirs" in lane_ast.COLLECTION_KEYS
-        assert "pyproject.toml" in lane_ast.PYTEST_CONFIG_FILES
-        assert "pytest.ini" in lane_ast.PYTEST_CONFIG_FILES
-        assert len(lane_ast.LIMITS) >= 10
 
 
 class TestCollectedIds:

@@ -107,9 +107,9 @@ class TestRuleSourceLocator:
         assert packaged_dir("skills") in {REPO_ROOT / "skills", REPO_ROOT / "aegis_core" / "_data" / "skills"}
 
     def test_a_broken_install_without_the_data_is_reported_not_guessed(self, tmp_path, monkeypatch):
-        import aegis_cli.init as init_mod
+        from aegis_core import scaffolding
 
-        monkeypatch.setattr(init_mod, "packaged_dir", lambda name, base=None: tmp_path / "missing" / name)
+        monkeypatch.setattr(scaffolding, "packaged_dir", lambda name, base=None: tmp_path / "missing" / name)
         with pytest.raises(ValueError, match="not found; reinstall aegis-guardrails"):
             preset_rules("minimal")
 
@@ -222,7 +222,7 @@ class TestSeededRulesAreLintClean:
         source = tmp_path / "pkg" / "providence.md"
         source.parent.mkdir()
         source.write_bytes(b"---\r\nid: providence\r\ndomain: governance\r\n---\r\n# Body\r\n")
-        monkeypatch.setattr("aegis_cli.init.preset_rules", lambda preset: [source])
+        monkeypatch.setattr("aegis_core.scaffolding.preset_rules", lambda preset: [source])
         installed = install_rules(tmp_path / "out", preset="minimal", rule_type="persona")
         assert installed == ["providence"]
         assert (tmp_path / "out" / "providence.md").read_bytes() == (
@@ -233,10 +233,17 @@ class TestSeededRulesAreLintClean:
         source = tmp_path / "pkg" / "testing.md"
         source.parent.mkdir()
         source.write_bytes(b"---\nid: testing\ntype: trap\ntarget_paths: tests/**\n---\nBody\n")
-        monkeypatch.setattr("aegis_cli.init.preset_rules", lambda preset: [source])
+        monkeypatch.setattr("aegis_core.scaffolding.preset_rules", lambda preset: [source])
         install_rules(tmp_path / "out", preset="minimal", rule_type="persona")
         assert (tmp_path / "out" / "testing.md").read_bytes() == (
             b"---\nid: testing\ntype: persona\ntarget_paths: tests/**\n---\nBody\n")
+
+
+def test_init_passes_the_full_mode_call_graph_check():
+    from aegis_core.verification.call_graph import check
+
+    evidence = check(str(REPO_ROOT / "aegis_cli" / "init.py"), str(REPO_ROOT), fast_mode=False)
+    assert evidence.verdict is True, evidence.detail
 
 
 def _tree(*roots: Path) -> dict:

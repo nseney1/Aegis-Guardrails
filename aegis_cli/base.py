@@ -4,12 +4,35 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import argparse
 from enum import Enum
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:
     from aegis_cli.ui.theme import OutputContext
 
-__all__ = ["CommandCategory", "AegisCommand"]
+__all__ = ["CommandCategory", "AegisCommand", "host_option", "unwritable"]
+
+
+def host_option(value: str):
+    """Parse a host selection, reporting bad values as command-line usage errors."""
+    from aegis_cli.install_hosts import parse_hosts
+
+    try:
+        return parse_hosts(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def unwritable(directory: Path) -> Optional[str]:
+    """Why no file can be created in ``directory`` (made with its parents when missing,
+    so the nearest directory that exists decides); None when one can."""
+    existing = Path(directory)
+    while not os.path.lexists(existing) and existing.parent != existing:
+        existing = existing.parent
+    if existing.is_dir() and os.access(existing, os.W_OK | os.X_OK):
+        return None
+    return f"{existing} is not a writable directory"
 
 
 class CommandCategory(str, Enum):

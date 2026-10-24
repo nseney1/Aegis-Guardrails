@@ -28,7 +28,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aegis_cli import NO_HOME_MESSAGE
-from aegis_cli.base import AegisCommand, CommandCategory
+from aegis_cli.base import AegisCommand, CommandCategory, host_option, unwritable
 from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/test_worktree_hooks.py
     AEGIS_HOOK_FORMAT,
     SOMA_HOOK_FORMAT,
@@ -41,11 +41,8 @@ from aegis_cli.init_views import (
     SCAFFOLD_LABEL,
     Step,
     _home_label,
-    _no_hooks,
     _print_actions,
-    _print_active,
     _print_card,
-    _print_ci,
     _report_ci,
     _report_hook,
     report_partial,
@@ -64,25 +61,25 @@ from aegis_cli.install_hosts import (
     registrable_hosts,
     write_managed_block,
 )
-from aegis_core import scaffolding as _scaffolding
 from aegis_core.workspace.layout import UserLayout
 from aegis_core.scaffolding import (
     ACTIVE_LABEL as _ACTIVE_LABEL,
     ACTIVE_STARTERS,
     ACTIVE_TYPE_DIR,
     CI_WORKFLOW_LABEL,
-    CI_WORKFLOW_PATH,
     DEFAULT_RULE_PRESET,
     NO_ACTIVE_PRESETS,
     RULE_PRESETS,
     SEED_TYPE,
     SEED_TYPE_DIR,
-    _CI_WORKFLOW,
-    _declare_type,
-    _runs_aegis_check,
-    _workflow_files,
     ci_workflow,
+    install_rules,
+    packaged_active_rules,
     packaged_dir,
+    packaged_rules,
+    preset_rules,
+    runs_aegis_check,
+    workflow_files,
 )
 from aegis_core.primitives import is_within, real_key
 from aegis_core.storage import atomic_write_bytes
@@ -92,18 +89,13 @@ __all__ = [
     "ACTIVE_STARTERS",
     "AGENTS_FILE",
     "CI_WORKFLOW_LABEL",
-    "CI_WORKFLOW_PATH",
     "CLAUDE_FILE",
     "CLAUDE_SHIM_ID",
     "CLAUDE_SHIM_TEXT",
-    "DEFAULT_RULE_PRESET",
     "InitCommand",
-    "NO_ACTIVE_PRESETS",
     "RULE_PRESETS",
     "RemovedOption",
     "Report",
-    "SEED_TYPE",
-    "SEED_TYPE_DIR",
     "Step",
     "ci_workflow",
     "hook_refusal",
@@ -124,36 +116,6 @@ AGENTS_FILE = "AGENTS.md"
 CLAUDE_FILE = "CLAUDE.md"
 CLAUDE_SHIM_ID = "agents-import"
 CLAUDE_SHIM_TEXT = "@AGENTS.md\n"
-
-
-def _shipped_rules() -> Dict[str, Path]:
-    return _scaffolding._shipped_rules(locator=packaged_dir)
-
-
-def packaged_rules() -> Dict[str, Path]:
-    """Every shipped guidance rule (``rules/*.md``, ``rules/.oracles/*.md``, through
-    ``packaged_dir``) by id: what the persona presets seed. The active starters are not
-    among them (see packaged_active_rules)."""
-    return _scaffolding.packaged_rules(locator=packaged_dir)
-
-
-def packaged_active_rules() -> Dict[str, Path]:
-    """The shipped active starters (ACTIVE_STARTERS) by id; ValueError when one is missing."""
-    return _scaffolding.packaged_active_rules(locator=packaged_dir)
-
-
-def preset_rules(preset: str) -> List[Path]:
-    """The packaged rule files of ``preset``; ValueError for an unknown preset or a missing rule."""
-    return _scaffolding.preset_rules(preset, locator=packaged_dir)
-
-
-def install_rules(rules_dir: Path, preset: str = DEFAULT_RULE_PRESET, dry_run: bool = False, force: bool = False,
-                  skip: Sequence[str] = (), rule_type: Optional[str] = None) -> List[str]:
-    """Copy the preset's packaged rules into ``rules_dir`` (flat); return the ids now there."""
-    return _scaffolding.install_rules(
-        rules_dir, preset=preset, dry_run=dry_run, force=force,
-        skip=skip, rule_type=rule_type, _preset_fn=preset_rules,
-    )
 
 
 def seed_workspace_rules(root: Path, preset: str, dry_run: bool = False) -> Tuple[List[str], List[str]]:
@@ -229,11 +191,8 @@ class RemovedOption(argparse.Action):
         parser.exit(2)
 
 
-def _host_option(value: str):
-    try:
-        return parse_hosts(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from None
+def _no_hooks(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "no_hooks", False)) or not getattr(args, "hooks", True)
 
 
 def _host_help() -> str:
@@ -265,8 +224,8 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
     cannot write through: a link, a file, or one resolving out of the repository."""
     workflows = root / ".github" / "workflows"
     if not write:
-        files = _workflow_files(root)
-        running = [f.relative_to(root).as_posix() for f in files if _runs_aegis_check(f)]
+        files = workflow_files(root)
+        running = [f.relative_to(root).as_posix() for f in files if runs_aegis_check(f)]
         if running:
             return Step(CI_WORKFLOW_LABEL, "present", f"{', '.join(running)} run{'s' if len(running) == 1 else ''} "
                                                       "aegis check")
@@ -302,17 +261,6 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
 
 
 # ── The pre-commit hook ──────────────────────────────────────────────────────
-
-def _unwritable(directory: Path) -> Optional[str]:
-    """Why no file can be created in ``directory`` (made with its parents when missing,
-    so the nearest directory that exists decides); None when one can."""
-    existing = Path(directory)
-    while not os.path.lexists(existing) and existing.parent != existing:
-        existing = existing.parent
-    if existing.is_dir() and os.access(existing, os.W_OK | os.X_OK):
-        return None
-    return f"{existing} is not a writable directory"
-
 
 @dataclass(frozen=True)
 class _HookPlace:
@@ -401,7 +349,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
             return (f"{hook} is a symlink to {target}, outside the repository; Aegis does not write through it. "
                     "To add the hook to that file anyway, run: aegis hook install --force")
     if not target.exists():
-        reason = None if removing else _unwritable(hooks_dir)
+        reason = None if removing else unwritable(hooks_dir)
         return f"{reason}, so the hook cannot be {verb}" if reason else None
     try:
         content = target.read_text(encoding="utf-8")
@@ -410,7 +358,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
     except OSError as exc:
         return f"{target} cannot be read ({exc.strerror or exc})"
     if _AEGIS_HOOK_START not in content and _SOMA_HOOK_START not in content:
-        reason = None if removing else _unwritable(target.parent)
+        reason = None if removing else unwritable(target.parent)
         return f"{reason}, so the hook cannot be {verb}" if reason else None
     if shared:
         return (f"{hook} holds the Aegis hook, but {place.where}, outside this repository, and may serve other "
@@ -422,7 +370,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
     if _replace_hook_block(content, "") is None:
         return f"{target} has an unterminated Aegis hook block; fix or remove it"
     # Removing may delete the hook file (and the file a link in the repository points to).
-    reason = next(filter(None, (_unwritable(d) for d in (hook.parent, target.parent))), None)
+    reason = next(filter(None, (unwritable(d) for d in (hook.parent, target.parent))), None)
     return f"{reason}, so the hook cannot be {verb}" if reason else None
 
 
@@ -515,7 +463,7 @@ def _check_repo_dirs(root: Path, dirs: Sequence[Path]) -> None:
 
 
 def _need_writable(directory: Path) -> None:
-    reason = _unwritable(directory)
+    reason = unwritable(directory)
     if reason:
         where = "" if os.path.lexists(directory) else f"{directory} cannot be created: "
         raise InstallError(f"{where}{reason}; nothing can be written there. Fix its permissions, then re-run.")
@@ -701,9 +649,8 @@ def _link_key_step(home: Path, dry_run: bool) -> Step:
     if dry_run:
         return Step(LINK_KEY_LABEL, "created", detail)
     try:
-        res = create_link_key(home)
-        status = ("created" if res[1] else "present") if isinstance(res, tuple) else str(res)
-        return Step(LINK_KEY_LABEL, status, detail)
+        _, created = create_link_key(home)
+        return Step(LINK_KEY_LABEL, "created" if created else "present", detail)
     except OSError as exc:
         raise InstallError(f"{LINK_KEY_LABEL}: cannot be created ({exc.strerror or exc}); fix the permissions of "
                            f"~/{AEGIS_DIRNAME}, then re-run.") from exc
@@ -721,7 +668,7 @@ def run_init(args: argparse.Namespace) -> int:
     root = ws.root
     dry_run = bool(getattr(args, "dry_run", False))
     yes = bool(getattr(args, "yes", False))
-    preset = getattr(args, "rules", None) or "standard"
+    preset = getattr(args, "rules", None) or DEFAULT_RULE_PRESET
     layout = UserLayout.current()
     if layout is None:
         report.error(NO_HOME_MESSAGE)
@@ -897,7 +844,7 @@ class InitCommand(AegisCommand):
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--host",
-            type=_host_option,
+            type=host_option,
             default=None,
             metavar="HOST[,HOST]|auto",
             help=_host_help(),
@@ -905,7 +852,7 @@ class InitCommand(AegisCommand):
         parser.add_argument(
             "--rules",
             choices=list(RULE_PRESETS),
-            default="standard",
+            default=DEFAULT_RULE_PRESET,
             help="Starter rules: guidance seeded into .aegis/rules/personas/ (minimal 2, standard 5, full every "
                  "shipped one), which applies to no file until you set its target_paths; a new workspace also gets "
                  "one active rule, the no-eval invariant in .aegis/rules/invariants/ (bans eval and exec in "
