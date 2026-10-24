@@ -77,7 +77,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - T5 counts a commit as a fix only from a Conventional `fix` subject or a `Fixes:` trailer in the trailer block, with a scope outside `ci, build, docs, deps, release, chore, tests`. A `Closes:` trailer, or a `Fixes:` or `Aegis-No-Test:` line in the body, no longer counts, and `fix(test)` and `fix(doc)` commits are now judged as fixes. The text report's prune-box note is gone.
 
 - `.aegis/config.json`, `~/.aegis/config.json`, `team.json`, `baseline.json`, packs and host configs that hold a number overflowing to infinity (such as `1e999`) are refused like `NaN`, and a duplicate key in a `config.json` is refused (it was last key wins).
-- A naive datetime passed as `now` is read as UTC everywhere; `check --record` and the scan-compliance report read it as local time.
+- A naive datetime passed as `now` is read as UTC everywhere; `check --record` and the scan-compliance report used to read it as local time.
 - Tree identity reads the user and system config named by `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` (and honours `GIT_CONFIG_NOSYSTEM`), so a git-lfs filter configured there runs.
 
 ### Added
@@ -127,7 +127,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis check --hook` reads staged blobs through gitsafe's one reader: a malformed `cat-file` size is a `GitError` (`git cannot read object <oid>`, exit 1) instead of a `ValueError`, and an unreadable staged object reports the same text.
 
 - `aegis doctor --fix` never writes `Infinity`: a host config holding `1e999` is reported as not valid JSON and left byte-identical.
-- `aegis verify FILES` in a repository at the filesystem root no longer treats every file as outside the tree, and a final-component symlink loop is refused where a path must stay inside.
+- `aegis check FILES` in a repository at the filesystem root no longer treats every file as outside the tree, and a final-component symlink loop is refused where a path must stay inside.
 - A host config swapped for a symlink while `aegis init` writes it keeps its permission bits, and a malformed `cat-file` size in `gitsafe.read_blob` is a `GitError`.
 
 ### Breaking (command line, JSON and MCP)
