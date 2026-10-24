@@ -409,13 +409,31 @@ def _count_repo_suppressions(root: Path, files: Iterable[str]) -> int:
     return count
 
 
+def _tracked_regular_files(root: Path) -> list[str]:
+    """Index modes, including where core.symlinks=false materializes links as files."""
+    try:
+        result = gitsafe.run(["ls-files", "-s", "-z"], root)
+    except gitsafe.GitError:
+        return []
+    if result.returncode:
+        return []
+    modes: dict[str, set[bytes]] = {}
+    for record in result.stdout.split(b"\0"):
+        meta, sep, name = record.partition(b"\t")
+        parts = meta.split()
+        if sep and len(parts) == 3:
+            modes.setdefault(os.fsdecode(name), set()).add(parts[0])
+    # Unmerged stages may repeat a path; count it once only if every mode is regular.
+    return [name for name, kinds in modes.items() if kinds <= {b"100644", b"100755"}]
+
+
 def suppression_count(root: Path | str, merge_base: str | None) -> dict[str, Any]:
     """Security suppressions in tracked regular files under ``root``, skipping binaries and files
     over 1 MiB: ``{"count", "delta"}``, against ``merge_base`` (None when its blobs cannot be read).
-    A signal; it never blocks. BASE uses the tree's inventory, so symlink target text is never
-    mistaken for a regular file and deleted HEAD paths still contribute to the comparison."""
+    A signal; it never blocks. HEAD uses index modes and BASE uses the tree's inventory, so
+    symlink target text is never counted and deleted HEAD paths still contribute to BASE."""
     root = Path(root).resolve()
-    head = _count_repo_suppressions(root, gitsafe.list_files(root, untracked=False) or [])
+    head = _count_repo_suppressions(root, _tracked_regular_files(root))
     try:
         prefix = gitsafe.show_prefix(root)
         entries = gitsafe.tree_blobs(root, merge_base or "")

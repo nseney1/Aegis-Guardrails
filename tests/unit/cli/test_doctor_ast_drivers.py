@@ -100,3 +100,16 @@ def test_malformed_custom_driver_reports_the_planner_refusal(project, capsys):
     assert (code, check["status"]) == (1, "warn")
     assert check["detail"] == [f"⚠️  AST driver (.js): {reason}"]
     assert _card_reason(root) == ("unavailable", reason)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
+def test_driver_planning_failure_keeps_the_public_warning_document(project, capsys):
+    root, home, _node = project
+    (root / "loop.js").symlink_to("loop.js")
+    (home / ".aegis" / "config.json").write_bytes(b'{"v":1,"drivers":{"js":"node loop.js"}}\n')
+    code, check = _doctor(root, capsys)
+    assert (code, check["status"]) == (1, "warn")
+    status, reason = _card_reason(root)
+    assert status == "unavailable" and reason.startswith("RuntimeError: Symlink loop")
+    assert "loop.js" in reason
+    assert check["detail"] == [f"⚠️  AST driver (.js): {reason}"]

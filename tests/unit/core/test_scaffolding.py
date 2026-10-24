@@ -237,3 +237,39 @@ class TestInitWorkflowRecognition:
 
         monkeypatch.setattr(builtins, "open", unreadable)
         assert self.init_action(project, capsys)["result"] == "suggested"
+
+    @pytest.mark.parametrize("run", [
+        "PYTHONPATH=. aegis check", "aegis check>results.txt",
+        "PYTHONPATH=. python3 -m aegis_cli check", "python3 -m aegis_cli check>results.txt",
+        'A="two words" python3 -I -m aegis_cli.cli check>results.txt',
+        "A='echo; harmless' aegis check", "A=foo#bar aegis check",
+        "PYTHONPATH=. MODE=fast aegis check>results.txt",
+        "echo ready; PYTHONPATH=. python3 -m aegis_cli check>results.txt",
+    ], ids=["assignment", "redirect", "module-assignment", "module-redirect", "quoted-space",
+            "quoted-semicolon", "embedded-hash", "multiple-assignments", "compound"])
+    def test_init_recognizes_shell_assignments_and_redirections(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "present"
+        assert action["detail"] == ".github/workflows/ci.yml runs aegis check"
+
+    @pytest.mark.parametrize("run", [
+        "A='echo; aegis check --ci'", 'A="echo; python3 -m aegis_cli check --ci"',
+        "A='unfinished; aegis check --ci", "aegis check \\", "aegis check#suffix",
+        "PYTHONPATH=. echo aegis check", "echo ';' PYTHONPATH=. aegis check>results.txt",
+        r"echo \; PYTHONPATH=. aegis check>results.txt", "# PYTHONPATH=. aegis check",
+        "A=foo # aegis check", "1A=. aegis check",
+        "PYTHONPATH=. echo '&&' python3 -m aegis_cli check", r"aegis check\>results.txt",
+    ], ids=["single-quoted-assignment-only", "double-quoted-assignment-only", "unterminated",
+            "trailing-escape", "subcommand-hash", "assignment-echo", "quoted-separator",
+            "escaped-separator", "comment", "assignment-comment", "invalid-name", "quoted-and",
+            "escaped-redirection"])
+    def test_init_rejects_shell_mentions_and_malformed_commands(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "suggested"
+        assert action["detail"] == "no GitHub Actions workflow runs aegis check; aegis init --ci writes one"

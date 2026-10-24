@@ -202,6 +202,11 @@ CI_WORKFLOW_PATH = CI_WORKFLOW_LABEL
 _RUNS_AEGIS_CHECK = re.compile(
     r"(?:aegis|python3?(?:[ \t]+-I)?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?=[ \t]|$)"
 )
+# Keep quoted/escaped chunks inside words and recognize comments only at a word start.
+# The alternatives have disjoint first characters; no shell expansion is evaluated.
+_WORKFLOW_SHELL_TOKENS = re.compile(
+    r"""((?!#)(?:[^\s;&|<>\\'"]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+|[;&|<>]+|\#.*)"""
+)
 _WORKFLOW_READ_LIMIT = 1 << 20
 
 _CI_WORKFLOW = """\
@@ -296,15 +301,15 @@ def _runs_aegis_check(path: Path) -> bool:
             body = run.group(1)
             if len(body) > 1 and body[0] in "\"'" and body[-1] == body[0]:
                 body = body[1:-1]  # YAML quotes around the whole run scalar
-        lexer = shlex.shlex(body, posix=False, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        try:
-            words = list(lexer)
-        except ValueError:  # an incomplete quoted command is not evidence of a runnable check
+        pieces = _WORKFLOW_SHELL_TOKENS.split(body)
+        if any(gap.strip() for gap in pieces[::2]):  # unmatched quotes or a trailing escape
             continue
+        words = [word for word in pieces[1::2] if not word.startswith("#")]
         starts = [0] + [i + 1 for i, word in enumerate(words)
-                        if word in ("&&", "||", ";", "|", "&")
-                        and (i == 0 or not words[i - 1].endswith("\\"))]
-        if any(_RUNS_AEGIS_CHECK.match(shlex.join(words[start:start + 5])) for start in starts):
-            return True
+                        if word in ("&&", "||", ";", "|", "&")]
+        for start in starts:
+            while start < len(words) and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[start]):
+                start += 1
+            if _RUNS_AEGIS_CHECK.match(shlex.join(words[start:start + 5])):
+                return True
     return False
