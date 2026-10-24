@@ -417,6 +417,15 @@ def _pr_plan(root: Path) -> Dict[str, Any]:
             "tree": tree, "crlf": crlf, "files": work}
 
 
+def _remote_url(top: Path, name: str) -> Optional[str]:
+    """``remote.<name>.url`` as resolve_repo reads origin's (no insteadOf), or None. Only an equal
+    URL is known to name origin's repository: the URL is never parsed here, nor shown (it may hold a token)."""
+    from aegis_core import gitsafe
+
+    res = gitsafe.run(["config", "--get", f"remote.{name}.url"], top)
+    return (os.fsdecode(res.stdout.strip()) or None) if res.returncode == 0 else None
+
+
 def _restore(root: Path, before: Dict[str, bytes]) -> None:
     """Put .aegis/rules and .aegis/adjudications back to ``before``, byte for byte."""
     for rel, data in _files(root).items():
@@ -539,8 +548,16 @@ def sync(
             try:
                 plan = _pr_plan(root)
                 # The default runner needs GH_REPO from origin (R-cli-28); an injected one names its own.
-                if gh_runner is None and human_gate.resolve_repo(plan["top"]) is None:
-                    raise _Refused("origin is not a GitHub repository, so gh cannot open the pull request")
+                if gh_runner is None:
+                    repo = human_gate.resolve_repo(plan["top"])
+                    if repo is None:
+                        raise _Refused("origin is not a GitHub repository, so gh cannot open the pull request")
+                    # The push goes to the branch's own remote: the PR's head must land in GH_REPO.
+                    if plan["remote"] != "origin" and (
+                            _remote_url(plan["top"], plan["remote"]) != _remote_url(plan["top"], "origin")):
+                        raise _Refused(f"the branch would be pushed to {plan['remote']}, but gh opens the pull request "
+                                       f"in origin's repository ({repo}); set branch.{plan['protected']}.remote to "
+                                       "origin or push the branch yourself")
             except (_Refused, gitsafe.GitError, OSError) as exc:
                 refused = f"no pull request opened: {exc}"
             else:
