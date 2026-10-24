@@ -1,7 +1,6 @@
 """Terminal output and JSON reporting views for ``aegis init`` and ``aegis uninstall``."""
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
@@ -20,19 +19,7 @@ from aegis_core.scaffolding import (
 )
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
-__all__ = [
-    "Report",
-    "Step",
-    "_home_label",
-    "_no_hooks",
-    "_print_actions",
-    "_print_active",
-    "_print_card",
-    "_print_ci",
-    "_report_ci",
-    "_report_hook",
-    "report_partial",
-]
+__all__ = ["Report", "Step", "report_partial"]
 
 SCAFFOLD_LABEL = f"{AEGIS_DIRNAME}/"
 _ICONS = {"failed": "❌", "manual": "👉", "kept": "⚠️ ", "skipped": "⚠️ "}
@@ -42,7 +29,6 @@ _NO_CHANGE = {
     "dry-run", "skipped (not a git repository)", "present", "suggested",
 }
 _NEXT_RULE = "    Next: add a rule for your own code with aegis rule create (aegis rule create --help)"
-_ENFORCE_SUFFIX = "; aegis check and the pre-commit hook enforce it"
 
 
 @dataclass
@@ -110,8 +96,7 @@ def _print_active(report: Report, action: Step, dry_run: bool, preset: str) -> N
         report.say(f"  Active rule in {action.target}/:")
         for name in action.names:
             desc = ACTIVE_STARTERS[name]
-            suffix = "" if desc.endswith(_ENFORCE_SUFFIX) else _ENFORCE_SUFFIX
-            report.say(f"    {'[DRY-RUN]' if dry_run else '✅'} {name}: {desc}{suffix}")
+            report.say(f"    {'[DRY-RUN]' if dry_run else '✅'} {name}: {desc}")
         for name in action.kept:
             report.say(f"    [SKIP] {name} (a file with this name exists)")
     else:
@@ -217,10 +202,6 @@ def _home_label(evidence: str, home: Path) -> str:
         return "~/" + Path(evidence).relative_to(home).as_posix()
     except ValueError:
         return evidence
-
-
-def _no_hooks(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "no_hooks", False)) or not getattr(args, "hooks", True)
 
 
 def _report_hook(report: Report, root: Path, actions: Sequence[Step]) -> None:

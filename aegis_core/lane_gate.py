@@ -84,10 +84,6 @@ from aegis_core import primitives
 from aegis_core import events, gitsafe, team
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.lane_ast import (
-    COLLECTION_KEYS,
-    COVERED,
-    LIMITS,
-    PYTEST_CONFIG_FILES,
     collected_ids,
     collection_hooks,
     pytest_settings,
@@ -98,7 +94,6 @@ from aegis_core.primitives import utc_stamp
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
-    "COLLECTION_KEYS",
     "COVERED",
     "KINDS",
     "LIMITS",
@@ -122,6 +117,32 @@ __all__ = [
     "pytest_settings",
     "skip_forms",
 ]
+
+COVERED = ("python",)
+# pytest's own search order; it reads the first that holds a configuration.
+PYTEST_CONFIG_FILES = ("pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini",
+                       "setup.cfg")
+LIMITS = (
+    "Assert weakening is not detected: a test that still exists but checks less passes.",
+    "Only Python test files and pytest's config files are checked; other test files are listed as not checked.",
+    "Test ids follow pytest's default discovery (functions and methods named test*), whatever "
+    "python_functions or python_classes the repository configures.",
+    "Skips reached indirectly are not detected: through a fixture or helper function, a marker imported "
+    "from another module, or getattr or setattr with a string.",
+    "A skip is compared by its own text and the blocks around it (if, while, for, try, with, match, a "
+    "conditional expression, and/or), not by what its condition evaluates to: a condition set elsewhere "
+    "(a module constant such as SLOW = True, an environment variable, a helper) or an earlier "
+    "'if ...: return' can change without a finding.",
+    "A decorator that replaces a test with something pytest does not collect (one that returns None, say) "
+    "is not detected; pytest.fixture is.",
+    "Trimming @pytest.mark.parametrize cases is not detected, nor are tests generated at import time "
+    "(exec, globals(), loops), which have no def to compare, or removed through globals() or vars().",
+    "Of the ways to end the run early only pytest.exit and os._exit are detected, not os.kill, a signal or "
+    "a plugin outside the test files.",
+    "The test command itself (a CI workflow, a Makefile, tox commands) is not read; containment and the "
+    "protection on .github/** cover the workflow.",
+    "Only committed changes are checked: the range is merge-base(base, HEAD)..HEAD.",
+)
 
 SOURCE = "aegis check --lane"
 NEEDS_HISTORY = "needs history: fetch with fetch-depth 0"

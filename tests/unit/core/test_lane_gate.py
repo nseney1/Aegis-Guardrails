@@ -134,6 +134,29 @@ def _violations(result: lane_gate.LaneCheck) -> List[tuple]:
 
 # ── Range ────────────────────────────────────────────────────────────────────
 
+def test_exported_constants():
+    assert "python" in lane_gate.COVERED
+    assert "pyproject.toml" in lane_gate.PYTEST_CONFIG_FILES
+    assert "pytest.ini" in lane_gate.PYTEST_CONFIG_FILES
+    assert len(lane_gate.LIMITS) >= 10
+
+
+@pytest.mark.parametrize("remove_test, status", [(False, "pass"), (True, "fail")])
+def test_coverage_and_limits_report_bytes_are_stable(repo: Repo, remove_test, status):
+    if remove_test:
+        repo.write("tests/test_app.py", TESTS.replace("def test_add", "def check_add"))
+    else:
+        repo.write("docs/guide.md", "updated guide\n")
+    repo.commit()
+    doc = _gate(repo, paths=["tests/**", "docs/**"]).as_dict()
+    assert doc["status"] == status
+    payload = {name: doc["integrity"][name] for name in ("covered", "limits")}
+    # Golden bytes from the public report before the constants move out of lane_ast.
+    assert hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest() == (
+        "be09ed89d1c8c173e49490c8cd70dc8c55d895f91304e55230caad295d3de48d"
+    )
+
+
 def test_the_range_starts_at_the_merge_base_so_base_s_own_changes_are_not_the_lane_s(repo: Repo):
     fork = _git(repo.root, "rev-parse", "HEAD")
     main_tip = repo.on_main(lambda r: r.write("src/other.py", "x = 1\n"))
