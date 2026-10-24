@@ -440,3 +440,114 @@ def test_a_failure_while_recording_is_reported_not_raised(tmp_path, monkeypatch)
 
     monkeypatch.setattr(credit, "submit_report", broken_submit)
     assert _report_as(repo) == {"status": "FAIL", "error": "Failed to record outcome: ledger is on fire"}
+
+
+# ── a report that records nothing writes nothing (R-structure-a1) ────────────
+
+def _edits(ws: Path) -> list:
+    path = ws / ".aegis" / "state" / "activity.jsonl"
+    if not path.exists():
+        return []
+    return [r for r in map(json.loads, path.read_text(encoding="utf-8").splitlines()) if r["event"] == "edit"]
+
+
+@pytest.fixture
+def reporting(tmp_path, monkeypatch):
+    """A governed workspace whose work tree binds to ``trees[-1]``, and an in-process report call
+    (the server's rate limiter is not in play)."""
+    from aegis_mcp.handlers import telemetry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    ws = _workspace_with_rule(tmp_path / "ws")
+    trees = ["a" * 40]
+
+    @contextlib.contextmanager
+    def bind(root):
+        class Bound:
+            binding = treeid.TreeBinding("ok", trees[-1], "")
+
+            def diff_entries(self, base):
+                return []
+        yield Bound()
+
+    monkeypatch.setattr(treeid, "bind", bind)
+    # The process-lifetime maps start empty, as in a fresh server.
+    monkeypatch.setattr(telemetry, "_RECORDED", type(telemetry._RECORDED)())
+    monkeypatch.setattr(telemetry, "_EDITS", {}, raising=False)
+
+    def report(key: str, session: str = "S") -> dict:
+        return telemetry.handle_report_outcome({
+            "workspace": str(ws), "outcome": "success", "rules_used": ["trap-x"], "idempotency_key": key,
+            "files": ["src/a.py"], "_host": "claude-code", "_session": session})
+
+    return ws, trees, report, telemetry
+
+
+def _witness(ws: Path, tree: str) -> None:
+    ledger.append_rows(ws, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-20T00:00:00Z", "event": "check",
+                             "id": "c1", "tree": tree, "witness": "aegis", "passed": True,
+                             "tests": {"exit": 0, "passed": 3}}])
+
+
+def test_unwitnessed_reports_with_fresh_keys_write_one_edit_row(reporting):
+    ws, _, report, telemetry = reporting
+    answers = [report(f"k{i}") for i in range(300)]
+    assert [(a["status"], a["recorded"]) for a in answers[:2]] == [("claimed", True), ("claimed", False)]
+    assert [r["event"] for r in _rows(ws)] == ["claimed"]
+    assert [e["key"] for e in _edits(ws)] == ["k0"]
+    assert [k[1:] for k in telemetry._RECORDED] == [("S", "k0")]
+
+
+def test_witnessed_reports_write_at_most_the_session_cap_of_edit_rows(reporting):
+    ws, trees, report, telemetry = reporting
+    _witness(ws, trees[-1])
+    assert {report(f"k{i}")["status"] for i in range(300)} == {"recorded"}
+    assert len(_edits(ws)) == credit.MAX_REPORT_ROWS_PER_SESSION
+    assert len(telemetry._RECORDED) == credit.MAX_REPORT_ROWS_PER_SESSION <= 1024
+
+
+def test_a_rate_limited_report_writes_no_edit_row(reporting, monkeypatch):
+    ws, _, report, _ = reporting
+    monkeypatch.setattr(credit, "MAX_REPORT_ROWS_PER_SESSION", 0)
+    assert report("k1")["status"] == "rate_limited"
+    assert _edits(ws) == []
+
+
+def test_a_retry_with_the_same_key_leaves_one_edit_row(reporting):
+    ws, trees, report, _ = reporting
+    _witness(ws, trees[-1])
+    assert report("k1")["status"] == report("k1")["status"] == "recorded"
+    assert [e["key"] for e in _edits(ws)] == ["k1"]
+
+
+def test_a_new_claim_after_the_tree_changed_still_writes_its_edit_row(reporting):
+    ws, trees, report, _ = reporting
+    assert report("k1")["recorded"] is True
+    trees.append("b" * 40)
+    assert report("k2")["recorded"] is True
+    assert [e["key"] for e in _edits(ws)] == ["k1", "k2"]
+
+
+def test_a_failed_append_does_not_count_toward_the_cap_or_fail_the_report(reporting, monkeypatch, capsys):
+    ws, trees, report, _ = reporting
+    _witness(ws, trees[-1])
+    monkeypatch.setattr(credit, "MAX_REPORT_ROWS_PER_SESSION", 1)
+    activity = ws / ".aegis" / "state" / "activity.jsonl"
+    activity.mkdir(parents=True)  # cannot be appended to
+    assert report("k1")["status"] == "recorded"
+    assert "edit event not recorded" in capsys.readouterr().err
+    activity.rmdir()
+    assert report("k2")["status"] == report("k3")["status"] == "recorded"
+    assert [e["key"] for e in _edits(ws)] == ["k2"]
+
+
+def test_the_process_maps_stay_bounded(reporting, monkeypatch):
+    ws, _, report, telemetry = reporting
+    monkeypatch.setattr(telemetry, "_MAX_RECORDED", 2)
+    for session in ("S1", "S2", "S3", "S4"):
+        assert report("k", session)["recorded"] is True
+    assert [e["session"] for e in _edits(ws)] == ["S1", "S2", "S3", "S4"]
+    assert len(telemetry._RECORDED) <= 2 and len(telemetry._EDITS) <= 2
