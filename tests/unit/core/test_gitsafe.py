@@ -1586,3 +1586,26 @@ def test_a_memoized_answer_under_an_ambient_git_dir_is_not_served_to_a_scrubbed_
         again = gitsafe.toplevel(a)
     assert os.path.samefile(ambient, b) and os.path.samefile(again, b)
     assert os.path.samefile(scrubbed, a)
+
+
+# ── read_blob: a malformed size is git's error, as in blob_sizes and read_blobs (w10 carry) ──
+
+@pytest.mark.parametrize("size", [b"12x", b"1.5", b"-1"], ids=["letters", "fraction", "negative"])
+def test_read_blob_refuses_a_cat_file_header_whose_size_is_not_a_number(repo: Path, monkeypatch, size):
+    real = gitsafe.subprocess.run
+
+    def bad_header(argv, **kwargs):
+        res = real(argv, **kwargs)
+        if "cat-file" in argv and res.returncode == 0:
+            oid = res.stdout.split(b" ", 1)[0]
+            return subprocess.CompletedProcess(argv, 0, oid + b" blob " + size + b"\nx", b"")
+        return res
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", bad_header)
+    with pytest.raises(gitsafe.GitError):
+        gitsafe.read_blob(repo, "HEAD", "a.py")
+
+
+def test_read_blob_still_reads_a_blob_and_answers_none_for_a_missing_path(repo: Path):
+    assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
+    assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None

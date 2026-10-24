@@ -745,7 +745,7 @@ def read_blob(cwd: Path | str, rev: str, path: str) -> Optional[bytes]:
     fields = header.split()
     if len(fields) != 3 or fields[1] != b"blob":
         return None
-    size = int(fields[2])
+    size = _blob_size(header, entry.oid)  # a size that is not a number is git's error, not a ValueError
     data = rest[:size]
     if len(data) != size or blob_id(data, len(entry.oid)) != entry.oid:
         raise GitError(f"git returned content for {path} at {rev} that does not match object {entry.oid}")
