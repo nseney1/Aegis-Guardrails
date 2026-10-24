@@ -60,6 +60,7 @@ __all__ = [
     "capture_suggestion",
     "create_link_key",
     "dirty_paths",
+    "effective_capture",
     "has_correction_cue",
     "host_capture_status",
     "insight_born_rules",
@@ -663,16 +664,19 @@ def record_hook_prompt(
         from aegis_core.config import env_workspace
         project = os.environ.get("CLAUDE_PROJECT_DIR", "") if host == "claude-code" else ""
         actual_ws = (project if os.path.isabs(project) else None) or payload_cwd or env_workspace() or os.getcwd()
+    resolved = Path(os.fspath(actual_ws)).resolve()
+    root = bounded_walk_up(resolved) or resolved
+    mode = effective_capture(excerpts, root, home=home)[0]
+    if mode == "off":  # decided before the link key, the log or the rules are touched
+        return {}
     hs = _ensure_hs(host, payload_session, home=home)
     cue = has_correction_cue(prompt_text)
-    excerpt = _redact(prompt_text) if cue and excerpts else ""
+    excerpt = _redact(prompt_text) if cue and mode == "excerpts" else ""
     if hs is None and not excerpt:
         # Without session identity a prompt counts toward no session: no heartbeat, no I/O.
         return {}
     path = insights_path(actual_ws, home=home)
     now = _utc_now()
-    resolved = Path(os.fspath(actual_ws)).resolve()
-    root = bounded_walk_up(resolved) or resolved
     to_write: List[Dict[str, Any]] = []
     revs: Optional[Dict[str, str]] = None
     inv = _inventory_id(root)
@@ -1338,4 +1342,20 @@ def host_capture_status(host: str, home: Optional[Path] = None) -> Dict[str, Any
     if not found:
         return {"status": "disabled", "excerpts": False}
     ex = "--excerpts" in " ".join(found[0]).split()
-    return {"status": "enabled_excerpts" if ex else "enabled_counters_only", "excerpts": ex}
+    capture, source = effective_capture(ex, None, home=home)
+    return {"status": "enabled_excerpts" if ex else "enabled_counters_only", "excerpts": ex,
+            "capture": capture, "capture_source": source}
+
+
+def effective_capture(entry_excerpts: bool, workspace_root: Any, *, home: Optional[Path] = None) -> Tuple[str, str]:
+    """(mode, source) of the passive hook: the host entry's mode ('excerpts' or 'counters'), lowered,
+    never raised, by the user-scope ``insights.capture``. An unset, invalid or unreadable value, or a
+    user file inside ``workspace_root``, leaves the entry's mode; a repository never sets it."""
+    from aegis_core.config import parse_capture_mode, read_user_config
+
+    entry, layout = "excerpts" if entry_excerpts else "counters", _user_layout(home)
+    section = (read_user_config(workspace_root, user=layout) or {}).get("insights") if layout else None
+    wanted = parse_capture_mode(section.get("capture")) if isinstance(section, dict) else None
+    if wanted == "off" or (wanted == "counters" and entry == "excerpts"):
+        return wanted, "insights.capture"
+    return entry, "host entry"
