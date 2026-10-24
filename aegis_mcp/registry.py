@@ -113,14 +113,12 @@ Generate ONLY the complete markdown rule file content. Start with --- for the YA
 _VIEW_PROPERTY = {
     "type": "string",
     "enum": ["full", "summary", "ids"],
-    "description": (
-        "Optional response projection: 'full' (default, complete payload), 'summary' "
-        "(retains identity/type/status/fitness fields, caps lists at 10 items, and adds "
-        "<list>_count), or 'ids' (projects each list to rule ID strings). Error responses "
-        "are never projected."
-    ),
+    "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'.",
 }
 _RULE_TYPE_PROPERTY = {"type": "string", "enum": list(CANONICAL_RULE_TYPES)}
+# tests_passed, rework_count and notes stay in the schema: additionalProperties is false, so
+# dropping them would fail v4.2 clients that still send them.
+_IGNORED = "Accepted for compatibility; ignored, never stored."
 
 
 def _read(title: str) -> dict:
@@ -137,16 +135,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_scan",
         "description": (
-            "Call before editing files: returns the governance rules matching `files` (or the git "
-            "diff when `files` is omitted), ranked by ledger fitness and clamped to the JIT token "
-            "budget. Use this tool before any file edit to satisfy the pre-edit scan gate and "
-            "record session rule exposure; use `aegis_list_rules` to inspect the full inventory "
-            "without file matching, and `aegis_report_outcome` after verifying your changes. "
-            "Mandatory rules (gates, invariants) take at most two slots; any excess is listed in "
-            "`omitted_mandatory`. Gates and invariants are served from the reviewed base commit "
-            "(`rules_base`), so branch-local edits to them never bind and are listed in "
-            "`unreviewed_rules`, while `stale_rules` lists rules edited since the last `aegis sync`. "
-            "Fails closed (`status: 'FAIL'`) if any rule file cannot be loaded."
+            "Call before editing files: returns the rules for `files` (default: the git diff), ranked by "
+            "fitness within the token budget, and records this session's scan and rule exposure. Mandatory "
+            "rules (gates, invariants) take at most two slots (the excess is in `omitted_mandatory`) and are "
+            "served from the reviewed base, so branch-local edits to them do not bind and are listed in "
+            "`unreviewed_rules`. Use `aegis_list_rules` to browse without recording and `aegis_report_outcome` "
+            "after verifying. Fails closed if a rule file cannot be loaded."
         ),
         "annotations": _read("Scan JIT Rules"),
         "inputSchema": {
@@ -156,8 +150,8 @@ TOOL_DEFINITIONS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Workspace-relative file paths you are about to edit. When omitted or "
-                        "empty, defaults to modified files in the current git working tree and index."
+                        "Paths you are about to edit; omitted or empty means the files changed in the git "
+                        "work tree and index."
                     ),
                 },
                 "view": _VIEW_PROPERTY,
@@ -168,15 +162,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_report_outcome",
         "description": (
-            "Record post-verification rule feedback in the local outcome ledger after running tests "
-            "or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` "
-            "before editing files and `aegis_capture_insight` to record user corrections. When a "
-            "passing `aegis check --record --tests` row exists for the current git tree, the server credits rules "
-            "exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated "
-            "against the rule inventory, not used as the credit source). Those credits count "
-            "toward fitness once CI passes on the landing commit. Without a matching check record, it "
-            "writes at most one unwitnessed claim per session and tree that earns no fitness credit. "
-            "Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds."
+            "Call after verifying a change with tests or `aegis check`, naming rules from `aegis_scan`; use "
+            "`aegis_capture_insight` for user corrections. With a passing `aegis check --record --tests` row "
+            "for the current tree, the rules this session's scans exposed that match the diff are credited, "
+            "counting once CI passes on the landing commit; without one, it writes at most one unwitnessed "
+            "claim per session and tree, which earns no credit. Capped at 200 report rows per session and "
+            "rate-limited to 5 calls per 60 seconds."
         ),
         "annotations": _write("Report Outcome"),
         "inputSchema": {
@@ -186,19 +177,16 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "enum": list(_VALID_OUTCOMES),
                     "description": (
-                        "Verification result for the rules in this change: 'success'/'tp'/'pass' "
-                        "claim a true positive, which earns credit only after CI confirms the landing "
-                        "commit; 'failure'/'fp'/'fail' are kept as the claim and, like 'partial', read "
-                        "as a neutral trigger, never a false positive."
+                        "'success', 'tp' and 'pass' claim a true positive (credited only after CI); the "
+                        "others read as a neutral trigger, never a false positive."
                     ),
                 },
                 "idempotency_key": {
                     "type": "string",
                     "maxLength": 256,
                     "description": (
-                        "Caller-supplied unique key (1-256 chars, scoped per host and session). "
-                        "Retrying with the same key and outcome is a no-op; reusing a key with a "
-                        "different outcome fails with status 'FAIL'."
+                        "Unique per report (scoped by host and session): a retry is a no-op; reuse with "
+                        "another outcome fails."
                     ),
                 },
                 "rules_used": {
@@ -206,34 +194,19 @@ TOOL_DEFINITIONS = [
                     "items": {"type": "string"},
                     "minItems": 1,
                     "description": (
-                        "Non-empty list of existing rule IDs from aegis_scan. Validated against "
-                        "the workspace rule inventory; actual fitness credit is computed "
-                        "server-side from session scan exposure and git diff paths."
+                        "Rule IDs from aegis_scan; credit comes from this session's scan exposure and the "
+                        "diff, not this list."
                     ),
                 },
-                "tests_passed": {
-                    "type": "boolean",
-                    "description": "Optional boolean. Accepted for compatibility; ignored, never stored.",
-                },
-                "rework_count": {
-                    "type": "integer",
-                    "default": 0,
-                    "description": "Optional integer. Accepted for compatibility; ignored, never stored.",
-                },
-                "notes": {
-                    "type": "string",
-                    "maxLength": 4096,
-                    "description": (
-                        "Optional text (max 4096 chars). Accepted for compatibility; ignored, never stored."
-                    ),
-                },
+                "tests_passed": {"type": "boolean", "description": _IGNORED},
+                "rework_count": {"type": "integer", "default": 0, "description": _IGNORED},
+                "notes": {"type": "string", "maxLength": 4096, "description": _IGNORED},
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Optional workspace-relative file paths edited in this change. Records "
-                        "one 'edit' activity event per idempotency_key for scan-before-edit "
-                        "compliance (aegis status --compliance); does not affect rule credit."
+                        "Paths edited in this change, for scan-before-edit compliance only (at most one "
+                        "'edit' event per report); never affects credit."
                     ),
                 },
                 "view": _VIEW_PROPERTY,
@@ -245,13 +218,10 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_create_rule",
         "description": (
-            "Build a structured prompt for drafting a new governance rule from a natural-language "
-            "`description`. Use this tool when asked to author or codify a repository rule; use "
-            "`aegis_list_rules` to inspect existing rules first, or `aegis_capture_insight` to log "
-            "a raw user correction without creating a rule file. Samples up to three active "
-            "workspace rules (500 chars each) as style examples, incorporates optional `rule_type` "
-            "and `domain` hints, and writes nothing to disk: save the drafted markdown to "
-            "`.aegis/rules/<type_dir>/<id>.md` yourself as directed by `instruction`."
+            "Builds a prompt for drafting a rule from `description`, with up to three active workspace rules "
+            "(500 chars each) as examples; it writes nothing to disk. Save the result to "
+            "`.aegis/rules/<type_dir>/<id>.md` as `instruction` says. Check `aegis_list_rules` for an "
+            "existing rule first."
         ),
         "annotations": _read("Create Rule"),
         "inputSchema": {
@@ -259,24 +229,13 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "description": {
                     "type": "string",
-                    "description": (
-                        "Non-empty natural-language description of the engineering defect, "
-                        "anti-pattern, or invariant to codify into a rule."
-                    ),
+                    "description": "The defect, anti-pattern or invariant the rule should codify.",
                 },
-                "rule_type": dict(
-                    _RULE_TYPE_PROPERTY,
-                    description=(
-                        "Optional rule category ('invariant' or 'gate' for blocking checks; "
-                        "'trap', 'boundary', 'persona', or 'contract' for advisory guidance), "
-                        "passed to the draft prompt as a hint."
-                    ),
-                ),
+                "rule_type": dict(_RULE_TYPE_PROPERTY, description="Rule type, passed to the draft prompt as a hint."),
                 "domain": {
                     "type": "string",
                     "description": (
-                        "Optional domain hint injected into the drafting prompt (e.g., "
-                        "'security', 'correctness', 'efficiency', 'style', 'governance')."
+                        "Domain hint for the draft prompt (security, correctness, efficiency, style, governance)."
                     ),
                 },
             },
@@ -287,27 +246,15 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_list_rules",
         "description": (
-            "List the workspace governance rule inventory in directory order without recording a "
-            "scan or exposure event. Use this tool to browse or audit rules, check ledger fitness, "
-            "or find stale/broken rule files; use `aegis_scan` instead before editing files so "
-            "pre-edit scan compliance and session rule exposure are recorded. Returns every rule "
-            "with its metadata and ledger fitness (or `_error` if unloadable, and `_expired: true` "
-            "if retired), rules modified since the last `aegis sync` (`stale_rules`), and non-rule "
-            "markdown under `.aegis/rules/` (`ignored`). Pass `rule_type` to filter `rules` and "
-            "`stale_rules` to one category, or `view` (`'summary'` or `'ids'`) to compact the payload."
+            "Lists every rule with metadata and ledger fitness (`_error` if unloadable, `_expired: true` if "
+            "retired), the `stale_rules` edited since the last `aegis sync`, and non-rule files under "
+            "`.aegis/rules/` (`ignored`). Records no scan or exposure: call `aegis_scan` before editing files."
         ),
         "annotations": _read("List Rules"),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "rule_type": dict(
-                    _RULE_TYPE_PROPERTY,
-                    description=(
-                        "Optional filter restricting both 'rules' and 'stale_rules' to a single "
-                        "rule category ('invariant', 'trap', 'gate', 'boundary', 'persona', or "
-                        "'contract'). Omit to list all categories."
-                    ),
-                ),
+                "rule_type": dict(_RULE_TYPE_PROPERTY, description="Only rules and stale_rules of this type."),
                 "view": _VIEW_PROPERTY,
             },
             "additionalProperties": False,
@@ -316,17 +263,11 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_capture_insight",
         "description": (
-            "Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) "
-            "for rule curation. Use this tool when the user corrects your approach or states a "
-            "recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file "
-            "immediately, or `aegis_report_outcome` to report whether existing rules helped. Each "
-            "call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty "
-            "git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted "
-            "records stay at `level: 'suggestion'`: invisible to `aegis_scan`, never counted by "
-            "`aegis rule insight review` and never upgraded to `level: 'W2'`, not even by a later "
-            "capture in the same session. A user prompt that a host hook captured on the same host "
-            "within 30 minutes and that contains the quote only annotates the record as corroborated. "
-            "Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds."
+            "Appends a user correction or preference to `~/.aegis/insights/` for rule curation; use "
+            "`aegis_report_outcome` to report whether rules helped. Secrets are redacted, `quote` is cut to "
+            "300 characters and `paths` default to the dirty git paths. Agent captures stay at "
+            "`level: 'suggestion'`: invisible to `aegis_scan`, never counted by `aegis rule insight review`, "
+            "never upgraded. Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds."
         ),
         "annotations": _write("Capture Insight"),
         "inputSchema": {
@@ -336,9 +277,7 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "maxLength": 1024,
                     "description": (
-                        "Non-empty verbatim quote of the user's correction or preference "
-                        "(1-1024 chars; secrets are automatically redacted and stored text is "
-                        "capped at 300 chars)."
+                        "The user's verbatim correction (1-1024 chars); secrets are redacted and 300 chars stored."
                     ),
                 },
                 "paths": {
@@ -346,10 +285,8 @@ TOOL_DEFINITIONS = [
                     "items": {"type": "string", "maxLength": 512},
                     "maxItems": 20,
                     "description": (
-                        "Optional workspace-relative file paths this correction applies to "
-                        "(sets psrc='explicit'; at most 20 of at most 512 characters, more fails the "
-                        "call). When omitted or empty, defaults to the first 20 currently modified "
-                        "git worktree paths (psrc='dirty')."
+                        "Paths it applies to (psrc 'explicit'; at most 20 of 512 chars); default: up to 20 "
+                        "dirty git paths (psrc 'dirty')."
                     ),
                 },
             },

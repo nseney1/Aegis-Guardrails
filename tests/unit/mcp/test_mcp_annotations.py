@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Dict, List
 
 import pytest
 
+from aegis_core import credit
 import aegis_mcp.server as server_module
 from aegis_mcp.server import handle_request
 
@@ -94,15 +96,15 @@ def test_read_only_tools_are_never_destructive(tools):
             assert ann["openWorldHint"] is False, name
 
 
-def test_every_input_schema_property_has_a_meaningful_description(tools):
+def test_every_input_schema_property_has_a_short_description(tools):
     for name, tool in tools.items():
-        schema = tool.get("inputSchema", {})
-        props = schema.get("properties", {})
+        props = tool.get("inputSchema", {}).get("properties", {})
         assert props, f"{name}: empty inputSchema properties"
         for prop_name, prop_schema in props.items():
             desc = prop_schema.get("description")
-            assert isinstance(desc, str) and len(desc.strip()) >= 40, (
-                f"{name}.inputSchema.properties.{prop_name} missing or stub description: {desc!r}"
+            limit = 120 if prop_name == "view" else 160
+            assert isinstance(desc, str) and 0 < len(desc.strip()) <= limit, (
+                f"{name}.inputSchema.properties.{prop_name}: {desc!r}"
             )
 
 
@@ -179,51 +181,50 @@ def test_an_error_result_has_the_same_two_keys(governed):
         "status": "FAIL", "error": "'description' must be a non-empty string."}
 
 
-def test_write_tool_descriptions_specify_sibling_routing_and_limits(tools):
-    report_desc = tools["aegis_report_outcome"]["description"]
-    assert "aegis_scan" in report_desc
-    assert "aegis_capture_insight" in report_desc
-    assert "200" in report_desc
-    assert "5 calls per 60 seconds" in report_desc
-    assert "aegis check --record" in report_desc
-    assert "unwitnessed" in report_desc
-    for sentence in [s.strip() for s in report_desc.split(".") if s.strip()]:
-        assert len(sentence.split()) <= 45, f"Sentence exceeds 45 words: {sentence!r}"
-
-    insight_desc = tools["aegis_capture_insight"]["description"]
-    assert "aegis_create_rule" in insight_desc
-    assert "aegis_report_outcome" in insight_desc
-    assert "~/.aegis/insights/" in insight_desc
-    assert "level: 'suggestion'" in insight_desc
-    assert "level: 'W2'" in insight_desc
-    assert "debits" not in insight_desc
-    assert "redacts secrets" in insight_desc
-    assert "300 characters" in insight_desc
+# The tool an agent could confuse each tool with, or should call next (D-mcp-schema).
+SIBLINGS = {
+    "aegis_scan": ("aegis_report_outcome", "aegis_list_rules"),
+    "aegis_report_outcome": ("aegis_scan", "aegis_capture_insight"),
+    "aegis_list_rules": ("aegis_scan",),
+    "aegis_create_rule": ("aegis_list_rules",),
+    "aegis_capture_insight": ("aegis_report_outcome",),
+}
 
 
-def test_read_tool_descriptions_specify_sibling_routing_and_mechanics(tools):
-    create_desc = tools["aegis_create_rule"]["description"]
-    assert "aegis_list_rules" in create_desc
-    assert "aegis_capture_insight" in create_desc
-    assert "three active workspace rules" in create_desc
-    assert "500 chars" in create_desc
-    assert "writes nothing to disk" in create_desc
-    assert ".aegis/rules/<type_dir>/<id>.md" in create_desc
+def _description_errors(tools: Dict[str, dict]) -> List[str]:
+    """One line per tool whose description is not 2 to 4 sentences or omits a sibling tool."""
+    errors = []
+    for name in sorted(tools):
+        text = tools[name]["description"]
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        if not 2 <= len(sentences) <= 4:
+            errors.append(f"{name}: {len(sentences)} sentences")
+        errors += [f"{name}: names no {sibling}" for sibling in SIBLINGS.get(name, ()) if sibling not in text]
+    return errors
 
-    list_desc = tools["aegis_list_rules"]["description"]
-    assert "aegis_scan" in list_desc
-    assert "directory order without recording a scan or exposure event" in list_desc
-    assert "_error" in list_desc
-    assert "_expired: true" in list_desc
-    assert "stale_rules" in list_desc
-    assert "ignored" in list_desc
-    assert "rule_type" in list_desc
-    assert "view" in list_desc
 
-    scan_desc = tools["aegis_scan"]["description"]
-    assert "aegis_list_rules" in scan_desc
-    assert "aegis_report_outcome" in scan_desc
-    assert "at most two slots" in scan_desc
-    assert "unreviewed_rules" in scan_desc
-    assert "pre-edit scan" in scan_desc
-    assert "session rule exposure" in scan_desc
+def test_every_description_is_two_to_four_sentences_naming_its_siblings(tools):
+    assert set(SIBLINGS) == set(tools)
+    assert _description_errors(tools) == []
+
+
+def test_the_report_description_states_the_limits_the_code_enforces(tools):
+    text = tools["aegis_report_outcome"]["description"]
+    calls, window = server_module._RATE_LIMITS["aegis_report_outcome"]
+    assert f"{credit.MAX_REPORT_ROWS_PER_SESSION} report rows per session" in text
+    assert f"{calls} calls per {window} seconds" in text
+
+
+def test_tools_list_fits_the_handshake_budget(tools):
+    assert len(json.dumps(list(tools.values()))) <= 6_500
+
+
+@pytest.mark.parametrize("name,description,error", [
+    ("aegis_list_rules", "One. Two. Three. Four. Five; see aegis_scan.", "aegis_list_rules: 5 sentences"),
+    ("aegis_create_rule", "Drafts a rule. It writes nothing.", "aegis_create_rule: names no aegis_list_rules"),
+    ("aegis_scan", "Call aegis_report_outcome and aegis_list_rules.", "aegis_scan: 1 sentences"),
+], ids=["five-sentences", "no-sibling", "one-sentence"])
+def test_the_description_guard_names_the_tool(tools, name, description, error):
+    broken = copy.deepcopy(tools)
+    broken[name]["description"] = description
+    assert _description_errors(broken) == [error]
