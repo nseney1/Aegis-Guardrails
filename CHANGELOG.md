@@ -71,6 +71,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis doctor --github` prints one `CODEOWNERS` line per governance pattern (`allowed_signers` and `CODEOWNERS` lines unanchored, so they also own `docs/CODEOWNERS` and nested copies), and a hand-written `CODEOWNERS` must own those too for tier A. The admin reason reads "the gh identity doctor used is an admin: re-run with the token the agent would hold".
 - A ledger row of kind `check_confirm`, `human_label`, `claim` or `transition` counts as one unusable row, and a non-object `fitness` value in `.aegis/config.json` warns.
 
+- MCP tool descriptions are 2 to 4 sentences and parameter descriptions one line. They keep the routing to sibling tools and the limits the server enforces; no input constraint (`type`, `enum`, `maxLength`, `minItems`, `required`, `additionalProperties`, `default`, `items`) changes.
+
 ### Added
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
@@ -81,6 +83,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis init --ci` writes an `aegis-sarif` job with a gated code-scanning upload. It is a separate job, so `security-events: write` never reaches the job that hands `GH_TOKEN` to the test reruns.
 - Insight proposals are always an advisory `trap` with `kind`, `count` and `insight_ids`. Their `target_paths` are the insights' common directories weighted by how rare they are, as at most three `<dir>/**` globs (a top-level file is kept as its bare name, which matches that name in any directory), never `**`; insights without paths make `propose` exit 1 and point at `aegis rule insight add --paths`.
 - `aegis rule insight add` prints the exact `Aegis-Approve-Insight:` trailer and a sign-then-re-run recipe (JSON `approval_trailer`, not stored), so an insight can reach level H. Following the recipe counts the correction once in review, proposals and recurrence: the earlier `cli` row is superseded by the signed one.
+
+- The user-scope key `insights.capture` in `~/.aegis/config.json` (`off`, `counters` or `excerpts`) narrows what the insight hook's host entry allows and never widens it: the hook runs with the lower of the two. `off` writes nothing, not even heartbeats. A repository `.aegis/config.json`, a user config inside the workspace, or an invalid or unreadable value never changes the mode, and the key does not govern `aegis rule insight add` or `aegis_capture_insight`. `aegis doctor --json` shows `capture` and `capture_source` for each enabled host.
 
 ### Fixed
 
@@ -111,6 +115,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - A `CODEOWNERS` that owns the six plural rule directories counts as covered, `docs/CODEOWNERS` is covered by the printed lines, and `exposed_rules` with no session reads the host's own exposures.
 - A signed re-run of `aegis rule insight add` without `--paths` counts the correction once, and supersedes only the one cli insight it restates: another correction with the same text and kind stays in review, can be proposed and counts toward recurrence.
 
+- An `aegis_report_outcome` call that records nothing (`rate_limited`, or a repeated unwitnessed claim) no longer writes an `edit` activity row, and edit rows are capped at 200 per session per server process.
+- The MCP server's report-edit maps and its scan-row map are bounded at 1,024 entries, so a long-lived server no longer grows them without limit.
+
 ### Breaking (command line, JSON and MCP)
 
 - Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
@@ -131,6 +138,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis rule insight review --cluster` is removed with no alias; a decision without `--insight` exits 2, and an unknown id exits 1, lists the valid ids and writes no row. `review --json` returns `insights`, `suppressed` and `suggestions` (each insight with `match`, its top-3 `neighbours`, `level`, `kind`, `paths` and `corroborated`); the `clusters`, `suppressed_clusters` and top-level `neighbours` keys and cluster ids are gone.
 - Breaking: `derived.json` and `aegis sync --json` rule entries lose `precision_lo`, `precision_hi` and `decay_factor`, and the `sync --pr` body drops the precision interval.
 - Breaking: the top-level and `fitness` spellings of `half_life_sessions` and `epsilon` in `.aegis/config.json` no longer apply (one warning); use `expiry.half_life_sessions` and `expiry.epsilon`.
+
+- Breaking: MCP `outputSchema` (on all five tools) and `structuredContent` (on every `tools/call` result) are removed, reversing the first 4.3.3 "Changed" entry. A result is `{content, isError}` and carries its payload once, as JSON text. `tools/list` shrinks from 17,977 bytes to 6,214, and a one-rule `aegis_scan` answer from 1,645 to 898 bytes in a local fixture.
 
 ### Breaking (internal `aegis_core` and `aegis_cli` API; `aegis_sdk` is unchanged)
 
@@ -156,11 +165,16 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis_core.insights.INSIGHT_LEVELS`, `aegis_core.insights.tfidf_cosine`, `aegis_core.insights.MAX_EXCERPT_CHARS` and `aegis_core.insights.fsync_dir` are removed, seven constants leave `aegis_core.insights.__all__`, `record_hook_prompt` takes `(host, payload, *, workspace=None, excerpts=True, home=None)`, and `record_decision(cluster_id=)`, `review_insights(include_suppressed=)` and `measure_recurrence(reset_on_rev_change=)` are gone (`record_decision` needs at least one insight id).
 - Breaking: `aegis_cli.hooks.insights.SUPPORTED_INSIGHT_HOSTS` and `aegis_cli.hooks.insights.insight_hook_status` are removed, with the `aegis_cli.hooks.management` `__getattr__` shim.
 
+- Breaking: `aegis_mcp.tools.__all__` no longer lists `TOOL_DEFINITIONS` (it can still be imported, and `aegis_mcp.registry` defines it), and `aegis_mcp.server.defaultdict` and `aegis_mcp.handlers.telemetry.Set` are no longer importable (unused imports).
+- Breaking: `aegis_core.taxonomy.MCP_DEFAULT_RATE_LIMITS` keeps only `MUTATION`; its `READ`, `EXECUTION`, `VERIFICATION` and `CHECKPOINT` entries were never read.
+
 ### Corrections
 
 - The 4.3.0 entry for the accountable Layer-2 arbiter advertised deterministic structural SHIP gaps, a vendor-family warning and 60-day prediction compaction. None of that code had a caller; 4.4.0 removes it, and the advisory above replaces the warning.
 - 4.3.0 did not document the decay keys `expiry.half_life_sessions` and `expiry.epsilon`.
 - The 4.3.0 entry said decay runs over heartbeat-alive eligible sessions. Exposure rows carry no heartbeat flag, so every exposed session was eligible; silence earns no credit in 4.4.0.
+
+- The 4.3.3 entry on 100% MCP `inputSchema` property coverage still holds: every property keeps a description, now shorter.
 
 ## [4.3.4] - 2026-10-20
 

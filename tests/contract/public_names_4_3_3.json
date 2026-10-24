@@ -1194,6 +1194,8 @@
   "aegis_core.verification.scanners.redact_secrets",
   "aegis_core.verification.scanners.run_preset_scanner",
   "aegis_core.workspace.layout.module_ancestors",
-  "aegis_core.workspace.layout.resolve_module_file"
+  "aegis_core.workspace.layout.resolve_module_file",
+  "aegis_mcp.handlers.telemetry.Set",
+  "aegis_mcp.server.defaultdict"
  ]
 }
