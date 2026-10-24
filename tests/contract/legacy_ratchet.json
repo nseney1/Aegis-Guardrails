@@ -1,7 +1,7 @@
 {
   "about": "Occurrences of the Soma-era vocabulary that remain; each count may only fall (tests/contract/test_legacy_ratchet.py). Words count in identifiers and non-docstring string literals of aegis_core, aegis_cli, aegis_mcp and aegis_sdk; contract_snapshots counts them in cli_tree.json and mcp_tools.json. Lower a record with: PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write",
   "counts": {
-    "soma": 67,
+    "soma": 65,
     "cell": 22,
     "genome": 0,
     "enzyme": 0,

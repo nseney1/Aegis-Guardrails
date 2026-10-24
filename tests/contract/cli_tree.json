@@ -1379,7 +1379,7 @@
             "metavar": "HOST[,HOST]|auto",
             "nargs": null,
             "required": false,
-            "type": "_host_option"
+            "type": "host_option"
           },
           {
             "choices": [
@@ -3292,7 +3292,7 @@
                 "metavar": "HOST[,HOST]|auto",
                 "nargs": null,
                 "required": false,
-                "type": "_host_option"
+                "type": "host_option"
               },
               {
                 "const": true,

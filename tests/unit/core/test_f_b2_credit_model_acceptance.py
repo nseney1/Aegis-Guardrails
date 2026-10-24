@@ -180,7 +180,7 @@ def test_scan_status_and_list_rules_show_no_number_below_min_n_and_agree(
     from aegis_core.rules import load_rules
     from aegis_core.scan import RULE_CACHE, scan
     from aegis_core.telemetry_engine import ledger
-    from aegis_mcp.registry import list_rules
+    from aegis_mcp.handlers.governance import list_rules
 
     counts = {"trap-none": None, "trap-zero": 0, "trap-one": 1, "trap-low": MIN_N - 1, "trap-at": MIN_N}
     for rid, n in counts.items():
@@ -631,7 +631,7 @@ def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_s
     """1. Repeated `sync.sync()` calls refresh CI on every call (revoking on later failure, querying newly landed commits).
     2. A fresh `status` process (`_VERIFIED_CI` cleared, no `client` passed) stays offline (R-trust-52): it makes no
        `gh` call and shows the rule without the CI-confirmed credit, which lives in the sync-derived document."""
-    from aegis_core import checkrun, human_gate, rules
+    from aegis_core import checkrun, ghcli, rules
     from tests import helpers_verified as hv
 
     repo = hv.make_project(tmp_path)
@@ -661,7 +661,7 @@ def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_s
         gh_calls.append(list(argv))
         return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [r1_ok]}), "")
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", counting_gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", counting_gh)
     capsys.readouterr()
     run_status(argparse.Namespace(_root=repo.root, plain=True))
     status_out = capsys.readouterr().out
