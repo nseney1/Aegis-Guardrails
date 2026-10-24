@@ -7,8 +7,10 @@ the repository's index, refs, work tree or object store:
 1. The work tree root is the git top level of the workspace; its git directory is resolved from
    ``<root>/.git`` (a directory, or a ``gitdir:`` file of a linked worktree).
 2. Every ``GIT_*`` variable is scrubbed from the environment (``rev-parse --local-env-vars``,
-   ``GIT_CONFIG_*``, ``GIT_EXTERNAL_DIFF``, ``GIT_SSH*``, ``GIT_TRACE*``, ``GIT_ATTR_SOURCE``,
-   ``GIT_EXEC_PATH`` and the rest), then ``GIT_DIR``/``GIT_WORK_TREE`` are set explicitly.
+   ``GIT_CONFIG_PARAMETERS``/``COUNT``, ``GIT_EXTERNAL_DIFF``, ``GIT_SSH*``, ``GIT_TRACE*``,
+   ``GIT_ATTR_SOURCE``, ``GIT_EXEC_PATH`` and the rest), then ``GIT_DIR``/``GIT_WORK_TREE`` are set
+   explicitly. ``GIT_CONFIG_GLOBAL``, ``GIT_CONFIG_SYSTEM`` and ``GIT_CONFIG_NOSYSTEM`` stay: they
+   name the user's and the system's config files, whose drivers step 5 runs as the user's git does.
 3. The real index is copied, mtime preserved, into a private 0700 directory and used as
    ``GIT_INDEX_FILE``, so git's racy-timestamp logic judges the same stat data the real one would.
 4. ``ls-files -v`` is audited: an assume-unchanged or skip-worktree entry whose path exists on
@@ -133,8 +135,11 @@ def _locate(root: Path) -> Tuple[Path, Path, Path]:
     return top, gitdir, common / "objects"
 
 
+_CONFIG_SCOPES = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
+
+
 def _scrubbed_environment() -> Dict[str, str]:
-    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_") or k.upper() in _CONFIG_SCOPES}
 
 
 def _submodule_environment() -> Dict[str, str]:
