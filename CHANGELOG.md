@@ -138,9 +138,9 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - A host config swapped for a symlink while `aegis init` writes it keeps its permission bits, and a malformed `cat-file` size in `gitsafe.read_blob` is a `GitError`.
 
 - An unexpected error while recording an event produces a warning at the team, lane-check, partition and verify sites, as at the other best-effort event sites.
-- BASE suppression counts read bounded tracked blobs, so materializing a symlink target cannot produce a false suppression delta.
-- `aegis init` recognizes GitHub Actions checks launched with `python3 [-I] -m aegis_cli[.cli] check`; comments and quoted command mentions do not count as executed checks.
-- `aegis doctor --drivers` warns when the AST driver's execution plan is unavailable, including packaged templates installed inside the workspace, workspace-contained custom scripts and malformed command quoting. It agrees with the day-0 card even when the interpreter resolves.
+- Suppression counts use Git index modes for working files and bounded tracked blobs for BASE, excluding symlinks even when `core.symlinks=false` materializes their target text as regular files.
+- `aegis init` recognizes GitHub Actions checks launched with `python3 [-I] -m aegis_cli[.cli] check`, including leading shell assignments and attached output redirection. Comments, quoted command mentions and malformed commands do not count as executed checks.
+- `aegis doctor --drivers` warns when the AST driver's execution plan is unavailable, including packaged templates installed inside the workspace, workspace-contained custom scripts and malformed command quoting. It agrees with the day-0 card even when the interpreter resolves; planning failures such as symlink loops remain visible in the text or JSON warning report.
 
 ### Breaking (command line, JSON and MCP)
 
