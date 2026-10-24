@@ -1308,3 +1308,47 @@ class TestInitHostEvent:
         root.mkdir()
         ih.register_workspace(home, root, ["zed", "kiro"])
         assert [r["host"] for r in events.read(root, "init_host").rows] == ["kiro"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_private_config_swapped_for_a_symlink_before_the_write_keeps_its_checked_mode(tmp_path, monkeypatch):
+    """w8b L4: Given a 0600 config checked as a regular file, When it is swapped for a symlink just
+    before the replacing write under umask 022, Then the replacement keeps the 0600 the check saw (not
+    the 0644 of a new file) and the link's target is spared."""
+    target = tmp_path / "mcp_config.json"
+    target.write_bytes(b'{"mcpServers": {}}\n')
+    target.chmod(0o600)
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b'{"keep": true}\n')
+    victim.chmod(0o644)
+    real_write = ih.atomic_write_bytes
+    swapped = []
+
+    def swap_then_write(path, data, *args, **kwargs):
+        if Path(path) == target and not swapped:
+            os.unlink(target)
+            symlink_or_skip(victim, target)
+            swapped.append(path)
+        return real_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(ih, "atomic_write_bytes", swap_then_write)
+    saved = os.umask(0o022)
+    try:
+        assert ih.merge_mcp_json(target, "aegis", ENTRY) == "added"
+    finally:
+        os.umask(saved)
+    assert swapped and not target.is_symlink()
+    assert json.loads(target.read_text(encoding="utf-8"))["mcpServers"] == {"aegis": ENTRY}
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert victim.read_bytes() == b'{"keep": true}\n' and victim.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_new_config_file_still_gets_the_default_mode(tmp_path):
+    target = tmp_path / "new" / "mcp_config.json"
+    saved = os.umask(0o022)
+    try:
+        assert ih.merge_mcp_json(target, "aegis", ENTRY) == "added"
+    finally:
+        os.umask(saved)
+    assert target.stat().st_mode & 0o777 == 0o644

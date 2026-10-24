@@ -193,24 +193,30 @@ def _writable_dir(path: Path, *, creating: bool) -> None:
                            "writable directory); left unchanged")
 
 
-def _preflight(path: Path, expected: Optional[bytes]) -> None:
-    """Every check a write of ``path`` makes before it changes a byte. A dry run (init's
-    check pass) runs exactly these, so whatever the write would refuse is refused first."""
-    if _check_target(path) is not None and _is_read_only(path):
+def _preflight(path: Path, expected: Optional[bytes]) -> Optional[os.stat_result]:
+    """Every check a write of ``path`` makes before it changes a byte, and the lstat it checked
+    (None: missing). A dry run (init's check pass) runs exactly these, so whatever the write
+    would refuse is refused first."""
+    checked = _check_target(path)
+    if checked is not None and _is_read_only(path):
         raise InstallError(f"{path}: is read-only; left unchanged. Make it writable, then re-run.")
     _writable_dir(path, creating=expected is None)
     if _read(path) != expected:
         raise InstallError(f"{path}: changed while Aegis was updating it; left unchanged. Re-run.")
+    return checked
 
 
 def _replace(path: Path, expected: Optional[bytes], data: bytes, *, dry_run: bool = False) -> None:
     """Atomically write ``data`` if ``path`` still holds ``expected`` (None: still missing);
     with ``dry_run`` only check that it could."""
-    _preflight(path, expected)
+    checked = _preflight(path, expected)
     if dry_run:
         return
+    # The checked mode, not the replaced name's: a file swapped for a link after the check would
+    # otherwise come back with a new file's bits (a 0600 config as 0644).
+    mode = None if checked is None else stat.S_IMODE(checked.st_mode)
     try:
-        atomic_write_bytes(path, data, follow_links=False)
+        atomic_write_bytes(path, data, mode=mode, follow_links=False)
     except OSError as exc:
         raise InstallError(f"{path}: cannot be written ({exc.strerror or exc}); left unchanged") from exc
 
