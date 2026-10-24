@@ -434,7 +434,12 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
     all_resolvable = True
     registry = ASTDriverRunner().registry
     for ext, cmd in sorted(ast_drivers.items()):
-        plan = registry.plan_driver(ext, workspace_root=ws_root)
+        try:
+            plan = registry.plan_driver(ext, workspace_root=ws_root)
+        except Exception as exc:  # like the card, keep a failed plan visible in the diagnostic
+            print(f"  ⚠️  AST driver ({ext}): {type(exc).__name__}: {exc}")
+            all_resolvable = False
+            continue
         try:
             parts = (
                 shlex.split(cmd)
