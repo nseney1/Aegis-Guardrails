@@ -16,6 +16,7 @@ from typing import Callable, Dict, List
 import pytest
 
 from aegis_core import credit, fitness, storage
+from aegis_core.primitives import parse_utc
 from aegis_core.rules import load_rules
 from aegis_core.telemetry_engine import ledger
 
@@ -166,7 +167,7 @@ def test_every_t4_event_arm_reads_as_before(ws):
     with open(ledger.ledger_path(ws), "a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps({"cell": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
                              "event_id": "v1-alias"}) + "\n")
-    now = fitness._parse_ts("2026-10-20T00:00:00Z")
+    now = parse_utc("2026-10-20T00:00:00Z")
     got = {rid: (f.triggers, f.tp, f.fp, f.caught, f.leaked, f.contested, f.eligible_sessions, f.adjudicated_n)
            for rid, f in fitness.for_rules(ws, _served(ws), now=now).items()}
     assert got == {"trap-a": (5, 4.5, 0.0, 1, 0, 0, 0, 0), "trap-b": (2, 1.5, 1.0, 1, 0, 1, 0, 0)}
