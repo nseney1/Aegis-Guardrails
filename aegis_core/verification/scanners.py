@@ -125,13 +125,10 @@ class Finding:
     fingerprint: str = ""
     severity: str = "error"
     message: str = ""
-    rule = property(lambda self: self.rule_id)
-    fp = property(lambda self: self.fingerprint)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "rule_id": self.rule_id,
-            "rule": self.rule_id,
             "path": self.path,
             "line": self.line,
             "snippet": self.snippet,
@@ -342,17 +339,6 @@ def scan_secrets_file(file_path: Path | str, *, repo_root: Path | str | None = N
     return scan_secrets_text(raw.decode("utf-8", "replace"), path=rel, include_advisory=include_advisory)
 
 
-def scan_secrets_workspace(workspace_root: Path | str, *, files: Sequence[str] | None = None, include_advisory: bool = False) -> list[Finding]:
-    root = Path(workspace_root).resolve()
-    rel_files = list(files) if files is not None else (gitsafe.list_files(root) or [])
-    if not rel_files and files is None:
-        rel_files = [
-            p.relative_to(root).as_posix() for p in sorted(root.rglob("*"))
-            if p.is_file() and not any(part.startswith(".") or part == "__pycache__" for part in p.relative_to(root).parts)
-        ]
-    return [f for rel in rel_files for f in scan_secrets_file(root / rel, repo_root=root, include_advisory=include_advisory)]
-
-
 # After any comment opener of the languages scanned (#, //, /*), as gitleaks itself honours it.
 _ALLOW_RE = re.compile(r"(?:#|//|/\*)[\t ]*gitleaks:allow\b", re.IGNORECASE)
 
@@ -400,6 +386,15 @@ def scan_secrets_delta(workspace_root: Path | str, files: Iterable[str], base_so
     return out
 
 
+def _count_suppressions(rel: str, data: bytes) -> int:
+    if b"\0" in data[:4096]:
+        return 0
+    text = data.decode("utf-8", "replace")
+    if rel == ".gitleaksignore":
+        return sum(1 for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
+    return len(_SUPPRESSION_RE.findall(text))
+
+
 def _count_repo_suppressions(root: Path, files: Iterable[str]) -> int:
     count = 0
     for rel in files:
@@ -410,34 +405,28 @@ def _count_repo_suppressions(root: Path, files: Iterable[str]) -> int:
             data = path.read_bytes()
         except OSError:
             continue
-        if b"\0" in data[:4096]:
-            continue
-        text = data.decode("utf-8", "replace")
-        if rel == ".gitleaksignore":
-            count += sum(1 for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#"))
-        else:
-            count += len(_SUPPRESSION_RE.findall(text))
+        count += _count_suppressions(rel, data)
     return count
 
 
 def suppression_count(root: Path | str, merge_base: str | None) -> dict[str, Any]:
-    """In-repository security suppressions (markers and ``.gitleaksignore`` entries) over the files git
-    tracks under ``root``, files over 1 MiB and binaries skipped: ``{"count", "delta"}``, the delta
-    against the export of ``merge_base`` (None when it cannot be exported). A signal; it never blocks."""
-    import tempfile
-
+    """Security suppressions in tracked regular files under ``root``, skipping binaries and files
+    over 1 MiB: ``{"count", "delta"}``, against ``merge_base`` (None when its blobs cannot be read).
+    A signal; it never blocks. BASE uses the tree's inventory, so symlink target text is never
+    mistaken for a regular file and deleted HEAD paths still contribute to the comparison."""
     root = Path(root).resolve()
     head = _count_repo_suppressions(root, gitsafe.list_files(root, untracked=False) or [])
-    with tempfile.TemporaryDirectory(prefix="aegis-supp-base-") as tmp:
-        export = Path(tmp) / "base"
-        try:
-            prefix = gitsafe.show_prefix(root)
-            gitsafe.export_tree(root, merge_base or "", export)
-        except gitsafe.GitError:
-            return {"count": head, "delta": None}
-        base_root = export.joinpath(*prefix.strip("/").split("/")) if prefix else export
-        files = [p.relative_to(base_root).as_posix() for p in base_root.rglob("*")] if base_root.is_dir() else []
-        return {"count": head, "delta": head - _count_repo_suppressions(base_root, files)}
+    try:
+        prefix = gitsafe.show_prefix(root)
+        entries = gitsafe.tree_blobs(root, merge_base or "")
+        files = {rel: oid for path, (_mode, oid) in entries.items()
+                 for rel in [gitsafe.relative_to_prefix(prefix, path)] if rel is not None}
+        sizes = gitsafe.blob_sizes(root, files.values())
+        blobs = gitsafe.read_blobs(root, (oid for oid in files.values() if sizes[oid] <= 1 << 20))
+    except gitsafe.GitError:
+        return {"count": head, "delta": None}
+    base = sum(_count_suppressions(rel, blobs[oid]) for rel, oid in files.items() if oid in blobs)
+    return {"count": head, "delta": head - base}
 
 
 def _sarif_artifact(uri: str, root: Path | None) -> tuple[str, Path | None]:
