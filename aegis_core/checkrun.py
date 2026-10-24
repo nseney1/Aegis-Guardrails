@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Op
 from aegis_core import gitsafe, governance, treeid
 from aegis_core._version import __version__
 from aegis_core.config import read_user_config
+from aegis_core.primitives import is_within
 from aegis_core.storage import ledger_locked, read_jsonl, read_tail_bytes
 from aegis_core.telemetry_engine import ledger
 
@@ -372,10 +373,12 @@ class _PytestOutcome(NamedTuple):
 # session and hides every other module's base result.
 _SNAPSHOT_PYTHON_FLAGS = ("-I", "-S", "-B", "--check-hash-based-pycs", "always")
 _SNAPSHOT_PYTEST_FLAGS = ("-p", "no:cacheprovider", "-o", "addopts=", "--continue-on-collection-errors")
+# ``within`` is primitives.key_within over realpath keys: the -I -S child cannot import aegis.
 _SNAPSHOT_RUNNER = (
     "import json, os, sys\n"
     "snap, ws, ext = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), json.loads(sys.argv[3])\n"
-    "within = lambda p, d: os.path.normcase(os.path.abspath(p)) == os.path.normcase(d) or os.path.normcase(os.path.abspath(p)).startswith(os.path.normcase(d) + os.sep)\n"
+    "key = lambda p: os.path.normcase(os.path.realpath(p))\n"
+    "within = lambda p, d: key(p) == key(d) or key(p).startswith(key(d).rstrip(os.sep) + os.sep)\n"
     "sys.path[:] = [snap] + [p for p in (*sys.path, *ext) if p and p != snap and (within(p, snap) or not within(p, ws))]\n"
     "import pytest\n"
     "raise SystemExit(pytest.main(sys.argv[4:]))\n"
@@ -391,9 +394,8 @@ def run_pytest_snapshot(snapshot: Path, test_files: Sequence[str], workspace: Pa
     home.mkdir(parents=True, exist_ok=True)
     tmp.mkdir(parents=True, exist_ok=True)
     ws, snap = workspace.resolve(), snapshot.resolve()
-    base = os.path.realpath(ws)
     ext_dirs = [d for d in (str(Path(p).resolve()) for p in sys.path if p and Path(p).is_dir())
-                if os.path.realpath(d) != base and not os.path.realpath(d).startswith(base.rstrip(os.sep) + os.sep)]
+                if not is_within(d, ws, unresolvable=True)]
     # The snapshot as rootdir makes a test's JUnit classname its dotted path from the tree root. The cwd is
     # the same string: Windows keeps a cwd as spelled (an 8.3 short TEMP), and pytest cannot relate a test
     # path under a second spelling to the rootdir, so the classname would come out empty.

@@ -81,6 +81,7 @@ from aegis_core.scaffolding import (
     ci_workflow,
     packaged_dir,
 )
+from aegis_core.primitives import is_within, real_key
 from aegis_core.storage import atomic_write_bytes
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
@@ -270,7 +271,6 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
         return Step(CI_WORKFLOW_LABEL, "suggested", "no GitHub Actions workflow runs aegis check; "
                                                     "aegis init --ci writes one",
                     names=[f.relative_to(root).as_posix() for f in files])
-    inside = _real_key(root) + os.sep
     for directory in (root / ".github", workflows):
         label = directory.relative_to(root).as_posix()
         if directory.is_symlink():
@@ -278,7 +278,7 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
                                "directory inside the repository. Replace the link, or re-run without --ci.")
         if os.path.lexists(directory) and not directory.is_dir():
             raise InstallError(f"{label}: is not a directory; left unchanged. Move it aside, or re-run without --ci.")
-        if directory.is_dir() and not _real_key(directory).startswith(inside):
+        if directory.is_dir() and not is_within(directory, root, unresolvable=False):
             raise InstallError(f"{label}: resolves outside the repository; aegis init --ci writes the workflow only "
                                "inside it. Re-run without --ci.")
     dest = workflows / "aegis.yml"
@@ -300,14 +300,6 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
 
 
 # ── The pre-commit hook ──────────────────────────────────────────────────────
-
-def _within(path: Path, boundary: Path) -> bool:
-    try:
-        path.relative_to(boundary.resolve())
-        return True
-    except ValueError:
-        return False
-
 
 def _unwritable(directory: Path) -> Optional[str]:
     """Why no file can be created in ``directory`` (made with its parents when missing,
@@ -338,9 +330,9 @@ def _hook_place(root: Path) -> Optional[_HookPlace]:
     hooks_dir = Path(hooks_dir)
     git_dir, common_dir = _find_git_dirs(root)
     repository = (root, *(d for d in (git_dir, common_dir) if d is not None))
-    shared = not any(_within(hooks_dir.resolve(), b) for b in repository)
+    shared = not any(is_within(hooks_dir, b, unresolvable=False) for b in repository)
     default = common_dir / "hooks" if common_dir is not None else None
-    if default is not None and _real_key(default) == _real_key(hooks_dir):
+    if default is not None and _same_place(default, hooks_dir):
         # No core.hooksPath: the repository's own hooks directory is a link out of it.
         where = f"{default} is a link to {hooks_dir.resolve()}"
     else:
@@ -402,7 +394,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
         target = hook.resolve()
         if not target.exists():
             return None if removing else f"{hook} is a dangling symlink; to replace it, run: aegis hook install --force"
-        outside = shared or not any(_within(target, b) for b in (root, hooks_dir))
+        outside = shared or not any(is_within(target, b, unresolvable=False) for b in (root, hooks_dir))
         if outside and not removing:
             return (f"{hook} is a symlink to {target}, outside the repository; Aegis does not write through it. "
                     "To add the hook to that file anyway, run: aegis hook install --force")
@@ -497,15 +489,16 @@ class _Context:
     ci: bool = False
 
 
-def _real_key(path: Path) -> str:
-    return os.path.normcase(os.path.realpath(path))
+def _same_place(a: Path, b: Path) -> bool:
+    """Whether both resolve to one location; one that cannot be resolved is no location."""
+    key = real_key(a)
+    return key is not None and key == real_key(b)
 
 
 def _check_repo_dirs(root: Path, dirs: Sequence[Path]) -> None:
     """Refuse, before the first write, a directory under .aegis/ that init writes into
     but cannot use: a link (it could point anywhere), a file, a junction resolving out of
     the workspace, or (when it is still to be made) no writable directory to make it in."""
-    inside = _real_key(root) + os.sep
     for directory in dirs:
         if directory.is_symlink():
             raise InstallError(f"{directory}: is a symlink; Aegis keeps .aegis/ only as real directories inside "
@@ -514,7 +507,7 @@ def _check_repo_dirs(root: Path, dirs: Sequence[Path]) -> None:
             _need_writable(directory)
         elif not directory.is_dir():
             raise InstallError(f"{directory}: is not a directory; left unchanged. Move it aside, then re-run.")
-        elif not _real_key(directory).startswith(inside):
+        elif not is_within(directory, root, unresolvable=False):
             raise InstallError(f"{directory}: resolves outside the workspace; Aegis keeps .aegis/ only inside it. "
                                "Replace it with a real directory, then re-run.")
 
@@ -532,7 +525,7 @@ def _claude_shim(ctx: _Context, dry_run: bool) -> Step:
     if not claude.is_symlink():
         return Step(CLAUDE_FILE, write_managed_block(
             claude, CLAUDE_SHIM_ID, CLAUDE_SHIM_TEXT, force=ctx.force, create=False, dry_run=dry_run))
-    if _real_key(claude) == _real_key(agents):
+    if _same_place(claude, agents):
         return Step(CLAUDE_FILE, "linked", "a link to AGENTS.md, so Claude Code reads the bootstrap as it is")
     ctx.report.warn(f"{claude} is a symlink to {os.path.realpath(claude)}; Aegis never writes through a link, so "
                     "it was left as it is. For Claude Code to read the Aegis bootstrap, add an @AGENTS.md import "

@@ -15,6 +15,7 @@ import urllib.parse
 
 from aegis_core import gitsafe
 from aegis_core.fitness import for_rules
+from aegis_core.primitives import is_within, key_within
 from aegis_core.rules import RuleSet, load_rules
 from aegis_core.storage import atomic_write_bytes, atomic_write_text, locked, read_json_dict, state_dir
 from aegis_core.telemetry_engine import ledger
@@ -345,18 +346,6 @@ def _local_push_path(url: str) -> Optional[str]:
     return url
 
 
-def _inside(path: str, *dirs: str) -> bool:
-    for found in (os.path.abspath(path), os.path.realpath(path)):
-        for folder in dirs:
-            for base in {os.path.abspath(folder), os.path.realpath(folder)}:
-                try:
-                    if os.path.commonpath([os.path.normcase(found), os.path.normcase(base)]) == os.path.normcase(base):
-                        return True
-                except ValueError:  # another drive
-                    continue
-    return False
-
-
 def _pr_plan(root: Path) -> Dict[str, Any]:
     """What the PR is cut from; raises _Refused, naming why, before anything moves."""
     from aegis_core import gitevidence, gitsafe
@@ -395,7 +384,11 @@ def _pr_plan(root: Path) -> Dict[str, Any]:
         # git drops -c for a local receiving repository, so its own hooks run: outside this repository
         # they are the user's, as on any server; inside it the repository chose them.
         local = _local_push_path(url)
-        if local is not None and _inside(os.path.join(top, local), top, facts.common_dir):
+        target = os.path.join(top, local or "")
+        spelled = os.path.normcase(os.path.abspath(target))  # inside as written or as resolved: refused
+        if local is not None and any(is_within(target, d, unresolvable=True)
+                                     or key_within(spelled, os.path.normcase(os.path.abspath(d)))
+                                     for d in (top, facts.common_dir)):
             raise _Refused(f"{remote} has a push URL inside this repository, whose own hooks the push would run; "
                            "push the branch yourself")
     # The branch is cut from HEAD: a commit the remote does not hold would ride along in the PR.

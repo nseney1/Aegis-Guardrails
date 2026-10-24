@@ -113,6 +113,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
+from aegis_core.primitives import is_within, real_key
 
 __all__ = ["run_doctor", "DoctorCommand", "probe_mcp_launcher", "SCHEMA", "V3_SHIPPED_RULE_SHA256"]
 
@@ -153,8 +154,8 @@ def _is_home(root: Path) -> bool:
     from aegis_core.workspace.layout import UserLayout
 
     layout = UserLayout.current()
-    key = _root_key(root)
-    return layout is not None and key is not None and key == _root_key(layout.home)
+    key = real_key(root)
+    return layout is not None and key is not None and key == real_key(layout.home)
 
 
 def _setup_command(root: Path) -> str:
@@ -352,8 +353,7 @@ def _check_mcp_launcher(path_env: Optional[str] = None, workspace: Optional[Path
     where = ""
     if len(current) == 1 and workspace is not None:
         # The script's directory, not the script: a version manager's link resolves elsewhere.
-        key, fence = _root_key(Path(current[0]).parent), _root_key(workspace)
-        if key and fence and (key == fence or key.startswith(fence.rstrip(os.sep) + os.sep)):
+        if is_within(Path(current[0]).parent, workspace, unresolvable=True):  # the cautious label
             where = ", inside the workspace"
     if len(current) == 1:
         print(f"  {'⚠️ ' if problems else '✅'} MCP launcher: {current[0]}{where} (what aegis init --host registers)")
@@ -765,7 +765,7 @@ from aegis_cli.doctor_findings import (  # noqa: E402
     _home_rules_finding, _hook_files, _hook_findings, _hook_row, _hook_tier_text, _host_row, _identity,
     _instruction_files, _instructions, _is_legacy_handler, _key_finding, _legacy_block_findings,
     _legacy_hook_findings, _legacy_items, _legacy_ranges, _level, _list_location, _location, _mcp_findings,
-    _mcp_loads, _path_key, _program_name, _prose, _registered_roots, _removed_host_phases, _root_key,
+    _mcp_loads, _path_key, _program_name, _prose, _registered_roots, _removed_host_phases,
     _runnable, _selection, _tiers, _upgrade_findings, _v3_copy_findings, _workspace_findings,
     _worktree_ledger_findings,
 )

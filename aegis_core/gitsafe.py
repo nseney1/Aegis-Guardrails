@@ -69,6 +69,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Named
 
 from aegis_core import pathlookup
 from aegis_core.errors import AegisError
+from aegis_core.primitives import is_within, safe_parts
 
 __all__ = [
     "CHANGE_MODES",
@@ -846,17 +847,11 @@ def _on_windows() -> bool:
 
 def _safe_export_target(destination: Path, rel_path: str) -> Optional[Path]:
     # On Windows ":" makes a part drive-relative (D:x) or a stream; on POSIX a:b.py is a plain file.
-    if not isinstance(rel_path, str) or not rel_path:
+    parts = safe_parts(rel_path, windows=_on_windows())
+    if parts is None:
         return None
-    parts = rel_path.replace("\\", "/").split("/")
-    if any(part in ("", ".", "..") or (_on_windows() and ":" in part) for part in parts):
-        return None
-    target = destination.joinpath(*parts)
-    base = os.path.abspath(destination)
-    try:
-        return target if os.path.commonpath([os.path.abspath(target), base]) == base else None
-    except ValueError:  # another drive
-        return None
+    target = destination.joinpath(*parts)  # the joined path is checked: D:x joins onto drive D
+    return target if is_within(target, destination, unresolvable=False) else None
 
 
 def export_tree(

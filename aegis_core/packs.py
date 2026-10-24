@@ -45,6 +45,7 @@ from aegis_core.fitness import for_rules
 from aegis_core.lifecycle.creation import _require_servable_id
 from aegis_core.lifecycle.parsers import validate_rule_id
 from aegis_core.migrate import _frontmatter_span, _strip_derived
+from aegis_core.primitives import real_key, real_path
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, RuleInventoryError
 from aegis_core.rules import Rule, load_rules, workspace_root
 from aegis_core.storage import atomic_write_bytes, locked
@@ -538,7 +539,7 @@ def _write(root: str, planned: Sequence[_Planned]) -> None:
     """Write every planned rule under the held workspace lock, or none: a failure removes the
     files and the directories this call created."""
     rules_dir = WorkspaceLayout(Path(root)).rules_dir
-    real_rules = os.path.realpath(rules_dir)
+    real_rules = real_path(rules_dir)
     created_files: List[Path] = []
     created_dirs: List[Path] = []
 
@@ -559,7 +560,7 @@ def _write(root: str, planned: Sequence[_Planned]) -> None:
             if os.path.lexists(target):
                 raise PackError([f"rules[{item.index}] ({item.source}): {item.relative} already exists"])
             make_dir(directory)
-            if os.path.normcase(os.path.realpath(directory)) != os.path.normcase(os.path.join(real_rules, item.directory)):
+            if real_key(directory) != os.path.normcase(os.path.join(real_rules, item.directory)):  # None: refused
                 raise PackError([f"rules[{item.index}] ({item.source}): refusing to write outside {RULES_RELDIR}/"])
             try:
                 atomic_write_bytes(target, item.data)

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple
 
 from aegis_core import gitsafe, rule_inventory, storage
 from aegis_core.errors import PathTraversalError
+from aegis_core.primitives import real_key
 from aegis_core.storage import (
     append_jsonl,
     atomic_write_text,
@@ -306,10 +307,9 @@ def insight_workspace_id(workspace: Any) -> str:
     fast = _fast_git_common_and_top(root)
     if fast is not None:
         common, top = fast
+        norm_root, norm_top = real_key(root), real_key(top)
         try:
-            norm_root = os.path.normcase(os.path.realpath(root))
-            norm_top = os.path.normcase(os.path.realpath(top))
-            rel = os.path.relpath(norm_root, norm_top).replace(os.sep, "/")
+            rel = os.path.relpath(norm_root, norm_top).replace(os.sep, "/") if norm_root and norm_top else "."
         except ValueError:
             rel = "."
         canon = f"{Path(os.path.realpath(common)).as_posix()}\x00{rel}"

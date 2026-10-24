@@ -241,3 +241,79 @@ def test_lenient_parse_refuses_what_is_not_a_time(value):
 
 def test_stamps_round_trip():
     assert parse_utc(utc_stamp(datetime(2026, 10, 19, 12, 0))) == datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+
+
+# ── Migrated containment sites (T17-e, T17-g, T17-h) ──────────────────────────
+
+@POSIX_ONLY
+@pytest.mark.skipif(not os.path.isfile("/etc/hosts"), reason="needs /etc/hosts")
+def test_verify_keeps_a_named_file_of_a_repository_at_the_filesystem_root(monkeypatch, capsys):
+    import argparse
+
+    from aegis_cli import verify
+
+    monkeypatch.setattr(verify, "_resolve_git_cwd", lambda args: "/")
+    assert verify.resolve_target_files(argparse.Namespace(files=["etc/hosts"])) == ["etc/hosts"]
+    assert "out-of-tree" not in capsys.readouterr().err
+
+
+def test_verify_still_skips_a_named_file_outside_the_repository(tmp_path, monkeypatch, capsys):
+    import argparse
+
+    from aegis_cli import verify
+
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "secret.txt").write_bytes(b"x")
+    monkeypatch.setattr(verify, "_resolve_git_cwd", lambda args: str(tmp_path / "repo"))
+    assert verify.resolve_target_files(argparse.Namespace(files=["../secret.txt"])) == []
+    assert "skipping out-of-tree file" in capsys.readouterr().err
+
+
+def test_a_baseline_finding_named_with_a_colon_reads_on_every_platform():
+    from aegis_core import baseline
+
+    entry = {"rule": "trap-x", "path": "a:b.py", "fp": "0" * 64}
+    data = ('{"v": 1, "findings": [%s]}' % str(entry).replace("'", '"')).encode("utf-8")
+    assert {e.path for e in baseline.parse(data)} == {"a:b.py"}
+    with pytest.raises(baseline.BaselineFileError):
+        baseline.parse(data.replace(b"a:b.py", b"a/../b.py"))
+
+
+@pytest.mark.parametrize("path", ["a:b", "a\\b", "../x", "/x", "", "a/./b"])
+def test_a_benchmark_corpus_path_follows_the_windows_rule_on_every_platform(path):
+    from aegis_core import benchmark
+
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark._check_corpus_path(path)
+    benchmark._check_corpus_path("src/x.py")
+
+
+def _registry(home, *roots):
+    import json
+
+    from aegis_core.workspace.layout import UserLayout
+
+    path = UserLayout(home).workspaces_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [{"root": r, "added_at": "2026-10-19T12:00:00Z", "added_by": "aegis init", "hosts": []} for r in roots]
+    path.write_bytes(json.dumps({"v": 1, "workspaces": entries}, indent=2).encode("utf-8") + b"\n")
+    return path
+
+
+def test_a_root_that_cannot_be_resolved_matches_no_registry_entry_and_removes_nothing(tmp_path):
+    """None-key trap: a skipped (relative) entry and an unresolvable root both have no key; they
+    must not match, or the unrelated entry would be found or removed."""
+    from aegis_cli import install_hosts as ih
+
+    home = tmp_path / "home"
+    path = _registry(home, "relative/root", str(tmp_path / "ws"))
+    before = path.read_bytes()
+    unresolvable = str(tmp_path / "x") + "\0y"
+    assert ih.find_workspace(ih.read_registry(home), unresolvable) is None
+    status, remaining = ih.unregister_workspace(home, unresolvable)
+    assert status == "absent" and len(remaining) == 2
+    assert path.read_bytes() == before
+    with pytest.raises(ih.InstallError, match="cannot be resolved"):
+        ih.register_workspace(home, unresolvable, ["claude-code"])
+    assert path.read_bytes() == before
+    assert ih.is_denied_root(unresolvable, home) is True

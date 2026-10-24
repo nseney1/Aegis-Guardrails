@@ -45,6 +45,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, O
 from aegis_core import gitsafe
 from aegis_core._version import __version__
 from aegis_core.errors import AegisError
+from aegis_core.primitives import is_within, safe_parts
 from aegis_core.storage import atomic_write_text
 from aegis_core.verification import ToolEvidence
 from aegis_core.workspace.layout import AEGIS_DIRNAME
@@ -230,9 +231,9 @@ def _no_constant(name: str) -> Any:
 
 
 def _path_ok(value: object) -> bool:
-    if not isinstance(value, str) or not value or _CONTROL.search(value) or "\\" in value:
-        return False
-    return all(part not in ("", ".", "..") for part in value.split("/"))
+    # The part rule of every platform (windows=False): a v1 file that holds a:b.py reads the same anywhere.
+    return isinstance(value, str) and not _CONTROL.search(value) and "\\" not in value \
+        and safe_parts(value, windows=False) is not None
 
 
 def parse(data: bytes) -> FrozenSet[Entry]:
@@ -305,10 +306,6 @@ class Baseline:
                 "entries": len(self.entries)}
 
 
-def _within(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
-
-
 def _read_working(root: Path) -> Optional[bytes]:
     """The working tree's baseline bytes, or None when there is no file. A symlink, a file
     that resolves outside the workspace and anything but a regular file are refused (a
@@ -324,7 +321,7 @@ def _read_working(root: Path) -> Optional[bytes]:
         raise BaselineFileError("is a symlink")
     if not stat.S_ISREG(info.st_mode):
         raise BaselineFileError("not a regular file")
-    if not _within(os.path.realpath(path), os.path.realpath(root)):
+    if not is_within(path, root, unresolvable=False):
         raise BaselineFileError("resolves outside the workspace")
     if info.st_size > MAX_BYTES:
         raise BaselineFileError(f"larger than {MAX_BYTES // (1024 * 1024)} MiB")
@@ -482,7 +479,7 @@ class Sources:
                 oid = self._staged_oid(path)
                 return None if oid is None else gitsafe.read_object(self.root, oid, MAX_BYTES)
             full = self.root / path
-            if not _within(os.path.realpath(full), os.path.realpath(self.root)) or os.path.getsize(full) > MAX_BYTES:
+            if not is_within(full, self.root, unresolvable=False) or os.path.getsize(full) > MAX_BYTES:
                 return None
             return full.read_bytes()
         except (OSError, ValueError, gitsafe.GitError):

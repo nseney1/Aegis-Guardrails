@@ -77,6 +77,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core import hosts as host_table
 from aegis_core.config import ENV_CLIENT, ENV_WORKSPACE
 from aegis_core.pathlookup import which
+from aegis_core.primitives import real_key
 from aegis_core.storage import atomic_write_bytes
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
@@ -546,27 +547,18 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _root_key(root: Union[str, Path]) -> str:
-    return os.path.normcase(os.path.realpath(os.fspath(root)))
-
-
 def _stored_key(root: str) -> Optional[str]:
     """The key of a root read from the registry, or None for one the server's reader skips:
     a relative root would resolve against the current directory, and the server cannot
-    resolve a NUL byte (realpath itself returns it as given on Windows Python 3.12+,
-    gh-106242). Such an entry never matches, and stays in the file as it is."""
-    if not os.path.isabs(root) or "\x00" in root:
-        return None
-    try:
-        return _root_key(root)
-    except (OSError, ValueError):
-        return None
+    resolve a NUL byte. Such an entry never matches (a None key equals nothing), and stays
+    in the file as it is."""
+    return real_key(root) if os.path.isabs(root) else None
 
 
 def is_denied_root(root: Union[str, Path], home: Union[str, Path]) -> bool:
     """True for the home directory and a filesystem root: never a workspace (AD-4)."""
-    real = os.path.realpath(os.fspath(root))
-    return _root_key(real) == _root_key(home) or os.path.dirname(real) == real
+    key = real_key(root)  # one that cannot be resolved is never a workspace either
+    return key is None or key == real_key(home) or os.path.dirname(key) == key
 
 
 def _registry_file(home: Union[str, Path]) -> Path:
@@ -644,7 +636,9 @@ def _update_registry(home: Union[str, Path], root: Union[str, Path], hosts: Sequ
                      dry_run: bool, now: Optional[str]) -> str:
     path = _registry_file(home)
     raw, data = _load_registry(path)
-    key = _root_key(root)
+    key = real_key(root)
+    if key is None:
+        raise InstallError(f"{root}: cannot be resolved, so it cannot be registered; left unchanged")
     entries = data["workspaces"]
     entry = next((e for e in entries if _stored_key(e["root"]) == key), None)
     if entry is None:
@@ -667,8 +661,8 @@ def unregister_workspace(home: Union[str, Path], root: Union[str, Path], *,
     """Remove ``root`` from the registry; (``removed`` or ``absent``, the remaining entries)."""
     path = _registry_file(home)
     raw, data = _load_registry(path)
-    key = _root_key(root)
-    remaining = [e for e in data["workspaces"] if _stored_key(e["root"]) != key]
+    key = real_key(root)
+    remaining = [e for e in data["workspaces"] if key is None or _stored_key(e["root"]) != key]
     if len(remaining) == len(data["workspaces"]):
         return "absent", remaining
     data["workspaces"] = remaining
@@ -682,8 +676,8 @@ def workspace_hosts(entry: Optional[Dict[str, Any]]) -> List[str]:
 
 
 def find_workspace(registry: Dict[str, Any], root: Union[str, Path]) -> Optional[Dict[str, Any]]:
-    key = _root_key(root)
-    return next((e for e in registry.get("workspaces", []) if _stored_key(e["root"]) == key), None)
+    key = real_key(root)
+    return next((e for e in registry.get("workspaces", []) if key is not None and _stored_key(e["root"]) == key), None)
 
 
 # ── Hosts ────────────────────────────────────────────────────────────────────

@@ -45,8 +45,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
-from aegis_cli.init import _host_option, _real_key, _unwritable, packaged_dir
+from aegis_cli.init import _host_option, _unwritable, packaged_dir
 from aegis_core import hosts as host_table
+from aegis_core.primitives import real_key
 
 __all__ = ["RESULTS", "Entry", "SkillsCommand", "SyncResult", "TargetResult", "run_skills", "summary", "sync_skills"]
 
@@ -302,13 +303,13 @@ def _is_link(path: Path) -> bool:
 def _check_dirs(root: Path, parts: Sequence[str]) -> None:
     """Raise _Refusal unless every existing directory on ``root/parts`` is a real directory
     exactly there inside the workspace: no link or junction, nothing but a directory, and
-    a realpath equal to the workspace's realpath plus these parts (as init._real_key
-    compares paths). Missing directories are fine; the write creates them."""
-    expected = _real_key(root)
+    a realpath key (``primitives.real_key``) equal to the workspace's plus these parts; one that cannot
+    be resolved is refused. Missing directories are fine; the write creates them."""
+    expected = real_key(root)
     current = root
     for depth, part in enumerate(parts, 1):
         current = current / part
-        expected = expected + os.sep + os.path.normcase(part)
+        expected = None if expected is None else expected + os.sep + os.path.normcase(part)
         rel = "/".join(parts[:depth])
         if _is_link(current):
             raise _Refusal("link", f"{rel} is a link (symlink or junction); Aegis never writes through a link, "
@@ -317,7 +318,7 @@ def _check_dirs(root: Path, parts: Sequence[str]) -> None:
             return
         if not os.path.isdir(current):
             raise _Refusal("not_directory", f"{rel} is not a directory; left as it is")
-        if _real_key(current) != expected:
+        if expected is None or real_key(current) != expected:
             raise _Refusal("outside", f"{rel} resolves to {os.path.realpath(current)}, not a real directory inside "
                                       f"the workspace (a junction or link); Aegis never writes through it, {_FORCE_NOTE}")
 

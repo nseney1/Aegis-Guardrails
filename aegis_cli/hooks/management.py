@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 from aegis_core import command_safety
+from aegis_core.primitives import is_within
 from aegis_core.storage import atomic_write_bytes
 
 _AEGIS_HOOK_START = "# >>> aegis pre-commit >>>"
@@ -208,15 +209,7 @@ def install_hook(
                 return False
             replace_link = True
         else:
-            is_contained = False
-            for boundary in (root, git_hooks_dir):
-                if boundary:
-                    try:
-                        real_target.relative_to(boundary.resolve())
-                        is_contained = True
-                        break
-                    except ValueError:
-                        pass
+            is_contained = any(is_within(real_target, b, unresolvable=False) for b in (root, git_hooks_dir) if b)
             if not is_contained and not force:
                 print(
                     f"Error: {hook_file} is a symlink pointing outside repository ({real_target}). Use --force to overwrite.",
@@ -303,15 +296,7 @@ def uninstall_hook(
                 return True
             return False
         else:
-            is_contained = False
-            for boundary in (root, git_hooks_dir):
-                if boundary:
-                    try:
-                        real_target.relative_to(boundary.resolve())
-                        is_contained = True
-                        break
-                    except ValueError:
-                        pass
+            is_contained = any(is_within(real_target, b, unresolvable=False) for b in (root, git_hooks_dir) if b)
             if not is_contained and not force:
                 print(
                     f"Error: {hook_file} is a symlink pointing outside repository ({real_target}). Use --force to uninstall.",
@@ -380,9 +365,9 @@ def _hooks_dir_in_work_tree(root: Path, git_hooks_dir: Path) -> bool:
     for top in (start, *start.parents):
         dot_git = top / ".git"
         if dot_git.exists():
-            if dot_git.is_dir() and hooks.is_relative_to(dot_git.resolve()):
+            if dot_git.is_dir() and is_within(hooks, dot_git, unresolvable=False):
                 return False
-            return hooks.is_relative_to(top)
+            return is_within(hooks, top, unresolvable=False)
     return False
 
 

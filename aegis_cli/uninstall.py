@@ -47,6 +47,7 @@ from aegis_cli.install_hosts import (
     unregister_workspace,
     workspace_hosts,
 )
+from aegis_core.primitives import real_key
 
 __all__ = ["run_uninstall", "UninstallCommand"]
 
@@ -76,8 +77,8 @@ def _recorded_hosts(root: Path, home: Path, report: Report) -> List[str]:
 
 
 def _links_to(link: Path, target: Path) -> bool:
-    return link.is_symlink() and (os.path.normcase(os.path.realpath(link))
-                                  == os.path.normcase(os.path.realpath(target)))
+    key = real_key(link) if link.is_symlink() else None
+    return key is not None and key == real_key(target)
 
 
 def _through_link(link: Path, block_id: str) -> Step:

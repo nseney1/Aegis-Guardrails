@@ -14,7 +14,7 @@ import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from aegis_core import gitsafe, pathlookup
-from aegis_core.config import _is_within
+from aegis_core.primitives import is_within
 from aegis_core.verification import test_runner
 
 # Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear); above
@@ -550,9 +550,10 @@ def _preset_argv(preset: str, target: Path) -> list[str]:
 
         ul = UserLayout.current()
         user_dir = ul.aegis_dir.resolve() if ul else None
-        if user_dir is not None and not _is_within(user_dir, target):
+        if user_dir is not None and not is_within(user_dir, target, unresolvable=True):
             cand = (user_dir / "gitleaks.toml").resolve()
-            if _is_within(cand, user_dir) and not _is_within(cand, target) and cand.is_file():
+            if is_within(cand, user_dir, unresolvable=False) and not is_within(cand, target, unresolvable=True) \
+                    and cand.is_file():
                 argv.extend(["--config", str(cand)])
         # Without --config gitleaks reads <source>/.gitleaks.toml: a repository allowlist would
         # silence the scan. lexists, so a dangling link or a case-folded name counts too.
@@ -613,7 +614,8 @@ def _line_keys(findings: Sequence[Finding], root: Path) -> list[str]:
         if f.path not in texts:
             real = Path(os.path.realpath(root / f.path))
             try:
-                readable = bool(f.path) and _is_within(real, root) and real.is_file() and real.stat().st_size <= 1 << 20
+                readable = bool(f.path) and is_within(real, root, unresolvable=False) and real.is_file() \
+                    and real.stat().st_size <= 1 << 20
                 texts[f.path] = baseline.split_lines(real.read_bytes().decode("utf-8", "replace")) if readable else []
             except OSError:
                 texts[f.path] = []

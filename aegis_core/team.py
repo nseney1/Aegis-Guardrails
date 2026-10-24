@@ -59,9 +59,10 @@ import types
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import events, gitsafe
-from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _is_within, _read_capped
+from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, _read_capped
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.match import normalize_path, sets_overlap
+from aegis_core.primitives import is_within
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -282,7 +283,7 @@ def load_team(workspace: Any) -> TeamPolicy:
     path = root / TEAM_FILE
     if os.path.islink(path):
         raise TeamFileError("is a symlink")
-    if os.path.lexists(path) and not _is_within(path, root):
+    if os.path.lexists(path) and not is_within(path, root, unresolvable=False):
         raise TeamFileError("resolves outside the workspace")
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:

@@ -31,6 +31,7 @@ import stat
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.errors import AegisValidationError, PathTraversalError
+from aegis_core.primitives import is_within
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 __all__ = [
@@ -163,12 +164,6 @@ def _valid_epsilon(value: Any) -> Optional[float]:
 
 # ── Reading files ────────────────────────────────────────────────────────────
 
-def _is_within(path: Path, root: Path) -> bool:
-    # realpath, not Path.resolve(): it never raises (3.9 resolve raises RuntimeError on loops).
-    real, base = os.path.realpath(path), os.path.realpath(root)
-    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
-
-
 def _read_capped(fd: int, limit: int) -> bytes:
     data = b""
     while len(data) <= limit:
@@ -260,7 +255,7 @@ class RepoConfig:
         """
         layout = WorkspaceLayout(Path(os.fspath(workspace_root)).resolve())
         path = layout.config_file
-        if os.path.lexists(path) and not _is_within(path, layout.root):
+        if os.path.lexists(path) and not is_within(path, layout.root, unresolvable=False):
             return cls(warnings=(f"ignored {REPO_LABEL}: it resolves to a path outside the workspace",))
         raw = _read_json(path, REPO_LABEL)
         return cls() if raw is None else cls.parse(raw)
@@ -451,7 +446,8 @@ class UserConfig:
         if user is None:
             return cls()
         path = user.config_file
-        if workspace_root is not None and os.path.lexists(path) and _is_within(path, Path(os.fspath(workspace_root))):
+        inside = workspace_root is not None and is_within(path, os.fspath(workspace_root), unresolvable=True)
+        if inside and os.path.lexists(path):
             return cls(warnings=(
                 f"ignored {USER_LABEL} as user scope: it lies inside the workspace, "
                 "so it is treated as repository content",
@@ -552,7 +548,7 @@ def read_user_config(
             return None
         path = user.config_file
     path = Path(os.fspath(path))
-    if workspace_root is not None and _is_within(path, Path(os.fspath(workspace_root))):
+    if workspace_root is not None and is_within(path, os.fspath(workspace_root), unresolvable=True):
         return None
     try:
         return _read_json(path, USER_LABEL)

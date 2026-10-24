@@ -34,6 +34,7 @@ from aegis_cli.formatters.report import (
     format_layer2_json,
     format_layer2_summary,
 )
+from aegis_core.primitives import is_within
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -105,7 +106,7 @@ def resolve_target_files(args: argparse.Namespace) -> list[str]:
         safe_files = []
         for f in explicit:
             resolved = os.path.realpath(os.path.join(repo_root, f))
-            if not resolved.startswith(repo_root + os.sep) and resolved != repo_root:
+            if not is_within(os.path.join(repo_root, f), git_cwd, unresolvable=False):  # each side resolved once
                 print(f"Warning: skipping out-of-tree file: {sanitize_display(f)}", file=sys.stderr)
                 continue
             if os.path.isdir(resolved):
@@ -121,8 +122,7 @@ def resolve_target_files(args: argparse.Namespace) -> list[str]:
                 if not listed:
                     print(f"Warning: no files to check under {sanitize_display(f)}", file=sys.stderr)
                 for g in listed:
-                    real = os.path.realpath(os.path.join(repo_root, g))
-                    if real.startswith(repo_root + os.sep):
+                    if is_within(os.path.join(repo_root, g), git_cwd, unresolvable=False):
                         safe_files.append(g)
                     else:
                         print(f"Warning: skipping out-of-tree file: {sanitize_display(g)}", file=sys.stderr)
@@ -203,14 +203,13 @@ def resolve_task_plan(args: argparse.Namespace, repo_root: str) -> str | None:
             print(f"Error: could not read plan file {plan_file}: {e}", file=sys.stderr)
             return None
 
-    real_root = os.path.realpath(repo_root)
     for default_name in ("docs/plan.md", f"{AEGIS_DIRNAME}/plan.md", "PLAN.md"):
         cand = os.path.join(repo_root, default_name)
         if not os.path.lexists(cand):
             continue
         # Nobody named this file, and its text goes to the model: a branch must not be
         # able to route a secret from outside the repository into the prompt.
-        if os.path.islink(cand) or not os.path.realpath(cand).startswith(real_root + os.sep):
+        if os.path.islink(cand) or not is_within(cand, repo_root, unresolvable=False):
             print(f"Warning: ignoring {default_name}: it is a symlink or leaves the repository", file=sys.stderr)
             continue
         if os.path.isfile(cand):
