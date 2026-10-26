@@ -35,7 +35,7 @@ def _lane(root):
 
 
 def _documents(root, monkeypatch, capsys):
-    from aegis_cli import approve, benchmark, cli, doctor_render, init_views, package, rule, skills_sync, team
+    from aegis_cli import approve, benchmark, cli, doctor, doctor_render, init_views, package, rule, skills_sync, team
     from aegis_cli.hooks import registrar
     from aegis_core import card, partition
     from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
@@ -69,12 +69,12 @@ def _documents(root, monkeypatch, capsys):
     diag = SimpleNamespace(ctx=SimpleNamespace(root=root, governed=True, selected=(), selection="default"),
                            rows=[], findings=[], tiers=[], trust=None, modes=None)
     docs["doctor"] = doctor_render._payload(diag, [])
-    monkeypatch.setattr(doctor_render.human_gate, "detect_tier", lambda root: human_gate.TierReport("C"))
-    assert doctor_render._run_github(root, True, False, None) == 0
+    monkeypatch.setattr(doctor.human_gate, "detect_tier", lambda root: human_gate.TierReport("C"))
+    assert doctor._run_github(root, True, False, None) == 0
     docs["doctor_github"] = json.loads(capsys.readouterr().out)
-    monkeypatch.setattr(doctor_render, "_run_checks", lambda *args, **kwargs: [
+    monkeypatch.setattr(doctor, "_run_checks", lambda *args, **kwargs: [
         {"id": "ast_drivers", "status": "pass", "text": "healthy", "detail": []}])
-    assert doctor_render._run_drivers_only(root, True, False, False) == 0
+    assert doctor._run_drivers_only(root, True, False, False) == 0
     docs["doctor_drivers"] = json.loads(capsys.readouterr().out)
     return docs
 

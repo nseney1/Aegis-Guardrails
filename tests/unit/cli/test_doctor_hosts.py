@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import run_doctor
 from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
 
@@ -559,7 +559,7 @@ def test_an_empty_home_rules_dir_left_by_v3_auto_mkdir_is_reported(env):
 def test_v3_flat_rule_copies_are_matched_by_sha256_never_by_name(env, monkeypatch):
     env.all_ok()
     shipped = b"---\nid: providence\n---\n# Providence (as v3.3.0 shipped it)\n"
-    monkeypatch.setattr(doctor, "V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
+    monkeypatch.setattr(doctor_base, "_V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
     leak = env.home / ".gemini" / "config" / "rules" / "providence.md"
     oracle = env.home / ".kiro" / "steering" / ".oracles" / "testing.md"
     edited = env.home / ".kiro" / "steering" / "providence.md"
@@ -573,8 +573,8 @@ def test_v3_flat_rule_copies_are_matched_by_sha256_never_by_name(env, monkeypatc
 
 
 def test_the_embedded_v3_digests_are_sha256_hex():
-    assert len(doctor.V3_SHIPPED_RULE_SHA256) == 28
-    assert all(len(d) == 64 and int(d, 16) >= 0 for d in doctor.V3_SHIPPED_RULE_SHA256)
+    assert len(doctor_base._V3_SHIPPED_RULE_SHA256) == 28
+    assert all(len(d) == 64 and int(d, 16) >= 0 for d in doctor_base._V3_SHIPPED_RULE_SHA256)
 
 
 def test_unparseable_host_config_is_reported_and_makes_registration_unknown(env):
@@ -1920,7 +1920,7 @@ def test_an_installed_app_counts_as_installed_without_a_cli(env, monkeypatch, tm
     apps = tmp_path / "Applications"
     (apps / "Kiro.app").mkdir(parents=True)
     monkeypatch.setattr(table, "APP_DIRS", {"darwin": (str(apps),)})
-    monkeypatch.setattr(doctor, "_platform", lambda: "darwin")
+    monkeypatch.setattr(doctor_base, "_platform", lambda: "darwin")
     env.all_ok()
     select(env, "kiro")
     row = host(env.doctor(), "kiro")
@@ -1939,7 +1939,7 @@ def test_an_app_that_doctor_cannot_ask_is_auth_unknown_never_ok(env, monkeypatch
     apps = tmp_path / "Applications"
     (apps / "Codex.app").mkdir(parents=True)
     monkeypatch.setattr(table, "APP_DIRS", {"darwin": (str(apps),)})
-    monkeypatch.setattr(doctor, "_platform", lambda: "darwin")
+    monkeypatch.setattr(doctor_base, "_platform", lambda: "darwin")
     env.bootstrap()
     env.register_workspace()
     row = host(env.doctor(), "codex-cli")

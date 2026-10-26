@@ -3,7 +3,7 @@ import argparse
 from pathlib import Path
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.cli import main
 from aegis_cli.doctor import run_doctor, _check_ast_drivers
 from aegis_core.skills.slots import SlotRegistry
@@ -25,10 +25,10 @@ def isolated_hosts(tmp_path, monkeypatch):
     # machine's PATH (doctor's own lookup).
     no_programs = tmp_path / "no-programs"
     no_programs.mkdir()
-    real_which, real_skipped = doctor.which, doctor.only_skipped
-    monkeypatch.setattr(doctor, "which", lambda name, path=None, outside=None:
+    real_which, real_skipped = doctor_base.which, doctor_base.only_skipped
+    monkeypatch.setattr(doctor_base, "which", lambda name, path=None, outside=None:
                         real_which(name, str(no_programs), outside))
-    monkeypatch.setattr(doctor, "only_skipped", lambda name, path=None, outside=None, base=None:
+    monkeypatch.setattr(doctor_base, "only_skipped", lambda name, path=None, outside=None, base=None:
                         real_skipped(name, str(no_programs), outside, base))
     return home
 

@@ -1,179 +1,27 @@
-"""Instruction/bootstrap parsing, host rows, hook evaluation, and findings for ``aegis doctor``."""
+"""Diagnosis for ``aegis doctor``: host rows, the PreToolUse hook rows, the findings, the enforcement
+tiers and the run's diagnosis.
+
+Hosts are asked only through the run's prober and files are read only through the run context
+(``aegis_cli.doctor_base``); repairing and printing live in doctor_repair and doctor_render."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
-import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+from aegis_cli import doctor_base as _base
+from aegis_cli.doctor_base import (
+    _Action, _Ctx, _File, _Finding, _Instructions, _claude_config, _claude_dir, _claude_user_registered,
+    _desktop_configs, _host_json_path, _instruction_files, _instructions, _legacy_items, _legacy_ranges,
+    _list_location, _location, _registered_roots, _removed_host_phases, _without_lines,
+)
+from aegis_core import human_gate
 from aegis_core.pathlookup import is_bare
 from aegis_core.primitives import real_key
 
-if TYPE_CHECKING:
-    from aegis_cli.doctor import _Ctx
-    from aegis_cli.doctor_repair import _File
 
 # ── Host plane: instruction files ───────────────────────────────────────────
-
-_BLOCK_BEGIN = re.compile(r"^<!-- aegis:begin id=(\S+) v=(\S+) sha=(\S+) -->[ \t]*$")
-_BLOCK_END = re.compile(r"^<!-- aegis:end id=(\S+) -->[ \t]*$")
-_HEX12 = re.compile(r"^[0-9a-f]{12}$")
-# An import path runs to the next whitespace, so @AGENTS.md.bak names another file. A
-# relative import resolves next to the file holding it: from .claude/ it is ../AGENTS.md.
-_IMPORTS_AGENTS = re.compile(r"(?<![\w@/.\-])@(?:\./)?AGENTS\.md(?=\s|$)")
-_IMPORTS_PARENT_AGENTS = re.compile(r"(?<![\w@/.\-])@\.\./AGENTS\.md(?=\s|$)")
-# What Claude Code loads as project memory from the directory it starts in and from every
-# parent. Any one of them turns off its native AGENTS.md reading (host research digest:
-# "only when no CLAUDE.md or CLAUDE.local.md exists in cwd or any ancestor"; the binary's
-# candidate list also has .claude/CLAUDE.md).
-_CLAUDE_FAMILY = ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_CODE_SPAN = re.compile(r"(`+).+?\1")
-_INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
-_BOM = "\ufeff"
-
-
-def _fence_step(fence: Optional[Tuple[str, int]], line: str) -> Optional[Tuple[str, int]]:
-    """The fenced-code state after ``line``: None outside a fence, else (fence char, length)."""
-    match = _FENCE.match(line)
-    if fence is None:
-        return (match.group(1)[0], len(match.group(1))) if match else None
-    closes = (match is not None and match.group(1)[0] == fence[0] and len(match.group(1)) >= fence[1]
-              and not line[match.end():].strip())
-    return None if closes else fence
-
-
-def _prose(text: str) -> str:
-    """``text`` without fenced or indented code blocks and inline code spans, where
-    Claude Code evaluates no ``@`` import.
-
-    An indented block starts after a blank line (or at the top) and cannot interrupt a
-    paragraph. List context is not tracked, so an import indented inside a list item
-    after a blank line counts as code: doctor may then under-report it, never over-report.
-    """
-    out, fence, blank_before, indented = [], None, True, False
-    for line in text.splitlines():
-        inside = fence is not None
-        fence = _fence_step(fence, line)
-        if inside or fence is not None:
-            blank_before, indented = False, False
-            continue
-        if not line.strip():
-            blank_before = True
-            continue
-        if _INDENTED_CODE.match(line) and (blank_before or indented):
-            indented, blank_before = True, False
-            continue
-        indented, blank_before = False, False
-        out.append(_CODE_SPAN.sub(" ", line))
-    return "\n".join(out)
-
-
-@dataclass
-class _ClaudeFile:
-    """One CLAUDE.md-family file in the workspace, as Claude Code would load it."""
-
-    name: str  # relative to the workspace, with forward slashes
-    path: Path
-    size: int
-    imports_agents: bool
-    # It and AGENTS.md are one file (a link either way): Claude Code reads AGENTS.md.
-    is_agents: bool
-    link_target: Optional[str]  # where it points when it is a symlink
-
-
-@dataclass
-class _Instructions:
-    agents_bytes: Optional[int] = None
-    bootstrap: str = "not_read"  # current outdated hand_edited malformed missing not_read
-    block_end: Optional[int] = None  # bytes up to the end of the closing marker line
-    claude: List[_ClaudeFile] = field(default_factory=list)  # in the workspace, _CLAUDE_FAMILY order
-    # CLAUDE.md-family files in the workspace's parent directories, except the user memory
-    # file: they count, but doctor reads no file outside the workspace, so whether one
-    # imports this AGENTS.md is unknown.
-    claude_outside: List[Path] = field(default_factory=list)
-    override: bool = False
-
-
-def _bootstrap_state(text: str) -> Tuple[str, Optional[int]]:
-    from aegis_cli import doctor as _doc
-    from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
-
-    # aegis init keeps a byte-order mark it finds, so the block can start right after one.
-    bom = text.startswith(_BOM)
-    lines = text[1:].splitlines(True) if bom else text.splitlines(True)
-    begins, ends, offset, end_at = [], [], len(_BOM.encode("utf-8")) if bom else 0, None
-    for index, line in enumerate(lines):
-        offset += len(line.encode("utf-8"))
-        bare = line.rstrip("\r\n")
-        begin = _BLOCK_BEGIN.match(bare)
-        if begin and begin.group(1) == BOOTSTRAP_ID:
-            begins.append((index, begin.group(2), begin.group(3)))
-        end = _BLOCK_END.match(bare)
-        if end and end.group(1) == BOOTSTRAP_ID:
-            ends.append(index)
-            end_at = offset
-    if not begins and not ends:
-        return "missing", None
-    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0][0]:
-        return "malformed", None
-    start, version, sha = begins[0]
-    if version != "1" or not _HEX12.match(sha):
-        return "malformed", None
-    body = "".join(lines[start + 1:ends[0]]).replace("\r\n", "\n")
-    if _doc._sha256(body.encode("utf-8"))[:12] != sha:
-        return "hand_edited", end_at
-    return ("current" if body == bootstrap_text() else "outdated"), end_at
-
-
-def _instructions(ctx: _Ctx) -> _Instructions:
-    from aegis_cli import doctor as _doc
-    from aegis_cli.doctor_repair import _claude_dir
-
-    info = _Instructions()
-    if not ctx.governed:
-        return info
-    agents = ctx.file(ctx.root / "AGENTS.md")
-    if agents.raw is not None:
-        info.agents_bytes = len(agents.raw)
-        text = agents.raw.decode("utf-8", errors="replace")
-        info.bootstrap, info.block_end = _bootstrap_state(text)
-    else:
-        info.bootstrap = "missing"
-    for name in _CLAUDE_FAMILY:
-        entry = ctx.file(ctx.root.joinpath(*name.split("/")))
-        if entry.raw is None:
-            continue
-        imports = _IMPORTS_PARENT_AGENTS if name.startswith(".claude/") else _IMPORTS_AGENTS
-        same = False
-        if agents.raw is not None:
-            try:
-                same = os.path.samefile(str(entry.path), str(agents.path))
-            except OSError:
-                same = False
-        info.claude.append(_ClaudeFile(
-            name=name, path=entry.path, size=len(entry.raw),
-            imports_agents=bool(imports.search(_prose(entry.raw.decode("utf-8", errors="replace")))),
-            is_agents=same, link_target=os.path.realpath(str(entry.path)) if entry.is_link else None))
-    # Claude Code loads <config dir>/CLAUDE.md (~/.claude/CLAUDE.md) as user memory and
-    # leaves exactly that path out of the walk that decides whether AGENTS.md is read
-    # (claude 2.1.301: the walk's processed paths start as {managed, user} memory).
-    # The match is by spelling. Under a symlinked home the ancestors of the resolved root
-    # spell that file differently, and whether Claude Code still skips it there is
-    # unverified, so it counts and the reach stays unknown rather than claimed.
-    claude_dir = _claude_dir(ctx)
-    user_memory = _path_key(claude_dir / "CLAUDE.md") if claude_dir is not None else None
-    candidates = (d.joinpath(*name.split("/")) for d in ctx.root.parents for name in _CLAUDE_FAMILY)
-    info.claude_outside = [p for p in candidates if _path_key(p) != user_memory and _doc._present(p)]
-    info.override = (ctx.root / "AGENTS.override.md").exists()
-    return info
-
-
-def _path_key(path: Path) -> str:
-    """``path`` as written, made absolute and case-folded where the OS folds case."""
-    return os.path.normcase(os.path.abspath(str(path)))
-
 
 def _claude_reads_agents(info: _Instructions) -> bool:
     return any(f.is_agents or f.imports_agents for f in info.claude)
@@ -216,13 +64,11 @@ def _budget(spec: Any, info: _Instructions) -> Dict[str, Any]:
 
 
 def _bootstrap_reaches(spec: Any, info: _Instructions) -> Optional[bool]:
-    from aegis_cli import doctor as _doc
-
     if info.bootstrap == "not_read" or spec.instructions in ("gemini_md", "none"):
         return None
     if info.bootstrap not in ("current", "outdated"):
         return False
-    if spec.id in _doc._READS_AGENTS_OVERRIDE and info.override:
+    if spec.id in _base._READS_AGENTS_OVERRIDE and info.override:
         return False
     if spec.instructions == "agents_md_unless_claude_md":
         if _claude_reads_agents(info):
@@ -234,39 +80,9 @@ def _bootstrap_reaches(spec: Any, info: _Instructions) -> Optional[bool]:
     return True
 
 
-def _registered_roots(ctx: _Ctx) -> Tuple[Optional[set], List[int]]:
-    """(normalized roots in ~/.aegis/workspaces.json, indexes of the entries skipped).
-
-    The roots are empty when the file is absent and None when it cannot be read. An
-    entry is skipped, as the server's registry reader skips it, unless it is an object
-    whose ``root`` is an absolute path that resolves: a relative root would otherwise be
-    resolved against doctor's own cwd, and a NUL byte makes resolving raise.
-    """
-    if ctx.home is None:
-        return None, []
-    from aegis_core.workspace.layout import UserLayout
-
-    reg = ctx.file(UserLayout(ctx.home).workspaces_file, as_json=True)
-    if not reg.exists:
-        return set(), []
-    if reg.error or reg.data.get("v") != 1 or not isinstance(reg.data.get("workspaces"), list):
-        return None, []
-    roots, skipped = set(), []
-    for index, entry in enumerate(reg.data["workspaces"]):
-        raw = entry.get("root") if isinstance(entry, dict) else None
-        key = real_key(raw) if isinstance(raw, str) and os.path.isabs(raw) else None
-        if key is None:
-            skipped.append(index)
-        else:
-            roots.add(key)
-    return roots, skipped
-
-
 # ── Host plane: one row per host ────────────────────────────────────────────
 
 def _identity(spec: Any, reg: Dict[str, Any]) -> Dict[str, Any]:
-    from aegis_cli import doctor as _doc
-
     client = reg.get("aegis_client")
     if reg["status"] != "registered":
         return {"status": "unknown", "aegis_client": None}
@@ -277,7 +93,7 @@ def _identity(spec: Any, reg: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "client_info" if known else "unknown", "aegis_client": None}
     if set(client) == {"*"}:
         return {"status": "unknown", "aegis_client": None}
-    return {"status": "mismatch", "aegis_client": _doc._clean(client, 128)}
+    return {"status": "mismatch", "aegis_client": _base._clean(client, 128)}
 
 
 def _any(*facts: Optional[bool]) -> Optional[bool]:
@@ -314,12 +130,10 @@ def _advisory(spec: Any, ctx: _Ctx, installed: Optional[bool], reg: Dict[str, An
     the repository only through the registry, and its bootstrap sends the agent to that
     server, so it needs this workspace registered as well.
     """
-    from aegis_cli import doctor as _doc
-
     if not ctx.governed or installed is False:
         return False
     route = _any(_mcp_loads(reg), False if spec.instructions == "none" else bootstrap)
-    if spec.id in _doc._REGISTRY_BOUND:
+    if spec.id in _base._REGISTRY_BOUND:
         route = _all(workspace_registered, route)
     return _all(installed, route)
 
@@ -346,7 +160,6 @@ def _level(advisory: Optional[bool], floor: str, governed: bool, installed: Opti
 
 
 def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], floor: str) -> Dict[str, Any]:
-    from aegis_cli import doctor as _doc
     from aegis_cli.install_hosts import launch_risk
     from aegis_core.pathlookup import INSIDE_FENCE
 
@@ -354,16 +167,16 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
     passed = [] if binary else [hit for name in spec.binaries for hit in ctx.passed_over(name)]
     ignored = list(dict.fromkeys(hit.path for hit in passed))
     # An IDE or desktop app of the plane puts no binary on PATH; its bundle is the evidence.
-    app = None if binary else _doc._app(spec, ctx)
+    app = None if binary else _base._app(spec, ctx)
     # Installed: True, False, or None when the only binary is one doctor will not run.
     installed: Optional[bool] = True if binary or app else (None if passed else False)
-    reg = _doc._probe(spec, binary, ctx)
+    reg = ctx.probe(spec, binary)
     identity = _identity(spec, reg)
     reasons: List[Dict[str, str]] = []
     unknown: List[str] = []
 
     def add(code: str, message: str) -> None:
-        reasons.append({"code": code, "message": _doc._clean(message, 1024)})
+        reasons.append({"code": code, "message": _base._clean(message, 1024)})
 
     names = " or ".join(f"`{b}`" for b in spec.binaries) or "a binary"
     if passed and not app:
@@ -420,7 +233,7 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
     budget = _budget(spec, info)
     reaches = _bootstrap_reaches(spec, info)
     # The host keeps too little of its instruction file for the bootstrap to arrive whole.
-    cut = (budget["within"] is False and info.bootstrap != "missing" and spec.id in _doc._TRUNCATES_TAIL
+    cut = (budget["within"] is False and info.bootstrap != "missing" and spec.id in _base._TRUNCATES_TAIL
            and (info.block_end or 0) > budget["budget_bytes"])
     workspace_registered = None if roots is None else real_key(ctx.root) in roots
     if roots is None:
@@ -448,15 +261,15 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
                 "natively when a CLAUDE.md, CLAUDE.local.md or .claude/CLAUDE.md is in the directory it starts "
                 "in or a parent, and doctor reads no file outside the workspace, so it cannot tell whether "
                 "AGENTS.md reaches Claude Code: add a CLAUDE.md holding the line @AGENTS.md to the workspace")
-        if spec.id in _doc._READS_AGENTS_OVERRIDE and info.override:
+        if spec.id in _base._READS_AGENTS_OVERRIDE and info.override:
             add("agents_override_shadows_agents_md", "AGENTS.override.md replaces AGENTS.md for Codex")
         if cut:
             add("over_budget", f"{budget['file']} is {budget['bytes']} bytes; {spec.display_name} reads "
                                f"{budget['budget_bytes']} and the Aegis block may not reach it")
-        if spec.id in _doc._REGISTRY_BOUND and workspace_registered is False:
+        if spec.id in _base._REGISTRY_BOUND and workspace_registered is False:
             add("workspace_unregistered", f"{spec.display_name} sends no workspace, so aegis finds this "
                                           f"repository only through ~/.aegis/workspaces.json: run aegis init")
-        elif spec.id in _doc._REGISTRY_BOUND and workspace_registered is None:
+        elif spec.id in _base._REGISTRY_BOUND and workspace_registered is None:
             add("workspace_registry_unknown", f"{spec.display_name} sends no workspace and "
                                               "~/.aegis/workspaces.json cannot be read, so doctor cannot tell "
                                               "whether aegis finds this repository")
@@ -514,8 +327,6 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
 # ── Host plane: PreToolUse hooks (v4.1 §2 Doctor) ──────────────────────────
 
 _HOOK_SCOPE_FILES = {"claude-code": (("local", (".claude", "settings.local.json")),)}
-# A token after which the shell starts a new command (a v3 entry may be `cd x && soma hook ...`).
-_COMMAND_STARTERS = frozenset({"&&", "||", "|", ";", "&", "!", "(", "{", "then", "do", "else", "exec"})
 _V3_PLUGIN = (".gemini", "config", "plugins", "governance", "hooks.json")
 
 
@@ -596,8 +407,6 @@ def _hook_row(spec: Any, ctx: _Ctx) -> Dict[str, Any]:
 
 
 def _hook_findings(ctx: _Ctx, rows: List[Dict[str, Any]]) -> List[_Finding]:
-    from aegis_cli.doctor_repair import _legacy_hook_findings
-
     found: List[_Finding] = []
     for row in rows:
         hooks, name, host_id = row["hooks"], row["display_name"], row["id"]
@@ -634,59 +443,8 @@ def _hook_findings(ctx: _Ctx, rows: List[Dict[str, Any]]) -> List[_Finding]:
 
 # ── Findings ────────────────────────────────────────────────────────────────
 
-@dataclass
-class _Action:
-    """One reported change --fix may make to one file."""
-
-    path: Path
-    kind: str  # remove_keys | remove_lines | remove_list_items | delete_file | enable_packaged_ast_drivers
-    sha256: Optional[str]
-    describe: str
-    keys: Tuple[Tuple[str, ...], ...] = ()
-    lines: Tuple[Tuple[int, int], ...] = ()
-    # remove_list_items: (key path to a JSON list, index in it); the file is unchanged since
-    # the check (sha256), so the indexes still name the entries doctor reported.
-    items: Tuple[Tuple[Tuple[Any, ...], int], ...] = ()
-
-
-@dataclass
-class _Finding:
-    code: str
-    path: Path
-    message: str
-    location: Optional[str] = None
-    severity: str = "warning"
-    action: Optional[_Action] = None
-
-    def __post_init__(self) -> None:
-        from aegis_cli import doctor as _doc
-
-        # Messages quote paths, keys and parser errors from files a repository can write.
-        self.message = _doc._clean(self.message, 4096)
-
-    def as_dict(self) -> Dict[str, Any]:
-        # A finding is fixable exactly when it carries the action --fix would take.
-        return {"code": self.code, "severity": self.severity, "path": str(self.path), "location": self.location,
-                "message": self.message, "fixable": self.action is not None}
-
-
-def _location(keys: Tuple[str, ...]) -> str:
-    """Where a key is, for people: the keys (project paths among them) without control sequences."""
-    from aegis_cli import doctor as _doc
-
-    out = []
-    for key in keys:
-        if out and out[-1] == "projects":
-            out[-1] = f"projects[{_doc._clean(key)}]"
-        else:
-            out.append(_doc._clean(key))
-    return ".".join(out)
-
-
 def _key_finding(ctx: _Ctx, entry: _File, code: str, keys: Tuple[str, ...], message: str,
                  fixable: bool = True, blocked: Optional[str] = None) -> _Finding:
-    from aegis_cli import doctor as _doc
-
     where = _location(keys)
     action = None
     text = f"{ctx.label(entry.path)}: {message} ({where})"
@@ -695,15 +453,12 @@ def _key_finding(ctx: _Ctx, entry: _File, code: str, keys: Tuple[str, ...], mess
     elif entry.refusal:
         text += f"; --fix will not change it: {entry.refusal}"
     else:
-        action = _Action(entry.path, "remove_keys", _doc._sha256(entry.raw or b""), f"remove {where}", keys=(keys,))
-        text += f". Fix: {_doc._FIX_HINT}"
+        action = _Action(entry.path, "remove_keys", _base._sha256(entry.raw or b""), f"remove {where}", keys=(keys,))
+        text += f". Fix: {_base._FIX_HINT}"
     return _Finding(code, entry.path, text, location=where, action=action)
 
 
 def _mcp_findings(ctx: _Ctx, claude_user: bool) -> List[_Finding]:
-    from aegis_cli import doctor as _doc
-    from aegis_cli.doctor_repair import _claude_config, _desktop_configs, _host_json_path
-
     found: List[_Finding] = []
     files: List[Tuple[Path, str]] = []
     if ctx.home is not None:
@@ -733,35 +488,33 @@ def _mcp_findings(ctx: _Ctx, claude_user: bool) -> List[_Finding]:
             continue
         data = entry.data or {}
         servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
-        if _doc.LEGACY_SERVER in servers:
-            found.append(_key_finding(ctx, entry, "legacy_mcp_entry", ("mcpServers", _doc.LEGACY_SERVER),
-                                      _doc._LEGACY_ENTRY))
-        if _doc.SERVER in servers and kind == "dot_mcp":
-            found.append(_key_finding(ctx, entry, "misplaced_mcp_entry", ("mcpServers", _doc.SERVER),
+        if _base.LEGACY_SERVER in servers:
+            found.append(_key_finding(ctx, entry, "legacy_mcp_entry", ("mcpServers", _base.LEGACY_SERVER),
+                                      _base._LEGACY_ENTRY))
+        if _base.SERVER in servers and kind == "dot_mcp":
+            found.append(_key_finding(ctx, entry, "misplaced_mcp_entry", ("mcpServers", _base.SERVER),
                                       "Aegis v4 registers 'aegis' per user, never in a .mcp.json file",
                                       fixable=claude_user, blocked=no_user))
-        if _doc.SERVER in servers and kind == "desktop":
-            found.append(_key_finding(ctx, entry, "desktop_mcp_entry", ("mcpServers", _doc.SERVER),
+        if _base.SERVER in servers and kind == "desktop":
+            found.append(_key_finding(ctx, entry, "desktop_mcp_entry", ("mcpServers", _base.SERVER),
                                       "Claude Desktop is identity only in v4 (H4); its 'aegis' entry moves out"))
         if kind == "claude" and isinstance(data.get("projects"), dict):
             for name, project in data["projects"].items():
                 psrv = project.get("mcpServers") if isinstance(project, dict) else None
                 if not isinstance(psrv, dict):
                     continue
-                if _doc.LEGACY_SERVER in psrv:
+                if _base.LEGACY_SERVER in psrv:
                     found.append(_key_finding(ctx, entry, "legacy_mcp_entry",
-                                              ("projects", name, "mcpServers", _doc.LEGACY_SERVER),
-                                              _doc._LEGACY_ENTRY))
-                if _doc.SERVER in psrv and claude_user:
+                                              ("projects", name, "mcpServers", _base.LEGACY_SERVER),
+                                              _base._LEGACY_ENTRY))
+                if _base.SERVER in psrv and claude_user:
                     found.append(_key_finding(ctx, entry, "misplaced_mcp_entry",
-                                              ("projects", name, "mcpServers", _doc.SERVER),
+                                              ("projects", name, "mcpServers", _base.SERVER),
                                               "a local-scope 'aegis' entry shadows your user registration"))
     return found
 
 
 def _budget_findings(ctx: _Ctx, info: _Instructions) -> List[_Finding]:
-    from aegis_cli.doctor_repair import _claude_dir
-
     found = []
     budgets = {s.id: s.budget_bytes for s in ctx.selected if s.budget_bytes}
     agent_hosts = [s for s in ctx.selected if s.budget_bytes and s.instructions in ("agents_md", "agents_md_unless_claude_md")]
@@ -806,7 +559,6 @@ def _bootstrap_tool_findings(ctx: _Ctx, info: _Instructions, rows: List[Dict[str
     tells it to call aegis_scan, while the host has no ``aegis`` server: the field case of
     an IDE that read AGENTS.md but had no tools. Any registrable host counts, selected or
     not; a registration doctor cannot read is unknown, never absent, so it is not one."""
-    from aegis_cli import doctor as _doc
     from aegis_core import hosts
 
     if not ctx.governed or info.bootstrap not in ("current", "outdated"):
@@ -816,7 +568,7 @@ def _bootstrap_tool_findings(ctx: _Ctx, info: _Instructions, rows: List[Dict[str
     for spec in hosts.all_hosts(phase=1):
         if spec.registration is None or spec.retired or _bootstrap_reaches(spec, info) is not True:
             continue
-        evidence = _doc._plane_found(spec, ctx)
+        evidence = _base._plane_found(spec, ctx)
         if evidence is None:
             continue
         row = by_id.get(spec.id)
@@ -824,7 +576,7 @@ def _bootstrap_tool_findings(ctx: _Ctx, info: _Instructions, rows: List[Dict[str
             status = row["registration"]["status"]
         else:
             binary = next((b for b in (ctx.which(name) for name in spec.binaries) if b), None)
-            status = _doc._probe(spec, binary, ctx)["status"]
+            status = ctx.probe(spec, binary)["status"]
         if status != "absent":
             continue
         found.append(_Finding(
@@ -885,8 +637,6 @@ def _home_rules_finding(ctx: _Ctx) -> List[_Finding]:
 
 
 def _v3_copy_findings(ctx: _Ctx) -> List[_Finding]:
-    from aegis_cli import doctor as _doc
-
     if ctx.home is None:
         return []
     found = []
@@ -896,21 +646,20 @@ def _v3_copy_findings(ctx: _Ctx) -> List[_Finding]:
                 continue
             for path in sorted(directory.glob("*.md")):
                 entry = ctx.file(path)
-                if entry.is_link or entry.raw is None or _doc._sha256(entry.raw) not in _doc.V3_SHIPPED_RULE_SHA256:
+                if entry.is_link or entry.raw is None or _base._sha256(entry.raw) not in _base._V3_SHIPPED_RULE_SHA256:
                     continue
                 message = f"{ctx.label(path)}: an unedited copy of a rule Aegis v3 shipped"
                 action = None
                 if entry.refusal:
                     message += f"; --fix will not change it: {entry.refusal}"
                 else:
-                    action = _Action(path, "delete_file", _doc._sha256(entry.raw), "delete the v3 rule copy")
-                    message += f". Fix: {_doc._FIX_HINT}"
+                    action = _Action(path, "delete_file", _base._sha256(entry.raw), "delete the v3 rule copy")
+                    message += f". Fix: {_base._FIX_HINT}"
                 found.append(_Finding("v3_rule_copy", path, message, action=action))
     return found
 
 
 def _selection(root: Path, governed: bool, ctx: _Ctx) -> Tuple[Tuple[Any, ...], str, List[_Finding]]:
-    from aegis_cli import doctor as _doc
     from aegis_core import hosts
     from aegis_core.config import ConfigError, RepoConfig
     from aegis_core.workspace.layout import WorkspaceLayout
@@ -918,7 +667,7 @@ def _selection(root: Path, governed: bool, ctx: _Ctx) -> Tuple[Tuple[Any, ...], 
     config = WorkspaceLayout(root).config_file
     # An experimental row joins the default matrix only where its plane is on this machine.
     default = tuple(h for h in hosts.all_hosts(phase=1) if h.registration is not None
-                    and (h.verified or _doc._plane_found(h, ctx) is not None))
+                    and (h.verified or _base._plane_found(h, ctx) is not None))
     if not governed:
         return default, "default", []
     try:
@@ -940,3 +689,283 @@ def _selection(root: Path, governed: bool, ctx: _Ctx) -> Tuple[Tuple[Any, ...], 
                               "cannot check", severity="info"))
     picked = tuple(h for h in hosts.HOSTS if h.id in set(chosen) and h.id in known)
     return picked, "config", notes
+
+
+# ── Legacy v3 hook & block findings (fixable by --fix) ──────────────────────
+
+def _legacy_hook_findings(ctx: _Ctx) -> List[_Finding]:
+    """v3 hook entries in every hook file of every hook host (selected or not), and the
+    stale v3 Antigravity plugin."""
+    from aegis_cli.hooks import registrar
+
+    files: Dict[str, Tuple[str, Path, bool]] = {}
+    for host_id in registrar.HOOK_HOSTS:
+        for _scope, path in _hook_files(host_id, ctx):
+            files.setdefault(os.path.normcase(os.path.abspath(str(path))), (host_id, path, False))
+    if ctx.home is not None:
+        plugin = ctx.home.joinpath(*_V3_PLUGIN)
+        files.setdefault(os.path.normcase(os.path.abspath(str(plugin))), ("antigravity", plugin, True))
+    phases = _removed_host_phases()
+    found: List[_Finding] = []
+    for host_id, path, is_plugin in files.values():
+        entry = ctx.file(path, as_json=True)
+        if entry.raw is None or entry.error or not isinstance(entry.data, dict):
+            continue
+        items, total, legacy = _legacy_items(host_id, entry.data, phases)
+        if not items:
+            continue
+        where = ", ".join(_list_location(p, i) for p, i in items)
+        calls = f"call {_base.LEGACY_SERVER} hook or a removed aegis hook phase"
+        if is_plugin:
+            code, message = "legacy_hook_plugin", f"{ctx.label(path)}: the stale v3 Antigravity plugin's hooks {calls}"
+        else:
+            code, message = "legacy_hook_entry", f"{ctx.label(path)}: v3 hook entries {calls}"
+        message += f" ({where})"
+        action = None
+        if entry.refusal:
+            message += f"; --fix will not change it: {entry.refusal}"
+        elif is_plugin and legacy == total:
+            action = _Action(path, "delete_file", _base._sha256(entry.raw), f"delete the file (it holds only v3 hooks, {where})")
+            message += f"; nothing else is in it, so --fix deletes the file. Fix: {_base._FIX_HINT}"
+        else:
+            action = _Action(path, "remove_list_items", _base._sha256(entry.raw), f"remove the v3 hook entries ({where})",
+                             items=tuple(items))
+            message += f". Fix: {_base._FIX_HINT}"
+        found.append(_Finding(code, path, message, location=where, action=action))
+    return found
+
+
+def _legacy_block_findings(ctx: _Ctx) -> List[_Finding]:
+    found = []
+    for path in _instruction_files(ctx):
+        entry = ctx.file(path)
+        if entry.raw is None:
+            continue
+        try:
+            text = entry.raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        ranges, balanced = _legacy_ranges(text)
+        if not ranges and balanced:
+            continue
+        label = ctx.label(path)
+        where = ", ".join(f"lines {a + 1}-{b + 1}" for a, b in ranges) or None
+        if not balanced:
+            found.append(_Finding("legacy_block", path, f"{label}: unbalanced SOMA/AEGIS START/END markers; "
+                                  "remove the old block by hand (--fix will not guess)", location=where))
+            continue
+        message = f"{label}: legacy Aegis/Soma rules block ({where})"
+        action = None
+        if entry.refusal:
+            message += f"; --fix will not change it: {entry.refusal}"
+        elif _without_lines(entry.raw, ranges) is None:
+            # An emptied CLAUDE.md would still keep Claude Code from reading AGENTS.md, so
+            # the file goes; the plan the user confirms says so.
+            action = _Action(path, "delete_file", _base._sha256(entry.raw),
+                             f"delete the file (it holds only the legacy block, {where})")
+            message += f"; nothing else is in the file, so --fix deletes the file. Fix: {_base._FIX_HINT}"
+        else:
+            action = _Action(path, "remove_lines", _base._sha256(entry.raw), f"remove the legacy block ({where})",
+                             lines=tuple(ranges))
+            message += f". Fix: {_base._FIX_HINT}"
+        found.append(_Finding("legacy_block", path, message, location=where, action=action))
+    return found
+
+
+# ── Enforcement tiers (AD-8) ────────────────────────────────────────────────
+
+def _floor_status(root: Path) -> Tuple[str, Optional[str]]:
+    """The local floor's status, and why an installed, current hook never runs. The floor
+    is active only for a hook that is installed, current and reached by git (hook_status
+    ``reachable``; a status without the key predates it and counts as reachable)."""
+    from aegis_cli.hooks import management
+
+    try:
+        st = management.hook_status(root)
+    except Exception:
+        return "unknown", None
+    if st.get("status") == "no_git_repository":
+        return "unavailable", None
+    if not st.get("managed_by_aegis"):
+        return "inactive", None
+    if st.get("status") != "installed":
+        return "outdated", None
+    gone = [p for p in (st.get("interpreter"), st.get("aegis_path")) if p and not p.get("exists")]
+    if gone:
+        return "outdated", None
+    if st.get("reachable", True) is False:
+        return "inactive", _base._clean(st.get("unreachable_reason") or "git does not reach the Aegis block", 1024)
+    return "active", None
+
+
+_TIER_TEXT = {
+    "advisory": ("Advisory", "AGENTS.md bootstrap, MCP instructions, JIT rules"),
+    "best_effort": ("Best-effort", "per-host pre-tool hooks"),
+    "local_floor": ("Local floor", "git pre-commit runs aegis check --hook (--no-verify bypasses it)"),
+    "authoritative": ("Authoritative", "CI runs aegis check on the exact SHA; a human merges"),
+}
+
+
+def _tiers(rows: List[Dict[str, Any]], floor: str, governed: bool, unreached: Optional[str] = None,
+           setup: str = "aegis init") -> List[Dict[str, Any]]:
+    ids = [r["id"] for r in rows]
+    reached = [r["id"] for r in rows if r["advisory"] is True]
+    unsure = [r["id"] for r in rows if r["advisory"] is None]
+    if ids and len(reached) == len(ids):
+        advisory = "active"
+    else:
+        advisory = "partial" if reached else ("unknown" if unsure else "inactive")
+    reach = f"reaches {', '.join(reached) or 'no selected host'}"
+    if unsure:
+        reach += f"; unknown for {', '.join(unsure)}"
+    floor_detail = {
+        "active": "the Aegis pre-commit hook is installed and current",
+        "inactive": "no Aegis pre-commit hook: run aegis hook install",
+        "outdated": "the Aegis pre-commit hook is outdated: run aegis hook install",
+        "unavailable": "not a git repository",
+        "unknown": "the git hooks directory could not be read",
+    }[floor]
+    if unreached:
+        floor_detail = f"the Aegis pre-commit hook is installed but never runs: {unreached}; see aegis hook status"
+    if not governed and floor != "unavailable":
+        # A hook here, installed or not, has no rules to check: the floor is not in force.
+        floor, floor_detail = "inactive", f"no .aegis/ here, so a pre-commit hook has nothing to enforce: run {setup}"
+    return [
+        {"tier": "advisory", "mechanism": _TIER_TEXT["advisory"][1], "hosts": ids, "status": advisory,
+         "detail": reach},
+        _best_effort(rows, governed, setup),
+        {"tier": "local_floor", "mechanism": _TIER_TEXT["local_floor"][1], "hosts": ids, "status": floor,
+         "detail": floor_detail},
+        {"tier": "authoritative", "mechanism": _TIER_TEXT["authoritative"][1], "hosts": [], "status": "unavailable",
+         "detail": "not checked: aegis doctor does not read CI runs; the trust tier says what GitHub enforces"},
+    ]
+
+
+def _hook_tier_text(host_id: str, hooks: Dict[str, Any]) -> str:
+    text = f"{host_id}: {hooks['tier']} [{hooks['evidence']}]"
+    return text + (f", {hooks['trust']}" if hooks["trust"] else "")
+
+
+def _best_effort(rows: List[Dict[str, Any]], governed: bool, setup: str) -> Dict[str, Any]:
+    """The per-host hook tier. Doctor reads files only, so a registered hook makes the tier
+    ``unknown``, never active: whether a host runs it is out of doctor's sight."""
+    tier = {"tier": "best_effort", "mechanism": _TIER_TEXT["best_effort"][1], "hosts": []}
+    hooks = {row["id"]: row["hooks"] for row in rows}
+    capable = [h for h, v in hooks.items() if v["status"] not in ("unavailable", "none")]
+    hooked = [h for h in capable if hooks[h]["status"] in ("registered", "duplicate")]
+    if not capable:
+        reasons = "; ".join(v["detail"] for v in hooks.values() if v["detail"]) or "no selected host has Aegis hooks"
+        return dict(tier, status="unavailable", detail=reasons)
+    if not governed:
+        return dict(tier, status="inactive",
+                    detail=f"no .aegis/ here, so a registered hook passes every call: run {setup}")
+    if hooked:
+        said = "; ".join(_hook_tier_text(h, hooks[h]) for h in hooked)
+        return dict(tier, hosts=hooked, status="unknown",
+                    detail=f"registered for {said}. Doctor reads the host files only and cannot confirm that a host "
+                           "runs them; each fails open when Aegis errors")
+    unreadable = [h for h in capable if hooks[h]["status"] == "unknown"]
+    if unreadable:
+        return dict(tier, status="unknown",
+                    detail=f"cannot tell for {', '.join(unreadable)}: a hook file cannot be read (see the warnings)")
+    modified = [h for h in capable if hooks[h]["status"] == "modified"]
+    if modified:
+        return dict(tier, status="unknown",
+                    detail=f"cannot tell for {', '.join(modified)}: its Aegis hook entry is not the one aegis hook "
+                           "install writes (see the warnings)")
+    absent = [h for h in capable if hooks[h]["status"] == "absent"]
+    broken = [h for h in capable if hooks[h]["status"] == "broken"]
+    parts = [f"no Aegis PreToolUse hook registered for {', '.join(absent)}"] if absent else []
+    if broken:
+        parts.append(f"the Aegis hook of {', '.join(broken)} runs a missing aegis")
+    return dict(tier, status="inactive", detail="; ".join(parts) + ": run aegis hook install --host <host>")
+
+
+# ── The diagnosis ───────────────────────────────────────────────────────────
+
+def _missing_ast_extensions(ws_root: Path) -> List[str]:
+    """Detected source extensions with no AST driver configured (what --fix provisions).
+
+    An unreadable config gives none: the AST check reports it, and --fix will not
+    write over a file it cannot parse.
+    """
+    from aegis_core.ast.detect import detect_project_languages
+    from aegis_core.skills.slots import SlotRegistry, SlotResolutionError
+
+    if _base._is_home(ws_root):
+        return []
+    langs = {k: v for k, v in detect_project_languages(ws_root).items() if k != "python"}
+    configured: set = set()
+    try:
+        registries = (SlotRegistry.load(ws_root), SlotRegistry.load_user(ws_root))
+    except SlotResolutionError:
+        return []
+    for registry in registries:
+        for name in registry.to_dict():
+            if name == "ast_driver":
+                configured.add("default")
+            elif name.startswith("ast_driver_"):
+                configured.add(f".{name[len('ast_driver_'):]}")
+    if "default" in configured:
+        return []
+    return sorted({ext for info in langs.values() for ext in info.get("extensions", []) if ext not in configured})
+
+
+@dataclass
+class _Diagnosis:
+    ctx: _Ctx
+    rows: List[Dict[str, Any]]
+    tiers: List[Dict[str, Any]]
+    findings: List[_Finding]
+    trust: Any = None  # the human_gate TierReport
+    modes: Any = None  # the shared state's StateModes, or None when it cannot be read
+
+
+def _diagnose(root: Path, prober: Callable[[Any, Optional[str], _Ctx], Dict[str, Any]],
+              environ: Optional[Mapping[str, str]] = None) -> _Diagnosis:
+    """The run's diagnosis; ``prober`` asks each host whether aegis is registered (doctor's probes)."""
+    from aegis_core.workspace.layout import UserLayout, is_aegis_workspace
+
+    environ = os.environ if environ is None else environ
+    layout = UserLayout.current()
+    # The home directory's .aegis/ is the user plane (~/.aegis), never a workspace.
+    is_home = _base._is_home(root)
+    governed = is_aegis_workspace(root) and not is_home
+    ctx = _Ctx(root=root, governed=governed, home=layout.home if layout else None, environ=environ,
+               selected=(), selection="default", prober=prober, is_home=is_home,
+               setup="aegis init" if governed or is_home else _base._setup_command(root))
+    ctx.selected, ctx.selection, notes = _selection(root, governed, ctx)
+    selected = ctx.selected
+    info = _instructions(ctx)
+    roots, skipped = _registered_roots(ctx)
+    floor, unreached = _floor_status(root)
+    rows = [_host_row(spec, ctx, info, roots, floor) for spec in selected]
+    claude_user = _claude_user_registered(ctx)
+    findings = (notes + _upgrade_findings(ctx) + _worktree_ledger_findings(ctx) + _workspace_findings(ctx, info)
+                + _mcp_findings(ctx, claude_user) + _legacy_block_findings(ctx) + _budget_findings(ctx, info)
+                + _home_rules_finding(ctx) + _v3_copy_findings(ctx) + _hook_findings(ctx, rows)
+                + _bootstrap_tool_findings(ctx, info, rows))
+    if roots is None and ctx.home is not None:
+        findings.append(_Finding("unreadable_config", UserLayout(ctx.home).workspaces_file,
+                                 "~/.aegis/workspaces.json cannot be read as a v1 registry; doctor "
+                                 "reports workspace registration as unknown"))
+    for index in skipped:
+        findings.append(_Finding("registry_entry_skipped", UserLayout(ctx.home).workspaces_file,
+                                 f"~/.aegis/workspaces.json: entry {index} has no absolute 'root' that resolves; "
+                                 "aegis skips it (run aegis init in that workspace to register it again)",
+                                 location=f"workspaces[{index}]"))
+    trust = human_gate.detect_tier(root)
+    for row in rows:
+        row["trust_tier"], row["trust_tier_status"] = trust.tier, "detected"
+    return _Diagnosis(ctx, rows, _tiers(rows, floor, governed, unreached, ctx.setup), findings, trust,
+                      _state_modes(root))
+
+
+def _state_modes(root: Path) -> Any:
+    from aegis_core import storage
+    from aegis_core.errors import AegisError
+
+    try:
+        return storage.shared_state_modes(root)
+    except (AegisError, OSError):
+        return None

@@ -98,32 +98,31 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass, field
 from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
-import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import re
-import stat
 import subprocess
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from aegis_cli import stdin_is_tty as _stdin_is_tty
+from aegis_cli import doctor_base as _base
+from aegis_cli import doctor_findings as _findings
+from aegis_cli import doctor_render as _render
+from aegis_cli import doctor_repair as _repair
 from aegis_cli.base import AegisCommand, CommandCategory
-from aegis_core.pathlookup import is_bare
-from aegis_core.pathlookup import INSIDE_FENCE, Hit, only_skipped, which
-from aegis_core.primitives import is_within, real_key
+from aegis_cli.doctor_base import (
+    SCHEMA, SERVER, SOURCE, Registered, _Ctx, _claude_config, _claude_project_keys, _clean, _entry_facts, _home,
+    _host_json_path, _is_home, _names, _registration, _server_entry, _setup_fix,
+)
+from aegis_core import github_ruleset, human_gate, primitives
+from aegis_core.pathlookup import INSIDE_FENCE, Hit
+from aegis_core.primitives import is_within
 
-__all__ = ["run_doctor", "DoctorCommand", "probe_mcp_launcher", "SCHEMA", "V3_SHIPPED_RULE_SHA256"]
+__all__ = ["run_doctor", "DoctorCommand", "probe_mcp_launcher", "SCHEMA"]
 
-SCHEMA = "aegis.doctor/v1"
-SOURCE = "aegis doctor"
-SERVER = "aegis"
-# The v3 server name; v4 registers only "aegis" and doctor --fix removes this one.
-LEGACY_SERVER = "soma"
 EXIT_USAGE = 2
 
 
@@ -149,35 +148,6 @@ def _check_zero_dependencies() -> bool:
     else:
         print("  ❌ frontmatter engine validation failed")
     return ok
-
-
-def _is_home(root: Path) -> bool:
-    """Whether ``root`` is the home directory, whose ``.aegis/`` is the user plane."""
-    from aegis_core.workspace.layout import UserLayout
-
-    layout = UserLayout.current()
-    key = real_key(root)
-    return layout is not None and key is not None and key == real_key(layout.home)
-
-
-def _setup_command(root: Path) -> str:
-    """What sets governance up here: ``aegis migrate`` while an unmigrated v3 workspace is
-    here (``aegis init`` would leave its rules unserved, and the check would then pass on
-    none of them), else ``aegis init``."""
-    from aegis_core.errors import WorkspaceError
-    from aegis_core.workspace.discovery import refuse_unmigrated_v3
-
-    try:
-        refuse_unmigrated_v3(root)
-    except WorkspaceError:
-        return "aegis migrate"
-    return "aegis init"
-
-
-def _setup_fix(root: Path, purpose: str) -> str:
-    if _setup_command(root) == "aegis migrate":
-        return "Fix: Run 'aegis migrate' to see how this v3 workspace converts, then 'aegis migrate --apply'."
-    return f"Fix: Run 'aegis init' to {purpose}."
 
 
 def _check_rules(project_root: Path) -> bool:
@@ -248,13 +218,13 @@ def _check_cli_resolvable(project_root: Optional[Path] = None) -> bool:
     project virtualenv the user put on PATH) counts, and the line says where it is.
     """
     root = Path(project_root or Path.cwd()).resolve()
-    path = which("aegis")
+    path = _base.which("aegis")
     if path:
-        inside = which("aegis", outside=root) != path
+        inside = _base.which("aegis", outside=root) != path
         print(f"  ✅ aegis CLI resolvable ({path}{', inside the workspace' if inside else ''})")
         return True
     print("  ❌ aegis CLI not found on PATH")
-    for hit in only_skipped("aegis", base=root):
+    for hit in _base.only_skipped("aegis", base=root):
         print(f"    {hit.path} is reached only through the relative PATH entry {hit.entry!r}, which "
               "resolves against the current directory: not counted")
     from aegis_cli.pathcheck import build_hint
@@ -279,18 +249,7 @@ def _child_env() -> Dict[str, str]:
     return env
 
 
-def _clean(text: Any, limit: int = 512) -> str:
-    """A string from a file or a host's output, safe to print: no escape or control sequences."""
-    from aegis_cli import sanitize_display
-
-    return sanitize_display(str(text), max_len=limit)
-
-
 # ── MCP launcher ─────────────────────────────────────────────────────────────
-
-# A registered command, as doctor compares it: (host id, argv as the host config holds it).
-Registered = Tuple[str, Sequence[str]]
-
 
 def _same_command(a: Sequence[str], b: Sequence[str]) -> bool:
     if len(a) != len(b) or not a:
@@ -458,7 +417,7 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
         # As the driver runs: absolute PATH entries outside the workspace, a relative path
         # joined to the workspace root (aegis_core.ast.runner).
         found = resolve_driver_executable(bin_name, workspace=ws_root)
-        hits = [] if found else only_skipped(bin_name, outside=ws_root, base=ws_root)
+        hits = [] if found else _base.only_skipped(bin_name, outside=ws_root, base=ws_root)
         if found and plan is not None and plan.unavailable:
             print(f"  ⚠️  AST driver ({ext}): {plan.unavailable}")
             all_resolvable = False
@@ -508,167 +467,18 @@ def _check_precommit_hook(project_root: Path | None = None) -> bool | None:
     return False
 
 
-# ── Host plane: context ──────────────────────────────────────────────────────
+# ── Host plane: registration probes ─────────────────────────────────────────
 
 # Codex's own answer when no server has that name. Any other failure leaves the
 # registration unknown: a CLI that crashed has not said "absent".
 _CODEX_ABSENT = re.compile(r"no mcp server named\s+['\"]?aegis['\"]?\s+found", re.IGNORECASE)
 _PROBE_TIMEOUT = 10.0
-# Hosts that silently keep only the start of an over-budget instruction file: Codex at
-# its 32 KiB project_doc_max_bytes, Antigravity at 24,000 bytes per file (host-matrix
-# §1-§2, verified 2026-10-15). A block that ends within the budget still arrives; for
-# the other hosts the budget is advice.
-_TRUNCATES_TAIL = frozenset({"codex-cli", "antigravity"})
-# Hosts that send no MCP roots and attest no workspace: the registry is how the server
-# finds the repository (host-matrix §2, §3.6).
-_REGISTRY_BOUND = frozenset({"antigravity"})
-# Hosts that read AGENTS.override.md instead of AGENTS.md at the same level.
-_READS_AGENTS_OVERRIDE = frozenset({"codex-cli"})
-_FIX_HINT = "aegis doctor --fix"
-_LEGACY_ENTRY = f"stale v3 '{LEGACY_SERVER}' MCP server"
 
 
 def _run_host_cli(argv: Sequence[str], cwd: str, timeout: float) -> "subprocess.CompletedProcess[str]":
     """The one place doctor starts a host CLI: an argv (no shell), no stdin, bounded in time."""
     return subprocess.run(list(argv), cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, errors="replace", timeout=timeout, env=_child_env())
-
-
-def _aegis_version() -> str:
-    from aegis_core._version import __version__
-    return __version__
-
-
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-@dataclass
-class _Ctx:
-    """What one doctor run looks at; files are read once."""
-
-    root: Path
-    governed: bool
-    home: Optional[Path]
-    environ: Mapping[str, str]
-    selected: Tuple[Any, ...]
-    selection: str
-    is_home: bool = False
-    # What sets this workspace up: aegis migrate while an unmigrated v3 workspace is here.
-    setup: str = "aegis init"
-    _cache: Dict[Tuple[str, bool], Any] = field(default_factory=dict)
-
-    @property
-    def path_env(self) -> str:
-        return self.environ.get("PATH", "")
-
-    def which(self, name: str) -> Optional[str]:
-        return which(name, self.path_env, outside=self.root)
-
-    def passed_over(self, name: str) -> List[Hit]:
-        """Where ``name`` is when ``which`` refused every place: a relative or empty PATH
-        entry (resolved against the workspace, where a host would start) or an absolute
-        entry inside it. Never run."""
-        return only_skipped(name, self.path_env, outside=self.root, base=self.root)
-
-    def file(self, path: Path, as_json: bool = False) -> Any:
-        key = (os.path.abspath(str(path)), as_json)
-        if key not in self._cache:
-            entry = _read_file(Path(path))
-            self._cache[key] = _parse_json(entry) if as_json else entry
-        return self._cache[key]
-
-    def label(self, path: Path) -> str:
-        """``~/x`` for a file under the home directory (as the docs name them), else the path."""
-        if self.home is not None:
-            try:
-                return "~/" + Path(path).relative_to(self.home).as_posix()
-            except ValueError:
-                pass
-        return str(path)
-
-
-def _platform() -> str:
-    """``sys.platform``, read in one place so a test can emulate another OS's app folders."""
-    return sys.platform
-
-
-def _app(spec: Any, ctx: _Ctx) -> Optional[str]:
-    """The installed desktop app of ``spec`` (an app bundle is a directory), or None."""
-    from aegis_core import hosts
-
-    if ctx.home is None:
-        return None
-    return next((app for app in hosts.app_paths(spec, ctx.home, ctx.environ, _platform()) if os.path.isdir(app)),
-                None)
-
-
-def _plane_found(spec: Any, ctx: _Ctx) -> Optional[str]:
-    """What shows ``spec``'s config plane is on this machine, for people: a binary doctor
-    would run, a config path in the home directory or a desktop app; None when nothing does."""
-    for name in spec.binaries:
-        found = ctx.which(name)
-        if found:
-            return ctx.label(Path(found))
-    if ctx.home is not None:
-        for spec_path in spec.config_paths:
-            rel = spec_path[2:] if spec_path.startswith("~/") else spec_path
-            if os.path.exists(ctx.home.joinpath(*rel.split("/"))):
-                return spec_path
-    app = _app(spec, ctx)
-    return ctx.label(Path(app)) if app else None
-
-
-# ── Host plane: registration probes ─────────────────────────────────────────
-
-def _registration(status: str, source: str, **facts: Any) -> Dict[str, Any]:
-    reg = {"status": status, "source": source, "scope": None, "command": None, "command_exists": None,
-           "enabled": None, "approval": None, "detail": None, "aegis_client": None}
-    reg.update(facts)
-    return reg
-
-
-def _entry_facts(entry: Any, ctx: _Ctx) -> Dict[str, Any]:
-    """Command, AEGIS_CLIENT and enabled flag of one MCP server entry.
-
-    The strings come from files a repository can write (a project .mcp.json), so the
-    command is reported without control sequences; the existence check uses it as
-    written, and AEGIS_CLIENT stays raw for the identity decision (``_identity`` cleans
-    what it reports), since the server sees the raw value.
-    """
-    facts: Dict[str, Any] = {}
-    if not isinstance(entry, dict):
-        return facts
-    command = entry.get("command")
-    if isinstance(command, str) and command:
-        args = entry.get("args") if isinstance(entry.get("args"), list) else []
-        facts["command"] = [_clean(command)] + [_clean(a) for a in args]
-        facts["command_exists"] = _command_exists(command, ctx)
-    env = entry.get("env")
-    if isinstance(env, dict) and isinstance(env.get("AEGIS_CLIENT"), str):
-        facts["aegis_client"] = env["AEGIS_CLIENT"]
-    if isinstance(entry.get("disabled"), bool):
-        facts["enabled"] = not entry["disabled"]
-    if isinstance(entry.get("enabled"), bool):
-        facts["enabled"] = entry["enabled"]
-    return facts
-
-
-def _command_exists(command: str, ctx: _Ctx) -> Optional[bool]:
-    """Whether the registered command exists; None when doctor cannot tell.
-
-    A relative path with a directory part resolves against the directory the host starts
-    the server in, which doctor does not know. A bare name found only through an empty or
-    relative PATH entry, or in an absolute entry inside the workspace, is one the host
-    may run but doctor does not count.
-    """
-    if os.path.isabs(command):
-        return os.path.isfile(command) and (os.name == "nt" or os.access(command, os.X_OK))
-    if not is_bare(command):
-        return None
-    if ctx.which(command) is not None:
-        return True
-    return None if ctx.passed_over(command) else False
 
 
 def _probe_codex(spec: Any, binary: Optional[str], ctx: _Ctx) -> Dict[str, Any]:
@@ -704,92 +514,66 @@ def _probe_codex(spec: Any, binary: Optional[str], ctx: _Ctx) -> Dict[str, Any]:
     return _registration("registered", source, scope="effective", **facts)
 
 
-def _present(path: Path) -> bool:
-    """Whether a file is there, without reading it; True when that cannot be told, so an
-    unreadable parent directory never lets doctor claim the bootstrap through."""
-    try:
-        return stat.S_ISREG(os.stat(path).st_mode)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except (OSError, ValueError):
-        return True
+def _probe_claude(spec: Any, binary: Optional[str], ctx: _Ctx) -> Dict[str, Any]:
+    path = _claude_config(ctx)
+    if path is None:
+        return _registration("unknown", "~/.claude.json", detail="no home directory")
+    source = ctx.label(path)
+    cfg = ctx.file(path, as_json=True)
+    if cfg.error:
+        return _registration("unknown", source, detail=f"{source} {cfg.error}")
+    data = cfg.data or {}
+    projects = data.get("projects") if isinstance(data.get("projects"), dict) else {}
+    key = next((k for k in _claude_project_keys(ctx) if isinstance(projects.get(k), dict)), None)
+    project = projects[key] if key is not None else {}
+
+    def facts_of(entry: Any) -> Dict[str, Any]:
+        facts = _entry_facts(entry, ctx)
+        # Claude Code turns off any server this project lists, whatever its scope
+        # (user, local or .mcp.json): "turned off; turn it on in /mcp".
+        if SERVER in _names(project.get("disabledMcpServers")):
+            facts["enabled"] = False
+            facts["detail"] = (f"Claude Code turns aegis off in this project: {source} lists it in "
+                               f"projects[{key}].disabledMcpServers; turn it on in Claude Code's /mcp")
+        return facts
+
+    local = _server_entry(project)
+    user = _server_entry(data)
+    if local is not None:
+        return _registration("registered", source, scope="local", **facts_of(local))
+    if user is not None:
+        return _registration("registered", source, scope="user", **facts_of(user))
+    dot_mcp = ctx.file(ctx.root / ".mcp.json", as_json=True)
+    shared = _server_entry(dot_mcp.data) if not dot_mcp.error else None
+    if shared is not None:
+        # A project .mcp.json server runs only after the user approves it; that answer
+        # lives in settings files doctor does not read, unless .claude.json records it.
+        approved = _names(project.get("enabledMcpjsonServers"))
+        denied = _names(project.get("disabledMcpjsonServers"))
+        approval = ("approved" if SERVER in approved or project.get("enableAllProjectMcpServers") is True
+                    else "denied" if SERVER in denied else "unknown")
+        facts = facts_of(shared)
+        if approval == "denied":
+            facts["enabled"] = False
+        return _registration("registered", ctx.label(ctx.root / ".mcp.json"), scope="project",
+                             approval=approval, **facts)
+    return _registration("absent", source)
 
 
-#: sha256 of every rules/*.md and rules/.oracles/*.md file shipped in the v3.0.0-v3.3.0
-#: wheels, which v3's Gemini and Kiro adapters copied byte for byte into
-#: ~/.gemini/config/rules and ~/.kiro/steering. Computed from the release tags with
-#: ``git show vX:rules/<file> | sha256sum``. A copy is removed only on an exact match;
-#: names and content are never compared (defense #39).
-V3_SHIPPED_RULE_SHA256 = frozenset({
-    "acab95f21fc4eb254337fc84fe87dbcd8b059173fb56fe520f385224e27825a2",  # .oracles/architectural-tenets
-    "af94c7153052c7488e0e67d86e780a74fdf106caf45da65244cc9fb9643130ba",  # .oracles/atomic-workstream-protocol
-    "3d605fdfe36b2fbef771776c43c079dffbda2a593e71cb5f04175e23807fe9a2",  # .oracles/documentation
-    "03a9e189a1c72f6178d9c1c5eb139fca008db810cd14eddc56400b014b9ce4db",  # .oracles/feature-specs
-    "e5bc5f348d4e2cdf93457471c60b239ab6d64f2420e349f368e4995396c2afc5",  # .oracles/git-workflow
-    "ca215d78f371e0f7aa4ad562a22be47db42e639d0cb28797dc7971157db0ddd8",  # .oracles/optional-import-guard (3.0)
-    "63a857db70e56ceabda0fd07412f8924b128e227ec94b63d839497ef73b7152b",  # .oracles/optional-import-guard (3.1+)
-    "ded22d86c5f47a0a13f64f9da99d543d276ddf830017b6a63f1c5a6e78b5c021",  # .oracles/polyglot-standards
-    "337cee795219e24354a7850acebb9d79e6266e595ca7d31e4598d0d21b9e82f4",  # .oracles/tdd-protocol (3.0)
-    "d33b2a6ebd2dc7c81ac3b98c060e52c38bb80baaf6362a3aea22900463af74c8",  # .oracles/tdd-protocol (3.1+)
-    "863c28d335a31e48a1aef27c83b32dcab881029b3eb07a955e0b8eadd5d198e8",  # .oracles/testing
-    "12d8813c7b251bc310e8122305c6ee7778fe01483dd4103691b26000a3369354",  # META (3.0)
-    "4879bfb58b4a5bd3344e0278c815ce33b90ae746f694f6b82b52e87e80938582",  # META (3.1+)
-    "f7ec0a8f721b64f8d37b5f259e64c86470d98a00dd3e535e68b4ab33813d486c",  # ci-green-before-release
-    "20b2f3294ef1e9ceb23c4714c3d1ed95cd89f6828dd57230099da9e62fd43ecc",  # core-change-protocol (3.0)
-    "8b85634178a5e121581ca98687c490c55c37a0dae4a36950866631fa215f2dcd",  # core-change-protocol (3.1+)
-    "4b1656771eab2a652e0b41f221be1f5712565493506295edd3de06be44978e0c",  # cost-optimization (3.0)
-    "db76ddf60f833f0b0070e0a811cdcd101e02ccc204956d6c62609e929ae13955",  # cost-optimization (3.1+)
-    "25600eecc61dbd447e67ae9d43255425efbcf94195930b8c8ca11c771d26add5",  # desktop-automation
-    "91fdf925befe794b662d882a069fe7035c5acf731e413d961b9e1c83d6432447",  # destructive-ops
-    "2473444c146b5d36d0edefd74347e0175e76a355536ab5d5df51514b69ba7ed1",  # gitflow-review-gate (3.0)
-    "18357403da55489f326c15dad044ded615badaea7b77f37aeb7757f163bdbb3a",  # gitflow-review-gate (3.1+)
-    "2be52fdd2f290e1cbd81600e35d8198bc6766b5c827c0d1b240ce060470984fc",  # no-pre-existing-excuse (3.0)
-    "5187404be379aca6b0cb0ec62436054ebfcad320c264a34ef95e271a42c95767",  # no-pre-existing-excuse (3.1+)
-    "27b596123c2a88dea15b82a846e07215774e0b1dfdc2c3b67f2336b89d3fad3b",  # providence (3.0)
-    "6417ece31939ece9e3f6fec52413d4f8c329fbf38be8c104b01b2f28ee0a5fe6",  # providence (3.1+)
-    "04946d5d7b525f24284ae51f2d958f8b5fcc4d3ed891e391ceec71f5dd5ddd0f",  # subagent-delegation (3.0)
-    "5d54ce9b04be9572698749908558800cbf2d8acdffc15e7b7a651fbf6f39488f",  # subagent-delegation (3.1+)
-})
+def _probe_json_host(spec: Any, binary: Optional[str], ctx: _Ctx) -> Dict[str, Any]:
+    path = _host_json_path(spec, ctx)
+    if path is None:
+        return _registration("unknown", spec.registration.path, detail="no home directory")
+    source = ctx.label(path)
+    cfg = ctx.file(path, as_json=True)
+    if cfg.error:
+        return _registration("unknown", source, detail=f"{source} {cfg.error}")
+    servers = (cfg.data or {}).get(spec.registration.key)
+    entry = servers.get(SERVER) if isinstance(servers, dict) else None
+    if entry is None:
+        return _registration("absent", source)
+    return _registration("registered", source, scope="user", **_entry_facts(entry, ctx))
 
-
-def _confirm(prompt: str) -> bool:
-    """Ask on the terminal; anything but y/yes is no. Without a terminal the answer is no."""
-    if not _stdin_is_tty():
-        print("stdin is not a terminal, so nothing was applied: re-run with --yes to apply these changes.")
-        return False
-    try:
-        answer = input(prompt)
-    except EOFError:
-        return False
-    return answer.strip().lower() in ("y", "yes")
-
-
-from aegis_cli.doctor_findings import (  # noqa: E402
-    _Action, _BLOCK_BEGIN, _BLOCK_END, _BOM, _CLAUDE_FAMILY, _CODE_SPAN, _COMMAND_STARTERS,
-    _ClaudeFile, _FENCE, _Finding, _HEX12, _HOOK_SCOPE_FILES, _IMPORTS_AGENTS, _IMPORTS_PARENT_AGENTS,
-    _INDENTED_CODE, _Instructions, _V3_PLUGIN, _advisory, _all, _any,
-    _bootstrap_reaches, _bootstrap_state, _bootstrap_tool_findings, _budget, _budget_findings,
-    _claude_import_advice, _claude_names, _claude_reads_agents, _fence_step,
-    _home_rules_finding, _hook_files, _hook_findings, _hook_row, _host_row, _identity,
-    _instructions, _key_finding, _level, _location, _mcp_findings,
-    _mcp_loads, _path_key, _prose, _registered_roots,
-    _runnable, _selection, _upgrade_findings, _v3_copy_findings, _workspace_findings,
-    _worktree_ledger_findings,
-)
-from aegis_cli.doctor_render import (  # noqa: E402
-    _CHECKS, _ICON, _PLACEHOLDER_CHECK, _TIER_TEXT, _best_effort, _floor_status, _github_plan, _hook_tier_text,
-    _hooks_line, _payload, _print_findings, _print_github, _print_hosts, _print_plan, _print_results, _print_tiers,
-    _print_trust, _registered_launchers, _run_checks, _run_drivers_only, _run_github, _run_release, _summary, _tiers,
-)
-from aegis_cli.doctor_repair import (  # noqa: E402
-    ListItem, _Change, _Diagnosis, _File, _LEGACY_MARKER, _Refused, _apply, _backup_root, _claude_config,
-    _claude_dir, _claude_project_keys, _claude_user_registered, _current_bytes, _desktop_configs, _diagnose,
-    _dump_like, _host_json_path, _instruction_files, _is_legacy_handler, _legacy_block_findings,
-    _legacy_hook_findings, _legacy_items, _legacy_ranges, _list_location, _missing_ast_extensions, _names,
-    _parse_json, _plan, _probe_claude, _probe_json_host, _program_name, _read_file, _removed_host_phases,
-    _server_entry, _state_modes, _without_keys, _without_lines, _without_list_items, _write_manifest,
-    _write_refusal,
-)
 
 _PROBES: Dict[str, Callable[[Any, Optional[str], _Ctx], Dict[str, Any]]] = {
     "codex-cli": _probe_codex,
@@ -803,6 +587,137 @@ def _probe(spec: Any, binary: Optional[str], ctx: _Ctx) -> Dict[str, Any]:
     if spec.registration is not None and spec.registration.kind == "json_file":
         return _probe_json_host(spec, binary, ctx)
     return _registration("unavailable", "-", detail=f"doctor has no check for {spec.display_name}")
+
+
+# ── Checks and modes ────────────────────────────────────────────────────────
+
+_CHECKS: Tuple[Tuple[str, bool], ...] = (
+    # (id, failing it fails the run); advisory checks only warn.
+    ("python_version", True), ("zero_dependencies", True), ("rules", True), ("state_dir", True),
+    ("cli_on_path", True), ("precommit_hook", True), ("ast_drivers", False), ("mcp_launcher", False),
+)
+
+
+def _run_checks(root: Path, fix_ast: bool, only: Optional[Sequence[str]] = None,
+                registered: Sequence[Registered] = ()) -> List[Dict[str, Any]]:
+    calls: Dict[str, Callable[[], Optional[bool]]] = {
+        "python_version": _check_python_version,
+        "zero_dependencies": _check_zero_dependencies,
+        "rules": lambda: _check_rules(root),
+        "state_dir": lambda: _check_state_dir(root),
+        "cli_on_path": lambda: _check_cli_resolvable(root),
+        "precommit_hook": lambda: _check_precommit_hook(root),
+        "ast_drivers": lambda: _check_ast_drivers(root, fix=fix_ast),
+        "mcp_launcher": lambda: _check_mcp_launcher(workspace=root, registered=registered),
+    }
+    out = []
+    for check_id, blocking in _CHECKS:
+        if only is not None and check_id not in only:
+            continue
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = calls[check_id]()
+        status = "skip" if ok is None else ("pass" if ok else ("fail" if blocking else "warn"))
+        # The lines quote rule file names, loader errors and paths a repository chooses:
+        # cleaned here, at the one place every check's output passes.
+        text = "".join(_clean(line, 4096) + "\n" for line in buf.getvalue().splitlines())
+        out.append({"id": check_id, "status": status, "text": text,
+                    "detail": [line.strip() for line in text.splitlines() if line.strip()]})
+    return out
+
+
+def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) -> int:
+    report = human_gate.detect_tier(root)
+    plan = _render._github_plan(root, report)
+    status = "printed"
+    result: Optional[Dict[str, Any]] = None
+    if apply:
+        if not _base._stdin_is_tty():
+            print("aegis doctor: --apply changes repository settings, so it only runs at a terminal with an "
+                  "interactive y/N answer (--yes does not apply); nothing was changed.", file=sys.stderr)
+            return 1
+        if not plan["required_checks_from_workflows"]:
+            print(f"aegis doctor: {_render._NO_AEGIS_JOB}; add the Aegis workflow (aegis init --ci) first. Nothing was changed.",
+                  file=sys.stderr)
+            return 1
+        try:
+            exists = github_ruleset.ruleset_exists(root)
+        except human_gate.HumanGateError as exc:
+            print(f"aegis doctor: cannot read the repository's rulesets: {_clean(exc, 1000)}. Nothing was changed.",
+                  file=sys.stderr)
+            return 1
+        if exists:
+            print(f"aegis doctor: a ruleset named {github_ruleset.RULESET_NAME!r} already exists; edit it on GitHub "
+                  "(--apply only ever creates). Nothing was changed.", file=sys.stderr)
+            return 1
+        body = plan["ruleset"][tier]
+        print(json.dumps(body, indent=2))
+        if not _base._confirm(f"Create this ruleset on the default branch (tier {tier})? [y/N] "):
+            print("No changes made.")
+            return 1
+        try:
+            result = github_ruleset.create_ruleset(root, body)
+        except human_gate.HumanGateError as exc:
+            print(f"aegis doctor: {_clean(exc, 1000)}", file=sys.stderr)
+            return 1
+        status = "applied"
+        print(f"Created ruleset {github_ruleset.RULESET_NAME!r}. Re-run aegis doctor to see the tier.")
+    if use_json:
+        print(json.dumps({
+            **primitives.envelope(SOURCE, {"machine": "local", "workspace": str(root), "mode": "github"}, schema=SCHEMA),
+            "stale": False, "unknown": [], "status": status, "human_gate": report.as_dict(), "github": plan,
+            "created": result,
+        }, indent=2))
+    elif not apply:
+        _render._print_github(plan, report)
+    return 0
+
+
+# ── --release: was this commit green, by a signed attestation ───────────────
+
+def _run_release(root: Path, sha: str, use_json: bool) -> int:
+    from aegis_core import release_verify
+
+    report = release_verify.verify_release(root, sha)
+    if use_json:
+        print(json.dumps(report.as_dict(root), indent=2))
+    else:
+        for line in report.text_lines():
+            print(_clean(line, 4096))
+    return 0 if report.verified else 1
+
+
+def _run_drivers_only(root: Path, use_json: bool, fix: bool, yes: bool) -> int:
+    results: List[Dict[str, Any]] = []
+    backup: Optional[Path] = None
+    declined = False
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text) if use_json else contextlib.nullcontext():
+        if not use_json:
+            print(f"aegis doctor — AST driver health check ({_clean(root, 4096)}):\n")
+            print("Trust tier: not read in this mode (run aegis doctor)")  # --drivers stays local, no gh
+        plan = _repair._plan([], _findings._missing_ast_extensions(root), root) if fix else []
+        if plan:
+            _render._print_plan(plan, _home())
+            if yes or _base._confirm(f"Apply these {len(plan)} changes? [y/N] "):
+                results, backup = _repair._apply(plan, _home(), root)
+                _render._print_results(results, backup)
+            else:
+                declined = True
+                print("No changes made.")
+        (check,) = [c for c in _run_checks(root, fix_ast=False, only=("ast_drivers",))]
+        if not use_json:
+            print(check["text"], end="")
+    failed = check["status"] != "pass" or declined or any(r["status"] != "applied" for r in results)
+    if use_json:
+        payload = {**primitives.envelope(SOURCE, {"machine": "local", "workspace": str(root), "checks": ["ast_drivers"]}, schema=SCHEMA),
+                   "stale": False, "unknown": [], "checks_ok": check["status"] == "pass",
+                   "checks": [{k: v for k, v in check.items() if k != "text"}]}
+        if fix:
+            payload["fixes"] = results
+            payload["backup_dir"] = str(backup) if backup else None
+        print(json.dumps(payload, indent=2))
+    return 1 if failed else 0
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -820,13 +735,6 @@ def _resolve_root(args: argparse.Namespace) -> Path:
         return Path(ws.root)
     raw = getattr(args, "workspace", None) or getattr(args, "_project_root", None)
     return Path(Workspace.resolve(raw).root)
-
-
-def _home() -> Optional[Path]:
-    from aegis_core.workspace.layout import UserLayout
-
-    layout = UserLayout.current()
-    return layout.home if layout else None
 
 
 def run_doctor(args: argparse.Namespace) -> int:
@@ -877,8 +785,8 @@ def run_doctor(args: argparse.Namespace) -> int:
     if getattr(args, "drivers", False):
         return _run_drivers_only(root, use_json, fix, yes)
 
-    diag = _diagnose(root)
-    plan = _plan(diag.findings, _missing_ast_extensions(root), root) if fix else []
+    diag = _findings._diagnose(root, _probe)
+    plan = _repair._plan(diag.findings, _findings._missing_ast_extensions(root), root) if fix else []
     results: List[Dict[str, Any]] = []
     backup: Optional[Path] = None
     declined = False
@@ -886,32 +794,32 @@ def run_doctor(args: argparse.Namespace) -> int:
     with contextlib.redirect_stdout(text) if use_json else contextlib.nullcontext():
         if not use_json:
             print(f"aegis doctor — running health checks ({_clean(root, 4096)}):\n")
-        checks = _run_checks(root, fix_ast=False, registered=_registered_launchers(diag.rows))
+        checks = _run_checks(root, fix_ast=False, registered=_render._registered_launchers(diag.rows))
         if not use_json:
             for check in checks:
                 print(check["text"], end="")
-            _print_hosts(diag)
-            _print_tiers(diag)
-            _print_trust(diag)
+            _render._print_hosts(diag)
+            _render._print_tiers(diag)
+            _render._print_trust(diag)
             from aegis_core.sync import base_fetch
 
             fetched = base_fetch(root)[0]  # Aegis never fetches; this says how old BASE may be
             if fetched:
                 print(f"  {fetched}")
-            _print_findings(diag.findings)
+            _render._print_findings(diag.findings)
         if fix:
             if not plan:
                 print("\nNothing to fix.")
             else:
-                _print_plan(plan, diag.ctx.home)
-                if yes or _confirm(f"Apply these {len(plan)} changes? [y/N] "):
-                    results, backup = _apply(plan, diag.ctx.home, root)
-                    _print_results(results, backup)
+                _render._print_plan(plan, diag.ctx.home)
+                if yes or _base._confirm(f"Apply these {len(plan)} changes? [y/N] "):
+                    results, backup = _repair._apply(plan, diag.ctx.home, root)
+                    _render._print_results(results, backup)
                 else:
                     declined = True
                     print("No changes made.")
 
-    payload = _payload(diag, checks)
+    payload = _render._payload(diag, checks)
     failed = payload["summary"]["failed"] > 0 or declined or any(r["status"] != "applied" for r in results)
     if use_json:
         if fix:

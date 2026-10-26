@@ -518,11 +518,11 @@ def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
 # ── 3. --apply never changes repository settings without a person at a terminal ──
 
 def _doctor_github(repo: hg.Repo, monkeypatch, gh: hg.FakeGh, answers=None, tty=False, workflow=True, **kw):
-    from aegis_cli import doctor
+    from aegis_cli import doctor, doctor_base
     if workflow:
         repo.write(".github/workflows/aegis.yml", hg.AEGIS_WORKFLOW if workflow is True else workflow)
     monkeypatch.setattr(ghcli, "default_gh_runner", gh)
-    monkeypatch.setattr(doctor, "_stdin_is_tty", lambda: tty)
+    monkeypatch.setattr(doctor_base, "_stdin_is_tty", lambda: tty)
     replies = iter(answers or [])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=False, github=True, apply=False, tier=None)

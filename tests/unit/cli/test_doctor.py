@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import (
     _check_cli_resolvable,
     _check_python_version,
@@ -36,10 +36,10 @@ def isolated_hosts(tmp_path, tmp_path_factory, monkeypatch):
     # workspace. Tests of the CLI check itself use the real lookup (``real_lookup``).
     programs = tmp_path_factory.mktemp("programs")
     _stub(programs, "aegis")
-    real_which, real_skipped = doctor.which, doctor.only_skipped
-    monkeypatch.setattr(doctor, "which", lambda name, path=None, outside=None:
+    real_which, real_skipped = doctor_base.which, doctor_base.only_skipped
+    monkeypatch.setattr(doctor_base, "which", lambda name, path=None, outside=None:
                         real_which(name, str(programs), outside))
-    monkeypatch.setattr(doctor, "only_skipped", lambda name, path=None, outside=None, base=None:
+    monkeypatch.setattr(doctor_base, "only_skipped", lambda name, path=None, outside=None, base=None:
                         real_skipped(name, str(programs), outside, base))
     return home
 
@@ -57,8 +57,8 @@ def real_lookup(monkeypatch):
     """Doctor's lookups search $PATH again, which each test sets to its own directories."""
     from aegis_core import pathlookup
 
-    monkeypatch.setattr(doctor, "which", pathlookup.which)
-    monkeypatch.setattr(doctor, "only_skipped", pathlookup.only_skipped)
+    monkeypatch.setattr(doctor_base, "which", pathlookup.which)
+    monkeypatch.setattr(doctor_base, "only_skipped", pathlookup.only_skipped)
 
 
 def _governed(root):
