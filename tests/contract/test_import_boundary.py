@@ -6,7 +6,7 @@ calls) and checked against the table below:
 
 - **aegis_core** imports nothing from aegis_cli, aegis_mcp or aegis_sdk. Inside it each
   module belongs to one layer and imports only its own layer or a lower one:
-  - L0 primitives: storage (atomic I/O, the lock), gitsafe, config, the workspace and
+  - L0 primitives: atomicio (atomic I/O), storage (the lock), gitsafe, config, the workspace and
     its layout, and the leaf tables (errors, taxonomy, _version), which import no
     aegis module at all;
   - L1 domain: the rule schema and loader (rules, rule_inventory, yaml_engine), the

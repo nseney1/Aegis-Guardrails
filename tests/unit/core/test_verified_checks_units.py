@@ -1114,6 +1114,7 @@ def test_each_function_has_one_name_and_no_public_name_is_unreferenced():
         assert not hasattr(testexec, gone), gone
     assert "parse_junit" not in testexec.__all__
     assert all(hasattr(testexec, name) for name in testexec.__all__)
+    assert all(hasattr(checkrun, name) for name in checkrun.__all__)
     assert treeid.named_paths(["a", "b"]) == "a, b" and "named_paths" in treeid.__all__
     assert treeid.named_paths([str(i) for i in range(7)]) == "0, 1, 2, 3, 4 and 2 more"
 

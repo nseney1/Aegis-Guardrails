@@ -261,7 +261,7 @@ def test_this_repository_has_no_gate_finding_from_the_wired_scans():
 
     files = sorted(p.relative_to(REPO).as_posix() for pkg in ("aegis_core", "aegis_cli", "aegis_mcp")
                    for p in (REPO / pkg).rglob("*.py"))
-    hot = ["aegis_core/human_gate.py", "aegis_core/checkrun.py", "aegis_core/verification/scanners.py"]
+    hot = ["aegis_core/human_gate.py", "aegis_core/testexec.py", "aegis_core/verification/scanners.py"]
     sample = sorted(set(files[:: max(1, len(files) // 40)] + hot))
     pack = evaluate_security_pack(REPO, sample, {})
     assert pack["violations"] == [] and [u for u in pack["unverified_findings"] if u["kind"] == "file"] == []

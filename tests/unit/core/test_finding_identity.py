@@ -154,8 +154,8 @@ def test_lines_split_where_cpython_counts_them_and_nowhere_else():
 
     # A form feed or a vertical tab does not start a line for the tokenizer, so line numbers
     # from the AST must index the same list: str.splitlines() would shift every later line.
-    text = "a\r\nb\rc\nd\x0ce\x0bf\x1cg h\n"
-    assert split_lines(text) == ["a", "b", "c", "d\x0ce\x0bf\x1cg h", ""]
+    text = "a\r\nb\rc\nd\x0ce\x0bf\x1cg\u2028h\n"
+    assert split_lines(text) == ["a", "b", "c", "d\x0ce\x0bf\x1cg\u2028h", ""]
 
 
 def test_repeated_lines_are_numbered_by_occurrence():
