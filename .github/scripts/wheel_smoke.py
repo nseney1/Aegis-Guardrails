@@ -56,6 +56,17 @@ def _ensure_site_packages():
 _SITE_ROOTS, _SUBPROC_FLAG = _ensure_site_packages()
 
 
+def _home_env(home, drop=()):
+    """os.environ without ``drop``, with HOME and USERPROFILE moved to ``home``. A user-site install
+    (the fallback above) finds its site directory through HOME, so its base stays pinned to this
+    process's, read before the child's HOME changes."""
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env.update(HOME=home, USERPROFILE=home)
+    if _SUBPROC_FLAG != "-I":
+        env["PYTHONUSERBASE"] = site.getuserbase()
+    return env
+
+
 def fail(msg):
     print(f"wheel smoke FAILED: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -92,13 +103,19 @@ def check_doctor(ws):
     """`aegis doctor --json` imports the whole doctor family from the wheel; a fresh HOME and an empty
     PATH keep the machine's hosts, git and gh out of it. A failed check (exit 1) is fine, a crash is not."""
     home = tempfile.mkdtemp(prefix="aegis-smoke-home-")
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME")}
-    env.update(HOME=home, USERPROFILE=home, PATH=home)
-    proc = subprocess.run([sys.executable, _SUBPROC_FLAG, "-m", "aegis_cli.cli", "doctor", "--json",
-                           "--workspace", ws], capture_output=True, text=True, timeout=120, cwd=ws, env=env)
+    env = _home_env(home, drop=("PYTHONPATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME"))
+    env["PATH"] = home
+    # -E would ignore the pinned PYTHONUSERBASE; the child runs in the fresh workspace with
+    # PYTHONPATH dropped, so nothing there can shadow site-packages.
+    flags = [] if _SUBPROC_FLAG == "-E" else [_SUBPROC_FLAG]
+    proc = subprocess.run([sys.executable, *flags, "-m", "aegis_cli.cli", "doctor", "--json", "--workspace", ws],
+                          capture_output=True, text=True, timeout=120, cwd=ws, env=env)
     if proc.returncode not in (0, 1):
         fail(f"aegis doctor --json exited {proc.returncode}: {proc.stderr[-500:]}")
-    payload = json.loads(proc.stdout)
+    try:
+        payload = json.loads(proc.stdout)
+    except ValueError:
+        fail(f"aegis doctor --json printed no JSON (exit {proc.returncode}): {proc.stderr[-500:]}")
     if payload.get("schema") != "aegis.doctor/v1" or not isinstance(payload.get("hosts"), list):
         fail(f"aegis doctor --json returned {proc.stdout[:500]!r}")
     print("ok  aegis doctor --json (hermetic HOME)")
@@ -251,8 +268,7 @@ def check_init_ignores_a_repository_rules_package():
         return
     repo, marker = _planted_repo(("skills",))
     home = tempfile.mkdtemp(prefix="aegis-smoke-home-")
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "AEGIS_WORKSPACE")}
-    env.update(HOME=home, USERPROFILE=home)
+    env = _home_env(home, drop=("PYTHONPATH", "AEGIS_WORKSPACE"))
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
     # Not isolated on purpose: the current directory is first on sys.path, as it was for
     # the README's old `python3 -m aegis_cli` advice.
