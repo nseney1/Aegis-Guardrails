@@ -1186,6 +1186,7 @@
   "aegis_cli.hooks.redaction.HOOK_REDACTION_PATTERNS",
   "aegis_cli.hooks.redaction.redact_payload",
   "aegis_cli.init.CI_WORKFLOW_PATH",
+  "aegis_cli.rule.prune_rules",
   "aegis_cli.verify.verdict_to_exit_code",
   "aegis_core.baseline.envelope",
   "aegis_core.credit.record_human_label",
