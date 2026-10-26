@@ -940,12 +940,3 @@ def _selection(root: Path, governed: bool, ctx: _Ctx) -> Tuple[Tuple[Any, ...], 
                               "cannot check", severity="info"))
     picked = tuple(h for h in hosts.HOSTS if h.id in set(chosen) and h.id in known)
     return picked, "config", notes
-
-
-from aegis_cli.doctor_render import (  # noqa: E402
-    _TIER_TEXT, _best_effort, _floor_status, _hook_tier_text, _tiers,
-)
-from aegis_cli.doctor_repair import (  # noqa: E402
-    ListItem, _LEGACY_MARKER, _instruction_files, _is_legacy_handler, _legacy_block_findings,
-    _legacy_hook_findings, _legacy_items, _legacy_ranges, _list_location, _program_name, _removed_host_phases,
-)

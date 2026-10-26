@@ -765,29 +765,30 @@ def _confirm(prompt: str) -> bool:
 
 
 from aegis_cli.doctor_findings import (  # noqa: E402
-    ListItem, _Action, _BLOCK_BEGIN, _BLOCK_END, _BOM, _CLAUDE_FAMILY, _CODE_SPAN, _COMMAND_STARTERS,
+    _Action, _BLOCK_BEGIN, _BLOCK_END, _BOM, _CLAUDE_FAMILY, _CODE_SPAN, _COMMAND_STARTERS,
     _ClaudeFile, _FENCE, _Finding, _HEX12, _HOOK_SCOPE_FILES, _IMPORTS_AGENTS, _IMPORTS_PARENT_AGENTS,
-    _INDENTED_CODE, _Instructions, _LEGACY_MARKER, _TIER_TEXT, _V3_PLUGIN, _advisory, _all, _any,
-    _best_effort, _bootstrap_reaches, _bootstrap_state, _bootstrap_tool_findings, _budget, _budget_findings,
-    _claude_import_advice, _claude_names, _claude_reads_agents, _fence_step, _floor_status,
-    _home_rules_finding, _hook_files, _hook_findings, _hook_row, _hook_tier_text, _host_row, _identity,
-    _instruction_files, _instructions, _is_legacy_handler, _key_finding, _legacy_block_findings,
-    _legacy_hook_findings, _legacy_items, _legacy_ranges, _level, _list_location, _location, _mcp_findings,
-    _mcp_loads, _path_key, _program_name, _prose, _registered_roots, _removed_host_phases,
-    _runnable, _selection, _tiers, _upgrade_findings, _v3_copy_findings, _workspace_findings,
+    _INDENTED_CODE, _Instructions, _V3_PLUGIN, _advisory, _all, _any,
+    _bootstrap_reaches, _bootstrap_state, _bootstrap_tool_findings, _budget, _budget_findings,
+    _claude_import_advice, _claude_names, _claude_reads_agents, _fence_step,
+    _home_rules_finding, _hook_files, _hook_findings, _hook_row, _host_row, _identity,
+    _instructions, _key_finding, _level, _location, _mcp_findings,
+    _mcp_loads, _path_key, _prose, _registered_roots,
+    _runnable, _selection, _upgrade_findings, _v3_copy_findings, _workspace_findings,
     _worktree_ledger_findings,
 )
 from aegis_cli.doctor_render import (  # noqa: E402
-    _CHECKS, _ICON, _PLACEHOLDER_CHECK, _github_plan, _hooks_line, _payload, _print_findings,
-    _print_github, _print_hosts, _print_plan, _print_results, _print_tiers, _print_trust,
-    _registered_launchers, _run_checks, _run_drivers_only, _run_github, _run_release, _summary,
+    _CHECKS, _ICON, _PLACEHOLDER_CHECK, _TIER_TEXT, _best_effort, _floor_status, _github_plan, _hook_tier_text,
+    _hooks_line, _payload, _print_findings, _print_github, _print_hosts, _print_plan, _print_results, _print_tiers,
+    _print_trust, _registered_launchers, _run_checks, _run_drivers_only, _run_github, _run_release, _summary, _tiers,
 )
 from aegis_cli.doctor_repair import (  # noqa: E402
-    _Change, _Diagnosis, _File, _Refused, _apply, _backup_root, _claude_config, _claude_dir,
-    _claude_project_keys, _claude_user_registered, _current_bytes, _desktop_configs, _diagnose,
-    _dump_like, _host_json_path, _missing_ast_extensions, _names, _parse_json, _plan, _probe_claude,
-    _probe_json_host, _read_file, _server_entry, _state_modes,
-    _without_keys, _without_lines, _without_list_items, _write_manifest, _write_refusal,
+    ListItem, _Change, _Diagnosis, _File, _LEGACY_MARKER, _Refused, _apply, _backup_root, _claude_config,
+    _claude_dir, _claude_project_keys, _claude_user_registered, _current_bytes, _desktop_configs, _diagnose,
+    _dump_like, _host_json_path, _instruction_files, _is_legacy_handler, _legacy_block_findings,
+    _legacy_hook_findings, _legacy_items, _legacy_ranges, _list_location, _missing_ast_extensions, _names,
+    _parse_json, _plan, _probe_claude, _probe_json_host, _program_name, _read_file, _removed_host_phases,
+    _server_entry, _state_modes, _without_keys, _without_lines, _without_list_items, _write_manifest,
+    _write_refusal,
 )
 
 _PROBES: Dict[str, Callable[[Any, Optional[str], _Ctx], Dict[str, Any]]] = {
