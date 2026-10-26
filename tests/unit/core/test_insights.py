@@ -1,6 +1,7 @@
 """Unit tests for aegis_core.insights edge cases, security boundaries, and clustering."""
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -934,3 +935,246 @@ def test_an_insight_without_tokens_matches_nothing_and_raises_nothing(tmp_path: 
     review = review_insights(repo, home=hb_home)
     assert _match_of(review, row["id"]) == (None, 0.0)
     assert {e["id"]: e["neighbours"] for e in review["insights"]} == {row["id"]: []}
+
+
+# ── R-structure-32: insights is a package of four modules with the module's surface ──
+
+REPO = Path(__file__).resolve().parents[3]
+# aegis_core.insights.__all__ on the w14 merge commit (e7e61536), when insights was one module. One
+# string: listed names would count as uses in test_every_name_in_insights_all_is_used_outside_the_module.
+W14_ALL = tuple("""
+    CaptureLimitReached INSIGHT_HOOK_MARKER JOIN_WINDOW_S KEY_SIZE MAX_CAPTURES_PER_SESSION RECURRENCE_DENOMINATOR
+    RECURRENCE_SIM RULE_MATCH_SIM RULE_MATCH_SIM_WITH_PATH SUPPORTED_INSIGHT_HOSTS add_insight capture_suggestion
+    create_link_key dirty_paths effective_capture has_correction_cue host_capture_status insight_born_rules
+    insight_status insight_status_lines insight_workspace_id insights_path measure_recurrence merge_insight_hook
+    read_insight_rows read_link_key record_decision record_hook_prompt redact_insight_text remove_insight_hook
+    review_insights session_hs write_proposal
+""".split())
+# The public names that module defined outside __all__ (the names it imported are not kept).
+W14_DEFINED = tuple("""
+    BURST_WINDOW_SECONDS COUNTABLE_LEVELS DECISIONS INSIGHT_SCHEMA_VERSION MAX_CAPTURE_PATHS MAX_CAPTURE_PATH_CHARS
+    RECURRENCE_ALARM_COUNT REJECTION_RESURFACE_COUNT
+""".split())
+# Each module may import only the ones before it; none imports the package itself.
+INSIGHT_MODULES = ("keys", "capture", "review", "recurrence")
+
+
+def unresolved_exports(module) -> list:
+    """The names in ``module.__all__`` that ``module`` does not bind."""
+    return [name for name in getattr(module, "__all__", ()) if not hasattr(module, name)]
+
+
+def test_the_package_exports_every_name_the_module_exported():
+    assert sorted(core_insights.__all__) == sorted(W14_ALL)
+    assert unresolved_exports(core_insights) == []
+    assert [name for name in W14_DEFINED if not hasattr(core_insights, name)] == []
+
+
+def test_an_export_the_module_does_not_bind_is_named(tmp_path: Path):
+    import importlib.util
+
+    pkg = tmp_path / "fixture_exports"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_bytes(b'__all__ = ["present", "missing"]\npresent = 1\n')
+    spec = importlib.util.spec_from_file_location("fixture_exports", pkg / "__init__.py",
+                                                  submodule_search_locations=[str(pkg)])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert unresolved_exports(module) == ["missing"]
+
+
+def test_insights_is_a_package_of_four_modules():
+    pkg = REPO / "aegis_core" / "insights"
+    assert not (REPO / "aegis_core" / "insights.py").exists()
+    assert sorted(p.name for p in pkg.glob("*.py")) == sorted(["__init__.py", *(f"{m}.py" for m in INSIGHT_MODULES)])
+    assert hasattr(core_insights, "__path__")
+
+
+def _insight_imports(source: str) -> set:
+    """The insights modules ``source`` imports, anywhere in it; "__init__" for the package itself."""
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = ("aegis_core.insights" + (f".{node.module}" if node.module else "")) if node.level else node.module
+            names = [f"{base}.{a.name}" if base == "aegis_core.insights" else str(base) for a in node.names]
+        else:
+            continue
+        for name in names:
+            parts = name.split(".")
+            if parts[:2] == ["aegis_core", "insights"]:
+                found.add(parts[2] if len(parts) > 2 and parts[2] in INSIGHT_MODULES else "__init__")
+    return found
+
+
+def _import_path(edges: dict, start: str, goal: str):
+    paths = [[start]]
+    while paths:
+        path = paths.pop(0)
+        if path[-1] == goal:
+            return path
+        paths += [path + [nxt] for nxt in sorted(edges.get(path[-1], ())) if nxt not in path]
+    return None
+
+
+def layering_violations(sources: dict) -> list:
+    """Each import of a later insights module, or of the package, with the cycle it closes."""
+    edges = {name: sorted(_insight_imports(src) - {name}) for name, src in sources.items()}
+    edges["__init__"] = list(INSIGHT_MODULES)  # the package imports every module
+    found = []
+    for name in INSIGHT_MODULES:
+        for target in edges.get(name, ()):
+            if target == "__init__" or INSIGHT_MODULES.index(target) > INSIGHT_MODULES.index(name):
+                back = _import_path(edges, target, name)
+                cycle = f" (cycle: {' -> '.join([name, *back])})" if back else ""
+                found.append(f"aegis_core.insights.{name} imports {target}{cycle}")
+    return found
+
+
+def _module_tricks(source: str) -> list:
+    tree = ast.parse(source)
+    found = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("__getattr__", "__dir__")]
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(
+            node, (ast.AugAssign, ast.AnnAssign)) else []
+        found += [ast.unparse(t) for t in targets if (isinstance(t, ast.Attribute) and t.attr == "__class__")
+                  or (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Attribute) and t.value.attr == "modules")]
+    return found
+
+
+def test_the_package_is_layered_and_its_init_is_plain():
+    """Given the package, When its modules are parsed, Then keys imports no sibling, capture only
+    keys, review only those two and recurrence only those three, none imports the package; the
+    __init__ has an __all__, and no file serves names lazily or swaps a module object."""
+    pkg = REPO / "aegis_core" / "insights"
+    sources = {name: (pkg / f"{name}.py").read_text(encoding="utf-8") for name in INSIGHT_MODULES}
+    assert layering_violations(sources) == []
+    init = (pkg / "__init__.py").read_text(encoding="utf-8")
+    assert "__all__" in {t.id for n in ast.parse(init).body if isinstance(n, ast.Assign)
+                         for t in n.targets if isinstance(t, ast.Name)}
+    assert {name: _module_tricks(src) for name, src in {**sources, "__init__": init}.items()
+            if _module_tricks(src)} == {}
+
+
+def test_an_import_against_the_layering_is_named_with_its_cycle():
+    keys_up = {"keys": "from aegis_core.insights.capture import has_correction_cue\n",
+               "capture": "from aegis_core.insights.keys import insights_path\n", "review": "", "recurrence": ""}
+    assert layering_violations(keys_up) == [
+        "aegis_core.insights.keys imports capture (cycle: keys -> capture -> keys)"]
+    via_package = {"keys": "", "capture": "def cap():\n    from aegis_core.insights import MAX_CAPTURES_PER_SESSION\n",
+                   "review": "", "recurrence": ""}
+    assert layering_violations(via_package) == [
+        "aegis_core.insights.capture imports __init__ (cycle: capture -> __init__ -> capture)"]
+    assert _module_tricks("import sys\nsys.modules[__name__] = 1\ndef __getattr__(name):\n    pass\n") == [
+        "__getattr__", "sys.modules[__name__]"]
+
+
+# Aegis modules a fresh interpreter held on the w14 merge commit (e7e61536) after
+# `import aegis_core.insights`, then one plain hook prompt, then one cue prompt with excerpts
+# (a workspace without rule files). The cue prompt loaded the scanner stack for redaction.
+_S0_IMPORT = frozenset({
+    "aegis_core", "aegis_core._version", "aegis_core.atomicio", "aegis_core.errors", "aegis_core.gitsafe",
+    "aegis_core.insights", "aegis_core.pathlookup", "aegis_core.primitives", "aegis_core.rule_inventory",
+    "aegis_core.storage", "aegis_core.taxonomy", "aegis_core.workspace", "aegis_core.workspace.binding",
+    "aegis_core.workspace.layout",
+})
+S0 = {
+    "import": _S0_IMPORT,
+    "prompt": _S0_IMPORT | {"aegis_core.config"},
+    "cue": _S0_IMPORT | {"aegis_core.config", "aegis_core.verification", "aegis_core.verification.scanners",
+                         "aegis_core.verification.test_runner"},
+}
+NEW_MODULES = frozenset({"aegis_core.redaction", *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
+REVIEW_ONLY = frozenset({"aegis_core.credit", "aegis_core.human_gate", "aegis_core.rules",
+                         "aegis_core.scan_compliance", "aegis_core.telemetry_engine.ledger"})
+_HOOK_PATH = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+
+def loaded():
+    return sorted(m for m in sys.modules if m.split(".")[0] in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk"))
+
+import aegis_core.insights as insights
+found = {"import": loaded()}
+ws, home = sys.argv[2], Path(sys.argv[3])
+insights.record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": ws},
+                            workspace=ws, home=home)
+found["prompt"] = loaded()
+row = insights.record_hook_prompt("claude-code", {"prompt": "No, stop breaking the build again.", "session_id": "s1",
+                                                  "cwd": ws}, workspace=ws, excerpts=True, home=home)
+assert row.get("event") == "insight", row
+found["cue"] = loaded()
+sys.stdout.write(json.dumps(found))
+"""
+
+
+def _child_env(home: Path) -> dict:
+    return {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}
+
+
+def unexpected_modules(loaded, before) -> list:
+    return sorted(set(loaded) - set(before) - NEW_MODULES)
+
+
+def test_the_hook_path_loads_no_module_it_did_not_load_before(tmp_path: Path, hb_home: Path):
+    """Given a fresh interpreter, When it imports aegis_core.insights and records a plain and a cue
+    prompt, Then each step loads only what it loaded on the w14 tree, the redaction module and the
+    four insights modules, and never a review-only module."""
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    proc = subprocess.run([sys.executable, "-I", "-c", _HOOK_PATH, str(REPO), str(ws), str(hb_home)], input=b"",
+                          capture_output=True, env=_child_env(hb_home), cwd=str(ws), timeout=120, check=False)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    found = json.loads(proc.stdout.decode("utf-8"))
+    assert {step: unexpected_modules(found[step], S0[step]) for step in S0} == {step: [] for step in S0}
+    assert {step: sorted(REVIEW_ONLY & set(found[step])) for step in S0} == {step: [] for step in S0}
+
+
+def test_a_heavy_module_on_the_hook_path_is_named():
+    loaded = S0["prompt"] | {"aegis_core.insights.capture", "aegis_core.human_gate"}
+    assert unexpected_modules(loaded, S0["prompt"]) == ["aegis_core.human_gate"]
+
+
+_APPEND = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.insights import record_hook_prompt
+
+ws, home, tag = sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+sys.stdin.buffer.read(1)  # both processes start appending together
+for i in range(50):
+    record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": f"{tag}-{i}", "cwd": ws},
+                       workspace=ws, excerpts=False, home=home)
+"""
+
+
+def test_two_processes_appending_at_once_leave_100_whole_rows(tmp_path: Path, hb_home: Path):
+    """Sad path: Given two processes with one HOME, each recording 50 prompts of 50 sessions, When
+    both finish, Then the log holds 100 heartbeats (one per prompt without rule files), every line
+    a JSON object, no skipped line and no torn tail."""
+    from aegis_core.storage import read_jsonl
+
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    create_link_key(hb_home)  # made here: what two first prompts do to a missing key is another matter
+    procs = [subprocess.Popen([sys.executable, "-I", "-c", _APPEND, str(REPO), str(ws), str(hb_home), tag],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=_child_env(hb_home), cwd=str(ws))
+             for tag in ("a", "b")]
+    for proc in procs:
+        proc.stdin.write(b"g")
+        proc.stdin.flush()
+    for proc in procs:
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err.decode("utf-8", "replace")
+    path = insights_path(ws, home=hb_home)
+    lines = path.read_bytes().splitlines()
+    assert len(lines) == 100 and all(isinstance(json.loads(line), dict) for line in lines)
+    read = read_jsonl(path)
+    assert (len(read.rows), read.skipped_lines, read.torn_tail) == (100, [], False)
+    assert {r["event"] for r in read.rows} == {"heartbeat"} and len({r["hs"] for r in read.rows}) == 100
