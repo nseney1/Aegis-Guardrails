@@ -88,6 +88,22 @@ def check_cli(ws):
     print("ok  aegis --help")
 
 
+def check_doctor(ws):
+    """`aegis doctor --json` imports the whole doctor family from the wheel; a fresh HOME and an empty
+    PATH keep the machine's hosts, git and gh out of it. A failed check (exit 1) is fine, a crash is not."""
+    home = tempfile.mkdtemp(prefix="aegis-smoke-home-")
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME")}
+    env.update(HOME=home, USERPROFILE=home, PATH=home)
+    proc = subprocess.run([sys.executable, _SUBPROC_FLAG, "-m", "aegis_cli.cli", "doctor", "--json",
+                           "--workspace", ws], capture_output=True, text=True, timeout=120, cwd=ws, env=env)
+    if proc.returncode not in (0, 1):
+        fail(f"aegis doctor --json exited {proc.returncode}: {proc.stderr[-500:]}")
+    payload = json.loads(proc.stdout)
+    if payload.get("schema") != "aegis.doctor/v1" or not isinstance(payload.get("hosts"), list):
+        fail(f"aegis doctor --json returned {proc.stdout[:500]!r}")
+    print("ok  aegis doctor --json (hermetic HOME)")
+
+
 def check_mcp(ws):
     requests = "".join(json.dumps(r) + "\n" for r in (
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -282,6 +298,7 @@ def main():
     check_module_origins()
     ws = make_workspace()
     check_cli(ws)
+    check_doctor(ws)
     check_mcp(ws)
     check_mcp_launcher()
     check_governance_fitness(ws)
