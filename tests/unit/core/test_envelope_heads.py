@@ -67,7 +67,7 @@ def _documents(root, monkeypatch, capsys):
     cli._print_hold(argparse.Namespace(json=True, command="status"), held)
     docs["hold"] = json.loads(capsys.readouterr().out)
     diag = SimpleNamespace(ctx=SimpleNamespace(root=root, governed=True, selected=(), selection="default"),
-                           rows=[], findings=[], tiers=[], trust=None, modes=None)
+                           rows=[], findings=[], tiers=[], trust=human_gate.TierReport("C"), modes=None)
     docs["doctor"] = doctor_render._payload(diag, [])
     monkeypatch.setattr(doctor.human_gate, "detect_tier", lambda root: human_gate.TierReport("C"))
     assert doctor._run_github(root, True, False, None) == 0

@@ -114,8 +114,8 @@ from aegis_cli import doctor_render as _render
 from aegis_cli import doctor_repair as _repair
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.doctor_base import (
-    SCHEMA, SERVER, SOURCE, Registered, _Ctx, _claude_config, _claude_project_keys, _clean, _entry_facts, _home,
-    _host_json_path, _is_home, _names, _registration, _server_entry, _setup_fix,
+    SCHEMA, SERVER, SOURCE, Registered, _Ctx, _HookStatus, _claude_config, _claude_project_keys, _clean,
+    _entry_facts, _home, _host_json_path, _is_home, _names, _registration, _server_entry, _setup_fix,
 )
 from aegis_core import github_ruleset, human_gate, primitives
 from aegis_core.pathlookup import INSIDE_FENCE, Hit
@@ -183,11 +183,11 @@ def _check_rules(project_root: Path) -> bool:
     return True
 
 
-def _check_state_dir(project_root: Path | None = None) -> Optional[bool]:
+def _check_state_dir(project_root: Path) -> Optional[bool]:
     """Check .aegis/state/ (ledger, lock) exists and is writable, or can be created (read-only check)."""
     from aegis_core.workspace.layout import WorkspaceLayout
 
-    root = Path(project_root or Path.cwd()).resolve()
+    root = Path(project_root).resolve()
     if _is_home(root):
         print(f"  ℹ️  State directory: not checked: {root} is your home directory, whose .aegis/ is your "
               "user layer; a workspace keeps its state in its own .aegis/state")
@@ -209,7 +209,7 @@ def _check_state_dir(project_root: Path | None = None) -> Optional[bool]:
     return False
 
 
-def _check_cli_resolvable(project_root: Optional[Path] = None) -> bool:
+def _check_cli_resolvable(project_root: Path) -> bool:
     """Check that the 'aegis' CLI the bootstrap sends agents to is on PATH.
 
     Only absolute PATH entries count (aegis_core.pathlookup): an empty or relative entry
@@ -217,7 +217,7 @@ def _check_cli_resolvable(project_root: Optional[Path] = None) -> bool:
     an ``aegis``. Doctor runs nothing here, so an absolute entry inside the workspace (a
     project virtualenv the user put on PATH) counts, and the line says where it is.
     """
-    root = Path(project_root or Path.cwd()).resolve()
+    root = Path(project_root).resolve()
     path = _base.which("aegis")
     if path:
         inside = _base.which("aegis", outside=root) != path
@@ -329,62 +329,30 @@ def _check_mcp_launcher(path_env: Optional[str] = None, workspace: Optional[Path
     return not problems
 
 
-def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> Optional[bool]:
+def _check_ast_drivers(project_root: Path) -> Optional[bool]:
     """Check the AST drivers this workspace uses and that their executables resolve.
 
     A repository opts in to a packaged driver in .aegis/config.json; driver commands
-    come only from ~/.aegis/config.json (D10).
+    come only from ~/.aegis/config.json (D10). The check only reports: ``--fix``
+    provisions the missing packaged drivers through its backed-up plan.
     """
     import shlex
-    from aegis_core.ast.detect import detect_project_languages, provision_ast_driver_slots
     from aegis_core.ast.runner import ASTDriverRunner, resolve_driver_executable
-    from aegis_core.errors import PathTraversalError
-    from aegis_core.skills.slots import SlotRegistry, SlotResolutionError
+    from aegis_core.skills.slots import SlotResolutionError
 
-    ws_root = Path(project_root or Path.cwd())
+    ws_root = Path(project_root)
     if _is_home(ws_root):
-        # Never walk the home directory for sources, nor write a repository's driver
-        # opt-in into ~/.aegis/config.json, which is the user scope.
+        # Never walk the home directory for sources: its .aegis/ is the user scope.
         print(f"  ℹ️  AST drivers: not checked: {ws_root} is your home directory, whose .aegis/ is your user layer")
         return None
-    detected_langs = detect_project_languages(ws_root)
-    non_py_langs = {k: v for k, v in detected_langs.items() if k != "python"}
-
-    def _configured() -> dict[str, str]:
-        drivers: dict[str, str] = {}
-        for registry in (SlotRegistry.load(ws_root), SlotRegistry.load_user(ws_root)):
-            for slot_name, slot_val in registry.to_dict().items():
-                if slot_name == "ast_driver":
-                    drivers["default"] = str(slot_val)
-                elif slot_name.startswith("ast_driver_"):
-                    drivers[f".{slot_name[len('ast_driver_'):]}"] = str(slot_val)
-        return drivers
-
     try:
-        ast_drivers = _configured()
+        ast_drivers, missing = _findings._ast_driver_state(ws_root)
     except SlotResolutionError as exc:
         print(f"  ❌ AST drivers: {exc}")
         return False
-
-    missing = sorted({
-        ext
-        for l_info in non_py_langs.values()
-        for ext in l_info.get("extensions", [])
-        if ext not in ast_drivers and "default" not in ast_drivers
-    })
     if missing:
-        if fix:
-            try:
-                _slots, written = provision_ast_driver_slots(ws_root, detected_langs)
-            except PathTraversalError as exc:
-                print(f"  ❌ AST drivers: {exc}")
-                return False
-            if written:
-                print(f"  ✅ Fixed: enabled the packaged AST drivers in .aegis/config.json for {', '.join(missing)}")
-                ast_drivers = _configured()
-        else:
-            print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. Run 'aegis doctor --fix' to provision.")
-            return False
+        print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. Run 'aegis doctor --fix' to provision.")
+        return False
 
     if not ast_drivers:
         print("  ✅ AST drivers: native Python stdlib (in-process)")
@@ -436,16 +404,28 @@ def _check_ast_drivers(project_root: Path | None = None, fix: bool = False) -> O
 
 # ── Pre-commit hook ──────────────────────────────────────────────────────────
 
-def _check_precommit_hook(project_root: Path | None = None) -> bool | None:
+def _hook_status(root: Path) -> _HookStatus:
+    """The run's one hook_status reading: (status, None), or (None, the exception it raised).
+    The local floor reports a reading that raised as unknown; the pre-commit check raises it."""
+    from aegis_cli.hooks import management
+
+    try:
+        return management.hook_status(root), None
+    except Exception as exc:
+        return None, exc
+
+
+def _check_precommit_hook(project_root: Path, hook: Optional[_HookStatus] = None) -> bool | None:
     """True for a current, runnable hook block; False for an older one or one whose
-    pinned interpreter or aegis path is gone; None if absent.
+    pinned interpreter or aegis path is gone; None if absent. ``hook`` is the run's
+    reading (_hook_status), taken here when none is given.
 
     Blocks before the current format resolved aegis through PATH, $VIRTUAL_ENV
     or the repository's .venv, so repository code could run on commit.
     """
-    from aegis_cli.hooks.management import hook_status
-
-    st = hook_status(project_root)
+    st, error = _hook_status(project_root) if hook is None else hook
+    if error is not None:
+        raise error
     if not st["managed_by_aegis"]:
         return None
     if st["status"] == "installed":
@@ -598,16 +578,16 @@ _CHECKS: Tuple[Tuple[str, bool], ...] = (
 )
 
 
-def _run_checks(root: Path, fix_ast: bool, only: Optional[Sequence[str]] = None,
-                registered: Sequence[Registered] = ()) -> List[Dict[str, Any]]:
+def _run_checks(root: Path, only: Optional[Sequence[str]] = None, registered: Sequence[Registered] = (),
+                hook: Optional[_HookStatus] = None) -> List[Dict[str, Any]]:
     calls: Dict[str, Callable[[], Optional[bool]]] = {
         "python_version": _check_python_version,
         "zero_dependencies": _check_zero_dependencies,
         "rules": lambda: _check_rules(root),
         "state_dir": lambda: _check_state_dir(root),
         "cli_on_path": lambda: _check_cli_resolvable(root),
-        "precommit_hook": lambda: _check_precommit_hook(root),
-        "ast_drivers": lambda: _check_ast_drivers(root, fix=fix_ast),
+        "precommit_hook": lambda: _check_precommit_hook(root, hook),
+        "ast_drivers": lambda: _check_ast_drivers(root),
         "mcp_launcher": lambda: _check_mcp_launcher(workspace=root, registered=registered),
     }
     out = []
@@ -629,8 +609,6 @@ def _run_checks(root: Path, fix_ast: bool, only: Optional[Sequence[str]] = None,
 def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) -> int:
     report = human_gate.detect_tier(root)
     plan = _render._github_plan(root, report)
-    status = "printed"
-    result: Optional[Dict[str, Any]] = None
     if apply:
         if not _base._stdin_is_tty():
             print("aegis doctor: --apply changes repository settings, so it only runs at a terminal with an "
@@ -656,17 +634,16 @@ def _run_github(root: Path, use_json: bool, apply: bool, tier: Optional[str]) ->
             print("No changes made.")
             return 1
         try:
-            result = github_ruleset.create_ruleset(root, body)
+            github_ruleset.create_ruleset(root, body)
         except human_gate.HumanGateError as exc:
             print(f"aegis doctor: {_clean(exc, 1000)}", file=sys.stderr)
             return 1
-        status = "applied"
         print(f"Created ruleset {github_ruleset.RULESET_NAME!r}. Re-run aegis doctor to see the tier.")
-    if use_json:
+    if use_json:  # run_doctor refuses --apply with --json, so this document only prints the plan
         print(json.dumps({
             **primitives.envelope(SOURCE, {"machine": "local", "workspace": str(root), "mode": "github"}, schema=SCHEMA),
-            "stale": False, "unknown": [], "status": status, "human_gate": report.as_dict(), "github": plan,
-            "created": result,
+            "stale": False, "unknown": [], "status": "printed", "human_gate": report.as_dict(), "github": plan,
+            "created": None,
         }, indent=2))
     elif not apply:
         _render._print_github(plan, report)
@@ -705,7 +682,7 @@ def _run_drivers_only(root: Path, use_json: bool, fix: bool, yes: bool) -> int:
             else:
                 declined = True
                 print("No changes made.")
-        (check,) = [c for c in _run_checks(root, fix_ast=False, only=("ast_drivers",))]
+        (check,) = [c for c in _run_checks(root, only=("ast_drivers",))]
         if not use_json:
             print(check["text"], end="")
     failed = check["status"] != "pass" or declined or any(r["status"] != "applied" for r in results)
@@ -785,7 +762,8 @@ def run_doctor(args: argparse.Namespace) -> int:
     if getattr(args, "drivers", False):
         return _run_drivers_only(root, use_json, fix, yes)
 
-    diag = _findings._diagnose(root, _probe)
+    hook = _hook_status(root)
+    diag = _findings._diagnose(root, _probe, hook)
     plan = _repair._plan(diag.findings, _findings._missing_ast_extensions(root), root) if fix else []
     results: List[Dict[str, Any]] = []
     backup: Optional[Path] = None
@@ -794,7 +772,7 @@ def run_doctor(args: argparse.Namespace) -> int:
     with contextlib.redirect_stdout(text) if use_json else contextlib.nullcontext():
         if not use_json:
             print(f"aegis doctor — running health checks ({_clean(root, 4096)}):\n")
-        checks = _run_checks(root, fix_ast=False, registered=_render._registered_launchers(diag.rows))
+        checks = _run_checks(root, registered=_render._registered_launchers(diag.rows), hook=hook)
         if not use_json:
             for check in checks:
                 print(check["text"], end="")

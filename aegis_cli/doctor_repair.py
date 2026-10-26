@@ -13,7 +13,7 @@ import stat
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aegis_cli.doctor_base import (
-    _Finding, _aegis_version, _clean, _location, _sha256, _without_lines, _write_refusal,
+    _Finding, _aegis_version, _clean, _location, _path_key, _sha256, _without_lines, _write_refusal,
 )
 from aegis_core.primitives import strict_loads, utc_stamp
 
@@ -122,7 +122,7 @@ def _plan(findings: List[_Finding], ast_missing: List[str], root: Path) -> List[
         action = finding.action
         if action is None:
             continue
-        key = os.path.normcase(os.path.abspath(str(action.path)))
+        key = _path_key(action.path)
         change = changes.setdefault(key, _Change(action.path, action.kind, action.sha256))
         change.describe.append(action.describe)
         change.keys.extend(action.keys)

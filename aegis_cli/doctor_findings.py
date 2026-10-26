@@ -8,13 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from aegis_cli import doctor_base as _base
 from aegis_cli.doctor_base import (
-    _Action, _Ctx, _File, _Finding, _Instructions, _claude_config, _claude_dir, _claude_user_registered,
-    _desktop_configs, _host_json_path, _instruction_files, _instructions, _legacy_items, _legacy_ranges,
-    _list_location, _location, _registered_roots, _removed_host_phases, _without_lines,
+    _Action, _Ctx, _File, _Finding, _HookStatus, _Instructions, _claude_config, _claude_dir,
+    _claude_user_registered, _desktop_configs, _host_json_path, _instruction_files, _instructions, _legacy_items,
+    _legacy_ranges, _list_location, _location, _path_key, _registered_roots, _removed_host_phases, _without_lines,
 )
 from aegis_core import human_gate
 from aegis_core.pathlookup import is_bare
@@ -343,7 +343,7 @@ def _hook_files(host_id: str, ctx: _Ctx) -> List[Tuple[str, Path]]:
     found.extend((scope, ctx.root.joinpath(*rel)) for scope, rel in _HOOK_SCOPE_FILES.get(host_id, ()))
     unique: Dict[str, Tuple[str, Path]] = {}
     for scope, path in found:  # in the home directory the project file is the user file
-        unique.setdefault(os.path.normcase(os.path.abspath(str(path))), (scope, path))
+        unique.setdefault(_path_key(path), (scope, path))
     return list(unique.values())
 
 
@@ -475,7 +475,7 @@ def _mcp_findings(ctx: _Ctx, claude_user: bool) -> List[_Finding]:
     seen = set()
     no_user = "keep it until aegis init --host claude-code registers aegis for your user"
     for path, kind in files:
-        key = os.path.normcase(os.path.abspath(str(path)))
+        key = _path_key(path)
         if key in seen:
             continue
         seen.add(key)
@@ -611,9 +611,7 @@ def _upgrade_findings(ctx: _Ctx) -> List[_Finding]:
         return []
     from aegis_core.workspace import discovery
 
-    # The helper comes with the commands that refuse; a build without it has neither.
-    pending = getattr(discovery, "unmigrated_state", None)
-    found = list(pending(ctx.root)) if pending is not None else []
+    found = list(discovery.unmigrated_state(ctx.root))
     if not found:
         return []
     return [_Finding("unmigrated_v3_state", ctx.root / found[0],
@@ -701,10 +699,10 @@ def _legacy_hook_findings(ctx: _Ctx) -> List[_Finding]:
     files: Dict[str, Tuple[str, Path, bool]] = {}
     for host_id in registrar.HOOK_HOSTS:
         for _scope, path in _hook_files(host_id, ctx):
-            files.setdefault(os.path.normcase(os.path.abspath(str(path))), (host_id, path, False))
+            files.setdefault(_path_key(path), (host_id, path, False))
     if ctx.home is not None:
         plugin = ctx.home.joinpath(*_V3_PLUGIN)
-        files.setdefault(os.path.normcase(os.path.abspath(str(plugin))), ("antigravity", plugin, True))
+        files.setdefault(_path_key(plugin), ("antigravity", plugin, True))
     phases = _removed_host_phases()
     found: List[_Finding] = []
     for host_id, path, is_plugin in files.values():
@@ -774,15 +772,13 @@ def _legacy_block_findings(ctx: _Ctx) -> List[_Finding]:
 
 # ── Enforcement tiers (AD-8) ────────────────────────────────────────────────
 
-def _floor_status(root: Path) -> Tuple[str, Optional[str]]:
-    """The local floor's status, and why an installed, current hook never runs. The floor
-    is active only for a hook that is installed, current and reached by git (hook_status
-    ``reachable``; a status without the key predates it and counts as reachable)."""
-    from aegis_cli.hooks import management
-
-    try:
-        st = management.hook_status(root)
-    except Exception:
+def _floor_status(hook: _HookStatus) -> Tuple[str, Optional[str]]:
+    """The local floor's status from the run's hook_status reading, and why an installed,
+    current hook never runs. The floor is active only for a hook that is installed, current
+    and reached by git (hook_status ``reachable``; a status without the key predates it and
+    counts as reachable). A reading that raised leaves the floor unknown."""
+    st, error = hook
+    if error is not None:
         return "unknown", None
     if st.get("status") == "no_git_repository":
         return "unavailable", None
@@ -883,32 +879,41 @@ def _best_effort(rows: List[Dict[str, Any]], governed: bool, setup: str) -> Dict
 
 # ── The diagnosis ───────────────────────────────────────────────────────────
 
+def _ast_driver_state(ws_root: Path) -> Tuple[Dict[str, str], List[str]]:
+    """(the AST driver configured per extension, 'default' for the catch-all slot; the detected
+    non-Python source extensions that have none): the one definition the driver check and the
+    --fix plan share. A config that cannot be read raises SlotResolutionError."""
+    from aegis_core.ast.detect import detect_project_languages
+    from aegis_core.skills.slots import SlotRegistry
+
+    langs = detect_project_languages(ws_root)
+    drivers: Dict[str, str] = {}
+    for registry in (SlotRegistry.load(ws_root), SlotRegistry.load_user(ws_root)):
+        for slot_name, slot_val in registry.to_dict().items():
+            if slot_name == "ast_driver":
+                drivers["default"] = str(slot_val)
+            elif slot_name.startswith("ast_driver_"):
+                drivers[f".{slot_name[len('ast_driver_'):]}"] = str(slot_val)
+    if "default" in drivers:
+        return drivers, []
+    return drivers, sorted({ext for lang, info in langs.items() if lang != "python"
+                            for ext in info.get("extensions", []) if ext not in drivers})
+
+
 def _missing_ast_extensions(ws_root: Path) -> List[str]:
     """Detected source extensions with no AST driver configured (what --fix provisions).
 
     An unreadable config gives none: the AST check reports it, and --fix will not
     write over a file it cannot parse.
     """
-    from aegis_core.ast.detect import detect_project_languages
-    from aegis_core.skills.slots import SlotRegistry, SlotResolutionError
+    from aegis_core.skills.slots import SlotResolutionError
 
     if _base._is_home(ws_root):
         return []
-    langs = {k: v for k, v in detect_project_languages(ws_root).items() if k != "python"}
-    configured: set = set()
     try:
-        registries = (SlotRegistry.load(ws_root), SlotRegistry.load_user(ws_root))
+        return _ast_driver_state(ws_root)[1]
     except SlotResolutionError:
         return []
-    for registry in registries:
-        for name in registry.to_dict():
-            if name == "ast_driver":
-                configured.add("default")
-            elif name.startswith("ast_driver_"):
-                configured.add(f".{name[len('ast_driver_'):]}")
-    if "default" in configured:
-        return []
-    return sorted({ext for info in langs.values() for ext in info.get("extensions", []) if ext not in configured})
 
 
 @dataclass
@@ -917,28 +922,28 @@ class _Diagnosis:
     rows: List[Dict[str, Any]]
     tiers: List[Dict[str, Any]]
     findings: List[_Finding]
-    trust: Any = None  # the human_gate TierReport
+    trust: Any  # the human_gate TierReport
     modes: Any = None  # the shared state's StateModes, or None when it cannot be read
 
 
 def _diagnose(root: Path, prober: Callable[[Any, Optional[str], _Ctx], Dict[str, Any]],
-              environ: Optional[Mapping[str, str]] = None) -> _Diagnosis:
-    """The run's diagnosis; ``prober`` asks each host whether aegis is registered (doctor's probes)."""
+              hook: _HookStatus) -> _Diagnosis:
+    """The run's diagnosis: ``prober`` asks each host whether aegis is registered (doctor's
+    probes), ``hook`` is the run's one hook_status reading."""
     from aegis_core.workspace.layout import UserLayout, is_aegis_workspace
 
-    environ = os.environ if environ is None else environ
     layout = UserLayout.current()
     # The home directory's .aegis/ is the user plane (~/.aegis), never a workspace.
     is_home = _base._is_home(root)
     governed = is_aegis_workspace(root) and not is_home
-    ctx = _Ctx(root=root, governed=governed, home=layout.home if layout else None, environ=environ,
+    ctx = _Ctx(root=root, governed=governed, home=layout.home if layout else None, environ=os.environ,
                selected=(), selection="default", prober=prober, is_home=is_home,
                setup="aegis init" if governed or is_home else _base._setup_command(root))
     ctx.selected, ctx.selection, notes = _selection(root, governed, ctx)
     selected = ctx.selected
     info = _instructions(ctx)
     roots, skipped = _registered_roots(ctx)
-    floor, unreached = _floor_status(root)
+    floor, unreached = _floor_status(hook)
     rows = [_host_row(spec, ctx, info, roots, floor) for spec in selected]
     claude_user = _claude_user_registered(ctx)
     findings = (notes + _upgrade_findings(ctx) + _worktree_ledger_findings(ctx) + _workspace_findings(ctx, info)

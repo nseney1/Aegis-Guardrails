@@ -43,6 +43,8 @@ _LEGACY_ENTRY = f"stale v3 '{LEGACY_SERVER}' MCP server"
 # A registered command, as doctor compares it: (host id, argv as the host config holds it).
 Registered = Tuple[str, Sequence[str]]
 ListItem = Tuple[Tuple[Any, ...], int]
+# One run's hook_status reading: (status, None), or (None, the exception the reading raised).
+_HookStatus = Tuple[Optional[Dict[str, Any]], Optional[Exception]]
 
 
 # ── Workspace ───────────────────────────────────────────────────────────────
@@ -364,7 +366,7 @@ def _desktop_configs(ctx: _Ctx) -> List[Path]:
             found.append(Path(xdg) / "Claude" / "claude_desktop_config.json")
     unique: Dict[str, Path] = {}
     for path in found:
-        unique.setdefault(os.path.normcase(os.path.abspath(str(path))), path)
+        unique.setdefault(_path_key(path), path)
     return list(unique.values())
 
 

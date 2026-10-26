@@ -52,7 +52,7 @@ def _payload(diag: _Diagnosis, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "checks": [{k: v for k, v in c.items() if k != "text"} for c in checks],
         "hosts": hosts,
         "enforcement_tiers": diag.tiers,
-        "human_gate": diag.trust.as_dict() if diag.trust is not None else None,
+        "human_gate": diag.trust.as_dict(),
         "state_modes": diag.modes.as_dict() if diag.modes is not None else None,
         "findings": [f.as_dict() for f in diag.findings],
     }

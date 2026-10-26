@@ -1754,6 +1754,53 @@ def test_a_hook_status_without_reachability_counts_as_reachable(env):
     assert check["status"] == "pass"
 
 
+def test_one_run_reads_the_hook_status_once_for_the_floor_and_the_check(env, monkeypatch):
+    """Given a current hook, when doctor runs, then the local floor and the pre-commit check
+    agree on one hook_status reading."""
+    from aegis_cli.hooks import management
+
+    env.all_ok()
+    _install_current_hook(env)
+    real, calls = management.hook_status, []
+    monkeypatch.setattr(management, "hook_status", lambda root=None: calls.append(root) or real(root))
+    payload = env.doctor()
+    assert len(calls) == 1
+    assert tier(payload, "local_floor")["status"] == "active"
+    (check,) = [c for c in payload["checks"] if c["id"] == "precommit_hook"]
+    assert check["status"] == "pass"
+
+
+def test_a_hook_status_that_raises_leaves_the_floor_unknown_and_the_check_raises_it(env, monkeypatch):
+    """Given hook_status raising, when doctor runs, then the floor is unknown (no retry, no
+    empty success) and the pre-commit check raises the same exception."""
+    from aegis_cli import doctor_findings
+    from aegis_cli.hooks import management
+
+    env.all_ok()
+    boom, calls, floors = RuntimeError("the hooks directory cannot be read"), [], []
+
+    def status(root=None):
+        calls.append(root)
+        raise boom
+
+    real_floor = doctor_findings._floor_status
+    monkeypatch.setattr(management, "hook_status", status)
+    monkeypatch.setattr(doctor_findings, "_floor_status", lambda *a: floors.append(real_floor(*a)) or floors[-1])
+    with pytest.raises(RuntimeError) as caught:
+        env.doctor()
+    assert caught.value is boom
+    assert floors == [("unknown", None)]
+    assert len(calls) == 1
+
+
+def test_apply_with_json_is_still_refused_before_anything_runs(env, capsys):
+    env.all_ok()
+    rc, out = env.run(github=True, apply=True, tier="A", json=True)
+    assert (rc, out) == (2, "")
+    assert capsys.readouterr().err == ("aegis doctor: --github --apply asks at a terminal, so it cannot run with "
+                                       "--json\n")
+
+
 def test_the_best_effort_tier_without_host_hooks_is_inactive_and_names_the_install_command(env):
     env.all_ok()
     best = tier(env.doctor(), "best_effort")
@@ -1836,15 +1883,12 @@ def test_unmigrated_v3_state_is_a_warning_that_names_the_files_and_aegis_migrate
     assert "unmigrated v3 state: .aegis/evidence/signals.jsonl, aegis.conf" in out.split("Warnings:")[1]
 
 
-def test_no_unmigrated_state_and_no_helper_mean_no_upgrade_warning(env, monkeypatch):
-    """A v4 workspace has none; a build without the helper (it lands in a parallel lane)
-    reports none and does not fail."""
+def test_no_unmigrated_state_means_no_upgrade_warning(env, monkeypatch):
+    """A v4 workspace has none, so doctor reports none."""
     from aegis_core.workspace import discovery
 
     env.all_ok()
-    monkeypatch.setattr(discovery, "unmigrated_state", lambda root: [], raising=False)
-    assert "unmigrated_v3_state" not in finding_codes(env.doctor())
-    monkeypatch.delattr(discovery, "unmigrated_state", raising=False)
+    monkeypatch.setattr(discovery, "unmigrated_state", lambda root: [])
     payload = env.doctor()
     assert "unmigrated_v3_state" not in finding_codes(payload) and payload["findings"] == []
 

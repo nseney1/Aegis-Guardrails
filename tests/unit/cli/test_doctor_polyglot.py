@@ -1,5 +1,6 @@
 """Tests for aegis doctor AST driver diagnostics and --fix auto-repair."""
 import argparse
+import json
 from pathlib import Path
 import pytest
 
@@ -40,8 +41,8 @@ def test_doctor_detects_unconfigured_polyglot_language(tmp_path: Path):
     src.mkdir()
     (src / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
 
-    # Doctor check without fix returns False / warns
-    ok = _check_ast_drivers(tmp_path, fix=False)
+    # The check only reports
+    ok = _check_ast_drivers(tmp_path)
     assert ok is False
 
 
@@ -51,9 +52,9 @@ def test_doctor_fix_provisions_missing_drivers(tmp_path: Path):
     src.mkdir()
     (src / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
 
-    # Doctor check with fix=True automatically provisions slots
-    ok = _check_ast_drivers(tmp_path, fix=True)
-    assert ok is True
+    # --fix provisions the slot (after a backup); the check that follows passes
+    rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
+    assert rc == 0
 
     # The repo now opts in to the packaged rust driver; nothing is staged
     registry = SlotRegistry.load(tmp_path)
@@ -80,9 +81,10 @@ def test_doctor_fix_output_reports_provisioned_driver_status(tmp_path: Path, cap
     src.mkdir()
     (src / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
 
-    ok = _check_ast_drivers(tmp_path, fix=True)
-    assert ok is True
+    rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
+    assert rc == 0
     out = capsys.readouterr().out
+    assert "enable the packaged AST drivers for .rs" in out
     assert "AST driver (.rs)" in out
     assert "AST drivers: native Python stdlib (in-process)" not in out
 
@@ -98,3 +100,59 @@ def test_doctor_drivers_flag_only_runs_ast_checks(tmp_path, capsys):
     # Full doctor checks (e.g. MCP launcher, rules, zero-dependencies) should not run
     assert "MCP launcher" not in out
     assert "zero-dependency runtime operational" not in out
+
+
+def _named(text, before, after):
+    """The extensions a line names between ``before`` and ``after``, or none."""
+    for line in text.splitlines():
+        if before in line:
+            return set(line.split(before, 1)[1].split(after, 1)[0].split(", "))
+    return set()
+
+
+@pytest.mark.parametrize("repo_drivers,user,expected", [
+    (None, None, {".go", ".rs"}),
+    (["rs", "go"], None, set()),
+    (None, {"drivers": {"rs": "rs-driver", "go": "go-driver"}}, set()),
+    (None, {"slots": {"ast_driver": "any-driver"}}, set()),
+    (["rs"], {"drivers": {"go": "go-driver"}}, set()),
+    (None, {"drivers": {"rs": "rs-driver"}}, {".go"}),
+    (["rs"], None, {".go"}),
+], ids=["nothing", "repo-packaged", "user-drivers", "user-catch-all", "mixed", "user-only", "repo-only"])
+def test_the_driver_check_and_the_fix_plan_agree_on_what_is_unconfigured(tmp_path, isolated_hosts, capsys,
+                                                                          repo_drivers, user, expected):
+    """Given main.rs and main.go and a driver configuration, When the AST check runs and
+    doctor --fix --json plans, Then both name the same unconfigured extensions."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "main.rs").write_bytes(b"fn main() {}\n")
+    (ws / "main.go").write_bytes(b"package main\nfunc main() {}\n")
+    if repo_drivers is not None:
+        (ws / ".aegis").mkdir()
+        (ws / ".aegis" / "config.json").write_bytes(
+            json.dumps({"v": 1, "ast": {"packaged_drivers": repo_drivers}}).encode())
+    if user is not None:
+        (isolated_hosts / ".aegis").mkdir()
+        (isolated_hosts / ".aegis" / "config.json").write_bytes(json.dumps({"v": 1, **user}).encode())
+    _check_ast_drivers(ws)
+    checked = _named(capsys.readouterr().out, "unconfigured driver for detected source extension(s): ", ". Run")
+    run_doctor(argparse.Namespace(workspace=str(ws), fix=True, yes=True, json=True))
+    fixes = json.loads(capsys.readouterr().out)["fixes"]
+    planned = set().union(*(_named(change, "enable the packaged AST drivers for ", "\n")
+                            for fix in fixes if fix["action"] == "enable_packaged_ast_drivers"
+                            for change in fix["changes"]))
+    assert checked == planned == expected
+
+
+def test_a_corrupt_repository_config_is_reported_and_fix_leaves_it_alone(tmp_path, isolated_hosts, capsys):
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    (ws / "main.rs").write_bytes(b"fn main() {}\n")
+    config = ws / ".aegis" / "config.json"
+    config.write_bytes(b"{corrupt")
+    assert _check_ast_drivers(ws) is False
+    assert ".aegis/config.json is not valid JSON" in capsys.readouterr().out
+    run_doctor(argparse.Namespace(workspace=str(ws), fix=True, yes=True, json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert [fix for fix in payload["fixes"] if fix["action"] == "enable_packaged_ast_drivers"] == []
+    assert config.read_bytes() == b"{corrupt"
