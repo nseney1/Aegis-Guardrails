@@ -113,6 +113,7 @@ from aegis_cli import doctor_findings as _findings
 from aegis_cli import doctor_render as _render
 from aegis_cli import doctor_repair as _repair
 from aegis_cli.base import AegisCommand, CommandCategory
+from aegis_cli.formatters.text import render_release
 from aegis_cli.doctor_base import (
     SCHEMA, SERVER, SOURCE, Registered, _Ctx, _HookStatus, _claude_config, _claude_project_keys, _clean,
     _entry_facts, _home, _host_json_path, _is_home, _names, _registration, _server_entry, _setup_fix,
@@ -659,7 +660,7 @@ def _run_release(root: Path, sha: str, use_json: bool) -> int:
     if use_json:
         print(json.dumps(report.as_dict(root), indent=2))
     else:
-        for line in report.text_lines():
+        for line in render_release(report.as_dict(root)):
             print(_clean(line, 4096))
     return 0 if report.verified else 1
 

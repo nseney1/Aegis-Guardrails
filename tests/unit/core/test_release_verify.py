@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 
 from aegis_cli.cli import main
+from aegis_cli.formatters.text import render_release
 from aegis_core import release_verify as rv
 from tests import helpers_humangate as hg
 
@@ -236,7 +237,7 @@ def test_a_gh_older_than_2_93_is_unverified_and_never_asked(tmp_path, version):
     gh = FakeGh(version)
     report = rv.verify_release(make_repo(tmp_path).root, "HEAD", run=gh, tier_runner=tier_runner_none)
     assert not report.verified and report.code == "gh_too_old"
-    assert report.text_lines()[0] == rv.UNVERIFIED_GH
+    assert render_release(report.as_dict())[0] == rv.UNVERIFIED_GH
     assert gh.verify_calls == []
 
 
@@ -247,7 +248,7 @@ def test_no_gh_or_a_gh_without_a_version_is_unverified(tmp_path, version):
         gh = lambda argv, timeout: (0, "something else\n", "")  # noqa: E731
     report = rv.verify_release(make_repo(tmp_path).root, "HEAD", run=gh, tier_runner=tier_runner_none)
     assert not report.verified and report.code == "gh_missing"
-    assert rv.UNVERIFIED_GH in report.text_lines()
+    assert rv.UNVERIFIED_GH in render_release(report.as_dict())
 
 
 @needs_git
@@ -351,7 +352,7 @@ def test_at_tier_c_an_attestation_is_reported_but_the_release_claim_fails_closed
     report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner_none)
     assert report.tier == "C"
     assert not report.verified and report.code == "agent_editable"
-    text = "\n".join(report.text_lines())
+    text = "\n".join(render_release(report.as_dict()))
     assert "attestation present, but the workflow is agent-editable" in text
     assert report.as_dict()["attested"] is True
 
@@ -367,7 +368,7 @@ def test_at_tier_b_an_attestation_is_reported_but_the_release_claim_is_agent_edi
     report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("B"))
     assert report.tier == "B" and report.attested
     assert (report.verified, report.code, report.status) == (False, "agent_editable", "agent_editable")
-    assert report.text_lines()[0] == "NOT VERIFIED: attestation present, but the workflow is agent-editable"
+    assert render_release(report.as_dict())[0] == "NOT VERIFIED: attestation present, but the workflow is agent-editable"
     assert report.as_dict()["verified"] is False
 
 
@@ -454,7 +455,7 @@ def test_a_rejected_attestation_still_reports_the_tier(tmp_path):
     report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (1, "", "no matching attestations")),
                                tier_runner=tier_runner("B"))
     assert (report.code, report.tier) == ("rejected", "B")
-    assert "  trust tier: B" in report.text_lines()
+    assert "  trust tier: B" in render_release(report.as_dict())
 
 
 @needs_git
@@ -469,9 +470,9 @@ def test_every_failure_after_the_work_tree_check_carries_the_tier(tmp_path, api,
 
 def test_a_report_without_gh_says_the_tier_is_unknown(tmp_path):
     report = rv.verify_release(tmp_path, "HEAD", run=FakeGh(None), tier_runner=tier_runner_none)
-    assert "  trust tier: unknown (gh unavailable)" in report.text_lines()
+    assert "  trust tier: unknown (gh unavailable)" in render_release(report.as_dict())
     outside = rv.verify_release(tmp_path, "HEAD", run=FakeGh("2.93.0"), tier_runner=tier_runner_none)
-    assert "  trust tier: unknown (not a git repository)" in outside.text_lines()
+    assert "  trust tier: unknown (not a git repository)" in render_release(outside.as_dict())
 
 
 @needs_git
@@ -521,7 +522,7 @@ _REVIEW_CASES = {
 def test_without_an_independent_approval_on_the_head_it_is_not_approved(tmp_path, case):
     report, _gh, _commit = _approval(tmp_path, reviews=_REVIEW_CASES[case])
     assert (report.verified, report.attested, report.code, report.status) == (False, True, "not_approved", "failed")
-    assert report.tier == "A" and report.text_lines()[0].startswith("NOT VERIFIED:")
+    assert report.tier == "A" and render_release(report.as_dict())[0].startswith("NOT VERIFIED:")
 
 
 @needs_git

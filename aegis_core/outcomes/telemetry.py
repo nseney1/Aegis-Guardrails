@@ -1,13 +1,25 @@
 """Ambient verification telemetry: `aegis check` records rule triggers in the ledger, never verdicts (spec T1)."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import secrets
-import sys
 from typing import Any, Optional
 
 from aegis_core.workspace import literal_workspace
 
-__all__ = ["record_verification_telemetry"]
+__all__ = ["Recorded", "record_verification_telemetry"]
+
+
+@dataclass(frozen=True)
+class Recorded:
+    """What one call wrote: ``rows`` trigger rows appended, and ``error`` when the ledger refused
+    them (the caller reports it; nothing is printed here). True exactly when rows were appended."""
+
+    rows: int
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.rows > 0
 
 
 def record_verification_telemetry(
@@ -18,22 +30,22 @@ def record_verification_telemetry(
     layer1_evidence: Any = None,
     source: str = "session",
     run_id: Optional[str] = None,
-) -> bool:
+) -> Recorded:
     """Append one trigger row per matched rule to the ledger. An unwitnessed local run is not a verdict:
     whether it passed is kept in ``meta`` and moves no tp/fp."""
     if not workspace or not target_files:
-        return False
+        return Recorded(0)
 
     ws = literal_workspace(workspace)
     if not ws.rules_dir.is_dir():
-        return False
+        return Recorded(0)
 
     from aegis_core.match import split_credit
     from aegis_core.outcomes.engine import matched_rules
 
     matched = matched_rules(ws, target_files)
     if not matched:
-        return False
+        return Recorded(0)
 
     from aegis_core.telemetry_engine import ledger
 
@@ -66,7 +78,6 @@ def record_verification_telemetry(
     # broke the committed manifest.
     try:
         ledger.append(ws.root, events)
-        return True
     except Exception as exc:
-        print(f"    ! failed to record ambient verification telemetry: {exc}", file=sys.stderr)
-        return False
+        return Recorded(0, str(exc))
+    return Recorded(len(events))

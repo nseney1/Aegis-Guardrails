@@ -12,6 +12,7 @@ import sys
 
 import pytest
 
+from aegis_cli.formatters.text import render_tier
 from aegis_core import codeowners as ownership
 from aegis_core import ghcli, github_ruleset, human_gate
 from tests import helpers_humangate as hg
@@ -415,7 +416,7 @@ def test_tier_b_says_a_pull_request_can_edit_the_check_that_verifies_the_signatu
     assert len(found) == 1, report.caveats
     caveat = found[0]
     assert ".github/workflows/**" in caveat and "signature" in caveat
-    assert f"  ! {caveat}" in report.text_lines() and caveat in report.as_dict()["caveats"]
+    assert f"  ! {caveat}" in render_tier(report.as_dict()) and caveat in report.as_dict()["caveats"]
 
 
 @needs_git

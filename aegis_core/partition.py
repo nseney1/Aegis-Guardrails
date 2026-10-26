@@ -352,47 +352,6 @@ class Report:
         )
         return document
 
-    def text_lines(self) -> List[str]:
-        kinds = ", ".join(f"{n} {lang}" for lang, n in sorted(self.languages.items())) or "none"
-        lines = [f"{SOURCE}: {len(self.lanes)} lanes, {self.files_analyzed} file(s) analyzed ({kinds}), "
-                 f"{len(self.not_analyzed)} not analyzed", "lanes:"]
-        for name, globs in self.lanes.items():
-            lines.append(f"  {name}: {self.lane_files.get(name, 0)} file(s) [{', '.join(globs)}]")
-        if self.overlap:
-            lines.append("overlap (matched by more than one lane; left out of the edges):")
-            lines.extend(f"  {path} ({', '.join(names)})" for path, names in self.overlap)
-        else:
-            lines.append("overlap: none")
-        if not self.edges:
-            lines.append("cross-lane edges: none")
-        else:
-            lines.append(f"cross-lane edges: {len(self.edges)}")
-            pair = None
-            for edge in self.edges:
-                if (edge.from_lane, edge.to_lane) != pair:
-                    pair = (edge.from_lane, edge.to_lane)
-                    count = sum(1 for e in self.edges if (e.from_lane, e.to_lane) == pair)
-                    lines.append(f"  {pair[0]} -> {pair[1]}: {count}")
-                landing = f"{edge.to_path}::{edge.symbol}" if edge.symbol else edge.to_path
-                lines.append(f"    {edge.kind:<7} {edge.from_path}:{edge.line} -> {landing}  ({edge.target})")
-        if self.not_analyzed:
-            lines.append("not analyzed:")
-            lines.extend(f"  {path}: {reason}" for path, reason in self.not_analyzed[:20])
-            if len(self.not_analyzed) > 20:
-                lines.append(f"  ... and {len(self.not_analyzed) - 20} more")
-        lines.append("[FROZEN_SIGNATURES]")
-        if self.frozen:
-            lines.append("# Do not change these while the lanes run in parallel; a change is a request to the dispatcher.")
-            for item in self.frozen:
-                users = ", ".join(sorted({f"{lane}: {path}:{line}" for lane, path, line in item.used_by}))
-                lines.append(f"{item.path}::{item.symbol}  {item.signature}  (lane {item.lane}; used by {users})")
-        else:
-            lines.append("(none)")
-        lines.append("[/FROZEN_SIGNATURES]")
-        lines.append(LIMITS[0])
-        lines.extend(f"warning: {warning}" for warning in self.warnings)
-        return lines
-
 
 # ── The check ────────────────────────────────────────────────────────────────
 

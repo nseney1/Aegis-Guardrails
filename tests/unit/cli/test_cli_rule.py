@@ -157,8 +157,9 @@ def test_rule_demote_and_force_demote(tmp_path, capsys):
         assert rc2 == 1
 
 
-def test_rule_archive(tmp_path):
-    with patch("aegis_cli.rule.prune_rules", return_value=0) as mock_prune:
+def test_rule_archive(tmp_path, capsys):
+    nothing = {"status": "nothing_to_archive", "unavailable": None, "candidates": []}
+    with patch("aegis_cli.rule.prune_rules", return_value=nothing) as mock_prune:
         args = argparse.Namespace(
             rule_action="archive",
             workspace=str(tmp_path),
@@ -167,6 +168,49 @@ def test_rule_archive(tmp_path):
         rc = run_rule(args)
         assert rc == 0
         mock_prune.assert_called_once_with(workspace=tmp_path, execute=True)
+    assert capsys.readouterr().out == "No rules to archive.\n"
+
+
+def _misfiring_trap(ws):
+    from aegis_core.fitness import MIN_N
+    from aegis_core.telemetry_engine import ledger
+
+    rule = ws / ".aegis" / "rules" / "traps" / "noisy.md"
+    rule.parent.mkdir(parents=True)
+    rule.write_bytes(b"---\nid: noisy\ntype: trap\nenforcement: advisory\n---\nBody.\n")
+    ledger.append(ws, [{"rule": "noisy", "outcome": "fp", "source": "ci", "key": f"run-{i}"} for i in range(MIN_N)])
+    return rule
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "archive"])
+def test_rule_archive_prints_each_candidate_and_what_archiving_did(tmp_path, capsys, dry_run):
+    """Given a trap the ledger says misfires, When aegis rule archive runs, Then it prints one
+    [ARCHIVE] line per candidate, marked (dry run) when nothing moved."""
+    from aegis_core.fitness import MIN_N
+
+    rule = _misfiring_trap(tmp_path)
+    assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=dry_run)) == 0
+    note = " (dry run)" if dry_run else ""
+    assert capsys.readouterr().out == (
+        f"[ARCHIVE] noisy (fitness 0.00, misfire bound 0.90, tp 0, fp {MIN_N}){note}\n")
+    assert rule.is_file() is dry_run
+
+
+def test_rule_archive_says_why_a_candidate_was_not_archived(tmp_path, capsys, monkeypatch):
+    from aegis_core.lifecycle import selection
+
+    _misfiring_trap(tmp_path)
+    monkeypatch.setattr(selection, "archive_rule", lambda ws, rule_id: {"status": "ineligible", "message": "it recovered"})
+    assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=False)) == 0
+    assert capsys.readouterr().out.endswith(" (not archived: it recovered)\n")
+
+
+@pytest.mark.parametrize("rules_dir,expected", [(False, "No rules directory found.\n"),
+                                                 (True, "No rules to archive.\n")], ids=["no-rules-dir", "nothing"])
+def test_rule_archive_names_the_empty_states(tmp_path, capsys, rules_dir, expected):
+    (tmp_path / ".aegis" / ("rules" if rules_dir else "state")).mkdir(parents=True)
+    assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=False)) == 0
+    assert capsys.readouterr().out == expected
 
 
 def test_rule_list_long_id_not_truncated_and_colored(tmp_path, capsys):

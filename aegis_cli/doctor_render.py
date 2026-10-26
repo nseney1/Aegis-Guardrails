@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from aegis_cli.doctor_base import SCHEMA, SOURCE, Registered, _Ctx, _Finding, _clean
 from aegis_cli.doctor_findings import _TIER_TEXT
+from aegis_cli.formatters.text import render_tier
 from aegis_core import primitives
 from aegis_core import codeowners, github_ruleset, human_gate
 
@@ -146,7 +147,7 @@ def _print_trust(diag: _Diagnosis) -> None:
     from aegis_core import gitsafe
 
     print("")
-    for line in diag.trust.text_lines():
+    for line in render_tier(diag.trust.as_dict()):
         print(_clean(line, 4096))
     if gitsafe.toplevel(diag.ctx.root) is not None:
         for line in _ci_workflow_lines(_ci_workflow(diag.ctx.root)):
@@ -251,7 +252,7 @@ def _github_plan(root: Path, report: Any) -> Dict[str, Any]:
 
 def _print_github(plan: Dict[str, Any], report: Any) -> None:
     print("aegis doctor --github: what the trust tiers need (read-only; nothing below has been applied)\n")
-    for line in report.text_lines():
+    for line in render_tier(report.as_dict()):
         print(_clean(line, 4096))
     for line in _ci_workflow_lines(plan["ci_workflow"]):
         print(_clean(line, 4096))

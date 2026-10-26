@@ -68,9 +68,6 @@ GH_TIMEOUT_SECONDS = 180.0
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 #: Codes reached after gh verified an attestation and its JSON re-checked.
 _ATTESTED_CODES = frozenset({"verified", "agent_editable", "not_approved"})
-#: Why a report printed before the trust tier could be read has none.
-_NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
-                "not_a_repository": "not a git repository", "git_failed": "git could not answer"}
 _RUN_ID_ATTEMPT = re.compile(r"\A\d+/\d+\Z")
 _VERSION = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")
 _REMOTE = re.compile(
@@ -120,25 +117,6 @@ class ReleaseReport:
         if self.unverified_gh:
             return "unverified"
         return "agent_editable" if self.code == "agent_editable" else "failed"
-
-    def text_lines(self) -> List[str]:
-        if self.unverified_gh:
-            lines = [UNVERIFIED_GH, f"  {self.message}"]
-        elif self.verified:
-            lines = [
-                f"VERIFIED: the CI verdict for {self.sha} is attested by {self.repository}'s {WORKFLOW}",
-                f"  {self.message}",
-            ]
-        elif self.code == "agent_editable":
-            lines = [f"NOT VERIFIED: {TIER_C_CAVEAT}", f"  {self.message}"]
-        else:
-            lines = [f"NOT VERIFIED: {self.message}"]
-        if self.tier:
-            lines.append(f"  trust tier: {self.tier}")
-        elif self.code in _NO_TIER_WHY:
-            lines.append(f"  trust tier: unknown ({_NO_TIER_WHY[self.code]})")
-        lines += [f"  ! {caveat}" for caveat in self.caveats]
-        return lines
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {

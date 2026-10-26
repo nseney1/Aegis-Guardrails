@@ -224,12 +224,6 @@ class PathCheck:
                 "allowed": self.allowed, "glob": self.glob, "source": self.source, "protected": self.protected}
 
 
-def _source_label(source: str, base: str) -> str:
-    if source.startswith("base@"):
-        return f"team.json at {base} {source[len('base@'):][:12]}"
-    return {"lease": "the lane's lease", "cli": "--paths", "worktree": "the working tree's team.json"}[source]
-
-
 @dataclass(frozen=True)
 class LaneCheck:
     """The outcome of one gate run. ``changes`` lists every path in git's order,
@@ -318,39 +312,6 @@ class LaneCheck:
             "notes": [NOTE_WITNESSED if self.label == WITNESSED else NOTE_SELF_ATTESTED, NOTE_EXEMPTION],
             "warnings": list(self.warnings),
         }
-
-    def text_lines(self) -> List[str]:
-        """The text report, one line per item; repository text is not sanitized here."""
-        verdict = "PASSED" if self.passed else "FAILED"
-        lines = [
-            f"{SOURCE} {self.lane}: {verdict} ({self.label})",
-            f"  range: {self.merge_base[:12]}..{self.head[:12]} (from the merge base of {self.base} and HEAD), "
-            f"{len(self.changes)} changed path(s)",
-            f"  allowed paths from {_source_label(self.paths_source, self.base)}: {', '.join(self.paths) or '(none)'}",
-            f"  shared from {_source_label(self.shared_source, self.base)}: {', '.join(self.shared) or '(none)'}",
-        ]
-        if self.violations:
-            lines.append(f"containment: FAILED, {len(self.violations)} of {len(self.changes)} changed path(s) "
-                         "outside the allowed set")
-            for change in self.violations:
-                why = ("protected: only team.json at the base tip (--base-policy) can allow "
-                       + " and ".join(PROTECTED)) if change.protected else "outside the allowed set"
-                lines.append(f"  [FAIL] {change.status} {change.path}: {why}")
-        else:
-            lines.append(f"containment: passed, {len(self.changes)} changed path(s) inside the allowed set")
-        if self.findings:
-            lines.append(f"test integrity (Python): FAILED, {len(self.findings)} finding(s); protected_changed: true")
-            for f in self.findings:
-                lines.append(f"  [FAIL] {f.id} {f.kind} {f.path}: {f.name} ({f.detail})")
-        else:
-            lines.append(f"test integrity (Python): passed, {len(self.checked)} file(s) checked; "
-                         "protected_changed: false")
-        for path, reason in self.not_checked:
-            lines.append(f"  not checked: {path} ({reason})")
-        lines.extend(f"warning: {warning}" for warning in self.warnings)
-        lines.append(NOTE_WITNESSED if self.label == WITNESSED else NOTE_SELF_ATTESTED)
-        lines.append(NOTE_EXEMPTION)
-        return lines
 
 
 def error_report(workspace: Any, lane: str, message: str, now: Optional[int] = None) -> Dict[str, Any]:

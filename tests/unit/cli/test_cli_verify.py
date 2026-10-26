@@ -167,6 +167,18 @@ class TestRunVerifyNamespaces:
         assert run_verify(args) == 0
         assert [(c["target_files"], c["passed"], c["verdict"]) for c in calls] == [(["core.py"], True, "PASS")]
 
+    def test_a_telemetry_failure_is_one_stderr_line_and_never_the_verdict(self, tmp_path, monkeypatch, capsys):
+        """Core returns the ledger's refusal; the CLI says it once on stderr and keeps the exit code."""
+        from aegis_cli.verify import run_verify
+        from aegis_core.outcomes.telemetry import Recorded
+
+        monkeypatch.setattr("aegis_core.outcomes.telemetry.record_verification_telemetry",
+                            lambda **kw: Recorded(0, "db error"))
+        (tmp_path / "core.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+        assert run_verify(argparse.Namespace(files=["core.py"], workspace=str(tmp_path), dry_run=False)) == 0
+        err = capsys.readouterr().err
+        assert err.count("    ! failed to record ambient verification telemetry: db error\n") == 1
+
 
 class TestVerifyLayer2Execution:
     """Layer 2 telemetry; the CLI Layer 2 behavior is tested in test_cli_check.py."""

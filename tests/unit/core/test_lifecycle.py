@@ -173,14 +173,18 @@ class TestIncompleteLedger:
         assert (tmp_path / ".aegis" / "rules" / "traps" / "noisy-trap.md").is_file()
 
     def test_aegis_rule_archive_moves_nothing(self, tmp_path, capsys):
+        import argparse
+
+        from aegis_cli.rule import run_rule
         from aegis_core.lifecycle.selection import prune_rules
 
         _trap(_ws(tmp_path), "noisy-trap", fp=MIN_N)
         _damage_ledger(tmp_path)
 
-        assert prune_rules(tmp_path, execute=True) == 0
-
         # Partial evidence decides nothing, so there is no candidate to refuse.
+        assert prune_rules(tmp_path, execute=True) == {
+            "status": "nothing_to_archive", "unavailable": "1 unreadable line(s)", "candidates": []}
+        assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=False)) == 0
         assert capsys.readouterr().out == "Evidence unavailable: 1 unreadable line(s)\nNo rules to archive.\n"
         assert (tmp_path / ".aegis" / "rules" / "traps" / "noisy-trap.md").is_file()
 

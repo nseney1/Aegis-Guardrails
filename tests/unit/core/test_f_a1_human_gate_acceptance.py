@@ -27,6 +27,7 @@ import subprocess
 
 import pytest
 
+from aegis_cli.formatters.text import render_lane, render_tier
 from aegis_core import ghcli, github_ruleset, human_gate, lane_gate, storage
 from tests import helpers_humangate as hg
 
@@ -493,7 +494,7 @@ def test_tier_c_says_self_attested_in_text_and_json(tmp_path):
     repo = hg.make_repo(tmp_path)
     report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: None)
     assert report.tier == "C" and report.label == "self-attested"
-    assert "self-attested" in report.text_lines()[0]
+    assert "self-attested" in render_tier(report.as_dict())[0]
     doc = report.as_dict()
     assert doc["tier"] == "C" and doc["label"] == "self-attested"
     for key in ("source", "aegis_version", "checked_at", "scope"): assert doc[key]
@@ -943,7 +944,7 @@ def test_the_aegis_test_change_trailer_is_not_an_exemption_in_the_lane_gate(tmp_
     repo.commit("drop a test\n\nAegis-Test-Change: the test was redundant\n")
     result = lane_gate.check_lane(repo.root, "docs", base="main", paths=["**"])
     assert not result.passed and [(f.kind, f.name) for f in result.findings] == [("removed", "test_b")]
-    assert lane_gate.NOTE_EXEMPTION in result.text_lines()
+    assert lane_gate.NOTE_EXEMPTION in render_lane(result.as_dict())
 
 # ── 6. file modes of the shared state ────────────────────────────────────────
 
