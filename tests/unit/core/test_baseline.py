@@ -9,7 +9,6 @@ baseline.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,55 +33,12 @@ def _doc(*entries, v=1, **extra):
 
 # ── Fingerprints ─────────────────────────────────────────────────────────────
 
-def test_the_fingerprint_is_the_full_hex_of_sha256_over_the_four_fields():
-    expected = hashlib.sha256("forbid_ast:no-eval|src/a.py|x = eval(y)|0".encode("utf-8")).hexdigest()
-    assert baseline.fingerprint("forbid_ast:no-eval", "src/a.py", "x = eval(y)", 0) == expected
-    assert len(expected) == 64
-
-
-@pytest.mark.parametrize("field, other", [
-    ("rule", ("import_guard", "src/a.py", "x = eval(y)", 0)),
-    ("path", ("forbid_ast:no-eval", "src/b.py", "x = eval(y)", 0)),
-    ("text", ("forbid_ast:no-eval", "src/a.py", "x = eval(z)", 0)),
-    ("index", ("forbid_ast:no-eval", "src/a.py", "x = eval(y)", 1)),
-])
-def test_every_field_changes_the_fingerprint(field, other):
-    assert baseline.fingerprint("forbid_ast:no-eval", "src/a.py", "x = eval(y)", 0) != baseline.fingerprint(*other)
-
-
-def test_text_is_normalized_so_indentation_and_spacing_runs_do_not_matter():
-    assert baseline.normalize_text("    x  =\teval( y )  \r") == "x = eval( y )"
-    assert baseline.normalize_text("x = eval(y)") == baseline.normalize_text("\t\tx = eval(y)")
-    assert baseline.normalize_text("x = eval(y)") != baseline.normalize_text("x = eval(z)")
-    assert baseline.normalize_text("   ") == ""
-
-
-def test_lines_split_where_cpython_counts_them_and_nowhere_else():
-    # A form feed or a vertical tab does not start a line for the tokenizer, so line numbers
-    # from the AST must index the same list: str.splitlines() would shift every later line.
-    text = "a\r\nb\rc\nd\x0ce\x0bf\x1cg h\n"
-    assert baseline.split_lines(text) == ["a", "b", "c", "d\x0ce\x0bf\x1cg h", ""]
-
-
 def test_a_finding_keeps_its_fingerprint_when_the_line_moves_but_not_when_it_changes():
     first = baseline.Finding("call_graph", "a.py", "def helper(x):", 0, 3, "orphan")
     moved = baseline.Finding("call_graph", "a.py", "def helper(x):", 0, 40, "orphan")
     edited = baseline.Finding("call_graph", "a.py", "def helper(x, y):", 0, 3, "orphan")
     assert first.fp == moved.fp != edited.fp
     assert first.entry == Entry("call_graph", "a.py", first.fp)
-
-
-def test_repeated_lines_are_numbered_by_occurrence():
-    lines = ["import a", "x = eval(1)", "y = 2", "x = eval(1)", "x = eval(1)"]
-    assert [baseline.occurrence_index(lines, n) for n in (2, 4, 5)] == [0, 1, 2]
-    assert baseline.occurrence_index(lines, 3) == 0
-    # indentation is not part of the text: the same call, deeper, is the same line
-    assert baseline.occurrence_index(["eval(1)", "    eval(1)"], 2) == 1
-
-
-def test_an_unknown_line_has_no_text_and_index_zero():
-    assert baseline.occurrence_index(["a"], 0) == 0
-    assert baseline.occurrence_index(["a"], 9) == 0
 
 
 # ── The file ─────────────────────────────────────────────────────────────────

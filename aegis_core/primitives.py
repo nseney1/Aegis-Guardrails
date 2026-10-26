@@ -1,10 +1,13 @@
 """The primitives every layer shares, one home each (layer 0, standard library only): path
-containment, strict JSON and UTC timestamps. Copies of these disagreed at their edges (a looped
-path inside or outside, ``1e999`` read as infinity, a naive datetime read as local time or UTC).
+containment, strict JSON, UTC timestamps and the line identity of a finding. Copies of these
+disagreed at their edges (a looped path inside or outside, ``1e999`` read as infinity, a naive
+datetime read as local time or UTC).
 """
 from __future__ import annotations
 
+import bisect
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -16,15 +19,20 @@ from aegis_core._version import __version__
 
 __all__ = [
     "DuplicateKeyError",
+    "LineIndex",
     "TS_FORMAT",
     "envelope",
+    "fingerprint",
     "aegis_import_root",
     "is_within",
     "key_within",
+    "normalize_text",
+    "occurrence_index",
     "parse_utc",
     "real_key",
     "real_path",
     "safe_parts",
+    "split_lines",
     "strict_loads",
     "utc_stamp",
 ]
@@ -134,6 +142,54 @@ def strict_loads(text: Union[str, bytes]) -> Any:
     (``duplicate key 'k'``, ``NaN is not allowed``): readers echo them in their refusals.
     RecursionError passes through."""
     return json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant, parse_float=_finite)
+
+
+# ── Finding identity (the baseline fingerprint) ──────────────────────────────
+
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def normalize_text(line: str) -> str:
+    """A line as the fingerprint reads it: leading and trailing whitespace dropped, inner
+    runs of whitespace collapsed to one space. Indentation and a CRLF checkout therefore
+    do not change a fingerprint; any other edit does."""
+    return " ".join(line.split())
+
+
+def split_lines(text: str) -> List[str]:
+    """``text`` split where CPython counts lines (``\\n``, ``\\r\\n``, ``\\r``) and nowhere
+    else. ``str.splitlines`` also splits at form feeds and vertical tabs, which the
+    tokenizer does not, so the line numbers of an AST would index the wrong lines."""
+    return _LINE_BREAK.split(text)
+
+
+class LineIndex:
+    """The normalized text of a file's lines and, for each text, where it occurs."""
+
+    def __init__(self, lines: List[str]) -> None:
+        self.texts = [normalize_text(line) for line in lines]
+        self._where: Dict[str, List[int]] = {}
+        for number, text in enumerate(self.texts, 1):
+            self._where.setdefault(text, []).append(number)
+
+    def text(self, number: int) -> str:
+        return self.texts[number - 1] if 1 <= number <= len(self.texts) else ""
+
+    def index(self, number: int) -> int:
+        if not 1 <= number <= len(self.texts):
+            return 0
+        return bisect.bisect_left(self._where[self.texts[number - 1]], number)
+
+
+def occurrence_index(lines: List[str], number: int) -> int:
+    """How many earlier lines of ``lines`` have the same normalized text as line ``number``
+    (1-based); 0 for a line that does not exist."""
+    return LineIndex(lines).index(number)
+
+
+def fingerprint(rule: str, path: str, text: str, index: int) -> str:
+    joined = "|".join((rule, path, text, str(index)))
+    return hashlib.sha256(joined.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # ── UTC timestamps ───────────────────────────────────────────────────────────

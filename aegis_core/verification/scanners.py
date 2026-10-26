@@ -13,7 +13,7 @@ import posixpath
 import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from aegis_core import gitsafe, pathlookup
+from aegis_core import gitsafe, pathlookup, primitives
 from aegis_core.primitives import is_within
 from aegis_core.verification import test_runner
 
@@ -611,11 +611,9 @@ def _scan_once(preset: str, target: Path, runner: Callable[..., dict[str, Any]],
 
 
 def _line_keys(findings: Sequence[Finding], root: Path) -> list[str]:
-    """One key per finding: baseline's fingerprint over the unmasked, normalized line it names and that
+    """One key per finding: the baseline fingerprint over the unmasked, normalized line it names and that
     line's occurrence index, so a rotated secret under the same mask is new and a moved line is not.
     The keys stay in memory; only masked snippets are ever shown."""
-    from aegis_core import baseline  # lazily: baseline reaches this package through runner
-
     keys, texts = [], {}  # type: list[str], dict[str, list[str]]
     for f in findings:
         if f.path not in texts:
@@ -623,12 +621,13 @@ def _line_keys(findings: Sequence[Finding], root: Path) -> list[str]:
             try:
                 readable = bool(f.path) and is_within(real, root, unresolvable=False) and real.is_file() \
                     and real.stat().st_size <= 1 << 20
-                texts[f.path] = baseline.split_lines(real.read_bytes().decode("utf-8", "replace")) if readable else []
+                texts[f.path] = primitives.split_lines(real.read_bytes().decode("utf-8", "replace")) if readable else []
             except OSError:
                 texts[f.path] = []
         lines = texts[f.path]
         text = lines[f.line - 1] if 1 <= f.line <= len(lines) else f.snippet
-        keys.append(baseline.fingerprint(f.rule_id, f.path, baseline.normalize_text(text), baseline.occurrence_index(lines, f.line)))
+        keys.append(primitives.fingerprint(f.rule_id, f.path, primitives.normalize_text(text),
+                                           primitives.occurrence_index(lines, f.line)))
     return keys
 
 
