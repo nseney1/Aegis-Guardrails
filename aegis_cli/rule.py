@@ -37,7 +37,7 @@ from aegis_core.lifecycle.promotion import (
     evaluate_demotions,
     evaluate_rule_tiers,
 )
-from aegis_core.lifecycle.selection import evidence_line, prune_rules, transition_candidates
+from aegis_core.lifecycle.selection import evidence_line, iter_rule_selection, transition_candidates
 from aegis_core.workspace.layout import is_aegis_workspace
 
 __all__ = [
@@ -357,28 +357,32 @@ run_demote = _run_demote
 
 
 def _run_archive(args: argparse.Namespace) -> int:
-    """Archive extinct rules; --dry-run only reports what would move."""
+    """Archive extinct rules; --dry-run only reports what would move. Each rule's line prints as
+    soon as it is archived, so an error on a later rule still leaves the moved ones reported."""
     root = _resolve_workspace_root(args)
     execute = not getattr(args, "dry_run", False)
-    for line in _archive_lines(prune_rules(workspace=root, execute=execute)):
+    rows = iter_rule_selection(workspace=root, execute=execute)
+    for line in _archive_head_lines(next(rows)):
         print(line)
+    for candidate in rows:
+        print(_archive_row(candidate))
     return 0
 
 
-def _archive_lines(selection: Dict[str, Any]) -> List[str]:
-    """What ``aegis rule archive`` says about a selection pass (lifecycle.selection)."""
-    if selection["status"] == "no_rules_directory":
+def _archive_head_lines(head: Dict[str, Any]) -> List[str]:
+    """What ``aegis rule archive`` says before its candidates (lifecycle.selection)."""
+    if head["status"] == "no_rules_directory":
         return ["No rules directory found."]
-    lines = [evidence_line(selection["unavailable"])] if selection["unavailable"] else []
-    if not selection["candidates"]:
-        return lines + ["No rules to archive."]
-    for c in selection["candidates"]:
-        result = c["archive"]
-        note = (" (dry run)" if result is None else
-                "" if result["status"] == "archived" else f" (not archived: {result['message']})")
-        lines.append(f"[ARCHIVE] {c['rule_id']} (fitness {c['fitness']:.2f}, misfire bound {c['misfire']:.2f}, "
-                     f"tp {c['tp']:g}, fp {c['fp']:g}){note}")
-    return lines
+    lines = [evidence_line(head["unavailable"])] if head["unavailable"] else []
+    return lines + (["No rules to archive."] if head["status"] == "nothing_to_archive" else [])
+
+
+def _archive_row(c: Dict[str, Any]) -> str:
+    result = c["archive"]
+    note = (" (dry run)" if result is None else
+            "" if result["status"] == "archived" else f" (not archived: {result['message']})")
+    return (f"[ARCHIVE] {c['rule_id']} (fitness {c['fitness']:.2f}, misfire bound {c['misfire']:.2f}, "
+            f"tp {c['tp']:g}, fp {c['fp']:g}){note}")
 
 
 def _split_csv_arg(raw: Any) -> list[str] | None:

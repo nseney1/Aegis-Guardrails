@@ -158,8 +158,8 @@ def test_rule_demote_and_force_demote(tmp_path, capsys):
 
 
 def test_rule_archive(tmp_path, capsys):
-    nothing = {"status": "nothing_to_archive", "unavailable": None, "candidates": []}
-    with patch("aegis_cli.rule.prune_rules", return_value=nothing) as mock_prune:
+    nothing = iter([{"status": "nothing_to_archive", "unavailable": None}])
+    with patch("aegis_cli.rule.iter_rule_selection", return_value=nothing) as mock_prune:
         args = argparse.Namespace(
             rule_action="archive",
             workspace=str(tmp_path),
@@ -203,6 +203,32 @@ def test_rule_archive_says_why_a_candidate_was_not_archived(tmp_path, capsys, mo
     monkeypatch.setattr(selection, "archive_rule", lambda ws, rule_id: {"status": "ineligible", "message": "it recovered"})
     assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=False)) == 0
     assert capsys.readouterr().out.endswith(" (not archived: it recovered)\n")
+
+
+def test_rule_archive_reports_the_rules_it_moved_before_an_archive_fails(tmp_path, capsys, monkeypatch):
+    """Review w14b F1: Given three candidates whose second archive raises, When aegis rule archive
+    runs, Then the evidence line and the first rule's row are printed before the error ends the
+    command with exit 1: a rule already moved to .archive is never left unreported."""
+    from aegis_cli.cli import main
+    from aegis_core.lifecycle import selection
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    rows = [{"rule_id": r, "fitness": 0.1, "misfire": 0.9, "tp": 0, "fp": 5} for r in ("r1", "r2", "r3")]
+    archived = []
+
+    def archive(ws, rule_id):
+        if rule_id == "r2":
+            raise OSError(13, "Permission denied")
+        archived.append(rule_id)
+        return {"status": "archived"}
+
+    monkeypatch.setattr(selection, "transition_candidates", lambda ws, kind: (rows, "gh timed out"))
+    monkeypatch.setattr(selection, "archive_rule", archive)
+    rc = main(["rule", "archive", "--workspace", str(tmp_path)])
+    out, err = capsys.readouterr()
+    assert (rc, archived) == (1, ["r1"])
+    assert out == "Evidence unavailable: gh timed out\n[ARCHIVE] r1 (fitness 0.10, misfire bound 0.90, tp 0, fp 5)\n"
+    assert err.startswith("Error: [Errno 13] Permission denied")
 
 
 @pytest.mark.parametrize("rules_dir,expected", [(False, "No rules directory found.\n"),

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from aegis_core.fitness import for_rules
 from aegis_core.primitives import utc_stamp
@@ -27,6 +27,7 @@ __all__ = [
     "archive_rule",
     "evaluate_archives",
     "evidence_line",
+    "iter_rule_selection",
     "prune_rules",
     "run_rule_selection",
     "transition_candidates",
@@ -149,20 +150,32 @@ def archive_rule(
     return {"status": "archived", "from_type": rule_type, "source_path": str(path), "target_path": str(dest)}
 
 
-def run_rule_selection(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
-    """The rules whose evidence supports archiving and, with ``execute``, what archiving each did.
+def iter_rule_selection(
+    workspace: Workspace | Path | str | None = None, execute: bool = False,
+) -> Iterator[Dict[str, Any]]:
+    """Yield the selection's head, then each candidate as soon as archiving it is done.
 
-    ``status`` is ``no_rules_directory``, ``nothing_to_archive`` or ``candidates``; ``unavailable``
-    says why the CI-confirmed evidence was cut short (None when it was not); each candidate carries
-    ``archive``, the archive_rule result (None on a dry run). Nothing is printed here: ``aegis rule
-    archive`` prints it.
+    The head is ``{"status", "unavailable"}``: ``status`` is ``no_rules_directory``,
+    ``nothing_to_archive`` or ``candidates``, and ``unavailable`` says why the CI-confirmed evidence
+    was cut short (None when it was not). Each candidate carries ``archive``, the archive_rule result
+    (None on a dry run). Yielding one rule at a time lets ``aegis rule archive`` report the rules
+    already moved when a later archive raises.
     """
     ws = literal_workspace(workspace)
     if not ws.rules_dir.exists():
-        return {"status": "no_rules_directory", "unavailable": None, "candidates": []}
+        yield {"status": "no_rules_directory", "unavailable": None}
+        return
     candidates, unavailable = transition_candidates(ws, "archive")
-    rows = [dict(c, archive=archive_rule(ws, c["rule_id"]) if execute else None) for c in candidates]
-    return {"status": "candidates" if rows else "nothing_to_archive", "unavailable": unavailable, "candidates": rows}
+    yield {"status": "candidates" if candidates else "nothing_to_archive", "unavailable": unavailable}
+    for c in candidates:
+        yield dict(c, archive=archive_rule(ws, c["rule_id"]) if execute else None)
+
+
+def run_rule_selection(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
+    """The rules whose evidence supports archiving and, with ``execute``, what archiving each did:
+    iter_rule_selection's head with its candidates as a list. Nothing is printed here."""
+    rows = iter_rule_selection(workspace=workspace, execute=execute)
+    return dict(next(rows), candidates=list(rows))
 
 
 def prune_rules(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
