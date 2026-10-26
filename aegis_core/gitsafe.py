@@ -67,7 +67,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
-from aegis_core import pathlookup
+from aegis_core import atomicio, pathlookup
 from aegis_core.errors import AegisError
 from aegis_core.primitives import is_within, safe_parts
 
@@ -866,8 +866,6 @@ def export_tree(
     ``checkout-index -a -f --prefix``, falling back to ``tree_blobs`` + ``read_blobs`` if needed,
     then write any ``overlay`` files via ``atomic_write_bytes``.
     """
-    from aegis_core.storage import atomic_write_bytes
-
     tree = _tree_of(cwd, tree_or_commit)
     dest = Path(destination).resolve()
     dest.mkdir(parents=True, exist_ok=True)
@@ -912,7 +910,7 @@ def export_tree(
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             file_mode = 0o755 if (mode == "100755" and os.name != "nt") else None
-            atomic_write_bytes(target, blobs[oid], mode=file_mode)
+            atomicio.atomic_write_bytes(target, blobs[oid], mode=file_mode)
 
     if overlay:
         for rel_path, content in overlay.items():
@@ -920,8 +918,7 @@ def export_tree(
             if target is None:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(target, content)
-
+            atomicio.atomic_write_bytes(target, content)
 
 
 # ── Objects and refs (the team leases, v4.1 §1) ──────────────────────────────
