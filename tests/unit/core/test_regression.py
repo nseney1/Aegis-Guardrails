@@ -254,18 +254,18 @@ def test_a_git_failure_reaches_the_caller_as_a_git_error(tmp_path: Path, monkeyp
                                else "git rev-list failed: fatal: bad object")
 
 
-def test_the_t5_snapshot_runner_is_checkrun_s_and_regression_reaches_no_private_name():
-    """checkrun.run_pytest_snapshot runs T5's pytest; regression reaches no private helper of another
-    aegis module, and checkrun does not import regression (no cycle)."""
+def test_the_t5_snapshot_runner_is_testexec_s_and_regression_reaches_no_private_name():
+    """testexec.run_pytest_snapshot runs T5's pytest; regression reaches no private helper of another
+    aegis module, and testexec does not import regression (no cycle)."""
     import ast
 
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     def private_reaches(module) -> list:
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         attrs = [f"{n.value.id}.{n.attr}" for n in ast.walk(tree) if isinstance(n, ast.Attribute)
                  and isinstance(n.value, ast.Name) and n.attr.startswith("_") and not n.attr.startswith("__")
-                 and n.value.id in ("checkrun", "config", "gitsafe", "governance", "human_gate", "match", "rule_integrity")]
+                 and n.value.id in ("testexec", "config", "gitsafe", "governance", "human_gate", "match", "rule_integrity")]
         names = [f"{n.module}.{a.name}" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
                  and (n.module or "").startswith("aegis_core") for a in n.names if a.name.startswith("_")]
         return attrs + names
@@ -277,9 +277,9 @@ def test_the_t5_snapshot_runner_is_checkrun_s_and_regression_reaches_no_private_
                    or (isinstance(n, ast.Import) and any(a.name == "aegis_core.regression" for a in n.names))
                    for n in ast.walk(tree))
 
-    assert callable(checkrun.run_pytest_snapshot)
+    assert callable(testexec.run_pytest_snapshot)
     assert private_reaches(regression) == []
-    assert not imports_regression(checkrun)
+    assert not imports_regression(testexec)
 
 
 @pytest.mark.parametrize("body,passed", [("def test_ok():\n    assert True\n", True),
@@ -287,14 +287,14 @@ def test_the_t5_snapshot_runner_is_checkrun_s_and_regression_reaches_no_private_
 def test_the_snapshot_runner_exits_zero_for_a_passing_file_and_non_zero_for_a_failing_one(
     tmp_path: Path, body: str, passed: bool
 ):
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     snapshot, workspace = tmp_path / "snap", tmp_path / "ws"
     (snapshot / "tests").mkdir(parents=True)
     workspace.mkdir()
     (snapshot / "tests" / "test_x.py").write_bytes(body.encode("utf-8"))
 
-    outcome = checkrun.run_pytest_snapshot(snapshot, ["tests/test_x.py"], workspace, tmp_path / "run", 120.0)
+    outcome = testexec.run_pytest_snapshot(snapshot, ["tests/test_x.py"], workspace, tmp_path / "run", 120.0)
     assert (outcome.exit_code == 0) is passed and outcome.timed_out is False
     assert (outcome.passed_ids if passed else outcome.failed_ids) == frozenset({"tests.test_x::test_ok"})
     assert (outcome.failed_ids if passed else outcome.passed_ids) == frozenset()
@@ -314,16 +314,16 @@ def test_a_fix_to_a_module_named_like_a_document_is_judged(tmp_path: Path):
 
 
 def _count_runs(monkeypatch: pytest.MonkeyPatch) -> list:
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     runs: list = []
-    real = checkrun.run_pytest_snapshot
+    real = testexec.run_pytest_snapshot
 
     def spy(snapshot, test_files, *args, **kwargs):
         runs.append(tuple(test_files))
         return real(snapshot, test_files, *args, **kwargs)
 
-    monkeypatch.setattr(checkrun, "run_pytest_snapshot", spy)
+    monkeypatch.setattr(testexec, "run_pytest_snapshot", spy)
     return runs
 
 
@@ -590,7 +590,7 @@ def test_a_scratch_path_that_resolves_elsewhere_still_attributes_the_fix(tmp_pat
     empty there and every fix reads no_tests_collected."""
     import tempfile
 
-    from aegis_core import checkrun
+    from aegis_core import testexec
     from conftest import symlink_or_skip
 
     repo = make_repo(tmp_path)
@@ -600,13 +600,13 @@ def test_a_scratch_path_that_resolves_elsewhere_still_attributes_the_fix(tmp_pat
     symlink_or_skip(real, link, target_is_directory=True)
     monkeypatch.setattr(tempfile, "tempdir", str(link))
     started: list = []
-    real_run = checkrun.run_tests
+    real_run = testexec.run_tests
 
     def spy(argv, cwd, *args, **kwargs):
         started.append((str(cwd), next(a.partition("=")[2] for a in argv if str(a).startswith("--rootdir="))))
         return real_run(argv, cwd, *args, **kwargs)
 
-    monkeypatch.setattr(checkrun, "run_tests", spy)
+    monkeypatch.setattr(testexec, "run_tests", spy)
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert len(started) == 2 and all(cwd == rootdir for cwd, rootdir in started), started
@@ -690,7 +690,7 @@ def test_no_python_test_to_judge_starts_no_run(tmp_path: Path, monkeypatch: pyte
 
 def _fake_outcomes(monkeypatch: pytest.MonkeyPatch, head: Any, base: Any) -> list:
     """Replace the pytest runner: a snapshot holding the head's src/app.py gets ``head``, else ``base``."""
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     seen: list = []
 
@@ -698,9 +698,9 @@ def _fake_outcomes(monkeypatch: pytest.MonkeyPatch, head: Any, base: Any) -> lis
         at_head = (snapshot / "src" / "app.py").read_text(encoding="utf-8") == APP.format(1)
         seen.append("head" if at_head else "base")
         passed, failed, errors = head if at_head else base
-        return checkrun._PytestOutcome(0, False, frozenset(passed), frozenset(failed), frozenset(errors))
+        return testexec.PytestOutcome(0, False, frozenset(passed), frozenset(failed), frozenset(errors))
 
-    monkeypatch.setattr(checkrun, "run_pytest_snapshot", fake)
+    monkeypatch.setattr(testexec, "run_pytest_snapshot", fake)
     return seen
 
 
@@ -733,7 +733,6 @@ def test_a_passing_fix_commit_looks_up_no_exemption(tmp_path: Path, monkeypatch:
     """Review F3: Given three fix commits whose tests are fail-to-pass and one fix without a test, When
     regressions are checked, Then only the failing commit looks up a test exemption, and git rev-list
     runs once for the metadata plus once for that lookup (each lookup rescans the range)."""
-    from aegis_core import gitsafe
 
     repo = make_repo(tmp_path)
     test_one = "def test_one():\n    pass\n"

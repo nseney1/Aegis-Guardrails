@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from aegis_core import checkrun, config, rule_integrity
+from aegis_core import config, rule_integrity, testexec
 from aegis_core.verification import perf_check
 from aegis_core.workspace.layout import UserLayout
 
@@ -70,7 +70,7 @@ def _decisions(root: Path) -> dict:
     # The fixture repository has one commit, so the default HEAD~1 base would not resolve.
     perf_check.run_perf_check(root, base_ref="HEAD", runner=spy)
     return {
-        "tests": checkrun.user_test_command(root),
+        "tests": testexec.user_test_command(root),
         "rules": "user-config" if anchor is not None and anchor.source == "user-config" else "other",
         "perf": bool(perf_calls),
     }

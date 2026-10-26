@@ -29,9 +29,7 @@ decorator violation that has no line.
 """
 from __future__ import annotations
 
-import bisect
 from dataclasses import dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,7 +39,7 @@ import stat
 import tempfile
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, primitives
 from aegis_core.errors import AegisError
 from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
 from aegis_core.storage import atomic_write_text
@@ -67,17 +65,13 @@ __all__ = [
     "basename_groups",
     "checkable",
     "collect",
-    "fingerprint",
     "label_base",
     "list_files",
     "load",
-    "normalize_text",
-    "occurrence_index",
     "parse",
     "render",
     "run_fast",
     "run_grouped",
-    "split_lines",
     "write",
 ]
 
@@ -89,7 +83,6 @@ LABEL_ABSENT = "baseline: absent at base"
 _KEYS = ("rule", "path", "fp")
 _FP = re.compile(r"\A[0-9a-f]{64}\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 def label_base(commit: str) -> str:
@@ -125,49 +118,6 @@ class Entry(NamedTuple):
     fp: str
 
 
-def normalize_text(line: str) -> str:
-    """A line as the fingerprint reads it: leading and trailing whitespace dropped, inner
-    runs of whitespace collapsed to one space. Indentation and a CRLF checkout therefore
-    do not change a fingerprint; any other edit does."""
-    return " ".join(line.split())
-
-
-def split_lines(text: str) -> List[str]:
-    """``text`` split where CPython counts lines (``\\n``, ``\\r\\n``, ``\\r``) and nowhere
-    else. ``str.splitlines`` also splits at form feeds and vertical tabs, which the
-    tokenizer does not, so the line numbers of an AST would index the wrong lines."""
-    return _LINE_BREAK.split(text)
-
-
-class _Lines:
-    """The normalized text of a file's lines and, for each text, where it occurs."""
-
-    def __init__(self, lines: List[str]) -> None:
-        self.texts = [normalize_text(line) for line in lines]
-        self._where: Dict[str, List[int]] = {}
-        for number, text in enumerate(self.texts, 1):
-            self._where.setdefault(text, []).append(number)
-
-    def text(self, number: int) -> str:
-        return self.texts[number - 1] if 1 <= number <= len(self.texts) else ""
-
-    def index(self, number: int) -> int:
-        if not 1 <= number <= len(self.texts):
-            return 0
-        return bisect.bisect_left(self._where[self.texts[number - 1]], number)
-
-
-def occurrence_index(lines: List[str], number: int) -> int:
-    """How many earlier lines of ``lines`` have the same normalized text as line ``number``
-    (1-based); 0 for a line that does not exist."""
-    return _Lines(lines).index(number)
-
-
-def fingerprint(rule: str, path: str, text: str, index: int) -> str:
-    joined = "|".join((rule, path, text, str(index)))
-    return hashlib.sha256(joined.encode("utf-8", "surrogatepass")).hexdigest()
-
-
 @dataclass(frozen=True)
 class Finding:
     """One finding: ``rule`` is the Layer 1 tool (``forbid_ast:<rule id>``, ``call_graph``,
@@ -184,7 +134,7 @@ class Finding:
 
     @property
     def fp(self) -> str:
-        return fingerprint(self.rule, self.path, self.text, self.index)
+        return primitives.fingerprint(self.rule, self.path, self.text, self.index)
 
     @property
     def entry(self) -> Entry:
@@ -433,7 +383,7 @@ class Sources:
         self.staged = staged
         self.reviewed = reviewed
         self._texts: Dict[str, Optional[str]] = {}
-        self._lines: Dict[str, _Lines] = {}
+        self._lines: Dict[str, primitives.LineIndex] = {}
         self._trees: Dict[str, Any] = {}
         self._sites: Dict[Tuple[str, str, str, str], List[int]] = {}
         self._index: Optional[Dict[str, str]] = None
@@ -473,11 +423,11 @@ class Sources:
 
     def lines(self, path: str) -> List[str]:
         text = self.text(path)
-        return [] if text is None else split_lines(text)
+        return [] if text is None else primitives.split_lines(text)
 
-    def _normalized(self, path: str) -> _Lines:
+    def _normalized(self, path: str) -> primitives.LineIndex:
         if path not in self._lines:
-            self._lines[path] = _Lines(self.lines(path))
+            self._lines[path] = primitives.LineIndex(self.lines(path))
         return self._lines[path]
 
     def line_text(self, path: str, number: int) -> str:

@@ -1,4 +1,4 @@
-"""The Windows fallback of ``checkrun.kill_group`` and what the documentation says about it (R-trust-27).
+"""The Windows fallback of ``testexec.kill_group`` and what the documentation says about it (R-trust-27).
 
 Windows has no process groups to signal; ``taskkill /T`` needs the root alive, so the post-exit
 sweep is POSIX-only, and ``taskkill`` itself is named by absolute path so no directory on ``PATH``
@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from aegis_core import checkrun
+from aegis_core import testexec
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -37,24 +37,24 @@ def calls(monkeypatch):
 
 def test_a_live_run_is_killed_with_the_absolute_taskkill(monkeypatch, calls):
     monkeypatch.setenv("SystemRoot", "D:\\Win")
-    checkrun.kill_group(_Proc(None))
+    testexec.kill_group(_Proc(None))
     assert calls == [["D:\\Win\\System32\\taskkill.exe", "/T", "/F", "/PID", "4242"]]
 
 
 @pytest.mark.parametrize("root", ["", "relative\\dir", "..\\Windows"])
 def test_a_relative_or_empty_systemroot_falls_back_to_c_windows(monkeypatch, calls, root):
     monkeypatch.setenv("SystemRoot", root)
-    checkrun.kill_group(_Proc(None))
+    testexec.kill_group(_Proc(None))
     assert calls == [["C:\\Windows\\System32\\taskkill.exe", "/T", "/F", "/PID", "4242"]]
 
 
 def test_an_exited_run_is_never_signalled(monkeypatch, calls):
     monkeypatch.setenv("SystemRoot", "D:\\Win")
-    checkrun.kill_group(_Proc(0))
+    testexec.kill_group(_Proc(0))
     assert calls == []
 
 
 def test_the_docs_say_the_post_exit_sweep_is_posix_only():
     sentence = "descendants a test run leaves behind after a normal exit are not swept"
-    assert sentence in " ".join((checkrun.__doc__ or "").split())
+    assert sentence in " ".join((testexec.__doc__ or "").split())
     assert sentence in (ROOT / "SECURITY.md").read_text(encoding="utf-8")

@@ -731,7 +731,7 @@ def test_a_scan_rows_time_is_read_as_strptime_reads_it(ws, capsys, stamp, counts
 # Measured on Linux, Python 3.12, after this change: 95 modules over a bare start, 22 of them
 # Aegis's. The bounds leave room for another Python version and platform (Windows loads
 # msvcrt, _winapi and nt-only modules), not for a new subsystem on the hook path.
-_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 26
+_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 27
 
 
 @pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])

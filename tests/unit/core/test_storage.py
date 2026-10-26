@@ -503,7 +503,7 @@ def test_the_mode_is_set_on_the_temporary_file_never_on_a_link_swapped_in_at_its
     """Given a write with an exact mode, When a symlink to another file is swapped in at the
     temporary name after it was opened, Then the opened file gets the mode and the link's
     target keeps its own."""
-    from aegis_core import storage
+    from aegis_core import atomicio
 
     umask(0o022)
     victim = tmp_path / "victim"
@@ -512,7 +512,7 @@ def test_the_mode_is_set_on_the_temporary_file_never_on_a_link_swapped_in_at_its
     out = tmp_path / "out"
     out.mkdir()
     moved = tmp_path / "opened-file"
-    real_write_all = storage._write_all
+    real_write_all = atomicio._write_all
 
     def write_then_swap(fd, data):
         real_write_all(fd, data)
@@ -520,7 +520,7 @@ def test_the_mode_is_set_on_the_temporary_file_never_on_a_link_swapped_in_at_its
         os.rename(tmp, moved)
         _symlink_or_skip(tmp, victim)
 
-    monkeypatch.setattr(storage, "_write_all", write_then_swap)
+    monkeypatch.setattr(atomicio, "_write_all", write_then_swap)
     atomic_write_bytes(out / "config.json", b"{}", mode=0o644)
     assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o600 and victim.read_bytes() == b"precious"
     assert _mode(moved) == 0o644 and moved.read_bytes() == b"{}"
@@ -575,13 +575,13 @@ def test_create_private_file_refuses_a_directory(tmp_path: Path):
 
 
 def test_create_private_file_removes_a_partial_file_when_the_write_fails(tmp_path: Path, monkeypatch):
-    from aegis_core import storage
+    from aegis_core import atomicio, storage
 
     def broken(fd, data):
         os.write(fd, data[:3])
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(storage, "_write_all", broken)
+    monkeypatch.setattr(atomicio, "_write_all", broken)
     with pytest.raises(OSError, match="No space"):
         storage.create_private_file(tmp_path / "link.key", b"k" * 32)
     assert list(tmp_path.iterdir()) == []

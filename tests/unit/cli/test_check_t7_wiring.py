@@ -4,7 +4,6 @@ recorded snapshot (`--record`) alike."""
 from __future__ import annotations
 
 import json
-import os
 import random
 import string
 import subprocess
@@ -242,9 +241,9 @@ def test_the_recorded_check_judges_what_the_change_introduces_like_aegis_check(t
 def test_a_trailer_recorded_before_the_wiring_diverges_as_documented(tmp_path, monkeypatch):
     """Rollout: a 4.3.x trailer on a commit that introduces os.system(cmd) passed without T7; the
     wired CI rerun fails it, which is reported as a divergence, never an exception."""
-    from aegis_core import checkrun
+    from aegis_core import checkrun, testexec
 
-    monkeypatch.setattr(checkrun, "run_tests", lambda *_a, **_k: checkrun.TestsRun(exit=0, collected=1, passed=1))
+    monkeypatch.setattr(testexec, "run_tests", lambda *_a, **_k: testexec.TestsRun(exit=0, collected=1, passed=1))
     project = hg.make_repo(tmp_path)
     project.write("src/run.py", "import os\n\n\ndef run(cmd):\n    return os.system(cmd)\n")
     project.git("add", "-A")
@@ -262,7 +261,7 @@ def test_this_repository_has_no_gate_finding_from_the_wired_scans():
 
     files = sorted(p.relative_to(REPO).as_posix() for pkg in ("aegis_core", "aegis_cli", "aegis_mcp")
                    for p in (REPO / pkg).rglob("*.py"))
-    hot = ["aegis_core/human_gate.py", "aegis_core/checkrun.py", "aegis_core/verification/scanners.py"]
+    hot = ["aegis_core/human_gate.py", "aegis_core/testexec.py", "aegis_core/verification/scanners.py"]
     sample = sorted(set(files[:: max(1, len(files) // 40)] + hot))
     pack = evaluate_security_pack(REPO, sample, {})
     assert pack["violations"] == [] and [u for u in pack["unverified_findings"] if u["kind"] == "file"] == []

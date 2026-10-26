@@ -11,7 +11,6 @@ import re
 import sys
 import textwrap
 
-import pytest
 
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 sys.path.insert(0, REPO_ROOT)
@@ -536,7 +535,6 @@ class TestPolyglotMutationTesterCoverage:
     def test_mutation_tester_reports_diagnostic_baseline_reasons(self, tmp_path, monkeypatch):
         """BUG-095: Mutation tester must report why baseline check failed."""
         from aegis_core.verification import mutation_tester
-        import subprocess
 
         src = tmp_path / "target.py"
         src.write_text("def inc(x):\n    return x + 1\n")
@@ -636,7 +634,7 @@ class TestModuleSwapStaging:
         assert ev.lines == []
 
     def test_check_tests_kills_process_group_on_timeout(self, tmp_path):
-        """A timed-out subprocess in _check_tests has its process group killed via checkrun.kill_group."""
+        """A timed-out subprocess in _check_tests has its process group killed via testexec.kill_group."""
         import subprocess
         from aegis_core.verification import mutation_tester
 
@@ -652,7 +650,7 @@ class TestModuleSwapStaging:
         fake_proc = _FakeProc()
         with patch("aegis_core.verification.test_runner.resolve_pytest_cmd", return_value=["pytest"]), patch(
             "subprocess.Popen", return_value=fake_proc
-        ) as mock_popen, patch("aegis_core.checkrun.kill_group") as mock_kill_group:
+        ) as mock_popen, patch("aegis_core.testexec.kill_group") as mock_kill_group:
             res = mutation_tester._check_tests([str(test)], timeout=5)
 
         assert res.passed is False
