@@ -242,9 +242,9 @@ def test_the_recorded_check_judges_what_the_change_introduces_like_aegis_check(t
 def test_a_trailer_recorded_before_the_wiring_diverges_as_documented(tmp_path, monkeypatch):
     """Rollout: a 4.3.x trailer on a commit that introduces os.system(cmd) passed without T7; the
     wired CI rerun fails it, which is reported as a divergence, never an exception."""
-    from aegis_core import checkrun
+    from aegis_core import checkrun, testexec
 
-    monkeypatch.setattr(checkrun, "run_tests", lambda *_a, **_k: checkrun.TestsRun(exit=0, collected=1, passed=1))
+    monkeypatch.setattr(testexec, "run_tests", lambda *_a, **_k: testexec.TestsRun(exit=0, collected=1, passed=1))
     project = hg.make_repo(tmp_path)
     project.write("src/run.py", "import os\n\n\ndef run(cmd):\n    return os.system(cmd)\n")
     project.git("add", "-A")
