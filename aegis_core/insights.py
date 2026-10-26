@@ -1,8 +1,8 @@
 """Human insights closed loop (v4.3 spec §3.5 T8, v4.4 spec §3.4 & §12.2).
 
 The per-prompt hook path (record_hook_prompt) imports only the standard library and the
-L0 transports at module load: credit, human_gate, the ledger, scan_compliance, the rule
-parser and the redaction scanners are imported where review or capture uses them, so a
+L0 modules at module load, the redaction table among them: credit, human_gate, the ledger,
+scan_compliance and the rule parser are imported where review or capture uses them, so a
 prompt that writes nothing pays for none of them. Their public re-exports stay reachable
 through the module ``__getattr__``.
 
@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple
 from aegis_core import gitsafe, rule_inventory, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import parse_utc, real_key, utc_stamp
+from aegis_core.redaction import redact_insight_text
 from aegis_core.storage import (
     append_jsonl,
     atomic_write_text,
@@ -41,10 +42,9 @@ from aegis_core.workspace.binding import bounded_walk_up
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 if TYPE_CHECKING:
-    # Bound for linters and type checkers only: at run time these names are served lazily by
-    # __getattr__ below, so a no-cue hook prompt never imports the scanner module.
+    # Bound for linters and type checkers only: at run time Rule is served lazily by __getattr__
+    # below, so a hook prompt never imports the rule parser.
     from aegis_core.rules import Rule
-    from aegis_core.verification.scanners import redact_insight_text
 
 __all__ = [
     "CaptureLimitReached",
@@ -117,7 +117,6 @@ MAX_CAPTURE_PATHS = 20
 MAX_CAPTURE_PATH_CHARS = 512
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _LAZY_NAMES = {
-    "redact_insight_text": "aegis_core.verification.scanners",
     "Rule": "aegis_core.rules",
     "load_rules": "aegis_core.rules",
     "first_match": "aegis_core.match",
@@ -136,12 +135,6 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> List[str]:
     return sorted(set(globals()) | set(_LAZY_NAMES))
-
-
-def _redact(text: str, **kwargs: Any) -> str:
-    from aegis_core.verification.scanners import redact_insight_text
-
-    return redact_insight_text(text, **kwargs)
 
 
 def _user_layout(home: Optional[Path] = None) -> Optional[UserLayout]:
@@ -562,7 +555,7 @@ def add_insight(
     # never from a typed argument, so CLI rows cannot forge distinct recurrence episodes.
     if not isinstance(text, str) or not text.strip():
         raise ValueError("insight text must be a non-empty string")
-    clean = _redact(text)
+    clean = redact_insight_text(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     # The human signs the hash of what they typed; only the redacted text is stored.
     level = "H" if _has_human_approval(workspace, commit, base_ref, text) else "cli"
@@ -584,7 +577,7 @@ def capture_suggestion(
 ) -> Dict[str, Any]:
     if not isinstance(quote, str) or not quote.strip():
         raise ValueError("quote must be a non-empty string")
-    redacted = _redact(quote)
+    redacted = redact_insight_text(quote)
     norm_paths, psrc, dropped = _capture_paths(workspace, paths)
     hs = _ensure_hs(host, session, home)
     path = insights_path(workspace, home=home)
@@ -660,7 +653,7 @@ def record_hook_prompt(
         return {}
     hs = _ensure_hs(host, payload_session, home=home)
     cue = has_correction_cue(prompt_text)
-    excerpt = _redact(prompt_text) if cue and mode == "excerpts" else ""
+    excerpt = redact_insight_text(prompt_text) if cue and mode == "excerpts" else ""
     if hs is None and not excerpt:
         # Without session identity a prompt counts toward no session: no heartbeat, no I/O.
         return {}
@@ -839,7 +832,7 @@ def record_decision(
     if kind:
         row["kind"] = str(kind)
     if reason:
-        row["reason"] = _redact(str(reason))
+        row["reason"] = redact_insight_text(str(reason))
     if rule_id:
         row["rule_id"] = str(rule_id)
     _append_user_insights(insights_path(workspace, home=home), [row])
@@ -1045,8 +1038,8 @@ def write_proposal(
         if levels.get(id(r)) in ("H", "cli", "W2") and str(r.get("text") or "").strip()
     ]
     typed_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else ""
-    typed_clean = _redact(typed_kind, max_len=64)
-    written = [_redact(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    typed_clean = redact_insight_text(typed_kind, max_len=64)
+    written = [redact_insight_text(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
     # Stored text is redacted, so a typed copy holding an email or a home path differs from it
     # raw: the forms the proposal writes (the bullet quotes the kind without backticks) are linted too.
     for cand in (kind or "", *summary_bullets, typed_clean, typed_clean.replace("`", ""), *written):
@@ -1071,7 +1064,7 @@ def write_proposal(
         raise ValueError("the insights carry no paths, so the proposal would target every file; "
                          "record them with aegis rule insight add --paths")
     targets = _proposal_targets([ps for ps in member_paths if ps], rows)
-    clean_kind = _redact(chosen_kind, max_len=64)
+    clean_kind = redact_insight_text(chosen_kind, max_len=64)
     bullets = [f"{len(members)} counted correction(s) of kind `{clean_kind.replace('`', '')}`."]
     bullets += written
     hyp = f"Prevent recurring {clean_kind} issues in {', '.join(targets)}."

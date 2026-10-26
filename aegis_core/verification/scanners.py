@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import hashlib
 import itertools
 import json
-import math
 import os
 from pathlib import Path
 import posixpath
@@ -15,12 +14,16 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from aegis_core import gitsafe, pathlookup, primitives
 from aegis_core.primitives import is_within
+from aegis_core.redaction import (
+    CANDIDATE_TOKEN_RE,
+    MAX_LINE_LENGTH,
+    TOKEN_REDACTIONS,
+    is_high_entropy_secret,
+    mask_secret,
+    shannon_entropy,
+)
 from aegis_core.verification import test_runner
 
-# Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear); above
-# this length a finding's snippet is the masked token alone, never the surrounding line.
-MAX_LINE_LENGTH = 4096
-MAX_EXCERPT_CHARS = 300
 # Left edges. Each body starts with a distinctive literal, so only a letter or digit before it means
 # "inside a longer run"; `_ - / +` are delimiters (deploy_ghp_..., clone URLs). Bodies that contain
 # `_` or `-` also treat those as identifier characters, and the generic OpenAI `sk-` shape keeps the
@@ -60,59 +63,6 @@ _PEM_BODY_RE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 _SUPPRESSION_RE = re.compile(r"#[\t ]*(?:noqa:[A-Za-z0-9\t ,]{0,200}?\bS[0-9]+|nosec\b)|(?:#|//|/\*)[\t ]*gitleaks:allow\b",
                              re.IGNORECASE)
 
-_NB = r"(?<![A-Za-z0-9])"
-_PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
-_PEM_TAIL = r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
-_KEYS = ("(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|credential|"
-         "authorization|auth(?![A-Za-z]))")
-_SCHEMES = "(?:basic|digest|token|negotiate)"
-# Built by concatenation, never as an rf-string: f-string formatting turns a {4,} quantifier
-# into the tuple "(4,)". Every quantifier is bounded so redaction stays linear in its input.
-_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
-    (re.compile(pattern), hook, text) for pattern, hook, text in (
-        # The body is optional, so an unterminated header cannot backtrack over the rest.
-        (_PEM_HEAD + "(?:(?:[^-]|-(?!-)){0,16384}" + _PEM_TAIL + ")?", "[REDACTED_PEM]", "[REDACTED_PEM]"),
-        # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
-        ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
-         r"\1[REDACTED]@"),
-        (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
-         "[REDACTED_JWT]"),
-        (_NB + "AKIA[0-9A-Z]{16}", "AKIA_REDACTED", "[REDACTED_AWS]"),
-        (_NB + "ASIA[0-9A-Z]{16}", "ASIA_REDACTED", "[REDACTED_AWS]"),
-        (_NB + "(?:AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}", "[REDACTED_AWS]", "[REDACTED_AWS]"),
-        (_NB + "ghp_[A-Za-z0-9]{20,255}", "ghp_REDACTED", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "gh[ousr]_[A-Za-z0-9]{20,255}", "gh_token_REDACTED", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "github_pat_[A-Za-z0-9_]{20,255}", "github_pat_REDACTED", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "glpat-[A-Za-z0-9_-]{16,255}", "[REDACTED_VCS_TOKEN]", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,99}", "[REDACTED_API_KEY]", "[REDACTED_API_KEY]"),
-        (_NB + "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,255}", "sk-REDACTED", "[REDACTED_API_KEY]"),
-        (_NB + "AIza[A-Za-z0-9_-]{25,255}", "AIzaSy_REDACTED", "[REDACTED_TOKEN]"),
-        (_NB + "(?:xox[abprs]-[A-Za-z0-9-]{10,255}|npm_[A-Za-z0-9]{20,255}|pypi-[A-Za-z0-9_-]{20,255})",
-         "[REDACTED_TOKEN]", "[REDACTED_TOKEN]"),
-        ("(?i)" + _NB + r"Bearer\s{1,8}[A-Za-z0-9._~+/=-]{16,1024}", "Bearer REDACTED", "Bearer [REDACTED]"),
-        # key=value and key: value; an Authorization scheme word is kept and its credential goes.
-        ("(?i)(" + _NB + "[A-Za-z0-9_]{0,32}" + _KEYS + "[A-Za-z0-9_]{0,32}[\"']?\\s{0,8}(?:=|:)\\s{0,8}[\"']?"
-         "(?:" + _SCHEMES + "\\s{1,8})?)(?!" + _SCHEMES + "\\b)([^\\s\"',;]{4,512})", r"\1REDACTED", r"\1[REDACTED]"),
-        # "the password is hunter2": the narrow keys only, so "the auth is broken" stays.
-        ("(?i)(" + _NB + "(?:password|passwd|pwd|secret|token|api key|private key)\\s{1,8}is\\s{1,8}[\"']?)"
-         "([^\\s\"',;]{6,512})", r"\1REDACTED", r"\1[REDACTED]"),
-    ))
-#: The hook-log form of the table: (pattern, replacement), applied in order.
-SECRET_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [(p, hook) for p, hook, _ in _SECRET_REDACTIONS]
-#: Personal data, scrubbed from stored insights only: the hook log keeps paths and addresses.
-_PII_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,63}(?![A-Za-z0-9])"),
-     "[REDACTED_EMAIL]"),
-    (re.compile(r"(?<=/home/)[^/\s]{1,255}|(?<=/Users/)[^/\s]{1,255}|(?<=C:\\Users\\)[^\\\s]{1,255}"), "~user"),
-    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
-)
-_TEXT_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS) + _PII_REDACTIONS
-# The single-token rows, safe over a snippet that already carries masks: PEM spans lines, and the URL
-# userinfo and keyed rows (the ones with a backreference) rewrite whatever follows, masks included.
-_TOKEN_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS if "\\1" not in text and text != "[REDACTED_PEM]")
-_HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
-_CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
-
 
 @dataclass(frozen=True)
 class Finding:
@@ -139,79 +89,9 @@ class Finding:
         }
 
 
-def mask_secret(secret: str) -> str:
-    if len(secret) <= 6:
-        return f"{secret[:2]}..." if len(secret) > 2 else "***"
-    return f"{secret[:4]}...{secret[-2:]}"
-
-
 def sarif_fingerprint(rule_id: str, rel_path: str, line_text: str) -> str:
     normalized = " ".join(line_text.split())
     return hashlib.sha256(f"{rule_id}|{rel_path}|{normalized}".encode("utf-8")).hexdigest()[:16]
-
-
-def shannon_entropy(s: str) -> float:
-    if not s:
-        return 0.0
-    counts = collections.Counter(s)
-    n = len(s)
-    return -sum((c / n) * math.log2(c / n) for c in counts.values())
-
-
-
-def _is_high_entropy_secret(tok: str, threshold: float = 3.8) -> bool:
-    if "REDACTED" in tok or _HEX_UUID_RE.match(tok) or not any(c.isdigit() for c in tok):
-        return False
-    classes = int(any(c.islower() for c in tok)) + int(any(c.isupper() for c in tok)) + 1
-    if classes < 2:
-        return False
-    return shannon_entropy(tok) >= threshold
-
-
-def redact_command_secrets(cmd: str) -> str:
-    """Mask known secret patterns in command strings before logging."""
-    for pattern, replacement in SECRET_REPLACEMENTS:
-        cmd = pattern.sub(replacement, cmd)
-    return cmd
-
-
-def _bounded_head(text: str, limit: int) -> str:
-    """The whole words of ``text`` up to about ``limit`` characters. A secret cut in half
-    would no longer match its pattern, so a word the cut splits is dropped, as is a trailing
-    PEM header whose END lies past the cut."""
-    raw = text[: limit + 1]
-    words = raw.split()
-    if words and not raw[-1].isspace():
-        words.pop()
-    head = " ".join(words)
-    begin = head.rfind("-----BEGIN")
-    # Closed only by a whole END marker: a cut inside the END line leaves a block the PEM row
-    # cannot match, and its body would survive. The join turned newlines into single spaces.
-    return head[:begin].rstrip() if begin != -1 and not re.search(_PEM_TAIL, head[begin:]) else head
-
-
-def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:
-    """Scrub secrets, PII, paths, IPs, and high-entropy tokens from insight text; past
-    ``max(MAX_LINE_LENGTH, 4 * max_len)`` characters only a whole-word head is kept."""
-    if not isinstance(text, str) or not text:
-        return ""
-    limit = max(MAX_LINE_LENGTH, 4 * max_len)
-    out = text if len(text) <= limit else _bounded_head(text, limit)
-    for pat, repl in _TEXT_REDACTIONS:
-        out = pat.sub(repl, out)
-    out = _CANDIDATE_TOKEN_RE.sub(
-        lambda m: "[REDACTED_HIENT]" if _is_high_entropy_secret(m.group(0)) else m.group(0),
-        out,
-    )
-    out = " ".join(out.split())
-    if max_len > 0 and len(out) > max_len:
-        sliced = out[:max_len]
-        last_open = sliced.rfind("[REDACTED")
-        if last_open != -1 and "]" not in sliced[last_open:]:
-            out = sliced[:last_open].rstrip()
-        else:
-            out = sliced
-    return out
 
 
 def _is_placeholder_text(val: str) -> bool:
@@ -227,9 +107,9 @@ def _is_benign_token(val: str, *, human_text: bool = False) -> bool:
 
 def _sweep_unreported_secrets(line: str) -> str:
     """Scrub secret-shaped values no scan pass reported, leaving the masks of reported ones intact."""
-    for pat, text in _TOKEN_REDACTIONS:
+    for pat, text in TOKEN_REDACTIONS:
         line = pat.sub(text, line)
-    return _CANDIDATE_TOKEN_RE.sub(lambda m: "[REDACTED]" if _is_high_entropy_secret(m.group(0), 4.0) else m.group(0), line)
+    return CANDIDATE_TOKEN_RE.sub(lambda m: "[REDACTED]" if is_high_entropy_secret(m.group(0), 4.0) else m.group(0), line)
 
 
 def _pem_key_material(lines: list[str], index: int, end: int) -> str | None:
@@ -295,6 +175,8 @@ def scan_secrets_text(text: str, path: str = "<memory>", *, include_advisory: bo
                 matched.append(("high-entropy-token", "advisory", val))
         if not matched:
             continue
+        # Lines of any length are scanned (every Tier A quantifier is bounded, so cost is linear);
+        # above MAX_LINE_LENGTH the snippet is the masked token alone, never the surrounding line.
         masked_line = raw_line.strip() if len(raw_line) <= MAX_LINE_LENGTH else ""
         if masked_line:
             for sec in sorted({*line_secrets, *extra_masks}, key=len, reverse=True):
