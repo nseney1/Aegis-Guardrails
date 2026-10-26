@@ -6,6 +6,7 @@ on a lock waits at most 0.5 s, and none asserts how long anything took.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 from pathlib import Path
@@ -232,3 +233,12 @@ def test_a_lock_another_process_holds_times_out(lock: Path, home: Path):
     assert child.returncode == 0, err
     with file_lock(lock, timeout=0.5):
         pass
+
+
+def test_storage_retries_the_os_lock_in_one_place():
+    """Given aegis_core/storage.py, When its functions are parsed, Then only _hold loops on the OS
+    lock: file_lock, locked, shared_locked and ledger_locked all wait through it."""
+    tree = ast.parse((REPO / "aegis_core" / "storage.py").read_text(encoding="utf-8"))
+    loops = [fn.name for fn in tree.body if isinstance(fn, ast.FunctionDef) for node in ast.walk(fn)
+             if isinstance(node, ast.While) and "_try_os_lock" in ast.unparse(node.test)]
+    assert loops == ["_hold"]
