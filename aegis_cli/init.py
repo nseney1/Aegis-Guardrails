@@ -517,6 +517,37 @@ def _skills_steps(ctx: _Context, dry_run: bool) -> List[Step]:
     return steps
 
 
+def _hook_steps(root: Path, dry_run: bool, actions: List[Step]) -> None:
+    """The pre-commit and prepare-commit-msg hooks, each appended to ``actions`` as it completes.
+    Raises InstallError for a hook that cannot be written safely."""
+    from aegis_cli.hooks import commitmsg
+    from aegis_core.workspace.hooks import resolve_git_hooks_dir
+
+    in_place = shared_hook_in_place(root)
+    if in_place is not None:
+        actions.append(Step("pre-commit hook", "unchanged",
+                            f"{in_place} already runs the Aegis hook (a shared hooks directory); left as it is"))
+        actions.append(Step("prepare-commit-msg hook", "unchanged",
+                            f"{in_place.parent / 'prepare-commit-msg'} (a shared hooks directory); left as it is"))
+    else:
+        refusal = hook_refusal(root)
+        if refusal:
+            raise InstallError(f"pre-commit hook: {refusal}. Or re-run with --no-hooks to set up everything else.")
+        hooked = install_hook(root, dry_run=dry_run)
+        hooks_dir = resolve_git_hooks_dir(root)
+        if not hooked and hooks_dir:
+            raise InstallError("the pre-commit hook could not be installed (see above); left unchanged")
+        actions.append(Step("pre-commit hook", "installed" if hooked else "skipped (not a git repository)"))
+        if hooked and hooks_dir:
+            cm_res = commitmsg.install(hooks_dir, dry_run=dry_run)
+            if cm_res == "foreign":
+                actions.append(Step("prepare-commit-msg hook", "kept", "existing hook is not Aegis's; left alone"))
+            else:
+                actions.append(Step("prepare-commit-msg hook", cm_res))
+        else:
+            actions.append(Step("prepare-commit-msg hook", "skipped (not a git repository)"))
+
+
 def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -> List[Step]:
     """Run every init step; with ``dry_run`` only check and plan. Raises InstallError.
 
@@ -526,7 +557,6 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     from aegis_core.ast.detect import detect_project_languages, provision_ast_driver_slots
     from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
     from aegis_core.errors import PathTraversalError, WorkspaceBareRepoError
-    from aegis_core.workspace.hooks import resolve_git_hooks_dir
     from aegis_core.workspace.layout import WorkspaceLayout
     from aegis_core.workspace.scaffold import ensure_runtime_gitignore
 
@@ -599,31 +629,7 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     actions.append(_ci_step(root, ctx.ci, dry_run))
 
     if not ctx.no_hooks:
-        from aegis_cli.hooks import commitmsg
-
-        in_place = shared_hook_in_place(root)
-        if in_place is not None:
-            actions.append(Step("pre-commit hook", "unchanged",
-                                f"{in_place} already runs the Aegis hook (a shared hooks directory); left as it is"))
-            actions.append(Step("prepare-commit-msg hook", "unchanged",
-                                f"{in_place.parent / 'prepare-commit-msg'} (a shared hooks directory); left as it is"))
-        else:
-            refusal = hook_refusal(root)
-            if refusal:
-                raise InstallError(f"pre-commit hook: {refusal}. Or re-run with --no-hooks to set up everything else.")
-            hooked = install_hook(root, dry_run=dry_run)
-            hooks_dir = resolve_git_hooks_dir(root)
-            if not hooked and hooks_dir:
-                raise InstallError("the pre-commit hook could not be installed (see above); left unchanged")
-            actions.append(Step("pre-commit hook", "installed" if hooked else "skipped (not a git repository)"))
-            if hooked and hooks_dir:
-                cm_res = commitmsg.install(hooks_dir, dry_run=dry_run)
-                if cm_res == "foreign":
-                    actions.append(Step("prepare-commit-msg hook", "kept", "existing hook is not Aegis's; left alone"))
-                else:
-                    actions.append(Step("prepare-commit-msg hook", cm_res))
-            else:
-                actions.append(Step("prepare-commit-msg hook", "skipped (not a git repository)"))
+        _hook_steps(root, dry_run, actions)
 
     actions.append(Step(REGISTRY_LABEL, register_workspace(ctx.home, root, ctx.selected, dry_run=dry_run)))
     actions.append(_link_key_step(ctx.home, dry_run))
