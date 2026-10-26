@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
 import pytest
 

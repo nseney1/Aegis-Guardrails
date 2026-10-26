@@ -470,7 +470,7 @@ class TestSarifIsSchemaValidAndHonest:
         from aegis_cli.cli import main
 
         repo = cov_repo(tmp_path)
-        os.chdir(repo.root)
+        monkeypatch.chdir(repo.root)
         rc = main(["check", "--ci", "--base", "no-such-ref", "--format", "sarif"])
         out, err = capsys.readouterr()
         assert rc == 1 and err.startswith("Error:")
@@ -571,7 +571,7 @@ class TestCheckCliIntegration:
         repo = cov_repo(tmp_path)
         summary = tmp_path / "summary.md"
         monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
-        os.chdir(repo.root)
+        monkeypatch.chdir(repo.root)
         fake_coverage(monkeypatch, A_REPORT)
         rc = main(["check", "--ci", "--coverage", "--base", "main"])
         out = capsys.readouterr().out
@@ -602,7 +602,7 @@ class TestCheckCliIntegration:
 
         repo = cov_repo(tmp_path)
         head = repo.head()
-        os.chdir(repo.root)
+        monkeypatch.chdir(repo.root)
         calls = fake_coverage(monkeypatch, A_REPORT)
         repo.write("pkg/b.py", "z = 2\n")
         rc = main(["check", "--ci", "--coverage", "--base", "main"])

@@ -11,7 +11,6 @@ import re
 import sys
 import textwrap
 
-import pytest
 
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 sys.path.insert(0, REPO_ROOT)
@@ -536,7 +535,6 @@ class TestPolyglotMutationTesterCoverage:
     def test_mutation_tester_reports_diagnostic_baseline_reasons(self, tmp_path, monkeypatch):
         """BUG-095: Mutation tester must report why baseline check failed."""
         from aegis_core.verification import mutation_tester
-        import subprocess
 
         src = tmp_path / "target.py"
         src.write_text("def inc(x):\n    return x + 1\n")

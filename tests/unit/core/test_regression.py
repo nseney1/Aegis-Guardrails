@@ -733,7 +733,6 @@ def test_a_passing_fix_commit_looks_up_no_exemption(tmp_path: Path, monkeypatch:
     """Review F3: Given three fix commits whose tests are fail-to-pass and one fix without a test, When
     regressions are checked, Then only the failing commit looks up a test exemption, and git rev-list
     runs once for the metadata plus once for that lookup (each lookup rescans the range)."""
-    from aegis_core import gitsafe
 
     repo = make_repo(tmp_path)
     test_one = "def test_one():\n    pass\n"

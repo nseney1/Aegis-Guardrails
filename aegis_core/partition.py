@@ -440,7 +440,7 @@ def _signature(root: str, path: str, facts: _Facts, symbol: str, cache: Dict[str
     if path not in cache:
         try:
             with open(full, "rb") as handle:
-                cache[path] = baseline.split_lines(handle.read().decode("utf-8", "replace"))
+                cache[path] = primitives.split_lines(handle.read().decode("utf-8", "replace"))
         except OSError:
             cache[path] = []
     return _rust_signature(cache[path], facts.defs[symbol].line)

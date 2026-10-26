@@ -45,6 +45,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.bootstrap": 0,
     "aegis_core.storage": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.atomicio": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
@@ -84,6 +85,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
     "aegis_core.checkrun": 2,
+    "aegis_core.testexec": 1,
     # GitHub ruleset administration uses the transport and trust-policy constants.
     "aegis_core.github_ruleset": 2,
     # v4.3 T3: rank 2+ rules served from the reviewed BASE (the loader, the inventory, gitsafe), under scan.
@@ -93,7 +95,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop (user-scope JSONL, redaction, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,
-    # v4.3 T5: fail-to-pass regression check (gitsafe, checkrun's snapshot pytest runner, human_gate exemptions).
+    # v4.3 T5: fail-to-pass regression check (gitsafe, testexec's snapshot pytest runner, human_gate exemptions).
     "aegis_core.regression": 2,
     "aegis_core.scan": 2,
     "aegis_core.scan_compliance": 2,
@@ -257,7 +259,7 @@ def test_imports_respect_the_package_and_layer_boundaries(edges):
 
 
 def test_checkrun_does_not_import_regression(edges):
-    """R-evidence-30: T5's snapshot runner is checkrun.run_pytest_snapshot; checkrun never imports regression."""
+    """R-evidence-30: T5's snapshot runner is testexec.run_pytest_snapshot; checkrun never imports regression."""
     assert [e for e in edges if e.source == "aegis_core.checkrun" and e.target == "aegis_core.regression"] == []
 
 

@@ -4,7 +4,6 @@ recorded snapshot (`--record`) alike."""
 from __future__ import annotations
 
 import json
-import os
 import random
 import string
 import subprocess
