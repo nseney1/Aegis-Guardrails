@@ -29,16 +29,16 @@ def _nothing_above_the_test_tree(tmp_path_factory, monkeypatch):
     Above pytest's base temp directory is the developer's machine (on Windows it sits
     under %USERPROFILE%, next to a real .claude/CLAUDE.md), so doctor finds nothing there.
     Tests that need such a file put it under their own tmp_path."""
-    from aegis_cli import doctor
+    from aegis_cli import doctor_base
 
     base = os.path.normcase(os.path.realpath(str(tmp_path_factory.getbasetemp())))
-    real = doctor._present
+    real = doctor_base._present
 
     def present(path):
         key = os.path.normcase(os.path.realpath(str(path)))
         return real(path) if key.startswith(base + os.sep) else False
 
-    monkeypatch.setattr(doctor, "_present", present)
+    monkeypatch.setattr(doctor_base, "_present", present)
 
 
 @pytest.fixture(autouse=True)

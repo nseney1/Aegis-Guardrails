@@ -149,30 +149,22 @@ def archive_rule(
     return {"status": "archived", "from_type": rule_type, "source_path": str(path), "target_path": str(dest)}
 
 
-def run_rule_selection(workspace: Workspace | Path | str | None = None, execute: bool = False) -> int:
-    """Report the rules whose evidence supports archiving; with ``execute``, archive them."""
+def run_rule_selection(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
+    """The rules whose evidence supports archiving and, with ``execute``, what archiving each did.
+
+    ``status`` is ``no_rules_directory``, ``nothing_to_archive`` or ``candidates``; ``unavailable``
+    says why the CI-confirmed evidence was cut short (None when it was not); each candidate carries
+    ``archive``, the archive_rule result (None on a dry run). Nothing is printed here: ``aegis rule
+    archive`` prints it.
+    """
     ws = literal_workspace(workspace)
     if not ws.rules_dir.exists():
-        print("No rules directory found.")
-        return 0
+        return {"status": "no_rules_directory", "unavailable": None, "candidates": []}
     candidates, unavailable = transition_candidates(ws, "archive")
-    if unavailable:
-        print(evidence_line(unavailable))
-    if not candidates:
-        print("No rules to archive.")
-        return 0
-    for c in candidates:
-        note = " (dry run)"
-        if execute:
-            result = archive_rule(ws, c["rule_id"])
-            note = "" if result["status"] == "archived" else f" (not archived: {result['message']})"
-        print(
-            f"[ARCHIVE] {c['rule_id']} (fitness {c['fitness']:.2f}, misfire bound {c['misfire']:.2f}, "
-            f"tp {c['tp']:g}, fp {c['fp']:g}){note}"
-        )
-    return 0
+    rows = [dict(c, archive=archive_rule(ws, c["rule_id"]) if execute else None) for c in candidates]
+    return {"status": "candidates" if rows else "nothing_to_archive", "unavailable": unavailable, "candidates": rows}
 
 
-def prune_rules(workspace: Workspace | Path | str | None = None, execute: bool = False) -> int:
+def prune_rules(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
     """Archive the rules that misfire (``run_rule_selection``)."""
     return run_rule_selection(workspace=workspace, execute=execute)

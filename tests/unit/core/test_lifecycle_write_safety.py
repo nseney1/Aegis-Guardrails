@@ -241,7 +241,7 @@ def test_archiving_logs_a_valid_utc_timestamp(tmp_path: Path) -> None:
     ws = _ws(tmp_path)
     _misfiring(_rules(ws) / "traps" / "noisy.md", "noisy")
 
-    assert run_rule_selection(ws, execute=True) == 0
+    assert run_rule_selection(ws, execute=True)["candidates"][0]["archive"]["status"] == "archived"
 
     log_lines = (ws / ".aegis" / "state" / "lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
     entry = json.loads(log_lines[-1])
@@ -406,9 +406,9 @@ def test_archive_pass_with_nothing_to_change_does_not_wait_for_the_rules_lock(tm
     before = _snapshot(_rules(ws))
     with _lock_held_by_another_process(tmp_path, ws):
         # Needing the lock here would raise LockTimeoutError after 10 s.
-        rc = run_rule_selection(ws, execute=True)
+        result = run_rule_selection(ws, execute=True)
 
-    assert rc == 0
+    assert result["status"] == "nothing_to_archive"
     assert _snapshot(_rules(ws)) == before
     assert _log_actions(ws) == []
 
@@ -436,26 +436,27 @@ def test_archive_pass_takes_the_rules_lock_once_per_changed_rule(tmp_path: Path,
 
     monkeypatch.setattr(selection, "locked", counting_lock)
 
-    assert run_rule_selection(ws, execute=True) == 0
+    archived = run_rule_selection(ws, execute=True)["candidates"]
 
+    assert sorted((c["rule_id"], c["archive"]["status"]) for c in archived) == [
+        (f"quiet-{x}", "archived") for x in "abc"]
     assert depth == [1, 1, 1]
     assert sorted(_log_actions(ws)) == [(f"quiet-{x}", "moved_to_archive") for x in "abc"]
     assert (_rules(ws) / "traps" / "strong.md").is_file()
 
 
 def test_archiving_acts_on_the_evidence_as_it_is_under_the_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The rule is judged unlocked; true positives recorded before the lock must win."""
     ws = _ws(tmp_path)
     rule = _misfiring(_rules(ws) / "traps" / "revived.md", "revived")
     _rival_on_first_lock(monkeypatch, lambda: _evidence(ws, "revived", tp=4 * MIN_N), module=selection)
 
-    assert run_rule_selection(ws, execute=True) == 0
+    (row,) = run_rule_selection(ws, execute=True)["candidates"]
 
-    out = capsys.readouterr().out
-    assert "[ARCHIVE] revived" in out
-    assert "(not archived: Rule 'revived' no longer has evidence that supports archiving it)" in out
+    assert (row["rule_id"], row["archive"]["status"], row["archive"]["message"]) == (
+        "revived", "ineligible", "Rule 'revived' no longer has evidence that supports archiving it")
     assert rule.is_file(), "a rule whose evidence recovered before the lock must not be archived"
     assert not (_rules(ws) / ".archive" / "revived.md").exists()
     assert _log_actions(ws) == []
@@ -472,8 +473,9 @@ def test_archiving_skips_a_rule_moved_away_meanwhile(tmp_path: Path, monkeypatch
 
     _rival_on_first_lock(monkeypatch, move_away, module=selection)
 
-    assert run_rule_selection(ws, execute=True) == 0
+    (row,) = run_rule_selection(ws, execute=True)["candidates"]
 
+    assert (row["rule_id"], row["archive"]["status"]) == ("doomed", "not_found")
     assert moved.is_file()
     assert not (_rules(ws) / ".archive" / "doomed.md").exists()
     assert _log_actions(ws) == []
@@ -486,26 +488,26 @@ def test_a_misfiring_invariant_is_a_demotion_candidate_not_archived(tmp_path: Pa
     before = rule.read_bytes()
 
     assert evaluate_archives(ws) == []
-    assert run_rule_selection(ws, execute=True) == 0
+    assert run_rule_selection(ws, execute=True)["candidates"] == []
 
     assert rule.read_bytes() == before
     assert [c["rule_id"] for c in evaluate_demotions(ws)] == ["noisy-inv"]
     assert _log_actions(ws) == []
 
 
-def test_archiving_never_revisits_a_legacy_last_gasp_queue(tmp_path: Path, capsys) -> None:
+def test_archiving_never_revisits_a_legacy_last_gasp_queue(tmp_path: Path) -> None:
     """Rules a v3 selection pass parked in .last_gasp_queue are not loaded, so never moved."""
     ws = _ws(tmp_path)
     queue = _rules(ws) / ".last_gasp_queue"
     waiting = _misfiring(queue / "waiting.md", "waiting")
     queued = _snapshot(queue)
 
-    run_rule_selection(ws, execute=True)
+    result = run_rule_selection(ws, execute=True)
 
     assert _snapshot(queue) == queued
     assert waiting.is_file()
     assert _log_actions(ws) == []
-    assert "waiting" not in capsys.readouterr().out
+    assert "waiting" not in [c["rule_id"] for c in result["candidates"]]
 
 
 def test_archiving_never_overwrites_a_rule_already_archived_under_the_same_name(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import aegis_cli
-from aegis_cli import approve, doctor, init, init_views, install_hosts
+from aegis_cli import approve, doctor_base, init, init_views, install_hosts
 from aegis_cli.hooks import commitmsg, management
 from aegis_core import primitives
 
@@ -36,7 +36,7 @@ def test_broken_or_missing_stdin_is_not_a_tty(monkeypatch, error):
         raise error("closed")
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=broken) if error is not AttributeError else object())
     assert aegis_cli.stdin_is_tty() is False
-    assert approve._stdin_is_tty() is False and doctor._stdin_is_tty() is False
+    assert approve._stdin_is_tty() is False and doctor_base._stdin_is_tty() is False
 
 
 def test_shared_import_root_is_installed_location_and_hook_default():

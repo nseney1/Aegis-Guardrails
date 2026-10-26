@@ -360,7 +360,25 @@ def _run_archive(args: argparse.Namespace) -> int:
     """Archive extinct rules; --dry-run only reports what would move."""
     root = _resolve_workspace_root(args)
     execute = not getattr(args, "dry_run", False)
-    return prune_rules(workspace=root, execute=execute)
+    for line in _archive_lines(prune_rules(workspace=root, execute=execute)):
+        print(line)
+    return 0
+
+
+def _archive_lines(selection: Dict[str, Any]) -> List[str]:
+    """What ``aegis rule archive`` says about a selection pass (lifecycle.selection)."""
+    if selection["status"] == "no_rules_directory":
+        return ["No rules directory found."]
+    lines = [evidence_line(selection["unavailable"])] if selection["unavailable"] else []
+    if not selection["candidates"]:
+        return lines + ["No rules to archive."]
+    for c in selection["candidates"]:
+        result = c["archive"]
+        note = (" (dry run)" if result is None else
+                "" if result["status"] == "archived" else f" (not archived: {result['message']})")
+        lines.append(f"[ARCHIVE] {c['rule_id']} (fitness {c['fitness']:.2f}, misfire bound {c['misfire']:.2f}, "
+                     f"tp {c['tp']:g}, fp {c['fp']:g}){note}")
+    return lines
 
 
 def _split_csv_arg(raw: Any) -> list[str] | None:

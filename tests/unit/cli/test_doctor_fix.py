@@ -17,7 +17,7 @@ from typing import Any, Dict
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import run_doctor
 from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
 
@@ -110,7 +110,7 @@ def test_fix_on_a_non_terminal_without_yes_changes_nothing(env, monkeypatch):
 
 def test_fix_asks_first_and_a_no_changes_nothing(env, monkeypatch):
     env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: False)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: False)
     before = _snapshot(env.tmp)
     rc, out = env.run(fix=True)
     assert rc == 1 and "No changes made" in out
@@ -215,7 +215,7 @@ def test_fix_never_touches_a_malformed_legacy_block(env):
 
 def test_fix_removes_v3_rule_copies_by_digest_and_keeps_edited_ones(env, monkeypatch):
     shipped = b"---\nid: providence\n---\n# Providence\n"
-    monkeypatch.setattr(doctor, "V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
+    monkeypatch.setattr(doctor_base, "_V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
     leak = env.home / ".gemini" / "config" / "rules" / "providence.md"
     oracle = env.home / ".kiro" / "steering" / ".oracles" / "testing.md"
     edited = env.home / ".kiro" / "steering" / "providence.md"
@@ -291,7 +291,7 @@ def test_fix_skips_a_file_that_changed_after_the_check(env, monkeypatch):
         stale.write_text(changed, encoding="utf-8")
         return True
 
-    monkeypatch.setattr(doctor, "_confirm", confirm_then_edit)
+    monkeypatch.setattr(doctor_base, "_confirm", confirm_then_edit)
     rc, out = env.run(fix=True)
     assert rc == 1
     assert stale.read_text() == changed
@@ -357,7 +357,7 @@ def test_the_ast_driver_fix_also_needs_yes_and_backs_up_the_config(env, monkeypa
 
 def test_text_fix_lists_the_plan_and_where_the_backup_went(env, monkeypatch):
     env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: True)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: True)
     rc, out = env.run(fix=True)
     assert rc == 0
     assert "remove mcpServers.soma" in out
@@ -382,7 +382,7 @@ def test_the_plan_names_the_deletion_before_anything_is_confirmed(env, monkeypat
     claude_md = env.ws / "CLAUDE.md"
     claude_md.write_bytes(b"<!-- SOMA:START -->\n# Soma Governance Rules\nrule\n<!-- SOMA:END -->\n")
     prompts = []
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: prompts.append(prompt) or False)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: prompts.append(prompt) or False)
     rc, out = env.run(fix=True)
     assert prompts, "the plan is confirmed first"
     (line,) = [ln for ln in out.splitlines() if ln.strip().startswith("1. ") and str(claude_md) in ln]
@@ -404,7 +404,7 @@ def test_the_plan_names_the_deletion_before_anything_is_confirmed(env, monkeypat
 def test_a_file_with_text_besides_the_legacy_block_is_edited_never_deleted(env, monkeypatch):
     path = env.ws / "GEMINI.md"
     path.write_bytes(b"# mine\n\n<!-- SOMA:START -->\nrules\n<!-- SOMA:END -->\n")
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: False)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: False)
     rc, out = env.run(fix=True)
     assert f"{path}: remove the legacy block (lines 3-5)" in out
     assert "delete the file" not in out

@@ -3,18 +3,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aegis_core.outcomes.telemetry import record_verification_telemetry
+from aegis_core.outcomes.telemetry import Recorded, record_verification_telemetry
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 
 
 def test_record_verification_telemetry(tmp_path: Path):
     ws = str(tmp_path)
     # Missing args
-    assert record_verification_telemetry("", [], passed=True) is False
-    assert record_verification_telemetry(ws, [], passed=True) is False
+    assert record_verification_telemetry("", [], passed=True) == Recorded(0)
+    assert record_verification_telemetry(ws, [], passed=True) == Recorded(0)
 
     # Missing cells_dir
-    assert record_verification_telemetry(ws, ["src/foo.py"], passed=True) is False
+    assert record_verification_telemetry(ws, ["src/foo.py"], passed=True) == Recorded(0)
 
     cells_dir = tmp_path / ".aegis" / "rules" / "traps"
     cells_dir.mkdir(parents=True, exist_ok=True)
@@ -35,7 +35,7 @@ def test_record_verification_telemetry(tmp_path: Path):
         layer1_evidence=["dummy"],
         source="session",
     )
-    assert ok is True
+    assert ok == Recorded(1) and ok
 
     # Fail
     ok_fail = record_verification_telemetry(
@@ -46,7 +46,7 @@ def test_record_verification_telemetry(tmp_path: Path):
         layer1_evidence=[],
         source="session",
     )
-    assert ok_fail is True
+    assert ok_fail == Recorded(1)
     from aegis_core.telemetry_engine import ledger
     # One trigger row per rule and run: a local run is never a verdict (R-evidence-1).
     assert ledger.aggregate(tmp_path, "test-cell") == {
@@ -55,10 +55,11 @@ def test_record_verification_telemetry(tmp_path: Path):
     assert [r["meta"]["passed"] for r in ledger.read(tmp_path).rows] == [True, False]
 
     # Target files do not match
-    assert record_verification_telemetry(ws, ["unmatched/file.txt"], passed=True) is False
+    nothing = record_verification_telemetry(ws, ["unmatched/file.txt"], passed=True)
+    assert nothing == Recorded(0) and not nothing
 
 
-def test_telemetry_edge_cases_and_error_branches(tmp_path: Path, monkeypatch):
+def test_telemetry_edge_cases_and_error_branches(tmp_path: Path, monkeypatch, capsys):
     ws = str(tmp_path)
 
     # record_verification_telemetry: a failing ledger append is handled
@@ -74,4 +75,7 @@ def test_telemetry_edge_cases_and_error_branches(tmp_path: Path, monkeypatch):
     def mock_append_err(*args, **kwargs):
         raise RuntimeError("db error")
     monkeypatch.setattr("aegis_core.telemetry_engine.ledger.append", mock_append_err)
-    assert record_verification_telemetry(ws, ["src/foo.py"], passed=True) is False
+    # The failure is returned for the caller to report; core prints nothing.
+    failed = record_verification_telemetry(ws, ["src/foo.py"], passed=True)
+    assert failed == Recorded(0, "db error") and not failed
+    assert capsys.readouterr() == ("", "")

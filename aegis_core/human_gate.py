@@ -252,13 +252,6 @@ class TierReport:
     def statement(self) -> str:
         return _STATEMENTS[self.tier]
 
-    def text_lines(self) -> List[str]:
-        return [
-            f"Trust tier (human_gate): {self.tier} ({self.label}): {self.statement}",
-            *(f"  - {r}" for r in self.reasons),
-            *(f"  ! {c}" for c in self.caveats),
-        ]
-
     def as_dict(self) -> Dict[str, Any]:
         return {
             **primitives.envelope(SOURCE, dict(self.scope), schema=SCHEMA, checked_at=self.checked_at),

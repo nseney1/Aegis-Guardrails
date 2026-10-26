@@ -16,6 +16,7 @@ from typing import Dict
 
 import pytest
 
+from aegis_cli.formatters.text import render_card
 from aegis_core import card, events
 from aegis_core._version import __version__
 from tests.helpers_checkmodes import NO_EVAL, commit, init_repo, write
@@ -90,7 +91,7 @@ def test_a_rule_that_does_not_load_is_counted_and_never_active(repo: Path):
     built = card.build(repo)
     rules = built.as_dict()["rules"]
     assert rules["errors"] == 1 and rules["total"] == 2 and "broken" not in rules["active"]
-    assert "1 rule file(s) cannot be served" in "\n".join(built.text_lines())
+    assert "1 rule file(s) cannot be served" in "\n".join(render_card(built.as_dict()))
 
 
 def test_an_expired_rule_is_not_active(repo: Path):
@@ -134,7 +135,7 @@ def test_an_empty_repository_has_no_pass_rate(tmp_path: Path):
     root = init_repo(tmp_path / "empty", rules=False)
     layer1 = card.build(root).as_dict()["layer1"]
     assert (layer1["checked"], layer1["pass_rate"], layer1["findings"]) == (0, None, 0)
-    assert "no file" in "\n".join(card.build(root).text_lines())
+    assert "no file" in "\n".join(render_card(card.build(root).as_dict()))
 
 
 # ── No active rule ───────────────────────────────────────────────────────────
@@ -148,8 +149,8 @@ def test_the_card_says_when_no_active_rule_targets_any_file(tmp_path: Path):
     data = built.as_dict()
     assert data["rules"]["active"] == [] and data["rules"]["total"] == 1
     note = "No active rule targets any file: aegis check enforces no rule until one names files."
-    assert note in data["notes"] and note in "\n".join(built.text_lines())
-    assert "Next: add a rule for your own code with aegis rule create" in "\n".join(built.text_lines())
+    assert note in data["notes"] and note in "\n".join(render_card(built.as_dict()))
+    assert "Next: add a rule for your own code with aegis rule create" in "\n".join(render_card(built.as_dict()))
 
 
 def test_the_note_is_absent_when_a_rule_is_active(repo: Path):
@@ -196,7 +197,7 @@ def test_the_card_says_when_it_sampled(repo: Path):
     assert data["scope"]["files"] == 33  # 30 generated + app.py, README.md, the rule
     assert data["layer1"]["checked"] <= 10
     assert any("sampled" in note.lower() for note in data["notes"])
-    assert "Sampled 10 of 33 files" in "\n".join(built.text_lines())
+    assert "Sampled 10 of 33 files" in "\n".join(render_card(built.as_dict()))
     # languages are counted on the whole listing, not on the sample
     assert {row["language"]: row["files"] for row in data["languages"]}["python"] == 31
 
@@ -257,7 +258,7 @@ def test_an_unsafe_rules_tree_is_reported_and_the_card_still_renders(repo: Path,
     built = card.build(repo)
     data = built.as_dict()
     assert data["rules"]["error"] and data["rules"]["total"] == 0
-    assert "rules: cannot be read" in "\n".join(built.text_lines())
+    assert "rules: cannot be read" in "\n".join(render_card(built.as_dict()))
     assert data["layer1"]["checked"] >= 1
 
 
@@ -274,7 +275,7 @@ def test_the_json_carries_the_envelope(repo: Path):
 
 def test_the_text_card_reads_top_to_bottom(repo: Path):
     write(repo, "bad.py", "x = eval('1')\n")
-    text = "\n".join(card.build(repo).text_lines())
+    text = "\n".join(render_card(card.build(repo).as_dict()))
     for fragment in ("Aegis day-0 card", f"workspace: {repo}", "languages: python 2", "AST drivers: python: built-in",
                      "rules: 1 (invariant 1)", "1 active", "Layer 1: 50% of 2 files pass", "1 finding(s) in 1 file(s)",
                      "files with the most findings:", "1  bad.py"):

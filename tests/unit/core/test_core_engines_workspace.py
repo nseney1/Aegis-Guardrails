@@ -82,7 +82,7 @@ class TestLifecycleWorkspaceInteroperability:
 
     def test_run_cell_selection_with_workspace_instance(self, mock_soma_workspace: Workspace):
         res = run_rule_selection(workspace=mock_soma_workspace, execute=False)
-        assert res == 0
+        assert (res["status"], res["candidates"]) == ("nothing_to_archive", [])
 
     def test_parsers_and_promotions_with_workspace_instance(self, mock_soma_workspace: Workspace):
         rules = load_rules(mock_soma_workspace)

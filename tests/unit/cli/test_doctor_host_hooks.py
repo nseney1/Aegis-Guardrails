@@ -25,7 +25,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import run_doctor
 from aegis_cli.hooks import registrar
 from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
@@ -588,7 +588,7 @@ def test_fix_skips_a_hook_file_that_changed_after_the_check(env, monkeypatch):
         path.write_text(changed, encoding="utf-8")
         return True
 
-    monkeypatch.setattr(doctor, "_confirm", confirm_then_edit)
+    monkeypatch.setattr(doctor_base, "_confirm", confirm_then_edit)
     rc, out = env.run(fix=True)
     assert rc == 1 and "changed since the check" in out
     assert path.read_text(encoding="utf-8") == changed

@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from aegis_cli.formatters.text import render_lane
 from aegis_core import events, gitsafe, lane_gate, team
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -249,7 +250,7 @@ def test_a_head_already_in_base_has_nothing_to_check_and_says_so(repo: Repo, bas
     warning = "HEAD is already contained in main: nothing was checked"
     assert result.warnings == (warning,)
     assert result.as_dict()["warnings"] == [warning]
-    lines = result.text_lines()
+    lines = render_lane(result.as_dict())
     assert f"warning: {warning}" in lines
     assert lines[-2:] == [lane_gate.NOTE_SELF_ATTESTED, lane_gate.NOTE_EXEMPTION]
 
@@ -423,7 +424,7 @@ def test_the_label_is_witnessed_only_when_every_input_came_from_base(paths_sourc
     assert check.as_dict()["label"] == check.event_detail()["label"] == label
     note = lane_gate.NOTE_WITNESSED if label == lane_gate.WITNESSED else lane_gate.NOTE_SELF_ATTESTED
     assert check.as_dict()["notes"][0] == note
-    assert check.text_lines()[0] == f"aegis check --lane docs: PASSED ({label})"
+    assert render_lane(check.as_dict())[0] == f"aegis check --lane docs: PASSED ({label})"
 
 
 # ── Containment ──────────────────────────────────────────────────────────────
@@ -877,7 +878,7 @@ def test_an_event_that_cannot_be_written_is_a_warning(repo: Repo, monkeypatch):
     result = _gate(repo, paths=["docs/**"])
     assert result.passed
     assert result.warnings == ("event not recorded: disk full",)
-    assert "warning: event not recorded: disk full" in result.text_lines()
+    assert "warning: event not recorded: disk full" in render_lane(result.as_dict())
 
 
 def test_the_report_carries_the_envelope_and_every_record(repo: Repo):
@@ -925,7 +926,7 @@ def test_the_text_report_names_the_label_violations_and_findings(repo: Repo):
     repo.write("tests/test_app.py", TESTS.replace("def test_add", "def check_add"))
     repo.commit()
     result = _gate(repo, paths=["tests/**"])
-    text = "\n".join(result.text_lines())
+    text = "\n".join(render_lane(result.as_dict()))
     assert text.splitlines()[0] == "aegis check --lane docs: FAILED (self-attested)"
     assert "src/x.py" in text and "outside the allowed set" in text
     finding = result.findings[0]
@@ -939,7 +940,7 @@ def test_a_witnessed_pass_says_so(repo: Repo):
     repo.write("docs/guide.md", "lane\n")
     repo.commit()
     result = _gate(repo, base_policy=True)
-    lines = result.text_lines()
+    lines = render_lane(result.as_dict())
     assert lines[0] == "aegis check --lane docs: PASSED (witnessed: base policy)"
     assert lines[2] == f"  allowed paths from team.json at main {tip[:12]}: docs/**"
     assert lines[3] == f"  shared from team.json at main {tip[:12]}: CHANGELOG.md, README.md"
@@ -952,7 +953,7 @@ def test_the_text_report_line_by_line(repo: Repo):
     repo.write(".aegis/rules/x.md", "rule\n")
     head = repo.commit()
     result = _gate(repo, paths=["docs/**"])
-    lines = result.text_lines()
+    lines = render_lane(result.as_dict())
     assert lines[1] == (f"  range: {result.merge_base[:12]}..{head[:12]} (from the merge base of main and HEAD), "
                         "2 changed path(s)")
     assert lines[2] == "  allowed paths from --paths: docs/**"
