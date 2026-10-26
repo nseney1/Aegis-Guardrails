@@ -672,7 +672,7 @@ def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Pat
 
 
 def test_suite_level_junit_error_is_recorded_as_collection_error(tmp_path: Path):
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     junit_xml = tmp_path / "junit.xml"
     junit_xml.write_text(
@@ -684,7 +684,7 @@ def test_suite_level_junit_error_is_recorded_as_collection_error(tmp_path: Path)
         '</testsuites>\n',
         encoding="utf-8",
     )
-    passed, failed, col_errors = checkrun.parse_junit_cases(junit_xml)
+    passed, failed, col_errors = testexec.parse_junit_cases(junit_xml)
     assert passed == set()
     assert failed == set()
     assert "<suite:pytest-collect>" in col_errors

@@ -16,7 +16,7 @@ from aegis_cli.formatters.report import (
     github_annotation_lines,
     layer1_findings,
 )
-from aegis_core import checkrun, events
+from aegis_core import events, testexec
 from aegis_core.verification import coverage_check
 from aegis_core.verification.coverage_check import parse_changed_lines, run_diff_coverage
 from tests import helpers_humangate as hg
@@ -159,7 +159,7 @@ class TestReportOnlyCoverage:
         state = (repo.root / ".aegis" / "state").resolve()
         assert Path(rcfile).resolve().parent.parent == state
         assert Path(calls[0]["env"]["COVERAGE_FILE"]).resolve().parent.parent == state
-        assert calls[0]["timeout"] == checkrun.DEFAULT_TIMEOUT_S
+        assert calls[0]["timeout"] == testexec.DEFAULT_TIMEOUT_S
         assert [p.name for p in state.iterdir()] == [".gitignore"], "the scratch directory is removed"
 
     def test_a_missing_coverage_module_is_unverified_not_zero_percent(self, tmp_path, cov_env, monkeypatch):
@@ -307,13 +307,13 @@ class TestReportOnlyCoverage:
         res = run_diff_coverage(repo.root, "main", "HEAD")
         assert (res["status"], res["ratio"]) == ("reported", 0.5)
 
-    def test_checkrun_pytest_args(self):
-        assert checkrun.pytest_args(["pytest", "-x"]) == ["-x"]
-        assert checkrun.pytest_args(["py.test"]) == []
-        assert checkrun.pytest_args(["python3", "-m", "pytest", "-q"]) == ["-q"]
-        assert checkrun.pytest_args(["make", "test"]) is None
-        assert checkrun.pytest_args(["python", "-m", "unittest"]) is None
-        assert checkrun.pytest_args([]) is None
+    def test_testexec_pytest_args(self):
+        assert testexec.pytest_args(["pytest", "-x"]) == ["-x"]
+        assert testexec.pytest_args(["py.test"]) == []
+        assert testexec.pytest_args(["python3", "-m", "pytest", "-q"]) == ["-q"]
+        assert testexec.pytest_args(["make", "test"]) is None
+        assert testexec.pytest_args(["python", "-m", "unittest"]) is None
+        assert testexec.pytest_args([]) is None
 
 
 class TestSarifAndGitHubFormatters:

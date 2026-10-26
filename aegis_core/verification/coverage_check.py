@@ -19,7 +19,7 @@ import sys
 import tempfile
 from typing import Any, Optional
 
-from aegis_core import gitsafe, storage
+from aegis_core import gitsafe, storage, testexec
 from aegis_core.errors import PathTraversalError
 from aegis_core.verification.test_runner import run_external_cmd
 
@@ -124,10 +124,8 @@ def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: 
 
 def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
     """Measure the changed lines of ``base..head`` (see the module docstring)."""
-    from aegis_core import checkrun  # lazy: checkrun sits in the checkrun/regression/verification import cycle
-
     root = Path(root).resolve()
-    args = checkrun.pytest_args(checkrun.user_test_command(root) or list(checkrun.DEFAULT_COMMAND))
+    args = testexec.pytest_args(testexec.user_test_command(root) or list(testexec.DEFAULT_COMMAND))
     if args is None:
         return _result("unverified", "tests.command is not pytest-based")
     changed = changed_lines(root, base, head)
@@ -150,7 +148,7 @@ def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
             env["COVERAGE_CORE"] = "sysmon"
         coverage = [sys.executable, "-m", "coverage"]
         run = run_external_cmd([*coverage, "run", f"--rcfile={rcfile}", "-m", "pytest", *args, "-p", "no:cacheprovider",
-                                "-o", "addopts="], cwd=root, env=env, timeout=checkrun.DEFAULT_TIMEOUT_S)
+                                "-o", "addopts="], cwd=root, env=env, timeout=testexec.DEFAULT_TIMEOUT_S)
         if run.get("timed_out"):
             return _result("unverified", "the coverage run timed out")
         dump = run_external_cmd([*coverage, "json", f"--rcfile={rcfile}", "-o", str(report)], cwd=root, env=env,

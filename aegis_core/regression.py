@@ -21,7 +21,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core import checkrun, gitsafe, governance, human_gate, match
+from aegis_core import gitsafe, governance, human_gate, match, testexec
 from aegis_core.errors import AegisError
 from aegis_core.rules import workspace_root
 
@@ -315,7 +315,7 @@ def _resolve_commit_exemption(root: str, head_commit: str, base_commit: str, met
 
 def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: str, tests: Iterable[str],
                   timeout: float, progress: Callable[[str], None]) -> Optional[Tuple[Any, Any]]:
-    """(head run, base run) of ``checkrun.run_pytest_snapshot`` for the ``tests`` present at head, on the
+    """(head run, base run) of ``testexec.run_pytest_snapshot`` for the ``tests`` present at head, on the
     head and on the merge base with the head's copies of those tests overlaid; None when none is present."""
     head_tree = _tree_blobs(root, head_commit)
     present = sorted(p for p in set(tests) if p in head_tree)
@@ -332,7 +332,7 @@ def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: st
             gitsafe.export_tree(root, commit, scratch / f"{name}_snap", overlay=layer, timeout=_GIT_TIMEOUT_S)
             progress(f"T5 regression run {k} of 2: pytest on {label} {commit[:10]} ({len(present)} test file(s))")
             started = time.monotonic()
-            runs.append(checkrun.run_pytest_snapshot(scratch / f"{name}_snap", present, workspace, scratch / f"{name}_run",
+            runs.append(testexec.run_pytest_snapshot(scratch / f"{name}_snap", present, workspace, scratch / f"{name}_run",
                                                      timeout))
             outcome = "timed out" if runs[-1].timed_out else f"pytest exit {runs[-1].exit_code}"
             progress(f"T5 regression run {k} of 2: {outcome} after {time.monotonic() - started:.1f}s")

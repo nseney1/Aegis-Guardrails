@@ -322,19 +322,19 @@ def test_a_rejected_exemption_shows_its_code_and_approve_agrees_with_ci(
 
 
 def _fake_pytest_and_rerun(monkeypatch: pytest.MonkeyPatch) -> list:
-    from aegis_core import checkrun, gitsafe
+    from aegis_core import checkrun, gitsafe, testexec
 
     reruns: list = []
 
     def fake_pytest(snapshot, test_files, *_args, **_kwargs):
-        return checkrun._PytestOutcome(0, False, frozenset(), frozenset(), frozenset())
+        return testexec.PytestOutcome(0, False, frozenset(), frozenset(), frozenset())
 
     def fake_rerun(root, commit, base_ref, *, timeout=None):
         reruns.append(commit)
         tree = gitsafe.run(["rev-parse", f"{commit}^{{tree}}"], root).stdout.decode("ascii").strip()
         return {"tree": tree, "exit": 0}
 
-    monkeypatch.setattr(checkrun, "run_pytest_snapshot", fake_pytest)
+    monkeypatch.setattr(testexec, "run_pytest_snapshot", fake_pytest)
     monkeypatch.setattr(checkrun, "rerun_commit_snapshot", fake_rerun)
     return reruns
 

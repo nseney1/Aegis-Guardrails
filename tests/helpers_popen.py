@@ -1,5 +1,5 @@
 """A fake ``subprocess.Popen`` for code that spawns through Popen and kills the process group
-with ``aegis_core.checkrun.kill_group``: no process is started and nothing is signalled.
+with ``aegis_core.testexec.kill_group``: no process is started and nothing is signalled.
 
 ``install_fake_popen`` returns the spawn records, one dict per Popen call: ``args``, ``kwargs``,
 ``timeouts`` (each ``communicate`` timeout) and ``killed`` (kill_group calls on it).
@@ -9,7 +9,7 @@ from __future__ import annotations
 import subprocess
 from typing import Any, Dict, List, Optional
 
-from aegis_core import checkrun
+from aegis_core import testexec
 
 
 def install_fake_popen(monkeypatch, returncode: int = 0, stdout: str = "", stderr: str = "", hang: bool = False,
@@ -46,5 +46,5 @@ def install_fake_popen(monkeypatch, returncode: int = 0, stdout: str = "", stder
         proc.record["killed"] += 1
 
     monkeypatch.setattr(subprocess, "Popen", _FakePopen)
-    monkeypatch.setattr(checkrun, "kill_group", kill_group)
+    monkeypatch.setattr(testexec, "kill_group", kill_group)
     return spawns

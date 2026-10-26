@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from aegis_core import checkrun
+from aegis_core import testexec
 from aegis_core.ast.schema import MutationPoint, NormalizedAST
 from aegis_core.primitives import key_within, real_key
 from aegis_core.storage import atomic_write_text
@@ -437,7 +437,7 @@ def _check_tests(
     if rootdir is not None:
         cmd += [f"--rootdir={rootdir}", f"--confcutdir={rootdir}"]
     env_root = swap.workdir if swap is not None else tempfile.gettempdir()
-    env = checkrun.hermetic_env(env_root)
+    env = testexec.hermetic_env(env_root)
     py_bin_dir = os.path.dirname(sys.executable)
     if py_bin_dir:
         existing_path = env.get("PATH", "")
@@ -473,7 +473,7 @@ def _check_tests(
             stdout = out_str or ""
             stderr = err_str or ""
         except subprocess.TimeoutExpired:
-            checkrun.kill_group(proc)
+            testexec.kill_group(proc)
             try:
                 proc.communicate()
             except Exception:
@@ -481,7 +481,7 @@ def _check_tests(
             raise
         finally:
             if os.name != "nt" or getattr(proc, "poll", lambda: None)() is None:
-                checkrun.kill_group(proc)
+                testexec.kill_group(proc)
     except subprocess.TimeoutExpired:
         return TestRunResult(
             passed=False,
