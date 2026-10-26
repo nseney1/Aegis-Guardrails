@@ -335,8 +335,7 @@ _OVERFLOW = b'{"v": 1, "n": 1e999}'
 
 
 def test_every_strict_reader_refuses_an_overflowing_number_with_its_own_error(tmp_path):
-    from aegis_cli import doctor, install_hosts  # doctor first: doctor_repair is loaded through it
-    from aegis_cli import doctor_repair
+    from aegis_cli import doctor, doctor_base, install_hosts
     from aegis_core import baseline, packs, team
 
     assert doctor.SCHEMA
@@ -354,7 +353,7 @@ def test_every_strict_reader_refuses_an_overflowing_number_with_its_own_error(tm
     host.write_bytes(b'{"mcpServers": {}, "n": 1e999}')
     with pytest.raises(install_hosts.InstallError, match="cannot be written back as JSON"):
         install_hosts._load_json_object(host)
-    entry = doctor_repair._parse_json(doctor_repair._File(host, raw=host.read_bytes()))
+    entry = doctor_base._parse_json(doctor_base._File(host, raw=host.read_bytes()))
     assert entry.error == "is not valid JSON (1e999 is not allowed)" and entry.data is None
 
 

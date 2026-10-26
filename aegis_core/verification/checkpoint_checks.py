@@ -293,9 +293,11 @@ def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_
     if parent_name == "yaml_engine" or stem in ("document", "serializer"):
         candidates.append(test_dir / "test_yaml_engine_roundtrip.py")
         candidates.append(test_dir / "test_frontmatter_engine.py")
-    if stem in ("doctor_findings", "doctor_repair", "doctor_render"):
+    if stem in ("doctor_base", "doctor_findings", "doctor_repair", "doctor_render"):
         candidates.append(test_dir / "test_doctor.py")
         candidates.append(test_dir / "test_doctor_fix.py")
+    if stem == "commands_table":
+        candidates.append(test_dir / "test_cli_removed_commands.py")
     if stem == "init_views":
         candidates.append(test_dir / "test_init.py")
         candidates.append(test_dir / "test_init_card.py")

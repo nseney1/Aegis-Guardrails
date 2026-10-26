@@ -183,9 +183,10 @@ def _print_card(report: Report, root: Path) -> None:
     from aegis_cli import sanitize_display
 
     try:
+        from aegis_cli.formatters.text import render_card
         from aegis_core import card
 
-        lines = card.build(root).text_lines()
+        lines = render_card(card.build(root).as_dict())
     except Exception as exc:
         report.warn(f"the day-0 card could not be built: {type(exc).__name__}: {exc}")
         return

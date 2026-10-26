@@ -327,6 +327,7 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
     """`aegis check --lane`: the post-lane gate (aegis_core.lane_gate). 0 pass, 1 findings
     or a gate that could not run, 2 usage."""
     from aegis_cli import sanitize_display
+    from aegis_cli.formatters.text import render_lane
     from aegis_core import gitsafe, lane_gate, team
 
     use_json = _wants_json(args)
@@ -353,7 +354,7 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
     if use_json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
-        for line in result.text_lines():  # warnings included, as "warning: ..." lines
+        for line in render_lane(result.as_dict()):  # warnings included, as "warning: ..." lines
             print(sanitize_display(line, max_len=None))
     if not result.integrity_passed:
         _void_lane_tree(root, result.head)
@@ -576,6 +577,7 @@ def _print_lines(lines: list[str]) -> None:
 
 def _run_card(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
     """`aegis check --card`: the day-0 card (aegis_core.card). Read-only."""
+    from aegis_cli.formatters.text import render_card
     from aegis_core import card
 
     try:
@@ -585,13 +587,14 @@ def _run_card(args: argparse.Namespace, root: str, use_json: bool, source: str, 
     if use_json:
         print(json.dumps(built.as_dict(), indent=2))
     else:
-        _print_lines(built.text_lines())
+        _print_lines(render_card(built.as_dict()))
     return 0
 
 
 def _run_partition(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
     """`aegis check --partition --split ...`: the cross-lane edge report (aegis_core.partition).
     A report: exit 0 even when it finds edges."""
+    from aegis_cli.formatters.text import render_partition
     from aegis_core import partition
 
     try:
@@ -605,7 +608,7 @@ def _run_partition(args: argparse.Namespace, root: str, use_json: bool, source: 
     if use_json:
         print(json.dumps(report.as_dict(), indent=2))
     else:
-        _print_lines(report.text_lines())
+        _print_lines(render_partition(report.as_dict()))
     return 0
 
 
@@ -901,7 +904,7 @@ def run_verify(args: argparse.Namespace) -> int:
         # Advisory rule-trigger telemetry: it must never change the verdict.
         try:
             from aegis_core.outcomes.telemetry import record_verification_telemetry
-            record_verification_telemetry(
+            recorded = record_verification_telemetry(
                 workspace=repo_root,
                 target_files=target_files,
                 passed=passed,
@@ -909,6 +912,8 @@ def run_verify(args: argparse.Namespace) -> int:
                 layer1_evidence=results,
                 source="session",
             )
+            if recorded.error is not None:  # an exception with no message is still a failure
+                print(f"    ! failed to record ambient verification telemetry: {recorded.error}", file=sys.stderr)
         except Exception:
             pass
 

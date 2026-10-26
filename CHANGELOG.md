@@ -148,6 +148,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Test discovery applies Aegis-specific suite aliases only to exact top-level `aegis_cli`, `aegis_core`, `aegis_mcp` and `aegis_sdk` packages. Foreign, nested and legacy-named packages no longer borrow an unrelated Aegis suite; ordinary matching test filenames still work.
 - The full-mode call-graph check no longer rejects `aegis_cli/init.py` for its unused `_shipped_rules` forwarding wrapper.
 
+- Importing `aegis_cli.doctor_repair` (or any other doctor module) on its own no longer raises `ImportError`. The doctor modules share one leaf, `aegis_cli.doctor_base`, and none of them imports `aegis_cli.doctor`.
+
 ### Breaking (command line, JSON and MCP)
 
 - Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
@@ -222,6 +224,11 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis_core.baseline.fingerprint`, `aegis_core.baseline.normalize_text`, `aegis_core.baseline.occurrence_index` and `aegis_core.baseline.split_lines` move to `aegis_core.primitives`, with `LineIndex` (formerly the private `baseline._Lines`). Fingerprints are byte-identical, so existing `.aegis/baseline.json` files still match.
 - Breaking: the incidental re-exports `aegis_core.storage.STORAGE_INITIAL_DELAY_SECONDS` and `aegis_core.storage.STORAGE_MAX_RETRIES` are removed; import them from `aegis_core.taxonomy`. The atomic writes now live in the layer-0 module `aegis_core.atomicio`; `aegis_core.storage` still exports the same five functions.
 
+- Breaking: `aegis_cli.doctor.V3_SHIPPED_RULE_SHA256` is removed. The shipped v3 rule digests are private to `aegis_cli.doctor_base`, and a patch of the old name raises `AttributeError`.
+- Breaking: `aegis_cli.doctor.LEGACY_SERVER` and `aegis_cli.doctor.ListItem` move to `aegis_cli.doctor_base`. The incidental re-exports `aegis_cli.doctor.Mapping`, `aegis_cli.doctor.dataclass`, `aegis_cli.doctor.field`, `aegis_cli.doctor.only_skipped`, `aegis_cli.doctor.which`, `aegis_cli.doctor_findings.ListItem`, `aegis_cli.doctor_findings.TYPE_CHECKING`, `aegis_cli.doctor_findings.field`, `aegis_cli.doctor_render.Callable`, `aegis_cli.doctor_render.Sequence`, `aegis_cli.doctor_render.Tuple`, `aegis_cli.doctor_repair.ListItem`, `aegis_cli.doctor_repair.Mapping` and `aegis_cli.doctor_repair.TYPE_CHECKING` are removed. `REMOVED_COMMANDS` lives in `aegis_cli.commands_table`, and `aegis_cli.cli` still exports it.
+- Breaking: `aegis_core.card.Card.text_lines`, `aegis_core.partition.Report.text_lines`, `aegis_core.lane_gate.LaneCheck.text_lines`, `aegis_core.release_verify.ReleaseReport.text_lines` and `aegis_core.human_gate.TierReport.text_lines` are removed. Render a report's `as_dict()` with `aegis_cli.formatters.text` (`render_card`, `render_partition`, `render_lane`, `render_release`, `render_tier`); the command output is unchanged.
+- Breaking: `aegis_core.lifecycle.selection.run_rule_selection` and `aegis_core.lifecycle.selection.prune_rules` return the selection as a dict and print nothing; `aegis_core.lifecycle.selection.iter_rule_selection` yields it one rule at a time, as each archive finishes, so `aegis rule archive` still reports the rules it moved when a later archive fails; the incidental import `aegis_cli.rule.prune_rules` is removed (use `aegis_core.lifecycle.selection.prune_rules`). `aegis_core.outcomes.telemetry.record_verification_telemetry` returns a `Recorded` (truthy only when rows were written) and prints nothing; the CLI prints what they used to.
+
 ### Corrections
 
 - The 4.3.0 entry for the accountable Layer-2 arbiter advertised deterministic structural SHIP gaps, a vendor-family warning and 60-day prediction compaction. None of that code had a caller; 4.4.0 removes it, and the advisory above replaces the warning.
@@ -230,6 +237,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - The 4.3.3 entry on 100% MCP `inputSchema` property coverage still holds: every property keeps a description, now shorter.
 - The 4.3.0 entry said a rule carrying `applies_to` is served unscoped "until v4.4". Scoping by `applies_to` moved to v4.5 with the labels plan.
+
+- The 4.3.2 entry on the monolith modularization said the `aegis_cli.doctor` split preserved all public and compatibility re-exports. 4.4.0 removes the incidental ones and `V3_SHIPPED_RULE_SHA256` (listed under Breaking).
 
 ## [4.3.4] - 2026-10-20
 

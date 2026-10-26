@@ -33,12 +33,12 @@ Test body
     ledger.append(tmp_path, [{"rule": "test-cell", "outcome": "fp", "source": "ci", "key": f"k{n}"} for n in range(25)])
 
     # Run check mode (dry run)
-    rc = run_rule_selection(workspace=tmp_path, execute=False)
-    assert rc == 0
+    (row,) = run_rule_selection(workspace=tmp_path, execute=False)["candidates"]
+    assert (row["rule_id"], row["archive"]) == ("test-cell", None)
     assert (traps_dir / "test-cell.md").exists()
 
     # Run execute mode
-    rc = run_rule_selection(workspace=tmp_path, execute=True)
-    assert rc == 0
+    (row,) = run_rule_selection(workspace=tmp_path, execute=True)["candidates"]
+    assert row["archive"]["status"] == "archived"
     assert not (traps_dir / "test-cell.md").exists()
     assert (archive_dir / "test-cell.md").read_text(encoding="utf-8") == cell_content

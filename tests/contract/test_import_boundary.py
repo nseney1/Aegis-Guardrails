@@ -310,3 +310,36 @@ def test_the_checker_accepts(source, target):
 def test_the_checker_flags_third_party_imports():
     assert third_party_imports([Edge("aegis_core.rules", "yaml", "x.py:1")]) != []
     assert third_party_imports([Edge("aegis_core.rules", "json", "x.py:1")]) == []
+
+
+_FRESH_IMPORTS = r"""
+import importlib, json, sys
+sys.path.insert(0, sys.argv[1])
+failures = {}
+for name in sys.argv[2:]:
+    for key in [k for k in sys.modules if k.split(".")[0] in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")]:
+        del sys.modules[key]
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        failures[name] = f"{type(exc).__name__}: {exc}"
+sys.stdout.write(json.dumps(failures))
+"""
+
+
+def test_every_module_imports_without_a_sibling_imported_first(tmp_path):
+    """R-structure-26: Given a fresh interpreter per module, When each first-party module is imported on its own,
+    Then none raises (doctor_repair used to fail with ImportError unless doctor was imported first)."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    modules = sorted(m for m in _module_files() if not m.endswith(".__main__"))
+    assert "aegis_cli.doctor_repair" in modules
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")}
+    env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    proc = subprocess.run([sys.executable, "-I", "-c", _FRESH_IMPORTS, str(REPO), *modules], input=b"",
+                          capture_output=True, env=env, timeout=600)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    assert json.loads(proc.stdout.decode("utf-8")) == {}

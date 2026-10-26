@@ -40,7 +40,7 @@ def test_workspace(tmp_path: Path) -> Path:
 
 def test_record_verification_telemetry_appends_signals(test_workspace: Path):
     """record_verification_telemetry writes one row for each matched rule."""
-    from aegis_core.outcomes.telemetry import record_verification_telemetry
+    from aegis_core.outcomes.telemetry import Recorded, record_verification_telemetry
     from aegis_core.telemetry_engine import ledger
 
     _create_cell(test_workspace, "cell-math", ["math_*.py", "calc.py"])
@@ -55,7 +55,7 @@ def test_record_verification_telemetry_appends_signals(test_workspace: Path):
         source="session",
     )
 
-    assert recorded is True
+    assert recorded == Recorded(1)
     rows = ledger.read(test_workspace).rows
     assert [(r["rule"], r["outcome"], r["meta"]["passed"]) for r in rows] == [("cell-math", "trigger", True)]
     assert ledger.aggregate(test_workspace, "cell-math")["triggers"] == 1
@@ -64,7 +64,7 @@ def test_record_verification_telemetry_appends_signals(test_workspace: Path):
 
 def test_record_verification_telemetry_handles_failure(test_workspace: Path):
     """When verification fails, the row is still only a trigger: never an fp."""
-    from aegis_core.outcomes.telemetry import record_verification_telemetry
+    from aegis_core.outcomes.telemetry import Recorded, record_verification_telemetry
     from aegis_core.telemetry_engine import ledger
 
     _create_cell(test_workspace, "cell-auth", ["auth.py"])
@@ -77,7 +77,7 @@ def test_record_verification_telemetry_handles_failure(test_workspace: Path):
         source="session",
     )
 
-    assert recorded is True
+    assert recorded == Recorded(1)
     totals = ledger.aggregate(test_workspace, "cell-auth")
     assert totals["triggers"] == 1
     assert totals["fp"] == 0
