@@ -697,13 +697,14 @@ def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(t
 
 def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
     """Every Name and Attribute identifier used in the Python files under ``roots``, except
-    ``module_file`` itself and the nodes in ``skip``."""
+    ``module_file`` itself (a package's ``__init__.py``: the whole package) and the nodes in ``skip``."""
     import ast
 
+    inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
     seen = set()
     for root in roots:
         for path in root.rglob("*.py"):
-            if path.resolve() == module_file.resolve():
+            if path.resolve() == inside or inside in path.resolve().parents:
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
             skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
@@ -896,9 +897,9 @@ def test_rule_matching_flips_at_the_shared_path_threshold(tmp_path: Path, hb_hom
     row = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
     rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
     assert rule == "trap-no-yaml-load" and 0 < s < core_insights.RULE_MATCH_SIM
-    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM_WITH_PATH", s + 0.001)
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM_WITH_PATH", s + 0.001)
     assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
-    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM_WITH_PATH", s - 0.001)
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM_WITH_PATH", s - 0.001)
     assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
 
 
@@ -907,12 +908,12 @@ def test_rule_matching_flips_at_the_no_shared_path_threshold(tmp_path: Path, hb_
     repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
     row = add_insight(repo, _OVERLAP_TEXT, paths=["docs/x.md"], home=hb_home)
     assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
-    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", 0.0001)
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM", 0.0001)
     rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
     assert rule == "trap-no-yaml-load" and s > 0.0001
-    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", s + 0.001)
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM", s + 0.001)
     assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
-    monkeypatch.setattr(core_insights, "RULE_MATCH_SIM", s - 0.001)
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM", s - 0.001)
     assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
 
 
@@ -923,9 +924,9 @@ def test_recurrence_counts_an_insight_at_the_recurrence_threshold(tmp_path: Path
     _prompt(repo, hb_home, session="s-rec")
     (repo / "app.py").write_text("a = 2\n", encoding="utf-8")  # the hook's paths are the dirty set
     _prompt(repo, hb_home, "No, stop adding a scheduler loop around Popen in app.py", session="s-rec")
-    monkeypatch.setattr(core_insights, "RECURRENCE_SIM", 0.0001)
+    monkeypatch.setattr(core_insights.recurrence, "RECURRENCE_SIM", 0.0001)
     assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 1
-    monkeypatch.setattr(core_insights, "RECURRENCE_SIM", 1.01)
+    monkeypatch.setattr(core_insights.recurrence, "RECURRENCE_SIM", 1.01)
     assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 0
 
 
