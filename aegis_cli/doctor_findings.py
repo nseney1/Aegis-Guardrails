@@ -159,10 +159,7 @@ def _level(advisory: Optional[bool], floor: str, governed: bool, installed: Opti
     return "none"
 
 
-def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], floor: str) -> Dict[str, Any]:
-    from aegis_cli.install_hosts import launch_risk
-    from aegis_core.pathlookup import INSIDE_FENCE
-
+def _installation(spec: Any, ctx: _Ctx) -> Tuple[Optional[str], List[Any], List[str], Optional[str], Optional[bool]]:
     binary = next((found for found in (ctx.which(name) for name in spec.binaries) if found), None)
     passed = [] if binary else [hit for name in spec.binaries for hit in ctx.passed_over(name)]
     ignored = list(dict.fromkeys(hit.path for hit in passed))
@@ -170,14 +167,12 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
     app = None if binary else _base._app(spec, ctx)
     # Installed: True, False, or None when the only binary is one doctor will not run.
     installed: Optional[bool] = True if binary or app else (None if passed else False)
-    reg = ctx.probe(spec, binary)
-    identity = _identity(spec, reg)
-    reasons: List[Dict[str, str]] = []
-    unknown: List[str] = []
+    return binary, passed, ignored, app, installed
 
-    def add(code: str, message: str) -> None:
-        reasons.append({"code": code, "message": _base._clean(message, 1024)})
 
+def _binary_reasons(spec: Any, binary: Optional[str], passed: List[Any], app: Optional[str],
+                    add: Callable[[str, str], None], unknown: List[str]) -> None:
+    from aegis_core.pathlookup import INSIDE_FENCE
     names = " or ".join(f"`{b}`" for b in spec.binaries) or "a binary"
     if passed and not app:
         unknown.append("binary")
@@ -193,6 +188,11 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
                                        "host is installed")
     if binary is None and not passed and not app:
         add("missing_binary", f"no {names} on PATH")
+
+
+def _registration_reasons(spec: Any, reg: Dict[str, Any], identity: Dict[str, Any], installed: Optional[bool],
+                          add: Callable[[str, str], None], unknown: List[str]) -> None:
+    from aegis_cli.install_hosts import launch_risk
     status = reg["status"]
     if status == "absent":
         add("not_registered", f"aegis is not registered with {spec.display_name}: run aegis init --host {spec.id}")
@@ -230,6 +230,9 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
         elif identity["status"] == "unknown":
             unknown.append("identity")
 
+
+def _policy_reasons(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], add: Callable[[str, str], None],
+                    unknown: List[str]) -> Tuple[Dict[str, Any], Optional[bool], bool, Optional[bool]]:
     budget = _budget(spec, info)
     reaches = _bootstrap_reaches(spec, info)
     # The host keeps too little of its instruction file for the bootstrap to arrive whole.
@@ -273,8 +276,10 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
             add("workspace_registry_unknown", f"{spec.display_name} sends no workspace and "
                                               "~/.aegis/workspaces.json cannot be read, so doctor cannot tell "
                                               "whether aegis finds this repository")
+    return budget, reaches, cut, workspace_registered
 
-    codes = {r["code"] for r in reasons}
+
+def _state_from_codes(codes: set) -> str:
     if codes & {"missing_binary", "binary_in_workspace", "binary_on_relative_path"}:
         state = "missing_binary"
     elif codes & {"not_registered", "command_missing"}:
@@ -286,6 +291,23 @@ def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], f
         state = "policy_gap"
     else:
         state = "ok"
+    return state
+
+
+def _host_row(spec: Any, ctx: _Ctx, info: _Instructions, roots: Optional[set], floor: str) -> Dict[str, Any]:
+    binary, passed, ignored, app, installed = _installation(spec, ctx)
+    reg = ctx.probe(spec, binary)
+    identity = _identity(spec, reg)
+    reasons: List[Dict[str, str]] = []
+    unknown: List[str] = []
+
+    def add(code: str, message: str) -> None:
+        reasons.append({"code": code, "message": _base._clean(message, 1024)})
+
+    _binary_reasons(spec, binary, passed, app, add, unknown)
+    _registration_reasons(spec, reg, identity, installed, add, unknown)
+    budget, reaches, cut, workspace_registered = _policy_reasons(spec, ctx, info, roots, add, unknown)
+    state = _state_from_codes({r["code"] for r in reasons})
 
     advisory = _advisory(spec, ctx, installed, reg, False if cut else reaches, workspace_registered)
     level = _level(advisory, floor, ctx.governed, installed)
