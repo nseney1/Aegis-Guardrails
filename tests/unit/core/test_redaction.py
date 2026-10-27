@@ -144,6 +144,15 @@ def test_a_second_pass_changes_nothing(rule_id: str):
         assert redact(once) == once
 
 
+def test_redaction_truncation_never_leaves_partial_redacted_tag():
+    prefix = "A" * 292
+    secret = "".join(["ghp_", "1234567890abcdefghijklmnopqrstuvwxyzABCD"])
+    out = redact_insight_text(f"{prefix} {secret}", max_len=300)
+    assert len(out) <= 300
+    assert "".join(["gh", "p_"]) not in out
+    assert not out.endswith("[REDACTED")
+
+
 def test_a_line_with_two_secrets_loses_both():
     samples = _samples()
     line = f"deploy --a {samples['github-pat']} --b {samples['aws-access-key-id']} --next"

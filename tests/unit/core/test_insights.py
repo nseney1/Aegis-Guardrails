@@ -81,15 +81,6 @@ def test_session_hs_rejects_invalid_inputs(tmp_path: Path):
     assert session_hs("claude-code", "valid-id", b"short") is None
 
 
-def test_redaction_truncation_never_leaves_partial_redacted_tag():
-    prefix = "A" * 292
-    secret = "".join(["ghp_", "1234567890abcdefghijklmnopqrstuvwxyzABCD"])
-    out = redact_insight_text(f"{prefix} {secret}", max_len=300)
-    assert len(out) <= 300
-    assert "".join(["gh", "p_"]) not in out
-    assert not out.endswith("[REDACTED")
-
-
 def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
     home.mkdir()
