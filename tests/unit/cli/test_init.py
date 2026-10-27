@@ -1461,6 +1461,21 @@ class TestRunInitPins:
         assert captured.err == err
         assert _snapshot(project, home) == before
 
+    def test_a_check_pass_refusal_prints_the_header_then_its_errors_and_writes_nothing(self, project, capsys):
+        """Review w15b F1: Given a hand-edited Aegis block in AGENTS.md, When init runs in text mode, Then the
+        setup header prints before the check pass refuses, the refusal goes to stderr, and nothing is written."""
+        agents = project / "AGENTS.md"
+        agents.write_bytes(b"<!-- aegis:begin id=bootstrap v=1 sha=000000000000 -->\nmine\n<!-- aegis:end id=bootstrap -->\n")
+        home = Path.home()
+        before = _snapshot(project, home)
+        assert run_init(_args(project)) == 1
+        captured = capsys.readouterr()
+        assert _scrub(captured.out, (project, "<WS>")) == HEADER
+        assert _scrub(captured.err, (agents, "<AGENTS.md>"), (project, "<WS>")) == (
+            "  ❌ <AGENTS.md>: the Aegis block 'bootstrap' was edited by hand; left unchanged. Move your text "
+            "outside the block, or re-run with --force to replace it.\n  ❌ Nothing was written.\n")
+        assert _snapshot(project, home) == before
+
     def test_a_failed_registration_is_one_json_document_with_status_failed(self, project, capsys, failing_codex,
                                                                            finish_calls):
         from aegis_cli.install_hosts import display_command
