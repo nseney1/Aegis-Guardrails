@@ -11,7 +11,7 @@ expiry_days: 60
 created: "2026-10-15T16:18:02Z"
 impact_weight: 1.0
 tags: ["dogfood", "process", "tdd"]
-target_paths: ["aegis_core/outcomes/**", "aegis_core/lifecycle/**", "aegis_core/fitness.py", "aegis_core/rules.py", "aegis_core/match.py", "aegis_core/scan.py", "aegis_core/sync.py", "aegis_core/verification/**", "aegis_cli/hooks/**"]
+target_paths: ["aegis_core/outcomes/**", "aegis_core/lifecycle/**", "aegis_core/fitness.py", "aegis_core/rules.py", "aegis_core/match.py", "aegis_core/scan.py", "aegis_core/sync.py", "aegis_core/verification/**", "aegis_core/redaction.py", "aegis_cli/hooks/**"]
 lineage:
   parent_id: null
   created_by: "manual"

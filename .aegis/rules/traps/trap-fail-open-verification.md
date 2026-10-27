@@ -8,6 +8,7 @@ prediction: "Will fire when a verification function returns an empty list, True,
 falsification: 0 findings in 10 sessions → prune
 target_paths:
   - "aegis_core/verification/*.py"
+  - aegis_core/redaction.py
   - aegis_cli/verify.py
   - aegis_cli/checkpoint.py
   - "aegis_core/ast/**"
