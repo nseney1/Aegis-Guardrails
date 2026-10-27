@@ -552,7 +552,8 @@ def ledger_locked(workspace: Any, timeout: Optional[float] = None) -> Iterator[L
 
 
 @contextmanager
-def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[Path]:
+def _hold(lock_path: Path, key: str, timeout: float, shared: bool, *, ordered: bool = True,
+          mode: Optional[int] = None) -> Iterator[Path]:
     """Hold the lock file ``lock_path`` (``key``: its one spelling) for the block:
     re-entrant per thread, a thread lock then the OS lock, bounded by ``timeout``.
 
@@ -562,7 +563,9 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
     it for longer than ``timeout`` seconds.
 
     ``shared`` marks a shared lock, which is a leaf: taking the workspace lock or another
-    shared lock while this thread holds one raises LockOrderError before waiting.
+    shared lock while this thread holds one raises LockOrderError before waiting. With
+    ``ordered`` False (``file_lock``) the lock takes no part in that order: it is never
+    refused for the leaves held and never becomes one. ``mode`` is forced on the lock file.
     """
     held = _held()
     if key in held:
@@ -572,7 +575,7 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
         return
 
     leaves = _held_leaves()
-    if leaves:
+    if ordered and leaves:
         holding = next(iter(leaves.values()))
         if shared:
             raise LockOrderError(
@@ -583,13 +586,13 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
         )
 
     deadline = time.monotonic() + max(0.0, timeout)
-    kind = "shared" if shared else "workspace"
+    kind = "file" if not ordered else "shared" if shared else "workspace"
     thread_lock = _thread_lock(key)
     if not thread_lock.acquire(timeout=max(0.0, timeout)):
         raise _timeout_error(lock_path, timeout, kind)
     fd = None
     try:
-        fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT)
+        fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT, mode=mode)
         interval = LOCK_RETRY_INTERVAL_SECONDS
         while not _try_os_lock(fd):
             if time.monotonic() >= deadline:
@@ -597,7 +600,7 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
             time.sleep(interval)
             interval = min(interval * 1.5, LOCK_MAX_BACKOFF_SECONDS)
         held.add(key)
-        if shared:
+        if shared and ordered:
             leaves[key] = lock_path
         try:
             yield lock_path
@@ -637,43 +640,17 @@ def locked(workspace: Any, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[Pa
 def file_lock(lock_path: Path, timeout: float = 5.0) -> Iterator[None]:
     """Hold an arbitrary lock file ``lock_path`` (e.g. a user-scope ``.lock`` file).
 
-    Re-entrant per thread, bounded by ``timeout`` seconds, using the same thread lock
-    and OS lock primitives as ``locked`` without participating in workspace/shared lock
-    ordering.
+    Re-entrant per thread, bounded by ``timeout`` seconds: ``locked``'s primitive
+    (``_hold``) on its own key and a 0o600 lock file, without participating in
+    workspace/shared lock ordering.
     """
     target = Path(os.fspath(lock_path))
     if target.parent.is_symlink():
         raise _link_error(target.parent)
     target.parent.mkdir(parents=True, exist_ok=True)
     key = f"file:{os.path.normcase(real_path(target))}"
-    held = _held()
-    if key in held:
+    with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
         yield
-        return
-
-    deadline = time.monotonic() + max(0.0, timeout)
-    thread_lock = _thread_lock(key)
-    if not thread_lock.acquire(timeout=max(0.0, timeout)):
-        raise _timeout_error(target, timeout, "file")
-    fd = None
-    try:
-        fd = _open_regular(target, os.O_RDWR | os.O_CREAT, mode=_PRIVATE_FILE_MODE)
-        interval = LOCK_RETRY_INTERVAL_SECONDS
-        while not _try_os_lock(fd):
-            if time.monotonic() >= deadline:
-                raise _timeout_error(target, timeout, "file")
-            time.sleep(interval)
-            interval = min(interval * 1.5, LOCK_MAX_BACKOFF_SECONDS)
-        held.add(key)
-        try:
-            yield
-        finally:
-            held.discard(key)
-            _os_unlock(fd)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        thread_lock.release()
 
 
 # ── JSONL ─────────────────────────────────────────────────────────────────────

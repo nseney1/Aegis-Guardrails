@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from aegis_core import redaction
 from aegis_core.verification import scanners
 
 
@@ -464,14 +465,14 @@ class TestKeyValueRedaction:
         ids=["eq", "colon", "quoted", "json", "prose", "export", "short"],
     )
     def test_short_key_value_secret_is_redacted(self, text: str, secret: str, context: str) -> None:
-        out = scanners.redact_insight_text(text, max_len=300)
+        out = redaction.redact_insight_text(text, max_len=300)
         assert secret not in out
         assert "[REDACTED]" in out
         assert context in out
-        assert scanners.redact_insight_text(out, max_len=300) == out
+        assert redaction.redact_insight_text(out, max_len=300) == out
 
     def test_value_under_four_characters_is_kept_by_design(self) -> None:
-        assert scanners.redact_insight_text("pwd=abc", max_len=300) == "pwd=abc"
+        assert redaction.redact_insight_text("pwd=abc", max_len=300) == "pwd=abc"
 
     @pytest.mark.parametrize("text, secret", [
         (_tok("authorization: ", "Basic dXNlcjpwYXNz"), "dXNlcjpwYXNz"),
@@ -479,13 +480,13 @@ class TestKeyValueRedaction:
         (_tok("auth", "=abcd1234"), "abcd1234"),
     ], ids=["basic", "proxy-basic", "auth"])
     def test_authorization_credentials_are_redacted(self, text: str, secret: str) -> None:
-        out = scanners.redact_insight_text(text, max_len=300)
+        out = redaction.redact_insight_text(text, max_len=300)
         assert secret not in out and "[REDACTED]" in out
-        assert scanners.redact_insight_text(out, max_len=300) == out
+        assert redaction.redact_insight_text(out, max_len=300) == out
 
     @pytest.mark.parametrize("text", ["the author: John Smith wrote this", "authorization: Basic"])
     def test_authorship_and_a_bare_scheme_are_left_alone(self, text: str) -> None:
-        assert scanners.redact_insight_text(text, max_len=300) == text
+        assert redaction.redact_insight_text(text, max_len=300) == text
 
 
 class TestSarifIngest:
