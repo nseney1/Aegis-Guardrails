@@ -118,6 +118,19 @@ def test_publish_caller_grants_what_the_reusable_build_needs():
     assert perms.get("id-token") == "write" and perms.get("attestations") == "write"
 
 
+def test_publish_caller_can_grant_every_reusable_validation_job_permission():
+    """GitHub rejects a callee requesting more than its caller grants."""
+    workflow = _load("validate.yml")
+    caller = _load("publish.yml")["jobs"]["validate"]["permissions"]
+    levels = {"none": 0, "read": 1, "write": 2}
+    missing = []
+    for name, job in workflow["jobs"].items():
+        for permission, access in job.get("permissions", workflow["permissions"]).items():
+            if levels[caller.get(permission, "none")] < levels[access]:
+                missing.append(f"{name}: {permission}: {access}")
+    assert missing == [], f"publish.yml cannot grant validate.yml: {missing}"
+
+
 def test_publish_uses_trusted_publishing_without_long_lived_tokens():
     publish = _load("publish.yml")["jobs"]["publish"]
     env = publish.get("environment")

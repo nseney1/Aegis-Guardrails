@@ -125,6 +125,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Fixed
 
+- The release publisher grants every permission used by reusable validation, including read-only pull-request access, so release-event validation can start.
+
 - Documentation separates deterministic checks, optional test receipts and CI-confirmed rule credit, including empty-rule scans and unsupported unittest/mixed-suite summaries. Contributor setup and approval guidance now cover isolated tests and governance changes; SECURITY distinguishes the tree-identity git runner from `gitsafe`.
 
 - Structural contract checks now reject import cycles, adapter names in core import strings, growth in pinned module/function sizes and private coupling, duplicate primitive helpers, and unreviewed process or executable-lookup sites. Their update commands only lower existing pins; git and gh execution stays within the reviewed transport modules.
