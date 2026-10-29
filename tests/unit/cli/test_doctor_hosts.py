@@ -2169,6 +2169,11 @@ def _pinned(row: Dict[str, Any]) -> Dict[str, Any]:
             "enforcement_level": row["enforcement_level"], "hooks": row["hooks"]["status"]}
 
 
+# On Windows, registrar.unavailable_reason rules out Antigravity hooks, and Codex hooks for any drive-letter
+# aegis path (outside AEGIS_PATH_CHARSET), so those rows say "unavailable" where POSIX says "absent".
+_NO_HOOKS_ON_WINDOWS = ("codex-cli", "antigravity")
+
+
 def _assert_pinned(payload: Dict[str, Any], direct: Dict[str, Dict[str, Any]], expected: Dict[str, Any]) -> None:
     shown = [key for key in ROW_KEYS if key != "advisory"]  # doctor --json leaves advisory out
     assert [row["id"] for row in payload["hosts"]] == list(expected)
@@ -2179,7 +2184,10 @@ def _assert_pinned(payload: Dict[str, Any], direct: Dict[str, Dict[str, Any]], e
         assert (own["trust_tier"], own["trust_tier_status"]) == (None, "unavailable")
         assert {k: v for k, v in row.items() if not k.startswith("trust_tier")} == {
             k: v for k, v in own.items() if k != "advisory" and not k.startswith("trust_tier")}
-        assert _pinned(own) == expected[row["id"]], row["id"]
+        want = expected[row["id"]]
+        if os.name == "nt" and row["id"] in _NO_HOOKS_ON_WINDOWS:
+            want = dict(want, hooks="unavailable")
+        assert _pinned(own) == want, row["id"]
 
 
 class TestHostRowPins:
