@@ -147,7 +147,7 @@ def _capture(ws: Path, quote: str, session=None, **extra):
 
 def test_the_session_cap_refuses_the_next_capture_and_writes_nothing(bounded, monkeypatch):
     ws, home = bounded
-    monkeypatch.setattr(insights_mod, "MAX_CAPTURES_PER_SESSION", 3)
+    monkeypatch.setattr(insights_mod.capture, "MAX_CAPTURES_PER_SESSION", 3)
     for i in range(3):
         assert _capture(ws, f"prefer explicit names {i}", "s1", paths=["src/service.py"])["status"] == "OK"
     refused = _capture(ws, "prefer explicit names 3", "s1", paths=["src/service.py"])
@@ -159,7 +159,7 @@ def test_the_session_cap_refuses_the_next_capture_and_writes_nothing(bounded, mo
 
 def test_hook_prompts_never_consume_the_session_cap(bounded, monkeypatch):
     ws, home = bounded
-    monkeypatch.setattr(insights_mod, "MAX_CAPTURES_PER_SESSION", 3)
+    monkeypatch.setattr(insights_mod.capture, "MAX_CAPTURES_PER_SESSION", 3)
     for i in range(5):
         record_hook_prompt("claude-code", {"prompt": f"No, stop doing thing {i} again", "session_id": "s1",
                                            "cwd": str(ws)}, workspace=ws, home=home)

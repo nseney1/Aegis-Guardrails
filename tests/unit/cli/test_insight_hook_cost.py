@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from aegis_core import insights as core_insights, rules as core_rules
+from aegis_core import rules as core_rules
 from aegis_core.insights import read_insight_rows, record_hook_prompt
 
 REPO = Path(__file__).resolve().parents[3]
@@ -94,9 +94,8 @@ def parses(monkeypatch: pytest.MonkeyPatch) -> list:
         calls.append(args)
         return real(*args, **kwargs)
 
+    # Every insights submodule imports load_rules from aegis_core.rules when it calls it.
     monkeypatch.setattr(core_rules, "load_rules", counting)
-    # Also the name insights may have bound at import, so the spy sees every parse either way.
-    monkeypatch.setattr(core_insights, "load_rules", counting, raising=False)
     return calls
 
 

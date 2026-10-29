@@ -9,7 +9,7 @@ from typing import List, Tuple
 import pytest
 
 from aegis_core.insights import read_insight_rows, record_hook_prompt
-from aegis_core.verification.scanners import redact_insight_text
+from aegis_core.redaction import redact_insight_text
 
 
 @pytest.mark.timing

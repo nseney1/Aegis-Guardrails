@@ -1,7 +1,7 @@
 """Every redactor scrubs every format the Tier A detector blocks, in linear time (R-checks-26).
 
 Three entry points persist or echo text: the hook log (aegis_cli.hooks.redaction.redact_secrets,
-scanners.redact_command_secrets) and stored insights (scanners.redact_insight_text). Secrets
+aegis_core.redaction.redact_command_secrets) and stored insights (aegis_core.redaction.redact_insight_text). Secrets
 are assembled at runtime so push protection never sees a literal.
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import pytest
 
 from aegis_cli.hooks import redaction
 from aegis_cli.hooks.safety import log_gate_event
+from aegis_core import redaction as core_redaction
 from aegis_core.verification import scanners
 
 
@@ -61,8 +62,8 @@ CASE_IDS = [c[0] for c in CASES]
 
 REDACTORS: Dict[str, Callable[[str], str]] = {
     "hook": redaction.redact_secrets,
-    "command": scanners.redact_command_secrets,
-    "insight": lambda text: scanners.redact_insight_text(text, max_len=4000),
+    "command": core_redaction.redact_command_secrets,
+    "insight": lambda text: core_redaction.redact_insight_text(text, max_len=4000),
 }
 
 
@@ -124,7 +125,7 @@ def test_prose_password_is_redacted(redactor):
 def test_hook_log_keeps_paths_and_addresses():
     text = "scp /home/nick/build.tar nick@10.0.0.7:/srv"
     assert redaction.redact_secrets(text) == text
-    assert scanners.redact_command_secrets(text) == text
+    assert core_redaction.redact_command_secrets(text) == text
 
 
 @pytest.mark.parametrize("redactor", list(REDACTORS))
