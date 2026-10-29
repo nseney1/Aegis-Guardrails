@@ -107,6 +107,39 @@ def test_an_unterminated_pem_loses_its_body_and_untrusted_suffix(redactor, tail)
     assert REDACTORS[redactor](out) == out
 
 
+PEM_LABEL_PAIRS = [
+    ("RSA PRIVATE KEY", "EC PRIVATE KEY"),
+    ("PRIVATE KEY", "RSA PRIVATE KEY"),
+    ("OPENSSH PRIVATE KEY", "PRIVATE KEY"),
+    ("RSA PRIVATE KEY BLOCK", "RSA PRIVATE KEY"),
+]
+
+
+@pytest.mark.parametrize("redactor", list(REDACTORS))
+@pytest.mark.parametrize("label,wrong_label", PEM_LABEL_PAIRS)
+@pytest.mark.parametrize("closed", [False, True], ids=["no-matching-end", "later-matching-end"])
+def test_a_pem_ends_only_at_its_own_label(redactor, label, wrong_label, closed):
+    text = _tok("deploy -----BEGIN ", label, "-----\nkeybody01\n-----END ", wrong_label,
+                "-----\nremainingkeymaterial")
+    text += f"\n-----END {label}----- --next" if closed else " --next"
+    expected = "deploy [REDACTED_PEM]" + (" --next" if closed else "")
+    out = REDACTORS[redactor](text)
+    assert out == expected
+    assert REDACTORS[redactor](out) == out
+
+
+@pytest.mark.parametrize("label,wrong_label", PEM_LABEL_PAIRS)
+def test_a_gate_log_never_persists_key_material_after_a_mismatched_end(tmp_path, label, wrong_label):
+    (tmp_path / ".aegis").mkdir()
+    command = _tok("deploy -----BEGIN ", label, "-----\nkeybody01\n-----END ", wrong_label,
+                   "-----\nremainingkeymaterial --next")
+    log_gate_event(command, "ALLOWED", "", tmp_path)
+    row, = [json.loads(line) for line in (tmp_path / ".aegis/state/gate_events.jsonl")
+            .read_text(encoding="utf-8").splitlines()]
+    assert row["command"] == "deploy [REDACTED_PEM]"
+    assert row["decision"] == "ALLOWED"
+
+
 @pytest.mark.parametrize("redactor", ["hook", "command"])
 @pytest.mark.parametrize("closed", [False, True], ids=["unterminated", "complete"])
 @pytest.mark.parametrize("body", ["keybody01" * 2500, "-----BEGIN PRIVATE KEY-----\nkeybody01\n" * 100],
@@ -195,6 +228,7 @@ def _fill(unit: str, n: int) -> str:
 HOSTILE: Dict[str, Callable[[int], str]] = {
     "pem-repeat": lambda n: _fill("-----BEGIN PRIVATE KEY-----", n),
     "pem-unterminated": lambda n: "-----BEGIN PRIVATE KEY-----\n" * 20 + "a" * n,
+    "pem-mismatched-end": lambda n: "-----BEGIN RSA PRIVATE KEY-----\n" + _fill("-----END EC PRIVATE KEY-----\n", n),
     "token-eq": lambda n: _fill("token=", n),
     "url-userinfo": lambda n: _fill("http://a:", n),
     "bearer": lambda n: _fill("Bearer ", n),

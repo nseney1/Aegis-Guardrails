@@ -30,7 +30,7 @@ MAX_LINE_LENGTH = 4096
 MAX_EXCERPT_CHARS = 300
 
 _NB = r"(?<![A-Za-z0-9])"
-_PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
+_PEM_HEAD = r"-----BEGIN (?P<pem_label>(?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?)-----"
 _PEM_TAIL = r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
 _KEYS = ("(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|credential|"
          "authorization|auth(?![A-Za-z]))")
@@ -39,9 +39,9 @@ _SCHEMES = "(?:basic|digest|token|negotiate)"
 # into the tuple "(4,)". Token quantifiers are bounded; PEM consumes once to its END or EOF.
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
     (re.compile(pattern), hook, text) for pattern, hook, text in (
-        # A missing or malformed END leaves the entire suffix untrusted. EOF always matches,
+        # Only the BEGIN label's own END closes a key; otherwise the suffix stays untrusted. EOF matches,
         # so repeated BEGIN markers cannot retry scans over the same unterminated body.
-        (_PEM_HEAD + r"[\s\S]*?(?:" + _PEM_TAIL + r"|\Z)", "[REDACTED_PEM]", "[REDACTED_PEM]"),
+        (_PEM_HEAD + r"[\s\S]*?(?:-----END (?P=pem_label)-----|\Z)", "[REDACTED_PEM]", "[REDACTED_PEM]"),
         # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
         ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
          r"\1[REDACTED]@"),
