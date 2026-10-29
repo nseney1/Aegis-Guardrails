@@ -25,15 +25,18 @@ class TestInvariant2_SymbolAuthority:
     """Invariant 2: All symbols declared in __all__ across core modules must be resolvable."""
 
     def test_all_symbols_resolvable(self):
-        core_dir = REPO_ROOT / "aegis_core" if (REPO_ROOT / "aegis_core").exists() else REPO_ROOT / "aegis_core"
-        pkg = "aegis_core" if (REPO_ROOT / "aegis_core").exists() else "soma_core"
-        python_files = [f for f in core_dir.glob("*.py") if f.name != "__init__.py"]
+        core_dir = REPO_ROOT / "aegis_core"
+        python_files = sorted(p for p in core_dir.rglob("*.py") if p.name != "__main__.py")
 
         missing_symbols = []
         for py_file in python_files:
-            module_name = f"{pkg}.{py_file.stem}"
+            parts = list(py_file.relative_to(REPO_ROOT).with_suffix("").parts)
+            if parts[-1] == "__init__":
+                parts.pop()
+            module_name = ".".join(parts)
             mod = importlib.import_module(module_name)
-            assert hasattr(mod, "__all__"), f"{module_name} lacks __all__ declaration"
+            if py_file.parent == core_dir and py_file.name != "__init__.py":
+                assert hasattr(mod, "__all__"), f"{module_name} lacks __all__ declaration"
             exported = getattr(mod, "__all__", [])
             for sym in exported:
                 if not hasattr(mod, sym):
@@ -64,3 +67,10 @@ class TestInvariant3_FailClosedConfinement:
     def test_confine_path_fails_closed(self, tmp_path, bad_path):
         with pytest.raises(ValueError):
             confine_path(bad_path, str(tmp_path))
+
+
+def test_symbol_authority_includes_package_exports(monkeypatch):
+    from aegis_core import command_safety
+    monkeypatch.setattr(command_safety, "__all__", ["missing_export"])
+    with pytest.raises(AssertionError, match="aegis_core.command_safety.*missing_export"):
+        TestInvariant2_SymbolAuthority().test_all_symbols_resolvable()

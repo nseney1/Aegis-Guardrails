@@ -117,6 +117,10 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 ### Fixed
 
+- Structural contract checks now reject import cycles, adapter names in core import strings, growth in pinned module/function sizes and private coupling, duplicate primitive helpers, and unreviewed process or executable-lookup sites. Their update commands only lower existing pins; git and gh execution stays within the reviewed transport modules.
+- Python source decoding lives in a shared leaf, removing the schema/driver import cycle without changing decoding. The SDK uses the public `get_changed_files` helper, and duplicate generic helpers have purpose-specific names.
+- CLI parser configuration runs once. An internal `TypeError` now propagates instead of triggering a retry, while hook and skills subcommands retain their common flags.
+
 - A warm scan in a git repository starts 3 git processes (was 9, and 13 for an MCP scan); the first scan starts 4, and a scan outside git starts 1 (was 7).
 - A scan reads the ledger once (was 3 times); an MCP scan reads it at most twice on a session's first scan and once afterwards (was 4); `aegis status` reads it once (was 5).
 - A branch that keeps editing a rule no longer re-lists, re-reads and re-parses the BASE rules on every scan.

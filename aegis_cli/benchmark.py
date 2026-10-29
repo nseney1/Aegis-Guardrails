@@ -49,7 +49,7 @@ def _runs(value: str) -> int:
     return runs
 
 
-def _envelope(root: Any, runs: int) -> Dict[str, Any]:
+def _benchmark_payload(root: Any, runs: int) -> Dict[str, Any]:
     return primitives.envelope("aegis benchmark", {"workspace": str(root), "runs": runs, "corpus": CORPUS_LABEL})
 
 
@@ -82,7 +82,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         result = benchmark.run_benchmark(runs)
     except benchmark.BenchmarkError as exc:
         if use_json:
-            print(json.dumps({**_envelope(root, runs), "status": "error", "error": str(exc)}, indent=2))
+            print(json.dumps({**_benchmark_payload(root, runs), "status": "error", "error": str(exc)}, indent=2))
         else:
             print(f"Error: {sanitize_display(exc, max_len=None)}", file=sys.stderr)
         return EXIT_FAILED
@@ -95,7 +95,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     if error is not None:
         warnings.append(f"the benchmark event could not be recorded ({type(error).__name__}: {error})")
     if use_json:
-        doc = _envelope(root, runs)
+        doc = _benchmark_payload(root, runs)
         doc.update({"status": "ok", "notice": benchmark.NOTICE, "measures": MEASURES, "not_measured": NOT_MEASURED,
                     "recorded": not warnings, "warnings": warnings})
         doc.update({key: result[key] for key in ("runs", "python", "platform", "corpus", "scan", "hook_run", "layer1")})

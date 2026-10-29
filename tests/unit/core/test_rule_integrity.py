@@ -279,14 +279,14 @@ def test_content_that_does_not_hash_to_its_object_id_is_refused(tmp_path, monkey
 
     monkeypatch.setattr(gitsafe, "run", forged)
     with pytest.raises(IntegrityError, match="does not match the object id"):
-        rule_integrity._read_blobs(str(repo.root), [oid])
+        rule_integrity._read_integrity_blobs(str(repo.root), [oid])
 
 
 @needs_git
 def test_a_missing_object_is_an_error_not_an_empty_rule(tmp_path):
     repo = make_repo(tmp_path)
     with pytest.raises(IntegrityError, match="cannot read object"):
-        rule_integrity._read_blobs(str(repo.root), ["0" * 40])
+        rule_integrity._read_integrity_blobs(str(repo.root), ["0" * 40])
 
 
 @needs_git

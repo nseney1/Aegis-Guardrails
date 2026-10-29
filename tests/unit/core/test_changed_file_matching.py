@@ -1,6 +1,6 @@
 """Rules match the files git reports as changed (the SDK `Governance.scan` path).
 
-`_get_changed_files` falls back to `git status --porcelain` when HEAD~1 does not
+`get_changed_files` falls back to `git status --porcelain` when HEAD~1 does not
 exist, and `match_rules_to_changes` maps those paths to the rules that target them.
 """
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from aegis_core.outcomes.engine import _get_changed_files, match_rules_to_changes
+from aegis_core.outcomes.engine import get_changed_files, match_rules_to_changes
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 
 
@@ -31,7 +31,7 @@ def _write_rule(ws: Path, rule_id: str, target_paths: list[str]) -> Path:
 
 
 def _matched_rules(ws: Path) -> set[str]:
-    return {c["_name"] for c in match_rules_to_changes(ws, _get_changed_files(str(ws)))}
+    return {c["_name"] for c in match_rules_to_changes(ws, get_changed_files(str(ws)))}
 
 
 def test_rule_matches_an_unstaged_modification(tmp_path: Path) -> None:
@@ -48,7 +48,7 @@ def test_rule_matches_an_unstaged_modification(tmp_path: Path) -> None:
     _git(tmp_path, "commit", "-q", "-m", "init")
     (tmp_path / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
 
-    assert _get_changed_files(str(tmp_path)) == ["src/app.py"]
+    assert get_changed_files(str(tmp_path)) == ["src/app.py"]
     assert _matched_rules(tmp_path) == {"guard-src"}
 
 
@@ -63,5 +63,5 @@ def test_rule_matches_a_renamed_destination(tmp_path: Path) -> None:
     (tmp_path / "lib").mkdir()
     _git(tmp_path, "mv", "src/a.py", "lib/a.py")
 
-    assert _get_changed_files(str(tmp_path)) == ["lib/a.py"]
+    assert get_changed_files(str(tmp_path)) == ["lib/a.py"]
     assert _matched_rules(tmp_path) == {"guard-lib"}

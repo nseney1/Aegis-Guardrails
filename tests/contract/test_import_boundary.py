@@ -14,6 +14,7 @@ calls) and checked against the table below:
     slots, command safety;
   - L2 services: scan, sync, lifecycle, migrate, metrics, outcomes, verification and
     its Layer-2 command backend.
+  - L3 reports: report builders over L2 services.
 - **aegis_cli** and **aegis_mcp** are adapters: they import aegis_core and themselves,
   never each other and never aegis_sdk.
 - **aegis_sdk** is the external facade: it imports aegis_core and itself only.
@@ -24,6 +25,7 @@ A new aegis_core module fails here until it is given a layer in CORE_LAYERS.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
@@ -74,8 +76,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
-    # The post-lane gate (aegis check --lane): team, the matcher, gitsafe and events.
+    # Pure AST inspection of lane declarations and pytest configuration.
     "aegis_core.lane_ast": 0,
+    # The post-lane gate (aegis check --lane): team, matcher, gitsafe and events.
     "aegis_core.lane_gate": 1,
     "aegis_core.scaffolding": 1,
     # The governance file set, CODEOWNERS coverage, and trust tiers / approvals over them.
@@ -171,7 +174,7 @@ def import_edges(root: Path = REPO) -> List[Edge]:
         is_package = path.name == "__init__.py"
         rel = path.relative_to(root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
-        for node in ast.walk(tree):
+        for node in import_nodes(tree):
             targets: List[str] = []
             if isinstance(node, ast.Import):
                 targets = [alias.name for alias in node.names]
@@ -345,3 +348,129 @@ def test_every_module_imports_without_a_sibling_imported_first(tmp_path):
                           capture_output=True, env=env, timeout=600)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     assert json.loads(proc.stdout.decode("utf-8")) == {}
+
+
+def test_no_import_cycles():
+    assert cycle_findings(import_edges()) == []
+
+
+def test_lazy_cycle_has_edges_and_main_guard_does_not_count(tmp_path):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    (package / "one.py").write_text("def go():\n    from aegis_core import two\n", encoding="utf-8")
+    two = package / "two.py"
+    two.write_text("def go():\n    from aegis_core import one\n", encoding="utf-8")
+    findings = cycle_findings(import_edges(tmp_path))
+    assert len(findings) == 1
+    assert "aegis_core/one.py:2" in findings[0] and "aegis_core/two.py:2" in findings[0]
+    two.write_text("if __name__ == '__main__':\n    from aegis_core import one\n", encoding="utf-8")
+    assert cycle_findings(import_edges(tmp_path)) == []
+    two.write_text("if __name__ == '__main__':\n    pass\nelse:\n    from aegis_core import one\n", encoding="utf-8")
+    assert cycle_findings(import_edges(tmp_path))
+
+
+def test_core_does_not_name_adapters_in_strings():
+    assert adapter_strings(REPO) == []
+
+
+def test_adapter_string_detector_ignores_docs_and_layout(tmp_path):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    path = package / "new.py"
+    path.write_text('"""aegis_cli.docs"""\nLAYOUT = "aegis_cli/"\nCODE = "aegis_cli.x"\n', encoding="utf-8")
+    assert adapter_strings(tmp_path) == ["aegis_core/new.py:3: aegis_cli.x"]
+
+
+def import_nodes(tree):
+    """Include lazy/type-checking imports; ignore only executable main-guard bodies."""
+    yield tree
+    if isinstance(tree, ast.If) and isinstance(tree.test, ast.Compare):
+        test = tree.test
+        if (len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq) and
+                {ast.dump(test.left), ast.dump(test.comparators[0])} ==
+                {ast.dump(ast.Name(id="__name__", ctx=ast.Load())), ast.dump(ast.Constant(value="__main__"))}):
+            for child in tree.orelse:
+                yield from import_nodes(child)
+            return
+    for child in ast.iter_child_nodes(tree):
+        yield from import_nodes(child)
+
+
+def cycle_findings(edges):
+    """Tarjan SCCs, with each cycle's source locations; the final allowlist is empty."""
+    graph = {}
+    for edge in edges:
+        if edge.source.endswith(".__main__") or edge.target.endswith(".__main__"):
+            continue
+        graph.setdefault(edge.source, set()).add(edge.target)
+    indices, low, stack, active, components = {}, {}, [], set(), []
+
+    def visit(node):
+        indices[node] = low[node] = len(indices)
+        stack.append(node)
+        active.add(node)
+        for target in sorted(graph.get(node, ())):
+            if target not in indices:
+                visit(target)
+                low[node] = min(low[node], low[target])
+            elif target in active:
+                low[node] = min(low[node], indices[target])
+        if low[node] == indices[node]:
+            component = set()
+            while True:
+                member = stack.pop()
+                active.remove(member)
+                component.add(member)
+                if member == node:
+                    break
+            if len(component) > 1 or node in graph.get(node, ()):
+                components.append(component)
+
+    for node in sorted(graph):
+        if node not in indices:
+            visit(node)
+    return sorted("\n".join(sorted(str(e) for e in edges if e.source in c and e.target in c))
+                  for c in components)
+
+
+# Exact values: neither exception allows new adapter code under the same variable name.
+ADAPTER_STRING_EXCEPTIONS = {
+    ("aegis_core/benchmark.py", "HOOK_RUNNER"):
+        "import sys; sys.path.insert(0, sys.argv[1]); from aegis_cli.cli import main; sys.exit(main(sys.argv[2:]))",
+    # Used to recognize installed insight hook commands, not import the adapter.
+    ("aegis_core/insights/capture.py", "INSIGHT_HOOK_MARKER"): "aegis_cli.hooks.insights",
+}
+
+
+def test_adapter_string_exceptions_still_exist():
+    for (rel, name), value in ADAPTER_STRING_EXCEPTIONS.items():
+        tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
+        assert any(isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and n.value.value == value
+                   and any(isinstance(t, ast.Name) and t.id == name for t in n.targets) for n in tree.body), (rel, name)
+
+
+def test_self_import_is_a_cycle():
+    edge = Edge("aegis_core.one", "aegis_core.one", "aegis_core/one.py:1")
+    assert cycle_findings([edge]) == [str(edge)]
+
+
+def adapter_strings(root):
+    found = []
+    for path in sorted((root / "aegis_core").rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+        docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                      if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                      and n.body and isinstance(n.body[0], ast.Expr)
+                      and isinstance(n.body[0].value, ast.Constant) and isinstance(n.body[0].value.value, str)}
+        # benchmark deliberately launches the public CLI in an isolated child interpreter.
+        allowed = {id(n.value) for n in tree.body
+                   if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+                   and any(isinstance(t, ast.Name) and ADAPTER_STRING_EXCEPTIONS.get((rel, t.id)) == n.value.value
+                           for t in n.targets)}
+        for node in ast.walk(tree):
+            # Repository path maps (aegis_cli/...) are data, not dotted adapter imports.
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings | allowed and re.search(r"\baegis_(cli|mcp)\.", node.value)):
+                found.append(f"{rel}:{node.lineno}: {node.value}")
+    return found

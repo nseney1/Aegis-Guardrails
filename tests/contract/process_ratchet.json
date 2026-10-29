@@ -1,0 +1,154 @@
+{
+  "lookup:aegis_core/ast/runner.py:_names_program:aegis_core.pathlookup.which": {
+    "count": 1,
+    "reason": "Existence probe; execution resolves the driver under its own policy."
+  },
+  "lookup:aegis_core/gitsafe.py:git_executable:aegis_core.pathlookup.which": {
+    "count": 1,
+    "reason": "Central git resolver intentionally searches the trusted process PATH."
+  },
+  "lookup:aegis_core/inference_provider.py:CommandBackend._start:aegis_core.pathlookup.which": {
+    "count": 1,
+    "reason": "Explicit user model command; execution uses an empty directory."
+  },
+  "lookup:aegis_core/testexec.py:run_tests:shutil.which": {
+    "count": 1,
+    "reason": "Existence probe against the hermetic fixed test PATH."
+  },
+  "lookup:aegis_core/verification/test_runner.py:resolve_pytest_cmd:aegis_core.pathlookup.which": {
+    "count": 1,
+    "reason": "Test runner discovery intentionally includes the user/workspace test environment."
+  },
+  "process:aegis_cli/doctor.py:_run_host_cli:subprocess.run": {
+    "count": 1,
+    "reason": "Explicit doctor capability probe, bounded by a timeout."
+  },
+  "process:aegis_cli/hooks/registrar.py:_probe:subprocess.run": {
+    "count": 1,
+    "reason": "Installed-host executable/version probe, bounded by a timeout."
+  },
+  "process:aegis_cli/install_hosts.py:_run_cli:subprocess.run": {
+    "count": 1,
+    "reason": "Host installation command boundary."
+  },
+  "process:aegis_core/ast/runner.py:_run_driver:subprocess.run": {
+    "count": 1,
+    "reason": "Configured AST driver process boundary."
+  },
+  "process:aegis_core/benchmark.py:measure_hook:subprocess.run": {
+    "count": 1,
+    "reason": "Injected child-process runner for hook latency measurements."
+  },
+  "process:aegis_core/benchmark.py:run_benchmark:subprocess.run": {
+    "count": 1,
+    "reason": "Forwards the injected child-process runner to hook measurements."
+  },
+  "process:aegis_core/ghcli.py:default_gh_runner:subprocess.run": {
+    "count": 1,
+    "reason": "Single GitHub transport, isolated working directory and explicit timeout."
+  },
+  "process:aegis_core/gitsafe.py:run:subprocess.run": {
+    "count": 1,
+    "reason": "Single hardened git transport."
+  },
+  "process:aegis_core/inference_provider.py:CommandBackend.generate:subprocess.run": {
+    "count": 1,
+    "reason": "Explicit user-configured model command boundary."
+  },
+  "process:aegis_core/testexec.py:kill_group:subprocess.run": {
+    "count": 1,
+    "reason": "Windows process-tree termination with the system taskkill executable."
+  },
+  "process:aegis_core/testexec.py:run_tests:subprocess.Popen": {
+    "count": 1,
+    "reason": "Test process with an isolated HOME and controlled environment."
+  },
+  "process:aegis_core/treeid.py:_spawn:subprocess.run": {
+    "count": 1,
+    "reason": "Git tree materialization with a scrubbed environment and private index."
+  },
+  "process:aegis_core/verification/mutation_tester.py:_check_tests:subprocess.Popen": {
+    "count": 1,
+    "reason": "Mutation test subprocess, bounded by the test timeout."
+  },
+  "process:aegis_core/verification/test_runner.py:discover_test_evidence:subprocess.run": {
+    "count": 1,
+    "reason": "Associated test subprocess, bounded by a timeout."
+  },
+  "process:aegis_core/verification/test_runner.py:run_external_cmd:subprocess.Popen": {
+    "count": 1,
+    "reason": "Configured test/tool process boundary with timeout and output capture."
+  },
+  "typeerror:aegis_cli/check.py:_event_pull:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_cli/check.py:_event_pull_request:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_cli/check.py:_event_shas:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_cli/status.py:_format_adaptive_expiry:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_cli/verify.py:_run_calibration:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/ast/source.py:_decodes_ascii_as_itself:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/config.py:_positive_int:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/config.py:_valid_epsilon:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/lifecycle/creation.py:_as_number:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/scan.py:resolve_token_budget:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/stats.py:_num:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/telemetry_engine/ledger.py:_validated:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/telemetry_engine/ledger.py:_weight:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/verification/adversarial_verify.py:parse_claims:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/verification/adversarial_verify.py:parse_predictions:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/verification/coverage_check.py:run_diff_coverage:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/verification/records.py:resolve_rows:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  },
+  "typeerror:aegis_core/workspace/base.py:Workspace.__eq__:TypeError": {
+    "count": 1,
+    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+  }
+}
