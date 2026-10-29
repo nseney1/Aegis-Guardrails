@@ -517,6 +517,37 @@ def _skills_steps(ctx: _Context, dry_run: bool) -> List[Step]:
     return steps
 
 
+def _hook_steps(root: Path, dry_run: bool, actions: List[Step]) -> None:
+    """The pre-commit and prepare-commit-msg hooks, each appended to ``actions`` as it completes.
+    Raises InstallError for a hook that cannot be written safely."""
+    from aegis_cli.hooks import commitmsg
+    from aegis_core.workspace.hooks import resolve_git_hooks_dir
+
+    in_place = shared_hook_in_place(root)
+    if in_place is not None:
+        actions.append(Step("pre-commit hook", "unchanged",
+                            f"{in_place} already runs the Aegis hook (a shared hooks directory); left as it is"))
+        actions.append(Step("prepare-commit-msg hook", "unchanged",
+                            f"{in_place.parent / 'prepare-commit-msg'} (a shared hooks directory); left as it is"))
+    else:
+        refusal = hook_refusal(root)
+        if refusal:
+            raise InstallError(f"pre-commit hook: {refusal}. Or re-run with --no-hooks to set up everything else.")
+        hooked = install_hook(root, dry_run=dry_run)
+        hooks_dir = resolve_git_hooks_dir(root)
+        if not hooked and hooks_dir:
+            raise InstallError("the pre-commit hook could not be installed (see above); left unchanged")
+        actions.append(Step("pre-commit hook", "installed" if hooked else "skipped (not a git repository)"))
+        if hooked and hooks_dir:
+            cm_res = commitmsg.install(hooks_dir, dry_run=dry_run)
+            if cm_res == "foreign":
+                actions.append(Step("prepare-commit-msg hook", "kept", "existing hook is not Aegis's; left alone"))
+            else:
+                actions.append(Step("prepare-commit-msg hook", cm_res))
+        else:
+            actions.append(Step("prepare-commit-msg hook", "skipped (not a git repository)"))
+
+
 def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -> List[Step]:
     """Run every init step; with ``dry_run`` only check and plan. Raises InstallError.
 
@@ -526,7 +557,6 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     from aegis_core.ast.detect import detect_project_languages, provision_ast_driver_slots
     from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
     from aegis_core.errors import PathTraversalError, WorkspaceBareRepoError
-    from aegis_core.workspace.hooks import resolve_git_hooks_dir
     from aegis_core.workspace.layout import WorkspaceLayout
     from aegis_core.workspace.scaffold import ensure_runtime_gitignore
 
@@ -599,31 +629,7 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     actions.append(_ci_step(root, ctx.ci, dry_run))
 
     if not ctx.no_hooks:
-        from aegis_cli.hooks import commitmsg
-
-        in_place = shared_hook_in_place(root)
-        if in_place is not None:
-            actions.append(Step("pre-commit hook", "unchanged",
-                                f"{in_place} already runs the Aegis hook (a shared hooks directory); left as it is"))
-            actions.append(Step("prepare-commit-msg hook", "unchanged",
-                                f"{in_place.parent / 'prepare-commit-msg'} (a shared hooks directory); left as it is"))
-        else:
-            refusal = hook_refusal(root)
-            if refusal:
-                raise InstallError(f"pre-commit hook: {refusal}. Or re-run with --no-hooks to set up everything else.")
-            hooked = install_hook(root, dry_run=dry_run)
-            hooks_dir = resolve_git_hooks_dir(root)
-            if not hooked and hooks_dir:
-                raise InstallError("the pre-commit hook could not be installed (see above); left unchanged")
-            actions.append(Step("pre-commit hook", "installed" if hooked else "skipped (not a git repository)"))
-            if hooked and hooks_dir:
-                cm_res = commitmsg.install(hooks_dir, dry_run=dry_run)
-                if cm_res == "foreign":
-                    actions.append(Step("prepare-commit-msg hook", "kept", "existing hook is not Aegis's; left alone"))
-                else:
-                    actions.append(Step("prepare-commit-msg hook", cm_res))
-            else:
-                actions.append(Step("prepare-commit-msg hook", "skipped (not a git repository)"))
+        _hook_steps(root, dry_run, actions)
 
     actions.append(Step(REGISTRY_LABEL, register_workspace(ctx.home, root, ctx.selected, dry_run=dry_run)))
     actions.append(_link_key_step(ctx.home, dry_run))
@@ -656,9 +662,113 @@ def _link_key_step(home: Path, dry_run: bool) -> Step:
                            f"~/{AEGIS_DIRNAME}, then re-run.") from exc
 
 
+def _announce(report: Report, root: Path, selected: List[str], detected: List[str], found: Dict[str, str],
+              host_arg: Any, home: Path) -> None:
+    """The header: the workspace, its languages, the hosts selected or found, and a warning for
+    each experimental host."""
+    from aegis_core.ast.detect import detect_project_languages
+
+    report.say()
+    report.say("  🛡️ Aegis Guardrails — Workspace Setup")
+    report.say()
+    report.say(f"  Workspace: {root}")
+    languages = detect_project_languages(root)
+    if languages:
+        report.say(f"  Detected language(s): {', '.join(k.title() for k in sorted(languages))}")
+    else:
+        report.say("  Project type: unknown (rules are language-agnostic)")
+    if selected:
+        report.say(f"  Hosts: {_with_surfaces(selected)}")
+    else:
+        report.say("  Hosts: none selected (only the repository is set up)")
+        if detected and host_arg is None:
+            report.say("  Found on this machine: "
+                       f"{', '.join(f'{h} ({_home_label(v, home)})' for h, v in found.items())}. "
+                       "To register Aegis with them:")
+            report.say(f"       aegis init --host {','.join(detected)}")
+    report.say()
+    from aegis_core import hosts as host_table
+
+    for host_id in selected:
+        spec = host_table.get(host_id)
+        if not spec.verified:
+            report.warn(f"{host_id} is an experimental host. {' '.join(spec.notes)}")
+
+
+def _confirm_plan(report: Report, plan: List[Step], preset: str, scope: Dict[str, Any]) -> Optional[int]:
+    """Show the plan and ask. None to go on; otherwise the exit code, after the run's one
+    report.finish (nothing was written)."""
+    report.say("  Will do:")
+    _print_actions(report, plan, True, preset)
+    try:
+        answer = input("  Proceed? [Y/n] ").strip().lower()
+    except EOFError:
+        # Not a decline: stdin is closed (a script that forgot --yes) and nothing was done.
+        report.say()
+        report.error("no answer to the prompt (end of input); nothing was written. "
+                     "Re-run with --yes to skip the prompt.")
+        report.finish("aborted", scope, False, plan)
+        return 1
+    except KeyboardInterrupt:
+        report.say()
+        report.say("  Aborted.")
+        report.finish("aborted", scope, False, plan)
+        return 130
+    if answer and answer not in ("y", "yes"):
+        report.say("  Aborted.")
+        report.finish("aborted", scope, False, plan)
+        return 0
+    report.say()
+    return None
+
+
+def _print_outcome(report: Report, ctx: _Context, root: Path, actions: List[Step]) -> bool:
+    """After the write pass: each failed registration, the summary, the day-0 card and the next
+    steps. True when a registration failed."""
+    failed = [a for a in actions if a.result == "failed"]
+    for action in failed:
+        report.error(f"{action.target}: registration failed ({action.detail}). Run it yourself: "
+                     f"{display_command(action.command or [])}")
+    manual = sum(1 for a in actions if a.result == "manual")
+    report.say()
+    if failed:
+        report.say("  Done, with errors (see above).")
+    elif manual:
+        # The host CLI is not installed here; nothing is governed until the user runs it.
+        report.say(f"  Done, but {manual} host{'s are' if manual > 1 else ' is'} not registered until you run the "
+                   f"command{'s' if manual > 1 else ''} above.")
+    elif ctx.selected:
+        report.say("  Done! Your next agent session will be governed.")
+    else:
+        report.say("  Done! No agent host was registered; to add one: aegis init --host HOST[,HOST]")
+    report.say()
+    _print_card(report, root)
+    report.say("  After a session, run: aegis status")
+    report.say()
+    _report_ci(report, actions)
+    # No CODEOWNERS is written: offline, init cannot tell a valid owner (a user, an organization's team).
+    report.say("  Governance files (rules, workflows, allowed_signers) are protected only by GitHub settings:")
+    report.say("  aegis doctor --github prints the CODEOWNERS lines and the ruleset for this repository;")
+    report.say("  commit the CODEOWNERS lines it prints and apply the ruleset.")
+    report.say()
+    return bool(failed)
+
+
+def _print_path_hint(json_mode: bool) -> None:
+    if not json_mode:
+        try:
+            from aegis_cli.pathcheck import build_hint
+
+            hint = build_hint()
+            if hint:
+                print(hint)
+                print()
+        except (OSError, RuntimeError):
+            pass
+
+
 def run_init(args: argparse.Namespace) -> int:
     """Main init flow. Returns the exit code (0 ok, 1 refused or failed, 2 usage)."""
-    from aegis_core.ast.detect import detect_project_languages
     from aegis_core.workspace.base import Workspace
 
     json_mode = bool(getattr(args, "json", False))
@@ -694,31 +804,7 @@ def run_init(args: argparse.Namespace) -> int:
         report.finish("refused", scope, dry_run, [])
         return 1
 
-    report.say()
-    report.say("  🛡️ Aegis Guardrails — Workspace Setup")
-    report.say()
-    report.say(f"  Workspace: {root}")
-    languages = detect_project_languages(root)
-    if languages:
-        report.say(f"  Detected language(s): {', '.join(k.title() for k in sorted(languages))}")
-    else:
-        report.say("  Project type: unknown (rules are language-agnostic)")
-    if selected:
-        report.say(f"  Hosts: {_with_surfaces(selected)}")
-    else:
-        report.say("  Hosts: none selected (only the repository is set up)")
-        if detected and host_arg is None:
-            report.say("  Found on this machine: "
-                       f"{', '.join(f'{h} ({_home_label(v, home)})' for h, v in found.items())}. "
-                       "To register Aegis with them:")
-            report.say(f"       aegis init --host {','.join(detected)}")
-    report.say()
-    from aegis_core import hosts as host_table
-
-    for host_id in selected:
-        spec = host_table.get(host_id)
-        if not spec.verified:
-            report.warn(f"{host_id} is an experimental host. {' '.join(spec.notes)}")
+    _announce(report, root, selected, detected, found, host_arg, home)
 
     ctx = _Context(ws=ws, root=root, home=home, selected=selected, preset=preset,
                    force=bool(getattr(args, "force", False)), no_hooks=_no_hooks(args),
@@ -750,27 +836,9 @@ def run_init(args: argparse.Namespace) -> int:
         return 0
 
     if not yes:
-        report.say("  Will do:")
-        _print_actions(report, plan, True, preset)
-        try:
-            answer = input("  Proceed? [Y/n] ").strip().lower()
-        except EOFError:
-            # Not a decline: stdin is closed (a script that forgot --yes) and nothing was done.
-            report.say()
-            report.error("no answer to the prompt (end of input); nothing was written. "
-                         "Re-run with --yes to skip the prompt.")
-            report.finish("aborted", scope, False, plan)
-            return 1
-        except KeyboardInterrupt:
-            report.say()
-            report.say("  Aborted.")
-            report.finish("aborted", scope, False, plan)
-            return 130
-        if answer and answer not in ("y", "yes"):
-            report.say("  Aborted.")
-            report.finish("aborted", scope, False, plan)
-            return 0
-        report.say()
+        code = _confirm_plan(report, plan, preset, scope)
+        if code is not None:
+            return code
 
     actions: List[Step] = []
     try:
@@ -784,42 +852,8 @@ def run_init(args: argparse.Namespace) -> int:
     _print_actions(report, actions, False, preset)
     _report_hook(report, root, actions)
 
-    failed = [a for a in actions if a.result == "failed"]
-    for action in failed:
-        report.error(f"{action.target}: registration failed ({action.detail}). Run it yourself: "
-                     f"{display_command(action.command or [])}")
-    manual = sum(1 for a in actions if a.result == "manual")
-    report.say()
-    if failed:
-        report.say("  Done, with errors (see above).")
-    elif manual:
-        # The host CLI is not installed here; nothing is governed until the user runs it.
-        report.say(f"  Done, but {manual} host{'s are' if manual > 1 else ' is'} not registered until you run the "
-                   f"command{'s' if manual > 1 else ''} above.")
-    elif ctx.selected:
-        report.say("  Done! Your next agent session will be governed.")
-    else:
-        report.say("  Done! No agent host was registered; to add one: aegis init --host HOST[,HOST]")
-    report.say()
-    _print_card(report, root)
-    report.say("  After a session, run: aegis status")
-    report.say()
-    _report_ci(report, actions)
-    # No CODEOWNERS is written: offline, init cannot tell a valid owner (a user, an organization's team).
-    report.say("  Governance files (rules, workflows, allowed_signers) are protected only by GitHub settings:")
-    report.say("  aegis doctor --github prints the CODEOWNERS lines and the ruleset for this repository;")
-    report.say("  commit the CODEOWNERS lines it prints and apply the ruleset.")
-    report.say()
-    if not json_mode:
-        try:
-            from aegis_cli.pathcheck import build_hint
-
-            hint = build_hint()
-            if hint:
-                print(hint)
-                print()
-        except (OSError, RuntimeError):
-            pass
+    failed = _print_outcome(report, ctx, root, actions)
+    _print_path_hint(json_mode)
     report.finish("failed" if failed else "ok", scope, False, actions)
     return 1 if failed else 0
 

@@ -90,6 +90,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 - `aegis_core.insights` is a package of `keys`, `capture`, `review` and `recurrence`; every `__all__` name and every public constant still imports from `aegis_core.insights`. `aegis_cli.hooks.redaction` no longer loads the scanner stack (7 Aegis modules instead of 14), and `aegis_core.storage.file_lock` takes the workspace lock's acquire loop (`_hold`, unordered) with the same behaviour. Redaction output is byte-identical for every Tier A token format. Every insight hook prompt now loads the redaction table (about 4 ms of import time); before, only cue prompts with excerpts did.
 
+- `aegis status`, `aegis doctor` and `aegis init` are split into private helpers (`run_status`, `_host_row`, `run_init` and init's `_steps`, each now under 100 lines) behind characterization tests that pin the printed output, JSON key order, `reasons` and `unknown` order, exit codes and one `Report.finish` per run. No output changes.
+
 ### Added
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
