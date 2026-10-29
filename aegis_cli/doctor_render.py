@@ -131,7 +131,7 @@ def _hooks_line(row: Dict[str, Any], ctx: _Ctx) -> str:
 def _print_tiers(diag: _Diagnosis) -> None:
     from aegis_cli.hooks import registrar
 
-    print("\nEnforcement tiers (AD-8):")
+    print("\nEnforcement tiers:")
     for tier in diag.tiers:
         name, mechanism = _TIER_TEXT[tier["tier"]]
         hosts = ", ".join(tier["hosts"]) or "-"

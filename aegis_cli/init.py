@@ -800,7 +800,7 @@ def run_init(args: argparse.Namespace) -> int:
         return 2
     if is_denied_root(root, home):
         report.error(f"refusing to set up {root}: your home directory and a filesystem root are never "
-                     "a workspace (ADR 0005 AD-4). Run aegis init in a repository.")
+                     "a workspace. Run aegis init in a repository.")
         report.finish("refused", scope, dry_run, [])
         return 1
 

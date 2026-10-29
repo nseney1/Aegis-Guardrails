@@ -2,10 +2,14 @@
 
 A read run changes nothing: it reads files, runs ``codex mcp get aegis --json`` (the only
 host CLI it starts: Codex keeps its registrations in TOML, which stdlib-only Aegis does not
-parse), and never syncs, checks or initializes. The one network access is the trust tier's
-read-only ``gh api`` GETs through the user's own ``gh`` (no ``gh`` means tier C). Claude Code
-is read from ``~/.claude.json`` instead of ``claude mcp list``, which starts every configured
-server.
+parse), and never syncs, checks or initializes. Its default report makes the trust tier's
+read-only ``gh api`` GETs through the user's own ``gh`` (no ``gh`` means tier C).
+``--github --apply`` can create a ruleset after confirmation; ``--release`` reads the default
+branch, pull requests and reviews and runs ``gh attestation verify``. Other GitHub callers
+are ``aegis sync`` and ``aegis rule promote|demote|archive`` for evidence, ``aegis sync --pr``
+to open a pull request, and ``aegis check --ci`` for tier-A approval reviews on pull-request
+events. Claude Code is read from ``~/.claude.json`` instead of ``claude mcp list``, which
+starts every configured server.
 
 Each host gets one state, the first of these that applies:
 

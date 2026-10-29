@@ -330,12 +330,12 @@ def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: st
         for k, (name, label, commit, layer) in enumerate(
                 (("head", "the pull request head", head_commit, None), ("base", "the merge base", merge_commit, overlay)), 1):
             gitsafe.export_tree(root, commit, scratch / f"{name}_snap", overlay=layer, timeout=_GIT_TIMEOUT_S)
-            progress(f"T5 regression run {k} of 2: pytest on {label} {commit[:10]} ({len(present)} test file(s))")
+            progress(f"Regression test run {k} of 2: pytest on {label} {commit[:10]} ({len(present)} test file(s))")
             started = time.monotonic()
             runs.append(testexec.run_pytest_snapshot(scratch / f"{name}_snap", present, workspace, scratch / f"{name}_run",
                                                      timeout))
             outcome = "timed out" if runs[-1].timed_out else f"pytest exit {runs[-1].exit_code}"
-            progress(f"T5 regression run {k} of 2: {outcome} after {time.monotonic() - started:.1f}s")
+            progress(f"Regression test run {k} of 2: {outcome} after {time.monotonic() - started:.1f}s")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     return runs[0], runs[1]
