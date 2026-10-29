@@ -51,13 +51,15 @@ A release goes to `main` only after all of these hold for the exact commit being
 
 1. An independent review of the release pull request.
 2. CI green on that commit: `python3 .github/scripts/ci_green.py <sha>` exits 0 (it needs the `gh` CLI).
-3. `aegis check` passes Layer 1. A Layer 2 review with a model from a different vendor than the one that wrote the change (`aegis check --full --plan-file <plan> --llm-cmd "<command>"`) is advisory: since 4.3.4 its verdict is logged and never changes the exit status, so it informs the release review but does not gate it.
+3. `aegis check` passes Layer 1.
 
 A maintainer merges the release pull request into `main`, tags `v<version>` (it must equal `aegis_core/_version.py`; `.github/scripts/release_guard.py` refuses a publish otherwise) and publishes the GitHub Release. That runs `.github/workflows/publish.yml`, which ships the wheel CI already built and tested. The [CHANGELOG](CHANGELOG.md) entry describes what changed for users, and its date is set when the release is cut.
 
+If a test job makes the publish run red, use **Re-run failed jobs** at most once on that same run. Never use Re-run all jobs or start a branch workflow dispatch to recover a release. If the retry fails, fix forward with a new patch version. After tagging, run `aegis doctor --release <sha>` and retain its verdict and trust-tier caveats. A release is complete only when `https://pypi.org/pypi/aegis-guardrails/<version>/json` returns HTTP 200; `aegis init --ci` pins the version that writes its workflow.
+
 ## Writing a rule
 
-Rules are Markdown files with YAML frontmatter, one per file, in `.aegis/rules/<type>/<id>.md`. The six types are `invariant`, `trap`, `gate`, `boundary`, `persona` and `contract`. Create one with the CLI:
+Rules are Markdown files with YAML frontmatter, one per file, in `.aegis/rules/<type-directory>/<id>.md`. The six types map to plural directories: `invariant` to `invariants/`, `trap` to `traps/`, `gate` to `gates/`, `boundary` to `boundaries/`, `persona` to `personas/` and `contract` to `contracts/`. Create one with the CLI:
 
 ```bash
 aegis rule create --type trap --id trap-unbounded-retries --domain correctness \

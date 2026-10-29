@@ -100,7 +100,7 @@ A multi-lens review graded the code at `9e4d976` (v3.3 plus the first v4 wave) 4
 
 Release Gate 4.5 required a "SHIP" receipt before a release. For v2.0, v2.1, v3.0 and v3.3 the receipt was written by hand by the agent being gated. One contained placeholder predictions `p1` to `p6`; the v3.3.0 receipt claims 8 convergences and lists 5. A hand-written evidence file with `verdict: ship` and the current tree hash passed the gate (review H6). *Source*: ADR 0005 §1, fact 1.
 
-**v4**: receipts and the release gate are deleted (ADR 0005 AD-2, §5). A release needs an independent review, CI green on the exact commit SHA, and `aegis check` passing Layer 1; a cross-vendor Layer 2 review is advisory input to the release review and never gates it ([CONTRIBUTING](../CONTRIBUTING.md#releases)). Old receipts are treated as unattested, not rewritten. The pre-tag check is `.github/scripts/ci_green.py <sha>`.
+**v4**: receipts and the release gate are deleted (ADR 0005 AD-2, §5). A release needs an independent review, CI green on the exact commit SHA, and `aegis check` passing Layer 1 ([CONTRIBUTING](../CONTRIBUTING.md#releases)). Old receipts are treated as unattested, not rewritten. The pre-tag check is `.github/scripts/ci_green.py <sha>`.
 
 ### 5.2 The fitness signal was inverted
 
@@ -108,7 +108,7 @@ v3 credited every rule whose paths matched a change with that run's pass or fail
 
 **v4**: promotion is a reviewed change. `aegis sync` rebuilds the scores from the ledger and only *suggests* promotions, demotions and archives; applying one is an explicit step (`aegis sync --apply` or `aegis rule promote`) that shows up in review.
 
-**Fixed since v4.0**: the score itself. A plain `aegis check`, including the pre-commit hook, now records triggers only, never a true or false positive. Credit comes from signals the agent cannot write: a passing `aegis check --record --tests` row bound to the exact git tree and confirmed by CI on the landing commit, detector replay over merged history, and human labels merged to the base branch. A self-report from an MCP client without a matching check row is recorded as `claimed` and earns nothing. The score ranks guidance in scan output and feeds `sync` suggestions; it never moves a rule by itself, and below 25 verdicts a rule shows no score at all (section 6).
+**Fixed since v4.0**: the score itself. A plain `aegis check`, including the pre-commit hook, now records triggers only, never a true or false positive. Evidence includes a passing `aegis check --record --tests` row bound to the exact git tree and confirmed by CI on the landing commit, detector replay over merged history, and human labels merged to the base branch. A self-report from an MCP client without a matching check row is recorded as `claimed` and earns nothing. Legacy ledger rows can still influence local fitness; the ledger and detector replay are writable by a same-user agent, so local fitness is a label, not authenticated evidence. Promotion requires human-adjudicated labels. The score ranks guidance in scan output and feeds `sync` suggestions; it never moves a rule by itself, and below 25 verdicts a rule shows no score at all (section 6).
 
 ### 5.3 Rules disabled themselves
 
@@ -152,9 +152,9 @@ v4.0 removed claims v3 could not back. v4.3 (ADR 0006, [SECURITY.md](../SECURITY
 | Component (v4.3) | Replaces | What holds (and at which tier) |
 |---|---|---|
 | Witnessed checks (`aegis check --record [--tests]`) | v3 receipts | Outcomes credited to rules are confirmed by a passing check row for the exact git tree; unwitnessed `aegis_report_outcome` calls are recorded as `claimed` and earn no rule credit |
-| Git-witnessed rule integrity (`aegis_scan`, `aegis check --ci`, `aegis approve`) | the HMAC manifest | Gates and invariants bind from the reviewed base branch (`rules_base`); weakening one or leaving a governance/workflow file unowned in `CODEOWNERS` fails `aegis check --ci` without a base-trusted approval (at Tier B, only while the pull request leaves `.github/workflows/**` and aegis alone) |
+| Git-witnessed rule integrity (`aegis_scan`, `aegis check --ci`, `aegis approve`) | the HMAC manifest | Gates and invariants bind from the reviewed base branch (`rules_base`); weakening one fails `aegis check --ci` without a base-trusted approval. Governance changes are gated only when the base lists an `allowed_signers` key; `aegis doctor` checks CODEOWNERS coverage (at Tier B, only while the pull request leaves `.github/workflows/**` and aegis alone) |
 | Per-rule credit model (`aegis sync [--pr]`) | inverted fitness | Standing comes from CI-confirmed checks, git detector replay (`caught` vs `leaked`), and human-adjudicated labels, reported as `untestable`, `insufficient (n=K)`, `inconclusive` or `decided` with session-count decay |
-| Regression discipline in CI (`aegis check --ci`) | the bug registry | Non-merge `fix` commits touching source files require a test that fails on `base` and passes on `head`, or a commit-scoped signed `Aegis-Exempt-Test` approval |
+| Regression discipline in CI (`aegis check --ci`) | the bug registry | Non-merge `fix` commits touching source files require a test that fails on `base` and passes on `head`, or a commit-scoped signed `Aegis-Exempt-Test` approval; this is advisory at warning tier and never blocks |
 | Calibrated arbiter (`aegis check --calibration`) | the "binding" Layer-2 verdict | Cross-vendor review predictions are logged to `.aegis/state/arbiter_predictions.jsonl`, resolved from git on read and scored per backend and kind with Wilson 95% confidence intervals and Brier skill scores (log-only; skill claims suppressed below `n_effective >= 100`) |
 | Security checks and SARIF (`aegis check --format sarif`) | substring "audits" | Delta-evaluated structured `forbid_ast` call predicates, a 7-rule Python security pack and known-format secret scanning that run in every `aegis check` on what a change introduces, optional `ruff`/`gitleaks` presets, and schema-valid SARIF 2.1.0 ingest/output |
 | Human-insights loop (`aegis rule insight`, `aegis_capture_insight`) | the unused insight tool | User-scope redacted corrections (`~/.aegis/insights/`) and content-bound `Aegis-Approve-Insight` signatures feed human-grouped proposals in `.aegis/proposals/` and track post-activation recurrence |
@@ -224,3 +224,14 @@ for rev in 9e4d976 895bbf5 41cd3f0 35d8ac21; do
     | while read -r f; do git show "$rev:$f"; done | wc -l                                          # 39426, 22188, 25963, 54125 lines
 done
 ```
+
+## Planned, not shipped
+
+These are future directions, not capabilities of the current release.
+
+- **4.5.0 — multi-language AST:** deeper TypeScript/JavaScript, Go and Rust analysis through a shared normalized AST, with explicit unsupported and unverified results. The packaged drivers available today do not provide this full analysis.
+- **4.6.0 — lessons from repository history:** `aegis mine` would turn observed failures and corrections into candidates in one proposal queue for human review. It would not create active rules automatically.
+- **4.7.0 — parallel agents in one repository:** improve coordination and review for agents sharing a repository, building on the existing advisory lanes and leases without claiming isolation or autonomous approval.
+- **4.8.0 — code-claim checks:** a proposed `aegis claims check FILE` would read `{id, anchor, probe, expect}` claims and report **holds**, **moved**, **no longer holds** or **contradicts** against the current code. It would be stateless, read-only and independent of any plan format.
+
+The 4.8.0 idea must first prove useful in a manual trial that records what its probes catch; if the trial misses most stale claims, drop the feature. It is not project management: no owners, assignees, dates, estimates, priorities, dependency ordering, stored progress or progress UI. Plans and responsibility stay outside Aegis.

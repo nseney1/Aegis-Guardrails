@@ -22,7 +22,7 @@ from aegis_core.primitives import key_within, real_key
 from aegis_core.storage import atomic_write_text
 from . import ToolEvidence
 
-__all__ = ["check", "apply_mutation_point", "collect_mutations_from_ast"]
+__all__ = ["check"]
 
 
 # ── AST Mutation Visitors ──────────────────────────────────────────────────

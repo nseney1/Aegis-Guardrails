@@ -146,7 +146,7 @@ On every host, rules are advisory through the bootstrap and `aegis_scan`, the gi
 
 1. **Bootstrap**: `aegis init` writes a compact bootstrap block into `AGENTS.md` (no rule text) and registers the `aegis` MCP server with your hosts.
 2. **Just-in-time scan**: Before editing, the agent calls `aegis_scan` with the files it will change and receives only matching rules, prioritizing gates and invariants within a token budget.
-3. **Witnessed verification**: The agent edits, runs tests, and reports with `aegis_report_outcome`. `aegis check --record --tests` snapshots the exact git tree and runs your tests there, so only witnessed passes earn rule credit.
+3. **Witnessed verification**: The agent edits, runs tests, and reports with `aegis_report_outcome`. `aegis check --record --tests` snapshots the exact git tree and runs your tests there, and agent-reported outcomes count only after CI confirms the landing commit. Local fitness also includes legacy ledger rows and detector replay; it is not authenticated evidence.
 4. **Pre-commit & CI enforcement**: `aegis check` runs Layer 1 (deterministic checks and every `forbid_ast` ban) in the pre-commit hook and in CI; `aegis check --full --plan "..." --llm-cmd 'claude -p'` adds Layer 2, an optional model review whose verdict is advisory and never changes the exit code.
 5. **Evidence-driven promotion**: Outcomes append to a local ledger; `aegis sync` computes rule fitness and suggests promotions for human review.
 
