@@ -36,11 +36,12 @@ jobs:
     needs: guard
     uses: ./.github/workflows/validate.yml
     # A reusable workflow can never exceed its caller's grants; the build job
-    # inside needs these to sign build provenance attestations.
+    # inside signs build provenance; the governance job reads pull-request reviews.
     permissions:
       contents: read
       id-token: write
       attestations: write
+      pull-requests: read
 
   publish:
     needs: validate

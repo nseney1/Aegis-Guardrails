@@ -729,14 +729,14 @@ def _renamed_from(data: bytes, base_tree: dict[str, tuple[str, str]], prefix: st
 
 
 def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
-                  contents: Optional[dict[str, bytes]] = None, present: Any = None) -> dict[str, str]:
+                  contents: Optional[dict[str, bytes]] = None, present: Any = None) -> dict[str, bytes]:
     """What the T7 delta subtracts for each of ``rels`` (relative to ``work_root``, which holds
     ``git_root``'s workspace or an export of it; ``contents`` holds the bytes of those read already):
-    walking the diff-base candidates in order, the text at the first one whose content differs from
+    walking the diff-base candidates in order, the bytes at the first one whose content differs from
     the work file. A file one of them does not hold is new against it and has no entry (judged
     whole) unless it is an exact rename of a path the change removed (``present``: whether a path
     relative to ``work_root`` is still in the checked tree; by default, on disk there). One equal at
-    every candidate keeps that text. Object ids are compared, so only the texts kept are read; a
+    every candidate keeps those bytes. Object ids are compared, so only the blobs kept are read; a
     binary file (NUL in its first 4 KiB, which neither scan reads) needs none. Raises GitError."""
     from aegis_core import gitsafe
 
@@ -782,7 +782,7 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
                 unchanged.append(rel)  # the same here: what changed it, if anything, is further back
         pending = unchanged
     blobs = gitsafe.read_blobs(git_root, kept.values())
-    return {rel: blobs[oid].decode("utf-8", "replace") for rel, oid in kept.items()}
+    return {rel: blobs[oid] for rel, oid in kept.items()}
 
 
 def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
@@ -803,7 +803,7 @@ def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Opti
         base_sources = _base_sources(git_root, rels, work_root, diff_base, contents, present)
         py = [rel for rel in rels if rel.endswith(".py")]
         pack = security_pack.evaluate_security_pack(work_root, py, base_sources) if py else {}
-        secrets = scanners.scan_secrets_delta(work_root, rels, base_sources, contents)
+        secrets = scanners.scan_secrets_delta(work_root, rels, {p: b.decode("utf-8", "replace") for p, b in base_sources.items()}, contents)
     except Exception as exc:
         return [_tool_failure("security_pack", "changed files", exc)]
     hits: dict[tuple[str, str], list[dict[str, Any]]] = {}

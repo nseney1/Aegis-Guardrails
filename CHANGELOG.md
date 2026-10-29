@@ -125,6 +125,11 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Fixed
 
+- The release publisher grants every permission used by reusable validation, including read-only pull-request access, so release-event validation can start.
+- Historical Python blobs use the same safe source decoding as checked files. Valid encoding cookies and BOMs no longer create false security deltas or hide replay detections; secret-delta decoding stays consistent and stale replay caches are refreshed.
+- Diff coverage uses the Python interpreter selected by user-scope `tests.command` for both collection and JSON reporting, and selects its coverage core without assuming Aegis's Python version.
+- Promotion guidance now states that missing or invalid `created` dates count as age zero and block promotion until a valid date establishes the required 30 days.
+
 - Documentation separates deterministic checks, optional test receipts and CI-confirmed rule credit, including empty-rule scans and unsupported unittest/mixed-suite summaries. Contributor setup and approval guidance now cover isolated tests and governance changes; SECURITY distinguishes the tree-identity git runner from `gitsafe`.
 
 - Structural contract checks now reject import cycles, adapter names in core import strings, growth in pinned module/function sizes and private coupling, duplicate primitive helpers, and unreviewed process or executable-lookup sites. Their update commands only lower existing pins; git and gh execution stays within the reviewed transport modules.

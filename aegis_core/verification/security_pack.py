@@ -10,6 +10,7 @@ from aegis_core.ast.policy import (
     evaluate_forbid_ast_structured,
     extract_normalized_ast,
 )
+from aegis_core.ast.source import decode_python_source
 from aegis_core.match import is_test_path, workspace_files
 
 __all__ = ["evaluate_security_pack"]
@@ -61,10 +62,10 @@ def _record(finding: Mapping[str, Any], rel_path: str, rule: Mapping[str, Any]) 
 
 
 def evaluate_security_pack(
-    workspace_root: Union[str, Path], changed_files: Iterable[str], base_sources: Mapping[str, Optional[str]],
+    workspace_root: Union[str, Path], changed_files: Iterable[str], base_sources: Mapping[str, Optional[Union[str, bytes]]],
 ) -> Dict[str, Any]:
     """The pack's findings in what ``changed_files`` introduce over ``base_sources`` (each path's
-    text at the base, read by the caller through gitsafe; None or absent: a new file).
+    source text or bytes at the base, read through gitsafe; None or absent: a new file).
 
     Every changed Python file inside the workspace is evaluated, reported unverified (one
     ``kind: "file"`` record when it cannot be read or parsed) or absent (deleted), never
@@ -85,8 +86,9 @@ def evaluate_security_pack(
             continue
         base_text = base_sources.get(rel_path)
         try:
+            base_text = decode_python_source(base_text) if isinstance(base_text, bytes) else base_text
             base_ast = extract_normalized_ast(rel_path, code=base_text) if base_text is not None else None
-        except ASTExtractionError:
+        except (ASTExtractionError, SyntaxError, UnicodeError):
             base_ast = None  # a base that does not parse accounts for nothing: every head finding is new
         is_test = is_test_path(rel_path)
         for rule in PYTHON_SECURITY_RULES:

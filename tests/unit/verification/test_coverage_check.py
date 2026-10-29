@@ -211,6 +211,61 @@ class TestReportOnlyCoverage:
         assert run_diff_coverage(repo.root, "main", "HEAD")["status"] == "reported"
         assert calls[0]["argv"][5:] == ["-m", "pytest", "-x", "tests/unit", "-p", "no:cacheprovider", "-o", "addopts="]
 
+    @pytest.mark.parametrize("kind", ["absolute-python", "relative-python", "absolute-pytest", "bare-pytest"])
+    def test_both_coverage_commands_keep_the_interpreter_contract(self, tmp_path, cov_env, monkeypatch, kind):
+        repo = cov_repo(tmp_path)
+        python = tmp_path / "environment" / ("python3.exe" if os.name == "nt" else "python3")
+        command = {
+            "absolute-python": [str(python), "-m", "pytest"],
+            "relative-python": ["python3", "-m", "pytest"],
+            "absolute-pytest": [str(python.with_name("pytest"))],
+            "bare-pytest": ["pytest"],
+        }[kind]
+        user_command(cov_env, [*command, "-x", "tests/unit"])
+        monkeypatch.delenv("COVERAGE_CORE", raising=False)
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        assert run_diff_coverage(repo.root, "main", "HEAD")["status"] == "reported"
+        selected = str(python) if kind == "absolute-python" else sys.executable
+        assert [call["argv"][0] for call in calls] == [selected, selected]
+        if kind == "absolute-python":
+            assert all("COVERAGE_CORE" not in call["env"] for call in calls)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable wrapper")
+    @pytest.mark.parametrize("mode", ["report", "missing-coverage", "failed-interpreter"])
+    def test_a_configured_python_process_controls_coverage(self, tmp_path, cov_env, monkeypatch, mode):
+        repo = cov_repo(tmp_path)
+        marker, python = tmp_path / "interpreter.jsonl", tmp_path / "environment" / "python3"
+        python.parent.mkdir()
+        python.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\nfrom pathlib import Path\n"
+            f"marker = Path({str(marker)!r})\n"
+            "with marker.open('a') as output:\n"
+            "    output.write(json.dumps({'argv': sys.argv[1:], 'core': os.environ.get('COVERAGE_CORE')}) + '\\n')\n"
+            "if os.environ.get('COVERAGE_CORE') == 'sysmon':\n"
+            "    sys.stderr.write('selected interpreter does not support sys.monitoring\\n')\n"
+            "    sys.exit(1)\n"
+            f"if {mode!r} != 'report':\n"
+            f"    sys.stderr.write({'No module named coverage' if mode == 'missing-coverage' else 'configured Python cannot load its project environment'!r} + '\\n')\n"
+            "    sys.exit(7)\n"
+            "if sys.argv[1:4] == ['-m', 'coverage', 'json']:\n"
+            f"    Path(sys.argv[sys.argv.index('-o') + 1]).write_text(json.dumps({{'files': {A_REPORT!r}}}))\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o700)
+        user_command(cov_env, [str(python), "-m", "pytest"])
+        monkeypatch.delenv("COVERAGE_CORE", raising=False)
+        result = run_diff_coverage(repo.root, "main", "HEAD")
+        if mode == "report":
+            assert (result["status"], result["ratio"], result["reason"]) == ("reported", 0.5, "")
+        else:
+            expected = ("No module named coverage" if mode == "missing-coverage"
+                        else "configured Python cannot load its project environment")
+            assert (result["status"], result["ratio"], result["reason"]) == ("unverified", None, expected)
+        calls = [json.loads(line) for line in marker.read_text().splitlines()]
+        assert [call["argv"][2] for call in calls] == ["run", "json"]
+        assert all(call["core"] is None for call in calls)
+
     def test_the_repositorys_coverage_json_and_coveragerc_are_never_read(self, tmp_path, cov_env, monkeypatch):
         repo = cov_repo(tmp_path)
         repo.write("coverage.json", json.dumps({"files": {"pkg/a.py": {"executed_lines": [3, 4, 5, 6], "missing_lines": []}}}))

@@ -80,7 +80,7 @@ On 15 October I had AI reviewers, each in a separate context, audit v3.3 plus th
 
 **Now:** since 4.3.4 a plain `aegis check` records only that a rule was triggered. Check-based credit needs a passing `aegis check --record --tests` that CI confirms on the commit that lands. An agent's own report (`aegis_report_outcome`) without a matching check is stored as "claimed" and earns nothing. Detector replay and legacy ledger rows can still influence local fitness, and an agent running as my user can write them: a local score is a label, not authenticated evidence. Human labels count only after they merge into the reviewed base branch.
 
-`aegis sync` only suggests promotions and demotions. Applying one (`aegis sync --apply` or `aegis rule promote`) is an explicit change that belongs in review. In 4.4.0, promotion recommendations need at least 25 positive human labels with no false positives, or at least 42 labels with at most one false positive. They also need at least three sessions spanning two repositories or 14 days, and a rule at least 30 days old when its age is known ([thresholds](../aegis_core/fitness.py)).
+`aegis sync` only suggests promotions and demotions. Applying one (`aegis sync --apply` or `aegis rule promote`) is an explicit change that belongs in review. In 4.4.0, promotion recommendations need at least 25 positive human labels with no false positives, or at least 42 labels with at most one false positive. They also need at least three sessions spanning two repositories or 14 days, and a valid `created` date at least 30 days ago; a missing or invalid date blocks promotion ([thresholds](../aegis_core/fitness.py)).
 
 ### Rules switched themselves off
 

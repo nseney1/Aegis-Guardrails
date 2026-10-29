@@ -7,7 +7,7 @@ from pathlib import Path
 import tokenize
 from typing import Union
 
-__all__ = ["read_python_source"]
+__all__ = ["decode_python_source", "read_python_source"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -26,8 +26,8 @@ def _decodes_ascii_as_itself(encoding: str) -> bool:
         return False
 
 
-def read_python_source(path: Union[str, Path]) -> str:
-    """Decode a Python source file with the encoding CPython chooses for it.
+def decode_python_source(data: bytes) -> str:
+    """Decode Python source bytes with the encoding CPython chooses for them.
 
     Honours a UTF-8 BOM and a PEP 263 coding cookie on line 1 or 2. Line endings are
     normalised before the cookie search because CPython counts ``\\r`` and ``\\r\\n`` as
@@ -38,9 +38,13 @@ def read_python_source(path: Union[str, Path]) -> str:
     encoding that does not decode ASCII to itself (utf-7, hz, iso2022, unicode_escape,
     utf-16, EBCDIC): there the code's meaning depends on the decoder, so it is refused.
     """
-    data = Path(path).read_bytes()
     universal = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     encoding, _ = tokenize.detect_encoding(io.BytesIO(universal).readline)
     if encoding not in ("utf-8", "utf-8-sig") and not _decodes_ascii_as_itself(encoding):
         raise UnicodeError(f"source encoding {encoding!r} does not decode ASCII to itself")
     return data.decode(encoding)
+
+
+def read_python_source(path: Union[str, Path]) -> str:
+    """Read a Python file using the same safe decoder as historical source blobs."""
+    return decode_python_source(Path(path).read_bytes())

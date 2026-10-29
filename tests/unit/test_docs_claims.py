@@ -202,6 +202,7 @@ FALSE_CLAIMS = (
     "until labels become the only promotion path", "unowned governance/workflow files in `CODEOWNERS`",
     "leaving a governance/workflow file unowned in `CODEOWNERS` fails `aegis check --ci`",
     "the rules that apply to the files about to change (read-only)",
+    "an unknown age does not itself block promotion",
 )
 
 

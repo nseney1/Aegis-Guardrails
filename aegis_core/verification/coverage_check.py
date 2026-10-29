@@ -125,9 +125,11 @@ def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: 
 def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
     """Measure the changed lines of ``base..head`` (see the module docstring)."""
     root = Path(root).resolve()
-    args = testexec.pytest_args(testexec.user_test_command(root) or list(testexec.DEFAULT_COMMAND))
+    command = testexec.user_test_command(root) or list(testexec.DEFAULT_COMMAND)
+    args = testexec.pytest_args(command)
     if args is None:
         return _result("unverified", "tests.command is not pytest-based")
+    python = testexec.plan_command(command)[0][0]
     changed = changed_lines(root, base, head)
     if changed is None:
         return _result("unverified", f"cannot diff {base}..{head}")
@@ -144,9 +146,10 @@ def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
         rcfile, report = Path(tmp) / "empty.coveragerc", Path(tmp) / "coverage.json"
         storage.atomic_write_bytes(rcfile, b"")
         env = {**os.environ, "COVERAGE_FILE": str(Path(tmp) / ".coverage")}
-        if sys.version_info >= (3, 12):
+        # A different interpreter chooses its own native core: Aegis's version cannot select it.
+        if python == sys.executable and sys.version_info >= (3, 12):
             env["COVERAGE_CORE"] = "sysmon"
-        coverage = [sys.executable, "-m", "coverage"]
+        coverage = [python, "-m", "coverage"]
         run = run_external_cmd([*coverage, "run", f"--rcfile={rcfile}", "-m", "pytest", *args, "-p", "no:cacheprovider",
                                 "-o", "addopts="], cwd=root, env=env, timeout=testexec.DEFAULT_TIMEOUT_S)
         if run.get("timed_out"):
