@@ -1,6 +1,6 @@
 # Why Aegis is built this way
 
-*By Nick Seney. Checked against the unreleased 4.4.0 development branch (`bed1e4a6`) on 2026-10-29. What Aegis does today is in [How Aegis works](how-it-works.md); this page is about how it got that way.*
+*By Nick Seney. Checked for 4.4.0 against `bed1e4a6` on 2026-10-29. What Aegis does today is in [How Aegis works](how-it-works.md); this page is about how it got that way.*
 
 I wrote this for anyone deciding whether to trust Aegis: where the rules came from, what I measured and how much those numbers are worth, what I got wrong, and why Aegis looks the way it does now.
 
@@ -32,7 +32,7 @@ The timeline, all in 2026:
 - **15 October.** AI reviewers audited the code, and one scored its design 4/10 (section 4). That review pushed me to v4.
 - **16 October.** v4.0, 4.1 and 4.2. 4.1.0 was never tagged: its release review found problems, and 4.1.1 shipped the fixes that afternoon.
 - **17 October.** 4.3, trust and evidence (section 6).
-- **21 October.** 4.3.4. Work on 4.4.0 followed to fix what the 4.3 reviews found; it remains unreleased.
+- **21 October.** 4.3.4. Work on 4.4.0 followed to fix what the 4.3 reviews found.
 
 Why so fast? I was excited, and I trusted what the agents wrote more than I should have. I wasn't reviewing much myself. The rename to Aegis is where I put my own hands on the decisions and the direction. The worst v3 bug, an agent writing its own release receipts, was the same mistake I was making as a maintainer. Much of how Aegis works now is about not repeating it: evidence comes from CI and git, not from anyone's say-so.
 
@@ -80,7 +80,7 @@ On 15 October I had AI reviewers, each in a separate context, audit v3.3 plus th
 
 **Now:** since 4.3.4 a plain `aegis check` records only that a rule was triggered. Check-based credit needs a passing `aegis check --record --tests` that CI confirms on the commit that lands. An agent's own report (`aegis_report_outcome`) without a matching check is stored as "claimed" and earns nothing. Detector replay and legacy ledger rows can still influence local fitness, and an agent running as my user can write them: a local score is a label, not authenticated evidence. Human labels count only after they merge into the reviewed base branch.
 
-`aegis sync` only suggests promotions and demotions. Applying one (`aegis sync --apply` or `aegis rule promote`) is an explicit change that belongs in review. In the unreleased 4.4.0 code, promotion recommendations need at least 25 positive human labels with no false positives, or at least 42 labels with at most one false positive. They also need at least three sessions spanning two repositories or 14 days, and a rule at least 30 days old when its age is known ([thresholds](../aegis_core/fitness.py)).
+`aegis sync` only suggests promotions and demotions. Applying one (`aegis sync --apply` or `aegis rule promote`) is an explicit change that belongs in review. In 4.4.0, promotion recommendations need at least 25 positive human labels with no false positives, or at least 42 labels with at most one false positive. They also need at least three sessions spanning two repositories or 14 days, and a rule at least 30 days old when its age is known ([thresholds](../aegis_core/fitness.py)).
 
 ### Rules switched themselves off
 

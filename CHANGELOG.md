@@ -4,7 +4,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ## [Unreleased]
 
-The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
+## [4.4.0] - 2026-10-29
 
 ### Security
 
@@ -36,7 +36,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Host setup, doctor and regression messages use descriptive labels instead of internal decision identifiers and obsolete version qualifiers.
 
 - **`aegis sync --pr` puts the transitions in the pull request.** It cuts an `aegis/lifecycle-*` branch from the protected branch, commits exactly the moves and the examples to label, pushes the branch to the current branch's remote with your own credentials, opens the PR with `gh pr create --head`, and leaves your branch, index and tree as they were. It never merges. The push is unsigned and goes over https, ssh or a local path only. It refuses when HEAD is detached, not on the protected branch, or not equal to the protected branch's remote-tracking branch (fetch, or push your commits, first); when `.aegis/rules` or `.aegis/adjudications` has uncommitted changes; when no usable remote exists, a push URL has another scheme or is a local path inside the repository; when the repository's own config sets a program the push would run; or when git has no identity. When only `gh` fails, the pushed branch is kept and named; a push that never answers names the branch the remote may already hold. An archive proposed this way writes no local `lifecycle.jsonl` row, since the move exists only on the branch.
-- The `aegis sync` table shows State, n, Weight and Score (blank below the 25-verdict minimum) instead of Fitness, Triggers, TP and FP. The `--pr` body states each rule's state, n and weight and the BASE commit its labels were read at, prints P(precision < 0.7) and the interval only for decided or inconclusive rules, and lists up to three replay detections per rule that are still unlabelled, instead of already-labelled rows.
+- The `aegis sync` table shows State, n, Weight and Score (blank below the 25-verdict minimum) instead of Fitness, Triggers, TP and FP. The `--pr` body states each rule's state, n and weight and the BASE commit its labels were read at, prints P(precision < 0.7) only for decided or inconclusive rules, and lists up to three replay detections per rule that are still unlabelled, instead of already-labelled rows.
 - `derived.json` entries carry `n` and `p_below_demote`; `samples` is always empty.
 - Detector replay walks the branch you name, else the user-scope `rules.base_ref` branch, else the protected branch, and never HEAD; with none it prints `replay skipped: no base branch`. Replayed catches carry the time of their evidence commit, so an old catch no longer clears newer exposure sessions.
 - `aegis sync` and `aegis doctor` print `BASE as of last fetch N days ago` or `never fetched`, and `aegis sync --json` gains `base_fetch_age_days`. Aegis never fetches.
@@ -59,7 +59,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis check --ci` prints a progress line on stderr before and after each T5 pytest run and each `Aegis-Check` trailer rerun. stdout is unchanged, and `--no-exec` prints none.
 - The default base branch (`check --record`, `check --lane`, `approve`, the `check --ci` fallback, insights, `team metrics`, `verify`) is `origin/$GITHUB_BASE_REF`, then the branch `origin/HEAD` names, then `main`, `develop` or `master`, each as `origin/<name>` before `<name>`. A repository whose only branch is `master` now has a base.
 - User and system clean filters (git-lfs, for example) now run during tree identity, as in any git command you type, so such trees can equal their commit's tree and earn T1 credit. A driver name that the repository's or a submodule's own config defines is still switched off, in every scope.
-- `aegis rule insight review --decision` gains `confirm --insight ID [--kind K]`: a confirmed suggestion counts at level `cli`. Snooze, propose and merge-into-rule now hide a cluster; snooze and reject resurface it after 2 new insights. A `propose` whose proposal cannot be written (an invalid `--proposal-id`, or a `--summary` quoting a human prompt) exits 1 and records no decision.
+- `aegis rule insight review --decision` gains `confirm --insight ID [--kind K]`: a confirmed suggestion counts at level `cli`. Snooze, propose and merge-into-rule now hide the named insights; snooze and reject resurface them after 2 new insights. A `propose` whose proposal cannot be written (an invalid `--proposal-id`, or a `--summary` quoting a human prompt) exits 1 and records no decision.
 - `aegis status` and `aegis sync` (text, and JSON `insights`) print each insight-born rule's recurrence, labelled `sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)`, and `N unconfirmed agent suggestions (not counted)`.
 - Insight rows gain add-only `source` and `corroborated_by` fields, and exposure rows carry each rule's digest prefix as `rev`.
 
@@ -77,7 +77,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis doctor --github` prints one `CODEOWNERS` line per governance pattern (`allowed_signers` and `CODEOWNERS` lines unanchored, so they also own `docs/CODEOWNERS` and nested copies), and a hand-written `CODEOWNERS` must own those too for tier A. The admin reason reads "the gh identity doctor used is an admin: re-run with the token the agent would hold".
 - A ledger row of kind `check_confirm`, `human_label`, `claim` or `transition` counts as one unusable row, and a non-object `fitness` value in `.aegis/config.json` warns.
 
-- MCP tool descriptions are 2 to 4 sentences and parameter descriptions one line. They keep the routing to sibling tools and the limits the server enforces; no input constraint (`type`, `enum`, `maxLength`, `minItems`, `required`, `additionalProperties`, `default`, `items`) changes.
+- MCP tool descriptions are 2 to 4 sentences and parameter descriptions one line. Their shortening preserves sibling routing and input constraints. Separately, `aegis_capture_insight.paths` now allows at most 20 entries of at most 512 characters, as described under Security.
 - T5 counts a commit as a fix only from a Conventional `fix` subject or a `Fixes:` trailer in the trailer block, with a scope outside `ci, build, docs, deps, release, chore, tests`. A `Closes:` trailer, or a `Fixes:` or `Aegis-No-Test:` line in the body, no longer counts, and `fix(test)` and `fix(doc)` commits are now judged as fixes. The text report's prune-box note is gone.
 
 - `.aegis/config.json`, `~/.aegis/config.json`, `team.json`, `baseline.json`, packs and host configs that hold a number overflowing to infinity (such as `1e999`) are refused like `NaN`, and a duplicate key in a `config.json` is refused (it was last key wins).
@@ -95,6 +95,12 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis_core.insights` is a package of `keys`, `capture`, `review` and `recurrence`; every `__all__` name and every public constant still imports from `aegis_core.insights`. `aegis_cli.hooks.redaction` no longer loads the scanner stack (7 Aegis modules instead of 14), and `aegis_core.storage.file_lock` takes the workspace lock's acquire loop (`_hold`, unordered) with the same behaviour. Redaction output is byte-identical for every Tier A token format. Every insight hook prompt now loads the redaction table (about 4 ms of import time); before, only cue prompts with excerpts did.
 
 - `aegis status`, `aegis doctor` and `aegis init` are split into private helpers (`run_status`, `_host_row`, `run_init` and init's `_steps`, each now under 100 lines) behind characterization tests that pin the printed output, JSON key order, `reasons` and `unknown` order, exit codes and one `Report.finish` per run. No output changes.
+
+### Configuration and migration
+
+- Command and evidence settings belong in **user-scope** `~/.aegis/config.json`, outside the workspace: `tests.command` (default `python -m pytest`), `rules.base_ref`, `perf.command`, `ci.workflow` (default `validate.yml`), `insights.capture` and `scanners`. Repository configuration cannot select these commands or the workflow used to confirm credit. Existing `regression.*` settings use the same user-config reader, but `regression.tier` is ignored and never makes T5 block. These settings include ones introduced in 4.3.4; they are listed here for upgrading users.
+- The reviewed rules BASE is the merge-base with the selected base ref (or its tip when an explicit user ref has no common history); without a reviewed anchor, a local-HEAD fallback is self-attested. The default branch order, trusted clean filters and fetch-age reporting are described above. Aegis never fetches.
+- `scan`, `aegis_list_rules`, `status`, `rule list`, `metrics` and packs stay offline. Scans rank without CI-confirmed credit; reading derived state from `sync` for scan ranking remains a 4.5.0 follow-up.
 
 ### Added
 
@@ -172,12 +178,11 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 ### Breaking (command line, JSON and MCP)
 
-- Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored.
+- Breaking: `aegis check --ci --strict` exits 2 as a usage error ("--ci does not combine with --strict"); `--strict` keeps one meaning, failing on checkpoint warnings without `--ci`. `--no-exec` refuses only `--coverage` and `--perf` as running repository code. The user-scope `regression.tier` key and a `require_regression` attribute are ignored; no setting makes T5 block. Diff coverage is report-only and the former 0.80 coverage threshold is removed.
 - Breaking: the JSON `coverage` block loses `passed`, `coverage`, `threshold` and `uncovered_by_file`. It has `status` (`reported` or `unverified`), `reason`, `covered_lines`, `executable_lines`, `ratio` (null when nothing was measured), `uncovered_ranges` and `unmeasured`.
 - Breaking: the fail-to-pass reason `collection_error_on_base` is gone; the reason `timeout` and the status `unverifiable` with reason `tests_not_pytest` are added.
 - Breaking: MCP `aegis_capture_insight` captures stay at level `suggestion` and never become `W2`. A same-host hook prompt containing the quote (12 characters or more) within 30 minutes only annotates the capture with `corroborated_by`, and the correction counts once.
 - Breaking: "exposed and ignored" needs a persisted exposure by the same host within 30 minutes at the rule's current rev (exposure rows written before 4.4.0 carry no rev and match any). Agent outcome reports, scan rows and in-memory exposures no longer count, and insights added with `aegis rule insight add` (host `cli`) never join an agent's exposure.
-- Breaking: `aegis rule insight review --decision` needs `--cluster` (or `--insight` for `confirm`), and `reject` needs `--reason` (exit 2). An unknown cluster or suggestion id lists the valid ids and writes nothing (exit 1). JSON review output emits neighbours once; the per-cluster `neighbours` key is removed.
 - Breaking: tree identity makes a tree unbindable when the repository's or a checked-out submodule's own config defines a filter driver whose name `git -c` cannot carry (containing `=` or bytes that are not UTF-8), or when checked-out submodules nest more than 16 deep.
 
 - Breaking: `aegis check --coverage` and `--perf` outside `--ci` exit 2, and `--json` with `--format github|sarif` is a usage error (exit 2).
@@ -187,7 +192,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - Breaking: `aegis rule insight review --category` is removed. A proposal's kind is the one its insights share, or the `--kind` given with `--decision propose`; with neither, `propose` exits 1 and asks for `--kind`.
 - Breaking: `rule insight add --commit` checks the `Aegis-Approve-Insight` hash against the text as typed, so approvals signed over redacted text no longer verify for texts that redaction changed.
 
-- Breaking: `aegis rule insight review --cluster` is removed with no alias; a decision without `--insight` exits 2, and an unknown id exits 1, lists the valid ids and writes no row. `review --json` returns `insights`, `suppressed` and `suggestions` (each insight with `match`, its top-3 `neighbours`, `level`, `kind`, `paths` and `corroborated`); the `clusters`, `suppressed_clusters` and top-level `neighbours` keys and cluster ids are gone.
+- Breaking: `aegis rule insight review --cluster` is removed with no alias; every decision requires repeatable `--insight ID`, and `reject` also requires `--reason` (exit 2 when missing). An unknown insight or suggestion id exits 1, lists the valid ids and writes no row. `review --json` returns `insights`, `suppressed` and `suggestions` (each insight with `match`, its top-3 `neighbours`, `level`, `kind`, `paths` and `corroborated`); the `clusters`, `suppressed_clusters` and top-level `neighbours` keys and cluster ids are gone.
 - Breaking: `derived.json` and `aegis sync --json` rule entries lose `precision_lo`, `precision_hi` and `decay_factor`, and the `sync --pr` body drops the precision interval.
 - Breaking: the top-level and `fitness` spellings of `half_life_sessions` and `epsilon` in `.aegis/config.json` no longer apply (one warning); use `expiry.half_life_sessions` and `expiry.epsilon`.
 
@@ -256,6 +261,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 ### Corrections
 
+- The 4.3.4 statement that `gh` chooses `GH_REPO` or a clone-default remote is superseded: Aegis resolves `remote.origin.url`, overrides `GH_REPO` and runs `gh` from an empty temporary directory, as described under Security.
 - The 4.3.0 insight-hook entry named a flag that never existed: `--counters-only`. Heartbeats contain no text; storing correction excerpts requires `aegis rule insight enable --host claude-code|codex-cli --excerpts`.
 - The 4.3.2 metadata changes included the Beta-to-Production/Stable classifier, three additional Topic classifiers and keywords expanded from 8 to 15. These packaging labels did not establish new security guarantees.
 - Earlier rule-credit wording overstated local trust: legacy ledger rows and replay can affect local fitness, promotion requires human-adjudicated labels, and agent-reported outcome credit requires CI confirmation. The policy docs now also describe the session pseudonymization key, scan bookkeeping, the warning-only regression check and the separate CODEOWNERS diagnostic.
