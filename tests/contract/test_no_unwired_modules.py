@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.contract.test_import_boundary import REPO, _module_files, import_edges
+from tests.contract.test_import_boundary import REPO, _module_files, import_edges, import_nodes
+from tests.contract.test_process_ratchets import ScopedNames, import_bindings
 
 MODULE_PREFIXES = ('aegis_core.verification', 'aegis_core.ast', 'aegis_cli.formatters')
 EXPORT_PREFIXES = ('aegis_core.verification', 'aegis_cli.formatters')
@@ -22,19 +23,7 @@ def _under(name: str, prefixes: tuple[str, ...]) -> bool:
     return any(name == prefix or name.startswith(prefix + '.') for prefix in prefixes)
 
 
-def _runtime_nodes(tree):
-    """Exclude script-only bodies; retain their else branches and all lazy imports."""
-    yield tree
-    if isinstance(tree, ast.If) and isinstance(tree.test, ast.Compare):
-        test = tree.test
-        if (len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq) and
-                {ast.dump(test.left), ast.dump(test.comparators[0])} ==
-                {ast.dump(ast.Name(id="__name__", ctx=ast.Load())), ast.dump(ast.Constant(value="__main__"))}):
-            for child in tree.orelse:
-                yield from _runtime_nodes(child)
-            return
-    for child in ast.iter_child_nodes(tree):
-        yield from _runtime_nodes(child)
+_runtime_nodes = import_nodes
 
 
 def _runtime_imports(root: Path):
@@ -53,15 +42,6 @@ def orphan_modules(root: Path) -> list[str]:
     return sorted(module for module in modules if _under(module, MODULE_PREFIXES) and not any(target == module or target.startswith(module + ".") for target in imported))
 
 
-def _qualified(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        base = _qualified(node.value)
-        return f'{base}.{node.attr}' if base else ''
-    return ''
-
-
 def unused_exports(root: Path) -> list[str]:
     modules = _module_files(root)
     # Imports and attribute references share the script-body exclusion.
@@ -70,7 +50,8 @@ def unused_exports(root: Path) -> list[str]:
     references = {}
     for module, path in modules.items():
         tree = ast.parse(path.read_text(encoding='utf-8'))
-        aliases = {}
+        rel = path.relative_to(root).as_posix()
+        resolver = ScopedNames(tree, rel, runtime_only=True)
         used = set()
         for node in _runtime_nodes(tree):
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == '__all__'
@@ -82,22 +63,12 @@ def unused_exports(root: Path) -> list[str]:
                     exports[module] = names
             if (module, getattr(node, 'lineno', None)) not in sites:
                 continue
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    aliases[alias.asname or alias.name.split('.')[0]] = alias.name if alias.asname else alias.name.split('.')[0]
-            elif isinstance(node, ast.ImportFrom):
-                base = module.split('.') if path.name == '__init__.py' else module.split('.')[:-1]
-                package = '.'.join(base[:len(base) - node.level + 1] + ([node.module] if node.module else [])) if node.level else node.module or ''
-                for alias in node.names:
-                    name = f'{package}.{alias.name}'
-                    aliases[alias.asname or alias.name] = name
-                    used.add(name)  # An explicit import is an external reference, including a re-export.
+            if isinstance(node, ast.ImportFrom):
+                # An explicit import is a reference, including an intentional re-export.
+                used.update(import_bindings(node, rel).values())
         for node in _runtime_nodes(tree):
             if isinstance(node, ast.Attribute):
-                name = _qualified(node)
-                first, _, rest = name.partition('.')
-                if first in aliases:
-                    used.add(aliases[first] + ('.' + rest if rest else ''))
+                used.update(resolver.resolve(node))
         references[module] = used
     return sorted(f'{module}.{name}' for module, names in exports.items() for name in names
                   if not any(f'{module}.{name}' in used for caller, used in references.items() if caller != module))
@@ -154,3 +125,20 @@ def test_dynamic_export_lists_fail_loudly(tmp_path):
     _write(tmp_path, 'aegis_core/verification/new.py', '__all__ = exported_names()\n')
     with pytest.raises(ValueError, match='malformed node or string'):
         unused_exports(tmp_path)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_export_consumers_do_not_leak_between_sibling_scopes(tmp_path, reverse):
+    _write(tmp_path, 'aegis_core/verification/new.py',
+           '__all__ = ["check", "orphan"]\ndef check(): pass\ndef orphan(): pass\n')
+    pieces = ['def unrelated():\n    import other as backend\n    backend.orphan()\n',
+              'def real():\n    from aegis_core.verification import new as backend\n    backend.check()\n']
+    _write(tmp_path, 'aegis_cli/check.py', '\n'.join(reversed(pieces) if reverse else pieces))
+    assert unused_exports(tmp_path) == ['aegis_core.verification.new.orphan']
+
+
+def test_export_parameter_shadows_a_module_alias(tmp_path):
+    _write(tmp_path, 'aegis_core/verification/new.py', '__all__ = ["orphan"]\ndef orphan(): pass\n')
+    _write(tmp_path, 'aegis_cli/check.py',
+           'from aegis_core.verification import new as backend\ndef unrelated(backend):\n    backend.orphan()\n')
+    assert unused_exports(tmp_path) == ['aegis_core.verification.new.orphan']

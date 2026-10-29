@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from tests.contract.test_process_ratchets import module_trees, qualified, aliases_for
+from tests.contract.test_process_ratchets import module_trees, ScopedNames, import_bindings
 
 REPO = Path(__file__).resolve().parents[2]
 PRIVATE_IMPORTS = {'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1,
@@ -188,15 +188,15 @@ def test_private_imports_count_imports_alias_attributes_and_skip_reexports(tmp_p
 def private_imports(root, locations=False):
     found = []
     for rel, tree in module_trees(root):
-        aliases = aliases_for(tree, rel)
+        resolver = ScopedNames(tree, rel)
         own = rel.removesuffix(".py").replace("/", ".")
         package = own.rsplit(".", 1)[0]
         for node in ast.walk(tree):
             names = []
             if isinstance(node, ast.ImportFrom):
-                names = [aliases[a.asname or a.name] for a in node.names if a.name.startswith("_") and not a.name.startswith("__")]
+                names = [import_bindings(node, rel)[a.asname or a.name] for a in node.names if a.name.startswith("_") and not a.name.startswith("__")]
             elif isinstance(node, ast.Attribute) and node.attr.startswith("_") and not node.attr.startswith("__"):
-                names = [qualified(node, aliases)]
+                names = resolver.resolve(node)
             for name in names:
                 if not name.startswith(tuple(p + "." for p in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"))):
                     continue
@@ -238,3 +238,13 @@ if __name__ == "__main__":
     lines = source.splitlines(keepends=True)
     lines[assignment.lineno - 1:assignment.end_lineno] = ["PRIVATE_IMPORTS = " + pprint.pformat(current, sort_dicts=True) + "\n"]
     path.write_text("".join(lines), encoding="utf-8")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_private_aliases_do_not_leak_between_sibling_scopes(tmp_path, reverse):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    pieces = ["def inspect():\n    from aegis_core import config as backend\n    backend._read_capped('x')\n",
+              "def decode():\n    import json as backend\n    backend._decoder('x')\n"]
+    (package / "probe.py").write_text("\n".join(reversed(pieces) if reverse else pieces), encoding="utf-8")
+    assert private_imports(tmp_path) == ["aegis_core/probe.py:aegis_core.config._read_capped"]
