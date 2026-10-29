@@ -98,6 +98,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 ### Added
 
+- Focused architecture, host-and-hook and agent-team guides, linked from a shorter README and concept-based how-it-works page. Why Aegis now carries the author's account, reproducible measurements, dated historical evidence and current trust limits.
+
 - Documentation examples are checked against the command contract, and AST, verification and formatter modules must have production importers. Declared verification and formatter exports must have references outside their own file. The future roadmap in `docs/why-aegis.md` is explicitly marked as planned and checked against the shipped version.
 
 - `aegis-guardrails` is a second name for the `aegis-mcp` command: it starts the same MCP server, so `uvx aegis-guardrails` and the MCP Registry entry (`server.json`) can run it. Such a registration is the host's own: `uvx` resolves through the host's PATH, and `aegis doctor` reports an `aegis` entry like that as unsafe (not an absolute path).
@@ -116,6 +118,8 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 - `aegis_core.redaction` (layer 0, standard library only): the one secret-redaction table and its entry points, shared by the hook command log, insight text and scanner snippets.
 
 ### Fixed
+
+- Documentation separates deterministic checks, optional test receipts and CI-confirmed rule credit, including empty-rule scans and unsupported unittest/mixed-suite summaries. Contributor setup and approval guidance now cover isolated tests and governance changes; SECURITY distinguishes the tree-identity git runner from `gitsafe`.
 
 - Structural contract checks now reject import cycles, adapter names in core import strings, growth in pinned module/function sizes and private coupling, duplicate primitive helpers, and unreviewed process or executable-lookup sites. Their update commands only lower existing pins; git and gh execution stays within the reviewed transport modules.
 - Python source decoding lives in a shared leaf, removing the schema/driver import cycle without changing decoding. Its codec tests follow the leaf so automatic mutation checks still discover them. The SDK uses the public `get_changed_files` helper, and duplicate generic helpers have purpose-specific names.

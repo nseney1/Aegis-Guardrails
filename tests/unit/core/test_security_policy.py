@@ -63,6 +63,8 @@ RETRACTED = (
     "aegis system",           # a removed command (D5)
     "DirectSDKBackend",       # the vendor SDK backends were cut (D14)
     "Git subprocesses strip inherited repository",  # selector scrubbing is scoped, not the default
+    "your PATH, always through `gitsafe`",  # treeid has its own runner and private index
+    "an executable resolved outside the repository",  # git accepts absolute PATH entries inside it
 )
 
 
@@ -80,6 +82,10 @@ def test_retracted_claim_guard_is_case_insensitive():
     assert retracted_claims_in("Keys are ED25519 and the server is Air-Gapped.") == ["Ed25519", "air-gapped"]
     assert retracted_claims_in("GIT SUBPROCESSES STRIP INHERITED REPOSITORY selectors.") == [
         "Git subprocesses strip inherited repository"]
+    assert retracted_claims_in("your PATH, always through `gitsafe`") == [
+        "your PATH, always through `gitsafe`"]
+    assert retracted_claims_in("AN EXECUTABLE RESOLVED OUTSIDE THE REPOSITORY") == [
+        "an executable resolved outside the repository"]
 
 
 def test_git_environment_claim_names_the_evidence_scope_and_hook_exception():
