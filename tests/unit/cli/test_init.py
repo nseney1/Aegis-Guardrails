@@ -1427,8 +1427,8 @@ class TestRunInitPins:
             "source": "aegis init", "aegis_version": "<V>", "checked_at": "<TS>",
             "scope": {"workspace": "<HOME>", "hosts": [], "detected": []},
             "dry_run": False, "status": "refused", "actions": [],
-            "errors": ["refusing to set up <HOME>: your home directory and a filesystem root are never a workspace "
-                       "(ADR 0005 AD-4). Run aegis init in a repository."],
+            "errors": ["refusing to set up <HOME>: your home directory and a filesystem root are never a workspace. "
+                       "Run aegis init in a repository."],
             "warnings": [],
         }
         assert captured.err == ""

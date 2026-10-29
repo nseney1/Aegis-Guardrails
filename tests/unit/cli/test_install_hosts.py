@@ -26,7 +26,7 @@ _REAL_RUN_CLI = ih._run_cli
 
 RETIRED_GEMINI_CLI = ("gemini-cli is not supported: Google retired Gemini CLI for individual Code Assist "
                       "accounts; use --host antigravity.")
-DESKTOP_H4 = ("claude-desktop is identity only: Aegis does not register there (ADR 0005 H4); "
+DESKTOP_H4 = ("claude-desktop is identity only: Aegis does not register there; "
               "the Claude desktop app's Code tab shares Claude Code's configuration: use --host claude-code")
 
 BEGIN = "<!-- aegis:begin id={id} v=1 sha={sha} -->"

@@ -144,7 +144,7 @@ def _no_registration(host_id: str) -> str:
     if spec.retired:
         return "retired: Aegis does not register there"
     if spec.registration is None:
-        return "identity only: Aegis does not register there (ADR 0005 H4)"
+        return "identity only: Aegis does not register there"
     return ""
 
 

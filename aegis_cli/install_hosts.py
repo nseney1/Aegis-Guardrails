@@ -673,7 +673,7 @@ def _never_registered(host: host_table.HostSpec) -> str:
     if host.retired:
         return host.retired
     if host.registration is None:
-        why = f"{host.id} is identity only: Aegis does not register there (ADR 0005 H4)"
+        why = f"{host.id} is identity only: Aegis does not register there"
         return f"{why}; {host.redirect}" if host.redirect else why
     return ""
 

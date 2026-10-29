@@ -464,7 +464,7 @@
             "flags": [
               "--lane"
             ],
-            "help": "Post-lane gate: check the lane's commits since merge-base(--base, HEAD) for containment (every changed path, deletions and both sides of a move included, inside the lane's globs) and Python test integrity (removed tests, added skips or xfails, pytest collection changes; assert weakening is not detected). Any finding fails. Self-attested from the live lease or --paths; witnessed with --base-policy. As a CI job it is advisory in v4.1, and a witness is only as strong as the protection on .github/** and on the base branch",
+            "help": "Post-lane gate: check the lane's commits since merge-base(--base, HEAD) for containment (every changed path, deletions and both sides of a move included, inside the lane's globs) and Python test integrity (removed tests, added skips or xfails, pytest collection changes; assert weakening is not detected). Any finding fails. Self-attested from the live lease or --paths; witnessed with --base-policy. As a CI job it is advisory, and a witness is only as strong as the protection on .github/** and on the base branch",
             "kind": "store",
             "metavar": "LANE",
             "nargs": null,
@@ -542,7 +542,7 @@
             "flags": [
               "--ci"
             ],
-            "help": "The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
+            "help": "The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the fix-commit regression check, a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -616,7 +616,7 @@
             "flags": [
               "--no-exec"
             ],
-            "help": "With --ci: read git objects only and run none of the repository's code: the T5 regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage and --perf",
+            "help": "With --ci: read git objects only and run none of the repository's code: the regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage and --perf",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,

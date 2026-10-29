@@ -594,7 +594,7 @@ def test_text_output_prints_the_matrix_and_the_tier_table(env):
     rc, out = env.run()
     assert "Codex CLI (codex-cli): unregistered" in out
     assert "Claude Code (claude-code): ok" in out
-    assert "Enforcement tiers" in out
+    assert "\nEnforcement tiers:\n" in out
     for tier in ("Advisory", "Best-effort", "Local floor", "Authoritative"):
         assert tier in out
     assert "aegis init --host codex-cli" in out

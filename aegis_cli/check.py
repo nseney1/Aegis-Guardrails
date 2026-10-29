@@ -312,7 +312,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         print(sanitize_display(f"  note: {note}", 400))
     if reg_report is not None:
         if reg_report.findings and reg_report.tier != "gate":
-            print("  regression tier: warning (advisory in 4.4.0; no setting makes it block)")
+            print("  regression tier: warning (advisory; no setting makes it block)")
         for finding in reg_report.findings:
             tag = ("UNVERIFIED" if finding.code in regression.UNVERIFIED_CODES
                    else "FAIL" if reg_report.tier == "gate" else "WARN")
@@ -529,7 +529,7 @@ class CheckCommand(AegisCommand):
             "(every changed path, deletions and both sides of a move included, inside the lane's globs) and "
             "Python test integrity (removed tests, added skips or xfails, pytest collection changes; assert "
             "weakening is not detected). Any finding fails. Self-attested from the live lease or --paths; "
-            "witnessed with --base-policy. As a CI job it is advisory in v4.1, and a witness is only as strong "
+            "witnessed with --base-policy. As a CI job it is advisory, and a witness is only as strong "
             "as the protection on .github/** and on the base branch",
         )
         mode.add_argument(
@@ -580,7 +580,7 @@ class CheckCommand(AegisCommand):
             "flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base "
             "branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's "
             "approving review of the "
-            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the T5 fix-commit regression check, "
+            "head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the fix-commit regression check, "
             "a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail",
         )
         parser.add_argument(
@@ -628,7 +628,7 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--no-exec",
             action="store_true",
-            help="With --ci: read git objects only and run none of the repository's code: the T5 regression "
+            help="With --ci: read git objects only and run none of the repository's code: the regression "
             "and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. "
             "Refuses --coverage and --perf",
         )

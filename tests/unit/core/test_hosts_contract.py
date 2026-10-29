@@ -81,6 +81,11 @@ def test_gemini_cli_is_retired_and_kept_only_to_name_the_client():
     assert hosts.identify("gemini-cli-mcp-client") == "gemini-cli"
 
 
+def test_identity_and_unverified_hook_notes_describe_current_support():
+    assert hosts.get("claude-desktop").notes == ("Identity only: Aegis does not register here.",)
+    assert "No Aegis hooks: Kiro's hook semantics for blocking are not verified." in hosts.get("kiro").notes
+
+
 def test_only_gemini_cli_is_retired_and_a_retired_row_never_registers():
     assert [h.id for h in hosts.HOSTS if h.retired] == ["gemini-cli"]
     assert hosts.get("claude-desktop").retired == ""

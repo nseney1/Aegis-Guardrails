@@ -192,7 +192,7 @@ def test_a_user_config_gate_tier_is_ignored_and_the_static_hint_says_so(
 
     rc, out, _err = run_ci(repo, capsys)
     assert rc == 0
-    assert "  regression tier: warning (advisory in 4.4.0; no setting makes it block)" in out
+    assert "  regression tier: warning (advisory; no setting makes it block)" in out
     assert "[WARN:regression/no_test_changes]" in out
     rc, out, _err = run_ci(repo, capsys, "--format", "json")
     reg = json.loads(out)["regression"]
@@ -364,10 +364,10 @@ def test_each_pytest_run_prints_a_start_and_an_end_line_on_stderr(tmp_path: Path
     base = payload["scope"]["merge_base"]
     progress = [line for line in err.splitlines() if line.startswith("aegis check --ci: ")]
     expected = [
-        rf"aegis check --ci: T5 regression run 1 of 2: pytest on the pull request head {head[:10]} \(1 test file\(s\)\)",
-        r"aegis check --ci: T5 regression run 1 of 2: pytest exit 0 after \d+\.\ds",
-        rf"aegis check --ci: T5 regression run 2 of 2: pytest on the merge base {base[:10]} \(1 test file\(s\)\)",
-        r"aegis check --ci: T5 regression run 2 of 2: pytest exit 0 after \d+\.\ds",
+        rf"aegis check --ci: Regression test run 1 of 2: pytest on the pull request head {head[:10]} \(1 test file\(s\)\)",
+        r"aegis check --ci: Regression test run 1 of 2: pytest exit 0 after \d+\.\ds",
+        rf"aegis check --ci: Regression test run 2 of 2: pytest on the merge base {base[:10]} \(1 test file\(s\)\)",
+        r"aegis check --ci: Regression test run 2 of 2: pytest exit 0 after \d+\.\ds",
         rf"aegis check --ci: Aegis-Check rerun 1 of up to 2: tests.command on commit {head[:10]} \(the whole tree\)",
         r"aegis check --ci: Aegis-Check rerun 1 of up to 2: exit 0 after \d+\.\ds",
     ]
@@ -389,3 +389,13 @@ def test_no_exec_runs_nothing_and_prints_no_progress(tmp_path: Path, capsys: pyt
     reruns = _fake_pytest_and_rerun(monkeypatch)
     rc, _out, err = run_ci(repo, capsys, "--no-exec")
     assert rc == 0 and reruns == [] and "aegis check --ci: " not in err
+
+
+def test_check_help_describes_regression_and_lane_checks_without_internal_labels(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["check", "--help"])
+    assert exc.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "fix-commit regression check" in text
+    assert "As a CI job it is advisory," in text
+    assert "T5" not in text and "in v4.1" not in text

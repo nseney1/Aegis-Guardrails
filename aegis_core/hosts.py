@@ -160,7 +160,7 @@ HOSTS: Tuple[HostSpec, ...] = (
         client_prefixes=("local-agent-mode-",),
         instructions="none",
         slot_profile=GENERIC,
-        notes=("Identity only: Aegis does not register here (ADR 0005 H4).",),
+        notes=("Identity only: Aegis does not register here.",),
         # Chat and Cowork read claude_desktop_config.json, have no workspace and no AGENTS.md
         # (DOC), and the MCP roots they send are the union of open sessions (live probe).
         surfaces=("Claude desktop app (chat)", "Claude desktop app (Cowork)"),
@@ -224,7 +224,7 @@ HOSTS: Tuple[HostSpec, ...] = (
         notes=(
             "Its row follows the vendor's documentation and is not yet checked on a real install.",
             "It becomes verified only after 3 clean runs (ADR 0007 section 4).",
-            "No Aegis hooks in v4.1: Kiro's hook semantics for blocking are not verified.",
+            "No Aegis hooks: Kiro's hook semantics for blocking are not verified.",
             "MCP support must be switched on in Kiro's settings.",
         ),
         surfaces=("Kiro IDE", "Kiro CLI"),

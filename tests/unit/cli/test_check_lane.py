@@ -302,7 +302,7 @@ def test_help_documents_the_gate_and_its_limits(capsys):
     flat = " ".join(out.split())
     for flag in ("--lane LANE", "--base REF", "--paths GLOB", "--base-policy"):
         assert flag in flat
-    assert "advisory" in flat and "v4.1" in flat
+    assert "advisory" in flat and "v4.1" not in flat
     assert "only as strong as the protection on .github/** and on the base branch" in flat
     assert "CHANGELOG.md also admits docs/CHANGELOG.md" in flat
     assert "fetch-depth 0" in flat
