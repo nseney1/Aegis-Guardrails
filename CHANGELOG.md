@@ -8,7 +8,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 
 ### Security
 
-- **Incomplete PEM private keys are redacted through the end of the text.** Shared hook and insight redaction no longer leaves the body behind when the closing marker is missing, malformed or beyond the former length limit. Complete keys retain surrounding text.
+- **Incomplete PEM private keys are redacted through the end of the text.** Shared hook and insight redaction no longer leaves the body behind when the closing marker is missing, malformed, has a different key label or is beyond the former length limit. Complete keys with matching begin/end labels retain surrounding text.
 
 - **`aegis_capture_insight` is bounded.** It allows 5 calls per 60 seconds and 50 captures per session, and refuses more than 20 `paths` or a path longer than 512 characters; the dirty-path default keeps the first 20 and records `paths_dropped`. Hook rows do not count toward the cap.
 - **`aegis check --ci --no-exec` runs no repository code.** It reads git objects only: it skips the regression and `Aegis-Check` trailer reruns, never reads or writes the ledger, says what it skipped (JSON `skipped`), and refuses `--coverage`, `--perf` and `--strict`.
@@ -118,7 +118,7 @@ The 4.4.0 remediation waves land here; the section becomes `[4.4.0]` at release.
 ### Fixed
 
 - Structural contract checks now reject import cycles, adapter names in core import strings, growth in pinned module/function sizes and private coupling, duplicate primitive helpers, and unreviewed process or executable-lookup sites. Their update commands only lower existing pins; git and gh execution stays within the reviewed transport modules.
-- Python source decoding lives in a shared leaf, removing the schema/driver import cycle without changing decoding. The SDK uses the public `get_changed_files` helper, and duplicate generic helpers have purpose-specific names.
+- Python source decoding lives in a shared leaf, removing the schema/driver import cycle without changing decoding. Its codec tests follow the leaf so automatic mutation checks still discover them. The SDK uses the public `get_changed_files` helper, and duplicate generic helpers have purpose-specific names.
 - CLI parser configuration runs once. An internal `TypeError` now propagates instead of triggering a retry, while hook and skills subcommands retain their common flags.
 
 - A warm scan in a git repository starts 3 git processes (was 9, and 13 for an MCP scan); the first scan starts 4, and a scan outside git starts 1 (was 7).
