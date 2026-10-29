@@ -1,0 +1,40 @@
+[
+  {
+    "verificationResult": {
+      "statement": {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [
+          {
+            "name": "subject.txt",
+            "digest": {
+              "sha256": "d5ad9ad58ea7d60cfc04f91927c8ee9b580813ea432f9c1ccc8fd0b0812608f5"
+            }
+          }
+        ],
+        "predicateType": "https://aegis.example/predicate/ci-verdict/v1",
+        "predicate": {
+          "commit": "9feae103cf58d5d29cacdb8699c38d8c50ec5287",
+          "jobs": {
+            "aegis-check": "success",
+            "build-wheel": "success",
+            "dependency-audit": "success",
+            "test-windows": "success",
+            "validate": "success"
+          },
+          "run": "39672680187/1",
+          "tree": "874fc12ef1b15340acad9667d57e12978ba159b2"
+        }
+      },
+      "signature": {
+        "certificate": {
+          "sourceRepositoryURI": "https://github.com/nseney1/Aegis-Guardrails",
+          "sourceRepositoryDigest": "9feae103cf58d5d29cacdb8699c38d8c50ec5287",
+          "sourceRepositoryRef": "refs/heads/main",
+          "buildSignerURI": "https://github.com/nseney1/Aegis-Guardrails/.github/workflows/validate.yml@refs/heads/main",
+          "buildSignerDigest": "9feae103cf58d5d29cacdb8699c38d8c50ec5287",
+          "runnerEnvironment": "github-hosted"
+        }
+      }
+    }
+  }
+]

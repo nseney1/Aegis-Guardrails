@@ -256,7 +256,6 @@ def run_external_cmd(
 
 
 __all__ = [
-    "NoTestRunnerFoundError",
     "resolve_pytest_cmd",
     "discover_test_evidence",
     "run_external_cmd",

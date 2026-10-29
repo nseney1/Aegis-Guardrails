@@ -21,7 +21,7 @@ from aegis_core.ast.schema import NormalizedAST
 from aegis_core.match import is_test_path
 from . import ToolEvidence
 
-__all__ = ["check", "check_normalized"]
+__all__ = ["check"]
 
 
 @dataclass(frozen=True)

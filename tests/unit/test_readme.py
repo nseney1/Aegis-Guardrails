@@ -549,6 +549,8 @@ def _registered_mcp_tools() -> List[str]:
 def test_no_doc_calls_a_shipped_version_planned():
     """No user-facing doc may describe a version <= the current minor version as planned,
     future work, or unshipped, and no ADR targeting a shipped version may remain draft."""
+    from tests.unit.test_docs_claims import roadmap_problems, shipped_text
+
     current = _current_minor()
     why = ROOT / "docs" / "why-aegis.md"
     security = ROOT / "SECURITY.md"
@@ -568,7 +570,9 @@ def test_no_doc_calls_a_shipped_version_planned():
         "will copy the 15 packaged",
     )
     for doc in (README, HOW, why, security):
-        text = _flat(doc.read_text(encoding="utf-8")).lower()
+        raw = doc.read_text(encoding="utf-8")
+        assert roadmap_problems(raw, current) == []
+        text = _flat(shipped_text(raw, doc.relative_to(ROOT).as_posix())).lower()
         for phrase in unconditional_stale:
             assert phrase not in text, (doc.name, phrase)
         for pattern in versioned_patterns:

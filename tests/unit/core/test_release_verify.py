@@ -840,3 +840,80 @@ def test_release_needs_a_commit(tmp_path, monkeypatch, capsys):
     repo = make_repo(tmp_path)
     rc, _out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", " ")
     assert rc == 2 and "--release" in err
+
+
+# Author-recorded gh 2.103.2 output. See tests/fixtures/README.md for provenance and
+# the sanitization boundary; this tests gh's JSON shape, not its cryptography.
+def _recorded_attestation() -> list:
+    return json.loads((ROOT / "tests/fixtures/gh_attestation_verify.json").read_text(encoding="utf-8"))
+
+
+def _recorded_for(repo: hg.Repo) -> list:
+    """Rebind only identities to a real temporary git repository, retaining the captured shape."""
+    records = _recorded_attestation()
+    result = records[0]["verificationResult"]
+    statement, certificate = result["statement"], result["signature"]["certificate"]
+    commit, tree, digest = facts(repo)
+    statement["predicate"].update(commit=commit, tree=tree)
+    statement["subject"][0]["digest"]["sha256"] = digest
+    certificate.update(sourceRepositoryDigest=commit, buildSignerDigest=commit,
+                       sourceRepositoryURI=f"https://github.com/{REPOSITORY}",
+                       buildSignerURI=f"https://github.com/{REPOSITORY}/{rv.WORKFLOW}@refs/heads/main")
+    return records
+
+
+@needs_git
+def test_author_recorded_gh_shape_verifies_through_public_release_api(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
+    records = _recorded_for(repo)
+    gh = FakeGh("2.103.2", (0, json.dumps(records), ""))
+    report = rv.verify_release(repo.root, repo.head(), run=gh, tier_runner=tier_runner("A"))
+    assert report.verified is True and report.code == "verified" and report.tier == "A"
+    assert report.details["run"] == records[0]["verificationResult"]["statement"]["predicate"]["run"]
+    assert gh.subjects == [rv.subject_bytes(*facts(repo)[:2])]
+    assert len(gh.verify_calls) == 1
+    assert gh.verify_calls[0][gh.verify_calls[0].index("--source-ref") + 1] == "refs/heads/main"
+
+
+def test_untouched_recorded_fixture_matches_its_original_subject():
+    records = _recorded_attestation()
+    result = records[0]["verificationResult"]
+    statement, certificate = result["statement"], result["signature"]["certificate"]
+    predicate = statement["predicate"]
+    digest = hashlib.sha256(rv.subject_bytes(predicate["commit"], predicate["tree"])).hexdigest()
+    assert statement["subject"][0]["digest"]["sha256"] == digest
+    assert rv._recheck(json.dumps(records), predicate["commit"], predicate["tree"], digest,
+                       "nseney1/Aegis-Guardrails", certificate["sourceRepositoryRef"]) == (
+                           True, "", predicate["run"])
+
+
+_RECORDED_MUTATIONS = [
+    ("statement.predicateType", "other", "the predicate type is not the Aegis CI verdict"),
+    ("statement.subject.0.digest.sha256", "0" * 64, "the attested subject is not this commit's verdict"),
+    ("statement.predicate.commit", "0" * 40, "the predicate names another commit or tree"),
+    ("statement.predicate.tree", "0" * 40, "the predicate names another commit or tree"),
+    ("statement.predicate.run", "bad", "the predicate lacks a valid run id and attempt"),
+    ("statement.predicate.jobs", {"validate": "failure"}, "the predicate does not say every job succeeded"),
+    ("signature.certificate.sourceRepositoryDigest", "0" * 40, "the certificate is for another commit"),
+    ("signature.certificate.buildSignerDigest", "0" * 40, "the certificate is for another commit"),
+    ("signature.certificate.runnerEnvironment", "self-hosted", "the build did not run on a GitHub-hosted runner"),
+    ("signature.certificate.sourceRepositoryURI", "https://github.com/other/repo", "the certificate is for another repository"),
+    ("signature.certificate.sourceRepositoryRef", "refs/tags/v4.3.4", "the certificate is for another ref than refs/heads/main"),
+    ("signature.certificate.buildSignerURI", "https://github.com/other/repo/workflow.yml", f"the signer is not {REPOSITORY}/{rv.WORKFLOW}"),
+]
+
+
+@needs_git
+@pytest.mark.parametrize("field,value,reason", _RECORDED_MUTATIONS, ids=[m[0] for m in _RECORDED_MUTATIONS])
+def test_recorded_gh_shape_rejects_each_rechecked_field(tmp_path, field, value, reason):
+    repo = make_repo(tmp_path, tier="A")
+    records = _recorded_for(repo)
+    target = records[0]["verificationResult"]
+    *parents, key = field.split(".")
+    for parent in parents:
+        target = target[int(parent)] if isinstance(target, list) else target[parent]
+    target[key] = value
+    gh = FakeGh("2.103.2", (0, json.dumps(records), ""))
+    report = rv.verify_release(repo.root, repo.head(), run=gh, tier_runner=tier_runner("A"))
+    assert report.verified is False and report.code == "bad_output"
+    assert report.message == f"gh exited 0 but its output does not check out: {reason}"
