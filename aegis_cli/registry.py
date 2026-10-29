@@ -56,10 +56,7 @@ class CommandRegistry:
                 kwargs["description"] = cmd.description
 
             sub_p = subparsers.add_parser(cmd.name, **kwargs)
-            try:
-                cmd.configure_parser(sub_p, parents=parents)
-            except TypeError:
-                cmd.configure_parser(sub_p)
+            cmd.configure_parser(sub_p)
             parsers[cmd.name] = sub_p
 
         return parsers
