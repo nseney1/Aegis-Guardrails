@@ -1,62 +1,34 @@
-# How Aegis works, end to end
+# How Aegis works
 
-This page follows one change from an agent's first tool call to a merged commit, and explains each part of Aegis on the way: rules, just-in-time delivery over MCP, checks, the evidence ledger, hosts and enforcement. It describes the code as it is on the development branch, which can be ahead of the latest release (the [CHANGELOG](../CHANGELOG.md) says which release each change is in). Section 8 covers agent hooks, teams and skills, section 9 adoption tools, and section 10 trust and evidence.
+Aegis connects project rules, checks and evidence. This guide explains those concepts and follows a change through them. It describes the development branch; the [changelog](../CHANGELOG.md) identifies released changes.
 
-For a two-minute setup, start with the [README](../README.md). For every command, flag and MCP tool schema, see the generated [reference](reference.md). For why Aegis is built this way, and what went wrong before v4, see [Why Aegis is built this way](why-aegis.md).
+Start with the [README](../README.md) for installation. The [reference](reference.md) lists every command and schema; [architecture](architecture.md), [hosts and hooks](hosts-and-hooks.md), and [agent teams](teams.md) cover their respective setup and implementation boundaries.
 
-## 1. The loop
+## The loop
 
 ```mermaid
 flowchart TD
-    A["aegis init<br/>AGENTS.md bootstrap + MCP registration"] --> B["Agent calls aegis_scan(files)<br/>gets only the matching rules"]
-    B --> C["Agent edits and runs tests"]
-    C --> D["Agent calls aegis_report_outcome"]
-    D --> E["git commit<br/>pre-commit hook: aegis check --hook"]
-    E --> F["CI: aegis check on the exact commit"]
-    F --> G["Reviewed merge"]
-    D -. "advisory row" .-> L[("Local ledger<br/>in the git directory")]
-    E -. "check result" .-> L
-    L --> S["aegis sync<br/>derived fitness, suggested promotions"]
-    S --> P["A person applies a promotion<br/>(aegis sync --apply) and commits it"]
-    P --> R["Rules in .aegis/rules/"]
-    R --> B
+    A["Initialize: bootstrap + MCP registration"] --> B["Scan the paths to edit"]
+    B --> C["Edit and run project checks"]
+    C --> D{"Scan returned rule IDs?"}
+    D -- yes --> E["Report the IDs actually served"]
+    D -- no --> F["Skip outcome report; state test results directly"]
+    E --> G["Commit: check staged content"]
+    F --> G
+    C -. optional .-> R["Record an isolated test run for the exact tree"]
+    R -. passing receipt required for linkage .-> E
+    G --> H["CI checks + reviewed merge"]
+    H --> I["Sync evidence; human reviews lifecycle suggestions"]
+    I --> B
 ```
 
-1. **Bootstrap.** `aegis init` writes a short marked block into `AGENTS.md` and registers the `aegis` MCP server with the hosts you name. The block holds no rule text; it tells the agent to call `aegis_scan` before editing and `aegis_report_outcome` after verifying.
-2. **Scan.** Before editing, the agent calls `aegis_scan` with the files it plans to change. Aegis returns the few rules whose `target_paths` match those files.
-3. **Edit and report.** The agent edits, runs its tests and calls `aegis_report_outcome` with the rules it used. When a passing `aegis check --record --tests` row exists for the exact git tree, it credits the rules served in that session; otherwise it records one `claimed` row that never counts as evidence. A `--record` row without `--tests` checks Layer 1 only and credits nothing.
-4. **Check.** `git commit` runs `aegis check --hook` (Layer 1 only, never a model call). CI runs `aegis check` and `aegis check --ci` on the pull request (section 5).
-5. **Learn.** `aegis sync` rebuilds each rule's standing from the ledger and suggests promotions or demotions. Nothing changes until a person applies a suggestion (`aegis sync --apply` or `aegis sync --pr`) and commits it.
+1. **Initialize.** `aegis init` writes a marked bootstrap block in `AGENTS.md` and registers MCP with the hosts you choose. It preserves text outside that block. Rules remain separate files.
+2. **Scan.** Before editing, call `aegis_scan` with the paths you will change. Follow the matching rules and inspect any omitted mandatory rules.
+3. **Verify.** Run the project's checks. You may also request an isolated test receipt with `aegis check --record --tests`; it is a separate operation with the [runner limits below](#evidence-and-outcomes).
+4. **Report and review.** Report outcomes only for IDs the scan returned. If no rule IDs matched, skip `aegis_report_outcome` and report the real commands and results directly. Commit, run CI, and review the change.
+5. **Learn.** `aegis sync` derives rule fitness and proposes changes. A person applies and reviews them; a reported success does not automatically promote a rule.
 
-## 2. What lives where
-
-| Path | Committed? | What it holds |
-|---|---|---|
-| `.aegis/config.json` | yes | `hosts`, `jit.max_tokens`, `jit.scan_window_s` (how recent a scan must be for the edit hook, section 8), rule `expiry`, `expiry.half_life_sessions` (the decay half-life H in exposed sessions; a positive integer, default 30), `expiry.epsilon` (the archive threshold; a number between 0 and 1, default 0.01; top-level and `fitness` spellings are ignored with a warning), `ast.packaged_drivers`. It can never name a command: such keys are ignored with a warning. |
-| `.aegis/rules/<type>/*.md` | yes | the rules, one file each |
-| `.aegis/team.json` | yes | optional: the `shared` globs any lane may change and committed per-lane paths (section 8) |
-| `.aegis/baseline.json` | yes | the ratchet baseline that `aegis check --write-baseline` writes (section 9) |
-| `.aegis/adjudications/<rule-id>.jsonl` | yes | `tp` and `fp` labels from `aegis rule adjudicate`; they count once a reviewed pull request merges them to the base branch (section 6) |
-| `.aegis/proposals/` | if you commit it | draft rule proposals that `aegis rule insight` writes (section 10) |
-| `.aegis/.gitignore` | yes | ignores `state/` |
-| `.aegis/state/` | no | `activity.jsonl` (scans and edits per session; `aegis scan` runs are logged too), `derived.json` (written by `aegis sync`), `lifecycle.jsonl` (rules moved to the archive), `arbiter_predictions.jsonl` (Layer 2 predictions, no model text), `gate_events.jsonl` (`aegis hook safety-gate` decisions), `lock` and `migrate-backup-*/`. In a git repository the outcome ledger is not here: see the `<git common dir>/aegis/` row |
-| `AGENTS.md` | yes | one marked bootstrap block; the rest of the file is yours |
-| the git hooks directory | no | the `pre-commit` hook (runs `aegis check --hook`) and the `prepare-commit-msg` hook, which adds an `Aegis-Check: tree=<tree> exit=<n>` trailer when a passing check row covers the staged tree (section 10) |
-| `.claude/skills/`, `.agents/skills/` | yes | skill copies written by `aegis skills sync`, each with an Aegis marker line |
-| `refs/aegis/lanes/<lane>` | git ref | a lane's lease, written by `aegis team` |
-| `<git common dir>/aegis/` | no | `state/<ws-id>/ledger.jsonl`, the outcome ledger every worktree shares, with its lock (`<ws-id>` names the workspace by its path below the git top level; outside git the ledger is `.aegis/state/ledger.jsonl`), and `events.jsonl`, the events log every worktree shares, with its lock |
-| `CLAUDE.md` | yes | an `@AGENTS.md` block, only if the file already existed |
-| `~/.aegis/workspaces.json` | user | the repos you ran `aegis init` in on this machine |
-| `~/.aegis/link.key` | user | 32 random bytes (`0600` on POSIX) that `aegis init` and `aegis rule insight enable` create (and the first insight capture that carries a session id, when it is missing) to pseudonymize host session ids; it stays on the machine |
-| `~/.aegis/insights/<workspace-id>.jsonl` | user | the opt-in redacted corrections of `aegis rule insight` (section 10) |
-| `~/.aegis/rules/` | user | an optional personal rule layer, served read-only where no repo is governed |
-| `~/.aegis/config.json` | user | the only place for command-like settings, such as an AST driver command |
-| `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.codex/rules/aegis.rules`, `~/.gemini/config/hooks.json` | user | the hook entries `aegis hook install --host` writes (or the repository's `.claude/settings.json`, `.codex/hooks.json` and `.agents/hooks.json` with `--scope project`) |
-| `~/.aegis/backups/` | user | a copy of each file taken before Aegis changes it, one timestamped folder per run: the host config `aegis init --host` and `aegis uninstall` merge (Antigravity's `mcp_config.json`), the files `aegis doctor --fix` edits, the host hook files `aegis hook install --host`, `aegis rule insight enable` and `uninstall --host` change, and the pre-commit hook `aegis hook install` (or `init`) rewrites |
-
-Aegis reads four variables of its own (hosts and GitHub Actions supply others, such as `CLAUDE_PROJECT_DIR`, `GITHUB_BASE_REF` and `GH_TOKEN`): `AEGIS_WORKSPACE` (pin the server to one repo, which must hold `.aegis/`; `aegis init --pin` writes it into the registration, and the CLI honors it too, as section 4 describes), `AEGIS_CLIENT` (host identity, written by `aegis init`), `AEGIS_MAX_JIT_TOKENS` (scan budget) and `AEGIS_LLM_CMD` (the Layer 2 model command).
-
-## 3. Rules
+## Rules and AST patterns
 
 A rule is a markdown file with YAML frontmatter. Its directory names its type:
 
@@ -69,7 +41,7 @@ A rule is a markdown file with YAML frontmatter. Its directory names its type:
 | `persona` | `personas/` | an idiomatic pattern to follow | no |
 | `contract` | `contracts/` | an API or data-shape agreement across services | no |
 
-Any rule that declares `enforcement: gate` is also served first. Type and enforcement decide how a rule is ranked and labeled when it is served; what `aegis check` blocks on is a rule's `forbid_ast` patterns (section 5). Here is a rule that `aegis check` enforces:
+Any rule that declares `enforcement: gate` is also served first. Type and enforcement decide how a rule is ranked and labeled when it is served; what `aegis check` blocks on is a rule's `forbid_ast` patterns ([Checks](#checks)). Here is a rule that `aegis check` enforces:
 
 ```markdown
 ---
@@ -97,21 +69,59 @@ Never call `eval` or `exec` on data. Parse it with `json.loads` or `ast.literal_
 - **Starter rules**: `aegis init --rules minimal|standard|full` seeds 2, 5 or all 12 of the shipped [rules](../rules/) as `persona` rules with `target_paths: []`. They apply to no file until you name the files each one governs; `aegis status` and `aegis sync` list them until you do. `aegis init` also seeds one active invariant (`.aegis/rules/invariants/no-eval.md`) from day one unless you pass `--rules none-active`.
 - **A file that cannot be loaded stops everything**: the scan fails and names it, and `aegis check` blocks, so a partial rule set is never presented as the whole one.
 
-## 4. Just-in-time delivery over MCP
+### A rule for your own code
 
-**The bootstrap.** The `AGENTS.md` block that `aegis init` writes is 572 bytes in a fresh repo. The MCP server sends the same guidance as its `initialize` instructions, which editing files cannot remove. Rule text is never inlined into an instructions file, so it never pushes a host past its size limit.
+The default `no-eval` rule exercises the whole setup. A more specific rule can ban a call only when an argument is absent. Save this as `.aegis/rules/invariants/no-naive-time.md`, then commit it to the reviewed base before trying it:
+
+```markdown
+---
+id: no-naive-time
+type: invariant
+domain: correctness
+enforcement: gate
+hypothesis: Naive datetimes shift by the server's UTC offset
+target_paths: ["src/**/*.py"]
+forbid_ast:
+  calls:
+    - datetime.utcnow
+    - name: datetime.now
+      where:
+        tz: {absent: true}
+---
+Use `datetime.now(timezone.utc)` with an explicit timezone.
+```
+
+For `src/clock.py`, `aegis check src/clock.py` fails on this call:
+
+```python
+from datetime import datetime
+now = datetime.now()
+```
+
+This version passes that rule:
+
+```python
+from datetime import datetime, timezone
+now = datetime.now(tz=timezone.utc)
+```
+
+The check matches syntax, including import aliases; it does not prove that a supplied timezone is semantically correct. A pattern using `where` cannot establish a result when a non-Python driver supplies no argument information.
+
+## Delivery over MCP
+
+**The bootstrap.** `aegis init` writes a small marked `AGENTS.md` block. The MCP server sends the same guidance as its `initialize` instructions, which editing files cannot remove. Rule text is never inlined into an instructions file, so it never pushes a host past its size limit.
 
 **The five tools** (schemas in the [reference](reference.md)):
 
 | Tool | What it does |
 |---|---|
 | `aegis_scan` | returns the rules that apply to the files about to change and records scan/exposure bookkeeping, serving mandatory rules from the reviewed base commit (`rules_base`) |
-| `aegis_report_outcome` | records an outcome for the rules served in this session: `recorded` when a passing `aegis check --record --tests` row exists for the exact git tree, otherwise `claimed` (unwitnessed, never counted as rule evidence) |
+| `aegis_report_outcome` | links an outcome to rules served in the session and a passing test receipt for the same tree; otherwise records `claimed`, which earns no credit. A nonempty list of real rule IDs is required |
 | `aegis_create_rule` | a prompt for drafting a rule; writes nothing |
 | `aegis_list_rules` | every rule with its type, hypothesis and ledger fitness, plus the rules edited since the last `aegis sync` |
 | `aegis_capture_insight` | records a redacted human correction at `~/.aegis/insights/<workspace-id>.jsonl` at `suggestion` level; a matching hook-captured prompt of the same host within 30 minutes annotates it, and the capture never counts |
 
-**What a scan returns.** One loader reads every rule; if any file fails to load, the scan fails. Rules are matched to the files, then ranked: gates, invariants and other `enforcement: gate` rules first, but they take at most two of the three slots a scan has by default, so a broad mandatory rule cannot starve every advisory one. Mandatory rules that do not get a slot are named in `omitted_mandatory`. Advisory rules are ranked by ledger fitness, read from the ledger alone: scan, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics and packs never call GitHub, so in a fresh process they rank without CI-confirmed credit (`aegis sync` and the promote, demote and archive decisions verify it). The whole response is clamped to the token budget, 2,000 estimated tokens by default (`AEGIS_MAX_JIT_TOKENS` or `jit.max_tokens`); a rule that does not fit is counted, never silently dropped. `view: "summary"` or `"ids"` returns less. For the rule above, a summary scan of `app.py` returns:
+**What a scan returns.** One loader reads every rule; if any file fails to load, the scan fails. Rules are matched to the files, then ranked: gates, invariants and other `enforcement: gate` rules first, but they take at most two of the three slots a scan has by default, so a broad mandatory rule cannot starve every advisory one. Mandatory rules that do not get a slot are named in `omitted_mandatory`. Advisory rules are ranked by ledger fitness, read from the ledger alone: scan, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics and packs never call GitHub, so in a fresh process they rank without CI-confirmed credit (`aegis sync` and the promote, demote and archive decisions verify it). The whole response is clamped to the token budget, 2,000 estimated tokens by default (`AEGIS_MAX_JIT_TOKENS` or `jit.max_tokens`); a rule that does not fit is counted, never silently dropped. `view: "summary"` or `"ids"` returns less. For the default `no-eval` rule, a summary scan of `app.py` returns:
 
 ```json
 {
@@ -131,24 +141,13 @@ Never call `eval` or `exec` on data. Parse it with `json.loads` or `ast.literal_
 
 `fitness` is `null` until a rule has a sample large enough to report (no verdicts yet, fewer than 25, or too few triggers to test); the text view prints `Fitness: no evidence yet` for a rule that has never fired. The full view also carries `rules_base`, which says where mandatory rules were read from: `"source": "local-head"` means the repository has no `origin/HEAD`, so they come from your local HEAD and are not review-witnessed.
 
-Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-only agent, and records the scan as `aegis_scan` does, so it also satisfies the scan-before-edit hook (section 8).
+Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-only agent, and records the scan as `aegis_scan` does, so it also satisfies the scan-before-edit hook ([Hosts and hooks](hosts-and-hooks.md)).
 
-MCP schemas and descriptions live in `aegis_mcp.schemas`; `aegis_mcp.registry` keeps the schema re-exports. Shared handler helpers live in `aegis_mcp.handlers.common`, while inventory and rule-creation prompt logic live in `handlers.governance`.
+**No match is a normal result.** An empty `relevant_rules` list does not mean a scan failed, and does not supply an ID for an outcome report. Skip the report when there are no matching IDs. The reporting schema rejects an empty `rules_used` list; inventing an ID or reporting an unrelated rule does not create evidence. A malformed rule or invalid request is an error and must be handled separately.
 
-**Which repository a call governs.** One `aegis-mcp` process can serve sessions in several repos, so every call is bound to a workspace. The first source that names a governed repo (one with `.aegis/`) wins:
+**Workspace and host identity.** A call binds to the operator's `AEGIS_WORKSPACE` pin, host metadata or MCP roots, a registered workspace, or a bounded walk from the server's working directory. Conflicting sources hold the call instead of choosing another repository. An unresolved workspace returns "not governed here" and may serve a read-only personal rule layer; it writes no repo state. The model cannot choose a workspace or host identity through tool arguments. See [workspace binding](hosts-and-hooks.md#workspace-binding) for precedence and repairs.
 
-1. an operator pin, `AEGIS_WORKSPACE` in the registration; it is strict: a pin that does not resolve, or names a directory without `.aegis/`, is an error, not a fallback, and a pin that disagrees with the workspace the host reports is a hold;
-2. what the host itself reports: Codex's per-turn workspace metadata, Claude Code's `CLAUDE_PROJECT_DIR`, or MCP roots;
-3. the registry `~/.aegis/workspaces.json`: the files in the call may only choose among repos you registered with `aegis init`;
-4. a walk up from the server's working directory that stops at the git top level.
-
-There is no workspace argument a model could set, and `$HOME` or `/` is never a workspace. When sources disagree, the call is held with a machine-readable reason instead of governing the wrong repo. When nothing resolves, the server answers "not governed here", and `aegis_scan` serves only the read-only personal layer in `~/.aegis/rules/`, writing nothing.
-
-The CLI reads the same pin. A command run inside another workspace, or in a git repository that does not hold the pinned one (where that repository's pre-commit hook runs), holds with the reason `pin_conflicts_with_cwd` and exits 1 instead of acting on the pinned workspace: unset the pin there. From outside any workspace and repository, the pin decides.
-
-**Who is calling.** The host id comes from `AEGIS_CLIENT` in the registration (written by `aegis init`, so the model cannot set it), otherwise from the MCP client name, otherwise `generic`. Ledger rows carry `host` and `session` set by the server; a tool argument with the same name is ignored.
-
-## 5. Verification: `aegis check`
+## Checks
 
 **Which files.** Files you name; with `--hook` (the pre-commit hook), the staged files, read as staged; or else the working-tree changes (`git diff HEAD` plus staged), or else what the branch adds to its base (`origin/$GITHUB_BASE_REF` in a GitHub pull request, then the branch `origin/HEAD` names, then `main`, `develop` or `master`), or else the last commit. Untracked files are never picked up on their own: `git add` a new file or name it (`aegis check app.py`).
 
@@ -161,170 +160,141 @@ The CLI reads the same pin. A command run inside another workspace, or in a git 
 
 The Python mutation check applies Aegis-specific suite aliases only when the source is inside an exact top-level `aegis_cli`, `aegis_core`, `aegis_mcp` or `aegis_sdk` package. Generic filename lookup remains available, including for nested and similarly named packages.
 
-**Layer 2** is optional: `aegis check --full --plan "what the change should do" --llm-cmd 'claude -p'`. The plan comes from `--plan`, `--plan-file`, or else the first of `docs/plan.md`, `.aegis/plan.md` and `PLAN.md` in the repository; without one, Layer 2 refuses to run. Any command that reads a prompt on stdin and prints a reply works (`codex exec --skip-git-repo-check`, a script). Aegis builds two prompts, one after the other: a spec reviewer gets the plan, the function signatures (with their docstrings) and the test names (no implementation) and predicts what could go wrong; a code reviewer gets the full text of each changed non-test Python file (`__init__.py` is skipped), the test output and the Layer 1 results, never the plan, together with those predictions, and answers each with claims backed by evidence. An arbiter compares the two by risk category, using Layer 1 as the tiebreaker, without asking a model to judge, and returns `SHIP`, `REVISE` or `BLOCK`. The verdict is advisory: `aegis check --full` exits on Layer 1 alone, a review that does not complete prints `UNVERIFIED`, and only a model command that cannot run, or a test discovery that fails, still makes the check exit 1. The command runs in an empty temporary directory, never in the repository, so the code under review cannot steer its reviewer through project config; and it comes only from `--llm-cmd` or `AEGIS_LLM_CMD`, never from a file in the repository. **This sends your plan, the source of the changed non-test Python files (whole files, not the diff; `__init__.py` is skipped), the test names and output and the Layer 1 results to whichever vendor the command calls.**
+**Layer 2** is optional: `aegis check --full --plan "what the change should do" --llm-cmd 'claude -p'`. The plan comes from `--plan`, `--plan-file`, or else the first of `docs/plan.md`, `.aegis/plan.md` and `PLAN.md` in the repository; without one, Layer 2 refuses to run. Any command that reads a prompt on stdin and prints a reply works (`codex exec --skip-git-repo-check`, a script). Aegis builds two prompts, one after the other: a spec reviewer gets the plan, the function signatures (with their docstrings) and the test names (no implementation) and predicts what could go wrong; a code reviewer gets the full text of each changed non-test Python file (`__init__.py` is skipped), the test output and the Layer 1 results, never the plan, together with those predictions, and answers each with claims backed by evidence. An arbiter compares the two by risk category, using Layer 1 as the tiebreaker, without asking a model to judge, and returns `SHIP`, `REVISE` or `BLOCK`.
 
-Use a reviewer from a different vendor than the agent that wrote the change. A model reviewing its own vendor's output tends to share its blind spots, and the Aegis release process asks for a cross-vendor `--llm-cmd` review as advisory input to the release review ([CONTRIBUTING](../CONTRIBUTING.md#releases)). `aegis check --calibration` scores the arbiter's logged predictions against outcomes with Wilson 95% confidence intervals and Brier skill scores (section 10); the predictions are logged and never gate.
+The verdict is advisory: `aegis check --full` exits on Layer 1 alone, a review that does not complete prints `UNVERIFIED`, and only a model command that cannot run, or a test discovery that fails, still makes the check exit 1.
 
-**The git hook.** `aegis init` installs a pre-commit hook (`aegis hook install|status|uninstall` manage it) that runs `aegis check --hook`: Layer 1 only, never a model, on the staged content, which is what `git commit` records, whatever the working tree holds. In an existing shell hook the Aegis block goes right after the shebang, so it runs before the hook's own lines (an `exec` or `exit` there would otherwise skip it), and the old file is first copied to `~/.aegis/backups/<UTC stamp>/`. A hook written in another language is refused, and `aegis init` then writes nothing: `aegis hook install --force` replaces it (keeping the copy), or call `aegis check --hook` from it yourself. `aegis hook status` and `aegis doctor` report a block git never reaches, such as a hook file that is not executable or an `exec` before the block. `git commit --no-verify` skips the hook, which is why CI matters.
+The command runs in an empty temporary directory, never in the repository, so the code under review cannot steer its reviewer through project config; and it comes only from `--llm-cmd` or `AEGIS_LLM_CMD`, never from a file in the repository. **This sends your plan, the source of the changed non-test Python files (whole files, not the diff; `__init__.py` is skipped), the test names and output and the Layer 1 results to whichever vendor the command calls.**
 
-**CI.** `aegis init --ci` writes `.github/workflows/aegis.yml`: an `aegis-check` job that checks out with `fetch-depth: 0` (so the base branch is there), installs the Aegis version that wrote it, and runs `aegis check` and then `aegis check --ci` with `GH_TOKEN` and `pull-requests: read`, plus an `aegis-sarif` job that uploads code-scanning annotations. On another CI, check out the full history and run those two commands. Plain `aegis check` enforces the reviewed rules: in a clone where `origin/HEAD` resolves, a rule is enforced once it is on that branch, so a pull request that deletes a rule and breaks it fails plain `check` there. Where `origin/HEAD` does not resolve, as in CI's checkout, the base is the checked-out commit itself, so plain `check` enforces the pull request's own rules and `aegis check --ci` is what catches a deleted or weakened rule. A rule that is new on the branch is not enforced until it reaches the base. `aegis check --ci` (section 10) also catches a weakening: it compares mandatory rules against the merge base and passes a rule weakening only when the branch carries a signed `aegis approve` commit. At tier A it also accepts an approving pull-request review from a person other than the author, when the rules of the pull request's base branch require an approval, code-owner review, stale-review dismissal and approval of the most recent push by someone other than its pusher, and the base `CODEOWNERS` owns every flagged path. A run whose base and head are the same commit (a push to the base branch, a manual run, a stale branch) prints that nothing was compared instead of PASSED; the pull-request run is the gate. Without `--no-exec`, `aegis check --ci` runs the repository's tests: it reruns the head commit's `Aegis-Check` trailer snapshot and the fix-commit regression tests, and with `--coverage` or `--perf` the coverage or benchmark command. `aegis check --ci --no-exec` reads git objects only and runs no repository code. On a pull-request run with a flagged change and no signed approval, `--ci` also starts your `gh` for read-only `gh api` GETs of the repository, the base branch's rules and the pull request's reviews (the job's `GH_TOKEN` with `pull-requests: read`); nothing else in `aegis check` starts `gh`. Review changes under `.aegis/` and to the CI workflow like code.
+An advisory model review does not replace independent human review. `aegis check --calibration` scores the arbiter's logged predictions against outcomes with Wilson 95% confidence intervals and Brier skill scores ([Evidence and outcomes](#evidence-and-outcomes)); the predictions are logged and never gate.
 
-## 6. Evidence: the ledger and `aegis sync`
+### Adopt checks in an existing repository
 
-**The ledger** is `<git common dir>/aegis/state/<ws-id>/ledger.jsonl` (or `.aegis/state/ledger.jsonl` outside git), append-only, one JSON row per event. In git every worktree shares it, and a row also records the absolute path of the work tree that wrote it (`<ws-id>` names the workspace by its path below the git top level, so each `.aegis` workspace of a monorepo has its own):
+`aegis check --card` reports languages, active drivers, rule counts and findings. `aegis check --write-baseline` records current eligible findings in `.aegis/baseline.json`; later checks fail on new ones, and `--prune-baseline` drops entries that no longer match. A baseline never grandfathers built-in security or secret findings. With `--base`, the baseline comes from that base, not the change being reviewed. Changes to it require approval when the base has a signing key; otherwise it is self-attested.
 
-- `aegis check` (and the pre-commit hook) appends one row per matched rule per run, and `aegis check --record [--tests]` binds the working tree to its exact git tree hash (`witness: aegis`).
-- `aegis_report_outcome` credits the rules served in that session when a passing `aegis check --record --tests` row exists for the exact tree; otherwise it records one `claimed` row per session and tree that never counts as evidence.
+`aegis rule export` and `aegis rule import` move rules in digest-checked bundles; packs are not signed. `aegis benchmark` measures scan, hook and check performance, not whether rules improve development outcomes. Experimental host registration and packaging are covered in [hosts and hooks](hosts-and-hooks.md).
+
+## CI governance
+
+`aegis init --ci` writes `.github/workflows/aegis.yml`: an `aegis-check` job that checks out with `fetch-depth: 0` (so the base branch is there), installs the Aegis version that wrote it, and runs `aegis check` and then `aegis check --ci` with `GH_TOKEN` and `pull-requests: read`, plus an `aegis-sarif` job that uploads code-scanning annotations.
+
+On another CI, check out the full history and run those two commands.
+
+Plain `aegis check` enforces the reviewed rules: in a clone where `origin/HEAD` resolves, a rule is enforced once it is on that branch, so a pull request that deletes a rule and breaks it fails plain `check` there. Where `origin/HEAD` does not resolve, as in CI's checkout, the base is the checked-out commit itself, so plain `check` enforces the pull request's own rules and `aegis check --ci` is what catches a deleted or weakened rule. A rule that is new on the branch is not enforced until it reaches the base. `aegis check --ci` also catches a weakening: it compares mandatory rules against the merge base and passes a rule weakening only when the branch carries a signed `aegis approve` commit.
+
+At tier A it also accepts an approving pull-request review from a person other than the author, when the rules of the pull request's base branch require an approval, code-owner review, stale-review dismissal and approval of the most recent push by someone other than its pusher, and the base `CODEOWNERS` owns every flagged path.
+
+A run whose base and head are the same commit (a push to the base branch, a manual run, a stale branch) prints that nothing was compared instead of PASSED; the pull-request run is the gate.
+
+Without `--no-exec`, `aegis check --ci` runs the repository's tests: it reruns the head commit's `Aegis-Check` trailer snapshot and the fix-commit regression tests, and with `--coverage` or `--perf` the coverage or benchmark command. `aegis check --ci --no-exec` reads git objects only and runs no repository code.
+
+On a pull-request run with a flagged change and no signed approval, `--ci` also starts your `gh` for read-only `gh api` GETs of the repository, the base branch's rules and the pull request's reviews (the job's `GH_TOKEN` with `pull-requests: read`); nothing else in `aegis check` starts `gh`. Review changes under `.aegis/` and to the CI workflow like code.
+
+### Protect the rules and workflows
+
+Trust tiers describe who can change the checks: Tier C is self-attested; Tier B uses a signing key the agent cannot use; Tier A adds separation of duties and code-owner review. `aegis doctor` detects the tier read-only. See [Trust tiers](trust-tiers.md) for setup and limits.
+
+- **Rule integrity and human approvals** (`aegis_scan`, `aegis check --ci`, `aegis approve`): `aegis_scan` serves gates and invariants from the reviewed base commit (`rules_base`), listing branch-local mandatory edits only in `unreviewed_rules`. `aegis check --ci` flags rule weakenings (a deleted, archived or lower-ranked rule, a dropped `target_paths` pattern, a narrowed `forbid_ast` call entry, a widening past the two-mandatory-rule cap). `aegis doctor` checks governance/workflow coverage in `CODEOWNERS`; an unowned file alone is not a `check --ci` failure. When the base branch lists a key in `allowed_signers`, it also fails any change to the governance set (`allowed_signers`, `CODEOWNERS`, workflows, `.aegis` config, team and baseline files at any depth, test infrastructure including root runner modules, and deleted tests) unless the change is signed with `aegis approve` (`Aegis-Approve: <governance tree hash>`) by a key already on the base (an SSH signature only; at Tier B this holds only while the pull request leaves `.github/workflows/**` and aegis alone). Rule edits stay under the weakening check, and `pyproject.toml`, `setup.cfg` and `tox.ini` count only when their pytest section changes. With no key on the base, a governance-file change is only noted and passes; a rule weakening still fails, because nothing can approve it (at tier A a qualifying review can). An approval covers the whole of `pyproject.toml`, `setup.cfg` and `tox.ini`, so after the base changes one of them the approval is re-signed on the new head. Comparing by pytest section leaves the rest of those files ungated by design: a `[project.entry-points.pytest11]` plugin, a dependency change or `tox.ini [testenv] commands` can still change what a test run does.
+
+- **Regression discipline** (`aegis check --ci`): a fix commit is a non-merge commit with a Conventional `fix` subject or a `Fixes:` trailer, with a scope outside `ci, build, docs, deps, release, chore, tests`, that changes a source file; `Closes:` and a `Fixes:` line outside the trailer block do not count. It needs a test that fails on `base` and passes at the pull-request head in an isolated snapshot, or a commit-scoped signed `Aegis-Exempt-Test: <fix-sha> <reason>` approval from `aegis approve --exempt-test`. This is advisory, at warning tier (no setting makes it block): judged once against the head with at most 2 pytest runs, `UNVERIFIED` for fixes whose only tests are not Python, with progress on stderr.
+
+- **Security checks, coverage and perf** (`aegis check --ci [--format github|sarif] [--coverage] [--perf]`): one verdict that the text, JSON (`blocking` lists the causes), GitHub annotations and step summary agree on; delta-evaluated structured `forbid_ast.calls` predicates, the security pack and secret delta of Layer 1, optional `ruff`/`gitleaks` presets named by the user-scope `scanners` key (only findings new against the merge base fail; an UNVERIFIED scanner never blocks), schema-valid SARIF 2.1.0 output with anchored findings only (also `aegis check FILES --format sarif` for Layer 1) and ingest, diff coverage on changed executable lines since merge-base(base, head) under the user-scope `tests.command` (`--coverage`; a report that never changes the exit code, `UNVERIFIED` with a reason when it cannot be measured), and paired interleaved base-vs-head benchmarking (`--perf`: the user-scope `perf.command`, or pytest-benchmark when installed; UNVERIFIED never blocks). `--coverage` and `--perf` exit 2 outside `--ci`. `aegis init --ci` adds an `aegis-sarif` job that uploads the SARIF log to code scanning, with `security-events: write` kept out of the job that runs repository code.
+
+- **Release verification** (`aegis doctor --release <sha>`): verifies the GitHub Actions `verdict` attestation emitted on a push to the default branch, with its source ref pinned to GitHub's default branch, using `gh attestation verify` (`gh >= 2.93.0`), failing closed at Tiers B and C (`agent_editable`: the required check runs the pull request's own workflow) or when `gh` is missing or older.
+
+For example, after committing the `no-eval` rule on `main`, removing its `exec` predicate on a branch makes `aegis check --ci --base main --no-exec` fail the weakening check. Restoring the predicate removes that finding. The example uses `--no-exec`, so it does not run the repository's tests or demonstrate test credit.
+
+When using the generated `.github/workflows/aegis.yml` for credit confirmation, set `ci.workflow` to `"aegis.yml"` in **user-scope** `~/.aegis/config.json`. Its default is `validate.yml`; generating a workflow does not change that setting.
+
+## Evidence and outcomes
+
+A passing deterministic check, an optional recorded test run and a credited rule outcome answer different questions:
+
+| Result | What it establishes | What it does not establish |
+|---|---|---|
+| `aegis check` passes | The selected files passed Layer 1 under the active rules | That tests ran, or that any rule earned credit |
+| `aegis check --record --tests` records a run | Layer 1 and tests were run on an isolated export of the exact git tree | A `recorded` row alone is not success: tests may fail or produce no recognized passing count |
+| Outcome report is linked | A passing receipt for the same tree can be linked to exposed rules matching the change | Credit is not confirmed until the landing commit has the configured successful CI run |
+
+A report without a matching passing test receipt is `claimed` and earns no rule credit. `aegis check --record` without `--tests` records Layer 1 only and earns none. If a scan returned no matching rule IDs, skip the outcome report; ordinary project test results remain useful without a rule receipt.
+
+### The test command and its current limits
+
+`tests.command` is read only from `~/.aegis/config.json`, outside the workspace. A repository config cannot select a program to run. The default is `python -m pytest` under the Python running Aegis. To use a different environment, name its **absolute Python interpreter** as the first word of the command; even an absolute `pytest` launcher is otherwise run under Aegis's Python. Python runs use `-s` and that interpreter's site directories, so a pytest installed only in the user site is unavailable.
+
+The receipt runs in an isolated snapshot with a temporary HOME and restricted PATH, rather than your interactive shell environment. It does not install dependencies. User-installed tools such as Cargo/Rustup may therefore be unavailable even when they work in your normal shell.
+
+For a pytest command Aegis requests JUnit output. Otherwise it falls back to the last recognizable timed summary line with counts such as `N passed`. A passing receipt requires exit 0, no timeout, and at least one recognized passing test. Normal `unittest` output (`Ran N tests`, then `OK`) does not supply that count. A Cargo summary may match the text fallback, but there is no native Rust/Python suite aggregation: a combined command can expose only the last recognized summary. **Changing `tests.command` alone does not fix these receipt limitations.** Run and report each native suite explicitly; do not claim combined evidence from a receipt that represents only one suite.
+
+### Landing and confirmation
+
+- **Credit states** (`aegis sync`, `aegis status`): a passing check row is `witnessed`, `landed` once its tree's commit is on the protected branch, and `confirmed` by a successful run, on that commit, of the workflow named in the user-scope `ci.workflow` key of `~/.aegis/config.json` (a bare `.yml` or `.yaml` file name; default `validate.yml`; the repository's config and ledger rows never choose it). A check is `voided` by one of three causes: a CI failure (a failed run of that workflow on the landing commit, or a CI rerun of the head commit's trailer that diverges, reason `ci_divergence`), a lane-gate failure (`aegis check --lane` failing its test-integrity check for that tree, reason `lane_integrity`) or a revert (a commit on the protected branch whose message says `This reverts commit <sha>`, found when `aegis sync` confirms credit, reason `reverted`). Of these, a later CI success supersedes a CI-failure void from a failed run; `void` rows (`ci_divergence`, `lane_integrity`, `reverted`) are terminal.
+
+- **Commit trailers** (`aegis check --ci`): the `Aegis-Check: tree=<tree> exit=<n>` trailer is verified for the head commit only, by rerunning the recorded check on that commit's tree. Only an equal tree whose outcome diverges twice is a failure; a tree mismatch, a head without a trailer or a timed-out rerun is `unbound`. In CI a divergence is a failed job; `record_void` writes the `ci_divergence` void to the ledger of the machine that ran the check, so it applies to a local `check --ci`.
+
+The local ledger is mutable and includes legacy rows and detector replay. Its fitness is not authenticated evidence. A linked report alone is not a CI confirmation; test logs and the configured workflow result must still be inspected.
+
+### Fitness and human review
 
 **Fitness and sample-size states** are computed on read: `aegis sync` evaluates CI-confirmed checks, git detector replay over merged history for `forbid_ast` rules (`caught` vs `leaked`), and human-adjudicated labels, with session-count decay `w = 2^(-delta / H)`, where H is `expiry.half_life_sessions`, over every exposed session (exposure rows carry no liveness flag yet; silence earns no credit in 4.4.0). Each rule reports one of four sample-size states: `untestable`, `insufficient (n=K)`, `inconclusive` or `decided`. Below `n = 25` verdicts (`MIN_N`) no precision number is shown (`reported_score` is empty) and no promotion, demotion, tier change or archive by misfire happens. A landed (leaked) violation is a disposition, not a false positive. Decay counts sessions; calendar days never decay a rule. A plain `aegis check` and native session reports record triggers only, never tp or fp. Frontmatter is not evidence: `prior`, `pack_prior`, `trigger_rate_per_day`, `expected_triggers_per_day` and `expiry.*` are accepted and ignored.
 
-**`aegis sync`** is the one writer of derived state. Under the workspace lock it reads the rules and the ledger, writes `derived.json` and prints a suggestion per rule:
+Promotion is suggested only for a promotable rule with enough evidence and reviewed adjudication labels: **at least 25 true-positive labels and no false positives, or at least 42 total labels with at most one false positive**. Those labels must span **at least 3 sessions**, plus **at least 2 repositories or 14 days**. When a rule's age is known, it must be at least 30 days old; an unknown age does not itself block promotion. CI results and replay alone cannot satisfy the label requirement. Incomplete evidence suppresses a decision; adverse evidence can instead produce a demotion or archive suggestion.
 
-- **promote** (trap to invariant, invariant to gate) once independent evidence reaches the promotion threshold (`>= 25` labels with `0` FP or `>= 42` with `1` FP across `>= 3` sessions and `>= 2` repos or `>= 14` days, and only when the rule's `created` date is at least 30 days old, so a rule with no `created` date never promotes; agent-only self-reports never promote);
-- **demote** or **archive** when the bound on the rule's false-positive rate exceeds the demotion threshold.
-
-`aegis sync --apply`, `aegis sync --pr` (which pushes an `aegis/lifecycle-*` branch with the moves and up to 3 unlabelled replay examples per rule and opens a human-reviewed pull request from it, never merging), `aegis rule promote|demote RULE_ID` or `aegis rule archive` moves the rule file; commit it and review it like code. `derived.json` also records a hash of each rule file, which is how `aegis_scan` and `aegis_list_rules` flag rules edited since the last sync. It is not a signature and never excludes a rule.
+`aegis sync` writes derived state and suggestions under the workspace lock. `aegis sync --apply`, `aegis rule promote|demote RULE_ID` and `aegis rule archive` apply explicit lifecycle moves; commit and review them like code. `aegis sync --pr` pushes an `aegis/lifecycle-*` branch with moves and up to three unlabelled replay examples per rule, opens a human-reviewed pull request and never merges it. The recorded rule hash detects edits since sync; it is not a signature and never excludes a rule.
 
 **Adjudication labels.** `aegis rule adjudicate` appends a `tp` or `fp` label to `.aegis/adjudications/<rule-id>.jsonl` in the working tree. The label counts only after a reviewed pull request merges the file to the base branch: `.aegis/adjudications/**` is in the governance set, so `aegis check --ci` asks for the approval, and Aegis reads labels from the reviewed base commit only (last row per example wins). Ledger `adjudication` rows, which any process can write, are read but never counted, so until labels are merged almost no rule is promoted. On a developer machine the reviewed base is whatever the local `origin/HEAD` or `rules.base_ref` points to, and the agent can move both, so a local promotion suggestion is only as trustworthy as those refs; the decision that counts is the reviewed pull request that moves the rule file, which `aegis check --ci` gates.
-
-```mermaid
-flowchart LR
-  CLI["aegis rule adjudicate<br/>working-tree file"] --> PR["pull request<br/>.aegis/adjudications/**"]
-  PR --> GATE["check --ci governance gate<br/>signed approval or CODEOWNERS"]
-  GATE --> BASE["reviewed base commit"]
-  BASE --> FIT["fitness: counts at MIN_N = 25"]
-  LEDGER["ledger adjudication rows<br/>(any writer)"] -. read, never counted .-> FIT
-```
-
-**Why Aegis never rewrites a rule file on its own.** v3 wrote fitness numbers back into each rule's frontmatter. Its integrity manifest then saw "edited" rules and dropped them, so a scan in the author's own session returned 0 rules, and unlocked rewrites lost about 80 of 120 updates under concurrency. In v4 the ledger is the only record of outcomes and rule files change only when a person changes them (the full account is in [Why Aegis is built this way](why-aegis.md)).
-
-**What the score means today.** When several rules apply to the same file in a check run, they share that check's pass or fail, while `forbid_ast` rules also get per-rule `caught` vs `leaked` replay over git history and `# aegis: allow` contested-override tracking (section 10). Unwitnessed agent self-reports (`claimed`) never count as evidence, and promotion stays a reviewed human step.
 
 **Compliance.** `aegis status --compliance` reports each host's scan-before-edit rate from `.aegis/state/activity.jsonl`: per session, how many edited files were scanned first. An edit is a file named in `aegis_report_outcome`, or a file in a commit made during exactly one session. The output states its own limits; a session with no observed edit counts as unknown, never as 0.
 
 With `--json`, the compliance report carries `source`, `aegis_version`, `checked_at` and `scope` before its report fields.
 
-## 7. Hosts and enforcement
+### Human corrections and model predictions
 
-| Host | Registered by `aegis init --host` | How the server learns the repo | Instructions file (size limit) |
-|---|---|---|---|
-| `claude-code` | `claude mcp add --scope user aegis -e AEGIS_CLIENT=claude-code -- <aegis-mcp>` | `CLAUDE_PROJECT_DIR`, MCP roots | `AGENTS.md` only when no `CLAUDE.md` exists; otherwise the `@AGENTS.md` block in `CLAUDE.md` (40 KiB; `aegis doctor` warns when the Aegis block ends past it) |
-| `codex-cli` | `codex mcp add aegis --env AEGIS_CLIENT=codex-cli -- <aegis-mcp>` | per-turn workspace metadata | `AGENTS.md` (32 KiB, truncated silently) |
-| `antigravity` (app, IDE, `agy`) | an `aegis` entry in `~/.gemini/config/mcp_config.json` | the registry only: it sends no roots | `AGENTS.md` (24,000 bytes per file) |
-| `kiro` (experimental) | an `aegis` entry in `~/.kiro/settings/mcp.json` | not checked on a real install | `AGENTS.md` (vendor docs; not checked on a real install) |
-| `cursor` (experimental) | an `aegis` entry in `~/.cursor/mcp.json` | not checked on a real install | `AGENTS.md` (vendor docs; not checked on a real install) |
-| `copilot` (experimental) | an `aegis` entry in `~/.copilot/mcp-config.json` (`COPILOT_HOME` moves it) | not checked on a real install | `AGENTS.md` (the vendor does not say) |
-| `windsurf` (experimental) | an `aegis` entry in `~/.codeium/windsurf/mcp_config.json` (the vendor's current docs name `~/.config/devin/mcp_config.json`; Aegis writes the `.codeium` path until a real install shows which one the app reads) | not checked on a real install | `AGENTS.md` (the vendor does not say) |
-| `gemini-cli` | never: retired (`init` exits 2 and names `--host antigravity`) | — | — |
-| `claude-desktop` | never: identity only | — | — |
+- **Human insights closed loop** (`aegis rule insight add|review|enable`, `aegis_capture_insight`): stores redacted corrections at `~/.aegis/insights/<workspace-id>.jsonl` (`0600`), verifies content-bound `Aegis-Approve-Insight` signatures for human-approved insights (`aegis rule insight add` prints `Aegis-Approve-Insight: <sha256 of the typed text>`; sign a commit carrying that trailer, then re-run the same command with `--commit SHA` to record the insight at level H), lists each counted insight with its top-3 TF-IDF neighbours so the human groups them (no automatic clustering) and turns the group named with `--decision propose --insight ID ...` into an advisory `trap` proposal in `.aegis/proposals/` (with the shared `kind`, the `count`, the insight ids and up to three `<dir>/**` target paths), and measures post-activation recurrence as a rate over heartbeat-alive sessions (at most 1, 95% upper bound, pre-activation baseline), labelled `sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)` in `aegis status` and `aegis sync`. Rule matching and recurrence use fixed similarity thresholds that were set by hand and never measured: cosine 0.15 with a shared path, 0.30 without, and 0.12 for recurrence.
 
-A host is the config plane its apps share: `codex-cli` covers the Codex CLI, IDE extension and ChatGPT desktop app; `claude-code` covers the CLI, IDE extensions and the desktop app's Code tab; `antigravity` covers the app, IDE and `agy`; `kiro` (experimental) covers the Kiro IDE and CLI. `--host` accepts surface names too (such as `codex-app` or `kiro-ide`), and `--host auto` discovers hosts via config directories and desktop app bundles as well as CLIs on `PATH`. `<aegis-mcp>` is an absolute command that never depends on the directory a host starts it in (the project, which a cloned repository controls). `init` takes, in order: the `aegis-mcp` script in an absolute `PATH` entry; the `aegis-mcp` script installed next to the Python running `aegis` (a virtual environment's `bin/`, or the user scripts directory after `pip install --user`); else that Python in isolated mode, `<python> -I -c "<run aegis_mcp.server>" <directory aegis is installed in>`, which keeps the current directory off `sys.path`. It never registers `python -m aegis_mcp`: `-m` imports from the current directory first, so a repository with its own `aegis_mcp` package would run its code. `aegis doctor` compares each host's registered command with this one and reports as an unsafe registration one that is not an absolute path, a Python that runs `-m` or `-c` without `-I` or a script by a relative path, or either behind `env`; it starts none of them. Gemini CLI is retired: Google refuses the client for individual Code Assist accounts, so `aegis init --host gemini-cli` and `aegis uninstall --host gemini-cli` exit with status 2 and point to `--host antigravity`, the Gemini-family host. Every host runs `aegis-mcp` unsandboxed with your user's permissions, so the server's own confinement is the only boundary. Repository files never register a server: a committed `.mcp.json` would run whatever command a pull request put there.
+- **Insight capture level** (`insights.capture` in `~/.aegis/config.json`: `off`, `counters` or `excerpts`): narrows what the host hook entry allows (`aegis rule insight enable --host H`, with `--excerpts` to keep excerpts) and never widens it, so the hook runs with the lower of the two. `counters` keeps heartbeats and drops excerpts; `off` writes nothing, not even heartbeats, so a rule activated from insights reports `no_prompt_traffic` in its recurrence measure. A repository `.aegis/config.json`, a user config inside the workspace, or an invalid or unreadable value never changes the mode. In `aegis doctor --json`, `insight_capture.status` and `excerpts` describe the host entry, `capture` is what the hook does, and `capture_source` says whether it comes from the `host entry` or `insights.capture`. `aegis rule insight add` and `aegis_capture_insight` are explicit actions; the key does not govern them.
 
-**Enforcement tiers**, as `aegis doctor` prints them:
+- **Calibrated Layer-2 arbiter** (`aegis check --calibration`): logs stamped, falsifiable predictions to `.aegis/state/arbiter_predictions.jsonl` (no model text), computes each one's disposition and outcome from git when it is read, and scores them per backend and kind with Wilson 95% confidence intervals and Brier skill scores (log-only; skill claims suppressed below `n_effective >= 100`).
 
-| Tier | Mechanism | Status |
+See [Why Aegis is built this way](why-aegis.md) for the reasoning and statistical limits.
+
+## Hosts and doctor
+
+`aegis init` registers hosts and installs the git hook. `aegis hook install --host <host>` adds a host pre-tool hook. They serve different purposes: the git hook checks staged content, while supported host hooks can check scan-before-edit and destructive commands earlier.
+
+Host hooks fail open on Aegis errors and do not see edits made through shell commands. Codex hooks must be trusted in `/hooks`; Antigravity's scan gate records only, and its hooks are unavailable on Windows. A registered hook is not proof that enforcement is active. `aegis doctor` reports registration, unsafe launches, known gaps and the trust tier; review its findings before using `--fix`.
+
+See [Hosts and hooks](hosts-and-hooks.md) for safe registrations, backups, instruction limits, runtime behavior and skill syncing. For parallel worktrees, [Agent teams](teams.md) explains cooperative leases, containment checks and their CI limits.
+
+## Where things live
+
+| Path | Committed? | What it holds |
 |---|---|---|
-| Advisory | AGENTS.md bootstrap, MCP instructions, JIT rules | every host |
-| Best-effort | per-host pre-tool hooks | after `aegis hook install --host <h>`: Claude Code blocking (documented; fails open on error); Codex blocking once trusted in /hooks (documented; fails open); Antigravity blocks destructive commands (live), scan gate records only, and is unavailable on Windows (section 8) |
-| Local floor | git pre-commit runs aegis check --hook (--no-verify bypasses it) | every host that commits through git |
-| Authoritative | CI runs aegis check on the exact SHA; a human merges | your CI and branch protection |
+| `.aegis/config.json` | yes | `hosts`, `jit.max_tokens`, `jit.scan_window_s` (how recent a scan must be for the edit hook, [Hosts and hooks](hosts-and-hooks.md)), rule `expiry`, `expiry.half_life_sessions` (the decay half-life H in exposed sessions; a positive integer, default 30), `expiry.epsilon` (the archive threshold; a number between 0 and 1, default 0.01; top-level and `fitness` spellings are ignored with a warning), `ast.packaged_drivers`. It can never name a command: such keys are ignored with a warning. |
+| `.aegis/rules/<type>/*.md` | yes | the rules, one file each |
+| `.aegis/team.json` | yes | optional: the `shared` globs any lane may change and committed per-lane paths ([Agent teams](teams.md)) |
+| `.aegis/baseline.json` | yes | the ratchet baseline that `aegis check --write-baseline` writes ([adopting checks](#adopt-checks-in-an-existing-repository)) |
+| `.aegis/adjudications/<rule-id>.jsonl` | yes | `tp` and `fp` labels from `aegis rule adjudicate`; they count once a reviewed pull request merges them to the base branch ([Evidence and outcomes](#evidence-and-outcomes)) |
+| `.aegis/proposals/` | if you commit it | draft rule proposals that `aegis rule insight` writes ([Evidence and outcomes](#evidence-and-outcomes)) |
+| `.aegis/.gitignore` | yes | ignores `state/` |
+| `.aegis/state/` | no | `activity.jsonl` (scans and edits per session; `aegis scan` runs are logged too), `derived.json` (written by `aegis sync`), `lifecycle.jsonl` (rules moved to the archive), `arbiter_predictions.jsonl` (Layer 2 predictions, no model text), `gate_events.jsonl` (`aegis hook safety-gate` decisions), `lock` and `migrate-backup-*/`. In a git repository the outcome ledger is not here: see the `<git common dir>/aegis/` row |
+| `AGENTS.md` | yes | one marked bootstrap block; the rest of the file is yours |
+| the git hooks directory | no | the `pre-commit` hook (runs `aegis check --hook`) and the `prepare-commit-msg` hook, which adds an `Aegis-Check: tree=<tree> exit=<n>` trailer when a passing check row covers the staged tree ([Evidence and outcomes](#evidence-and-outcomes)) |
+| `.claude/skills/`, `.agents/skills/` | yes | skill copies written by `aegis skills sync`, each with an Aegis marker line |
+| `refs/aegis/lanes/<lane>` | git ref | a lane's lease, written by `aegis team` |
+| `<git common dir>/aegis/` | no | `state/<ws-id>/ledger.jsonl`, the outcome ledger every worktree shares, with its lock (`<ws-id>` names the workspace by its path below the git top level; outside git the ledger is `.aegis/state/ledger.jsonl`), and `events.jsonl`, the events log every worktree shares, with its lock |
+| `CLAUDE.md` | yes | an `@AGENTS.md` block, only if the file already existed |
+| `~/.aegis/workspaces.json` | user | the repos you ran `aegis init` in on this machine |
+| `~/.aegis/link.key` | user | 32 random bytes (`0600` on POSIX) that `aegis init` and `aegis rule insight enable` create (and the first insight capture that carries a session id, when it is missing) to pseudonymize host session ids; it stays on the machine |
+| `~/.aegis/insights/<workspace-id>.jsonl` | user | the opt-in redacted corrections of `aegis rule insight` ([Evidence and outcomes](#evidence-and-outcomes)) |
+| `~/.aegis/rules/` | user | an optional personal rule layer, served read-only where no repo is governed |
+| `~/.aegis/config.json` | user | the only place for command-like settings, `tests.command`, `perf.command`, scanner commands and AST driver commands; also `ci.workflow` for receipt confirmation |
+| `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.codex/rules/aegis.rules`, `~/.gemini/config/hooks.json` | user | the hook entries `aegis hook install --host` writes (or the repository's `.claude/settings.json`, `.codex/hooks.json` and `.agents/hooks.json` with `--scope project`) |
+| `~/.aegis/backups/` | user | a copy of each file taken before Aegis changes it, one timestamped folder per run: the host config `aegis init --host` and `aegis uninstall` merge (Antigravity's `mcp_config.json`), the files `aegis doctor --fix` edits, the host hook files `aegis hook install --host`, `aegis rule insight enable` and `uninstall --host` change, and the pre-commit hook `aegis hook install` (or `init`) rewrites |
 
-**`aegis doctor`** reads; it changes nothing, reads GitHub only through your own `gh` (read-only requests for the trust tier) and starts no host CLI except `codex mcp get aegis --json` (Codex keeps its registrations in TOML). For each host it reports one state: `missing_binary`, `unregistered`, `auth_unknown` (it cannot confirm the host loads `aegis`), `policy_gap` (the server loads, but the rules do not fully reach the agent, for example a `CLAUDE.md` shadowing `AGENTS.md` or an instructions file past the host's limit) or `ok`. It also shows the host's hook entries and their tier (section 8), and reports the strongest tier known to be in force for that host (`local_floor`, `advisory`, `none` or `unknown`), never a guess: the local floor counts only when the Aegis pre-commit hook is installed, current and reached by git (an earlier `exec` or `exit` in the hook, or a hook that is not a shell script, means it never runs). `--json` prints the same as one document. `aegis doctor --fix` removes only what doctor reported, such as stale v3 `soma` entries, v3 hook entries and legacy instruction blocks, after confirmation, and copies each file to `~/.aegis/backups/` first.
+Aegis reads four variables of its own (hosts and GitHub Actions supply others, such as `CLAUDE_PROJECT_DIR`, `GITHUB_BASE_REF` and `GH_TOKEN`): `AEGIS_WORKSPACE` (pin the server to one repo, which must hold `.aegis/`; `aegis init --pin` writes it into the registration, and the CLI honors it too, as [Delivery over MCP](#delivery-over-mcp) describes), `AEGIS_CLIENT` (host identity, written by `aegis init`), `AEGIS_MAX_JIT_TOKENS` (scan budget) and `AEGIS_LLM_CMD` (the Layer 2 model command).
 
-**`aegis uninstall`** removes the hook block, the `AGENTS.md`/`CLAUDE.md` blocks, the registry entry and the host registrations, keeping a host that another registered repo still uses. It never deletes `.aegis/`.
-
-**Upgrading from v3.** `aegis migrate` shows the plan and `aegis migrate --apply` performs it: the v3 ledger's rows are converted into the v4 ledger (section 6), the old config files become `.aegis/config.json`, `.soma` rules move to `.aegis/rules/<type>/`, and every changed file is backed up first (the [changelog](../CHANGELOG.md#upgrading-from-3x) lists every file it converts). Then run `aegis init --host <hosts>` to register the server and write the bootstrap, and `aegis doctor --fix` to remove v3 leftovers. Until the workspace is migrated, `aegis status`, `aegis scan` and `aegis sync` refuse to run in it and name the v3 state v4 does not read (a v3 or v2 ledger, `aegis.conf` or `soma.conf`, `.aegis/slots.yaml` or `.aegis/config.yaml`, v3 keys, receipts or rule manifest); `aegis check` warns and still runs, `aegis init` refuses while `.soma/` holds rules, and `aegis doctor` lists the files. In a `.soma` workspace, `aegis doctor` says to run `aegis migrate`, not `aegis init`.
-
-## 8. Agent hooks, teams and skills
-
-Claims below carry the evidence labels doctor uses: **LIVE** (probed on a real host), **DOC** (the host's official docs or source, not probed) and **UNVERIFIED** (neither).
-
-### Per-host hooks
-
-`aegis hook install --host <h>` registers one handler, `aegis hook run pre-tool --host <h>`, as the PreToolUse hook of Claude Code, Codex CLI or Antigravity. `aegis hook install` without `--host` still manages the git pre-commit hook, and `aegis hook uninstall --host <h>` removes only Aegis's entries, including the insight capture (UserPromptSubmit) entry `aegis rule insight enable` writes. That entry is written by the same merge, refusal, backup and re-read rules as the PreToolUse hook below, and runs the interpreter that wrote it.
-
-| Host | User scope (default) | `--scope project` | How it runs |
-|---|---|---|---|
-| Claude Code | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) | `.claude/settings.json` | exec form, no shell (Claude Code 2.1.139 or later, DOC); no `permissions.deny` entries are written, because the hook parses commands and deny patterns cannot |
-| Codex CLI | `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`), plus `~/.codex/rules/aegis.rules` | `.codex/hooks.json` (Codex loads it only in trusted projects) | through `$SHELL -lc` (DOC). Codex runs a new or changed hook only after you trust it in its `/hooks` screen, and skips it silently until then; `codex exec` has no documented trust path besides `--dangerously-bypass-hook-trust` on each run |
-| Antigravity | `~/.gemini/config/hooks.json` (LIVE) | `.agents/hooks.json` (LIVE) | through a shell wrapper that turns the handler's exit 75 into agy's blocking exit 1 and every other exit code into 0. Not available on Windows, where agy's hook shell is unverified |
-
-The hook matchers keep the handler off read-only tools: `Bash|PowerShell|Monitor|Write|Edit|NotebookEdit` on Claude Code, `Bash|apply_patch` on Codex and `run_command|write_to_file|replace_file_content|multi_replace_file_content` on Antigravity (only `*` was probed live there; if agy ignored the regex, the hook would never fire, which fails open). Every registration has a 10 s timeout. The install merges into the file and keeps everything else in it, refuses a file it cannot parse or one that is a symlink or hard-linked, copies the old file to `~/.aegis/backups/<stamp>/<scope>/`, writes atomically and re-reads the result: a broken Claude settings file silently drops all of its hooks (DOC). A host never gets an Aegis entry at both scopes. `--scope project` writes a file your teammates' hosts will execute once they pull it. The Codex entry stays byte-identical across upgrades, because any change makes Codex ask for trust again.
-
-**What the handler sees.** It reads the payload on stdin and turns it into one shape: the tool, whether it is a shell command or an edit, the command, the edited paths and the workspace.
-
-- Claude Code: `Bash`, `PowerShell` and `Monitor` carry `tool_input.command`; `Write` and `Edit` carry `tool_input.file_path`, `NotebookEdit` `tool_input.notebook_path`. The workspace is `CLAUDE_PROJECT_DIR`, then the payload's `cwd`.
-- Codex CLI: `Bash` carries `tool_input.command`; for `apply_patch` (and a `Bash` command that runs an `apply_patch` heredoc, which Codex intercepts) the paths come from the patch's `*** Add File:`, `*** Update File:`, `*** Delete File:` and `*** Move to:` headers. The workspace is the payload's `cwd`.
-- Antigravity: `run_command` carries `toolCall.args.CommandLine`; `write_to_file`, `replace_file_content` and `multi_replace_file_content` carry `toolCall.args.TargetFile`. The workspace is `workspacePaths[0]`.
-
-The workspace goes through the same resolver `aegis-mcp` binds with (section 4): the nearest `.aegis/` inside the git top level, never `$HOME`. User-scope hooks fire in every repository, so in one without `.aegis/` the handler does nothing. Edited paths are made relative to that workspace; a path outside it is not checked.
-
-**Fail-open is the design.** The handler keeps a 5 s deadline and catches every error. An error, the deadline, a payload it cannot read, an unknown host or event and an ungoverned workspace all exit 0, which lets the call through, and it never writes to stdout. It blocks with exit 2 and the reason on stderr on Claude Code and Codex CLI, and with exit 75 on Antigravity, which the wrapper turns into exit 1. It never answers `ask`.
-
-**Scan-before-edit** (edit tools). An edit passes when one `scan` row in `.aegis/state/activity.jsonl`, from any host or session, names every edited path and was written within `jit.scan_window_s` (default 3600, from 60 to 86400) seconds. Rows are matched on workspace and path, never on session id, because a Claude Code `/clear` starts a new hook session while `aegis-mcp` keeps the old one (LIVE). `aegis_scan` writes such a row, and writes it again once the last one for the same session and files is older than half the window; `aegis scan FILE...` writes one with host `cli`; and `aegis_scan` accepts a file that does not exist yet, so a new file can be scanned before it is created. A path is covered only by itself: scanning a directory does not cover its files. When no row covers the edit:
-
-- Claude Code exits 2 with `aegis: call aegis_scan with <paths> before editing (or run: aegis scan <paths>)` on stderr, which blocks the edit (DOC).
-- Codex CLI does the same, which blocks once you trust the hook (DOC).
-- Antigravity only records it: stderr after exit 0 has no visible effect there (LIVE), and a visible deny waits for a live probe.
-
-Edits to the rule files under `.aegis/rules/` are only recorded on every host: one broken rule file makes every scan fail and write no row, so blocking its repair would block every edit for good.
-
-**Destructive-command guard** (shell tools). The command is parsed with the same lexer as `aegis hook safety-gate`, split at every separator run (a blank line, `;`, `&&`, `||`, `&` or `|` plus a newline), with wrappers such as `sudo`, `env -S`, `su -c`, `ionice`, `stdbuf`, `setsid` and `busybox` unwrapped, long-option prefixes of the blocked git and `rm` options resolved and (in the guard) same-line git aliases expanded. The guard and the manual gate differ by design (the guard blocks a fixed set and records the rest; the gate asks on anything risky); the parity table in `tests/unit/core/test_command_safety.py` pins both columns. An empty or unparseable command never matches. The guard is lexical: `chrt`, `taskset`, `flock`, `nsenter`, `watch`, `script -c`, abbreviated wrapper options (`env --split=`, `su --comm`), more than 16 nested `!` git alias scripts in one command, shell functions, aliases defined outside the command, commands fed to a shell on stdin, and a later line with an unclosed quote (the whole command then fails open) are not seen.
-
-- The **block set** is irreversible operations only: `git-push-force` (`--force`, `-f`, `--force-with-lease`), `git-push-refspec` (`+refspec`), `git-reset-hard`, `git-clean-force` (`git clean -f`), `rm-recursive-dangerous` (`rm -r` of `/`, `~`, `$HOME`, `*`, `.` or `..`), `mkfs` and `dd-device` (`dd of=/dev/…`). It blocks with `aegis: blocked <rule>: <reason>` on stderr, on all three hosts (on Codex, once trusted). Codex also gets the same set as `forbidden` prefix rules in `~/.codex/rules/aegis.rules`; Aegis never touches `default.rules`.
-- The **record set** is only recorded: `git-merge`, `gh-pr-merge`, `git-add-bulk` (`git add -A`, `--all` or `.`), `git-push-protected` (a push to `main` or `master`), `sudo`, `chmod-777` and `sql-destructive`. Merges are never blocked, so a release process that lets an agent merge once its gates hold keeps working.
-
-**What doctor reports.** For each host, `aegis doctor` shows whether Aegis's entries are present at each scope and point at an executable `aegis`, and the tier such an entry gives, with its evidence label:
-
-| Host | Tier | Evidence |
-|---|---|---|
-| Claude Code | `blocking (documented; fails open on error)` | DOC: documented by Anthropic, never probed |
-| Codex CLI | `blocking once trusted in /hooks (documented; fails open)`, and `needs approval in /hooks (cannot be checked)` | DOC: documented by OpenAI, never probed; exit 1 was verified live to fail open |
-| Antigravity | `blocks destructive commands (live); scan gate records only`, or `unavailable` on Windows | LIVE: exit-1 blocking probed on `agy` 1.3.6 |
-
-Doctor reads files only, so a registered hook never counts as enforcement in force: the Best-effort tier then reads `unknown`. It also flags duplicate entries, entries edited by hand, and v3 leftovers: the stale Antigravity plugin `~/.gemini/config/plugins/governance/hooks.json` and hook entries that call `soma hook …` or a removed `aegis hook` phase. `aegis doctor --fix` removes those leftovers, backing each file up first.
-
-**Known gaps.** The hooks are guardrails, not a security boundary, as OpenAI's own docs say of Codex hooks. Doctor prints these, and they hold today:
-
-- Edits made through shell commands never reach the edit gate on any host.
-- Codex write_stdin into an interactive shell has no PreToolUse payload, and the Codex Bash payload carries no working directory.
-- Antigravity manage_task with send_input types into a background terminal past run_command.
-- Aegis never emits an 'ask' decision (it fails open on Codex and soft-denies in agy headless runs).
-- The hooks fail open on any Aegis error: they are guardrails, not a security boundary.
-
-### Agent teams: leases and the lane gate
-
-A lane is one agent's worktree and branch. Whoever dispatches the agents, usually a script or a person, declares each lane's paths with `aegis team claim <lane> --paths <globs> [--role R] [--owner O] [--ttl S] [--branch B]`. There is no MCP tool for teams and nothing renews on tool calls.
-
-- **A lease** is the ref `refs/aegis/lanes/<lane>`, pointing to a small JSON record (`lane`, `role`, `owner`, `claim_id`, `gen`, `branch`, `paths`, `ts`, `ttl_s`). It is written by compare-and-swap through `git update-ref --stdin`, so every worktree sees it, and it expires after its time-to-live (at most 86400 s), so no daemon is needed. Lane names match `[a-z0-9][a-z0-9._-]{0,62}`.
-- **A claim is refused** when a live lease of another lane may overlap its paths. The check is conservative: two globs overlap when the literal text before the first wildcard of one, compared without case, starts the other's, and a glob without `/` overlaps everything, because it matches a file name at any depth. An expired lease is taken over with a new `claim_id`.
-- `renew`, `transfer` and `release` take `--expect <oid>`, the lease they last saw; `gc` deletes expired leases and `list [--json]` shows them, with `expired`, `clock_skew` (written more than 300 s in the reader's future; still live) and `overlaps`.
-- **A lease is cooperative conflict input**: not a lock, not an identity and not proof that an agent is alive. Claims of different lanes can race, and `owner` and `role` are display labels that nothing compares. Anyone, a person included, may release a lease.
-
-**`.aegis/team.json`** (optional, committed) is `{"v":1,"shared":["CHANGELOG.md"],"lanes":{"docs":["docs/**","README.md"]}}`. `shared` lists globs any lane may change; `lanes` holds committed path sets per lane. It is parsed strictly: an unknown key, a bad glob or an invalid lane name exits 2. Globs match as rule `target_paths` do, so `shared: ["CHANGELOG.md"]` also admits `docs/CHANGELOG.md`.
-
-**The post-lane gate**, `aegis check --lane <lane> [--base <ref>] [--paths G...] [--base-policy]`, looks at every change from the merge base of the base branch and `HEAD` to `HEAD`. A shallow clone fails: fetch with `fetch-depth: 0`.
-
-- **Containment**: every changed path, including deletions, type changes, both sides of a move and submodules, must be inside the allowed set. `.aegis/**` and `.github/workflows/**` are allowed only through the base branch's `team.json`, never through a lease or `--paths`.
-- **Test integrity** (Python test files; other test files are listed as not checked): a test present at the base and gone at `HEAD`; a skip or xfail added at `HEAD` (pytest and unittest decorators, `pytestmark`, `pytest.skip`, `pytest.xfail`, `pytest.importorskip`, `self.skipTest`, `raise unittest.SkipTest`); and changes to pytest collection (`collect_ignore`, `pytest_collection_modifyitems` in `conftest.py`, or `addopts`, `testpaths` and the `python_*` and `norecursedirs` settings in the pytest config). Assert weakening is not detected.
-- **Provenance**: by default the allowed paths come from the lane's live lease or `--paths`, plus `shared` from the working tree, and the result is labeled **self-attested**: the lane can write all of those. With `--base-policy` they come from `lanes.<lane>` and `shared` in `team.json` at the base branch's tip, never the merge base or the candidate, `--paths` is refused, and the result is labeled **witnessed: base policy**.
-- Any finding fails the check, and there is no exemption flag: the reviewer or the person merging decides with the itemized findings in view.
-- **In CI** the `check --lane` job is advisory (not a required check) in v4.1, and it still is: `aegis init --ci` writes no lane job, and the ruleset `aegis doctor --github` prints requires only the job that runs `aegis check --ci`. Under `pull_request` the workflow itself comes from the candidate, so a witness is only as strong as the protection on `.github/**` and on the base branch. Run the gate from a workflow defined on the base branch.
-
-**`aegis team metrics [--base REF]`** counts claims and denials from the events log and, for each first-parent merge since the base, whether both sides changed a common path and whether `git merge-tree` reports a conflict (git 2.38 or later; GitHub's synthetic `refs/pull/*/merge` commits are left out). These numbers decide whether leases earn their place: if no lease is denied in 30 days of multi-lane use, leases go, and `check --lane` and the metrics stay.
-
-A read-only reviewer claims nothing and never blocks a writer; its verdict applies to the exact tree it read. Aegis records no review verdicts: the record is the pull request review.
-
-### Skills projection
-
-`aegis skills sync [--host ...] [--force] [--dry-run]`, or `aegis init --skills`, copies the 15 packaged [skills](../skills/) into the workspace for the hosts in `.aegis/config.json` (or `--host`):
-
-- `.claude/skills/<id>/SKILL.md` for Claude Code (DOC), with Claude Code's wording;
-- `.agents/skills/<id>/SKILL.md` for Codex CLI and Antigravity, which share the directory, with neutral wording (Antigravity DOC, Codex UNVERIFIED). Neither directory has been checked on a real install yet, and sync says so.
-
-Each copy keeps only `name` and `description` in its frontmatter, renders the slots and is otherwise the packaged file byte for byte. Right after the frontmatter it carries the marker `<!-- aegis:skill id=<id> v=1 sha=<12 hex> -->`, where the sha covers the rest of the file with LF line endings. A later sync replaces a copy whose sha still matches (CRLF line endings and a byte order mark are no edit), skips a copy edited since unless `--force`, and leaves a file without the marker alone: it is yours and is never replaced, even with `--force`. Every directory on the way must be a real directory inside the workspace and `SKILL.md` a regular file with one link; `--force` never overrides a link or a path that leaves the workspace. Whether a host then uses a skill is up to the host and cannot be measured.
-
-If no home directory resolves, `aegis init` and `aegis uninstall` exit 1 before writing; `aegis skills sync --host auto` exits 2 and asks for explicit hosts. Supplying a host, such as `--host claude-code`, still allows skills to sync into the workspace.
+**The ledger** is `<git common dir>/aegis/state/<ws-id>/ledger.jsonl` (or `.aegis/state/ledger.jsonl` outside git), append-only, one JSON row per event. In git every worktree shares it, and a row also records the absolute path of the work tree that wrote it (`<ws-id>` names the workspace by its path below the git top level, so each `.aegis` workspace of a monorepo has its own).
 
 ### The events log
 
@@ -332,37 +302,7 @@ The commands above record what the prune conditions count in an events log: `<gi
 
 Command event writes are best effort: a recording error becomes a warning and does not undo the command's result. Hook event logging keeps its separate guard so a logging failure does not replace the host decision.
 
-## 9. Adoption tools
-
-Each feature ships with a stated metric and a prune condition, and is removed if it does not earn its place.
-
-- **Day-0 card**: `aegis check --card`, also printed at the end of `aegis init`: languages, drivers, rule counts, the Layer 1 pass rate and the files with the most findings, for an existing repository.
-- **Ratchet baseline**: `aegis check --write-baseline` records today's findings in `.aegis/baseline.json`, so `aegis check` fails only on new ones (`--prune-baseline` drops entries that no longer match). With `--base`, the baseline is read from the base branch, never from the change under review. Where the base lists a signing key, an edit to `baseline.json` needs the approval `aegis check --ci` asks for; elsewhere the working-tree baseline is self-attested.
-- **Rule packs**: `aegis rule export` and `aegis rule import` move rules between repositories in a bundle checked by sha256 digests. Packs are not signed.
-- **Benchmark**: `aegis benchmark` measures scan and hook latency, payload size and Layer 1 throughput. It measures speed, not whether rules help.
-- **Also**: a report of the call and import edges between planned lanes (`aegis check --partition`), experimental rows for Cursor, Copilot, Kiro and Windsurf, a ledger shared by all worktrees, and an experimental Claude Code plugin directory (`aegis package --host claude-code`; nothing is published).
-
-## 10. Trust and evidence
-
-Aegis 4 removed claims the v3 code could not back, such as self-written release receipts and a manifest that excluded rules it should have protected. The current model ([SECURITY.md](../SECURITY.md#trust-tiers), [Trust tiers](trust-tiers.md)) replaces them with verifiable guarantees across three trust tiers (`A` separation of duties, `B` solo and signed, `C` self-attested), which `aegis doctor` detects read-only and prints on every report:
-
-- **Witnessed checks** (`aegis check --record [--tests]`): binds the work tree to its exact git tree hash, runs Layer 1 and (with `--tests`) `tests.command` from `~/.aegis/config.json` on an isolated snapshot export, and writes a `check` row (`witness: aegis`). The default command is `python -m pytest` under the Python running Aegis; the absolute Python named as the first word of `tests.command` replaces it, and a bare `pytest` is run as `python -m pytest` under that Python. The hermetic run uses that interpreter's own site dirs and not the user site (`-s`), so a pytest installed only in the user site needs `tests.command` to name an interpreter that has it. `aegis_report_outcome` credits rules only when a passing `aegis check --record --tests` row exists for the tree; otherwise it records a `claimed` row that earns no credit.
-- **Rule integrity and human approvals** (`aegis_scan`, `aegis check --ci`, `aegis approve`): `aegis_scan` serves gates and invariants from the reviewed base commit (`rules_base`), listing branch-local mandatory edits only in `unreviewed_rules`. `aegis check --ci` flags rule weakenings (a deleted, archived or lower-ranked rule, a dropped `target_paths` pattern, a narrowed `forbid_ast` call entry, a widening past the two-mandatory-rule cap). `aegis doctor` checks governance/workflow coverage in `CODEOWNERS`; an unowned file alone is not a `check --ci` failure. When the base branch lists a key in `allowed_signers`, it also fails any change to the governance set (`allowed_signers`, `CODEOWNERS`, workflows, `.aegis` config, team and baseline files at any depth, test infrastructure including root runner modules, and deleted tests) unless the change is signed with `aegis approve` (`Aegis-Approve: <governance tree hash>`) by a key already on the base (an SSH signature only; at Tier B this holds only while the pull request leaves `.github/workflows/**` and aegis alone). Rule edits stay under the weakening check, and `pyproject.toml`, `setup.cfg` and `tox.ini` count only when their pytest section changes. With no key on the base, a governance-file change is only noted and passes; a rule weakening still fails, because nothing can approve it (at tier A a qualifying review can). An approval covers the whole of `pyproject.toml`, `setup.cfg` and `tox.ini`, so after the base changes one of them the approval is re-signed on the new head. Comparing by pytest section leaves the rest of those files ungated by design: a `[project.entry-points.pytest11]` plugin, a dependency change or `tox.ini [testenv] commands` can still change what a test run does.
-- **Credit states** (`aegis sync`, `aegis status`): a passing check row is `witnessed`, `landed` once its tree's commit is on the protected branch, and `confirmed` by a successful run, on that commit, of the workflow named in the user-scope `ci.workflow` key of `~/.aegis/config.json` (a bare `.yml` or `.yaml` file name; default `validate.yml`; the repository's config and ledger rows never choose it). A check is `voided` by one of three causes: a CI failure (a failed run of that workflow on the landing commit, or a CI rerun of the head commit's trailer that diverges, reason `ci_divergence`), a lane-gate failure (`aegis check --lane` failing its test-integrity check for that tree, reason `lane_integrity`) or a revert (a commit on the protected branch whose message says `This reverts commit <sha>`, found when `aegis sync` confirms credit, reason `reverted`). Of these, a later CI success supersedes a CI-failure void from a failed run; `void` rows (`ci_divergence`, `lane_integrity`, `reverted`) are terminal.
-- **Commit trailers** (`aegis check --ci`): the `Aegis-Check: tree=<tree> exit=<n>` trailer is verified for the head commit only, by rerunning the recorded check on that commit's tree. Only an equal tree whose outcome diverges twice is a failure; a tree mismatch, a head without a trailer or a timed-out rerun is `unbound`. In CI a divergence is a failed job; `record_void` writes the `ci_divergence` void to the ledger of the machine that ran the check, so it applies to a local `check --ci`.
-- **Per-rule credit model** (`aegis sync [--pr]`): standing is computed from CI-confirmed checks, git detector replay (`caught` vs `leaked`), and human-adjudicated labels, with four sample-size states (`untestable`, `insufficient (n=K)`, `inconclusive`, `decided`), session-count decay `w = 2^(-delta / H)`, and inline `# aegis: allow` contested-override tracking. `aegis sync --pr` pushes a branch with the moves and unlabelled replay examples, opens a human-reviewed pull request from it, and never merges.
-- **Regression discipline** (`aegis check --ci`): a fix commit is a non-merge commit with a Conventional `fix` subject or a `Fixes:` trailer, with a scope outside `ci, build, docs, deps, release, chore, tests`, that changes a source file; `Closes:` and a `Fixes:` line outside the trailer block do not count. It needs a test that fails on `base` and passes at the pull-request head in an isolated snapshot, or a commit-scoped signed `Aegis-Exempt-Test: <fix-sha> <reason>` approval from `aegis approve --exempt-test`. This is advisory, at warning tier (no setting makes it block): judged once against the head with at most 2 pytest runs, `UNVERIFIED` for fixes whose only tests are not Python, with progress on stderr.
-- **Calibrated Layer-2 arbiter** (`aegis check --calibration`): logs stamped, falsifiable predictions to `.aegis/state/arbiter_predictions.jsonl` (no model text), computes each one's disposition and outcome from git when it is read, and scores them per backend and kind with Wilson 95% confidence intervals and Brier skill scores (log-only; skill claims suppressed below `n_effective >= 100`).
-- **Security checks, coverage and perf** (`aegis check --ci [--format github|sarif] [--coverage] [--perf]`): one verdict that the text, JSON (`blocking` lists the causes), GitHub annotations and step summary agree on; delta-evaluated structured `forbid_ast.calls` predicates, the security pack and secret delta of Layer 1, optional `ruff`/`gitleaks` presets named by the user-scope `scanners` key (only findings new against the merge base fail; an UNVERIFIED scanner never blocks), schema-valid SARIF 2.1.0 output with anchored findings only (also `aegis check FILES --format sarif` for Layer 1) and ingest, diff coverage on changed executable lines since merge-base(base, head) under the user-scope `tests.command` (`--coverage`; a report that never changes the exit code, `UNVERIFIED` with a reason when it cannot be measured), and paired interleaved base-vs-head benchmarking (`--perf`: the user-scope `perf.command`, or pytest-benchmark when installed; UNVERIFIED never blocks). `--coverage` and `--perf` exit 2 outside `--ci`. `aegis init --ci` adds an `aegis-sarif` job that uploads the SARIF log to code scanning, with `security-events: write` kept out of the job that runs repository code.
-- **Human insights closed loop** (`aegis rule insight add|review|enable`, `aegis_capture_insight`): stores redacted corrections at `~/.aegis/insights/<workspace-id>.jsonl` (`0600`), verifies content-bound `Aegis-Approve-Insight` signatures for human-approved insights (`aegis rule insight add` prints `Aegis-Approve-Insight: <sha256 of the typed text>`; sign a commit carrying that trailer, then re-run the same command with `--commit SHA` to record the insight at level H), lists each counted insight with its top-3 TF-IDF neighbours so the human groups them (no automatic clustering) and turns the group named with `--decision propose --insight ID ...` into an advisory `trap` proposal in `.aegis/proposals/` (with the shared `kind`, the `count`, the insight ids and up to three `<dir>/**` target paths), and measures post-activation recurrence as a rate over heartbeat-alive sessions (at most 1, 95% upper bound, pre-activation baseline), labelled `sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)` in `aegis status` and `aegis sync`. Rule matching and recurrence use fixed similarity thresholds that were set by hand and never measured: cosine 0.15 with a shared path, 0.30 without, and 0.12 for recurrence.
-- **Insight capture level** (`insights.capture` in `~/.aegis/config.json`: `off`, `counters` or `excerpts`): narrows what the host hook entry allows (`aegis rule insight enable --host H`, with `--excerpts` to keep excerpts) and never widens it, so the hook runs with the lower of the two. `counters` keeps heartbeats and drops excerpts; `off` writes nothing, not even heartbeats, so a rule activated from insights reports `no_prompt_traffic` in its recurrence measure. A repository `.aegis/config.json`, a user config inside the workspace, or an invalid or unreadable value never changes the mode. In `aegis doctor --json`, `insight_capture.status` and `excerpts` describe the host entry, `capture` is what the hook does, and `capture_source` says whether it comes from the `host entry` or `insights.capture`. `aegis rule insight add` and `aegis_capture_insight` are explicit actions; the key does not govern them.
-- **Release verification** (`aegis doctor --release <sha>`): verifies the GitHub Actions `verdict` attestation emitted on a push to the default branch, with its source ref pinned to GitHub's default branch, using `gh attestation verify` (`gh >= 2.93.0`), failing closed at Tiers B and C (`agent_editable`: the required check runs the pull request's own workflow) or when `gh` is missing or older.
-
-The reasoning and sample-size limits behind these guarantees are in [Why Aegis is built this way](why-aegis.md).
-
-GitHub transport lives in `aegis_core.ghcli`, CODEOWNERS parsing and coverage in `aegis_core.codeowners`, and ruleset administration in `aegis_core.github_ruleset`. `aegis_core.human_gate` keeps tier detection and signed approval verification.
-
-## 11. Cheat sheet
+## Cheat sheet
 
 Flags and defaults for every command are in the [reference](reference.md); this table only maps tasks to commands.
 
@@ -372,7 +312,7 @@ Flags and defaults for every command are in the [reference](reference.md); this 
 | see what `init` would do | `aegis init --dry-run` |
 | check that each host is wired | `aegis doctor` (`--json` for scripts, `--fix` to repair, `--github` for Tier A/B setup, `--release <sha>` for release attestation) |
 | see the rules for files I am about to edit | `aegis scan FILE...` |
-| check my change | `aegis check` (`--strict` to fail on warnings too, `--record --tests` to bind the git tree) |
+| check my change | `aegis check` (`--strict` for plain checkpoint warnings; `--record --tests` for an optional test receipt) |
 | run the CI weakening, regression and SARIF checks | `aegis check --ci` (`--format github|sarif`, `--coverage`, `--perf`, `--no-exec`) |
 | sign a governance change or test exemption | `aegis approve` (or `aegis approve --exempt-test <sha> --reason "..."`) |
 | add a model review | `aegis check --full --plan "..." --llm-cmd 'claude -p'` (`aegis check --calibration` to score predictions) |
