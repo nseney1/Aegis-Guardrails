@@ -42,6 +42,57 @@ def orphan_modules(root: Path) -> list[str]:
     return sorted(module for module in modules if _under(module, MODULE_PREFIXES) and not any(target == module or target.startswith(module + ".") for target in imported))
 
 
+def _module_export_binding(node, resolver):
+    """Distinguish a module's export table from an unrelated function/class local."""
+    scope = resolver.at.get(id(node))
+    while scope is not None and scope.parent is not None:
+        if "__all__" in scope.globals:
+            return True
+        if "__all__" in scope.nonlocals:
+            scope = scope.parent
+            continue
+        if "__all__" in scope.bound:
+            return False
+        scope = scope.parent
+    return scope is not None
+
+
+def declared_exports(tree, rel, resolver):
+    """Accept one module-level literal declaration; refuse mutations and aliases.
+
+    Rejecting unevaluated operations is safer than inventing an export list. A local
+    variable named __all__ is unrelated; a function's global mutation is not.
+    """
+    allowed_targets = set()
+    names = []
+    declared = False
+    for statement in tree.body:
+        targets = statement.targets if isinstance(statement, ast.Assign) else (
+            [statement.target] if isinstance(statement, ast.AnnAssign) else [])
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or targets[0].id != "__all__":
+            continue
+        if declared:
+            raise ValueError(f"{rel}:{statement.lineno}: unsupported __all__ mutation or reference")
+        declared = True
+        value = statement.value
+        if not isinstance(value, (ast.List, ast.Tuple)) or not all(
+                isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts):
+            raise ValueError(f"{rel}:{statement.lineno}: __all__ must be a literal list or tuple of strings")
+        names = [item.value for item in value.elts]
+        allowed_targets.add(id(targets[0]))
+    for node in _runtime_nodes(tree):
+        named = isinstance(node, ast.Name) and node.id == "__all__"
+        named = named or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "__all__")
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            named = named or "__all__" in import_bindings(node, rel)
+        indirect = (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name) and node.value.func.id == "globals"
+                    and isinstance(node.slice, ast.Constant) and node.slice.value == "__all__")
+        if indirect or (named and id(node) not in allowed_targets and _module_export_binding(node, resolver)):
+            raise ValueError(f"{rel}:{node.lineno}: unsupported __all__ mutation or reference")
+    return names
+
+
 def unused_exports(root: Path) -> list[str]:
     modules = _module_files(root)
     # Imports and attribute references share the script-body exclusion.
@@ -53,14 +104,9 @@ def unused_exports(root: Path) -> list[str]:
         rel = path.relative_to(root).as_posix()
         resolver = ScopedNames(tree, rel, runtime_only=True)
         used = set()
+        if _under(module, EXPORT_PREFIXES):
+            exports[module] = declared_exports(tree, rel, resolver)
         for node in _runtime_nodes(tree):
-            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == '__all__'
-                                                   for t in node.targets):
-                if _under(module, EXPORT_PREFIXES):
-                    # Refuse dynamic exports: an unevaluated list must not silently evade this guard.
-                    names = ast.literal_eval(node.value)
-                    assert isinstance(names, (list, tuple)) and all(isinstance(n, str) for n in names)
-                    exports[module] = names
             if (module, getattr(node, 'lineno', None)) not in sites:
                 continue
             if isinstance(node, ast.ImportFrom):
@@ -123,8 +169,9 @@ def test_main_only_import_does_not_count_as_an_export_consumer(tmp_path):
 
 def test_dynamic_export_lists_fail_loudly(tmp_path):
     _write(tmp_path, 'aegis_core/verification/new.py', '__all__ = exported_names()\n')
-    with pytest.raises(ValueError, match='malformed node or string'):
+    with pytest.raises(ValueError) as error:
         unused_exports(tmp_path)
+    assert str(error.value) == 'aegis_core/verification/new.py:1: __all__ must be a literal list or tuple of strings'
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -142,3 +189,51 @@ def test_export_parameter_shadows_a_module_alias(tmp_path):
     _write(tmp_path, 'aegis_cli/check.py',
            'from aegis_core.verification import new as backend\ndef unrelated(backend):\n    backend.orphan()\n')
     assert unused_exports(tmp_path) == ['aegis_core.verification.new.orphan']
+
+
+@pytest.mark.parametrize("declaration", [
+    '__all__: list[str] = ["check"]',
+    '__all__: tuple[str, ...] = ("check",)',
+])
+def test_annotated_export_declarations_are_checked(tmp_path, declaration):
+    _write(tmp_path, 'aegis_core/verification/new.py', declaration + '\ndef check(): pass\n')
+    assert unused_exports(tmp_path) == ['aegis_core.verification.new.check']
+    _write(tmp_path, 'aegis_cli/check.py', 'from aegis_core.verification.new import check\n')
+    assert unused_exports(tmp_path) == []
+
+
+@pytest.mark.parametrize("mutation", [
+    '__all__ += ["orphan"]',
+    '__all__.append("orphan")',
+    '__all__.extend(exported_names())',
+    '__all__[0] = "orphan"',
+    'del __all__',
+    'exports = __all__',
+    '__all__ = ["orphan"]',
+    'globals()["__all__"] = ["orphan"]',
+])
+def test_export_mutations_fail_with_exact_location(tmp_path, mutation):
+    _write(tmp_path, 'aegis_core/verification/new.py', '__all__ = ["check"]\n' + mutation + '\n')
+    with pytest.raises(ValueError) as error:
+        unused_exports(tmp_path)
+    assert str(error.value) == 'aegis_core/verification/new.py:2: unsupported __all__ mutation or reference'
+
+
+@pytest.mark.parametrize("declaration", [
+    '__all__ = exported_names()',
+    '__all__: list[str] = exported_names()',
+    '__all__: list[str]',
+    '__all__ = "check"',
+    '__all__ = ["check", 2]',
+])
+def test_nonliteral_export_declarations_fail_with_exact_location(tmp_path, declaration):
+    _write(tmp_path, 'aegis_core/verification/new.py', declaration + '\n')
+    with pytest.raises(ValueError) as error:
+        unused_exports(tmp_path)
+    assert str(error.value) == 'aegis_core/verification/new.py:1: __all__ must be a literal list or tuple of strings'
+
+
+def test_local_export_named_variables_are_not_module_declarations(tmp_path):
+    _write(tmp_path, 'aegis_core/verification/new.py',
+           'def helper():\n    __all__ = ["unrelated"]\n    __all__.append("local")\n    return __all__\n')
+    assert unused_exports(tmp_path) == []
