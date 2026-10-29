@@ -62,6 +62,7 @@ RETRACTED = (
     "check --release",        # Release Gate 4.5 was cut (D6)
     "aegis system",           # a removed command (D5)
     "DirectSDKBackend",       # the vendor SDK backends were cut (D14)
+    "Git subprocesses strip inherited repository",  # selector scrubbing is scoped, not the default
 )
 
 
@@ -77,6 +78,17 @@ def test_policy_documents_make_no_retracted_claim():
 
 def test_retracted_claim_guard_is_case_insensitive():
     assert retracted_claims_in("Keys are ED25519 and the server is Air-Gapped.") == ["Ed25519", "air-gapped"]
+    assert retracted_claims_in("GIT SUBPROCESSES STRIP INHERITED REPOSITORY selectors.") == [
+        "Git subprocesses strip inherited repository"]
+
+
+def test_git_environment_claim_names_the_evidence_scope_and_hook_exception():
+    trust = _section(_security_text(), "Repository trust")
+    paragraphs = [paragraph for paragraph in trust.split("\n\n") if "`gitsafe.scrubbed()`" in paragraph]
+    assert len(paragraphs) == 1, "scope the selector-scrubbing claim to gitsafe.scrubbed()"
+    for detail in ("evidence", "Ordinary git calls retain", "hooks", "alternate `GIT_INDEX_FILE`",
+                   "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        assert detail in paragraphs[0], detail
 
 
 # Names of v3 components and v3 biology vocabulary that v4 dropped. A policy document
