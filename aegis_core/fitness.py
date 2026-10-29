@@ -447,8 +447,9 @@ def _rule_key(rule: Any) -> Tuple[str, str]:
 
 
 def _blob_texts(root: Path, oids: List[str]) -> Dict[str, Optional[str]]:
-    """The text of each blob, read in one batch; a blob git cannot give back is None (UNVERIFIED)."""
+    """Python text read in one batch; unreadable or undecodable blobs are None (UNVERIFIED)."""
     from aegis_core import gitsafe
+    from aegis_core.ast.source import decode_python_source
 
     try:
         blobs = gitsafe.read_blobs(root, oids) if oids else {}
@@ -459,7 +460,13 @@ def _blob_texts(root: Path, oids: List[str]) -> Dict[str, Optional[str]]:
                 blobs.update(gitsafe.read_blobs(root, [oid]))
             except gitsafe.GitError:
                 continue
-    return {oid: (blobs[oid].decode("utf-8", "replace") if oid in blobs else None) for oid in oids}
+    texts: Dict[str, Optional[str]] = {}
+    for oid in oids:
+        try:
+            texts[oid] = decode_python_source(blobs[oid]) if oid in blobs else None
+        except (SyntaxError, UnicodeError):
+            texts[oid] = None
+    return texts
 
 
 def _patterns(rel: str, text: Optional[str], rules: Sequence[Any]) -> Dict[Tuple[str, str], Optional[FrozenSet[str]]]:
@@ -566,7 +573,7 @@ def _utc_stamp(iso: str) -> Optional[str]:
 
 # Raise whenever replay or forbid_ast evaluation semantics change: it is part of the digest stored with
 # replay.tip, so a tip recorded by another evaluator is never resumed from and history is walked again.
-REPLAY_FORMAT = 1
+REPLAY_FORMAT = 2
 
 
 def _rules_digest(rules: Sequence[Any]) -> str:

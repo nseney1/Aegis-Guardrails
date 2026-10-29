@@ -126,6 +126,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 ### Fixed
 
 - The release publisher grants every permission used by reusable validation, including read-only pull-request access, so release-event validation can start.
+- Historical Python blobs use the same safe source decoding as checked files. Valid encoding cookies and BOMs no longer create false security deltas or hide replay detections; secret-delta decoding stays consistent and stale replay caches are refreshed.
 
 - Documentation separates deterministic checks, optional test receipts and CI-confirmed rule credit, including empty-rule scans and unsupported unittest/mixed-suite summaries. Contributor setup and approval guidance now cover isolated tests and governance changes; SECURITY distinguishes the tree-identity git runner from `gitsafe`.
 
