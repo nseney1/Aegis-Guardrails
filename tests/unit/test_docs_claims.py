@@ -68,31 +68,37 @@ def command_problems(text: str, parser: dict, name: str = "doc.md") -> list[str]
         except ValueError as exc:
             problems.append(f"{name}:{line}: malformed command: {exc}")
             continue
-        nodes = [parser]
-        skip = 0
+        branches = [([parser], 0)]
         for word in words[1:]:
-            if skip:
-                skip -= 1
-                continue
-            if word in ("...", "…", "ARG"):
-                continue
-            options = {flag: arg for node in nodes for arg in node["arguments"] for flag in arg["flags"]}
-            if word.startswith("-"):
-                flag = word.split("=", 1)[0].rstrip(",.;:")
-                if flag not in options:
-                    problems.append(f"{name}:{line}: unknown flag {flag}: {example}")
-                elif "=" not in word and options[flag].get("nargs") != 0:
-                    skip = 1
-                continue
-            choices = nodes[-1].get("commands", {})
-            if choices:
-                alternatives = word.split("|")
-                unknown = [part for part in alternatives if part not in choices]
-                if unknown:
+            following = []
+            for nodes, skip in branches:
+                if skip:
+                    following.append((nodes, skip - 1))
+                    continue
+                if word in ("...", "…", "ARG"):
+                    following.append((nodes, 0))
+                    continue
+                options = {flag: arg for node in nodes for arg in node["arguments"] for flag in arg["flags"]}
+                if word.startswith("-"):
+                    flag = word.split("=", 1)[0].rstrip(",.;:")
+                    if flag not in options:
+                        problems.append(f"{name}:{line}: unknown flag {flag}: {example}")
+                    else:
+                        skip = int("=" not in word and options[flag].get("nargs") != 0)
+                        following.append((nodes, skip))
+                    continue
+                choices = nodes[-1].get("commands", {})
+                if choices:
+                    for alternative in word.split("|"):
+                        if alternative not in choices:
+                            problems.append(f"{name}:{line}: unknown command {alternative}: {example}")
+                        else:
+                            following.append(([*nodes, choices[alternative]], 0))
+                elif any(not arg["flags"] for arg in nodes[-1]["arguments"]):
+                    following.append((nodes, 0))
+                else:
                     problems.append(f"{name}:{line}: unknown command {word}: {example}")
-                    break
-                # Shorthand command alternatives must share the flags they document.
-                nodes.append(choices[alternatives[0]])
+            branches = following
     return problems
 
 
@@ -132,6 +138,26 @@ def test_documented_commands_and_flags_exist():
 def test_command_guard_rejects_unknown_examples(example, message):
     parser = json.loads((ROOT / "tests/contract/cli_tree.json").read_text(encoding="utf-8"))["parser"]
     assert message in command_problems(example, parser)[0]
+
+
+@pytest.mark.parametrize("example, message", [
+    ("aegis hook install|status --force", "unknown flag --force"),
+    ("aegis hook status|install --force", "unknown flag --force"),
+    ("aegis rule|hook insight add", "unknown command insight"),
+    ("aegis hook|rule insight add", "unknown command insight"),
+    ("aegis rule|status insight add", "unknown command insight"),
+    ("aegis status|rule insight add", "unknown command insight"),
+])
+def test_command_alternatives_must_all_accept_the_remaining_example(example, message):
+    parser = json.loads((ROOT / "tests/contract/cli_tree.json").read_text(encoding="utf-8"))["parser"]
+    problems = command_problems(f"`{example}`", parser)
+    assert any(message in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize("commands", ["install|uninstall", "uninstall|install"])
+def test_command_alternatives_accept_shared_flags_and_values(commands):
+    parser = json.loads((ROOT / "tests/contract/cli_tree.json").read_text(encoding="utf-8"))["parser"]
+    assert command_problems(f"`aegis hook {commands} --host <host> --force`", parser) == []
 
 
 def test_roadmap_exemption_is_narrow_and_ends_at_the_next_section():
