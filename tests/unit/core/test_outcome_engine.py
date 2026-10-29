@@ -74,9 +74,9 @@ class TestMatchRulesToChanges:
 class TestOutcomeEngineExecution:
     """Direct tests for aegis_core.outcomes.engine functions."""
 
-    def test_get_changed_files(self, tmp_path):
+    def testget_changed_files(self, tmp_path):
         import subprocess
-        from aegis_core.outcomes.engine import _get_changed_files
+        from aegis_core.outcomes.engine import get_changed_files
 
         def git(*args):
             subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
@@ -84,7 +84,7 @@ class TestOutcomeEngineExecution:
 
         # 1. not a repository: nothing is known
         if subprocess.run(["git", "-C", str(tmp_path), "rev-parse"], capture_output=True).returncode != 0:
-            assert _get_changed_files(str(tmp_path)) == []
+            assert get_changed_files(str(tmp_path)) == []
 
         # 2. one commit: the uncommitted and untracked files
         (tmp_path / "src").mkdir()
@@ -94,12 +94,12 @@ class TestOutcomeEngineExecution:
         git("commit", "-q", "-m", "init")
         (tmp_path / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
         (tmp_path / "untracked.py").write_text("u\n", encoding="utf-8")
-        assert _get_changed_files(str(tmp_path)) == ["src/app.py", "untracked.py"]
+        assert get_changed_files(str(tmp_path)) == ["src/app.py", "untracked.py"]
 
         # 3. later commits: the last commit's files plus uncommitted edits
         git("add", "src/app.py")
         git("commit", "-q", "-m", "two")
         (tmp_path / "src" / "util.py").write_text("y\n", encoding="utf-8")
         git("add", "src/util.py")
-        assert _get_changed_files(str(tmp_path)) == ["src/app.py", "src/util.py"]
+        assert get_changed_files(str(tmp_path)) == ["src/app.py", "src/util.py"]
 

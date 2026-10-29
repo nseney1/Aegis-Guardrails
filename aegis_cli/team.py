@@ -32,7 +32,7 @@ EXIT_USAGE = 2
 ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "metrics")
 
 
-def _envelope(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
+def _team_payload(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
     return primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now)
 
 
@@ -75,7 +75,7 @@ def _lease_lines(lease: Optional[Dict[str, Any]]) -> List[str]:
 
 def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseChange) -> int:
     if args.json:
-        payload = _envelope(args.team_action, root, now, refs=team.LANES_REF, lane=change.lane)
+        payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=change.lane)
         payload.update({
             "status": change.action,
             "oid": change.oid,
@@ -114,7 +114,7 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
     result = team.gc(root, now=now)
     warnings = [line for change in result.collected for line in change.warnings]
     if args.json:
-        payload = _envelope("gc", root, now, refs=team.LANES_REF)
+        payload = _team_payload("gc", root, now, refs=team.LANES_REF)
         payload.update({
             "status": "collected" if result.collected else "nothing to collect",
             "collected": [{"lane": c.lane, "previous": c.previous, "caller": c.caller} for c in result.collected],
@@ -138,7 +138,7 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
 def _list(args: argparse.Namespace, root: Path, now: int) -> int:
     found = team.describe(root, now)
     if args.json:
-        payload = _envelope("list", root, now, refs=team.LANES_REF)
+        payload = _team_payload("list", root, now, refs=team.LANES_REF)
         payload.update({"note": team.LEASE_NOTE, **found})
         _emit(payload)
         return EXIT_OK
@@ -160,7 +160,7 @@ def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     counts = team.event_counts(root)
     span = merges.pop("range")
     if args.json:
-        payload = _envelope("metrics", root, now, **span)
+        payload = _team_payload("metrics", root, now, **span)
         payload.update({"events": counts, "merges": merges})
         _emit(payload)
         return EXIT_OK
@@ -197,7 +197,7 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
 
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
     if args.json:
-        payload = _envelope(args.team_action, root, now)
+        payload = _team_payload(args.team_action, root, now)
         payload.update({"status": "error", "error": message})
         _emit(payload)
     else:
@@ -208,7 +208,7 @@ def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: 
 def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused) -> int:
     lease = _view(root, now, exc.current)
     if args.json:
-        payload = _envelope(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
+        payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
         payload.update({
             "status": "refused",
             "reason": exc.reason,

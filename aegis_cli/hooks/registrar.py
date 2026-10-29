@@ -812,7 +812,7 @@ def uninstall(host: str, scope: Optional[str] = None, *, home: Union[str, Path],
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
-def _envelope(command: str, host: str, scope: Optional[str], root: Optional[Path],
+def _hook_payload(command: str, host: str, scope: Optional[str], root: Optional[Path],
               results: List[HookResult]) -> Dict[str, Any]:
 
     return {**primitives.envelope(f"aegis hook {command}", {"host": host, "scope": scope, "workspace": None if root is None else str(root)}),
@@ -890,7 +890,7 @@ def _run(command: str, args: Any) -> int:
         print(f"❌ aegis hook {command} --host {host}: {exc}", file=sys.stderr)
         return 1
     if use_json:
-        print(json.dumps(_envelope(command, host, scope or ("user" if command == "install" else None), root,
+        print(json.dumps(_hook_payload(command, host, scope or ("user" if command == "install" else None), root,
                                    results), indent=2))
         for r in results:
             for warning in r.warnings:
