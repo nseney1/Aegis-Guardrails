@@ -33,10 +33,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from aegis_core import baseline, events
+from aegis_core import baseline, events, primitives, team
 from aegis_core.errors import AegisError
 from aegis_core.match import matches, normalize_path
-from aegis_core.workspace.layout import module_ancestors, resolve_module_file
 
 __all__ = ["LIMITS", "MAX_PREDICTED", "SOURCE", "Edge", "Frozen", "PartitionUsage", "Report", "check", "parse_splits"]
 
@@ -44,7 +43,6 @@ SOURCE = "aegis check --partition"
 MAX_PREDICTED = 200  # edges kept in the event: the log is a metric, not an archive
 MIN_LANES = 2
 _NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _USAGE = "--partition needs at least 2 --split NAME=GLOB[,GLOB...]"
 LIMITS = (
     "Edges come from static name resolution through imports: a call on an object, a name reached through a "
@@ -82,12 +80,16 @@ def parse_splits(values: Optional[Iterable[str]]) -> Dict[str, Tuple[str, ...]]:
             raise PartitionUsage(f"--split: lane {name} has no glob")
         globs: List[str] = []
         for raw in rest.split(","):
-            if _CONTROL.search(raw):
-                raise PartitionUsage(f"--split: lane {name} has a glob with a control character")
+            # Check before strip: C1 NEL is whitespace too, but must not disappear.
+            problem = team.glob_problem(raw)
+            if problem != "control":
+                problem = team.glob_problem(raw.strip())
             clean = normalize_path(raw.strip())
-            if not clean:
+            if problem == "control":
+                raise PartitionUsage(f"--split: lane {name} has a glob with a control character")
+            if problem == "empty":
                 raise PartitionUsage(f"--split: lane {name} has an empty glob")
-            if ".." in clean.split("/"):
+            if problem == "climbs":
                 raise PartitionUsage(f"--split: lane {name}: glob {clean!r} climbs out of the workspace with '..'")
             if clean not in globs:
                 globs.append(clean)
@@ -120,11 +122,25 @@ class _Facts:
 
 def _ancestors(directory: str) -> List[str]:
     """``directory`` and each directory above it, nearest first, ending with the workspace root ('')."""
-    return module_ancestors(directory)
+    found: List[str] = []
+    while directory and directory != ".":
+        found.append(directory)
+        directory = posixpath.dirname(directory)
+    found.append("")
+    return found
 
 
 def _module_file(files: frozenset, importer: str, segments: Sequence[str], language: str) -> Optional[str]:
-    return resolve_module_file(list(segments), files, importer=importer, language=language)
+    if not segments:
+        return None
+    tail = "/".join(segments)
+    for directory in _ancestors(posixpath.dirname(importer)):
+        base = posixpath.join(directory, tail) if directory else tail
+        options = (f"{base}.py", f"{base}/__init__.py") if language == "python" else (f"{base}.rs", f"{base}/mod.rs")
+        for option in options:
+            if option in files:
+                return option
+    return None
 
 
 def _python_segments(source: str) -> List[str]:
@@ -315,7 +331,7 @@ class Report:
         }
 
     def as_dict(self) -> Dict[str, Any]:
-        document = baseline.envelope(SOURCE, {
+        document = primitives.envelope(SOURCE, {
             "workspace": self.workspace,
             "listing": self.listing,
             "lanes": list(self.lanes),
@@ -335,47 +351,6 @@ class Report:
             warnings=list(self.warnings),
         )
         return document
-
-    def text_lines(self) -> List[str]:
-        kinds = ", ".join(f"{n} {lang}" for lang, n in sorted(self.languages.items())) or "none"
-        lines = [f"{SOURCE}: {len(self.lanes)} lanes, {self.files_analyzed} file(s) analyzed ({kinds}), "
-                 f"{len(self.not_analyzed)} not analyzed", "lanes:"]
-        for name, globs in self.lanes.items():
-            lines.append(f"  {name}: {self.lane_files.get(name, 0)} file(s) [{', '.join(globs)}]")
-        if self.overlap:
-            lines.append("overlap (matched by more than one lane; left out of the edges):")
-            lines.extend(f"  {path} ({', '.join(names)})" for path, names in self.overlap)
-        else:
-            lines.append("overlap: none")
-        if not self.edges:
-            lines.append("cross-lane edges: none")
-        else:
-            lines.append(f"cross-lane edges: {len(self.edges)}")
-            pair = None
-            for edge in self.edges:
-                if (edge.from_lane, edge.to_lane) != pair:
-                    pair = (edge.from_lane, edge.to_lane)
-                    count = sum(1 for e in self.edges if (e.from_lane, e.to_lane) == pair)
-                    lines.append(f"  {pair[0]} -> {pair[1]}: {count}")
-                landing = f"{edge.to_path}::{edge.symbol}" if edge.symbol else edge.to_path
-                lines.append(f"    {edge.kind:<7} {edge.from_path}:{edge.line} -> {landing}  ({edge.target})")
-        if self.not_analyzed:
-            lines.append("not analyzed:")
-            lines.extend(f"  {path}: {reason}" for path, reason in self.not_analyzed[:20])
-            if len(self.not_analyzed) > 20:
-                lines.append(f"  ... and {len(self.not_analyzed) - 20} more")
-        lines.append("[FROZEN_SIGNATURES]")
-        if self.frozen:
-            lines.append("# Do not change these while the lanes run in parallel; a change is a request to the dispatcher.")
-            for item in self.frozen:
-                users = ", ".join(sorted({f"{lane}: {path}:{line}" for lane, path, line in item.used_by}))
-                lines.append(f"{item.path}::{item.symbol}  {item.signature}  (lane {item.lane}; used by {users})")
-        else:
-            lines.append("(none)")
-        lines.append("[/FROZEN_SIGNATURES]")
-        lines.append(LIMITS[0])
-        lines.extend(f"warning: {warning}" for warning in self.warnings)
-        return lines
 
 
 # ── The check ────────────────────────────────────────────────────────────────
@@ -424,7 +399,7 @@ def _signature(root: str, path: str, facts: _Facts, symbol: str, cache: Dict[str
     if path not in cache:
         try:
             with open(full, "rb") as handle:
-                cache[path] = baseline.split_lines(handle.read().decode("utf-8", "replace"))
+                cache[path] = primitives.split_lines(handle.read().decode("utf-8", "replace"))
         except OSError:
             cache[path] = []
     return _rust_signature(cache[path], facts.defs[symbol].line)
@@ -525,8 +500,7 @@ def check(root: Any, lanes: Dict[str, Tuple[str, ...]], now: Optional[float] = N
     if not record:
         return report
     warnings: Tuple[str, ...] = ()
-    try:
-        events.append(base, "partition_check", "edges" if edges else "clear", report.event_detail())
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(base, "partition_check", "edges" if edges else "clear", report.event_detail())
+    if exc is not None:
         warnings = (f"event not recorded: {exc}",)
     return Report(**{**report.__dict__, "warnings": warnings}) if warnings else report

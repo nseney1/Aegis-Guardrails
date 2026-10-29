@@ -22,11 +22,14 @@ so a caller can report such a host as unknown rather than absent.
 """
 from __future__ import annotations
 
+import ntpath
 import os
 import sys
 from typing import List, NamedTuple, Optional, Union
 
-__all__ = ["Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "only_skipped", "which"]
+from aegis_core.primitives import key_within, real_key
+
+__all__ = ["Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "is_bare", "only_skipped", "which"]
 
 PathLike = Union[str, "os.PathLike[str]"]
 
@@ -42,6 +45,11 @@ class Hit(NamedTuple):
     path: str
     entry: str
     reason: str
+
+
+def is_bare(name: str, *, windows: bool = os.name == "nt") -> bool:
+    """A name with no directory or drive; the explicit platform keeps both rules testable."""
+    return "/" not in name and (not windows or ("\\" not in name and not ntpath.splitdrive(name)[0]))
 
 
 def _candidates(name: str) -> List[str]:
@@ -77,18 +85,11 @@ def _programs(directory: str, name: str) -> List[str]:
     return found
 
 
-def _key(path: str) -> Optional[str]:
-    try:
-        return os.path.normcase(os.path.realpath(path))
-    except (OSError, ValueError):
-        return None
-
-
 def _inside(entry: str, fence: str) -> bool:
     """Whether ``entry`` (resolved through links) is ``fence`` or below it. An entry
     that cannot be resolved is treated as inside: it is never searched."""
-    key = _key(entry)
-    return key is None or key == fence or key.startswith(fence.rstrip(os.sep) + os.sep)
+    key = real_key(entry)
+    return key is None or key_within(key, fence)
 
 
 def _search(path: Optional[str]) -> List[str]:
@@ -99,12 +100,14 @@ def _fence(outside: Optional[PathLike]) -> Optional[str]:
     if outside is None:
         return None
     # A fence that cannot be resolved still fences its spelling.
-    return _key(os.fspath(outside)) or os.path.normcase(os.path.abspath(os.fspath(outside)))
+    return real_key(os.fspath(outside)) or os.path.normcase(os.path.abspath(os.fspath(outside)))
 
 
 def which(name: str, path: Optional[str] = None, outside: Optional[PathLike] = None) -> Optional[str]:
     """The first program ``name`` in an absolute entry of ``path`` (default ``$PATH``)
     that is not inside ``outside``, or None."""
+    if not is_bare(name):
+        return None
     fence = _fence(outside)
     for entry in _search(path):
         if not entry or not os.path.isabs(entry):
@@ -127,7 +130,7 @@ def only_skipped(name: str, path: Optional[str] = None, outside: Optional[PathLi
     directory), where a host started from that directory would look. Nothing found
     here is ever to be run.
     """
-    if which(name, path, outside) is not None:
+    if not is_bare(name) or which(name, path, outside) is not None:
         return []
     fence = _fence(outside)
     root = os.fspath(base) if base is not None else os.getcwd()

@@ -107,9 +107,9 @@ class TestRuleSourceLocator:
         assert packaged_dir("skills") in {REPO_ROOT / "skills", REPO_ROOT / "aegis_core" / "_data" / "skills"}
 
     def test_a_broken_install_without_the_data_is_reported_not_guessed(self, tmp_path, monkeypatch):
-        import aegis_cli.init as init_mod
+        from aegis_core import scaffolding
 
-        monkeypatch.setattr(init_mod, "packaged_dir", lambda name, base=None: tmp_path / "missing" / name)
+        monkeypatch.setattr(scaffolding, "packaged_dir", lambda name, base=None: tmp_path / "missing" / name)
         with pytest.raises(ValueError, match="not found; reinstall aegis-guardrails"):
             preset_rules("minimal")
 
@@ -222,7 +222,7 @@ class TestSeededRulesAreLintClean:
         source = tmp_path / "pkg" / "providence.md"
         source.parent.mkdir()
         source.write_bytes(b"---\r\nid: providence\r\ndomain: governance\r\n---\r\n# Body\r\n")
-        monkeypatch.setattr("aegis_cli.init.preset_rules", lambda preset: [source])
+        monkeypatch.setattr("aegis_core.scaffolding.preset_rules", lambda preset: [source])
         installed = install_rules(tmp_path / "out", preset="minimal", rule_type="persona")
         assert installed == ["providence"]
         assert (tmp_path / "out" / "providence.md").read_bytes() == (
@@ -233,10 +233,17 @@ class TestSeededRulesAreLintClean:
         source = tmp_path / "pkg" / "testing.md"
         source.parent.mkdir()
         source.write_bytes(b"---\nid: testing\ntype: trap\ntarget_paths: tests/**\n---\nBody\n")
-        monkeypatch.setattr("aegis_cli.init.preset_rules", lambda preset: [source])
+        monkeypatch.setattr("aegis_core.scaffolding.preset_rules", lambda preset: [source])
         install_rules(tmp_path / "out", preset="minimal", rule_type="persona")
         assert (tmp_path / "out" / "testing.md").read_bytes() == (
             b"---\nid: testing\ntype: persona\ntarget_paths: tests/**\n---\nBody\n")
+
+
+def test_init_passes_the_full_mode_call_graph_check():
+    from aegis_core.verification.call_graph import check
+
+    evidence = check(str(REPO_ROOT / "aegis_cli" / "init.py"), str(REPO_ROOT), fast_mode=False)
+    assert evidence.verdict is True, evidence.detail
 
 
 def _tree(*roots: Path) -> dict:
@@ -1234,3 +1241,366 @@ def test_the_wheel_smoke_expects_the_active_starters_init_seeds():
     node = next(n for n in tree.body if isinstance(n, pyast.Assign)
                 and any(getattr(t, "id", None) == "ACTIVE_STARTERS" for t in n.targets))
     assert tuple(pyast.literal_eval(node.value)) == tuple(ACTIVE_STARTERS)
+
+
+class TestGovernanceHint:
+    """R-trust-42: init writes no CODEOWNERS (it cannot tell a valid owner offline); a real run points at
+    `aegis doctor --github`, the one place the CODEOWNERS lines and the ruleset come from."""
+
+    CODEOWNERS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+
+    def _no_codeowners(self, project: Path) -> None:
+        assert not any((project / p).exists() for p in self.CODEOWNERS)
+
+    def test_a_real_run_prints_the_doctor_github_hint_after_the_ci_floor(self, project, capsys):
+        assert run_init(_args(project)) == 0
+        out = capsys.readouterr().out
+        assert "aegis doctor --github" in out and "CODEOWNERS" in out
+        assert out.index("CI is the floor") < out.index("aegis doctor --github")
+        self._no_codeowners(project)
+
+    def test_json_keeps_its_keys_and_carries_no_hint(self, project, capsys):
+        assert main(["--json", "init", "--workspace", str(project), "--yes", "--no-hooks", "--rules", "minimal"]) == 0
+        out = capsys.readouterr().out
+        assert set(json.loads(out)) == {"source", "aegis_version", "checked_at", "scope", "dry_run", "status",
+                                        "actions", "errors", "warnings"}
+        assert "doctor --github" not in out
+        self._no_codeowners(project)
+
+    def test_a_dry_run_prints_no_hint_and_writes_nothing(self, project, capsys):
+        assert run_init(_args(project, "--dry-run")) == 0
+        assert "doctor --github" not in capsys.readouterr().out
+        assert not (project / ".aegis").exists()
+        self._no_codeowners(project)
+
+
+
+# ── Pins: what each run_init path prints and returns (R-cli-a1; recorded before the split) ──
+
+INIT_KEYS = ["source", "aegis_version", "checked_at", "scope", "dry_run", "status", "actions", "errors", "warnings"]
+
+HEADER = (
+    "\n"
+    "  🛡️ Aegis Guardrails — Workspace Setup\n"
+    "\n"
+    "  Workspace: <WS>\n"
+    "  Project type: unknown (rules are language-agnostic)\n"
+    "  Hosts: none selected (only the repository is set up)\n"
+    "\n"
+)
+
+PLAN = (
+    "  ✅ .aegis/config.json: created (hosts: none)\n"
+    "  ✅ .aegis/.gitignore: dry-run\n"
+    "  Starter rules (preset=minimal) in .aegis/rules/personas/:\n"
+    "    [DRY-RUN] providence\n"
+    "    [DRY-RUN] destructive-ops\n"
+    "    They apply to no file until you set their target_paths (aegis status lists them).\n"
+    "  Active rule in .aegis/rules/invariants/:\n"
+    "    [DRY-RUN] no-eval: bans builtin eval() and exec() in **/*.py (method calls like df.eval() and "
+    "model.eval() are allowed); aegis check and the pre-commit hook enforce it\n"
+    "  ✅ AGENTS.md: created\n"
+    "  ✅ ~/.aegis/workspaces.json: added\n"
+    "  ✅ ~/.aegis/link.key: created (pseudonymization key for session labels; stays on this machine)\n"
+)
+
+NO_ANSWER = "  ❌ no answer to the prompt (end of input); nothing was written. Re-run with --yes to skip the prompt.\n"
+
+OUTCOME_TAIL = (
+    "  (the card of <WS>)\n"
+    "  After a session, run: aegis status\n"
+    "\n"
+    "  Governance files (rules, workflows, allowed_signers) are protected only by GitHub settings:\n"
+    "  aegis doctor --github prints the CODEOWNERS lines and the ruleset for this repository;\n"
+    "  commit the CODEOWNERS lines it prints and apply the ruleset.\n"
+    "\n"
+)
+
+
+def _written(hosts: str, ci: str) -> str:
+    """What a real run in an empty workspace prints for the steps it wrote."""
+    return (
+        f"  ✅ .aegis/config.json: created (hosts: {hosts})\n"
+        "  ✅ .aegis/.gitignore: created\n"
+        "  Starter rules (preset=minimal) in .aegis/rules/personas/:\n"
+        "    ✅ providence\n"
+        "    ✅ destructive-ops\n"
+        "    They apply to no file until you set their target_paths (aegis status lists them).\n"
+        "  Active rule in .aegis/rules/invariants/:\n"
+        "    ✅ no-eval: bans builtin eval() and exec() in **/*.py (method calls like df.eval() and "
+        "model.eval() are allowed); aegis check and the pre-commit hook enforce it\n"
+        "    Next: add a rule for your own code with aegis rule create (aegis rule create --help)\n"
+        "  ✅ AGENTS.md: created\n"
+        f"{ci}"
+        "  ✅ ~/.aegis/workspaces.json: added\n"
+        "  ✅ ~/.aegis/link.key: created (pseudonymization key for session labels; stays on this machine)\n"
+    )
+
+
+def _scrub(value, *marks):
+    """``value`` (text, or parsed JSON) with each (path, mark) pair's path, raw or resolved, as the
+    mark; ``checked_at`` and ``aegis_version`` of a JSON document as <TS> and <V>."""
+    if isinstance(value, dict):
+        return {k: "<TS>" if k == "checked_at" else "<V>" if k == "aegis_version" else _scrub(v, *marks)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub(v, *marks) for v in value]
+    if isinstance(value, str):
+        for path, mark in marks:
+            for form in sorted({str(Path(path).resolve()), str(path)}, key=len, reverse=True):
+                value = value.replace(form, mark)
+    return value
+
+
+def _one_document(text: str) -> dict:
+    """The one JSON object ``text`` holds: json.loads refuses a second document after it."""
+    doc = json.loads(text)
+    assert isinstance(doc, dict) and text == json.dumps(doc, indent=2) + "\n"
+    return doc
+
+
+def _answer(monkeypatch, reply) -> None:
+    def ask(_prompt):
+        if isinstance(reply, type):
+            raise reply
+        return reply
+    monkeypatch.setattr("builtins.input", ask)
+
+
+@pytest.fixture
+def failing_codex(tmp_path, monkeypatch):
+    """codex and aegis-mcp on PATH, and a codex that refuses every registration: the argv it got."""
+    import aegis_cli.install_hosts as install_hosts
+
+    bindir = tmp_path / "host-bin"
+    bindir.mkdir()
+    for name in ("codex", "aegis-mcp"):
+        exe = bindir / (name + (".exe" if os.name == "nt" else ""))
+        exe.write_bytes(b"#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    calls: list = []
+
+    def refuse(argv):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, "", "denied")
+
+    monkeypatch.setattr(install_hosts, "_run_cli", refuse)
+    return calls
+
+
+@pytest.fixture
+def finish_calls(monkeypatch):
+    """The status of each Report.finish call; the spy calls through to the real method."""
+    from aegis_cli.init_views import Report
+
+    calls: list = []
+    real = Report.finish
+
+    def spy(self, status, scope, dry_run, actions):
+        calls.append(status)
+        return real(self, status, scope, dry_run, actions)
+
+    monkeypatch.setattr(Report, "finish", spy)
+    return calls
+
+
+class TestRunInitPins:
+    """Characterization pins: green before run_init was split into helpers, unchanged after."""
+
+    def test_json_without_yes_or_dry_run_is_one_stderr_line_and_exit_2(self, project, capsys):
+        home = Path.home()
+        before = _snapshot(project, home)
+        assert run_init(_args(project, "--json", yes=False)) == 2
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "aegis init --json needs --yes or --dry-run (it cannot prompt)\n")
+        assert _snapshot(project, home) == before
+
+    def test_a_denied_root_is_refused_in_exactly_one_json_document(self, project, capsys):
+        home = Path.home()
+        before = _snapshot(home)
+        assert run_init(_args(home, "--json")) == 1
+        captured = capsys.readouterr()
+        doc = _one_document(captured.out)
+        assert list(doc) == INIT_KEYS
+        assert _scrub(doc, (home, "<HOME>")) == {
+            "source": "aegis init", "aegis_version": "<V>", "checked_at": "<TS>",
+            "scope": {"workspace": "<HOME>", "hosts": [], "detected": []},
+            "dry_run": False, "status": "refused", "actions": [],
+            "errors": ["refusing to set up <HOME>: your home directory and a filesystem root are never a workspace. "
+                       "Run aegis init in a repository."],
+            "warnings": [],
+        }
+        assert captured.err == ""
+        assert _snapshot(home) == before
+
+    def test_a_dry_run_prints_the_plan_and_writes_nothing(self, project, capsys):
+        (project / ".git" / "hooks").mkdir(parents=True)
+        home = Path.home()
+        before = _snapshot(project, home)
+        assert run_init(_args(project, "--dry-run", yes=False, hooks=True)) == 0
+        captured = capsys.readouterr()
+        assert _scrub(captured.out, (project, "<WS>")) == (
+            HEADER + PLAN + "    🪝 Would install pre-commit hook\n    🪝 Would install prepare-commit-msg hook\n"
+            "\n  Dry run complete. No files were created.\n")
+        assert captured.err == ""
+        assert _snapshot(project, home) == before
+
+    @pytest.mark.parametrize("reply, code, out, err", [
+        ("n", 0, "  Aborted.\n", ""),
+        (EOFError, 1, "\n", NO_ANSWER),
+        (KeyboardInterrupt, 130, "\n  Aborted.\n", ""),
+    ], ids=["declined", "end-of-input", "interrupted"])
+    def test_an_unanswered_or_declined_prompt_writes_nothing(self, project, monkeypatch, capsys, reply, code, out, err):
+        _answer(monkeypatch, reply)
+        home = Path.home()
+        before = _snapshot(project, home)
+        assert run_init(_args(project, yes=False)) == code
+        captured = capsys.readouterr()
+        assert _scrub(captured.out, (project, "<WS>")) == HEADER + "  Will do:\n" + PLAN + out
+        assert captured.err == err
+        assert _snapshot(project, home) == before
+
+    def test_a_check_pass_refusal_prints_the_header_then_its_errors_and_writes_nothing(self, project, capsys):
+        """Review w15b F1: Given a hand-edited Aegis block in AGENTS.md, When init runs in text mode, Then the
+        setup header prints before the check pass refuses, the refusal goes to stderr, and nothing is written."""
+        agents = project / "AGENTS.md"
+        agents.write_bytes(b"<!-- aegis:begin id=bootstrap v=1 sha=000000000000 -->\nmine\n<!-- aegis:end id=bootstrap -->\n")
+        home = Path.home()
+        before = _snapshot(project, home)
+        assert run_init(_args(project)) == 1
+        captured = capsys.readouterr()
+        assert _scrub(captured.out, (project, "<WS>")) == HEADER
+        assert _scrub(captured.err, (agents, "<AGENTS.md>"), (project, "<WS>")) == (
+            "  ❌ <AGENTS.md>: the Aegis block 'bootstrap' was edited by hand; left unchanged. Move your text "
+            "outside the block, or re-run with --force to replace it.\n  ❌ Nothing was written.\n")
+        assert _snapshot(project, home) == before
+
+    def test_a_failed_registration_is_one_json_document_with_status_failed(self, project, capsys, failing_codex,
+                                                                           finish_calls):
+        from aegis_cli.install_hosts import display_command
+
+        assert run_init(_args(project, "--host", "codex-cli", "--json")) == 1
+        captured = capsys.readouterr()
+        doc = _one_document(captured.out)
+        assert list(doc) == INIT_KEYS
+        add = ["codex", *failing_codex[-1][1:]]
+        assert add[:-1] == ["codex", "mcp", "add", "aegis", "--env", "AEGIS_CLIENT=codex-cli", "--"]
+        assert (doc["status"], doc["dry_run"], doc["warnings"]) == ("failed", False, [])
+        assert _scrub(doc["scope"], (project, "<WS>")) == {"workspace": "<WS>", "hosts": ["codex-cli"],
+                                                           "detected": ["codex-cli"]}
+        assert [(a["target"], a["result"]) for a in doc["actions"]] == [
+            (".aegis/", "created"), (".aegis/config.json", "created"), (".aegis/.gitignore", "created"),
+            (".aegis/rules/personas", "seeded"), (".aegis/rules/invariants", "seeded"), ("ast drivers", "none"),
+            ("AGENTS.md", "created"), ("CLAUDE.md", "absent"), (".github/workflows/aegis.yml", "suggested"),
+            ("~/.aegis/workspaces.json", "added"), ("~/.aegis/link.key", "created"), ("codex-cli", "failed")]
+        assert doc["actions"][-1] == {"target": "codex-cli", "result": "failed", "detail": "exit 1: denied",
+                                      "command": add}
+        assert doc["errors"] == [f"codex-cli: registration failed (exit 1: denied). Run it yourself: "
+                                 f"{display_command(add)}"]
+        assert captured.err == ""
+        assert finish_calls == ["failed"]
+
+    def test_a_failed_registration_prints_its_error_then_the_outcome(self, project, monkeypatch, capsys,
+                                                                     failing_codex):
+        from aegis_cli import pathcheck
+        from aegis_cli.install_hosts import display_command
+        import aegis_cli.init as init_module
+
+        monkeypatch.setattr(pathcheck, "build_hint", lambda: "  (the PATH hint)")
+        monkeypatch.setattr(init_module, "_print_card", lambda report, root: report.say(f"  (the card of {root})"))
+        workflows = project / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_bytes(b"jobs:\n  a:\n    steps:\n      - run: aegis check\n")
+        assert run_init(_args(project, "--host", "codex-cli")) == 1
+        captured = capsys.readouterr()
+        command = display_command(["codex", *failing_codex[-1][1:]])
+        assert _scrub(captured.out, (project, "<WS>")).replace(command, "<CMD>") == (
+            HEADER.replace("  Hosts: none selected (only the repository is set up)\n",
+                           "  Hosts: codex-cli (Codex CLI, Codex IDE extension, ChatGPT desktop app (Codex mode))\n")
+            + _written("codex-cli", "  ✅ CI: .github/workflows/ci.yml runs aegis check\n")
+            + "  ❌ codex-cli: failed (<CMD>)\n\n  Done, with errors (see above).\n\n" + OUTCOME_TAIL
+            + "  (the PATH hint)\n\n")
+        assert _scrub(captured.err, (project, "<WS>")).replace(command, "<CMD>") == (
+            "  ❌ codex-cli: registration failed (exit 1: denied). Run it yourself: <CMD>\n")
+
+    @pytest.mark.parametrize("hint, shown", [
+        (lambda: "  (the PATH hint)", "  (the PATH hint)\n\n"),
+        (lambda: "", ""),
+        (OSError, ""),
+        (RuntimeError, ""),
+    ], ids=["hint", "no-hint", "hint-oserror", "hint-runtimeerror"])
+    def test_a_real_run_prints_the_outcome_the_card_and_then_the_path_hint(self, project, monkeypatch, capsys,
+                                                                           finish_calls, hint, shown):
+        from aegis_cli import pathcheck
+        import aegis_cli.init as init_module
+
+        def build_hint():
+            if isinstance(hint, type):
+                raise hint("no PATH hint here")
+            return hint()
+
+        monkeypatch.setattr(pathcheck, "build_hint", build_hint)
+        monkeypatch.setattr(init_module, "_print_card", lambda report, root: report.say(f"  (the card of {root})"))
+        workflows = project / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_bytes(b"jobs:\n  a:\n    steps:\n      - run: aegis check\n")
+        assert run_init(_args(project)) == 0
+        captured = capsys.readouterr()
+        assert _scrub(captured.out, (project, "<WS>")) == (
+            HEADER + _written("none", "  ✅ CI: .github/workflows/ci.yml runs aegis check\n")
+            + "\n  Done! No agent host was registered; to add one: aegis init --host HOST[,HOST]\n\n" + OUTCOME_TAIL
+            + shown)
+        assert captured.err == ""
+        assert finish_calls == ["ok"]
+
+    @pytest.mark.parametrize("reply, code", [("n", 0), (EOFError, 1), (KeyboardInterrupt, 130)],
+                             ids=["declined", "end-of-input", "interrupted"])
+    def test_each_prompt_path_finishes_once_as_aborted(self, project, monkeypatch, capsys, finish_calls, reply, code):
+        _answer(monkeypatch, reply)
+        assert run_init(_args(project, yes=False)) == code
+        assert finish_calls == ["aborted"]
+
+    def test_every_other_path_finishes_once_with_its_status(self, project, tmp_path, monkeypatch, capsys,
+                                                            finish_calls):
+        import aegis_cli.init as init_module
+
+        def run(root, *flags, **kwargs):
+            finish_calls.clear()
+            code = run_init(_args(root, *flags, **kwargs))
+            captured = capsys.readouterr()
+            if "--json" in flags and code != 2:
+                _one_document(captured.out)
+            return code, list(finish_calls)
+
+        def fresh(name):
+            root = tmp_path / name
+            root.mkdir()
+            return root
+
+        assert run(project, "--json", yes=False) == (2, [])  # usage: no document at all
+        assert run(Path.home()) == (1, ["refused"])
+        assert run(Path.home(), "--json") == (1, ["refused"])
+        hand_edited = fresh("hand-edited")
+        (hand_edited / "AGENTS.md").write_bytes(
+            b"<!-- aegis:begin id=bootstrap v=1 sha=000000000000 -->\nmine\n<!-- aegis:end id=bootstrap -->\n")
+        assert run(hand_edited, "--json") == (1, ["refused"])  # the check pass refuses it
+        assert run(fresh("dry"), "--dry-run", "--json") == (0, ["ok"])
+        assert run(fresh("real"), "--json") == (0, ["ok"])
+
+        broken = fresh("broken")
+        (broken / ".git" / "hooks").mkdir(parents=True)
+
+        def disk_error(*args, dry_run=False, **kwargs):
+            if dry_run:
+                return True
+            raise PermissionError(13, "Permission denied", str(broken / ".git" / "hooks" / "pre-commit"))
+
+        monkeypatch.setattr(init_module, "install_hook", disk_error)
+        assert run(broken, "--json", hooks=True) == (1, ["failed"])  # the write pass fails part way
+
+        def no_home(cls):
+            raise RuntimeError("no home directory")
+
+        monkeypatch.setattr(Path, "home", classmethod(no_home))
+        assert run(fresh("homeless"), "--json") == (1, ["refused"])

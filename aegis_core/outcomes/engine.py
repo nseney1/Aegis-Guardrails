@@ -13,7 +13,7 @@ from aegis_core.workspace import literal_workspace
 __all__ = ["match_rules_to_changes", "matched_rules"]
 
 
-def _get_changed_files(workspace: str) -> list[str]:
+def get_changed_files(workspace: str) -> list[str]:
     """What the session changed: the last commit plus uncommitted edits (``git diff HEAD~1``);
     in a repository with one commit, the uncommitted and untracked files (``git status``)."""
     uncommitted = gitsafe.changed_files(workspace, "working") or []

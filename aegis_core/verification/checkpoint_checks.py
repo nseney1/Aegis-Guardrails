@@ -274,6 +274,8 @@ def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_
         candidates.append(test_dir / "test_mcp_protocol_hygiene.py")
     if stem == "tools":
         candidates.append(test_dir / "test_mcp_tools_contract.py")
+    if top_dir == "aegis_mcp" and stem == "schemas":
+        candidates.append(test_dir / "unit" / "mcp" / "test_mcp_registry.py")
     if parent_name == "skills" or stem in ("slots", "skills"):
         candidates.append(test_dir / "test_skills.py")
     if parent_name == "handlers" or stem in ("registry", "projection"):
@@ -291,9 +293,11 @@ def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_
     if parent_name == "yaml_engine" or stem in ("document", "serializer"):
         candidates.append(test_dir / "test_yaml_engine_roundtrip.py")
         candidates.append(test_dir / "test_frontmatter_engine.py")
-    if stem in ("doctor_findings", "doctor_repair", "doctor_render"):
+    if stem in ("doctor_base", "doctor_findings", "doctor_repair", "doctor_render"):
         candidates.append(test_dir / "test_doctor.py")
         candidates.append(test_dir / "test_doctor_fix.py")
+    if stem == "commands_table":
+        candidates.append(test_dir / "test_cli_removed_commands.py")
     if stem == "init_views":
         candidates.append(test_dir / "test_init.py")
         candidates.append(test_dir / "test_init_card.py")
@@ -449,10 +453,9 @@ def check_assertion_density(root: Path) -> list[dict]:
 
 
 def check_rule_fitness(root: Path) -> list[dict]:
-    """Unreadable ledger rows, and rules the ledger says misfire (the lifecycle's own
-    criterion: the Wilson lower bound of the false-positive rate above 0.5)."""
+    """Unreadable ledger rows, and rules the fitness engine (aegis_core.fitness.compute, the
+    lifecycle's one decision) decides misfire."""
     from aegis_core.fitness import compute
-    from aegis_core.lifecycle.constants import MISFIRE_THRESHOLD
     from aegis_core.telemetry_engine import ledger
 
     issues = []  # type: List[dict]
@@ -475,13 +478,13 @@ def check_rule_fitness(root: Path) -> list[dict]:
 
     for rule_id, counts in sorted(ledger.aggregate_rows(view.rows).items()):
         fit = compute(counts, rule=rule_id)
-        if fit.has_min_n and fit.misfire > MISFIRE_THRESHOLD:
+        if fit.state == "decided" and fit.suggestion in ("demote", "archive"):
             issues.append({
                 "check": "rule_fitness",
                 "rule": rule_id,
                 "message": (
                     f"Rule '{rule_id}' misfires: {fit.fp:g} of {fit.verdicts:g} verdicts are false "
-                    f"positives (misfire bound {fit.misfire:.2f} > {MISFIRE_THRESHOLD}); "
+                    f"positives, and the fitness engine decided it (P(precision < 0.7) = {fit.p_below_demote:.2f}); "
                     "aegis sync suggests demoting or archiving it"
                 ),
             })

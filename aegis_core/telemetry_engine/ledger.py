@@ -33,7 +33,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -44,6 +43,7 @@ import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.errors import PathTraversalError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import append_jsonl, ledger_locked, ledger_site, read_jsonl
 
 __all__ = [
@@ -69,31 +69,16 @@ __all__ = [
 LEDGER_VERSION = 2
 OUTCOMES = ("tp", "fp", "trigger")
 SOURCES = ("ci", "session", "mcp", "manual", "migrate")
-_CREDIT_EVENTS = frozenset({
-    "exposure",
-    "detection",
-    "check_confirm",
-    "override",
-    "human_label",
-    "claim",
-    "claimed",
-    "transition",
-    "check",
-    "adjudication",
-    "report",
-    "ci",
-    "void",
-})
+# Exactly credit.EVENTS, which credit cannot hand over (credit imports this module); a kind missing
+# here would count as an unusable row (tests/unit/core/test_ledger.py ties the two lists).
+_CREDIT_EVENTS = frozenset({"check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication",
+                            "override"})
 _V1_SIGNALS = {"tp": "tp", "success": "tp", "fp": "fp", "failure": "fp", "trigger": "trigger"}
 _MAX_LEGACY_WEIGHT = Decimal("10")
 
 
 class EventConflictError(ValueError):
     """An idempotency key was already recorded for this rule with a different payload."""
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def ledger_path(workspace: Any) -> Path:
@@ -228,6 +213,9 @@ class LedgerView:
     torn_tail: bool = False
     error: Optional[str] = None
     path: Optional[Path] = None
+    # Every row as read (events included), for the other readers of the same call: one snapshot,
+    # one parse. None on a view that never read the file; such a reader reads it and says why not.
+    raw_rows: Optional[Tuple[Dict[str, Any], ...]] = field(default=None, repr=False, compare=False)
 
     def health(self) -> Dict[str, Any]:
         """What the read could not use, as derived.json and ``aegis status`` record it."""
@@ -274,7 +262,8 @@ def read(workspace: Any) -> LedgerView:
         return LedgerView([], error=f"cannot read {exc.filename or 'the ledger directory'}: {exc.strerror or exc}")
     raw = read_jsonl(path)
     rows, unusable = normalize_rows(raw.rows)
-    return LedgerView(rows, list(raw.skipped_lines), unusable, raw.torn_tail, raw.error, path)
+    return LedgerView(rows, list(raw.skipped_lines), unusable, raw.torn_tail, raw.error, path,
+                      None if raw.error else tuple(raw.rows))
 
 
 def _plain(value: Decimal) -> Any:
@@ -503,7 +492,7 @@ def append(workspace: Any, events: Iterable[Dict[str, Any]]) -> List[Dict[str, A
         results: List[Dict[str, Any]] = []
         new_rows: List[Dict[str, Any]] = []
         seq = index.last_seq
-        stamp = _utc_now()
+        stamp = utc_stamp()
         for row in planned:
             identity = (row["key"], row["rule"]) if row["key"] else None
             existing = None
@@ -536,7 +525,7 @@ def append_epoch(workspace: Any, note: Dict[str, Any]) -> Dict[str, Any]:
     with ledger_locked(workspace) as site:
         path = site.path
         index = _current_index(path)
-        row = {"v": LEDGER_VERSION, "seq": index.last_seq + 1, "ts": _utc_now(), "epoch": note}
+        row = {"v": LEDGER_VERSION, "seq": index.last_seq + 1, "ts": utc_stamp(), "epoch": note}
         if site.worktree is not None:
             row["worktree"] = site.worktree
         _write(path, [row])

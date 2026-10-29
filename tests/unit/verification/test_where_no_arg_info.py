@@ -20,15 +20,19 @@ def _spec(where=None) -> dict:
     return {"calls": [{"name": "exec", **({"where": where} if where is not None else {})}]}
 
 
+def _split(norm: NormalizedAST, spec: dict):
+    """(confirmed lines, unverified lines) of the findings of rule ``r``."""
+    found = evaluate_forbid_ast_structured(norm, spec, rule_id="r")
+    return [f["line"] for f in found if not f["unknown"]], [f["line"] for f in found if f["unknown"]]
+
+
 @pytest.mark.parametrize("where", [{"shell": True}, {"shell": {"absent": True}}, {"shell": {"not": False}}],
                          ids=["literal", "absent", "not"])
 def test_a_site_without_recorded_arguments_is_unknown(where):
     """Given a typescript site with no recorded arguments, When a where is evaluated,
     Then nothing is confirmed and the site is reported once as unverified."""
     norm = _ts(CallSiteNode(target="exec", line=3))
-    confirmed, unverified = evaluate_forbid_ast_structured(norm, _spec(where), rule_id="r")
-    assert confirmed == []
-    assert [(u["line"], u["status"]) for u in unverified] == [(3, "unverified")]
+    assert _split(norm, _spec(where)) == ([], [3])
     assert evaluate_forbid_ast(norm, _spec(where)) == []
 
 
@@ -39,21 +43,19 @@ def test_a_site_without_recorded_arguments_is_unknown(where):
 ], ids=["literal-hit", "literal-miss", "absent-miss"])
 def test_a_non_python_site_that_records_arguments_is_judged_normally(args, where, hit):
     norm = _ts(CallSiteNode(target="exec", line=3, args=args))
-    confirmed, unverified = evaluate_forbid_ast_structured(norm, _spec(where), rule_id="r")
-    assert ([c["line"] for c in confirmed], unverified) == (([3], []) if hit else ([], []))
+    assert _split(norm, _spec(where)) == (([3], []) if hit else ([], []))
 
 
 @pytest.mark.parametrize("where,hit", [({"shell": {"absent": True}}, True), ({"shell": True}, False)],
                          ids=["absent", "literal"])
 def test_a_python_call_with_no_arguments_stays_a_definite_answer(where, hit):
     norm = extract_normalized_ast("mod.py", code="exec()\n")
-    confirmed, unverified = evaluate_forbid_ast_structured(norm, _spec(where), rule_id="r")
-    assert ([c["line"] for c in confirmed], unverified) == (([1], []) if hit else ([], []))
+    assert _split(norm, _spec(where)) == (([1], []) if hit else ([], []))
 
 
 def test_a_real_python_exec_with_an_unmatched_positional_is_neither_hit_nor_unknown():
     norm = extract_normalized_ast("mod.py", code="exec('print(1)')\n")
-    assert evaluate_forbid_ast_structured(norm, _spec({"#0": {"in": ["rm", "ls"]}}), rule_id="r") == ([], [])
+    assert evaluate_forbid_ast_structured(norm, _spec({"#0": {"in": ["rm", "ls"]}}), rule_id="r") == []
 
 
 def test_a_rule_without_where_still_matches_a_non_python_site():

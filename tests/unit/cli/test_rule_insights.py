@@ -99,8 +99,7 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
     rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
     assert rc == 0, err
     rev = json.loads(out)
-    assert len(rev["clusters"]) == 1
-    cid = rev["clusters"][0]["cluster_id"]
+    assert [e["id"] for e in rev["insights"]] == [added["id"]]
 
     rc, out, err = _invoke_rule(
         ws,
@@ -108,12 +107,10 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
         "review",
         "--decision",
         "propose",
-        "--cluster",
-        cid,
+        "--insight",
+        added["id"],
         "--proposal-id",
         "trap-subprocess-timeout",
-        "--category",
-        "reliability",
         "--summary",
         "Require an explicit timeout on subprocess invocations.",
         "--json",
@@ -121,7 +118,16 @@ def test_rule_insight_add_review_and_propose_cli(tmp_path: Path, monkeypatch: py
     assert rc == 0, err
     dec = json.loads(out)
     assert dec["decision"] == "propose"
-    assert (ws / ".aegis" / "proposals" / "trap-subprocess-timeout.md").is_file()
+    proposal = (ws / ".aegis" / "proposals" / "trap-subprocess-timeout.md").read_text(encoding="utf-8")
+    assert 'kind: "reliability"' in proposal and "count: 1" in proposal and '  - "src/**"' in proposal
+    assert "category" not in proposal
+
+    # The decision takes effect: the proposed insight leaves the review list.
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert rc == 0, err
+    after = json.loads(out)
+    assert after["insights"] == []
+    assert [e["id"] for e in after["suppressed"]] == [added["id"]]
 
 
 def test_rule_insight_enable_and_doctor_host_reporting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -263,6 +269,99 @@ def test_rule_insight_add_with_signed_commit_flag(tmp_path: Path, monkeypatch: p
     assert json.loads(out)["level"] == "H"
 
 
+def test_insight_add_prints_the_approval_trailer_for_the_typed_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """R-evidence-44: Given `insight add`, Then text mode prints the exact Aegis-Approve-Insight line
+    for the text as typed (not its redacted form) with the sign-then-re-run recipe, and --json
+    carries it as approval_trailer, which the stored row does not."""
+    from aegis_core.human_gate import INSIGHT_APPROVE_TRAILER, insight_text_hash
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    ws = _make_workspace(tmp_path / "ws")
+    text = "Never log the reviewer address alice@example.com from src/main.py"
+    line = f"{INSIGHT_APPROVE_TRAILER}: {insight_text_hash(text)}"
+
+    rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py")
+    assert rc == 0, err
+    assert f"  {line}\n" in out and "--commit SHA" in out
+
+    rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py", "--json")
+    assert rc == 0, err
+    added = json.loads(out)
+    assert added["approval_trailer"] == line and "alice@example.com" not in added["text"]
+    assert all("approval_trailer" not in row for row in read_insight_rows(ws, home=home))
+
+
+def test_a_signed_trailer_over_the_typed_text_gives_h_even_when_redaction_changes_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    text = "Never log the reviewer address alice@example.com from src/app.py"
+    sha = repo.commit(f"chore: approve insight\n\n{human_gate.INSIGHT_APPROVE_TRAILER}: "
+                      f"{human_gate.insight_text_hash(text)}\n", sign_key=human_key, allow_empty=True)
+
+    for typed, level in ((text, "H"), (text.replace("Never", "Do not"), "cli")):
+        rc, out, err = _invoke_rule(repo.root, "insight", "add", typed, "--paths", "src/app.py", "--commit", sha,
+                                    "--base-ref", "main", "--json")
+        assert rc == 0, err
+        row = json.loads(out)
+        assert row["level"] == level and "alice@example.com" not in row["text"]
+
+
+def test_the_documented_h_recipe_counts_one_correction_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Review M1: Given `insight add T` (a cli row and the printed trailer), a signed commit
+    carrying that trailer and the re-run with --commit SHA (an H row), When the insights are
+    reviewed, Then one insight counts the correction once, at level H."""
+    from tests import helpers_humangate as hg
+
+    if not hg.signing_ok():
+        pytest.skip("needs git >= 2.34 and ssh-keygen")
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    human_key, human_pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, human_pub)
+    text = "Never log the reviewer address alice@example.com from src/app.py"
+    argv = ("insight", "add", text, "--paths", "src/app.py", "--kind", "logging")
+
+    rc, out, err = _invoke_rule(repo.root, *argv)
+    assert rc == 0, err
+    trailer = out.splitlines()[-1].strip()
+    sha = repo.commit(f"chore: approve insight\n\n{trailer}\n", sign_key=human_key, allow_empty=True)
+    rc, out, err = _invoke_rule(repo.root, *argv, "--commit", sha, "--base-ref", "main", "--json")
+    assert rc == 0, err
+    signed = json.loads(out)
+    assert signed["level"] == "H"
+
+    rc, out, err = _invoke_rule(repo.root, "insight", "review", "--json")
+    assert rc == 0, err
+    assert [(e["id"], e["level"]) for e in json.loads(out)["insights"]] == [(signed["id"], "H")]
+
+
+def test_review_no_longer_takes_a_category(tmp_path: Path):
+    parser = argparse.ArgumentParser(prog="aegis rule")
+    RuleCommand().configure_parser(parser)
+    with pytest.raises(SystemExit) as exc, contextlib.redirect_stderr(io.StringIO()):
+        parser.parse_args(["insight", "review", "--decision", "propose", "--insight", "c", "--category", "x"])
+    assert exc.value.code == 2
+
+
 # ── `insight add` takes no session identity (R-evidence-42) ─────────────────
 
 @pytest.mark.parametrize("flag", ["--session", "--host"])
@@ -279,7 +378,7 @@ def test_insight_add_refuses_a_typed_session_or_host(tmp_path: Path, monkeypatch
     assert read_insight_rows(ws, home=tmp_path / "home") == []
 
 
-def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_three_cli_adds_carry_no_session_and_are_one_unattributed_episode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from aegis_core.insights import measure_recurrence
 
     home = tmp_path / "home"
@@ -302,7 +401,8 @@ def test_three_cli_adds_carry_no_session_and_count_as_one_episode(tmp_path: Path
     rows = [r for r in read_insight_rows(ws, home=home) if r.get("event") == "insight"]
     assert len(rows) == 3
     assert all("hs" not in r and r["host"] == "cli" for r in rows)
-    assert measure_recurrence(ws, "trap-popen-timeout", home=home)["recurrences"] == 1
+    rec = measure_recurrence(ws, "trap-popen-timeout", home=home)
+    assert (rec["recurrences"], rec["unattributed_recurrences"]) == (0, 1)  # no session: reported, never counted
 
 
 # ── one confinement rule on every channel (R-evidence-43) ─────────────────────
@@ -346,3 +446,278 @@ def test_mcp_capture_insight_confines_like_the_cli(tmp_path: Path, monkeypatch: 
                       {"workspace": str(ws), "quote": "Stay inside", "paths": [str(ws / "src" / "main.py"), "src/a,b.py"]})
     assert ok["status"] == "OK", ok
     assert ok["paths"] == ["src/a,b.py", "src/main.py"]
+
+
+# ── R-evidence-38: decisions need their target, and take effect ─────────────────
+
+@pytest.fixture
+def review_ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    ws = _make_workspace(tmp_path / "ws")
+    ids = []
+    for text in ("Never call subprocess.Popen without a timeout in src/main.py",
+                 "Always pass a timeout to subprocess.Popen calls in src/main.py"):
+        rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py", "--kind", "reliability",
+                                    "--json")
+        assert rc == 0, err
+        ids.append(json.loads(out)["id"])
+    return ws, home, ids
+
+
+def _decision_rows(ws: Path, home: Path) -> list:
+    return [r for r in read_insight_rows(ws, home=home) if r.get("event") == "decision"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["--decision", "snooze"],
+    ["--decision", "reject", "--reason", "later"],
+    ["--decision", "reject", "--insight", "ID"],
+    ["--decision", "confirm"],
+], ids=["no-insight", "reject-no-insight", "reject-no-reason", "confirm-no-insight"])
+def test_a_decision_without_its_target_or_reason_is_a_usage_error(review_ws, argv):
+    ws, home, ids = review_ws
+    rc, _out, err = _invoke_rule(ws, "insight", "review", *[ids[0] if a == "ID" else a for a in argv])
+    assert rc == 2
+    assert "--reason" in err or "--insight" in err
+    assert _decision_rows(ws, home) == []
+
+
+def test_an_unknown_insight_to_propose_writes_nothing_and_lists_the_valid_ids(review_ws):
+    ws, home, ids = review_ws
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--insight", "ins-typo", "--json")
+    assert rc == 1
+    assert all(i in json.loads(out)["error"] for i in ids)
+    assert _decision_rows(ws, home) == []
+    assert not (ws / ".aegis" / "proposals").exists()
+
+
+def test_an_unknown_insight_to_confirm_writes_nothing_and_lists_the_valid_ids(review_ws):
+    from aegis_core.insights import capture_suggestion
+
+    ws, home, ids = review_ws
+    cap = capture_suggestion(ws, "Prefer pathlib joins over string concatenation", paths=["src/main.py"],
+                             host="claude-code", session="agent", home=home)
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "confirm", "--insight", "ins-nope", "--json")
+    assert rc == 1
+    assert cap["id"] in json.loads(out)["error"]
+    assert _decision_rows(ws, home) == []
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--decision", "confirm", "--insight", cap["id"],
+                                "--kind", "style", "--json")
+    assert rc == 0, err
+    assert (json.loads(out)["insight_ids"], json.loads(out)["kind"]) == ([cap["id"]], "style")
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert [e["id"] for e in json.loads(out)["insights"]] == ids + [cap["id"]]
+
+
+@pytest.mark.parametrize("extra,error", [
+    (["--proposal-id", "Bad ID!"], "invalid proposal_id"),
+    (["--summary", "Never call subprocess.Popen without a timeout in src/main.py"], "verbatim"),
+], ids=["bad-proposal-id", "verbatim-summary"])
+def test_a_proposal_that_cannot_be_written_records_no_decision_and_keeps_the_insights(review_ws, extra, error):
+    """Review F2: Given two insights, When --decision propose fails to write its proposal (an invalid id,
+    or a summary quoting a human prompt), Then it exits 1, writes no decision row and no proposal, and
+    the next review still lists them; a corrected propose then records the decision and hides them."""
+    ws, home, ids = review_ws
+    named = [a for i in ids for a in ("--insight", i)]
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "propose", *named, *extra, "--json")
+    assert rc == 1 and error in json.loads(out)["error"]
+    assert _decision_rows(ws, home) == []
+    assert list((ws / ".aegis").glob("proposals/*")) == []
+    assert _review_ids(ws) == (ids, [])
+
+    rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", *named,
+                                 "--proposal-id", "trap-popen-timeout", "--summary", "Require timeouts on child processes.")
+    assert rc == 0, err
+    assert [r["decision"] for r in _decision_rows(ws, home)] == ["propose"]
+    assert _review_ids(ws) == ([], ids)
+
+
+def test_a_reject_stores_its_reason_and_the_proposal_kind_is_the_shared_kind(review_ws):
+    ws, home, ids = review_ws
+    named = [a for i in ids for a in ("--insight", i)]
+    rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", *named,
+                                 "--proposal-id", "trap-popen", "--summary", "Require timeouts on child processes.")
+    assert rc == 0, err
+    assert 'kind: "reliability"' in (ws / ".aegis" / "proposals" / "trap-popen.md").read_text(encoding="utf-8")
+    assert _review_ids(ws) == ([], ids)
+    rc, _out, err = _invoke_rule(ws, "insight", "review", "--decision", "reject", *named,
+                                 "--reason", "covered by trap-popen")
+    assert rc == 0, err
+    assert [r.get("reason") for r in _decision_rows(ws, home)] == [None, "covered by trap-popen"]
+
+
+def test_text_review_lists_each_insight_once_with_its_neighbours(review_ws):
+    ws, home, ids = review_ws
+    rc, out, err = _invoke_rule(ws, "insight", "review")
+    assert rc == 0, err
+    assert "Insight Review: 2 insight(s), 0 hidden by a decision, 0 unconfirmed agent suggestion(s)" in out
+    for ins_id in ids:
+        member_lines = [line for line in out.splitlines() if line.strip().startswith(f"{ins_id}:")]
+        assert len(member_lines) == 1
+        other, = [i for i in ids if i != ins_id]
+        assert f"neighbours: {other}" in member_lines[0] and "no_rule, rule none" in member_lines[0]
+
+
+# ── R-evidence-41: status and sync report insight-born rules, offline ──────────
+
+LABEL = "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"
+
+
+def _born_rule(ws: Path) -> None:
+    (ws / ".aegis" / "rules" / "traps" / "trap-popen-timeout.md").write_text(
+        "---\nid: trap-popen-timeout\ntype: trap\nenforcement: advisory\nhypothesis: Popen without a timeout hangs.\n"
+        'insight_ids:\n  - "ins-000000000001"\ntarget_paths:\n  - src/*.py\n---\n'
+        "# trap-popen-timeout\n\nNever call subprocess.Popen without a timeout in src modules.\n", encoding="utf-8")
+
+
+def _status_text(ws: Path, *, as_json: bool = False):
+    from aegis_cli.status import run_status
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = run_status(argparse.Namespace(_root=ws, json=as_json, plain=True))
+    return rc, out.getvalue()
+
+
+@pytest.fixture
+def status_ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    return _make_workspace(tmp_path / "ws"), home
+
+
+def test_status_shows_an_insight_born_rules_recurrence_and_the_uncounted_suggestions(status_ws):
+    from aegis_core.insights import capture_suggestion, record_hook_prompt
+
+    ws, home = status_ws
+    _born_rule(ws)
+    record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
+                       workspace=ws, home=home)
+    capture_suggestion(ws, "prefer short functions", paths=["src/main.py"], host="claude-code", session="a", home=home)
+    rc, out = _status_text(ws)
+    assert rc == 0
+    line, = [x for x in out.splitlines() if "trap-popen-timeout" in x and "recurrence" in x]
+    assert "ok" in line and "0/1 sessions" in line and "95% bound" in line and LABEL in line
+    assert "1 unconfirmed agent suggestions (not counted)" in out
+    rc, out = _status_text(ws, as_json=True)
+    payload = json.loads(out)["insights"]
+    assert [r["rule"] for r in payload["rules"]] == ["trap-popen-timeout"]
+    assert (payload["unconfirmed_suggestions"], payload["denominator"]) == (1, LABEL)
+
+
+def test_status_with_only_suggestions_shows_the_not_counted_line_and_no_recurrence(status_ws):
+    from aegis_core.insights import capture_suggestion
+
+    ws, home = status_ws
+    capture_suggestion(ws, "prefer short functions", paths=["src/main.py"], host="claude-code", session="a", home=home)
+    rc, out = _status_text(ws)
+    assert rc == 0
+    assert "1 unconfirmed agent suggestions (not counted)" in out
+    assert "recurrence" not in out
+
+
+def test_status_and_sync_print_nothing_about_insights_without_an_insights_file(status_ws):
+    from aegis_cli.sync import run_sync
+
+    ws, home = status_ws
+    _born_rule(ws)
+    rc, out = _status_text(ws)
+    assert rc == 0 and "recurrence" not in out and "not counted" not in out
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run_sync(argparse.Namespace(_root=ws, json=False, plain=True)) == 0
+    assert "recurrence" not in buf.getvalue() and "not counted" not in buf.getvalue()
+    assert not (home / ".aegis" / "insights").exists()
+
+
+def test_sync_reports_the_recurrence_line_and_the_json_payload(status_ws):
+    from aegis_cli.sync import run_sync
+    from aegis_core.insights import record_hook_prompt
+
+    ws, home = status_ws
+    _born_rule(ws)
+    record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": str(ws)},
+                       workspace=ws, home=home)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run_sync(argparse.Namespace(_root=ws, json=False, plain=True)) == 0
+    line, = [x for x in buf.getvalue().splitlines() if "recurrence trap-popen-timeout" in x]
+    assert LABEL in line
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert run_sync(argparse.Namespace(_root=ws, json=True)) == 0
+    assert [r["rule"] for r in json.loads(buf.getvalue())["insights"]["rules"]] == ["trap-popen-timeout"]
+
+
+def test_review_with_a_rule_prints_its_recurrence_line_in_text_mode(status_ws):
+    ws, home = status_ws
+    _born_rule(ws)
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--rule", "trap-popen-timeout")
+    assert rc == 0, err
+    assert f"recurrence trap-popen-timeout: no_prompt_traffic, rate 0.00 (0/0 sessions), 95% bound 1.00; {LABEL}" in out
+
+
+# ── R-evidence-46: decisions name insights (--insight ID), never a cluster ────
+
+def _review_ids(ws: Path) -> tuple:
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--json")
+    assert rc == 0, err
+    rev = json.loads(out)
+    return [e["id"] for e in rev["insights"]], [e["id"] for e in rev["suppressed"]]
+
+
+def test_review_has_no_cluster_option(tmp_path: Path):
+    parser = argparse.ArgumentParser(prog="aegis rule")
+    RuleCommand().configure_parser(parser)
+    with pytest.raises(SystemExit) as exc, contextlib.redirect_stderr(io.StringIO()) as err:
+        parser.parse_args(["insight", "review", "--decision", "snooze", "--cluster", "x"])
+    assert exc.value.code == 2 and "--cluster" in err.getvalue()
+
+
+@pytest.mark.parametrize("argv, needs", [
+    (["--decision", "propose"], "--insight"),
+    (["--decision", "noise"], "--insight"),
+    (["--decision", "reject", "--insight", "FIRST"], "--reason"),
+], ids=["propose", "noise", "reject-no-reason"])
+def test_a_decision_needs_its_insights_and_a_reject_its_reason(review_ws, argv, needs):
+    ws, home, ids = review_ws
+    rc, _out, err = _invoke_rule(ws, "insight", "review", *[ids[0] if a == "FIRST" else a for a in argv])
+    assert rc == 2 and needs in err
+    assert _decision_rows(ws, home) == []
+
+
+def test_an_unknown_insight_id_writes_nothing_and_lists_the_valid_ids(review_ws):
+    ws, home, ids = review_ws
+    rc, out, _err = _invoke_rule(ws, "insight", "review", "--decision", "snooze", "--insight", ids[0],
+                                 "--insight", "ins-typo", "--json")
+    assert rc == 1
+    error = json.loads(out)["error"]
+    assert "ins-typo" in error and all(i in error for i in ids)
+    assert _decision_rows(ws, home) == []
+
+
+def test_propose_without_an_id_names_the_proposal_after_its_sorted_insights(review_ws):
+    import hashlib
+
+    ws, home, ids = review_ws
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--insight", ids[1],
+                                "--insight", ids[0], "--json")
+    assert rc == 0, err
+    digest = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()[:8]
+    path = ws / ".aegis" / "proposals" / f"trap-{digest}.md"
+    assert json.loads(out)["proposal_path"] == str(path)
+    text = path.read_text(encoding="utf-8")
+    assert all(f'  - "{i}"' in text for i in ids) and '  - "src/**"' in text
+    assert _review_ids(ws) == ([], ids)
+    rc, out, err = _invoke_rule(ws, "insight", "review", "--decision", "propose", "--insight", ids[0],
+                                "--insight", ids[1], "--json")
+    assert rc == 0, err
+    assert json.loads(out)["proposal_path"] == str(path)

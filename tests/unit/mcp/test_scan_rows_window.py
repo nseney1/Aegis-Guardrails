@@ -157,6 +157,48 @@ def test_a_row_that_failed_to_write_is_retried_on_the_next_scan(ws, monkeypatch,
     assert len(_rows(ws)) == 1
 
 
+# ── a bounded map of recorded scans (R-evidence-53 e) ───────────────────────
+
+@pytest.fixture
+def small_map(monkeypatch):
+    """The re-record map holds two keys: a third evicts the one recorded longest ago."""
+    from aegis_mcp.handlers import core
+
+    monkeypatch.setattr(core, "_MAX_RECORDED", 2)
+    monkeypatch.setattr(core, "_RECORDED", {})
+    return core
+
+
+def test_a_forgotten_key_costs_one_row_never_the_scan(ws, monkeypatch, clock, small_map):
+    _pin(monkeypatch, ws)
+    _initialize()
+    for i, name in enumerate(("src/a.py", "src/b.py", "src/c.py")):
+        _scan([name], i)
+    assert len(_rows(ws)) == 3 and len(small_map._RECORDED) == 2
+    _scan(["src/c.py"], 4)
+    _scan(["src/b.py"], 5)
+    assert len(_rows(ws)) == 3
+    is_error, payload = _scan(["src/a.py"], 6)
+    assert not is_error and [r["name"] for r in payload["relevant_rules"]] == ["trap-x"]
+    assert [r["files"] for r in _rows(ws)][-1] == ["src/a.py"] and len(_rows(ws)) == 4
+
+
+def test_a_re_recorded_key_is_the_newest(ws, monkeypatch, clock, small_map):
+    _pin(monkeypatch, ws)
+    _initialize()
+    _scan(["src/a.py"])
+    clock.advance(600)
+    _scan(["src/b.py"], 2)
+    clock.advance(1200)
+    _scan(["src/a.py"], 3)  # half the default window has passed: a is recorded again, newest
+    _scan(["src/c.py"], 4)  # evicts b, not a
+    assert len(_rows(ws)) == 4
+    _scan(["src/a.py"], 5)
+    assert len(_rows(ws)) == 4
+    _scan(["src/b.py"], 6)  # live (1200 s old) but forgotten: one extra row
+    assert len(_rows(ws)) == 5
+
+
 # ── (c) a file that does not exist yet ───────────────────────────────────────
 
 @pytest.mark.parametrize("name", ["src/new.py", "newdir/deeper/new.py"])

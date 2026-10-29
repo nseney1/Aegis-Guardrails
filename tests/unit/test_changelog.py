@@ -58,7 +58,6 @@ REMOVED_FLAGS = [
     (["check", "--checkpoint-only"], "--checkpoint-only", False),
     (["check", "--layer1-only"], "--layer1-only", False),
     (["check", "--deep"], "--deep", False),
-    (["check", "--format", "sarif"], "--format sarif", False),
     (["rule", "create", "--from-description", "x"], "--from-description", False),
     (["rule", "create", "--weight", "1"], "--weight", False),
     (["rule", "create", "--expiry-sessions", "1"], "--expiry-sessions", False),

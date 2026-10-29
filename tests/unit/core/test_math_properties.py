@@ -1,12 +1,19 @@
 """Mathematical invariants of the one fitness estimator (seeded properties, stdlib only)."""
 from __future__ import annotations
 
+from functools import partial
 import math
 import random
 
 import pytest
 
-from aegis_core.fitness import compute, wilson_interval, wilson_lower_bound
+from aegis_core import stats
+from aegis_core.fitness import compute
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
+
+# The fitness estimator's 90% interval: aegis_core.stats defaults to 95%.
+wilson_interval = partial(stats.wilson_interval, confidence=DEFAULT_CONFIDENCE_LEVEL)
+wilson_lower_bound = partial(stats.wilson_lower_bound, confidence=DEFAULT_CONFIDENCE_LEVEL)
 
 
 def _pairs(seed: int, count: int, high: int):

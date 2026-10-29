@@ -46,6 +46,8 @@ import os
 from pathlib import Path, PurePath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_core import primitives
+from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.storage import append_jsonl, locked, read_jsonl, read_tail_bytes
 from aegis_core.workspace.layout import WorkspaceLayout
 
@@ -75,7 +77,6 @@ CLI_HOST = "cli"
 GATE_TAIL_BYTES = 4 * 1024 * 1024
 #: How far ahead of the reader's clock a row may be and still count.
 FUTURE_SKEW_SECONDS = 300
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 HEURISTIC = (
     "Each aegis-mcp session (one server process) records the files it scanned. Edits are the "
@@ -100,19 +101,6 @@ def utc_now() -> datetime:
     """The clock activity rows are stamped with. aegis-mcp's re-record decision reads it
     too, so that decision and the gate's window share one (wall-clock) timeline."""
     return datetime.now(timezone.utc)
-
-
-def _stamp(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime(_TS_FORMAT)
-
-
-def _parse_ts(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.strptime(value, _TS_FORMAT).replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
 
 
 def activity_path(workspace: Any) -> Path:
@@ -145,7 +133,7 @@ def record(
         raise ValueError("host and session must be non-empty strings")
     row: Dict[str, Any] = {
         "v": ACTIVITY_VERSION,
-        "ts": _stamp(utc_now()),
+        "ts": utc_stamp(utc_now()),
         "event": event,
         "host": host,
         "session": session,
@@ -224,7 +212,7 @@ def scan_covers(workspace: Any, paths: Iterable[str], window_s: float, now: Opti
             continue
         if not isinstance(row, dict) or not _usable(row) or row["event"] != "scan":
             continue
-        written = _parse_ts(row["ts"])
+        written = parse_utc(row["ts"])
         assert written is not None  # _usable checked it
         if written < floor:
             break
@@ -265,14 +253,14 @@ def _usable(row: Dict[str, Any]) -> bool:
         and isinstance(row.get("session"), str) and bool(row["session"])
         and isinstance(row.get("host"), str) and bool(row["host"])
         and isinstance(files, list) and all(isinstance(f, str) for f in files)
-        and _parse_ts(row.get("ts")) is not None
+        and parse_utc(row.get("ts")) is not None
     )
 
 
 def _sessions(rows: Iterable[Dict[str, Any]]) -> Dict[str, _Session]:
     sessions: Dict[str, _Session] = {}
     for row in rows:
-        moment = _parse_ts(row["ts"])
+        moment = parse_utc(row["ts"])
         assert moment is not None
         session = sessions.get(row["session"])
         if session is None:
@@ -304,8 +292,8 @@ def _commits(root: Path, since: datetime, until: datetime) -> Optional[List[Tupl
         return None
     try:
         listed = gitsafe.run(
-            ["rev-list", "--timestamp", f"--since={_stamp(since - timedelta(seconds=1))}",
-             f"--until={_stamp(until + timedelta(seconds=1))}", "HEAD"],
+            ["rev-list", "--timestamp", f"--since={utc_stamp(since - timedelta(seconds=1))}",
+             f"--until={utc_stamp(until + timedelta(seconds=1))}", "HEAD"],
             root,
         )
     except gitsafe.GitError:
@@ -385,8 +373,8 @@ def report(workspace: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
             "session": s.session,
             "host": s.host,
             "client": s.client,
-            "first_event": _stamp(s.first),
-            "last_event": _stamp(s.last),
+            "first_event": utc_stamp(s.first),
+            "last_event": utc_stamp(s.last),
             "scans": s.scan_events,
             "edits_observed": edited,
             "scanned_before_edit": before if edited else None,
@@ -418,16 +406,13 @@ def report(workspace: Any, now: Optional[datetime] = None) -> Dict[str, Any]:
         for name, totals in sorted(per_host.items())
     ]
     return {
-        "schema": SCHEMA,
-        "source": "aegis status --compliance",
-        "checked_at": _stamp(now or utc_now()),
-        "scope": {
+        **primitives.envelope("aegis status --compliance", {
             "workspace": str(root),
             "hosts": sorted(per_host),
             "sessions": [s.session for s in ordered],
-            "since": _stamp(ordered[0].first) if ordered else None,
-            "until": _stamp(max(s.last for s in ordered)) if ordered else None,
-        },
+            "since": utc_stamp(ordered[0].first) if ordered else None,
+            "until": utc_stamp(max(s.last for s in ordered)) if ordered else None,
+        }, schema=SCHEMA, now=now or utc_now()),
         "stale": False,
         "metric": "scan_before_edit",
         "heuristic": {"edits": HEURISTIC, "limits": list(LIMITS)},

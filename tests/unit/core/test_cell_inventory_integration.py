@@ -123,7 +123,7 @@ def test_invalid_utf8_is_exposed_as_diagnostic_by_sdk_and_mcp(tmp_path, monkeypa
 def test_create_prompt_uses_inventory_bytes_without_reopen(tmp_path, monkeypatch):
     from aegis_core.rule_inventory import inventory_rules
     import aegis_core.rules as rules
-    import aegis_mcp.registry as registry
+    import aegis_mcp.handlers.governance as governance
 
     cell_path = _write_cell(tmp_path, "snapshot", "captured hypothesis")
     snapshot = inventory_rules(str(tmp_path))
@@ -133,7 +133,7 @@ def test_create_prompt_uses_inventory_bytes_without_reopen(tmp_path, monkeypatch
     )
     monkeypatch.setattr(rules, "inventory_rules", lambda workspace: snapshot)
 
-    prompt = registry.build_rule_create_prompt(
+    prompt = governance.build_rule_create_prompt(
         "new concern", args={"workspace": str(tmp_path)}
     )
 
@@ -143,7 +143,7 @@ def test_create_prompt_uses_inventory_bytes_without_reopen(tmp_path, monkeypatch
 
 def test_create_prompt_rejects_outside_symlinked_example(tmp_path):
     from aegis_core.rule_inventory import RuleInventoryError
-    from aegis_mcp.registry import build_rule_create_prompt
+    from aegis_mcp.handlers.governance import build_rule_create_prompt
 
     workspace = _symlinked_cell_directory(tmp_path)
     with pytest.raises(RuleInventoryError, match="symlink"):

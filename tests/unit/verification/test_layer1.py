@@ -277,24 +277,24 @@ class TestRunnerCoverageEnhancements:
 
     def test_find_test_file_runner_mapping(self):
         from aegis_core.verification.runner import _find_test_file
-        test_file = _find_test_file("soma_core/verification/runner.py", REPO_ROOT)
+        test_file = _find_test_file("aegis_core/verification/runner.py", REPO_ROOT)
         assert test_file is not None
         assert test_file.endswith("test_layer1.py")
 
         # Test decomposed domain mappings
-        mcp_test = _find_test_file("soma_mcp/handlers/governance.py", REPO_ROOT)
+        mcp_test = _find_test_file("aegis_mcp/handlers/governance.py", REPO_ROOT)
         assert mcp_test is not None and mcp_test.endswith("test_mcp_handlers.py")
 
-        telemetry_test = _find_test_file("soma_core/outcomes/telemetry.py", REPO_ROOT)
+        telemetry_test = _find_test_file("aegis_core/outcomes/telemetry.py", REPO_ROOT)
         assert telemetry_test is not None and telemetry_test.endswith("test_outcomes_telemetry.py")
 
-        engine_test = _find_test_file("soma_core/outcomes/engine.py", REPO_ROOT)
+        engine_test = _find_test_file("aegis_core/outcomes/engine.py", REPO_ROOT)
         assert engine_test is not None and engine_test.endswith("test_outcome_engine.py")
 
-        skills_test = _find_test_file("soma_core/skills/__init__.py", REPO_ROOT)
+        skills_test = _find_test_file("aegis_core/skills/__init__.py", REPO_ROOT)
         assert skills_test is not None and skills_test.endswith("test_skills.py")
 
-        slots_test = _find_test_file("soma_core/skills/slots.py", REPO_ROOT)
+        slots_test = _find_test_file("aegis_core/skills/slots.py", REPO_ROOT)
         assert slots_test is not None and slots_test.endswith("test_slots.py")
 
     def test_discover_functions_with_target_lines(self, tmp_path):
@@ -398,7 +398,7 @@ class TestLayer1FailsClosed:
         def boom(*_args, **_kwargs):
             raise MemoryError("ast too large")
 
-        monkeypatch.setattr(policy, "evaluate_forbid_ast", boom)
+        monkeypatch.setattr(policy, "evaluate_forbid_ast_structured", boom)
         results = runner.run_layer1(changed_files=["mod.py"], repo_root=str(ws), fast_mode=True)
         failed = [r for r in results if r.tool == "forbid_ast:no-eval"]
         assert [(r.target, r.verdict, r.detail) for r in failed] == [
@@ -517,6 +517,48 @@ class TestLayer1FailsClosed:
         results = runner.run_layer1(changed_files=["mod.py"], repo_root=str(tmp_path), fast_mode=True)
         assert [r for r in results if r.tool.startswith("forbid_ast")] == []
         assert runner.gate_verdict(results) is True
+
+
+_NO_EVAL = "---\nid: no-eval\ntype: invariant\nenforcement: gate\nforbid_ast:\n  calls: [eval]\n---\n"
+
+
+def _no_eval_ws(tmp_path, files):
+    rules = tmp_path / ".aegis" / "rules" / "invariants"
+    rules.mkdir(parents=True)
+    (rules / "no-eval.md").write_text(_NO_EVAL, encoding="utf-8")
+    for name, text in files.items():
+        (tmp_path / name).write_bytes(text.encode("utf-8"))
+    return tmp_path
+
+
+class TestOneForbidAstEvaluation:
+    """R-checks-11: one evaluation per (file, rule) feeds the verdict, the lines and the overrides."""
+
+    def test_each_file_and_rule_is_evaluated_once_however_many_sites(self, tmp_path, monkeypatch):
+        import aegis_core.ast.policy as policy
+        from aegis_core.verification import security_pack
+
+        ws = _no_eval_ws(tmp_path, {"mod.py": "x = eval(1)\n" * 5000})
+        # The built-in security pack (R-checks-29) makes its own passes per pack rule; this counts the user rule's.
+        monkeypatch.setattr(security_pack, "evaluate_security_pack", lambda *a, **k: {})
+        passes = []
+        real = policy._eval_call_entry
+        monkeypatch.setattr(policy, "_eval_call_entry", lambda *a, **k: passes.append(1) or real(*a, **k))
+        results = runner.run_layer1(changed_files=["mod.py"], repo_root=str(ws), fast_mode=True)
+        failing = [r for r in results if r.tool == "forbid_ast:no-eval"]
+        assert [(r.verdict, len(r.lines)) for r in failing] == [(False, 5000)]
+        assert len(passes) == 1
+
+    def test_an_allowed_hit_is_recorded_once_and_an_allow_for_another_rule_still_fails(self, tmp_path):
+        from aegis_core import credit
+
+        ws = _no_eval_ws(tmp_path, {"ok.py": "x = eval(1)  # aegis: allow[no-eval]: reviewed\n",
+                                    "other.py": "x = eval(1)  # aegis: allow[other-rule]: theirs\n"})
+        for _ in range(2):
+            results = runner.run_layer1(changed_files=["ok.py", "other.py"], repo_root=str(ws), fast_mode=True)
+        assert [(r.target, r.verdict) for r in results if r.tool == "forbid_ast:no-eval"] == [("other.py", False)]
+        overrides = [r for r in credit.read_rows(ws) if r.get("event") == "override"]
+        assert [(r["file"], r["line"], r["reason"]) for r in overrides] == [("ok.py", 1, "reviewed")]
 
 
 class TestLayer1LegacyEncodings:

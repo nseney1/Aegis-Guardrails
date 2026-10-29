@@ -5,8 +5,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
 1. Trigger rule (two signals required):
    - A non-merge commit in ``merge-base(base, head)..head`` triggers T5 iff it has BOTH:
      (a) a Conventional Commit ``fix`` subject (``fix:``, ``fix(<scope>):``, ``fix!:``) with scope
-         outside ``{ci, build, docs, deps, release, chore, tests}`` OR a ``Fixes:`` / ``Closes:``
-         issue trailer, AND
+         outside ``{ci, build, docs, deps, release, chore, tests}`` OR a ``Fixes:`` issue trailer
+         in the trailer block (``Closes:`` is no fix signal: R-evidence-30), AND
      (b) at least one changed non-test, non-doc, non-config source file.
    - ``fix(ci):``, ``fix(docs):``, or a ``fix:`` commit touching only ``README.md`` or
      ``pyproject.toml`` does not trigger T5.
@@ -14,8 +14,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
      but is reported in the non-failing ``untested_changes`` report.
 2. Evidence: fail-to-pass on a temporary snapshot:
    - Overlaying the changed test files onto ``base`` source in a hermetic temporary directory and
-     running pytest requires at least one test nodeid that FAILS on ``base`` (assertion/test
-     failure, not collection syntax error) and PASSES on ``head``.
+     running pytest requires at least one test nodeid that FAILS on ``base`` (a test failure, or its
+     module failing collection there) and PASSES on ``head``.
    - A tautological ``assert True`` test passes on ``base`` and therefore fails T5
      (``reason="passed_on_base"``).
    - A ``fix:`` commit with no test file changes fails T5 (``reason="no_test_changes"``).
@@ -28,8 +28,8 @@ Given/When/Then, written before the code and never weakened to make it pass:
 4. Rollout at warning tier in ``aegis check --ci``:
    - Default ``warning`` tier reports findings in ``regression`` in ``--format json`` and emits
      ``::warning`` annotations in ``--format github`` while exiting 0 when rules are intact.
-   - At ``gate`` tier (``--strict`` or user config ``regression.tier="gate"``), unapproved
-     regression failures exit 1 and emit ``::error`` annotations.
+   - No setting raises the tier in 4.4.0 (gate status is earned through T4): ``--ci --strict``
+     is a usage error (exit 2) and a user config ``regression.tier="gate"`` is ignored.
 """
 from __future__ import annotations
 
@@ -201,8 +201,7 @@ def test_real_fail_to_pass_regression_test_passes(tmp_path: Path):
     assert report.total_fix_commits == 1
     item = report.commits[0]
     assert item.status == "passed"
-    assert item.failed_on_base is True
-    assert item.passed_on_head is True
+    assert item.reason == "ok"
     assert any("test_add_regression" in nodeid for nodeid in item.fail_to_pass_tests)
     assert report.findings == ()
 
@@ -233,8 +232,7 @@ def test_tautological_assert_true_fails_fail_to_pass_because_it_passes_on_base(t
     item = report.commits[0]
     assert item.status == "failed"
     assert item.reason == "passed_on_base"
-    assert item.failed_on_base is False
-    assert item.passed_on_head is True
+    assert item.fail_to_pass_tests == ()
     assert len(report.findings) == 1
     assert report.findings[0].code == "passed_on_base"
 
@@ -257,8 +255,7 @@ def test_fix_commit_with_no_test_changes_flags_no_test_changes(tmp_path: Path):
     item = report.commits[0]
     assert item.status == "failed"
     assert item.reason == "no_test_changes"
-    assert item.failed_on_base is False
-    assert item.passed_on_head is False
+    assert item.fail_to_pass_tests == ()
     assert len(report.findings) == 1
     assert report.findings[0].code == "no_test_changes"
 
@@ -278,7 +275,7 @@ def test_aegis_no_test_trailer_without_human_gate_approval_does_not_exempt(tmp_p
     assert report.exemption_rate == 0.0
     item = report.commits[0]
     assert item.status == "failed"
-    assert item.exempted is False
+    assert item.approval is None
     assert item.no_test_reason == "pure refactor of internal expression"
     assert len(report.findings) == 1
     assert "pure refactor of internal expression" in report.findings[0].message
@@ -318,12 +315,12 @@ def test_aegis_no_test_with_verified_human_gate_approval_exempts_and_reports_rat
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert report.passed_count == 1
+    assert [c.status for c in report.commits] == ["passed", "exempted"]
     assert report.exempted_count == 1
     assert report.exemption_rate == 0.5
-    assert report.prune_box_exceeded is True
+    assert "prune_box_exceeded" not in report.as_dict()
     assert report.commits[1].status == "exempted"
-    assert report.commits[1].exempted is True
+    assert report.commits[1].approval is not None and report.commits[1].approval.valid
     assert report.commits[1].no_test_reason == "trivial constant return"
     assert report.findings == ()
 
@@ -367,10 +364,10 @@ def test_a_rejected_exemption_names_its_verdict_code_in_the_report(
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     item = report.commits[0]
-    assert (item.status, item.reason, item.exempted) == ("failed", "no_test_changes", False)
+    assert (item.status, item.reason, item.approval) == ("failed", "no_test_changes", None)
     assert item.exemption_code == code and item.as_dict()["exemption_code"] == code
     assert code in report.findings[0].message
-    assert report.approval is None
+    assert "approval" not in report.as_dict()
 
 
 @needs_git
@@ -435,8 +432,8 @@ def test_governance_tree_approval_never_exempts_testless_fix_commit(
     assert report.exempted_count == 0
     assert report.commits[0].commit == fix_oid
     assert report.commits[0].status == "failed"
-    assert report.commits[0].exempted is False
-    assert report.approval is None
+    assert report.commits[0].approval is None
+    assert "approval" not in report.as_dict()
 
 
 @needs_git
@@ -459,21 +456,21 @@ def test_targeted_test_exemption_exempts_only_named_fix_commit(
     assert report.passed is False
     assert report.total_fix_commits == 2
     assert report.exempted_count == 1
-    assert report.failed_count == 1
+    assert [c.status for c in report.commits].count("failed") == 1
     by_oid = {c.commit: c for c in report.commits}
     assert by_oid[fix1_oid].status == "exempted"
-    assert by_oid[fix1_oid].exempted is True
+    assert by_oid[fix1_oid].approval is not None and by_oid[fix1_oid].approval.valid
     assert by_oid[fix2_oid].status == "failed"
-    assert by_oid[fix2_oid].exempted is False
+    assert by_oid[fix2_oid].approval is None
 
 
 @needs_git
-def test_performance_invariant_each_commit_tree_is_read_at_most_once(
+def test_performance_invariant_only_the_head_tree_is_read_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Performance invariant, not behaviour: the regression check reads each commit's tree once
-    however many fix commits share it. The verdict is the same either way, so only counting the
-    calls to the private tree reader can see a regression here."""
+    """Performance invariant, not behaviour: the PR-level check reads one tree, the head's, however
+    many fix commits there are. The verdict is the same either way, so only counting the calls to the
+    private tree reader can see a regression here."""
     repo = make_calc_repo(tmp_path)
     repo.write(
         "src/calc.py",
@@ -522,7 +519,7 @@ def test_performance_invariant_each_commit_tree_is_read_at_most_once(
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert report.passed is True
     assert report.total_fix_commits == 2
-    assert call_counts and all(count == 1 for count in call_counts.values()), call_counts
+    assert call_counts == {repo.head(): 1}, call_counts
 
 
 # ── 4. Warning-tier rollout & `aegis check --ci` integration ─────────────────
@@ -558,20 +555,26 @@ def test_check_ci_starts_at_warning_tier_and_emits_warning_annotations_without_f
 
 
 @needs_git
-def test_check_ci_in_strict_or_gate_mode_fails_on_unapproved_regression(
+def test_check_ci_strict_is_refused_and_a_gate_config_stays_at_warning(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
     repo = make_calc_repo(tmp_path)
     repo.write("src/calc.py", "def add(a: int, b: int) -> int:\n    return a + b\n")
     repo.commit("fix: addition fix without test")
 
-    rc, out, _err = run_ci(repo, capsys, "--strict", "--format", "json")
-    assert rc == 1
+    rc, out, err = run_ci(repo, capsys, "--strict", "--format", "json")
+    assert rc == 2 and out == "" and "--strict" in err
+
+    user_cfg = tmp_path / "home" / ".aegis"
+    user_cfg.mkdir(parents=True, exist_ok=True)
+    (user_cfg / "config.json").write_text(json.dumps({"v": 1, "regression": {"tier": "gate"}}), encoding="utf-8")
+    rc, out, _err = run_ci(repo, capsys, "--format", "json")
+    assert rc == 0
     payload = json.loads(out)
-    assert payload["status"] == "fail"
-    assert payload["regression"]["tier"] == "gate"
+    assert payload["status"] == "pass"
+    assert payload["regression"]["tier"] == "warning"
     assert payload["regression"]["passed"] is False
-    assert payload["regression"]["blocking"] is True
+    assert payload["regression"]["blocking"] is False
 
 
 @needs_git
@@ -629,8 +632,7 @@ def test_editable_install_pth_and_pep660_finder_cannot_shadow_snapshot_source(
     assert report.total_fix_commits == 1
     item = report.commits[0]
     assert item.status == "passed"
-    assert item.failed_on_base is True
-    assert item.passed_on_head is True
+    assert item.reason == "ok"
     assert report.findings == ()
 
 
@@ -656,7 +658,7 @@ def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Pat
     )
     oid = repo.commit("fix: rename readme and fix addition operator")
 
-    meta = regression._commit_meta(str(repo.root), oid, "main")
+    (meta,) = regression._commits_meta(str(repo.root), "main", oid)
     assert "src/calc.py" in meta.changed_files
     assert "tests/test_calc.py" in meta.present_files
     assert "GUIDE.md" in meta.present_files
@@ -666,12 +668,11 @@ def test_fix_commit_with_rename_does_not_desynchronize_commit_meta(tmp_path: Pat
     assert report.total_fix_commits == 1
     item = report.commits[0]
     assert item.status == "passed"
-    assert "src/calc.py" in item.source_files
-    assert "tests/test_calc.py" in item.test_files
+    assert any("test_add_regression" in nodeid for nodeid in item.fail_to_pass_tests)
 
 
 def test_suite_level_junit_error_is_recorded_as_collection_error(tmp_path: Path):
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     junit_xml = tmp_path / "junit.xml"
     junit_xml.write_text(
@@ -683,7 +684,7 @@ def test_suite_level_junit_error_is_recorded_as_collection_error(tmp_path: Path)
         '</testsuites>\n',
         encoding="utf-8",
     )
-    passed, failed, col_errors = checkrun.parse_junit_cases(junit_xml)
+    passed, failed, col_errors = testexec.parse_junit_cases(junit_xml)
     assert passed == set()
     assert failed == set()
     assert "<suite:pytest-collect>" in col_errors

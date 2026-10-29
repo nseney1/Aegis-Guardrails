@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import baseline
 from aegis_core.taxonomy import RULE_TYPES
 
@@ -133,7 +134,8 @@ def _layer1(root: str, targets: Sequence[str]) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class Card:
-    """The card of one workspace: ``as_dict()`` for ``--json``, ``text_lines()`` for the terminal."""
+    """The card of one workspace: ``as_dict()`` is the ``--json`` document, which the CLI renders for
+    the terminal (aegis_cli.formatters.text)."""
 
     workspace: str
     listing: str
@@ -173,7 +175,7 @@ class Card:
     def as_dict(self) -> Dict[str, Any]:
         layer1 = dict(self.layer1)
         top = layer1.pop("top")
-        document = baseline.envelope(SOURCE, {
+        document = primitives.envelope(SOURCE, {
             "workspace": self.workspace,
             "listing": self.listing,
             "files": self.files,
@@ -190,49 +192,6 @@ class Card:
             notes=self.notes,
         )
         return document
-
-    def text_lines(self) -> List[str]:
-        lines = ["Aegis day-0 card", f"  workspace: {self.workspace}"]
-        origin = "git" if self.listing == "git" else "walked"
-        if self.sampled:
-            lines.append(f"  files: {self.files} ({origin}). Sampled {self.files_analyzed} of {self.files} files "
-                         "for Layer 1")
-        else:
-            lines.append(f"  files: {self.files} ({origin}), all analyzed")
-        if self.languages:
-            lines.append("  languages: " + ", ".join(f"{row['language']} {row['files']}" for row in self.languages))
-        else:
-            lines.append("  languages: none recognized (rules are language-agnostic)")
-        if self.drivers:
-            parts = []
-            for row in self.drivers:
-                label = "built-in" if row["language"] == "python" else row["status"]
-                parts.append(f"{row['language']}: {label}")
-            lines.append("  AST drivers: " + "; ".join(parts))
-        rules = self.rules
-        if rules.get("error"):
-            lines.append("  rules: cannot be read (see the note below)")
-        else:
-            kinds = ", ".join(f"{name} {n}" for name, n in rules["by_type"].items())
-            detail = f" ({kinds})" if kinds else ""
-            lines.append(f"  rules: {rules['total']}{detail}, {len(rules['active'])} active "
-                         "(served and targeting a file)")
-        layer1 = self.layer1
-        if not layer1["checked"]:
-            lines.append("  Layer 1: no file to check")
-        else:
-            percent = int(layer1["pass_rate"] * 100) if layer1["pass_rate"] is not None else 0
-            lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files pass "
-                         f"({layer1['passed']} of {layer1['checked']}); "
-                         f"{layer1['findings']} finding(s) in {layer1['failed']} file(s)")
-        if layer1["top"]:
-            lines.append("  files with the most findings:")
-            lines.extend(f"    {row['findings']:>5}  {row['path']}" for row in layer1["top"])
-        for note in self.notes:
-            lines.append(f"  note: {note}")
-        if not rules["active"]:
-            lines.append(f"  {NEXT_RULE}")
-        return lines
 
 
 def build(root: Any, now: Optional[float] = None, sample_limit: int = SAMPLE_LIMIT) -> Card:

@@ -1,10 +1,10 @@
 """Rule creation: one new rule file in its type directory, under the workspace lock."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 
+from aegis_core.primitives import utc_stamp
 from aegis_core.rules import VALID_ENFORCEMENT, load_rules
 from aegis_core.storage import atomic_write_text, locked
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES, RULE_TYPE_DIRS, RULE_TYPES, normalize_review_mode
@@ -19,6 +19,7 @@ from .parsers import (
 __all__ = [
     "MAX_RULE_BODY_BYTES",
     "create_rule",
+    "require_servable_id",
     "validate_rule_body",
 ]
 
@@ -108,10 +109,10 @@ def create_rule(
     target_dir = ws.rules_dir / type_plural
 
     slug = generate_slug(hypothesis, id_override)
-    _require_servable_id(slug)
+    require_servable_id(slug)
     file_path = target_dir / f"{slug}.md"
 
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    date_str = utc_stamp()
     type_title = type_lower.capitalize()
     truncated_hypo = hypothesis[:60] + ("..." if len(hypothesis) > 60 else "")
 
@@ -170,7 +171,7 @@ def create_rule(
     return file_path
 
 
-def _require_servable_id(slug: str) -> None:
+def require_servable_id(slug: str) -> None:
     """Refuse an id whose file the loader would never serve (aegis_core.rules)."""
     if slug.lower() == "readme":
         raise ValueError(f"Invalid rule id {slug!r}: a README.md under .aegis/rules is documentation, never a rule.")

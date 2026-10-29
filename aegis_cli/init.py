@@ -27,7 +27,8 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from aegis_cli.base import AegisCommand, CommandCategory
+from aegis_cli import NO_HOME_MESSAGE
+from aegis_cli.base import AegisCommand, CommandCategory, host_option, unwritable
 from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/test_worktree_hooks.py
     AEGIS_HOOK_FORMAT,
     SOMA_HOOK_FORMAT,
@@ -37,13 +38,11 @@ from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/
 )
 from aegis_cli.init_views import (
     Report,
+    SCAFFOLD_LABEL,
     Step,
     _home_label,
-    _no_hooks,
     _print_actions,
-    _print_active,
     _print_card,
-    _print_ci,
     _report_ci,
     _report_hook,
     report_partial,
@@ -62,25 +61,27 @@ from aegis_cli.install_hosts import (
     registrable_hosts,
     write_managed_block,
 )
-from aegis_core import scaffolding as _scaffolding
+from aegis_core.workspace.layout import UserLayout
 from aegis_core.scaffolding import (
     ACTIVE_LABEL as _ACTIVE_LABEL,
     ACTIVE_STARTERS,
     ACTIVE_TYPE_DIR,
     CI_WORKFLOW_LABEL,
-    CI_WORKFLOW_PATH,
     DEFAULT_RULE_PRESET,
     NO_ACTIVE_PRESETS,
     RULE_PRESETS,
     SEED_TYPE,
     SEED_TYPE_DIR,
-    _CI_WORKFLOW,
-    _declare_type,
-    _runs_aegis_check,
-    _workflow_files,
     ci_workflow,
+    install_rules,
+    packaged_active_rules,
     packaged_dir,
+    packaged_rules,
+    preset_rules,
+    runs_aegis_check,
+    workflow_files,
 )
+from aegis_core.primitives import is_within, real_key
 from aegis_core.storage import atomic_write_bytes
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
@@ -88,18 +89,13 @@ __all__ = [
     "ACTIVE_STARTERS",
     "AGENTS_FILE",
     "CI_WORKFLOW_LABEL",
-    "CI_WORKFLOW_PATH",
     "CLAUDE_FILE",
     "CLAUDE_SHIM_ID",
     "CLAUDE_SHIM_TEXT",
-    "DEFAULT_RULE_PRESET",
     "InitCommand",
-    "NO_ACTIVE_PRESETS",
     "RULE_PRESETS",
     "RemovedOption",
     "Report",
-    "SEED_TYPE",
-    "SEED_TYPE_DIR",
     "Step",
     "ci_workflow",
     "hook_refusal",
@@ -116,41 +112,10 @@ __all__ = [
 
 CONFIG_LABEL = f"{AEGIS_DIRNAME}/config.json"
 GITIGNORE_LABEL = f"{AEGIS_DIRNAME}/.gitignore"
-SCAFFOLD_LABEL = f"{AEGIS_DIRNAME}/"
 AGENTS_FILE = "AGENTS.md"
 CLAUDE_FILE = "CLAUDE.md"
 CLAUDE_SHIM_ID = "agents-import"
 CLAUDE_SHIM_TEXT = "@AGENTS.md\n"
-
-
-def _shipped_rules() -> Dict[str, Path]:
-    return _scaffolding._shipped_rules(locator=packaged_dir)
-
-
-def packaged_rules() -> Dict[str, Path]:
-    """Every shipped guidance rule (``rules/*.md``, ``rules/.oracles/*.md``, through
-    ``packaged_dir``) by id: what the persona presets seed. The active starters are not
-    among them (see packaged_active_rules)."""
-    return _scaffolding.packaged_rules(locator=packaged_dir)
-
-
-def packaged_active_rules() -> Dict[str, Path]:
-    """The shipped active starters (ACTIVE_STARTERS) by id; ValueError when one is missing."""
-    return _scaffolding.packaged_active_rules(locator=packaged_dir)
-
-
-def preset_rules(preset: str) -> List[Path]:
-    """The packaged rule files of ``preset``; ValueError for an unknown preset or a missing rule."""
-    return _scaffolding.preset_rules(preset, locator=packaged_dir)
-
-
-def install_rules(rules_dir: Path, preset: str = DEFAULT_RULE_PRESET, dry_run: bool = False, force: bool = False,
-                  skip: Sequence[str] = (), rule_type: Optional[str] = None) -> List[str]:
-    """Copy the preset's packaged rules into ``rules_dir`` (flat); return the ids now there."""
-    return _scaffolding.install_rules(
-        rules_dir, preset=preset, dry_run=dry_run, force=force,
-        skip=skip, rule_type=rule_type, _preset_fn=preset_rules,
-    )
 
 
 def seed_workspace_rules(root: Path, preset: str, dry_run: bool = False) -> Tuple[List[str], List[str]]:
@@ -226,11 +191,8 @@ class RemovedOption(argparse.Action):
         parser.exit(2)
 
 
-def _host_option(value: str):
-    try:
-        return parse_hosts(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from None
+def _no_hooks(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "no_hooks", False)) or not getattr(args, "hooks", True)
 
 
 def _host_help() -> str:
@@ -262,15 +224,14 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
     cannot write through: a link, a file, or one resolving out of the repository."""
     workflows = root / ".github" / "workflows"
     if not write:
-        files = _workflow_files(root)
-        running = [f.relative_to(root).as_posix() for f in files if _runs_aegis_check(f)]
+        files = workflow_files(root)
+        running = [f.relative_to(root).as_posix() for f in files if runs_aegis_check(f)]
         if running:
             return Step(CI_WORKFLOW_LABEL, "present", f"{', '.join(running)} run{'s' if len(running) == 1 else ''} "
                                                       "aegis check")
         return Step(CI_WORKFLOW_LABEL, "suggested", "no GitHub Actions workflow runs aegis check; "
                                                     "aegis init --ci writes one",
                     names=[f.relative_to(root).as_posix() for f in files])
-    inside = _real_key(root) + os.sep
     for directory in (root / ".github", workflows):
         label = directory.relative_to(root).as_posix()
         if directory.is_symlink():
@@ -278,7 +239,7 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
                                "directory inside the repository. Replace the link, or re-run without --ci.")
         if os.path.lexists(directory) and not directory.is_dir():
             raise InstallError(f"{label}: is not a directory; left unchanged. Move it aside, or re-run without --ci.")
-        if directory.is_dir() and not _real_key(directory).startswith(inside):
+        if directory.is_dir() and not is_within(directory, root, unresolvable=False):
             raise InstallError(f"{label}: resolves outside the repository; aegis init --ci writes the workflow only "
                                "inside it. Re-run without --ci.")
     dest = workflows / "aegis.yml"
@@ -301,25 +262,6 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
 
 # ── The pre-commit hook ──────────────────────────────────────────────────────
 
-def _within(path: Path, boundary: Path) -> bool:
-    try:
-        path.relative_to(boundary.resolve())
-        return True
-    except ValueError:
-        return False
-
-
-def _unwritable(directory: Path) -> Optional[str]:
-    """Why no file can be created in ``directory`` (made with its parents when missing,
-    so the nearest directory that exists decides); None when one can."""
-    existing = Path(directory)
-    while not os.path.lexists(existing) and existing.parent != existing:
-        existing = existing.parent
-    if existing.is_dir() and os.access(existing, os.W_OK | os.X_OK):
-        return None
-    return f"{existing} is not a writable directory"
-
-
 @dataclass(frozen=True)
 class _HookPlace:
     hooks_dir: Path
@@ -338,9 +280,9 @@ def _hook_place(root: Path) -> Optional[_HookPlace]:
     hooks_dir = Path(hooks_dir)
     git_dir, common_dir = _find_git_dirs(root)
     repository = (root, *(d for d in (git_dir, common_dir) if d is not None))
-    shared = not any(_within(hooks_dir.resolve(), b) for b in repository)
+    shared = not any(is_within(hooks_dir, b, unresolvable=False) for b in repository)
     default = common_dir / "hooks" if common_dir is not None else None
-    if default is not None and _real_key(default) == _real_key(hooks_dir):
+    if default is not None and _same_place(default, hooks_dir):
         # No core.hooksPath: the repository's own hooks directory is a link out of it.
         where = f"{default} is a link to {hooks_dir.resolve()}"
     else:
@@ -402,12 +344,12 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
         target = hook.resolve()
         if not target.exists():
             return None if removing else f"{hook} is a dangling symlink; to replace it, run: aegis hook install --force"
-        outside = shared or not any(_within(target, b) for b in (root, hooks_dir))
+        outside = shared or not any(is_within(target, b, unresolvable=False) for b in (root, hooks_dir))
         if outside and not removing:
             return (f"{hook} is a symlink to {target}, outside the repository; Aegis does not write through it. "
                     "To add the hook to that file anyway, run: aegis hook install --force")
     if not target.exists():
-        reason = None if removing else _unwritable(hooks_dir)
+        reason = None if removing else unwritable(hooks_dir)
         return f"{reason}, so the hook cannot be {verb}" if reason else None
     try:
         content = target.read_text(encoding="utf-8")
@@ -416,7 +358,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
     except OSError as exc:
         return f"{target} cannot be read ({exc.strerror or exc})"
     if _AEGIS_HOOK_START not in content and _SOMA_HOOK_START not in content:
-        reason = None if removing else _unwritable(target.parent)
+        reason = None if removing else unwritable(target.parent)
         return f"{reason}, so the hook cannot be {verb}" if reason else None
     if shared:
         return (f"{hook} holds the Aegis hook, but {place.where}, outside this repository, and may serve other "
@@ -428,7 +370,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
     if _replace_hook_block(content, "") is None:
         return f"{target} has an unterminated Aegis hook block; fix or remove it"
     # Removing may delete the hook file (and the file a link in the repository points to).
-    reason = next(filter(None, (_unwritable(d) for d in (hook.parent, target.parent))), None)
+    reason = next(filter(None, (unwritable(d) for d in (hook.parent, target.parent))), None)
     return f"{reason}, so the hook cannot be {verb}" if reason else None
 
 
@@ -497,15 +439,16 @@ class _Context:
     ci: bool = False
 
 
-def _real_key(path: Path) -> str:
-    return os.path.normcase(os.path.realpath(path))
+def _same_place(a: Path, b: Path) -> bool:
+    """Whether both resolve to one location; one that cannot be resolved is no location."""
+    key = real_key(a)
+    return key is not None and key == real_key(b)
 
 
 def _check_repo_dirs(root: Path, dirs: Sequence[Path]) -> None:
     """Refuse, before the first write, a directory under .aegis/ that init writes into
     but cannot use: a link (it could point anywhere), a file, a junction resolving out of
     the workspace, or (when it is still to be made) no writable directory to make it in."""
-    inside = _real_key(root) + os.sep
     for directory in dirs:
         if directory.is_symlink():
             raise InstallError(f"{directory}: is a symlink; Aegis keeps .aegis/ only as real directories inside "
@@ -514,13 +457,13 @@ def _check_repo_dirs(root: Path, dirs: Sequence[Path]) -> None:
             _need_writable(directory)
         elif not directory.is_dir():
             raise InstallError(f"{directory}: is not a directory; left unchanged. Move it aside, then re-run.")
-        elif not _real_key(directory).startswith(inside):
+        elif not is_within(directory, root, unresolvable=False):
             raise InstallError(f"{directory}: resolves outside the workspace; Aegis keeps .aegis/ only inside it. "
                                "Replace it with a real directory, then re-run.")
 
 
 def _need_writable(directory: Path) -> None:
-    reason = _unwritable(directory)
+    reason = unwritable(directory)
     if reason:
         where = "" if os.path.lexists(directory) else f"{directory} cannot be created: "
         raise InstallError(f"{where}{reason}; nothing can be written there. Fix its permissions, then re-run.")
@@ -532,7 +475,7 @@ def _claude_shim(ctx: _Context, dry_run: bool) -> Step:
     if not claude.is_symlink():
         return Step(CLAUDE_FILE, write_managed_block(
             claude, CLAUDE_SHIM_ID, CLAUDE_SHIM_TEXT, force=ctx.force, create=False, dry_run=dry_run))
-    if _real_key(claude) == _real_key(agents):
+    if _same_place(claude, agents):
         return Step(CLAUDE_FILE, "linked", "a link to AGENTS.md, so Claude Code reads the bootstrap as it is")
     ctx.report.warn(f"{claude} is a symlink to {os.path.realpath(claude)}; Aegis never writes through a link, so "
                     "it was left as it is. For Claude Code to read the Aegis bootstrap, add an @AGENTS.md import "
@@ -574,6 +517,37 @@ def _skills_steps(ctx: _Context, dry_run: bool) -> List[Step]:
     return steps
 
 
+def _hook_steps(root: Path, dry_run: bool, actions: List[Step]) -> None:
+    """The pre-commit and prepare-commit-msg hooks, each appended to ``actions`` as it completes.
+    Raises InstallError for a hook that cannot be written safely."""
+    from aegis_cli.hooks import commitmsg
+    from aegis_core.workspace.hooks import resolve_git_hooks_dir
+
+    in_place = shared_hook_in_place(root)
+    if in_place is not None:
+        actions.append(Step("pre-commit hook", "unchanged",
+                            f"{in_place} already runs the Aegis hook (a shared hooks directory); left as it is"))
+        actions.append(Step("prepare-commit-msg hook", "unchanged",
+                            f"{in_place.parent / 'prepare-commit-msg'} (a shared hooks directory); left as it is"))
+    else:
+        refusal = hook_refusal(root)
+        if refusal:
+            raise InstallError(f"pre-commit hook: {refusal}. Or re-run with --no-hooks to set up everything else.")
+        hooked = install_hook(root, dry_run=dry_run)
+        hooks_dir = resolve_git_hooks_dir(root)
+        if not hooked and hooks_dir:
+            raise InstallError("the pre-commit hook could not be installed (see above); left unchanged")
+        actions.append(Step("pre-commit hook", "installed" if hooked else "skipped (not a git repository)"))
+        if hooked and hooks_dir:
+            cm_res = commitmsg.install(hooks_dir, dry_run=dry_run)
+            if cm_res == "foreign":
+                actions.append(Step("prepare-commit-msg hook", "kept", "existing hook is not Aegis's; left alone"))
+            else:
+                actions.append(Step("prepare-commit-msg hook", cm_res))
+        else:
+            actions.append(Step("prepare-commit-msg hook", "skipped (not a git repository)"))
+
+
 def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -> List[Step]:
     """Run every init step; with ``dry_run`` only check and plan. Raises InstallError.
 
@@ -583,7 +557,6 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     from aegis_core.ast.detect import detect_project_languages, provision_ast_driver_slots
     from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
     from aegis_core.errors import PathTraversalError, WorkspaceBareRepoError
-    from aegis_core.workspace.hooks import resolve_git_hooks_dir
     from aegis_core.workspace.layout import WorkspaceLayout
     from aegis_core.workspace.scaffold import ensure_runtime_gitignore
 
@@ -656,31 +629,7 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     actions.append(_ci_step(root, ctx.ci, dry_run))
 
     if not ctx.no_hooks:
-        from aegis_cli.hooks import commitmsg
-
-        in_place = shared_hook_in_place(root)
-        if in_place is not None:
-            actions.append(Step("pre-commit hook", "unchanged",
-                                f"{in_place} already runs the Aegis hook (a shared hooks directory); left as it is"))
-            actions.append(Step("prepare-commit-msg hook", "unchanged",
-                                f"{in_place.parent / 'prepare-commit-msg'} (a shared hooks directory); left as it is"))
-        else:
-            refusal = hook_refusal(root)
-            if refusal:
-                raise InstallError(f"pre-commit hook: {refusal}. Or re-run with --no-hooks to set up everything else.")
-            hooked = install_hook(root, dry_run=dry_run)
-            hooks_dir = resolve_git_hooks_dir(root)
-            if not hooked and hooks_dir:
-                raise InstallError("the pre-commit hook could not be installed (see above); left unchanged")
-            actions.append(Step("pre-commit hook", "installed" if hooked else "skipped (not a git repository)"))
-            if hooked and hooks_dir:
-                cm_res = commitmsg.install(hooks_dir, dry_run=dry_run)
-                if cm_res == "foreign":
-                    actions.append(Step("prepare-commit-msg hook", "kept", "existing hook is not Aegis's; left alone"))
-                else:
-                    actions.append(Step("prepare-commit-msg hook", cm_res))
-            else:
-                actions.append(Step("prepare-commit-msg hook", "skipped (not a git repository)"))
+        _hook_steps(root, dry_run, actions)
 
     actions.append(Step(REGISTRY_LABEL, register_workspace(ctx.home, root, ctx.selected, dry_run=dry_run)))
     actions.append(_link_key_step(ctx.home, dry_run))
@@ -699,7 +648,6 @@ def _link_key_step(home: Path, dry_run: bool) -> Step:
     with ``O_EXCL`` here and nowhere else, never replaced or repaired when a file is already
     there. Without it no ``hs`` exists and agy and Claude labels read unknown."""
     from aegis_core.insights import create_link_key
-    from aegis_core.workspace.layout import UserLayout
 
     if os.path.lexists(UserLayout(Path(home)).aegis_dir / "link.key"):
         return Step(LINK_KEY_LABEL, "present")
@@ -707,46 +655,18 @@ def _link_key_step(home: Path, dry_run: bool) -> Step:
     if dry_run:
         return Step(LINK_KEY_LABEL, "created", detail)
     try:
-        res = create_link_key(home)
-        status = ("created" if res[1] else "present") if isinstance(res, tuple) else str(res)
-        return Step(LINK_KEY_LABEL, status, detail)
+        _, created = create_link_key(home)
+        return Step(LINK_KEY_LABEL, "created" if created else "present", detail)
     except OSError as exc:
         raise InstallError(f"{LINK_KEY_LABEL}: cannot be created ({exc.strerror or exc}); fix the permissions of "
                            f"~/{AEGIS_DIRNAME}, then re-run.") from exc
 
 
-def run_init(args: argparse.Namespace) -> int:
-    """Main init flow. Returns the exit code (0 ok, 1 refused or failed, 2 usage)."""
+def _announce(report: Report, root: Path, selected: List[str], detected: List[str], found: Dict[str, str],
+              host_arg: Any, home: Path) -> None:
+    """The header: the workspace, its languages, the hosts selected or found, and a warning for
+    each experimental host."""
     from aegis_core.ast.detect import detect_project_languages
-    from aegis_core.workspace.base import Workspace
-
-    json_mode = bool(getattr(args, "json", False))
-    report = Report(json_mode, "aegis init")
-    ws = getattr(args, "ws", None) or Workspace.for_init(
-        getattr(args, "workspace", None) or getattr(args, "_project_root", None) or Path.cwd())
-    root = ws.root
-    dry_run = bool(getattr(args, "dry_run", False))
-    yes = bool(getattr(args, "yes", False))
-    preset = getattr(args, "rules", None) or "standard"
-    home = Path.home()
-    path_env = os.environ.get("PATH")
-
-    found = detection_evidence(home, path_env)
-    detected = list(found)
-    host_arg = getattr(args, "host", None)
-    if isinstance(host_arg, str):
-        host_arg = parse_hosts(host_arg)
-    selected: List[str] = list(detected) if host_arg == "auto" else list(host_arg or [])
-    scope = {"workspace": str(root), "hosts": selected, "detected": detected}
-
-    if json_mode and not (yes or dry_run):
-        print("aegis init --json needs --yes or --dry-run (it cannot prompt)", file=sys.stderr)
-        return 2
-    if is_denied_root(root, home):
-        report.error(f"refusing to set up {root}: your home directory and a filesystem root are never "
-                     "a workspace (ADR 0005 AD-4). Run aegis init in a repository.")
-        report.finish("refused", scope, dry_run, [])
-        return 1
 
     report.say()
     report.say("  🛡️ Aegis Guardrails — Workspace Setup")
@@ -773,6 +693,118 @@ def run_init(args: argparse.Namespace) -> int:
         spec = host_table.get(host_id)
         if not spec.verified:
             report.warn(f"{host_id} is an experimental host. {' '.join(spec.notes)}")
+
+
+def _confirm_plan(report: Report, plan: List[Step], preset: str, scope: Dict[str, Any]) -> Optional[int]:
+    """Show the plan and ask. None to go on; otherwise the exit code, after the run's one
+    report.finish (nothing was written)."""
+    report.say("  Will do:")
+    _print_actions(report, plan, True, preset)
+    try:
+        answer = input("  Proceed? [Y/n] ").strip().lower()
+    except EOFError:
+        # Not a decline: stdin is closed (a script that forgot --yes) and nothing was done.
+        report.say()
+        report.error("no answer to the prompt (end of input); nothing was written. "
+                     "Re-run with --yes to skip the prompt.")
+        report.finish("aborted", scope, False, plan)
+        return 1
+    except KeyboardInterrupt:
+        report.say()
+        report.say("  Aborted.")
+        report.finish("aborted", scope, False, plan)
+        return 130
+    if answer and answer not in ("y", "yes"):
+        report.say("  Aborted.")
+        report.finish("aborted", scope, False, plan)
+        return 0
+    report.say()
+    return None
+
+
+def _print_outcome(report: Report, ctx: _Context, root: Path, actions: List[Step]) -> bool:
+    """After the write pass: each failed registration, the summary, the day-0 card and the next
+    steps. True when a registration failed."""
+    failed = [a for a in actions if a.result == "failed"]
+    for action in failed:
+        report.error(f"{action.target}: registration failed ({action.detail}). Run it yourself: "
+                     f"{display_command(action.command or [])}")
+    manual = sum(1 for a in actions if a.result == "manual")
+    report.say()
+    if failed:
+        report.say("  Done, with errors (see above).")
+    elif manual:
+        # The host CLI is not installed here; nothing is governed until the user runs it.
+        report.say(f"  Done, but {manual} host{'s are' if manual > 1 else ' is'} not registered until you run the "
+                   f"command{'s' if manual > 1 else ''} above.")
+    elif ctx.selected:
+        report.say("  Done! Your next agent session will be governed.")
+    else:
+        report.say("  Done! No agent host was registered; to add one: aegis init --host HOST[,HOST]")
+    report.say()
+    _print_card(report, root)
+    report.say("  After a session, run: aegis status")
+    report.say()
+    _report_ci(report, actions)
+    # No CODEOWNERS is written: offline, init cannot tell a valid owner (a user, an organization's team).
+    report.say("  Governance files (rules, workflows, allowed_signers) are protected only by GitHub settings:")
+    report.say("  aegis doctor --github prints the CODEOWNERS lines and the ruleset for this repository;")
+    report.say("  commit the CODEOWNERS lines it prints and apply the ruleset.")
+    report.say()
+    return bool(failed)
+
+
+def _print_path_hint(json_mode: bool) -> None:
+    if not json_mode:
+        try:
+            from aegis_cli.pathcheck import build_hint
+
+            hint = build_hint()
+            if hint:
+                print(hint)
+                print()
+        except (OSError, RuntimeError):
+            pass
+
+
+def run_init(args: argparse.Namespace) -> int:
+    """Main init flow. Returns the exit code (0 ok, 1 refused or failed, 2 usage)."""
+    from aegis_core.workspace.base import Workspace
+
+    json_mode = bool(getattr(args, "json", False))
+    report = Report(json_mode, "aegis init")
+    ws = getattr(args, "ws", None) or Workspace.for_init(
+        getattr(args, "workspace", None) or getattr(args, "_project_root", None) or Path.cwd())
+    root = ws.root
+    dry_run = bool(getattr(args, "dry_run", False))
+    yes = bool(getattr(args, "yes", False))
+    preset = getattr(args, "rules", None) or DEFAULT_RULE_PRESET
+    layout = UserLayout.current()
+    if layout is None:
+        report.error(NO_HOME_MESSAGE)
+        report.finish("refused", {"workspace": str(root), "hosts": []}, dry_run, [])
+        return 1
+    home = layout.home
+    path_env = os.environ.get("PATH")
+
+    found = detection_evidence(home, path_env)
+    detected = list(found)
+    host_arg = getattr(args, "host", None)
+    if isinstance(host_arg, str):
+        host_arg = parse_hosts(host_arg)
+    selected: List[str] = list(detected) if host_arg == "auto" else list(host_arg or [])
+    scope = {"workspace": str(root), "hosts": selected, "detected": detected}
+
+    if json_mode and not (yes or dry_run):
+        print("aegis init --json needs --yes or --dry-run (it cannot prompt)", file=sys.stderr)
+        return 2
+    if is_denied_root(root, home):
+        report.error(f"refusing to set up {root}: your home directory and a filesystem root are never "
+                     "a workspace. Run aegis init in a repository.")
+        report.finish("refused", scope, dry_run, [])
+        return 1
+
+    _announce(report, root, selected, detected, found, host_arg, home)
 
     ctx = _Context(ws=ws, root=root, home=home, selected=selected, preset=preset,
                    force=bool(getattr(args, "force", False)), no_hooks=_no_hooks(args),
@@ -804,27 +836,9 @@ def run_init(args: argparse.Namespace) -> int:
         return 0
 
     if not yes:
-        report.say("  Will do:")
-        _print_actions(report, plan, True, preset)
-        try:
-            answer = input("  Proceed? [Y/n] ").strip().lower()
-        except EOFError:
-            # Not a decline: stdin is closed (a script that forgot --yes) and nothing was done.
-            report.say()
-            report.error("no answer to the prompt (end of input); nothing was written. "
-                         "Re-run with --yes to skip the prompt.")
-            report.finish("aborted", scope, False, plan)
-            return 1
-        except KeyboardInterrupt:
-            report.say()
-            report.say("  Aborted.")
-            report.finish("aborted", scope, False, plan)
-            return 130
-        if answer and answer not in ("y", "yes"):
-            report.say("  Aborted.")
-            report.finish("aborted", scope, False, plan)
-            return 0
-        report.say()
+        code = _confirm_plan(report, plan, preset, scope)
+        if code is not None:
+            return code
 
     actions: List[Step] = []
     try:
@@ -838,37 +852,8 @@ def run_init(args: argparse.Namespace) -> int:
     _print_actions(report, actions, False, preset)
     _report_hook(report, root, actions)
 
-    failed = [a for a in actions if a.result == "failed"]
-    for action in failed:
-        report.error(f"{action.target}: registration failed ({action.detail}). Run it yourself: "
-                     f"{display_command(action.command or [])}")
-    manual = sum(1 for a in actions if a.result == "manual")
-    report.say()
-    if failed:
-        report.say("  Done, with errors (see above).")
-    elif manual:
-        # The host CLI is not installed here; nothing is governed until the user runs it.
-        report.say(f"  Done, but {manual} host{'s are' if manual > 1 else ' is'} not registered until you run the "
-                   f"command{'s' if manual > 1 else ''} above.")
-    elif ctx.selected:
-        report.say("  Done! Your next agent session will be governed.")
-    else:
-        report.say("  Done! No agent host was registered; to add one: aegis init --host HOST[,HOST]")
-    report.say()
-    _print_card(report, root)
-    report.say("  After a session, run: aegis status")
-    report.say()
-    _report_ci(report, actions)
-    if not json_mode:
-        try:
-            from aegis_cli.pathcheck import build_hint
-
-            hint = build_hint()
-            if hint:
-                print(hint)
-                print()
-        except (OSError, RuntimeError):
-            pass
+    failed = _print_outcome(report, ctx, root, actions)
+    _print_path_hint(json_mode)
     report.finish("failed" if failed else "ok", scope, False, actions)
     return 1 if failed else 0
 
@@ -893,7 +878,7 @@ class InitCommand(AegisCommand):
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--host",
-            type=_host_option,
+            type=host_option,
             default=None,
             metavar="HOST[,HOST]|auto",
             help=_host_help(),
@@ -901,7 +886,7 @@ class InitCommand(AegisCommand):
         parser.add_argument(
             "--rules",
             choices=list(RULE_PRESETS),
-            default="standard",
+            default=DEFAULT_RULE_PRESET,
             help="Starter rules: guidance seeded into .aegis/rules/personas/ (minimal 2, standard 5, full every "
                  "shipped one), which applies to no file until you set its target_paths; a new workspace also gets "
                  "one active rule, the no-eval invariant in .aegis/rules/invariants/ (bans eval and exec in "

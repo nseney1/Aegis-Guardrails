@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 
 import pytest
 
@@ -142,3 +145,65 @@ def test_a_refusal_found_only_when_applying_is_a_json_report_and_exit_1(tmp_path
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "refused" and "lock: it is a symlink" in report["refusal"]
     assert list(outside.iterdir()) == []
+
+
+# ── R-cli-38: --apply reports the modes it tightened ─────────────────────────
+
+posix_git = pytest.mark.skipif(os.name == "nt" or shutil.which("git") is None,
+                               reason="POSIX permission bits and git")
+
+
+@pytest.fixture
+def loose_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Given a v4 git workspace whose shared ledger is 0666."""
+    from aegis_core import storage
+    from tests import helpers_humangate as hg
+
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(tmp_path / "home"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    repo = hg.make_repo(tmp_path)
+    site = storage.ledger_site(repo.root)
+    storage.append_jsonl(site.path, [{"v": 2}])
+    os.chmod(site.path, 0o666)
+    return repo.root, site.path
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+@posix_git
+def test_apply_says_it_tightened_the_loose_state_and_a_second_apply_says_nothing(loose_ledger, capsys):
+    root, ledger = loose_ledger
+    assert main(["migrate", "--workspace", str(root), "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert _mode(ledger) == 0o600
+    assert "state modes: tightened 1 of 1 loose entries" in out
+    assert "looser" not in out and "tightens them" not in out
+
+    assert main(["migrate", "--workspace", str(root), "--apply"]) == 0
+    assert "state modes" not in capsys.readouterr().out
+
+
+@posix_git
+def test_a_dry_run_offers_to_tighten_and_changes_no_mode(loose_ledger, capsys):
+    root, ledger = loose_ledger
+    assert main(["migrate", "--workspace", str(root)]) == 0
+    out = capsys.readouterr().out
+    assert "state modes: 1 entries in the shared state are looser than 0700/0600 (--apply tightens them)" in out
+    assert _mode(ledger) == 0o666
+
+
+@posix_git
+def test_a_chmod_that_fails_is_reported_as_not_tightened(loose_ledger, capsys, monkeypatch):
+    from aegis_core import storage
+
+    root, ledger = loose_ledger
+    monkeypatch.setattr(storage, "_chmod_exact", lambda path, mode, is_dir: False)
+    assert main(["migrate", "--workspace", str(root), "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "state modes: tightened 0 of 1 loose entries" in out and "tightens them" not in out
+    assert _mode(ledger) == 0o666

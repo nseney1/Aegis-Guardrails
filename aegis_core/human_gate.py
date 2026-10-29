@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-import fnmatch
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import itertools
 import json
@@ -14,45 +13,39 @@ import posixpath
 import re
 import shutil
 import struct
-import subprocess
 import tempfile
-from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
-from aegis_core import gitsafe, governance, pathlookup
-from aegis_core._version import __version__
+from aegis_core import primitives
+from aegis_core import codeowners as _codeowners
+from aegis_core import ghcli, gitsafe, governance, pathlookup
 from aegis_core.errors import AegisError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
-from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
 __all__ = [
     "ALLOWED_SIGNERS",
     "Approval",
-    "COVERAGE_SAMPLES",
     "GITHUB_ACTIONS_APP_ID",
-    "GhResult",
     "HumanGateError",
     "INSIGHT_APPROVE_TRAILER",
     "KeyCustody",
-    "RULESET_NAME",
+    "PullRequest",
     "SCHEMA",
     "SOURCE",
     "TierReport",
     "aegis_check_jobs",
     "approval_message",
-    "build_ruleset",
     "check_key_custody",
-    "codeowners_coverage",
-    "codeowners_lines",
-    "create_ruleset",
-    "default_gh_runner",
     "detect_tier",
     "exemption_message",
     "find_approval",
+    "find_review_approval",
+    "is_branch_name",
     "find_test_exemption",
     "governance_tree_hash",
     "insight_text_hash",
-    "ruleset_exists",
     "signed_empty_commit",
     "signers_setup",
     "signing_config",
@@ -65,11 +58,9 @@ __all__ = [
 SCHEMA = "aegis.human_gate/v1"
 SOURCE = "aegis human_gate"
 ALLOWED_SIGNERS = "allowed_signers"
-RULESET_NAME = "aegis-human-gate"
 INSIGHT_APPROVE_TRAILER = "Aegis-Approve-Insight"
 # github.com's GitHub Actions app: a required check sourced from it cannot be posted by a token.
 GITHUB_ACTIONS_APP_ID = 15368
-GH_TIMEOUT_SECONDS = 10.0
 SIGN_TIMEOUT_SECONDS = 300.0
 HASH_DOMAIN = b"aegis-governance-tree/v1\n"
 MAX_SCANNED_COMMITS = 500
@@ -83,39 +74,6 @@ _STATEMENTS = {
     "B": "governance changes need a signature from a key listed in allowed_signers on the base branch",
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
-COVERAGE_SAMPLES: Tuple[str, ...] = (
-    f"{RULES_RELDIR}/trap/sample.md",
-    f"{AEGIS_DIRNAME}/config.json",
-    f"{AEGIS_DIRNAME}/team.json",
-    f"{AEGIS_DIRNAME}/baseline.json",
-    f"{AEGIS_DIRNAME}/adjudications/r.jsonl",
-    f"svc/{RULES_RELDIR}/gates/x.md",
-    f"svc/{AEGIS_DIRNAME}/adjudications/r.jsonl",
-    f"svc/{AEGIS_DIRNAME}/config.json",
-    f"svc/{AEGIS_DIRNAME}/team.json",
-    f"svc/{AEGIS_DIRNAME}/baseline.json",
-    "allowed_signers",
-    ".github/workflows/ci.yml",
-    "conftest.py",
-    "pytest.ini",
-    ".pytest.ini",
-    "pytest.toml",
-    ".pytest.toml",
-    "tox.ini",
-    "setup.cfg",
-    "pyproject.toml",
-    "sitecustomize.py",
-    "evil.pth",
-    "Makefile",
-    *(f"{name}.py" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__init__.py" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__init__.pyc" for name in governance.RUNNER_MODULES),
-    *(f"{name}/__main__.py" for name in governance.RUNNER_MODULES),
-)
-_CODEOWNERS_LOCATIONS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
-_OWNER = re.compile(r"\A(?:@[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9._-]+)?|[^@\s]+@[^@\s]+\.[^@\s]+)\Z")
-_MAX_CODEOWNERS_LINES = 5000
-_MAX_PATTERN = 300
 _ACCEPT_LINE = re.compile(r"^[ \t]*aegis-accept[ \t]*:", re.IGNORECASE | re.MULTILINE)
 _APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 _APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
@@ -128,7 +86,9 @@ _JOB_NAME = re.compile(r"""^    name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^#\n]*?))[ \
 _JOB_MATRIX = re.compile(r"^    strategy:.*\bmatrix\b|^      matrix[ \t]*:")
 _AEGIS_CHECK_CI = re.compile(r"(?:\baegis|-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check\b[^\n]*?[ \t]--ci(?![\w-])")
 # The whole of a script that fails exactly when aegis fails, in any built-in shell: no operator, quote or expansion.
-_DIRECT_CHECK = re.compile(r"(?:aegis|python3?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?:[ \t]+[\w./=:@%+,-]+)*")
+# `-I` (isolated mode, which keeps the checkout off sys.path so the installed wheel runs) is the one
+# interpreter flag accepted; it cannot change the exit status.
+_DIRECT_CHECK = re.compile(r"(?:aegis|python3?(?:[ \t]+-I)?[ \t]+-m[ \t]+aegis_cli(?:\.cli)?)[ \t]+check(?:[ \t]+[\w./=:@%+,-]+)*")
 _KEY = re.compile(r"""["']?([\w-]+)["']?[ \t]*:(?:[ \t]+(.*))?""")
 _ALWAYS = re.compile(r"""(["']?)(?:\$\{\{[ \t]*always\(\)[ \t]*\}\}|always\(\))\1""")
 _SHELLS = ("bash", "sh", "pwsh", "powershell", "cmd", "python")
@@ -145,209 +105,11 @@ class HumanGateError(AegisError):
     """git or the signing program cannot answer, or an input cannot be trusted."""
 
 
-class GhResult(NamedTuple):
-    returncode: int
-    stdout: str
-    stderr: str
-
-
-GhRunner = Callable[..., Optional[GhResult]]
-
-
-def default_gh_runner(
-    argv: Sequence[str],
-    stdin: Optional[bytes] = None,
-    cwd: Any = None,
-    timeout: float = GH_TIMEOUT_SECONDS,
-) -> Optional[GhResult]:
-    exe = pathlookup.which("gh", outside=cwd)
-    if exe is None:
-        return None
-    env = {
-        **os.environ,
-        "GH_PROMPT_DISABLED": "1",
-        "GH_NO_UPDATE_NOTIFIER": "1",
-        "NO_COLOR": "1",
-    }
-    try:
-        proc = subprocess.run(
-            [exe, *argv],
-            input=stdin,
-            stdin=None if stdin is not None else subprocess.DEVNULL,
-            capture_output=True,
-            env=env,
-            cwd=None if cwd is None else str(cwd),
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return GhResult(124, "", f"gh timed out after {timeout:g}s")
-    except OSError as exc:
-        return GhResult(126, "", f"cannot run gh: {exc}")
-    return GhResult(
-        proc.returncode,
-        proc.stdout.decode("utf-8", "replace"),
-        proc.stderr.decode("utf-8", "replace"),
-    )
-
-
-_real_default_gh_runner = default_gh_runner
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _parse_codeowners(text: str, *, org_login: Optional[str] = None) -> List[Tuple[str, Tuple[str, ...]]]:
-    # GitHub ignores the bare handle of the organization that owns the repository (it takes a user,
-    # @org/team or an email), so that owner is dropped when the caller knows the owner is one.
-    org_handle = f"@{org_login}".lower() if org_login else None
-    entries: List[Tuple[str, Tuple[str, ...]]] = []
-    for line in text.splitlines()[:_MAX_CODEOWNERS_LINES]:
-        tokens = line.strip().split()
-        if not tokens or tokens[0].startswith("#"):
-            continue
-        owners: List[str] = []
-        for token in tokens[1:]:
-            if token.startswith("#"):
-                break
-            if _OWNER.match(token) and token.lower() != org_handle:
-                owners.append(token)
-        entries.append((tokens[0], tuple(owners)))
-    return entries
-
-
-def _segment_match(pattern: str, text: str) -> bool:
-    return fnmatch.fnmatchcase(text, pattern.replace("**", "*"))
-
-
-def _prefix_ends(segments: List[str], parts: List[str], start: int) -> List[int]:
-    ends = {start} if not segments else set()
-    reach = {(0, start)}
-    seen = set()
-    while reach:
-        si, pi = reach.pop()
-        if (si, pi) in seen:
-            continue
-        seen.add((si, pi))
-        if si == len(segments):
-            ends.add(pi)
-            continue
-        seg = segments[si]
-        if seg == "**":
-            for end in range(pi, len(parts) + 1):
-                reach.add((si + 1, end))
-        elif pi < len(parts) and _segment_match(seg.replace("**", "*"), parts[pi]):
-            reach.add((si + 1, pi + 1))
-    return sorted(ends)
-
-
-def _codeowners_match(pattern: str, path: str) -> bool:
-    if (
-        not pattern
-        or len(pattern) > _MAX_PATTERN
-        or pattern[0] == "!"
-        or any(c in pattern for c in "[]\\")
-    ):
-        return False
-    directory = pattern.endswith("/")
-    core = pattern.strip("/")
-    if not core:
-        return False
-    anchored = pattern.startswith("/") or "/" in core
-    segments = core.split("/")
-    parts = path.split("/")
-    starts = [0] if anchored else range(len(parts))
-    for start in starts:
-        for end in _prefix_ends(segments, parts, start):
-            if (end == len(parts) and not directory) or (end > start and directory):
-                return True
-    return False
-
-
-def codeowners_coverage(
-    text: str,
-    location: str = "CODEOWNERS",
-    *,
-    repo_paths: Sequence[str] = (),
-    org_login: Optional[str] = None,
-) -> Tuple[List[str], List[str]]:
-    entries = _parse_codeowners(text, org_login=org_login)
-    covered: List[str] = []
-    uncovered: List[str] = []
-    unsupported = any(any(c in pat for c in "[]\\") for pat, _ in entries)
-    targets = dict.fromkeys(
-        (
-            *COVERAGE_SAMPLES,
-            location.lstrip("/"),
-            *(p.lstrip("/") for p in repo_paths if p and p.lstrip("/")),
-        )
-    )
-    for path in targets:
-        owners: Tuple[str, ...] = ()
-        if not unsupported:
-            for pattern, found in entries:
-                if pattern.startswith("!"):
-                    if not pattern[1:] or _codeowners_match(pattern[1:], path):
-                        owners = ()
-                elif _codeowners_match(pattern, path):
-                    owners = found
-        if owners:
-            covered.append(path)
-        else:
-            uncovered.append(path)
-    return covered, uncovered
-
-
-def codeowners_lines(owner: str = "@OWNER") -> List[str]:
-    paths = [
-        f"/{RULES_RELDIR}/",
-        f"/{AEGIS_DIRNAME}/config.json",
-        f"/{AEGIS_DIRNAME}/team.json",
-        f"/{AEGIS_DIRNAME}/baseline.json",
-        f"/{AEGIS_DIRNAME}/adjudications/",
-        # A workspace below the root has its own .aegis; a leading **/ matches at any depth
-        # (the root included) both here and on GitHub.
-        f"**/{RULES_RELDIR}/",
-        f"**/{AEGIS_DIRNAME}/adjudications/",
-        f"**/{AEGIS_DIRNAME}/config.json",
-        f"**/{AEGIS_DIRNAME}/team.json",
-        f"**/{AEGIS_DIRNAME}/baseline.json",
-        "/allowed_signers",
-        "/CODEOWNERS",
-        "/.github/CODEOWNERS",
-        "/.github/workflows/",
-        "conftest.py",
-        "pytest.ini",
-        ".pytest.ini",
-        "pytest.toml",
-        ".pytest.toml",
-        "tox.ini",
-        "setup.cfg",
-        "pyproject.toml",
-        "sitecustomize.py",
-        "*.pth",
-        "Makefile",
-        *(f"{name}.*" for name in governance.RUNNER_MODULES),
-        *(f"/{name}/" for name in governance.RUNNER_MODULES),
-    ]
-    return [f"{path} {owner}" for path in paths]
-
-
-@dataclass(frozen=True)
-class KeyCustody:
+class KeyCustody(NamedTuple):
     status: str
     detail: str
     degrades: bool
     key: Optional[str] = None
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "status": self.status,
-            "detail": self.detail,
-            "degrades": self.degrades,
-            "key": self.key,
-        }
 
 
 def _user_config(root: Path, key: str) -> Optional[str]:
@@ -480,7 +242,7 @@ class TierReport:
     caveats: Tuple[str, ...] = ()
     evidence: Mapping[str, Any] = field(default_factory=dict)
     scope: Mapping[str, Any] = field(default_factory=dict)
-    checked_at: str = field(default_factory=_utc_now)
+    checked_at: str = field(default_factory=utc_stamp)
 
     @property
     def label(self) -> str:
@@ -490,28 +252,9 @@ class TierReport:
     def statement(self) -> str:
         return _STATEMENTS[self.tier]
 
-    @property
-    def codeowners_complete(self) -> bool:
-        return bool(
-            isinstance(self.evidence.get("codeowners"), Mapping)
-            and self.evidence["codeowners"].get("present")
-            and not self.evidence["codeowners"].get("uncovered")
-        )
-
-    def text_lines(self) -> List[str]:
-        return [
-            f"Trust tier (human_gate): {self.tier} ({self.label}): {self.statement}",
-            *(f"  - {r}" for r in self.reasons),
-            *(f"  ! {c}" for c in self.caveats),
-        ]
-
     def as_dict(self) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA,
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": self.checked_at,
-            "scope": dict(self.scope),
+            **primitives.envelope(SOURCE, dict(self.scope), schema=SCHEMA, checked_at=self.checked_at),
             "tier": self.tier,
             "label": self.label,
             "statement": self.statement,
@@ -519,19 +262,6 @@ class TierReport:
             "caveats": list(self.caveats),
             "evidence": json.loads(json.dumps(self.evidence)),
         }
-
-
-def _gh_json(runner: GhRunner, endpoint: str, cwd: Path) -> Tuple[Any, Optional[str]]:
-    result = runner(["api", "--method", "GET", endpoint], None, cwd)
-    if result is None:
-        return None, "gh is not installed"
-    if result.returncode != 0:
-        detail = " ".join((result.stderr or result.stdout).split())[:200] or f"exit {result.returncode}"
-        return None, f"gh api {endpoint} failed: {detail}"
-    try:
-        return json.loads(result.stdout), None
-    except ValueError:
-        return None, f"gh api {endpoint} did not return JSON"
 
 
 def _signer_keys(text: Optional[bytes]) -> int:
@@ -555,6 +285,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
     approvals = 0
     owners = False
     dismisses = False
+    last_push = False
     contexts: List[str] = []
     unpinned: List[str] = []
     has_pr = False
@@ -569,6 +300,7 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
             approvals = max(approvals, valid_count)
             owners = owners or params.get("require_code_owner_review") is True
             dismisses = dismisses or params.get("dismiss_stale_reviews_on_push") is True
+            last_push = last_push or params.get("require_last_push_approval") is True
         elif rule.get("type") == "required_status_checks":
             for check in params.get("required_status_checks") or []:
                 if not isinstance(check, dict) or not isinstance(check.get("context"), str):
@@ -584,18 +316,49 @@ def _ruleset_facts(rules: Any) -> Dict[str, Any]:
         "required_approving_review_count": approvals,
         "require_code_owner_review": owners,
         "dismiss_stale_reviews_on_push": dismisses,
+        "require_last_push_approval": last_push,
         "required_status_checks": contexts,
         "unpinned_status_checks": unpinned,
     }
 
 
-def detect_tier(
-    root: Any,
-    gh: Optional[GhRunner] = None,
-    environ: Optional[Mapping[str, str]] = None,
-) -> TierReport:
+# Spec 2.2's tier requirements, one row each: (key, the tiers it blocks, unmet when, why). Reasons keep
+# this order; a row for both tiers is one reason, listed once in tier C.
+_TIER_REQUIREMENTS: Tuple[Tuple[str, str, Callable[[Mapping[str, Any]], Any], Any], ...] = (
+    ("ruleset", "AB", lambda n: n["rules"] is None, "the default branch's ruleset was not read"),
+    ("review", "A", lambda n: n["rules"] is not None and n["rules"]["required_approving_review_count"] < 1,
+     "the default branch does not require an approving review"),
+    ("code-owners", "A", lambda n: n["rules"] is not None and not n["rules"]["require_code_owner_review"],
+     "the default branch does not require code-owner review"),
+    ("stale", "A", lambda n: n["rules"] is not None and not n["rules"]["dismiss_stale_reviews_on_push"],
+     "the default branch keeps an approval after new commits are pushed, so a pull request can change after its "
+     "review and still merge (set dismiss_stale_reviews_on_push)"),
+    ("checks", "AB", lambda n: n["rules"] is not None and not n["checks"],
+     "the default branch has no required status checks"),
+    ("unpinned", "B", lambda n: n["unpinned"], lambda n: n["unpinned"]),
+    ("aegis-job", "AB", lambda n: n["workflow"], lambda n: n["workflow"]),
+    ("codeowners", "A", lambda n: not n["codeowners"]["present"], "no CODEOWNERS file on the base branch"),
+    ("uncovered", "A", lambda n: n["codeowners"]["present"] and n["codeowners"]["uncovered"],
+     lambda n: f"CODEOWNERS leaves {len(n['codeowners']['uncovered'])} governance path(s) without an owner"),
+    ("bare-org", "A", lambda n: n["bare_org"],
+     lambda n: f"CODEOWNERS names @{n['org']}, the organization that owns this repository, which GitHub ignores as a "
+               f"code owner: name a team (@{n['org']}/<team>) or people"),
+    ("admin", "A", lambda n: n["admin"] is True,
+     "the gh identity doctor used is an admin: re-run with the token the agent would hold"),
+    ("admin-unknown", "A", lambda n: n["admin"] is None, "whether the gh identity is an admin is unknown"),
+    ("signers", "B", lambda n: n["signers"]["keys"] < 1, f"{ALLOWED_SIGNERS} on the base branch lists no signing key"),
+    ("custody", "B", lambda n: n["custody"].degrades, lambda n: n["custody"].detail),
+)
+
+
+def _unmet(tier: str, need: Mapping[str, Any]) -> List[str]:
+    return [why if isinstance(why, str) else why(need)
+            for _key, tiers, unmet, why in _TIER_REQUIREMENTS if tier in tiers and unmet(need)]
+
+
+def detect_tier(root: Any, gh: Optional[ghcli.GhRunner] = None) -> TierReport:
     root = Path(root)
-    runner: GhRunner = gh if gh is not None else default_gh_runner
+    runner: ghcli.GhRunner = gh if gh is not None else ghcli.default_gh_runner
     top = gitsafe.toplevel(root)
     evidence: Dict[str, Any] = {
         "gh": {"available": None, "error": None},
@@ -617,7 +380,7 @@ def detect_tier(
 
     reasons: List[str] = []
     caveats: List[str] = []
-    repo_info, why = _gh_json(runner, "repos/{owner}/{repo}", top)
+    repo_info, why = ghcli.gh_json(runner, "repos/{owner}/{repo}", top)
     facts: Optional[Dict[str, Any]] = None
     default_branch: Optional[str] = None
     admin: Optional[bool] = None
@@ -643,7 +406,7 @@ def detect_tier(
                             "owner": {"login": login, "type": kind} if known else None}
         evidence["identity"] = {"admin": admin}
         if default_branch:
-            rules, why = _gh_json(
+            rules, why = ghcli.gh_json(
                 runner,
                 "repos/{owner}/{repo}/rules/branches/" + quote(default_branch, safe=""),
                 top,
@@ -668,16 +431,16 @@ def detect_tier(
         "present": False,
         "path": None,
         "covered": [],
-        "uncovered": list(dict.fromkeys((*COVERAGE_SAMPLES, *tracked_gov))),
+        "uncovered": list(dict.fromkeys((*_codeowners.COVERAGE_SAMPLES, *tracked_gov))),
     }
     signers: Dict[str, Any] = {"present": False, "keys": 0}
     bare_org = False
     if base is not None:
-        for location in _CODEOWNERS_LOCATIONS:
+        for location in _codeowners.CODEOWNERS_LOCATIONS:
             blob = _blob(top, base, location)
             if blob is not None:
                 text = blob.decode("utf-8", "replace")
-                covered, uncovered = codeowners_coverage(text, location, repo_paths=tracked_gov, org_login=org_login)
+                covered, uncovered = _codeowners.codeowners_coverage(text, location, repo_paths=tracked_gov, org_login=org_login)
                 codeowners = {
                     "present": True,
                     "path": location,
@@ -685,7 +448,7 @@ def detect_tier(
                     "uncovered": uncovered,
                 }
                 bare_org = bool(org_login) and any(
-                    o.lower() == f"@{org_login}".lower() for _p, found in _parse_codeowners(text) for o in found
+                    o.lower() == f"@{org_login}".lower() for _p, found in _codeowners.parse_codeowners(text) for o in found
                 )
                 break
         blob = _blob(top, base, ALLOWED_SIGNERS)
@@ -696,56 +459,13 @@ def detect_tier(
     evidence["aegis_checks"] = {"jobs": sorted(aegis_jobs),
                                 "path_filtered": sorted(j for j, why in aegis_jobs.items() if why == _PATH_FILTER_WHY)}
     custody = check_key_custody(top)
-    evidence["key_custody"] = custody.as_dict()
+    evidence["key_custody"] = custody._asdict()
 
-    checks = facts["required_status_checks"] if facts else []
     unpinned_why, workflow_why = _required_check_gaps(facts, aegis_jobs)
-    a_missing: List[str] = []
-    if facts is None:
-        a_missing.append("the default branch's ruleset was not read")
-    else:
-        if facts["required_approving_review_count"] < 1:
-            a_missing.append("the default branch does not require an approving review")
-        if not facts["require_code_owner_review"]:
-            a_missing.append("the default branch does not require code-owner review")
-        if not facts["dismiss_stale_reviews_on_push"]:
-            a_missing.append(
-                "the default branch keeps an approval after new commits are pushed, so a pull request can change "
-                "after its review and still merge (set dismiss_stale_reviews_on_push)"
-            )
-        if not checks:
-            a_missing.append("the default branch has no required status checks")
-        elif workflow_why:
-            a_missing.append(workflow_why)
-    if not codeowners["present"]:
-        a_missing.append("no CODEOWNERS file on the base branch")
-    elif codeowners["uncovered"]:
-        a_missing.append(f"CODEOWNERS leaves {len(codeowners['uncovered'])} governance path(s) without an owner")
-    if bare_org:
-        a_missing.append(
-            f"CODEOWNERS names @{org_login}, the organization that owns this repository, which GitHub ignores as a "
-            f"code owner: name a team (@{org_login}/<team>) or people"
-        )
-    if admin is True:
-        a_missing.append(
-            "the gh identity doctor used is a repository admin, who can edit the ruleset (an agent needs its own non-admin identity)"
-        )
-    elif admin is None:
-        a_missing.append("whether the gh identity is an admin is unknown")
-
-    b_missing: List[str] = []
-    if facts is None:
-        b_missing.append("the default branch's ruleset was not read")
-    elif not checks:
-        b_missing.append("the default branch has no required status checks")
-    elif unpinned_why:
-        b_missing.append(unpinned_why)
-    if workflow_why:
-        b_missing.append(workflow_why)
-    if signers["keys"] < 1:
-        b_missing.append(f"{ALLOWED_SIGNERS} on the base branch lists no signing key")
-    if custody.degrades:
-        b_missing.append(custody.detail)
+    need = {"rules": facts, "checks": facts["required_status_checks"] if facts else [], "unpinned": unpinned_why,
+            "workflow": workflow_why, "codeowners": codeowners, "bare_org": bare_org, "org": org_login, "admin": admin,
+            "signers": signers, "custody": custody}
+    a_missing, b_missing = _unmet("A", need), _unmet("B", need)
 
     if not a_missing:
         tier = "A"
@@ -935,6 +655,7 @@ class Approval(NamedTuple):
     reason: str
     commit: str
     signer: Optional[str] = None
+    source: str = "signature"  # or "review": tier A's approving review (find_review_approval)
 
     @property
     def ok(self) -> bool:
@@ -942,19 +663,17 @@ class Approval(NamedTuple):
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA,
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": _utc_now(),
-            "scope": {
+            **primitives.envelope(SOURCE, {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
                 "commit": self.commit,
-            },
+            }, schema=SCHEMA),
             "valid": self.valid,
             "code": self.code,
             "reason": self.reason,
             "signer": self.signer,
+            # not "source": that key names the producer in every envelope
+            "method": self.source,
         }
 
 
@@ -1077,11 +796,13 @@ _APPROVE_OK = "good signature by a key in the base allowed_signers"
 _FULL_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
+@gitsafe.scrubbed()
 def verify_approval(root: Any, commit: str, governance_hash: str, base_ref: str) -> Approval:
     return _verify_single_trailer(root, commit, base_ref, _APPROVE_LINE, "Aegis-Approve", governance_hash,
                                   _APPROVE_MISMATCH, _APPROVE_OK)
 
 
+@gitsafe.scrubbed()
 def verify_insight_approval(workspace: Any, commit: str, text: str, base_ref: Optional[str] = None) -> Approval:
     if not isinstance(commit, str) or not commit.strip() or not isinstance(text, str) or not text.strip():
         return _no("invalid_input", "commit and insight text must be non-empty", str(commit or ""))
@@ -1097,6 +818,7 @@ def verify_insight_approval(workspace: Any, commit: str, text: str, base_ref: Op
     )
 
 
+@gitsafe.scrubbed()
 def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base_ref: str) -> Approval:
     """No reason binding: the signature names the fix's full oid, which already commits to its message."""
     try:
@@ -1171,6 +893,7 @@ def _signature(top: Path, oid: str, signers: bytes) -> Tuple[str, Optional[str]]
     return status, fingerprint
 
 
+@gitsafe.scrubbed()
 def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional[str] = None) -> Optional[Approval]:
     """The newest valid ``Aegis-Approve`` commit in ``merge-base(base_ref, head)..head`` (at most
     MAX_SCANNED_COMMITS), or None. One ``git log`` reads every message, so only commits that carry an
@@ -1196,6 +919,84 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
     return None
 
 
+class PullRequest(NamedTuple):
+    """The pull request a CI job checks, as the caller validated it from the Actions event file.
+    ``base_ref``: the branch it merges into (``pull_request.base.ref``), whose rules gate the merge."""
+    number: int
+    author: str
+    head: str
+    base_ref: str
+
+
+_REVIEWER_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+_REVIEW_PAGE = 100
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
+
+
+def is_branch_name(name: Any) -> bool:
+    """Whether ``name`` is a branch name safe to put in a GitHub API path: git's ref-name rules over a
+    conservative character set. Anything else is refused, never escaped into a different request."""
+    return (isinstance(name, str) and _BRANCH_NAME.fullmatch(name) is not None and ".." not in name
+            and "//" not in name and "/." not in name and ".lock/" not in name
+            and not name.endswith(("/", ".", ".lock")))
+
+
+def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequence[str],
+                         gh: Optional[ghcli.GhRunner] = None) -> Optional[Approval]:
+    """Tier A's approval of a flagged change: some reviewer's latest review of ``pull`` is APPROVED on its
+    head commit, by a person (account type User) other than its author whose ``author_association`` is
+    OWNER, MEMBER or COLLABORATOR. An association is not a permission: write access is not checked here.
+    What makes the review count is the merge gate: the rules GitHub applies to the pull request's own
+    base branch (``pull.base_ref``, never the default branch's) require an approval, code-owner review,
+    stale approvals dismissed on push and the last push approved by someone other than its pusher (so
+    whoever pushed the head cannot be the approving reviewer), and the CODEOWNERS at ``base`` owns every
+    one of ``paths`` (repository-relative); the reviews are read only then. Read-only gh GETs; None whenever anything
+    cannot be read or does not hold (a base branch name in doubt reads nothing), so a missing gh, token
+    or permission fails closed."""
+    if not is_branch_name(pull.base_ref):
+        return None
+    runner: ghcli.GhRunner = gh if gh is not None else ghcli.default_gh_runner
+    top = _top(root)
+    repo, why = ghcli.gh_json(runner, "repos/{owner}/{repo}", top)
+    if why is not None or not isinstance(repo, dict):
+        return None
+    rules, why = ghcli.gh_json(runner, "repos/{owner}/{repo}/rules/branches/" + quote(pull.base_ref, safe=""), top)
+    facts = _ruleset_facts(rules) if why is None else None
+    if not facts or facts["required_approving_review_count"] < 1 or not facts["require_code_owner_review"] \
+            or not facts["dismiss_stale_reviews_on_push"] or not facts["require_last_push_approval"]:
+        return None
+    owner = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
+    org = owner.get("login") if owner.get("type") == "Organization" and isinstance(owner.get("login"), str) else None
+    text: Optional[str] = None
+    for location in _codeowners.CODEOWNERS_LOCATIONS:  # GitHub reads the first one present
+        blob = _blob(top, base, location)
+        if blob is not None:
+            text = blob.decode("utf-8", "replace")
+            break
+    if text is None or _codeowners.codeowners_coverage(text, location, repo_paths=paths, org_login=org)[1]:
+        return None
+    reviews, why = ghcli.gh_json(runner, f"repos/{{owner}}/{{repo}}/pulls/{pull.number}/reviews?per_page={_REVIEW_PAGE}", top)
+    # A full page may hide later reviews (a change request, a dismissal), so it never approves.
+    if why is not None or not isinstance(reviews, list) or len(reviews) >= _REVIEW_PAGE:
+        return None
+    latest: Dict[str, Dict[str, Any]] = {}
+    for item in reviews:
+        user = item.get("user") if isinstance(item, dict) else None
+        login = user.get("login") if isinstance(user, dict) else None
+        if isinstance(login, str) and login:
+            latest[login.lower()] = item  # the list is oldest first: keep each reviewer's last word
+    for login, item in latest.items():
+        # A person's review only: an app or bot account may act for the agent.
+        if (item.get("state") == "APPROVED" and str(item.get("commit_id") or "").lower() == pull.head.lower()
+                and login != pull.author.lower() and item.get("author_association") in _REVIEWER_ASSOCIATIONS
+                and item["user"].get("type") == "User"):
+            name = item["user"]["login"]
+            return Approval(True, "ok", f"an approving review of the head commit by {name}, not its author",
+                            pull.head.lower(), name, "review")
+    return None
+
+
+@gitsafe.scrubbed()
 def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
     """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
     trailer names it (so a refusal can say why); else None."""
@@ -1219,7 +1020,9 @@ def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) ->
     return rejected
 
 
-def signed_empty_commit(root: Any, message: str) -> str:
+def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -> str:
+    """``interactive``: a person at the caller's terminal; ssh-keygen asks there for a key passphrase
+    (with stdin on /dev/null it would try ssh-askpass instead)."""
     top = _top(root)
     config = signing_config(top)
     if config["format"] != "ssh" or not config["key"]:
@@ -1248,6 +1051,7 @@ def signed_empty_commit(root: Any, message: str) -> str:
         ],
         top,
         timeout=SIGN_TIMEOUT_SECONDS,
+        tty=interactive,
     )
     if res.returncode != 0:
         detail = " ".join((res.stderr or res.stdout).decode("utf-8", "replace").split())[:300]
@@ -1256,40 +1060,6 @@ def signed_empty_commit(root: Any, message: str) -> str:
     if not commit:
         raise HumanGateError("the signed commit was made but HEAD cannot be read")
     return commit
-
-
-def build_ruleset(tier: str, contexts: Iterable[str]) -> Dict[str, Any]:
-    if tier not in ("A", "B"):
-        raise ValueError(f"tier must be 'A' or 'B', got {tier!r}")
-    reviewed = tier == "A"
-    return {
-        "name": RULESET_NAME,
-        "target": "branch",
-        "enforcement": "active",
-        "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
-        "bypass_actors": [],
-        "rules": [
-            {"type": "deletion"},
-            {"type": "non_fast_forward"},
-            {
-                "type": "pull_request",
-                "parameters": {
-                    "required_approving_review_count": 1 if reviewed else 0,
-                    "dismiss_stale_reviews_on_push": True,
-                    "require_code_owner_review": reviewed,
-                    "require_last_push_approval": reviewed,
-                    "required_review_thread_resolution": False,
-                },
-            },
-            {
-                "type": "required_status_checks",
-                "parameters": {
-                    "strict_required_status_checks_policy": False,
-                    "required_status_checks": [{"context": c, "integration_id": GITHUB_ACTIONS_APP_ID} for c in contexts],
-                },
-            },
-        ],
-    }
 
 
 def aegis_check_jobs(text: str) -> List[str]:
@@ -1426,32 +1196,6 @@ def _aegis_job_verdicts(text: str) -> Dict[str, Optional[str]]:
             why = _skip_why(vals) or (None if None in whys else whys[0])
         verdicts[name] = verdicts.get(name) or (f"the Aegis job {name} {why}" if why else None)
     return verdicts
-
-
-def ruleset_exists(root: Any, gh: Optional[GhRunner] = None) -> bool:
-    runner: GhRunner = gh if gh is not None else default_gh_runner
-    listing, why = _gh_json(runner, "repos/{owner}/{repo}/rulesets", Path(root))
-    if why is not None or not isinstance(listing, list):
-        raise HumanGateError(why or "gh api rulesets did not return a list")
-    return any(isinstance(r, dict) and r.get("name") == RULESET_NAME for r in listing)
-
-
-def create_ruleset(root: Any, ruleset: Mapping[str, Any], gh: Optional[GhRunner] = None) -> Dict[str, Any]:
-    runner: GhRunner = gh if gh is not None else default_gh_runner
-    result = runner(
-        ["api", "--method", "POST", "repos/{owner}/{repo}/rulesets", "--input", "-"],
-        json.dumps(ruleset).encode("utf-8"),
-        Path(root),
-    )
-    if result is None:
-        raise HumanGateError("gh is not installed")
-    if result.returncode != 0:
-        raise HumanGateError(f"gh could not create the ruleset: {' '.join(result.stderr.split())[:300]}")
-    try:
-        created = json.loads(result.stdout)
-    except ValueError:
-        created = {}
-    return created if isinstance(created, dict) else {}
 
 
 def signers_setup() -> List[str]:

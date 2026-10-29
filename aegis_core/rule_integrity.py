@@ -1,25 +1,24 @@
 """Rule integrity: git is the witness (v4.3 spec T3)."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import os
-from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
-from aegis_core import gitsafe, governance
+from aegis_core import primitives
+from aegis_core import gitevidence, gitsafe, governance, rule_inventory
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
-from aegis_core.rules import ENFORCEMENT_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
+from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
 from aegis_core.workspace.layout import RULES_RELDIR
 
 __all__ = [
-    "BENIGN_KEYS",
     "BaseAnchor",
     "CiReport",
-    "EXCLUDED_KEYS",
     "Effective",
     "IntegrityError",
     "LOCAL_HEAD_LABEL",
@@ -37,13 +36,6 @@ __all__ = [
 SCHEMA, SOURCE = "aegis.rule_integrity/v1", "aegis check --ci"
 LOCAL_HEAD_LABEL, MANDATORY_SLOT_CAP = "local-head, not review-witnessed", 2
 
-EXCLUDED_KEYS = frozenset({"minimum_mode", "impact_weight", "expiry_days", "expiry_sessions", "expired_at"})
-BENIGN_KEYS = frozenset({
-    "id", "name", "description", "domain", "hypothesis", "prediction", "falsification", "created", "tags",
-    "lineage", "triggers", "persona_name", "origin", "expertise", "expertise_domain", "promotion_threshold", "demotion_threshold",
-})
-_CHECKED_KEYS = frozenset({"detect", "applies_to"})
-_KNOWN_KEYS = ENFORCEMENT_KEYS | EXCLUDED_KEYS | BENIGN_KEYS | _CHECKED_KEYS
 _FORBID_KINDS = ("imports", "calls", "decorators")
 _ENFORCEMENT_ORDER = {name: index for index, name in enumerate(VALID_ENFORCEMENT)}
 _GIT_TIMEOUT, _MD, _MISSING = 60.0, ".md", object()
@@ -61,15 +53,6 @@ class BaseAnchor:
     witnessed: bool
     label: str
 
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "ref": self.ref,
-            "commit": self.commit,
-            "source": self.source,
-            "witnessed": self.witnessed,
-            "label": self.label,
-        }
-
 
 def _user_base_ref(root: str) -> Optional[str]:
     data = read_user_config(root)
@@ -80,44 +63,40 @@ def _user_base_ref(root: str) -> Optional[str]:
     return None
 
 
+def _origin_merge_base(root: str) -> str:
+    # Constant refs need no option guard, and one merge-base resolves both: a failure (no
+    # origin/HEAD, no common history, not a repository) means no origin anchor.
+    try:
+        res = gitsafe.run(["merge-base", gitevidence.ORIGIN_HEAD, "HEAD"], root)
+    except gitsafe.GitError:
+        return ""
+    return os.fsdecode(res.stdout.strip()) if res.returncode == 0 else ""
+
+
 def resolve_base(workspace: Any) -> Optional[BaseAnchor]:
     root = workspace_root(workspace)
+    # Inside a request (a scan) every reader shares one set of repository facts and the merge base
+    # is kept by object id across requests; a lone call asks git only the question it needs.
+    shared = gitsafe.in_memo()
+    facts = gitevidence.repo_facts(root) if shared else None
+    if shared and facts is None:
+        return None
     ref = _user_base_ref(root)
     if ref:
         tip = gitsafe.resolve_commit(root, ref)
         if tip:
             # The fork point, as check --ci and the origin/HEAD anchor compare: a rule the ref changed
             # after the branch forked is not an edit of this branch.
-            fork = gitsafe.merge_base(root, tip, "HEAD")
+            fork = gitevidence.merge_base_with(facts, tip) if shared else gitsafe.merge_base(root, tip, "HEAD")
             note = "" if fork else "; no common history with HEAD, using its tip"
             return BaseAnchor(ref, fork or tip, "user-config", True, f"rules.base_ref {ref} (user config{note})")
-    # Constant refs need no option guard, and one merge-base resolves both: a failure (no
-    # origin/HEAD, no common history, not a repository) means no origin anchor.
-    try:
-        res = gitsafe.run(["merge-base", "refs/remotes/origin/HEAD", "HEAD"], root)
-    except gitsafe.GitError:
-        res = None
-    reviewed = os.fsdecode(res.stdout.strip()) if res is not None and res.returncode == 0 else ""
+    reviewed = gitevidence.merge_base_with(facts) if shared else _origin_merge_base(root)
     if reviewed:
         return BaseAnchor("origin/HEAD", reviewed, "origin-head", True, "merge-base of HEAD and origin/HEAD")
-    head = gitsafe.head_commit(root)
+    head = facts.head if facts is not None else gitsafe.head_commit(root)
     if head:
         return BaseAnchor("HEAD", head, "local-head", False, LOCAL_HEAD_LABEL)
     return None
-
-
-def _run(cwd: str, args: Sequence[str], stdin: Optional[bytes] = None) -> bytes:
-    try:
-        res = gitsafe.run(list(args), cwd, timeout=_GIT_TIMEOUT, stdin=stdin)
-    except gitsafe.GitError as exc:
-        raise IntegrityError(str(exc)) from exc
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise IntegrityError(f"git {args[0]} failed: {detail}")
-    return res.stdout
-
-
-_DEFAULT_RUN = _run
 
 
 def _prefix(root: str) -> str:
@@ -133,7 +112,9 @@ def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
     if not commit or commit.startswith("-"):
         raise IntegrityError(f"invalid revision {commit!r}")
     found: Dict[str, str] = {}
-    for record in _run(cwd, ["ls-tree", "-r", "-z", commit, "--", RULES_RELDIR]).split(b"\0"):
+    listing = gitsafe.run_checked(["ls-tree", "-r", "-z", commit, "--", RULES_RELDIR], cwd, error=IntegrityError,
+                                  timeout=_GIT_TIMEOUT).stdout
+    for record in listing.split(b"\0"):
         meta, sep, raw_path = record.partition(b"\t")
         fields = meta.split()
         path = os.fsdecode(raw_path)
@@ -142,24 +123,11 @@ def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
     return found
 
 
-def _read_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
+def _read_integrity_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
     try:
-        if _run is not _DEFAULT_RUN:
-            wanted = list(dict.fromkeys(oids))
-            if not wanted:
-                return {}
-            out = _run(cwd, ["cat-file", "--batch"], stdin=("\n".join(wanted) + "\n").encode("ascii"))
-            return gitsafe._parse_cat_file_batch(out, wanted)
         return gitsafe.read_blobs(cwd, oids, timeout=_GIT_TIMEOUT)
     except gitsafe.GitError as exc:
         raise IntegrityError(str(exc)) from exc
-
-
-def _fingerprint(entries: Sequence[RuleInventoryEntry]) -> str:
-    aggregate = hashlib.sha256(b"aegis-rule-inventory-v1\0")
-    for entry in entries:
-        aggregate.update(entry.relative_path.encode("utf-8") + b"\0" + bytes.fromhex(entry.digest) + b"\0")
-    return aggregate.hexdigest()
 
 
 def _same_blob(data: bytes, oid: str) -> bool:
@@ -169,8 +137,14 @@ def _same_blob(data: bytes, oid: str) -> bool:
     return b"\r\n" in data and gitsafe.blob_id(data.replace(b"\r\n", b"\n"), len(oid)) == oid
 
 
-def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None) -> RuleInventory:
-    blobs = _rule_blobs(root, commit)
+def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = None,
+                  cache: Optional[RuleCache] = None) -> RuleInventory:
+    # A commit's listing and a blob's bytes never change.
+    if cache is not None:
+        blobs = cache.listing((os.path.realpath(root), commit), lambda: _rule_blobs(root, commit))
+        read = lambda oids: cache.blobs(list(oids), lambda missing: _read_integrity_blobs(root, missing))  # noqa: E731
+    else:
+        blobs, read = _rule_blobs(root, commit), lambda oids: _read_integrity_blobs(root, oids)
     present = {e.relative_path: e for e in working.entries} if working is not None else {}
     entries: List[RuleInventoryEntry] = []
     missing: List[Tuple[str, str]] = []
@@ -180,7 +154,7 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
             entries.append(local)
         else:
             missing.append((path, oid))
-    contents = _read_blobs(root, (oid for _path, oid in missing))
+    contents = read([oid for _path, oid in missing])
     for path, oid in missing:
         data = contents[oid]
         entries.append(
@@ -193,11 +167,12 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
             )
         )
     entries.sort(key=lambda e: e.relative_path)
-    return RuleInventory(tuple(entries), _fingerprint(entries))
+    return RuleInventory(tuple(entries), rule_inventory.fingerprint(entries))
 
 
 def _tree_files(root: str, commit: str) -> List[str]:
-    out = _run(root, ["ls-tree", "-r", "-z", "--name-only", commit])
+    out = gitsafe.run_checked(["ls-tree", "-r", "-z", "--name-only", commit], root, error=IntegrityError,
+                              timeout=_GIT_TIMEOUT).stdout
     return sorted(os.fsdecode(p) for p in out.split(b"\0") if p)
 
 
@@ -227,19 +202,6 @@ class Weakening:
     rule: str
     path: str
     message: str
-
-    def as_dict(self) -> Dict[str, str]:
-        return {
-            "code": self.code,
-            "rule": self.rule,
-            "path": self.path,
-            "message": self.message,
-        }
-
-
-class _Tree:
-    def __init__(self, renames: Optional[Mapping[str, str]] = None) -> None:
-        self.renames = renames or {}
 
 
 def _dotted_covers(kind: str, broad: str, narrow: str) -> bool:
@@ -369,7 +331,7 @@ def _reach_dropped(base: Rule, head: Rule) -> List[str]:
     return dropped + ([_TEST_FILES] if head.skips_tests and not base.skips_tests else [])
 
 
-def _coverage_lost(base: Rule, head: Rule, tree: _Tree) -> List[str]:
+def _coverage_lost(base: Rule, head: Rule, renames: Mapping[str, str]) -> List[str]:
     dropped = _reach_dropped(base, head)
     if dropped:
         return [
@@ -378,7 +340,7 @@ def _coverage_lost(base: Rule, head: Rule, tree: _Tree) -> List[str]:
             "may lose the rule"
             for p in dropped
         ]
-    lost = {new for old, new in tree.renames.items() if base.applies_to(old) and not head.applies_to(new)}
+    lost = {new for old, new in renames.items() if base.applies_to(old) and not head.applies_to(new)}
     return [f"no longer applies to {path}, which the reviewed version covered" for path in sorted(lost)]
 
 
@@ -386,11 +348,13 @@ def _key_changes(base: Rule, head: Rule) -> List[str]:
     return sorted(
         str(k)
         for k, v in head.meta.items()
-        if k not in _KNOWN_KEYS and not str(k).startswith("_") and base.meta.get(k, _MISSING) != v
+        if k not in KNOWN_KEYS and not str(k).startswith("_") and base.meta.get(k, _MISSING) != v
     )
 
 
-def weakenings(base: Rule, head: Optional[Rule], tree: Optional[_Tree] = None) -> List[Weakening]:
+def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, str]] = None) -> List[Weakening]:
+    """How ``head`` binds less than the reviewed ``base``, in a fixed order. An ``applies_to`` change is
+    not among them: check_ci reports it for a rule of any rank (``_applies_to_changed``)."""
     if head is None or not head.ok:
         why = "the rule is gone from the branch" if head is None else f"the rule no longer loads: {head.error}"
         return [
@@ -428,15 +392,17 @@ def weakenings(base: Rule, head: Optional[Rule], tree: Optional[_Tree] = None) -
         found.append(
             Weakening("detect", base.id, head.path, "detect is not an exact superset of the reviewed version")
         )
-    for message in _coverage_lost(base, head, tree or _Tree()):
+    for message in _coverage_lost(base, head, renames or {}):
         found.append(Weakening("coverage", base.id, head.path, message))
-    if base.meta.get("applies_to") != head.meta.get("applies_to"):
-        found.append(Weakening("applies_to", base.id, head.path, "applies_to changed"))
     return found
 
 
+def _applies_to_changed(reviewed: Optional[Rule], head: Rule) -> bool:
+    return (reviewed.meta.get("applies_to") if reviewed is not None else None) != head.meta.get("applies_to")
+
+
 def _stricter(base: Rule, head: Rule) -> bool:
-    if weakenings(base, head, None):
+    if weakenings(base, head) or _applies_to_changed(base, head):
         return False
     return (
         any(base.meta.get(k) != head.meta.get(k) for k in ("target_paths", "forbid_ast", "enforcement"))
@@ -446,17 +412,11 @@ def _stricter(base: Rule, head: Rule) -> bool:
 
 @dataclass(frozen=True)
 class Unreviewed:
+    """A rank 2+ rule whose branch-local version is not served: one printable line of each text."""
+
     id: str
     title: str
     change: str
-    path: str = ""
-
-    def as_dict(self) -> Dict[str, str]:
-        return {
-            "id": _one_line(self.id),
-            "title": self.title,
-            "change": self.change,
-        }
 
 
 @dataclass(frozen=True)
@@ -485,9 +445,9 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
                 served.append(rule)
             elif rule.id in base_all:
                 served.append(base_all[rule.id])
-                unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
+                unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "changed"))
             else:
-                unreviewed.append(Unreviewed(rule.id, title_of(rule), "new", rule.path))
+                unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "new"))
             continue
         if policy_view(reviewed) == policy_view(rule):
             served.append(rule)
@@ -506,21 +466,15 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
             if merged.mandatory and added:
                 widened.append((len(served), reviewed, added))
             served.append(merged)
-            unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
+            unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "changed"))
         else:
             served.append(reviewed)
-            unreviewed.append(Unreviewed(rule.id, title_of(rule), "changed", rule.path))
+            unreviewed.append(Unreviewed(_one_line(rule.id), title_of(rule), "changed"))
     for rule_id, reviewed in binding.items():
         if rule_id not in seen_ok:
             served.append(reviewed)
-            unreviewed.append(
-                Unreviewed(
-                    rule_id,
-                    title_of(reviewed),
-                    "broken" if rule_id in seen_any else "removed",
-                    reviewed.path,
-                )
-            )
+            change = "broken" if rule_id in seen_any else "removed"
+            unreviewed.append(Unreviewed(_one_line(rule_id), title_of(reviewed), change))
     # Widening onto paths that may already hold the cap of mandatory rules would crowd one out of
     # a scan (CI flags it as mandatory_cap): serve the reviewed version until that is approved.
     for index, reviewed, added in widened:
@@ -546,9 +500,11 @@ def effective(workspace: Any, cache: Optional[RuleCache] = None) -> Effective:
         return Effective(head, None)
 
     def load_base() -> Optional[RuleSet]:
-        base_inventory = _inventory_at(root, anchor.commit, inventory)
+        base_inventory = _inventory_at(root, anchor.commit, inventory, cache)
         if base_inventory.fingerprint == inventory.fingerprint:
             return None  # the working rules are the reviewed ones
+        if cache is not None:
+            return cache.base_rules(root, base_inventory, lambda: load_rules(root, inventory=base_inventory))
         return load_rules(root, inventory=base_inventory)
 
     # A commit's tree never changes, so these inputs fix the parsed BASE set.
@@ -585,25 +541,19 @@ class CiReport:
         return self.approval is not None and self.approval.valid
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
-        from datetime import datetime, timezone
-        from aegis_core._version import __version__
-
         return {
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": {
+            **primitives.envelope(SOURCE, {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
                 "mode": "ci",
                 "base": self.base,
                 "head": self.head,
                 "merge_base": self.merge_base,
-            },
+            }),
             "schema": SCHEMA,
             "status": "pass" if self.passed else "fail",
             "rules_checked": self.rules_checked,
-            "weakenings": [w.as_dict() for w in self.weakenings],
+            "weakenings": [asdict(w) for w in self.weakenings],
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
             "governance": {
                 "categories": list(self.governance_categories),
@@ -614,24 +564,18 @@ class CiReport:
         }
 
 
-def _diff(root: str, base: str, head: str, prefix: Optional[str] = None) -> Tuple[Dict[str, str], List[str]]:
-    prefix = _prefix(root) if prefix is None else prefix
-    raw = _run(root, ["diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "-M50%", base, head])
+def _renames(root: str, base: str, head: str, prefix: str) -> Dict[str, str]:
+    """Old path -> new path of each file moved within the workspace between ``base`` and ``head``."""
+    raw = gitsafe.run_checked(["diff-tree", "-r", "-z", "--name-status", "--no-commit-id", "-M50%", base, head], root,
+                              error=IntegrityError, timeout=_GIT_TIMEOUT).stdout
     renames: Dict[str, str] = {}
-    deleted: List[str] = []
     for status, path, new_path in gitsafe.parse_name_status_z(raw):
-        kind, old = status[:1], gitsafe.relative_to_prefix(prefix, path)
-        if old is None:
-            continue  # outside the workspace (a move into it is an addition)
+        old = gitsafe.relative_to_prefix(prefix, path)
         new = None if new_path is None else gitsafe.relative_to_prefix(prefix, new_path)
-        if kind == "R" and new is not None:
+        # A path outside the workspace has no old name here (a move into it is an addition).
+        if status[:1] == "R" and old is not None and new is not None:
             renames[old] = new
-        elif kind in ("D", "R"):
-            deleted.append(old)
-    return renames, deleted
-
-
-renamed_rules = _diff
+    return renames
 
 
 def _cap_findings(head: RuleSet, base: RuleSet, files: Callable[[], List[str]]) -> List[Weakening]:
@@ -710,7 +654,10 @@ def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tu
     return tuple(found)
 
 
-def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
+@gitsafe.scrubbed()
+def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None) -> CiReport:
+    """``pull_request`` (a ``human_gate.PullRequest``): with no signed approval, tier A's approving
+    review of that pull request's head may approve instead, and only when the head under check is it."""
     from aegis_core import human_gate
 
     root = workspace_root(workspace)
@@ -728,24 +675,21 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
     prefix = _prefix(root)
     base_rules = load_rules(root, inventory=_inventory_at(root, merge))
     head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
-    renames, _deleted = _diff(root, merge, head_commit, prefix)
-    tree = _Tree(renames)
+    renames = _renames(root, merge, head_commit, prefix)
 
     found: List[Weakening] = []
     checked = 0
+    # A binding rule's applies_to finding comes last among its own; then each other rule's, any rank.
     for rule in base_rules.rules:
         if rule.ok and rule.rank >= 2:
             checked += 1
-            found += weakenings(rule, head_rules.get(rule.id), tree)
-    reported = {(w.rule, w.code) for w in found}
+            branch = head_rules.get(rule.id)
+            found += weakenings(rule, branch, renames)
+            if branch is not None and _applies_to_changed(rule, branch):
+                found.append(Weakening("applies_to", rule.id, branch.path, "applies_to changed"))
     for rule in head_rules.rules:
         reviewed = base_rules.get(rule.id)
-        reviewed_applies = reviewed.meta.get("applies_to") if reviewed else None
-        if (
-            rule.ok
-            and (rule.id, "applies_to") not in reported
-            and reviewed_applies != rule.meta.get("applies_to")
-        ):
+        if rule.ok and not (reviewed is not None and reviewed.rank >= 2) and _applies_to_changed(reviewed, rule):
             found.append(Weakening("applies_to", rule.id, rule.path, "applies_to changed"))
     head_files: List[str] = []
 
@@ -765,4 +709,10 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD") -> CiReport:
             approval = human_gate.find_approval(root, head_commit, base_commit)
         except (human_gate.HumanGateError, gitsafe.GitError):
             approval = None
+        if approval is None and pull_request is not None and pull_request.head.lower() == head_commit.lower():
+            flagged = [prefix + w.path for w in found] + ([path for path, _c in paths] if signers else [])
+            try:
+                approval = human_gate.find_review_approval(root, pull_request, base_commit, flagged)
+            except (human_gate.HumanGateError, gitsafe.GitError):
+                approval = None
     return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers)

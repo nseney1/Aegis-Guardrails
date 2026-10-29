@@ -170,8 +170,10 @@ def _scan_gate(call: hook_events.HookCall, environ: Mapping[str, str], now: Opti
     rules = PurePath(os.path.relpath(WorkspaceLayout(root).rules_dir, root)).as_posix() + "/"
     gated = [p for p in edited if not p.startswith(rules)]
     # Exit 0 with stderr has no visible effect on agy (LIVE); a visible deny waits for a
-    # probe. A rule file stays editable: a broken one makes every scan fail closed.
-    if call.host == _AGY or not gated or scan_compliance.scan_covers(root, gated, window, now):
+    # probe. A rule file stays editable: a broken one makes every scan fail closed. When no
+    # rule file is among the edited paths the log was just asked about these very paths.
+    if call.host == _AGY or not gated or (
+            len(gated) < len(edited) and scan_compliance.scan_covers(root, gated, window, now)):
         return _Decision(root=root, event="scan_gate", result="record", detail=detail)
     shown = " ".join(shlex.quote(p) for p in gated)
     message = f"aegis: call aegis_scan with {shown} before editing (or run: aegis scan {shown})"
@@ -225,7 +227,7 @@ def run_pre_tool(
                     sys.stderr.flush()
                 if decision.event:
                     events.append(decision.root, decision.event, decision.result, decision.detail, host=host)
-            except BaseException:
+            except BaseException:  # unlike CLI metrics, a hook must not interrupt its host
                 pass  # telemetry and the reason text never change the decision
             return decision.code
     except BaseException:

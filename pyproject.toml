@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aegis-guardrails"
 dynamic = ["version"]
-description = "Rules and an MCP server that keep AI coding agents on track: Claude Code, Codex CLI and Antigravity"
+description = "Project rules for AI coding agents (Claude Code, Codex CLI, Antigravity): MCP server, AGENTS.md bootstrap, AST checks, pre-commit hook and CI gate"
 
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -14,10 +14,10 @@ authors = [
     {name = "Aegis Contributors"}
 ]
 keywords = [
-    "ai-coding-agents", "guardrails", "mcp", "model-context-protocol",
-    "agents-md", "claude-md", "claude-code", "codex", "antigravity",
-    "pre-commit", "code-review", "static-analysis", "ast",
-    "llm-guardrails", "agentic-coding"
+    "ai-coding-agents", "ai-guardrails", "coding-agents", "guardrails", "mcp", "mcp-server",
+    "model-context-protocol", "agents-md", "claude-md", "claude-code", "claude-code-hooks",
+    "codex-cli", "antigravity", "pre-commit", "git-hooks", "code-review", "static-analysis", "ast",
+    "secret-scanning", "llm-guardrails", "agentic-coding"
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -38,6 +38,8 @@ dependencies = []
 [project.scripts]
 aegis = "aegis_cli.cli:main"
 aegis-mcp = "aegis_mcp.server:main"
+# The same server under the distribution name, for `uvx aegis-guardrails` and the MCP Registry.
+aegis-guardrails = "aegis_mcp.server:main"
 
 [project.optional-dependencies]
 # Layer 2 runs any model through --llm-cmd / AEGIS_LLM_CMD, so there are no
@@ -48,6 +50,10 @@ dev = ["pytest", "pytest-xdist>=3.5.0", "ruff", "hypothesis>=6.100.0", "coverage
 Homepage = "https://github.com/nseney1/Aegis-Guardrails"
 Documentation = "https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/how-it-works.md"
 Changelog = "https://github.com/nseney1/Aegis-Guardrails/blob/main/CHANGELOG.md"
+Source = "https://github.com/nseney1/Aegis-Guardrails"
+Issues = "https://github.com/nseney1/Aegis-Guardrails/issues"
+Security = "https://github.com/nseney1/Aegis-Guardrails/blob/main/SECURITY.md"
+"Release Notes" = "https://github.com/nseney1/Aegis-Guardrails/blob/main/CHANGELOG.md"
 
 
 
@@ -68,6 +74,8 @@ packages = [
     "aegis_core.ast",
     "aegis_core.ast.drivers",
     "aegis_core.ast.drivers.templates",
+    "aegis_core.command_safety",
+    "aegis_core.insights",
     "aegis_core.lifecycle",
     "aegis_core.outcomes",
     "aegis_core.skills",
@@ -98,6 +106,8 @@ aegis_core = ["ast/drivers/templates/*", "benchmark_corpus/corpus.json"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 addopts = "--import-mode=importlib"
+# Dumps every thread's stack when a test hangs this long; it does not abort the run.
+faulthandler_timeout = 300
 # pytest < 9 silently skips an async test when no async plugin is installed;
 # make that an error so a missing plugin can't hide tests on CI again.
 # Matched by message: pytest 9 removed the warning class (it fails instead).

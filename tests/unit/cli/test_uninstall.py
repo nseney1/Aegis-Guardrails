@@ -219,7 +219,7 @@ class TestRecordedHostsAegisNeverRegisters:
 
     SKIPPED = {
         "gemini-cli": "retired: Aegis does not register there",
-        "claude-desktop": "identity only: Aegis does not register there (ADR 0005 H4)",
+        "claude-desktop": "identity only: Aegis does not register there",
         "zed": "not a host Aegis knows",
     }
 
@@ -258,7 +258,7 @@ class TestRecordedHostsAegisNeverRegisters:
         out = capsys.readouterr().out
         assert env.runner.calls == []
         assert "gemini-cli: skipped (retired: Aegis does not register there)" in out
-        assert "claude-desktop: skipped (identity only: Aegis does not register there (ADR 0005 H4))" in out
+        assert "claude-desktop: skipped (identity only: Aegis does not register there)" in out
         assert "Nothing was changed" not in out
 
 
@@ -546,7 +546,7 @@ class TestCommandLine:
     @pytest.mark.parametrize("value, message", [
         ("gemini-cli", "gemini-cli is not supported: Google retired Gemini CLI for individual Code Assist "
                        "accounts; use --host antigravity."),
-        ("claude-desktop", "claude-desktop is identity only: Aegis does not register there (ADR 0005 H4); "
+        ("claude-desktop", "claude-desktop is identity only: Aegis does not register there; "
                            "the Claude desktop app's Code tab shares Claude Code's configuration: "
                            "use --host claude-code"),
     ])

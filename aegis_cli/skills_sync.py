@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 import os
@@ -43,10 +43,13 @@ import stat
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from aegis_cli import sanitize_display
-from aegis_cli.base import AegisCommand, CommandCategory
-from aegis_cli.init import _host_option, _real_key, _unwritable, packaged_dir
+from aegis_cli import NO_HOME_MESSAGE, sanitize_display
+from aegis_cli.base import AegisCommand, CommandCategory, host_option, unwritable
 from aegis_core import hosts as host_table
+from aegis_core import primitives
+from aegis_core.primitives import real_key
+from aegis_core.scaffolding import packaged_dir
+from aegis_core.workspace.layout import UserLayout
 
 __all__ = ["RESULTS", "Entry", "SkillsCommand", "SyncResult", "TargetResult", "run_skills", "summary", "sync_skills"]
 
@@ -302,13 +305,13 @@ def _is_link(path: Path) -> bool:
 def _check_dirs(root: Path, parts: Sequence[str]) -> None:
     """Raise _Refusal unless every existing directory on ``root/parts`` is a real directory
     exactly there inside the workspace: no link or junction, nothing but a directory, and
-    a realpath equal to the workspace's realpath plus these parts (as init._real_key
-    compares paths). Missing directories are fine; the write creates them."""
-    expected = _real_key(root)
+    a realpath key (``primitives.real_key``) equal to the workspace's plus these parts; one that cannot
+    be resolved is refused. Missing directories are fine; the write creates them."""
+    expected = real_key(root)
     current = root
     for depth, part in enumerate(parts, 1):
         current = current / part
-        expected = expected + os.sep + os.path.normcase(part)
+        expected = None if expected is None else expected + os.sep + os.path.normcase(part)
         rel = "/".join(parts[:depth])
         if _is_link(current):
             raise _Refusal("link", f"{rel} is a link (symlink or junction); Aegis never writes through a link, "
@@ -317,7 +320,7 @@ def _check_dirs(root: Path, parts: Sequence[str]) -> None:
             return
         if not os.path.isdir(current):
             raise _Refusal("not_directory", f"{rel} is not a directory; left as it is")
-        if _real_key(current) != expected:
+        if expected is None or real_key(current) != expected:
             raise _Refusal("outside", f"{rel} resolves to {os.path.realpath(current)}, not a real directory inside "
                                       f"the workspace (a junction or link); Aegis never writes through it, {_FORCE_NOTE}")
 
@@ -380,10 +383,10 @@ def _sync_one(root: Path, target: _Target, skill: _Skill, *, force: bool, dry_ru
     if dry_run:
         # A dry run (init's check pass among them) predicts the write's failure, so init
         # stops before its first write; a real run reports what the OS says instead.
-        unwritable = _unwritable(path.parent)
-        if unwritable:
+        reason = unwritable(path.parent)
+        if reason:
             entry.result, entry.reason = "failed", "write"
-            entry.detail = f"{rel} cannot be written ({unwritable})"
+            entry.detail = f"{rel} cannot be written ({reason})"
         return entry
     from aegis_core.storage import atomic_write_bytes
 
@@ -404,9 +407,8 @@ def _record(root: Path, result: SyncResult, trigger: str) -> None:
 
     detail = {"trigger": trigger, "hosts": list(result.hosts), "targets": [t.dir for t in result.targets],
               "force": result.force, "counts": result.counts}
-    try:
-        events.append(root, "skills_sync", result.status, detail)
-    except Exception as exc:  # a metric never fails the sync (events.append documents what it raises)
+    exc = events.try_append(root, "skills_sync", result.status, detail)
+    if exc is not None:
         result.warnings.append(f"the skills_sync event could not be recorded ({type(exc).__name__}: {exc})")
 
 
@@ -471,7 +473,10 @@ def _hosts(args: argparse.Namespace, root: Path) -> Tuple[Optional[List[str]], s
 
     chosen = getattr(args, "host", None)
     if chosen == "auto":
-        detected = detect_hosts(Path.home(), os.environ.get("PATH"))
+        layout = UserLayout.current()
+        if layout is None:
+            return None, f"{NO_HOME_MESSAGE}; name the hosts with --host"
+        detected = detect_hosts(layout.home, os.environ.get("PATH"))
         return (detected, "") if detected else (None, "no host detected on this machine; name one with --host")
     if chosen:
         return list(chosen), ""
@@ -483,7 +488,6 @@ def _hosts(args: argparse.Namespace, root: Path) -> Tuple[Optional[List[str]], s
 
 
 def run_skills(args: argparse.Namespace) -> int:
-    from aegis_cli import __version__
     from aegis_core.workspace.layout import is_aegis_workspace
 
     ws = getattr(args, "ws", None)
@@ -503,10 +507,8 @@ def run_skills(args: argparse.Namespace) -> int:
     result = sync_skills(root, hosts, force=bool(args.force), dry_run=bool(args.dry_run))
     if args.json:
         print(json.dumps({
-            "source": "aegis skills sync",
-            "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": {"workspace": str(root), "hosts": result.hosts, "targets": [t.dir for t in result.targets]},
+            **primitives.envelope("aegis skills sync", {"workspace": str(root), "hosts": result.hosts,
+                                                       "targets": [t.dir for t in result.targets]}),
             "dry_run": result.dry_run,
             "force": result.force,
             "status": result.status,
@@ -528,6 +530,14 @@ class SkillsCommand(AegisCommand):
     help = "Copy the packaged skills into your hosts' project skills folders (sync)"
 
     def configure_parser(self, parser: argparse.ArgumentParser, parents: Any = None) -> None:
+        if parents is None:
+            common = argparse.ArgumentParser(add_help=False)
+            common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                                help="Emit machine-readable JSON output")
+            common.add_argument("--plain", action="store_true", default=argparse.SUPPRESS,
+                                help="Strip ANSI styling and emoji")
+            common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
+            parents = [common]
         sub = parser.add_subparsers(dest="skills_action", metavar="ACTION")
         sub.required = True
         p_sync = sub.add_parser(
@@ -536,7 +546,7 @@ class SkillsCommand(AegisCommand):
                  "Antigravity), replacing only Aegis's own unedited copies",
         )
         p_sync.add_argument(
-            "--host", type=_host_option, default=None, metavar="HOST[,HOST]|auto",
+            "--host", type=host_option, default=None, metavar="HOST[,HOST]|auto",
             help="Hosts to copy skills for (default: the hosts in .aegis/config.json); "
                  "'auto' takes the ones detected on this machine",
         )

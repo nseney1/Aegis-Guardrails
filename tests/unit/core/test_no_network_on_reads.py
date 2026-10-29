@@ -1,6 +1,6 @@
 """R-trust-52 / ratchet R6 (reads): no read-only surface runs ``gh``; sync and the decision callers do.
 
-Two probes see every surface: ``CountingGh`` on ``human_gate.default_gh_runner``, and (POSIX) a
+Two probes see every surface: ``CountingGh`` on ``ghcli.default_gh_runner``, and (POSIX) a
 marker-writing fake ``gh`` first on ``PATH`` under the pytest temp root with the real runner
 restored, so an actual exec is logged. The conftest lets ``pathlookup.which`` find only that ``gh``.
 """
@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
-from aegis_core import checkrun, credit, human_gate
+from aegis_core import checkrun, credit, ghcli
 from aegis_core.telemetry_engine import ledger
 from tests import helpers_humangate as hg
 from tests import helpers_verified as hv
@@ -23,10 +23,10 @@ from tests import helpers_verified as hv
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
 
 FORGED = [f"{0xbeef + i:040x}" for i in range(6)]
-AMBIENT_TP = 24  # one short of fitness.MIN_N: only the CI-confirmed credit makes it promotable
-# 8 tp + 17 fp are MIN_N verdicts misfiring alone (Wilson lower bound of the fp rate 0.516 > 0.5);
-# 0.493 with the confirmed tp
-AMBIENT_FP_TP, AMBIENT_FP = 8, 17
+AMBIENT_TP = 24  # one short of fitness.MIN_N: the CI-confirmed credit completes the sample, never a promotion
+# 15 tp + 11 fp misfire alone (P(precision < 0.7) = 0.920 >= 0.9 over at least MIN_N verdicts);
+# 0.897 with the confirmed tp
+AMBIENT_FP_TP, AMBIENT_FP = 15, 11
 RULE = ("---\nid: trap-sample\ntype: trap\nenforcement: advisory\nhypothesis: sample\ncreated: '2026-01-01'\n"
         "target_paths:\n  - src/*.py\n---\n# Sample\n\nBody long enough to be a rule body.\n")
 
@@ -114,7 +114,7 @@ def _project(tmp_path: Path, monkeypatch):
 
 
 def _misfiring(tmp_path: Path, monkeypatch):
-    """``trap-sample`` with 8 tp and 17 fp ledger rows and one reported check landed on ``main``, no ``ci``
+    """``trap-sample`` with 15 tp and 11 fp ledger rows and one reported check landed on ``main``, no ``ci``
     row: archived on the ledger alone, kept once CI confirms the landed check."""
     repo, commit = _landed(tmp_path, monkeypatch)
     ledger.append(repo.root, [{"rule": "trap-sample", "outcome": "fp", "source": "ci", "key": f"fp{i}"}
@@ -154,7 +154,7 @@ def _surfaces(root: Path, capsys) -> Dict[str, Callable[[], Any]]:
 def test_read_surfaces_make_no_gh_call_through_the_runner(tmp_path, monkeypatch, capsys):
     repo, commit = _project(tmp_path, monkeypatch)
     gh = CountingGh([hv.ci_run(commit, run_id=10)])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
     called = {}
     for name, run in _surfaces(repo.root, capsys).items():
         _fresh_process()
@@ -167,7 +167,7 @@ def test_read_surfaces_make_no_gh_call_through_the_runner(tmp_path, monkeypatch,
 
 @needs_git
 @pytest.mark.skipif(os.name == "nt", reason="the fake gh is a shebang script")
-def test_read_surfaces_exec_no_gh_found_on_path(tmp_path, monkeypatch, capsys):
+def test_read_surfaces_exec_no_gh_found_on_path(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo, _commit = _project(tmp_path, monkeypatch)
     marker = tmp_path / "gh-calls.log"
     bindir = tmp_path / "fakebin"
@@ -176,7 +176,6 @@ def test_read_surfaces_exec_no_gh_found_on_path(tmp_path, monkeypatch, capsys):
     fake.write_bytes(f'#!/bin/sh\necho "$@" >> "{marker}"\nexit 1\n'.encode("utf-8"))
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
-    monkeypatch.setattr(human_gate, "default_gh_runner", human_gate._real_default_gh_runner)
     for name, run in _surfaces(repo.root, capsys).items():
         _fresh_process()
         run()
@@ -191,22 +190,24 @@ def test_sync_and_promotion_decisions_verify_ci_through_gh(tmp_path, monkeypatch
 
     repo, commit = _project(tmp_path, monkeypatch)
     gh = CountingGh([hv.ci_run(commit, run_id=10)])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
 
     assert main(["sync", "--json"]) == 0
     assert _rule_row(capsys)["tp"] == AMBIENT_TP + 1
     assert gh.calls
 
+    # Confirmed verdicts are evidence, not labels: the decision verifies CI and still finds no
+    # promotion without adjudicated labels (R-evidence-4).
     _fresh_process()
     gh.calls.clear()
     assert main(["rule", "promote", "--json"]) == 0
-    assert [c["rule_id"] for c in json.loads(capsys.readouterr().out)["candidates"]] == ["trap-sample"]
+    assert json.loads(capsys.readouterr().out)["candidates"] == []
     assert gh.calls
 
     _fresh_process()
     gh.calls.clear()
     res = promote_rule(repo.root, "trap-sample", force=False)
-    assert (res["status"], res["to_type"]) == ("promoted", "invariant")
+    assert res["status"] == "ineligible" and "adjudicated labels" in res["message"]
     assert gh.calls
 
 
@@ -219,7 +220,7 @@ def test_without_gh_sync_reports_ci_unavailable_and_promotion_is_ineligible(tmp_
     repo, _commit = _project(tmp_path, monkeypatch)
     if gh is not None:
         gh.calls.clear()
-        monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+        monkeypatch.setattr(ghcli, "default_gh_runner", gh)
 
     assert main(["sync", "--apply", "--json"]) == 0
     row = _rule_row(capsys)
@@ -260,7 +261,7 @@ def test_a_transient_gh_failure_stops_ci_verification_and_decisions_fail_closed(
 
     repo, commit = _project(tmp_path, monkeypatch)
     gh = FlakyGh([hv.ci_run(commit, run_id=10)])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
 
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert (_api_calls(gh), _runs_gets(gh)) == (2, 1)  # the repository GET, then the one runs GET that failed
@@ -271,7 +272,7 @@ def test_a_transient_gh_failure_stops_ci_verification_and_decisions_fail_closed(
     gh.calls.clear()  # the next runs GET fails again
     rule = load_rules(repo.root).get("trap-sample")
     fit = fitness.for_rules(repo.root, [rule], verify_ci=True)["trap-sample"]
-    assert (fit.state, fit.suggestion, fit.evidence_available) == ("evidence_unavailable", None, False)
+    assert (fit.state, fit.suggestion, fit.evidence_available) == ("insufficient", None, False)
 
     _fresh_process()
     gh.calls.clear()
@@ -284,7 +285,7 @@ def test_a_transient_gh_failure_stops_ci_verification_and_decisions_fail_closed(
 def test_a_failing_repository_get_stops_ci_verification_before_any_run_is_read(tmp_path, monkeypatch):
     repo, commit = _project(tmp_path, monkeypatch)
     gh = CountingGh([hv.ci_run(commit, run_id=10)], fail_repo=True)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
 
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert (_api_calls(gh), _runs_gets(gh)) == (1, 0)
@@ -303,13 +304,13 @@ def test_sync_decides_nothing_when_gh_fails_inside_confirm(tmp_path, monkeypatch
 
     repo, commit = _misfiring(tmp_path, monkeypatch)
     gh = CountingGh([hv.ci_run(commit, run_id=10)], **{fails: True})
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
 
     res = sync.sync(repo.root, apply=True)
     assert (res.applied, res.refused) == ([], None)
     assert (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").is_file()
     row = res.derived["rules"]["trap-sample"]
-    assert (row["evidence_available"], row["state"], row["suggestion"]) == (False, "evidence_unavailable", None)
+    assert (row["evidence_available"], row["state"], row["suggestion"]) == (False, "inconclusive", None)
     assert row["evidence_error"] == (f"CI verification stopped: gh failed while confirming CI for {commit[:12]}; "
                                      "1 landed commit(s) were not verified")
 
@@ -328,7 +329,7 @@ def test_sync_with_a_healthy_gh_confirms_and_decides(tmp_path, monkeypatch, conc
     from aegis_core import sync
 
     repo, commit = _misfiring(tmp_path, monkeypatch)
-    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, conclusion, run_id=10)]))
+    monkeypatch.setattr(ghcli, "default_gh_runner", CountingGh([hv.ci_run(commit, conclusion, run_id=10)]))
 
     res = sync.sync(repo.root, apply=True)
     assert [(a["rule"], a["action"], a["status"]) for a in res.applied] == (
@@ -343,7 +344,7 @@ def test_sync_with_a_healthy_gh_confirms_and_decides(tmp_path, monkeypatch, conc
 def test_a_healthy_gh_verifies_every_commit_and_reads_stay_offline(tmp_path, monkeypatch):
     repo, commit = _project(tmp_path, monkeypatch)
     gh = CountingGh([hv.ci_run(commit, run_id=10)])
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
 
     proj = credit.project_credits(repo.root, verify_ci=True)
     assert (proj.available, proj.error) == (True, None)
@@ -374,7 +375,7 @@ def test_direct_decisions_refuse_when_ci_verification_stops(tmp_path, monkeypatc
 
     repo, commit = _misfiring(tmp_path, monkeypatch)
     _ci_confirmable(repo, commit)
-    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, run_id=10)], **{fails: True}))
+    monkeypatch.setattr(ghcli, "default_gh_runner", CountingGh([hv.ci_run(commit, run_id=10)], **{fails: True}))
     path = repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md"
     before = path.read_bytes()
 
@@ -394,7 +395,7 @@ def test_direct_archive_still_acts_on_complete_evidence(tmp_path, monkeypatch):
 
     repo, commit = _misfiring(tmp_path, monkeypatch)
     _ci_confirmable(repo, commit)
-    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, "failure", run_id=10)]))
+    monkeypatch.setattr(ghcli, "default_gh_runner", CountingGh([hv.ci_run(commit, "failure", run_id=10)]))
 
     assert archive_rule(repo.root, "trap-sample")["status"] == "archived"
     assert not (repo.root / ".aegis" / "rules" / "traps" / "trap-sample.md").exists()
@@ -411,7 +412,7 @@ def test_text_output_says_why_the_evidence_is_unavailable(tmp_path, monkeypatch,
 
     repo, commit = _misfiring(tmp_path, monkeypatch)
     _ci_confirmable(repo, commit)
-    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh(fail=True))
+    monkeypatch.setattr(ghcli, "default_gh_runner", CountingGh(fail=True))
 
     main(argv)
     out = capsys.readouterr().out
@@ -427,7 +428,7 @@ def test_text_output_names_no_reason_when_the_evidence_is_complete(tmp_path, mon
 
     repo, commit = _misfiring(tmp_path, monkeypatch)
     _ci_confirmable(repo, commit)
-    monkeypatch.setattr(human_gate, "default_gh_runner", CountingGh([hv.ci_run(commit, run_id=10)]))
+    monkeypatch.setattr(ghcli, "default_gh_runner", CountingGh([hv.ci_run(commit, run_id=10)]))
 
     main(argv)
     out = capsys.readouterr().out

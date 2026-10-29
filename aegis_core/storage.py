@@ -20,18 +20,18 @@ concurrency guarantees live in one place:
   workspace lock.
 - Shared state is private: its directories are 0o700 and its files 0o600, set explicitly
   (``chmod``/``fchmod``, so the umask does not matter). ``shared_state_modes`` counts the
-  entries that are looser (never naming them) and, with ``fix``, tightens them
-  (v4.4 spec §12.7).
+  entries of ``<git common dir>/aegis`` that are looser (never naming them) and, with
+  ``fix``, tightens them (v4.4 spec §12.7). Outside git there is no shared state: the
+  workspace's ``.aegis/state`` keeps the umask's modes and is neither counted nor changed.
 - ``state_dir(workspace)``: ``.aegis/state``, refused when it (or ``.aegis``, or any
   entry directly inside it: the ledger, the lock, a log, a backup) is a symlink or
   resolves outside the workspace, so machine-local state is never written through a
   link a commit planted (a tracked symlink is not hidden by the ``state/`` ignore
   entry). It also keeps ``state/.gitignore`` ("*"), so state never shows in
   ``git status`` even where ``.aegis/.gitignore`` lacks ``state/``.
-- ``atomic_write_bytes``/``atomic_write_text``: write a temporary file next to the
-  target, fsync it, then replace. An existing file keeps its mode; a new file gets
-  the mode the umask gives (0o644 typically), not mkstemp's 0o600; ``mode`` sets it
-  exactly (a private copy stays private).
+- ``atomic_write_bytes``/``atomic_write_text``, ``atomic_write_and_unlink``,
+  ``create_private_file`` and ``fsync_dir``: ``aegis_core.atomicio``'s atomic writes,
+  re-exported here.
 - ``append_jsonl``: one ``O_APPEND`` write and one fsync, never through a symlink. A
   torn trailing line left by a crash is terminated first, so it cannot swallow the
   new row.
@@ -46,20 +46,34 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import secrets
 import stat
 import threading
 import time
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Union
 
 from aegis_core import gitsafe
+from aegis_core.atomicio import (
+    _O_CLOEXEC,
+    _O_NOFOLLOW,
+    _O_NONBLOCK,
+    _PRIVATE_FILE_MODE,
+    _SHARED_DIR_NAME,
+    _link_error,
+    _make_private,
+    _open_regular,
+    _write_all,
+    atomic_write_and_unlink,
+    atomic_write_bytes,
+    atomic_write_text,
+    create_private_file,
+    fsync_dir,
+)
 from aegis_core.errors import AegisError, LockTimeoutError, PathTraversalError
+from aegis_core.primitives import is_within, real_path
 from aegis_core.taxonomy import (
     LOCK_MAX_BACKOFF_SECONDS,
     LOCK_RETRY_INTERVAL_SECONDS,
     LOCK_TIMEOUT_SECONDS,
-    STORAGE_INITIAL_DELAY_SECONDS,
-    STORAGE_MAX_RETRIES,
 )
 from aegis_core.workspace.layout import WorkspaceLayout
 
@@ -82,6 +96,7 @@ __all__ = [
     "atomic_write_and_unlink",
     "atomic_write_bytes",
     "atomic_write_text",
+    "create_private_file",
     "file_lock",
     "fsync_dir",
     "ledger_locked",
@@ -89,6 +104,7 @@ __all__ = [
     "locked",
     "read_json_dict",
     "read_jsonl",
+    "parse_jsonl",
     "read_tail_bytes",
     "StateModes",
     "shared_locked",
@@ -99,16 +115,6 @@ __all__ = [
     "workspace_relative",
     "worktree_label",
 ]
-
-_O_BINARY = getattr(os, "O_BINARY", 0)
-_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-# POSIX: the open itself refuses a symlink, so a link swapped in after the lstat check
-# is refused too. Windows has no O_NOFOLLOW; the lstat check is the guard there.
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
-# A new file's permission bits before the umask: the kernel applies the umask, so no
-# process-wide os.umask() round trip (which races other threads) is needed.
-_NEW_FILE_MODE = 0o666
 
 
 # ── The one workspace lock ───────────────────────────────────────────────────
@@ -199,44 +205,6 @@ def _timeout_error(path: Path, timeout: float, kind: str = "workspace") -> LockT
     )
 
 
-_EXTENDED_UNC, _EXTENDED = "\\\\?\\UNC\\", "\\\\?\\"
-
-
-def _resolved(path: Path | str) -> str:
-    """``path`` with every link resolved and without the Windows extended-length prefix.
-
-    realpath, not Path.resolve(): it never raises (3.9 resolve raises RuntimeError on
-    loops) and it resolves Windows junctions, which is_symlink() misses before 3.12.
-    Windows realpath answers in the extended-length form (``\\\\?\\C:\\...``) when the
-    path appears or disappears while it resolves it (another process creating
-    ``.aegis/state``); that prefix is dropped.
-    """
-    real = os.path.realpath(path)
-    if real.startswith(_EXTENDED_UNC):
-        real = "\\\\" + real[len(_EXTENDED_UNC):]
-    elif real.startswith(_EXTENDED):
-        real = real[len(_EXTENDED):]
-    return real
-
-
-def _real(path: Path | str) -> str:
-    """``path`` resolved (``_resolved``) in one spelling per location: normcase folds the
-    case Windows ignores, so two spellings of one location compare equal."""
-    return os.path.normcase(_resolved(path))
-
-
-def _within(path: Path, root: Path) -> bool:
-    real, base = _real(path), _real(root)
-    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
-
-
-def _link_error(path: Path) -> PathTraversalError:
-    return PathTraversalError(
-        f"refusing to use {path}: it is a symlink; aegis keeps workspace state only inside the workspace",
-        path=str(path),
-    )
-
-
 def _outside_error(path: Path) -> PathTraversalError:
     return PathTraversalError(
         f"refusing to use {path}: it resolves outside the workspace; aegis keeps workspace "
@@ -261,7 +229,7 @@ def state_dir(workspace: Any) -> Path:
     for path in (layout.aegis_dir, layout.state_dir):
         if path.is_symlink():
             raise _link_error(path)
-    if not _within(layout.state_dir, layout.root):  # a Windows junction is not a symlink
+    if not is_within(layout.state_dir, layout.root, unresolvable=False):  # a Windows junction is not a symlink
         raise _outside_error(layout.state_dir)
     layout.state_dir.mkdir(parents=True, exist_ok=True)
     with os.scandir(layout.state_dir) as entries:
@@ -269,7 +237,7 @@ def state_dir(workspace: Any) -> Path:
             if entry.is_symlink():
                 raise _link_error(Path(entry.path))
             # Every entry, not only directories: a file here always resolves inside it.
-            if not _within(Path(entry.path), layout.root):
+            if not is_within(Path(entry.path), layout.root, unresolvable=False):
                 raise _outside_error(Path(entry.path))
     if not os.path.lexists(layout.state_gitignore):
         atomic_write_bytes(layout.state_gitignore, _STATE_GITIGNORE)
@@ -278,26 +246,7 @@ def state_dir(workspace: Any) -> Path:
 
 # ── Shared state: one directory for every worktree of a repository ───────────
 
-_SHARED_DIR_NAME = "aegis"
 _SHARED_DIR_MODE = 0o700
-_PRIVATE_FILE_MODE = 0o600
-
-
-def _in_shared_state(path: Path) -> bool:
-    """Whether ``path`` is inside a repository's shared state: below a directory named
-    ``aegis`` that sits directly in a git directory (it holds ``HEAD`` and ``objects``)."""
-    for parent in list(path.parents)[:8]:
-        if parent.name == _SHARED_DIR_NAME and (parent.parent / "HEAD").is_file() \
-                and (parent.parent / "objects").is_dir():
-            return True
-    return False
-
-
-def _make_private(fd: int, mode: int) -> None:
-    """Set ``mode`` exactly on an open file; the umask does not apply. Windows has no
-    POSIX bits to set."""
-    if hasattr(os, "fchmod"):
-        os.fchmod(fd, mode)
 
 
 def _shared_link_error(path: Path, base: Path) -> PathTraversalError:
@@ -322,7 +271,7 @@ def _confined(directory: Path, base: Path, link_error, outside_error, entries: b
         raise link_error(directory)
     if not os.path.lexists(directory):
         return
-    if not _within(directory, base):  # a Windows junction is not a symlink
+    if not is_within(directory, base, unresolvable=False):  # a Windows junction is not a symlink
         raise outside_error(directory)
     if not directory.is_dir():
         raise PathTraversalError(f"refusing to use {directory}: it is not a directory", path=str(directory))
@@ -332,7 +281,7 @@ def _confined(directory: Path, base: Path, link_error, outside_error, entries: b
         for entry in found:
             if entry.is_symlink():
                 raise link_error(Path(entry.path))
-            if entry.is_dir(follow_symlinks=False) and not _within(Path(entry.path), base):
+            if entry.is_dir(follow_symlinks=False) and not is_within(Path(entry.path), base, unresolvable=False):
                 raise outside_error(Path(entry.path))
 
 
@@ -353,7 +302,7 @@ def shared_state_dir(workspace: Any, create: bool = True) -> Path:
     common = gitsafe.common_dir(root)
     if common is None:
         return _local_state_dir(root, create)
-    return _shared_dir(Path(_resolved(common)), create)
+    return _shared_dir(Path(real_path(common)), create)
 
 
 class StateModes(NamedTuple):
@@ -374,13 +323,18 @@ def shared_state_modes(workspace: Any, fix: bool = False) -> StateModes:
     """Count the entries of ``<git common dir>/aegis`` looser than 0o700 (directories) and
     0o600 (files); with ``fix`` set them to exactly that. Nothing is created.
 
+    Outside a git repository (or when git cannot run) there is no shared state, so nothing
+    is checked: the workspace-local ``.aegis/state`` is not held to the shared standard.
     A symlink is never followed or changed. Raises what ``shared_state_dir`` raises for an
     unconfined directory. Without POSIX permission bits (Windows) nothing is checked and
     ``supported`` is False.
     """
     if os.name == "nt":
         return StateModes(0, 0, 0, False)
-    top = shared_state_dir(workspace, create=False)
+    common = gitsafe.common_dir(Path(os.fspath(workspace)).resolve())
+    if common is None:
+        return StateModes(0, 0, 0, True)
+    top = _shared_dir(Path(real_path(common)), create=False)
     if not os.path.lexists(top):
         return StateModes(0, 0, 0, True)
     checked = looser = fixed = 0
@@ -481,7 +435,7 @@ def shared_locked(workspace: Any, name: str, timeout: float = LOCK_TIMEOUT_SECON
     _shared_lock_name(name)
     directory = shared_state_dir(workspace)
     lock_path = directory / name
-    key = os.path.join(_real(directory), name)
+    key = os.path.join(os.path.normcase(real_path(directory)), name)
     with _hold(lock_path, key, timeout, shared=True) as path:
         yield path
 
@@ -512,7 +466,7 @@ def _relative_posix(root: Path, top: Path) -> Optional[str]:
     link to the repository answers as the repository does, and normcase folds the case
     Windows ignores, so the same workspace has one name in every worktree."""
     try:
-        relative = os.path.relpath(os.path.normcase(_resolved(root)), os.path.normcase(_resolved(top)))
+        relative = os.path.relpath(os.path.normcase(real_path(root)), os.path.normcase(real_path(top)))
     except ValueError:
         return None
     return relative.replace(os.sep, "/")
@@ -543,7 +497,7 @@ def workspace_id(workspace: Any) -> Optional[str]:
 def worktree_label(top: Any) -> str:
     """How a work tree's top directory is written in a ledger row's ``worktree``: resolved,
     POSIX spelling."""
-    return Path(_resolved(Path(os.fspath(top)))).as_posix()
+    return Path(real_path(Path(os.fspath(top)))).as_posix()
 
 
 def ledger_site(workspace: Any, create: bool = True) -> LedgerSite:
@@ -566,7 +520,7 @@ def ledger_site(workspace: Any, create: bool = True) -> LedgerSite:
     if common is None or top is None or relative is None:
         local = _local_state_dir(root, create)
         return LedgerSite(local / _LEDGER_FILE, local / _LEDGER_LOCK, False)
-    base = Path(_resolved(common))
+    base = Path(real_path(common))
     state = _shared_dir(base, create) / _LEDGER_STATE_DIRNAME
     _confined_shared(state, base, create)
     directory = state / _id_of(relative)
@@ -592,48 +546,14 @@ def ledger_locked(workspace: Any, timeout: Optional[float] = None) -> Iterator[L
         with locked(workspace, wait):
             yield site
         return
-    key = os.path.join(_real(site.lock.parent), site.lock.name)
+    key = os.path.join(os.path.normcase(real_path(site.lock.parent)), site.lock.name)
     with _hold(site.lock, key, wait, shared=True):
         yield site
 
 
-def _open_regular(path: Path, flags: int, mode: Optional[int] = None) -> int:
-    """``os.open`` that refuses a symlink at ``path`` and anything but a regular file.
-
-    Raises PathTraversalError for a symlink (an existing one, or, on POSIX, one swapped
-    in before the open) and for a FIFO, device or directory. A missing file is created
-    when ``flags`` has O_CREAT.
-    """
-    try:
-        st: Optional[os.stat_result] = os.lstat(path)
-    except FileNotFoundError:
-        st = None
-    if st is not None and stat.S_ISLNK(st.st_mode):
-        raise _link_error(path)
-    if st is not None and not stat.S_ISREG(st.st_mode):
-        raise PathTraversalError(f"refusing to use {path}: it is not a regular file", path=str(path))
-    create_mode = _NEW_FILE_MODE if mode is None else stat.S_IMODE(mode)
-    try:
-        fd = os.open(str(path), flags | _O_NOFOLLOW | _O_BINARY | _O_CLOEXEC, create_mode)
-    except OSError as exc:
-        if os.path.islink(path):  # ELOOP (EMLINK on BSD): a link replaced it since the lstat
-            raise _link_error(path) from exc
-        raise
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise PathTraversalError(f"refusing to use {path}: it is not a regular file", path=str(path))
-        if mode is not None:
-            _make_private(fd, stat.S_IMODE(mode))
-        elif st is None and _in_shared_state(Path(path)):
-            _make_private(fd, _PRIVATE_FILE_MODE)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
 @contextmanager
-def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[Path]:
+def _hold(lock_path: Path, key: str, timeout: float, shared: bool, *, ordered: bool = True,
+          mode: Optional[int] = None) -> Iterator[Path]:
     """Hold the lock file ``lock_path`` (``key``: its one spelling) for the block:
     re-entrant per thread, a thread lock then the OS lock, bounded by ``timeout``.
 
@@ -643,7 +563,9 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
     it for longer than ``timeout`` seconds.
 
     ``shared`` marks a shared lock, which is a leaf: taking the workspace lock or another
-    shared lock while this thread holds one raises LockOrderError before waiting.
+    shared lock while this thread holds one raises LockOrderError before waiting. With
+    ``ordered`` False (``file_lock``) the lock takes no part in that order: it is never
+    refused for the leaves held and never becomes one. ``mode`` is forced on the lock file.
     """
     held = _held()
     if key in held:
@@ -653,7 +575,7 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
         return
 
     leaves = _held_leaves()
-    if leaves:
+    if ordered and leaves:
         holding = next(iter(leaves.values()))
         if shared:
             raise LockOrderError(
@@ -664,13 +586,13 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
         )
 
     deadline = time.monotonic() + max(0.0, timeout)
-    kind = "shared" if shared else "workspace"
+    kind = "file" if not ordered else "shared" if shared else "workspace"
     thread_lock = _thread_lock(key)
     if not thread_lock.acquire(timeout=max(0.0, timeout)):
         raise _timeout_error(lock_path, timeout, kind)
     fd = None
     try:
-        fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT)
+        fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT, mode=mode)
         interval = LOCK_RETRY_INTERVAL_SECONDS
         while not _try_os_lock(fd):
             if time.monotonic() >= deadline:
@@ -678,7 +600,7 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool) -> Iterator[P
             time.sleep(interval)
             interval = min(interval * 1.5, LOCK_MAX_BACKOFF_SECONDS)
         held.add(key)
-        if shared:
+        if shared and ordered:
             leaves[key] = lock_path
         try:
             yield lock_path
@@ -709,7 +631,7 @@ def locked(workspace: Any, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[Pa
     # state_dir() confined the directory; the lock file itself is opened by its own
     # name, never through what a link named "lock" points at. One spelling per location:
     # two keys for one lock file would make a nested locked() wait on itself.
-    key = os.path.join(_real(state), lock_path.name)
+    key = os.path.join(os.path.normcase(real_path(state)), lock_path.name)
     with _hold(lock_path, key, timeout, shared=False) as path:
         yield path
 
@@ -718,166 +640,17 @@ def locked(workspace: Any, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[Pa
 def file_lock(lock_path: Path, timeout: float = 5.0) -> Iterator[None]:
     """Hold an arbitrary lock file ``lock_path`` (e.g. a user-scope ``.lock`` file).
 
-    Re-entrant per thread, bounded by ``timeout`` seconds, using the same thread lock
-    and OS lock primitives as ``locked`` without participating in workspace/shared lock
-    ordering.
+    Re-entrant per thread, bounded by ``timeout`` seconds: ``locked``'s primitive
+    (``_hold``) on its own key and a 0o600 lock file, without participating in
+    workspace/shared lock ordering.
     """
     target = Path(os.fspath(lock_path))
     if target.parent.is_symlink():
         raise _link_error(target.parent)
     target.parent.mkdir(parents=True, exist_ok=True)
-    key = f"file:{_real(target)}"
-    held = _held()
-    if key in held:
+    key = f"file:{os.path.normcase(real_path(target))}"
+    with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
         yield
-        return
-
-    deadline = time.monotonic() + max(0.0, timeout)
-    thread_lock = _thread_lock(key)
-    if not thread_lock.acquire(timeout=max(0.0, timeout)):
-        raise _timeout_error(target, timeout, "file")
-    fd = None
-    try:
-        fd = _open_regular(target, os.O_RDWR | os.O_CREAT, mode=_PRIVATE_FILE_MODE)
-        interval = LOCK_RETRY_INTERVAL_SECONDS
-        while not _try_os_lock(fd):
-            if time.monotonic() >= deadline:
-                raise _timeout_error(target, timeout, "file")
-            time.sleep(interval)
-            interval = min(interval * 1.5, LOCK_MAX_BACKOFF_SECONDS)
-        held.add(key)
-        try:
-            yield
-        finally:
-            held.discard(key)
-            _os_unlock(fd)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        thread_lock.release()
-
-
-# ── Atomic writes ─────────────────────────────────────────────────────────────
-
-def fsync_dir(directory: Path | str) -> None:
-    """Best-effort directory fsync so a rename or a new file survives power loss (POSIX)."""
-    if os.name != "posix":
-        return
-    try:
-        fd = os.open(str(directory), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
-def _replace_with_retry(src: str, dst: str, max_retries: int, initial_delay: float) -> None:
-    """os.replace, retrying the transient Windows sharing violations (WinError 32/5) an
-    indexer or antivirus causes. 8 attempts from 0.01s back off to ~2.55s in total."""
-    delay = initial_delay
-    for attempt in range(max_retries):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(delay)
-            delay *= 2
-
-
-def _write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        written = os.write(fd, view)
-        view = view[written:]
-
-
-def atomic_write_bytes(
-    path: Path | str,
-    data: bytes,
-    max_retries: int = STORAGE_MAX_RETRIES,
-    initial_delay: float = STORAGE_INITIAL_DELAY_SECONDS,
-    mode: Optional[int] = None,
-) -> None:
-    """Replace ``path`` with ``data`` atomically: readers see the old or the new bytes.
-
-    The parent directory is created if missing. ``mode`` sets the permission bits
-    exactly (the umask does not apply); without it an existing file keeps its bits and
-    a new one gets ``0o666 & ~umask``. The temporary file is removed on failure.
-    """
-    target = Path(path).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    keep_mode: Optional[int] = None if mode is None else stat.S_IMODE(mode)
-    if keep_mode is None:
-        try:
-            keep_mode = stat.S_IMODE(os.stat(target).st_mode)
-        except FileNotFoundError:
-            if _in_shared_state(target):
-                keep_mode = _PRIVATE_FILE_MODE
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_CLOEXEC
-    # A file that ends with set bits starts private, so it is never looser in between.
-    create_mode = _NEW_FILE_MODE if keep_mode is None else 0o600
-    while True:
-        tmp = str(target.parent / f".{target.name}.{secrets.token_hex(6)}.tmp")
-        try:
-            fd = os.open(tmp, flags, create_mode)
-            break
-        except FileExistsError:
-            continue
-    try:
-        try:
-            _write_all(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        if keep_mode is not None:
-            os.chmod(tmp, keep_mode)
-        _replace_with_retry(tmp, str(target), max_retries, initial_delay)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    fsync_dir(target.parent)
-
-
-def atomic_write_text(
-    path: Path | str,
-    text: str,
-    encoding: str = "utf-8",
-    max_retries: int = STORAGE_MAX_RETRIES,
-    initial_delay: float = STORAGE_INITIAL_DELAY_SECONDS,
-) -> None:
-    """atomic_write_bytes for text; the text is written byte for byte (no newline translation)."""
-    atomic_write_bytes(path, text.encode(encoding), max_retries=max_retries, initial_delay=initial_delay)
-
-
-def atomic_write_and_unlink(source_path: Path | str, target_path: Path | str, new_content: str) -> None:
-    """Write ``new_content`` to ``target_path`` atomically, then remove ``source_path``.
-
-    If the source cannot be removed the new target is removed again, so a rule never
-    ends up in two places.
-    """
-    src = Path(source_path)
-    dst = Path(target_path)
-    atomic_write_text(dst, new_content)
-    try:
-        if src != dst and src.exists():
-            src.unlink()
-    except Exception:
-        if dst.exists() and src.exists():
-            try:
-                os.remove(dst)
-            except Exception as ex:
-                raise RuntimeError(f"Rollback failed: duplicate rule remains at {dst}") from ex
-        raise
 
 
 # ── JSONL ─────────────────────────────────────────────────────────────────────
@@ -944,14 +717,6 @@ class JsonlRead:
     @property
     def skipped(self) -> int:
         return len(self.skipped_lines)
-
-
-def _parse_line(raw: bytes, errors: str) -> Optional[Dict[str, Any]]:
-    try:
-        value = json.loads(raw.decode("utf-8-sig", errors))
-    except (UnicodeDecodeError, ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
 
 
 def _read_tail_from_fd(fd: int, limit: int) -> bytes:
@@ -1069,6 +834,11 @@ def read_jsonl(
         except OSError as exc:
             return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 
+    return parse_jsonl(data, errors, contains=contains)
+
+
+def parse_jsonl(data: bytes, errors: str = "strict", *, contains: Optional[bytes] = None) -> JsonlRead:
+    """Parse bytes with the same tolerant line, BOM, skipped-line and tail rules as read_jsonl."""
     if contains is not None and contains not in data:
         return JsonlRead([], [], [])
     rows: List[Dict[str, Any]] = []
@@ -1085,7 +855,11 @@ def read_jsonl(
         raw = raw.rstrip(b"\r")
         if not raw.strip():
             continue
-        row = _parse_line(raw, errors)
+        try:
+            value = json.loads(raw.decode("utf-8-sig", errors))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            value = None
+        row = value if isinstance(value, dict) else None
         if row is not None:
             rows.append(row)
             numbers.append(index + 1)

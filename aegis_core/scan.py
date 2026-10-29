@@ -26,7 +26,7 @@ rule into a system prompt, it returns only the rules for the changed files:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path, PurePath
 import posixpath
@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.match import normalize_path, workspace_files
-from aegis_core import rule_integrity
+from aegis_core import gitsafe, rule_integrity
 from aegis_core.rule_integrity import MANDATORY_SLOT_CAP
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
@@ -317,6 +317,12 @@ def scan(
     ``max_tokens`` bounds the whole response. Returns ``{"status": "FAIL", "error"}``
     (with ``rule_errors``) when the rules cannot all be loaded.
     """
+    with gitsafe.memo():  # one answer per repository question for the whole scan
+        return _scan(workspace, changed_files, budget, max_tokens)
+
+
+def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[int],
+          max_tokens: Optional[int]) -> Dict[str, Any]:
     from aegis_core.sync import read_derived, stale_rules
 
     token_budget = resolve_token_budget(workspace, max_tokens)
@@ -346,9 +352,9 @@ def _integrity_extras(view: "rule_integrity.Effective") -> Dict[str, Any]:
     """``rules_base`` and ``unreviewed_rules`` (id, title, kind of change; nothing else) for a scan."""
     if view.anchor is None:
         return {}
-    extras: Dict[str, Any] = {"rules_base": view.anchor.as_dict()}
+    extras: Dict[str, Any] = {"rules_base": asdict(view.anchor)}
     if view.unreviewed:
-        extras["unreviewed_rules"] = [u.as_dict() for u in view.unreviewed[:_UNREVIEWED_LISTED]]
+        extras["unreviewed_rules"] = [asdict(u) for u in view.unreviewed[:_UNREVIEWED_LISTED]]
         if len(view.unreviewed) > _UNREVIEWED_LISTED:
             extras["unreviewed_total"] = len(view.unreviewed)
     return extras

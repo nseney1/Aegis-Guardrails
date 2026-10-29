@@ -35,7 +35,9 @@ def test_reporting_uses_private_channel_not_public_issues():
 
 def test_readme_links_to_security_policy():
     readme = read(str(ROOT / "README.md"))
-    assert re.search(r"\]\((\./)?SECURITY\.md\)", readme), "README.md does not link to SECURITY.md"
+    # The README is also the PyPI page, where only an absolute link resolves.
+    assert re.search(r"\]\((\./|https://github\.com/nseney1/Aegis-Guardrails/blob/main/)?SECURITY\.md\)", readme), \
+        "README.md does not link to SECURITY.md"
 
 
 def test_supported_versions_cover_the_current_major_line():
@@ -60,6 +62,9 @@ RETRACTED = (
     "check --release",        # Release Gate 4.5 was cut (D6)
     "aegis system",           # a removed command (D5)
     "DirectSDKBackend",       # the vendor SDK backends were cut (D14)
+    "Git subprocesses strip inherited repository",  # selector scrubbing is scoped, not the default
+    "your PATH, always through `gitsafe`",  # treeid has its own runner and private index
+    "an executable resolved outside the repository",  # git accepts absolute PATH entries inside it
 )
 
 
@@ -75,6 +80,21 @@ def test_policy_documents_make_no_retracted_claim():
 
 def test_retracted_claim_guard_is_case_insensitive():
     assert retracted_claims_in("Keys are ED25519 and the server is Air-Gapped.") == ["Ed25519", "air-gapped"]
+    assert retracted_claims_in("GIT SUBPROCESSES STRIP INHERITED REPOSITORY selectors.") == [
+        "Git subprocesses strip inherited repository"]
+    assert retracted_claims_in("your PATH, always through `gitsafe`") == [
+        "your PATH, always through `gitsafe`"]
+    assert retracted_claims_in("AN EXECUTABLE RESOLVED OUTSIDE THE REPOSITORY") == [
+        "an executable resolved outside the repository"]
+
+
+def test_git_environment_claim_names_the_evidence_scope_and_hook_exception():
+    trust = _section(_security_text(), "Repository trust")
+    paragraphs = [paragraph for paragraph in trust.split("\n\n") if "`gitsafe.scrubbed()`" in paragraph]
+    assert len(paragraphs) == 1, "scope the selector-scrubbing claim to gitsafe.scrubbed()"
+    for detail in ("evidence", "Ordinary git calls retain", "hooks", "alternate `GIT_INDEX_FILE`",
+                   "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        assert detail in paragraphs[0], detail
 
 
 # Names of v3 components and v3 biology vocabulary that v4 dropped. A policy document
@@ -111,11 +131,11 @@ SPAWN_SITES = {
     # The trust tier (`aegis doctor`) reads GitHub settings with `gh api` GETs, and `doctor --github --apply` makes
     # one POST after a typed y/N at a terminal; git signs and verifies approvals through ssh-keygen, which only
     # gitsafe-run git starts.
-    "aegis_core/human_gate.py": ("`gh`",),
+    "aegis_core/ghcli.py": ("`gh`",),
     # `aegis check --record` computes the tree git would commit with `git` under a scrubbed environment and a
     # private index, and runs the test command from the user-scope config (never the repository's) in a snapshot.
     "aegis_core/treeid.py": ("`git`",),
-    "aegis_core/checkrun.py": ("your test command",),
+    "aegis_core/testexec.py": ("your test command",),
     # `aegis doctor --release` asks `gh --version`, one read-only `gh api` GET of the repository for its
     # default branch, the tier GETs, then `gh attestation verify` (read-only).
     "aegis_core/release_verify.py": ("`gh`",),

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import (
     _check_cli_resolvable,
     _check_python_version,
@@ -36,10 +36,10 @@ def isolated_hosts(tmp_path, tmp_path_factory, monkeypatch):
     # workspace. Tests of the CLI check itself use the real lookup (``real_lookup``).
     programs = tmp_path_factory.mktemp("programs")
     _stub(programs, "aegis")
-    real_which, real_skipped = doctor.which, doctor.only_skipped
-    monkeypatch.setattr(doctor, "which", lambda name, path=None, outside=None:
+    real_which, real_skipped = doctor_base.which, doctor_base.only_skipped
+    monkeypatch.setattr(doctor_base, "which", lambda name, path=None, outside=None:
                         real_which(name, str(programs), outside))
-    monkeypatch.setattr(doctor, "only_skipped", lambda name, path=None, outside=None, base=None:
+    monkeypatch.setattr(doctor_base, "only_skipped", lambda name, path=None, outside=None, base=None:
                         real_skipped(name, str(programs), outside, base))
     return home
 
@@ -57,8 +57,8 @@ def real_lookup(monkeypatch):
     """Doctor's lookups search $PATH again, which each test sets to its own directories."""
     from aegis_core import pathlookup
 
-    monkeypatch.setattr(doctor, "which", pathlookup.which)
-    monkeypatch.setattr(doctor, "only_skipped", pathlookup.only_skipped)
+    monkeypatch.setattr(doctor_base, "which", pathlookup.which)
+    monkeypatch.setattr(doctor_base, "only_skipped", pathlookup.only_skipped)
 
 
 def _governed(root):
@@ -273,16 +273,16 @@ def test_check_ast_drivers_missing_driver_warns_and_fixes(tmp_path, capsys):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "index.ts").write_text("const x = 1;")
 
-    # Without fix flag: warns and returns False
-    assert _check_ast_drivers(tmp_path, fix=False) is False
+    # The check warns and returns False
+    assert _check_ast_drivers(tmp_path) is False
     out = capsys.readouterr().out
     assert "unconfigured driver for detected source extension(s): .ts" in out
     assert "Run 'aegis doctor --fix' to provision" in out
 
-    # With fix flag: auto-provisions and returns True
-    assert _check_ast_drivers(tmp_path, fix=True) is True
+    # --fix provisions the packaged driver through the backed-up plan
+    run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
     out = capsys.readouterr().out
-    assert "Fixed: enabled the packaged AST drivers in .aegis/config.json for .ts" in out
+    assert "enable the packaged AST drivers for .ts" in out
     assert (tmp_path / ".aegis" / "config.json").is_file()
 
 
@@ -296,15 +296,15 @@ def test_check_ast_drivers_missing_extension_slot_warns_and_fixes(tmp_path, caps
     config.parent.mkdir(parents=True)
     config.write_text('{"v": 1, "ast": {"packaged_drivers": ["ts"]}}')
 
-    # Without fix: warns
-    assert _check_ast_drivers(tmp_path, fix=False) is False
+    # The check warns
+    assert _check_ast_drivers(tmp_path) is False
     out = capsys.readouterr().out
     assert "unconfigured driver for detected source extension(s): .rs" in out
 
-    # With fix: provisions missing slot
-    assert _check_ast_drivers(tmp_path, fix=True) is True
+    # --fix provisions the missing slot
+    assert run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True)) == 0
     out = capsys.readouterr().out
-    assert "Fixed: enabled the packaged AST drivers in .aegis/config.json for .rs" in out
+    assert "enable the packaged AST drivers for .rs" in out
     assert '"rs"' in config.read_text()
 
 
@@ -340,12 +340,12 @@ def test_run_doctor_drivers_flag(tmp_path):
         mock_check.return_value = True
         args = argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=False)
         assert run_doctor(args) == 0
-        mock_check.assert_called_with(tmp_path, fix=False)
+        mock_check.assert_called_with(tmp_path)
 
         mock_check.return_value = False
         args_fail = argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True)
         assert run_doctor(args_fail) == 1
-        mock_check.assert_called_with(tmp_path, fix=False)
+        mock_check.assert_called_with(tmp_path)
 
 
 def test_drivers_fix_provisions_after_a_backup(tmp_path, isolated_hosts, capsys):
@@ -466,7 +466,6 @@ def test_doctor_json_mode_and_warning_counts(tmp_path, monkeypatch, capsys):
 
 def test_doctor_fix_refuses_a_symlinked_config_without_crashing(tmp_path, capsys):
     from conftest import symlink_or_skip
-    from aegis_cli.doctor import _check_ast_drivers
 
     proj = tmp_path / "proj"
     (proj / "src").mkdir(parents=True)
@@ -475,7 +474,7 @@ def test_doctor_fix_refuses_a_symlinked_config_without_crashing(tmp_path, capsys
     outside = tmp_path / "user-config.json"
     symlink_or_skip(outside, proj / ".aegis" / "config.json")
 
-    assert _check_ast_drivers(proj, fix=True) is False
+    assert run_doctor(argparse.Namespace(drivers=True, workspace=str(proj), fix=True, yes=True)) == 1
     assert "is a symlink" in capsys.readouterr().out
     assert not outside.exists()
 

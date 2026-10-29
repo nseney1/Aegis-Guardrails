@@ -175,20 +175,22 @@ Category: Daily Workflow & Verification.
 | `--dry-run` |  |  | Show what would be checked without running anything |
 | `--record` |  |  | Bind the work tree to a git tree, run Layer 1 on an exported snapshot of it and write one ledger check row (witness: aegis). A label, not proof: only CI on the landing commit confirms it. A tree git cannot see completely (assume-unchanged or skip-worktree files) or that holds symbolic links is unbindable and writes no row; exit 0 only when the run passed |
 | `--tests` |  |  | With --record: also run the test command from the user-scope config (tests.command in ~/.aegis/config.json, default python -m pytest, never the repository's) in the snapshot with a fixed environment; exit 5 or zero passed tests is never evidence |
-| `--format` | one of `text`, `json`, `github`, `sarif` | `"text"` | Output format (github, with --ci only: workflow-command annotations) |
-| `--lane` | `LANE` |  | Post-lane gate: check the lane's commits since merge-base(--base, HEAD) for containment (every changed path, deletions and both sides of a move included, inside the lane's globs) and Python test integrity (removed tests, added skips or xfails, pytest collection changes; assert weakening is not detected). Any finding fails. Self-attested from the live lease or --paths; witnessed with --base-policy. As a CI job it is advisory in v4.1, and a witness is only as strong as the protection on .github/** and on the base branch |
+| `--format` | one of `text`, `json`, `github`, `sarif` | `"text"` | Output format. github\|sarif: workflow-command annotations or SARIF 2.1.0 for --ci or a plain Layer 1 check (also appended to $GITHUB_STEP_SUMMARY); neither combines with --json |
+| `--lane` | `LANE` |  | Post-lane gate: check the lane's commits since merge-base(--base, HEAD) for containment (every changed path, deletions and both sides of a move included, inside the lane's globs) and Python test integrity (removed tests, added skips or xfails, pytest collection changes; assert weakening is not detected). Any finding fails. Self-attested from the live lease or --paths; witnessed with --base-policy. As a CI job it is advisory, and a witness is only as strong as the protection on .github/** and on the base branch |
 | `--partition` |  |  | Report the cross-lane call, def and import edges between lanes planned with --split (at least two), and the [FROZEN_SIGNATURES] of the functions that cross a lane boundary. Python, and Rust when its driver is enabled. A report: it changes nothing and exits 0 even when it finds edges |
 | `--card` |  |  | Print the day-0 card: languages, AST drivers, rules by type, the Layer 1 pass rate on the files and the 5 files with the most findings (above 2000 files it samples, and says so). Changes nothing and never reads baseline.json; --json for the machine-readable form |
+| `--calibration` |  |  | Report how well the logged Layer 2 predictions (.aegis/state/arbiter_predictions.jsonl, one row per prediction of aegis check --full, no model text) came true, per backend and observable kind: the resolved count, hits, a Wilson interval and, from 100 resolved, a Brier skill score. Read-only and log-only: no verdict or exit code depends on it |
 | `--write-baseline` |  |  | Record every current Layer 1 finding in .aegis/baseline.json, so that aegis check then fails only on new ones. Findings are fingerprinted by rule, path, matched line and its occurrence, not by line number. A failure that is not about a line (a rule that cannot load, a file that cannot be parsed) is listed and is never recorded |
 | `--prune-baseline` |  |  | Drop the entries of .aegis/baseline.json whose findings are fixed (or whose file is gone). It never adds a finding, and it refuses to run while a check cannot run |
-| `--ci` |  |  | The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers. Also runs T5 fix-commit regression checks (advisory at default warning tier; blocking at gate tier via --strict or user config regression.tier="gate"). Exit 0 pass, 1 fail |
+| `--ci` |  |  | The CI weakening check: compare the rules that bind (gates, invariants, enforcement: gate) at merge-base(--base, --head) with those at --head, and flag every way one binds less (a deletion or archive, a rank decrease, a target_paths pattern no longer kept or a file moved out of reach, a forbid_ast pattern or call entry no longer covered, a new or unknown key, any applies_to change, or a mandatory rule widened or added past the scan's slot cap), or a change to the governance set (when the base lists a signing key). A flagged change passes only with a signed Aegis-Approve commit (aegis approve) by a key in the base branch's allowed_signers or, at tier A on a pull_request or pull_request_target run, a non-author's approving review of the head commit (read with gh; GH_TOKEN with pull-requests: read). Also runs the fix-commit regression check, a report at warning tier that never changes the exit code (no setting makes it block). Exit 0 pass, 1 fail |
 | `--head` | `REF` |  | With --ci: the commit under review (default: the pull request head in $GITHUB_EVENT_PATH, else HEAD) |
 | `--split` | `NAME=GLOB[,GLOB...]` |  | With --partition: one planned lane and the globs of its files; give at least two. They match as rule target_paths do: a glob without '/' matches at any depth |
-| `--base` | `REF` |  | With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, $GITHUB_BASE_REF, origin/main, main, origin/develop or develop). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection |
+| `--base` | `REF` |  | With --ci: the pull request's base (default: its base.sha in $GITHUB_EVENT_PATH, else as below). With --lane: the base branch (default: origin/$GITHUB_BASE_REF, then the branch origin/HEAD names, then main, develop or master, each as origin/<name> before <name>). A shallow clone fails: fetch with fetch-depth 0. Without --lane: read .aegis/baseline.json from REF (label baseline: base@<sha>; absent there means empty: baseline: absent at base) and check what changed since REF; the working tree's baseline is then not consulted, and a REF that does not resolve is an error. Without --base the working tree's baseline is used and labelled self-attested: a candidate can edit its own. There is no CI detection |
 | `--paths` | `GLOB [GLOB ...]` |  | With --lane: the lane's globs instead of its live lease (self-attested). They match as rule target_paths do: a glob without '/' matches at any depth, so CHANGELOG.md also admits docs/CHANGELOG.md. They never allow .aegis/** or .github/workflows/** |
 | `--base-policy` |  |  | With --lane: take lanes.<lane> and shared from .aegis/team.json at the base tip, never the candidate; refuses --paths. Only then is the result 'witnessed: base policy', and only then may .aegis/** and .github/workflows/** change |
-| `--coverage` |  |  | With --ci: run pytest with diff coverage over changed lines |
-| `--perf` |  |  | With --ci: run performance regression check |
+| `--no-exec` |  |  | With --ci: read git objects only and run none of the repository's code: the regression and Aegis-Check trailer reruns are skipped and said so, and the ledger is never read or written. Refuses --coverage and --perf |
+| `--coverage` |  |  | With --ci only: report-only diff coverage, the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason |
+| `--perf` |  |  | With --ci only: a paired, interleaved benchmark of the merge-base export against the checked-out tree (the user-scope perf.command, or pytest-benchmark when it is installed). A regression fails the run; a run that measured nothing says UNVERIFIED and does not block |
 
 ### `aegis scan`
 
@@ -253,7 +255,7 @@ Claims and denials from the events log, and for each first-parent merge since --
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--base` | `REF` |  | Count merges since this commit (default: the branch base, as for aegis check --lane: origin/main, main, origin/develop or develop; with none, the whole first-parent history) |
+| `--base` | `REF` |  | Count merges since this commit (default: the branch base, as for aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, develop or master; with none, the whole first-parent history) |
 
 ### `aegis team release`
 
@@ -401,17 +403,17 @@ Opt-in enable UserPromptSubmit insight capture for a host
 
 ### `aegis rule insight review`
 
-Cluster and review insights or record a decision
+List insights with their top-3 neighbours or record a decision on some
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise` |  | Record a review decision for a cluster |
-| `--cluster` | `CLUSTER_ID` |  | Cluster ID for --decision |
-| `--proposal-id` | `PROPOSAL_ID` |  | Proposal ID when --decision propose |
-| `--category` | `CATEGORY` | `"correctness"` | Proposal category when --decision propose |
+| `--decision` | one of `propose`, `reject`, `snooze`, `merge-into-rule`, `noise`, `confirm` |  | Record a review decision on the insights --insight names (reject also needs --reason; confirm names unconfirmed suggestions) |
+| `--insight` | `ID` |  | Insight ID the decision names, as review lists it (repeatable) |
+| `--kind` | `KIND` |  | Insight kind recorded with --decision confirm; with --decision propose, the proposal's kind (default: the one kind the named insights share) |
+| `--proposal-id` | `PROPOSAL_ID` |  | Proposal ID when --decision propose (default: trap- and 8 hex digits of the ids) |
 | `--summary` | `SUMMARY` |  | Closed-template summary bullet when --decision propose |
 | `--rule` | `RULE_ID` |  | Target rule ID for merge-into-rule or recurrence check |
-| `--reason` | `REASON` |  | Optional reason for the decision |
+| `--reason` | `REASON` |  | Reason for the decision (required with reject) |
 
 ### `aegis rule list`
 
@@ -561,12 +563,12 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 
 **Scan JIT Rules** (read-only, idempotent)
 
-Call before editing files: returns the governance rules matching `files` (or the git diff when `files` is omitted), ranked by ledger fitness and clamped to the JIT token budget. Use this tool before any file edit to satisfy the pre-edit scan gate and record session rule exposure; use `aegis_list_rules` to inspect the full inventory without file matching, and `aegis_report_outcome` after verifying your changes. Mandatory rules (gates, invariants) take at most two slots; any excess is listed in `omitted_mandatory`. Gates and invariants are served from the reviewed base commit (`rules_base`), so branch-local edits to them never bind and are listed in `unreviewed_rules`, while `stale_rules` lists rules edited since the last `aegis sync`. Fails closed (`status: 'FAIL'`) if any rule file cannot be loaded.
+Call before editing files: returns the rules for `files` (default: the git diff), ranked by fitness within the token budget, and records this session's scan and rule exposure. Mandatory rules (gates, invariants) take at most two slots (the excess is in `omitted_mandatory`) and are served from the reviewed base, so branch-local edits to them do not bind and are listed in `unreviewed_rules`. Use `aegis_list_rules` to browse without recording and `aegis_report_outcome` after verifying. Fails closed if a rule file cannot be loaded.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `files` | array of string | no | Workspace-relative file paths you are about to edit. When omitted or empty, defaults to modified files in the current git working tree and index. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
+| `files` | array of string | no | Paths you are about to edit; omitted or empty means the files changed in the git work tree and index. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | 'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'. |
 
 Input schema:
 
@@ -579,7 +581,7 @@ Input schema:
       "items": {
         "type": "string"
       },
-      "description": "Workspace-relative file paths you are about to edit. When omitted or empty, defaults to modified files in the current git working tree and index."
+      "description": "Paths you are about to edit; omitted or empty means the files changed in the git work tree and index."
     },
     "view": {
       "type": "string",
@@ -588,132 +590,9 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected."
+      "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'."
     }
   },
-  "additionalProperties": false
-}
-```
-
-Output schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "relevant_rules": {
-      "type": "array",
-      "description": "Active rules matching the target files, ranked by fitness within the JIT token budget (rule objects in 'full'/'summary' view, or rule ID strings in 'ids' view)."
-    },
-    "relevant_rules_count": {
-      "type": "integer",
-      "description": "Total count of relevant_rules before 'summary' view truncation (present when view='summary')."
-    },
-    "guidance": {
-      "type": "string",
-      "description": "Rendered markdown guidance block ready for prompt injection (omitted when view='summary' or 'ids')."
-    },
-    "invariant_warnings": {
-      "type": "array",
-      "description": "Mandatory gate and invariant rules triggered by the target files."
-    },
-    "invariant_warnings_count": {
-      "type": "integer",
-      "description": "Total count of invariant_warnings before 'summary' view truncation (present when view='summary')."
-    },
-    "rules_staged": {
-      "type": [
-        "integer",
-        "array"
-      ],
-      "description": "Count of rules staged in relevant_rules after budget clamping (omitted when view='ids')."
-    },
-    "rules_staged_count": {
-      "type": "integer",
-      "description": "Total count of rules_staged before 'summary' view truncation (present when view='summary')."
-    },
-    "omitted_mandatory": {
-      "type": "array",
-      "description": "Mandatory gate or invariant rules that matched but exceeded the two-slot mandatory cap."
-    },
-    "omitted_mandatory_count": {
-      "type": "integer",
-      "description": "Total count of omitted_mandatory before 'summary' view truncation (present when view='summary')."
-    },
-    "stale_rules": {
-      "type": "array",
-      "description": "Rules edited on disk since the last 'aegis sync' derived-file regeneration."
-    },
-    "stale_rules_count": {
-      "type": "integer",
-      "description": "Total count of stale_rules before 'summary' view truncation (present when view='summary')."
-    },
-    "unreviewed_rules": {
-      "type": "array",
-      "description": "Gate or invariant rules added or modified since rules_base whose local changes do not bind."
-    },
-    "unreviewed_rules_count": {
-      "type": "integer",
-      "description": "Total count of unreviewed_rules before 'summary' view truncation (present when view='summary')."
-    },
-    "unreviewed_total": {
-      "type": "integer",
-      "description": "Total count of unreviewed gate or invariant rules across the workspace."
-    },
-    "rules_base": {
-      "type": [
-        "object",
-        "string",
-        "null"
-      ],
-      "description": "Reviewed git base anchor from which binding gate and invariant rules were loaded."
-    },
-    "stats": {
-      "type": "object",
-      "description": "Scan telemetry summary including matched counts and token budget usage (omitted in 'summary'/'ids' views)."
-    },
-    "warnings": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "description": "Optional non-fatal scan warning messages."
-    },
-    "warnings_count": {
-      "type": "integer",
-      "description": "Total count of warnings before 'summary' view truncation (present when view='summary')."
-    },
-    "user_layer": {
-      "type": "object",
-      "description": "Read-only user-layer metadata ({path, rules}) when scanning outside a governed Aegis workspace."
-    },
-    "status": {
-      "type": "string",
-      "description": "Optional status indicator ('not_governed' when scanning the user layer outside an Aegis workspace, or 'FAIL' on error)."
-    },
-    "message": {
-      "type": "string",
-      "description": "Informational message when status='not_governed'."
-    },
-    "reason": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "description": "Unbound workspace reason code when status='not_governed'."
-    },
-    "error": {
-      "type": "string",
-      "description": "Error detail when status='FAIL'."
-    },
-    "rule_errors": {
-      "type": "array",
-      "description": "Rule files that failed to parse when status='FAIL'."
-    }
-  },
-  "required": [
-    "relevant_rules"
-  ],
   "additionalProperties": false
 }
 ```
@@ -722,18 +601,18 @@ Output schema:
 
 **Report Outcome**
 
-Record post-verification rule feedback in the local outcome ledger after running tests or `aegis check`. Use this tool at the end of an edit-and-verify cycle; use `aegis_scan` before editing files and `aegis_capture_insight` to record user corrections. When a passing `aegis check --record --tests` row exists for the current git tree, the server credits rules exposed by `aegis_scan` in this session that match the diff (`rules_used` is validated against the rule inventory, not used as the credit source). Those credits count toward fitness once CI passes on the landing commit. Without a matching check record, it writes at most one unwitnessed claim per session and tree that earns no fitness credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.
+Call after verifying a change with tests or `aegis check`, naming rules from `aegis_scan`; use `aegis_capture_insight` for user corrections. With a passing `aegis check --record --tests` row for the current tree, the rules this session's scans exposed that match the diff are credited, counting once CI passes on the landing commit; without one, it writes at most one unwitnessed claim per session and tree, which earns no credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | Verification result for the rules in this change: 'success'/'tp'/'pass' record a true positive ('tp'), 'failure'/'fp'/'fail' record a false positive ('fp'), and 'partial' records a neutral trigger ('trigger'). |
-| `idempotency_key` | string | yes | Caller-supplied unique key (1-256 chars, scoped per host and session). Retrying with the same key and outcome is a no-op; reusing a key with a different outcome fails with status 'FAIL'. |
-| `rules_used` | array of string | yes | Non-empty list of existing rule IDs from aegis_scan. Validated against the workspace rule inventory; actual fitness credit is computed server-side from session scan exposure and git diff paths. |
-| `tests_passed` | boolean | no | Optional boolean recording whether the project's test suite passed during verification. |
-| `rework_count` | integer | no | Optional non-negative integer count of edit-and-retest cycles before verification succeeded (default: 0). |
-| `notes` | string | no | Optional free-text context describing how the rules helped or failed (max 4096 chars). |
-| `files` | array of string | no | Optional workspace-relative file paths edited in this change. Records one 'edit' activity event per idempotency_key for scan-before-edit compliance (aegis status --compliance); does not affect rule credit. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
+| `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | 'success', 'tp' and 'pass' claim a true positive (credited only after CI); the others read as a neutral trigger, never a false positive. |
+| `idempotency_key` | string | yes | Unique per report (scoped by host and session): a retry is a no-op; reuse with another outcome fails. |
+| `rules_used` | array of string | yes | Rule IDs from aegis_scan; credit comes from this session's scan exposure and the diff, not this list. |
+| `tests_passed` | boolean | no | Accepted for compatibility; ignored, never stored. |
+| `rework_count` | integer | no | Accepted for compatibility; ignored, never stored. |
+| `notes` | string | no | Accepted for compatibility; ignored, never stored. |
+| `files` | array of string | no | Paths edited in this change, for scan-before-edit compliance only (at most one 'edit' event per report); never affects credit. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | 'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'. |
 
 Input schema:
 
@@ -752,12 +631,12 @@ Input schema:
         "pass",
         "fail"
       ],
-      "description": "Verification result for the rules in this change: 'success'/'tp'/'pass' record a true positive ('tp'), 'failure'/'fp'/'fail' record a false positive ('fp'), and 'partial' records a neutral trigger ('trigger')."
+      "description": "'success', 'tp' and 'pass' claim a true positive (credited only after CI); the others read as a neutral trigger, never a false positive."
     },
     "idempotency_key": {
       "type": "string",
       "maxLength": 256,
-      "description": "Caller-supplied unique key (1-256 chars, scoped per host and session). Retrying with the same key and outcome is a no-op; reusing a key with a different outcome fails with status 'FAIL'."
+      "description": "Unique per report (scoped by host and session): a retry is a no-op; reuse with another outcome fails."
     },
     "rules_used": {
       "type": "array",
@@ -765,28 +644,28 @@ Input schema:
         "type": "string"
       },
       "minItems": 1,
-      "description": "Non-empty list of existing rule IDs from aegis_scan. Validated against the workspace rule inventory; actual fitness credit is computed server-side from session scan exposure and git diff paths."
+      "description": "Rule IDs from aegis_scan; credit comes from this session's scan exposure and the diff, not this list."
     },
     "tests_passed": {
       "type": "boolean",
-      "description": "Optional boolean recording whether the project's test suite passed during verification."
+      "description": "Accepted for compatibility; ignored, never stored."
     },
     "rework_count": {
       "type": "integer",
       "default": 0,
-      "description": "Optional non-negative integer count of edit-and-retest cycles before verification succeeded (default: 0)."
+      "description": "Accepted for compatibility; ignored, never stored."
     },
     "notes": {
       "type": "string",
       "maxLength": 4096,
-      "description": "Optional free-text context describing how the rules helped or failed (max 4096 chars)."
+      "description": "Accepted for compatibility; ignored, never stored."
     },
     "files": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Optional workspace-relative file paths edited in this change. Records one 'edit' activity event per idempotency_key for scan-before-edit compliance (aegis status --compliance); does not affect rule credit."
+      "description": "Paths edited in this change, for scan-before-edit compliance only (at most one 'edit' event per report); never affects credit."
     },
     "view": {
       "type": "string",
@@ -795,7 +674,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected."
+      "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'."
     }
   },
   "required": [
@@ -807,99 +686,17 @@ Input schema:
 }
 ```
 
-Output schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "status": {
-      "type": "string",
-      "enum": [
-        "recorded",
-        "claimed",
-        "rate_limited",
-        "FAIL"
-      ],
-      "description": "Report disposition: 'recorded' (witnessed by a matching check record), 'claimed' (unwitnessed self-report), 'rate_limited' (session cap reached), or 'FAIL'."
-    },
-    "witness": {
-      "type": "string",
-      "enum": [
-        "aegis",
-        "self"
-      ],
-      "description": "Attestation tier: 'aegis' when backed by a passing 'aegis check --record --tests' row for the current tree, or 'self' for unwitnessed claims."
-    },
-    "credited": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "description": "Rule IDs credited in the outcome ledger (empty for unwitnessed 'claimed' or 'rate_limited' reports)."
-    },
-    "credited_count": {
-      "type": "integer",
-      "description": "Total count of credited rules before 'summary' view truncation (present when view='summary')."
-    },
-    "check": {
-      "type": "string",
-      "description": "Check record ID that witnessed the report (present when status='recorded')."
-    },
-    "tree": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "description": "Git tree hash computed for the workspace at report time."
-    },
-    "recorded": {
-      "type": "boolean",
-      "description": "False when status='rate_limited' or when an unwitnessed claim for the same session and tree was already recorded."
-    },
-    "limit": {
-      "type": "integer",
-      "description": "Per-session report cap (200) returned when status='rate_limited'."
-    },
-    "source": {
-      "type": "string",
-      "description": "Command or tool name that produced the response ('aegis_report_outcome')."
-    },
-    "aegis_version": {
-      "type": "string",
-      "description": "Running Aegis package version string."
-    },
-    "checked_at": {
-      "type": "string",
-      "description": "UTC ISO-8601 timestamp when the report was processed."
-    },
-    "scope": {
-      "type": "object",
-      "description": "Workspace scope metadata envelope ({tree})."
-    },
-    "error": {
-      "type": "string",
-      "description": "Error message when status='FAIL'."
-    }
-  },
-  "required": [
-    "credited"
-  ],
-  "additionalProperties": false
-}
-```
-
 ### `aegis_create_rule`
 
 **Create Rule** (read-only, idempotent)
 
-Build a structured prompt for drafting a new governance rule from a natural-language `description`. Use this tool when asked to author or codify a repository rule; use `aegis_list_rules` to inspect existing rules first, or `aegis_capture_insight` to log a raw user correction without creating a rule file. Samples up to three active workspace rules (500 chars each) as style examples, incorporates optional `rule_type` and `domain` hints, and writes nothing to disk: save the drafted markdown to `.aegis/rules/<type_dir>/<id>.md` yourself as directed by `instruction`.
+Builds a prompt for drafting a rule from `description`, with up to three active workspace rules (500 chars each) as examples; it writes nothing to disk. Save the result to `.aegis/rules/<type_dir>/<id>.md` as `instruction` says. Check `aegis_list_rules` for an existing rule first.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `description` | string | yes | Non-empty natural-language description of the engineering defect, anti-pattern, or invariant to codify into a rule. |
-| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional target rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance). Determines the target subdirectory under .aegis/rules/. |
-| `domain` | string | no | Optional domain hint injected into the drafting prompt (e.g., 'security', 'correctness', 'efficiency', 'style', 'governance'). |
+| `description` | string | yes | The defect, anti-pattern or invariant the rule should codify. |
+| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Rule type, passed to the draft prompt as a hint. |
+| `domain` | string | no | Domain hint for the draft prompt (security, correctness, efficiency, style, governance). |
 
 Input schema:
 
@@ -909,7 +706,7 @@ Input schema:
   "properties": {
     "description": {
       "type": "string",
-      "description": "Non-empty natural-language description of the engineering defect, anti-pattern, or invariant to codify into a rule."
+      "description": "The defect, anti-pattern or invariant the rule should codify."
     },
     "rule_type": {
       "type": "string",
@@ -921,11 +718,11 @@ Input schema:
         "persona",
         "contract"
       ],
-      "description": "Optional target rule category ('invariant' or 'gate' for blocking checks; 'trap', 'boundary', 'persona', or 'contract' for advisory guidance). Determines the target subdirectory under .aegis/rules/."
+      "description": "Rule type, passed to the draft prompt as a hint."
     },
     "domain": {
       "type": "string",
-      "description": "Optional domain hint injected into the drafting prompt (e.g., 'security', 'correctness', 'efficiency', 'style', 'governance')."
+      "description": "Domain hint for the draft prompt (security, correctness, efficiency, style, governance)."
     }
   },
   "required": [
@@ -935,47 +732,16 @@ Input schema:
 }
 ```
 
-Output schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "prompt": {
-      "type": "string",
-      "description": "Structured rule-generation prompt containing schema requirements and up to three workspace rule examples."
-    },
-    "instruction": {
-      "type": "string",
-      "description": "Step-by-step instruction telling the caller where under .aegis/rules/<type_dir>/<id>.md to save the drafted markdown."
-    },
-    "status": {
-      "type": "string",
-      "description": "Present with value 'FAIL' only when input validation fails."
-    },
-    "error": {
-      "type": "string",
-      "description": "Error message when status='FAIL'."
-    }
-  },
-  "required": [
-    "prompt",
-    "instruction"
-  ],
-  "additionalProperties": false
-}
-```
-
 ### `aegis_list_rules`
 
 **List Rules** (read-only, idempotent)
 
-List the workspace governance rule inventory in directory order without recording a scan or exposure event. Use this tool to browse or audit rules, check ledger fitness, or find stale/broken rule files; use `aegis_scan` instead before editing files so pre-edit scan compliance and session rule exposure are recorded. Returns every rule with its metadata and ledger fitness (or `_error` if unloadable, and `_expired: true` if retired), rules modified since the last `aegis sync` (`stale_rules`), and non-rule markdown under `.aegis/rules/` (`ignored`). Pass `rule_type` to filter `rules` and `stale_rules` to one category, or `view` (`'summary'` or `'ids'`) to compact the payload.
+Lists every rule with metadata and ledger fitness (`_error` if unloadable, `_expired: true` if retired), the `stale_rules` edited since the last `aegis sync`, and non-rule files under `.aegis/rules/` (`ignored`). Records no scan or exposure: call `aegis_scan` before editing files.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Optional filter restricting both 'rules' and 'stale_rules' to a single rule category ('invariant', 'trap', 'gate', 'boundary', 'persona', or 'contract'). Omit to list all categories. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected. |
+| `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Only rules and stale_rules of this type. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | 'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'. |
 
 Input schema:
 
@@ -993,7 +759,7 @@ Input schema:
         "persona",
         "contract"
       ],
-      "description": "Optional filter restricting both 'rules' and 'stale_rules' to a single rule category ('invariant', 'trap', 'gate', 'boundary', 'persona', or 'contract'). Omit to list all categories."
+      "description": "Only rules and stale_rules of this type."
     },
     "view": {
       "type": "string",
@@ -1002,57 +768,9 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "Optional response projection: 'full' (default, complete payload), 'summary' (retains identity/type/status/fitness fields, caps lists at 10 items, and adds <list>_count), or 'ids' (projects each list to rule ID strings). Error responses are never projected."
+      "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'."
     }
   },
-  "additionalProperties": false
-}
-```
-
-Output schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "rules": {
-      "type": "array",
-      "description": "Workspace rule records with metadata and ledger fitness (or rule ID strings when view='ids')."
-    },
-    "rules_count": {
-      "type": "integer",
-      "description": "Total count of rules before 'summary' view truncation (present when view='summary')."
-    },
-    "stale_rules": {
-      "type": "array",
-      "description": "Rules edited since the last 'aegis sync' derived-file regeneration."
-    },
-    "stale_rules_count": {
-      "type": "integer",
-      "description": "Total count of stale_rules before 'summary' view truncation (present when view='summary')."
-    },
-    "ignored": {
-      "type": "array",
-      "description": "Non-rule markdown files under .aegis/rules/ with path and reason."
-    },
-    "ignored_count": {
-      "type": "integer",
-      "description": "Total count of ignored files before 'summary' view truncation (present when view='summary')."
-    },
-    "status": {
-      "type": "string",
-      "description": "Present with value 'FAIL' only when the rules directory cannot be safely loaded."
-    },
-    "error": {
-      "type": "string",
-      "description": "Error message when status='FAIL'."
-    }
-  },
-  "required": [
-    "rules",
-    "stale_rules",
-    "ignored"
-  ],
   "additionalProperties": false
 }
 ```
@@ -1061,12 +779,12 @@ Output schema:
 
 **Capture Insight**
 
-Append a user correction quote to the user-scoped insights log (`~/.aegis/insights/`) for rule curation. Use this tool when the user corrects your approach or states a recurring preference; use `aegis_create_rule` to draft a `.aegis/rules/` file immediately, or `aegis_report_outcome` to report whether existing rules helped. Each call redacts secrets, truncates `quote` to 300 characters, associates `paths` (or dirty git worktree paths when omitted), and appends a new `ins-<hex>` record. Agent-submitted records start at `level: 'suggestion'`, which is invisible to `aegis_scan` and excluded from `aegis insights review` rule proposals until corroborated (`level: 'W2'`) by a matching user prompt captured by a host hook in the same session.
+Appends a user correction or preference to `~/.aegis/insights/` for rule curation; use `aegis_report_outcome` to report whether rules helped. Secrets are redacted, `quote` is cut to 300 characters and `paths` default to the dirty git paths. Agent captures stay at `level: 'suggestion'`: invisible to `aegis_scan`, never counted by `aegis rule insight review`, never upgraded. Capped at 50 captures per session and rate-limited to 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `quote` | string | yes | Non-empty verbatim quote of the user's correction or preference (1-1024 chars; secrets are automatically redacted and stored text is capped at 300 chars). |
-| `paths` | array of string | no | Optional workspace-relative file paths this correction applies to (sets psrc='explicit'). When omitted or empty, defaults to currently modified git worktree paths (psrc='dirty'). |
+| `quote` | string | yes | The user's verbatim correction (1-1024 chars); secrets are redacted and 300 chars stored. |
+| `paths` | array of string | no | Paths it applies to (psrc 'explicit'; at most 20 of 512 chars); default: up to 20 dirty git paths (psrc 'dirty'). |
 
 Input schema:
 
@@ -1077,80 +795,20 @@ Input schema:
     "quote": {
       "type": "string",
       "maxLength": 1024,
-      "description": "Non-empty verbatim quote of the user's correction or preference (1-1024 chars; secrets are automatically redacted and stored text is capped at 300 chars)."
+      "description": "The user's verbatim correction (1-1024 chars); secrets are redacted and 300 chars stored."
     },
     "paths": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 512
       },
-      "description": "Optional workspace-relative file paths this correction applies to (sets psrc='explicit'). When omitted or empty, defaults to currently modified git worktree paths (psrc='dirty')."
+      "maxItems": 20,
+      "description": "Paths it applies to (psrc 'explicit'; at most 20 of 512 chars); default: up to 20 dirty git paths (psrc 'dirty')."
     }
   },
   "required": [
     "quote"
-  ],
-  "additionalProperties": false
-}
-```
-
-Output schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "status": {
-      "type": "string",
-      "enum": [
-        "OK",
-        "FAIL"
-      ],
-      "description": "'OK' when the insight row was appended, or 'FAIL' on validation/storage error."
-    },
-    "id": {
-      "type": "string",
-      "description": "Content-addressed insight identifier ('ins-<12-hex>')."
-    },
-    "level": {
-      "type": "string",
-      "enum": [
-        "suggestion",
-        "W2"
-      ],
-      "description": "Corroboration tier: 'suggestion' initially, or 'W2' when matched to a hook-captured user prompt in the same session."
-    },
-    "text": {
-      "type": "string",
-      "description": "Secret-redacted and length-capped (max 300 chars) correction quote stored in the ledger."
-    },
-    "paths": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "description": "Workspace-relative file paths associated with this insight."
-    },
-    "psrc": {
-      "type": "string",
-      "enum": [
-        "explicit",
-        "dirty"
-      ],
-      "description": "Path provenance: 'explicit' when caller supplied paths, or 'dirty' when inferred from git status."
-    },
-    "error": {
-      "type": "string",
-      "description": "Error message when status='FAIL'."
-    }
-  },
-  "required": [
-    "status",
-    "id",
-    "level",
-    "text",
-    "paths",
-    "psrc"
   ],
   "additionalProperties": false
 }

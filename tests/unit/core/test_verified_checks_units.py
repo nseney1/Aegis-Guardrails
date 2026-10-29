@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from aegis_core import checkrun, credit, treeid
+from aegis_core import checkrun, credit, testexec, treeid
 from tests import helpers_humangate as hg
 from tests import helpers_verified as hv
 
@@ -179,57 +179,6 @@ def test_the_run_sees_a_fixed_environment(tmp_path, monkeypatch):
     assert "evil" not in json.dumps(env) and seen["stdin_tty"] is False
 
 
-@needs_git
-def test_the_user_config_command_may_be_an_argv_list_and_the_digest_is_machine_independent(tmp_path):
-    repo = hv.make_project(tmp_path)
-    hv.write_user_config(repo.home.path, tests={"command": ["python", "run_checks.py"]})
-    assert checkrun.user_test_command(repo.root) == ["python", "run_checks.py"]
-    first = checkrun.command_digest(["python", "run_checks.py"])
-    argv, logical = checkrun.plan_command(["python", "run_checks.py"])
-    assert argv[0] == sys.executable and logical == ["python", "run_checks.py"]
-    assert checkrun.command_digest(logical) == first
-
-
-def test_a_bare_pytest_runs_as_python_m_pytest_with_every_hermetic_flag(tmp_path):
-    junit = tmp_path / "junit.xml"
-    argv, logical = checkrun.plan_command(["pytest", "-q"], junit)
-    assert argv[:6] == [sys.executable, "-s", "--check-hash-based-pycs", "always", "-m", "pytest"]
-    at = argv.index("-p")
-    assert argv[at:at + 4] == ["-p", "no:cacheprovider", "-o", "addopts="]
-    assert f"--junitxml={junit}" in argv and "-q" in argv
-    assert logical == ["pytest", "-q"]
-
-
-@pytest.mark.parametrize("word", ["/opt/venv/bin/pytest", "py.test", "PYTEST.EXE"])
-def test_any_pytest_program_runs_under_the_aegis_interpreter(word):
-    argv, logical = checkrun.plan_command([word, "-q"])
-    assert argv[0] == sys.executable and argv[4:6] == ["-m", "pytest"] and "addopts=" in argv
-    assert logical == [word, "-q"]
-
-
-def test_only_an_absolute_python_first_word_is_kept_as_the_interpreter(tmp_path):
-    python = tmp_path / "python3"
-    python.write_text("#!/bin/sh\nexit 0\n")
-    python.chmod(0o755)
-    argv, _ = checkrun.plan_command([str(python), "-m", "pytest"])
-    assert argv[:4] == [str(python), "-s", "--check-hash-based-pycs", "always"] and "addopts=" in argv
-    assert checkrun.plan_command(["python", "-m", "pytest"])[0][0] == sys.executable
-    tool = str(tmp_path / "runtests")
-    assert checkrun.plan_command([tool, "-x"])[0] == [tool, "-x"]
-
-
-def test_a_missing_absolute_interpreter_exits_127(tmp_path):
-    junit = tmp_path / "junit.xml"
-    argv, _ = checkrun.plan_command([str(tmp_path / "nowhere" / "python3"), "-m", "pytest"], junit)
-    run = checkrun.run_tests(argv, tmp_path, checkrun.hermetic_env(tmp_path), 60.0, junit, tmp_path / "out.txt")
-    assert run.exit == 127 and not run.evidence
-
-
-def test_the_default_command_keeps_its_digest():
-    _argv, logical = checkrun.plan_command(None)
-    assert checkrun.command_digest(logical) == "982597b8a8141596e8015b5c60700b600e69fc8873640cb98a23585cfff5b8ea"
-
-
 def _record_with_stand_in(tmp_path, monkeypatch, capsys, script: str):
     from aegis_cli.cli import main
 
@@ -262,16 +211,6 @@ def test_a_failing_run_with_pytest_present_prints_no_hint(tmp_path, monkeypatch,
     code, out, rows = _record_with_stand_in(tmp_path, monkeypatch, capsys,
                                             "echo '2 passed, 1 failed in 0.01s'\nexit 1\n")
     assert code == 1 and "hint:" not in out and rows[-1]["passed"] is False
-
-
-@needs_git
-@pytest.mark.parametrize("config", ["not json", '{"tests": {"command": 5}}', '{"tests": {"command": ""}}', "[]"])
-def test_an_unusable_user_config_falls_back_to_the_default(tmp_path, config):
-    repo = hv.make_project(tmp_path)
-    path = repo.home.path / ".aegis" / "config.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(config)
-    assert checkrun.user_test_command(repo.root) is None
 
 
 @needs_git
@@ -532,7 +471,7 @@ def test_a_rerun_that_times_out_is_unbound_and_check_ci_passes(tmp_path, monkeyp
     _trailer_head(repo)
     out = checkrun.verify_commit_trailers(repo.root, "main", "HEAD", timeout=1)
     assert [(e["result"], e["failed"]) for e in out] == [("unbound", False)] and "timed out" in out[0]["reason"]
-    monkeypatch.setattr(checkrun, "DEFAULT_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(testexec, "DEFAULT_TIMEOUT_S", 1.0)
     monkeypatch.chdir(repo.root)
     capsys.readouterr()
     assert main(["check", "--ci", "--base", "main", "--json"]) == 0
@@ -550,14 +489,14 @@ def test_the_rerun_uses_the_record_recipe_and_snapshot_bytes(tmp_path, monkeypat
     def recorder(argv, cwd, env, timeout, junit, output):
         seen.append(([a.replace(str(junit), "JUNIT") for a in argv], sorted(env), timeout,
                      (Path(cwd) / "src" / "app.py").read_bytes()))
-        return checkrun.TestsRun(exit=0, collected=1, passed=1)
+        return testexec.TestsRun(exit=0, collected=1, passed=1)
 
-    monkeypatch.setattr(checkrun, "run_tests", recorder)
+    monkeypatch.setattr(testexec, "run_tests", recorder)
     recorded = checkrun.record(repo.root, tests=True, base="main")
     rerun = checkrun.rerun_commit_snapshot(repo.root, "HEAD", "main")
     assert recorded.status == "recorded" and rerun["tree"] == recorded.row["tree"] and rerun["exit"] == 0
     assert len(seen) == 2 and seen[0] == seen[1]
-    assert seen[0][2] == checkrun.DEFAULT_TIMEOUT_S and seen[0][3] == b"def app():\n    return 2\n"
+    assert seen[0][2] == testexec.DEFAULT_TIMEOUT_S and seen[0][3] == b"def app():\n    return 2\n"
 
 
 @needs_git
@@ -894,6 +833,37 @@ def test_derive_is_pure_and_needs_a_report_to_name_a_rule():
     assert credit.confirmed_outcome_rows(credits)[0]["rule"] == "r"
 
 
+def test_a_type_error_inside_a_landed_lookup_propagates_and_is_not_retried():
+    """Given a check row with a head and a landed lookup that raises TypeError internally, When
+    credit is derived, Then the TypeError surfaces after one call (no retry as landed(tree))."""
+    calls = []
+
+    def landed(tree, head=None):
+        calls.append((tree, head))
+        raise TypeError("boom")
+
+    check = {"event": "check", "id": "c1", "tree": SHA, "head": "d" * 40, "passed": True, "tests": TESTED}
+    report = {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"}
+    with pytest.raises(TypeError, match="boom"):
+        credit.derive([check, report], landed=landed)
+    assert calls == [(SHA, "d" * 40)]
+
+
+def test_a_landed_lookup_gets_the_head_once_and_a_row_without_a_head_gets_the_tree_alone():
+    calls = []
+
+    def landed(*args):
+        calls.append(args)
+        return "c" * 40
+
+    rows = [{"event": "check", "id": "c1", "tree": SHA, "head": "d" * 40, "passed": True, "tests": TESTED},
+            {"event": "check", "id": "c2", "tree": "2" * 40, "head": "", "passed": True, "tests": TESTED},
+            {"event": "report", "check": "c1", "for_rule": "r", "result": "tp", "ts": "t"},
+            {"event": "report", "check": "c2", "for_rule": "r", "result": "tp", "ts": "t"}]
+    assert [c.commit for c in credit.derive(rows, landed=landed)] == ["c" * 40] * 2
+    assert calls == [(SHA, "d" * 40), ("2" * 40,)]
+
+
 @pytest.mark.parametrize("claimed,fields,expected", [
     ("tp", {"passed": True}, "tp"),
     ("trigger", {"passed": True}, "trigger"),
@@ -942,3 +912,230 @@ def test_a_report_with_no_tree_is_a_claim_and_the_cap_is_honoured(tmp_path):
                                   rules_for=lambda c: [], cap=1)
     assert first["status"] == "claimed" and second["status"] == "rate_limited"
     assert len(hv.rows_of(tmp_path, "claimed")) == 1
+
+
+# ── evidence ignores the caller's GIT_DIR (R-trust-19) ─────────────────────────
+
+_LOCAL_GIT_ENV = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                  "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+                  "GIT_INDEX_FILE", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR")
+
+
+@pytest.fixture
+def two_repos(tmp_path):
+    """A (work branch: only_in_a.txt and a sharpened rule) and B (work branch: only_in_b.txt)."""
+    a = hv.make_project(tmp_path, name="a")
+    a.write("only_in_a.txt", "a\n")
+    a.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("hypothesis: sample", "hypothesis: sharper"))
+    a.commit("a")
+    b = hv.make_project(tmp_path, name="b")
+    b.write("only_in_b.txt", "b\n")
+    b.commit("b")
+    hv.use_stub_runner(a.home.path)
+    return a, b
+
+
+def _ambient(monkeypatch, b) -> None:
+    monkeypatch.setenv("GIT_DIR", str(b.root / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(b.root))
+
+
+def _git_children(monkeypatch):
+    """The environment of every git child, whichever runner starts it."""
+    seen = []
+    real = subprocess.run
+
+    def spy(argv, *args, **kwargs):
+        if os.path.basename(str(argv[0])).lower() in ("git", "git.exe"):
+            seen.append(dict(kwargs.get("env") or os.environ))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    return seen
+
+
+def _evidence_calls(a):
+    from aegis_core import human_gate, regression, release_verify, rule_integrity, sync
+    from aegis_core.verification import records
+
+    head, logged = a.head(), _logged_row(a)
+    no_rerun = lambda commit, tree: {"tree": tree, "exit": 0}  # noqa: E731
+
+    def gh(argv, timeout=0):
+        return (0, "gh version 2.93.0 (2026-01-01)\n", "") if argv[:1] == ["--version"] else (1, "", "no")
+
+    return {
+        "treeid.tree_files": lambda: treeid.tree_files(a.root),
+        "treeid.tree_of": lambda: treeid.tree_of(a.root),
+        "checkrun.record": lambda: checkrun.record(a.root),
+        "checkrun.rerun_commit_snapshot": lambda: checkrun.rerun_commit_snapshot(a.root, head, "main", timeout=60),
+        "checkrun.verify_commit_trailers": lambda: checkrun.verify_commit_trailers(a.root, "main", rerun_fn=no_rerun),
+        "credit.verify_commit_trailers": lambda: credit.verify_commit_trailers(a.root, "main", rerun_fn=no_rerun),
+        "rule_integrity.check_ci": lambda: rule_integrity.check_ci(a.root, "main", "HEAD"),
+        "human_gate.find_approval": lambda: human_gate.find_approval(a.root, "HEAD", "main"),
+        "human_gate.find_test_exemption": lambda: human_gate.find_test_exemption(a.root, "HEAD", "main", head),
+        "human_gate.verify_approval": lambda: human_gate.verify_approval(a.root, head, "0" * 64, "main"),
+        "human_gate.verify_insight_approval": lambda: human_gate.verify_insight_approval(a.root, head, "x", "main"),
+        "human_gate.verify_test_exemption": lambda: human_gate.verify_test_exemption(a.root, head, head, "main"),
+        "release_verify.verify_release": lambda: release_verify.verify_release(a.root, head, run=gh,
+                                                                               tier_runner=lambda *x, **k: None),
+        "regression.check_ci_regressions": lambda: regression.check_ci_regressions(a.root, "main", "HEAD"),
+        "sync.base_fetch": lambda: sync.base_fetch(a.root),
+        "sync.sync": lambda: sync.sync(a.root),
+        "credit.project_credits": lambda: credit.project_credits(a.root),
+        "records.resolve_rows": lambda: records.resolve_rows(a.root, [logged], time.time()),
+    }
+
+
+def _logged_row(a) -> dict:
+    return {"id": "r-1", "verdict_id": "v", "ts": time.time() - 60, "tree": hv.tree_now(a.root), "backend": "claude",
+            "scope": {"path": "src/app.py", "symbol": "app"}, "observable": {"kind": "revert", "selector": "src/app.py"},
+            "window_days": 14, "p": 0.4, "disposition": "logged", "outcome": None}
+
+
+def _landed_report(a) -> None:
+    """A's passing check of the sharpened rule, reported and landed on main: the projection then
+    reaches the lazily-run landed and approval lookups, not only its eager git."""
+    row = checkrun.record(a.root, tests=True, base="main").row
+    assert credit.submit_report(a.root, tree=row["tree"], session="s", host="h", key="k", outcome="success",
+                                rules_for=lambda c: ["trap-sample"])["status"] == "recorded"
+    a.git("branch", "-f", "main", a.head())
+
+
+# Run before GIT_DIR is exported: what an entry point needs in A to start its git at all.
+_PREPARE = {"credit.project_credits": _landed_report}
+
+_EVIDENCE = [
+    "treeid.tree_files", "treeid.tree_of", "checkrun.record", "checkrun.rerun_commit_snapshot",
+    "checkrun.verify_commit_trailers", "credit.verify_commit_trailers", "rule_integrity.check_ci",
+    "human_gate.find_approval", "human_gate.find_test_exemption", "human_gate.verify_approval",
+    "human_gate.verify_insight_approval", "human_gate.verify_test_exemption", "release_verify.verify_release",
+    "regression.check_ci_regressions", "sync.base_fetch", "sync.sync", "credit.project_credits",
+    "records.resolve_rows",
+]
+
+
+@needs_git
+@pytest.mark.parametrize("name", _EVIDENCE)
+def test_no_evidence_git_call_follows_an_exported_git_dir(two_repos, monkeypatch, name):
+    """Given GIT_DIR/GIT_WORK_TREE exported for repository B, when an evidence function runs against A,
+    then no git child it starts is pointed at B (the leak matrix of R-trust-19)."""
+    a, b = two_repos
+    call = _evidence_calls(a)[name]
+    _PREPARE.get(name, lambda repo: None)(a)
+    _ambient(monkeypatch, b)
+    seen = _git_children(monkeypatch)
+    try:
+        call()
+    except Exception:  # noqa: BLE001 - the verdict does not matter here, only where git looked
+        pass
+    assert seen, "the function started no git at all"
+    marks = {os.path.normcase(str(b.root)), os.path.normcase(os.path.realpath(b.root))}
+    leaked = sorted({k for env in seen for k, v in env.items()
+                     if k.upper() in _LOCAL_GIT_ENV and any(m in os.path.normcase(v) for m in marks)})
+    assert leaked == []
+
+
+@needs_git
+def test_the_tree_head_base_and_rules_are_the_repository_asked_about(two_repos, monkeypatch):
+    """Given GIT_DIR/GIT_WORK_TREE exported for B, then every tree, head, base and rule read is A's."""
+    from aegis_core import rule_integrity
+
+    a, b = two_repos
+    clean_tree, head, base = treeid.tree_of(a.root).tree, a.head(), a.git("merge-base", "main", "HEAD")
+    assert clean_tree == hv.tree_now(a.root)
+    _ambient(monkeypatch, b)  # from here the helpers' own git would follow it too
+    files = treeid.tree_files(a.root)
+    assert "only_in_a.txt" in files and "only_in_b.txt" not in files
+    assert treeid.tree_of(a.root).tree == clean_tree
+    outcome = checkrun.record(a.root)
+    assert outcome.status == "recorded", outcome.reason
+    assert outcome.row["head"] == head and outcome.row["tree"] == clean_tree and outcome.row["base"] == base
+    report = rule_integrity.check_ci(a.root, "main", "HEAD")
+    assert report.head == head and report.merge_base == base
+
+
+@needs_git
+def test_credit_lands_on_the_commit_of_the_repository_asked_about(two_repos, monkeypatch):
+    """Given A's reported check landed on A's main and GIT_DIR/GIT_WORK_TREE exported for B, when
+    credit is projected for A (directly and through the arbiter records), then it lands on A's commit."""
+    from aegis_core.verification import records
+
+    a, b = two_repos
+    _landed_report(a)
+    head, logged = a.head(), _logged_row(a)
+    _ambient(monkeypatch, b)  # from here the test's own git would follow it too
+    credit_, = credit.project_credits(a.root).credits
+    assert credit_.commit == head
+    row, = records.resolve_rows(a.root, [logged], time.time())
+    assert row["disposition"] == "landed_unchanged"
+
+
+@needs_git
+def test_approve_reads_the_key_from_the_user_config_and_signs_in_the_repository_asked_about(two_repos, monkeypatch):
+    """Given the signing key only in GIT_CONFIG_GLOBAL and GIT_DIR exported for B, when aegis approve
+    runs in A, then the key comes from that file and the signed commit is made in A (spy, no ssh-keygen)."""
+    import argparse
+    import builtins
+
+    from aegis_cli import approve
+    from aegis_core import gitsafe, human_gate
+
+    a, b = two_repos
+    head = a.head()
+    config = a.home.path / "global.gitconfig"
+    config.write_bytes(b"[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    _ambient(monkeypatch, b)
+    with gitsafe.scrubbed():
+        assert human_gate.signing_config(a.root) == {"format": "ssh", "key": "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"}
+    signed = []
+
+    def custody(top):
+        signed.append(("custody", Path(top), human_gate.signing_config(top)["key"]))
+        return human_gate.KeyCustody("agent", "an agent holds the key", False)
+
+    monkeypatch.setattr(human_gate, "check_key_custody", custody)
+    monkeypatch.setattr(human_gate, "signed_empty_commit",
+                        lambda top, message, interactive=False: signed.append(("sign", Path(top), message)) or head)
+    monkeypatch.setattr(approve, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
+    code = approve.run_approve(argparse.Namespace(workspace=str(a.root), json=False, base="main", exempt_test=None,
+                                                  reason=None))
+    assert code == 0
+    assert [(kind, os.path.samefile(top, a.root)) for kind, top, _ in signed] == [("custody", True), ("sign", True)]
+    assert signed[0][2] == "key::ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"
+
+
+# ── one name per function (R-trust-50) ───────────────────────────────────────
+
+def test_each_function_has_one_name_and_no_public_name_is_unreferenced():
+    for gone in ("parse_junit", "_junit", "_hermetic_env", "_kill_group"):
+        assert not hasattr(testexec, gone), gone
+    assert "parse_junit" not in testexec.__all__
+    assert all(hasattr(testexec, name) for name in testexec.__all__)
+    assert all(hasattr(checkrun, name) for name in checkrun.__all__)
+    assert treeid.named_paths(["a", "b"]) == "a, b" and "named_paths" in treeid.__all__
+    assert treeid.named_paths([str(i) for i in range(7)]) == "0, 1, 2, 3, 4 and 2 more"
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="time.tzset is POSIX")
+def test_a_check_row_stamps_a_naive_now_as_utc(tmp_path):
+    """A naive datetime is UTC by rule (R-structure-20); it was read as local time here."""
+    from datetime import datetime
+
+    repo = hv.make_project(tmp_path)
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    try:
+        outcome = checkrun.record(repo.root, now=datetime(2026, 10, 19, 12, 0))
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+    assert outcome.status == "recorded", outcome.reason
+    assert outcome.row["ts"] == outcome.row["checked_at"] == "2026-10-19T12:00:00Z"

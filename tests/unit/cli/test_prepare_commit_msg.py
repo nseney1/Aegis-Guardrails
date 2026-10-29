@@ -191,3 +191,92 @@ def test_init_installs_both_hooks_and_commit_of_checked_tree_gets_one_trailer(tm
     capsys.readouterr()
     assert not (hooks / HOOK).exists()
 
+
+
+# ── R-cli-42: `hook uninstall` removes the trailer hook on its own ─────────────
+
+def _installed(tmp_path):
+    from aegis_cli import cli
+
+    repo = hv.make_project(tmp_path)
+    hooks = repo.root / ".git" / "hooks"
+    assert cli.main(["hook", "install", "--workspace", str(repo.root)]) == 0
+    assert (hooks / "pre-commit").is_file() and (hooks / HOOK).is_file()
+    return repo, hooks
+
+
+def _uninstall(repo, capsys, *flags):
+    from aegis_cli import cli
+
+    capsys.readouterr()
+    rc = cli.main(["hook", "uninstall", "--workspace", str(repo.root), *flags])
+    captured = capsys.readouterr()
+    return rc, captured.out, captured.err
+
+
+@needs_git
+def test_uninstall_removes_the_trailer_hook_when_pre_commit_was_deleted_by_hand(tmp_path, capsys):
+    repo, hooks = _installed(tmp_path)
+    (hooks / "pre-commit").unlink()
+    rc, out, _err = _uninstall(repo, capsys)
+    assert rc == 1
+    assert "No aegis pre-commit hook found to uninstall" in out and "prepare-commit-msg hook removed" in out
+    assert not (hooks / HOOK).exists()
+
+
+@needs_git
+def test_uninstall_removes_the_trailer_hook_beside_a_users_own_pre_commit(tmp_path, capsys):
+    repo, hooks = _installed(tmp_path)
+    mine = b"#!/bin/sh\necho users own check\n"
+    (hooks / "pre-commit").write_bytes(mine)
+    rc, _out, _err = _uninstall(repo, capsys)
+    assert rc == 1
+    assert (hooks / "pre-commit").read_bytes() == mine
+    assert not (hooks / HOOK).exists()
+
+
+@needs_git
+def test_uninstall_leaves_a_foreign_prepare_commit_msg_alone(tmp_path, capsys):
+    repo = hv.make_project(tmp_path)
+    hooks = repo.root / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    foreign = b"#!/bin/sh\necho mine\n"
+    (hooks / HOOK).write_bytes(foreign)
+    rc, out, _err = _uninstall(repo, capsys)
+    assert rc == 1
+    assert (hooks / HOOK).read_bytes() == foreign
+    assert "prepare-commit-msg hook" not in out
+
+
+@needs_git
+def test_a_dry_run_uninstall_changes_no_hook_file(tmp_path, capsys):
+    repo, hooks = _installed(tmp_path)
+    (hooks / "pre-commit").unlink()
+    before = (hooks / HOOK).read_bytes()
+    rc, out, _err = _uninstall(repo, capsys, "--dry-run")
+    assert rc == 1 and (hooks / HOOK).read_bytes() == before
+    assert "prepare-commit-msg hook would be removed (dry run)" in out
+
+
+@needs_git
+def test_json_uninstall_prints_only_its_payload_and_removes_the_trailer_hook(tmp_path, capsys):
+    import json
+
+    repo, hooks = _installed(tmp_path)
+    (hooks / "pre-commit").unlink()
+    rc, out, _err = _uninstall(repo, capsys, "--json")
+    assert rc == 1
+    assert json.loads(out) == {"status": "not_found", "success": False}
+    assert not (hooks / HOOK).exists()
+
+
+@needs_git
+def test_a_pre_commit_that_is_not_utf8_is_left_unchanged_and_the_trailer_hook_still_goes(tmp_path, capsys):
+    repo, hooks = _installed(tmp_path)
+    odd = b"#!/bin/sh\n# aegis-hook \xff\xfe\n"
+    (hooks / "pre-commit").write_bytes(odd)
+    rc, _out, err = _uninstall(repo, capsys)
+    assert rc == 1
+    assert (hooks / "pre-commit").read_bytes() == odd
+    assert f"Error: {hooks / 'pre-commit'} is not UTF-8 text; left unchanged" in err
+    assert not (hooks / HOOK).exists()

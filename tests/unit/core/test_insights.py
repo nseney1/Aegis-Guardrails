@@ -1,6 +1,8 @@
 """Unit tests for aegis_core.insights edge cases, security boundaries, and clustering."""
 from __future__ import annotations
 
+import ast
+import json
 import os
 from pathlib import Path
 import stat
@@ -29,7 +31,6 @@ from aegis_core.insights import (
     redact_insight_text,
     review_insights,
     session_hs,
-    tfidf_cosine,
     write_proposal,
 )
 
@@ -80,15 +81,6 @@ def test_session_hs_rejects_invalid_inputs(tmp_path: Path):
     assert session_hs("claude-code", "valid-id", b"short") is None
 
 
-def test_redaction_truncation_never_leaves_partial_redacted_tag():
-    prefix = "A" * 292
-    secret = "".join(["ghp_", "1234567890abcdefghijklmnopqrstuvwxyzABCD"])
-    out = redact_insight_text(f"{prefix} {secret}", max_len=300)
-    assert len(out) <= 300
-    assert "".join(["gh", "p_"]) not in out
-    assert not out.endswith("[REDACTED")
-
-
 def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -96,15 +88,16 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
     monkeypatch.setenv("USERPROFILE", str(home))
     repo = _make_repo(tmp_path / "repo")
 
+    seed = add_insight(repo, "Hung child processes stalled the nightly job", paths=["app.py"], kind="reliability",
+                       home=home)
     write_proposal(
         repo,
         proposal_id="trap-timeout-required",
-        rule_type="trap",
-        target_paths=["*.py"],
-        category="reliability",
+        insight_ids=[seed["id"]],
         summary_bullets=["Always pass an explicit timeout parameter to subprocess and network requests."],
         home=home,
     )
+    record_decision(repo, decision="noise", insight_ids=[seed["id"]], home=home)
 
     ins1 = add_insight(
         repo,
@@ -121,19 +114,18 @@ def test_matches_proposal_and_noise_decision_filtering(tmp_path: Path, monkeypat
 
     record_decision(
         repo,
-        cluster_id="cluster-noise",
         decision="noise",
         insight_ids=[ins_noise["id"]],
         home=home,
     )
 
     rev = review_insights(repo, home=home)
-    all_clustered_ids = [iid for c in rev["clusters"] for iid in c["insight_ids"]]
-    assert ins_noise["id"] not in all_clustered_ids
-    assert ins1["id"] in all_clustered_ids
-    prop_clusters = [c for c in rev["clusters"] if c["match_status"] == "matches_proposal"]
-    assert len(prop_clusters) == 1
-    assert prop_clusters[0]["matched_rule"] == "trap-timeout-required"
+    reviewed_ids = [e["id"] for e in rev["insights"] + rev["suppressed"]]
+    assert ins_noise["id"] not in reviewed_ids
+    assert ins1["id"] in reviewed_ids
+    prop_matches = [e for e in rev["insights"] if e["match"]["status"] == "matches_proposal"]
+    assert len(prop_matches) == 1
+    assert prop_matches[0]["match"]["rule"] == "trap-timeout-required"
 
 
 def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -158,17 +150,28 @@ def test_hook_counters_only_mode_records_heartbeat_without_excerpt(tmp_path: Pat
     assert "text" not in rows[0]
 
 
-def test_tfidf_cosine_and_dirty_paths(tmp_path: Path):
+def _neighbours_of(review: dict, insight_id: str) -> list:
+    (entry,) = [e for e in review["insights"] if e["id"] == insight_id]
+    return entry["neighbours"]
+
+
+def test_tfidf_neighbours_and_dirty_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo = _make_repo(tmp_path / "repo")
     assert dirty_paths(repo) == []
     (repo / "app.py").write_text("a = 2\n", encoding="utf-8")
     (repo / "new_file.py").write_text("b = 3\n", encoding="utf-8")
     assert dirty_paths(repo) == ["app.py", "new_file.py"]
 
-    sim_same = tfidf_cosine("validate path confinement before deletion", "validate path confinement before deleting")
-    sim_diff = tfidf_cosine("validate path confinement before deletion", "configure oauth2 bearer token refresh")
-    assert sim_same > sim_diff
-    assert sim_same > 0.3
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    texts = ("validate path confinement before deletion", "validate path confinement before deleting",
+             "configure oauth2 bearer token refresh")
+    same, near, other = (add_insight(repo, t, paths=["app.py"], home=home)["id"] for t in texts)
+    (only,) = _neighbours_of(review_insights(repo, home=home), same)  # no shared term: not a neighbour
+    assert only["id"] == near and only["similarity"] > 0.3
+    assert _neighbours_of(review_insights(repo, home=home), other) == []
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -352,7 +355,8 @@ def test_host_capture_status_ignores_a_relative_config_dir(tmp_path: Path, monke
         '{"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "/py", "args": ["-c", "aegis_cli.hooks.insights", "--excerpts"]}]}]}}',
         encoding="utf-8")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "relative/dir")
-    assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True}
+    assert host_capture_status("claude-code", home=home) == {"status": "enabled_excerpts", "excerpts": True,
+                                                             "capture": "excerpts", "capture_source": "host entry"}
 
 
 # ── One workspace, one insights file, whatever the hook's cwd (R-evidence-39) ──
@@ -517,7 +521,7 @@ def _hook_entry(repo: Path, home: Path, stdin: str):
 
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        rc = run_insight_hook(["--host", "claude-code", "--workspace", str(repo), "--excerpts"], stdin=stdin, home=home)
+        rc = run_insight_hook(["--host", "claude-code", "--excerpts"], stdin=stdin, home=home)
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -546,5 +550,623 @@ def test_a_corrupt_log_and_no_session_still_exit_zero_silently(tmp_path: Path, h
     store = insights_path(repo, home=hb_home)
     store.parent.mkdir(parents=True)
     store.write_bytes(b"\xff{garbage\n")
-    assert _hook_entry(repo, hb_home, '{"prompt": "No, wrong file again"}') == (0, "", "")
+    assert _hook_entry(repo, hb_home, json.dumps({"prompt": "No, wrong file again", "cwd": str(repo)})) == (0, "", "")
     assert [r["event"] for r in read_insight_rows(repo, home=hb_home)] == ["insight"]
+
+
+# ── R-evidence-35: the verbatim lint protects human text only, with a 25-character floor ──
+
+@pytest.fixture
+def lint_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    return _make_repo(tmp_path / "repo"), home
+
+
+def _propose(repo: Path, home: Path, bullet: str, pid: str = "trap-lint") -> Path:
+    member = add_insight(repo, "Keep this member text apart from every bullet", paths=["app.py"], kind="correctness",
+                         home=home)
+    return write_proposal(repo, proposal_id=pid, insight_ids=[member["id"]], summary_bullets=[bullet], home=home)
+
+
+def _hook_prompt(repo: Path, home: Path, text: str, session: str = "s-lint") -> dict:
+    row = record_hook_prompt("claude-code", {"prompt": text, "session_id": session, "cwd": str(repo)},
+                             workspace=repo, home=home)
+    assert row.get("event") == "insight", text
+    return row
+
+
+def test_agent_suggestions_never_block_a_proposal(lint_repo):
+    repo, home = lint_repo
+    capture_suggestion(repo, "e", paths=["app.py"], host="claude-code", session="agent", home=home)
+    capture_suggestion(repo, "Address recurring correction cluster", paths=["app.py"], host="claude-code",
+                       session="agent", home=home)
+    assert _propose(repo, home, "Address recurring correction cluster cluster-ab12cd.").is_file()
+
+
+def test_a_short_hook_prompt_blocks_only_an_identical_bullet(lint_repo):
+    repo, home = lint_repo
+    _hook_prompt(repo, home, "revert")
+    assert _propose(repo, home, "Always revert partial writes when the update fails.").is_file()
+    with pytest.raises(ValueError, match="verbatim H/cli/W2 prompt text"):
+        _propose(repo, home, "Revert", pid="trap-lint-2")
+
+
+def test_a_4_3_upgraded_w2_capture_does_not_protect_its_text(lint_repo):
+    repo, home = lint_repo
+    from aegis_core.storage import append_jsonl
+
+    append_jsonl(insights_path(repo, home=home), [{
+        "v": 1, "ts": "2026-10-20T00:00:00Z", "event": "insight", "id": "ins-0000000000dd", "level": "W2",
+        "text": "revert partial writes when the update fails", "paths": ["app.py"], "psrc": "explicit",
+        "host": "claude-code", "hs": "a" * 32, "confirmed_by": "ins-000000000001"}])
+    assert _propose(repo, home, "Always revert partial writes when the update fails.").is_file()
+
+
+@pytest.mark.parametrize("bullet", [
+    "No, never call shutil.rmtree on unvalidated user paths in src/app.py!",
+    "Remember: no, never call shutil.rmtree on unvalidated user paths in src/app.py! Validate first.",
+    "never call rmtree",
+], ids=["full", "embedded", "short-exact"])
+def test_hook_prompts_still_block_verbatim_bullets(lint_repo, bullet):
+    repo, home = lint_repo
+    _hook_prompt(repo, home, "No, never call shutil.rmtree on unvalidated user paths in src/app.py!")
+    _hook_prompt(repo, home, "never call rmtree", session="s-lint-2")
+    with pytest.raises(ValueError, match="verbatim"):
+        _propose(repo, home, bullet)
+
+
+def test_cli_text_of_25_characters_or_more_is_protected(lint_repo):
+    repo, home = lint_repo
+    text = "Validate symlink confinement before opening state files"
+    add_insight(repo, text, paths=["app.py"], home=home)
+    with pytest.raises(ValueError, match="verbatim H/cli/W2 prompt text"):
+        _propose(repo, home, f"Rule: {text}.")
+    assert not (repo / ".aegis" / "proposals" / "trap-lint.md").exists()
+
+
+# ── R-evidence-45: one hook calling convention, a reachable surface, Rule.applies_to ──
+
+def test_the_old_argument_order_of_record_hook_prompt_is_a_type_error(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    payload = {"prompt": "No, stop breaking the build!", "session_id": "s-old", "cwd": str(repo)}
+    with pytest.raises(TypeError):
+        record_hook_prompt(repo, "claude-code", payload, home=hb_home)
+    with pytest.raises(TypeError):
+        record_hook_prompt("claude-code", payload, session="s-typed", home=hb_home)
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_a_hook_whose_recorder_raises_exits_zero_with_the_error_on_stderr(tmp_path: Path, hb_home: Path,
+                                                                           monkeypatch: pytest.MonkeyPatch):
+    from aegis_cli.hooks import insights as hook
+
+    repo = _make_repo(tmp_path / "repo")
+
+    def broken(*args, **kwargs):
+        raise TypeError("recorder broke")
+
+    monkeypatch.setattr(hook, "record_hook_prompt", broken)
+    payload = json.dumps({"prompt": "No, stop breaking the build!", "session_id": "s-err", "cwd": str(repo)})
+    rc, out, err = _hook_entry(repo, hb_home, payload)
+    assert (rc, out) == (0, "") and "aegis insight hook error: recorder broke" in err
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_hook_stdin_that_is_not_a_json_object_records_no_insight(tmp_path: Path, hb_home: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(repo)
+    for stdin in ("stop doing that", '["No, stop doing that"]', '"No, stop doing that"'):
+        assert _hook_entry(repo, hb_home, stdin) == (0, "", "")
+    assert read_insight_rows(repo, home=hb_home) == []
+
+
+def test_a_payload_without_the_prompt_key_stores_a_heartbeat_only(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    for alias in ("user_prompt", "text", "message", "input"):
+        payload = {alias: "No, stop breaking the build!", "session_id": f"s-{alias}", "cwd": str(repo)}
+        assert _hook_entry(repo, hb_home, json.dumps(payload)) == (0, "", "")
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["heartbeat"] * 4
+    assert all(r["cue"] is False and "text" not in r for r in rows)
+
+
+def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(tmp_path: Path, hb_home: Path):
+    repo = _make_repo(tmp_path / "repo")
+    payload = {"prompt": "No, stop breaking the build!", "sessionId": "s-alias", "workspace": str(repo),
+               "cwd": str(repo)}
+    assert _hook_entry(repo, hb_home, json.dumps(payload)) == (0, "", "")
+    rows = read_insight_rows(repo, home=hb_home)
+    assert [r["event"] for r in rows] == ["insight"] and "hs" not in rows[0]
+
+
+def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
+    """Every Name and Attribute identifier used in the Python files under ``roots``, except
+    ``module_file`` itself (a package's ``__init__.py``: the whole package) and the nodes in ``skip``."""
+    import ast
+
+    inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
+    seen = set()
+    for root in roots:
+        for path in root.rglob("*.py"):
+            if path.resolve() == inside or inside in path.resolve().parents:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
+                       for n in ast.walk(top)}
+            for node in ast.walk(tree):
+                if id(node) in skipped:
+                    continue
+                if isinstance(node, ast.Name):
+                    seen.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    seen.add(node.attr)
+                elif isinstance(node, ast.alias):
+                    seen.add(node.name.split(".")[-1])
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                    seen.add(node.value)  # monkeypatch.setattr(insights, "NAME", ...)
+    return seen
+
+
+def test_every_name_in_insights_all_is_used_outside_the_module():
+    repo = Path(__file__).resolve().parents[3]
+    roots = [repo / name for name in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests")]
+    used = _defined_names_referenced_outside(Path(core_insights.__file__), roots,
+                                             {"test_every_name_in_insights_all_is_used_outside_the_module"})
+    assert sorted(set(core_insights.__all__) - used) == []
+    assert all(hasattr(core_insights, name) for name in core_insights.__all__)
+
+
+def test_dead_insight_names_are_gone():
+    for name in ("INSIGHT_LEVELS", "tfidf_cosine", "MAX_EXCERPT_CHARS"):
+        assert name not in core_insights.__all__
+        assert not hasattr(core_insights, name), name
+    assert "hook" not in core_insights.COUNTABLE_LEVELS
+
+
+_OVERLAP_TEXT = "Stop touching yaml settings in the release scheduler worker"
+_YAML_BODY = "Never call yaml.load on configuration files; use yaml.safe_load for parsing settings."
+
+
+def _overlap_repo(tmp_path: Path, frontmatter: str) -> Path:
+    repo = _make_repo(tmp_path / "repo")
+    (repo / ".aegis" / "rules" / "traps" / "trap-no-yaml-load.md").write_text(
+        f"---\nid: trap-no-yaml-load\ntype: trap\nenforcement: advisory\n{frontmatter}"
+        f"hypothesis: Prevent recurring defect in trap-no-yaml-load.\n---\n# trap-no-yaml-load\n\n{_YAML_BODY}\n",
+        encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "rule")
+    return repo
+
+
+def _match_of(review: dict, insight_id: str) -> tuple:
+    """(matched rule or None, similarity to the closest rule) of one insight in a review."""
+    for entry in review["insights"] + review["suppressed"]:
+        if entry["id"] == insight_id:
+            return entry["match"]["rule"], entry["match"]["similarity"]
+    raise AssertionError(f"{insight_id} is not in the review")
+
+
+def _similarity(repo: Path, home: Path, text: str) -> float:
+    """The similarity the review reports for ``text`` against the one rule when it matches."""
+    import shutil
+
+    probe = home.parent / "probe-home"
+    shutil.rmtree(probe, ignore_errors=True)
+    probe.mkdir()
+    row = add_insight(repo, text, paths=["src/x.py"], home=probe)
+    return _match_of(review_insights(repo, home=probe), row["id"])[1]
+
+
+def test_a_forbid_ast_rule_does_not_match_an_insight_about_a_test_file(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - '**/*.py'\nforbid_ast:\n  calls: [eval]\n")
+    s = _similarity(repo, hb_home, _OVERLAP_TEXT)
+    assert 0.15 <= s < 0.30, s  # a shared path is needed for this similarity to match
+    src = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    test = add_insight(repo, _OVERLAP_TEXT, paths=["tests/x.py"], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, src["id"])[0] == "trap-no-yaml-load"
+    assert _match_of(review, test["id"])[0] is None
+
+
+def test_a_rule_without_target_paths_overlaps_no_insight_path(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "")
+    from aegis_core.rules import load_rules
+
+    assert load_rules(repo).get("trap-no-yaml-load").target_paths == ()
+    probe = add_insight(repo, _OVERLAP_TEXT, paths=[], home=hb_home)  # no paths: overlaps every rule
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, probe["id"])[0] == "trap-no-yaml-load"
+    assert 0.15 <= _match_of(review, probe["id"])[1] < 0.30
+    assert _match_of(review, row["id"])[0] is None
+
+
+def test_a_rule_scoped_to_src_does_not_overlap_an_insight_about_tests(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    s = _similarity(repo, hb_home, _OVERLAP_TEXT)
+    assert 0.15 <= s < 0.30, s
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["tests/x.py"], home=hb_home)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+
+
+def test_an_insight_without_paths_overlaps_every_rule(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, home=hb_home)  # a clean tree: no dirty paths
+    assert row["paths"] == []
+    match = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert match[0] == "trap-no-yaml-load" and 0.15 <= match[1] < 0.30
+
+
+# ── X-w8-carry j: the private directories get their mode through a descriptor ──
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and mode bits")
+
+
+@posix_only
+def test_a_link_swapped_in_after_the_check_is_never_chmodded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Given ~/.aegis a directory, When a link to another directory replaces it at the first look
+    before its mode is set (the mkdir that finds it, an lstat or the descriptor open), Then the
+    link is refused and its target keeps its mode."""
+    home = tmp_path / "home"
+    aegis = home / ".aegis"
+    aegis.mkdir(parents=True, mode=0o755)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    real_mkdir, real_lstat, real_open, swapped = Path.mkdir, os.lstat, os.open, []
+
+    def swap(path) -> None:
+        if os.fspath(path) == str(aegis) and not swapped:
+            swapped.append(True)
+            os.rename(aegis, tmp_path / "moved")
+            os.symlink(victim, aegis)
+
+    def mkdir_then_swap(self, *args, **kwargs):
+        try:
+            return real_mkdir(self, *args, **kwargs)
+        finally:
+            swap(self)
+
+    def lstat_then_swap(path, *args, **kwargs):
+        found = real_lstat(path, *args, **kwargs)
+        swap(path)
+        return found
+
+    def swap_then_open(path, *args, **kwargs):
+        swap(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_swap)
+    monkeypatch.setattr(os, "lstat", lstat_then_swap)
+    monkeypatch.setattr(os, "open", swap_then_open)
+    refused = False
+    try:
+        create_link_key(home)
+    except PathTraversalError:
+        refused = True
+    assert swapped, "no link was swapped in: the test no longer reaches the step that sets the mode"
+    assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755
+    assert not (victim / "link.key").exists() and refused
+
+
+@posix_only
+def test_the_private_directories_end_0o700_and_a_linked_one_is_refused(tmp_path: Path):
+    home = tmp_path / "home"
+    (home / ".aegis").mkdir(parents=True, mode=0o755)
+    os.chmod(home / ".aegis", 0o755)
+    create_link_key(home)
+    assert stat.S_IMODE(os.stat(home / ".aegis").st_mode) == 0o700
+    other = tmp_path / "other"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    os.chmod(victim, 0o755)
+    other.mkdir()
+    (other / ".aegis").symlink_to(victim)
+    with pytest.raises(PathTraversalError):
+        create_link_key(other)
+    assert stat.S_IMODE(os.stat(victim).st_mode) == 0o755 and list(victim.iterdir()) == []
+
+
+# ── R-evidence-b2: the similarity thresholds are named once (hand-set, not measured) ──
+
+def test_the_similarity_thresholds_are_named_constants():
+    from aegis_core.insights import RECURRENCE_SIM, RULE_MATCH_SIM, RULE_MATCH_SIM_WITH_PATH
+
+    assert (RULE_MATCH_SIM_WITH_PATH, RULE_MATCH_SIM, RECURRENCE_SIM) == (0.15, 0.30, 0.12)
+
+
+def test_rule_matching_flips_at_the_shared_path_threshold(tmp_path: Path, hb_home: Path,
+                                                           monkeypatch: pytest.MonkeyPatch):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["src/x.py"], home=hb_home)
+    rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert rule == "trap-no-yaml-load" and 0 < s < core_insights.RULE_MATCH_SIM
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM_WITH_PATH", s + 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM_WITH_PATH", s - 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
+
+
+def test_rule_matching_flips_at_the_no_shared_path_threshold(tmp_path: Path, hb_home: Path,
+                                                              monkeypatch: pytest.MonkeyPatch):
+    repo = _overlap_repo(tmp_path, "target_paths:\n  - 'src/*.py'\n")
+    row = add_insight(repo, _OVERLAP_TEXT, paths=["docs/x.md"], home=hb_home)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM", 0.0001)
+    rule, s = _match_of(review_insights(repo, home=hb_home), row["id"])
+    assert rule == "trap-no-yaml-load" and s > 0.0001
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM", s + 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] is None
+    monkeypatch.setattr(core_insights.review, "RULE_MATCH_SIM", s - 0.001)
+    assert _match_of(review_insights(repo, home=hb_home), row["id"])[0] == "trap-no-yaml-load"
+
+
+def test_recurrence_counts_an_insight_at_the_recurrence_threshold(tmp_path: Path, hb_home: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path / "repo")
+    _put_rule(repo, "trap-rec")
+    _prompt(repo, hb_home, session="s-rec")
+    (repo / "app.py").write_text("a = 2\n", encoding="utf-8")  # the hook's paths are the dirty set
+    _prompt(repo, hb_home, "No, stop adding a scheduler loop around Popen in app.py", session="s-rec")
+    monkeypatch.setattr(core_insights.recurrence, "RECURRENCE_SIM", 0.0001)
+    assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 1
+    monkeypatch.setattr(core_insights.recurrence, "RECURRENCE_SIM", 1.01)
+    assert measure_recurrence(repo, "trap-rec", home=hb_home)["recurrences"] == 0
+
+
+def test_an_insight_without_tokens_matches_nothing_and_raises_nothing(tmp_path: Path, hb_home: Path):
+    repo = _overlap_repo(tmp_path, "")
+    row = add_insight(repo, "the and of", paths=[], home=hb_home)
+    review = review_insights(repo, home=hb_home)
+    assert _match_of(review, row["id"]) == (None, 0.0)
+    assert {e["id"]: e["neighbours"] for e in review["insights"]} == {row["id"]: []}
+
+
+# ── R-structure-32: insights is a package of four modules with the module's surface ──
+
+REPO = Path(__file__).resolve().parents[3]
+# aegis_core.insights.__all__ on the w14 merge commit (e7e61536), when insights was one module. One
+# string: listed names would count as uses in test_every_name_in_insights_all_is_used_outside_the_module.
+W14_ALL = tuple("""
+    CaptureLimitReached INSIGHT_HOOK_MARKER JOIN_WINDOW_S KEY_SIZE MAX_CAPTURES_PER_SESSION RECURRENCE_DENOMINATOR
+    RECURRENCE_SIM RULE_MATCH_SIM RULE_MATCH_SIM_WITH_PATH SUPPORTED_INSIGHT_HOSTS add_insight capture_suggestion
+    create_link_key dirty_paths effective_capture has_correction_cue host_capture_status insight_born_rules
+    insight_status insight_status_lines insight_workspace_id insights_path measure_recurrence merge_insight_hook
+    read_insight_rows read_link_key record_decision record_hook_prompt redact_insight_text remove_insight_hook
+    review_insights session_hs write_proposal
+""".split())
+# The public names that module defined outside __all__ (the names it imported are not kept).
+W14_DEFINED = tuple("""
+    BURST_WINDOW_SECONDS COUNTABLE_LEVELS DECISIONS INSIGHT_SCHEMA_VERSION MAX_CAPTURE_PATHS MAX_CAPTURE_PATH_CHARS
+    RECURRENCE_ALARM_COUNT REJECTION_RESURFACE_COUNT
+""".split())
+# Each module may import only the ones before it; none imports the package itself.
+INSIGHT_MODULES = ("keys", "capture", "review", "recurrence")
+
+
+def unresolved_exports(module) -> list:
+    """The names in ``module.__all__`` that ``module`` does not bind."""
+    return [name for name in getattr(module, "__all__", ()) if not hasattr(module, name)]
+
+
+def test_the_package_exports_every_name_the_module_exported():
+    assert sorted(core_insights.__all__) == sorted(W14_ALL)
+    assert unresolved_exports(core_insights) == []
+    assert [name for name in W14_DEFINED if not hasattr(core_insights, name)] == []
+
+
+def test_an_export_the_module_does_not_bind_is_named(tmp_path: Path):
+    import importlib.util
+
+    pkg = tmp_path / "fixture_exports"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_bytes(b'__all__ = ["present", "missing"]\npresent = 1\n')
+    spec = importlib.util.spec_from_file_location("fixture_exports", pkg / "__init__.py",
+                                                  submodule_search_locations=[str(pkg)])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert unresolved_exports(module) == ["missing"]
+
+
+def test_insights_is_a_package_of_four_modules():
+    pkg = REPO / "aegis_core" / "insights"
+    assert not (REPO / "aegis_core" / "insights.py").exists()
+    assert sorted(p.name for p in pkg.glob("*.py")) == sorted(["__init__.py", *(f"{m}.py" for m in INSIGHT_MODULES)])
+    assert hasattr(core_insights, "__path__")
+
+
+def _insight_imports(source: str) -> set:
+    """The insights modules ``source`` imports, anywhere in it; "__init__" for the package itself."""
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = ("aegis_core.insights" + (f".{node.module}" if node.module else "")) if node.level else node.module
+            names = [f"{base}.{a.name}" if base == "aegis_core.insights" else str(base) for a in node.names]
+        else:
+            continue
+        for name in names:
+            parts = name.split(".")
+            if parts[:2] == ["aegis_core", "insights"]:
+                found.add(parts[2] if len(parts) > 2 and parts[2] in INSIGHT_MODULES else "__init__")
+    return found
+
+
+def _import_path(edges: dict, start: str, goal: str):
+    paths = [[start]]
+    while paths:
+        path = paths.pop(0)
+        if path[-1] == goal:
+            return path
+        paths += [path + [nxt] for nxt in sorted(edges.get(path[-1], ())) if nxt not in path]
+    return None
+
+
+def layering_violations(sources: dict) -> list:
+    """Each import of a later insights module, or of the package, with the cycle it closes."""
+    edges = {name: sorted(_insight_imports(src) - {name}) for name, src in sources.items()}
+    edges["__init__"] = list(INSIGHT_MODULES)  # the package imports every module
+    found = []
+    for name in INSIGHT_MODULES:
+        for target in edges.get(name, ()):
+            if target == "__init__" or INSIGHT_MODULES.index(target) > INSIGHT_MODULES.index(name):
+                back = _import_path(edges, target, name)
+                cycle = f" (cycle: {' -> '.join([name, *back])})" if back else ""
+                found.append(f"aegis_core.insights.{name} imports {target}{cycle}")
+    return found
+
+
+def _module_tricks(source: str) -> list:
+    tree = ast.parse(source)
+    found = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("__getattr__", "__dir__")]
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(
+            node, (ast.AugAssign, ast.AnnAssign)) else []
+        found += [ast.unparse(t) for t in targets if (isinstance(t, ast.Attribute) and t.attr == "__class__")
+                  or (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Attribute) and t.value.attr == "modules")]
+    return found
+
+
+def test_the_package_is_layered_and_its_init_is_plain():
+    """Given the package, When its modules are parsed, Then keys imports no sibling, capture only
+    keys, review only those two and recurrence only those three, none imports the package; the
+    __init__ has an __all__, and no file serves names lazily or swaps a module object."""
+    pkg = REPO / "aegis_core" / "insights"
+    sources = {name: (pkg / f"{name}.py").read_text(encoding="utf-8") for name in INSIGHT_MODULES}
+    assert layering_violations(sources) == []
+    init = (pkg / "__init__.py").read_text(encoding="utf-8")
+    assert "__all__" in {t.id for n in ast.parse(init).body if isinstance(n, ast.Assign)
+                         for t in n.targets if isinstance(t, ast.Name)}
+    assert {name: _module_tricks(src) for name, src in {**sources, "__init__": init}.items()
+            if _module_tricks(src)} == {}
+
+
+def test_an_import_against_the_layering_is_named_with_its_cycle():
+    keys_up = {"keys": "from aegis_core.insights.capture import has_correction_cue\n",
+               "capture": "from aegis_core.insights.keys import insights_path\n", "review": "", "recurrence": ""}
+    assert layering_violations(keys_up) == [
+        "aegis_core.insights.keys imports capture (cycle: keys -> capture -> keys)"]
+    via_package = {"keys": "", "capture": "def cap():\n    from aegis_core.insights import MAX_CAPTURES_PER_SESSION\n",
+                   "review": "", "recurrence": ""}
+    assert layering_violations(via_package) == [
+        "aegis_core.insights.capture imports __init__ (cycle: capture -> __init__ -> capture)"]
+    assert _module_tricks("import sys\nsys.modules[__name__] = 1\ndef __getattr__(name):\n    pass\n") == [
+        "__getattr__", "sys.modules[__name__]"]
+
+
+# Aegis modules a fresh interpreter held on the w14 merge commit (e7e61536) after
+# `import aegis_core.insights`, then one plain hook prompt, then one cue prompt with excerpts
+# (a workspace without rule files). The cue prompt loaded the scanner stack for redaction.
+_S0_IMPORT = frozenset({
+    "aegis_core", "aegis_core._version", "aegis_core.atomicio", "aegis_core.errors", "aegis_core.gitsafe",
+    "aegis_core.insights", "aegis_core.pathlookup", "aegis_core.primitives", "aegis_core.rule_inventory",
+    "aegis_core.storage", "aegis_core.taxonomy", "aegis_core.workspace", "aegis_core.workspace.binding",
+    "aegis_core.workspace.layout",
+})
+S0 = {
+    "import": _S0_IMPORT,
+    "prompt": _S0_IMPORT | {"aegis_core.config"},
+    "cue": _S0_IMPORT | {"aegis_core.config", "aegis_core.verification", "aegis_core.verification.scanners",
+                         "aegis_core.verification.test_runner"},
+}
+NEW_MODULES = frozenset({"aegis_core.redaction", *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
+REVIEW_ONLY = frozenset({"aegis_core.credit", "aegis_core.human_gate", "aegis_core.rules",
+                         "aegis_core.scan_compliance", "aegis_core.telemetry_engine.ledger"})
+_HOOK_PATH = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+
+def loaded():
+    return sorted(m for m in sys.modules if m.split(".")[0] in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk"))
+
+import aegis_core.insights as insights
+found = {"import": loaded()}
+ws, home = sys.argv[2], Path(sys.argv[3])
+insights.record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "s1", "cwd": ws},
+                            workspace=ws, home=home)
+found["prompt"] = loaded()
+row = insights.record_hook_prompt("claude-code", {"prompt": "No, stop breaking the build again.", "session_id": "s1",
+                                                  "cwd": ws}, workspace=ws, excerpts=True, home=home)
+assert row.get("event") == "insight", row
+found["cue"] = loaded()
+sys.stdout.write(json.dumps(found))
+"""
+
+
+def _child_env(home: Path) -> dict:
+    return {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}
+
+
+def unexpected_modules(loaded, before) -> list:
+    return sorted(set(loaded) - set(before) - NEW_MODULES)
+
+
+def test_the_hook_path_loads_no_module_it_did_not_load_before(tmp_path: Path, hb_home: Path):
+    """Given a fresh interpreter, When it imports aegis_core.insights and records a plain and a cue
+    prompt, Then each step loads only what it loaded on the w14 tree, the redaction module and the
+    four insights modules, and never a review-only module."""
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    proc = subprocess.run([sys.executable, "-I", "-c", _HOOK_PATH, str(REPO), str(ws), str(hb_home)], input=b"",
+                          capture_output=True, env=_child_env(hb_home), cwd=str(ws), timeout=120, check=False)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    found = json.loads(proc.stdout.decode("utf-8"))
+    assert {step: unexpected_modules(found[step], S0[step]) for step in S0} == {step: [] for step in S0}
+    assert {step: sorted(REVIEW_ONLY & set(found[step])) for step in S0} == {step: [] for step in S0}
+
+
+def test_a_heavy_module_on_the_hook_path_is_named():
+    loaded = S0["prompt"] | {"aegis_core.insights.capture", "aegis_core.human_gate"}
+    assert unexpected_modules(loaded, S0["prompt"]) == ["aegis_core.human_gate"]
+
+
+_APPEND = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.insights import record_hook_prompt
+
+ws, home, tag = sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+sys.stdin.buffer.read(1)  # both processes start appending together
+for i in range(50):
+    record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": f"{tag}-{i}", "cwd": ws},
+                       workspace=ws, excerpts=False, home=home)
+"""
+
+
+def test_two_processes_appending_at_once_leave_100_whole_rows(tmp_path: Path, hb_home: Path):
+    """Sad path: Given two processes with one HOME, each recording 50 prompts of 50 sessions, When
+    both finish, Then the log holds 100 heartbeats (one per prompt without rule files), every line
+    a JSON object, no skipped line and no torn tail."""
+    from aegis_core.storage import read_jsonl
+
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    create_link_key(hb_home)  # made here: what two first prompts do to a missing key is another matter
+    procs = [subprocess.Popen([sys.executable, "-I", "-c", _APPEND, str(REPO), str(ws), str(hb_home), tag],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=_child_env(hb_home), cwd=str(ws))
+             for tag in ("a", "b")]
+    for proc in procs:
+        proc.stdin.write(b"g")
+        proc.stdin.flush()
+    for proc in procs:
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err.decode("utf-8", "replace")
+    path = insights_path(ws, home=hb_home)
+    lines = path.read_bytes().splitlines()
+    assert len(lines) == 100 and all(isinstance(json.loads(line), dict) for line in lines)
+    read = read_jsonl(path)
+    assert (len(read.rows), read.skipped_lines, read.torn_tail) == (100, [], False)
+    assert {r["event"] for r in read.rows} == {"heartbeat"} and len({r["hs"] for r in read.rows}) == 100

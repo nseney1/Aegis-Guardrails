@@ -19,6 +19,7 @@ from typing import Dict
 
 import pytest
 
+from aegis_cli.formatters.text import render_partition
 from aegis_core import events, partition
 from aegis_core._version import __version__
 from tests.helpers_checkmodes import commit, init_repo, write
@@ -147,7 +148,7 @@ def test_a_file_in_two_lanes_is_an_overlap_and_takes_no_part_in_the_edges(repo: 
     data = report.as_dict()
     assert data["overlap"] == [{"path": "a/api.py", "lanes": ["A", "B"]}]
     assert _edges(report) == []  # a/api.py was the only crossing file
-    assert "overlap" in "\n".join(report.text_lines()) and "a/api.py (A, B)" in "\n".join(report.text_lines())
+    assert "overlap" in "\n".join(render_partition(report.as_dict())) and "a/api.py (A, B)" in "\n".join(render_partition(report.as_dict()))
 
 
 # ── Edges ────────────────────────────────────────────────────────────────────
@@ -198,7 +199,7 @@ def test_lanes_with_no_call_between_them_have_no_edges(repo: Path):
     report = partition.check(repo, _splits(A="a/**", D="d/**"), record=False)
     assert _edges(report) == []
     assert report.as_dict()["frozen_signatures"] == []
-    assert "cross-lane edges: none" in "\n".join(report.text_lines())
+    assert "cross-lane edges: none" in "\n".join(render_partition(report.as_dict()))
 
 
 def test_an_aliased_module_import_is_followed(repo: Path):
@@ -235,6 +236,51 @@ def test_a_module_that_is_not_in_the_workspace_makes_no_edge(repo: Path):
     assert not any(e[1] == "a/std.py" for e in _edges(partition.check(repo, _splits(**AB), record=False)))
 
 
+
+# ── Module resolution (R-cli-44: pinned across the revert into partition.py) ─
+
+def test_the_nearest_module_shadows_one_higher_up(tmp_path: Path):
+    root = init_repo(tmp_path / "shadow", rules=False)
+    write(root, "pkg/app.py", "from util import helper\n\n\ndef go():\n    return helper()\n")
+    write(root, "pkg/util.py", "def helper():\n    return 1\n")
+    write(root, "util.py", "def helper():\n    return 2\n")
+    commit(root, "base")
+    # The root util.py is in no lane (a slash-free glob would match pkg/util.py too): an edge
+    # exists only if the import resolved to pkg/util.py.
+    report = partition.check(root, _splits(A="pkg/app.py", B="pkg/util.py"), record=False)
+    assert _edges(report, "import") == [("import", "pkg/app.py", 1, "pkg/util.py", "helper")]
+
+
+def test_an_importer_at_the_workspace_root_finds_a_package(tmp_path: Path):
+    root = init_repo(tmp_path / "rooted", rules=False)
+    write(root, "app.py", "from lib import f\n\n\ndef go():\n    return f()\n")
+    write(root, "lib/__init__.py", "def f():\n    return 1\n")
+    commit(root, "base")
+    report = partition.check(root, _splits(A="app.py", B="lib/**"), record=False)
+    assert _edges(report) == [
+        ("import", "app.py", 1, "lib/__init__.py", "f"),
+        ("call", "app.py", 5, "lib/__init__.py", "f"),
+    ]
+
+
+def test_a_rust_module_directory_resolves_through_mod_rs(tmp_path: Path):
+    root = init_repo(tmp_path / "rustmod", rules=False)
+    write(root, "src/a.rs", "use crate::b::work;\n\npub fn run() -> i32 {\n    work(2)\n}\n")
+    write(root, "src/b/mod.rs", "pub fn work(x: i32) -> i32 { x }\n")
+    write(root, ".aegis/config.json", json.dumps({"v": 1, "ast": {"packaged_drivers": ["rs"]}}))
+    commit(root, "base")
+    edges = _edges(partition.check(root, _splits(A="src/a.rs", B="src/b/**"), record=False))
+    assert ("import", "src/a.rs", 1, "src/b/mod.rs", "work") in edges
+    assert ("call", "src/a.rs", 4, "src/b/mod.rs", "work") in edges
+
+
+def test_an_import_that_resolves_to_no_file_makes_no_edge(tmp_path: Path):
+    root = init_repo(tmp_path / "unresolved", rules=False)
+    write(root, "a/x.py", "from missing.mod import f\nimport gone\n\n\ndef go():\n    return f() + gone.g()\n")
+    write(root, "b/y.py", "def f():\n    return 1\n")
+    commit(root, "base")
+    assert _edges(partition.check(root, _splits(A="a/**", B="b/**"), record=False)) == []
+
 # ── FROZEN_SIGNATURES ────────────────────────────────────────────────────────
 
 def _frozen(report):
@@ -270,7 +316,7 @@ def test_an_async_function_keeps_its_keyword_only_arguments(repo: Path):
 
 
 def test_the_text_block_is_delimited_and_names_each_symbol(repo: Path):
-    lines = partition.check(repo, _splits(**AB), record=False).text_lines()
+    lines = render_partition(partition.check(repo, _splits(**AB), record=False).as_dict())
     start, end = lines.index("[FROZEN_SIGNATURES]"), lines.index("[/FROZEN_SIGNATURES]")
     block = lines[start + 1:end]
     assert any("def work(x, y=0)" in line and "b/svc.py::work" in line for line in block)
@@ -278,7 +324,7 @@ def test_the_text_block_is_delimited_and_names_each_symbol(repo: Path):
 
 
 def test_no_block_markers_are_printed_without_boundary_symbols(repo: Path):
-    lines = partition.check(repo, _splits(A="a/**", D="d/**"), record=False).text_lines()
+    lines = render_partition(partition.check(repo, _splits(A="a/**", D="d/**"), record=False).as_dict())
     assert "[FROZEN_SIGNATURES]" in lines and lines[lines.index("[FROZEN_SIGNATURES]") + 1] == "(none)"
 
 
@@ -413,7 +459,7 @@ def test_outside_git_the_files_are_walked(tmp_path: Path):
 
 
 def test_text_report_header_counts_lanes_files_and_edges(repo: Path):
-    text = "\n".join(partition.check(repo, _splits(**AB), record=False).text_lines())
+    text = "\n".join(render_partition(partition.check(repo, _splits(**AB), record=False).as_dict()))
     assert "aegis check --partition: 2 lanes, 6 file(s) analyzed (6 python)" in text
     assert "cross-lane edges: 8" in text and "A -> B: 8" in text
     assert "call    a/api.py:7 -> b/svc.py::work  (svc.work)" in text

@@ -17,7 +17,7 @@ from typing import Any, Dict
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import run_doctor
 from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
 
@@ -110,7 +110,7 @@ def test_fix_on_a_non_terminal_without_yes_changes_nothing(env, monkeypatch):
 
 def test_fix_asks_first_and_a_no_changes_nothing(env, monkeypatch):
     env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: False)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: False)
     before = _snapshot(env.tmp)
     rc, out = env.run(fix=True)
     assert rc == 1 and "No changes made" in out
@@ -215,7 +215,7 @@ def test_fix_never_touches_a_malformed_legacy_block(env):
 
 def test_fix_removes_v3_rule_copies_by_digest_and_keeps_edited_ones(env, monkeypatch):
     shipped = b"---\nid: providence\n---\n# Providence\n"
-    monkeypatch.setattr(doctor, "V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
+    monkeypatch.setattr(doctor_base, "_V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
     leak = env.home / ".gemini" / "config" / "rules" / "providence.md"
     oracle = env.home / ".kiro" / "steering" / ".oracles" / "testing.md"
     edited = env.home / ".kiro" / "steering" / "providence.md"
@@ -241,6 +241,35 @@ def test_fix_refuses_to_write_through_a_symlink(env, tmp_path):
     assert finding["fixable"] is False and "symlink" in finding["message"]
 
 
+def test_fix_replaces_a_file_swapped_for_a_symlink_after_the_check_and_spares_the_link_target(env, tmp_path, monkeypatch):
+    """R-cli-41: Given ~/.mcp.json checked as a regular file, When it is swapped for a symlink to
+    another file just before the replacing write, Then the write replaces the link itself: the
+    link's target keeps its bytes and no temporary file is left beside it."""
+    from conftest import symlink_or_skip
+    from aegis_core import storage
+
+    mcp = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}, "other": 1})
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b'{"keep": true}\n')
+    real_write = storage.atomic_write_bytes
+    swapped = []
+
+    def swap_then_write(path, data, *args, **kwargs):
+        if Path(path) == mcp and not swapped:
+            os.unlink(mcp)
+            symlink_or_skip(victim, mcp)
+            swapped.append(path)
+        return real_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "atomic_write_bytes", swap_then_write)
+    payload = env.fix()
+    assert swapped, "the swap happened before the write"
+    assert {f["status"] for f in payload["fixes"]} == {"applied"}
+    assert victim.read_bytes() == b'{"keep": true}\n'
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".victim")) == []
+    assert not mcp.is_symlink() and json.loads(mcp.read_text(encoding="utf-8")) == {"mcpServers": {}, "other": 1}
+
+
 def test_fix_refuses_a_hard_linked_file(env, tmp_path):
     target = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
     try:
@@ -262,7 +291,7 @@ def test_fix_skips_a_file_that_changed_after_the_check(env, monkeypatch):
         stale.write_text(changed, encoding="utf-8")
         return True
 
-    monkeypatch.setattr(doctor, "_confirm", confirm_then_edit)
+    monkeypatch.setattr(doctor_base, "_confirm", confirm_then_edit)
     rc, out = env.run(fix=True)
     assert rc == 1
     assert stale.read_text() == changed
@@ -328,7 +357,7 @@ def test_the_ast_driver_fix_also_needs_yes_and_backs_up_the_config(env, monkeypa
 
 def test_text_fix_lists_the_plan_and_where_the_backup_went(env, monkeypatch):
     env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: True)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: True)
     rc, out = env.run(fix=True)
     assert rc == 0
     assert "remove mcpServers.soma" in out
@@ -353,7 +382,7 @@ def test_the_plan_names_the_deletion_before_anything_is_confirmed(env, monkeypat
     claude_md = env.ws / "CLAUDE.md"
     claude_md.write_bytes(b"<!-- SOMA:START -->\n# Soma Governance Rules\nrule\n<!-- SOMA:END -->\n")
     prompts = []
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: prompts.append(prompt) or False)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: prompts.append(prompt) or False)
     rc, out = env.run(fix=True)
     assert prompts, "the plan is confirmed first"
     (line,) = [ln for ln in out.splitlines() if ln.strip().startswith("1. ") and str(claude_md) in ln]
@@ -375,7 +404,7 @@ def test_the_plan_names_the_deletion_before_anything_is_confirmed(env, monkeypat
 def test_a_file_with_text_besides_the_legacy_block_is_edited_never_deleted(env, monkeypatch):
     path = env.ws / "GEMINI.md"
     path.write_bytes(b"# mine\n\n<!-- SOMA:START -->\nrules\n<!-- SOMA:END -->\n")
-    monkeypatch.setattr(doctor, "_confirm", lambda prompt: False)
+    monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: False)
     rc, out = env.run(fix=True)
     assert f"{path}: remove the legacy block (lines 3-5)" in out
     assert "delete the file" not in out
@@ -404,3 +433,69 @@ def test_backups_and_their_manifest_are_owner_only(env):
     for path in files:
         assert path.stat().st_mode & 0o077 == 0, f"{path.name} is {oct(path.stat().st_mode & 0o777)}"
     assert backup.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_private_config_swapped_for_a_symlink_after_the_check_stays_owner_only(env, tmp_path, monkeypatch):
+    """Review L4: Given a 0600 ~/.claude.json checked as a regular file, When it is swapped for a
+    symlink just before the replacing write under umask 022, Then the replacement keeps the 0600
+    the check saw (not the 0644 of a new file) and the link's target is spared."""
+    from conftest import symlink_or_skip
+    from aegis_core import storage
+
+    claude = env.claude_user_registration(
+        mcpServers={"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
+                    "soma": {"command": "soma-mcp"}})
+    claude.chmod(0o600)
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b'{"keep": true}\n')
+    victim.chmod(0o644)
+    real_write = storage.atomic_write_bytes
+    swapped = []
+
+    def swap_then_write(path, data, *args, **kwargs):
+        if Path(path) == claude and not swapped:
+            os.unlink(claude)
+            symlink_or_skip(victim, claude)
+            swapped.append(path)
+        return real_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "atomic_write_bytes", swap_then_write)
+    saved = os.umask(0o022)
+    try:
+        payload = env.fix()
+    finally:
+        os.umask(saved)
+    assert swapped, "the swap happened before the write"
+    assert {f["status"] for f in payload["fixes"]} == {"applied"}
+    assert not claude.is_symlink() and "soma" not in json.loads(claude.read_text(encoding="utf-8"))["mcpServers"]
+    assert claude.stat().st_mode & 0o777 == 0o600
+    assert victim.read_bytes() == b'{"keep": true}\n' and victim.stat().st_mode & 0o777 == 0o644
+
+
+# ── Numbers JSON cannot hold (R-structure-21, R-cli-50) ─────────────────────────
+
+def test_fix_leaves_a_host_config_holding_an_overflowing_number_byte_identical(env):
+    """json reads 1e999 as infinity, which written back is the non-JSON literal Infinity: the file is
+    reported as not valid JSON and nothing is planned for it; a control file is fixed as before."""
+    overflow = env.home / ".mcp.json"
+    overflow.write_bytes(b'{\n  "mcpServers": {"soma": {}},\n  "n": 1e999\n}\n')
+    before = overflow.read_bytes()
+    control = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"soma": {}, "db": {"command": "db"}}})
+    payload = env.fix()
+    assert overflow.read_bytes() == before and b"Infinity" not in overflow.read_bytes()
+    # By the path field, never a substring of json.dumps: it doubles every Windows backslash.
+    key = os.path.normcase(os.path.realpath(overflow))
+    about = [f for f in payload["findings"] + payload["fixes"]
+             if isinstance(f.get("path"), str) and os.path.normcase(os.path.realpath(f["path"])) == key]
+    assert [(f.get("code"), f.get("fixable")) for f in about] == [("unreadable_config", False)]
+    assert "not valid JSON" in json.dumps(payload) and "1e999 is not allowed" in json.dumps(payload)
+    assert json.loads(control.read_text()) == {"mcpServers": {"db": {"command": "db"}}}
+
+
+def test_a_non_finite_number_is_never_serialized_into_a_host_config():
+    from aegis_cli import doctor_repair
+
+    with pytest.raises(ValueError):
+        doctor_repair._dump_like(b'{\n  "n": 1\n}\n', {"n": float("inf")})
+    assert doctor_repair._dump_like(b'{\n  "n": 1\n}\n', {"n": 2.5}) == b'{\n  "n": 2.5\n}\n'

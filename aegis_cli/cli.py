@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from aegis_core import primitives
+from aegis_cli.commands_table import REMOVED_COMMANDS
 from aegis_cli.registry import get_default_registry
 from aegis_core._version import __version__
 from aegis_core.workspace.layout import LEGACY_SOMA_DIRNAME, is_aegis_workspace
@@ -20,46 +22,6 @@ from aegis_core.workspace.layout import LEGACY_SOMA_DIRNAME, is_aegis_workspace
 __all__ = ["main", "AegisParser", "REMOVED_COMMANDS"]
 
 PROG = "aegis"
-
-_HOST_HOOK = "no replacement; remove it from your agent host's hook config"
-
-# "name" or "name action" -> what to use instead. The longest match wins, so
-# `aegis agent scan` gets its own pointer, and a removed action of a live
-# command (`aegis hook session-close`, still called by v3 host hook configs)
-# gets one too.
-REMOVED_COMMANDS: Dict[str, str] = {
-    "install": "use aegis init --host",
-    "system": "use aegis doctor",
-    "sys": "use aegis doctor",
-    "system doctor": "use aegis doctor",
-    "system drivers": "use aegis doctor",
-    "system hook": "use aegis hook",
-    "detect": "use aegis doctor",
-    "languages": "use aegis doctor",
-    "drivers": "use aegis doctor",
-    "audit": "use aegis doctor",
-    "rules": "use aegis status",
-    "agent": "use aegis scan to see which rules apply; record outcomes with the MCP tool aegis_report_outcome",
-    "agent scan": "use aegis scan",
-    "agent record": "use aegis_report_outcome (MCP)",
-    "report": (
-        "aegis status shows rule trigger counts; "
-        "outcomes are recorded with the MCP tool aegis_report_outcome"
-    ),
-    "completion": "no replacement",
-    "skill": "no replacement",
-    "handoff": "no replacement",
-    "verify": "use aegis check",
-    "checkpoint": "use aegis check",
-    "rule clean": "no replacement; remove leaked global rule copies by hand",
-    "hook pre-commit": "use aegis check --hook",
-    "hook pre-invocation": _HOST_HOOK,
-    "hook governance-monitor": _HOST_HOOK,
-    "hook immune-init": _HOST_HOOK,
-    "hook session-close": _HOST_HOOK,
-    "hook stop": _HOST_HOOK,
-    "hook post-session": _HOST_HOOK,
-}
 
 # Global options that take a value, so the removed-name scan can skip it.
 _VALUE_OPTIONS = ("--workspace",)
@@ -271,16 +233,12 @@ _WORKSPACE_ERROR_EXIT: Dict[str, int] = {"scan": 2}
 def _print_hold(args: argparse.Namespace, exc: Exception) -> None:
     """A workspace hold: machine-readable with --json, one stderr line otherwise."""
     import json
-    from datetime import datetime, timezone
 
     binding = exc.binding.as_dict()  # type: ignore[attr-defined]
     if getattr(args, "json", False):
         print(json.dumps({
             **binding,
-            "source": f"{PROG} {args.command}",
-            "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": {"command": args.command, "workspace": None},
+            **primitives.envelope(f"{PROG} {args.command}", {"command": args.command, "workspace": None}),
         }, indent=2))
     else:
         print(f"Hold ({binding['reason']}): {binding['message']}", file=sys.stderr)

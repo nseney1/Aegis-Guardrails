@@ -1,6 +1,6 @@
 """Scan and hook budgets on platform-independent counters, never on wall-clock time (R-structure-6).
 
-Spawns are counted at ``subprocess.Popen.__init__`` and ledger opens at ``os.open`` (both
+Spawns are counted at ``subprocess.Popen.__init__`` and ledger reads at ``os.open`` (both
 patched reversibly; an audit hook cannot be removed). The fixture's 100 rules must load:
 a rule file that does not load makes the scan return early with fewer spawns (trap F2).
 Counters that today's code misses are ``xfail(strict=True)`` at the observed value, and
@@ -98,7 +98,9 @@ def _count(monkeypatch, fn: Callable[[], object], delay: float = 0.0) -> _Counte
         return real_init(self, args, *rest, **kwargs)
 
     def opener(path, *rest, **kwargs):
-        seen.opens.append(os.fspath(path))
+        flags = rest[0] if rest else kwargs.get("flags", os.O_RDONLY)
+        if not flags & (os.O_WRONLY | os.O_RDWR):  # a read: the append a first exposure needs is not one
+            seen.opens.append(os.fspath(path))
         return real_open(path, *rest, **kwargs)
 
     with monkeypatch.context() as patch:
@@ -123,14 +125,49 @@ def _scan(ws: Path) -> Dict:
 
 # ── (a) and (b): git spawns per scan ────────────────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason="7 git spawns outside git today; R-structure-4 brings it to 1")
 def test_a_scan_outside_git_starts_one_git_process(plain_ws, monkeypatch):
     _scan(plain_ws)
     assert len(_count(monkeypatch, lambda: _scan(plain_ws)).git()) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="15 git spawns (one ls-tree) on a warm scan in git with an origin today (19 without; "
-                   "M4 measured 17 on its fixture); R-structure-4/8")
+def _mcp_scan(ws: Path, session: str = "s1") -> Dict:
+    from aegis_mcp.handlers.core import handle_scan
+
+    result = handle_scan({"workspace": str(ws), "files": ["src/foo.py"], "_session": session, "_host": "claude-code"})
+    assert result.get("status") != "FAIL" and result["relevant_rules"], result
+    return result
+
+
+def test_an_mcp_scan_with_a_session_outside_git_starts_one_git_process(plain_ws, monkeypatch):
+    _mcp_scan(plain_ws)
+    assert len(_count(monkeypatch, lambda: _mcp_scan(plain_ws)).git()) == 1
+
+
+_OBJECT_READS = {"ls-tree", "cat-file", "rev-list", "merge-base"}
+
+
+@pytest.mark.parametrize("how", ["core", "mcp"])
+def test_a_warm_scan_asks_no_object_question_it_already_answered(git_ws, monkeypatch, how):
+    run = (lambda: _scan(git_ws)) if how == "core" else (lambda: _mcp_scan(git_ws))
+    run()
+    spawned = _count(monkeypatch, run).git()
+    assert len(spawned) <= 4, spawned
+    assert not [argv for argv in spawned if _OBJECT_READS & set(argv)], spawned
+
+
+def test_a_commit_between_two_scans_serves_the_new_base(git_ws, monkeypatch):
+    first = _scan(git_ws)
+    rule = git_ws / ".aegis" / "rules" / "traps" / "perf-rule-0.md"
+    rule.write_text(rule.read_text(encoding="utf-8").replace("Guidance", "Reviewed again"), encoding="utf-8")
+    _git(git_ws, "commit", "-qam", "reword a rule")
+    _git(git_ws, "update-ref", "refs/remotes/origin/main", "HEAD")
+    second = _scan(git_ws)
+    assert second["rules_base"]["commit"] != first["rules_base"]["commit"]
+    assert second["rules_base"]["commit"] == subprocess.run(
+        ["git", "-C", str(git_ws), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    assert "unreviewed_rules" not in second
+
+
 def test_a_warm_scan_in_git_starts_at_most_four_and_no_tree_reads(git_ws, monkeypatch):
     _scan(git_ws)
     spawned = _count(monkeypatch, lambda: _scan(git_ws)).git()
@@ -144,15 +181,12 @@ def _seed_ledger(ws: Path) -> None:
     ledger.append(ws, [{"rule": "perf-rule-0", "outcome": "tp", "source": "ci", "key": f"k{i}"} for i in range(3)])
 
 
-@pytest.mark.xfail(strict=True, reason="3 ledger opens per core scan today; R-structure-5 brings it to 1")
 def test_a_core_scan_opens_the_ledger_once(git_ws, monkeypatch):
     _seed_ledger(git_ws)
     _scan(git_ws)
     assert _ledger_opens(git_ws, _count(monkeypatch, lambda: _scan(git_ws))) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="5 then 4 ledger opens per MCP scan in this fixture today (M5: 6 then 4); "
-                   "R-structure-5 brings it to 2")
 def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
     import aegis_mcp.server as server
 
@@ -168,7 +202,8 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
         assert json.loads(response["result"]["content"][0]["text"])["rules_staged"] > 0
 
     counts = [_ledger_opens(git_ws, _count(monkeypatch, lambda i=i: call(i))) for i in (1, 2)]
-    assert max(counts) <= 2, counts
+    # The first scan of a session also takes record_exposure's locked dedup read; the second reads once.
+    assert counts[0] <= 2 and counts[1] == 1, counts
 
 
 # ── (d): a scan that matches no rule does no fitness work (R-structure-7) ───

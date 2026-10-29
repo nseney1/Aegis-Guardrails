@@ -431,3 +431,256 @@ class TestStatusComplianceCLI:
         assert row.startswith("  " + "h" * 13 + "...")
         assert len(row) == len(header)
         assert row.endswith("100%")
+
+
+# ── Pins: what run_status prints, in order (R-cli-a1; goldens recorded before the split) ──
+
+
+def _pinned_workspace(tmp_path, monkeypatch):
+    """PIN-1's workspace: the expired traps t-one and t-two, the gate invariant i-one, the trap
+    legacy with derived counters, walls/old.md, notes.md, blocked guard events for claude-code
+    twice and codex-cli once plus one recorded event, ledger rows, a claimed report, an agent
+    suggestion in the user's insights log and one core rule."""
+    import aegis_cli.init as init_module
+    from aegis_core import events
+    from aegis_core.insights import insights_path
+    from aegis_core.telemetry_engine import ledger
+
+    ws = tmp_path / "ws"
+    rules = ws / ".aegis" / "rules"
+    for kind in ("traps", "invariants", "walls"):
+        (rules / kind).mkdir(parents=True)
+    (rules / "traps" / "t-one.md").write_bytes(
+        b"---\nid: t-one\ncreated: 2020-01-01\nexpiry_days: 30\ntarget_paths: ['src/*.py']\n---\n# One\n")
+    (rules / "traps" / "t-two.md").write_bytes(b"---\nid: t-two\ncreated: 2020-01-01\nexpiry_days: 30\n---\n# Two\n")
+    (rules / "invariants" / "i-one.md").write_bytes(
+        b"---\nid: i-one\nenforcement: gate\ntarget_paths: ['src/*.py']\n---\n# Gate\n")
+    (rules / "traps" / "legacy.md").write_bytes(b"---\nid: legacy\nfitness:\n  score: 0.9\ntriggers: 12\n---\n# Old\n")
+    (rules / "walls" / "old.md").write_bytes(b"---\nid: old\ntype: wall\n---\n")
+    (rules / "notes.md").write_bytes(b"# Not a rule\n")
+    for host in ("claude-code", "claude-code", "codex-cli"):
+        events.append(ws, "guard_match", "block", {"rule": "git-safety", "tier": "block", "action": "block"}, host=host)
+    events.append(ws, "guard_match", "record", {"rule": "git-safety", "tier": "record", "action": "record"},
+                  host="claude-code")
+    # The core rule is looked up by its id before its file name: two rows count, not one.
+    ledger.append(ws, [{"rule": "core-one", "outcome": "tp", "source": "ci", "key": "c1"},
+                       {"rule": "core-one", "outcome": "tp", "source": "ci", "key": "c2"},
+                       {"rule": "core-file", "outcome": "tp", "source": "ci", "key": "c3"},
+                       {"rule": "t-two", "outcome": "tp", "source": "ci", "key": "t1"}])
+    ledger.append_rows(ws, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-01T00:00:00Z", "event": "claimed",
+                             "witness": "self", "tree": "a" * 40, "source": "mcp", "session": "s1",
+                             "host": "claude-code", "key": "claim:claude-code/s1:" + "a" * 40,
+                             "report_key": "mcp:claude-code/s1:r1", "result": "success"}])
+    log = insights_path(ws)
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b'{"v": 1, "event": "insight", "source": "mcp", "id": "s-1"}\n')
+    # Core rules are listed only in the checkout they ship from; this workspace stands in for it.
+    core = ws / "rules"
+    core.mkdir()
+    (core / "core-file.md").write_bytes(b"---\nid: core-one\n---\n# Core\n")
+    monkeypatch.setattr(init_module, "packaged_dir", lambda name: core)
+    monkeypatch.setattr(init_module, "packaged_rules", lambda: {"core-one": core / "core-file.md"})
+    monkeypatch.setenv("COLUMNS", "120")
+    return ws
+
+
+
+def _adaptive(name: str, kind: str, triggers: int, expiry: str) -> dict:
+    """One adaptive rule of the pinned JSON, every key in the order run_status writes them."""
+    return {"name": name, "type": kind, "score": None, "state": "insufficient",
+            "status_label": f"insufficient (n={triggers})", "evidence_available": True, "evidence_error": None,
+            "contested": 0, "override_rate": 0.0, "flagged_for_review": False, "triggers": triggers,
+            "expiry": expiry, "is_core": False}
+
+
+PIN_TEXT = (
+    "Aegis Workspace Status\n"
+    "\n"
+    "  Core rules:     1 active\n"
+    "  Adaptive rules: 4 (traps/patterns)\n"
+    "  Context load:   ~76 tokens (pre-JIT max)\n"
+    "  Token budget:   [#-------------------] 76/2,000 (4%)\n"
+    "  Last sync:      never (run aegis sync)\n"
+    "\n"
+    "  1 unconfirmed agent suggestions (not counted)\n"
+    "\n"
+    "  Blocked cmds:   3 (hook-observed: claude-code: 2, codex-cli: 1)\n"
+    "\n"
+    "  claimed (unwitnessed): 1 report(s) from 1 session(s), no rule's evidence\n"
+    "\n"
+    "  ❌ 1 rule file(s) cannot be loaded; aegis scan fails until they are fixed:\n"
+    "     .aegis/rules/walls/old.md: not served: walls/ is not a rule type directory (a v3 type directory: aegis m...\n"
+    "  ⚠️  1 rule file(s) still carry derived counters or retired v3 keys (ignored; run aegis migrate --apply to "
+    "strip them):\n"
+    "     .aegis/rules/traps/legacy.md: fitness, triggers\n"
+    "  ℹ️  1 file(s) under .aegis/rules are not rules:\n"
+    "     .aegis/rules/notes.md: not a rule: it is not in a rule type directory\n"
+    "  ⚠️  2 rule(s) apply to no file (no target_paths), so scan and check never serve them:\n"
+    "     legacy: .aegis/rules/traps/legacy.md\n"
+    "     t-two: .aegis/rules/traps/t-two.md\n"
+    "\n"
+    "  Rule      Triggers  Type       Fitness             Expiry  \n"
+    "  --------  --------  ---------  ------------------  --------\n"
+    "  core-one  2         core       —                   ∞ (core)\n"
+    "  --------  --------  ---------  ------------------  --------\n"
+    "  i-one     0         invariant  insufficient (n=0)  —       \n"
+    "  --------  --------  ---------  ------------------  --------\n"
+    "  t-two     1         trap       insufficient (n=1)  expired \n"
+    "  legacy    0         trap       insufficient (n=0)  —       \n"
+    "  t-one     0         trap       insufficient (n=0)  expired \n"
+)
+
+PIN_JSON = {
+    "core_rules": 1,
+    "adaptive_rules": 4,
+    "estimated_tokens": 76,
+    "rules": [
+        {"name": "core-one", "type": "core", "score": None, "triggers": 2, "expiry": "∞ (core)", "is_core": True},
+        _adaptive("i-one", "invariant", 0, "—"),
+        _adaptive("t-two", "trap", 1, "expired"),
+        _adaptive("legacy", "trap", 0, "—"),
+        _adaptive("t-one", "trap", 0, "expired"),
+    ],
+    "last_sync": None,
+    "inventory_error": None,
+    "ledger": {"skipped_lines": [], "unusable_rows": 0, "error": None, "torn_tail": False},
+    "claimed": {"label": "claimed (unwitnessed)", "claimed": 1, "sessions": 1},
+    "blocked_commands": {"total": 3, "by_host": {"claude-code": 2, "codex-cli": 1}, "source": "hook-observed",
+                         "label": "hook-observed"},
+    "insights": {"rules": [], "unconfirmed_suggestions": 1,
+                 "denominator": "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"},
+    "rule_errors": [{"path": ".aegis/rules/walls/old.md",
+                     "error": "not served: walls/ is not a rule type directory (a v3 type directory: aegis migrate "
+                              "moves its rules to .aegis/rules/invariants/)"}],
+    "ignored": [{"path": ".aegis/rules/notes.md", "reason": "not a rule: it is not in a rule type directory"}],
+    "stale_rules": [],
+    "needs_migrate": [{"path": ".aegis/rules/traps/legacy.md", "keys": ["fitness", "triggers"]}],
+    "untargeted": [{"id": "legacy", "path": ".aegis/rules/traps/legacy.md"},
+                   {"id": "t-two", "path": ".aegis/rules/traps/t-two.md"}],
+}
+
+PIN_EMPTY_TEXT = (
+    "Aegis Workspace Status\n"
+    "\n"
+    "  Core rules:     0 active\n"
+    "  Adaptive rules: 0 (traps/patterns)\n"
+    "  Context load:   ~0 tokens (pre-JIT max)\n"
+    "  Token budget:   [--------------------] 0/2,000 (0%)\n"
+    "  Last sync:      never (run aegis sync)\n"
+    "\n"
+    "  No rules found. Run 'aegis init' to set up governance rules.\n"
+)
+
+
+class TestStatusPins:
+    """Characterization pins: green before run_status was split into helpers, unchanged after."""
+
+    def test_the_text_view_prints_every_section_in_its_fixed_order(self, tmp_path, monkeypatch, capsys):
+        ws = _pinned_workspace(tmp_path, monkeypatch)
+        assert run_status(argparse.Namespace(_root=ws, plain=True)) == 1
+        captured = capsys.readouterr()
+        assert captured.out == PIN_TEXT
+        assert captured.err == ""
+
+    def test_json_keeps_its_key_order_and_never_reads_an_input_of_the_text_view(self, tmp_path, monkeypatch, capsys):
+        ws = _pinned_workspace(tmp_path, monkeypatch)
+
+        def text_view_only(*args, **kwargs):
+            raise AssertionError("the JSON view read an input of the text view")
+
+        monkeypatch.setattr("aegis_core.config.jit_max_tokens", text_view_only)
+        monkeypatch.setattr("aegis_cli.ui.theme.OutputContext.from_env_and_args", text_view_only)
+        assert run_status(argparse.Namespace(_root=ws, json=True)) == 1
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert list(payload) == ["core_rules", "adaptive_rules", "estimated_tokens", "rules", "last_sync",
+                                 "inventory_error", "ledger", "claimed", "blocked_commands", "insights",
+                                 "rule_errors", "ignored", "stale_rules", "needs_migrate", "untargeted"]
+        assert [r["name"] for r in payload["rules"]] == ["core-one", "i-one", "t-two", "legacy", "t-one"]
+        assert captured.out == json.dumps(PIN_JSON, indent=2) + "\n"
+        assert captured.err == ""
+
+    def test_an_empty_rules_directory_says_no_rules_found_and_exits_0(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+        monkeypatch.setenv("COLUMNS", "120")
+        assert run_status(argparse.Namespace(_root=tmp_path, plain=True)) == 0
+        assert capsys.readouterr().out == PIN_EMPTY_TEXT
+
+    def test_a_symlinked_rule_type_directory_is_an_inventory_error_in_both_views(self, tmp_path, capsys):
+        from conftest import symlink_or_skip
+
+        rules = tmp_path / ".aegis" / "rules"
+        rules.mkdir(parents=True)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "t-out.md").write_bytes(b"---\nid: t-out\n---\n# Out\n")
+        symlink_or_skip(elsewhere, rules / "traps", target_is_directory=True)
+
+        assert run_status(argparse.Namespace(_root=tmp_path, plain=True)) == 1
+        lines = capsys.readouterr().out.splitlines()
+        (error,) = [line for line in lines if "cannot be read safely" in line]
+        assert error.startswith("  ❌ The rules directory cannot be read safely: ")
+        assert lines.index(error) > lines.index("  Last sync:      never (run aegis sync)")
+        assert lines[-1] == "  No rules found. Run 'aegis init' to set up governance rules."
+        assert "t-out" not in "\n".join(lines)
+
+        assert run_status(argparse.Namespace(_root=tmp_path, json=True)) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert isinstance(payload["inventory_error"], str) and payload["inventory_error"]
+        assert (payload["adaptive_rules"], payload["rules"], payload["rule_errors"]) == (0, [], [])
+
+    def test_a_claimed_report_alone_prints_the_claimed_line_and_no_blocked_line(self, tmp_path, capsys):
+        from aegis_core.telemetry_engine import ledger
+
+        (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+        ledger.append_rows(tmp_path, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-01T00:00:00Z", "event": "claimed",
+                                       "witness": "self", "tree": "b" * 40, "source": "mcp", "session": "s2",
+                                       "host": "codex-cli", "key": "claim:codex-cli/s2:" + "b" * 40,
+                                       "report_key": "mcp:codex-cli/s2:r1", "result": "failure"}])
+        assert run_status(argparse.Namespace(_root=tmp_path, plain=True)) == 0
+        lines = capsys.readouterr().out.splitlines()
+        claimed = "  claimed (unwitnessed): 1 report(s) from 1 session(s), no rule's evidence"
+        assert lines[lines.index(claimed) - 2:lines.index(claimed) + 2] == [
+            "  Last sync:      never (run aegis sync)", "", claimed, ""]
+        assert not [line for line in lines if "Blocked cmds:" in line]
+
+    def test_blocked_commands_print_before_the_claimed_line(self, tmp_path, capsys):
+        from aegis_core import events
+        from aegis_core.telemetry_engine import ledger
+
+        (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+        events.append(tmp_path, "guard_match", "block", {"rule": "git-safety", "tier": "block", "action": "block"},
+                      host="codex-cli")
+        ledger.append_rows(tmp_path, [{"v": ledger.LEDGER_VERSION, "ts": "2026-10-01T00:00:00Z", "event": "claimed",
+                                       "witness": "self", "tree": "c" * 40, "source": "mcp", "session": "s3",
+                                       "host": "codex-cli", "key": "claim:codex-cli/s3:" + "c" * 40,
+                                       "report_key": "mcp:codex-cli/s3:r1", "result": "success"}])
+        assert run_status(argparse.Namespace(_root=tmp_path, plain=True)) == 0
+        lines = capsys.readouterr().out.splitlines()
+        start = lines.index("  Last sync:      never (run aegis sync)")
+        assert lines[start + 1:start + 6] == [
+            "", "  Blocked cmds:   1 (hook-observed: codex-cli: 1)", "",
+            "  claimed (unwitnessed): 1 report(s) from 1 session(s), no rule's evidence", ""]
+
+    def test_an_incomplete_ledger_is_named_before_the_rule_table(self, tmp_path, monkeypatch, capsys):
+        from aegis_core.telemetry_engine import ledger
+
+        traps = tmp_path / ".aegis" / "rules" / "traps"
+        traps.mkdir(parents=True)
+        (traps / "t-one.md").write_bytes(b"---\nid: t-one\ntarget_paths: ['src/*.py']\n---\n# One\n")
+        ledger.append(tmp_path, [{"rule": "t-one", "outcome": "tp", "source": "ci", "key": "k1"}])
+        with ledger.ledger_path(tmp_path).open("ab") as fh:
+            fh.write(b"{garbled\n")
+        monkeypatch.setenv("COLUMNS", "120")
+        assert run_status(argparse.Namespace(_root=tmp_path, plain=True)) == 0
+        lines = capsys.readouterr().out.splitlines()
+        start = lines.index("  Last sync:      never (run aegis sync)")
+        assert lines[start + 1:] == [
+            "",
+            "  ⚠️  The ledger is incomplete (1 unreadable line(s)): fitness counts only the rows that could be read, "
+            "so moves that rely on it (sync --apply, rule archive, tier changes) are refused",
+            "",
+            "  Rule   Triggers  Type  Fitness               Expiry",
+            "  -----  --------  ----  --------------------  ------",
+            "  t-one  1         trap  evidence unavailable  —     ",
+        ]

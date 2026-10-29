@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any  # noqa: F401  (pinned 4.3.3 public name, tests/contract/public_names_4_3_3.json)
 
-from aegis_core.verification.scanners import SECRET_REPLACEMENTS, redact_command_secrets
+from aegis_core.redaction import SECRET_REPLACEMENTS, redact_command_secrets
 
 __all__ = [
     "SECRET_REPLACEMENTS",

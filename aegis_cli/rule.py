@@ -12,20 +12,23 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from aegis_core import primitives
 from aegis_cli import sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, validate_rule_body
+from aegis_core.primitives import utc_stamp
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES
 from aegis_core.workspace.base import Workspace
-from aegis_core.workspace.binding import bounded_walk_up, home_message
+from aegis_core.workspace.binding import bounded_walk_up, denial, denial_message, home_message  # noqa: F401 - pinned name
 from aegis_core.workspace.layout import WorkspaceLayout
 from aegis_core.lifecycle.promotion import (
     promote_rule,
@@ -34,7 +37,7 @@ from aegis_core.lifecycle.promotion import (
     evaluate_demotions,
     evaluate_rule_tiers,
 )
-from aegis_core.lifecycle.selection import evidence_line, prune_rules, transition_candidates
+from aegis_core.lifecycle.selection import evidence_line, iter_rule_selection, transition_candidates
 from aegis_core.workspace.layout import is_aegis_workspace
 
 __all__ = [
@@ -68,6 +71,11 @@ def _emit_error(args: argparse.Namespace, msg: str) -> int:
     return 1
 
 
+def _usage_error(args: argparse.Namespace, msg: str) -> int:
+    _emit_error(args, msg)
+    return 2
+
+
 class _WorkspaceArg(argparse.Action):
     """Keep the operator's ``--workspace`` verbatim.
 
@@ -78,13 +86,6 @@ class _WorkspaceArg(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
         setattr(namespace, self.dest, values)
         setattr(namespace, "_rule_workspace_arg", values)
-
-
-def _home() -> Path | None:
-    try:
-        return Path.home().resolve()
-    except (RuntimeError, KeyError, OSError):
-        return None
 
 
 def _not_a_workspace(directory: Path) -> WorkspaceNotFoundError:
@@ -127,10 +128,9 @@ def _resolve_workspace_root(args: argparse.Namespace, require_aegis: bool = Fals
             root = Path(ws_obj.root if ws_obj is not None else Workspace.resolve().root).resolve()
             start = Path.cwd().resolve()
 
-    home = _home()
-    if home is not None and root == home:
-        if start == home:
-            raise WorkspaceNotFoundError(home_message(home))
+    if denial(root):
+        if start == root:
+            raise WorkspaceNotFoundError(denial_message(root))
         raise _not_a_workspace(start)
 
     if (explicit or require_aegis) and not is_aegis_workspace(root):
@@ -357,10 +357,32 @@ run_demote = _run_demote
 
 
 def _run_archive(args: argparse.Namespace) -> int:
-    """Archive extinct rules; --dry-run only reports what would move."""
+    """Archive extinct rules; --dry-run only reports what would move. Each rule's line prints as
+    soon as it is archived, so an error on a later rule still leaves the moved ones reported."""
     root = _resolve_workspace_root(args)
     execute = not getattr(args, "dry_run", False)
-    return prune_rules(workspace=root, execute=execute)
+    rows = iter_rule_selection(workspace=root, execute=execute)
+    for line in _archive_head_lines(next(rows)):
+        print(line)
+    for candidate in rows:
+        print(_archive_row(candidate))
+    return 0
+
+
+def _archive_head_lines(head: Dict[str, Any]) -> List[str]:
+    """What ``aegis rule archive`` says before its candidates (lifecycle.selection)."""
+    if head["status"] == "no_rules_directory":
+        return ["No rules directory found."]
+    lines = [evidence_line(head["unavailable"])] if head["unavailable"] else []
+    return lines + (["No rules to archive."] if head["status"] == "nothing_to_archive" else [])
+
+
+def _archive_row(c: Dict[str, Any]) -> str:
+    result = c["archive"]
+    note = (" (dry run)" if result is None else
+            "" if result["status"] == "archived" else f" (not archived: {result['message']})")
+    return (f"[ARCHIVE] {c['rule_id']} (fitness {c['fitness']:.2f}, misfire bound {c['misfire']:.2f}, "
+            f"tp {c['tp']:g}, fp {c['fp']:g}){note}")
 
 
 def _split_csv_arg(raw: Any) -> list[str] | None:
@@ -450,25 +472,12 @@ _SHOWN_PROBLEMS = 10
 _UNSIGNED = "The pack is unsigned: its sha256 ({short}) shows it was not altered after export, not who made it."
 
 
-def _show(value: object) -> str:
-    """Pack content and rule files are repository or network content: no terminal controls."""
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))
-
-
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
-def _pack_envelope(action: str, root: Optional[Path], scope: Dict[str, Any]) -> Dict[str, Any]:
-    from aegis_core._version import __version__
-
-    return {
-        "source": f"aegis rule {action}",
-        "aegis_version": __version__,
-        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "scope": {"workspace": str(root) if root is not None else None, **scope},
-    }
+def _pack_payload(action: str, root: Optional[Path], scope: Dict[str, Any]) -> Dict[str, Any]:
+    return primitives.envelope(f"aegis rule {action}", {"workspace": str(root) if root is not None else None, **scope})
 
 
 def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scope: Dict[str, Any],
@@ -476,7 +485,7 @@ def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scop
     """A refusal or failure that wrote nothing: an enveloped document with --json, else stderr.
     With problems, the text lists the first ten under ``header``."""
     if getattr(args, "json", False):
-        doc = _pack_envelope(action, root, scope)
+        doc = _pack_payload(action, root, scope)
         doc.update({"status": status, "error": message})
         if problems:
             doc["problems"] = list(problems)
@@ -484,11 +493,11 @@ def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scop
     elif problems and header:
         print(f"Error: {header}", file=sys.stderr)
         for problem in problems[:_SHOWN_PROBLEMS]:
-            print(f"  {_show(problem)}", file=sys.stderr)
+            print(f"  {sanitize_display(problem, max_len=None)}", file=sys.stderr)
         if len(problems) > _SHOWN_PROBLEMS:
             print(f"  ... and {len(problems) - _SHOWN_PROBLEMS} more problems", file=sys.stderr)
     else:
-        print(f"Error: {_show(message)}", file=sys.stderr)
+        print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
     return 1
 
 
@@ -542,16 +551,16 @@ def _run_export(args: argparse.Namespace) -> int:
         entries.append({"path": entry["path"], "id": parsed.id, "type": parsed.type, "sha256": entry["sha256"]})
     skipped = [{"id": rule_id, "reason": reason} for rule_id, reason in selection.skipped]
     if getattr(args, "json", False):
-        doc = _pack_envelope("export", root, scope)
+        doc = _pack_payload("export", root, scope)
         doc.update({"status": "exported", "out": out, "signed": False, "sha256": pack["sha256"],
                     "rules": entries, "skipped": skipped})
         print(json.dumps(doc, indent=2))
         return 0
-    print(f"Exported {_plural(len(entries), 'rule')} to {_show(out)}")
+    print(f"Exported {_plural(len(entries), 'rule')} to {sanitize_display(out, max_len=None)}")
     for entry in entries:
         print(f"  {entry['path']}")
     if skipped:
-        print("Skipped: " + ", ".join(f"{_show(s['id'])} ({s['reason']})" for s in skipped))
+        print("Skipped: " + ", ".join(f"{sanitize_display(s['id'], max_len=None)} ({s['reason']})" for s in skipped))
     print(_UNSIGNED.format(short=pack["sha256"][:12]))
     return 0
 
@@ -603,7 +612,7 @@ def _run_import(args: argparse.Namespace) -> int:
     rules = [{"path": r.path, "id": r.id, "type": r.type, "renamed_from": r.renamed_from, "sha256": r.sha256}
              for r in result.rules]
     if getattr(args, "json", False):
-        doc = _pack_envelope("import", root, scope)
+        doc = _pack_payload("import", root, scope)
         doc.update({"status": "dry_run" if result.dry_run else "imported", "signed": False,
                     "pack_sha256": result.pack_sha256, "rules": rules, "warnings": list(result.warnings)})
         print(json.dumps(doc, indent=2))
@@ -611,12 +620,12 @@ def _run_import(args: argparse.Namespace) -> int:
     short = result.pack_sha256[:12]
     count = _plural(len(rules), "rule")
     verb = f"Dry run: would import {count}" if result.dry_run else f"Imported {count}"
-    print(f"{verb} from {_show(pack_path)} (sha256 {short}):")
+    print(f"{verb} from {sanitize_display(pack_path, max_len=None)} (sha256 {short}):")
     for rule in rules:
         renamed = f" (renamed from {rule['renamed_from']!r})" if rule["renamed_from"] else ""
         print(f"  {rule['path']}{renamed}")
     for warning in result.warnings:
-        print(f"Warning: {_show(warning)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(warning, max_len=None)}", file=sys.stderr)
     if result.dry_run:
         print("Nothing was written.")
     else:
@@ -710,15 +719,21 @@ class RuleCommand(AegisCommand):
         p_ins_add.add_argument("--commit", default=None, help="Optional signed commit SHA carrying Aegis-Approve-Insight")
         p_ins_add.add_argument("--base-ref", dest="base_ref", default=None, help="Optional base branch reference for --commit")
 
-        p_ins_rev = ins_sub.add_parser("review", parents=[common], help="Cluster and review insights or record a decision")
-        p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise"],
-                               default=None, help="Record a review decision for a cluster")
-        p_ins_rev.add_argument("--cluster", dest="cluster_id", default=None, help="Cluster ID for --decision")
-        p_ins_rev.add_argument("--proposal-id", dest="proposal_id", default=None, help="Proposal ID when --decision propose")
-        p_ins_rev.add_argument("--category", default="correctness", help="Proposal category when --decision propose")
+        p_ins_rev = ins_sub.add_parser("review", parents=[common],
+                                       help="List insights with their top-3 neighbours or record a decision on some")
+        p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise", "confirm"],
+                               default=None, help="Record a review decision on the insights --insight names "
+                                                  "(reject also needs --reason; confirm names unconfirmed suggestions)")
+        p_ins_rev.add_argument("--insight", dest="insight_ids", action="append", default=None, metavar="ID",
+                               help="Insight ID the decision names, as review lists it (repeatable)")
+        p_ins_rev.add_argument("--kind", default=None,
+                               help="Insight kind recorded with --decision confirm; with --decision propose, the "
+                                    "proposal's kind (default: the one kind the named insights share)")
+        p_ins_rev.add_argument("--proposal-id", dest="proposal_id", default=None,
+                               help="Proposal ID when --decision propose (default: trap- and 8 hex digits of the ids)")
         p_ins_rev.add_argument("--summary", default=None, help="Closed-template summary bullet when --decision propose")
         p_ins_rev.add_argument("--rule", dest="rule_id", default=None, help="Target rule ID for merge-into-rule or recurrence check")
-        p_ins_rev.add_argument("--reason", default=None, help="Optional reason for the decision")
+        p_ins_rev.add_argument("--reason", default=None, help="Reason for the decision (required with reject)")
 
         p_ins_en = ins_sub.add_parser("enable", parents=[common], help="Opt-in enable UserPromptSubmit insight capture for a host")
         p_ins_en.add_argument("--host", required=True, choices=["claude-code", "codex-cli"],
@@ -750,19 +765,29 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
 
     from aegis_core.adjudication import ADJUDICATIONS_DIR, RULE_ID
     from aegis_core.errors import AegisError
+    from aegis_core.rule_inventory import RuleInventoryError
+    from aegis_core.rules import load_rules
     from aegis_core.storage import append_jsonl
 
     rule_id = str(args.rule_id)
     if not RULE_ID.fullmatch(rule_id):
         return _emit_error(args, f"invalid rule id {sanitize_display(rule_id, 80)!r}: use letters, digits, '.', '_' or '-' (at most 128)")
     root = _resolve_workspace_root(args)
+    try:
+        # Exact match on the typed id (no normalising): a label must name a rule that loads.
+        known = load_rules(root).get(rule_id) is not None
+    except RuleInventoryError as exc:
+        return _emit_error(args, str(exc))
+    if not known:
+        return _emit_error(args, f"no rule {rule_id!r} that loads cleanly in this workspace; "
+                                 "aegis rule list shows the rule ids")
     directory = root.joinpath(*ADJUDICATIONS_DIR.split("/"))
     if directory.is_symlink() or directory.parent.is_symlink():
         return _emit_error(args, f"{ADJUDICATIONS_DIR} is a symlink; refusing to write a label through it")
     ref, file, line, summary = (getattr(args, k, None) for k in ("ref", "file", "line", "summary"))
     example = ref or hashlib.sha256(f"{rule_id}|{file or ''}|{'' if line is None else line}|{summary or ''}".encode("utf-8")).hexdigest()[:16]
     row: Dict[str, Any] = {"example_id": str(example), "verdict": str(args.verdict),
-                           "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                           "ts": utc_stamp()}
     for key in ("ref", "summary", "file", "session", "repo"):
         if getattr(args, key, None) is not None:
             row[key] = str(getattr(args, key))
@@ -779,6 +804,11 @@ def _run_adjudicate(args: argparse.Namespace) -> int:
         print(f"Recorded a {row['verdict']} label for {sanitize_display(rule_id)} in {rel}; "
               "it counts after it is merged to the base branch")
     return 0
+
+
+def _default_proposal_id(insight_ids: Sequence[str]) -> str:
+    """``trap-`` and 8 hex digits of the sorted ids: the same group names the same proposal."""
+    return "trap-" + hashlib.sha256("\n".join(sorted(set(insight_ids))).encode("utf-8")).hexdigest()[:8]
 
 
 def _run_insight(args: argparse.Namespace) -> int:
@@ -816,37 +846,56 @@ def _run_insight(args: argparse.Namespace) -> int:
             )
         except Exception as exc:
             return _emit_error(args, str(exc))
-        print(json.dumps(row, indent=2) if use_json else f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
+        from aegis_core.human_gate import INSIGHT_APPROVE_TRAILER, insight_text_hash
+
+        trailer = f"{INSIGHT_APPROVE_TRAILER}: {insight_text_hash(getattr(args, 'text', ''))}"
+        if use_json:
+            print(json.dumps({**row, "approval_trailer": trailer}, indent=2))
+        else:
+            print(f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
+            if row["level"] != "H":
+                print(f"To record it at level H, sign a commit carrying this trailer, then re-run with --commit SHA:\n  {trailer}")
         return 0
 
     if sub_action == "review":
         root = _resolve_workspace_root(args)
         decision = getattr(args, "decision", None)
+        ids = list(dict.fromkeys(getattr(args, "insight_ids", None) or []))
+        if decision and not ids:
+            return _usage_error(args, f"--decision {decision} needs --insight ID")
+        if decision == "reject" and not (getattr(args, "reason", None) or "").strip():
+            return _usage_error(args, "--decision reject needs --reason")
         rev = review_insights(root)
         if decision:
-            cid = getattr(args, "cluster_id", None)
-            target_cluster = next((c for c in rev["clusters"] if c["cluster_id"] == cid), None) if cid else (rev["clusters"][0] if rev["clusters"] else None)
-            cid = cid or (target_cluster["cluster_id"] if target_cluster else None)
-            if not cid:
-                return _emit_error(args, "no cluster available to record decision; pass --cluster")
-            ins_ids = target_cluster["insight_ids"] if target_cluster else []
+            if decision == "confirm":
+                one, many = "an unconfirmed suggestion", "unconfirmed suggestions"
+                valid = [str(s.get("id")) for s in rev["suggestions"]]
+            else:
+                one, many = "a counted insight", "counted insights"
+                valid = [e["id"] for e in rev["insights"] + rev["suppressed"]]
+            unknown = [i for i in ids if i not in valid]
+            if unknown:
+                return _emit_error(args, f"not {one}: {sanitize_display(', '.join(unknown))}; "
+                                         f"{many}: {sanitize_display(', '.join(valid), 400) or 'none'}")
             try:
+                proposal_path = None
+                # A propose row hides its insights, so it is written only once the proposal exists.
+                if decision == "propose":
+                    prop_id = getattr(args, "proposal_id", None) or _default_proposal_id(ids)
+                    summary = getattr(args, "summary", None)
+                    proposal_path = str(write_proposal(
+                        root, proposal_id=prop_id, insight_ids=ids, summary_bullets=[summary] if summary else [],
+                        kind=getattr(args, "kind", None),
+                    ))
                 dec_row = record_decision(
-                    root, cluster_id=cid, decision=decision, insight_ids=ins_ids,
+                    root, decision=decision, insight_ids=ids, kind=getattr(args, "kind", None),
                     reason=getattr(args, "reason", None), rule_id=getattr(args, "rule_id", None),
                 )
-                if decision == "propose":
-                    prop_id = getattr(args, "proposal_id", None) or f"trap-{cid.replace('cluster-', '')}"
-                    summary = getattr(args, "summary", None) or f"Address recurring correction cluster {cid}."
-                    paths = (target_cluster.get("paths") if target_cluster else None) or ["**"]
-                    dec_row["proposal_path"] = str(write_proposal(
-                        root, proposal_id=prop_id, target_paths=paths,
-                        category=getattr(args, "category", "correctness") or "correctness",
-                        summary_bullets=[summary], insight_ids=ins_ids,
-                    ))
+                if proposal_path is not None:
+                    dec_row["proposal_path"] = proposal_path
             except Exception as exc:
                 return _emit_error(args, str(exc))
-            print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {cid}")
+            print(json.dumps(dec_row, indent=2) if use_json else f"Recorded decision '{decision}' for {', '.join(ids)}")
             return 0
 
         if rule_id := getattr(args, "rule_id", None):
@@ -857,10 +906,18 @@ def _run_insight(args: argparse.Namespace) -> int:
         if use_json:
             print(json.dumps(rev, indent=2))
         else:
-            clusters, suggestions = rev.get("clusters", []), rev.get("suggestions", [])
-            print(f"Insight Review: {len(clusters)} cluster(s), {len(suggestions)} unconfirmed agent suggestion(s)")
-            for c in clusters:
-                print(f"  [{c['cluster_id']}] count={c['count']} status={c['match_status']} rule={c.get('matched_rule') or 'none'}")
+            print(f"Insight Review: {len(rev['insights'])} insight(s), {len(rev['suppressed'])} hidden by a decision, "
+                  f"{len(rev['suggestions'])} unconfirmed agent suggestion(s)")
+            if "recurrence" in rev:
+                from aegis_core.insights import RECURRENCE_DENOMINATOR, insight_status_lines
+
+                for line in insight_status_lines({"rules": [rev["recurrence"]], "denominator": RECURRENCE_DENOMINATOR}):
+                    print(f"  {sanitize_display(line, 300)}")
+            for e in rev["insights"]:
+                match = e["match"]
+                near = ", ".join(f"{n['id']} ({n['similarity']:.2f})" for n in e["neighbours"])
+                print(f"  {sanitize_display(e['id'])}: {sanitize_display(e['text'], 60)} | {match['status']}, rule "
+                      f"{sanitize_display(match['rule'] or 'none')} | neighbours: {sanitize_display(near or 'none', 200)}")
         return 0
 
     return _emit_error(args, "Specify an insight action: add, review, or enable")

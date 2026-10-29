@@ -12,17 +12,17 @@ that names no commit, no git repository). ``list`` and ``metrics`` change nothin
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from aegis_core import primitives
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
-from aegis_core._version import __version__
+from aegis_core.primitives import utc_stamp
 
 __all__ = ["TeamCommand", "run_team"]
 
@@ -32,32 +32,17 @@ EXIT_USAGE = 2
 ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "metrics")
 
 
-def _stamp(epoch: int) -> str:
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _envelope(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
-    return {
-        "source": f"aegis team {action}",
-        "aegis_version": __version__,
-        "checked_at": _stamp(now),
-        "scope": {"workspace": str(root), **scope},
-    }
+def _team_payload(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
+    return primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now)
 
 
 def _emit(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2))
 
 
-def _text(value: object) -> str:
-    """Repository-chosen text (labels, globs, git's messages) without terminal controls."""
-    text = str(value)
-    return sanitize_display(text, max_len=len(text))  # stripped text is never longer: no cut
-
-
 def _warn(warnings: List[str]) -> None:
     for line in warnings:
-        print(f"Warning: {_text(line)}", file=sys.stderr)
+        print(f"Warning: {sanitize_display(line, max_len=None)}", file=sys.stderr)
 
 
 def _view(root: Path, now: int, oid: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -76,10 +61,10 @@ def _lease_lines(lease: Optional[Dict[str, Any]]) -> List[str]:
     state = "expired" if lease["expired"] else "live"
     skew = " (writer clock ahead)" if lease["clock_skew"] else ""
     lines = [
-        f"  {lease['lane']}  {state}  owner {_text(lease['owner'])}  role {_text(lease['role'])}  "
+        f"  {lease['lane']}  {state}  owner {sanitize_display(lease['owner'], max_len=None)}  role {sanitize_display(lease['role'], max_len=None)}  "
         f"gen {lease['gen']}  expires {lease['expires_at']}{skew}",
-        f"    paths: {_text(', '.join(lease['paths']))}",
-        f"    oid: {lease['oid']}" + (f"  branch: {_text(lease['branch'])}" if lease["branch"] else ""),
+        f"    paths: {sanitize_display(', '.join(lease['paths']), max_len=None)}",
+        f"    oid: {lease['oid']}" + (f"  branch: {sanitize_display(lease['branch'], max_len=None)}" if lease["branch"] else ""),
     ]
     if lease["overlaps"]:
         lines.append(f"    overlaps live: {', '.join(lease['overlaps'])}")
@@ -90,7 +75,7 @@ def _lease_lines(lease: Optional[Dict[str, Any]]) -> List[str]:
 
 def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseChange) -> int:
     if args.json:
-        payload = _envelope(args.team_action, root, now, refs=team.LANES_REF, lane=change.lane)
+        payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=change.lane)
         payload.update({
             "status": change.action,
             "oid": change.oid,
@@ -129,7 +114,7 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
     result = team.gc(root, now=now)
     warnings = [line for change in result.collected for line in change.warnings]
     if args.json:
-        payload = _envelope("gc", root, now, refs=team.LANES_REF)
+        payload = _team_payload("gc", root, now, refs=team.LANES_REF)
         payload.update({
             "status": "collected" if result.collected else "nothing to collect",
             "collected": [{"lane": c.lane, "previous": c.previous, "caller": c.caller} for c in result.collected],
@@ -144,7 +129,7 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
     if not result.collected:
         print("nothing to collect")
     for lane, reason in result.kept:
-        print(f"kept {_text(lane)}: {reason}", file=sys.stderr)
+        print(f"kept {sanitize_display(lane, max_len=None)}: {reason}", file=sys.stderr)
     return EXIT_OK
 
 
@@ -153,19 +138,19 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
 def _list(args: argparse.Namespace, root: Path, now: int) -> int:
     found = team.describe(root, now)
     if args.json:
-        payload = _envelope("list", root, now, refs=team.LANES_REF)
+        payload = _team_payload("list", root, now, refs=team.LANES_REF)
         payload.update({"note": team.LEASE_NOTE, **found})
         _emit(payload)
         return EXIT_OK
     if not found["leases"] and not found["unreadable"]:
         print(f"There are no leases under {team.LANES_REF}.")
     else:
-        print(f"Leases under {team.LANES_REF} (checked {_stamp(now)}):")
+        print(f"Leases under {team.LANES_REF} (checked {utc_stamp(now)}):")
     for lease in found["leases"]:
         for line in _lease_lines(lease):
             print(line)
     for bad in found["unreadable"]:
-        print(f"  {_text(bad['lane'])}  unreadable  oid {bad['oid']}: {_text(bad['error'])}")
+        print(f"  {sanitize_display(bad['lane'], max_len=None)}  unreadable  oid {bad['oid']}: {sanitize_display(bad['error'], max_len=None)}")
     print(team.LEASE_NOTE)
     return EXIT_OK
 
@@ -175,7 +160,7 @@ def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     counts = team.event_counts(root)
     span = merges.pop("range")
     if args.json:
-        payload = _envelope("metrics", root, now, **span)
+        payload = _team_payload("metrics", root, now, **span)
         payload.update({"events": counts, "merges": merges})
         _emit(payload)
         return EXIT_OK
@@ -183,14 +168,14 @@ def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     print(f"Lease events: {counts['claims']} claims, {counts['denials']} denials"
           + (f" ({reasons})" if reasons else "") + f"; {counts['lanes_claimed']} lanes claimed")
     if counts["error"]:
-        print(f"  events log unreadable: {_text(counts['error'])}")
+        print(f"  events log unreadable: {sanitize_display(counts['error'], max_len=None)}")
     since = span["base"] if span["base"] is not None else "the first commit"
     tip = span["tip"][:12] if span["tip"] else "an unborn branch"
-    print(f"First-parent merges on {tip} since {_text(since)}: {merges['count']}")
+    print(f"First-parent merges on {tip} since {sanitize_display(since, max_len=None)}: {merges['count']}")
     print(f"  overlapping (both sides changed a common path): {merges['overlapping_merge']}")
     conflicting = merges["conflicting_merge"]
     if conflicting == "unavailable":
-        conflicting = f"unavailable ({_text(merges['conflicting_unavailable'])})"
+        conflicting = f"unavailable ({sanitize_display(merges['conflicting_unavailable'], max_len=None)})"
     print(f"  conflicting (git merge-tree): {conflicting}")
     if merges["excluded_synthetic"]:
         print(f"  excluded synthetic pull-request merges: {merges['excluded_synthetic']}")
@@ -212,18 +197,18 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
 
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
     if args.json:
-        payload = _envelope(args.team_action, root, now)
+        payload = _team_payload(args.team_action, root, now)
         payload.update({"status": "error", "error": message})
         _emit(payload)
     else:
-        print(f"Error: {_text(message)}", file=sys.stderr)
+        print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
     return code
 
 
 def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused) -> int:
     lease = _view(root, now, exc.current)
     if args.json:
-        payload = _envelope(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
+        payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
         payload.update({
             "status": "refused",
             "reason": exc.reason,
@@ -236,7 +221,7 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
         _emit(payload)
         return EXIT_REFUSED
     _warn(list(exc.warnings))
-    print(_text(str(exc)), file=sys.stderr)
+    print(sanitize_display(str(exc), max_len=None), file=sys.stderr)
     for line in _lease_lines(lease):
         print(line, file=sys.stderr)
     return EXIT_REFUSED
@@ -337,7 +322,8 @@ class TeamCommand(AegisCommand):
         )
         metrics.add_argument("--base", default=None, metavar="REF",
                              help="Count merges since this commit (default: the branch base, as for "
-                                  "aegis check --lane: origin/main, main, origin/develop or develop; "
+                                  "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
+                                  "develop or master; "
                                   "with none, the whole first-parent history)")
 
     def execute(self, args: argparse.Namespace) -> int:

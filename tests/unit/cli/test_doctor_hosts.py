@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from aegis_cli import doctor
+from aegis_cli import doctor, doctor_base
 from aegis_cli.doctor import run_doctor
 from aegis_core.bootstrap import BOOTSTRAP_ID, bootstrap_text
 
@@ -559,7 +559,7 @@ def test_an_empty_home_rules_dir_left_by_v3_auto_mkdir_is_reported(env):
 def test_v3_flat_rule_copies_are_matched_by_sha256_never_by_name(env, monkeypatch):
     env.all_ok()
     shipped = b"---\nid: providence\n---\n# Providence (as v3.3.0 shipped it)\n"
-    monkeypatch.setattr(doctor, "V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
+    monkeypatch.setattr(doctor_base, "_V3_SHIPPED_RULE_SHA256", frozenset({hashlib.sha256(shipped).hexdigest()}))
     leak = env.home / ".gemini" / "config" / "rules" / "providence.md"
     oracle = env.home / ".kiro" / "steering" / ".oracles" / "testing.md"
     edited = env.home / ".kiro" / "steering" / "providence.md"
@@ -573,8 +573,8 @@ def test_v3_flat_rule_copies_are_matched_by_sha256_never_by_name(env, monkeypatc
 
 
 def test_the_embedded_v3_digests_are_sha256_hex():
-    assert len(doctor.V3_SHIPPED_RULE_SHA256) == 28
-    assert all(len(d) == 64 and int(d, 16) >= 0 for d in doctor.V3_SHIPPED_RULE_SHA256)
+    assert len(doctor_base._V3_SHIPPED_RULE_SHA256) == 28
+    assert all(len(d) == 64 and int(d, 16) >= 0 for d in doctor_base._V3_SHIPPED_RULE_SHA256)
 
 
 def test_unparseable_host_config_is_reported_and_makes_registration_unknown(env):
@@ -594,7 +594,7 @@ def test_text_output_prints_the_matrix_and_the_tier_table(env):
     rc, out = env.run()
     assert "Codex CLI (codex-cli): unregistered" in out
     assert "Claude Code (claude-code): ok" in out
-    assert "Enforcement tiers" in out
+    assert "\nEnforcement tiers:\n" in out
     for tier in ("Advisory", "Best-effort", "Local floor", "Authoritative"):
         assert tier in out
     assert "aegis init --host codex-cli" in out
@@ -1754,6 +1754,53 @@ def test_a_hook_status_without_reachability_counts_as_reachable(env):
     assert check["status"] == "pass"
 
 
+def test_one_run_reads_the_hook_status_once_for_the_floor_and_the_check(env, monkeypatch):
+    """Given a current hook, when doctor runs, then the local floor and the pre-commit check
+    agree on one hook_status reading."""
+    from aegis_cli.hooks import management
+
+    env.all_ok()
+    _install_current_hook(env)
+    real, calls = management.hook_status, []
+    monkeypatch.setattr(management, "hook_status", lambda root=None: calls.append(root) or real(root))
+    payload = env.doctor()
+    assert len(calls) == 1
+    assert tier(payload, "local_floor")["status"] == "active"
+    (check,) = [c for c in payload["checks"] if c["id"] == "precommit_hook"]
+    assert check["status"] == "pass"
+
+
+def test_a_hook_status_that_raises_leaves_the_floor_unknown_and_the_check_raises_it(env, monkeypatch):
+    """Given hook_status raising, when doctor runs, then the floor is unknown (no retry, no
+    empty success) and the pre-commit check raises the same exception."""
+    from aegis_cli import doctor_findings
+    from aegis_cli.hooks import management
+
+    env.all_ok()
+    boom, calls, floors = RuntimeError("the hooks directory cannot be read"), [], []
+
+    def status(root=None):
+        calls.append(root)
+        raise boom
+
+    real_floor = doctor_findings._floor_status
+    monkeypatch.setattr(management, "hook_status", status)
+    monkeypatch.setattr(doctor_findings, "_floor_status", lambda *a: floors.append(real_floor(*a)) or floors[-1])
+    with pytest.raises(RuntimeError) as caught:
+        env.doctor()
+    assert caught.value is boom
+    assert floors == [("unknown", None)]
+    assert len(calls) == 1
+
+
+def test_apply_with_json_is_still_refused_before_anything_runs(env, capsys):
+    env.all_ok()
+    rc, out = env.run(github=True, apply=True, tier="A", json=True)
+    assert (rc, out) == (2, "")
+    assert capsys.readouterr().err == ("aegis doctor: --github --apply asks at a terminal, so it cannot run with "
+                                       "--json\n")
+
+
 def test_the_best_effort_tier_without_host_hooks_is_inactive_and_names_the_install_command(env):
     env.all_ok()
     best = tier(env.doctor(), "best_effort")
@@ -1836,15 +1883,12 @@ def test_unmigrated_v3_state_is_a_warning_that_names_the_files_and_aegis_migrate
     assert "unmigrated v3 state: .aegis/evidence/signals.jsonl, aegis.conf" in out.split("Warnings:")[1]
 
 
-def test_no_unmigrated_state_and_no_helper_mean_no_upgrade_warning(env, monkeypatch):
-    """A v4 workspace has none; a build without the helper (it lands in a parallel lane)
-    reports none and does not fail."""
+def test_no_unmigrated_state_means_no_upgrade_warning(env, monkeypatch):
+    """A v4 workspace has none, so doctor reports none."""
     from aegis_core.workspace import discovery
 
     env.all_ok()
-    monkeypatch.setattr(discovery, "unmigrated_state", lambda root: [], raising=False)
-    assert "unmigrated_v3_state" not in finding_codes(env.doctor())
-    monkeypatch.delattr(discovery, "unmigrated_state", raising=False)
+    monkeypatch.setattr(discovery, "unmigrated_state", lambda root: [])
     payload = env.doctor()
     assert "unmigrated_v3_state" not in finding_codes(payload) and payload["findings"] == []
 
@@ -1920,7 +1964,7 @@ def test_an_installed_app_counts_as_installed_without_a_cli(env, monkeypatch, tm
     apps = tmp_path / "Applications"
     (apps / "Kiro.app").mkdir(parents=True)
     monkeypatch.setattr(table, "APP_DIRS", {"darwin": (str(apps),)})
-    monkeypatch.setattr(doctor, "_platform", lambda: "darwin")
+    monkeypatch.setattr(doctor_base, "_platform", lambda: "darwin")
     env.all_ok()
     select(env, "kiro")
     row = host(env.doctor(), "kiro")
@@ -1939,7 +1983,7 @@ def test_an_app_that_doctor_cannot_ask_is_auth_unknown_never_ok(env, monkeypatch
     apps = tmp_path / "Applications"
     (apps / "Codex.app").mkdir(parents=True)
     monkeypatch.setattr(table, "APP_DIRS", {"darwin": (str(apps),)})
-    monkeypatch.setattr(doctor, "_platform", lambda: "darwin")
+    monkeypatch.setattr(doctor_base, "_platform", lambda: "darwin")
     env.bootstrap()
     env.register_workspace()
     row = host(env.doctor(), "codex-cli")
@@ -2092,3 +2136,148 @@ def test_doctor_labels_an_experimental_row_experimental_and_a_verified_one_not(e
     notice = "experimental documented by the vendor, not yet checked on a real install (verified after 3 clean runs)"
     assert out.count(notice) == 1
     assert lines[lines.index(cursor_line) + 1].strip() == notice  # inside Cursor's block, not Codex's
+
+
+# ── Pins: a host row's reasons, unknown, state and keys, in order (R-cli-a1; recorded before the split) ──
+
+ROW_KEYS = ["id", "display_name", "verified_row", "experimental", "surfaces", "state", "reasons", "binary", "app",
+            "registration", "identity", "workspace_registered", "bootstrap", "budget", "enforcement_level",
+            "advisory", "hooks", "insight_capture", "trust_tier", "trust_tier_status", "stale", "unknown"]
+
+
+def _rows_and_direct_rows(env: Env, monkeypatch: pytest.MonkeyPatch):
+    """The doctor payload, and each host row again from a direct _host_row call with the
+    arguments the run passed (the payload's rows also carry the trust tier _diagnose sets)."""
+    from aegis_cli import doctor_findings
+
+    real = doctor_findings._host_row
+    seen: List[tuple] = []
+
+    def spy(*args):
+        seen.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(doctor_findings, "_host_row", spy)
+    payload = env.doctor()
+    monkeypatch.setattr(doctor_findings, "_host_row", real)
+    return payload, {args[0].id: real(*args) for args in seen}
+
+
+def _pinned(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {"state": row["state"], "reasons": codes(row), "unknown": row["unknown"],
+            "workspace_registered": row["workspace_registered"], "advisory": row["advisory"],
+            "enforcement_level": row["enforcement_level"], "hooks": row["hooks"]["status"]}
+
+
+# On Windows, registrar.unavailable_reason rules out Antigravity hooks, and Codex hooks for any drive-letter
+# aegis path (outside AEGIS_PATH_CHARSET), so those rows say "unavailable" where POSIX says "absent".
+_NO_HOOKS_ON_WINDOWS = ("codex-cli", "antigravity")
+
+
+def _assert_pinned(payload: Dict[str, Any], direct: Dict[str, Dict[str, Any]], expected: Dict[str, Any]) -> None:
+    shown = [key for key in ROW_KEYS if key != "advisory"]  # doctor --json leaves advisory out
+    assert [row["id"] for row in payload["hosts"]] == list(expected)
+    for row in payload["hosts"]:
+        own = direct[row["id"]]
+        assert list(own) == ROW_KEYS
+        assert list(row) == shown
+        assert (own["trust_tier"], own["trust_tier_status"]) == (None, "unavailable")
+        assert {k: v for k, v in row.items() if not k.startswith("trust_tier")} == {
+            k: v for k, v in own.items() if k != "advisory" and not k.startswith("trust_tier")}
+        want = expected[row["id"]]
+        if os.name == "nt" and row["id"] in _NO_HOOKS_ON_WINDOWS:
+            want = dict(want, hooks="unavailable")
+        assert _pinned(own) == want, row["id"]
+
+
+class TestHostRowPins:
+    """Characterization pins: green before _host_row was split into helpers, unchanged after."""
+
+    def test_every_unknown_at_once_keeps_its_order_in_the_payload_and_the_direct_row(self, env, monkeypatch):
+        env.codex_registered()
+        env.stub("claude")
+        python = env.stub("python3")
+        # Claude Code: only this project's .mcp.json registers aegis (approval unknown), through a
+        # launch that imports from the start directory (unsafe), as any client (identity unknown);
+        # its user settings cannot be read (hooks unknown).
+        (env.ws / ".mcp.json").write_text(json.dumps({"mcpServers": {"aegis": {
+            "command": str(python), "args": ["-m", "aegis_mcp"], "env": {"AEGIS_CLIENT": "*"}}}}), encoding="utf-8")
+        (env.home / ".claude").mkdir()
+        (env.home / ".claude" / "settings.json").write_bytes(b"{not json")
+        env.antigravity_registered()
+        env.register_workspace()
+        (env.home / ".aegis" / "workspaces.json").write_bytes(b"{not json")  # the registry is unknown
+        env.bootstrap()
+        payload, direct = _rows_and_direct_rows(env, monkeypatch)
+        _assert_pinned(payload, direct, {
+            "codex-cli": {"state": "ok", "reasons": [], "unknown": ["workspace_registered"],
+                          "workspace_registered": None, "advisory": True, "enforcement_level": "advisory",
+                          "hooks": "absent"},
+            "claude-code": {"state": "auth_unknown", "reasons": ["unsafe_registration", "approval_unknown"],
+                            "unknown": ["identity", "workspace_registered", "hooks"], "workspace_registered": None,
+                            "advisory": True, "enforcement_level": "advisory", "hooks": "unknown"},
+            "antigravity": {"state": "auth_unknown", "reasons": ["workspace_registry_unknown"],
+                            "unknown": ["workspace_registered"], "workspace_registered": None, "advisory": None,
+                            "enforcement_level": "unknown", "hooks": "absent"},
+        })
+        assert payload["unknown"] == ["codex-cli.workspace_registered", "claude-code.identity",
+                                      "claude-code.workspace_registered", "claude-code.hooks",
+                                      "antigravity.workspace_registered"]
+        assert {Path(c["argv"][0]).stem for c in env.calls} == {"codex"}
+
+    def test_each_state_wins_over_the_lower_codes_beside_it(self, env, monkeypatch):
+        env.stub("agy")  # installed, never registered
+        env.claude_registered(client="codex-cli")
+        (env.ws / "CLAUDE.md").write_bytes(b"# Project notes\n")
+        (env.ws / "AGENTS.override.md").write_bytes(b"# local override\n")
+        env.register_workspace()
+        (env.home / ".aegis" / "workspaces.json").write_bytes(b"{not json")
+        env.bootstrap()
+        payload, direct = _rows_and_direct_rows(env, monkeypatch)
+        _assert_pinned(payload, direct, {
+            "codex-cli": {"state": "missing_binary", "reasons": ["missing_binary", "agents_override_shadows_agents_md"],
+                          "unknown": ["registration", "workspace_registered"], "workspace_registered": None,
+                          "advisory": False, "enforcement_level": "none", "hooks": "absent"},
+            "claude-code": {"state": "policy_gap", "reasons": ["identity_mismatch", "claude_md_shadows_agents_md"],
+                            "unknown": ["workspace_registered"], "workspace_registered": None, "advisory": True,
+                            "enforcement_level": "advisory", "hooks": "absent"},
+            "antigravity": {"state": "unregistered", "reasons": ["not_registered", "workspace_registry_unknown"],
+                            "unknown": ["workspace_registered"], "workspace_registered": None, "advisory": None,
+                            "enforcement_level": "unknown", "hooks": "absent"},
+        })
+        assert env.calls == []
+
+    def test_outside_a_governed_workspace_an_unreadable_registry_is_unknown_but_no_reason(self, env, monkeypatch,
+                                                                                          tmp_path):
+        env.all_ok()
+        (env.home / ".aegis" / "workspaces.json").write_bytes(b"{not json")
+        bare = tmp_path / "bare"
+        bare.mkdir()
+        monkeypatch.setattr(env, "ws", bare)
+        payload, direct = _rows_and_direct_rows(env, monkeypatch)
+        ungoverned = {"state": "policy_gap", "reasons": ["workspace_not_governed"], "unknown": ["workspace_registered"],
+                      "workspace_registered": None, "advisory": False, "enforcement_level": "none", "hooks": "absent"}
+        _assert_pinned(payload, direct, dict.fromkeys(PHASE1, ungoverned))
+
+    def test_a_binary_only_inside_the_workspace_is_unknown_and_never_run(self, env, monkeypatch, tmp_path):
+        inside = env.ws / ".local" / "bin"
+        marker = tmp_path / "decoy-ran"
+        _decoy(inside, "agy", marker)
+        monkeypatch.setenv("PATH", os.pathsep.join([str(inside), str(env.bin)]))
+        env.register_workspace()
+        (env.home / ".aegis" / "workspaces.json").write_bytes(b"{not json")
+        env.bootstrap()
+        payload, direct = _rows_and_direct_rows(env, monkeypatch)
+        missing = {"state": "missing_binary", "reasons": ["missing_binary"],
+                   "unknown": ["registration", "workspace_registered"], "workspace_registered": None,
+                   "advisory": False, "enforcement_level": "none", "hooks": "absent"}
+        _assert_pinned(payload, direct, {
+            "codex-cli": missing,
+            "claude-code": dict(missing, reasons=["missing_binary", "not_registered"],
+                                unknown=["workspace_registered"]),
+            "antigravity": {"state": "missing_binary",
+                            "reasons": ["binary_in_workspace", "not_registered", "workspace_registry_unknown"],
+                            "unknown": ["binary", "workspace_registered"], "workspace_registered": None,
+                            "advisory": None, "enforcement_level": "unknown", "hooks": "absent"},
+        })
+        assert env.calls == [] and not marker.exists()

@@ -1,6 +1,7 @@
 """One reader for ~/.aegis/config.json (R-trust-26): the same bytes give the same
-honoured-or-ignored decision for tests.command, rules.base_ref, perf.command and
-regression.tier, and a file inside the workspace is repository content for all four."""
+honoured-or-ignored decision for tests.command, rules.base_ref and perf.command, and a
+file inside the workspace is repository content for all three (regression.tier is
+accepted and ignored since T5 became a report)."""
 from __future__ import annotations
 
 import json
@@ -12,7 +13,7 @@ import threading
 
 import pytest
 
-from aegis_core import checkrun, config, regression, rule_integrity
+from aegis_core import config, rule_integrity, testexec
 from aegis_core.verification import perf_check
 from aegis_core.workspace.layout import UserLayout
 
@@ -26,8 +27,8 @@ SETTINGS = {
     "perf": {"command": "python bench.py"},
     "regression": {"tier": "gate"},
 }
-HONOURED = {"tests": ["python", "run_checks.py"], "rules": "user-config", "perf": True, "regression": "gate"}
-IGNORED = {"tests": None, "rules": "other", "perf": False, "regression": "warning"}
+HONOURED = {"tests": ["python", "run_checks.py"], "rules": "user-config", "perf": True}
+IGNORED = {"tests": None, "rules": "other", "perf": False}
 
 
 def _git(root: Path, *args: str) -> None:
@@ -69,10 +70,9 @@ def _decisions(root: Path) -> dict:
     # The fixture repository has one commit, so the default HEAD~1 base would not resolve.
     perf_check.run_perf_check(root, base_ref="HEAD", runner=spy)
     return {
-        "tests": checkrun.user_test_command(root),
+        "tests": testexec.user_test_command(root),
         "rules": "user-config" if anchor is not None and anchor.source == "user-config" else "other",
         "perf": bool(perf_calls),
-        "regression": regression._user_regression_tier(str(root)),
     }
 
 

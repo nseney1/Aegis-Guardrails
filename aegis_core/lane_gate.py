@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import os
 from pathlib import Path
@@ -80,24 +80,20 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from aegis_core import primitives
 from aegis_core import events, gitsafe, team
-from aegis_core._version import __version__
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.lane_ast import (
-    COLLECTION_KEYS,
-    COVERED,
-    LIMITS,
-    PYTEST_CONFIG_FILES,
     collected_ids,
     collection_hooks,
     pytest_settings,
     skip_forms,
 )
 from aegis_core.match import is_test_path, matches, normalize_path
+from aegis_core.primitives import utc_stamp
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
-    "COLLECTION_KEYS",
     "COVERED",
     "KINDS",
     "LIMITS",
@@ -122,6 +118,32 @@ __all__ = [
     "skip_forms",
 ]
 
+COVERED = ("python",)
+# pytest's own search order; it reads the first that holds a configuration.
+PYTEST_CONFIG_FILES = ("pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini",
+                       "setup.cfg")
+LIMITS = (
+    "Assert weakening is not detected: a test that still exists but checks less passes.",
+    "Only Python test files and pytest's config files are checked; other test files are listed as not checked.",
+    "Test ids follow pytest's default discovery (functions and methods named test*), whatever "
+    "python_functions or python_classes the repository configures.",
+    "Skips reached indirectly are not detected: through a fixture or helper function, a marker imported "
+    "from another module, or getattr or setattr with a string.",
+    "A skip is compared by its own text and the blocks around it (if, while, for, try, with, match, a "
+    "conditional expression, and/or), not by what its condition evaluates to: a condition set elsewhere "
+    "(a module constant such as SLOW = True, an environment variable, a helper) or an earlier "
+    "'if ...: return' can change without a finding.",
+    "A decorator that replaces a test with something pytest does not collect (one that returns None, say) "
+    "is not detected; pytest.fixture is.",
+    "Trimming @pytest.mark.parametrize cases is not detected, nor are tests generated at import time "
+    "(exec, globals(), loops), which have no def to compare, or removed through globals() or vars().",
+    "Of the ways to end the run early only pytest.exit and os._exit are detected, not os.kill, a signal or "
+    "a plugin outside the test files.",
+    "The test command itself (a CI workflow, a Makefile, tox commands) is not read; containment and the "
+    "protection on .github/** cover the workflow.",
+    "Only committed changes are checked: the range is merge-base(base, HEAD)..HEAD.",
+)
+
 SOURCE = "aegis check --lane"
 NEEDS_HISTORY = "needs history: fetch with fetch-depth 0"
 WITNESSED = "witnessed: base policy"
@@ -144,8 +166,6 @@ NOTE_EXEMPTION = (
 
 _REGULAR = ("100644", "100755")
 _OID = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _PARSE_ERRORS = (SyntaxError, ValueError, RecursionError)
 
 
@@ -202,17 +222,6 @@ class PathCheck:
     def as_dict(self) -> Dict[str, Any]:
         return {"path": self.path, "status": self.status, "old_mode": self.old_mode, "new_mode": self.new_mode,
                 "allowed": self.allowed, "glob": self.glob, "source": self.source, "protected": self.protected}
-
-
-def _stamp(epoch: Optional[int] = None) -> str:
-    moment = int(time.time()) if epoch is None else int(epoch)
-    return datetime.fromtimestamp(moment, timezone.utc).strftime(_TS_FORMAT)
-
-
-def _source_label(source: str, base: str) -> str:
-    if source.startswith("base@"):
-        return f"team.json at {base} {source[len('base@'):][:12]}"
-    return {"lease": "the lane's lease", "cli": "--paths", "worktree": "the working tree's team.json"}[source]
 
 
 @dataclass(frozen=True)
@@ -281,10 +290,7 @@ class LaneCheck:
     def as_dict(self) -> Dict[str, Any]:
         """The ``--json`` document."""
         return {
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": self.checked_at,
-            "scope": {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()},
+            **primitives.envelope(SOURCE, {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()}, checked_at=self.checked_at),
             "status": "pass" if self.passed else "fail",
             "label": self.label,
             "provenance": {"paths": self.paths_source, "shared": self.shared_source},
@@ -307,47 +313,11 @@ class LaneCheck:
             "warnings": list(self.warnings),
         }
 
-    def text_lines(self) -> List[str]:
-        """The text report, one line per item; repository text is not sanitized here."""
-        verdict = "PASSED" if self.passed else "FAILED"
-        lines = [
-            f"{SOURCE} {self.lane}: {verdict} ({self.label})",
-            f"  range: {self.merge_base[:12]}..{self.head[:12]} (from the merge base of {self.base} and HEAD), "
-            f"{len(self.changes)} changed path(s)",
-            f"  allowed paths from {_source_label(self.paths_source, self.base)}: {', '.join(self.paths) or '(none)'}",
-            f"  shared from {_source_label(self.shared_source, self.base)}: {', '.join(self.shared) or '(none)'}",
-        ]
-        if self.violations:
-            lines.append(f"containment: FAILED, {len(self.violations)} of {len(self.changes)} changed path(s) "
-                         "outside the allowed set")
-            for change in self.violations:
-                why = ("protected: only team.json at the base tip (--base-policy) can allow "
-                       + " and ".join(PROTECTED)) if change.protected else "outside the allowed set"
-                lines.append(f"  [FAIL] {change.status} {change.path}: {why}")
-        else:
-            lines.append(f"containment: passed, {len(self.changes)} changed path(s) inside the allowed set")
-        if self.findings:
-            lines.append(f"test integrity (Python): FAILED, {len(self.findings)} finding(s); protected_changed: true")
-            for f in self.findings:
-                lines.append(f"  [FAIL] {f.id} {f.kind} {f.path}: {f.name} ({f.detail})")
-        else:
-            lines.append(f"test integrity (Python): passed, {len(self.checked)} file(s) checked; "
-                         "protected_changed: false")
-        for path, reason in self.not_checked:
-            lines.append(f"  not checked: {path} ({reason})")
-        lines.extend(f"warning: {warning}" for warning in self.warnings)
-        lines.append(NOTE_WITNESSED if self.label == WITNESSED else NOTE_SELF_ATTESTED)
-        lines.append(NOTE_EXEMPTION)
-        return lines
-
 
 def error_report(workspace: Any, lane: str, message: str, now: Optional[int] = None) -> Dict[str, Any]:
     """The ``--json`` document of a gate that could not run."""
     return {
-        "source": SOURCE,
-        "aegis_version": __version__,
-        "checked_at": _stamp(now),
-        "scope": {"workspace": str(workspace), "lane": lane},
+        **primitives.envelope(SOURCE, {"workspace": str(workspace), "lane": lane}, now=now),
         "status": "error",
         "error": message,
     }
@@ -372,13 +342,13 @@ def _cli_globs(paths: object) -> Tuple[str, ...]:
         raise LaneGateUsage("--paths: give at least one glob")
     out: List[str] = []
     for ordinal, glob in enumerate(paths, 1):
-        if not isinstance(glob, str) or _CONTROL.search(glob):
-            raise LaneGateUsage(f"--paths: glob {ordinal} is not text without control characters")
+        problem = team.glob_problem(glob)
+        if problem:
+            message = {"not_text": "is not text without control characters",
+                       "control": "is not text without control characters", "empty": "is empty",
+                       "climbs": "climbs out of the repository with '..'"}[problem]
+            raise LaneGateUsage(f"--paths: glob {ordinal} {message}")
         clean = normalize_path(glob)
-        if not clean:
-            raise LaneGateUsage(f"--paths: glob {ordinal} is empty")
-        if ".." in clean.split("/"):
-            raise LaneGateUsage(f"--paths: glob {ordinal} climbs out of the repository with '..'")
         if clean not in out:
             out.append(clean)
     return tuple(out)
@@ -394,8 +364,8 @@ def _commit_range(top: Path, base: Optional[str]) -> Tuple[str, str, str, str]:
         raise LaneGateError(f"{NEEDS_HISTORY} (this is a shallow clone)")
     ref = base if base is not None else gitsafe.resolve_base_ref(top)
     if ref is None:
-        raise LaneGateError(f"{NEEDS_HISTORY} (no base branch: none of origin/$GITHUB_BASE_REF, origin/main, "
-                            "main, origin/develop or develop exists; pass --base)")
+        raise LaneGateError(f"{NEEDS_HISTORY} (no base branch: none of origin/$GITHUB_BASE_REF, the branch "
+                            "origin/HEAD names, main, develop or master exists; pass --base)")
     base_commit = gitsafe.resolve_commit(top, ref)
     if not base_commit:
         raise LaneGateError(f"{NEEDS_HISTORY} (cannot resolve the base {ref!r})")
@@ -414,7 +384,7 @@ def _lease_paths(top: Path, lane: str, now: int) -> Tuple[str, ...]:
     if lease is not None and not lease.expired(now):
         return lease.paths
     if lease is not None:
-        why = f"its lease expired at {_stamp(lease.expires_at)}"
+        why = f"its lease expired at {utc_stamp(lease.expires_at)}"
     elif found.unreadable_lane(lane) is not None:
         why = "its lease is unreadable"
     else:
@@ -538,9 +508,8 @@ def _integrity(top: Path, merge_base: str, head: str, entries: Sequence[Tuple[st
 
 
 def _record(top: Path, result: LaneCheck) -> Tuple[str, ...]:
-    try:
-        events.append(top, "lane_check", "pass" if result.passed else "fail", result.event_detail())
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(top, "lane_check", "pass" if result.passed else "fail", result.event_detail())
+    if exc is not None:
         return (f"event not recorded: {exc}",)
     return ()
 
@@ -590,6 +559,6 @@ def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional
         merge_base=merge_base, head=head, paths=tuple(lane_paths), paths_source=paths_source,
         shared=tuple(shared), shared_source=shared_source,
         changes=tuple(_contain(entry, allowed) for entry in entries),
-        findings=findings, checked=checked, not_checked=not_checked, checked_at=_stamp(moment), warnings=empty,
+        findings=findings, checked=checked, not_checked=not_checked, checked_at=utc_stamp(moment), warnings=empty,
     )
     return dataclasses.replace(result, warnings=empty + _record(top, result))

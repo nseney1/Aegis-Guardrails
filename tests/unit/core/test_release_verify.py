@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 
 from aegis_cli.cli import main
+from aegis_cli.formatters.text import render_release
 from aegis_core import release_verify as rv
 from tests import helpers_humangate as hg
 
@@ -236,7 +237,7 @@ def test_a_gh_older_than_2_93_is_unverified_and_never_asked(tmp_path, version):
     gh = FakeGh(version)
     report = rv.verify_release(make_repo(tmp_path).root, "HEAD", run=gh, tier_runner=tier_runner_none)
     assert not report.verified and report.code == "gh_too_old"
-    assert report.text_lines()[0] == rv.UNVERIFIED_GH
+    assert render_release(report.as_dict())[0] == rv.UNVERIFIED_GH
     assert gh.verify_calls == []
 
 
@@ -247,7 +248,7 @@ def test_no_gh_or_a_gh_without_a_version_is_unverified(tmp_path, version):
         gh = lambda argv, timeout: (0, "something else\n", "")  # noqa: E731
     report = rv.verify_release(make_repo(tmp_path).root, "HEAD", run=gh, tier_runner=tier_runner_none)
     assert not report.verified and report.code == "gh_missing"
-    assert rv.UNVERIFIED_GH in report.text_lines()
+    assert rv.UNVERIFIED_GH in render_release(report.as_dict())
 
 
 @needs_git
@@ -351,7 +352,7 @@ def test_at_tier_c_an_attestation_is_reported_but_the_release_claim_fails_closed
     report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner_none)
     assert report.tier == "C"
     assert not report.verified and report.code == "agent_editable"
-    text = "\n".join(report.text_lines())
+    text = "\n".join(render_release(report.as_dict()))
     assert "attestation present, but the workflow is agent-editable" in text
     assert report.as_dict()["attested"] is True
 
@@ -367,7 +368,7 @@ def test_at_tier_b_an_attestation_is_reported_but_the_release_claim_is_agent_edi
     report = rv.verify_release(repo.root, commit, run=gh, tier_runner=tier_runner("B"))
     assert report.tier == "B" and report.attested
     assert (report.verified, report.code, report.status) == (False, "agent_editable", "agent_editable")
-    assert report.text_lines()[0] == "NOT VERIFIED: attestation present, but the workflow is agent-editable"
+    assert render_release(report.as_dict())[0] == "NOT VERIFIED: attestation present, but the workflow is agent-editable"
     assert report.as_dict()["verified"] is False
 
 
@@ -454,7 +455,7 @@ def test_a_rejected_attestation_still_reports_the_tier(tmp_path):
     report = rv.verify_release(repo.root, "HEAD", run=FakeGh("2.93.0", (1, "", "no matching attestations")),
                                tier_runner=tier_runner("B"))
     assert (report.code, report.tier) == ("rejected", "B")
-    assert "  trust tier: B" in report.text_lines()
+    assert "  trust tier: B" in render_release(report.as_dict())
 
 
 @needs_git
@@ -469,17 +470,17 @@ def test_every_failure_after_the_work_tree_check_carries_the_tier(tmp_path, api,
 
 def test_a_report_without_gh_says_the_tier_is_unknown(tmp_path):
     report = rv.verify_release(tmp_path, "HEAD", run=FakeGh(None), tier_runner=tier_runner_none)
-    assert "  trust tier: unknown (gh unavailable)" in report.text_lines()
+    assert "  trust tier: unknown (gh unavailable)" in render_release(report.as_dict())
     outside = rv.verify_release(tmp_path, "HEAD", run=FakeGh("2.93.0"), tier_runner=tier_runner_none)
-    assert "  trust tier: unknown (not a git repository)" in outside.text_lines()
+    assert "  trust tier: unknown (not a git repository)" in render_release(outside.as_dict())
 
 
 @needs_git
 def test_doctor_drivers_says_it_did_not_read_the_tier_and_asks_gh_nothing(tmp_path, monkeypatch, capsys):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     asked = []
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None, **kw: asked.append(argv))
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, **kw: asked.append(argv))
     repo = make_repo(tmp_path)
     _rc, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--drivers")
     assert "Trust tier: not read in this mode (run aegis doctor)" in out.splitlines() and asked == []
@@ -521,7 +522,7 @@ _REVIEW_CASES = {
 def test_without_an_independent_approval_on_the_head_it_is_not_approved(tmp_path, case):
     report, _gh, _commit = _approval(tmp_path, reviews=_REVIEW_CASES[case])
     assert (report.verified, report.attested, report.code, report.status) == (False, True, "not_approved", "failed")
-    assert report.tier == "A" and report.text_lines()[0].startswith("NOT VERIFIED:")
+    assert report.tier == "A" and render_release(report.as_dict())[0].startswith("NOT VERIFIED:")
 
 
 @needs_git
@@ -532,12 +533,12 @@ def test_a_review_entry_that_is_not_an_object_is_skipped_not_fatal(tmp_path):
 
 @needs_git
 def test_the_cli_prints_the_json_report_for_a_malformed_reviews_answer(tmp_path, monkeypatch, capsys):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     repo = make_repo(tmp_path, tier="A")
     commit, tree, digest = facts(repo)
     release = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""), reviews=[1])
-    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh("A", release))
+    monkeypatch.setattr(ghcli, "default_gh_runner", TierAndReleaseGh("A", release))
     rc, out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", commit, "--json")
     payload = json.loads(out)
     assert rc == 1 and (payload["code"], payload["status"], payload["verified"]) == ("not_approved", "failed", False)
@@ -623,12 +624,12 @@ def test_a_tree_lookup_that_git_refuses_is_a_bad_commit(tmp_path, monkeypatch):
 
 @needs_git
 def test_the_cli_prints_the_json_envelope_for_a_git_failure(tmp_path, monkeypatch, capsys):
-    from aegis_core import gitsafe, human_gate
+    from aegis_core import ghcli, gitsafe
 
     repo = make_repo(tmp_path)
     head = repo.head()
     release = FakeGh("2.93.0")
-    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh("A", release))
+    monkeypatch.setattr(ghcli, "default_gh_runner", TierAndReleaseGh("A", release))
     _git_tree_lookup(monkeypatch, gitsafe.GitError("git rev-parse timed out after 30s"))
     rc, out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", head, "--json")
     payload = json.loads(out)
@@ -677,6 +678,64 @@ def test_verifying_writes_nothing_into_the_repository(tmp_path):
     assert before == after
 
 
+# ── the default gh runner (R-trust-29) ───────────────────────────────────────
+
+class RecordingRunner:
+    """ghcli.default_gh_runner's signature; answers ``result`` (or raises it) and records each call."""
+
+    def __init__(self, result: Any) -> None:
+        self.result, self.calls = result, []
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        self.calls.append((list(argv), cwd, timeout))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def test_a_type_error_inside_the_runner_propagates_and_gh_runs_once(tmp_path, monkeypatch):
+    """Given a gh runner with a bug that raises TypeError, When the release closure runs gh --version,
+    Then the TypeError surfaces after one call: no second gh call with other arguments."""
+    from aegis_core import ghcli
+
+    runner = RecordingRunner(TypeError("runner bug"))
+    monkeypatch.setattr(ghcli, "default_gh_runner", runner)
+    with pytest.raises(TypeError, match="runner bug"):
+        rv.default_gh(tmp_path)(["--version"], 20.0)
+    assert runner.calls == [(["--version"], tmp_path, 20.0)]
+
+
+def test_the_closure_maps_the_runner_result_and_defaults_to_the_release_timeout(tmp_path, monkeypatch):
+    from aegis_core import ghcli
+
+    runner = RecordingRunner(ghcli.GhResult(0, "gh version 2.93.0 (2026-10-01)\n", "warning"))
+    monkeypatch.setattr(ghcli, "default_gh_runner", runner)
+    run = rv.default_gh(tmp_path)
+    assert runner.calls == []
+    assert run(["--version"], 20.0) == (0, "gh version 2.93.0 (2026-10-01)\n", "warning")
+    run(["auth", "status"])
+    assert runner.calls[-1] == (["auth", "status"], tmp_path, rv.GH_TIMEOUT_SECONDS)
+
+
+def test_a_missing_gh_is_none_through_the_closure(tmp_path, monkeypatch):
+    from aegis_core import ghcli
+
+    monkeypatch.setattr(ghcli, "default_gh_runner", RecordingRunner(None))
+    assert rv.default_gh(tmp_path)(["--version"], 20.0) is None
+
+
+@needs_git
+def test_without_an_injected_gh_the_conftest_stub_reads_as_gh_missing(tmp_path):
+    report = rv.verify_release(make_repo(tmp_path).root, "HEAD", tier_runner=tier_runner_none)
+    assert (report.code, report.verified, report.status) == ("gh_missing", False, "unverified")
+
+
+def test_default_gh_takes_only_the_repository_root():
+    import inspect
+
+    assert list(inspect.signature(rv.default_gh).parameters) == ["root"]
+
+
 # ── doctor --release, CLI level ─────────────────────────────────────────────
 
 def fake_gh_dir(directory: Path, version: str) -> Path:
@@ -700,7 +759,8 @@ def cli(repo_root: Path, monkeypatch, capsys, path: str, *args: str) -> Tuple[in
 
 
 @needs_git
-def test_the_json_report_carries_the_envelope_and_fails_closed_without_gh(tmp_path, monkeypatch, capsys):
+def test_the_json_report_carries_the_envelope_and_fails_closed_without_gh(tmp_path, monkeypatch, capsys,
+                                                                            real_gh_runner):
     repo = make_repo(tmp_path)
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -716,18 +776,19 @@ def test_the_json_report_carries_the_envelope_and_fails_closed_without_gh(tmp_pa
 
 @needs_git
 @posix_only
-def test_the_cli_with_gh_2_45_prints_unverified(tmp_path, monkeypatch, capsys):
+def test_the_cli_with_gh_2_45_prints_unverified(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo = make_repo(tmp_path)
     gh_dir = fake_gh_dir(tmp_path / "bin", "2.45.0")
     path = f"{gh_dir}{os.pathsep}{os.path.dirname(shutil.which('git'))}"
     rc, out, _err = cli(repo.root, monkeypatch, capsys, path, "--release", repo.head())
     assert rc == 1
     assert out.splitlines()[0] == "UNVERIFIED (gh >= 2.93.0 required)"
+    assert "gh 2.45.0 is installed" in out  # the fake gh on PATH ran, not the conftest stub
 
 
 @needs_git
 @posix_only
-def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, monkeypatch, capsys):
+def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, monkeypatch, capsys, real_gh_runner):
     repo = make_repo(tmp_path)
     gh_dir = fake_gh_dir(tmp_path / "bin", "2.93.0")
     path = f"{gh_dir}{os.pathsep}{os.path.dirname(shutil.which('git'))}"
@@ -737,30 +798,30 @@ def test_the_cli_fails_closed_when_gh_cannot_name_the_default_branch(tmp_path, m
 
 
 class TierAndReleaseGh:
-    """``human_gate.default_gh_runner`` for the CLI: ``gh api`` GETs go to the tier detector's
+    """``ghcli.default_gh_runner`` for the CLI: ``gh api`` GETs go to the tier detector's
     fake, the rest to the release fake."""
 
     def __init__(self, tier: str, release: FakeGh) -> None:
         self.tier, self.release = tier_runner(tier), release
 
     def __call__(self, argv: Sequence[str], stdin: Optional[bytes] = None, cwd: Any = None, timeout: float = 0.0):
-        from aegis_core import human_gate
+        from aegis_core import ghcli
 
         if list(argv)[:1] == ["api"] and not list(argv)[-1].startswith(f"repos/{REPOSITORY}"):
             return self.tier(argv, stdin, cwd)
         result = self.release(argv, timeout)
-        return None if result is None else human_gate.GhResult(*result)
+        return None if result is None else ghcli.GhResult(*result)
 
 
 @needs_git
 @pytest.mark.parametrize("tier, rc, first", [("A", 0, "VERIFIED:"), ("B", 1, "NOT VERIFIED:")])
 def test_the_cli_says_verified_at_tier_a_only(tmp_path, monkeypatch, capsys, tier, rc, first):
-    from aegis_core import human_gate
+    from aegis_core import ghcli
 
     repo = make_repo(tmp_path, tier=tier)
     commit, tree, digest = facts(repo)
     release = FakeGh("2.93.0", (0, json.dumps([record(commit, tree, digest)]), ""))
-    monkeypatch.setattr(human_gate, "default_gh_runner", TierAndReleaseGh(tier, release))
+    monkeypatch.setattr(ghcli, "default_gh_runner", TierAndReleaseGh(tier, release))
     code, out, _err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", commit)
     assert (code, out.splitlines()[0].startswith(first)) == (rc, True), out
     assert f"trust tier: {tier}" in out and release.verify_calls
@@ -779,3 +840,80 @@ def test_release_needs_a_commit(tmp_path, monkeypatch, capsys):
     repo = make_repo(tmp_path)
     rc, _out, err = cli(repo.root, monkeypatch, capsys, os.environ.get("PATH", ""), "--release", " ")
     assert rc == 2 and "--release" in err
+
+
+# Author-recorded gh 2.103.2 output. See tests/fixtures/README.md for provenance and
+# the sanitization boundary; this tests gh's JSON shape, not its cryptography.
+def _recorded_attestation() -> list:
+    return json.loads((ROOT / "tests/fixtures/gh_attestation_verify.json").read_text(encoding="utf-8"))
+
+
+def _recorded_for(repo: hg.Repo) -> list:
+    """Rebind only identities to a real temporary git repository, retaining the captured shape."""
+    records = _recorded_attestation()
+    result = records[0]["verificationResult"]
+    statement, certificate = result["statement"], result["signature"]["certificate"]
+    commit, tree, digest = facts(repo)
+    statement["predicate"].update(commit=commit, tree=tree)
+    statement["subject"][0]["digest"]["sha256"] = digest
+    certificate.update(sourceRepositoryDigest=commit, buildSignerDigest=commit,
+                       sourceRepositoryURI=f"https://github.com/{REPOSITORY}",
+                       buildSignerURI=f"https://github.com/{REPOSITORY}/{rv.WORKFLOW}@refs/heads/main")
+    return records
+
+
+@needs_git
+def test_author_recorded_gh_shape_verifies_through_public_release_api(tmp_path):
+    repo = make_repo(tmp_path, tier="A")
+    records = _recorded_for(repo)
+    gh = FakeGh("2.103.2", (0, json.dumps(records), ""))
+    report = rv.verify_release(repo.root, repo.head(), run=gh, tier_runner=tier_runner("A"))
+    assert report.verified is True and report.code == "verified" and report.tier == "A"
+    assert report.details["run"] == records[0]["verificationResult"]["statement"]["predicate"]["run"]
+    assert gh.subjects == [rv.subject_bytes(*facts(repo)[:2])]
+    assert len(gh.verify_calls) == 1
+    assert gh.verify_calls[0][gh.verify_calls[0].index("--source-ref") + 1] == "refs/heads/main"
+
+
+def test_untouched_recorded_fixture_matches_its_original_subject():
+    records = _recorded_attestation()
+    result = records[0]["verificationResult"]
+    statement, certificate = result["statement"], result["signature"]["certificate"]
+    predicate = statement["predicate"]
+    digest = hashlib.sha256(rv.subject_bytes(predicate["commit"], predicate["tree"])).hexdigest()
+    assert statement["subject"][0]["digest"]["sha256"] == digest
+    assert rv._recheck(json.dumps(records), predicate["commit"], predicate["tree"], digest,
+                       "nseney1/Aegis-Guardrails", certificate["sourceRepositoryRef"]) == (
+                           True, "", predicate["run"])
+
+
+_RECORDED_MUTATIONS = [
+    ("statement.predicateType", "other", "the predicate type is not the Aegis CI verdict"),
+    ("statement.subject.0.digest.sha256", "0" * 64, "the attested subject is not this commit's verdict"),
+    ("statement.predicate.commit", "0" * 40, "the predicate names another commit or tree"),
+    ("statement.predicate.tree", "0" * 40, "the predicate names another commit or tree"),
+    ("statement.predicate.run", "bad", "the predicate lacks a valid run id and attempt"),
+    ("statement.predicate.jobs", {"validate": "failure"}, "the predicate does not say every job succeeded"),
+    ("signature.certificate.sourceRepositoryDigest", "0" * 40, "the certificate is for another commit"),
+    ("signature.certificate.buildSignerDigest", "0" * 40, "the certificate is for another commit"),
+    ("signature.certificate.runnerEnvironment", "self-hosted", "the build did not run on a GitHub-hosted runner"),
+    ("signature.certificate.sourceRepositoryURI", "https://github.com/other/repo", "the certificate is for another repository"),
+    ("signature.certificate.sourceRepositoryRef", "refs/tags/v4.3.4", "the certificate is for another ref than refs/heads/main"),
+    ("signature.certificate.buildSignerURI", "https://github.com/other/repo/workflow.yml", f"the signer is not {REPOSITORY}/{rv.WORKFLOW}"),
+]
+
+
+@needs_git
+@pytest.mark.parametrize("field,value,reason", _RECORDED_MUTATIONS, ids=[m[0] for m in _RECORDED_MUTATIONS])
+def test_recorded_gh_shape_rejects_each_rechecked_field(tmp_path, field, value, reason):
+    repo = make_repo(tmp_path, tier="A")
+    records = _recorded_for(repo)
+    target = records[0]["verificationResult"]
+    *parents, key = field.split(".")
+    for parent in parents:
+        target = target[int(parent)] if isinstance(target, list) else target[parent]
+    target[key] = value
+    gh = FakeGh("2.103.2", (0, json.dumps(records), ""))
+    report = rv.verify_release(repo.root, repo.head(), run=gh, tier_runner=tier_runner("A"))
+    assert report.verified is False and report.code == "bad_output"
+    assert report.message == f"gh exited 0 but its output does not check out: {reason}"

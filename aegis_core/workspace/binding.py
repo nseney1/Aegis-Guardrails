@@ -57,6 +57,7 @@ __all__ = [
     "bounded_walk_up",
     "check_pin_agrees",
     "denial",
+    "denial_message",
     "git_boundary",
     "home_message",
     "read_registry",
@@ -188,6 +189,16 @@ def denial(path: Path) -> Optional[str]:
     home = _home()
     if home is not None and path == home:
         return "home_directory"
+    return None
+
+
+def denial_message(path: Path) -> Optional[str]:
+    """The CLI refusal for a root that can never be a workspace, or None."""
+    denied = denial(path)
+    if denied == "home_directory":
+        return home_message(path)
+    if denied:
+        return f"not an Aegis workspace ({path} is the filesystem root); run aegis init in a project"
     return None
 
 
@@ -584,9 +595,7 @@ def resolve_cli_root(
     found = bounded_walk_up(start, accept)
     if found is not None:
         return found
-    denied = denial(start)
-    if denied == "home_directory":
-        raise WorkspaceNotFoundError(home_message(start))
-    if denied:
-        raise WorkspaceNotFoundError(f"not an Aegis workspace ({start} is the filesystem root); run aegis init in a project")
+    message = denial_message(start)
+    if message:
+        raise WorkspaceNotFoundError(message)
     return start

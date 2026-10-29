@@ -1,14 +1,14 @@
 """Terminal output and JSON reporting views for ``aegis init`` and ``aegis uninstall``."""
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
+from aegis_core import primitives
 from aegis_cli.hooks.management import hook_status, work_tree_warning
 from aegis_cli.install_hosts import display_command
 from aegis_core.scaffolding import (
@@ -19,19 +19,7 @@ from aegis_core.scaffolding import (
 )
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
-__all__ = [
-    "Report",
-    "Step",
-    "_home_label",
-    "_no_hooks",
-    "_print_actions",
-    "_print_active",
-    "_print_card",
-    "_print_ci",
-    "_report_ci",
-    "_report_hook",
-    "report_partial",
-]
+__all__ = ["Report", "Step", "report_partial"]
 
 SCAFFOLD_LABEL = f"{AEGIS_DIRNAME}/"
 _ICONS = {"failed": "❌", "manual": "👉", "kept": "⚠️ ", "skipped": "⚠️ "}
@@ -41,7 +29,6 @@ _NO_CHANGE = {
     "dry-run", "skipped (not a git repository)", "present", "suggested",
 }
 _NEXT_RULE = "    Next: add a rule for your own code with aegis rule create (aegis rule create --help)"
-_ENFORCE_SUFFIX = "; aegis check and the pre-commit hook enforce it"
 
 
 @dataclass
@@ -90,13 +77,9 @@ class Report:
     def finish(self, status: str, scope: Dict[str, Any], dry_run: bool, actions: Sequence[Step]) -> None:
         if not self.json_mode:
             return
-        from aegis_cli import __version__
 
         print(json.dumps({
-            "source": self.source,
-            "aegis_version": __version__,
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "scope": scope,
+            **primitives.envelope(self.source, scope),
             "dry_run": dry_run,
             "status": status,
             "actions": [a.as_dict() for a in actions],
@@ -113,8 +96,7 @@ def _print_active(report: Report, action: Step, dry_run: bool, preset: str) -> N
         report.say(f"  Active rule in {action.target}/:")
         for name in action.names:
             desc = ACTIVE_STARTERS[name]
-            suffix = "" if desc.endswith(_ENFORCE_SUFFIX) else _ENFORCE_SUFFIX
-            report.say(f"    {'[DRY-RUN]' if dry_run else '✅'} {name}: {desc}{suffix}")
+            report.say(f"    {'[DRY-RUN]' if dry_run else '✅'} {name}: {desc}")
         for name in action.kept:
             report.say(f"    [SKIP] {name} (a file with this name exists)")
     else:
@@ -201,9 +183,10 @@ def _print_card(report: Report, root: Path) -> None:
     from aegis_cli import sanitize_display
 
     try:
+        from aegis_cli.formatters.text import render_card
         from aegis_core import card
 
-        lines = card.build(root).text_lines()
+        lines = render_card(card.build(root).as_dict())
     except Exception as exc:
         report.warn(f"the day-0 card could not be built: {type(exc).__name__}: {exc}")
         return
@@ -220,10 +203,6 @@ def _home_label(evidence: str, home: Path) -> str:
         return "~/" + Path(evidence).relative_to(home).as_posix()
     except ValueError:
         return evidence
-
-
-def _no_hooks(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "no_hooks", False)) or not getattr(args, "hooks", True)
 
 
 def _report_hook(report: Report, root: Path, actions: Sequence[Step]) -> None:

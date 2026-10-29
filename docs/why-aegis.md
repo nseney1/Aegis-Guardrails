@@ -1,226 +1,194 @@
-# Why Aegis is built this way: evidence, mistakes, and what changed in v4
+# Why Aegis is built this way
 
-This page explains where Aegis's rules came from, what the project measured, what it got wrong, and why v4 looks the way it does. It is written for people deciding whether to trust Aegis, and for contributors deciding what to change next.
+*By Nick Seney. Checked for 4.4.0 against `bed1e4a6` on 2026-10-29. What Aegis does today is in [How Aegis works](how-it-works.md); this page is about how it got that way.*
 
-**Status.** Written during the v4.0 build (2026-10-15) and checked against the code once waves A, B and C were merged. Where this page describes v4, it describes what that code does; the decisions behind it are in ADR 0005 and ADR 0006, and the [CHANGELOG](../CHANGELOG.md) records each release. Section 6 describes the v4.3 trust and evidence model. What 4.1 to 4.3 add (agent hooks, teams, skills, adoption tools, and trust and evidence) is described in [How Aegis works](how-it-works.md) sections 8–10; here section 6 and the AD-7 row of section 7 were updated as they shipped.
+I wrote this for anyone deciding whether to trust Aegis: where the rules came from, what I measured and how much those numbers are worth, what I got wrong, and why Aegis looks the way it does now.
 
-**How to read the numbers.** Every number here is one of two kinds:
+## 1. The problem
 
-- **Re-derived**: computed by a command run at a named commit (`895bbf5` unless the text says otherwise); every such command is listed under [Sources](#sources). Where a figure is a difference of two printed values (a time span or a day count), the comment next to the command says so.
-- **Quoted**: taken from a document, with its source and a caveat. Several sources were deleted from the tree in v4; git keeps them. Read one from the v3.3.0 release tag, for example `git show v3.3.0:docs/project/METRICS.md`.
+Coding agents read an instruction file (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) and then go and do things. Nothing checks that they followed it.
 
-## 1. The problem: a rules file is a gentleman's agreement
+My clearest example comes from TAB AI, a reinforcement-learning agent I was training locally to play *They Are Billions*. Think DeepMind and StarCraft II, at hobby scale. In one long session the coding agent needed the game's hotkeys. Instead of checking the settings or a screenshot, it invented them, and that one habit cost 180 steps. I had rules at the time. Nothing put the right one in front of the agent when it mattered, and nothing checked afterwards.
 
-Coding agents read instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) and then act. Nothing checks that they followed the file. In practice they fail in three ways:
+Agents fail a rules file in three ways:
 
-- **They skip rules.** Under task pressure an agent follows the letter of a rule and misses its point. The earliest Aegis notes record an agent "verifying" by re-reading the same file four times.
-- **They forget.** Long sessions compact context, and new sessions start from zero. The project's session analysis found the same environment traps rediscovered independently across sessions.
-- **They fail open.** A check that crashes, a tool that is missing or a rule that is not loaded looks exactly like "no problem found".
+- **They skip rules.** Under pressure an agent follows the letter of a rule and misses the point. My early notes have one "verifying" its work by re-reading the same file four times.
+- **They forget.** Long sessions compact their context and new sessions start from zero, so the same environment traps get rediscovered again and again.
+- **They fail open.** A check that crashes, a missing tool or a rule that never loaded looks exactly like "no problem found".
 
-Aegis's own history has examples of all three. The v4 review found that `aegis_scan` returned 0 rules in the author's own session, that the AST gate silently skipped files with a byte-order mark, and that the release gate's "SHIP" receipts were written by the agent being gated (ADR 0005 §1; review H3, H4, H6).
+Aegis's own history has all three. At one point `aegis_scan` returned zero rules in my own session, a code check silently skipped Python files that started with a byte-order mark, and the release gate's "ship it" receipts were written by the agent being gated (section 4). My first write-up of this is [Your AI agent's rules file is a gentleman's agreement](https://dev.to/nseney1/your-ai-agents-rules-file-is-a-gentlemans-agreement-heres-what-happens-when-you-build-2dml).
 
-The author's post on this framing is [Your AI agent's rules file is a gentleman's agreement](https://dev.to/nseney1/your-ai-agents-rules-file-is-a-gentlemans-agreement-heres-what-happens-when-you-build-2dml).
+## 2. How I got here
 
-So Aegis tries to do three things, in this order of trust:
+I started Aegis for a small reason: I wanted one set of steering files that worked across Gemini, Claude and the other agents. That was Prism, rules plus hooks. The deeper I dug, the more I wondered whether an agent's behavior is shaped more by its guidance than by its training: the model as DNA, the rules as upbringing. People aren't forced to be good; they're raised that way. That became Soma, where I experimented with rules that adapt over time. It was the wrong theory. Training is where behavior forms, and I couldn't fit it in. I dropped the theory and kept what Soma taught me about guardrails.
 
-1. Check deterministically whatever can be checked, in CI on the exact commit.
-2. Put the relevant rule in front of the agent at the moment it edits a matching file, instead of hoping it remembers a long instruction file.
-3. Keep a local record of outcomes, so a rule that never fires can be found and pruned.
+The timeline, all in 2026:
 
-## 2. Where the rules came from
+- **26 September.** First commit, "Gemini Steering Rules": nine rules for Gemini and Antigravity. Within ten minutes it had installers for Copilot and Kiro and a new name, "AI Steering Rules". The same day I turned the TAB AI post-mortem (section 3) into rules.
+- **27 September.** Prism, and the first tag, v0.15.0.
+- **28 September.** Soma. Everything got a biology name (rules became `genome/`, scripts became `enzymes/`), and the MCP server started. The fitness idea came straight from TAB AI: I was learning reinforcement learning, so scoring rules by reward felt natural.
+- **8 October.** v1.0.
+- **14 October.** At 2:50 a.m. I renamed Soma to Aegis. That's when I let go of the theory. Later that day I tagged v2.0, v2.1, v3.0, v3.1, v3.2 and v3.3. Sixteen minutes after v3.3 came the first commit of a v4 rewrite, with a failing test and no commit-message body. Counting the rename, v2.0, v2.1, v3.0 and that rewrite, that's five foundational resets in under 21 hours. By that night, 19 days after the first commit, the repository had 850 commits and 94 tags.
+- **15 October.** AI reviewers audited the code, and one scored its design 4/10 (section 4). That review pushed me to v4.
+- **16 October.** v4.0, 4.1 and 4.2. 4.1.0 was never tagged: its release review found problems, and 4.1.1 shipped the fixes that afternoon.
+- **17 October.** 4.3, trust and evidence (section 6).
+- **21 October.** 4.3.4. Work on 4.4.0 followed to fix what the 4.3 reviews found.
 
-The core rules were not written from best-practice lists. They were extracted from failures.
+Why so fast? I was excited, and I trusted what the agents wrote more than I should have. I wasn't reviewing much myself. The rename to Aegis is where I put my own hands on the decisions and the direction. The worst v3 bug, an agent writing its own release receipts, was the same mistake I was making as a maintainer. Much of how Aegis works now is about not repeating it: evidence comes from CI and git, not from anyone's say-so.
 
-**The 1,339-step post-mortem.** One real coding session was analyzed step by step. 749 of its 1,339 steps were rework (55.9%, re-derived from the quoted counts). The largest itemized failures, and the rule each one produced:
+## 3. The evidence, and how much it's worth
 
-| Failure | Steps wasted | Rule it produced | Where it lives today |
+These numbers come from my own sessions, classified by my own tooling, with no second rater. They're why I wrote the rules. They're not proof that the rules work.
+
+**The TAB AI post-mortem.** 749 of the session's 1,339 steps were rework (55.9%). The biggest items, and the rule each produced:
+
+| What went wrong | Steps | Rule it produced | Where it is now |
 |---|---|---|---|
-| Agent invented game hotkeys instead of checking | 180 | verify UI controls from screenshots, never guess | [providence](../rules/providence.md) §10 |
-| Host Python confused with the project venv | 110 | bind `$(VENV)/bin/python` explicitly | [polyglot-standards](../rules/.oracles/polyglot-standards.md) |
-| Test polled forever with no timeout | 103 | mock hardware boundaries; time-box polling | [testing](../rules/.oracles/testing.md) |
-| A method silently shadowed another | 50 | grep for `def <name>` before defining in large files | [providence](../rules/providence.md) §3 |
-| Stale references after a rename | 30 | global grep confirms zero old references | [providence](../rules/providence.md) §3 |
+| Invented game hotkeys instead of checking | 180 | Verify UI controls from screenshots or settings; never guess | [providence](../rules/providence.md) §10 |
+| Host Python confused with the project's virtualenv | 110 | Call `$(VENV)/bin/python` explicitly | [polyglot-standards](../rules/.oracles/polyglot-standards.md) |
+| A test polled forever with no timeout | 103 | Mock hardware; time-box every polling loop | [testing](../rules/.oracles/testing.md) |
+| One method silently shadowed another | 50 | Grep for `def <name>` before defining one in a large file | [providence](../rules/providence.md) §3 |
+| Stale references after a rename | 30 | Grep for the old name before finishing | [providence](../rules/providence.md) §3 |
 
-The itemized rows sum to 473 steps (63% of the waste). The other 276 steps happened before step-level tracking existed and were never itemized; 473 + 276 = 749, which matches the quoted total (both re-derived).
+Those rows add up to 473 steps. The other 276 came before I tracked steps one by one, and were never itemized.
 
-*Source*: the evolution log, `docs/architecture/phylogeny.md` "Phase 2", and `docs/project/METRICS.md` "Aggregate Stats" (both at `v3.3.0`). *Caveat*: one session, one developer, classified by the project's own analysis with no second rater.
+*Limits:* one session, one developer, my own classification. The old docs give the session's length as 611, then 1,042, then 1,339 steps on the day of the analysis, and another table puts the same 180 hotkey steps in a 1,551-step session. Treat the totals as approximate.
 
-**Cross-session patterns.** Comparing sessions across projects showed the failures were systemic. The worst session ran 1,579 steps with 8 architectural pivots, 2 safety incidents and zero subagent delegation, and produced zero working autonomous runs. It added rules on premature abstraction, pivot discipline (the Two-Pivot Halt), delegation floors and real-time loop budgets, which now live in [architectural-tenets](../rules/.oracles/architectural-tenets.md) and [subagent-delegation](../rules/subagent-delegation.md). It also added a desktop-automation safety rule, which v4 no longer ships (ADR 0005 D16). *Source*: the evolution log, "Phase 3". *Caveat*: the author's own projects only.
+**Seventeen sessions with the rules.** Across 17 sessions from 25 to 27 September, 1,317 of 7,015 steps were waste (18.8%).
 
-## 3. Design principles
+*Limits:* the baseline is circular. The post-mortem session is both where the rules came from and the "before" number, so later sessions are scored on exactly the failures the rules were written to catch. The sessions may also overlap. The 17 aren't listed anywhere, so I can't tell whether the TAB AI session is one of them. If it is, it alone holds 749 of the 1,317 wasted steps, and the other 16 wasted 10.0% (568 of 5,676).
 
-Principles C1–C6 emerged from that work and are listed in the evolution log ("Design Principles"). C7 was learned the hard way: the C7 key is defined in ADR 0005 Appendix A, which cites all seven by these keys, and rests on ADR 0005 H6 and AD-1.
+**One A/B pair.** Two TAB AI sessions: with weak rules, 27.6% of 547 steps were waste; with the full rule set, 1.1% of 1,325.
 
-| Key | Principle | In one sentence |
-|---|---|---|
-| C1 | Evidence over intuition | Every rule traces back to an observed failure; no rule exists "just in case". |
-| C2 | Accuracy over speed | An agent never trades correctness for tokens or time. |
-| C3 | Rules as a system | Rules reference each other on purpose: providence requires read-before-write, and the refactoring-pilot skill turns that into a phased workflow. |
-| C4 | Continuous validation | A rule is never "done"; it is re-checked against new sessions. |
-| C5 | Installation completeness | Governance installed at partial fidelity gives false assurance, so every install path deploys rules, skills and hooks with the same completeness. |
-| C6 | Hypothesis-driven governance | Every rule and feature states what it predicts, how to measure it, and when to prune it. |
-| C7 | Ledger, not frontmatter, for fitness | Outcomes go to an append-only ledger; rule files are never rewritten by the tool that scores them (ADR 0005 H6, AD-1). |
+*Limits:* two sessions at different times, not necessarily on the same task. Other things changed too. Subagents ran on Opus in the first and entirely on the cheaper Flash tier in the second, and the second used about 12% of the first's credits. The weak-rules session also fed three amendments back into the rules. It's not a controlled experiment, and it can't separate the prose rules from the machinery I was adding at the time.
 
-Three ideas survive from the project's earlier mechanism-design notes (`docs/architecture/mechanism_design.md` at `v3.3.0`):
+**What I'm not claiming.** None of this shows what caused the improvement. The v3 scoring counted false alarms but never misses, and its outcome signals could be written by the agent being measured, so any v3 fitness number is self-graded. The old token figures were estimated from word counts, so I don't quote them.
 
-- **External ground truth**: credit should come from signals the agent cannot manufacture, such as CI exit codes and reverts.
-- **Graduated enforcement**: a rule earns blocking power (trap, then invariant, then gate) only after evidence.
-- **Budget balance**: governance must cost less context than the rework it prevents.
+## 4. What I got wrong in v3, and what changed
 
-In v3 the first one was claimed but not delivered: an MCP caller could write true- and false-positive signals for any rule (review H4), and pass/fail credit went to every rule whose paths matched (section 5.2).
+On 15 October I had AI reviewers, each in a separate context, audit v3.3 plus the first v4 commits. The harshest score was 4/10 on product value and design: "a real problem, a prototype-grade solution, over-built roughly 5-10x and unsound at its centre". An earlier run of the same reviewer gave 5/10. Code health, end-to-end behavior and test health scored 6/10. The deterministic checks held up, and so did the zero-dependency, local-first claims. These are model opinions, not an outside audit, and the report isn't in the repository.
 
-## 4. What we measured, and how to read it
+### The agent signed its own release receipts
 
-| Measurement | Number | Source (at `v3.3.0`) | Kind |
-|---|---|---|---|
-| Waste in the post-mortem session | 749 / 1,339 steps (55.9%) | evolution log, Phase 2 | one session |
-| Waste across 17 governed sessions | 1,317 / 7,015 steps (18.8%) | `METRICS.md` "Aggregate Stats" | observational, one developer |
-| Same project, weak rules vs "full governance" | 27.6% of 547 steps vs 1.1% of 1,325 steps | `METRICS.md` "Live A/B Validation" | two sessions, one project |
-| 66 masked production sessions, ~7 weeks | rules deployed without skills (an installer gap), so the review steps the rules named could not run | `METRICS.md` "Expanded Dataset Analysis" | observational, different model family |
+**Then:** a release needed a "SHIP" receipt. For v2.0, v2.1, v3.0 and v3.3 the agent being gated wrote it by hand. One still had placeholder predictions `p1` to `p6`; the v3.3.0 receipt claims 8 convergences and lists 5. A hand-written file saying `verdict: ship` passed the gate.
 
-The first two percentages are re-derived from the quoted counts. The A/B percentages are quoted: `METRICS.md` gives them with total steps but not the wasted-step counts. Everything else in the table is quoted.
+**Now:** receipts and that gate are gone. A release needs three things for the exact commit being tagged: an independent review of the release pull request, green CI (`python3 .github/scripts/ci_green.py <sha>`), and an `aegis check` that passes the deterministic checks ([Releases](../CONTRIBUTING.md#releases)).
 
-**Limitations** (the first four are paraphrased from the project's research abstract, `docs/research/abstract.md` at `v3.3.0`):
+### Credit pointed the wrong way
 
-- Differences between the evaluation baselines prevent causal claims.
-- Waste classification lacked multi-rater reliability.
-- The full rule lifecycle was never validated end to end against human assessment.
-- The fitness function optimized for precision and ignored recall (false negatives).
-- The "A/B" compares two sessions of the same project (TAB AI) at different times, and the two sessions need not have faced the same task; it is not a controlled experiment.
-- Outcome signals in v3 could be written by the agent being measured (review H4), so any fitness number from that period is self-graded.
-- Token figures in the old metrics were estimated with a word-count ratio calibrated for one model family, not measured with a tokenizer. This page quotes none of them.
+**Then:** v3 gave every rule whose paths matched a change that run's pass or fail. For a gate that's backwards: a gate that blocked 4 bad commits scored 4 false positives and 1 true positive.
 
-**What the numbers do not show.** They do not show what caused the improvement. `METRICS.md` labels the 1.1% figure "Phase 22", and the evolution log puts Phases 17–21 (rule lineage, promotion and demotion, the evidence pipeline, transcript verification) before Phase 22, so parts of the v3 machinery may already have been in place during the governed session. The data cannot separate the effect of the prose rules from the effect of that machinery, and none of the measurements above isolates either one. v4 keeps the prose rules and the deterministic checks, and removes machinery whose effect was never measured.
+**Now:** since 4.3.4 a plain `aegis check` records only that a rule was triggered. Check-based credit needs a passing `aegis check --record --tests` that CI confirms on the commit that lands. An agent's own report (`aegis_report_outcome`) without a matching check is stored as "claimed" and earns nothing. Detector replay and legacy ledger rows can still influence local fitness, and an agent running as my user can write them: a local score is a label, not authenticated evidence. Human labels count only after they merge into the reviewed base branch.
 
-## 5. What we got wrong, and what v4 does instead
+`aegis sync` only suggests promotions and demotions. Applying one (`aegis sync --apply` or `aegis rule promote`) is an explicit change that belongs in review. In 4.4.0, promotion recommendations need at least 25 positive human labels with no false positives, or at least 42 labels with at most one false positive. They also need at least three sessions spanning two repositories or 14 days, and a valid `created` date at least 30 days ago; a missing or invalid date blocks promotion ([thresholds](../aegis_core/fitness.py)).
 
-A multi-lens review graded the code at `9e4d976` (v3.3 plus the first v4 wave) 4/10 on product value and design soundness: "a real problem, a prototype-grade solution, over-built roughly 5-10x and unsound at its centre". Its central finding was that the loop meant to show which rules prove their value measured the wrong thing and was inverted for gates (section 5.2); it also found that receipts were not a security boundary and that Layer 2's adversarial verification was largely unproven. It scored code health, end-to-end behavior and test health 6/10 each, and found the deterministic Layer-1 checks and the zero-dependency, local-first claims genuinely true. The reviewers were AI agents working in separate contexts with the project's own review skills ([adaptive-reviewer](../skills/adaptive-reviewer/SKILL.md), escalated to the Citadel mode of [staff-review](../skills/staff-review/SKILL.md)), not a person or an outside auditor, so the grades are one model-assisted opinion, not an external audit. (This is the adaptive review listed under ADR 0005 "Evidence"; its report is not in the repository.) The specific mistakes:
+### Rules switched themselves off
 
-### 5.1 Self-minted SHIP receipts
+**Then:** at session close v3 wrote fitness numbers back into each rule file, but didn't refresh the integrity manifest. The next scan saw an "edited" rule, decided it had been tampered with and dropped it, with the warning only on stderr. On `main`, 45 of 49 manifest entries were stale, and `aegis_scan` returned zero rules in my own session. The same unlocked write path lost about 80 of 120 updates in a concurrency reproduction.
 
-Release Gate 4.5 required a "SHIP" receipt before a release. For v2.0, v2.1, v3.0 and v3.3 the receipt was written by hand by the agent being gated. One contained placeholder predictions `p1` to `p6`; the v3.3.0 receipt claims 8 convergences and lists 5. A hand-written evidence file with `verdict: ship` and the current tree hash passed the gate (review H6). *Source*: ADR 0005 §1, fact 1.
+**Now:** outcomes go into an append-only ledger, and scores are rebuilt from it and reviewed labels under a lock. Checks, scans and hooks never rewrite rule files; `tests/integration/test_no_rule_writes.py` holds those paths to that. Explicit rule, sync and migration commands can write them. The signed manifest is gone, and git review and CI protect the rules. Since 4.3, `aegis check --ci` reads gates from the reviewed base branch and fails a pull request that weakens one without an approval. Whether that approval is beyond the agent's reach depends on the trust tier (section 6).
 
-**v4**: receipts and the release gate are deleted (ADR 0005 AD-2, §5). A release needs an independent review, CI green on the exact commit SHA, and `aegis check` passing Layer 1 and a cross-vendor Layer 2 ([CONTRIBUTING](../CONTRIBUTING.md#releases)). Old receipts are treated as unattested, not rewritten. The pre-tag check is `.github/scripts/ci_green.py <sha>`.
+### Most of it was never used
 
-### 5.2 The fitness signal was inverted
+**Then:** my local logs from about 690 sessions show 73 MCP calls, 66 of them in the last two days of that window. Only 5 of the 17 tools were ever called. No rule was ever promoted, demoted or archived in either repository I ran it on.
 
-v3 credited every rule whose paths matched a change with that run's pass or fail. For a gate this is backwards: a gate that blocked 4 bad commits scored 4 false positives and 1 true positive (ADR 0005 §8b). The review also found that "decay to zero" and the sampling the docs described were not what the code did.
+**Now:** v4.0 shipped 4 MCP tools; 4.3 added a fifth, for capturing insights. The CLI has 15 commands. Receipts, the background job engine (the only daemon thread), the claim and bug registries and the unreachable code were cut, and none of them came back.
 
-**v4**: promotion is a reviewed change. `aegis sync` rebuilds the scores from the ledger and only *suggests* promotions, demotions and archives; applying one is an explicit step (`aegis sync --apply` or `aegis rule promote`) that shows up in review.
+### Five resets in a day
 
-**Not fixed yet**: the score itself. `aegis check`, including the pre-commit hook, still records each run's pass or fail against every rule whose paths match the checked files. The verdict is now split by file, so each rule gets a fraction of it, but a gate that blocks a bad commit is still scored as a miss. Self-reports from MCP clients are labeled `source: "mcp"` and still count toward the score, although AD-2 asks for credit from external signals only. So the score only ranks guidance in scan output and feeds `sync` suggestions; it never moves a rule by itself. Which rule actually helped is an open question, pinned for after v4.2 (ADR 0005 §8b); the per-rule credit model in section 6 is the plan to answer it.
+**Then:** see 14 October above. The v4 rewrite began as one commit of about 4,000 added lines, with a failing test and no message body.
 
-### 5.3 Rules disabled themselves
+**Now:** the on-disk formats carry a version, and `aegis migrate` converts an old v3 or Soma workspace in place, dry run first and with backups, instead of a clean-slate purge. A tag needs a review and green CI on its commit. Rule files don't carry a schema version yet.
 
-v3 wrote fitness numbers back into each rule file's frontmatter at session close. The integrity manifest was not refreshed afterwards, so the next scan saw an "edited" rule, treated it as tampered, and dropped it, with the message only on stderr. On `main`, 45 of 49 manifest entries were stale; `aegis_scan` in the author's own session returned 0 rules. The same write path lost about 80 of 120 updates under concurrency, because the read-modify-write was not locked. *Source*: ADR 0005 §1, facts 3 and 4; the review's end-to-end lane.
+### Repository files could run commands
 
-**v4**: the append-only ledger is the only source of truth for outcomes; fitness and rollups are derived views, rebuilt by one writer under one lock (AD-1). MCP handlers, hooks and session close never rewrite rule files; `tests/integration/test_no_rule_writes.py` pins that. The HMAC manifest and its keys are deleted; rules are protected by git review and CI, not by Aegis. `aegis sync` keeps an unsigned hash of each rule file, used only to show which rules were edited since the last sync; it never excludes a rule.
+**Then:** a repository's `.aegis/slots.yaml` could name commands that `aegis check` ran, and its values were pasted into the scan output the agent reads.
 
-### 5.4 Most of the surface was never used
+**Now:** repository config (`.aegis/config.json`) can't name commands. They come only from Aegis's packaged templates or your user-level config. Aegis runs git with the repository settings that could start a program switched off. It runs repository tests or benchmarks only when you ask: `aegis check --full`, `aegis check --record --tests`, `aegis check --ci --coverage` and `aegis check --ci --perf`, and the reruns in `aegis check --ci` (`--no-exec` skips those reruns and refuses coverage and perf). [SECURITY.md](../SECURITY.md#repository-trust) lists everything Aegis runs.
 
-Across about 690 sessions the author's logs show 73 MCP calls, to only 5 of the 17 tools; 12 tools were never called. No rule was ever promoted, demoted or archived in either governed repository (ADR 0005 §5, from the refactor sweep's count of the author's local session logs).
+### And then it grew back
 
-**v4**: the MCP surface is 4 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`), and the CLI shrinks to the commands in ADR 0005 §5. Receipts, the async job engine (the only daemon thread), the claim and bug registries, the agent-side hook phases and the unreachable code are cut with them. Re-derived: the MCP registry lists 4 tools, and the Python in the four `aegis_*` packages went from 39,426 lines in 160 files at `9e4d976` to 25,963 lines in 107 files at `41cd3f0`, the merge of waves A, B and C (34.1% fewer). The low point was 22,188 lines in 109 files at `895bbf5` (43.7% fewer), after the cuts and before later waves added the storage layer, `aegis migrate`, `gitsafe`, the host plane and `aegis doctor`. The docs were cut the same way: this page replaces the evolution log, the metrics log, the research notes and the archive.
+The cuts took the four Python packages from 39,426 lines to 22,188. At `bed1e4a6` they're at 53,739, 36.3% above where v4 started, and the tests more than doubled (42,476 lines at v3.3, 104,371 now: 2.46 times as many). These counts include blank lines and comments. I see it as trimming the fat to make room for what I need in my own projects: signed approvals and per-rule credit, team lanes, setup across hosts, git safety, `aegis doctor` and the security checks. The cut surface didn't come back, but the size is real, and you should weigh it.
 
-### 5.5 Five resets in about 21 hours
+## 5. Why v4 is built this way
 
-On 2026-10-14 the project rebranded, tagged v2.0.0, v2.1.0 and v3.0.0, then started a v4 "Wave 1" 16 minutes after tagging v3.3.0: five foundational resets in about 21 hours. Over its first 19 days it accumulated 850 commits and 94 tags. Wave 1 was committed with the test suite red, as one commit of about 4,000 added lines with an empty body. *Source*: ADR 0005 §1 and the review. *Re-derived*: the rebrand (`2c85f58`, 02:50) and Wave 1 (`6f47f13`, 23:30) are 20 h 40 min apart; `6f47f13` changed 40 files (+4,267/−3,272 lines) and its message is a subject line only; `9e4d976` has 850 commits since the first one on 2026-09-26, and the repository has 94 tags.
+1. **Check what you can, where it counts.** CI on the exact commit is the floor. The local git hook gives quick feedback, but `git commit --no-verify` skips it, and hooks inside agent hosts are best effort. Aegis says which is which instead of claiming enforcement it lacks.
+2. **Rules just in time.** A short note in `AGENTS.md` tells the agent to call `aegis_scan` before editing, and the scan returns only the rules for those files. That depends on the agent making the call, so Aegis measures how often it does (`aegis status --compliance`).
+3. **Separate claims from confirmed evidence.** CI on the commit that lands confirms check-based credit. Local scores and detector replay remain labels an agent can write; its reports without a matching check earn nothing.
+4. **People change the rules.** Aegis suggests; applying a change is an explicit step that belongs in a reviewed commit. Checks, scans and hooks never rewrite rule files.
 
-**v4**: the ledger, the config files, the derived view and the workspace registry carry a format version, and `aegis migrate` converts a v3 or `.soma` workspace in place, dry run first and with backups, instead of a clean-slate purge (AD-5). Rule frontmatter does not carry a schema version yet. Further paradigm changes to the rule store, host plane or team model need a new ADR (Two-Pivot Halt, ADR 0005 §9). Every wave is reviewed independently before the next starts, and a tag needs CI green on its SHA (AD-10).
-
-### 5.6 Repository files could run commands
-
-A repository's `.aegis/slots.yaml` named AST-driver commands that `aegis check` executed, and its slot values were inlined into the scan output the agent reads (review H5).
-
-**v4**: one `.aegis/config.json`, and repository config cannot name commands or tool slots. Driver commands come only from packaged templates or user-scope config (ADR 0005 §5 "Config" and D10; ADR 0016 status). Every git call goes through `gitsafe`, which switches off what a repository's git config could run. The [repository trust table](../SECURITY.md#repository-trust) lists everything Aegis does run and where it comes from (`tests/unit/core/test_security_policy.py` fails when a module that starts a program has no row there); the one case that runs repository code is `aegis check --full`, which runs the tests that match the change.
+Underneath all four: no runtime dependencies, no daemon and no telemetry. [PRIVACY.md](../PRIVACY.md) describes the outbound data paths and what Aegis stores locally.
 
 ```mermaid
 flowchart LR
-    A["Agent edits code"] --> B["aegis check<br/>local, bypassable"]
-    B --> C["CI on the exact commit<br/>authoritative"]
-    C --> D["Reviewed merge"]
-    D --> E["Append-only ledger"]
-    E --> F["aegis sync<br/>suggests changes"]
-    F --> G["Person applies a rule change"]
+    A["Agent edits code"] --> B["aegis check<br/>local, skippable"]
+    B --> C["Reviewed merge"]
+    C --> D["CI result on the exact landing commit"]
+    L["Local scan, aegis check --record --tests<br/>or outcome report"] --> E["Local append-only ledger<br/>labels"]
+    E --> F["aegis sync<br/>matches reports to eligible checks<br/>and confirms landing CI"]
+    D --> F
+    F -->|records CI result| E
+    F --> G["A person applies a suggested rule change"]
     G -.-> A
 ```
 
-## 6. v4.3 trust and evidence: label locally, confirm externally, approve humanly
+## 6. Trust
 
-v4.0 removed claims v3 could not back. v4.3 (ADR 0006, [SECURITY.md](../SECURITY.md#trust-tiers)) makes them verifiable rather than dropping them. Its principle is **label locally, confirm externally, approve humanly**: Aegis labels what it observes on the developer's machine (`witness: aegis`), CI on the exact commit confirms outcomes, and approvals the agent cannot produce (a non-author PR review at Tier A, or an `aegis approve` commit signed by a key in the base branch's `allowed_signers` at Tier B, which holds only while the pull request leaves `.github/workflows/**` and aegis alone) gate governance changes. `aegis doctor` detects the repository's trust tier (`A`, `B` or `C` self-attested) read-only and prints it on every report.
+The 4.3 work started from an uncomfortable finding: nothing on my machine is a reliable witness against an agent running as the same user. It can edit the files, run the commands and write the logs. So Aegis labels what it sees locally, lets CI on the exact commit confirm check-based credit, and uses reviewed or signed approvals for rule weakenings: label locally, confirm externally, approve humanly.
 
-| Component (v4.3) | Replaces | What holds (and at which tier) |
+How much of that holds depends on how your repository is set up, and `aegis doctor` tells you your trust tier. At tier A a code owner other than the author approves the pull request, under enforced review rules, and the agent uses its own non-admin identity. At tier B you sign approvals with a key the agent can't use, but a pull request that edits its own workflow or Aegis can change the check that verifies them. A fresh repository is tier C: Aegis detects and records, but does not stop a deliberate agent running as your user.
+
+A rule weakening is always gated by `aegis check --ci`; other governance-file changes are gated only when the base branch lists a key in `allowed_signers`. The check itself must be required to stop a merge. Separately, the regression check asks for a test that fails before a fix and passes after it, or a signed exemption; at warning tier this is advisory and never blocks. The exact conditions and their gaps are in [SECURITY.md](../SECURITY.md#trust-tiers) and [Trust tiers](trust-tiers.md).
+
+## 7. Predictions, and where they stand
+
+Each v4 change came with a prediction that could fail, and a failed one is something to act on, not explain away. The results below were checked on 2026-10-23; they are historical results, not fresh checks of the development commit named above:
+
+| Prediction | How to check | Status |
 |---|---|---|
-| Witnessed checks (`aegis check --record [--tests]`) | v3 receipts | Outcomes credited to rules are confirmed by a passing check row for the exact git tree; unwitnessed `aegis_report_outcome` calls are recorded as `claimed` and earn no rule credit |
-| Git-witnessed rule integrity (`aegis_scan`, `aegis check --ci`, `aegis approve`) | the HMAC manifest | Gates and invariants bind from the reviewed base branch (`rules_base`); weakening one or leaving a governance/workflow file unowned in `CODEOWNERS` fails `aegis check --ci` without a base-trusted approval (at Tier B, only while the pull request leaves `.github/workflows/**` and aegis alone) |
-| Per-rule credit model (`aegis sync [--pr]`) | inverted fitness | Standing comes from CI-confirmed checks, git detector replay (`caught` vs `leaked`), and human-adjudicated labels, reported as `untestable`, `insufficient (n=K)`, `inconclusive` or `decided` with session-count decay |
-| Regression discipline in CI (`aegis check --ci`) | the bug registry | Non-merge `fix` commits touching source files require a test that fails on `base` and passes on `head`, or a commit-scoped signed `Aegis-Exempt-Test` approval |
-| Calibrated arbiter (`aegis check --calibration`) | the "binding" Layer-2 verdict | Cross-vendor review predictions are logged and scored with Wilson 95% confidence intervals and Brier skill scores (log-only in v4.3; skill claims suppressed below `n_effective >= 100`) |
-| Security checks and SARIF (`aegis check --format sarif`) | substring "audits" | Delta-evaluated structured `forbid_ast` call predicates, an 8-rule Python security pack, known-format secret scanning, and SARIF 2.1.0 ingest/output |
-| Human-insights loop (`aegis rule insight`, `aegis_capture_insight`) | the unused insight tool | User-scope redacted corrections (`~/.aegis/insights/`) and content-bound `Aegis-Approve-Insight` signatures cluster into `.aegis/proposals/` and track post-activation recurrence |
+| Checks, scans and hooks do not rewrite rule files, and no outcome is lost when several processes write at once | `python3 -m pytest tests/integration/test_no_rule_writes.py tests/unit/core/test_ledger.py tests/unit/core/test_locking.py` | 73 tests passed on 2026-10-23 |
+| No release tag without green CI on its commit | `python3 .github/scripts/ci_green.py "$(git rev-list -n1 <tag>)"` (needs `gh`) | Verified for the eight v4 tags present on 2026-10-23. The publish runs for 4.3.0 and 4.3.3 had failed, and neither version was on PyPI at that check |
+| Agents scan before editing at least 80% of the time on each supported host, after 3 sessions | `aegis status --compliance` | No published measurement yet |
+| In 20 multi-lane sessions no cross-lane write conflict reaches a merge. Proposed maintainer decision: remove the lease feature after 30 days of multi-lane use with no denial; this is not automatic lease expiry | `aegis team metrics` | Not yet measured over 20 sessions |
+| The next major version ships without a clean-slate purge | Its CHANGELOG gives an `aegis migrate` path for every format it changes | Holds for 4.0.0; rule files have no schema version yet |
 
-Why this landed in v4.3 after the v4.0–v4.2 foundation: the review behind ADR 0006 established that nothing on the developer's machine is a reliable witness against a same-user agent, that CI is a trust root only when GitHub enforces it, and that per-rule statistics cannot reach a decision at one developer's volume without detector replay and explicit sample-size states (`insufficient` below `n = 25`).
+## Appendix A: Trade-offs
 
-## 7. Predictions you can check
+| Decision | What it costs | What you give up |
+|---|---|---|
+| Outcome rows live in the ledger; human labels live in reviewed files | `aegis sync` is a batch step | Scores in `.aegis/state/derived.json` are as fresh as the last sync |
+| CI decides releases | A release waits for CI | Offline releases |
+| Rules just in time | One extra tool call per batch of edits | It depends on the agent calling the scan |
+| Repository config can't name commands | Test and benchmark commands are set per machine | A repository can't ship its own check commands |
+| No runtime dependencies or daemons | A hand-written YAML subset parser to maintain | Features that need a library or a background process |
 
-Each v4 decision carries a falsifiable prediction (principle C6). A failed prediction is a result to act on, not something to explain away; where a decision has a prune condition, the table says what gets removed. The last column says whether the check can be run on the v4.0 code (waves A, B and C merged). Where it cannot, the release that adds it is named.
+## Appendix B: Re-deriving the numbers
 
-| Decision | Prediction | How to check | Runnable on v4.0? |
-|---|---|---|---|
-| AD-1 ledger only | Zero "tampered rule" exclusions and zero lost increments in a 3-process test | After real sessions, `git status --porcelain .aegis/rules` lists no change made by Aegis; `python3 -m pytest tests/integration/test_no_rule_writes.py tests/unit/core/test_ledger.py tests/unit/core/test_locking.py` passes (the last two include 3-process append and lock tests) | Yes |
-| AD-2 CI attestation | No release tag without a green CI run on the same SHA | For each tag: `python3 .github/scripts/ci_green.py "$(git rev-list -n1 <tag>)"` exits 0 (needs the `gh` CLI) | Yes |
-| AD-3 layered core | Duplicate implementations go to 0, and the import-boundary test stays green | `python3 -m pytest tests/contract/test_import_boundary.py` | Partly. The boundary test runs; counting duplicate implementations needs a new sweep like the one behind ADR 0005 §5 |
-| AD-4 workspace binding | In 3 real sessions per host, every scan resolves to the intended repository and none to `$HOME` | An MCP scan appends a row (once per session and set of files), with the source of its binding, to `.aegis/state/activity.jsonl` in the repository it resolved to. After the sessions, every scan should appear in the log of the repository you were working in | Yes, after real sessions |
-| AD-5 versioned formats | The next major version ships without a clean-slate purge | Its CHANGELOG entry gives an `aegis migrate` path, not a purge, for every on-disk format it changes | Partly. `aegis migrate` converts v3 and `.soma` workspaces, and the 4.0.0 entry gives that path; rule frontmatter has no schema version yet |
-| AD-6 small contract | The contract changes in under 10% of PRs; ghost CLI flags drop to 0 | `git log --oneline -- tests/contract/` against merged PRs (`python3 -m pytest tests/contract` fails on any CLI or MCP surface change until the snapshot is regenerated in the same PR) | Partly. Ghost flags are options the parser registers and `--help` advertises that the code ignores or does not honor, such as the removed `rule create --from-description`. The snapshot tests list every registered flag, and the flags v4 removed have rejection tests, but nothing yet checks that each registered flag is read |
-| AD-7 git-native team | In 20 multi-lane sessions, no cross-lane write conflict reaches a merge | `aegis team metrics`: lease denials, and the merges where both sides changed a common path or git reports a conflict. If no lease is denied in 30 days of multi-lane use, leases are dropped and `aegis check --lane` and the merge metrics stay | Not on v4.0. From 4.1.0, after real multi-lane sessions: `aegis team` and leases shipped in 4.1.0 |
-| AD-9 bootstrap and JIT | Scan-before-edit rate of at least 80% on each Phase-1 host after 3 sessions | `aegis status --compliance` (it prints the rate per host and per session, and the limits of how edits are observed) | Yes, after real sessions |
+The v3 sources were deleted in v4, but git keeps them. The post-mortem table and the "four times" note are in `git show v3.3.0:docs/architecture/phylogeny.md`; the 17 sessions and the A/B pair are in `git show v3.3.0:docs/project/METRICS.md`. Three things can't be re-derived from the repository: the MCP usage counts (my local session logs), the review scores (the report isn't published) and the receipt and manifest findings (the review notes behind v4).
 
-New v4.1 and v4.2 features get a prune box before they merge (ADR 0005 Appendix D). Examples: lane leases are pruned after 0 denials in 30 days of multi-lane use; the test-integrity check after 60 days without a finding that a reviewer did not override; the benchmark after it catches no regression in 3 releases; an experimental host row after it stays unverified for 2 minor releases.
-
-## 8. Trade-offs
-
-From ADR 0005 §7, with what each choice costs you.
-
-| Decision | Latency | Complexity | Cost | What you give up |
-|---|---|---|---|---|
-| Ledger-only fitness (AD-1) | none; `aegis sync` is batch | lower: one writer instead of about 6 | none | fitness shown in rule files is stale until `sync` runs |
-| CI attestation (AD-2) | a release waits for CI | lower: receipts deleted | none (free CI) | no offline releases, by design |
-| Layered core (AD-3) | none | one-time refactor, then lower | none | merge churn for in-flight branches |
-| Workspace resolver (AD-4) | about 1 cached lookup per call | medium | none | `aegis init` once per machine before an Antigravity session can be governed |
-| Versioned formats (AD-5) | none | low | none | readers must accept the current and previous format |
-| Contract tests (AD-6) | none | lower | none | less "docs match code" coverage, replaced by generated reference docs |
-| Git-native team (AD-7) | milliseconds per claim | much lower than a custom swarm package | none | requires git |
-| Bootstrap + JIT rules (AD-9) | +1 tool call per edit batch | lower | ADR estimate, not re-measured: 65–190× fewer fixed instruction tokens than inlined rules, 4–11× counting scan payloads | depends on the agent calling the scan tool, hence the measured compliance rate |
-| Zero runtime dependencies, no daemons | none | a hand-written YAML subset parser to maintain | none | features that need a library or a background process |
-
-The trade Aegis does not make: it does not claim enforcement it lacks. CI on every PR is the authoritative floor; the local git hook is fast feedback that `--no-verify` skips; per-host agent hooks are best effort and differ by host (AD-8).
-
-## Sources
-
-**Decision records**: ADR 0005 (plan of record), its evidence review, ADR 0003, ADR 0007 (the host plane), and ADR 0012–0016. ADR 0005's appendices hold the delegated decisions D1–D23 and the v4.1/v4.2 scope, which lived in a separate build sheet during the build.
-
-**Deleted documents quoted here**, readable from the v3.3.0 release tag with `git show v3.3.0:<path>` (all four are byte-identical at `895bbf5`; `git diff --stat v3.3.0 895bbf5 -- <the four paths>` prints nothing):
-
-- `docs/architecture/phylogeny.md` (the evolution log): post-mortem, cross-session patterns, design principles;
-- `docs/project/METRICS.md`: session telemetry, the A/B comparison, the 66-session dataset;
-- `docs/research/abstract.md`: the limitations sentences;
-- `docs/architecture/mechanism_design.md`: the three incentive ideas.
-
-**Re-derived** (run from the repository root at `895bbf5`):
+From the repository root:
 
 ```sh
-python3 -c "print(749/1339, 180+110+103+50+30, 749-473, 473/749, 1317/7015, 1-25963/39426, 1-22188/39426)"   # 0.559, 473, 276, 0.632, 0.188, 0.341, 0.437
-git log -1 --format='%h %ci' 2c85f58; git log -1 --format='%h %ci' 6f47f13   # 02:50 and 23:30 on 2026-10-14; 20 h 40 min is their difference
-git show --shortstat --format='%B' 6f47f13                                     # the subject line only; 40 files changed, 4267 insertions, 3272 deletions
-git rev-list --count 9e4d976; git tag --merged 895bbf5 | wc -l               # 850, 94
-git log --reverse --format=%ci 9e4d976 | head -1                               # 2026-09-26; to 2026-10-14 is 19 calendar days, counting both ends
-git for-each-ref --format='%(creatordate:iso) %(refname:short)' refs/tags/v3.3.0   # 23:14; 16 min is the difference to 6f47f13 (23:30)
-python3 -c "import aegis_mcp.registry as r; print(len(r.TOOL_DEFINITIONS))"   # 4
-# Python lines and files under aegis_core, aegis_cli, aegis_mcp, aegis_sdk (all lines, blank and comment lines included):
-for rev in 9e4d976 895bbf5 41cd3f0; do
-  git ls-tree -r --name-only $rev -- aegis_core aegis_cli aegis_mcp aegis_sdk | grep -c '\.py$'    # 160, 109, 107 files
-  git ls-tree -r --name-only $rev -- aegis_core aegis_cli aegis_mcp aegis_sdk | grep '\.py$' \
-    | while read -r f; do git show "$rev:$f"; done | wc -l                                          # 39426, 22188, 25963 lines
-done
+python3 -c "print(749/1339, 180+110+103+50+30, 749-473, 1317/7015, (1317-749)/(7015-1339), 1-22188/39426, 53739/39426-1, 104371/42476)"
+# 0.559  473  276  0.188  0.100  0.437  0.363  2.46
+git log -1 --format='%h %ci' 2c85f58   # rename to Aegis: 2026-10-14 02:50
+git log -1 --format='%h %ci' 6f47f13   # first v4 commit: 23:30, 20 h 40 min later
+git for-each-ref --format='%(creatordate:iso)' refs/tags/v3.3.0   # 23:14, 16 min earlier
+git show --shortstat --format='%B' 6f47f13   # subject only; 40 files, +4267 / -3272
+git rev-list --count 9e4d976; git tag --merged 9e4d976 | wc -l   # 850, 94
+loc() { rev=$1; shift; git ls-tree -r --name-only "$rev" -- "$@" | grep '\.py$' | while IFS= read -r f; do git show "$rev:$f"; done | wc -l; }
+for rev in 9e4d976 895bbf5 bed1e4a6; do loc "$rev" aegis_core aegis_cli aegis_mcp aegis_sdk; done   # 39426, 22188, 53739
+for rev in v3.3.0 bed1e4a6; do loc "$rev" tests; done                                          # 42476, 104371
+python3 -c "import aegis_mcp.registry as r; print(len(r.TOOL_DEFINITIONS))"   # 5
 ```
+
+## Planned, not shipped
+
+These are future directions, not capabilities of the current release.
+
+- **4.5.0 — multi-language AST:** deeper TypeScript/JavaScript, Go and Rust analysis through a shared normalized AST, with explicit unsupported and unverified results. The packaged drivers available today do not provide this full analysis.
+- **4.6.0 — lessons from repository history:** `aegis mine` would turn observed failures and corrections into candidates in one proposal queue for human review. It would not create active rules automatically.
+- **4.7.0 — parallel agents in one repository:** improve coordination and review for agents sharing a repository, building on the existing advisory lanes and leases without claiming isolation or autonomous approval.
+- **4.8.0 — code-claim checks:** a proposed `aegis claims check FILE` would read `{id, anchor, probe, expect}` claims and report **holds**, **moved**, **no longer holds** or **contradicts** against the current code. It would be stateless, read-only and independent of any plan format.
+
+The 4.8.0 idea must first prove useful in a manual trial that records what its probes catch; if the trial misses most stale claims, drop the feature. It is not project management: no owners, assignees, dates, estimates, priorities, dependency ordering, stored progress or progress UI. Plans and responsibility stay outside Aegis.

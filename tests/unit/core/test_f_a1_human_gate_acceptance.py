@@ -27,7 +27,8 @@ import subprocess
 
 import pytest
 
-from aegis_core import human_gate, lane_gate, storage
+from aegis_cli.formatters.text import render_lane, render_tier
+from aegis_core import ghcli, github_ruleset, human_gate, lane_gate, storage
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -186,6 +187,54 @@ def test_verify_insight_approval_binds_to_signed_commit_and_insight_text_hash(tm
     assert ok_verdict.valid and ok_verdict.ok
     mismatch = human_gate.verify_insight_approval(repo.root, sha, text_b, "main")
     assert not mismatch.valid and not mismatch.ok and mismatch.code == "hash_mismatch"
+
+
+class _ReviewsGh(hg.FakeGh):
+    def __init__(self, reviews, **kw):
+        super().__init__(**kw)
+        self.reviews = reviews
+
+    def __call__(self, argv, stdin=None, cwd=None, timeout=None):
+        if "/pulls/" in argv[-1]:
+            self.calls.append((tuple(argv), stdin))
+            return ghcli.GhResult(0, json.dumps(self.reviews), "")
+        return super().__call__(argv, stdin, cwd)
+
+
+@needs_git
+def test_a_review_approves_only_where_the_ruleset_makes_it_the_merge_gate(tmp_path):
+    """Given a base CODEOWNERS that owns the changed rule and a non-author's APPROVED review of the head,
+    When the ruleset requires an approval, code-owner review, stale-review dismissal and the last push's
+    approval by someone else (tier A), Then the review is the approval; When any of the four is missing,
+    Then it is not, and the reviews are never read."""
+    repo = hg.make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    repo.write(".github/CODEOWNERS", hg.CODEOWNERS_FULL)
+    base = repo.commit("protect")
+    head = "a" * 40
+    pull = human_gate.PullRequest(3, "agent", head, "main")
+    approving = [{"user": {"login": "human", "type": "User"}, "state": "APPROVED", "commit_id": head,
+                  "author_association": "OWNER"}]
+    paths = [".aegis/rules/traps/trap-sample.md"]
+    gh = _ReviewsGh(approving, rules=[hg.pull_request_rule(last_push=True)])
+    verdict = human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh)
+    assert verdict is not None and verdict.valid and (verdict.source, verdict.signer, verdict.commit) == ("review", "human", head)
+    # The ruleset doctor --github proposes for tier A is such a merge gate.
+    gh = _ReviewsGh(approving, rules=github_ruleset.build_ruleset("A", ["aegis-check"])["rules"])
+    assert human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh) is not None
+    absent = hg.pull_request_rule(last_push=True)
+    del absent["parameters"]["require_last_push_approval"]
+    # Without require_last_push_approval whoever pushed the last commit may be the approving reviewer.
+    for rule in (hg.pull_request_rule(approvals=0, last_push=True), hg.pull_request_rule(code_owners=False, last_push=True),
+                 hg.pull_request_rule(dismiss_stale=False, last_push=True), hg.pull_request_rule(last_push=False), absent):
+        gh = _ReviewsGh(approving, rules=[rule])
+        assert human_gate.find_review_approval(repo.root, pull, base, paths, gh=gh) is None
+        assert not any("/pulls/" in c[0][-1] for c in gh.calls) and gh.posts == []
+    # The base branch is the pull request's, checked again here: a name in doubt reads nothing.
+    for ref in ("", "../main", "main?x", "a b", None):
+        gh = _ReviewsGh(approving, rules=[hg.pull_request_rule(last_push=True)])
+        assert human_gate.find_review_approval(repo.root, pull._replace(base_ref=ref), base, paths, gh=gh) is None
+        assert gh.calls == []
 
 
 # ── 1b. an approval is an SSH signature, checked against the base allowed_signers ──
@@ -443,9 +492,9 @@ def test_a_genuine_ssh_approval_verifies_in_a_sha256_repository(tmp_path, monkey
 @needs_git
 def test_tier_c_says_self_attested_in_text_and_json(tmp_path):
     repo = hg.make_repo(tmp_path)
-    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None: None)
+    report = human_gate.detect_tier(repo.root, gh=lambda argv, stdin=None, cwd=None, timeout=None: None)
     assert report.tier == "C" and report.label == "self-attested"
-    assert "self-attested" in report.text_lines()[0]
+    assert "self-attested" in render_tier(report.as_dict())[0]
     doc = report.as_dict()
     assert doc["tier"] == "C" and doc["label"] == "self-attested"
     for key in ("source", "aegis_version", "checked_at", "scope"): assert doc[key]
@@ -454,7 +503,7 @@ def test_tier_c_says_self_attested_in_text_and_json(tmp_path):
 def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
     from aegis_cli import doctor
     repo = hg.make_repo(tmp_path)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: None)
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=False, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)
@@ -470,11 +519,11 @@ def test_doctor_prints_the_tier_on_every_report(tmp_path, monkeypatch):
 # ── 3. --apply never changes repository settings without a person at a terminal ──
 
 def _doctor_github(repo: hg.Repo, monkeypatch, gh: hg.FakeGh, answers=None, tty=False, workflow=True, **kw):
-    from aegis_cli import doctor
+    from aegis_cli import doctor, doctor_base
     if workflow:
         repo.write(".github/workflows/aegis.yml", hg.AEGIS_WORKFLOW if workflow is True else workflow)
-    monkeypatch.setattr(human_gate, "default_gh_runner", gh)
-    monkeypatch.setattr(doctor, "_stdin_is_tty", lambda: tty)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
+    monkeypatch.setattr(doctor_base, "_stdin_is_tty", lambda: tty)
     replies = iter(answers or [])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=False, github=True, apply=False, tier=None)
@@ -503,12 +552,12 @@ def test_apply_with_a_terminal_and_a_yes_creates_exactly_the_printed_ruleset(tmp
     assert rc == 0
     ((argv, body),) = gh.posts
     assert argv[:3] == ("api", "--method", "POST") and "rulesets" in argv[3]
-    sent, printed = json.loads(body), human_gate.build_ruleset("B", ["aegis-check"])
+    sent, printed = json.loads(body), github_ruleset.build_ruleset("B", ["aegis-check"])
     assert sent == printed and sent["enforcement"] == "active" and sent["bypass_actors"] == []
 
 @needs_git
 def test_apply_never_overwrites_a_ruleset_of_the_same_name(tmp_path, monkeypatch):
-    repo, gh = hg.make_repo(tmp_path), hg.FakeGh(rulesets=[{"id": 3, "name": human_gate.RULESET_NAME}])
+    repo, gh = hg.make_repo(tmp_path), hg.FakeGh(rulesets=[{"id": 3, "name": github_ruleset.RULESET_NAME}])
     rc, out, err = _doctor_github(repo, monkeypatch, gh, answers=["y"], tty=True, apply=True, tier="B")
     assert rc != 0 and gh.posts == [] and "already exists" in (out + err)
 
@@ -543,7 +592,7 @@ def test_github_json_carries_the_envelope_and_applies_nothing(tmp_path, monkeypa
     rc, out, _err = _doctor_github(repo, monkeypatch, gh, json=True)
     doc = json.loads(out)
     assert rc == 0 and doc["status"] == "printed" and gh.posts == []
-    assert doc["github"]["ruleset"]["B"] == human_gate.build_ruleset("B", doc["github"]["required_checks"])
+    assert doc["github"]["ruleset"]["B"] == github_ruleset.build_ruleset("B", doc["github"]["required_checks"])
     for key in ("source", "aegis_version", "checked_at", "scope"): assert doc[key]
 
 @needs_git
@@ -895,7 +944,7 @@ def test_the_aegis_test_change_trailer_is_not_an_exemption_in_the_lane_gate(tmp_
     repo.commit("drop a test\n\nAegis-Test-Change: the test was redundant\n")
     result = lane_gate.check_lane(repo.root, "docs", base="main", paths=["**"])
     assert not result.passed and [(f.kind, f.name) for f in result.findings] == [("removed", "test_b")]
-    assert lane_gate.NOTE_EXEMPTION in result.text_lines()
+    assert lane_gate.NOTE_EXEMPTION in render_lane(result.as_dict())
 
 # ── 6. file modes of the shared state ────────────────────────────────────────
 
@@ -955,12 +1004,31 @@ def test_doctor_reports_how_many_entries_are_looser_without_naming_them(tmp_path
     site = storage.ledger_site(repo.root)
     storage.append_jsonl(site.path, [{"v": 2}])
     os.chmod(site.path, 0o644)
-    monkeypatch.setattr(human_gate, "default_gh_runner", lambda argv, stdin=None, cwd=None: None)
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
     args = argparse.Namespace(workspace=str(repo.root), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
     out = io.StringIO()
     with contextlib.redirect_stdout(out): doctor.run_doctor(args)
     payload = json.loads(out.getvalue())
     assert payload["state_modes"]["looser"] == 1 and "ledger.jsonl" not in json.dumps(payload["state_modes"])
+
+@posix_only
+def test_doctor_counts_nothing_looser_in_a_workspace_outside_git(tmp_path, monkeypatch):
+    """R-cli-39: Given a non-git workspace whose local state the umask made 0755/0644, When
+    doctor runs, Then it reports no looser entry (the standard covers the git common dir only)."""
+    from aegis_cli import doctor
+    ws = tmp_path / "ws"
+    (ws / ".aegis" / "rules" / "traps").mkdir(parents=True)
+    old = os.umask(0o022)
+    try:
+        storage.append_jsonl(storage.state_dir(ws) / "ledger.jsonl", [{"v": 2}])
+        with storage.locked(ws): pass
+    finally:
+        os.umask(old)
+    monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
+    args = argparse.Namespace(workspace=str(ws), fix=False, yes=False, drivers=False, json=True, github=False, apply=False, tier=None)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out): doctor.run_doctor(args)
+    assert json.loads(out.getvalue())["state_modes"]["looser"] == 0
 
 @posix_only
 @needs_git

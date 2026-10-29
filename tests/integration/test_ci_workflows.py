@@ -15,7 +15,7 @@ yaml = pytest.importorskip("yaml")
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 GITHUB = os.path.join(REPO_ROOT, ".github")
 WORKFLOWS = os.path.join(GITHUB, "workflows")
-WORKFLOW_FILES = ("validate.yml", "publish.yml")
+WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml")
 SHA_REF = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 PINNED_LINE = re.compile(r"uses:\s*[^@\s]+@[0-9a-f]{40}\s+#\s*v\d+\.\d+\.\d+\s*$")
 
@@ -118,6 +118,19 @@ def test_publish_caller_grants_what_the_reusable_build_needs():
     assert perms.get("id-token") == "write" and perms.get("attestations") == "write"
 
 
+def test_publish_caller_can_grant_every_reusable_validation_job_permission():
+    """GitHub rejects a callee requesting more than its caller grants."""
+    workflow = _load("validate.yml")
+    caller = _load("publish.yml")["jobs"]["validate"]["permissions"]
+    levels = {"none": 0, "read": 1, "write": 2}
+    missing = []
+    for name, job in workflow["jobs"].items():
+        for permission, access in job.get("permissions", workflow["permissions"]).items():
+            if levels[caller.get(permission, "none")] < levels[access]:
+                missing.append(f"{name}: {permission}: {access}")
+    assert missing == [], f"publish.yml cannot grant validate.yml: {missing}"
+
+
 def test_publish_uses_trusted_publishing_without_long_lived_tokens():
     publish = _load("publish.yml")["jobs"]["publish"]
     env = publish.get("environment")
@@ -193,12 +206,33 @@ def test_windows_test_job_runs_the_whole_suite_and_fails_on_failure():
         assert "|| true" not in step["run"] and "--deselect" not in step["run"]
 
 
-def test_windows_test_job_installs_like_the_linux_test_job():
-    def install_run(job):
-        return next(s["run"] for s in job["steps"] if s.get("name") == "Install test dependencies")
-    jobs = _load("validate.yml")["jobs"]
-    assert install_run(_windows_test_job()) == install_run(jobs["validate"])
+# The jobs that run the suite: the matrix, Windows, and aegis-check, whose `check --ci` reruns the
+# head commit's trailer snapshot and must be able to collect what the others collect (R-trust-a3).
+TEST_JOBS = ("validate", "test-windows", "aegis-check")
+INSTALL_STEP = "Install test dependencies"
+
+
+def _install_step(job):
+    return next((s for s in job.get("steps", []) if s.get("name") == INSTALL_STEP), None)
+
+
+def _divergent_installs(jobs):
+    """Test jobs whose install step is missing or differs from the validate job's text."""
+    want = (_install_step(jobs["validate"]) or {}).get("run")
+    return [name for name in TEST_JOBS if want is None or (_install_step(jobs[name]) or {}).get("run") != want]
+
+
+def test_the_test_jobs_install_identical_test_dependencies():
+    assert _divergent_installs(_load("validate.yml")["jobs"]) == []
     assert "build-wheel" in str(_windows_test_job().get("needs"))
+
+
+def test_a_package_dropped_from_one_install_copy_fails_the_comparison():
+    jobs = _load("validate.yml")["jobs"]
+    step = _install_step(jobs["aegis-check"])
+    assert step is not None and " hypothesis==" in step["run"]
+    step["run"] = step["run"].replace(" hypothesis==6.126.0", "")
+    assert _divergent_installs(jobs) == ["aegis-check"]
 
 
 def test_windows_test_job_isolates_home_and_userprofile():
@@ -285,3 +319,145 @@ def test_publish_uploads_only_what_pypi_lacks_and_waits_for_it():
     for i in (stage, action):
         assert steps[i].get("if") == f"steps.{plan_id}.outputs.state != 'identical'"
     assert "skip-existing" not in yaml.safe_dump(publish)
+
+
+# --- R-cli-12: CI hygiene ----------------------------------------------------
+
+def _jobs_without_timeout(workflow):
+    """Jobs that run steps and lack an integer timeout-minutes within GitHub's 360 cap. A job that
+    calls a reusable workflow (`uses:`) cannot carry the key; the called jobs carry theirs."""
+    return [name for name, job in workflow["jobs"].items() if "uses" not in job
+            and not (type(job.get("timeout-minutes")) is int and 0 < job["timeout-minutes"] <= 360)]
+
+
+def test_every_job_that_runs_steps_has_a_bounded_timeout():
+    for name in WORKFLOW_FILES:
+        assert _jobs_without_timeout(_load(name)) == [], name
+    jobs = _load("validate.yml")["jobs"]
+    # A limit must never turn a slow green run red on release day.
+    assert jobs["validate"]["timeout-minutes"] >= 45 and jobs["test-windows"]["timeout-minutes"] >= 45
+
+
+def test_a_job_without_a_usable_timeout_is_reported():
+    workflow = {"jobs": {"a": {"runs-on": "x", "timeout-minutes": 10}, "b": {"runs-on": "x"},
+                         "c": {"uses": "./w.yml"}, "d": {"timeout-minutes": "10"}, "e": {"timeout-minutes": 400}}}
+    assert _jobs_without_timeout(workflow) == ["b", "d", "e"]
+
+
+def test_pytest_dumps_the_stacks_of_a_hung_test():
+    with open(os.path.join(REPO_ROOT, "pyproject.toml"), encoding="utf-8") as f:
+        text = f.read()  # Python 3.9 has no tomllib
+    block = re.search(r"^\[tool\.pytest\.ini_options\]\n(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    assert block and re.search(r"^faulthandler_timeout\s*=\s*300\s*$", block.group(1), re.M)
+
+
+def test_one_red_validate_leg_does_not_cancel_the_others():
+    assert _load("validate.yml")["jobs"]["validate"]["strategy"]["fail-fast"] is False
+
+
+def test_windows_runs_the_same_wheel_smoke_as_the_other_legs():
+    runs = [s.get("run", "") for s in _windows_test_job()["steps"]]
+    smoke = [r for r in runs if "wheel_smoke.py" in r]
+    assert len(smoke) == 1
+    assert re.search(r'cd "\$RUNNER_TEMP" && env -u PYTHONPATH python -I "\$SMOKE"', smoke[0]), smoke[0]
+    assert not any(re.search(r"python -c .*import aegis_cli", r) for r in runs), "the import-only smoke is gone"
+
+
+def test_aegis_check_runs_the_installed_wheel_and_is_the_only_check_ci():
+    jobs = _load("validate.yml")["jobs"]
+    cli = [s["run"].strip() for s in jobs["aegis-check"]["steps"] if "aegis_cli.cli" in s.get("run", "")]
+    # -I keeps the checkout off sys.path, so the wheel, not the source tree, is what runs.
+    assert cli and all(re.match(r"python3 -I -m aegis_cli\.cli check(\s|$)", r) for r in cli), cli
+    with_ci = [name for name, job in jobs.items()
+               if any(re.search(r"aegis_cli\.cli check --ci\b", s.get("run", "")) for s in job.get("steps", []))]
+    assert with_ci == ["aegis-check"]
+
+
+# --- R-trust-43: at tier A check --ci reads the pull request's reviews ------------------------
+
+def _check_ci_steps(job):
+    return [s for s in job.get("steps", []) if re.search(r"\bcheck --ci\b", s.get("run", ""))]
+
+
+def _scaffold():
+    from aegis_core import scaffolding
+    return yaml.safe_load(scaffolding.ci_workflow())
+
+
+@pytest.mark.parametrize("load", [lambda: _load("validate.yml"), _scaffold], ids=["validate", "scaffold"])
+def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
+    job = load()["jobs"]["aegis-check"]
+    assert job.get("permissions") == {"contents": "read", "pull-requests": "read"}
+    steps = _check_ci_steps(job)
+    assert len(steps) == 1, steps
+    assert steps[0].get("env") == {"GH_TOKEN": "${{ github.token }}"}
+
+
+# --- R-trust-13 (c)-(f): a base-sourced, no-exec governance check ----------------------------
+
+GOVERNANCE_WORKFLOW = "aegis-governance.yml"
+_BASE_SHA = "${{ github.event.pull_request.base.sha }}"
+
+
+def _permission_maps(workflow):
+    yield workflow.get("permissions")
+    for job in workflow["jobs"].values():
+        if "permissions" in job:
+            yield job["permissions"]
+
+
+def test_the_governance_job_is_an_aegis_check_triggered_only_by_pull_request_target():
+    """N3: the base-sourced job counts as the required Aegis check under its literal name."""
+    from aegis_core import human_gate
+    text = _read(GOVERNANCE_WORKFLOW)
+    assert set(_triggers(yaml.safe_load(text))) == {"pull_request_target"}
+    assert human_gate.aegis_check_jobs(text) == ["aegis-governance"]
+
+
+def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
+    """N4 (static): base.sha checkout without credentials, the head only as data, a read-only token
+    (contents and pull-requests, the latter for tier A's review lookup) handed as GH_TOKEN to the check
+    step only, no secret, nothing that builds, installs, caches or tests the checkout."""
+    text = _read(GOVERNANCE_WORKFLOW)
+    workflow = yaml.safe_load(text)
+    assert set(_triggers(workflow)) == {"pull_request_target"}
+    assert workflow.get("permissions") == {"contents": "read", "pull-requests": "read"}
+    for perms in _permission_maps(workflow):
+        assert isinstance(perms, dict), "permissions must be explicit maps"
+        assert set(perms.items()) <= {("contents", "read"), ("pull-requests", "read")}, perms
+    assert "secrets." not in text
+    assert "env" not in workflow and all("env" not in job for job in workflow["jobs"].values())
+    steps = [s for job in workflow["jobs"].values() for s in job.get("steps", [])]
+    (check_step,) = [s for s in steps if re.search(r"\bcheck --ci\b", s.get("run", ""))]
+    assert check_step.get("env") == {"GH_TOKEN": "${{ github.token }}"}
+    assert [s for s in steps if re.search(r"GH_TOKEN|GITHUB_TOKEN|github\.token", str(s.get("env") or ""))] == [check_step]
+    assert text.count("github.token") == 1
+    checkouts = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+    assert checkouts and all((s.get("with") or {}).get("ref") == _BASE_SHA for s in checkouts)
+    assert all((s.get("with") or {}).get("persist-credentials") is False for s in checkouts)
+    for step in steps:
+        with_ = step.get("with") or {}
+        for value in (with_.get("ref"), with_.get("repository"), step.get("run")):
+            assert "github.event.pull_request.head" not in str(value or ""), step
+        run = step.get("run", "")
+        assert not re.search(r"\bmake\b|pytest|pip3? install|python3? -m pip|setup\.py", run), step
+        assert not step.get("uses", "").startswith("actions/cache"), step
+    runs = [s.get("run", "") for s in steps]
+    assert any(re.fullmatch(r"python3 -m aegis_cli\.cli check --ci --no-exec", r.strip()) for r in runs), runs
+
+
+# --- R-trust-17: check --ci runs on every event its job runs on ------------------------------
+# A condition on the step (say, pull requests only) would let a push or dispatch run of the same
+# job name pass on the pull request's head commit without comparing anything, and doctor no longer
+# counts such a job as the required Aegis check (human_gate._skip_why). A run with nothing to compare
+# says so instead of PASSED (aegis_cli.check).
+
+@pytest.mark.parametrize("text", [lambda: _read("validate.yml"),
+                                  lambda: __import__("aegis_core.scaffolding", fromlist=["x"]).ci_workflow()],
+                         ids=["validate", "scaffold"])
+def test_the_check_ci_step_has_no_condition_and_stays_the_required_check(text):
+    from aegis_core import human_gate
+    body = text()
+    (step,) = _check_ci_steps(yaml.safe_load(body)["jobs"]["aegis-check"])
+    assert "if" not in step and "continue-on-error" not in step
+    assert human_gate.aegis_check_jobs(body) == ["aegis-check"]

@@ -266,10 +266,27 @@ def test_a_forged_base_object_is_refused_by_the_public_loaders(tmp_path):
 
 
 @needs_git
+def test_content_that_does_not_hash_to_its_object_id_is_refused(tmp_path, monkeypatch):
+    """The lying cat-file is forged at the public git boundary (gitsafe.run), not at a module seam."""
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
+    real = gitsafe.run
+
+    def forged(args, cwd, **kw):
+        if args and args[0] == "cat-file":
+            return subprocess.CompletedProcess(["git", *args], 0, f"{oid} blob 5\nlies!\n".encode("ascii"), b"")
+        return real(args, cwd, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(IntegrityError, match="does not match the object id"):
+        rule_integrity._read_integrity_blobs(str(repo.root), [oid])
+
+
+@needs_git
 def test_a_missing_object_is_an_error_not_an_empty_rule(tmp_path):
     repo = make_repo(tmp_path)
     with pytest.raises(IntegrityError, match="cannot read object"):
-        rule_integrity._read_blobs(str(repo.root), ["0" * 40])
+        rule_integrity._read_integrity_blobs(str(repo.root), ["0" * 40])
 
 
 @needs_git
@@ -525,6 +542,105 @@ def test_a_crlf_working_copy_of_lf_blobs_reads_no_blob_and_lists_nothing(tmp_pat
     assert rule_integrity.policy_view(view.ruleset.get("inv-a")) == rule_integrity.policy_view(lf)
 
 
+# ── BASE is read once per commit and blob (R-structure-8) ───────────────────
+
+def base_loads(monkeypatch) -> List[int]:
+    loads: List[int] = []
+    real = rule_integrity.load_rules
+    monkeypatch.setattr(rule_integrity, "load_rules", lambda *a, **kw: loads.append(1) or real(*a, **kw))
+    return loads
+
+
+def object_reads(calls: List[List[str]]) -> List[List[str]]:
+    return [c for c in calls if c and c[0] in ("ls-tree", "cat-file")]
+
+
+def reword(repo: hg.Repo, n: int) -> None:
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body=f"# Softer\n\nEdit {n}.\n"))
+
+
+@needs_git
+def test_a_branch_that_keeps_editing_a_rule_reads_and_parses_the_base_once(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    cache = scan_mod.RuleCache()
+    loads, calls = base_loads(monkeypatch), git_calls(monkeypatch)
+    views = []
+    for n in range(3):
+        reword(repo, n)  # a new working fingerprint each time, the same BASE
+        views.append(rule_integrity.effective(repo.root, cache))
+        if n == 0:
+            calls.clear()
+    assert object_reads(calls) == [] and loads == [1], calls
+    for n, view in enumerate(views):
+        assert f"Edit {n}." in view.ruleset.get("trap-a").body and view.unreviewed == ()
+        assert view.anchor == views[0].anchor
+    assert rule_integrity.effective(repo.root).ruleset == views[-1].ruleset  # what an uncached read serves
+
+
+@needs_git
+def test_a_base_that_moves_is_listed_again_and_served_new(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    cache = scan_mod.RuleCache()
+    reword(repo, 0)
+    first = rule_integrity.effective(repo.root, cache)
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nReviewed anew.\n"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("move the reviewed base"))
+    reword(repo, 1)
+    calls = git_calls(monkeypatch)
+    second = rule_integrity.effective(repo.root, cache)
+    assert second.anchor.commit != first.anchor.commit
+    assert [c[0] for c in object_reads(calls)][:1] == ["ls-tree"]
+    assert "Reviewed anew." in second.ruleset.get("inv-a").body
+
+
+@needs_git
+def test_a_forged_blob_is_refused_and_nothing_of_it_is_kept(tmp_path):
+    repo = make_repo(tmp_path)
+    oid = repo.git("rev-parse", "HEAD:" + path_of("inv-a"))
+    loose = repo.root / ".git" / "objects" / oid[:2] / oid[2:]
+    genuine = loose.read_bytes()
+    os.chmod(str(loose), 0o644)
+    loose.write_bytes(zlib.compress(b"blob 5\x00lies!"))
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# The title\n\nA reworded reason.\n"))
+    cache = scan_mod.RuleCache()
+    with pytest.raises(IntegrityError, match="does not match the object id"):
+        rule_integrity.effective(repo.root, cache)
+    loose.write_bytes(genuine)
+    view = rule_integrity.effective(repo.root, cache)
+    assert "Why this rule exists." in view.ruleset.get("inv-a").body  # the reviewed text, not the forgery
+
+
+@needs_git
+def test_a_blob_cache_smaller_than_the_rules_evicts_and_still_serves_them_right(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    padding = "x" * 16000 + "\n"
+    for n in range(300):
+        repo.write(f".aegis/rules/traps/bulk-{n}.md", rule_text(f"bulk-{n}", "trap", "advisory", body=f"# B{n}\n\n{padding}"))
+    repo.git("update-ref", "refs/remotes/origin/main", repo.commit("many large rules"))
+    monkeypatch.setattr(scan_mod.RuleCache, "_MAX_BLOB_BYTES", 4 * 1024 * 1024)
+    cache = scan_mod.RuleCache()
+    for round_ in range(2):
+        for n in range(300):
+            repo.write(f".aegis/rules/traps/bulk-{n}.md",
+                       rule_text(f"bulk-{n}", "trap", "advisory", body=f"# B{n} r{round_}\n\n{padding}"))
+        view = rule_integrity.effective(repo.root, cache)
+        assert view.ruleset == rule_integrity.effective(repo.root).ruleset
+    assert cache._blob_bytes <= 4 * 1024 * 1024
+
+
+@needs_git
+def test_a_spy_at_the_git_boundary_does_not_bypass_the_base_caches(tmp_path, monkeypatch):
+    """R-structure-22 (rewrites the seam test it removes): production code no longer branches on a
+    replaced git runner, so a spy at gitsafe.run sees the cached base serve the second read."""
+    repo = make_repo(tmp_path)
+    calls = git_calls(monkeypatch)
+    cache = scan_mod.RuleCache()
+    for n in range(2):
+        reword(repo, n)
+        rule_integrity.effective(repo.root, cache)
+    assert [c[0] for c in object_reads(calls)] == ["ls-tree", "cat-file"], calls
+
+
 # ── the CI check ─────────────────────────────────────────────────────────────
 
 @needs_git
@@ -687,7 +803,7 @@ def test_unrelated_histories_fail_instead_of_passing(tmp_path, capsys):
 
 
 @needs_git
-@pytest.mark.parametrize("flag", [["--format", "github"], ["--head", "HEAD"]])
+@pytest.mark.parametrize("flag", [["--lane", "x", "--format", "github"], ["--head", "HEAD"]])
 def test_ci_only_options_are_refused_elsewhere(tmp_path, capsys, flag):
     repo = make_repo(tmp_path)
     os.chdir(repo.root)
@@ -874,3 +990,621 @@ def test_reading_the_range_never_writes_to_the_repository(tmp_path, capsys):
 
 def test_gitsafe_is_how_git_is_run():
     assert rule_integrity.gitsafe is gitsafe
+
+
+# ── R-trust-43: at tier A a non-author's approving review of the head commit approves ──
+
+class ReviewGh(hg.FakeGh):
+    """FakeGh plus the pull request reviews endpoint; ``fail`` maps a path fragment to a failing GhResult."""
+
+    def __init__(self, reviews: Optional[List[Dict[str, Any]]] = None, fail: Optional[Dict[str, Any]] = None,
+                 branch_rules: Optional[Dict[str, List[Dict[str, Any]]]] = None, **kw: Any) -> None:
+        kw.setdefault("rules", [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=True)])
+        super().__init__(**kw)
+        self.reviews = reviews if reviews is not None else []
+        self.fail = fail or {}
+        self.branch_rules = branch_rules or {}  # the quoted branch of a rules/branches/ path -> its rules
+
+    def __call__(self, argv, stdin=None, cwd=None):
+        from aegis_core import ghcli
+        if self.missing:
+            return None
+        path = tuple(argv)[-1]
+        for fragment, result in self.fail.items():
+            if fragment in path:
+                self.calls.append((tuple(argv), stdin))
+                return result
+        if "/pulls/" in path:
+            self.calls.append((tuple(argv), stdin))
+            return ghcli.GhResult(0, json.dumps(self.reviews), "")
+        branch = path.partition("/rules/branches/")[2]
+        if branch in self.branch_rules:
+            self.calls.append((tuple(argv), stdin))
+            return ghcli.GhResult(0, json.dumps(self.branch_rules[branch]), "")
+        return super().__call__(argv, stdin, cwd)
+
+    @property
+    def review_calls(self) -> List[str]:
+        return [c[0][-1] for c in self.calls if "/pulls/" in c[0][-1]]
+
+    @property
+    def rules_calls(self) -> List[str]:
+        return [c[0][-1] for c in self.calls if "/rules/branches/" in c[0][-1]]
+
+
+def review(login: str, sha: str, state: str = "APPROVED", association: str = "COLLABORATOR",
+           kind: Optional[str] = "User") -> Dict[str, Any]:
+    user = {"login": login, **({} if kind is None else {"type": kind})}
+    return {"user": user, "state": state, "commit_id": sha, "author_association": association}
+
+
+def tier_a_repo(tmp_path: Path, codeowners: Optional[str] = hg.CODEOWNERS_FULL, signer: bool = False) -> hg.Repo:
+    """make_repo with the base's CODEOWNERS (and an allowed_signers key) committed on main."""
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    if codeowners is not None:
+        repo.write(".github/CODEOWNERS", codeowners)
+    if signer:
+        repo.write("allowed_signers", hg.allowed_signers_text(hg.hardware_public_key()))
+    repo.commit("protect", allow_empty=True)
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("checkout", "-q", "-B", "work")
+    return repo
+
+
+_ABSENT = object()
+
+
+def pull_event(tmp_path: Path, monkeypatch, base: str, head: str, number: Any = 7, login: Any = "agent",
+               name: str = "pull_request", base_ref: Any = "main") -> None:
+    event = tmp_path / "event.json"
+    pull = {"number": number, "user": {"login": login}, "base": {"sha": base, **({} if base_ref is _ABSENT else
+                                                                                 {"ref": base_ref})},
+            "head": {"sha": head}}
+    event.write_text(json.dumps({"number": number, "pull_request": pull}), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", name)
+
+
+def reviewed_weakening(tmp_path: Path, monkeypatch, gh: ReviewGh, **event: Any) -> Tuple[hg.Repo, str]:
+    """A tier A repo whose pull request deletes the binding rule inv-a, run as a pull_request job."""
+    from aegis_core import ghcli
+    repo = tier_a_repo(tmp_path)
+    base = repo.head()
+    (repo.root / path_of("inv-a")).unlink()
+    head = repo.commit("drop the rule")
+    pull_event(tmp_path, monkeypatch, base, event.pop("head", head), **event)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    return repo, head
+
+
+def ci_event(capsys, *extra: str) -> Tuple[int, Any]:
+    rc = main(["check", "--ci", "--format", "json", *extra])
+    out = capsys.readouterr().out
+    return rc, json.loads(out) if out.strip() else None
+
+
+@needs_git
+def test_tier_a_a_non_author_approving_review_of_the_head_approves_a_weakening(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["status"] == "pass", payload
+    assert payload["approval"]["valid"] is True and payload["approval"]["method"] == "review"
+    assert payload["approval"]["signer"] == "human" and payload["approval"]["scope"]["commit"] == head
+    assert gh.review_calls == ["repos/{owner}/{repo}/pulls/7/reviews?per_page=100"]
+    assert gh.posts == []
+    assert main(["check", "--ci"]) == 0
+    assert "approved by review of human" in capsys.readouterr().out
+
+
+def _without_last_push() -> Dict[str, Any]:
+    rule = hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=True)
+    del rule["parameters"]["require_last_push_approval"]
+    return rule
+
+
+@needs_git
+@pytest.mark.parametrize("rule", [
+    hg.pull_request_rule(approvals=1, code_owners=False, dismiss_stale=True, last_push=True),
+    hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=False, last_push=True),
+    hg.pull_request_rule(approvals=0, code_owners=True, dismiss_stale=True, last_push=True),
+    hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=False),
+    _without_last_push(),
+], ids=["no-code-owner-review", "stale-kept", "no-approval", "last-pusher-may-approve", "last-push-absent"])
+def test_a_review_under_a_tier_b_or_c_ruleset_approves_nothing_and_reviews_are_never_read(
+        tmp_path, capsys, monkeypatch, rule):
+    gh = ReviewGh(rules=[rule])
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+    assert gh.review_calls == []
+
+
+@needs_git
+@pytest.mark.parametrize("codeowners", [None, "/src/ @octo\n"], ids=["none", "partial"])
+def test_a_base_codeowners_that_does_not_own_the_change_reads_no_review(tmp_path, capsys, monkeypatch, codeowners):
+    from aegis_core import ghcli
+    gh = ReviewGh()
+    repo = tier_a_repo(tmp_path, codeowners=codeowners)
+    base = repo.head()
+    (repo.root / path_of("inv-a")).unlink()
+    head = repo.commit("drop the rule")
+    gh.reviews = [review("human", head, association="OWNER")]
+    pull_event(tmp_path, monkeypatch, base, head)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None and gh.review_calls == []
+
+
+def _old_sha() -> str:
+    return "0123456789abcdef0123456789abcdef01234567"
+
+
+@needs_git
+@pytest.mark.parametrize("make_reviews", [
+    lambda head: [review("human", _old_sha())],
+    lambda head: [review("agent", head)],
+    lambda head: [review("Agent", head)],
+    lambda head: [review("human", head, association="NONE")],
+    lambda head: [review("human", head, association="CONTRIBUTOR")],
+    lambda head: [review("human", head), review("human", head, state="CHANGES_REQUESTED")],
+    lambda head: [review("human", head, state="DISMISSED")],
+    lambda head: [review("human", head, state="COMMENTED")],
+    lambda head: [review(f"user{i}", head, state="COMMENTED") for i in range(100)],
+    lambda head: [{"state": "APPROVED", "commit_id": head, "author_association": "OWNER"}],
+    lambda head: {"message": "not a list"},
+    lambda head: [review("helper[bot]", head, kind="Bot")],
+    lambda head: [review("helper", head, kind=None)],
+], ids=["old-sha", "author", "author-case", "none-assoc", "contributor", "later-change-request", "dismissed",
+        "commented", "full-page", "no-user", "not-a-list", "bot", "untyped"])
+def test_a_review_that_does_not_approve_this_head_as_a_reviewer_fails(tmp_path, capsys, monkeypatch, make_reviews):
+    gh = ReviewGh()
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = make_reviews(head)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+def test_a_full_first_page_fails_closed_even_when_it_holds_an_approval(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head)] + [review(f"user{i}", head, state="COMMENTED") for i in range(99)]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+@pytest.mark.parametrize("fail", [
+    {"/rules/branches/": (1, "", "gh: Not Found (HTTP 404)")},
+    {"repos/{owner}/{repo}": (4, "", "To get started with GitHub CLI, please run:  gh auth login")},
+    {"/pulls/": (1, "", "gh: Resource not accessible by integration (HTTP 403)")},
+    {"/pulls/": (0, "not json", "")},
+    {"/rules/branches/": (0, "not json", "")},
+], ids=["rules-404", "unauthenticated", "http-403", "reviews-bad-json", "rules-bad-json"])
+def test_gh_that_cannot_answer_fails_closed(tmp_path, capsys, monkeypatch, fail):
+    from aegis_core import ghcli
+    gh = ReviewGh(fail={k: ghcli.GhResult(*v) for k, v in fail.items()})
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+def test_without_gh_the_review_path_fails_closed(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    gh.missing = True
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+
+
+@needs_git
+@pytest.mark.parametrize("event", [
+    {"number": -1}, {"number": 0}, {"number": True}, {"number": "7"},
+    {"login": "a/b"}, {"login": "x?y"}, {"login": ""}, {"login": None},
+    {"head": "short"}, {"name": "push"}, {"name": ""},
+    {"base_ref": _ABSENT}, {"base_ref": None}, {"base_ref": ""}, {"base_ref": "../main"}, {"base_ref": "main?x=1"},
+    {"base_ref": "-x"}, {"base_ref": "a b"}, {"base_ref": "x/"}, {"base_ref": "x.lock"}, {"base_ref": ["main"]},
+], ids=["negative", "zero", "bool", "string", "slash", "query", "empty-login", "no-login", "short-sha",
+        "push", "no-event", "no-base-ref", "null-base-ref", "empty-base-ref", "dotdot-base-ref",
+        "query-base-ref", "dash-base-ref", "space-base-ref", "slash-end-base-ref", "lock-base-ref", "list-base-ref"])
+def test_a_doubtful_event_is_no_pull_request_and_calls_no_gh(tmp_path, capsys, monkeypatch, event):
+    gh = ReviewGh()
+    if event.get("head") == "short":
+        repo = tier_a_repo(tmp_path)
+        base = repo.head()
+        (repo.root / path_of("inv-a")).unlink()
+        head = repo.commit("drop the rule")
+        event = {"head": head[:7]}
+        from aegis_core import ghcli
+        pull_event(tmp_path, monkeypatch, base, **event)
+        monkeypatch.setattr(ghcli, "default_gh_runner", gh)
+        os.chdir(repo.root)
+    else:
+        _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, **event)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None and gh.calls == []
+
+
+TIER_A_RULES = [hg.pull_request_rule(approvals=1, code_owners=True, dismiss_stale=True, last_push=True)]
+
+
+@needs_git
+def test_a_pull_request_into_another_branch_is_judged_by_that_branchs_rules(tmp_path, capsys, monkeypatch):
+    """Given main's rules make the review the merge gate and develop's do not require code-owner review,
+    When the pull request targets develop, Then its review approves nothing and the reviews are never read."""
+    develop = [hg.pull_request_rule(approvals=1, code_owners=False, dismiss_stale=True, last_push=True)]
+    gh = ReviewGh(rules=TIER_A_RULES, branch_rules={"main": TIER_A_RULES, "develop": develop})
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, base_ref="develop")
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["approval"] is None
+    assert gh.rules_calls == ["repos/{owner}/{repo}/rules/branches/develop"] and gh.review_calls == []
+
+
+@needs_git
+@pytest.mark.parametrize("ref,quoted", [("develop", "develop"), ("release/4.4", "release%2F4.4")])
+def test_a_pull_request_into_a_branch_whose_own_rules_gate_the_review_is_approved(
+        tmp_path, capsys, monkeypatch, ref, quoted):
+    weak = [hg.pull_request_rule(approvals=0, code_owners=False, dismiss_stale=False)]
+    gh = ReviewGh(rules=weak, branch_rules={"main": weak, quoted: TIER_A_RULES})
+    _repo, head = reviewed_weakening(tmp_path, monkeypatch, gh, base_ref=ref)
+    gh.reviews = [review("human", head, association="OWNER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["approval"]["method"] == "review", payload
+    assert gh.rules_calls == [f"repos/{{owner}}/{{repo}}/rules/branches/{quoted}"]
+
+
+@needs_git
+def test_a_review_of_the_event_head_does_not_approve_another_head(tmp_path, capsys, monkeypatch):
+    gh = ReviewGh()
+    repo, head = reviewed_weakening(tmp_path, monkeypatch, gh)
+    gh.reviews = [review("human", head, association="OWNER")]
+    repo.write("src/app.py", "x = 2\n")
+    later = repo.commit("a later commit the review never saw")
+    rc, payload = ci_event(capsys, "--head", later)
+    assert rc == 1 and payload["approval"] is None and gh.calls == []
+
+
+@needs_git
+@needs_signing
+def test_a_signed_approval_still_passes_with_no_gh_call(tmp_path, capsys, monkeypatch):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    gh = ReviewGh()
+    from aegis_core import ghcli
+    repo = make_repo(tmp_path, signer_pub=pub)
+    base = repo.head()
+    (repo.root / path_of("inv-a")).unlink()
+    repo.commit("drop the rule")
+    approve(repo, key)
+    pull_event(tmp_path, monkeypatch, base, repo.head())
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["approval"]["method"] == "signature" and gh.calls == []
+
+
+@needs_git
+def test_a_governance_change_at_a_signed_base_accepts_the_same_review(tmp_path, capsys, monkeypatch):
+    from aegis_core import ghcli
+    gh = ReviewGh()
+    repo = tier_a_repo(tmp_path, signer=True)
+    base = repo.head()
+    repo.write(".github/workflows/ci.yml", "name: CI\n")
+    head = repo.commit("a workflow")
+    pull_event(tmp_path, monkeypatch, base, head)
+    monkeypatch.setattr(ghcli, "default_gh_runner", gh)
+    os.chdir(repo.root)
+    rc, payload = ci_event(capsys)
+    assert rc == 1 and payload["governance"]["enforced"] is True and payload["approval"] is None
+    gh.reviews = [review("human", head, association="MEMBER")]
+    rc, payload = ci_event(capsys)
+    assert rc == 0 and payload["governance"]["approved"] is True and payload["approval"]["method"] == "review"
+
+
+# ── R-trust-63: a skip marker is a lane finding, not a check --ci gate (the accepted 2.3 gap) ──
+
+@needs_git
+def test_a_skip_marker_is_reported_by_the_lane_gate_and_not_gated_by_check_ci(tmp_path, capsys):
+    from aegis_core import lane_gate
+    repo = make_repo(tmp_path)
+    repo.git("checkout", "-q", "main")
+    repo.write("tests/test_app.py", "def test_app():\n    assert True\n")
+    repo.commit("a test")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("checkout", "-q", "-B", "work")
+    repo.write("tests/test_app.py", "import pytest\n\n\n@pytest.mark.skip\ndef test_app():\n    assert True\n")
+    repo.commit("skip it")
+    lane = lane_gate.check_lane(repo.root, "docs", base="main", paths=["**"])
+    assert [f.kind for f in lane.findings] == ["skip"]
+    rc, payload, _err = ci(repo, capsys)
+    # The gap stays visible: this flips when check --ci gates skip markers (R-trust-63 option B).
+    assert rc == 0 and payload["weakenings"] == [] and payload["governance"]["paths"] == []
+
+
+# ── R-trust-13 (a): check --ci --no-exec reads git objects only ──────────────────
+
+def _ledger_spies(monkeypatch) -> List[str]:
+    """Every way to the ledger, recorded: its site, its rows and a void row."""
+    from aegis_core import credit, storage
+    from aegis_core.telemetry_engine import ledger
+    seen: List[str] = []
+    for module, name in ((storage, "ledger_site"), (ledger, "ledger_site"), (credit, "read_rows"),
+                         (credit, "record_void")):
+        real = getattr(module, name)
+
+        def spy(*a, _real=real, _name=name, **kw):
+            seen.append(_name)
+            return _real(*a, **kw)
+        monkeypatch.setattr(module, name, spy)
+    return seen
+
+
+def trailer_repo(tmp_path: Path, sentinel: Path) -> hg.Repo:
+    """A pull request whose head adds a conftest.py that writes ``sentinel`` and carries a matching
+    Aegis-Check trailer, so a full check --ci reruns the head snapshot's tests. The user-scope test
+    command runs that conftest.py itself (this machine's pytest may live outside the hermetic run)."""
+    import sys
+    aegis_home = tmp_path / "home" / ".aegis"
+    aegis_home.mkdir(parents=True, exist_ok=True)
+    (aegis_home / "config.json").write_text(json.dumps({"v": 1, "tests": {"command": [sys.executable, "conftest.py"]}}),
+                                            encoding="utf-8")
+    repo = make_repo(tmp_path)
+    repo.write("tests/test_app.py", "def test_app():\n    assert True\n")
+    repo.write("conftest.py", f"open({str(sentinel)!r}, 'w').close()\n")
+    repo.git("add", "-A")
+    tree = repo.git("write-tree")
+    repo.commit(f"tests\n\nAegis-Check: tree={tree} exit=0\n")
+    return repo
+
+
+@needs_git
+def test_no_exec_runs_no_repository_code_and_never_touches_the_ledger(tmp_path, capsys, monkeypatch):
+    sentinel = tmp_path / "sentinel"
+    repo = trailer_repo(tmp_path, sentinel)
+    seen = _ledger_spies(monkeypatch)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--base", "main"])
+    out = capsys.readouterr().out
+    assert rc == 0 and not sentinel.exists()
+    assert "note: --no-exec: the regression and Aegis-Check trailer checks were not run" in out
+    assert seen == [] and not (repo.root / ".git" / "aegis").exists()
+    rc, payload, _err = ci(repo, capsys, "--no-exec")
+    assert rc == 0 and payload["skipped"] == ["regression", "trailer_checks"] and "trailer_checks" not in payload
+    assert "regression" not in payload and seen == [] and not sentinel.exists()
+    for fmt in ("sarif", "github"):
+        assert main(["check", "--ci", "--no-exec", "--base", "main", "--format", fmt]) == 0
+    assert "--no-exec" in capsys.readouterr().out and seen == [] and not sentinel.exists()
+
+
+@needs_git
+def test_without_no_exec_the_same_range_runs_the_head_snapshot(tmp_path, capsys):
+    sentinel = tmp_path / "sentinel"
+    repo = trailer_repo(tmp_path, sentinel)
+    rc, payload, _err = ci(repo, capsys)
+    assert sentinel.exists(), "the control must prove the harness executes the pull request's code"
+    assert "skipped" not in payload and payload["trailer_checks"]
+
+
+@needs_git
+@needs_signing
+def test_no_exec_still_fails_an_unapproved_gate_deletion_and_passes_a_signed_one(tmp_path, capsys):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, signer_pub=pub)
+    (repo.root / path_of("inv-a")).unlink()
+    repo.commit("drop the rule")
+    rc, payload, _err = ci(repo, capsys, "--no-exec")
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["deleted"]
+    approve(repo, key)
+    rc, payload, _err = ci(repo, capsys, "--no-exec")
+    assert rc == 0 and payload["approval"]["valid"] is True
+
+
+@needs_git
+@pytest.mark.parametrize("path,text", [
+    (".github/workflows/aegis.yml", "name: Aegis\non: [pull_request]\njobs: {}\n"),
+    ("allowed_signers", None),
+    ("CODEOWNERS", "* @someone-else\n"),
+], ids=["workflow", "signers", "codeowners"])
+def test_no_exec_fails_an_unapproved_change_to_what_defines_enforcement(tmp_path, capsys, path, text):
+    repo = make_repo(tmp_path, signer_pub=hg.hardware_public_key())
+    repo.write(path, text if text is not None else hg.allowed_signers_text(hg.hardware_public_key(), "ssh-ed25519 " + "A" * 68))
+    repo.commit("rewrite enforcement")
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--base", "main"])
+    out = capsys.readouterr().out
+    assert rc == 1 and "FAILED: governance change without approval" in out
+    assert f"] {path}" in out
+
+
+@needs_git
+@pytest.mark.parametrize("flag", ["--coverage", "--perf"])
+def test_no_exec_refuses_the_flags_that_run_code(tmp_path, capsys, flag):
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", flag, "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "--no-exec" in err and flag in err
+
+
+@needs_git
+def test_no_exec_never_says_strict_runs_code_and_strict_gets_the_ci_refusal(tmp_path, capsys):
+    """Review F5: --strict runs no code under --ci, where it is a usage error of its own. Given --no-exec
+    --strict, Then exit 2 with --ci's refusal of --strict; given --no-exec --coverage --strict, Then exit
+    2 and the --no-exec refusal names --coverage alone."""
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--strict", "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "--ci does not combine with --strict" in err and "run the repository's code" not in err
+    rc = main(["check", "--ci", "--no-exec", "--coverage", "--strict", "--base", "main"])
+    err = capsys.readouterr().err
+    assert rc == 2 and "Error: --no-exec does not combine with --coverage: they run the repository's code" in err
+
+
+@needs_git
+def test_no_exec_refuses_a_required_regression_gate(tmp_path, capsys):
+    import argparse
+    from aegis_cli.check import run_check
+    repo = make_repo(tmp_path)
+    args = argparse.Namespace(ci=True, no_exec=True, require_regression=True, base="main", workspace=str(repo.root))
+    assert run_check(args) == 2 and "--require-regression" in capsys.readouterr().err
+
+
+@needs_git
+def test_no_exec_without_ci_is_a_usage_error(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--no-exec"])
+    assert rc == 2 and "--ci" in capsys.readouterr().err
+
+
+@needs_git
+def test_no_exec_with_an_unresolvable_base_still_fails(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    os.chdir(repo.root)
+    rc = main(["check", "--ci", "--no-exec", "--base", "no-such-branch"])
+    assert rc == 1 and "cannot resolve the base" in capsys.readouterr().err
+
+
+# ── R-trust-49: one fingerprint, one key schema, one rank; the JSON shapes stay as they were ──
+
+# The key order of each serialized record at ff3ac4d0 (AC-9): a reader that walks the keys sees the same document.
+WEAKENING_KEYS = ["code", "rule", "path", "message"]
+RULES_BASE_KEYS = ["ref", "commit", "source", "witnessed", "label"]
+UNREVIEWED_KEYS = ["id", "title", "change"]
+
+
+@needs_git
+def test_a_deleted_gate_rule_serializes_its_weakening_in_the_pinned_key_order(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    (repo.root / path_of("inv-a")).unlink()
+    repo.commit("drop the rule")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1 and [w["code"] for w in payload["weakenings"]] == ["deleted"]
+    assert list(payload["weakenings"][0]) == WEAKENING_KEYS
+    assert payload["weakenings"][0]["rule"] == "inv-a" and payload["weakenings"][0]["path"] == path_of("inv-a")
+
+
+@needs_git
+def test_a_scan_serializes_the_base_and_each_unreviewed_rule_in_the_pinned_key_order(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", body="# A branch-local title\n\nReworded.\n"))
+    scan_mod.RULE_CACHE.invalidate()
+    result = scan_mod.scan(str(repo.root), ["src/app.py"])
+    assert list(result["rules_base"]) == RULES_BASE_KEYS
+    assert result["rules_base"]["source"] == "origin-head" and result["rules_base"]["witnessed"] is True
+    assert [list(u) for u in result["unreviewed_rules"]] == [UNREVIEWED_KEYS]
+    assert result["unreviewed_rules"] == [{"id": "inv-a", "title": "A branch-local title", "change": "changed"}]
+
+
+@needs_git
+def test_one_fingerprint_function_decides_a_working_tree_equal_to_base_and_one_that_is_not(tmp_path):
+    from aegis_core import rule_inventory
+
+    repo = make_repo(tmp_path)
+    working = rule_inventory.inventory_rules(repo.root)
+    base = rule_integrity._inventory_at(str(repo.root), repo.head())
+    assert base.fingerprint == rule_inventory.fingerprint(base.entries) == rule_inventory.fingerprint(working.entries)
+    assert working.fingerprint == base.fingerprint
+    view = rule_integrity.effective(repo.root)
+    assert view.unreviewed == () and view.ruleset.fingerprint == load_rules(repo.root).fingerprint
+
+    target = repo.root / path_of("trap-a", "trap")
+    target.write_bytes(target.read_bytes().replace(b"Why this rule", b"why this rule"))
+    edited = rule_inventory.inventory_rules(repo.root)
+    assert edited.fingerprint == rule_inventory.fingerprint(edited.entries) != base.fingerprint
+    assert rule_integrity.effective(repo.root).ruleset.fingerprint == f"{edited.fingerprint}@{repo.head()}"
+
+
+@needs_git
+def test_no_rule_files_give_the_fingerprint_of_no_entries_on_both_sides(tmp_path):
+    from aegis_core import rule_inventory
+
+    repo = hg.Repo(tmp_path / "bare-rules", hg.Home(tmp_path / "home"))
+    repo.write("src/app.py", "x = 1\n")
+    repo.commit("no rules")
+    empty = rule_inventory.fingerprint(())
+    assert rule_inventory.inventory_rules(repo.root).fingerprint == empty
+    assert rule_integrity._inventory_at(str(repo.root), repo.head()).fingerprint == empty
+
+
+def test_weakenings_no_longer_reports_applies_to_and_check_ci_still_does(tmp_path):
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a"))
+    scoped = parsed(tmp_path / "b", "inv-a", rule_text("inv-a", extra="applies_to:\n  - api-surface"))
+    assert weakenings(base, scoped) == [] and weakenings(scoped, base) == []
+
+
+@needs_git
+def test_applies_to_is_reported_once_per_rule_last_within_a_base_rule_then_for_head_rules(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/app.py",), extra="applies_to:\n  - api-surface"))
+    repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", extra="applies_to:\n  - cli"))
+    repo.commit("scope both rules")
+    rc, payload, _err = ci(repo, capsys)
+    assert rc == 1
+    assert [(w["code"], w["rule"]) for w in payload["weakenings"]] == [
+        ("coverage", "inv-a"), ("applies_to", "inv-a"), ("applies_to", "trap-a")]
+
+
+@needs_git
+def test_a_binding_edit_that_changes_applies_to_and_widens_target_paths_is_still_served_as_reviewed(tmp_path):
+    """The _stricter guard: a widening alone would be merged, but not one that also changes applies_to."""
+    repo = make_repo(tmp_path)
+    repo.write(path_of("inv-a"), rule_text("inv-a", paths=("src/*.py", "lib/*.py"), extra="applies_to:\n  - api-surface"))
+    view = rule_integrity.effective(repo.root)
+    served = view.ruleset.get("inv-a")
+    assert not served.applies_to("lib/x.py") and "applies_to" not in served.meta
+    assert [(u.id, u.change) for u in view.unreviewed] == [("inv-a", "changed")]
+
+
+@pytest.mark.parametrize("rtype,enforcement,rank", [
+    ("gate", None, 3), ("gate", "advisory", 3), ("invariant", None, 2), ("invariant", "advisory", 2),
+    ("trap", "gate", 2), ("boundary", "gate", 2), ("trap", "mechanical", 1), ("trap", None, 1), (None, None, 1),
+], ids=["gate", "gate-advisory", "invariant", "invariant-advisory", "trap-gate", "boundary-gate", "trap-mech",
+        "trap", "untyped"])
+def test_the_rank_is_three_for_a_gate_two_for_any_other_mandatory_rule_and_one_otherwise(rtype, enforcement, rank):
+    from aegis_core import rules as rules_mod
+
+    meta = {} if enforcement is None else {"enforcement": enforcement}
+    rule = rules_mod.Rule("r", "x.md", rtype, meta, "", "0" * 64)
+    assert rule.rank == rank and rule.mandatory is (rank >= 2)
+
+
+def test_the_duplicated_definitions_are_gone():
+    from aegis_core import rules as rules_mod
+
+    assert not hasattr(rules_mod, "rank_of")
+    assert [name for name in ("renamed_rules", "BENIGN_KEYS", "EXCLUDED_KEYS") if hasattr(rule_integrity, name)] == []
+
+
+# Adding a key to a rule's known keys is a reviewed edit of this literal (aegis_core.rules owns the schema).
+KNOWN_KEYS = frozenset({
+    "type", "enforcement", "target_paths", "forbid_ast", "expired_at", "applies_to",
+    "minimum_mode", "impact_weight", "expiry_days", "expiry_sessions", "detect",
+    "id", "name", "description", "domain", "hypothesis", "prediction", "falsification", "created", "tags",
+    "lineage", "triggers", "persona_name", "origin", "expertise", "expertise_domain", "promotion_threshold",
+    "demotion_threshold",
+})
+
+
+def test_the_known_keys_are_the_pinned_schema_and_only_another_key_is_unknown(tmp_path):
+    from dataclasses import replace
+
+    from aegis_core import rules as rules_mod
+
+    assert rules_mod.KNOWN_KEYS == KNOWN_KEYS and "KNOWN_KEYS" in rules_mod.__all__
+    base = parsed(tmp_path, "inv-a", rule_text("inv-a"))
+    for key in sorted(KNOWN_KEYS):
+        head = replace(base, meta={**base.meta, key: "changed-value"})
+        assert "unknown_key" not in codes(weakenings(base, head)), key
+    invented = replace(base, meta={**base.meta, "exempt_files": ["src"]})
+    assert codes(weakenings(base, invented)) == ["unknown_key"]

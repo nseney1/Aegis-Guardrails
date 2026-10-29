@@ -9,12 +9,13 @@ import pytest
 from aegis_core import __version__
 from aegis_core.scaffolding import (
     ACTIVE_STARTERS,
-    CI_WORKFLOW_PATH,
+    CI_WORKFLOW_LABEL,
     DEFAULT_RULE_PRESET,
     RULE_PRESETS,
-    _declare_type,
-    _runs_aegis_check,
-    _workflow_files,
+    _RUNS_AEGIS_CHECK,
+    declare_type,
+    runs_aegis_check,
+    workflow_files,
     ci_workflow,
     install_rules,
     packaged_active_rules,
@@ -52,9 +53,25 @@ class TestPackagedDirAndRules:
         assert "no-eval" not in guidance
         assert {"providence", "destructive-ops", "testing"} <= set(guidance)
 
-    def test_packaged_active_rules_raises_when_missing(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="not found; reinstall aegis-guardrails"):
-            packaged_active_rules(locator=lambda name: tmp_path / "missing" / name)
+    def test_packaged_active_rules_raises_when_missing(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr("aegis_core.scaffolding.packaged_dir", lambda name: tmp_path / "missing" / name)
+        with pytest.raises(ValueError, match="^packaged rule\\(s\\) no-eval not found; reinstall aegis-guardrails$"):
+            packaged_active_rules()
+
+    def test_preset_install_and_active_starters_use_the_canonical_locator(self, tmp_path: Path, monkeypatch) -> None:
+        source = tmp_path / "package" / "rules"
+        source.mkdir(parents=True)
+        for name in ("providence", "destructive-ops", "no-eval"):
+            (source / f"{name}.md").write_bytes(f"---\nid: {name}\n---\n# Packaged {name}\n".encode())
+        monkeypatch.setattr("aegis_core.scaffolding.packaged_dir", lambda name: source.parent / name)
+
+        assert preset_rules("minimal") == [source / "providence.md", source / "destructive-ops.md"]
+        assert packaged_active_rules() == {"no-eval": source / "no-eval.md"}
+        dest = tmp_path / "installed"
+        assert install_rules(dest, "minimal") == ["providence", "destructive-ops"]
+        assert {p.name: p.read_bytes() for p in dest.iterdir()} == {
+            name: (source / name).read_bytes() for name in ("providence.md", "destructive-ops.md")
+        }
 
     def test_preset_rules_resolves_presets_and_rejects_unknown(self) -> None:
         assert DEFAULT_RULE_PRESET == "standard"
@@ -72,21 +89,21 @@ class TestDeclareTypeAndInstallRules:
     def test_declare_type_inserts_or_replaces_type_and_target_paths(self, tmp_path: Path) -> None:
         rule_file = tmp_path / "sample.md"
         rule_file.write_bytes(b"---\nid: sample\ndomain: governance\n---\n# Title\n")
-        projected = _declare_type(rule_file, "persona")
+        projected = declare_type(rule_file, "persona")
         assert projected == (
             b"---\nid: sample\ntype: persona\ntarget_paths: []\ndomain: governance\n---\n# Title\n"
         )
 
         typed_file = tmp_path / "typed.md"
         typed_file.write_bytes(b"---\r\nid: typed\r\ntype: trap\r\ntarget_paths: [\"*.py\"]\r\n---\r\n# Body\r\n")
-        replaced = _declare_type(typed_file, "persona")
+        replaced = declare_type(typed_file, "persona")
         assert replaced == b"---\r\nid: typed\r\ntype: persona\r\ntarget_paths: [\"*.py\"]\r\n---\r\n# Body\r\n"
 
     def test_declare_type_rejects_missing_frontmatter(self, tmp_path: Path) -> None:
         bad = tmp_path / "bad.md"
         bad.write_text("# No frontmatter\n", encoding="utf-8")
         with pytest.raises(ValueError, match="has no frontmatter"):
-            _declare_type(bad, "persona")
+            declare_type(bad, "persona")
 
     def test_install_rules_respects_skip_force_and_dry_run(self, tmp_path: Path) -> None:
         dry_dest = tmp_path / "dry"
@@ -109,7 +126,7 @@ class TestDeclareTypeAndInstallRules:
 
 class TestCiWorkflowHelpers:
     def test_ci_workflow_pins_version_and_runs_aegis_check(self, tmp_path: Path) -> None:
-        assert CI_WORKFLOW_PATH == ".github/workflows/aegis.yml"
+        assert CI_WORKFLOW_LABEL == ".github/workflows/aegis.yml"
         wf = ci_workflow()
         assert f"pip install aegis-guardrails=={__version__}" in wf
         wf_file = tmp_path / ".github" / "workflows" / "aegis.yml"
@@ -118,7 +135,157 @@ class TestCiWorkflowHelpers:
         other_file = wf_file.parent / "other.yaml"
         other_file.write_text("name: Test\non: push\njobs: {}\n", encoding="utf-8")
 
-        assert _workflow_files(tmp_path) == [wf_file, other_file]
-        assert _runs_aegis_check(wf_file) is True
-        assert _runs_aegis_check(other_file) is False
-        assert _runs_aegis_check(tmp_path / "missing.yml") is False
+        assert workflow_files(tmp_path) == [wf_file, other_file]
+        assert runs_aegis_check(wf_file) is True
+        assert runs_aegis_check(other_file) is False
+        assert runs_aegis_check(tmp_path / "missing.yml") is False
+
+
+class TestCiWorkflowSarifUpload:
+    """R-checks-41: the generated workflow uploads the SARIF log only where code scanning can take it,
+    from a job of its own that holds the write permission and runs none of the pull request's code."""
+
+    @staticmethod
+    def _doc():
+        yaml = pytest.importorskip("yaml")
+        return yaml.safe_load(ci_workflow())
+
+    def test_the_gate_is_unchanged_and_only_the_upload_job_may_write_security_events(self):
+        doc = self._doc()
+        gate, sarif = doc["jobs"]["aegis-check"], doc["jobs"]["aegis-sarif"]
+        runs = [step.get("run", "") for step in gate["steps"]]
+        assert runs[-2:] == ["aegis check", "aegis check --ci"] and _RUNS_AEGIS_CHECK.search(ci_workflow())
+        assert "security-events" not in gate["permissions"] and "security-events" not in doc.get("permissions", {})
+        assert sarif["permissions"] == {"contents": "read", "security-events": "write"}
+        (upload,) = [step for step in sarif["steps"] if "upload-sarif" in step.get("uses", "")]
+        assert "head.repo.full_name == github.repository" in upload["if"]
+        assert "!github.event.repository.private" in upload["if"] and "always()" in upload["if"]
+
+    def test_the_sarif_step_cannot_fail_the_run_and_runs_no_ci_check_with_a_token(self):
+        steps = self._doc()["jobs"]["aegis-sarif"]["steps"]
+        runs = [step.get("run", "") for step in steps]
+        sarif = runs.index("aegis check --format sarif > aegis.sarif")
+        assert steps[sarif]["continue-on-error"] is True
+        assert sarif < [i for i, step in enumerate(steps) if "upload-sarif" in step.get("uses", "")][0]
+        assert not [r for r in runs if "--ci" in r] and not [step for step in steps if "env" in step]
+
+    def test_the_rendered_expressions_are_github_expressions(self):
+        text = ci_workflow()
+        assert "${{ always() && hashFiles('aegis.sarif') != ''" in text
+        assert "${ always()" not in text.replace("${{ always()", "")
+
+
+class TestInitWorkflowRecognition:
+    """Init reports commands that run a check, including installed Python module entrypoints."""
+
+    @pytest.fixture
+    def project(self, tmp_path, monkeypatch):
+        from aegis_core import hosts
+
+        home = tmp_path / "home"
+        home.mkdir()
+        for key in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(key, str(home))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / "gitconfig"))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        for key in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(hosts, "APP_DIRS", {})
+        root = tmp_path / "ws"
+        root.mkdir()
+        return root
+
+    @staticmethod
+    def init_action(root, capsys):
+        import json
+        from aegis_cli.cli import main
+
+        assert main(["init", "--workspace", str(root), "--yes", "--dry-run", "--no-hooks",
+                     "--rules", "none-active", "--host", "claude-code", "--json"]) == 0
+        doc = json.loads(capsys.readouterr().out)
+        action, = [a for a in doc["actions"] if a["target"] == CI_WORKFLOW_LABEL]
+        return action
+
+    @pytest.mark.parametrize("run", [
+        "python3 -m aegis_cli check", "python3 -m aegis_cli.cli check --ci",
+        "python3 -I -m aegis_cli check", "python3 -I -m aegis_cli.cli check --ci",
+        "python -m aegis_cli.cli check", "'python3 -I -m aegis_cli.cli check --ci'",
+        "pip install aegis-guardrails && aegis check", "echo ready; python3 -m aegis_cli check",
+        "|\n          python3 -I -m aegis_cli.cli check --ci",
+    ], ids=["module", "cli-module", "isolated", "isolated-cli", "python", "yaml-quoted", "and", "semicolon", "block"])
+    def test_init_names_a_workflow_running_check(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "present"
+        assert action["detail"] == ".github/workflows/ci.yml runs aegis check"
+
+    @pytest.mark.parametrize("run", [
+        "python3 -m aegis_cli_extra check", "python3 -m aegis_cli.cli.extra check",
+        "python3 -m aegis_cli check-other", "echo python3 -m aegis_cli check",
+        "echo 'aegis check'", "echo 'ready && aegis check'", "# aegis check",
+        "echo ';' aegis check", "echo '&&' python3 -m aegis_cli check",
+        r"echo \; aegis check", r"echo \&\& python3 -m aegis_cli check",
+        "|\n          # python3 -I -m aegis_cli.cli check --ci\n          echo ready",
+    ], ids=["module-near", "submodule-near", "command-near", "echo-module", "echo-bare", "quoted-shell", "comment", "quoted-semicolon", "quoted-and", "escaped-semicolon", "escaped-and", "block-comment"])
+    def test_init_suggests_ci_for_mentions_that_do_not_run_check(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "suggested"
+        assert action["detail"] == "no GitHub Actions workflow runs aegis check; aegis init --ci writes one"
+
+    def test_an_unreadable_workflow_is_not_reported_as_running_check(self, project, capsys, monkeypatch):
+        import builtins
+
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(b"jobs:\n  test:\n    steps:\n      - run: aegis check\n")
+        real_open = builtins.open
+
+        def unreadable(path, *args, **kwargs):
+            if Path(path) == workflow:
+                raise PermissionError("workflow unreadable")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", unreadable)
+        assert self.init_action(project, capsys)["result"] == "suggested"
+
+    @pytest.mark.parametrize("run", [
+        "PYTHONPATH=. aegis check", "aegis check>results.txt",
+        "PYTHONPATH=. python3 -m aegis_cli check", "python3 -m aegis_cli check>results.txt",
+        'A="two words" python3 -I -m aegis_cli.cli check>results.txt',
+        "A='echo; harmless' aegis check", "A=foo#bar aegis check",
+        "PYTHONPATH=. MODE=fast aegis check>results.txt",
+        "echo ready; PYTHONPATH=. python3 -m aegis_cli check>results.txt",
+    ], ids=["assignment", "redirect", "module-assignment", "module-redirect", "quoted-space",
+            "quoted-semicolon", "embedded-hash", "multiple-assignments", "compound"])
+    def test_init_recognizes_shell_assignments_and_redirections(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "present"
+        assert action["detail"] == ".github/workflows/ci.yml runs aegis check"
+
+    @pytest.mark.parametrize("run", [
+        "A='echo; aegis check --ci'", 'A="echo; python3 -m aegis_cli check --ci"',
+        "A='unfinished; aegis check --ci", "aegis check \\", "aegis check#suffix",
+        "PYTHONPATH=. echo aegis check", "echo ';' PYTHONPATH=. aegis check>results.txt",
+        r"echo \; PYTHONPATH=. aegis check>results.txt", "# PYTHONPATH=. aegis check",
+        "A=foo # aegis check", "1A=. aegis check",
+        "PYTHONPATH=. echo '&&' python3 -m aegis_cli check", r"aegis check\>results.txt",
+    ], ids=["single-quoted-assignment-only", "double-quoted-assignment-only", "unterminated",
+            "trailing-escape", "subcommand-hash", "assignment-echo", "quoted-separator",
+            "escaped-separator", "comment", "assignment-comment", "invalid-name", "quoted-and",
+            "escaped-redirection"])
+    def test_init_rejects_shell_mentions_and_malformed_commands(self, project, capsys, run):
+        workflow = project / ".github" / "workflows" / "ci.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_bytes(("jobs:\n  test:\n    steps:\n      - run: " + run + "\n").encode())
+        action = self.init_action(project, capsys)
+        assert action["result"] == "suggested"
+        assert action["detail"] == "no GitHub Actions workflow runs aegis check; aegis init --ci writes one"

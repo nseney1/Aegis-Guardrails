@@ -1,0 +1,7 @@
+# Recorded release-verification response
+
+`gh_attestation_verify.json` preserves selected JSON fields from the repository author's public `gh attestation verify --format json` capture, supplied for this regression test. The capture used gh 2.103.2 on 2026-10-26 for Aegis-Guardrails commit `9feae103cf58d5d29cacdb8699c38d8c50ec5287` on `refs/heads/main`, tree `874fc12ef1b15340acad9667d57e12978ba159b2`, run `39672680187/1`. The original subject SHA-256 is `d5ad9ad58ea7d60cfc04f91927c8ee9b580813ea432f9c1ccc8fd0b0812608f5`.
+
+Sanitization retained the complete verified statement and the six certificate fields that `release_verify` rechecks, with their original values and nesting. It removed the attestation bundle, encoded signatures and certificates, bundle URLs, timestamps, verified identity and unused certificate metadata. This fixture tests the JSON shape after gh verification; it cannot itself verify the signature or prove that GitHub still serves the attestation.
+
+The public `verify_release` tests use real temporary Git objects and FakeGh at the process boundary. They replace only the repository, commit, tree and corresponding subject digest in a fresh fixture copy to bind it to that repository. This is a shape and policy regression, not a claim that the recorded signature attests those temporary identities. A supplementary check uses the untouched fixture and its original subject. Each field that Aegis rechecks also has a rejection test through the public API.

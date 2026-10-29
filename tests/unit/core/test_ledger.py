@@ -208,6 +208,20 @@ def test_a_v2_row_with_only_a_rule_or_only_an_outcome_is_unusable(tmp_path: Path
     assert (view.rows, view.skipped_lines, view.unusable_rows) == ([], [], 2)
 
 
+def test_every_credit_event_row_is_skipped_not_counted_unusable():
+    """Given a v2 row of each credit.EVENTS kind (no outcome), When rows are normalized, Then each is
+    skipped: the ledger's skip list cannot miss a kind credit writes."""
+    from aegis_core import credit
+
+    for kind in credit.EVENTS:
+        assert ledger.normalize_rows([{"v": 2, "event": kind, "rule": "r"}]) == ([], 0), kind
+
+
+@pytest.mark.parametrize("kind", ["check_confirm", "human_label", "claim", "transition"])
+def test_a_row_of_a_kind_no_code_writes_is_one_unusable_row(kind):
+    assert ledger.normalize_rows([{"v": 2, "event": kind, "rule": "r"}]) == ([], 1)
+
+
 def _append_unterminated(ws: Path, row: dict) -> None:
     """A complete row whose newline never reached the disk (a crash cut the write there)."""
     with open(_path(ws), "ab") as fh:

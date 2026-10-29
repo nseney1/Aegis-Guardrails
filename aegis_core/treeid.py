@@ -7,20 +7,31 @@ the repository's index, refs, work tree or object store:
 1. The work tree root is the git top level of the workspace; its git directory is resolved from
    ``<root>/.git`` (a directory, or a ``gitdir:`` file of a linked worktree).
 2. Every ``GIT_*`` variable is scrubbed from the environment (``rev-parse --local-env-vars``,
-   ``GIT_CONFIG_*``, ``GIT_EXTERNAL_DIFF``, ``GIT_SSH*``, ``GIT_TRACE*``, ``GIT_ATTR_SOURCE``,
-   ``GIT_EXEC_PATH`` and the rest), then ``GIT_DIR``/``GIT_WORK_TREE`` are set explicitly.
+   ``GIT_CONFIG_PARAMETERS``/``COUNT``, ``GIT_EXTERNAL_DIFF``, ``GIT_SSH*``, ``GIT_TRACE*``,
+   ``GIT_ATTR_SOURCE``, ``GIT_EXEC_PATH`` and the rest), then ``GIT_DIR``/``GIT_WORK_TREE`` are set
+   explicitly. ``GIT_CONFIG_GLOBAL``, ``GIT_CONFIG_SYSTEM`` and ``GIT_CONFIG_NOSYSTEM`` stay: they
+   name the user's and the system's config files, whose drivers step 5 runs as the user's git does.
 3. The real index is copied, mtime preserved, into a private 0700 directory and used as
    ``GIT_INDEX_FILE``, so git's racy-timestamp logic judges the same stat data the real one would.
 4. ``ls-files -v`` is audited: an assume-unchanged or skip-worktree entry whose path exists on
    disk lets a file change without git seeing it, so the tree is ``unbindable``.
-5. Every filter driver the configuration names is neutralised on the commands that hash content
-   (``filter.<d>.clean=``, ``smudge=``, ``process=``, ``required=false``): a clean filter is a
-   program the repository chose.
+5. Every filter driver that the config of the work tree or of a checked-out submodule below it
+   (16 deep at most) defines outside the user's and the system's config is neutralised on the
+   commands that hash content (``filter.<d>.clean=``, ``smudge=``, ``process=``,
+   ``required=false``): a clean filter is a program the repository chose. A driver of the user's
+   or the system's config (git-lfs, say) runs as in any git command the user types, so the tree is
+   the one a commit records; a name the repository also defines is neutralised everywhere, and a
+   git without ``config --show-scope`` (before 2.26) neutralises every driver. ``git add`` runs
+   ``git status`` in each submodule under that submodule's own config, and the ``-c`` options reach
+   it, so its drivers are named there too. A driver ``-c`` cannot name (it splits at the first
+   ``=``), a deeper chain or an unreadable config makes the tree ``unbindable``.
 6. A private object directory takes the writes, with the real store as its alternate.
 7. ``git add -A -- . ':(exclude,glob)**/.aegis/state/**'`` then ``git write-tree``.
 8. An empty tree is refused when HEAD is not empty (an unreadable work tree must not look clean).
 9. Gitlinks are listed; a submodule whose HEAD or work tree differs from the recorded commit makes
-   the result ``partial``: the tree names the pointer, not the submodule's content.
+   the result ``partial``: the tree names the pointer, not the submodule's content. The submodule
+   is read under the same switches (its own drivers named), with no variable of the work tree's
+   environment and with replace refs ignored.
 
 ``bind`` keeps the private index for as long as the caller needs it (the snapshot export and the
 diff against the base read it); ``tree_of`` is the one-shot form.
@@ -28,15 +39,15 @@ diff against the base read it); ``tree_of`` is the one-shot form.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from aegis_core import gitsafe, pathlookup
+from aegis_core import gitsafe
 from aegis_core.errors import AegisError
 
 __all__ = [
@@ -45,6 +56,7 @@ __all__ = [
     "TreeBinding",
     "TreeError",
     "bind",
+    "named_paths",
     "tree_files",
     "tree_of",
 ]
@@ -60,8 +72,11 @@ _FILTER_VARS = ("clean", "smudge", "process")
 _STABLE_CONFIG = (
     "core.fsmonitor=false", f"core.hooksPath={os.devnull}", "core.splitIndex=false",
     "core.untrackedCache=false", "gc.auto=0", "maintenance.auto=false",
-    "core.trustctime=true", "core.checkStat=default",
+    "core.trustctime=true", "core.checkStat=default", "protocol.allow=never", "credential.helper=",
+    "core.sshCommand=false",
 )
+#: Checked-out submodules below the work tree whose drivers are named; a deeper chain is unbindable.
+_MAX_SUBMODULE_DEPTH = 16
 
 
 class TreeError(AegisError):
@@ -87,21 +102,16 @@ class TreeBinding:
                 "gitlinks": list(self.gitlinks)}
 
 
-def _named(paths: Sequence[str]) -> str:
+def named_paths(paths: Sequence[str]) -> str:
+    """The first five of ``paths``, then how many more."""
     shown = ", ".join(paths[:_NAMED])
     return shown + (f" and {len(paths) - _NAMED} more" if len(paths) > _NAMED else "")
 
 
-def _git_executable() -> str:
-    found = pathlookup.which("git")
-    if not found:
-        raise TreeError("git is not installed or not on PATH")
-    return found
-
-
 def _locate(root: Path) -> Tuple[Path, Path, Path]:
     """(work tree top, git directory, real object directory) of the work tree holding ``root``."""
-    top = gitsafe.toplevel(root)
+    with gitsafe.scrubbed():  # the one git call here that runs outside BoundTree.env
+        top = gitsafe.toplevel(root)
     if top is None:
         raise TreeError(f"{root} is not inside a git work tree")
     dotgit = top / ".git"
@@ -125,8 +135,112 @@ def _locate(root: Path) -> Tuple[Path, Path, Path]:
     return top, gitdir, common / "objects"
 
 
+_CONFIG_SCOPES = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
+
+
 def _scrubbed_environment() -> Dict[str, str]:
-    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_") or k.upper() in _CONFIG_SCOPES}
+
+
+def _submodule_environment() -> Dict[str, str]:
+    """git inside a submodule: nothing of the work tree's environment reaches it (``GIT_DIR`` or
+    ``GIT_INDEX_FILE`` would make it read the work tree's repository instead)."""
+    env = _scrubbed_environment()
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
+    return env
+
+
+def _spawn(flags: Sequence[str], args: Sequence[str], cwd: Path, env: Dict[str, str],
+           stdin: Optional[bytes] = None, timeout: float = GIT_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
+    try:
+        argv = [gitsafe.git_executable(), *flags, *args]
+    except gitsafe.GitError as exc:  # a sibling of TreeError, the only error tree_of turns into an answer
+        raise TreeError(str(exc)) from exc
+    try:
+        return subprocess.run(argv, cwd=str(cwd), env=env, input=stdin,
+                              stdin=None if stdin is not None else subprocess.DEVNULL,
+                              capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise TreeError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
+    except OSError as exc:
+        raise TreeError(f"cannot run git: {exc}") from exc
+
+
+def _parse_entries(stdout: bytes) -> List[Tuple[str, str, str]]:
+    """``(mode, oid, path)`` of each ``ls-files -s -z`` record."""
+    found = []
+    for item in stdout.split(b"\0"):
+        meta, _, path = item.partition(b"\t")
+        parts = meta.split()
+        if len(parts) == 3:
+            found.append((parts[0].decode("ascii"), parts[1].decode("ascii"), os.fsdecode(path)))
+    return found
+
+
+def _stable_flags() -> List[str]:
+    return [arg for setting in _STABLE_CONFIG for arg in ("-c", setting)]
+
+
+def _neutralising_flags(drivers: Sequence[str]) -> List[str]:
+    flags: List[str] = []
+    for driver in drivers:
+        flags += [arg for var in _FILTER_VARS for arg in ("-c", f"filter.{driver}.{var}=")]
+        flags += ["-c", f"filter.{driver}.required=false"]
+    return flags
+
+
+def _config_keys(repo: Path, env: Dict[str, str]) -> Optional[List[Tuple[str, str]]]:
+    """``(scope, key)`` of each config entry git reads in ``repo``, or None when it cannot list them.
+    A git before 2.26 has no ``--show-scope``: every scope then reads ``""``, which is not trusted."""
+    listed = _spawn(_stable_flags(), ["config", "--list", "--show-scope", "--name-only", "-z"], repo, env)
+    if listed.returncode == 0:
+        fields = listed.stdout.decode("utf-8", "replace").split("\0")
+        return list(zip(fields[0::2], fields[1::2]))
+    listed = _spawn(_stable_flags(), ["config", "--list", "--name-only", "-z"], repo, env)
+    if listed.returncode != 0:
+        return None
+    return [("", key) for key in listed.stdout.decode("utf-8", "replace").split("\0")]
+
+
+def _filter_drivers(repo: Path, env: Dict[str, str]) -> Tuple[List[str], str]:
+    """The filter drivers that the configuration of ``repo`` (read under ``env``) and of each
+    checked-out submodule below it defines outside ``gitsafe.TRUSTED_SCOPES``, and why that list
+    cannot be relied on (``""`` when it can).
+
+    The ``-c`` options of the outer ``git add`` reach the ``git status`` it runs in a submodule
+    (``GIT_CONFIG_PARAMETERS``), so naming a submodule's drivers there switches them off.
+    """
+    drivers: List[str] = []
+    seen: Set[str] = set()
+    pending = [(repo, 0)]
+    while pending:
+        here, depth = pending.pop()
+        real = os.path.realpath(here)
+        if real in seen:
+            continue
+        seen.add(real)
+        if depth > _MAX_SUBMODULE_DEPTH:
+            return drivers, f"submodules are nested more than {_MAX_SUBMODULE_DEPTH} deep"
+        here_env = env if depth == 0 else _submodule_environment()
+        keys = _config_keys(here, here_env)
+        if keys is None:
+            if depth == 0:
+                return drivers, "git config --list failed, so its filter drivers cannot be switched off"
+            continue  # git cannot read this submodule's config, so it runs nothing from it
+        for scope, key in keys:
+            lowered = key.lower()
+            if scope not in gitsafe.TRUSTED_SCOPES and lowered.startswith("filter.") \
+                    and lowered.rsplit(".", 1)[-1] in (*_FILTER_VARS, "required"):
+                driver = key[len("filter."):].rsplit(".", 1)[0]
+                if "=" in driver or "\ufffd" in driver:  # -c splits at the first "="; undecodable bytes
+                    return drivers, f"filter driver {driver!r} has a name git -c cannot carry: it cannot be switched off"
+                if driver and driver not in drivers:
+                    drivers.append(driver)
+        listing = _spawn(_stable_flags(), ["ls-files", "-s", "-z"], here, here_env)
+        if listing.returncode == 0:
+            pending += [(here / path, depth + 1) for mode, _oid, path in _parse_entries(listing.stdout)
+                        if mode == _GITLINK_MODE and (here / path / ".git").exists()]
+    return drivers, ""
 
 
 class BoundTree:
@@ -150,21 +264,14 @@ class BoundTree:
             "LC_ALL": "C",
         })
         self._flags: List[str] = []
+        self._refusal = ""
         self.binding = TreeBinding("unbindable", None, "not computed")
 
     # git -------------------------------------------------------------------
 
     def run(self, args: Sequence[str], stdin: Optional[bytes] = None, cwd: Optional[Path] = None,
             timeout: float = GIT_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
-        argv = [_git_executable(), *self._flags, *args]
-        try:
-            return subprocess.run(argv, cwd=str(cwd or self.top), env=self.env, input=stdin,
-                                  stdin=None if stdin is not None else subprocess.DEVNULL,
-                                  capture_output=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired as exc:
-            raise TreeError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
-        except OSError as exc:
-            raise TreeError(f"cannot run git: {exc}") from exc
+        return _spawn(self._flags, args, cwd or self.top, self.env, stdin, timeout)
 
     def _text(self, args: Sequence[str]) -> str:
         res = self.run(args)
@@ -172,28 +279,9 @@ class BoundTree:
             raise TreeError(f"git {args[0]} failed: {res.stderr.decode('utf-8', 'replace').strip()[:300]}")
         return res.stdout.decode("utf-8", "replace").strip()
 
-    def _configured_filters(self) -> List[str]:
-        res = subprocess.run([_git_executable(), "config", "--list", "--name-only", "-z"], cwd=str(self.top),
-                             env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
-                             timeout=GIT_TIMEOUT_SECONDS, check=False)
-        names: List[str] = []
-        for key in res.stdout.decode("utf-8", "replace").split("\0"):
-            lowered = key.lower()
-            if lowered.startswith("filter.") and lowered.rsplit(".", 1)[-1] in (*_FILTER_VARS, "required"):
-                driver = key[len("filter."):].rsplit(".", 1)[0]
-                if driver and driver not in names:
-                    names.append(driver)
-        return names
-
     def prepare(self) -> None:
-        flags: List[str] = []
-        for setting in _STABLE_CONFIG:
-            flags += ["-c", setting]
-        for driver in self._configured_filters():
-            for var in _FILTER_VARS:
-                flags += ["-c", f"filter.{driver}.{var}="]
-            flags += ["-c", f"filter.{driver}.required=false"]
-        self._flags = flags
+        drivers, self._refusal = _filter_drivers(self.top, self.env)
+        self._flags = [*_stable_flags(), *_neutralising_flags(drivers)]
 
     # views of the private index --------------------------------------------
 
@@ -202,15 +290,7 @@ class BoundTree:
         out = self.run(["ls-files", "-s", "-z"])
         if out.returncode != 0:
             raise TreeError("git ls-files -s failed")
-        found = []
-        for item in out.stdout.split(b"\0"):
-            if not item:
-                continue
-            meta, _, path = item.partition(b"\t")
-            parts = meta.split()
-            if len(parts) == 3:
-                found.append((parts[0].decode("ascii"), parts[1].decode("ascii"), os.fsdecode(path)))
-        return found
+        return _parse_entries(out.stdout)
 
     def files(self) -> List[str]:
         return sorted(path for _mode, _oid, path in self.entries())
@@ -252,7 +332,7 @@ class BoundTree:
     # the recipe ------------------------------------------------------------
 
     def compute(self) -> TreeBinding:
-        audit = self._audit()
+        audit = self._refusal or self._audit()
         if audit:
             self.binding = TreeBinding("unbindable", None, audit)
             return self.binding
@@ -271,11 +351,12 @@ class BoundTree:
         if tree == empty and self._head_tree() not in (None, empty):
             self.binding = TreeBinding("unbindable", None, "the work tree reads as empty while HEAD is not")
             return self.binding
-        gitlinks = tuple(sorted(path for mode, _oid, path in self.entries() if mode == _GITLINK_MODE))
-        dirty = [path for path in gitlinks if self._dirty_submodule(path)]
+        links = {path: oid for mode, oid, path in self.entries() if mode == _GITLINK_MODE}
+        gitlinks = tuple(sorted(links))
+        dirty = [path for path in gitlinks if self._dirty_submodule(path, links[path])]
         if dirty:
-            self.binding = TreeBinding("partial", tree, f"submodule(s) differ from the recorded commit: {_named(dirty)}",
-                                       gitlinks)
+            self.binding = TreeBinding("partial", tree,
+                                       f"submodule(s) differ from the recorded commit: {named_paths(dirty)}", gitlinks)
         else:
             self.binding = TreeBinding("ok", tree, "", gitlinks)
         return self.binding
@@ -305,28 +386,27 @@ class BoundTree:
             elif tag == "S" and os.path.lexists(self.top / path):
                 sparse.append(path)
         if unmerged:
-            return f"unmerged entries (resolve the conflict first): {_named(unmerged)}"
+            return f"unmerged entries (resolve the conflict first): {named_paths(unmerged)}"
         if assume:
-            return f"assume-unchanged entries exist on disk, so git cannot see their changes: {_named(assume)}"
+            return f"assume-unchanged entries exist on disk, so git cannot see their changes: {named_paths(assume)}"
         if sparse:
-            return f"skip-worktree entries exist on disk, so git cannot see their changes: {_named(sparse)}"
+            return f"skip-worktree entries exist on disk, so git cannot see their changes: {named_paths(sparse)}"
         return ""
 
-    def _dirty_submodule(self, path: str) -> bool:
+    def _dirty_submodule(self, path: str, recorded: str) -> bool:
         sub = self.top / path
         if not (sub / ".git").exists():
             return False  # not checked out: the pointer is all there is to know
-        recorded = next((oid for mode, oid, p in self.entries() if mode == _GITLINK_MODE and p == path), None)
-        env = _scrubbed_environment()
-        env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
+        env = _submodule_environment()
         try:
-            head = subprocess.run([_git_executable(), "-c", "core.fsmonitor=false", "rev-parse", "HEAD"],
-                                  cwd=str(sub), env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                                  timeout=GIT_TIMEOUT_SECONDS, check=False)
-            status = subprocess.run([_git_executable(), "-c", "core.fsmonitor=false", "status", "--porcelain",
-                                     "--untracked-files=normal"], cwd=str(sub), env=env, stdin=subprocess.DEVNULL,
-                                    capture_output=True, timeout=GIT_TIMEOUT_SECONDS, check=False)
-        except (subprocess.TimeoutExpired, OSError):
+            # Walked again from here: `git add -A` may have just recorded an embedded repository.
+            drivers, refusal = _filter_drivers(sub, env)
+            if refusal:
+                return True  # not read at all: the tree names the pointer, which is what "partial" says
+            flags = [*_stable_flags(), *_neutralising_flags(drivers)]
+            head = _spawn(flags, ["rev-parse", "HEAD"], sub, env)
+            status = _spawn(flags, ["status", "--porcelain", "--untracked-files=normal"], sub, env)
+        except TreeError:
             return True
         if head.returncode != 0 or status.returncode != 0:
             return True

@@ -16,12 +16,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from aegis_core import checkrun
+from aegis_core import testexec
 from aegis_core.ast.schema import MutationPoint, NormalizedAST
+from aegis_core.primitives import key_within, real_key
 from aegis_core.storage import atomic_write_text
 from . import ToolEvidence
 
-__all__ = ["check", "apply_mutation_point", "collect_mutations_from_ast"]
+__all__ = ["check"]
 
 
 # ── AST Mutation Visitors ──────────────────────────────────────────────────
@@ -370,13 +371,6 @@ class TestRunResult:
     loaded: bool = False  # the run imported the staged source for the target module
 
 
-def _is_within(path: str, parent: str) -> bool:
-    try:
-        return os.path.commonpath([path, parent]) == parent
-    except ValueError:
-        return False
-
-
 def _resolve_test_rootdir(test_files: Sequence[str]) -> Optional[str]:
     """Return a bounded pytest rootdir/confcutdir for *test_files*, or None if none exist on disk."""
     dirs = [os.path.dirname(os.path.abspath(f)) for f in test_files if f and os.path.exists(f)]
@@ -408,14 +402,15 @@ def _resolve_test_rootdir(test_files: Sequence[str]) -> Optional[str]:
 def _filter_sys_path(entries: Sequence[str], test_files: Sequence[str], temp_root: str) -> list[str]:
     """The existing directories of *entries* a test run may import from: one under *temp_root* only
     when it holds a test file, so another run's scratch directory cannot shadow the code under test."""
-    temp_real = os.path.normcase(os.path.realpath(temp_root))
-    test_real = [os.path.normcase(os.path.realpath(f)) for f in test_files if f and os.path.exists(f)]
+    temp_key = real_key(temp_root)
+    test_keys = [key for key in (real_key(f) for f in test_files if f and os.path.exists(f)) if key is not None]
     kept: list[str] = []
     for p in entries:
         if not p or not os.path.isdir(p):
             continue
-        p_real = os.path.normcase(os.path.realpath(p))
-        if _is_within(p_real, temp_real) and not any(_is_within(tf, p_real) for tf in test_real):
+        key = real_key(p)
+        scratch = key is None or temp_key is None or key_within(key, temp_key)  # unresolvable counts as scratch
+        if scratch and not (key is not None and any(key_within(t, key) for t in test_keys)):
             continue
         kept.append(p)
     return kept
@@ -442,7 +437,7 @@ def _check_tests(
     if rootdir is not None:
         cmd += [f"--rootdir={rootdir}", f"--confcutdir={rootdir}"]
     env_root = swap.workdir if swap is not None else tempfile.gettempdir()
-    env = checkrun.hermetic_env(env_root)
+    env = testexec.hermetic_env(env_root)
     py_bin_dir = os.path.dirname(sys.executable)
     if py_bin_dir:
         existing_path = env.get("PATH", "")
@@ -478,7 +473,7 @@ def _check_tests(
             stdout = out_str or ""
             stderr = err_str or ""
         except subprocess.TimeoutExpired:
-            checkrun.kill_group(proc)
+            testexec.kill_group(proc)
             try:
                 proc.communicate()
             except Exception:
@@ -486,7 +481,7 @@ def _check_tests(
             raise
         finally:
             if os.name != "nt" or getattr(proc, "poll", lambda: None)() is None:
-                checkrun.kill_group(proc)
+                testexec.kill_group(proc)
     except subprocess.TimeoutExpired:
         return TestRunResult(
             passed=False,

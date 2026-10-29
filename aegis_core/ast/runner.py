@@ -22,7 +22,7 @@ from typing import Dict, List, Mapping, Optional, Tuple, Union
 from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.schema import NormalizedAST
 from aegis_core.errors import AegisError
-from aegis_core.pathlookup import INSIDE_FENCE, only_skipped, which
+from aegis_core.pathlookup import is_bare, INSIDE_FENCE, only_skipped, which
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace import as_workspace
 
@@ -86,17 +86,12 @@ def _command_plan(command: str, ext: str, ws_root: Optional[Path] = None, where:
         return _DriverPlan(label=command, unavailable=f"the driver command cannot be parsed: {exc}")
     if parts and _is_python_name(parts[0]):
         parts[0] = resolve_driver_executable(parts[0]) or parts[0]
-    elif parts and _is_bare(parts[0]):
+    elif parts and is_bare(parts[0]):
         found = which(parts[0], outside=ws_root)
         if found is None:
             return _DriverPlan(label=command, unavailable=f"{where} {_not_found(parts[0], ws_root)}")
         parts[0] = found
     return _DriverPlan(label=command, argv=tuple(parts))
-
-
-def _is_bare(name: str) -> bool:
-    """A name PATH lookup applies to: no directory part and no drive."""
-    return not (os.sep in name or (os.altsep and os.altsep in name) or os.path.splitdrive(name)[0])
 
 
 def _not_found(name: str, ws_root: Optional[Path]) -> str:
@@ -190,7 +185,7 @@ def _user_command_plan(command: str, ext: str, ws_root: Path) -> Optional[_Drive
     argv = list(plan.argv)
     first = _split_command(command)[0]
     if not _is_python_name(first):  # python names already resolved to sys.executable, which runs aegis itself
-        if not _is_bare(first):
+        if not is_bare(first):
             # The child runs in an empty directory, so a relative path is joined to the
             # workspace root here, never left to the child's cwd or to CreateProcess.
             full = os.path.normpath(os.path.join(str(ws_root), first))
@@ -283,7 +278,7 @@ class ASTDriverRegistry:
 def _names_program(token: str) -> bool:
     """An absolute path to a file, or a bare name on an absolute PATH entry. A relative
     path names a file in aegis's own cwd, which the repository may control."""
-    if _is_bare(token):
+    if is_bare(token):
         return which(token) is not None
     return os.path.isabs(token) and os.path.isfile(token)
 
@@ -314,7 +309,7 @@ def resolve_driver_executable(name: str, workspace: Optional[Union[Path, str]] =
     clean = name.strip()
     if _is_python_name(clean):
         return sys.executable if sys.executable else None
-    if _is_bare(clean):
+    if is_bare(clean):
         return which(clean, outside=workspace)
     if not os.path.isabs(clean):
         if workspace is None:

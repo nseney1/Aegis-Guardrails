@@ -81,14 +81,14 @@ def json_parses(monkeypatch: pytest.MonkeyPatch) -> list:
     return calls
 
 
-def test_a_buried_hook_prompt_still_corroborates_its_sessions_suggestion(ws: Path, home: Path):
+def test_a_buried_hook_prompt_still_corroborates_its_hosts_capture(ws: Path, home: Path):
     hook = _prompt(ws, home, f"No, {QUOTE} again!", "S1")
     assert hook["event"] == "insight"
     _bury(ws, home)
-    confirmed = capture_suggestion(ws, QUOTE, host="claude-code", session="S1", home=home)
-    assert (confirmed["level"], confirmed["confirmed_by"]) == ("W2", hook["id"])
-    other = capture_suggestion(ws, QUOTE, host="claude-code", session="S2", home=home)
-    assert other["level"] == "suggestion" and "confirmed_by" not in other
+    corroborated = capture_suggestion(ws, QUOTE, host="claude-code", session="S2", home=home)
+    assert (corroborated["level"], corroborated["corroborated_by"]) == ("suggestion", hook["id"])
+    other = capture_suggestion(ws, QUOTE, host="codex-cli", session="S1", home=home)
+    assert other["level"] == "suggestion" and "corroborated_by" not in other
 
 
 def test_buried_heartbeat_and_inventory_rows_are_not_duplicated(ws: Path, home: Path):
@@ -110,7 +110,7 @@ def test_a_write_parses_at_most_25_rows(ws: Path, home: Path, json_parses: list,
     if call == "add_insight":
         add_insight(ws, "Never parse the whole log in src/app.py", paths=["src/app.py"], home=home)
     elif call == "record_decision":
-        record_decision(ws, cluster_id="cluster-x", decision="noise", insight_ids=["ins-1"], home=home)
+        record_decision(ws, decision="noise", insight_ids=["ins-1"], home=home)
     elif call == "capture_suggestion":
         capture_suggestion(ws, QUOTE, paths=["src/app.py"], host="claude-code", session="S1", home=home)
     else:

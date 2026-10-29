@@ -5,7 +5,7 @@ repository's files by absolute GitHub URLs. tests/unit/test_docs_links.py checks
 relative links; this module checks that every absolute link into this repository (and
 every pyproject [project.urls] entry) names a path that exists here, a file for
 ``blob/`` and a directory for ``tree/``, spelled with the exact case GitHub needs. It
-also holds ADR 0005 AD-8 to its word: the README states the enforcement tiers exactly as
+also checks that the README states the enforcement tiers exactly as
 ``aegis doctor`` reports them. The rest runs what the README tells a newcomer to run and
 holds its claims to what the code does: the quick start, which files ``aegis check``
 sees, what CI can and cannot judge, the install remedies and which hosts ``aegis init``
@@ -25,6 +25,8 @@ import pytest
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
 README = ROOT / "README.md"
 HOW = ROOT / "docs" / "how-it-works.md"
+HOSTS = ROOT / "docs" / "hosts-and-hooks.md"
+TEAMS = ROOT / "docs" / "teams.md"
 PYPROJECT = ROOT / "pyproject.toml"
 REPO_URL = "https://github.com/nseney1/Aegis-Guardrails"
 
@@ -271,14 +273,13 @@ def test_the_quick_start_no_eval_rule_allows_method_calls_via_builtin_true(quick
 
 
 def test_the_readme_uses_progressive_disclosure_and_three_step_quick_start():
-    """The README leads Quick start with a 3-step loop and wraps advanced internals in
-    collapsible <details> blocks."""
+    """Keep the install path visible and send advanced setup to the focused guides."""
     readme = README.read_text(encoding="utf-8")
     quick = _section(readme, "Quick start")
     for step in ("Step 1", "Step 2", "Step 3"):
         assert step in quick, f"Quick start is missing {step}"
-    details_blocks = re.findall(r"<details>\s*<summary>.*?</summary>.*?</details>", readme, re.S)
-    assert len(details_blocks) >= 3, "expected at least 3 progressive-disclosure <details> blocks in README.md"
+    for guide in ("architecture.md", "hosts-and-hooks.md", "teams.md"):
+        assert ("blob", "docs/" + guide) in repo_links(readme), guide
 
 
 
@@ -298,7 +299,9 @@ def test_the_docs_say_plain_check_enforces_the_reviewed_rules(quick_start, capsy
     _git(quick_start, "branch", "main-base")
     _git(quick_start, "checkout", "-q", "-b", "agent-pr")
     _git(quick_start, "rm", "-q", ".aegis/rules/invariants/no-eval.md")
-    (quick_start / "app.py").write_text("def f(x):\n    return eval(x)\n", encoding="utf-8")
+    # The allow keeps the built-in security pack (aegis check runs it too) out of a test of rule binding.
+    (quick_start / "app.py").write_text("def f(x):\n    return eval(x)  # aegis: allow[sec-py-eval-exec]: not under test\n",
+                                        encoding="utf-8")
     _git(quick_start, "add", "app.py")
     _git(quick_start, "commit", "-q", "-m", "pr")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")
@@ -344,22 +347,23 @@ def test_the_readme_never_advises_running_aegis_with_python_dash_m():
     readme = README.read_text(encoding="utf-8")
     advice = re.findall(r"python3? -m aegis_\w+", readme)
     assert all("Do not fall back to `" + a in readme for a in advice), advice
-    how = HOW.read_text(encoding="utf-8")
-    assert "-m aegis_mcp" not in how.replace("never registers `python -m aegis_mcp`", "")
+    for doc in (HOW, HOSTS):
+        text = " ".join(doc.read_text(encoding="utf-8").split())
+        assert "-m aegis_mcp" not in text.replace("never registers `python -m aegis_mcp`", ""), doc.name
 
 
 UNSAFE_KINDS = "a Python that runs `-m` or `-c` without `-I` or a script by a relative path, or either behind `env`"
 
 
 def test_the_docs_name_the_unsafe_registrations_doctor_reports():
-    """how-it-works, SECURITY and the changelog list what `aegis doctor` calls an unsafe MCP
+    """The host guide, SECURITY and the changelog list what `aegis doctor` calls an unsafe MCP
     registration: each kind they name is one launch_risk flags, and isolated mode is not."""
     import sys
 
     from aegis_cli.install_hosts import launch_risk
 
-    for doc in (HOW, ROOT / "SECURITY.md", ROOT / "CHANGELOG.md"):
-        assert UNSAFE_KINDS in doc.read_text(encoding="utf-8"), doc.name
+    for doc in (HOSTS, ROOT / "SECURITY.md", ROOT / "CHANGELOG.md"):
+        assert UNSAFE_KINDS in " ".join(doc.read_text(encoding="utf-8").split()), doc.name
     py = sys.executable
     env = os.path.join(os.path.dirname(py), "env")
     for argv in (["aegis-mcp"], [py, "-m", "aegis_mcp"], [py, "-c", "x"], [py, "aegis_mcp/server.py"],
@@ -399,10 +403,10 @@ def _keywords() -> List[str]:
 
 def test_the_retired_gemini_cli_is_promised_nowhere():
     """Gemini CLI is retired (aegis_core.hosts): `aegis init --host gemini-cli` is refused for
-    good, so no line of the README or how-it-works that names it may promise a version or
+    good, so no line of the README or overview/host guides that names it may promise a version or
     tell the reader to register it by hand, and the PyPI summary and keywords drop it."""
     lines = (README.read_text(encoding="utf-8").splitlines() + HOW.read_text(encoding="utf-8").splitlines()
-             + [_description()])
+             + HOSTS.read_text(encoding="utf-8").splitlines() + [_description()])
     promises = [line for line in lines
                 if ("Gemini CLI" in line or "gemini-cli" in line) and re.search(r"\bv4\.\d", line)]
     assert promises == []
@@ -547,6 +551,8 @@ def _registered_mcp_tools() -> List[str]:
 def test_no_doc_calls_a_shipped_version_planned():
     """No user-facing doc may describe a version <= the current minor version as planned,
     future work, or unshipped, and no ADR targeting a shipped version may remain draft."""
+    from tests.unit.test_docs_claims import roadmap_problems, shipped_text
+
     current = _current_minor()
     why = ROOT / "docs" / "why-aegis.md"
     security = ROOT / "SECURITY.md"
@@ -566,7 +572,9 @@ def test_no_doc_calls_a_shipped_version_planned():
         "will copy the 15 packaged",
     )
     for doc in (README, HOW, why, security):
-        text = _flat(doc.read_text(encoding="utf-8")).lower()
+        raw = doc.read_text(encoding="utf-8")
+        assert roadmap_problems(raw, current) == []
+        text = _flat(shipped_text(raw, doc.relative_to(ROOT).as_posix())).lower()
         for phrase in unconditional_stale:
             assert phrase not in text, (doc.name, phrase)
         for pattern in versioned_patterns:
@@ -588,19 +596,19 @@ def test_no_doc_calls_a_shipped_version_planned():
 
 
 def test_how_it_works_lists_every_mcp_tool():
-    """Section 4 of how-it-works names every tool in the MCP contract snapshot."""
-    sec4 = _section(HOW.read_text(encoding="utf-8"), "4. Just-in-time delivery over MCP")
-    named = sorted(set(re.findall(r"`(aegis_[a-z_]+)`", sec4)))
+    """The delivery concept names every tool in the MCP contract snapshot."""
+    delivery = _section(HOW.read_text(encoding="utf-8"), "Delivery over MCP")
+    named = sorted(set(re.findall(r"`(aegis_[a-z_]+)`", delivery)))
     assert named == _registered_mcp_tools()
 
 
-def test_the_best_effort_row_states_each_hosts_hook_tier_as_doctor_reports_it():
-    """AD-8: the Best-effort row names, per host, the tier and evidence label `aegis doctor`
+def test_the_host_guide_states_each_hosts_hook_tier_as_doctor_reports_it():
+    """The host guide names, per host, the tier and evidence label `aegis doctor`
     prints for a registered hook, that the hooks fail open, and where they are unavailable."""
     from aegis_cli.hooks import registrar
     from aegis_core.hosts import get
 
-    row = re.search(r"^\| Best-effort \|[^\n]*$", README.read_text(encoding="utf-8"), re.M).group(0)
+    row = HOSTS.read_text(encoding="utf-8")
     for host in registrar.HOOK_HOSTS:
         said = f"{get(host).display_name}: {registrar.TIERS[host]} [{registrar.EVIDENCE[host]}]"
         assert said in row, said
@@ -610,21 +618,21 @@ def test_the_best_effort_row_states_each_hosts_hook_tier_as_doctor_reports_it():
 
 def test_the_readme_has_a_short_agent_teams_section():
     """Leases are cooperative conflict input; check --lane is the gate, self-attested unless
-    --base-policy makes it witnessed. Details live in how-it-works."""
+    --base-policy makes it witnessed. Details live in the teams guide."""
     teams = _flat(_section(README.read_text(encoding="utf-8"), "Agent teams"))
     for phrase in ("aegis team claim", "conflict input", "not a lock", "aegis check --lane",
-                   "self-attested", "--base-policy", "witnessed", "advisory", "how-it-works.md"):
+                   "self-attested", "--base-policy", "witnessed", "advisory", "teams.md"):
         assert phrase in teams, phrase
-    assert len(teams.split()) < 220, "keep the README section short; details go to how-it-works"
+    assert len(teams.split()) < 220, "keep the README section short; details go to the teams guide"
 
 
-def test_how_it_works_states_the_hook_runtime_as_the_code_runs_it():
+def test_the_host_guide_states_the_hook_runtime_as_the_code_runs_it():
     """The known gaps, the block and record sets, the scan window key with its default and
     range, and the exit codes per host are the ones the handler uses."""
     from aegis_cli.hooks import pretool, registrar
     from aegis_core import command_safety, config
 
-    how = _flat(HOW.read_text(encoding="utf-8"))
+    how = _flat(HOSTS.read_text(encoding="utf-8"))
     for gap in registrar.KNOWN_GAPS:
         assert _flat(gap) in how, gap
     for rule in command_safety.BLOCK_SET + command_safety.RECORD_SET:
@@ -643,6 +651,25 @@ def test_how_it_works_lists_the_scan_window_among_the_repo_config_keys():
     assert "`jit.scan_window_s`" in row and "`jit.max_tokens`" in row
 
 
+def test_how_it_works_lists_the_decay_keys_with_their_defaults_among_the_repo_config_keys():
+    """The two decay keys are read only under ``expiry`` (R-evidence-23); the config row names them."""
+    from aegis_core import config
+
+    row = next(line for line in HOW.read_text(encoding="utf-8").splitlines()
+               if line.startswith("| `.aegis/config.json` |"))
+    assert "`expiry.half_life_sessions`" in row and "`expiry.epsilon`" in row
+    assert f"default {config.DEFAULT_HALF_LIFE_SESSIONS}" in row and f"default {config.DEFAULT_EPSILON}" in row
+
+
+@pytest.mark.parametrize("doc", [README, HOW], ids=["readme", "how"])
+def test_the_decay_sentence_claims_no_heartbeat_gate(doc):
+    """Exposure rows carry no heartbeat flag (R-evidence-17), so no decay sentence may claim one."""
+    decay = [line for line in doc.read_text(encoding="utf-8").splitlines() if "2^(-delta / H)" in line]
+    if doc == HOW:
+        assert decay, "the evidence guide must explain session-count decay"
+    assert not [line for line in decay if "heartbeat" in line.lower()]
+
+
 def test_how_it_works_describes_the_events_log_the_code_writes(tmp_path):
     """The events log lives in the git common dir (shared by every worktree), and the doc
     names every kind 4.1 writes."""
@@ -658,11 +685,11 @@ def test_how_it_works_describes_the_events_log_the_code_writes(tmp_path):
                                  "skills_sync"}
 
 
-def test_how_it_works_shows_the_skills_marker_sync_writes(tmp_path):
+def test_the_host_guide_shows_the_skills_marker_sync_writes(tmp_path):
     """The provenance marker in the doc is the one `aegis skills sync` writes, and the
     overwrite rules match: unedited copies replaced, edited ones only with --force, files
     without the marker never."""
-    how = _flat(HOW.read_text(encoding="utf-8"))
+    how = _flat(HOSTS.read_text(encoding="utf-8"))
     assert "`<!-- aegis:skill id=<id> v=1 sha=<12 hex> -->`" in how
     for phrase in (".claude/skills/<id>/SKILL.md", ".agents/skills/<id>/SKILL.md", "--force",
                    "never replaced, even with `--force`"):
@@ -672,8 +699,8 @@ def test_how_it_works_shows_the_skills_marker_sync_writes(tmp_path):
     assert skills_sync.MARKER_VERSION == 1 and skills_sync.SHA_LEN == 12
 
 
-def test_how_it_works_states_the_lane_gate_ci_caveat():
-    how = _flat(HOW.read_text(encoding="utf-8"))
-    for phrase in ("advisory (not a required check) in v4.1", "a witness is only as strong as the protection on",
+def test_the_team_guide_states_the_lane_gate_ci_caveat():
+    how = _flat(TEAMS.read_text(encoding="utf-8"))
+    for phrase in ("advisory (not a required check)", "a witness is only as strong as the protection on",
                    "Assert weakening is not detected", "`refs/aegis/lanes/<lane>`"):
         assert phrase in how, phrase

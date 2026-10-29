@@ -17,14 +17,14 @@ Given/When/Then scenarios written before the implementation:
    traps, doubt-served sessions (``scope_basis == "fallback_unscoped"``) are
    neutral (neither silence credit nor decay) per v4.4 §12.9.
 4. Detector replay, feasibility & four sample-size states, asymmetric transitions
-   with prior cap (<= 10 pseudo-labels and disclosure), silence credit with
-   heartbeat gate, and ``aegis sync --pr`` with 3 sampled examples and no auto-merge.
+   with prior cap (<= 10 pseudo-labels and disclosure), and ``aegis sync --pr`` with
+   3 sampled examples and no auto-merge. Silence earns no credit in 4.4.0 (R-evidence-17).
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
-import math
 from pathlib import Path
 import subprocess
 
@@ -32,7 +32,7 @@ import pytest
 
 from aegis_cli.status import run_status
 from aegis_cli.sync import run_sync
-from aegis_core import credit, fitness, sync
+from aegis_core import config, credit, fitness, sync
 from aegis_core.verification.runner import run_layer1
 from tests import helpers_adjudication as ha
 from tests import helpers_humangate as hg
@@ -180,7 +180,7 @@ def test_scan_status_and_list_rules_show_no_number_below_min_n_and_agree(
     from aegis_core.rules import load_rules
     from aegis_core.scan import RULE_CACHE, scan
     from aegis_core.telemetry_engine import ledger
-    from aegis_mcp.registry import list_rules
+    from aegis_mcp.handlers.governance import list_rules
 
     counts = {"trap-none": None, "trap-zero": 0, "trap-one": 1, "trap-low": MIN_N - 1, "trap-at": MIN_N}
     for rid, n in counts.items():
@@ -275,9 +275,8 @@ def test_quiet_trap_decays_over_eligible_sessions_and_respects_pin_and_tier_immu
     result = sync.sync(tmp_path)
     rules = result.derived["rules"]
 
-    # 3H = 60 eligible sessions -> decay_factor == 2**(-3) == 0.125.
+    # 3H = 60 eligible sessions -> effective_weight == 2**(-3) == 0.125.
     assert rules["trap-quiet"]["eligible_sessions"] == 60
-    assert rules["trap-quiet"]["decay_factor"] == pytest.approx(0.125, abs=1e-6)
     assert rules["trap-quiet"]["effective_weight"] == pytest.approx(0.125, abs=1e-6)
     assert rules["trap-quiet"]["archive_candidate"] is True
     assert rules["trap-quiet"]["suggestion"] == "archive"
@@ -294,7 +293,113 @@ def test_quiet_trap_decays_over_eligible_sessions_and_respects_pin_and_tier_immu
     assert rules["gate-quiet"]["suggestion"] is None
 
 
-# ── 4. Detector replay, states, prior cap, silence credit, and sync --pr ─────
+def test_quiet_sessions_only_decay_a_traps_score() -> None:
+    """Given a trap with 30 triggers, 28 tp and 2 fp and H = 20, When it is computed after 0, 10, 20,
+    60 and 600 eligible sessions, Then the score never rises and 3H sessions leave 0.125 of it."""
+    scores = [fitness.compute({"triggers": 30, "tp": 28, "fp": 2}, eligible_sessions=s, half_life_sessions=20.0).score
+              for s in (0, 10, 20, 60, 600)]
+    assert scores == sorted(scores, reverse=True)
+    assert scores == pytest.approx([0.8173, 0.5779, 0.4086, 0.1022, 0.0], abs=1e-4)
+    assert scores[3] == pytest.approx(scores[0] * 0.125, abs=1e-3)
+
+
+def test_three_exposed_sessions_are_three_eligible_sessions(tmp_path: Path) -> None:
+    """Given a trap exposed in three sessions (exposure rows carry no heartbeat flag), When fitness is
+    read, Then all three are eligible and the weight is 2^(-3/H) with the configured H."""
+    _write_rule(tmp_path, "trap", "trap-seen")
+    for s in range(3):
+        credit.record_exposure(tmp_path, "claude-code", f"sess-{s}", ["trap-seen"], paths=["src/app.py"])
+    fit = sync.build(tmp_path)["rules"]["trap-seen"]
+    h = config.DEFAULT_HALF_LIFE_SESSIONS
+    assert fit["eligible_sessions"] == 3 and fit["effective_weight"] == pytest.approx(2 ** (-3 / h), abs=1e-6)
+
+
+def test_silence_earns_no_credit_in_4_4_0() -> None:
+    """The silence likelihood ratio had no caller and no RRR source: it is gone, field and keyword too."""
+    assert not hasattr(fitness, "compute_silence_credit") and "compute_silence_credit" not in fitness.__all__
+    assert "silence_lr" not in {f.name for f in dataclasses.fields(fitness.Fitness)}
+    with pytest.raises(TypeError):
+        fitness.compute({"tp": 1}, silence_lr=2.0)
+
+
+# ── R-evidence-18: no Clopper-Pearson term; the decisions are unchanged ──────
+
+def _decision_grid() -> dict:
+    cells = {}
+    for tp in range(61):
+        for fp in range(61):
+            cells[f"base/{tp}/{fp}"] = fitness.compute({"tp": tp, "fp": fp, "triggers": tp + fp})
+            cells[f"adj/{tp}/{fp}"] = fitness.compute({}, adjudicated_tp=tp, adjudicated_fp=fp, sessions_count=3,
+                                                      repos_count=2)
+    for base_fp in range(31):
+        cells[f"near/{base_fp}"] = fitness.compute({"fp": base_fp, "triggers": base_fp}, adjudicated_tp=41,
+                                                   adjudicated_fp=1, sessions_count=3, repos_count=2)
+    for sessions in (0, 10, 60):
+        for tp, fp in ((28, 2), (5, 20)):
+            cells[f"decay/{sessions}/{tp}/{fp}/trap"] = fitness.compute(
+                {"tp": tp, "fp": fp, "triggers": 30}, eligible_sessions=sessions, half_life_sessions=20.0, epsilon=0.15)
+    return cells
+
+
+def test_every_decision_over_the_grid_is_the_one_recorded_before_the_interval_went() -> None:
+    """Given the decision grid recorded at develop 35d8ac21 (with the Clopper-Pearson interval still
+    computed), When it is computed now, Then every state and suggestion is the same and the scores,
+    weights and P(precision < 0.7) sum to the recorded values (a 1e-3 margin absorbs libm rounding)."""
+    import hashlib
+
+    cells = _decision_grid()
+    decisions = json.dumps([[name, cells[name].state, cells[name].suggestion] for name in sorted(cells)])
+    assert len(cells) == 7479
+    assert hashlib.sha256(decisions.encode("utf-8")).hexdigest() == (
+        "c7b63fe4aa59914578e24d2a1cc998951c895435210c8078e7326ac39f5c5d03")
+    for name, recorded in (("score", 3026.0486), ("effective_weight", 7476.6642), ("p_below_demote", 5837.0097)):
+        assert sum(getattr(fit, name) for fit in cells.values()) == pytest.approx(recorded, abs=1e-3), name
+
+
+def test_41_tp_and_1_fp_adjudicated_promote_by_count_alone() -> None:
+    fit = fitness.compute({}, adjudicated_tp=41, adjudicated_fp=1, sessions_count=3, repos_count=2)
+    assert (fit.state, fit.suggestion) == ("decided", "promote")
+
+
+DERIVED_KEYS = {
+    "path", "sha256", "type", "fitness", "reported_score", "status", "triggers", "tp", "fp", "last_ts", "suggestion",
+    "state", "evidence_available", "effective_weight", "eligible_sessions", "contested", "override_rate",
+    "flagged_for_review", "archive_candidate", "caught", "leaked", "adjudicated_n", "sessions_count", "repos_count",
+    "n", "p_below_demote", "samples",
+}
+
+
+def test_derived_and_sync_json_entries_drop_only_the_interval_and_the_decay_copy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Given two rules and a 3/1 tp/fp ledger, When sync writes derived.json and sync --json prints, Then
+    each entry lacks precision_lo, precision_hi and decay_factor and keeps every other key."""
+    from aegis_core.telemetry_engine import ledger
+
+    _write_rule(tmp_path, "trap", "trap-a")
+    _write_rule(tmp_path, "gate", "gate-b")
+    ledger.append(tmp_path, [{"rule": "trap-a", "outcome": o, "source": "ci", "key": f"k{i}"}
+                             for i, o in enumerate(["tp", "tp", "tp", "fp"])])
+    result = sync.sync(tmp_path)
+    on_disk = json.loads(result.path.read_text(encoding="utf-8"))["rules"]
+    assert sorted(on_disk) == ["gate-b", "trap-a"] and all(set(e) == DERIVED_KEYS for e in on_disk.values())
+    assert run_sync(argparse.Namespace(_root=tmp_path, json=True)) == 0
+    printed = json.loads(capsys.readouterr().out)["rules"]
+    assert [set(e) for e in printed] == [DERIVED_KEYS | {"id"}] * 2
+
+
+def test_the_sdk_interval_stays_the_90_percent_wilson_interval(tmp_path: Path) -> None:
+    from aegis_core.telemetry_engine import ledger
+    from aegis_sdk.governance import Governance
+
+    _write_rule(tmp_path, "trap", "trap-a")
+    ledger.append(tmp_path, [{"rule": "trap-a", "outcome": o, "source": "ci", "key": f"k{i}"}
+                             for i, o in enumerate(["tp", "tp", "tp", "fp"])])
+    row, = Governance(tmp_path).fitness_landscape(bayesian=True)
+    assert (row["tp"], row["fp"], row["bayesian"]) == (3, 1, {"lower": 0.3561, "upper": 0.9421})
+
+
+# ── 4. Detector replay, states, prior cap and sync --pr ──────────────────────
 
 
 @needs_git
@@ -378,26 +483,15 @@ def test_prior_cap_at_ten_pseudo_labels_and_asymmetric_transitions(tmp_path: Pat
     assert fit_untestable.state == "untestable"
     assert fit_untestable.mde is not None and fit_untestable.mde > 0.6
 
-    # Silence credit: LR = exp(c * RRR) only when heartbeat is alive.
-    assert fitness.compute_silence_credit(0.5, c=0.1, heartbeat_alive=True) == pytest.approx(
-        math.exp(0.05)
-    )
-    assert fitness.compute_silence_credit(0.5, c=0.1, heartbeat_alive=False) == 1.0
-    assert (
-        fitness.compute_silence_credit(
-            0.5, c=0.1, heartbeat_alive=True, scope_basis="fallback_unscoped"
-        )
-        == 1.0
-    )
 
-
-def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_merges(
+def test_sync_pr_writes_transitions_with_three_examples_to_label_and_never_auto_merges(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """§3 T4 Evidence-backed `aegis sync --pr`:
     When a rule reaches `decided`, `aegis sync --pr` writes the transition and opens a PR
-    whose body contains the evidence report and up to 3 sampled examples, via injectable
-    `gh` runner, and never auto-merges."""
+    whose body contains the evidence report (state, n, weight) and up to 3 examples for a human
+    to label (unlabelled replay detections, not labelled rows), via injectable `gh` runner, and
+    never auto-merges."""
     _write_rule(tmp_path, "trap", "trap-decided", created="2026-01-01", target_paths=["src/*.py"])
     ha.write_labels(tmp_path, "trap-decided", [
         {"example_id": f"PR-{100 + i}", "verdict": "tp", "ref": f"PR-{100 + i}", "session": f"sess-{(i % 4) + 1}",
@@ -406,6 +500,15 @@ def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_m
         for i in range(25)
     ])
     ha.merge_to_base(tmp_path)
+    origin = tmp_path.parent / f"{tmp_path.name}-origin.git"
+    ha._git(tmp_path.parent, "init", "-q", "--bare", str(origin))
+    for args in (("config", "user.email", "dev@example.com"), ("config", "user.name", "Dev"),
+                 ("remote", "add", "origin", str(origin)), ("push", "-q", "origin", "main"),
+                 ("remote", "set-head", "origin", "main")):
+        ha._git(tmp_path, *args)
+    for n in range(4):
+        credit.record_detection(tmp_path, "trap-decided", "src/app.py", f"call-{n}", disposition="leaked",
+                                rev=f"{n:040x}")
 
     gh_calls: list[list[str]] = []
 
@@ -425,13 +528,13 @@ def test_sync_pr_writes_transitions_with_three_sampled_examples_and_never_auto_m
     assert payload["pr"]["status"] == "opened"
     assert payload["pr"]["url"] == "https://github.com/octo/proj/pull/42"
     body = payload["pr"]["body"]
-    assert "trap-decided" in body
-    assert "Prevented bug example #1" in body
-    assert "Prevented bug example #2" in body
-    assert "Prevented bug example #3" in body
-    # Exactly one gh call (`pr create`), never `pr merge`.
+    assert "trap-decided" in body and "- **State**: decided; n = 25; weight" in body
+    assert "Prevented bug example" not in body  # labelled rows are not samples to label
+    listed = [line for line in body.splitlines() if line.startswith("  ") and "`call-" in line]
+    assert len(listed) == 3 and "`call-0`" not in body  # the three newest detections
+    # Exactly one gh call (`pr create`) for the pushed lifecycle branch, never `pr merge`.
     assert len(gh_calls) == 1
-    assert gh_calls[0][:2] == ["pr", "create"]
+    assert gh_calls[0][:2] == ["pr", "create"] and payload["pr"]["branch"] in gh_calls[0]
     assert not any("merge" in call for call in gh_calls)
 
 
@@ -528,7 +631,7 @@ def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_s
     """1. Repeated `sync.sync()` calls refresh CI on every call (revoking on later failure, querying newly landed commits).
     2. A fresh `status` process (`_VERIFIED_CI` cleared, no `client` passed) stays offline (R-trust-52): it makes no
        `gh` call and shows the rule without the CI-confirmed credit, which lives in the sync-derived document."""
-    from aegis_core import checkrun, human_gate, rules
+    from aegis_core import checkrun, ghcli, rules
     from tests import helpers_verified as hv
 
     repo = hv.make_project(tmp_path)
@@ -558,7 +661,7 @@ def test_repeated_sync_refreshes_reruns_and_new_landed_checks_and_fresh_status_s
         gh_calls.append(list(argv))
         return subprocess.CompletedProcess(argv, 0, json.dumps({"workflow_runs": [r1_ok]}), "")
 
-    monkeypatch.setattr(human_gate, "default_gh_runner", counting_gh)
+    monkeypatch.setattr(ghcli, "default_gh_runner", counting_gh)
     capsys.readouterr()
     run_status(argparse.Namespace(_root=repo.root, plain=True))
     status_out = capsys.readouterr().out
@@ -815,6 +918,68 @@ def test_detector_replay_walks_commits_after_merge_and_prefers_ahead_remote_bran
 
     detections = fitness.replay_detector_history(repo.root)
     assert any(d["pattern"] == "eval" and d["disposition"] == "leaked" for d in detections)
+
+
+def _golden_history(tmp_path: Path) -> hg.Repo:
+    """A history with a caught call, a leaked import, a leaked call fixed later and an allowed site."""
+    repo = hg.Repo(tmp_path / "repo", hg.Home(tmp_path / "home"))
+    _write_rule(repo.root, "gate", "no-eval-exec", forbid_calls=["eval", "exec"])
+    _write_rule(repo.root, "gate", "no-pickle", extra_frontmatter="forbid_ast:\n  imports: [pickle]\n")
+    repo.write("src/app.py", "def f(x):\n    return x\n")
+    repo.write("src/util.py", "def g(y):\n    return y\n")
+    repo.commit("initial")
+    repo.branch("feat-a")
+    repo.write("src/app.py", "import pickle\n\ndef f(x):\n    return eval(x)\n")
+    repo.commit("wip with eval and pickle")
+    repo.write("src/app.py", "import pickle\n\ndef f(x):\n    return int(x)\n")
+    repo.commit("drop eval")
+    repo.git("checkout", "-q", "main")
+    repo.git("merge", "--no-ff", "feat-a", "-m", "Merge branch 'feat-a'")
+    repo.write("src/util.py", "def g(y):\n    exec(y)  # aegis: allow[no-eval-exec]: reviewed\n    exec(y + 1)\n")
+    repo.commit("add exec")
+    repo.write("src/util.py", "def g(y):\n    exec(y)  # aegis: allow[no-eval-exec]: reviewed\n    return y\n")
+    repo.commit("fix exec")
+    return repo
+
+
+@needs_git
+def test_replay_keys_of_a_recorded_history_are_unchanged(tmp_path: Path) -> None:
+    """Golden (R-structure-38, R-checks-11): Given a recorded history, When replay runs, Then its
+    (rule, file, pattern) keys, dispositions and commits are the ones recorded before findings
+    replaced the parsed violation messages; an allowed site is never a finding."""
+    repo = _golden_history(tmp_path)
+    subject = {sha: repo.git("log", "-1", "--format=%s", sha) for sha in repo.git("rev-list", "--all").split()}
+    found = {(d["rule"], d["file"], d["pattern"], d["disposition"], subject[d["rev"]],
+              subject.get(d.get("fix_rev") or "", None)) for d in fitness.replay_detector_history(repo.root, persist=False)}
+    assert found == {
+        ("no-eval-exec", "src/app.py", "eval", "caught", "wip with eval and pickle", "Merge branch 'feat-a'"),
+        ("no-pickle", "src/app.py", "pickle", "leaked", "Merge branch 'feat-a'", None),
+        ("no-eval-exec", "src/util.py", "exec", "leaked", "add exec", "fix exec"),
+    }
+
+
+@needs_git
+def test_sync_stores_where_replay_stopped_and_a_second_sync_appends_nothing(tmp_path: Path, monkeypatch) -> None:
+    """R-evidence-12: Given a synced history, When sync runs again with no new commit, Then it
+    resumes from the stored tip and the ledger is unchanged; a 4.3.3 document without the key
+    replays everything."""
+    repo = _golden_history(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    sync.sync(repo.root)
+    replay = sync.read_derived(repo.root)["replay"]
+    assert (replay["tip"], replay["branch"]) == (repo.git("rev-parse", "main"), "main")
+    rows = credit.read_rows(repo.root)
+    walked = []
+    real = fitness._violations_at_commit
+    monkeypatch.setattr(fitness, "_violations_at_commit", lambda root, sha, *a: walked.append(sha) or real(root, sha, *a))
+    assert sync.sync(repo.root).replay.detections == [] and walked == []
+    assert credit.read_rows(repo.root) == rows and sync.read_derived(repo.root)["replay"] == replay
+    path = repo.root / ".aegis" / "state" / "derived.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc.pop("replay")
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    sync.sync(repo.root)
+    assert len(set(walked)) == len(repo.git("rev-list", "main").split()) and credit.read_rows(repo.root) == rows
 
 
 @needs_git

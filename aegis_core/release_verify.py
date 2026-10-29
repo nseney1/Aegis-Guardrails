@@ -28,7 +28,7 @@ into the default branch holding the commit, approved on its head by someone othe
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import hashlib
 import json
 from pathlib import Path
@@ -36,8 +36,8 @@ import re
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe, human_gate
-from aegis_core._version import __version__
+from aegis_core import primitives
+from aegis_core import ghcli, gitevidence, gitsafe, human_gate
 
 __all__ = [
     "GH_MINIMUM",
@@ -68,9 +68,6 @@ GH_TIMEOUT_SECONDS = 180.0
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 #: Codes reached after gh verified an attestation and its JSON re-checked.
 _ATTESTED_CODES = frozenset({"verified", "agent_editable", "not_approved"})
-#: Why a report printed before the trust tier could be read has none.
-_NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
-                "not_a_repository": "not a git repository", "git_failed": "git could not answer"}
 _RUN_ID_ATTEMPT = re.compile(r"\A\d+/\d+\Z")
 _VERSION = re.compile(r"gh version (\d+)\.(\d+)\.(\d+)")
 _REMOTE = re.compile(
@@ -80,10 +77,6 @@ _REMOTE = re.compile(
 #: ``runner(argv, timeout)``: run ``gh <argv>`` and return (returncode, stdout, stderr), or None
 #: when gh is not installed. Injectable so a test never reaches a real gh.
 GhRun = Callable[[Sequence[str], float], Optional[Tuple[int, str, str]]]
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def subject_bytes(commit: str, tree: str) -> bytes:
@@ -125,38 +118,15 @@ class ReleaseReport:
             return "unverified"
         return "agent_editable" if self.code == "agent_editable" else "failed"
 
-    def text_lines(self) -> List[str]:
-        if self.unverified_gh:
-            lines = [UNVERIFIED_GH, f"  {self.message}"]
-        elif self.verified:
-            lines = [
-                f"VERIFIED: the CI verdict for {self.sha} is attested by {self.repository}'s {WORKFLOW}",
-                f"  {self.message}",
-            ]
-        elif self.code == "agent_editable":
-            lines = [f"NOT VERIFIED: {TIER_C_CAVEAT}", f"  {self.message}"]
-        else:
-            lines = [f"NOT VERIFIED: {self.message}"]
-        if self.tier:
-            lines.append(f"  trust tier: {self.tier}")
-        elif self.code in _NO_TIER_WHY:
-            lines.append(f"  trust tier: unknown ({_NO_TIER_WHY[self.code]})")
-        lines += [f"  ! {caveat}" for caveat in self.caveats]
-        return lines
-
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
         return {
-            "schema": SCHEMA,
-            "source": SOURCE,
-            "aegis_version": __version__,
-            "checked_at": _utc_now(),
-            "scope": {
+            **primitives.envelope(SOURCE, {
                 "machine": "local",
                 "workspace": None if workspace is None else str(workspace),
                 "mode": "release",
                 "commit": self.sha,
                 "repository": self.repository,
-            },
+            }, schema=SCHEMA),
             "status": self.status,
             "verified": self.verified,
             "attested": self.attested,
@@ -169,28 +139,12 @@ class ReleaseReport:
         }
 
 
-def _invoke_gh(
-    argv: Sequence[str],
-    *,
-    cwd: Any = None,
-    timeout: float = GH_TIMEOUT_SECONDS,
-) -> Optional[Tuple[int, str, str]]:
-    try:
-        res = human_gate.default_gh_runner(argv, cwd=cwd, timeout=timeout)
-    except TypeError:
-        res = human_gate._real_default_gh_runner(argv, cwd=cwd, timeout=timeout)
-    if res is None:
-        return None
-    return res.returncode, res.stdout, res.stderr
-
-
-def default_gh(root: Any, timeout: Optional[float] = None) -> Any:
-    if isinstance(root, (list, tuple)):
-        eff_timeout = GH_TIMEOUT_SECONDS if timeout is None else timeout
-        return _invoke_gh(root, timeout=eff_timeout)
-
-    def run(argv: Sequence[str], call_timeout: float = GH_TIMEOUT_SECONDS) -> Optional[Tuple[int, str, str]]:
-        return _invoke_gh(argv, cwd=root, timeout=call_timeout)
+def default_gh(root: Any) -> GhRun:
+    """The ``GhRun`` for the repository at ``root``: ``ghcli.default_gh_runner``, looked up at each
+    call so a patched runner is the one used."""
+    def run(argv: Sequence[str], timeout: float = GH_TIMEOUT_SECONDS) -> Optional[Tuple[int, str, str]]:
+        res = ghcli.default_gh_runner(argv, cwd=root, timeout=timeout)
+        return None if res is None else (res.returncode, res.stdout, res.stderr)
 
     return run
 
@@ -336,14 +290,13 @@ def release_approved(commit: str, repository: str, branch: str, gh: GhRun) -> Tu
 
 
 def _tier(root: Path, tier_runner: Optional[Callable[..., Any]]) -> Optional[str]:
-    from aegis_core import human_gate
-
     try:
         return human_gate.detect_tier(root, tier_runner).tier
     except Exception:  # noqa: BLE001 - detect_tier reports, it does not raise; this keeps a report a report
         return None
 
 
+@gitsafe.scrubbed()
 def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner: Optional[Callable[..., Any]] = None,
                    *, source_ref: Optional[str] = None) -> ReleaseReport:
     """Verify the CI-verdict attestation of ``sha`` (a commit id or a ref of the repository in ``root``).
@@ -370,12 +323,11 @@ def verify_release(root: Any, sha: str, run: Optional[GhRun] = None, tier_runner
 
     try:
         commit = gitsafe.resolve_commit(top, sha)
-        res = gitsafe.run(["rev-parse", "--verify", f"{commit}^{{tree}}"], top) if commit and _SHA.match(commit) else None
+        tree = gitevidence.commit_tree(top, commit) if commit and _SHA.match(commit) else None
     except gitsafe.GitError as exc:
         return failed(sha, "git_failed", f"git could not answer: {exc}")
-    if res is None or res.returncode != 0 or not commit:
+    if tree is None or not commit:
         return failed(sha, "bad_commit", f"{sha!r} is not a commit of this repository (fetch it first)")
-    tree = res.stdout.decode("ascii", "replace").strip()
     repository = _repository(top)
     if not repository:
         return failed(sha, "no_repository", "origin is not a github.com repository, so there is nothing to pin "

@@ -3,16 +3,17 @@ session decay, v4.4 §12.9 scope_basis neutrality, and AST allow overrides."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import math
+import os
 from pathlib import Path
 
 import pytest
 
-from aegis_core import credit, fitness, sync
+from aegis_core import credit, fitness, stats
 from aegis_core.ast.policy import (
-    evaluate_forbid_ast_with_overrides,
+    evaluate_forbid_ast_structured,
     extract_normalized_ast,
     parse_allow_comments,
+    violation_messages,
 )
 from aegis_core.lifecycle.promotion import suggest
 from aegis_core.rules import load_rules
@@ -64,34 +65,17 @@ def _write_rule(
     return path
 
 
-def test_beta_cdf_ppf_and_clopper_pearson_bounds() -> None:
-    # Uniform Beta(1, 1) has CDF(x) == x and PPF(p) == p.
+def test_beta_cdf_bounds() -> None:
+    # Uniform Beta(1, 1) has CDF(x) == x.
     for x in (0.1, 0.25, 0.5, 0.75, 0.9):
-        assert fitness.beta_cdf(x, 1.0, 1.0) == pytest.approx(x, abs=1e-6)
-        assert fitness.beta_ppf(x, 1.0, 1.0) == pytest.approx(x, abs=1e-5)
+        assert stats.beta_cdf(x, 1.0, 1.0) == pytest.approx(x, abs=1e-6)
 
     # Boundary conditions.
-    assert fitness.beta_cdf(0.0, 2.0, 3.0) == 0.0
-    assert fitness.beta_cdf(1.0, 2.0, 3.0) == 1.0
-    assert fitness.beta_ppf(0.0, 2.0, 3.0) == 0.0
-    assert fitness.beta_ppf(1.0, 2.0, 3.0) == 1.0
-
-    # Clopper-Pearson 90% CI for 25/25 TP: lower bound >= 0.88, upper == 1.0.
-    lo_25, hi_25 = fitness.clopper_pearson_interval(25.0, 0.0, 0.90)
-    assert lo_25 >= 0.88
-    assert hi_25 == 1.0
-
-    # Clopper-Pearson 90% CI for 42 TP, 1 FP: lower bound >= 0.90.
-    lo_42, hi_42 = fitness.clopper_pearson_interval(42.0, 1.0, 0.90)
-    assert lo_42 >= 0.90
-    assert hi_42 <= 1.0
-
-    # Clopper-Pearson 90% CI for 2 TP, 8 FP (n=10): upper bound < 0.65.
-    lo_bad, hi_bad = fitness.clopper_pearson_interval(2.0, 8.0, 0.90)
-    assert 0.0 < lo_bad < hi_bad < 0.65
+    assert stats.beta_cdf(0.0, 2.0, 3.0) == 0.0
+    assert stats.beta_cdf(1.0, 2.0, 3.0) == 1.0
 
 
-def test_cap_prior_mde_silence_credit_and_session_decay() -> None:
+def test_cap_prior_mde_and_session_decay() -> None:
     # Prior mass <= 10 is preserved unchanged.
     assert fitness.cap_prior(4.0, 2.0) == (4.0, 2.0)
     # Prior mass > 10 is scaled down proportionally so alpha + beta == 10.
@@ -106,19 +90,6 @@ def test_cap_prior_mde_silence_credit_and_session_decay() -> None:
     mde_frequent = fitness.compute_mde_180d(1.0)
     assert mde_rare > fitness.MDE_UNTESTABLE_THRESHOLD
     assert mde_frequent < 0.25
-
-    # Silence credit LR = exp(c * RRR) gated by heartbeat and scope_basis.
-    assert fitness.compute_silence_credit(0.8, c=0.1, heartbeat_alive=True) == pytest.approx(
-        math.exp(0.08)
-    )
-    assert fitness.compute_silence_credit(0.8, c=0.1, heartbeat_alive=False) == 1.0
-    assert (
-        fitness.compute_silence_credit(
-            0.8, c=0.1, heartbeat_alive=True, scope_basis="fallback_unscoped"
-        )
-        == 1.0
-    )
-    assert fitness.compute_silence_credit(0.0, c=0.1, heartbeat_alive=True) == 1.0
 
     # Session decay factor w = 2 ** (-delta / H).
     assert fitness.session_decay_factor(0, 20.0) == 1.0
@@ -143,20 +114,18 @@ def test_parse_allow_comments_and_rule_scoped_overrides(tmp_path: Path) -> None:
     assert norm_ast is not None
 
     # For gate-eval: line 2 is overridden, line 4 has no allow comment so eval remains a violation.
-    v_eval, ov_eval = evaluate_forbid_ast_with_overrides(
-        norm_ast, {"calls": ["eval"]}, rule_id="gate-eval", source=source
-    )
+    f_eval = evaluate_forbid_ast_structured(norm_ast, {"calls": ["eval"]}, rule_id="gate-eval", source=source)
+    ov_eval = [f for f in f_eval if f["override"] is not None]
     assert len(ov_eval) == 1
     assert ov_eval[0]["line"] == 2
-    assert ov_eval[0]["reason"] == "allowed for gate-eval only"
+    assert ov_eval[0]["override"] == "allowed for gate-eval only"
+    v_eval = violation_messages(f_eval)
     assert len(v_eval) == 1 and "eval" in v_eval[0]
 
     # For another-rule checking eval: line 2 targets gate-eval so it is NOT overridden for another-rule.
-    v_other, ov_other = evaluate_forbid_ast_with_overrides(
-        norm_ast, {"calls": ["eval"]}, rule_id="another-rule", source=source
-    )
-    assert ov_other == []
-    assert len(v_other) == 1
+    f_other = evaluate_forbid_ast_structured(norm_ast, {"calls": ["eval"]}, rule_id="another-rule", source=source)
+    assert [f for f in f_other if f["override"] is not None] == []
+    assert len(violation_messages(f_other)) == 1
 
 
 def test_credit_event_writers_and_deduplication(tmp_path: Path) -> None:
@@ -405,3 +374,211 @@ def test_a_4_3_ledger_replayed_twice_supersedes_its_rows_without_double_counting
     first = counts()
     fitness.replay_detector_history(repo.root)
     assert first == counts() == (0, 1, 2)
+
+
+# ── Replay cost (R-evidence-12) ──────────────────────────────────────────────
+#
+# Given a history, When replay runs, Then each commit costs at most 3 git processes (one tree
+# listing, one batched blob read, one range walk for a merge), findings are persisted under one
+# lock with one append, and a replay that starts from a stored tip equals a from-scratch replay.
+
+
+@pytest.fixture
+def git_spawns(monkeypatch):
+    """The argv of every git process started while the test runs (counted at Popen)."""
+    import subprocess
+
+    seen: list = []
+
+    class Counting(subprocess.Popen):  # type: ignore[misc]
+        def __init__(self, args, *rest, **kwargs):
+            # basename, not rsplit("/"): on Windows the program is C:\...\git.exe
+            if isinstance(args, (list, tuple)) and args and os.path.basename(str(args[0])).lower().startswith("git"):
+                seen.append(list(args))
+            super().__init__(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", Counting)
+    return seen
+
+
+def _forty_by_six(tmp_path: Path) -> "hg.Repo":
+    """40 commits over 6 files; c20 adds an eval to src/m2.py and c32 removes it."""
+    repo = hg.Repo(tmp_path / "repo", hg.Home(tmp_path / "home"))
+    _write_rule(repo.root, "gate", "no-eval", forbid_calls=["eval"])
+    files = {f"src/m{i}.py": f"def f{i}(x):\n    return x\n" for i in range(6)}
+    for name, text in files.items():
+        repo.write(name, text)
+    repo.commit("c0")
+    for i in range(1, 40):
+        name = f"src/m{i % 6}.py"
+        files[name] += f"V{i} = {i}\n"
+        if i == 20:
+            files[name] += "Y = eval('1')\n"
+        if i == 32:
+            files[name] = files[name].replace("Y = eval('1')\n", "")
+        repo.write(name, files[name])
+        repo.commit(f"c{i}")
+    return repo
+
+
+def _subjects(repo: "hg.Repo") -> dict:
+    return {sha: repo.git("log", "-1", "--format=%s", sha) for sha in repo.git("rev-list", "--all").split()}
+
+
+def _state(report) -> dict:
+    return {"tip": report.tip, "rules": report.rules, "branch": report.branch}
+
+
+def _ledger_state(root: Path) -> dict:
+    latest = {}
+    for row in credit.read_rows(root):
+        if row.get("event") == "detection":
+            latest[(row["rule"], row["file"], row["pattern"], row["rev"])] = (row["disposition"], row.get("fix_rev"), row["weight"])
+    return latest
+
+
+def _units(detections) -> dict:
+    return {(d["rule"], d["file"], d["pattern"], d["rev"]): (d["disposition"], d.get("fix_rev"), d["weight"])
+            for d in detections}
+
+
+def _from_scratch(root: Path) -> dict:
+    return _units(fitness.replay_detector_history(root, persist=False))
+
+
+@needs_git
+def test_replay_costs_at_most_three_git_spawns_per_commit_and_finds_the_same(tmp_path: Path, git_spawns) -> None:
+    repo = _forty_by_six(tmp_path)
+    del git_spawns[:]
+    rows = fitness.replay_detector_history(repo.root, persist=False)
+    assert len(git_spawns) <= 3 * 40
+    subject = _subjects(repo)
+    assert [(r["rule"], r["file"], r["pattern"], r["disposition"], subject[r["rev"]], subject.get(r["fix_rev"]))
+            for r in rows] == [("no-eval", "src/m2.py", "eval", "leaked", "c20", "c32")]
+
+
+@needs_git
+def test_a_replay_from_its_own_tip_spawns_at_most_five_and_appends_nothing(tmp_path: Path, git_spawns) -> None:
+    repo = _forty_by_six(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    assert first.tip == repo.head()
+    before = credit.read_rows(repo.root)
+    del git_spawns[:]
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first))
+    assert len(git_spawns) <= 5
+    assert (again.detections, again.tip, again.commits) == ([], first.tip, 40)
+    assert credit.read_rows(repo.root) == before
+
+
+def test_25_findings_are_persisted_under_one_lock_with_one_append(tmp_path: Path, monkeypatch) -> None:
+    from contextlib import contextmanager
+
+    from aegis_core.telemetry_engine import ledger
+
+    locks, appends, real_lock, real_append = [], [], credit.ledger_locked, ledger.append_rows
+
+    @contextmanager
+    def counting_lock(root):
+        locks.append(root)
+        with real_lock(root) as site:
+            yield site
+
+    monkeypatch.setattr(credit, "ledger_locked", counting_lock)
+    monkeypatch.setattr(ledger, "append_rows", lambda root, rows: appends.append(len(rows)) or real_append(root, rows))
+    findings = [{"rule": "r", "file": f"src/f{n}.py", "pattern": "eval", "disposition": "leaked", "rev": f"{n:040x}",
+                 "branch": "main", "fix_rev": None, "weight": 1.0, "ts": "2026-01-01T00:00:00Z"} for n in range(25)]
+    rows = credit.record_detections(tmp_path, findings)
+    assert (len(locks), appends, len(rows)) == (1, [25], 25)
+    assert credit.record_detections(tmp_path, findings) == rows and appends == [25]
+    moved = dict(findings[3], fix_rev="f" * 40)
+    assert [r["fix_rev"] for r in credit.record_detections(tmp_path, [findings[2], moved])] == [None, "f" * 40]
+    assert appends == [25, 1]
+
+
+@pytest.mark.parametrize("disposition", ["fixed", ""])
+def test_record_detections_refuses_an_unknown_disposition_and_writes_nothing(tmp_path: Path, disposition) -> None:
+    good = {"rule": "r", "file": "a.py", "pattern": "eval", "disposition": "leaked", "rev": "1" * 40}
+    with pytest.raises(ValueError):
+        credit.record_detections(tmp_path, [good, dict(good, disposition=disposition)])
+    assert credit.read_rows(tmp_path) == []
+
+
+def _small_history(tmp_path: Path) -> "hg.Repo":
+    repo = _replay_repo(tmp_path)
+    repo.write("src/app.py", "def f(x):\n    return eval(x)\n")
+    repo.commit("feat: eval")
+    repo.write("src/util.py", "def g(y):\n    return y\n")
+    repo.commit("feat: util")
+    return repo
+
+
+@needs_git
+def test_e1_a_clean_commit_after_the_stored_tip_equals_a_full_replay(tmp_path: Path, git_spawns) -> None:
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    repo.write("README.md", "# docs\n")
+    repo.commit("docs: readme")
+    del git_spawns[:]
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first))
+    assert sum("ls-tree" in argv for argv in git_spawns) == 2  # the old tip and the new commit only
+    assert again.detections == [] and again.tip == repo.head()
+    assert _ledger_state(repo.root) == _from_scratch(repo.root)
+
+
+@needs_git
+def test_e2_a_new_commit_that_fixes_a_finding_open_at_the_tip_equals_a_full_replay(tmp_path: Path, git_spawns) -> None:
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    assert [d["fix_rev"] for d in first.detections] == [None]
+    repo.write("src/app.py", "def f(x):\n    return int(x)\n")
+    fixed = repo.commit("fix: drop eval")
+    del git_spawns[:]
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first))
+    assert sum("ls-tree" in argv for argv in git_spawns) == 2
+    assert [(d["pattern"], d["disposition"], d["fix_rev"]) for d in again.detections] == [("eval", "leaked", fixed)]
+    assert _ledger_state(repo.root) == _from_scratch(repo.root)
+
+
+@needs_git
+def test_e3_a_rewritten_base_branch_replays_everything(tmp_path: Path) -> None:
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    repo.git("checkout", "-q", "-B", "main", "HEAD~1")
+    repo.write("src/app.py", "def f(x):\n    exec(x)\n    return eval(x)\n")
+    repo.commit("rewritten: exec")
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first))
+    assert _units(again.detections) == _from_scratch(repo.root)
+    assert {d["pattern"] for d in again.detections} == {"eval", "exec"}
+
+
+@needs_git
+def test_e4_an_edited_rule_replays_everything(tmp_path: Path) -> None:
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    _write_rule(repo.root, "gate", "no-eval-exec", target_paths=["src/*.py"], forbid_calls=["eval", "exec", "compile"])
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first))
+    assert again.rules != first.rules
+    assert _units(again.detections) == _from_scratch(repo.root) != {}
+
+
+@needs_git
+def test_a_tip_stored_under_another_replay_format_is_not_resumed_from(tmp_path: Path, monkeypatch) -> None:
+    """Given a complete replay stored by an evaluator of another format (F5, w6 review), When the same
+    history is replayed again, Then it walks everything instead of trusting the old tip."""
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root)
+    assert first.tip == repo.head()
+    monkeypatch.setattr(fitness, "REPLAY_FORMAT", getattr(fitness, "REPLAY_FORMAT", 1) + 1, raising=False)
+    again = fitness.replay_detector_history_report(repo.root, since=_state(first), persist=False)
+    assert again.rules != first.rules
+    assert _units(again.detections) == _from_scratch(repo.root) != {}
+
+
+@needs_git
+@pytest.mark.parametrize("tip", ["not-hex", "0" * 40, None], ids=["non-hex", "unknown-oid", "missing"])
+def test_a_forged_or_missing_stored_tip_replays_everything(tmp_path: Path, tip) -> None:
+    repo = _small_history(tmp_path)
+    first = fitness.replay_detector_history_report(repo.root, persist=False)
+    since = None if tip is None else dict(_state(first), tip=tip)
+    again = fitness.replay_detector_history_report(repo.root, since=since, persist=False)
+    assert again.detections == first.detections != []

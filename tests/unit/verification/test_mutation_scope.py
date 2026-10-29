@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import textwrap
 from typing import Optional
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from aegis_core.verification import mutation_tester, runner
+from aegis_core.verification.checkpoint_checks import check_test_coverage
 from tests.helpers_popen import install_fake_popen
 
 _STRONG = """\
@@ -63,6 +65,22 @@ def _snapshot(root: Path) -> set:
 
 class TestTestFileResolution:
     """T1: the convention file plus every test file that imports the module and names the function."""
+
+    def test_extracted_python_decoder_keeps_its_real_tests(self, tmp_path):
+        repo = Path(__file__).resolve().parents[3]
+        source = "aegis_core/ast/source.py"
+        test = "tests/unit/core/test_ast_source.py"
+        root = _repo(tmp_path, {}, sources={source: (repo / source).read_text(encoding="utf-8"),
+                                           "aegis_core/__init__.py": "", "aegis_core/ast/__init__.py": ""})
+        if (repo / test).is_file():
+            (root / test).parent.mkdir(parents=True)
+            shutil.copyfile(repo / test, root / test)
+
+        ev = _mutation_evidence(runner.run_layer1([source], str(root), max_mutations=1), "read_python_source")
+
+        assert ev.verdict is True, ev.detail
+        assert ev.detail == "0/1 survived (1 test file ran)"
+        assert not [issue for issue in check_test_coverage(root) if issue.get("file") == source]
 
     def test_tests_outside_the_convention_file_kill_mutants(self, tmp_path):
         root = _repo(tmp_path, {

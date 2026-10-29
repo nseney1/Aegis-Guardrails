@@ -69,7 +69,7 @@ def _extract_python_decorators_from_file(file_path: str) -> Tuple[str, ...]:
     """
     if not file_path or not file_path.endswith(".py") or not os.path.isfile(file_path):
         return ()
-    from aegis_core.ast.drivers.python import read_python_source  # the driver imports this module
+    from aegis_core.ast.source import read_python_source
 
     source = read_python_source(file_path)
     if not source.strip():
@@ -84,7 +84,7 @@ def _as_names(value: Any) -> Tuple[str, ...]:
     return (value,) if isinstance(value, str) else tuple(value or ())
 
 
-def _add_binding(table: Dict[str, List[str]], name: str, original: str) -> None:
+def add_binding(table: Dict[str, List[str]], name: str, original: str) -> None:
     bound = table.setdefault(name, [])
     if original not in bound:
         bound.append(original)
@@ -133,7 +133,7 @@ def _import_aliases(imp: Any) -> Dict[str, Tuple[str, ...]]:
     table: Dict[str, List[str]] = {}
     for a, o in pairs:
         if a and o:
-            _add_binding(table, _normalize_ast_token(str(a)), _normalize_ast_token(str(o)))
+            add_binding(table, _normalize_ast_token(str(a)), _normalize_ast_token(str(o)))
     return {name: tuple(originals) for name, originals in table.items()}
 
 

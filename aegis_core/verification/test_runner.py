@@ -177,7 +177,7 @@ def run_external_cmd(
     """Run an external command with shell=False and return structured execution status."""
     import subprocess
     import time
-    from aegis_core import checkrun
+    from aegis_core import testexec
 
     if not argv:
         return {
@@ -211,7 +211,7 @@ def run_external_cmd(
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            checkrun.kill_group(proc)
+            testexec.kill_group(proc)
             try:
                 out_tail, err_tail = proc.communicate()
             except Exception:
@@ -226,7 +226,7 @@ def run_external_cmd(
             }
         finally:
             if os.name != "nt" or getattr(proc, "poll", lambda: None)() is None:
-                checkrun.kill_group(proc)
+                testexec.kill_group(proc)
         return {
             "returncode": proc.returncode,
             "stdout": out or "",
@@ -256,7 +256,6 @@ def run_external_cmd(
 
 
 __all__ = [
-    "NoTestRunnerFoundError",
     "resolve_pytest_cmd",
     "discover_test_evidence",
     "run_external_cmd",

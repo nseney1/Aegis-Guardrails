@@ -157,8 +157,9 @@ def test_rule_demote_and_force_demote(tmp_path, capsys):
         assert rc2 == 1
 
 
-def test_rule_archive(tmp_path):
-    with patch("aegis_cli.rule.prune_rules", return_value=0) as mock_prune:
+def test_rule_archive(tmp_path, capsys):
+    nothing = iter([{"status": "nothing_to_archive", "unavailable": None}])
+    with patch("aegis_cli.rule.iter_rule_selection", return_value=nothing) as mock_prune:
         args = argparse.Namespace(
             rule_action="archive",
             workspace=str(tmp_path),
@@ -167,6 +168,75 @@ def test_rule_archive(tmp_path):
         rc = run_rule(args)
         assert rc == 0
         mock_prune.assert_called_once_with(workspace=tmp_path, execute=True)
+    assert capsys.readouterr().out == "No rules to archive.\n"
+
+
+def _misfiring_trap(ws):
+    from aegis_core.fitness import MIN_N
+    from aegis_core.telemetry_engine import ledger
+
+    rule = ws / ".aegis" / "rules" / "traps" / "noisy.md"
+    rule.parent.mkdir(parents=True)
+    rule.write_bytes(b"---\nid: noisy\ntype: trap\nenforcement: advisory\n---\nBody.\n")
+    ledger.append(ws, [{"rule": "noisy", "outcome": "fp", "source": "ci", "key": f"run-{i}"} for i in range(MIN_N)])
+    return rule
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "archive"])
+def test_rule_archive_prints_each_candidate_and_what_archiving_did(tmp_path, capsys, dry_run):
+    """Given a trap the ledger says misfires, When aegis rule archive runs, Then it prints one
+    [ARCHIVE] line per candidate, marked (dry run) when nothing moved."""
+    from aegis_core.fitness import MIN_N
+
+    rule = _misfiring_trap(tmp_path)
+    assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=dry_run)) == 0
+    note = " (dry run)" if dry_run else ""
+    assert capsys.readouterr().out == (
+        f"[ARCHIVE] noisy (fitness 0.00, misfire bound 0.90, tp 0, fp {MIN_N}){note}\n")
+    assert rule.is_file() is dry_run
+
+
+def test_rule_archive_says_why_a_candidate_was_not_archived(tmp_path, capsys, monkeypatch):
+    from aegis_core.lifecycle import selection
+
+    _misfiring_trap(tmp_path)
+    monkeypatch.setattr(selection, "archive_rule", lambda ws, rule_id: {"status": "ineligible", "message": "it recovered"})
+    assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=False)) == 0
+    assert capsys.readouterr().out.endswith(" (not archived: it recovered)\n")
+
+
+def test_rule_archive_reports_the_rules_it_moved_before_an_archive_fails(tmp_path, capsys, monkeypatch):
+    """Review w14b F1: Given three candidates whose second archive raises, When aegis rule archive
+    runs, Then the evidence line and the first rule's row are printed before the error ends the
+    command with exit 1: a rule already moved to .archive is never left unreported."""
+    from aegis_cli.cli import main
+    from aegis_core.lifecycle import selection
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    rows = [{"rule_id": r, "fitness": 0.1, "misfire": 0.9, "tp": 0, "fp": 5} for r in ("r1", "r2", "r3")]
+    archived = []
+
+    def archive(ws, rule_id):
+        if rule_id == "r2":
+            raise OSError(13, "Permission denied")
+        archived.append(rule_id)
+        return {"status": "archived"}
+
+    monkeypatch.setattr(selection, "transition_candidates", lambda ws, kind: (rows, "gh timed out"))
+    monkeypatch.setattr(selection, "archive_rule", archive)
+    rc = main(["rule", "archive", "--workspace", str(tmp_path)])
+    out, err = capsys.readouterr()
+    assert (rc, archived) == (1, ["r1"])
+    assert out == "Evidence unavailable: gh timed out\n[ARCHIVE] r1 (fitness 0.10, misfire bound 0.90, tp 0, fp 5)\n"
+    assert err.startswith("Error: [Errno 13] Permission denied")
+
+
+@pytest.mark.parametrize("rules_dir,expected", [(False, "No rules directory found.\n"),
+                                                 (True, "No rules to archive.\n")], ids=["no-rules-dir", "nothing"])
+def test_rule_archive_names_the_empty_states(tmp_path, capsys, rules_dir, expected):
+    (tmp_path / ".aegis" / ("rules" if rules_dir else "state")).mkdir(parents=True)
+    assert run_rule(argparse.Namespace(rule_action="archive", workspace=str(tmp_path), dry_run=False)) == 0
+    assert capsys.readouterr().out == expected
 
 
 def test_rule_list_long_id_not_truncated_and_colored(tmp_path, capsys):
@@ -301,3 +371,85 @@ def test_rule_create_without_type_makes_a_trap(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     assert main(["rule", "create", "--json", "--id", "plain", "--hypothesis", "h", "--workspace", str(ws)]) == 0
     assert (ws / ".aegis" / "rules" / "traps" / "plain.md").is_file()
+
+
+# ── R-cli-5: `rule adjudicate` labels only a rule that loads cleanly ──────────
+
+def _files(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _adjudicate(ws: Path, *argv: str) -> int:
+    from aegis_cli.cli import main
+
+    return main(["rule", "adjudicate", "--workspace", str(ws), *argv])
+
+
+def _labels(ws: Path, rule_id: str) -> list:
+    path = ws / ".aegis" / "adjudications" / f"{rule_id}.jsonl"
+    return [json.loads(line) for line in path.read_bytes().splitlines()]
+
+
+def test_adjudicate_records_a_label_for_a_served_rule_and_for_an_expired_one(tmp_path, capsys):
+    ws = _two_rule_workspace(tmp_path / "ws")
+    assert _adjudicate(ws, "--json", "--ref", "PR-7", "inv", "tp") == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "recorded"
+    assert [(r["example_id"], r["verdict"]) for r in _labels(ws, "inv")] == [("PR-7", "tp")]
+    for _ in range(2):
+        assert _adjudicate(ws, "--json", "--ref", "PR-7", "old-trap", "fp") == 0
+    capsys.readouterr()
+    assert {(r["example_id"], r["verdict"]) for r in _labels(ws, "old-trap")} == {("PR-7", "fp")}
+
+
+@pytest.mark.parametrize("rule_id,says", [
+    ("trap-nope", "no rule"), ("inv.md", "no rule"), ("INV", "no rule"),
+    ("../../x", "invalid rule id"), ("a/b", "invalid rule id"), ("..\\..\\x", "invalid rule id"),
+    (" inv", "invalid rule id"), ("", "invalid rule id"), ("inv\x1b[2J", "invalid rule id"),
+], ids=["unknown", "dot-md", "case", "dotdot", "slash", "backslash", "space", "empty", "escape"])
+def test_adjudicate_refuses_an_id_that_names_no_loaded_rule_and_writes_nothing(tmp_path, capsys, rule_id, says):
+    ws = _two_rule_workspace(tmp_path / "ws")
+    before = _files(tmp_path)
+    assert _adjudicate(ws, "--json", rule_id, "tp") == 1
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error" and says in payload["error"]
+    assert "\x1b" not in captured.out and "\x1b" not in captured.err
+    assert _files(tmp_path) == before
+
+
+def test_adjudicate_names_the_unknown_rule_on_stderr_in_text_mode(tmp_path, capsys):
+    ws = _two_rule_workspace(tmp_path / "ws")
+    before = _files(tmp_path)
+    assert _adjudicate(ws, "trap-nope", "tp") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Error: no rule 'trap-nope' that loads cleanly in this workspace")
+    assert "aegis rule list" in captured.err
+    assert _files(tmp_path) == before
+
+
+def test_adjudicate_refuses_a_broken_rule_and_an_archived_one(tmp_path, capsys):
+    ws = _two_rule_workspace(tmp_path / "ws")
+    (ws / ".aegis" / "rules" / "traps" / "trap-broken.md").write_text("no frontmatter here\n", encoding="utf-8")
+    archived = ws / ".aegis" / "rules" / ".archive" / "traps"
+    archived.mkdir(parents=True)
+    (archived / "trap-gone.md").write_text("---\nid: trap-gone\ntype: trap\n---\nBody\n", encoding="utf-8")
+    before = _files(tmp_path)
+    for rule_id in ("trap-broken", "trap-gone"):
+        assert _adjudicate(ws, "--json", rule_id, "tp") == 1
+        assert "no rule" in json.loads(capsys.readouterr().out)["error"]
+    assert _files(tmp_path) == before
+
+
+def test_adjudicate_fails_closed_when_the_rules_tree_holds_a_symlink(tmp_path, capsys):
+    ws = _two_rule_workspace(tmp_path / "ws")
+    real = tmp_path / "elsewhere.md"
+    real.write_text("---\nid: trap-linked\ntype: trap\n---\nBody\n", encoding="utf-8")
+    try:
+        (ws / ".aegis" / "rules" / "traps" / "trap-linked.md").symlink_to(real)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    before = _files(tmp_path)
+    assert _adjudicate(ws, "--json", "inv", "tp") == 1
+    assert "symlink" in json.loads(capsys.readouterr().out)["error"]
+    assert _files(tmp_path) == before

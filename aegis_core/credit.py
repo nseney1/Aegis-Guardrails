@@ -11,14 +11,15 @@ a revert of its landing commit on the protected branch (``reverted``, found by `
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
 from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from aegis_core import gitsafe, human_gate
+from aegis_core import ghcli, gitevidence, gitsafe, human_gate
 from aegis_core.errors import AegisError, PathTraversalError
+from aegis_core.primitives import utc_stamp
 from aegis_core.storage import ledger_locked, read_jsonl
 from aegis_core.telemetry_engine import ledger
 
@@ -27,8 +28,8 @@ __all__ = [
     "GhRestClient", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "required_workflow",
-    "record_adjudication", "record_detection", "record_exposure", "record_override",
-    "record_void", "resolve_protected_branch", "select_ci_run", "session_exposed_rules", "submit_report",
+    "record_adjudication", "record_detection", "record_detections", "record_exposure", "record_override",
+    "record_void", "resolve_protected_branch", "select_ci_run", "submit_report",
     "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
@@ -71,14 +72,22 @@ def _normalize_event_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def _read_ledger_events(root: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _event_rows(raw_rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    return [_normalize_event_row(r) for r in raw_rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
+
+
+def _read_ledger_events(root: Any, view: Any = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """The event rows and why some could not be read; from ``view``'s snapshot when it holds one."""
+    raw = getattr(view, "raw_rows", None)
+    if raw is not None:
+        skipped = view.skipped_lines
+        return _event_rows(raw), view.error or (f"{len(skipped)} unreadable line(s)" if skipped else None)
     try:
         res = read_jsonl(ledger.ledger_path(root))
     except (PathTraversalError, OSError) as exc:
         return [], str(exc)
     err = res.error or (f"{len(res.skipped_lines)} unreadable line(s)" if res.skipped_lines else None)
-    rows = [_normalize_event_row(r) for r in res.rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
-    return rows, err
+    return _event_rows(res.rows), err
 
 
 def read_rows(root: Any) -> List[Dict[str, Any]]:
@@ -135,20 +144,7 @@ def _workflow_path(run: Mapping[str, Any]) -> str:
 
 
 def resolve_protected_branch(root: Any) -> Optional[str]:
-    top = gitsafe.toplevel(Path(str(root)))
-    if top is None:
-        return None
-    sym = gitsafe.run(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], top)
-    if sym.returncode == 0:
-        target = sym.stdout.decode("utf-8", "replace").strip()
-        if target.startswith("refs/remotes/origin/"):
-            branch = target[len("refs/remotes/origin/"):].strip()
-            if branch and branch != "HEAD":
-                return branch
-    for cand in ("main", "master"):
-        if gitsafe.resolve_commit(top, f"refs/remotes/origin/{cand}") or gitsafe.resolve_commit(top, f"refs/heads/{cand}"):
-            return cand
-    return None
+    return gitevidence.protected_branch(gitevidence.repo_facts(root))
 
 
 def select_ci_run(
@@ -188,7 +184,7 @@ def ci_conclusion(run: Optional[Mapping[str, Any]]) -> str:
 
 class GhRestClient:
     def __init__(self, repo: Optional[str] = None, runner: Optional[Callable[..., Any]] = None, cwd: Any = None) -> None:
-        self.repo, self.runner, self.cwd = repo, runner or human_gate.default_gh_runner, cwd
+        self.repo, self.runner, self.cwd = repo, runner or ghcli.default_gh_runner, cwd
 
     def _api(self, path: str) -> Any:
         result = self.runner(["api", f"repos/{self.repo or '{owner}/{repo}'}{path}"], cwd=self.cwd)
@@ -230,56 +226,41 @@ def _protected_branch(root: Any, client: Any) -> Optional[str]:
     return _DEFAULT_BRANCH[key]
 
 
-def _call_landed(landed: Callable[..., Optional[str]], tree: str, head: Optional[str] = None) -> Optional[str]:
-    if isinstance(head, str) and head:
-        try:
-            return landed(tree, head)
-        except TypeError:
-            return landed(tree)
-    return landed(tree)
-
-
 def landed_lookup(
     root: Any, refs: Optional[Sequence[str]] = None, limit: int = _REV_LIMIT,
 ) -> Callable[..., Optional[str]]:
-    top = gitsafe.toplevel(Path(str(root)))
-    entries: Optional[List[Tuple[str, str]]] = None
+    """``lookup(tree, head=None)``: the newest commit of the protected branch (or ``refs``) with
+    ``tree`` that ``head`` is an ancestor of. Git is asked nothing until the first lookup, and each
+    (tree, head) once; a ``head`` that is not a full object id (ledger text) lands nowhere."""
+    index: List[Any] = []
+    answers: Dict[Tuple[str, Optional[str]], Optional[str]] = {}
 
-    def load() -> List[Tuple[str, str]]:
-        if top is None:
-            return []
-        if refs is None:
-            branch = resolve_protected_branch(top)
-            target_refs: Sequence[str] = (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}") if branch else ()
-        else:
-            target_refs = refs
-        resolved = [r for r in target_refs if gitsafe.resolve_commit(top, r)]
-        if not resolved:
-            return []
-        res = gitsafe.run(["rev-list", f"--max-count={limit}", "--format=%T", *resolved], top)
-        if res.returncode != 0:
-            return []
-        out: List[Tuple[str, str]] = []
-        commit = None
-        for line in res.stdout.decode("ascii", "replace").splitlines():
-            if line.startswith("commit "):
-                commit = line.split()[1]
-            elif commit and line.strip():
-                out.append((commit, line.strip()))
-                commit = None
-        return out
+    def load() -> Tuple[Any, Dict[str, List[str]]]:
+        if not index:
+            facts = gitevidence.repo_facts(root)
+            if facts is None or facts.top is None:
+                tips: Sequence[str] = ()
+            elif refs is None:
+                tips = gitevidence.branch_tips(facts, gitevidence.protected_branch(facts) or "")
+            else:
+                tips = [oid for oid in (gitsafe.resolve_commit(facts.top, r) for r in refs) if oid]
+            by_tree: Dict[str, List[str]] = {}
+            for commit, commit_tree in gitevidence.commits(facts, tips, limit):
+                by_tree.setdefault(commit_tree, []).append(commit)
+            index.append((facts, by_tree))
+        return index[0]
 
+    @gitsafe.scrubbed()  # a closure runs after its maker returns: the caller's scope may not cover it
     def lookup(tree: str, head: Optional[str] = None) -> Optional[str]:
-        nonlocal entries
-        if entries is None:
-            entries = load()
-        for commit, commit_tree in entries:
-            if commit_tree != tree:
-                continue
-            if head and top is not None and gitsafe.run(["merge-base", "--is-ancestor", head, commit], top).returncode != 0:
-                continue
-            return commit
-        return None
+        key = (tree, head or None)
+        if key not in answers:
+            facts, by_tree = load()
+            if head and not (isinstance(head, str) and _FULL_SHA.fullmatch(head)):
+                answers[key] = None
+            else:
+                answers[key] = next((c for c in by_tree.get(tree, ())
+                                     if not head or gitevidence.is_ancestor(facts, head, c)), None)
+        return answers[key]
 
     setattr(lookup, "_aegis_root", _canon_root(root))
     return lookup
@@ -287,17 +268,20 @@ def landed_lookup(
 
 _EXPOSED: Dict[Tuple[str, str, str], Set[str]] = {}
 _MAX_EXPOSED_SESSIONS = 256
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# (root, host, session, rule, scope_basis) this process wrote or found in the ledger: a rescan
+# of the same session then takes no lock and reads nothing. Rows are only ever appended.
+_PERSISTED: Set[Tuple[str, str, str, str, Optional[str]]] = set()
+_MAX_PERSISTED = 50_000
 
 
 def record_exposure(
     root: Any, host: Optional[str], session: Optional[str], rules: Iterable[str], *,
     paths: Optional[Iterable[str]] = None, rev: Optional[str] = None, scope_basis: Optional[str] = None,
     heartbeat: Optional[bool] = None, ts: Optional[str] = None, persist: bool = True,
+    revs: Optional[Mapping[str, str]] = None,
 ) -> List[Dict[str, Any]]:
+    """``revs`` names each rule's own revision (``rev`` is the fallback): insight review joins an
+    exposure to a correction only at the rule's current revision."""
     rule_list = [r for r in dict.fromkeys(rules) if isinstance(r, str) and r]
     key = (str(root), host or "", session or "")
     if key not in _EXPOSED and len(_EXPOSED) >= _MAX_EXPOSED_SESSIONS:
@@ -305,7 +289,10 @@ def record_exposure(
     _EXPOSED.setdefault(key, set()).update(rule_list)
     if not persist or not rule_list:
         return []
-    stamp, s_id, h_id = ts or _now(), session or "", host or ""
+    stamp, s_id, h_id = ts or utc_stamp(), session or "", host or ""
+    kept = [(str(root), h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
+    if all(k in _PERSISTED for k in kept):
+        return []
     path_list = [str(p) for p in (paths or ()) if isinstance(p, str)]
     with ledger_locked(root):
         seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read_rows(root), "exposure")}
@@ -322,27 +309,21 @@ def record_exposure(
                 "session": s_id,
                 "host": h_id,
                 "paths": path_list,
-                "rev": rev,
+                "rev": (revs or {}).get(rule_id, rev),
             }
             if scope_basis is not None:
                 row["scope_basis"] = str(scope_basis)
             if heartbeat is not None:
                 row["heartbeat"] = bool(heartbeat)
             to_append.append(row)
-        return [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
+        written = [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
+        if len(_PERSISTED) + len(kept) > _MAX_PERSISTED:
+            _PERSISTED.clear()
+        _PERSISTED.update(kept)
+        return written
 
 
 def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None) -> Set[str]:
-    if session is None:
-        s_id = host or ""
-        found = {r for (r_root, _h_id, r_sess), rules in _EXPOSED.items() if r_root == str(root) and r_sess == s_id for r in rules}
-        if s_id:
-            for row in _of(read_rows(root), "exposure"):
-                if str(row.get("session") or "") == s_id:
-                    rule_id = row.get("rule") or row.get("for_rule")
-                    if isinstance(rule_id, str) and rule_id:
-                        found.add(rule_id)
-        return found
     h_id, s_id = host or "", session or ""
     found = set(_EXPOSED.get((str(root), h_id, s_id), ()))
     if s_id:
@@ -352,9 +333,6 @@ def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None)
                 if isinstance(rule_id, str) and rule_id:
                     found.add(rule_id)
     return found
-
-
-session_exposed_rules = exposed_rules
 
 
 def witnessed_exposed_rules(root: Any, host: Optional[str], session: Optional[str]) -> Set[str]:
@@ -368,33 +346,41 @@ def record_detection(
     rev: Optional[str] = None, branch: str = "main", fix_rev: Optional[str] = None,
     weight: Optional[float] = None, ts: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if disposition not in ("caught", "leaked"):
-        raise ValueError(f"disposition must be 'caught' or 'leaked', got {disposition!r}")
-    eff_weight = float(weight) if weight is not None else (0.5 if disposition == "caught" else 1.0)
-    b_name = branch or "main"
+    return record_detections(root, [{"rule": rule, "file": file, "pattern": pattern, "disposition": disposition,
+                                      "rev": rev, "branch": branch, "fix_rev": fix_rev, "weight": weight, "ts": ts}])[0]
+
+
+def record_detections(root: Any, findings: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """A ``detection`` row per finding (``rule``, ``file``, ``pattern``, ``disposition``, optional ``rev``,
+    ``branch``, ``fix_rev``, ``weight``, ``ts``) under one ledger lock, one read and one append. A
+    finding whose unit (rule, file, pattern, rev) already ends in the same disposition, fix and weight
+    writes nothing; returns each finding's row, written or existing, in order."""
     with ledger_locked(root):
-        latest = None
+        latest: Dict[Tuple[Any, ...], Mapping[str, Any]] = {}
         # One unit per introducing commit (rev), as replay and fitness key it: a re-replay supersedes it.
         for ex in _of(read_rows(root), "detection"):
-            if (ex.get("rule") or ex.get("for_rule")) == rule and ex.get("file") == file and ex.get("pattern") == pattern and ex.get("rev") == rev:
-                latest = ex
-        if (latest is not None and latest.get("disposition") == disposition
-                and latest.get("fix_rev") == fix_rev and float(latest.get("weight") or 0.0) == eff_weight):
-            return _normalize_event_row(latest)
-        row = {
-            "v": ledger.LEDGER_VERSION,
-            "ts": ts or _now(),
-            "event": "detection",
-            "rule": rule,
-            "file": file,
-            "pattern": pattern,
-            "disposition": disposition,
-            "branch": b_name,
-            "rev": rev,
-            "fix_rev": fix_rev,
-            "weight": eff_weight,
-        }
-        return _normalize_event_row(ledger.append_rows(root, [row])[0])
+            latest[(ex.get("rule") or ex.get("for_rule"), ex.get("file"), ex.get("pattern"), ex.get("rev"))] = ex
+        out: List[Any] = []
+        fresh: List[Dict[str, Any]] = []
+        for f in findings:
+            disposition = f.get("disposition")
+            if disposition not in ("caught", "leaked"):
+                raise ValueError(f"disposition must be 'caught' or 'leaked', got {disposition!r}")
+            weight = float(f["weight"]) if f.get("weight") is not None else (0.5 if disposition == "caught" else 1.0)
+            unit = (f["rule"], f["file"], f["pattern"], f.get("rev"))
+            prev = latest.get(unit)
+            if (prev is not None and prev.get("disposition") == disposition
+                    and prev.get("fix_rev") == f.get("fix_rev") and float(prev.get("weight") or 0.0) == weight):
+                out.append(prev)
+                continue
+            row = {"v": ledger.LEDGER_VERSION, "ts": f.get("ts") or utc_stamp(), "event": "detection", "rule": f["rule"],
+                   "file": f["file"], "pattern": f["pattern"], "disposition": disposition,
+                   "branch": f.get("branch") or "main", "rev": f.get("rev"), "fix_rev": f.get("fix_rev"), "weight": weight}
+            latest[unit] = row
+            out.append(len(fresh))
+            fresh.append(row)
+        written = ledger.append_rows(root, fresh) if fresh else []
+        return [_normalize_event_row(written[r] if isinstance(r, int) else r) for r in out]
 
 
 def record_adjudication(
@@ -417,7 +403,7 @@ def record_adjudication(
                     return _normalize_event_row(ex)
         row: Dict[str, Any] = {
             "v": ledger.LEDGER_VERSION,
-            "ts": ts or _now(),
+            "ts": ts or utc_stamp(),
             "event": "adjudication",
             "rule": rule,
             "verdict": norm_verdict,
@@ -431,9 +417,6 @@ def record_adjudication(
         return _normalize_event_row(ledger.append_rows(root, [row])[0])
 
 
-record_human_label = record_adjudication
-
-
 def record_override(
     root: Any, rule: str, file: str, line: int, reason: str = "", *, rev: Optional[str] = None, ts: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -443,7 +426,7 @@ def record_override(
                 return _normalize_event_row(ex)
         row: Dict[str, Any] = {
             "v": ledger.LEDGER_VERSION,
-            "ts": ts or _now(),
+            "ts": ts or utc_stamp(),
             "event": "override",
             "rule": rule,
             "file": str(file),
@@ -461,7 +444,7 @@ def record_void(root: Any, check_id: str, reason: str) -> Dict[str, Any]:
         existing = next((r for r in _of(read_rows(root), "void") if r.get("check") == check_id), None)
         if existing is not None:
             return dict(existing)
-        return ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "void", "check": check_id, "reason": reason}])[0]
+        return ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "void", "check": check_id, "reason": reason}])[0]
 
 
 def void_tree(root: Any, tree: str, reason: str) -> int:
@@ -473,7 +456,7 @@ def void_tree(root: Any, tree: str, reason: str) -> int:
         ids = [c["id"] for c in _of(rows, "check") if c.get("tree") == tree and isinstance(c.get("id"), str)]
         fresh = [i for i in dict.fromkeys(ids) if i not in done]
         if fresh:
-            stamp = _now()
+            stamp = utc_stamp()
             ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "void", "check": i,
                                        "reason": reason} for i in fresh])
         return len(fresh)
@@ -524,7 +507,8 @@ def confirm(
     for check_id in sorted({r.get("check") for r in _of(rows, "report")}):
         if check_id not in voided_checks and check_id in by_id:
             chk = by_id[check_id]
-            commit = _call_landed(look, str(chk.get("tree")), chk.get("head"))
+            tree, head = str(chk.get("tree")), chk.get("head")
+            commit = look(tree, head) if isinstance(head, str) and head else look(tree)
             if commit:
                 commits.setdefault(commit, []).append(check_id)
     target_branch = branch
@@ -562,7 +546,7 @@ def confirm(
         run_attempt = run.get("run_attempt") if run else None
         _VERIFIED_CI[(c_root, commit)] = {"conclusion": conclusion, "workflow": workflow, "branch": target_branch, "run_id": run_id, "run_attempt": run_attempt}
         if latest_ci.get(commit) != (conclusion, run_id, run_attempt):
-            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "ci", "commit": commit, "workflow": workflow, "ci_conclusion": conclusion, "run_id": run_id, "ci_run_attempt": run_attempt}])
+            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "ci", "commit": commit, "workflow": workflow, "ci_conclusion": conclusion, "run_id": run_id, "ci_run_attempt": run_attempt}])
         if conclusion == "success":
             summary["confirmed"] += len(checks)
         elif conclusion in CI_FAILED:
@@ -592,7 +576,7 @@ def submit_report(
                 return {"status": "claimed", "witness": "self", "credited": [], "tree": tree, "recorded": False}
             if used >= limit:
                 return {"status": "rate_limited", "limit": limit, "witness": "self", "credited": []}
-            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": _now(), "event": "claimed", "witness": "self", "tree": tree, "source": source, "session": session, "host": host, "key": f"claim:{host}/{session}:{tree}", "report_key": namespaced, "result": result}])
+            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "claimed", "witness": "self", "tree": tree, "source": source, "session": session, "host": host, "key": f"claim:{host}/{session}:{tree}", "report_key": namespaced, "result": result}])
             return {"status": "claimed", "witness": "self", "credited": [], "tree": tree, "recorded": True}
         rules = list(dict.fromkeys(rules_for(check)))
         have = {(r.get("rule") or r.get("for_rule")) for r in _of(rows, "report") if r.get("check") == check["id"]}
@@ -600,7 +584,7 @@ def submit_report(
         if used + len(fresh) > limit:
             return {"status": "rate_limited", "limit": limit, "witness": "aegis", "credited": []}
         if fresh:
-            stamp = _now()
+            stamp = utc_stamp()
             ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "witness": "aegis", "check": check["id"], "tree": tree, "rule": rule, "for_rule": rule, "result": result, "source": source, "session": session, "host": host, "key": f"credit:{check['id']}:{rule}", "report_key": namespaced} for rule in fresh])
         return {"status": "recorded", "witness": "aegis", "credited": rules, "check": check["id"], "tree": tree}
 
@@ -637,7 +621,8 @@ def derive(
             continue
         seen.add(identity)
         tree = str(check.get("tree"))
-        commit = _call_landed(landed, tree, check.get("head"))
+        head = check.get("head")
+        commit = landed(tree, head) if isinstance(head, str) and head else landed(tree)
         ci_row = ci_rows.get(commit) if commit else None
         ledger_conc = str(ci_row.get("ci_conclusion")) if ci_row is not None else None
         unavail = bool(commit and c_root and (c_root, commit) in _UNAVAILABLE_CI)
@@ -702,6 +687,7 @@ def _last_signers_change(top: Path, tip_ref: str) -> Optional[str]:
     return _SIGNERS_CHANGED[key]
 
 
+@gitsafe.scrubbed()
 def approval_lookup(
     root: Any, rows: Sequence[Mapping[str, Any]], landed: Optional[Callable[..., Optional[str]]] = None,
     *, branch: Optional[str] = None,
@@ -715,30 +701,31 @@ def approval_lookup(
     look = landed or landed_lookup(root)
     checks = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
     cache: Dict[str, bool] = {}
-    anchor: List[Optional[Tuple[str, str]]] = []
+    anchor: List[Optional[Tuple[str, str, str]]] = []
 
-    def protected_tip() -> Optional[Tuple[str, str]]:
+    def protected_tip() -> Optional[Tuple[str, str, str]]:
         if not anchor:
-            p_branch = branch if branch is not None else resolve_protected_branch(top)
+            p_branch = branch if branch is not None else resolve_protected_branch(root)
             refs = (f"refs/remotes/origin/{p_branch}", f"refs/heads/{p_branch}") if p_branch and top else ()
-            anchor.append(next(((p_branch, r) for r in refs if gitsafe.resolve_commit(top, r)), None))
+            anchor.append(next(((p_branch, r, oid) for r in refs if (oid := gitsafe.resolve_commit(top, r))), None))
         return anchor[0]
 
+    @gitsafe.scrubbed()  # a closure, as landed_lookup's
     def is_approved(check_id: str, _categories: Sequence[str] = ()) -> bool:
         if check_id in cache:
             return cache[check_id]
         check = checks.get(check_id)
         base_ref = check.get("base") if check is not None else None
-        commit = _call_landed(look, str(check.get("tree") or ""), check.get("head")) if check is not None else None
+        tree, head = (str(check.get("tree") or ""), check.get("head")) if check is not None else ("", None)
+        commit = None if check is None else look(tree, head) if isinstance(head, str) and head else look(tree)
         tip = protected_tip() if commit and isinstance(base_ref, str) and _OID.fullmatch(base_ref) else None
         ok = False
         if top is not None and tip is not None:
-            p_branch, tip_ref = tip
+            p_branch, tip_ref, tip_oid = tip
             try:
                 signers = _last_signers_change(top, tip_ref)
-                if (signers is not None
-                        and gitsafe.run(["merge-base", "--is-ancestor", base_ref, tip_ref], top).returncode == 0
-                        and gitsafe.run(["merge-base", "--is-ancestor", signers, base_ref], top).returncode == 0):
+                if (signers is not None and gitevidence.is_ancestor_at(top, base_ref, tip_oid)
+                        and gitevidence.is_ancestor_at(top, signers, base_ref)):
                     gov_hash = human_gate.governance_tree_hash(top, commit, base=base_ref)
                     tips = [commit, f"refs/heads/{p_branch}", f"refs/remotes/origin/{p_branch}", "HEAD"]
                     ok = any(
@@ -768,25 +755,33 @@ def _ci_cache_current(entry: Optional[Mapping[str, Any]], ci_row: Mapping[str, A
     return (entry.get("run_id"), entry.get("run_attempt")) == (ci_row.get("run_id"), ci_row.get("ci_run_attempt"))
 
 
+@gitsafe.scrubbed()
 def project_credits(
     root: Any, *, view: Any = None, client: Any = None, workflow: Optional[str] = None,
     landed: Optional[Callable[..., Optional[str]]] = None,
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
     verify_ci: bool = False,
 ) -> CreditProjection:
-    workflow = required_workflow(root) if workflow is None else workflow
     c_root = _canon_root(root)
-    look = landed or landed_lookup(root)
     if landed is not None:
         try:
             setattr(landed, "_aegis_root", c_root)
         except AttributeError:
             pass
-    if client is not None:
-        confirm(root, client=client, workflow=workflow, landed=look)
-    rows, read_err = _read_ledger_events(root)
+    # confirm() appends ci rows, so with a client the snapshot is read again after it.
+    rows, read_err = _read_ledger_events(root, view if client is None else None)
     view_err = getattr(view, "incomplete", None) if view is not None else None
     err = view_err or read_err
+    # Credits derive from report rows only (confirm() iterates them too): without one there is
+    # nothing to land, verify or approve, so no git, no gh and no CI.
+    if not any(r.get("event") == "report" for r in rows):
+        return CreditProjection((), (), available=not err, error=str(err) if err else None)
+    workflow = required_workflow(root) if workflow is None else workflow
+    look = landed or landed_lookup(root)
+    if client is not None:
+        confirm(root, client=client, workflow=workflow, landed=look)
+        rows, read_err = _read_ledger_events(root)  # confirm() appends ci rows
+        err = view_err or read_err
     if err:
         return CreditProjection((), (), available=False, error=str(err))
     stopped: Optional[str] = None
@@ -838,8 +833,8 @@ def project_credits(
                             available=stopped is None, error=stopped)
 
 
-def claimed_summary(root: Any) -> Dict[str, Any]:
-    claims = _of(read_rows(root), "claimed")
+def claimed_summary(root: Any, view: Any = None) -> Dict[str, Any]:
+    claims = _of(_read_ledger_events(root, view)[0], "claimed")
     return {"label": "claimed (unwitnessed)", "claimed": len(claims), "sessions": len({(c.get("host"), c.get("session")) for c in claims})}
 
 
@@ -876,6 +871,7 @@ def check_ci_divergence(trailer: Any, rerun: Mapping[str, Any], second: Optional
     return {"result": "void", "failed": True, "reason": "outcomes still diverge on the same tree after a re-run"}
 
 
+@gitsafe.scrubbed()
 def verify_commit_trailers(
     root: Any, base: str, head: str = "HEAD", *, rerun_fn: Callable[[str, str], Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -889,10 +885,9 @@ def verify_commit_trailers(
     if not mb or not tip or tip == mb:
         return []
     msg = gitsafe.run(["log", "-1", "--format=%B", tip], top)
-    tree_res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{tip}^{{tree}}"], top)
-    if msg.returncode != 0 or tree_res.returncode != 0:
+    commit_tree = gitevidence.commit_tree(top, tip)
+    if msg.returncode != 0 or commit_tree is None:
         return [{"commit": tip, "result": "unbound", "failed": False, "reason": "git could not read the head commit"}]
-    commit_tree = tree_res.stdout.decode("ascii", "replace").strip()
     trailers = [t for line in msg.stdout.decode("utf-8", "replace").splitlines() if (t := parse_trailer(line)) is not None]
     reruns: List[Mapping[str, Any]] = []
 

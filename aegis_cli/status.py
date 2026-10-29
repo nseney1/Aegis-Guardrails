@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from aegis_cli import resolve_root, sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
@@ -112,25 +113,64 @@ def blocked_commands_summary(workspace: Path | str) -> dict:
     }
 
 
-def collect_status(workspace: Path | str, home: Path | str | None = None) -> dict:
-    """Return structured workspace status including hook-observed blocked_commands."""
-    blocked = blocked_commands_summary(workspace)
-    return {
-        "workspace": str(workspace),
-        "blocked_commands": blocked,
-        "events": {
-            "blocked_commands": blocked["total"],
-            "blocked_commands_source": "hook-observed",
-            "blocked_commands_by_host": dict(blocked["by_host"]),
-        },
-    }
+class _StatusModel(NamedTuple):
+    """What both views of ``aegis status`` show, gathered once (one ledger read)."""
+
+    core_files: List[Path]
+    ruleset: Any
+    inventory_error: Optional[str]
+    view: Any
+    claimed: Dict[str, Any]
+    proj_credits: Any
+    blocked_cmds: Dict[str, Any]
+    loaded: List[Any]
+    fits: Dict[str, Any]
+    derived: Optional[Dict[str, Any]]
+    stale: List[Dict[str, Any]]
+    insights: Dict[str, Any]
 
 
 def run_status(args: argparse.Namespace) -> int:
     """Show active rules and stats."""
     root = _repo_root(args)
     proj = _project_root(args)
+    model = _gather_status(root, proj)
 
+    # 4. Process all rules and calculate character overhead
+    # Host-installed instruction rules ("core") list first, then the rule types in table order.
+    _type_order = {"core": 0, **{name: spec.display_order for name, spec in RULE_TYPES.items()}}
+
+    core_rules, core_chars = _core_entries(model.core_files, model.view, model.proj_credits)
+    adaptive_rules, adaptive_chars = _adaptive_entries(model.loaded, model.fits)
+    all_rules = core_rules + adaptive_rules
+    total_chars = core_chars + adaptive_chars
+    problems = _status_problems(model.ruleset, model.stale)
+    ledger_health = model.view.health()
+    rc = 1 if (problems["rule_errors"] or model.inventory_error) else 0
+
+    # Context load: total characters / 4
+    estimated_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
+
+    # Sort rules grouped by modern type, then triggers descending, fitness descending, name
+    all_rules.sort(
+        key=lambda r: (
+            _type_order.get(r["type"], 99),
+            -r["triggers"],
+            -(float(r["score"]) if isinstance(r.get("score"), (int, float)) else -1.0),
+            r["name"],
+        )
+    )
+
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(_status_payload(model, all_rules, estimated_tokens, ledger_health, problems), indent=2))
+        return rc
+
+    return _print_status(args, proj, model, all_rules, estimated_tokens, problems, rc)
+
+
+def _gather_status(root: Path, proj: Path) -> _StatusModel:
+    """Read what both views show; every per-rule number comes from the one ledger read."""
     # 1. Core rules: the shipped rules, listed only in the Aegis checkout they ship from.
     #    v4 installs no rule files into host directories (host-matrix spec §3.2), and a
     #    workspace's own rules/ is its project's, never Aegis's.
@@ -159,37 +199,35 @@ def run_status(args: argparse.Namespace) -> int:
     from aegis_core.credit import claimed_summary, project_credits
 
     # aegis_report_outcome calls with no check row for their tree: counted apart, never per rule.
-    claimed = claimed_summary(proj)
+    claimed = claimed_summary(proj, view=view)
     proj_credits = project_credits(proj, view=view)
     blocked_cmds = blocked_commands_summary(proj)
     loaded = [r for r in ruleset.rules if r.ok]
     fits = for_rules(proj, loaded, view=view)
     derived = read_derived(proj)
     stale = stale_rules(ruleset, derived)
+    from aegis_core.insights import insight_status
 
-    # 3. Ledger totals of the host-installed rules (they have no rule file here)
+    # The user-scope insights log, read once and offline; nothing when there is none.
+    insights = insight_status(proj)
+    return _StatusModel(core_files, ruleset, inventory_error, view, claimed, proj_credits, blocked_cmds, loaded,
+                        fits, derived, stale, insights)
+
+
+def _core_fitness(totals: Dict[str, Any], proj_credits: Any, *names: str) -> Tuple[int, Optional[float]]:
     from aegis_core.fitness import compute
 
-    combined_rows = []
-    seen_keys: set[tuple[str, str]] = set()
-    for r in list(view.rows) + list(proj_credits.outcome_rows):
-        k, rid = r.get("key"), r.get("rule")
-        if isinstance(k, str) and k and isinstance(rid, str):
-            if (k, rid) in seen_keys:
-                continue
-            seen_keys.add((k, rid))
-        combined_rows.append(r)
-    totals = ledger.aggregate_rows(combined_rows)
+    entry = next((totals[n] for n in names if n in totals), {})
+    fit = compute(entry, evidence_available=proj_credits.available, evidence_error=proj_credits.error)
+    return fit.triggers, fit.reported_score
 
-    def _core_fitness(*names: str) -> tuple[int, float | None]:
-        entry = next((totals[n] for n in names if n in totals), {})
-        fit = compute(entry, evidence_available=proj_credits.available, evidence_error=proj_credits.error)
-        return fit.triggers, fit.reported_score
 
-    # 4. Process all rules and calculate character overhead
-    # Host-installed instruction rules ("core") list first, then the rule types in table order.
-    _type_order = {"core": 0, **{name: spec.display_order for name, spec in RULE_TYPES.items()}}
+def _core_entries(core_files: List[Path], view: Any, proj_credits: Any) -> Tuple[List[dict], int]:
+    """The core rules' table entries, and their characters for the context load."""
+    # 3. Ledger totals of the host-installed rules (they have no rule file here)
+    from aegis_core.fitness import combined_totals
 
+    totals = combined_totals(view, proj_credits)
     total_chars = 0
     all_rules: list[dict] = []
 
@@ -201,7 +239,7 @@ def run_status(args: argparse.Namespace) -> int:
         total_chars += len(content)
         fm = _parse_frontmatter(str(f))
         rule_name = sanitize_display(str(fm.get("id") or f.stem))
-        triggers, score = _core_fitness(rule_name, f.stem)
+        triggers, score = _core_fitness(totals, proj_credits, rule_name, f.stem)
         all_rules.append({
             "name": rule_name,
             "type": "core",
@@ -210,7 +248,13 @@ def run_status(args: argparse.Namespace) -> int:
             "expiry": "∞ (core)",
             "is_core": True,
         })
+    return all_rules, total_chars
 
+
+def _adaptive_entries(loaded: List[Any], fits: Dict[str, Any]) -> Tuple[List[dict], int]:
+    """The workspace rules' table entries, and their characters for the context load."""
+    total_chars = 0
+    all_rules: list[dict] = []
     for rule in loaded:
         total_chars += len(rule.raw.decode("utf-8-sig", "replace"))
         fit = fits[rule.id]
@@ -230,7 +274,11 @@ def run_status(args: argparse.Namespace) -> int:
                 rule.meta.get("created"), rule.meta.get("expiry_days")),
             "is_core": False,
         })
-    problems = {
+    return all_rules, total_chars
+
+
+def _status_problems(ruleset: Any, stale: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
         "rule_errors": [{"path": r.path, "error": r.error} for r in ruleset.errors],
         "ignored": [{"path": i.path, "reason": i.reason} for i in ruleset.ignored],
         "stale_rules": stale,
@@ -238,41 +286,34 @@ def run_status(args: argparse.Namespace) -> int:
         "untargeted": [{"id": r.id, "path": r.path} for r in sorted(ruleset.served, key=lambda r: r.id)
                        if not r.target_paths],
     }
-    ledger_health = view.health()
-    rc = 1 if (problems["rule_errors"] or inventory_error) else 0
 
-    # Context load: total characters / 4
-    estimated_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
 
-    # Sort rules grouped by modern type, then triggers descending, fitness descending, name
-    all_rules.sort(
-        key=lambda r: (
-            _type_order.get(r["type"], 99),
-            -r["triggers"],
-            -(float(r["score"]) if isinstance(r.get("score"), (int, float)) else -1.0),
-            r["name"],
-        )
-    )
+def _status_payload(model: _StatusModel, all_rules: List[dict], estimated_tokens: int, ledger_health: Dict[str, Any],
+                    problems: Dict[str, Any]) -> Dict[str, Any]:
+    """The JSON document, its keys in the order the view has always written them."""
+    return {
+        "core_rules": len(model.core_files),
+        "adaptive_rules": len(model.loaded),
+        "estimated_tokens": estimated_tokens,
+        "rules": all_rules,
+        "last_sync": model.derived.get("synced_at") if model.derived else None,
+        "inventory_error": model.inventory_error,
+        "ledger": ledger_health,
+        "claimed": model.claimed,
+        "blocked_commands": model.blocked_cmds,
+        "insights": model.insights,
+        **problems,
+    }
 
-    if getattr(args, "json", False):
-        import json
-        payload = {
-            "core_rules": len(core_files),
-            "adaptive_rules": len(loaded),
-            "estimated_tokens": estimated_tokens,
-            "rules": all_rules,
-            "last_sync": derived.get("synced_at") if derived else None,
-            "inventory_error": inventory_error,
-            "ledger": ledger_health,
-            "claimed": claimed,
-            "blocked_commands": blocked_cmds,
-            **problems,
-        }
-        print(json.dumps(payload, indent=2))
-        return rc
 
+def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all_rules: List[dict],
+                  estimated_tokens: int, problems: Dict[str, Any], rc: int) -> int:
+    """The text view: only it reads the token budget and the terminal's output settings."""
+    core_files, loaded, derived, insights = model.core_files, model.loaded, model.derived, model.insights
+    blocked_cmds, claimed, inventory_error, view = model.blocked_cmds, model.claimed, model.inventory_error, model.view
     from aegis_cli.ui.table import Table
     from aegis_cli.ui.theme import OutputContext
+    from aegis_core.insights import insight_status_lines
 
     existing_ui = getattr(args, "ui", None)
     ui = existing_ui if isinstance(existing_ui, OutputContext) else OutputContext.from_env_and_args(args)
@@ -287,6 +328,11 @@ def run_status(args: argparse.Namespace) -> int:
     print(f"  {'Context load:':<16}~{estimated_tokens:,} tokens (pre-JIT max)")
     print(f"  {'Token budget:':<16}{ui.format_budget_bar(estimated_tokens, max_budget)}")
     print(f"  {'Last sync:':<16}{derived.get('synced_at') if derived else 'never (run aegis sync)'}\n")
+    insight_lines = insight_status_lines(insights)
+    for line in insight_lines:
+        print(f"  {sanitize_display(line, 300)}")
+    if insight_lines:
+        print()
     if blocked_cmds["total"]:
         by_host_str = ", ".join(f"{sanitize_display(h)}: {n}" for h, n in sorted(blocked_cmds["by_host"].items()))
         print(f"  {'Blocked cmds:':<16}{blocked_cmds['total']} ({blocked_cmds['label']}: {by_host_str})\n")

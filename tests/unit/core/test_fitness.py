@@ -9,14 +9,22 @@ frontmatter.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 
 import pytest
 
-from aegis_core.fitness import Fitness, compute, for_rules, wilson_interval, wilson_lower_bound
+from aegis_core import stats
+from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.rules import load_rules
+from aegis_core.taxonomy import DEFAULT_CONFIDENCE_LEVEL
 from aegis_core.telemetry_engine import ledger
+
+# The fitness estimator's 90% interval: aegis_core.stats defaults to 95%.
+wilson_interval = partial(stats.wilson_interval, confidence=DEFAULT_CONFIDENCE_LEVEL)
+wilson_lower_bound = partial(stats.wilson_lower_bound, confidence=DEFAULT_CONFIDENCE_LEVEL)
 
 NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -71,7 +79,7 @@ def test_a_rule_without_evidence_has_fitness_zero() -> None:
 def test_calendar_days_never_decay_a_rule(age_days: int) -> None:
     totals = {"triggers": 40, "tp": 40, "fp": 0, "last_ts": _iso(NOW - timedelta(days=age_days))}
     fit = compute(totals, now=NOW)
-    assert (fit.decay_factor, fit.effective_weight) == (1.0, 1.0)
+    assert fit.effective_weight == 1.0
     assert fit.score == pytest.approx(wilson_lower_bound(40, 40), abs=1e-4)
 
 
@@ -86,7 +94,7 @@ def test_the_half_life_and_epsilon_are_defined_once() -> None:
 
 
 def test_the_posterior_decays_with_sessions_and_reverts_to_the_prior() -> None:
-    from aegis_core.fitness import beta_cdf
+    from aegis_core.stats import beta_cdf
 
     def gate(sessions: int) -> Fitness:
         return compute({}, rule_type="gate", adjudicated_fp=5, min_n=5, eligible_sessions=sessions, half_life_sessions=20)
@@ -178,6 +186,102 @@ def test_a_rule_with_no_ledger_rows_scores_zero_whatever_its_frontmatter_says(tm
     ws = _workspace(tmp_path)
     fits = for_rules(ws, load_rules(ws).rules, now=NOW)
     assert {k: (v.triggers, v.score) for k, v in fits.items()} == {"t": (0, 0.0), "i": (0, 0.0)}
+
+
+def _t4_row(event=None, **fields):
+    return {"v": 2, "rule": "t", "ts": "2026-10-08T00:00:00Z", "event": event, **fields}
+
+
+def test_for_rules_folds_every_t4_event_arm_in_ledger_order(tmp_path: Path, monkeypatch) -> None:
+    from tests.helpers_adjudication import write_labels
+    from tests.helpers_humangate import Home, Repo
+
+    home = Home(tmp_path / "home")
+    for name, value in home.env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home.path / ".config"))
+    repo = Repo(tmp_path / "repo", home)
+    ws = _workspace(repo.root)
+    write_labels(ws, "t", [
+        {"example_id": "reviewed-tp", "verdict": "tp", "session": "reviewed-1", "repo": "repo-1",
+         "ts": "2026-10-05T00:00:00Z"},
+        {"example_id": "reviewed-fp", "verdict": "fp", "session": "reviewed-2", "repo": "repo-2",
+         "ts": "2026-10-07T00:00:00Z"},
+    ])
+    repo.git("add", ".aegis/rules/traps/t.md", ".aegis/rules/invariants/i.md", ".aegis/adjudications/t.jsonl")
+    repo.git("commit", "-q", "-m", "reviewed labels")
+    repo.git("update-ref", "refs/remotes/origin/main", repo.head())
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    write_labels(ws, "t", [{"example_id": "branch-fp", "verdict": "fp"}])
+    rows = [
+        _t4_row(outcome="tp", source="ci", ts="2026-10-02T00:00:00Z", key="legacy"),
+        _t4_row("exposure", session="s1", heartbeat=True, scope_basis="match"),
+        _t4_row("exposure", session="s2", heartbeat=False, scope_basis="match"),
+        _t4_row("exposure", session="s3", scope_basis="fallback_unscoped"),
+        _t4_row("exposure", session="s4"),
+        _t4_row("exposure", session="s5", heartbeat_alive=False),
+        _t4_row("exposure", session="early", ts="2026-10-04T00:00:00Z"),
+        _t4_row("detection", file="a.py", pattern="eval", rev="one", disposition="leaked", ts="2026-10-03T00:00:00Z"),
+        _t4_row("detection", file="a.py", pattern="eval", rev="one", disposition="caught", ts="2026-10-04T00:00:00Z"),
+        _t4_row("adjudication", verdict="tp"),
+        _t4_row("adjudication", verdict="fp"),
+        _t4_row("detection", file="a.py", pattern="eval", rev="one", disposition="leaked", ts="2026-10-06T00:00:00Z"),
+        _t4_row("detection", file="a.py", pattern="eval", rev="one", disposition="caught", ts="2026-10-01T00:00:00Z"),
+        _t4_row("detection", file="b.py", pattern="exec", rev="one", disposition="leaked", ts="2026-10-09T00:00:00Z"),
+        _t4_row("detection", file="a.py", pattern="eval", rev="two", disposition="leaked", ts="2026-10-10T00:00:00Z"),
+        _t4_row("override"),
+        _t4_row("report", check="unknown-check"),
+    ]
+    ledger.append_rows(ws, rows)
+    rules = load_rules(ws).rules
+    now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+    fits = for_rules(ws, rules, now)
+    assert asdict(fits["t"]) == {
+        "rule": "t", "triggers": 1, "tp": 2.5, "fp": 1.0, "last_ts": "2026-10-02T00:00:00Z",
+        "score": 0.2943, "misfire": 0.0646, "state": "insufficient", "adjudicated_n": 2,
+        "adjudicated_tp": 1, "adjudicated_fp": 1, "caught": 1, "leaked": 2, "contested": 1,
+        "override_rate": 0.5, "flagged_for_review": True, "p_below_demote": 0.5907, "prior_mass": 0.0,
+        "prior_disclosure": None, "mde": 0.3869, "eligible_sessions": 2, "effective_weight": 0.954842,
+        "archive_candidate": False, "sessions_count": 2, "repos_count": 2, "suggestion": None,
+        "evidence_available": True, "evidence_error": None, "min_n": 25,
+    }
+    assert fits["i"] == Fitness(rule="i")
+    ledger.append_rows(ws, [_t4_row("detection", rule="unknown", disposition="caught")])
+    assert for_rules(ws, rules, now) == fits
+    with open(ledger.ledger_path(ws), "ab") as stream:
+        stream.write(b"{unreadable json\n")
+    assert for_rules(ws, rules, now) == {
+        rid: replace(fit, evidence_available=False, evidence_error="1 unreadable line(s)")
+        for rid, fit in fits.items()
+    }
+
+
+def test_for_rules_keeps_detection_and_exposure_buckets_independent(tmp_path: Path, monkeypatch) -> None:
+    from aegis_core.adjudication import Adjudications
+
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    ws = _workspace(tmp_path / "repo")
+    ledger.append_rows(ws, [
+        _t4_row("detection", file="a.py", pattern="eval", rev="one", disposition="caught", ts="2026-10-10T00:00:00Z"),
+        _t4_row("detection", file="a.py", pattern="eval", rev="one", disposition="leaked", ts="2026-10-02T00:00:00Z"),
+        _t4_row("detection", rule="i", file="a.py", pattern="eval", rev="one", disposition="caught", ts="2026-10-11T00:00:00Z"),
+        _t4_row("exposure", session="shared", heartbeat=False, ts="2026-10-12T00:00:00Z"),
+        _t4_row("exposure", session="shared", heartbeat=True, ts="2026-10-12T00:00:00Z"),
+        _t4_row("exposure", rule="i", session="shared", heartbeat=True, ts="2026-10-12T00:00:00Z"),
+    ])
+    rules = list(load_rules(ws).rules)
+    fits = for_rules(ws, rules, NOW, adjudications=Adjudications())
+    assert (fits["t"].caught, fits["t"].leaked, fits["t"].eligible_sessions, fits["t"].last_ts) == (
+        0, 1, 0, "2026-10-10T00:00:00Z",
+    )
+    assert (fits["i"].caught, fits["i"].leaked, fits["i"].eligible_sessions, fits["i"].last_ts) == (
+        1, 0, 1, "2026-10-11T00:00:00Z",
+    )
+    assert for_rules(ws, reversed(rules), NOW, adjudications=Adjudications()) == fits
 
 
 # ── One minimum-sample gate (R-evidence-8, spec T4 and section 9) ─────────────

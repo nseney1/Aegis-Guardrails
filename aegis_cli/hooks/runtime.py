@@ -120,6 +120,14 @@ class HookCommand(AegisCommand):
     help = "Install, inspect or remove the git pre-commit hook and the agent hosts' PreToolUse hooks"
 
     def configure_parser(self, parser: Any, parents: Any = None) -> None:
+        if parents is None:
+            common = argparse.ArgumentParser(add_help=False)
+            common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                                help="Emit machine-readable JSON output")
+            common.add_argument("--plain", action="store_true", default=argparse.SUPPRESS,
+                                help="Strip ANSI styling and emoji")
+            common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
+            parents = [common]
         p_hook_sub = parser.add_subparsers(dest="hook_action")
         p_parents = parents or []
 

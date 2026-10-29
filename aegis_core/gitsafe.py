@@ -1,4 +1,5 @@
-"""Every git subprocess Aegis runs (D20, host-matrix §3.7, v4.3 spec §10.1).
+"""Every git subprocess Aegis runs, except treeid's (scrubbed environment, private index;
+SECURITY.md). D20, host-matrix §3.7, v4.3 spec §10.1.
 
 A repository's own config is attacker-controlled: ``core.fsmonitor`` names a program
 that ``git status``/``git diff`` run, hooks run on many commands, a clean filter
@@ -15,38 +16,33 @@ every call here:
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
   Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
-- uses plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
+- reads with plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
-  ``check-ref-format``, ``hash-object``, ``version`` and ``config`` (reads only). It
-  writes in four places only, never to the work tree, the index, a branch or a tag:
-  ``hash-object -w`` stores a blob, ``update-ref --no-deref --stdin`` creates, swaps
-  or deletes one ref under compare-and-swap, always under ``refs/aegis/`` (the team's
-  leases; ``update_ref`` refuses any other name), and ``merge-tree --write-tree``
-  stores the objects of a trial merge that nothing references (git's gc collects
-  them), and ``interpret-trailers --in-place`` edits the prepare-commit-msg hook's message
-  file, with no repository config read (its ``trailer.*`` commands). ``diff-index`` without ``--cached``, ``ls-files --others`` and
-  ``hash-object --stdin-paths`` read the working tree, which is where an fsmonitor or
-  a clean filter would run; they are needed (no plumbing lists changed or untracked
-  files otherwise, and only git knows its line-ending conversion). The forced
-  ``core.fsmonitor=false`` keeps them inert, every filter driver the repository's own
-  config defines is switched off for them (a driver from the user's or the system's
-  config, git-lfs say, still runs, as in any git command the user types), and
-  ``diff-index`` does not look inside a dirty submodule, where it would run ``git
-  status`` under the submodule's own config.
+  ``check-ref-format``, ``hash-object``, ``version``, ``config`` and ``symbolic-ref`` (the
+  branch ``refs/remotes/origin/HEAD`` names, which ``resolve_base_ref`` tries before the fixed
+  names: repository data, as ``origin/main`` is). It never writes to the work tree, the index,
+  a branch or a tag; it writes with ``hash-object -w`` (a blob),
+  ``update-ref --no-deref --stdin`` (one ref under compare-and-swap, always under
+  ``refs/aegis/``: the team's leases), ``merge-tree --write-tree`` (a trial merge's objects,
+  referenced by nothing, which git's gc collects), ``read-tree`` into a private index in a fresh
+  0700 temporary directory and ``checkout-index -a -f --prefix`` below the caller's scratch
+  directory (``export_tree``), and ``interpret-trailers --in-place`` (the prepare-commit-msg
+  message file, no repository config read: its ``trailer.*`` commands are programs).
+  Callers also use ``run`` for approval commits and ``sync --pr`` (SECURITY.md).
 
-Blob content read through ``cat-file`` is checked against the object id it was asked
-for, so a replaced or corrupted object is an error rather than silent input.
+Working-tree plumbing disables repository filters and fsmonitor; trusted user/system
+filters still run. Blob reads verify their requested object ids.
 
 The query helpers answer None when git cannot answer. The ref, object, diff and merge
-primitives the team lanes use (``write_blob``, ``update_ref``, ``read_ref``,
-``list_refs``, ``read_object``, ``diff_entries``, ``merge_tree_conflicted``) raise
-GitError instead, so "git could not say" is never mistaken for "nothing there".
+primitives raise GitError instead, so "git could not say" never means "nothing there".
 ``merge-tree`` runs merge drivers and, with ``merge.renormalize``, filters: a merge
 driver the repository's own config defines makes it unavailable, and the repository's
 filter drivers and renormalization are switched off for it.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass
 import hashlib
 import os
@@ -57,10 +53,11 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
-from aegis_core import pathlookup
+from aegis_core import atomicio, pathlookup
 from aegis_core.errors import AegisError
+from aegis_core.primitives import is_within, safe_parts
 
 __all__ = [
     "CHANGE_MODES",
@@ -69,22 +66,31 @@ __all__ = [
     "UPDATE_REF_ATTEMPTS",
     "UPDATE_REF_BACKOFF_SECONDS",
     "GitError",
+    "Layout",
     "MergeTreeUnavailable",
     "RefConflict",
     "RefNameError",
+    "TRUSTED_SCOPES",
     "add_trailer",
     "blob_id",
     "blob_oid",
+    "blob_sizes",
     "changed_files",
     "common_dir",
     "diff_entries",
     "export_tree",
+    "filter_overrides",
+    "git_executable",
     "git_path",
     "git_version",
     "head_commit",
+    "in_memo",
+    "layout",
     "list_files",
     "list_refs",
     "merge_base",
+    "memo",
+    "memoized",
     "merge_tree_conflicted",
     "parse_name_status_z",
     "read_blob",
@@ -95,6 +101,8 @@ __all__ = [
     "resolve_base_ref",
     "resolve_commit",
     "run",
+    "run_checked",
+    "scrubbed",
     "show_prefix",
     "toplevel",
     "tree_blobs",
@@ -134,6 +142,15 @@ _ENV = {
     "GIT_NO_REPLACE_OBJECTS": "1",
     "LC_ALL": "C",
 }
+# What ``git rev-parse --local-env-vars`` lists: each points git at another repository, index or
+# object store. Identity, SSH and the config-scope variables (how a HOME is faked) are not here.
+_LOCAL_ENV = frozenset((
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+))
+_SCRUB: "contextvars.ContextVar[bool]" = contextvars.ContextVar("aegis_git_scrub", default=False)
 
 
 class GitError(AegisError):
@@ -163,13 +180,26 @@ class MergeTreeUnavailable(GitError):
     driver from the repository's own config it would run)."""
 
 
-def _git_executable() -> str:
+_GIT_FOUND: Dict[Tuple[Optional[str], ...], str] = {}
+
+
+def _reset_for_tests() -> None:
+    _GIT_FOUND.clear()
+
+
+def git_executable() -> str:
+    """The git ``run`` starts, looked up once per PATH value; a git removed since raises GitError."""
     # Absolute PATH entries only: an empty or relative entry names the cwd (the
     # repository, where a clone can plant a git), and so does the current directory
     # the standard library's lookup searches first on Windows.
-    found = pathlookup.which("git")
-    if not found:
-        raise GitError("git is not installed or not on PATH")
+    key = (os.environ.get("PATH"), os.environ.get("PATHEXT"))
+    found = _GIT_FOUND.get(key)
+    if not (found and os.path.isfile(found) and os.access(found, os.X_OK)):
+        _GIT_FOUND.clear()
+        found = pathlookup.which("git")
+        if not found:
+            raise GitError("git is not installed or not on PATH")
+        _GIT_FOUND[key] = found
     return found
 
 
@@ -180,14 +210,16 @@ def run(
     stdin: Optional[bytes] = None,
     _hardening: Sequence[str] = _HARDENING,
     _env: Optional[Mapping[str, str]] = None,
+    tty: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run ``git <args>`` hardened as described above; return the completed process (bytes).
 
     A non-zero exit is returned, not raised. Raises GitError when git cannot be started
-    or exceeds ``timeout``.
+    or exceeds ``timeout``. ``tty``: git (and a signing program it runs) reads the caller's stdin.
     """
-    argv = [_git_executable(), *_hardening, *args]
-    env = dict(os.environ)
+    argv = [git_executable(), *_hardening, *args]
+    scrub = _SCRUB.get()
+    env = {k: v for k, v in os.environ.items() if not (scrub and k.upper() in _LOCAL_ENV)}
     env.update(_ENV)
     if _env is not None:
         env.update(_env)
@@ -197,7 +229,7 @@ def run(
             cwd=str(cwd),
             env=env,
             input=stdin,
-            stdin=None if stdin is not None else subprocess.DEVNULL,
+            stdin=None if stdin is not None or tty else subprocess.DEVNULL,
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -206,6 +238,31 @@ def run(
         raise GitError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
     except OSError as exc:
         raise GitError(f"cannot run git: {exc}") from exc
+
+
+@contextmanager
+def scrubbed() -> Iterator[None]:
+    """Inside the block (or a function decorated with ``@scrubbed()``) ``run`` drops the caller's
+    ``_LOCAL_ENV``, so evidence is about the repository at ``cwd``; ``_env`` still wins. Not the
+    default: git hands a hook its index in GIT_INDEX_FILE (and a linked worktree its GIT_DIR)."""
+    token = _SCRUB.set(True)
+    try:
+        yield
+    finally:
+        _SCRUB.reset(token)
+
+
+def run_checked(args: Sequence[str], cwd: Path | str, *, error: Callable[[str], Exception] = GitError,
+                timeout: float = GIT_TIMEOUT_SECONDS, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    """``run`` that answers only a zero exit: git that cannot start, times out or exits non-zero raises
+    ``error`` (GitError unless named), with git's stderr whitespace-collapsed and cut to 200 characters."""
+    try:
+        res = run(args, cwd, timeout=timeout, stdin=stdin)
+    except GitError as exc:
+        raise error(str(exc)) from exc
+    if res.returncode != 0:
+        raise error(f"git {args[0]} failed: {' '.join(res.stderr.decode('utf-8', 'replace').split())[:200]}")
+    return res
 
 
 def add_trailer(message_file: Path | str, trailer: str) -> bool:
@@ -251,10 +308,79 @@ def _z_paths(out: Optional[bytes]) -> Optional[List[str]]:
 
 # ── Repository facts ─────────────────────────────────────────────────────────
 
+# One request's answers (a scan): None outside a scope. Only ``layout`` and gitevidence read it,
+# and nothing in it outlives the scope, so a ref that moves is seen by the next request.
+_MEMO: "contextvars.ContextVar[Optional[Dict[Any, Any]]]" = contextvars.ContextVar("aegis_git_memo", default=None)
+
+
+@contextmanager
+def memo() -> Iterator[None]:
+    """Remember repository facts until the outermost scope exits (an inner one shares it)."""
+    token = _MEMO.set({}) if _MEMO.get() is None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _MEMO.reset(token)
+
+
+def in_memo() -> bool:
+    return _MEMO.get() is not None
+
+
+def memoized(key: Tuple[Any, ...], produce: Callable[[], Any]) -> Any:
+    """``produce()`` once per scope for ``key`` (which starts with the realpath of the cwd it is
+    about), None answers included; outside a scope every call computes."""
+    store = _MEMO.get()
+    if store is None:
+        return produce()
+    key = (_SCRUB.get(), *key)  # an answer under the caller's GIT_DIR is not the scrubbed one
+    if key not in store:
+        store[key] = produce()
+    return store[key]
+
+
+class Layout(NamedTuple):
+    """Where ``cwd`` sits: ``common_dir`` as git names it (maybe relative to cwd), ``prefix`` below the
+    top level, whether the repository is shallow, and the top level (None outside a work tree)."""
+
+    common_dir: str
+    prefix: str
+    shallow: bool
+    top: Optional[str]
+
+
+def _layout(cwd: Path | str) -> Optional[Layout]:
+    try:
+        res = run(["rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel"], cwd)
+    except GitError:
+        return None
+    # In a bare repository or inside .git, git dies on --show-toplevel after the first three lines.
+    lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
+    if len(lines) == (4 if res.returncode == 0 else 3):
+        # An old git echoes the flag it does not know: read as shallow, the side that caches nothing.
+        # git prints C:/x on Windows; normpath gives the separators Path and the callers use.
+        top = lines[3].strip() if len(lines) == 4 else ""
+        return Layout(lines[0].strip(), lines[1].rstrip("\r"), lines[2].strip() != "false", os.path.normpath(top) if top else None)
+    common = _text(["rev-parse", "--git-common-dir"], cwd) if lines else None
+    if common is None:
+        return None
+    # A path holding a newline cannot be split by line: each question alone, as before the combined
+    # call, and shallow assumed so that nothing about it is kept beyond the request.
+    prefix = _out(["rev-parse", "--show-prefix"], cwd) or b""
+    top = _text(["rev-parse", "--show-toplevel"], cwd)
+    return Layout(common, os.fsdecode(prefix.rstrip(b"\r\n")), True, os.path.normpath(top) if top else None)
+
+
+def layout(cwd: Path | str) -> Optional[Layout]:
+    """``cwd``'s Layout in one git call (memoized in a scope), or None outside any repository."""
+    return memoized((os.path.realpath(cwd), "layout"), lambda: _layout(cwd))
+
+
 def toplevel(cwd: Path | str) -> Optional[Path]:
     """The work tree root containing ``cwd``, or None outside a work tree."""
-    text = _text(["rev-parse", "--show-toplevel"], cwd)
-    return Path(text) if text else None
+    found = layout(cwd)
+    return Path(found.top) if found is not None and found.top else None
 
 
 def show_prefix(cwd: Path | str) -> str:
@@ -283,10 +409,10 @@ def common_dir(cwd: Path | str) -> Optional[Path]:
     Every worktree of a repository answers the same directory (the main ``.git``), unlike
     ``--git-path``, which answers ``.git/worktrees/<name>/...`` in a linked worktree.
     """
-    text = _text(["rev-parse", "--git-common-dir"], cwd)
-    if not text:
+    found = layout(cwd)
+    if found is None or not found.common_dir:
         return None
-    path = Path(text)
+    path = Path(found.common_dir)
     # git names it relative to the directory it ran in (e.g. "../.git" from a subdirectory).
     return path if path.is_absolute() else Path(os.path.abspath(cwd)) / path
 
@@ -339,15 +465,19 @@ def merge_base(cwd: Path | str, a: str, b: str = "HEAD") -> Optional[str]:
 
 def resolve_base_ref(cwd: Path | str, environ: Optional[dict] = None) -> Optional[str]:
     """The base branch a change is measured against: the first that resolves of
-    ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, ``origin/main``, ``main``,
-    ``origin/develop``, ``develop``. Returns the ref name, or None."""
+    ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, the branch ``refs/remotes/origin/HEAD``
+    names (``origin/<name>``, ``<name>``), ``origin/main``, ``main``, ``origin/develop``,
+    ``develop``, ``origin/master``, ``master``. Returns the ref name, or None."""
     env = os.environ if environ is None else environ
-    candidates: List[str] = []
     base = (env.get("GITHUB_BASE_REF") or "").strip()  # set by GitHub Actions on pull requests
-    if base:
-        candidates += [f"origin/{base}", base]
-    candidates += ["origin/main", "main", "origin/develop", "develop"]
-    for ref in candidates:
+    for ref in [f"origin/{base}", base] if base else []:
+        if resolve_commit(cwd, ref):
+            return ref
+    # Repository data, as origin/main is; a target outside refs/remotes/origin/ names no remote branch.
+    target = _text(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], cwd) or ""
+    name = target[len("refs/remotes/origin/"):] if target.startswith("refs/remotes/origin/") else ""
+    default = [f"origin/{name}", name] if name else []
+    for ref in dict.fromkeys([*default, "origin/main", "main", "origin/develop", "develop", "origin/master", "master"]):
         if resolve_commit(cwd, ref):
             return ref
     return None
@@ -371,37 +501,31 @@ def blob_id(data: bytes, oid_length: int = 40) -> str:
     return digest(header + data).hexdigest()
 
 
-_blob_id = blob_id
-
-
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
 # any other scope (the repository's .git/config or config.worktree, or a file either
 # includes) is switched off before git reads working-tree files.
-_TRUSTED_SCOPES = frozenset({"system", "global", "command"})
+TRUSTED_SCOPES = frozenset({"system", "global", "command"})
 _FILTER_COMMANDS = ("clean", "smudge", "process")
 _REGULAR_MODES = frozenset({"100644", "100755"})
 _LINK_MODE = "120000"
 
 
-def _filter_overrides(cwd: Path | str) -> Optional[Tuple[str, ...]]:
-    """``-c`` options that switch off every filter driver the repository's config
-    defines, or None when git cannot list them or a driver's name cannot be given to
-    ``-c`` (it splits at the first ``=``)."""
+def filter_overrides(cwd: Path | str, scope: str = "untrusted") -> Optional[Tuple[str, ...]]:
+    """``-c`` options that switch off every filter driver the repository's config defines
+    (``scope="all"``: every configured driver, whoever wrote it), or None when git cannot
+    list them or a driver's name cannot be given to ``-c`` (it splits at the first ``=``)."""
     listing = ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]
-    res = _completed([listing[0], "--show-scope", *listing[1:]], cwd)
+    res = _completed([listing[0], "--show-scope", *listing[1:]] if scope == "untrusted" else listing, cwd)
     if res is None:
         return None
     if res.returncode == 1:  # no filter driver is configured anywhere
         return ()
-    if res.returncode == 0:
-        fields = res.stdout.split(b"\0")
-        keys = [key for scope, key in zip(fields[0::2], fields[1::2])
-                if key and scope.decode("ascii", "replace") not in _TRUSTED_SCOPES]
-    else:  # git before 2.26 has no --show-scope: switch off every driver
-        res = _completed(listing, cwd)
-        if res is None or res.returncode not in (0, 1):
-            return None
-        keys = [key for key in res.stdout.split(b"\0") if key]
+    if res.returncode != 0:  # git before 2.26 has no --show-scope: switch off every driver
+        return filter_overrides(cwd, "all") if scope == "untrusted" else None
+    fields = res.stdout.split(b"\0")
+    keys = [key for key in fields if key] if scope != "untrusted" else [
+        key for where, key in zip(fields[0::2], fields[1::2])
+        if key and where.decode("ascii", "replace") not in TRUSTED_SCOPES]
     overrides: List[str] = []
     for driver in dict.fromkeys(os.fsdecode(key)[len("filter."):].rpartition(".")[0] for key in keys):
         if not driver:
@@ -465,7 +589,7 @@ def _working_changes(cwd: Path | str, tree: str) -> Optional[List[str]]:
     blobs under core.autocrlf or ``text``). Its own bytes are compared first; only a
     regular file that differs is hashed by git.
     """
-    overrides = _filter_overrides(cwd)
+    overrides = filter_overrides(cwd)
     if overrides is None:
         return None
     hardening = (*_HARDENING, *overrides)
@@ -485,7 +609,7 @@ def _working_changes(cwd: Path | str, tree: str) -> Optional[List[str]]:
         path = os.fsdecode(raw_path)
         if set(old_oid) != {"0"}:  # all zeros: not in the tree, so added
             data, is_file = _work_tree_bytes(root / path, old_mode)
-            if data is not None and _blob_id(data, len(old_oid)) == old_oid:
+            if data is not None and blob_id(data, len(old_oid)) == old_oid:
                 continue
             if is_file and old_mode in _REGULAR_MODES:
                 to_convert[path] = old_oid
@@ -609,11 +733,19 @@ def read_blob(cwd: Path | str, rev: str, path: str) -> Optional[bytes]:
     fields = header.split()
     if len(fields) != 3 or fields[1] != b"blob":
         return None
-    size = int(fields[2])
+    size = _blob_size(header, entry.oid)  # a size that is not a number is git's error, not a ValueError
     data = rest[:size]
-    if len(data) != size or _blob_id(data, len(entry.oid)) != entry.oid:
+    if len(data) != size or blob_id(data, len(entry.oid)) != entry.oid:
         raise GitError(f"git returned content for {path} at {rev} that does not match object {entry.oid}")
     return data
+
+
+def _blob_size(header: bytes, oid: str) -> int:
+    """The size a ``cat-file --batch``/``--batch-check`` header line gives blob ``oid``, else GitError."""
+    fields = header.split()
+    if len(fields) != 3 or fields[0].decode("ascii", "replace") != oid or fields[1] != b"blob" or not fields[2].isdigit():
+        raise GitError(f"git cannot read object {oid}")
+    return int(fields[2])
 
 
 def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]:
@@ -621,15 +753,7 @@ def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]
     position = 0
     for oid in wanted:
         end = out.find(b"\n", position)
-        header = out[position:end].split() if end >= 0 else []
-        if (
-            len(header) != 3
-            or header[0].decode("ascii", "replace") != oid
-            or header[1] != b"blob"
-            or not header[2].isdigit()
-        ):
-            raise GitError(f"git cannot read object {oid}")
-        size = int(header[2])
+        size = _blob_size(out[position:end] if end >= 0 else b"", oid)
         data = out[end + 1 : end + 1 + size]
         if len(data) != size or blob_id(data, len(oid)) != oid:
             raise GitError(f"git returned content for {oid} that does not match the object id")
@@ -638,32 +762,27 @@ def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]
     return blobs
 
 
-def read_blobs(
-    cwd: Union[str, os.PathLike[str]],
-    oids: Iterable[str],
-    *,
-    timeout: float = 60.0,
-) -> Dict[str, bytes]:
+def read_blobs(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, bytes]:
     """Batch-read git blob objects via ``cat-file --batch``, verifying each object's type, size, and hash."""
     wanted = list(dict.fromkeys(oids))
     if not wanted:
         return {}
-    stdin = ("\n".join(wanted) + "\n").encode("ascii")
-    res = run(["cat-file", "--batch"], cwd, timeout=timeout, stdin=stdin)
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise GitError(f"git cat-file failed: {detail}")
+    res = run_checked(["cat-file", "--batch"], cwd, timeout=timeout, stdin=("\n".join(wanted) + "\n").encode("ascii"))
     return _parse_cat_file_batch(res.stdout, wanted)
 
 
-def tree_blobs(
-    cwd: Union[str, os.PathLike[str]],
-    rev: str,
-    *,
-    paths: Sequence[str] = (),
-    include_symlinks: bool = False,
-    timeout: float = 60.0,
-) -> Dict[str, Tuple[str, str]]:
+def blob_sizes(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, int]:
+    """The size of each blob from ``cat-file --batch-check`` (no content is read); GitError as ``read_blobs``."""
+    wanted = list(dict.fromkeys(oids))
+    if not wanted:
+        return {}
+    lines = run_checked(["cat-file", "--batch-check"], cwd, timeout=timeout,
+                        stdin=("\n".join(wanted) + "\n").encode("ascii")).stdout.split(b"\n")
+    return {oid: _blob_size(lines[i] if i < len(lines) else b"", oid) for i, oid in enumerate(wanted)}
+
+
+def tree_blobs(cwd: Union[str, os.PathLike[str]], rev: str, *, paths: Sequence[str] = (), include_symlinks: bool = False,
+               timeout: float = 60.0) -> Dict[str, Tuple[str, str]]:
     """List blob entries in ``rev`` via ``ls-tree -r -z --full-tree`` as ``{path: (mode, oid)}``."""
     if not isinstance(rev, str) or not rev or rev.startswith("-"):
         raise GitError(f"invalid revision {rev!r}")
@@ -671,10 +790,7 @@ def tree_blobs(
     if paths:
         args.append("--")
         args.extend(paths)
-    res = run(args, cwd, timeout=timeout)
-    if res.returncode != 0:
-        detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
-        raise GitError(f"git ls-tree failed: {detail}")
+    res = run_checked(args, cwd, timeout=timeout)
     found: Dict[str, Tuple[str, str]] = {}
     for record in res.stdout.split(b"\0"):
         if not record:
@@ -695,36 +811,21 @@ def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
     """Parse NUL-delimited ``--name-status -z`` (or ``--raw -z``) output into
     ``(status, path, new_path)`` records without desynchronizing on 3-token ``R*``/``C*`` records.
     """
-    if not raw:
-        return []
     fields = raw.split(b"\0")
     records: List[Tuple[str, str, Optional[str]]] = []
     index = 0
-    total = len(fields)
-    while index < total:
-        token = fields[index]
-        if not token:
-            index += 1
-            continue
-        parts = token.split()
+    while index < len(fields):
+        parts = fields[index].split()
         if not parts:
             index += 1
             continue
         status = parts[-1].decode("ascii", "replace")
-        kind = status[:1]
-        if kind in ("R", "C"):
-            if index + 2 >= total or not fields[index + 1] or not fields[index + 2]:
-                break
-            old_path = os.fsdecode(fields[index + 1])
-            new_path = os.fsdecode(fields[index + 2])
-            records.append((status, old_path, new_path))
-            index += 3
-        else:
-            if index + 1 >= total or not fields[index + 1]:
-                break
-            path = os.fsdecode(fields[index + 1])
-            records.append((status, path, None))
-            index += 2
+        width = 3 if status[:1] in ("R", "C") else 2  # a rename or copy names two paths
+        paths = fields[index + 1:index + width]
+        if len(paths) < width - 1 or not all(paths):
+            break
+        records.append((status, os.fsdecode(paths[0]), os.fsdecode(paths[1]) if width == 3 else None))
+        index += width
     return records
 
 
@@ -734,17 +835,11 @@ def _on_windows() -> bool:
 
 def _safe_export_target(destination: Path, rel_path: str) -> Optional[Path]:
     # On Windows ":" makes a part drive-relative (D:x) or a stream; on POSIX a:b.py is a plain file.
-    if not isinstance(rel_path, str) or not rel_path:
+    parts = safe_parts(rel_path, windows=_on_windows())
+    if parts is None:
         return None
-    parts = rel_path.replace("\\", "/").split("/")
-    if any(part in ("", ".", "..") or (_on_windows() and ":" in part) for part in parts):
-        return None
-    target = destination.joinpath(*parts)
-    base = os.path.abspath(destination)
-    try:
-        return target if os.path.commonpath([os.path.abspath(target), base]) == base else None
-    except ValueError:  # another drive
-        return None
+    target = destination.joinpath(*parts)  # the joined path is checked: D:x joins onto drive D
+    return target if is_within(target, destination, unresolvable=False) else None
 
 
 def export_tree(
@@ -759,15 +854,13 @@ def export_tree(
     ``checkout-index -a -f --prefix``, falling back to ``tree_blobs`` + ``read_blobs`` if needed,
     then write any ``overlay`` files via ``atomic_write_bytes``.
     """
-    from aegis_core.storage import atomic_write_bytes
-
     tree = _tree_of(cwd, tree_or_commit)
     dest = Path(destination).resolve()
     dest.mkdir(parents=True, exist_ok=True)
     root = toplevel(cwd) or Path(cwd).resolve()
 
     exported = False
-    overrides = _filter_overrides(root)
+    overrides = filter_overrides(root)
     if overrides is not None:
         temp_dir = Path(tempfile.mkdtemp(prefix="aegis-export-"))
         try:
@@ -805,7 +898,7 @@ def export_tree(
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             file_mode = 0o755 if (mode == "100755" and os.name != "nt") else None
-            atomic_write_bytes(target, blobs[oid], mode=file_mode)
+            atomicio.atomic_write_bytes(target, blobs[oid], mode=file_mode)
 
     if overlay:
         for rel_path, content in overlay.items():
@@ -813,8 +906,7 @@ def export_tree(
             if target is None:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(target, content)
-
+            atomicio.atomic_write_bytes(target, content)
 
 
 # ── Objects and refs (the team leases, v4.1 §1) ──────────────────────────────
@@ -836,7 +928,7 @@ def _hashed_blob(cwd: Path | str, data: bytes, write: bool) -> str:
     oid = (out or b"").strip().decode("ascii", "replace")
     if not _OID.match(oid):
         raise GitError(f"git hash-object {'-w ' if write else ''}failed in {cwd}")
-    if _blob_id(bytes(data), len(oid)) != oid:
+    if blob_id(bytes(data), len(oid)) != oid:
         raise GitError(f"git named the blob {oid}, which does not hash its content")
     return oid
 
@@ -1064,7 +1156,7 @@ def read_object(cwd: Path | str, oid: str, max_bytes: int) -> bytes:
         raise GitError(f"git cannot read object {oid} in {cwd}")
     head, _, rest = out.partition(b"\n")
     data = rest[:size]
-    if head.split()[1:] != [b"blob", str(size).encode()] or len(data) != size or _blob_id(data, len(oid)) != oid:
+    if head.split()[1:] != [b"blob", str(size).encode()] or len(data) != size or blob_id(data, len(oid)) != oid:
         raise GitError(f"git returned content for {oid} that does not match the object id")
     return data
 
@@ -1114,7 +1206,7 @@ def _repository_merge_drivers(cwd: Path | str) -> Optional[List[str]]:
     names = [
         os.fsdecode(key)[len("merge."):-len(".driver")]
         for scope, key in zip(fields[0::2], fields[1::2])
-        if key and scope.decode("ascii", "replace") not in _TRUSTED_SCOPES
+        if key and scope.decode("ascii", "replace") not in TRUSTED_SCOPES
     ]
     return list(dict.fromkeys(names))
 
@@ -1147,7 +1239,7 @@ def merge_tree_conflicted(cwd: Path | str, p1: str, p2: str) -> bool:
             f"the repository config defines merge driver {', '.join(drivers)}, which git merge-tree would run; "
             "the merge metric is unavailable here"
         )
-    overrides = _filter_overrides(cwd)
+    overrides = filter_overrides(cwd)
     if overrides is None:
         raise MergeTreeUnavailable("cannot switch off the repository's filter drivers; the merge metric is unavailable here")
     hardening = (*_HARDENING, "-c", "merge.renormalize=false", *overrides)

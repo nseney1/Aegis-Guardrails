@@ -28,12 +28,14 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from aegis_core import primitives
 from aegis_cli.checkpoint import is_blocking, run_checkpoint
 from aegis_cli.formatters.report import (
     format_layer1_json_payload,
     format_layer2_json,
     format_layer2_summary,
 )
+from aegis_core.primitives import is_within
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -105,7 +107,7 @@ def resolve_target_files(args: argparse.Namespace) -> list[str]:
         safe_files = []
         for f in explicit:
             resolved = os.path.realpath(os.path.join(repo_root, f))
-            if not resolved.startswith(repo_root + os.sep) and resolved != repo_root:
+            if not is_within(os.path.join(repo_root, f), git_cwd, unresolvable=False):  # each side resolved once
                 print(f"Warning: skipping out-of-tree file: {sanitize_display(f)}", file=sys.stderr)
                 continue
             if os.path.isdir(resolved):
@@ -121,8 +123,7 @@ def resolve_target_files(args: argparse.Namespace) -> list[str]:
                 if not listed:
                     print(f"Warning: no files to check under {sanitize_display(f)}", file=sys.stderr)
                 for g in listed:
-                    real = os.path.realpath(os.path.join(repo_root, g))
-                    if real.startswith(repo_root + os.sep):
+                    if is_within(os.path.join(repo_root, g), git_cwd, unresolvable=False):
                         safe_files.append(g)
                     else:
                         print(f"Warning: skipping out-of-tree file: {sanitize_display(g)}", file=sys.stderr)
@@ -203,14 +204,13 @@ def resolve_task_plan(args: argparse.Namespace, repo_root: str) -> str | None:
             print(f"Error: could not read plan file {plan_file}: {e}", file=sys.stderr)
             return None
 
-    real_root = os.path.realpath(repo_root)
     for default_name in ("docs/plan.md", f"{AEGIS_DIRNAME}/plan.md", "PLAN.md"):
         cand = os.path.join(repo_root, default_name)
         if not os.path.lexists(cand):
             continue
         # Nobody named this file, and its text goes to the model: a branch must not be
         # able to route a secret from outside the repository into the prompt.
-        if os.path.islink(cand) or not os.path.realpath(cand).startswith(real_root + os.sep):
+        if os.path.islink(cand) or not is_within(cand, repo_root, unresolvable=False):
             print(f"Warning: ignoring {default_name}: it is a symlink or leaves the repository", file=sys.stderr)
             continue
         if os.path.isfile(cand):
@@ -222,6 +222,57 @@ def resolve_task_plan(args: argparse.Namespace, repo_root: str) -> str | None:
             except OSError:
                 pass
     return None
+
+
+def _vendor_warning(repo_root: str) -> str:
+    """The cross-vendor advisory for the user's declared ``arbiter_vendor`` (user scope only: a
+    repository cannot set it) against ``AEGIS_CLIENT``. An advisory input never fails Layer 2, so
+    an unusable user config reads as nothing declared."""
+    from aegis_core.config import UserConfig, env_client
+    from aegis_core.errors import AegisError
+    from aegis_core.verification.arbiter import vendor_warning
+
+    try:
+        declared = UserConfig.load(repo_root).arbiter_vendor
+    except (AegisError, OSError):
+        declared = None
+    return vendor_warning(declared, env_client())
+
+
+def _append_step_summary(document: dict, root: str) -> None:
+    """Append the Markdown summary of ``document`` to $GITHUB_STEP_SUMMARY when it is set: appended, as
+    every step of the job does, never read back; one stderr note when it cannot be written."""
+    from aegis_cli.formatters.report import format_github_step_summary
+    from aegis_core.config import env_github_step_summary
+
+    summary_path = env_github_step_summary()
+    if not summary_path:
+        return
+    md = format_github_step_summary(document, workspace_root=root)
+    try:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(md)
+    except OSError as exc:
+        print(f"note: the step summary could not be written ({type(exc).__name__})", file=sys.stderr)
+
+
+def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool, root: str) -> None:
+    """``--format github|sarif`` for Layer 1: one report on stdout, and the step summary."""
+    from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, layer1_report_document
+
+    document = layer1_report_document(passed, owned, issues, strict)
+    print(format_sarif_report(document, workspace_root=root) if fmt == "sarif" else "\n".join(github_annotation_lines(document)))
+    _append_step_summary(document, root)
+
+
+def _unjudged(report_fmt: str, why: str) -> int:
+    """Exit 1 for a run that could not be judged; under --format sarif stdout still holds a valid log that
+    says so (an upload step that always runs never meets an empty file). The error is already on stderr."""
+    if report_fmt == "sarif":
+        from aegis_cli.formatters.report import format_sarif_report
+
+        print(format_sarif_report({}, error=why))
+    return 1
 
 
 def _usage_error(message: str) -> int:
@@ -243,6 +294,7 @@ _MODE_FLAGS = (
     ("--card", "card"),
     ("--write-baseline", "write_baseline"),
     ("--prune-baseline", "prune_baseline"),
+    ("--calibration", "calibration"),
 )
 
 
@@ -275,6 +327,7 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
     """`aegis check --lane`: the post-lane gate (aegis_core.lane_gate). 0 pass, 1 findings
     or a gate that could not run, 2 usage."""
     from aegis_cli import sanitize_display
+    from aegis_cli.formatters.text import render_lane
     from aegis_core import gitsafe, lane_gate, team
 
     use_json = _wants_json(args)
@@ -284,7 +337,7 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
         if use_json:
             print(json.dumps(lane_gate.error_report(root, args.lane, message), indent=2))
         else:
-            print(f"Error: {sanitize_display(message, max_len=len(message))}", file=sys.stderr)
+            print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
         return code
 
     others = _other_options(args)
@@ -301,8 +354,8 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
     if use_json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
-        for line in result.text_lines():  # warnings included, as "warning: ..." lines
-            print(sanitize_display(line, max_len=len(line)))
+        for line in render_lane(result.as_dict()):  # warnings included, as "warning: ..." lines
+            print(sanitize_display(line, max_len=None))
     if not result.integrity_passed:
         _void_lane_tree(root, result.head)
     return 0 if result.passed else 1
@@ -311,12 +364,11 @@ def _run_lane_gate(args: argparse.Namespace) -> int:
 def _void_lane_tree(root: str, head: str) -> None:
     """A failed integrity gate voids the credit of the lane head's tree; bookkeeping never changes
     the gate's exit code, so a failure is one stderr note."""
-    from aegis_core import credit, gitsafe
+    from aegis_core import credit, gitevidence, gitsafe
     from aegis_core.errors import AegisError
 
     try:
-        res = gitsafe.run(["rev-parse", "--verify", "--quiet", f"{head}^{{tree}}"], root)
-        tree = res.stdout.decode("ascii", "replace").strip() if res.returncode == 0 else ""
+        tree = gitevidence.commit_tree(root, head)
         if not tree:
             raise gitsafe.GitError(f"cannot read the tree of {head[:12]}")
         credit.void_tree(root, tree, "lane_integrity")
@@ -331,17 +383,16 @@ _MODE_WHY = {
     "--card": "it reports on the whole workspace",
     "--write-baseline": "it records the whole workspace's findings",
     "--prune-baseline": "it re-checks the whole workspace against the baseline",
+    "--calibration": "it reports on the whole prediction log",
 }
 
 
 def _event_warning(root: str, kind: str, result: str, detail: dict) -> list[str]:
     """Append an event; a log that cannot be written is a warning, never a failure."""
     from aegis_core import events
-    from aegis_core.errors import AegisError
 
-    try:
-        events.append(root, kind, result, detail)
-    except (ValueError, TypeError, OSError, AegisError) as exc:
+    exc = events.try_append(root, kind, result, detail)
+    if exc is not None:
         return [f"event not recorded: {exc}"]
     return []
 
@@ -356,7 +407,6 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
     """`aegis check --card | --write-baseline | --prune-baseline | --partition`. 0 done,
     1 could not run, 2 usage. Every option the mode would ignore is refused."""
     from aegis_cli import sanitize_display
-    from aegis_core import baseline
 
     use_json = _wants_json(args)
     root = _resolve_git_cwd(args)
@@ -364,11 +414,11 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
 
     def fail(message: str, code: int) -> int:
         if use_json:
-            document = baseline.envelope(source, {"workspace": str(root)})
+            document = primitives.envelope(source, {"workspace": str(root)})
             document.update(status="error", error=message)
             print(json.dumps(document, indent=2))
         else:
-            print(f"Error: {sanitize_display(message, max_len=len(message))}", file=sys.stderr)
+            print(f"Error: {sanitize_display(message, max_len=None)}", file=sys.stderr)
         return code
 
     for lane_option, given in (("--paths", getattr(args, "paths", None) is not None),
@@ -385,6 +435,7 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
         "--write-baseline": _run_write_baseline,
         "--prune-baseline": _run_prune_baseline,
         "--partition": _run_partition,
+        "--calibration": _run_calibration,
     }[flag]
     return runner_for(args, str(root), use_json, source, fail)
 
@@ -436,7 +487,7 @@ def _run_write_baseline(args: argparse.Namespace, root: str, use_json: bool, sou
         "mode": "write", "entries": len(entries), "added": added, "removed": removed,
         "files_checked": len(targets), "unbaselinable": len(collected.blocked)})
     if use_json:
-        document = baseline.envelope(source, {"workspace": root})
+        document = primitives.envelope(source, {"workspace": root})
         document.update(status="written", path=baseline.BASELINE_FILE, entries=len(entries), added=added,
                         removed=removed, files_checked=len(targets),
                         unbaselinable=_unbaselinable_rows(collected.blocked), warnings=warnings,
@@ -499,7 +550,7 @@ def _run_prune_baseline(args: argparse.Namespace, root: str, use_json: bool, sou
             "mode": "prune", "entries": len(kept), "added": 0, "removed": len(dropped),
             "files_checked": len(targets), "unbaselinable": len(collected.blocked)})
     if use_json:
-        document = baseline.envelope(source, {"workspace": root})
+        document = primitives.envelope(source, {"workspace": root})
         document.update(status="pruned" if dropped else "unchanged", path=baseline.BASELINE_FILE,
                         entries=len(kept), removed=len(dropped), kept=len(kept), not_added=not_added,
                         files_checked=len(targets), warnings=warnings)
@@ -526,6 +577,7 @@ def _print_lines(lines: list[str]) -> None:
 
 def _run_card(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
     """`aegis check --card`: the day-0 card (aegis_core.card). Read-only."""
+    from aegis_cli.formatters.text import render_card
     from aegis_core import card
 
     try:
@@ -535,13 +587,14 @@ def _run_card(args: argparse.Namespace, root: str, use_json: bool, source: str, 
     if use_json:
         print(json.dumps(built.as_dict(), indent=2))
     else:
-        _print_lines(built.text_lines())
+        _print_lines(render_card(built.as_dict()))
     return 0
 
 
 def _run_partition(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
     """`aegis check --partition --split ...`: the cross-lane edge report (aegis_core.partition).
     A report: exit 0 even when it finds edges."""
+    from aegis_cli.formatters.text import render_partition
     from aegis_core import partition
 
     try:
@@ -555,36 +608,83 @@ def _run_partition(args: argparse.Namespace, root: str, use_json: bool, source: 
     if use_json:
         print(json.dumps(report.as_dict(), indent=2))
     else:
-        _print_lines(report.text_lines())
+        _print_lines(render_partition(report.as_dict()))
     return 0
 
 
-def _run_calibration(args: argparse.Namespace) -> int:
-    """Display Arbiter calibration summary (`aegis verify --calibration`)."""
+def _run_calibration(args: argparse.Namespace, root: str, use_json: bool, source: str, fail: Any) -> int:
+    """`aegis check --calibration`: the calibration of the logged Layer 2 predictions per backend and
+    observable kind. Read-only; T6 is log-only, so nothing depends on it."""
+    import time
+
     from aegis_core.storage import read_jsonl
-    from aegis_core.verification.arbiter import calibration_summary
+    from aegis_core.verification import records
+    from aegis_core.verification.arbiter import calibration
     from aegis_core.workspace.layout import WorkspaceLayout
 
-    root = Path(_resolve_git_cwd(args)).resolve()
-    state_dir = WorkspaceLayout(root).state_dir
-    rows: list[dict[str, Any]] = []
-    for name in ("predictions.jsonl", "arbiter_predictions.jsonl"):
-        p = state_dir / name
-        if p.exists():
-            rows.extend(read_jsonl(p).rows)
-    summary = calibration_summary(rows)
-    if _wants_json(args):
-        print(json.dumps(dict(summary), indent=2))
-    else:
-        print(str(summary))
+    log = read_jsonl(WorkspaceLayout(Path(root)).predictions_log)
+    if log.error:
+        return fail(f"cannot read the prediction log: {log.error}", 1)
+    try:  # dispositions and outcomes come from git, on read; nothing is written back
+        groups = calibration(records.resolve_rows(root, log.rows, time.time()))
+    except (ValueError, TypeError) as exc:
+        return fail(f"the prediction log holds a row that cannot be scored: {exc}", 1)
+    n = sum(group["n"] for group in groups.values())
+    status = f"insufficient (n={n}/25)" if n < 25 else "ok"
+    if use_json:
+        print(json.dumps({"logged": len(log.rows), "n": n, "status": status, "groups": groups}, indent=2))
+        return 0
+    shown = "; ".join(f"{key}: {g['status']}, n={g['n']}, hits={g['hits']}" for key, g in groups.items())
+    print(_shown(f"{len(log.rows)} logged | {shown or status}", 2000))
     return 0
+
+
+def _log_predictions(root: str, predictions: Any, backend: Any, files: list[str]) -> list[str]:
+    """Append one stamped row per Layer 2 prediction to .aegis/state/arbiter_predictions.jsonl, without
+    the model's text: risk and mechanism are dropped, and the symbol, the selector and the observable
+    kind are kept only when they name a function the change defines, a changed path and a kind of
+    OBSERVABLE_KINDS (else empty), since any of them can quote the diff. Only in an Aegis workspace;
+    a failure is a warning: logging never changes the verdict or the exit code."""
+    import time
+
+    from aegis_core import storage, treeid
+    from aegis_core.verification import OBSERVABLE_KINDS
+    from aegis_core.verification.adversarial_verify import extract_signatures
+    from aegis_core.verification.arbiter import stamp
+    from aegis_core.workspace.layout import WorkspaceLayout
+
+    if not predictions or not os.path.isdir(os.path.join(root, AEGIS_DIRNAME)):
+        return []
+    try:
+        try:
+            with treeid.bind(root) as bound:
+                tree = bound.binding.tree or ""
+        except treeid.TreeError:
+            tree = ""
+        defined: dict[str, str] = {}  # function name -> the first changed file that defines it
+        for rel in files:
+            if rel.endswith(".py") and os.path.isfile(os.path.join(root, rel)):
+                for sig in extract_signatures(os.path.join(root, rel)):
+                    defined.setdefault(sig[4:].split("(", 1)[0], rel.replace(os.sep, "/"))
+        changed = {rel.replace(os.sep, "/") for rel in files}
+        rows = []
+        for p in stamp(list(predictions), tree=tree, backend=os.path.basename(backend.argv[0]), ts=time.time()):
+            row = {k: v for k, v in p.to_dict().items() if k not in ("risk", "mechanism", "affected_function")}
+            symbol, kind, selector = p.scope.get("symbol"), p.observable.get("kind"), p.observable.get("selector")
+            symbol = symbol if isinstance(symbol, str) and symbol in defined else ""
+            row["scope"] = {"path": defined.get(symbol, ""), "symbol": symbol}
+            row["observable"] = {"kind": kind if kind in OBSERVABLE_KINDS else "",
+                                 "selector": selector if isinstance(selector, str) and selector in changed else ""}
+            rows.append(row)
+        storage.state_dir(root)  # refuses a linked .aegis or state directory
+        storage.append_jsonl(WorkspaceLayout(Path(root)).predictions_log, rows)
+    except Exception as exc:
+        return [f"predictions not logged: {type(exc).__name__}: {exc}"]
+    return []
 
 
 def run_verify(args: argparse.Namespace) -> int:
     """Run `aegis check` for *args*. Returns 0, 1 or 2 (see the module docstring)."""
-    if getattr(args, "calibration", False):
-        return _run_calibration(args)
-
     from aegis_core import baseline
     from aegis_core.inference_provider import MISSING_BACKEND, LLMCommandError, resolve_backend
     from aegis_core.verification.pipeline import VerificationPipeline
@@ -614,6 +714,13 @@ def run_verify(args: argparse.Namespace) -> int:
     layer2 = bool(getattr(args, "full", False)) or plan is not None or plan_file is not None
     if hook and layer2:
         return _usage_error("--hook runs Layer 1 only; drop --full, --plan and --plan-file")
+    fmt = str(getattr(args, "format", None) or "text").lower()
+    report_fmt = fmt if fmt in ("github", "sarif") else ""
+    if report_fmt and (layer2 or getattr(args, "dry_run", False)):
+        named = "--dry-run" if getattr(args, "dry_run", False) else next(
+            flag for flag, given in (("--full", getattr(args, "full", False)), ("--plan", plan is not None),
+                                     ("--plan-file", plan_file is not None)) if given)
+        return _usage_error(f"--format {report_fmt} reports a Layer 1 check; it does not combine with {named}")
     if plan is not None and not plan.strip():
         return _usage_error("Layer 2 needs a task plan: --plan is empty")
     if plan_file is not None and not plan_file.strip():
@@ -638,12 +745,12 @@ def run_verify(args: argparse.Namespace) -> int:
     if getattr(args, "ws", None) is None and raw_ws and not os.path.isdir(str(raw_ws)):
         # Workspace.resolve walks up to an existing parent; checking that instead fails open.
         print(f"Error: workspace does not exist: {raw_ws}", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the workspace does not exist")
     ws_obj = getattr(args, "ws", None) or Workspace.resolve(raw_ws)
     repo_root = str(ws_obj.root)
     if not os.path.isdir(repo_root):
         print(f"Error: repo root does not exist: {repo_root}", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the repository root does not exist")
 
     held = baseline.Baseline(frozenset(), None, "none")
     if not getattr(args, "dry_run", False):
@@ -653,7 +760,7 @@ def run_verify(args: argparse.Namespace) -> int:
             return _usage_error(_shown(str(exc), 300))
         except baseline.BaselineError as exc:
             print(f"Error: {_shown(str(exc), 300)}", file=sys.stderr)
-            return 1
+            return _unjudged(report_fmt, _shown(str(exc), 300))
 
     task_plan = None
     if layer2:
@@ -663,24 +770,24 @@ def run_verify(args: argparse.Namespace) -> int:
         if not task_plan:
             return _usage_error("Layer 2 needs a task plan: pass --plan or --plan-file (or add docs/plan.md)")
 
-    fmt = str(getattr(args, "format", None) or "text").lower()
     use_json = bool(getattr(args, "json", False) or fmt == "json")
+    machine = use_json or bool(report_fmt)  # stdout holds exactly one report
     strict = bool(getattr(args, "strict", False))
     mode = "Layer 1 + Layer 2" if layer2 else "Layer 1"
 
     target_files = resolve_target_files(args)
     if getattr(args, "files", None) and not target_files:
-        return 1
+        return _unjudged(report_fmt, "none of the named files can be checked")
     if getattr(args, "_base_unreadable", False):
         print(f"Error: cannot list what changed since {_shown(str(args.base), 120)}: needs history: fetch with "
               "fetch-depth 0 (no merge base with HEAD)", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the changes since --base cannot be listed")
     staged = hook and not getattr(args, "files", None)
     if staged and getattr(args, "_staged_unreadable", False):
         # Fail closed: a commit whose content cannot be listed is not checked.
         print("Error: cannot read the staged changes (not a git work tree, or git failed); nothing was checked",
               file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "the staged changes cannot be read")
     no_diff_base = not target_files and bool(getattr(args, "_no_diff_base", False))
     if layer2 and no_diff_base:
         return _usage_error(
@@ -692,7 +799,7 @@ def run_verify(args: argparse.Namespace) -> int:
         if missing:
             for f in missing:
                 print(f"Error: file not found: {f}", file=sys.stderr)
-            return 1
+            return _unjudged(report_fmt, "a named file is not found")
 
     if getattr(args, "dry_run", False):
         if use_json:
@@ -705,7 +812,7 @@ def run_verify(args: argparse.Namespace) -> int:
 
     # ── Layer 1: workspace checkpoint, then the per-file tools ────────────
     issues, blocking = run_checkpoint(Path(repo_root), strict=strict)
-    if not use_json:
+    if not machine:
         _print_checkpoint(issues, strict)
 
     if not target_files:
@@ -717,7 +824,9 @@ def run_verify(args: argparse.Namespace) -> int:
             summary = "Layer 1: 0 files changed (clean repository)"
         # Say so: a Layer 2 run that reviewed nothing must not read like a Layer 1-only pass.
         layer2_summary = "Layer 2: no changed files to review"
-        if use_json:
+        if report_fmt:
+            _emit_report(report_fmt, not blocking, [], issues, strict, repo_root)
+        elif use_json:
             payload = format_layer1_json_payload(not blocking, [], [], summary)
             payload["checkpoint_issues"] = issues
             if held.active:
@@ -750,7 +859,7 @@ def run_verify(args: argparse.Namespace) -> int:
                 target_files, root=repo_root)
     except Exception as exc:
         print(f"Error: Layer 1 could not run: {exc}", file=sys.stderr)
-        return 1
+        return _unjudged(report_fmt, "Layer 1 could not run")
     results = [evidence for _path, evidence in pairs]
     applied = None
     if held.active:
@@ -759,7 +868,7 @@ def run_verify(args: argparse.Namespace) -> int:
             applied = baseline.apply(pairs, baseline.Sources(repo_root, staged=staged), held)
         except Exception as exc:  # fail closed: a baseline that cannot be applied excuses nothing
             print(f"Error: the baseline could not be applied: {_shown(str(exc), 300)}", file=sys.stderr)
-            return 1
+            return _unjudged(report_fmt, "the baseline could not be applied")
         results = list(applied.effective)
 
     tools_pass = runner.gate_verdict(results)
@@ -769,11 +878,11 @@ def run_verify(args: argparse.Namespace) -> int:
     else:
         n = len(target_files)
         summary = f"Layer 1: no check applies to the {n} target file{'' if n == 1 else 's'} (0 checks run, PASSED)"
-    if not use_json:
+    if not machine:
         for r in results:
             if not r.verdict:
                 print(f"🔴 {r.tool}: {r.target} — {r.detail}")
-            elif r.tool == runner.INDEX_NOTE_TOOL:  # what the hook could not read from git
+            elif r.tool in runner.NOTE_TOOLS:  # advisory: what was not read, decided or checked
                 print(f"note: {r.detail}")
         print(summary)
         if applied is not None:
@@ -795,7 +904,7 @@ def run_verify(args: argparse.Namespace) -> int:
         # Advisory rule-trigger telemetry: it must never change the verdict.
         try:
             from aegis_core.outcomes.telemetry import record_verification_telemetry
-            record_verification_telemetry(
+            recorded = record_verification_telemetry(
                 workspace=repo_root,
                 target_files=target_files,
                 passed=passed,
@@ -803,10 +912,12 @@ def run_verify(args: argparse.Namespace) -> int:
                 layer1_evidence=results,
                 source="session",
             )
+            if recorded.error is not None:  # an exception with no message is still a failure
+                print(f"    ! failed to record ambient verification telemetry: {recorded.error}", file=sys.stderr)
         except Exception:
             pass
 
-    def _emit_json(passed: bool, layer2_result: Any = None) -> None:
+    def _emit_json(passed: bool, layer2_result: Any = None, vendor: str = "") -> None:
         payload = format_layer1_json_payload(passed, target_files, results, summary)
         payload["checkpoint_issues"] = issues
         if applied is not None:
@@ -817,13 +928,16 @@ def run_verify(args: argparse.Namespace) -> int:
                 "blocked": _unbaselinable_rows(applied.blocked),
             }
         if layer2_result is not None:
-            payload["layer2"] = format_layer2_json(layer2_result.arbitration_result, layer2_result.verdict)
+            payload["layer2"] = format_layer2_json(layer2_result.arbitration_result, layer2_result.verdict, vendor)
         print(json.dumps(payload, indent=2))
 
     if not layer2:
         _record_telemetry(tools_pass, "PASS" if tools_pass else "FAIL")
         _record_baseline(layer1_pass)
-        if use_json:
+        if report_fmt:  # baseline.apply keeps one item per pair, in order
+            _emit_report(report_fmt, layer1_pass, [(path, e) for (path, _), e in zip(pairs, results)], issues, strict,
+                         repo_root)
+        elif use_json:
             _emit_json(layer1_pass)
         return 0 if layer1_pass else 1
 
@@ -852,13 +966,16 @@ def run_verify(args: argparse.Namespace) -> int:
     # T6 is log-only: the Layer 2 verdict is meta text, never the exit status or a rule outcome.
     passed = layer1_pass
     arb = pipeline_res.arbitration_result
+    for warning in _log_predictions(repo_root, getattr(arb, "llm_predictions", ()), backend, target_files):
+        print(f"warning: {_shown(warning, 300)}", file=sys.stderr)
     # arbitrate() still names a verdict (SHIP over a passing Layer 1) for a review that never completed;
     # the ledger says UNVERIFIED, as the text and JSON output do.
     unverified = arb is not None and getattr(arb, "infra_status", "ok") != "ok"
     _record_telemetry(tools_pass, "UNVERIFIED" if unverified else pipeline_res.verdict)
     _record_baseline(passed)
+    vendor = _vendor_warning(repo_root)
     if use_json:
-        _emit_json(passed, pipeline_res)
+        _emit_json(passed, pipeline_res, vendor)
     elif pipeline_res.arbitration_result:
-        print(format_layer2_summary(pipeline_res.arbitration_result))
+        print(format_layer2_summary(pipeline_res.arbitration_result, vendor))
     return 0 if passed else 1

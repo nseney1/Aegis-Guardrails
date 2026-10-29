@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -449,6 +450,23 @@ def test_only_filter_drivers_outside_the_repository_config_clean_content(
     assert gitsafe.changed_files(repo, "working") == ["a.py"]
 
 
+def _switched_off(driver: str) -> list:
+    return ["-c", f"filter.{driver}.clean=", "-c", f"filter.{driver}.smudge=", "-c", f"filter.{driver}.process=",
+            "-c", f"filter.{driver}.required=false"]
+
+
+def test_filter_overrides_name_the_repository_drivers_or_with_scope_all_every_driver(tmp_path: Path, git_config):
+    git_config(global_=_STRIP_TRAILING_SPACES + "[filter \"a=b\"]\n\tclean = cat\n")
+    repo = _repo(tmp_path / "repo")
+    _git(repo, "config", "filter.mine.clean", "cat")
+    assert gitsafe.TRUSTED_SCOPES == frozenset({"system", "global", "command"})
+
+    assert gitsafe.filter_overrides(repo) == tuple(_switched_off("mine"))  # the user's a=b is not named
+    assert gitsafe.filter_overrides(repo, scope="all") is None  # a=b cannot be switched off
+    _git(tmp_path, "config", "--global", "--remove-section", "filter.a=b")
+    assert gitsafe.filter_overrides(repo, scope="all") == (*_switched_off("strip"), *_switched_off("mine"))
+
+
 def test_a_symlink_whose_stat_changed_but_target_did_not_is_unchanged(repo: Path):
     link = repo / "link.py"
     try:
@@ -577,7 +595,7 @@ def test_blob_id_computes_sha1_and_sha256_blob_hashes(repo: Path):
     data = b"a = 1\n"
     expected_sha1 = _git(repo, "rev-parse", "HEAD:a.py").strip()
     assert gitsafe.blob_id(data) == expected_sha1
-    assert gitsafe._blob_id(data, 40) == expected_sha1
+    assert gitsafe.blob_id(data, 40) == expected_sha1
     sha256_id = gitsafe.blob_id(data, 64)
     assert len(sha256_id) == 64 and sha256_id != expected_sha1
 
@@ -608,6 +626,87 @@ def test_read_blobs_batches_and_verifies_hashes(repo: Path, monkeypatch):
     monkeypatch.setattr(gitsafe, "run", forged_run)
     with pytest.raises(gitsafe.GitError, match="does not match the object id"):
         gitsafe.read_blobs(repo, [oid_a])
+
+
+# ── blob_sizes and run_checked: the one batch reader, the one checked call (R-structure-22) ──
+
+def _answering(monkeypatch, stdout: bytes = b"", returncode: int = 0, stderr: bytes = b"") -> None:
+    """``gitsafe.run`` answers every ``cat-file`` with the given reply; anything else runs git."""
+    real_run = gitsafe.run
+
+    def forged(args, cwd, **kwargs):
+        if args and args[0] == "cat-file":
+            return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
+        return real_run(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+
+
+def test_blob_sizes_reads_each_blobs_size_from_its_header(repo: Path):
+    oid_a = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    oid_gone = _git(repo, "rev-parse", "HEAD:gone.py").strip()
+    sizes = {oid: int(_git(repo, "cat-file", "-s", oid)) for oid in (oid_a, oid_gone)}
+    assert gitsafe.blob_sizes(repo, []) == {}
+    assert gitsafe.blob_sizes(repo, [oid_a, oid_gone, oid_a]) == sizes
+
+
+@pytest.mark.parametrize("what", ["missing", "commit"])
+def test_blob_sizes_refuses_an_object_that_is_not_a_blob(repo: Path, what: str):
+    oid = "0" * 40 if what == "missing" else gitsafe.head_commit(repo)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        gitsafe.blob_sizes(repo, [oid])
+
+
+@pytest.mark.parametrize("reply", ["{oid} blob 6x\n", "{oid} blob -6\n", "{oid} blob\n", "", "{other} blob 6\n"],
+                         ids=["suffix", "negative", "short", "empty", "other-oid"])
+def test_a_malformed_size_line_is_a_git_error_not_a_value_error(repo: Path, monkeypatch, reply: str):
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    _answering(monkeypatch, reply.format(oid=oid, other="1" * 40).encode("ascii"))
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        gitsafe.blob_sizes(repo, [oid])
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        gitsafe.read_blobs(repo, [oid])
+
+
+def test_a_failed_batch_call_names_gits_stderr_collapsed_and_capped(repo: Path, monkeypatch):
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    noise = ("fatal:\n  object  store\tbroken " * 20)[:500].encode("ascii")
+    _answering(monkeypatch, returncode=128, stderr=noise)
+    expected = "git cat-file failed: " + " ".join(noise.decode("ascii").split())[:200]
+    for read in (gitsafe.blob_sizes, gitsafe.read_blobs):
+        with pytest.raises(gitsafe.GitError) as info:
+            read(repo, [oid])
+        assert str(info.value) == expected and "\n" not in str(info.value)
+
+
+class _DomainError(Exception):
+    pass
+
+
+def test_run_checked_returns_a_zero_exit_and_raises_the_requested_error_otherwise(repo: Path, monkeypatch):
+    done = gitsafe.run_checked(["rev-parse", "--verify", "HEAD"], repo)
+    assert done.returncode == 0 and done.stdout.strip() == gitsafe.head_commit(repo).encode("ascii")
+    with pytest.raises(_DomainError, match=r"^git rev-parse failed: fatal: "):
+        gitsafe.run_checked(["rev-parse", "--verify", "no-such-ref"], repo, error=_DomainError)
+    with pytest.raises(gitsafe.GitError, match=r"^git rev-parse failed: "):
+        gitsafe.run_checked(["rev-parse", "--verify", "no-such-ref"], repo)
+    long_noise = ("line one\n\n  line two " * 40).encode("ascii")
+    monkeypatch.setattr(gitsafe, "run", lambda args, cwd, **kw: subprocess.CompletedProcess(args, 1, b"", long_noise))
+    with pytest.raises(_DomainError) as info:
+        gitsafe.run_checked(["ls-tree", "HEAD"], repo, error=_DomainError)
+    assert str(info.value) == "git ls-tree failed: " + " ".join(long_noise.decode("ascii").split())[:200]
+
+
+def test_run_checked_turns_a_spawn_failure_into_the_requested_error(repo: Path, monkeypatch):
+    def cannot_start(args, cwd, **kwargs):
+        raise gitsafe.GitError("cannot run git: [Errno 2] No such file or directory")
+
+    monkeypatch.setattr(gitsafe, "run", cannot_start)
+    with pytest.raises(_DomainError, match=r"^cannot run git: \[Errno 2\]") as info:
+        gitsafe.run_checked(["rev-parse", "HEAD"], repo, error=_DomainError)
+    assert isinstance(info.value.__cause__, gitsafe.GitError)
+    with pytest.raises(gitsafe.GitError, match="^cannot run git"):
+        gitsafe.run_checked(["rev-parse", "HEAD"], repo)
 
 
 def test_tree_blobs_lists_blobs_and_filters_paths_and_symlinks(repo: Path):
@@ -716,7 +815,7 @@ def test_the_fallback_export_keeps_a_posix_file_name_with_a_colon(tmp_path: Path
     (root / "src").mkdir()
     (root / "src" / "x.py").write_bytes(b"x\n")
     _commit(root)
-    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)  # checkout-index is not tried
+    monkeypatch.setattr(gitsafe, "filter_overrides", lambda cwd, scope="untrusted": None)  # checkout-index is not tried
     dest = tmp_path / "dest"
     gitsafe.export_tree(root, "HEAD", dest)
     assert (dest / "a:b.py").read_bytes() == b"colon\n" and (dest / "src" / "x.py").read_bytes() == b"x\n"
@@ -738,7 +837,7 @@ def test_with_windows_rules_a_drive_or_stream_name_is_skipped(tmp_path: Path, mo
         (root / "a:b.py").write_bytes(b"colon\n")
     _commit(root)
     monkeypatch.setattr(gitsafe, "_on_windows", lambda: True)
-    monkeypatch.setattr(gitsafe, "_filter_overrides", lambda cwd: None)
+    monkeypatch.setattr(gitsafe, "filter_overrides", lambda cwd, scope="untrusted": None)
     dest = tmp_path / "out" / "dest"
     overlay = {"D:evil.py": b"x", "D:/x/evil.py": b"x", "x:stream": b"x", "ok.py": b"y"}
     gitsafe.export_tree(root, "HEAD", dest, overlay=overlay)
@@ -872,6 +971,85 @@ def test_resolve_base_ref_prefers_the_pull_request_base(repo: Path):
     assert gitsafe.resolve_base_ref(repo, environ={}) == "develop"
 
 
+# ── The default base: the branch origin/HEAD names, then the legacy list (R-trust-21) ──
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GITHUB_BASE_REF", "AEGIS_WORKSPACE", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    return home
+
+
+def _gitflow(tmp_path: Path):
+    """``develop`` holds a rule change ``main`` lacks; ``feature`` (checked out, off develop) touches
+    only src/; origin/HEAD names origin/develop and origin/main exists too. Returns (repo, develop)."""
+    from tests import helpers_humangate as hg
+    from tests import helpers_verified as hv
+
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.git("checkout", "-q", "-b", "develop", "main")
+    repo.write(".aegis/rules/traps/trap-sample.md", hg.RULE.replace("hypothesis: sample", "hypothesis: sharper"))
+    develop = repo.commit("develop sharpens a rule")
+    repo.git("checkout", "-q", "-b", "feature")
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.commit("feature")
+    repo.git("update-ref", "refs/remotes/origin/main", "main")
+    repo.git("update-ref", "refs/remotes/origin/develop", develop)
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop")
+    return repo, develop
+
+
+def test_the_default_base_is_the_branch_origin_head_names(tmp_path: Path, fake_home):
+    from aegis_core import checkrun
+
+    repo, develop = _gitflow(tmp_path)
+    assert gitsafe.resolve_base_ref(repo.root, environ={}) == "origin/develop"
+
+    out = checkrun.record(repo.root)
+    assert out.status == "recorded", out.reason
+    assert out.row["base"] == develop == gitsafe.merge_base(repo.root, "develop")
+    assert out.row["protected_changed"] is False  # develop's rule change is not the feature's
+
+
+def test_the_pull_request_base_still_wins_over_origin_head(tmp_path: Path, fake_home):
+    repo, _ = _gitflow(tmp_path)
+    assert gitsafe.resolve_base_ref(repo.root, environ={"GITHUB_BASE_REF": "main"}) == "origin/main"
+
+
+@pytest.mark.parametrize("target", ["refs/remotes/origin/gone", "refs/heads/develop"])
+def test_an_origin_head_that_names_no_remote_branch_is_skipped(repo: Path, target: str):
+    _git(repo, "branch", "develop")
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", target)
+    assert gitsafe.resolve_base_ref(repo, environ={}) == "main"
+
+
+def test_a_master_only_repository_without_a_remote_measures_against_master(tmp_path: Path, fake_home,
+                                                                            monkeypatch, capsys):
+    import json
+
+    from aegis_cli.cli import main
+    from aegis_core import checkrun
+    from tests import helpers_verified as hv
+
+    repo = hv.make_project(tmp_path, runner=None)
+    repo.git("branch", "-m", "main", "master")
+    assert gitsafe.resolve_base_ref(repo.root, environ={}) == "master"
+
+    out = checkrun.record(repo.root)
+    assert out.status == "recorded", out.reason
+
+    monkeypatch.chdir(repo.root)
+    capsys.readouterr()
+    assert main(["approve", "--json"]) == 1
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["code"] == "nothing"  # it got past the base: governance did not change since master
+
+
 # ── Ratchet: no git subprocess outside gitsafe ───────────────────────────────
 
 _SPAWNERS = {
@@ -892,31 +1070,192 @@ def _is_git_command_line(node: ast.AST) -> bool:
     )
 
 
+def _calls_git_executable(node: ast.AST) -> bool:
+    """argv[0] of a git call through a lookup: ``git_executable()``, ``gitsafe.git_executable()`` or a copy."""
+    func = node.func if isinstance(node, ast.Call) else None
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+    return name.endswith("git_executable")
+
+
+# treeid spawns git itself: it needs a scrubbed environment and a private index, which gitsafe.run
+# cannot give (SECURITY.md, Repository trust). Its argv heads are gitsafe.git_executable() calls.
+_GIT_EXECUTABLE_HEADS_ALLOWED = {"aegis_core/gitsafe.py", "aegis_core/treeid.py"}
+
+
+def _git_spawn_offenders(rel: str, source: str) -> list:
+    tree = ast.parse(source)
+    # `binary in ("git", "gh")` names git without running it
+    membership = {
+        id(comparator)
+        for node in ast.walk(tree) if isinstance(node, ast.Compare)
+        for op, comparator in zip(node.ops, node.comparators) if isinstance(op, (ast.In, ast.NotIn))
+    }
+    offenders = []
+    for node in ast.walk(tree):
+        # an argv list or tuple whose program is git
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _is_git_program(node.elts[0]) \
+                and id(node) not in membership:
+            offenders.append(f"{rel}:{node.lineno} builds a git argv")
+        if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _calls_git_executable(node.elts[0]) \
+                and rel not in _GIT_EXECUTABLE_HEADS_ALLOWED:
+            offenders.append(f"{rel}:{node.lineno} builds a git argv from git_executable()")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and (node.func.value.id, node.func.attr) in _SPAWNERS \
+                and node.args and _is_git_command_line(node.args[0]):
+            offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
+    return offenders
+
+
 def test_no_git_subprocess_outside_gitsafe():
     offenders = []
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel == "aegis_core/gitsafe.py":
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            # `binary in ("git", "gh")` names git without running it
-            membership = {
-                id(comparator)
-                for node in ast.walk(tree) if isinstance(node, ast.Compare)
-                for op, comparator in zip(node.ops, node.comparators) if isinstance(op, (ast.In, ast.NotIn))
-            }
-            for node in ast.walk(tree):
-                # an argv list or tuple whose program is git
-                if isinstance(node, (ast.List, ast.Tuple)) and node.elts and _is_git_program(node.elts[0]) \
-                        and id(node) not in membership:
-                    offenders.append(f"{rel}:{node.lineno} builds a git argv")
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                        and isinstance(node.func.value, ast.Name) \
-                        and (node.func.value.id, node.func.attr) in _SPAWNERS \
-                        and node.args and _is_git_command_line(node.args[0]):
-                    offenders.append(f"{rel}:{node.lineno} runs git through {node.func.value.id}.{node.func.attr}")
+            if rel != "aegis_core/gitsafe.py":
+                offenders += _git_spawn_offenders(rel, path.read_text(encoding="utf-8"))
     assert offenders == []
+
+
+def _single_reader_offenders(rel: str, source: str) -> list:
+    """A reach into gitsafe's private names, or a ``cat-file --batch``/``--batch-check`` spelled outside
+    gitsafe: the one batch reader is ``gitsafe.read_blobs``/``blob_sizes``, which check what git hands back."""
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "gitsafe" \
+                and node.attr.startswith("_"):
+            offenders.append(f"{rel}:{node.lineno} uses gitsafe.{node.attr}")
+        if isinstance(node, ast.ImportFrom) and node.module == "aegis_core.gitsafe":
+            offenders += [f"{rel}:{node.lineno} imports gitsafe.{a.name}" for a in node.names if a.name.startswith("_")]
+        if isinstance(node, ast.Constant) and node.value in ("--batch", "--batch-check"):
+            offenders.append(f"{rel}:{node.lineno} names cat-file {node.value}")
+    return offenders
+
+
+def test_no_package_module_reaches_gitsafe_private_names():
+    offenders = []
+    for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
+        for path in sorted((ROOT / pkg).rglob("*.py")):
+            rel = path.relative_to(ROOT).as_posix()
+            if rel != "aegis_core/gitsafe.py":
+                offenders += _single_reader_offenders(rel, path.read_text(encoding="utf-8"))
+    assert offenders == []
+
+
+def test_the_single_reader_ratchet_flags_a_private_reach_and_a_batch_spelling():
+    source = ("from aegis_core import gitsafe\nfrom aegis_core.gitsafe import _blob_id\n"
+              "gitsafe._parse_cat_file_batch(b'', [])\ngitsafe.run(['cat-file', '--batch-check'], '.')\n")
+    assert _single_reader_offenders("aegis_core/x.py", source) == [
+        "aegis_core/x.py:2 imports gitsafe._blob_id", "aegis_core/x.py:3 uses gitsafe._parse_cat_file_batch",
+        "aegis_core/x.py:4 names cat-file --batch-check"]
+    assert _single_reader_offenders("aegis_core/x.py", "gitsafe.read_blobs('.', [])\n") == []
+
+
+def test_the_ratchet_flags_a_git_argv_headed_by_a_git_executable_call():
+    source = "import subprocess\nfrom aegis_core import gitsafe\nsubprocess.run([gitsafe.git_executable(), 'status'])\n"
+    assert _git_spawn_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:3 builds a git argv from git_executable()"]
+    assert _git_spawn_offenders("aegis_core/treeid.py", source) == []
+
+
+# ── The docstring is the list of what gitsafe's git calls write (R-trust-28) ──
+
+_WRITERS = {
+    "update-ref", "merge-tree", "read-tree", "checkout-index", "update-index", "write-tree", "commit-tree",
+    "mktree", "mktag", "add", "commit", "checkout", "reset", "tag", "branch", "gc", "prune", "repack",
+    "pack-refs", "fetch", "pull", "push", "clone", "init", "stash", "apply",
+}
+
+
+def _first_strings(tree: ast.AST) -> list:
+    """The first string element of every list literal (the subcommand of an argv list)."""
+    return [next((e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)), None)
+            for node in ast.walk(tree) if isinstance(node, ast.List)]
+
+
+def test_the_module_docstring_names_every_git_command_that_writes():
+    tree = ast.parse((ROOT / "aegis_core" / "gitsafe.py").read_text(encoding="utf-8"))
+    firsts = _first_strings(tree)
+    detected = _WRITERS.intersection(firsts)
+    assert {"update-ref", "merge-tree", "read-tree", "checkout-index"} <= detected  # the detector sees them
+    if "hash-object" in firsts and "-w" in firsts:
+        detected.add("hash-object -w")
+    doc = gitsafe.__doc__ or ""
+    assert sorted(name for name in detected if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", doc)) == []
+
+
+def _repository_state(repo: Path) -> dict:
+    work_tree = {p.relative_to(repo).as_posix(): p.read_bytes() for p in sorted(repo.rglob("*"))
+                 if p.is_file() and ".git" not in p.relative_to(repo).parts}
+    refs = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+    return {"work tree": work_tree, "index": (repo / ".git" / "index").read_bytes(), "refs": refs,
+            "HEAD": (repo / ".git" / "HEAD").read_bytes()}
+
+
+def test_export_tree_leaves_the_repository_work_tree_index_and_refs_alone(repo: Path, tmp_path: Path):
+    (repo / "a.py").write_bytes(b"a = 2\n")                     # modified, unstaged
+    (repo / "staged.py").write_bytes(b"s = 1\n")
+    _git(repo, "add", "staged.py")                              # staged
+    before = _repository_state(repo)
+
+    gitsafe.export_tree(repo, "HEAD", tmp_path / "plain")
+    gitsafe.export_tree(repo, "HEAD", tmp_path / "overlaid", overlay={"b.py": b"b = 9\n"})
+
+    assert _repository_state(repo) == before
+    assert (tmp_path / "plain" / "a.py").read_bytes() == b"a = 1\n"
+    assert (tmp_path / "overlaid" / "b.py").read_bytes() == b"b = 9\n"
+
+
+# Read plumbing, the hardened `log`, and the named writers: the signed approval commit
+# (human_gate), the Aegis-Check trailer's write-tree (hooks/commitmsg) and add_trailer.
+_RUN_ALLOWED = {
+    "cat-file", "config", "diff-index", "diff-tree", "for-each-ref", "ls-files", "ls-tree", "merge-base",
+    "rev-list", "rev-parse", "symbolic-ref", "check-ref-format", "version", "log", "commit", "interpret-trailers",
+    "write-tree",
+}
+# `aegis sync --pr` (SECURITY.md, the git row) reads its remote's push URLs and the committer
+# identity, writes its own aegis/lifecycle-* branch, and pushes that one branch.
+_RUN_ALLOWED_IN = {"aegis_core/sync.py": {"remote", "var", "update-ref", "push"}}
+
+
+def _run_subcommand_offenders(rel: str, source: str) -> list:
+    """``gitsafe.run([...])`` and ``gitsafe.run_checked([...])`` calls whose subcommand (after leading
+    ``-c <setting>`` pairs) is not allowed. Wrappers that pass ``list(args)`` (sync._git) are out of this
+    detector's reach."""
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("run", "run_checked")
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "gitsafe"
+                and node.args and isinstance(node.args[0], ast.List)):
+            continue
+        elts = node.args[0].elts
+        while len(elts) > 1 and isinstance(elts[0], ast.Constant) and elts[0].value == "-c":
+            elts = elts[2:]
+        head = elts[0].value if elts and isinstance(elts[0], ast.Constant) else None
+        if isinstance(head, str) and head not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
+            offenders.append(f"{rel}:{node.lineno} runs git {head}")
+    return offenders
+
+
+def test_gitsafe_run_callers_use_only_allowed_subcommands():
+    offenders = []
+    for pkg in ("aegis_core", "aegis_cli", "aegis_mcp"):
+        for path in sorted((ROOT / pkg).rglob("*.py")):
+            offenders += _run_subcommand_offenders(path.relative_to(ROOT).as_posix(), path.read_text(encoding="utf-8"))
+    assert offenders == []
+
+
+def test_the_subcommand_ratchet_flags_a_worktree_add():
+    source = "gitsafe.run(['worktree', 'add', 'x'], root)\ngitsafe.run(['-c', 'a=b', 'worktree', 'add'], root)\n"
+    assert _run_subcommand_offenders("aegis_core/x.py", source) == [
+        "aegis_core/x.py:1 runs git worktree", "aegis_core/x.py:2 runs git worktree"]
+    assert _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], top)\n") == []
+    assert _run_subcommand_offenders("aegis_core/x.py", "gitsafe.run(['push', 'origin'], top)\n") != []
+
+
+def test_the_subcommand_ratchet_sees_run_checked_too():
+    source = "gitsafe.run_checked(['worktree', 'add'], root, error=E)\ngitsafe.run_checked(['ls-tree', 'HEAD'], root)\n"
+    assert _run_subcommand_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:1 runs git worktree"]
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──
@@ -984,3 +1323,289 @@ def test_a_snapshot_rerun_of_a_leading_dash_revision_fails_without_reaching_git(
     git_calls.clear()
     assert checkrun.rerun_commit_snapshot(repo, "--output=x", "main") == {"tree": "", "exit": 1}
     assert not any("--output=x" in arg for call in git_calls for arg in call)
+
+
+# ── one request's repository facts: memo and layout (R-structure-4) ─────────
+
+def test_a_memo_scope_asks_git_once_for_the_top_level_and_the_common_dir(repo: Path, git_calls):
+    (repo / "sub").mkdir()
+    git_calls.clear()
+    with gitsafe.memo():
+        for _ in range(3):
+            assert gitsafe.toplevel(repo / "sub") == repo.resolve()
+            assert gitsafe.common_dir(repo / "sub") == repo / "sub" / ".." / ".git"
+            assert gitsafe.toplevel(str(repo / "sub")) == repo.resolve()
+    assert len(git_calls) == 1, git_calls
+    git_calls.clear()
+    assert gitsafe.toplevel(repo / "sub") == repo.resolve()
+    assert gitsafe.common_dir(repo / "sub") == repo / "sub" / ".." / ".git"
+    assert len(git_calls) == 2  # outside a scope every question is asked
+
+
+def test_a_nested_memo_shares_the_outer_one_and_every_exit_path_clears_it(repo: Path, git_calls):
+    git_calls.clear()
+    with gitsafe.memo():
+        gitsafe.toplevel(repo)
+        with gitsafe.memo():
+            gitsafe.toplevel(repo)
+        gitsafe.toplevel(repo)  # the inner exit did not clear the outer scope
+    assert len(git_calls) == 1
+    with pytest.raises(RuntimeError):
+        with gitsafe.memo():
+            gitsafe.toplevel(repo)
+            raise RuntimeError("the body fails")
+    with gitsafe.memo():
+        gitsafe.toplevel(repo)
+    assert len(git_calls) == 3
+
+
+def test_memoized_answers_none_once_and_computes_every_time_outside_a_scope():
+    produced = []
+    with gitsafe.memo():
+        assert [gitsafe.memoized(("k",), lambda: produced.append(1)) for _ in range(3)] == [None, None, None]
+    assert produced == [1]
+    gitsafe.memoized(("k",), lambda: produced.append(2))
+    gitsafe.memoized(("k",), lambda: produced.append(3))
+    assert produced == [1, 2, 3]
+
+
+def test_layout_names_the_common_dir_prefix_shallowness_and_top_level(repo: Path, tmp_path: Path):
+    (repo / "sub").mkdir()
+    assert gitsafe.layout(repo) == gitsafe.Layout(".git", "", False, str(repo.resolve()))
+    assert gitsafe.layout(repo / "sub") == gitsafe.Layout("../.git", "sub/", False, str(repo.resolve()))
+    inside = gitsafe.layout(repo / ".git")  # git places it, but no work tree contains it
+    assert inside is not None and inside.top is None and inside.common_dir == "."
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    if gitsafe.toplevel(plain) is None:  # not inside some enclosing repository
+        assert gitsafe.layout(plain) is None
+
+
+def test_a_bare_repository_has_a_common_dir_and_no_top_level(repo: Path, tmp_path: Path):
+    bare = tmp_path / "bare.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(repo), str(bare))
+    assert gitsafe.toplevel(bare) is None
+    assert gitsafe.common_dir(bare) == Path(os.path.abspath(bare)) / "."
+    assert gitsafe.layout(bare).shallow is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids a newline in a path")
+def test_a_workspace_path_with_a_newline_keeps_the_answers_of_the_single_calls(repo: Path, git_calls):
+    odd = repo / "line\nbreak"
+    odd.mkdir()
+    git_calls.clear()
+    with gitsafe.memo():
+        assert gitsafe.toplevel(odd) == repo.resolve()
+        assert gitsafe.common_dir(odd) == odd / ".." / ".git"
+        assert gitsafe.layout(odd).prefix == "line\nbreak/"
+    assert len(git_calls) >= 2  # the combined answer cannot be split by line, so it is asked again
+
+# ── the git executable is resolved once per PATH value (R-structure-10) ─────
+
+@pytest.fixture
+def fresh_git_lookup():
+    gitsafe._reset_for_tests()
+    yield
+    gitsafe._reset_for_tests()
+
+
+def _counting_which(monkeypatch):
+    from aegis_core import pathlookup
+
+    real, asked = pathlookup.which, []
+    monkeypatch.setattr(pathlookup, "which", lambda name, *a, **kw: asked.append(name) or real(name, *a, **kw))
+    return asked
+
+
+def test_twenty_git_calls_with_one_path_look_git_up_once(tmp_path, monkeypatch, fresh_git_lookup):
+    asked = _counting_which(monkeypatch)
+    for _ in range(20):
+        assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    assert asked == ["git"]
+    assert os.path.samefile(gitsafe.git_executable(), shutil.which("git")) and asked == ["git"]
+
+
+def _copy_git(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    real = Path(shutil.which("git"))
+    copy = directory / real.name
+    shutil.copy2(str(real), str(copy))
+    return copy
+
+
+@pytest.mark.skipif(os.name == "nt", reason="copies the git binary; Git for Windows needs its whole tree")
+def test_a_new_path_finds_its_own_git_and_a_deleted_git_fails_loudly(tmp_path, monkeypatch, fresh_git_lookup):
+    copy = _copy_git(tmp_path / "other")
+    monkeypatch.setenv("PATH", str(tmp_path / "other"))
+    assert gitsafe.git_executable() == str(copy)
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    saved = copy.read_bytes()
+    copy.unlink()
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+        gitsafe.run(["--version"], tmp_path)
+    copy.write_bytes(saved)
+    copy.chmod(0o755)
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+
+
+def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp_path, monkeypatch,
+                                                                            fresh_git_lookup):
+    marker = tmp_path / "PWNED"
+    _plant_git(tmp_path / "repo", marker)
+    monkeypatch.chdir(tmp_path / "repo")
+    assert gitsafe.run(["--version"], tmp_path).returncode == 0  # cached under the real PATH
+    monkeypatch.setenv("PATH", ".")
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+        gitsafe.run(["--version"], tmp_path)
+    assert not marker.exists()
+
+
+# ── scrubbed(): evidence ignores the caller's local GIT_* variables (R-trust-19) ──
+
+_LOCAL_GIT_ENV = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                  "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+                  "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+                  "GIT_SHALLOW_FILE", "GIT_COMMON_DIR")
+_KEPT_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Author", "GIT_COMMITTER_EMAIL": "c@example.com",
+                 "GIT_SSH_COMMAND": "ssh -o BatchMode=yes", "GIT_SSH": "ssh", "GIT_EXEC_PATH": "/opt/git-core",
+                 "GIT_CONFIG_SYSTEM": "/etc/none"}
+
+
+def _env_spy(monkeypatch):
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", fake_run)
+    return seen
+
+
+def test_scrubbed_drops_exactly_the_local_variables_git_lists(fake_home, tmp_path, monkeypatch):
+    """Given the 15 local variables and the identity, SSH and config-scope ones, when git runs inside
+    scrubbed(), then none of the 15 reach it and the rest do unchanged; outside, all of them do."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(fake_home / ".gitconfig"))
+    for name in _LOCAL_GIT_ENV:
+        monkeypatch.setenv(name, str(tmp_path / name.lower()))
+    for name, value in _KEPT_GIT_ENV.items():
+        monkeypatch.setenv(name, value)
+    seen = _env_spy(monkeypatch)
+    with gitsafe.scrubbed():
+        gitsafe.run(["rev-parse", "HEAD"], tmp_path)
+    gitsafe.run(["rev-parse", "HEAD"], tmp_path)
+    inside, outside = seen
+    assert not {k for k in inside if k in _LOCAL_GIT_ENV} - {"GIT_NO_REPLACE_OBJECTS"}
+    assert inside["GIT_NO_REPLACE_OBJECTS"] == "1"  # gitsafe's own setting, not the caller's
+    assert {k: inside[k] for k in _KEPT_GIT_ENV} == _KEPT_GIT_ENV
+    assert inside["GIT_CONFIG_GLOBAL"] == str(fake_home / ".gitconfig")
+    assert all(outside[k] == str(tmp_path / k.lower()) for k in _LOCAL_GIT_ENV if k != "GIT_NO_REPLACE_OBJECTS")
+    assert {k: outside[k] for k in _KEPT_GIT_ENV} == _KEPT_GIT_ENV
+    assert "scrubbed" in gitsafe.__all__
+
+
+def test_scrubbed_matches_names_whatever_their_case(fake_home, tmp_path, monkeypatch):
+    """Windows environment names are case-insensitive: a lower-case git_dir is still GIT_DIR."""
+    monkeypatch.setattr(gitsafe.os, "environ", {"PATH": os.environ["PATH"], "git_dir": str(tmp_path),
+                                                "Git_Index_File": "x", "HOME": str(fake_home)})
+    seen = _env_spy(monkeypatch)
+    with gitsafe.scrubbed():
+        gitsafe.run(["rev-parse", "HEAD"], tmp_path)
+    assert "git_dir" not in seen[0] and "Git_Index_File" not in seen[0] and seen[0]["HOME"] == str(fake_home)
+
+
+def test_an_explicit_index_still_wins_inside_scrubbed(repo, fake_home, tmp_path, monkeypatch):
+    """export_tree's own GIT_INDEX_FILE beats an ambient one pointing at a missing file."""
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "missing" / "index"))
+    dest = tmp_path / "out"
+    with gitsafe.scrubbed():
+        gitsafe.export_tree(repo, "HEAD", dest)
+    assert sorted(p.name for p in dest.iterdir()) == [".gitignore", "a.py", "b.py", "gone.py"]
+
+
+def test_a_hook_index_is_still_read_outside_scrubbed(repo, fake_home, tmp_path, monkeypatch):
+    """GUARD: git hands a hook its index in GIT_INDEX_FILE; the default run keeps it."""
+    index = tmp_path / "hook-index"
+    shutil.copy2(str(repo / ".git" / "index"), str(index))
+    (repo / "staged_only.py").write_bytes(b"x = 1\n")
+    subprocess.run(["git", "add", "staged_only.py"], cwd=str(repo), check=True, capture_output=True,
+                   env=dict(os.environ, GIT_INDEX_FILE=str(index)))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(index))
+    seen = []
+    real = gitsafe.subprocess.run
+
+    def spy(argv, **kwargs):
+        seen.append(kwargs["env"].get("GIT_INDEX_FILE"))
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", spy)
+    assert gitsafe.changed_files(repo, "staged") == ["staged_only.py"]
+    assert str(index) in seen
+    monkeypatch.delenv("GIT_INDEX_FILE")
+    assert gitsafe.changed_files(repo, "staged") == []
+
+
+def test_the_scrub_ends_with_its_block_even_on_an_exception_and_nests(fake_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_INDEX_FILE", "ambient")
+    seen = _env_spy(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with gitsafe.scrubbed():
+            raise RuntimeError("boom")
+    gitsafe.run(["status"], tmp_path)
+    with gitsafe.scrubbed():
+        with gitsafe.scrubbed():
+            pass
+        gitsafe.run(["status"], tmp_path)
+    gitsafe.run(["status"], tmp_path)
+    assert [env.get("GIT_INDEX_FILE") for env in seen] == ["ambient", None, "ambient"]
+
+
+def test_scrubbed_decorates_a_function(fake_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_DIR", "ambient")
+    seen = _env_spy(monkeypatch)
+
+    @gitsafe.scrubbed()
+    def evidence():
+        gitsafe.run(["status"], tmp_path)
+
+    evidence()
+    evidence()
+    gitsafe.run(["status"], tmp_path)
+    assert [env.get("GIT_DIR") for env in seen] == [None, None, "ambient"]
+
+
+def test_a_memoized_answer_under_an_ambient_git_dir_is_not_served_to_a_scrubbed_call(fake_home, tmp_path,
+                                                                                    monkeypatch):
+    a, b = _repo(tmp_path / "a"), _repo(tmp_path / "b")
+    monkeypatch.setenv("GIT_DIR", str(b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(b))
+    with gitsafe.memo():
+        ambient = gitsafe.toplevel(a)
+        with gitsafe.scrubbed():
+            scrubbed = gitsafe.toplevel(a)
+        again = gitsafe.toplevel(a)
+    assert os.path.samefile(ambient, b) and os.path.samefile(again, b)
+    assert os.path.samefile(scrubbed, a)
+
+
+# ── read_blob: a malformed size is git's error, as in blob_sizes and read_blobs (w10 carry) ──
+
+@pytest.mark.parametrize("size", [b"12x", b"1.5", b"-1"], ids=["letters", "fraction", "negative"])
+def test_read_blob_refuses_a_cat_file_header_whose_size_is_not_a_number(repo: Path, monkeypatch, size):
+    real = gitsafe.subprocess.run
+
+    def bad_header(argv, **kwargs):
+        res = real(argv, **kwargs)
+        if "cat-file" in argv and res.returncode == 0:
+            oid = res.stdout.split(b" ", 1)[0]
+            return subprocess.CompletedProcess(argv, 0, oid + b" blob " + size + b"\nx", b"")
+        return res
+
+    monkeypatch.setattr(gitsafe.subprocess, "run", bad_header)
+    with pytest.raises(gitsafe.GitError):
+        gitsafe.read_blob(repo, "HEAD", "a.py")
+
+
+def test_read_blob_still_reads_a_blob_and_answers_none_for_a_missing_path(repo: Path):
+    assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
+    assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None

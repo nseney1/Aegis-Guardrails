@@ -22,7 +22,7 @@ from aegis_cli.base import AegisCommand, CommandCategory
 __all__ = ["MigrateCommand", "run_migrate"]
 
 
-def _print_report(report: Dict[str, Any], applied: bool, backup: Any) -> None:
+def _print_report(report: Dict[str, Any], applied: bool, backup: Any, tightened: bool) -> None:
     root = report["root"]
     if report["status"] == "refused":
         print(f"aegis migrate: {root}: refused: {report['refusal']}")
@@ -76,7 +76,7 @@ def _print_report(report: Dict[str, Any], applied: bool, backup: Any) -> None:
             print(f"    {entry['path']}: {entry['reason']}")
     modes = report.get("state_modes")
     if modes and modes["looser"]:
-        if applied:
+        if tightened:
             print(f"  state modes: tightened {modes['fixed']} of {modes['looser']} loose entries "
                   f"in the shared state (0700 directories, 0600 files)")
         else:
@@ -118,12 +118,14 @@ def run_migrate(args: argparse.Namespace) -> int:
             report["status"], report["refusal"] = "refused", str(exc)
     if apply_it and report["status"] == "pending":
         report["status"] = "applied"
-    report["state_modes"] = _state_modes(root, tighten=apply_it and report["status"] != "refused")
+    # An up-to-date workspace has no backup but is still tightened, so this is not "applied".
+    tighten = apply_it and report["status"] != "refused"
+    report["state_modes"] = _state_modes(root, tighten=tighten)
     report["backup"] = str(backup) if backup else None
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2))
     else:
-        _print_report(report, apply_it and backup is not None, backup)
+        _print_report(report, apply_it and backup is not None, backup, tighten)
     if report["status"] == "refused":
         return 1
     left_behind = report["unmapped"] or report["conflicts"] or report["unreadable"] or report["skipped"]

@@ -31,6 +31,7 @@ import stat
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.errors import AegisValidationError, PathTraversalError
+from aegis_core.primitives import is_within, strict_loads
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout, WorkspaceLayout
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "ENV_WORKSPACE",
     "MAX_CONFIG_BYTES",
     "RepoConfig",
+    "SCANNER_PRESETS",
     "UserConfig",
     "env_client",
     "env_github_step_summary",
@@ -51,9 +53,12 @@ __all__ = [
     "env_max_jit_tokens",
     "env_workspace",
     "jit_max_tokens",
+    "parse_capture_mode",
+    "read_capped",
     "read_user_config",
     "scan_window_s",
     "update_repo_config",
+    "user_scanners",
 ]
 
 CONFIG_VERSION = 1
@@ -74,9 +79,14 @@ ENV_MAX_JIT_TOKENS = "AEGIS_MAX_JIT_TOKENS"
 ENV_LLM_CMD = "AEGIS_LLM_CMD"
 ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
 
-_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "half_life_sessions", "epsilon"})
-# tests, rules, perf and regression are read through read_user_config by their own consumers.
-_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci"})
+_DECAY_KEYS = ("half_life_sessions", "epsilon")
+# "fitness" and the top-level decay keys are known (warned about, not counted as unknown keys).
+_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", *_DECAY_KEYS})
+# tests, rules, perf, regression, scanners and insights are read through read_user_config by their consumers.
+_USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci",
+                        "scanners", "insights"})
+#: The scanner presets the user-scope ``scanners`` key may name (aegis_core.verification.scanners).
+SCANNER_PRESETS = ("ruff", "gitleaks")
 # Keys a repository might use to smuggle in a command. Only these names (aegis's own
 # vocabulary) are ever echoed in a warning; any other unknown key is only counted,
 # since warnings reach the agent and key names are repo-chosen text.
@@ -155,13 +165,7 @@ def _valid_epsilon(value: Any) -> Optional[float]:
 
 # ── Reading files ────────────────────────────────────────────────────────────
 
-def _is_within(path: Path, root: Path) -> bool:
-    # realpath, not Path.resolve(): it never raises (3.9 resolve raises RuntimeError on loops).
-    real, base = os.path.realpath(path), os.path.realpath(root)
-    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
-
-
-def _read_capped(fd: int, limit: int) -> bytes:
+def read_capped(fd: int, limit: int) -> bytes:
     data = b""
     while len(data) <= limit:
         chunk = os.read(fd, limit + 1 - len(data))
@@ -190,7 +194,7 @@ def _read_json(path: Path, label: str) -> Optional[Dict[str, Any]]:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ConfigError(f"{label} is not a regular file")
-        data = _read_capped(fd, MAX_CONFIG_BYTES)
+        data = read_capped(fd, MAX_CONFIG_BYTES)
     except OSError as exc:
         raise ConfigError(f"cannot read {label}") from exc
     finally:
@@ -198,7 +202,7 @@ def _read_json(path: Path, label: str) -> Optional[Dict[str, Any]]:
     if len(data) > MAX_CONFIG_BYTES:
         raise ConfigError(f"{label} is larger than {MAX_CONFIG_BYTES // 1024} KiB")
     try:
-        value = json.loads(data.decode("utf-8-sig"))
+        value = strict_loads(data.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ConfigError(f"{label} is not valid JSON") from exc
     if not isinstance(value, dict):
@@ -252,7 +256,7 @@ class RepoConfig:
         """
         layout = WorkspaceLayout(Path(os.fspath(workspace_root)).resolve())
         path = layout.config_file
-        if os.path.lexists(path) and not _is_within(path, layout.root):
+        if os.path.lexists(path) and not is_within(path, layout.root, unresolvable=False):
             return cls(warnings=(f"ignored {REPO_LABEL}: it resolves to a path outside the workspace",))
         raw = _read_json(path, REPO_LABEL)
         return cls() if raw is None else cls.parse(raw)
@@ -327,35 +331,27 @@ class RepoConfig:
         else:
             warnings.append(f"ignored 'expiry' in {REPO_LABEL}: it must be an object")
 
+        # The decay keys are read under ``expiry`` only; the top-level and ``fitness`` spellings
+        # earlier releases accepted are named in one warning (their values never echoed).
         fitness_raw = raw.get("fitness", {})
-        fitness_map = fitness_raw if isinstance(fitness_raw, Mapping) else {}
+        if not isinstance(fitness_raw, Mapping):
+            warnings.append(f"ignored 'fitness' in {REPO_LABEL}: it must be an object")
+            fitness_raw = {}
+        if any(key in where for where in (raw, fitness_raw) for key in _DECAY_KEYS):
+            warnings.append(f"ignored decay key(s) in {REPO_LABEL} outside 'expiry': use expiry.half_life_sessions "
+                            "and expiry.epsilon")
         expiry_map = expiry if isinstance(expiry, Mapping) else {}
-
-        half_life_sessions = DEFAULT_HALF_LIFE_SESSIONS
-        raw_hl = raw.get("half_life_sessions")
-        if raw_hl is None:
-            raw_hl = fitness_map.get("half_life_sessions")
-        if raw_hl is None:
-            raw_hl = expiry_map.get("half_life_sessions")
-        if raw_hl is not None:
-            parsed_hl = _valid_half_life_sessions(raw_hl)
-            if parsed_hl is not None:
-                half_life_sessions = parsed_hl
-            else:
-                warnings.append(f"ignored 'half_life_sessions' in {REPO_LABEL}: it must be a positive integer")
-
-        epsilon = DEFAULT_EPSILON
-        raw_eps = raw.get("epsilon")
-        if raw_eps is None:
-            raw_eps = fitness_map.get("epsilon")
-        if raw_eps is None:
-            raw_eps = expiry_map.get("epsilon")
-        if raw_eps is not None:
-            parsed_eps = _valid_epsilon(raw_eps)
-            if parsed_eps is not None:
-                epsilon = parsed_eps
-            else:
-                warnings.append(f"ignored 'epsilon' in {REPO_LABEL}: it must be a number between 0 and 1")
+        half_life_sessions, epsilon = DEFAULT_HALF_LIFE_SESSIONS, DEFAULT_EPSILON
+        if "half_life_sessions" in expiry_map:
+            parsed_hl = _valid_half_life_sessions(expiry_map["half_life_sessions"])
+            if parsed_hl is None:
+                warnings.append(f"ignored 'expiry.half_life_sessions' in {REPO_LABEL}: it must be a positive integer")
+            half_life_sessions = parsed_hl or half_life_sessions
+        if "epsilon" in expiry_map:
+            parsed_eps = _valid_epsilon(expiry_map["epsilon"])
+            if parsed_eps is None:
+                warnings.append(f"ignored 'expiry.epsilon' in {REPO_LABEL}: it must be a number between 0 and 1")
+            epsilon = parsed_eps or epsilon
 
         packaged: List[str] = []
         ast = raw.get("ast", {})
@@ -437,6 +433,7 @@ class UserConfig:
     warnings: Tuple[str, ...] = ()
     arbiter_vendor: Optional[str] = None
     ci_workflow: Optional[str] = None
+    insights_capture: Optional[str] = None
 
     @classmethod
     def load(cls, workspace_root: Any = None, user: Optional[UserLayout] = None) -> "UserConfig":
@@ -450,7 +447,8 @@ class UserConfig:
         if user is None:
             return cls()
         path = user.config_file
-        if workspace_root is not None and os.path.lexists(path) and _is_within(path, Path(os.fspath(workspace_root))):
+        inside = workspace_root is not None and is_within(path, os.fspath(workspace_root), unresolvable=True)
+        if inside and os.path.lexists(path):
             return cls(warnings=(
                 f"ignored {USER_LABEL} as user scope: it lies inside the workspace, "
                 "so it is treated as repository content",
@@ -487,8 +485,25 @@ class UserConfig:
             ci_workflow = ci_workflow_name(raw_ci.get("workflow")) if isinstance(raw_ci, dict) else None
             if ci_workflow is None:
                 warnings.append(f"ignored 'ci.workflow' in {USER_LABEL}: it must be a bare .yml or .yaml file name")
+        if "scanners" in raw and (not isinstance(raw["scanners"], list)
+                                  or any(name not in SCANNER_PRESETS for name in raw["scanners"])):
+            warnings.append(f"ignored entries of 'scanners' in {USER_LABEL}: it lists preset names "
+                            f"({', '.join(SCANNER_PRESETS)})")
+        section, capture = raw.get("insights"), None
+        if section is not None and not isinstance(section, dict):
+            warnings.append(f"ignored 'insights' in {USER_LABEL}: it must be an object")
+        elif section and section.get("capture") is not None:
+            capture = parse_capture_mode(section["capture"])
+            if capture is None:
+                warnings.append(f"ignored 'insights.capture' in {USER_LABEL}: expected off, counters or excerpts")
         return cls(drivers=drivers, slots=slots, warnings=tuple(warnings), arbiter_vendor=arbiter_vendor,
-                   ci_workflow=ci_workflow)
+                   ci_workflow=ci_workflow, insights_capture=capture)
+
+
+def parse_capture_mode(value: Any) -> Optional[str]:
+    """``insights.capture`` as 'off', 'counters' or 'excerpts' (stripped, any case), else None."""
+    mode = value.strip().lower() if isinstance(value, str) else None
+    return mode if mode in ("off", "counters", "excerpts") else None
 
 
 def ci_workflow_name(value: Any) -> Optional[str]:
@@ -507,13 +522,22 @@ def user_ci_workflow(workspace_root: Any = None) -> Optional[str]:
     return ci_workflow_name(ci.get("workflow")) if isinstance(ci, dict) else None
 
 
+def user_scanners(workspace_root: Any = None) -> List[str]:
+    """The presets ``scanners`` in the user-scope config names, known names only, in order. The
+    repository never names them: a scanner is a program aegis runs over its code."""
+    names = (read_user_config(workspace_root) or {}).get("scanners")
+    if not isinstance(names, list):
+        return []
+    return list(dict.fromkeys(name for name in names if isinstance(name, str) and name in SCANNER_PRESETS))
+
+
 def read_user_config(
     workspace_root: Any = None, *, user: Optional[UserLayout] = None, path: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """The user-scope config as a dict, or None; never raises.
 
     The one lenient reader for the command-like user keys (``tests.command``,
-    ``rules.base_ref``, ``perf.command``, ``regression.*``): the repository never supplies
+    ``rules.base_ref``, ``perf.command``, ``regression.*``, ``scanners``): the repository never supplies
     them. ``path`` overrides ``~/.aegis/config.json``. None without a home directory, when
     the file lies inside ``workspace_root`` (repository content), and whenever
     UserConfig.load would raise ConfigError (not a regular file, over the size cap, not a
@@ -525,7 +549,7 @@ def read_user_config(
             return None
         path = user.config_file
     path = Path(os.fspath(path))
-    if workspace_root is not None and _is_within(path, Path(os.fspath(workspace_root))):
+    if workspace_root is not None and is_within(path, os.fspath(workspace_root), unresolvable=True):
         return None
     try:
         return _read_json(path, USER_LABEL)

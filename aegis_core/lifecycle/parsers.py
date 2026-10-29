@@ -1,12 +1,12 @@
 """Rule ids, slugs, file lookup and frontmatter transforms for the lifecycle."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
+from aegis_core.fitness import rule_age_days
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 from aegis_core.yaml_engine.frontmatter import parse_rule_frontmatter
 from aegis_core.workspace import literal_workspace
@@ -71,30 +71,6 @@ def find_rule_file(workspace: Workspace | Path | str, rule_id: str) -> Tuple[Opt
         if candidate.is_file():
             return candidate, type_name
     return None, None
-
-
-def rule_age_days(rule: Any, now: Optional[datetime] = None) -> int:
-    """Days since the rule's ``created`` date (0 when it has none or it cannot be read)."""
-    created = (getattr(rule, "meta", None) or {}).get("created")
-    if isinstance(created, datetime):
-        created_dt = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
-    elif isinstance(created, str) and created:
-        text = created.strip()
-        text = text[:-1] + "+00:00" if text.endswith("Z") else text
-        try:
-            created_dt = datetime.fromisoformat(text) if "T" in text else datetime.strptime(text[:10], "%Y-%m-%d")
-        except ValueError:
-            return 0
-        if created_dt.tzinfo is None:
-            created_dt = created_dt.replace(tzinfo=timezone.utc)
-    elif hasattr(created, "isoformat"):  # a date
-        created_dt = datetime(created.year, created.month, created.day, tzinfo=timezone.utc)
-    else:
-        return 0
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return max(0, (current - created_dt).days)
 
 
 def _transform_frontmatter_type(content: str, new_type: str) -> str:

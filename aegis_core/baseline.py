@@ -29,10 +29,7 @@ decorator violation that has no line.
 """
 from __future__ import annotations
 
-import bisect
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,9 +39,9 @@ import stat
 import tempfile
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe
-from aegis_core._version import __version__
+from aegis_core import gitsafe, primitives
 from aegis_core.errors import AegisError
+from aegis_core.primitives import DuplicateKeyError, is_within, safe_parts, strict_loads
 from aegis_core.storage import atomic_write_text
 from aegis_core.verification import ToolEvidence
 from aegis_core.workspace.layout import AEGIS_DIRNAME
@@ -68,19 +65,13 @@ __all__ = [
     "basename_groups",
     "checkable",
     "collect",
-    "envelope",
-    "fingerprint",
     "label_base",
     "list_files",
     "load",
-    "normalize_text",
-    "occurrence_index",
     "parse",
     "render",
     "run_fast",
     "run_grouped",
-    "split_lines",
-    "utc_stamp",
     "write",
 ]
 
@@ -92,7 +83,6 @@ LABEL_ABSENT = "baseline: absent at base"
 _KEYS = ("rule", "path", "fp")
 _FP = re.compile(r"\A[0-9a-f]{64}\Z")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 def label_base(commit: str) -> str:
@@ -128,49 +118,6 @@ class Entry(NamedTuple):
     fp: str
 
 
-def normalize_text(line: str) -> str:
-    """A line as the fingerprint reads it: leading and trailing whitespace dropped, inner
-    runs of whitespace collapsed to one space. Indentation and a CRLF checkout therefore
-    do not change a fingerprint; any other edit does."""
-    return " ".join(line.split())
-
-
-def split_lines(text: str) -> List[str]:
-    """``text`` split where CPython counts lines (``\\n``, ``\\r\\n``, ``\\r``) and nowhere
-    else. ``str.splitlines`` also splits at form feeds and vertical tabs, which the
-    tokenizer does not, so the line numbers of an AST would index the wrong lines."""
-    return _LINE_BREAK.split(text)
-
-
-class _Lines:
-    """The normalized text of a file's lines and, for each text, where it occurs."""
-
-    def __init__(self, lines: List[str]) -> None:
-        self.texts = [normalize_text(line) for line in lines]
-        self._where: Dict[str, List[int]] = {}
-        for number, text in enumerate(self.texts, 1):
-            self._where.setdefault(text, []).append(number)
-
-    def text(self, number: int) -> str:
-        return self.texts[number - 1] if 1 <= number <= len(self.texts) else ""
-
-    def index(self, number: int) -> int:
-        if not 1 <= number <= len(self.texts):
-            return 0
-        return bisect.bisect_left(self._where[self.texts[number - 1]], number)
-
-
-def occurrence_index(lines: List[str], number: int) -> int:
-    """How many earlier lines of ``lines`` have the same normalized text as line ``number``
-    (1-based); 0 for a line that does not exist."""
-    return _Lines(lines).index(number)
-
-
-def fingerprint(rule: str, path: str, text: str, index: int) -> str:
-    joined = "|".join((rule, path, text, str(index)))
-    return hashlib.sha256(joined.encode("utf-8", "surrogatepass")).hexdigest()
-
-
 @dataclass(frozen=True)
 class Finding:
     """One finding: ``rule`` is the Layer 1 tool (``forbid_ast:<rule id>``, ``call_graph``,
@@ -187,7 +134,7 @@ class Finding:
 
     @property
     def fp(self) -> str:
-        return fingerprint(self.rule, self.path, self.text, self.index)
+        return primitives.fingerprint(self.rule, self.path, self.text, self.index)
 
     @property
     def entry(self) -> Entry:
@@ -212,27 +159,10 @@ def render(entries: Iterable[Entry]) -> str:
     return json.dumps(document, indent=2) + "\n"
 
 
-class _DuplicateKey(Exception):
-    pass
-
-
-def _unique_object(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    found: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:
-            raise _DuplicateKey()
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not JSON")
-
-
 def _path_ok(value: object) -> bool:
-    if not isinstance(value, str) or not value or _CONTROL.search(value) or "\\" in value:
-        return False
-    return all(part not in ("", ".", "..") for part in value.split("/"))
+    # The part rule of every platform (windows=False): a v1 file that holds a:b.py reads the same anywhere.
+    return isinstance(value, str) and not _CONTROL.search(value) and "\\" not in value \
+        and safe_parts(value, windows=False) is not None
 
 
 def parse(data: bytes) -> FrozenSet[Entry]:
@@ -248,8 +178,8 @@ def parse(data: bytes) -> FrozenSet[Entry]:
     except UnicodeDecodeError:
         raise BaselineFileError("not valid UTF-8") from None
     try:
-        value = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant)
-    except _DuplicateKey:
+        value = strict_loads(text)
+    except DuplicateKeyError:  # before ValueError, which it is
         raise BaselineFileError("duplicate key") from None
     except (ValueError, RecursionError):
         raise BaselineFileError("not valid JSON") from None
@@ -305,10 +235,6 @@ class Baseline:
                 "entries": len(self.entries)}
 
 
-def _within(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
-
-
 def _read_working(root: Path) -> Optional[bytes]:
     """The working tree's baseline bytes, or None when there is no file. A symlink, a file
     that resolves outside the workspace and anything but a regular file are refused (a
@@ -324,7 +250,7 @@ def _read_working(root: Path) -> Optional[bytes]:
         raise BaselineFileError("is a symlink")
     if not stat.S_ISREG(info.st_mode):
         raise BaselineFileError("not a regular file")
-    if not _within(os.path.realpath(path), os.path.realpath(root)):
+    if not is_within(path, root, unresolvable=False):
         raise BaselineFileError("resolves outside the workspace")
     if info.st_size > MAX_BYTES:
         raise BaselineFileError(f"larger than {MAX_BYTES // (1024 * 1024)} MiB")
@@ -449,17 +375,20 @@ def run_grouped(
 
 class Sources:
     """The text and syntax trees the findings are read from: the working tree, or the
-    index (``staged``) when the pre-commit hook checks what a commit would record."""
+    index (``staged``) when the pre-commit hook checks what a commit would record.
+    ``reviewed`` as in ``runner.run_layer1``: which version of the gate rules was enforced."""
 
-    def __init__(self, root: Any, staged: bool = False) -> None:
+    def __init__(self, root: Any, staged: bool = False, reviewed: bool = True) -> None:
         self.root = Path(os.fspath(root))
         self.staged = staged
+        self.reviewed = reviewed
         self._texts: Dict[str, Optional[str]] = {}
-        self._lines: Dict[str, _Lines] = {}
+        self._lines: Dict[str, primitives.LineIndex] = {}
         self._trees: Dict[str, Any] = {}
-        self._sites: Dict[Tuple[str, str, str], List[int]] = {}
+        self._sites: Dict[Tuple[str, str, str, str], List[int]] = {}
         self._index: Optional[Dict[str, str]] = None
         self._runner: Any = None
+        self._rules: Any = None  # rule id -> the forbid_ast the gate enforced, once; False when unreadable
 
     def _staged_oid(self, path: str) -> Optional[str]:
         if self._index is None:
@@ -479,7 +408,7 @@ class Sources:
                 oid = self._staged_oid(path)
                 return None if oid is None else gitsafe.read_object(self.root, oid, MAX_BYTES)
             full = self.root / path
-            if not _within(os.path.realpath(full), os.path.realpath(self.root)) or os.path.getsize(full) > MAX_BYTES:
+            if not is_within(full, self.root, unresolvable=False) or os.path.getsize(full) > MAX_BYTES:
                 return None
             return full.read_bytes()
         except (OSError, ValueError, gitsafe.GitError):
@@ -494,11 +423,11 @@ class Sources:
 
     def lines(self, path: str) -> List[str]:
         text = self.text(path)
-        return [] if text is None else split_lines(text)
+        return [] if text is None else primitives.split_lines(text)
 
-    def _normalized(self, path: str) -> _Lines:
+    def _normalized(self, path: str) -> primitives.LineIndex:
         if path not in self._lines:
-            self._lines[path] = _Lines(self.lines(path))
+            self._lines[path] = primitives.LineIndex(self.lines(path))
         return self._lines[path]
 
     def line_text(self, path: str, number: int) -> str:
@@ -535,44 +464,40 @@ class Sources:
         self._trees[path] = tree
         return tree
 
-    def sites(self, path: str, kind: str, pattern: str) -> List[int]:
-        """The lines of ``path`` where a ``forbid_ast`` pattern (``call`` or ``import``) is
-        violated. Matched lines are extracted in a single pass against the file's own
-        imports so aliases resolve exactly as in the gate. A decorator has no line: the
-        answer is empty."""
-        key = (path, kind, pattern)
+    def _forbid_spec(self, rule_id: str) -> Optional[dict]:
+        """The ``forbid_ast`` of ``rule_id`` as the gate enforced it: the runner's own discovery
+        (the reviewed base version), never the working tree's or the index's copy, which the
+        change under check can narrow to hide a new site. None when it is not enforced."""
+        if self._rules is None:
+            from aegis_core.verification import runner
+
+            root = os.fspath(self.root)
+            try:
+                found, _broken = runner._discover_forbid_ast_rules(*((root,) if self.reviewed else (root, False)))
+                self._rules = {rule.id: spec for rule, spec in found}
+            except Exception:
+                self._rules = False
+        spec = self._rules.get(rule_id) if self._rules else None
+        return spec if isinstance(spec, dict) else None
+
+    def sites(self, path: str, kind: str, pattern: str, rule_id: str) -> List[int]:
+        """The lines of ``path`` where the ``forbid_ast`` rule ``rule_id`` reports ``pattern`` as a
+        ``call`` or ``import``: its whole spec on the full tree with the file's allow comments,
+        as the gate evaluated it, so an allowed or benign site is never a finding. A decorator has
+        no line, and a rule that cannot be loaded has no sites: the answer is empty."""
+        key = (path, kind, pattern, rule_id)
         if key in self._sites:
             return self._sites[key]
-        from aegis_core.ast.policy import (
-            _match_ImportNode_against_pattern,
-            evaluate_forbid_ast_structured,
-        )
-        from aegis_core.ast.schema import NormalizedAST
+        from aegis_core.ast.policy import evaluate_forbid_ast_structured
 
-        found: set[int] = set()
-        tree = self._ast(path)
+        spec, tree = self._forbid_spec(rule_id), self._ast(path)
         try:
-            if tree is not None and kind == "call":
-                probe = NormalizedAST(
-                    file_path=tree.file_path,
-                    language=tree.language,
-                    imports=tree.imports,
-                    call_sites=tree.call_sites,
-                )
-                confirmed, _ = evaluate_forbid_ast_structured(
-                    probe, {"calls": [pattern]}, source=""
-                )
-                for hit in confirmed:
-                    ln = hit.get("line", 0)
-                    if isinstance(ln, int) and ln > 0:
-                        found.add(ln)
-            elif tree is not None and kind == "import":
-                for imp in tree.imports:
-                    if _match_ImportNode_against_pattern(imp, pattern):
-                        found.add(imp.line)
+            found = [] if spec is None or tree is None or kind == "decorator" else evaluate_forbid_ast_structured(
+                tree, spec, rule_id=rule_id, source=self.text(path) or "")
         except Exception:
-            found = set()
-        self._sites[key] = sorted(found)
+            found = []
+        self._sites[key] = sorted({f["line"] for f in found if f["kind"] == f"{kind}s" and f["pattern"] == pattern
+                                   and not f["unknown"] and f["override"] is None and f["line"] > 0})
         return self._sites[key]
 
 
@@ -611,13 +536,18 @@ def _findings_of(path: Optional[str], evidence: ToolEvidence, sources: Sources) 
                 found.append(Finding(evidence.tool, path, sources.line_text(path, number),
                                      sources.occurrence(path, number), number, message))
         else:
+            rule_id = evidence.tool.partition(":")[2]
+            covered: set = set()
             for kind, pattern, message in violations:
-                lines = sources.sites(path, kind, pattern)
+                lines = sources.sites(path, kind, pattern, rule_id)
                 if not lines:
                     return None
+                covered.update(lines)
                 for number in lines:
                     found.append(Finding(evidence.tool, path, sources.line_text(path, number),
                                          sources.occurrence(path, number), number, message))
+            if covered != set(evidence.lines):  # sites the gate did not report, or a reported site left out
+                return None
     return found or None
 
 
@@ -698,16 +628,6 @@ def apply(pairs: Sequence[Tuple[Optional[str], ToolEvidence]], sources: Sources,
 
 # ── The files a whole-workspace mode looks at ────────────────────────────────
 
-def utc_stamp(now: Optional[float] = None) -> str:
-    moment = datetime.now(timezone.utc) if now is None else datetime.fromtimestamp(now, timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def envelope(source: str, scope: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
-    """The head every machine-readable output of the v4.2 modes carries."""
-    return {"source": source, "aegis_version": __version__, "checked_at": utc_stamp(now), "scope": scope}
-
-
 def list_files(root: Any) -> Tuple[List[str], str]:
     """The files of the workspace as workspace-relative POSIX paths, sorted, and where the
     list came from (``git``: tracked and untracked files git does not ignore, which exist
@@ -750,15 +670,16 @@ def checkable(root: Any, files: Iterable[str]) -> List[str]:
     return out
 
 
-def run_fast(root: Any, files: Sequence[str], *,
-             reviewed: bool = True) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
+def run_fast(root: Any, files: Sequence[str], *, reviewed: bool = True, git_root: Optional[str] = None,
+             diff_base: Optional[str] = None) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
     """Layer 1 as ``aegis check`` runs it by default (no model, no mutation testing) on
-    ``files`` of the working tree, each piece of evidence paired with its file. ``reviewed``
-    as in ``runner.run_layer1``."""
+    ``files`` of the working tree, each piece of evidence paired with its file. ``reviewed``,
+    ``git_root`` (the history of an exported tree) and ``diff_base`` as in ``runner.run_layer1``."""
     from aegis_core.verification import runner
 
     base = os.fspath(root)
     pairs = run_grouped(
-        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed),
+        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed,
+                                        git_root=git_root, diff_base=diff_base),
         files, root=base)
-    return pairs, Sources(base)
+    return pairs, Sources(base, reviewed=reviewed)

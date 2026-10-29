@@ -30,7 +30,9 @@ def test_repository_plane_paths(tmp_path: Path):
 
 def test_every_machine_local_file_lives_under_state(tmp_path: Path):
     layout = WorkspaceLayout(tmp_path)
-    for path in (layout.ledger_file, layout.derived_file, layout.lock_file, layout.lifecycle_log, layout.gate_log):
+    assert layout.predictions_log == layout.state_dir / "arbiter_predictions.jsonl"
+    for path in (layout.ledger_file, layout.derived_file, layout.lock_file, layout.lifecycle_log, layout.gate_log,
+                 layout.predictions_log):
         assert layout.state_dir in path.parents
     assert GITIGNORE_ENTRIES == ("state/",)
 
@@ -87,3 +89,12 @@ def test_a_marker_that_is_a_file_does_not_count(tmp_path: Path):
     (other / ".aegis").mkdir(parents=True)
     (other / ".aegis" / "rules").write_text("", encoding="utf-8")
     assert (is_aegis_workspace(tmp_path), has_rules_dir(other)) == (False, False)
+
+
+def test_layout_holds_no_import_resolution():
+    """R-cli-44: import resolution has one consumer (partition) and lives there, not in the path module."""
+    from aegis_core.workspace import layout
+
+    removed = {"module_ancestors", "resolve_module_file"}
+    assert removed.isdisjoint(layout.__all__)
+    assert not [name for name in removed if hasattr(layout, name)]

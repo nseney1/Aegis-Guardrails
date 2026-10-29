@@ -419,3 +419,169 @@ def test_an_entry_of_the_state_dir_resolving_elsewhere_is_refused(tmp_path: Path
 
     with pytest.raises(PathTraversalError, match="backups: it resolves outside the workspace"):
         state_dir(ws)
+
+
+# ── follow_links=False: a link at the name is replaced, never followed (R-cli-41) ─
+
+def _strays(*directories: Path) -> list:
+    return sorted(p.name for d in directories for p in d.iterdir() if p.name.endswith(".tmp"))
+
+
+def test_by_default_a_write_goes_through_a_link_at_the_name(tmp_path: Path):
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b"old")
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, victim)
+    atomic_write_bytes(link, b"new")
+    assert link.is_symlink() and victim.read_bytes() == b"new"
+
+
+def test_without_following_links_the_link_is_replaced_and_its_target_spared(tmp_path: Path):
+    """Given a symlink at the name, When it is written with follow_links=False, Then the name
+    becomes a regular file holding the data and the link's target keeps its bytes."""
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b"precious")
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, victim)
+    atomic_write_bytes(link, b"new", follow_links=False)
+    assert not link.is_symlink() and link.read_bytes() == b"new"
+    assert victim.read_bytes() == b"precious"
+    assert _strays(tmp_path) == []
+
+
+@posix_only
+def test_a_replaced_link_inherits_none_of_its_targets_bits(tmp_path: Path, umask):
+    umask(0o022)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"#!/bin/sh\n")
+    os.chmod(victim, 0o4755)
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, victim)
+    atomic_write_bytes(link, b"{}", follow_links=False)
+    assert _mode(link) == 0o644
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o4755 and victim.read_bytes() == b"#!/bin/sh\n"
+
+
+def test_a_dangling_link_is_replaced_without_creating_its_target(tmp_path: Path):
+    missing = tmp_path / "nowhere" / "target.json"
+    link = tmp_path / "config.json"
+    _symlink_or_skip(link, missing)
+    atomic_write_bytes(link, b"{}", follow_links=False)
+    assert not link.is_symlink() and link.read_bytes() == b"{}"
+    assert not missing.parent.exists()
+
+
+@pytest.mark.parametrize("relative", ["through/config.json", "through/sub/../config.json"],
+                         ids=["direct", "dotdot"])
+def test_a_linked_directory_above_the_name_is_still_written_through(tmp_path: Path, relative: str):
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    try:
+        (tmp_path / "through").symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    atomic_write_bytes(tmp_path / relative, b"{}", follow_links=False)
+    assert (real / "config.json").read_bytes() == b"{}"
+    assert _strays(real, real / "sub", tmp_path) == []
+
+
+@posix_only
+def test_without_following_links_an_existing_regular_file_keeps_its_mode(tmp_path: Path, umask):
+    umask(0o022)
+    target = tmp_path / "rule.md"
+    target.write_bytes(b"old")
+    os.chmod(target, 0o640)
+    atomic_write_bytes(target, b"new", follow_links=False)
+    assert _mode(target) == 0o640 and target.read_bytes() == b"new"
+
+
+# ── The temporary file's mode is set through its descriptor (review L3) ─────────
+
+@posix_only
+def test_the_mode_is_set_on_the_temporary_file_never_on_a_link_swapped_in_at_its_name(
+        tmp_path: Path, umask, monkeypatch):
+    """Given a write with an exact mode, When a symlink to another file is swapped in at the
+    temporary name after it was opened, Then the opened file gets the mode and the link's
+    target keeps its own."""
+    from aegis_core import atomicio
+
+    umask(0o022)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    os.chmod(victim, 0o600)
+    out = tmp_path / "out"
+    out.mkdir()
+    moved = tmp_path / "opened-file"
+    real_write_all = atomicio._write_all
+
+    def write_then_swap(fd, data):
+        real_write_all(fd, data)
+        tmp, = (p for p in out.iterdir() if p.name.endswith(".tmp"))
+        os.rename(tmp, moved)
+        _symlink_or_skip(tmp, victim)
+
+    monkeypatch.setattr(atomicio, "_write_all", write_then_swap)
+    atomic_write_bytes(out / "config.json", b"{}", mode=0o644)
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o600 and victim.read_bytes() == b"precious"
+    assert _mode(moved) == 0o644 and moved.read_bytes() == b"{}"
+
+
+# ── create_private_file: an exclusive 0o600 file, never through a link (R-evidence-45) ──
+
+def test_create_private_file_writes_a_new_file_exclusively(tmp_path: Path, umask):
+    from aegis_core.storage import create_private_file
+
+    umask(0o000)
+    target = tmp_path / "link.key"
+    assert create_private_file(target, b"k" * 32) is True
+    assert target.read_bytes() == b"k" * 32
+    if os.name == "posix":
+        assert _mode(target) == 0o600
+
+
+def test_create_private_file_leaves_an_existing_file_alone(tmp_path: Path):
+    from aegis_core.storage import create_private_file
+
+    target = tmp_path / "link.key"
+    target.write_bytes(b"old")
+    assert create_private_file(target, b"new") is False
+    assert target.read_bytes() == b"old"
+
+
+@pytest.mark.parametrize("dangling", [False, True], ids=["link", "dangling"])
+def test_create_private_file_refuses_a_symlink(tmp_path: Path, dangling: bool):
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.storage import create_private_file
+
+    victim = tmp_path / "victim"
+    if not dangling:
+        victim.write_bytes(b"precious")
+    target = tmp_path / "link.key"
+    _symlink_or_skip(target, victim)
+    with pytest.raises(PathTraversalError):
+        create_private_file(target, b"k" * 32)
+    assert victim.read_bytes() == b"precious" if not dangling else not victim.exists()
+    assert os.path.islink(target)
+
+
+def test_create_private_file_refuses_a_directory(tmp_path: Path):
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.storage import create_private_file
+
+    (tmp_path / "link.key").mkdir()
+    with pytest.raises(PathTraversalError):
+        create_private_file(tmp_path / "link.key", b"k")
+    assert (tmp_path / "link.key").is_dir()
+
+
+def test_create_private_file_removes_a_partial_file_when_the_write_fails(tmp_path: Path, monkeypatch):
+    from aegis_core import atomicio, storage
+
+    def broken(fd, data):
+        os.write(fd, data[:3])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(atomicio, "_write_all", broken)
+    with pytest.raises(OSError, match="No space"):
+        storage.create_private_file(tmp_path / "link.key", b"k" * 32)
+    assert list(tmp_path.iterdir()) == []

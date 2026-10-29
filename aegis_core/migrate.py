@@ -76,8 +76,10 @@ import zlib
 
 from aegis_core import gitsafe
 from aegis_core.errors import PathTraversalError, WorkspaceError
+from aegis_core.primitives import is_within
 from aegis_core.rules import is_legacy_key
 from aegis_core.storage import (
+    parse_jsonl,
     JsonlRead,
     atomic_write_bytes,
     atomic_write_text,
@@ -102,7 +104,7 @@ from aegis_core.workspace.layout import (
     WorkspaceLayout,
 )
 
-__all__ = ["MigrationPlan", "MigrationRefused", "MigrationResult", "apply", "plan"]
+__all__ = ["MigrationPlan", "MigrationRefused", "MigrationResult", "apply", "frontmatter_span", "plan", "strip_derived"]
 
 # A compaction archive larger than this decompressed is reported unreadable, not read.
 _ARCHIVE_LIMIT = 256 * 1024 * 1024
@@ -238,7 +240,7 @@ class MigrationResult:
 
 # ── Frontmatter line editing ─────────────────────────────────────────────────
 
-def _frontmatter_span(lines: List[str]) -> Optional[Tuple[int, int]]:
+def frontmatter_span(lines: List[str]) -> Optional[Tuple[int, int]]:
     if not lines or lines[0].rstrip("\r\n").strip() != "---":
         return None
     for end in range(1, len(lines)):
@@ -251,7 +253,7 @@ def _eol(lines: List[str]) -> str:
     return "\r\n" if lines and lines[0].endswith("\r\n") else "\n"
 
 
-def _strip_derived(text: str) -> Tuple[str, List[str]]:
+def strip_derived(text: str) -> Tuple[str, List[str]]:
     """Remove derived and retired top-level keys (and their nested lines) from the frontmatter.
 
     A ``fitness`` block's ``impact_weight`` is a property, not a counter: it moves to the
@@ -260,10 +262,10 @@ def _strip_derived(text: str) -> Tuple[str, List[str]]:
     from aegis_core.yaml_engine.frontmatter import parse_frontmatter
 
     if text.startswith("\ufeff"):
-        stripped, keys = _strip_derived(text[1:])
+        stripped, keys = strip_derived(text[1:])
         return "\ufeff" + stripped, keys
     lines = text.splitlines(keepends=True)
-    span = _frontmatter_span(lines)
+    span = frontmatter_span(lines)
     if span is None:
         return text, []
     start, end = span
@@ -298,7 +300,7 @@ def _set_type(text: str, rule_type: str) -> str:
     if text.startswith("\ufeff"):
         return "\ufeff" + _set_type(text[1:], rule_type)
     lines = text.splitlines(keepends=True)
-    span = _frontmatter_span(lines)
+    span = frontmatter_span(lines)
     if span is None:
         return text
     start, end = span
@@ -310,12 +312,6 @@ def _set_type(text: str, rule_type: str) -> str:
             return "".join(lines)
     lines.insert(start, f"type: {rule_type}{eol}")
     return "".join(lines)
-
-
-def _inside(root: Path, path: Path) -> bool:
-    """True if ``path``, with every symlink resolved, stays inside ``root``."""
-    real, base = os.path.realpath(path), os.path.realpath(root)
-    return real == base or real.startswith(base.rstrip(os.sep) + os.sep)
 
 
 def _merge_missing(current: Dict[str, Any], changes: Dict[str, Any]) -> None:
@@ -355,39 +351,6 @@ def _record(result: "MigrationPlan", path: Path, data: Optional[bytes] = None) -
 
 # ── Planning ─────────────────────────────────────────────────────────────────
 
-def _jsonl_row(raw: bytes, errors: str) -> Optional[Dict[str, Any]]:
-    try:
-        value = json.loads(raw.decode("utf-8-sig", errors))
-    except (UnicodeDecodeError, ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _jsonl_rows(data: bytes, errors: str) -> JsonlRead:
-    """Parse JSONL ``data`` as storage.read_jsonl parses a file (same lines, numbers, tail)."""
-    rows: List[Dict[str, Any]] = []
-    numbers: List[int] = []
-    skipped: List[int] = []
-    torn = False
-    lines = data.split(b"\n")
-    last = len(lines) - 1
-    for index, raw in enumerate(lines):
-        if index == last and not raw:
-            break
-        raw = raw.rstrip(b"\r")
-        if not raw.strip():
-            continue
-        row = _jsonl_row(raw, errors)
-        if row is not None:
-            rows.append(row)
-            numbers.append(index + 1)
-        elif index == last:
-            torn = True
-        else:
-            skipped.append(index + 1)
-    return JsonlRead(rows, numbers, skipped, torn_tail=torn)
-
-
 def _read_archive(path: Path) -> Tuple[Optional[bytes], JsonlRead]:
     """A v3.3 compaction archive: (its bytes as read, for the plan's fingerprint; its rows).
     A link, a damaged or oversized file reads as no rows with ``error`` set."""
@@ -401,7 +364,7 @@ def _read_archive(path: Path) -> Tuple[Optional[bytes], JsonlRead]:
         return None, JsonlRead([], [], [], error=f"cannot read {path}: {exc}")
     if len(data) > _ARCHIVE_LIMIT:
         return raw, JsonlRead([], [], [], error=f"cannot read {path}: larger than {_ARCHIVE_LIMIT >> 20} MiB")
-    return raw, _jsonl_rows(data, "surrogatepass")
+    return raw, parse_jsonl(data, "surrogatepass")
 
 
 def _ledger_families(layout: WorkspaceLayout) -> List[List[Path]]:
@@ -540,7 +503,8 @@ def _read_worktree_ledger(label: str, workspace: Path) -> Optional[_WorktreeLedg
     layout = WorkspaceLayout(workspace)
     source = _WorktreeLedger(label, workspace, layout.ledger_file)
     for directory in (layout.aegis_dir, layout.state_dir):
-        if directory.is_symlink() or (os.path.lexists(directory) and not _inside(workspace, directory)):
+        outside = os.path.lexists(directory) and not is_within(directory, workspace, unresolvable=False)
+        if directory.is_symlink() or outside:
             why = "is a symlink" if directory.is_symlink() else "resolves outside the workspace"
             source.problem = ("skipped", directory.as_posix(),
                               f"{why}; its ledger was not read (aegis migrate reads and writes only inside the workspace)")
@@ -771,7 +735,7 @@ def _plan_moves(
         if source.name.lower() == "readme.md" or any(part.startswith(".") for part in source.relative_to(source_dir).parts):
             continue
         rel = result._rel(source)
-        if source.is_symlink() or not _inside(layout.root, source):
+        if source.is_symlink() or not is_within(source, layout.root, unresolvable=False):
             result.skipped.append({"path": rel, "reason": "a symlink or outside the workspace; not followed"})
             continue
         try:
@@ -789,8 +753,8 @@ def _plan_moves(
             result.unmapped.append({"path": rel, "type": str(raw_type)})
             continue
         target = layout.rules_dir / RULE_TYPE_DIRS[rule_type] / source.name
-        content, _keys = _strip_derived(_set_type(text, rule_type))
-        if not _inside(layout.root, target.parent):
+        content, _keys = strip_derived(_set_type(text, rule_type))
+        if not is_within(target.parent, layout.root, unresolvable=False):
             result.skipped.append({"path": rel, "reason": f"{result._rel(target.parent)} resolves outside the workspace"})
             continue
         sources.append(source)
@@ -847,7 +811,7 @@ def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
         for path in sorted(layout.rules_dir.rglob("*.md")):
             if path.name == "README.md" or path in moving:
                 continue  # a moved rule is stripped on its way
-            if path.is_symlink() or not _inside(layout.root, path):
+            if path.is_symlink() or not is_within(path, layout.root, unresolvable=False):
                 result.skipped.append({"path": result._rel(path), "reason": "a symlink or outside the workspace; not rewritten"})
                 continue
             try:
@@ -859,7 +823,7 @@ def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
             in_type_dir = path.parent.parent == layout.rules_dir
             retype = _retype(text, path.parent.name) if in_type_dir else None
             new_text = _set_type(text, retype[1]) if retype else text
-            new_text, keys = _strip_derived(new_text)
+            new_text, keys = strip_derived(new_text)
             if keys or retype:
                 result.strips.append(_RuleStrip(path, keys, new_text, raw, retype))
                 _record(result, path, raw)
@@ -1014,7 +978,7 @@ def plan(root: Any) -> MigrationPlan:
     layout = WorkspaceLayout(Path(os.fspath(root)).resolve())
     result = MigrationPlan(root=layout.root)
     for directory in (layout.aegis_dir, layout.legacy_soma_dir, layout.state_dir):
-        if directory.is_symlink() or not _inside(layout.root, directory):
+        if directory.is_symlink() or not is_within(directory, layout.root, unresolvable=False):
             why = "is a symlink" if directory.is_symlink() else "resolves outside the workspace"
             result.refusal = f"{result._rel(directory)} {why}; aegis migrate reads and writes only inside the workspace"
             return result

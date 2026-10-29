@@ -23,16 +23,17 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from aegis_cli.base import CommandCategory, AegisCommand
+from aegis_cli import NO_HOME_MESSAGE
+from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.init import (
     AGENTS_FILE,
     CLAUDE_FILE,
     CLAUDE_SHIM_ID,
     RemovedOption,
-    Step,
     Report,
-    report_partial,
+    Step,
     hook_refusal,
+    report_partial,
 )
 from aegis_cli.install_hosts import (
     REGISTRY_LABEL,
@@ -47,6 +48,8 @@ from aegis_cli.install_hosts import (
     unregister_workspace,
     workspace_hosts,
 )
+from aegis_core.primitives import real_key
+from aegis_core.workspace.layout import UserLayout
 
 __all__ = ["run_uninstall", "UninstallCommand"]
 
@@ -76,8 +79,8 @@ def _recorded_hosts(root: Path, home: Path, report: Report) -> List[str]:
 
 
 def _links_to(link: Path, target: Path) -> bool:
-    return link.is_symlink() and (os.path.normcase(os.path.realpath(link))
-                                  == os.path.normcase(os.path.realpath(target)))
+    key = real_key(link) if link.is_symlink() else None
+    return key is not None and key == real_key(target)
 
 
 def _through_link(link: Path, block_id: str) -> Step:
@@ -141,7 +144,7 @@ def _no_registration(host_id: str) -> str:
     if spec.retired:
         return "retired: Aegis does not register there"
     if spec.registration is None:
-        return "identity only: Aegis does not register there (ADR 0005 H4)"
+        return "identity only: Aegis does not register there"
     return ""
 
 
@@ -200,7 +203,13 @@ def run_uninstall(args: argparse.Namespace) -> int:
     report = Report(json_mode, "aegis uninstall")
     ws = getattr(args, "ws", None)
     root = Path(ws.root if ws is not None else (getattr(args, "_project_root", None) or Path.cwd())).resolve()
-    home = Path.home()
+    layout = UserLayout.current()
+    if layout is None:
+        report.error(NO_HOME_MESSAGE)
+        report.error("Nothing was changed.")
+        report.finish("refused", {"workspace": str(root), "hosts": []}, dry_run, [])
+        return 1
+    home = layout.home
     scope = {"workspace": str(root), "hosts": []}
 
     # Every step is checked first; a refusal stops uninstall before anything changes.

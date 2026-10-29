@@ -73,7 +73,7 @@ class TestCLIDispatch:
         ("scan", ["src/app.py"]),
         ("hook", ["status"]),
     ])
-    def test_subcommand_runs_without_crash(self, cmd, extra_args, capsys, monkeypatch):
+    def test_subcommand_runs_without_crash(self, cmd, extra_args, capsys, monkeypatch, tmp_path):
         from aegis_cli import doctor
         from aegis_cli.cli import main
 
@@ -81,6 +81,11 @@ class TestCLIDispatch:
             raise OSError("host CLIs are not run in tests")
 
         monkeypatch.setattr(doctor, "_run_host_cli", no_host_cli)
+        # A workspace of its own: run from the checkout, scan recorded activity in the repository's .aegis/state.
+        (tmp_path / ".aegis").mkdir()
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
         result = main([cmd] + extra_args)
         assert result in (0, 1)
         captured = capsys.readouterr()
@@ -325,3 +330,57 @@ def test_hook_run_help_goes_through_the_parser(argv, monkeypatch, tmp_path, caps
         cli.main(argv)
     assert exited.value.code == 0
     assert "--host" in capsys.readouterr().out
+
+
+def test_registry_does_not_retry_a_parser_type_error():
+    import argparse
+    from aegis_cli.base import AegisCommand, CommandCategory
+    from aegis_cli.registry import CommandRegistry
+
+    class Broken(AegisCommand):
+        name = "broken"
+        help = "test"
+        category = CommandCategory.SETUP
+        calls = 0
+
+        def configure_parser(self, parser, parents=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TypeError("parser implementation failed")
+
+        def execute(self, args):
+            return 0
+
+    command = Broken()
+    registry = CommandRegistry()
+    registry.register(command)
+    parser = argparse.ArgumentParser()
+    with pytest.raises(TypeError, match="^parser implementation failed$"):
+        registry.populate_subparsers(parser.add_subparsers())
+    assert command.calls == 1
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_skills_common_flags_work_on_both_sides_of_sync(position, tmp_path, capsys):
+    (tmp_path / ".aegis").mkdir()
+    common = ["--workspace", str(tmp_path), "--json", "--plain"]
+    argv = ["skills"] + (common if position == "before" else []) + ["sync"]
+    argv += common if position == "after" else []
+    assert cli.main(argv + ["--host", "claude-code", "--dry-run"]) in (0, 1)
+    import json
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source"] == "aegis skills sync"
+    assert payload["scope"]["workspace"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_hook_common_flags_work_on_both_sides_of_status(position, tmp_path, capsys):
+    import json
+    (tmp_path / ".aegis").mkdir()
+    common = ["--workspace", str(tmp_path), "--json", "--plain"]
+    argv = ["hook"] + (common if position == "before" else []) + ["status"]
+    argv += common if position == "after" else []
+    assert cli.main(argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["repository_root"] == str(tmp_path)
+    assert payload["is_git_repo"] is False

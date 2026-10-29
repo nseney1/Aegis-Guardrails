@@ -315,6 +315,78 @@ def test_a_staged_file_no_check_can_read_is_never_read_from_git(repo, blob_reads
     assert _staged_oid(repo, ".env") not in blob_reads
 
 
+def test_a_crlf_working_copy_of_a_staged_lf_file_is_read_from_disk(repo, blob_reads, capsys):
+    """A core.autocrlf checkout keeps CRLF in the working copy and LF in the staged blob: the bytes
+    are the staged content once their line endings are LF, so the hook reads them from disk."""
+    (repo / ".env").write_bytes(b"API_TOKEN=not-a-real-token\n")
+    _git(repo, "add", ".env")
+    (repo / ".env").write_bytes(b"API_TOKEN=not-a-real-token\r\n")
+
+    assert main(["check", "--hook"]) == 0, capsys.readouterr().out
+    assert _staged_oid(repo, ".env") not in blob_reads
+
+
+def test_a_working_copy_that_differs_beyond_line_endings_is_read_from_git(repo, blob_reads, capsys):
+    (repo / ".env").write_bytes(b"API_TOKEN=not-a-real-token\n")
+    _git(repo, "add", ".env")
+    (repo / ".env").write_bytes(b"API_TOKEN=another-value-here\r\n")
+
+    assert main(["check", "--hook"]) == 0, capsys.readouterr().out
+    assert _staged_oid(repo, ".env") in blob_reads
+
+
+def test_a_corrupt_staged_object_fails_closed_with_the_git_error(repo, capsys):
+    """R-structure-22: the hook reads staged blobs through gitsafe's one reader, so a staged object
+    git cannot read is a GitError in gitsafe's words, exit 1, and nothing passes."""
+    _stage(repo, "app.py", SAFE)
+    oid = _staged_oid(repo, "app.py")
+    loose = repo / ".git" / "objects" / oid[:2] / oid[2:]
+    os.chmod(loose, 0o644)  # git writes object files read-only
+    loose.write_bytes(b"not a zlib stream")
+
+    assert main(["check", "--hook"]) == 1
+    captured = capsys.readouterr()
+    assert f"git cannot read object {oid}" in captured.err
+    assert "ValueError" not in captured.err and "invalid literal" not in captured.err
+    assert "PASSED" not in captured.out
+
+
+def _non_numeric_content_size(monkeypatch) -> None:
+    """``git cat-file --batch`` (content) answers each object with a size that is not a number."""
+    from aegis_core import gitsafe
+
+    real_run = gitsafe.run
+
+    def forged(args, cwd, *rest, **kwargs):
+        if list(args[:2]) == ["cat-file", "--batch"]:
+            oids = (kwargs.get("stdin") or b"").decode("ascii").split()
+            reply = "".join(f"{oid} blob 1x\nx\n" for oid in oids).encode("ascii")
+            return subprocess.CompletedProcess(["git", *args], 0, reply, b"")
+        return real_run(args, cwd, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+
+
+def test_a_non_numeric_size_from_git_is_a_git_error_on_the_snapshot_path(repo, monkeypatch, tmp_path):
+    from aegis_core import gitsafe
+    from aegis_core.verification import runner
+
+    _stage(repo, "app.py", SAFE)
+    _non_numeric_content_size(monkeypatch)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {_staged_oid(repo, 'app.py')}$"):
+        runner.snapshot_index(str(repo), ["app.py"], str(tmp_path / "snapshot"))
+
+
+def test_a_non_numeric_size_from_git_fails_the_hook_closed(repo, monkeypatch, capsys):
+    _stage(repo, "app.py", SAFE)
+    _non_numeric_content_size(monkeypatch)
+
+    assert main(["check", "--hook"]) == 1
+    captured = capsys.readouterr()
+    assert "git cannot read object" in captured.err and "invalid literal" not in captured.err
+    assert "PASSED" not in captured.out
+
+
 def _oversized_source(runner_module) -> str:
     line = "x = 1\n"
     return line * (runner_module.INDEX_BLOB_LIMIT_BYTES // len(line) + 1)

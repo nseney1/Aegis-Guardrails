@@ -8,12 +8,13 @@ each move is logged to ``.aegis/state/lifecycle.jsonl``.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from aegis_core.fitness import for_rules
+from aegis_core.primitives import utc_stamp
 from aegis_core.rules import load_rules
 from aegis_core.storage import append_jsonl, locked
 from aegis_core.telemetry_engine import ledger
@@ -26,16 +27,13 @@ __all__ = [
     "archive_rule",
     "evaluate_archives",
     "evidence_line",
+    "iter_rule_selection",
     "prune_rules",
     "run_rule_selection",
     "transition_candidates",
 ]
 
 ARCHIVE_DIR = ".archive"
-
-
-def _utc_timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _candidate(wanted: str, rule: Any, fit: Any, now: Optional[datetime]) -> Dict[str, Any]:
@@ -110,8 +108,11 @@ def _archive_refusal(ws: Workspace, rule_id: str, view: Any) -> Optional[str]:
     return None
 
 
-def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False) -> Dict[str, Any]:
-    """Move one rule to ``.aegis/rules/.archive/`` and log it.
+def archive_rule(
+    workspace: Workspace | Path | str, rule_id: str, dry_run: bool = False, *, audit: bool = True,
+) -> Dict[str, Any]:
+    """Move one rule to ``.aegis/rules/.archive/`` and log it (``audit=False``: no log row, for a
+    move that ``sync --pr`` makes only on its lifecycle branch and then undoes here).
 
     Only a rule whose ledger evidence supports archiving (``promotion.suggest``) moves,
     and that is checked again under the lock: evidence recorded since the caller judged
@@ -140,38 +141,43 @@ def archive_rule(workspace: Workspace | Path | str, rule_id: str, dry_run: bool 
         if refusal:
             return {"status": "ineligible", "message": refusal}
         dest = _park(path, archive_dir)
-        append_jsonl(ws.layout.lifecycle_log, [{
-            "timestamp": _utc_timestamp(),
-            "rule": clean,
-            "action": "moved_to_archive",
-        }])
+        if audit:
+            append_jsonl(ws.layout.lifecycle_log, [{
+                "timestamp": utc_stamp(),
+                "rule": clean,
+                "action": "moved_to_archive",
+            }])
     return {"status": "archived", "from_type": rule_type, "source_path": str(path), "target_path": str(dest)}
 
 
-def run_rule_selection(workspace: Workspace | Path | str | None = None, execute: bool = False) -> int:
-    """Report the rules whose evidence supports archiving; with ``execute``, archive them."""
+def iter_rule_selection(
+    workspace: Workspace | Path | str | None = None, execute: bool = False,
+) -> Iterator[Dict[str, Any]]:
+    """Yield the selection's head, then each candidate as soon as archiving it is done.
+
+    The head is ``{"status", "unavailable"}``: ``status`` is ``no_rules_directory``,
+    ``nothing_to_archive`` or ``candidates``, and ``unavailable`` says why the CI-confirmed evidence
+    was cut short (None when it was not). Each candidate carries ``archive``, the archive_rule result
+    (None on a dry run). Yielding one rule at a time lets ``aegis rule archive`` report the rules
+    already moved when a later archive raises.
+    """
     ws = literal_workspace(workspace)
     if not ws.rules_dir.exists():
-        print("No rules directory found.")
-        return 0
+        yield {"status": "no_rules_directory", "unavailable": None}
+        return
     candidates, unavailable = transition_candidates(ws, "archive")
-    if unavailable:
-        print(evidence_line(unavailable))
-    if not candidates:
-        print("No rules to archive.")
-        return 0
+    yield {"status": "candidates" if candidates else "nothing_to_archive", "unavailable": unavailable}
     for c in candidates:
-        note = " (dry run)"
-        if execute:
-            result = archive_rule(ws, c["rule_id"])
-            note = "" if result["status"] == "archived" else f" (not archived: {result['message']})"
-        print(
-            f"[ARCHIVE] {c['rule_id']} (fitness {c['fitness']:.2f}, misfire bound {c['misfire']:.2f}, "
-            f"tp {c['tp']:g}, fp {c['fp']:g}){note}"
-        )
-    return 0
+        yield dict(c, archive=archive_rule(ws, c["rule_id"]) if execute else None)
 
 
-def prune_rules(workspace: Workspace | Path | str | None = None, execute: bool = False) -> int:
+def run_rule_selection(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
+    """The rules whose evidence supports archiving and, with ``execute``, what archiving each did:
+    iter_rule_selection's head with its candidates as a list. Nothing is printed here."""
+    rows = iter_rule_selection(workspace=workspace, execute=execute)
+    return dict(next(rows), candidates=list(rows))
+
+
+def prune_rules(workspace: Workspace | Path | str | None = None, execute: bool = False) -> Dict[str, Any]:
     """Archive the rules that misfire (``run_rule_selection``)."""
     return run_rule_selection(workspace=workspace, execute=execute)

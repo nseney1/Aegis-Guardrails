@@ -9,7 +9,10 @@ import shlex
 import sys
 from typing import Any
 
+from aegis_cli import aegis_import_root
 from aegis_core import command_safety
+from aegis_core.primitives import is_within
+from aegis_core.storage import atomic_write_bytes
 
 _AEGIS_HOOK_START = "# >>> aegis pre-commit >>>"
 _AEGIS_HOOK_END = "# <<< aegis pre-commit <<<"
@@ -32,12 +35,6 @@ _SHELLS = frozenset({"sh", "bash", "dash", "zsh"})
 _HOOK_RUNNER = "import sys; sys.path.insert(0, sys.argv[1]); from aegis_cli.cli import main; sys.exit(main(sys.argv[2:]))"
 
 
-def _default_import_root() -> str:
-    import aegis_cli
-
-    return str(Path(aegis_cli.__file__).resolve().parent.parent)
-
-
 def _sh_path(path: str) -> str:
     return path.replace("\\", "/") if os.name == "nt" else path
 
@@ -52,7 +49,7 @@ def generate_hook_block(python: str | None = None, import_root: str | None = Non
     hook's own lines after the block run (no exec).
     """
     python = python if python is not None else sys.executable
-    import_root = import_root if import_root is not None else _default_import_root()
+    import_root = import_root if import_root is not None else aegis_import_root()
     # A relative path would resolve against the repository the hook runs in.
     if not os.path.isabs(python):
         raise ValueError(f"hook interpreter must be an absolute path, got {python!r}")
@@ -207,15 +204,7 @@ def install_hook(
                 return False
             replace_link = True
         else:
-            is_contained = False
-            for boundary in (root, git_hooks_dir):
-                if boundary:
-                    try:
-                        real_target.relative_to(boundary.resolve())
-                        is_contained = True
-                        break
-                    except ValueError:
-                        pass
+            is_contained = any(is_within(real_target, b, unresolvable=False) for b in (root, git_hooks_dir) if b)
             if not is_contained and not force:
                 print(
                     f"Error: {hook_file} is a symlink pointing outside repository ({real_target}). Use --force to overwrite.",
@@ -262,25 +251,9 @@ def install_hook(
         hook_file.unlink()
 
     git_hooks_dir.mkdir(parents=True, exist_ok=True)
-    tmp_file = target_file.parent / f".pre-commit.tmp.{os.getpid()}"
-    try:
-        tmp_file.write_bytes(payload)
-        if os.name != "nt":
-            tmp_file.chmod(0o755)
-        tmp_file.replace(target_file)
-    finally:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except OSError:
-                pass
-
-    if os.name != "nt" and target_file.exists():
-        try:
-            target_file.chmod(target_file.stat().st_mode | 0o755)
-        except OSError:
-            pass
-
+    # An exclusive temporary file whose mode is set through its descriptor, then a rename: a
+    # link planted at a temporary name is never written through.
+    atomic_write_bytes(target_file, payload, mode=0o755 if os.name != "nt" else None)
     return True
 
 
@@ -318,15 +291,7 @@ def uninstall_hook(
                 return True
             return False
         else:
-            is_contained = False
-            for boundary in (root, git_hooks_dir):
-                if boundary:
-                    try:
-                        real_target.relative_to(boundary.resolve())
-                        is_contained = True
-                        break
-                    except ValueError:
-                        pass
+            is_contained = any(is_within(real_target, b, unresolvable=False) for b in (root, git_hooks_dir) if b)
             if not is_contained and not force:
                 print(
                     f"Error: {hook_file} is a symlink pointing outside repository ({real_target}). Use --force to uninstall.",
@@ -335,7 +300,12 @@ def uninstall_hook(
                 return False
             target_file = real_target
 
-    content = target_file.read_text(encoding="utf-8")
+    try:
+        content = target_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Never a lossy errors="replace" rewrite: it would corrupt the user's own bytes.
+        print(f"Error: {target_file} is not UTF-8 text; left unchanged", file=sys.stderr)
+        return False
     if not any(start_m in content for start_m, _end_m in _MARKERS):
         return False
 
@@ -378,18 +348,7 @@ def uninstall_hook(
         return True
 
     remaining = remaining.replace("\r\n", "\n")
-    tmp_file = target_file.parent / f".pre-commit.tmp.{os.getpid()}"
-    try:
-        tmp_file.write_bytes(remaining.encode("utf-8"))
-        if os.name != "nt":
-            tmp_file.chmod(target_file.stat().st_mode)
-        tmp_file.replace(target_file)
-    finally:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except OSError:
-                pass
+    atomic_write_bytes(target_file, remaining.encode("utf-8"))  # keeps the hook's mode
     return True
 
 
@@ -401,9 +360,9 @@ def _hooks_dir_in_work_tree(root: Path, git_hooks_dir: Path) -> bool:
     for top in (start, *start.parents):
         dot_git = top / ".git"
         if dot_git.exists():
-            if dot_git.is_dir() and hooks.is_relative_to(dot_git.resolve()):
+            if dot_git.is_dir() and is_within(hooks, dot_git, unresolvable=False):
                 return False
-            return hooks.is_relative_to(top)
+            return is_within(hooks, top, unresolvable=False)
     return False
 
 
@@ -706,8 +665,9 @@ def run_hook_uninstall(args: Any) -> int:
 
     st = hook_status(ws)
     ok = uninstall_hook(ws, force=force, dry_run=dry_run)
-    if ok:
-        _trailer_hook(st, "uninstall", dry_run=dry_run)
+    # The trailer hook can outlive its pre-commit hook, and commitmsg.uninstall removes only
+    # a file that carries Aegis's markers, so it is removed whatever happened to pre-commit.
+    trailer = _trailer_hook(st, "uninstall", dry_run=dry_run)
     if use_json:
         print(json.dumps({"status": "uninstalled" if ok else "not_found", "success": ok}))
     else:
@@ -715,6 +675,9 @@ def run_hook_uninstall(args: Any) -> int:
             print("✅ aegis pre-commit hook removed")
         else:
             print("ℹ️ No aegis pre-commit hook found to uninstall")
+            if trailer == "removed":
+                print("prepare-commit-msg hook would be removed (dry run)" if dry_run
+                      else "prepare-commit-msg hook removed")
     return 0 if ok else 1
 
 
@@ -754,12 +717,3 @@ def run_hook_status(args: Any) -> int:
     if st["unreachable_reason"]:
         print(f"  Reachable:       ❌ {st['unreachable_reason']}")
     return 0
-
-
-def __getattr__(name: str) -> Any:
-    if name in ("enable_insight_hook", "insight_hook_status"):
-        from aegis_cli.hooks import insights
-
-        return getattr(insights, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-

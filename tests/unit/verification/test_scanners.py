@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from aegis_core import redaction
 from aegis_core.verification import scanners
 
 
@@ -210,6 +211,7 @@ class TestLongLinesAreScanned:
         assert finding.snippet == f"TOKEN = '{scanners.mask_secret(raw)}'"
         assert finding.fingerprint == scanners.sarif_fingerprint("github-pat", "app.py", finding.snippet)
 
+    @pytest.mark.timing
     def test_scan_cost_stays_linear_in_line_length(self):
         """No absolute budget. A 4x longer line costs about 4x when linear and 16x when quadratic,
         so the bound of 8 leaves room for a loaded Windows runner on both sides."""
@@ -219,6 +221,7 @@ class TestLongLinesAreScanned:
         ratio = _best_of(5, scan, 200_000) / max(_best_of(5, scan, 50_000), 1e-9)
         assert ratio < 8, f"quadrupling the line multiplied the scan time by {ratio:.1f}"
 
+    @pytest.mark.timing
     def test_the_ratio_check_catches_a_quadratic_cost(self):
         def quadratic(n):
             sum(1 for _ in range(n // 100) for _ in range(n // 100))
@@ -444,9 +447,6 @@ class TestTierBAndTierCAdvisory:
         assert file_findings[0].path == "pkg/client.py"
         assert file_findings[0].rule_id == "slack-token"
 
-        ws_findings = scanners.scan_secrets_workspace(tmp_path)
-        assert len(ws_findings) == 1
-        assert ws_findings[0].rule_id == "slack-token"
 
 
 class TestKeyValueRedaction:
@@ -465,14 +465,14 @@ class TestKeyValueRedaction:
         ids=["eq", "colon", "quoted", "json", "prose", "export", "short"],
     )
     def test_short_key_value_secret_is_redacted(self, text: str, secret: str, context: str) -> None:
-        out = scanners.redact_insight_text(text, max_len=300)
+        out = redaction.redact_insight_text(text, max_len=300)
         assert secret not in out
         assert "[REDACTED]" in out
         assert context in out
-        assert scanners.redact_insight_text(out, max_len=300) == out
+        assert redaction.redact_insight_text(out, max_len=300) == out
 
     def test_value_under_four_characters_is_kept_by_design(self) -> None:
-        assert scanners.redact_insight_text("pwd=abc", max_len=300) == "pwd=abc"
+        assert redaction.redact_insight_text("pwd=abc", max_len=300) == "pwd=abc"
 
     @pytest.mark.parametrize("text, secret", [
         (_tok("authorization: ", "Basic dXNlcjpwYXNz"), "dXNlcjpwYXNz"),
@@ -480,13 +480,13 @@ class TestKeyValueRedaction:
         (_tok("auth", "=abcd1234"), "abcd1234"),
     ], ids=["basic", "proxy-basic", "auth"])
     def test_authorization_credentials_are_redacted(self, text: str, secret: str) -> None:
-        out = scanners.redact_insight_text(text, max_len=300)
+        out = redaction.redact_insight_text(text, max_len=300)
         assert secret not in out and "[REDACTED]" in out
-        assert scanners.redact_insight_text(out, max_len=300) == out
+        assert redaction.redact_insight_text(out, max_len=300) == out
 
     @pytest.mark.parametrize("text", ["the author: John Smith wrote this", "authorization: Basic"])
     def test_authorship_and_a_bare_scheme_are_left_alone(self, text: str) -> None:
-        assert scanners.redact_insight_text(text, max_len=300) == text
+        assert redaction.redact_insight_text(text, max_len=300) == text
 
 
 class TestSarifIngest:
@@ -548,20 +548,12 @@ class TestSarifIngest:
             ],
         }
 
-        report = scanners.ingest_sarif(
-            sarif_doc,
-            workspace_root=tmp_path,
-            base_fingerprints={expected_fp1},
-        )
+        report = scanners.ingest_sarif(sarif_doc, workspace_root=tmp_path)
         assert report["status"] == "fail"
         assert report["total_raw"] == 2
-        assert report["base_subtracted"] == 1
-        assert len(report["findings"]) == 1
-        finding = report["findings"][0]
-        assert finding.rule_id == "S307"
-        assert finding.fingerprint == expected_fp2
-        # 3 inline suppressions (noqa, nosec, gitleaks:allow) + 2 .gitleaksignore entries = 5
-        assert report["suppression_count"] == 5
+        assert [(f.rule_id, f.fingerprint) for f in report["findings"]] == [("S605", expected_fp1), ("S307", expected_fp2)]
+        # the document's own suppressions only; in-repository markers are suppression_count's (R-checks-20)
+        assert report["suppression_count"] == 0
 
 
 _SARIF_ONE_FINDING = {
@@ -629,12 +621,6 @@ class TestSarifIngestStaysInsideWorkspace:
         assert self.SENTINEL not in json.dumps(finding.as_dict())
         assert finding.snippet == "reported message"
 
-    def test_the_base_document_is_confined_the_same_way(self, tree):
-        ws, _ = tree
-        doc = _sarif_for("sub/../../outside.txt")
-        base = [f.fingerprint for f in scanners.ingest_sarif(doc, workspace_root=ws)["findings"]]
-        report = scanners.ingest_sarif(doc, workspace_root=ws, base_fingerprints=base)
-        assert (report["status"], report["base_subtracted"]) == ("pass", 1)
 
     @pytest.mark.parametrize("uri", ["sub/app.py", "./sub/app.py", "ABS", "FILE"])
     def test_an_in_tree_uri_reads_the_reported_line(self, tree, uri):
@@ -693,6 +679,9 @@ _MALFORMED_DOCS = {
 }
 
 
+_CLEAN_SARIF = '{"version": "2.1.0", "runs": [{"results": []}]}'
+
+
 class TestSarifVerdictNeedsACompletedScan:
     """R-checks-17: a scanner result is ``pass`` only when the scan demonstrably ran and its output
     was understood; anything else is ``unverified``, and untrusted output never raises."""
@@ -721,11 +710,16 @@ class TestSarifVerdictNeedsACompletedScan:
         assert (report["status"], report["total_raw"]) == ("pass", 0)
 
     @staticmethod
-    def _run(rc, stdout, stderr="scanner said so", base=()):
+    def _run(rc, stdout, stderr="scanner said so", base_stdout=_CLEAN_SARIF):
+        """run_preset with a runner that answers ``stdout`` on the head and ``base_stdout`` on the base."""
+        root = _git_ws()
+
         def runner(argv, cwd, env=None, timeout=60):
+            if Path(cwd).resolve() != root.resolve():
+                return {"returncode": 1 if base_stdout != _CLEAN_SARIF else 0, "stdout": base_stdout, "stderr": ""}
             res = {"stdout": stdout, "stderr": stderr}
             return res if rc == "none" else {**res, "returncode": rc}
-        return scanners.run_preset_scanner("ruff", Path("."), runner=runner, base_fingerprints=base)
+        return scanners.run_preset("ruff", root, "HEAD", runner=runner)
 
     @pytest.mark.parametrize("rc,stdout", [
         (0, ""), (0, "   \n"), (0, "all good"), (0, "[]"), (0, "null"), (0, "{}"), (0, '{"error":"boom"}'),
@@ -745,7 +739,7 @@ class TestSarifVerdictNeedsACompletedScan:
         assert report["status"] == "unverified" and report["reason"] == "ruff produced no SARIF output"
 
     def test_a_clean_completed_scan_passes(self):
-        assert self._run(0, '{"version": "2.1.0", "runs": [{"results": []}]}')["status"] == "pass"
+        assert self._run(0, _CLEAN_SARIF)["status"] == "pass"
 
     @pytest.mark.parametrize("rc", [0, 1, 2])
     def test_a_new_finding_fails_whatever_the_exit_code(self, rc):
@@ -753,34 +747,48 @@ class TestSarifVerdictNeedsACompletedScan:
         assert report["status"] == "fail" and [f.rule_id for f in report["findings"]] == ["S307"]
 
     def test_the_exit_code_is_judged_on_raw_findings_not_the_base_delta(self):
-        fp = scanners.ingest_sarif(_SARIF_ONE_FINDING)["findings"][0].fingerprint
-        baselined = self._run(1, json.dumps(_SARIF_ONE_FINDING), base=[fp])
-        assert (baselined["status"], baselined["base_subtracted"]) == ("pass", 1)
-        crashed = self._run(2, json.dumps(_SARIF_ONE_FINDING), stderr="crashed", base=[fp])
+        baselined = self._run(1, json.dumps(_SARIF_ONE_FINDING), base_stdout=json.dumps(_SARIF_ONE_FINDING))
+        assert (baselined["status"], baselined["subtracted"], baselined["findings"]) == ("pass", 1, [])
+        crashed = self._run(2, json.dumps(_SARIF_ONE_FINDING), stderr="crashed", base_stdout=json.dumps(_SARIF_ONE_FINDING))
         assert (crashed["status"], crashed["reason"]) == ("unverified", "crashed")
+
+    def test_a_base_scan_that_does_not_complete_is_unverified(self):
+        report = self._run(1, json.dumps(_SARIF_ONE_FINDING), base_stdout="not sarif")
+        assert (report["status"], report["findings"]) == ("unverified", [])
+        assert report["reason"].startswith("the merge-base scan: ")
+
+
+def _git_ws(root: Path | None = None) -> Path:
+    """A one-commit repository (``app.py`` holds ``eval(x)``) under a fresh temporary directory."""
+    import subprocess
+    import tempfile
+
+    root = root or Path(tempfile.mkdtemp(prefix="aegis-scan-test-"))
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "app.py").write_bytes(b"eval(x)\n")
+    for args in (["init", "-q", "-b", "main"], ["add", "-A"],
+                 ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "c"]):
+        subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True,
+                       env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"})
+    return root
 
 
 class TestExternalScannerPresets:
-    def test_ruff_preset_argv_isolated_and_ignores_s603_s607(self, tmp_path: Path) -> None:
-        argv = scanners.build_preset_argv("ruff", tmp_path)
-        assert argv[0] == "ruff"
+    def test_ruff_preset_argv_isolated_and_ignores_s603_s607(self) -> None:
+        argv = scanners.PRESET_ARGV["ruff"]
+        assert argv[:2] == ("ruff", "check")
         assert "--isolated" in argv
-        assert "--select" in argv
-        assert "S" in argv
-        assert "--ignore" in argv
-        assert "S603,S607" in argv
+        assert argv[argv.index("--select") + 1] == "S"
+        assert argv[argv.index("--ignore") + 1] == "S603,S607"
 
-    def test_gitleaks_preset_uses_redact_and_only_user_scope_config(self, tmp_path: Path) -> None:
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
-        user_dir = tmp_path / "user_aegis"
-        user_dir.mkdir()
-        user_cfg = user_dir / "gitleaks.toml"
-        user_cfg.write_bytes(b"# trusted user config\n")
+    def test_the_presets_are_the_names_the_config_key_accepts(self) -> None:
+        from aegis_core.config import SCANNER_PRESETS
 
-        argv_user = scanners.build_preset_argv("gitleaks", repo_dir, user_config_dir=user_dir)
-        assert "--redact" in argv_user
-        assert argv_user[argv_user.index("--config") + 1] == str(user_cfg.resolve())
+        assert tuple(scanners.PRESET_ARGV) == SCANNER_PRESETS
+
+    def test_an_unknown_preset_is_refused(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="bandit"):
+            scanners.run_preset("bandit", tmp_path, "HEAD")
 
     @pytest.fixture
     def home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -794,7 +802,7 @@ class TestExternalScannerPresets:
     def _stub(calls: list):
         def runner(argv, cwd, env=None, timeout=60):
             calls.append(list(argv))
-            return {"returncode": 0, "stdout": '{"version": "2.1.0", "runs": [{"results": []}]}', "stderr": ""}
+            return {"returncode": 0, "stdout": _CLEAN_SARIF, "stderr": ""}
         return runner
 
     @staticmethod
@@ -804,11 +812,20 @@ class TestExternalScannerPresets:
         (repo / ".gitleaks.toml").write_bytes(b'[allowlist]\npaths = [".*"]\n')
         return repo
 
+    def test_gitleaks_preset_uses_redact_and_only_user_scope_config(self, tmp_path: Path, home: Path) -> None:
+        user_cfg = home / ".aegis" / "gitleaks.toml"
+        user_cfg.write_bytes(b"# trusted user config\n")
+        (tmp_path / "repo").mkdir()
+        calls: list = []
+        scanners.run_preset("gitleaks", tmp_path / "repo", "HEAD", runner=self._stub(calls))
+        assert "--redact" in calls[0]
+        assert calls[0][calls[0].index("--config") + 1] == str(user_cfg.resolve())
+
     def test_a_repository_gitleaks_config_without_a_user_config_is_unverified(self, tmp_path, home):
         """R-checks-18: gitleaks would read <source>/.gitleaks.toml when no --config is given, so a
         repository allowlist could silence every finding; the preset refuses to run instead."""
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", self._allow_all_repo(tmp_path), "HEAD", runner=self._stub(calls))
         assert (res["status"], res["findings"], calls) == ("unverified", [], [])
         assert ".gitleaks.toml" in res["reason"]
 
@@ -816,16 +833,18 @@ class TestExternalScannerPresets:
         user_cfg = home / ".aegis" / "gitleaks.toml"
         user_cfg.write_bytes(b"# trusted user config\n")
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", self._allow_all_repo(tmp_path), "HEAD", runner=self._stub(calls))
         assert res["status"] == "pass"
         assert calls[0][calls[0].index("--config") + 1] == str(user_cfg.resolve())
 
-    def test_a_user_config_dir_inside_the_repository_does_not_count(self, tmp_path, home):
+    def test_a_user_config_dir_inside_the_repository_does_not_count(self, tmp_path, monkeypatch):
         repo = self._allow_all_repo(tmp_path)
         (repo / ".aegis").mkdir()
         (repo / ".aegis" / "gitleaks.toml").write_bytes(b"# planted\n")
+        for name in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(name, str(repo))
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", repo, user_config_dir=repo / ".aegis", runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", repo, "HEAD", runner=self._stub(calls))
         assert (res["status"], calls) == ("unverified", [])
 
     def test_a_dangling_repository_config_symlink_still_counts(self, tmp_path, home):
@@ -836,33 +855,39 @@ class TestExternalScannerPresets:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks are unavailable")
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", repo, runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", repo, "HEAD", runner=self._stub(calls))
         assert (res["status"], calls) == ("unverified", [])
 
     def test_with_neither_config_gitleaks_runs_redacted_without_a_config(self, tmp_path, home):
         calls: list = []
-        res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=self._stub(calls))
+        res = scanners.run_preset("gitleaks", tmp_path, "HEAD", runner=self._stub(calls))
         assert res["status"] == "pass"
         assert "--redact" in calls[0] and "--config" not in calls[0]
 
     def test_the_ruff_preset_ignores_a_repository_gitleaks_config(self, tmp_path, home):
         calls: list = []
-        res = scanners.run_preset_scanner("ruff", self._allow_all_repo(tmp_path), runner=self._stub(calls))
+        res = scanners.run_preset("ruff", self._allow_all_repo(tmp_path), "HEAD", runner=self._stub(calls))
         assert res["status"] == "pass" and calls[0][0] == "ruff"
 
     def test_missing_binary_returns_unverified_not_pass(self, tmp_path: Path) -> None:
         def fake_missing_runner(argv, cwd, env=None, timeout=60):
-            return {
-                "returncode": 127,
-                "stdout": "",
-                "stderr": f"{argv[0]}: not found",
-                "missing_binary": True,
-                "timed_out": False,
-            }
+            return {"returncode": 127, "stdout": "", "stderr": f"{argv[0]}: not found", "missing_binary": True,
+                    "timed_out": False}
 
-        res = scanners.run_preset_scanner("gitleaks", tmp_path, runner=fake_missing_runner)
+        res = scanners.run_preset("gitleaks", tmp_path, "HEAD", runner=fake_missing_runner)
         assert res["status"] == "unverified"
         assert "not found" in res["reason"].lower()
+
+    def test_the_base_is_scanned_only_when_the_head_has_findings(self, tmp_path, home):
+        calls: list = []
+        scanners.run_preset("ruff", tmp_path, "no-such-commit", runner=self._stub(calls))
+        assert len(calls) == 1
+
+    def test_a_merge_base_that_cannot_be_exported_is_unverified(self, tmp_path, home):
+        root = _git_ws(tmp_path / "ws")
+        res = scanners.run_preset("ruff", root, "no-such-commit",
+                                  runner=lambda argv, cwd, **kw: {"returncode": 1, "stdout": json.dumps(_SARIF_ONE_FINDING)})
+        assert (res["status"], res["findings"]) == ("unverified", [])
 
 
 def _program(path: Path, body: str) -> Path:
@@ -916,7 +941,7 @@ class TestPresetScannerProgramLookup:
         trusted.mkdir()  # holds no scanner: the real one is not installed
         _set_path(monkeypatch, str(repo / "bin") if entry == "REPO_BIN" else entry, str(trusted))
 
-        res = scanners.run_preset_scanner(preset, repo)
+        res = scanners.run_preset(preset, repo, "HEAD")
 
         assert not marker.exists(), "a program the repository planted ran"
         assert res["status"] == "unverified"
@@ -927,10 +952,15 @@ class TestPresetScannerProgramLookup:
         marker = tmp_path / "planted-ran"
         self._plant(repo, preset, marker)
         trusted = tmp_path / "trusted"
-        _program(trusted / preset, f"import json\nprint(json.dumps({_SARIF_ONE_FINDING!r}))\n")
-        _set_path(monkeypatch, "", "bin", str(repo / "bin"), str(trusted))
+        _git_ws(repo)  # the base export holds the same eval(x); the fake reports it on the head only
+        real = os.path.realpath(repo)
+        _program(trusted / preset, "import json, os, sys\n"
+                 f"found = os.path.realpath(sys.argv[-1]) == {real!r}\n"
+                 f"print(json.dumps({_SARIF_ONE_FINDING!r} if found else {{'runs': [{{'results': []}}]}}))\n")
+        import shutil
+        _set_path(monkeypatch, "", "bin", str(repo / "bin"), str(trusted), os.path.dirname(shutil.which("git")))
 
-        res = scanners.run_preset_scanner(preset, repo)
+        res = scanners.run_preset(preset, repo, "HEAD")
 
         assert not marker.exists()
         assert res["status"] == "fail"
@@ -943,5 +973,214 @@ class TestPresetScannerProgramLookup:
             seen.append(list(argv))
             return {"returncode": 0, "stdout": json.dumps(_SARIF_ONE_FINDING), "stderr": ""}
 
-        scanners.run_preset_scanner("ruff", tmp_path, runner=runner)
-        assert [argv[0] for argv in seen] == ["ruff"]
+        scanners.run_preset("ruff", _git_ws(tmp_path / "ws"), "HEAD", runner=runner)
+        assert [argv[0] for argv in seen] == ["ruff", "ruff"]  # the head, then the merge-base export
+
+
+class TestSecuritySuppressionCount:
+    """R-checks-20: the suppression signal counts markers that silence security findings, over the
+    files git tracks, with bounded reads, and reports head minus the merge base."""
+
+    @staticmethod
+    def _git(root: Path, *args: str) -> None:
+        import subprocess
+
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=str(root),
+                       check=True, capture_output=True, env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"})
+
+    def _repo(self, root: Path, files: dict) -> str:
+        root.mkdir(parents=True, exist_ok=True)
+        if not (root / ".git").exists():
+            self._git(root, "init", "-q", "-b", "main")
+        for rel, data in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_bytes(data)
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-q", "-m", "c", "--allow-empty")
+        import subprocess
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, check=True).stdout.decode().strip()
+
+    def test_only_security_markers_in_tracked_files_count(self, tmp_path):
+        root = tmp_path / "ws"
+        base = self._repo(root, {"keep.txt": b"x\n"})
+        self._repo(root, {
+            "app.py": (b"a = eval(x)  # noqa: S307\nb = 1  # nosec\nc = 2  # gitleaks:allow\nimport os  # noqa\n"
+                       b"x=1  # noqa: E501\ny = eval(z)  # noqa: E501, S307\n"),
+            ".gitleaksignore": b"# a comment line\nlegacy/secret.py:generic-api-key:12\n\ndocs/example.md:aws-access-key:5\n",
+        })
+        (root / "venv").mkdir()
+        (root / "venv" / "lib.py").write_bytes(b"x = 1  # noqa: S101\n" * 100)  # untracked: never read
+        assert scanners.suppression_count(root, base) == {"count": 6, "delta": 6}
+
+    def test_the_delta_is_head_minus_the_merge_base(self, tmp_path):
+        root = tmp_path / "ws"
+        base = self._repo(root, {"a.py": b"x = 1  # nosec\n"})
+        self._repo(root, {"a.py": b"x = 1  # nosec\ny = 2  # nosec\nz = 3  # noqa: S105\n"})
+        assert scanners.suppression_count(root, base) == {"count": 3, "delta": 2}
+
+    def test_large_binary_and_unreadable_files_are_skipped_without_raising(self, tmp_path):
+        root = tmp_path / "ws"
+        base = self._repo(root, {"keep.txt": b"x\n"})
+        self._repo(root, {"big.py": b"x = 1  # nosec\n" * (5 * 1024 * 1024 // 15 + 1),
+                          "blob.bin": b"\0\1\2 # nosec\n", "a.py": b"x = 1  # nosec\n", "locked.py": b"y = 1  # nosec\n"})
+        locked = root / "locked.py"
+        locked.chmod(0)
+        try:
+            readable = os.access(locked, os.R_OK)  # root, or Windows, still reads it
+            counted = scanners.suppression_count(root, base)
+        finally:
+            locked.chmod(0o644)
+        assert counted["count"] == (2 if readable else 1)
+
+    def test_a_merge_base_that_cannot_be_exported_has_no_delta(self, tmp_path):
+        root = tmp_path / "ws"
+        self._repo(root, {"a.py": b"x = 1  # nosec\n"})
+        assert scanners.suppression_count(root, "no-such-commit") == {"count": 1, "delta": None}
+
+
+class TestGitleaksAllowInOtherLanguages:
+    """`gitleaks:allow` after any comment opener the scanned languages use (#, // or /*) skips the line in
+    the Layer 1 secret delta and is counted as a suppression; anywhere else it is just text."""
+
+    TOKEN = "ghp_" + "Ab3" * 12  # the GitHub classic PAT shape, built so no token literal sits here
+
+    def _scan(self, tmp_path: Path, line: str) -> list:
+        (tmp_path / "client.ts").write_bytes((line + "\n").encode("utf-8"))
+        return [f.rule_id for f in scanners.scan_secrets_delta(tmp_path, ["client.ts"], {})]
+
+    @pytest.mark.parametrize("marker", ["# gitleaks:allow", "// gitleaks:allow", "//gitleaks:allow",
+                                        "/* gitleaks:allow */", "/*gitleaks:allow*/"])
+    def test_the_marker_after_a_comment_opener_skips_the_line(self, tmp_path, marker):
+        assert self._scan(tmp_path, f'const t = "{self.TOKEN}"; {marker}') == []
+
+    @pytest.mark.parametrize("line", ['const t = "{t}";', 'const t = "{t}"; / gitleaks:allow',
+                                      'const t = "{t}gitleaks:allow";', 'const t = "{t}"; // gitleaks:allowed'])
+    def test_without_a_comment_opener_the_token_still_blocks(self, tmp_path, line):
+        assert self._scan(tmp_path, line.format(t=self.TOKEN)) == ["github-pat"]
+
+    def test_each_marker_is_counted_as_a_suppression(self, tmp_path):
+        root = tmp_path / "ws"
+        files = {"a.ts": b'a = 1; // gitleaks:allow\nb = 2; /* gitleaks:allow */\n', "b.go": b"c := 3 //gitleaks:allow\n"}
+        counter = TestSecuritySuppressionCount()
+        base = counter._repo(root, {"keep.txt": b"x\n"})
+        counter._repo(root, files)
+        assert scanners.suppression_count(root, base) == {"count": 3, "delta": 3}
+
+
+class TestScannerSurfaceAndInventory:
+    """The remaining scanner API and BASE inventory share the same safe file boundary."""
+
+    @pytest.fixture(autouse=True)
+    def isolated(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        for key in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(key, str(home))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / "gitconfig"))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        for key in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_findings_have_one_rule_name_and_no_raw_secret(self):
+        secret = _tier_a_samples()["slack-token"]
+        finding, = scanners.scan_secrets_text(secret)
+        doc = finding.as_dict()
+        assert doc["rule_id"] == "slack-token" and "rule" not in doc
+        assert not hasattr(finding, "rule") and not hasattr(finding, "fp")
+        assert secret not in json.dumps(doc)
+
+    def test_no_workspace_scanner_surface(self):
+        assert not hasattr(scanners, "scan_secrets_workspace")
+
+    def test_file_scanner_skips_binary_and_directory(self, tmp_path):
+        path = tmp_path / "bin"
+        path.write_bytes(b"\0" + _tier_a_samples()["slack-token"].encode())
+        assert scanners.scan_secrets_file(path) == []
+        assert scanners.scan_secrets_file(tmp_path) == []
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
+    def test_file_scanner_skips_a_link_to_a_real_secret(self, tmp_path):
+        path = tmp_path / "src"
+        path.write_bytes(_tier_a_samples()["slack-token"].encode())
+        link = tmp_path / "link"
+        link.symlink_to(path)
+        assert len(scanners.scan_secrets_file(path)) == 1
+        assert scanners.scan_secrets_file(link) == []
+
+    def test_no_scanner_walk_or_containment_copies(self):
+        import ast
+        from aegis_core.verification import perf_check, security_pack
+
+        for module in (scanners, perf_check, security_pack):
+            tree = ast.parse(Path(module.__file__).read_bytes())
+            assert not [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                        and node.name.startswith("_is_within")]
+            assert not [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr in ("rglob", "walk")]
+
+    @staticmethod
+    def git(root, *args):
+        import subprocess
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                              cwd=str(root), check=True, capture_output=True).stdout.decode().strip()
+
+    def test_base_inventory_keeps_deleted_files_and_workspace_prefix(self, tmp_path):
+        root = tmp_path / "ws"
+        root.mkdir()
+        self.git(root, "init", "-q", "-b", "main")
+        (root / "sub").mkdir()
+        files = {"sub/a.py": b"x = 1 # nosec\n", "sub/gone.py": b"x = 2 # nosec\n",
+                 "sub/.gitleaksignore": b"# comment\nlegacy-id\n", "other.py": b"# nosec\n" * 5,
+                 "sub/large.py": b"# nosec\n" * ((1 << 20) // 8 + 1), "sub/bin": b"\0# nosec\n"}
+        for rel, data in files.items():
+            (root / rel).write_bytes(data)
+        self.git(root, "add", *files)
+        self.git(root, "commit", "-qm", "base")
+        base = self.git(root, "rev-parse", "HEAD")
+        self.git(root, "rm", "sub/gone.py")
+        (root / "sub" / "a.py").write_bytes(b"x = 1 # nosec\ny = 2 # nosec\n")
+        assert scanners.suppression_count(root / "sub", base) == {"count": 3, "delta": 0}
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires Windows privileges")
+    def test_base_does_not_count_materialized_symlink_text(self, tmp_path):
+        root = tmp_path / "ws"
+        root.mkdir()
+        self.git(root, "init", "-q", "-b", "main")
+        (root / "link").symlink_to("absent # nosec")
+        self.git(root, "add", "link")
+        self.git(root, "commit", "-qm", "base")
+        assert scanners.suppression_count(root, "HEAD") == {"count": 0, "delta": 0}
+
+    @pytest.mark.parametrize("prefix", ["", "sub"], ids=["root", "subworkspace"])
+    @pytest.mark.parametrize("name, data", [
+        (".gitleaksignore", b"shared-allowlist.txt"),
+        ("link", b"absent # nosec"),
+    ], ids=["allowlist", "marker"])
+    def test_index_symlinks_are_not_working_file_suppressions(self, tmp_path, prefix, name, data):
+        import subprocess
+
+        root = tmp_path / "ws"
+        root.mkdir()
+        workspace = root / prefix
+        workspace.mkdir(exist_ok=True)
+        self.git(root, "init", "-q", "-b", "main")
+        self.git(root, "config", "core.symlinks", "false")
+        oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=data, cwd=str(root),
+                             check=True, capture_output=True).stdout.decode().strip()
+        rel = f"{prefix}/{name}" if prefix else name
+        self.git(root, "update-index", "--add", "--cacheinfo", f"120000,{oid},{rel}")
+        self.git(root, "commit", "-qm", "symlink entry")
+        self.git(root, "checkout-index", "-f", "--", rel)
+        path = workspace / name
+        assert path.is_file() and not path.is_symlink() and path.read_bytes() == data
+        assert self.git(root, "status", "--porcelain") == ""
+        assert scanners.suppression_count(workspace, "HEAD") == {"count": 0, "delta": 0}
+
+        # The index mode controls eligibility; regular entries still use working bytes.
+        self.git(root, "update-index", "--cacheinfo", f"100644,{oid},{rel}")
+        path.write_bytes(data + b"\n" + data + b"\n")
+        assert scanners.suppression_count(workspace, "HEAD") == {"count": 2, "delta": 2}
+
+    def test_unavailable_git_leaves_the_suppression_delta_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+        assert scanners.suppression_count(tmp_path, "HEAD") == {"count": 0, "delta": None}
