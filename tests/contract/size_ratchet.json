@@ -1,0 +1,106 @@
+{
+  "functions": {
+    "aegis_cli/check.py:CheckCommand.configure_parser": {
+      "lines": 186,
+      "stmts": 29
+    },
+    "aegis_cli/rule.py:RuleCommand.configure_parser": {
+      "lines": 108,
+      "stmts": 65
+    },
+    "aegis_cli/rule.py:_run_insight": {
+      "lines": 110,
+      "stmts": 79
+    },
+    "aegis_cli/verify.py:run_verify": {
+      "lines": 296,
+      "stmts": 201
+    },
+    "aegis_core/command_safety/lexer.py:extract_subshell_commands": {
+      "lines": 150,
+      "stmts": 121
+    },
+    "aegis_core/command_safety/lexer.py:unwrap_command_stage": {
+      "lines": 272,
+      "stmts": 201
+    },
+    "aegis_core/config.py:RepoConfig.parse": {
+      "lines": 132,
+      "stmts": 86
+    },
+    "aegis_core/human_gate.py:detect_tier": {
+      "lines": 141,
+      "stmts": 90
+    },
+    "aegis_core/lifecycle/creation.py:create_rule": {
+      "lines": 134,
+      "stmts": 57
+    },
+    "aegis_core/migrate.py:_plan_config": {
+      "lines": 112,
+      "stmts": 95
+    },
+    "aegis_core/sync.py:sync": {
+      "lines": 102,
+      "stmts": 72
+    },
+    "aegis_core/verification/arbiter.py:arbitrate": {
+      "lines": 128,
+      "stmts": 47
+    },
+    "aegis_core/verification/call_graph.py:check": {
+      "lines": 154,
+      "stmts": 69
+    },
+    "aegis_core/verification/call_graph.py:check_normalized": {
+      "lines": 105,
+      "stmts": 47
+    },
+    "aegis_core/verification/checkpoint_checks.py:_aegis_suite_candidates": {
+      "lines": 117,
+      "stmts": 113
+    },
+    "aegis_core/verification/import_guard.py:check": {
+      "lines": 113,
+      "stmts": 56
+    },
+    "aegis_core/verification/mutation_tester.py:check": {
+      "lines": 134,
+      "stmts": 79
+    },
+    "aegis_core/verification/runner.py:_layer1_on_snapshot": {
+      "lines": 114,
+      "stmts": 72
+    },
+    "aegis_core/verification/runner.py:run_layer1": {
+      "lines": 207,
+      "stmts": 112
+    },
+    "aegis_core/workspace/binding.py:resolve_binding": {
+      "lines": 122,
+      "stmts": 68
+    }
+  },
+  "modules": {
+    "aegis_cli/install_hosts.py": {
+      "lines": 1037,
+      "stmts": 632
+    },
+    "aegis_core/gitsafe.py": {
+      "lines": 1250,
+      "stmts": 709
+    },
+    "aegis_core/human_gate.py": {
+      "lines": 1211,
+      "stmts": 751
+    },
+    "aegis_core/migrate.py": {
+      "lines": 1151,
+      "stmts": 770
+    },
+    "aegis_core/verification/runner.py": {
+      "lines": 1214,
+      "stmts": 774
+    }
+  }
+}

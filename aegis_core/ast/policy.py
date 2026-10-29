@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core.errors import AegisError
 from aegis_core.ast.schema import (
-    NormalizedAST, _SpellingIndex, _add_binding, _call_target, _decorator_name,
+    NormalizedAST, _SpellingIndex, add_binding, _call_target, _decorator_name,
     _decorator_pattern, _extract_import_tuple, _extract_python_decorators_from_file,
     _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, _spellings,
 )
@@ -235,11 +235,11 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
         src, syms = _extract_import_tuple(imp)
         for name, originals in _import_aliases(imp).items():
             for orig in originals:
-                _add_binding(aliases, name, orig)
+                add_binding(aliases, name, orig)
         parsed_imports.append((imp, (src, syms)))
         for sym in syms if src else ():
             if sym and sym != src:
-                _add_binding(imported_qual_map, sym, f"{src}.{sym}")
+                add_binding(imported_qual_map, sym, f"{src}.{sym}")
     by_line = lambda hit: _line_of(hit[0]) or 0
     hits: List[Tuple[str, str, Any, Optional[bool]]] = []
     for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():

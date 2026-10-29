@@ -123,7 +123,7 @@ def _rule_blobs(cwd: str, commit: str) -> Dict[str, str]:
     return found
 
 
-def _read_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
+def _read_integrity_blobs(cwd: str, oids: Iterable[str]) -> Dict[str, bytes]:
     try:
         return gitsafe.read_blobs(cwd, oids, timeout=_GIT_TIMEOUT)
     except gitsafe.GitError as exc:
@@ -142,9 +142,9 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
     # A commit's listing and a blob's bytes never change.
     if cache is not None:
         blobs = cache.listing((os.path.realpath(root), commit), lambda: _rule_blobs(root, commit))
-        read = lambda oids: cache.blobs(list(oids), lambda missing: _read_blobs(root, missing))  # noqa: E731
+        read = lambda oids: cache.blobs(list(oids), lambda missing: _read_integrity_blobs(root, missing))  # noqa: E731
     else:
-        blobs, read = _rule_blobs(root, commit), lambda oids: _read_blobs(root, oids)
+        blobs, read = _rule_blobs(root, commit), lambda oids: _read_integrity_blobs(root, oids)
     present = {e.relative_path: e for e in working.entries} if working is not None else {}
     entries: List[RuleInventoryEntry] = []
     missing: List[Tuple[str, str]] = []

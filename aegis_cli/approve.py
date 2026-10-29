@@ -41,7 +41,7 @@ SCHEMA = "aegis.approve/v1"
 SOURCE = "aegis approve"
 
 
-def _envelope(root: Path, status: str, **fields: Any) -> Dict[str, Any]:
+def _approval_payload(root: Path, status: str, **fields: Any) -> Dict[str, Any]:
     from aegis_core import primitives
 
     return {**primitives.envelope(SOURCE, {"machine": "local", "workspace": str(root)}, schema=SCHEMA),
@@ -179,14 +179,14 @@ def run_approve(args: argparse.Namespace) -> int:
             result = _approve(root, getattr(args, "base", None), use_json)
     except _Refused as exc:
         if use_json:
-            print(json.dumps(_envelope(root, "declined" if exc.code == "declined" else "refused",
+            print(json.dumps(_approval_payload(root, "declined" if exc.code == "declined" else "refused",
                                        code=exc.code, reason=str(exc)), indent=2))
         else:
             print(f"aegis approve: {exc}" if exc.code != "declined" else str(exc),
                   file=sys.stdout if exc.code == "declined" else sys.stderr)
         return 1
     if use_json:
-        print(json.dumps(_envelope(root, "approved", **result), indent=2))
+        print(json.dumps(_approval_payload(root, "approved", **result), indent=2))
         return 0
     if "exempt_commit" in result:
         print(f"Approved test exemption for {result['exempt_commit']} in commit {result['commit']}.")

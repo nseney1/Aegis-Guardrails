@@ -42,12 +42,12 @@ def _documents(root, monkeypatch, capsys):
 
     (root / ".aegis" / "rules").mkdir(parents=True)
     docs = {
-        "benchmark": benchmark._envelope(root, 3),
-        "team": team._envelope("list", root, 0, refs="refs/aegis/lanes"),
-        "hook": registrar._envelope("install", "claude-code", "user", root, []),
-        "approve": approve._envelope(root, "refused", reason="no signature"),
-        "package": package._envelope(root, root / "out"),
-        "pack": rule._pack_envelope("export", root, {"files": 1}),
+        "benchmark": benchmark._benchmark_payload(root, 3),
+        "team": team._team_payload("list", root, 0, refs="refs/aegis/lanes"),
+        "hook": registrar._hook_payload("install", "claude-code", "user", root, []),
+        "approve": approve._approval_payload(root, "refused", reason="no signature"),
+        "package": package._package_payload(root, root / "out"),
+        "pack": rule._pack_payload("export", root, {"files": 1}),
         "tier": human_gate.TierReport("C", scope={"workspace": str(root)}, checked_at=STAMP).as_dict(),
         "approval": human_gate.Approval(False, "missing", "no approval", "a" * 40).as_dict(root),
         "lane": _lane(root).as_dict(),

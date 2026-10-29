@@ -30,17 +30,18 @@ MAX_LINE_LENGTH = 4096
 MAX_EXCERPT_CHARS = 300
 
 _NB = r"(?<![A-Za-z0-9])"
-_PEM_HEAD = r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
+_PEM_HEAD = r"-----BEGIN (?P<pem_label>(?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?)-----"
 _PEM_TAIL = r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
 _KEYS = ("(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|credential|"
          "authorization|auth(?![A-Za-z]))")
 _SCHEMES = "(?:basic|digest|token|negotiate)"
 # Built by concatenation, never as an rf-string: f-string formatting turns a {4,} quantifier
-# into the tuple "(4,)". Every quantifier is bounded so redaction stays linear in its input.
+# into the tuple "(4,)". Token quantifiers are bounded; PEM consumes once to its END or EOF.
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
     (re.compile(pattern), hook, text) for pattern, hook, text in (
-        # The body is optional, so an unterminated header cannot backtrack over the rest.
-        (_PEM_HEAD + "(?:(?:[^-]|-(?!-)){0,16384}" + _PEM_TAIL + ")?", "[REDACTED_PEM]", "[REDACTED_PEM]"),
+        # Only the BEGIN label's own END closes a key; otherwise the suffix stays untrusted. EOF matches,
+        # so repeated BEGIN markers cannot retry scans over the same unterminated body.
+        (_PEM_HEAD + r"[\s\S]*?(?:-----END (?P=pem_label)-----|\Z)", "[REDACTED_PEM]", "[REDACTED_PEM]"),
         # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
         ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
          r"\1[REDACTED]@"),
@@ -123,8 +124,8 @@ def _bounded_head(text: str, limit: int) -> str:
         words.pop()
     head = " ".join(words)
     begin = head.rfind("-----BEGIN")
-    # Closed only by a whole END marker: a cut inside the END line leaves a block the PEM row
-    # cannot match, and its body would survive. The join turned newlines into single spaces.
+    # Drop the trailing incomplete block before redaction; only a whole END marker closes it.
+    # The join turned newlines into single spaces.
     return head[:begin].rstrip() if begin != -1 and not re.search(_PEM_TAIL, head[begin:]) else head
 
 

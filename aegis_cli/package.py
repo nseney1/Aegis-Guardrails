@@ -41,7 +41,7 @@ DEFAULT_OUT = "aegis-claude-plugin"
 NOTICE = "experimental: nothing is published; the directory works only on this machine"
 
 
-def _envelope(root: Path, out: Any) -> Dict[str, Any]:
+def _package_payload(root: Path, out: Any) -> Dict[str, Any]:
     return primitives.envelope("aegis package", {"workspace": str(root), "host": HOST, "out": str(out)})
 
 
@@ -112,7 +112,7 @@ def run_package(args: argparse.Namespace) -> int:
         if not isinstance(exc, (packaging.PackagingError, InstallError, OSError)):
             raise
         if use_json:
-            print(json.dumps({**_envelope(root, out), "status": "error", "experimental": True, "error": str(exc)},
+            print(json.dumps({**_package_payload(root, out), "status": "error", "experimental": True, "error": str(exc)},
                              indent=2))
         else:
             print(f"Error: {sanitize_display(exc, max_len=None)}", file=sys.stderr)
@@ -129,7 +129,7 @@ def run_package(args: argparse.Namespace) -> int:
     for _path, state in plan:
         counts[state] = counts.get(state, 0) + 1
     if use_json:
-        doc = _envelope(root, out)
+        doc = _package_payload(root, out)
         doc.update({"status": "ok", "experimental": True, "notice": NOTICE, "dry_run": dry_run,
                     "files": [{"path": path, "result": state} for path, state in plan],
                     "counts": counts, "recorded": recorded, "warnings": warnings})

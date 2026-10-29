@@ -11,7 +11,6 @@ from typing import Any, Optional
 from aegis_cli import sanitize_display
 
 __all__ = [
-    "ci_findings",
     "format_github_step_summary",
     "format_layer1_json_payload",
     "format_layer2_json",
@@ -19,7 +18,6 @@ __all__ = [
     "format_sarif_report",
     "github_annotation_lines",
     "governance_note",
-    "layer1_findings",
     "layer1_report_document",
     "perf_line",
 ]

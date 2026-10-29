@@ -4,6 +4,7 @@ The goldens were recorded on the w14 merge commit (e7e61536), before the table m
 aegis_core.verification.scanners, through the three entry points that exist on both sides of the
 move: the hook command log (aegis_cli.hooks.redaction.redact_secrets), stored insight text
 (aegis_core.insights.redact_insight_text) and a scanner finding's snippet (scan_secrets_text).
+The unterminated-PEM golden is corrected in w16; the move-era output leaked its body.
 Tokens are assembled at run time so push protection never sees a literal.
 """
 from __future__ import annotations
@@ -90,11 +91,10 @@ GOLDENS: Dict[str, Tuple[str, str, List[Tuple[str, str, str]]]] = {
         "deploy --opt [REDACTED_TOKEN] --next",
         [("google-api-key", "gate", "deploy --opt AIza...tu --next")],
     ),
-    # The hook log has no entropy pass, so a PEM header without its END line keeps the body after
-    # it (insight text masks it). Recorded as the w14 tree writes it: the move changes no output.
+    # Without a complete END marker, everything after the header may still be key material.
     "private-key-pem": (
-        _tok("deploy --opt [REDACTED_PEM]\\n", "MIIEow", "IBAAKCAQEA3Tz2mr7SZiAMfQyuvBjM9OiJ --next"),
-        "deploy --opt [REDACTED_PEM]\\[REDACTED_HIENT] --next",
+        "deploy --opt [REDACTED_PEM]",
+        "deploy --opt [REDACTED_PEM]",
         [("private-key-pem", "gate", "deploy --opt ----...--\\nMII...iJ --next")],
     ),
     "jwt-three-segment": (
@@ -121,7 +121,7 @@ def test_the_goldens_cover_every_tier_a_format():
 @pytest.mark.parametrize("rule_id", list(GOLDENS))
 def test_every_entry_point_writes_its_golden(rule_id: str):
     """Given a Tier A token inside a command line, When it runs through the hook log redactor, the
-    insight redactor and the scanner, Then each output equals the one recorded before the move."""
+    insight redactor and the scanner, Then each output matches its golden, including the corrected unterminated-PEM result."""
     line = f"deploy --opt {_samples()[rule_id]} --next"
     hook, insight, scan = GOLDENS[rule_id]
     assert redact_secrets(line) == hook

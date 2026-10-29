@@ -12,7 +12,7 @@ from aegis_core.ast.policy import (
 )
 from aegis_core.match import is_test_path, workspace_files
 
-__all__ = ["PYTHON_SECURITY_RULES", "evaluate_security_pack"]
+__all__ = ["evaluate_security_pack"]
 
 _REQ_METHODS = ("request", "get", "post", "put", "delete", "head", "options", "patch")
 _SUB_FUNCS = ("run", "Popen", "call", "check_call", "check_output")

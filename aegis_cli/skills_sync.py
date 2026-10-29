@@ -530,6 +530,14 @@ class SkillsCommand(AegisCommand):
     help = "Copy the packaged skills into your hosts' project skills folders (sync)"
 
     def configure_parser(self, parser: argparse.ArgumentParser, parents: Any = None) -> None:
+        if parents is None:
+            common = argparse.ArgumentParser(add_help=False)
+            common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                                help="Emit machine-readable JSON output")
+            common.add_argument("--plain", action="store_true", default=argparse.SUPPRESS,
+                                help="Strip ANSI styling and emoji")
+            common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
+            parents = [common]
         sub = parser.add_subparsers(dest="skills_action", metavar="ACTION")
         sub.required = True
         p_sync = sub.add_parser(

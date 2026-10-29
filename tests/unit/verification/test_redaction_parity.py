@@ -6,6 +6,7 @@ are assembled at runtime so push protection never sees a literal.
 """
 from __future__ import annotations
 
+import gc
 import json
 from pathlib import Path
 import time
@@ -95,6 +96,73 @@ def test_gate_log_holds_no_secret(tmp_path: Path, case_id, rule_id, sample):
     assert row["decision"] == "ALLOWED"
 
 
+@pytest.mark.parametrize("redactor", list(REDACTORS))
+@pytest.mark.parametrize("tail", ["", "-----END RSA PRIVATE KEY----", "-----END CERTIFICATE-----"],
+                         ids=["missing-end", "truncated-end", "wrong-end"])
+def test_an_unterminated_pem_loses_its_body_and_untrusted_suffix(redactor, tail):
+    """Given a private-key header with no complete end, no later text is safe to log."""
+    text = _tok("deploy --opt -----BEGIN ", "RSA PRIVATE KEY-----\nkeybody01\n", tail, " --next")
+    out = REDACTORS[redactor](text)
+    assert out == "deploy --opt [REDACTED_PEM]"
+    assert REDACTORS[redactor](out) == out
+
+
+PEM_LABEL_PAIRS = [
+    ("RSA PRIVATE KEY", "EC PRIVATE KEY"),
+    ("PRIVATE KEY", "RSA PRIVATE KEY"),
+    ("OPENSSH PRIVATE KEY", "PRIVATE KEY"),
+    ("RSA PRIVATE KEY BLOCK", "RSA PRIVATE KEY"),
+]
+
+
+@pytest.mark.parametrize("redactor", list(REDACTORS))
+@pytest.mark.parametrize("label,wrong_label", PEM_LABEL_PAIRS)
+@pytest.mark.parametrize("closed", [False, True], ids=["no-matching-end", "later-matching-end"])
+def test_a_pem_ends_only_at_its_own_label(redactor, label, wrong_label, closed):
+    text = _tok("deploy -----BEGIN ", label, "-----\nkeybody01\n-----END ", wrong_label,
+                "-----\nremainingkeymaterial")
+    text += f"\n-----END {label}----- --next" if closed else " --next"
+    expected = "deploy [REDACTED_PEM]" + (" --next" if closed else "")
+    out = REDACTORS[redactor](text)
+    assert out == expected
+    assert REDACTORS[redactor](out) == out
+
+
+@pytest.mark.parametrize("label,wrong_label", PEM_LABEL_PAIRS)
+def test_a_gate_log_never_persists_key_material_after_a_mismatched_end(tmp_path, label, wrong_label):
+    (tmp_path / ".aegis").mkdir()
+    command = _tok("deploy -----BEGIN ", label, "-----\nkeybody01\n-----END ", wrong_label,
+                   "-----\nremainingkeymaterial --next")
+    log_gate_event(command, "ALLOWED", "", tmp_path)
+    row, = [json.loads(line) for line in (tmp_path / ".aegis/state/gate_events.jsonl")
+            .read_text(encoding="utf-8").splitlines()]
+    assert row["command"] == "deploy [REDACTED_PEM]"
+    assert row["decision"] == "ALLOWED"
+
+
+@pytest.mark.parametrize("redactor", ["hook", "command"])
+@pytest.mark.parametrize("closed", [False, True], ids=["unterminated", "complete"])
+@pytest.mark.parametrize("body", ["keybody01" * 2500, "-----BEGIN PRIVATE KEY-----\nkeybody01\n" * 100],
+                         ids=["long-body", "repeated-begin"])
+def test_pem_redaction_covers_long_and_repeated_headers(redactor, closed, body):
+    tail = "\n-----END PRIVATE KEY----- --next" if closed else " --next"
+    text = _tok("deploy --opt -----BEGIN ", "PRIVATE KEY-----\n", body, tail)
+    expected = "deploy --opt [REDACTED_PEM]" + (" --next" if closed else "")
+    out = REDACTORS[redactor](text)
+    assert out == expected
+    assert REDACTORS[redactor](out) == out
+
+
+def test_a_gate_log_never_persists_an_unterminated_pem_body(tmp_path):
+    (tmp_path / ".aegis").mkdir()
+    command = _tok("deploy -----BEGIN ", "PRIVATE KEY-----\nkeybody01\n--next")
+    log_gate_event(command, "ALLOWED", "", tmp_path)
+    row, = [json.loads(line) for line in (tmp_path / ".aegis/state/gate_events.jsonl")
+            .read_text(encoding="utf-8").splitlines()]
+    assert row["command"] == "deploy [REDACTED_PEM]"
+    assert row["decision"] == "ALLOWED"
+
+
 KEY_VALUES = {
     "password": (_tok("password", "=hunter2hunter2"), "hunter2hunter2"),
     "export": (_tok("export API_", "TOKEN=abcd1234efgh"), "abcd1234efgh"),
@@ -160,6 +228,7 @@ def _fill(unit: str, n: int) -> str:
 HOSTILE: Dict[str, Callable[[int], str]] = {
     "pem-repeat": lambda n: _fill("-----BEGIN PRIVATE KEY-----", n),
     "pem-unterminated": lambda n: "-----BEGIN PRIVATE KEY-----\n" * 20 + "a" * n,
+    "pem-mismatched-end": lambda n: "-----BEGIN RSA PRIVATE KEY-----\n" + _fill("-----END EC PRIVATE KEY-----\n", n),
     "token-eq": lambda n: _fill("token=", n),
     "url-userinfo": lambda n: _fill("http://a:", n),
     "bearer": lambda n: _fill("Bearer ", n),
@@ -173,9 +242,15 @@ HANG_CEILING_S = 30.0
 def _best_of_3(fn: Callable[[str], str], text: str) -> float:
     best = HANG_CEILING_S
     for _ in range(3):
-        start = time.perf_counter()
-        fn(text)
-        elapsed = time.perf_counter() - start
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            start = time.perf_counter()
+            fn(text)
+            elapsed = time.perf_counter() - start
+        finally:
+            if enabled:
+                gc.enable()
         assert elapsed < HANG_CEILING_S
         best = min(best, elapsed)
     return best
@@ -185,9 +260,9 @@ def _best_of_3(fn: Callable[[str], str], text: str) -> float:
 @pytest.mark.parametrize("redactor", ["hook", "insight"])
 @pytest.mark.parametrize("family", list(HOSTILE))
 def test_redaction_time_is_linear(redactor, family):
-    # A ratio, never an absolute budget; the 20 ms floor keeps timer noise on a linear
-    # pattern from failing it. Quadratic doubles to about 4x.
+    # Eight times the input separates linear scaling from quadratic (about 64x),
+    # while allowing noise up to 24x, as the AST evaluator scaling checks do.
     n = 25_000
     small = _best_of_3(REDACTORS[redactor], HOSTILE[family](n))
-    large = _best_of_3(REDACTORS[redactor], HOSTILE[family](2 * n))
-    assert large <= 3 * max(small, 0.02), (small, large)
+    large = _best_of_3(REDACTORS[redactor], HOSTILE[family](8 * n))
+    assert large <= 24 * max(small, 1e-9), (small, large)

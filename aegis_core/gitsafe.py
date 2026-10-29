@@ -28,25 +28,13 @@ every call here:
   0700 temporary directory and ``checkout-index -a -f --prefix`` below the caller's scratch
   directory (``export_tree``), and ``interpret-trailers --in-place`` (the prepare-commit-msg
   message file, no repository config read: its ``trailer.*`` commands are programs).
-  Callers write more through ``run``: the signed approval ``commit``, the Aegis-Check
-  trailer's ``write-tree``, and ``aegis sync --pr``'s commit, branch and push (SECURITY.md).
+  Callers also use ``run`` for approval commits and ``sync --pr`` (SECURITY.md).
 
-``diff-index`` without ``--cached``, ``ls-files --others`` and ``hash-object --stdin-paths``
-read the working tree, where an fsmonitor or a clean filter would run; they are needed (no
-plumbing lists changed or untracked files otherwise, and only git knows its line-ending
-conversion). The forced ``core.fsmonitor=false`` keeps them inert, every filter driver the
-repository's own config defines is switched off for them (``filter_overrides``; one from the
-user's or the system's config, git-lfs say, runs as in any git command the user types), and
-``diff-index`` does not look inside a dirty submodule, where it would run ``git status`` under
-the submodule's own config.
-
-Blob content read through ``cat-file`` is checked against the object id it was asked
-for, so a replaced or corrupted object is an error rather than silent input.
+Working-tree plumbing disables repository filters and fsmonitor; trusted user/system
+filters still run. Blob reads verify their requested object ids.
 
 The query helpers answer None when git cannot answer. The ref, object, diff and merge
-primitives the team lanes use (``write_blob``, ``update_ref``, ``read_ref``,
-``list_refs``, ``read_object``, ``diff_entries``, ``merge_tree_conflicted``) raise
-GitError instead, so "git could not say" is never mistaken for "nothing there".
+primitives raise GitError instead, so "git could not say" never means "nothing there".
 ``merge-tree`` runs merge drivers and, with ``merge.renormalize``, filters: a merge
 driver the repository's own config defines makes it unavailable, and the repository's
 filter drivers and renormalization are switched off for it.

@@ -476,7 +476,7 @@ def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
-def _pack_envelope(action: str, root: Optional[Path], scope: Dict[str, Any]) -> Dict[str, Any]:
+def _pack_payload(action: str, root: Optional[Path], scope: Dict[str, Any]) -> Dict[str, Any]:
     return primitives.envelope(f"aegis rule {action}", {"workspace": str(root) if root is not None else None, **scope})
 
 
@@ -485,7 +485,7 @@ def _pack_fail(args: argparse.Namespace, action: str, root: Optional[Path], scop
     """A refusal or failure that wrote nothing: an enveloped document with --json, else stderr.
     With problems, the text lists the first ten under ``header``."""
     if getattr(args, "json", False):
-        doc = _pack_envelope(action, root, scope)
+        doc = _pack_payload(action, root, scope)
         doc.update({"status": status, "error": message})
         if problems:
             doc["problems"] = list(problems)
@@ -551,7 +551,7 @@ def _run_export(args: argparse.Namespace) -> int:
         entries.append({"path": entry["path"], "id": parsed.id, "type": parsed.type, "sha256": entry["sha256"]})
     skipped = [{"id": rule_id, "reason": reason} for rule_id, reason in selection.skipped]
     if getattr(args, "json", False):
-        doc = _pack_envelope("export", root, scope)
+        doc = _pack_payload("export", root, scope)
         doc.update({"status": "exported", "out": out, "signed": False, "sha256": pack["sha256"],
                     "rules": entries, "skipped": skipped})
         print(json.dumps(doc, indent=2))
@@ -612,7 +612,7 @@ def _run_import(args: argparse.Namespace) -> int:
     rules = [{"path": r.path, "id": r.id, "type": r.type, "renamed_from": r.renamed_from, "sha256": r.sha256}
              for r in result.rules]
     if getattr(args, "json", False):
-        doc = _pack_envelope("import", root, scope)
+        doc = _pack_payload("import", root, scope)
         doc.update({"status": "dry_run" if result.dry_run else "imported", "signed": False,
                     "pack_sha256": result.pack_sha256, "rules": rules, "warnings": list(result.warnings)})
         print(json.dumps(doc, indent=2))
