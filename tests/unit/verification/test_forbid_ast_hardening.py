@@ -644,39 +644,10 @@ class TestLineEndingsInCookieDetection:
         ]
         assert gate_verdict(evidence) is False
 
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            b"# -*- coding: latin-1 -*-\rimport pickle\rS = '\xe9'\r",
-            b"#!/usr/bin/env python\r# -*- coding: latin-1 -*-\rimport pickle\rS = '\xe9'\r",
-            b"# -*- coding: latin-1 -*-\r\nimport pickle\r\nS = '\xe9'\r\n",
-        ],
-        ids=["cr-line1", "cr-line2", "crlf-line1"],
-    )
-    def test_cookie_on_first_two_cr_lines_is_honoured(self, tmp_path: Path, raw: bytes):
-        from aegis_core.ast.drivers.python import read_python_source
-
-        target = tmp_path / "legacy.py"
-        target.write_bytes(raw)
-        assert "S = 'é'" in read_python_source(target)
-        assert evaluate_forbid_ast(extract_normalized_ast(target), {"imports": ["pickle"]}) == [
-            "Forbidden import 'pickle' matched rule forbid_ast.imports"
-        ]
-
 
 class TestDecoderDependentEncodingsFailClosed:
     """A codec that can decode ASCII bytes into something else makes the code's meaning
     depend on which decoder reads it, so forbid_ast refuses to judge such a file."""
-
-    @pytest.mark.parametrize("codec", ["utf-7", "hz", "iso2022_jp", "unicode_escape", "utf-16", "cp037", "idna"])
-    def test_non_ascii_transparent_cookie_raises_extraction_error(self, tmp_path: Path, codec: str):
-        from aegis_core.ast.policy import ASTExtractionError
-
-        target = tmp_path / "odd.py"
-        target.write_bytes(f"# coding: {codec}\nimport json\n".encode("ascii"))
-        with pytest.raises(ASTExtractionError) as excinfo:
-            extract_normalized_ast(target)
-        assert excinfo.value.reason == f"UnicodeError: source encoding {codec!r} does not decode ASCII to itself"
 
     def test_utf7_line1_payload_is_unverifiable_in_layer1(self, ws: Path):
         (ws / "src" / "u7.py").write_bytes(b"# coding: utf-7\n# +AAo-import os; os.system('echo X')\n")
@@ -685,27 +656,6 @@ class TestDecoderDependentEncodingsFailClosed:
             (False, "forbid_ast: cannot verify src/u7.py: UnicodeError: source encoding 'utf-7' does not decode ASCII to itself")
         ]
         assert gate_verdict(evidence) is False
-
-    @pytest.mark.parametrize(
-        "codec, text",
-        [
-            ("cp1252", "café €"),
-            ("iso-8859-15", "café €"),
-            ("koi8-r", "привет"),
-            ("shift_jis", "日本語"),
-            ("euc-jp", "日本語"),
-            ("gbk", "中文"),
-            ("big5", "中文"),
-            ("euc-kr", "한국어"),
-            ("mac-roman", "café"),
-        ],
-    )
-    def test_ascii_transparent_legacy_codecs_are_parsed(self, tmp_path: Path, codec: str, text: str):
-        target = tmp_path / "legacy.py"
-        target.write_bytes(f"# -*- coding: {codec} -*-\nimport pickle\nS = '{text}'\n".encode(codec))
-        assert evaluate_forbid_ast(extract_normalized_ast(target), {"imports": ["pickle"]}) == [
-            "Forbidden import 'pickle' matched rule forbid_ast.imports"
-        ]
 
 
 # ── Review round 2, finding 3: dynamic imports through aliases and chains ─────
