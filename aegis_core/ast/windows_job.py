@@ -9,8 +9,9 @@ and https://learn.microsoft.com/en-us/windows/win32/toolhelp/traversing-the-thre
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import ctypes
+import time
 
 
 CREATE_SUSPENDED = 0x00000004
@@ -18,6 +19,10 @@ _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x100000
+_JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+_MAX_JOB_PROCESSES = 65536
 _THREAD_SUSPEND_RESUME = 0x0002
 _THREAD_QUERY_LIMITED_INFORMATION = 0x0800
 _TH32CS_SNAPTHREAD = 0x00000004
@@ -27,6 +32,13 @@ _DWORD = ctypes.c_uint32
 _BOOL = ctypes.c_int32
 _HANDLE = ctypes.c_void_p
 _SIZE_T = ctypes.c_size_t
+
+
+def _remaining_milliseconds(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise OSError('timed out waiting for Windows job termination')
+    return int(remaining * 1000)
 
 
 class JobBasicLimitInformation(ctypes.Structure):
@@ -53,6 +65,14 @@ class JobExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+class JobBasicAccountingInformation(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int64) for name in (
+        'TotalUserTime', 'TotalKernelTime', 'ThisPeriodTotalUserTime', 'ThisPeriodTotalKernelTime',
+    )] + [(name, _DWORD) for name in (
+        'TotalPageFaultCount', 'TotalProcesses', 'ActiveProcesses', 'TotalTerminatedProcesses',
+    )]
+
+
 class ThreadEntry32(ctypes.Structure):
     _fields_ = [
         ('dwSize', _DWORD), ('cntUsage', _DWORD), ('th32ThreadID', _DWORD),
@@ -67,6 +87,11 @@ def _load_kernel32():
         'CreateJobObjectW': (_HANDLE, [ctypes.c_void_p, ctypes.c_wchar_p]),
         'SetInformationJobObject': (_BOOL, [_HANDLE, ctypes.c_int, ctypes.c_void_p, _DWORD]),
         'AssignProcessToJobObject': (_BOOL, [_HANDLE, _HANDLE]),
+        'TerminateJobObject': (_BOOL, [_HANDLE, _DWORD]),
+        'QueryInformationJobObject': (_BOOL, [_HANDLE, ctypes.c_int, ctypes.c_void_p, _DWORD,
+                                             ctypes.POINTER(_DWORD)]),
+        'IsProcessInJob': (_BOOL, [_HANDLE, _HANDLE, ctypes.POINTER(_BOOL)]),
+        'WaitForSingleObject': (_DWORD, [_HANDLE, _DWORD]),
         'OpenProcess': (_HANDLE, [_DWORD, _BOOL, _DWORD]),
         'CreateToolhelp32Snapshot': (_HANDLE, [_DWORD, _DWORD]),
         'Thread32First': (_BOOL, [_HANDLE, ctypes.POINTER(ThreadEntry32)]),
@@ -88,6 +113,8 @@ class WindowsJob:
 
     def __init__(self):
         self._kernel = _load_kernel32()
+        self._assigned = False
+        self._root_pid = None
         self._handle = self._kernel.CreateJobObjectW(None, None)
         if not self._handle:
             raise self._error('CreateJobObjectW')
@@ -155,6 +182,8 @@ class WindowsJob:
         with self._owned(process):
             if not self._kernel.AssignProcessToJobObject(self._handle, process):
                 raise self._error('AssignProcessToJobObject')
+            self._assigned = True
+            self._root_pid = pid
             tid = self._primary_thread(pid)
             thread = self._kernel.OpenThread(
                 _THREAD_SUSPEND_RESUME | _THREAD_QUERY_LIMITED_INFORMATION, False, tid)
@@ -171,6 +200,94 @@ class WindowsJob:
                     raise self._error('ResumeThread')
                 if previous != 1:
                     raise OSError(f'ResumeThread expected suspend count 1, got {previous}')
+
+    def _process_ids(self, deadline):
+        capacity = 64
+        while capacity <= _MAX_JOB_PROCESSES:
+            _remaining_milliseconds(deadline)
+
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [('assigned', _DWORD), ('count', _DWORD), ('pids', _SIZE_T * capacity)]
+
+            info = ProcessIds()
+            if self._kernel.QueryInformationJobObject(
+                    self._handle, _JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                    ctypes.byref(info), ctypes.sizeof(info), None):
+                if info.count > capacity or info.assigned != info.count:
+                    raise OSError('invalid Windows job process list')
+                return list(info.pids[:info.count])
+            if self._kernel.GetLastError() != 234:  # ERROR_MORE_DATA
+                raise self._error('QueryInformationJobObject')
+            capacity = max(capacity * 2, info.assigned)
+        raise OSError('Windows job process list exceeds 65536 members')
+
+    def _check_process_census(self, observed, deadline):
+        _remaining_milliseconds(deadline)
+        info = JobBasicAccountingInformation()
+        if not self._kernel.QueryInformationJobObject(
+                self._handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+            raise self._error('QueryInformationJobObject(accounting)')
+        _remaining_milliseconds(deadline)
+        if info.TotalProcesses != len(observed):
+            raise OSError('cannot verify complete Windows descendant termination: '
+                          f'job admitted {info.TotalProcesses} processes; observed {len(observed)} identities')
+
+    def terminate_and_wait(self) -> None:
+        """Wait for process exits, rather than asynchronous kill-on-close.
+
+        Retain validated member handles before termination can remove their
+        PIDs from the job list. A lifetime admission count detects descendants
+        missing from that snapshot, including prior children: those sessions
+        fail closed because complete descendant termination cannot be proven.
+        The caller retains and reaps the known root through its Popen handle.
+        A handle no longer in the job must already be signaled; an alive process
+        outside the job is ambiguous and receives no timed wait.
+
+        https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject
+        https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
+        https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information
+        """
+        if self._handle is None or not self._assigned:
+            return
+        deadline = time.monotonic() + 3.0
+        pids = self._process_ids(deadline)
+        observed = set(pids) | {self._root_pid}
+        with ExitStack() as owners:
+            processes = []
+            for pid in pids:
+                _remaining_milliseconds(deadline)
+                process = self._kernel.OpenProcess(
+                    _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if not process:
+                    if self._kernel.GetLastError() == 87:  # ERROR_INVALID_PARAMETER: process gone
+                        continue
+                    raise self._error('OpenProcess(member)')
+                owners.enter_context(self._owned(process))
+                member = _BOOL()
+                if not self._kernel.IsProcessInJob(process, self._handle, ctypes.byref(member)):
+                    raise self._error('IsProcessInJob')
+                if member.value:
+                    processes.append(process)
+                else:
+                    result = self._kernel.WaitForSingleObject(process, 0)
+                    if result == 0xFFFFFFFF:
+                        raise self._error('WaitForSingleObject')
+                    if result != 0:
+                        raise OSError('cannot verify complete Windows descendant termination: '
+                                      'former member is not signaled')
+            if not self._kernel.TerminateJobObject(self._handle, 1):
+                raise self._error('TerminateJobObject')
+            self._check_process_census(observed, deadline)
+            for process in processes:
+                milliseconds = _remaining_milliseconds(deadline)
+                result = self._kernel.WaitForSingleObject(process, milliseconds)
+                if result == 0xFFFFFFFF:
+                    raise self._error('WaitForSingleObject')
+                if result == 258:  # WAIT_TIMEOUT
+                    raise OSError('timed out waiting for Windows job termination')
+                if result != 0:
+                    raise OSError(f'WaitForSingleObject returned unexpected result {result}')
+            self._check_process_census(observed, deadline)
 
     def close(self) -> None:
         if self._handle is not None:

@@ -15,6 +15,11 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 - Wave pull requests retain base-sourced governance checks while full audit, build, test and regression validation runs on develop pushes and downstream stages.
 
+### Fixed
+
+- Windows AST driver cleanup retains process handles before termination, waits before removing its temporary directory, and reports descendants it cannot account for.
+- Distribution checks reject original ZIP member names changed by separator normalization or NUL truncation.
+
 ## [4.4.0] - 2026-10-29
 
 ### Security

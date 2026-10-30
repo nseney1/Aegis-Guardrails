@@ -55,11 +55,17 @@ def check_metadata(data):
 def check_wheel(path):
     try:
         with zipfile.ZipFile(path) as wheel:
-            names = wheel.namelist()
+            members = wheel.infolist()
+            names = [member.orig_filename for member in members]
             if len(names) != len(set(names)):
                 fail("duplicate wheel member")
             templates, metadata, info_roots = set(), [], set()
-            for name in names:
+            for member in members:
+                name = member.orig_filename
+                # ZipInfo normalizes Windows separators and truncates NUL.
+                # Validate the archive spelling before applying the allowlist.
+                if name != member.filename:
+                    fail("forbidden wheel member: " + repr(name))
                 parts = PurePosixPath(name).parts
                 if (not parts or "\\" in name or name.startswith("/") or
                         any(p in ("", ".", "..") for p in name.split("/")) or
@@ -75,7 +81,7 @@ def check_wheel(path):
                     if "/".join(parts[1:]) not in DIST_INFO:
                         fail("unexpected wheel member: " + name)
                     if parts[1:] == ("METADATA",):
-                        metadata.append(wheel.read(name))
+                        metadata.append(wheel.read(member))
                 elif name in ASSETS:
                     continue
                 elif (parts[0] not in PACKAGES or "_data" in parts or

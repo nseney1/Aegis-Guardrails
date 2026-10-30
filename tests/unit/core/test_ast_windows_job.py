@@ -109,6 +109,243 @@ class KernelBoundary:
     def GetLastError(self):
         return self.error
 
+    def TerminateJobObject(self, job, code):
+        assert (job, code) == (101, 1)
+        return True
+
+    def QueryInformationJobObject(self, job, kind, pointer, size, returned):
+        assert job == 101 and kind in (1, 3)
+        if kind == 1:
+            # Four LARGE_INTEGER times, then page faults, lifetime process count.
+            ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32))[9] = 1
+        return True  # startup failures have no un-reaped descendant in this boundary
+
+
+class ShutdownKernel(KernelBoundary):
+    """Terminating a job requests exit; only process waits witness completion."""
+
+    def __init__(self, failure=None, members=(731, 732)):
+        super().__init__(failure)
+        self.members = members
+        self.waits = []
+        self.total_processes = len(set(members) | {731})
+        self.clear_on_termination = False
+
+    def TerminateJobObject(self, job, code):
+        assert (job, code) == (101, 1)
+        self.events.append('terminate requested')
+        if self.clear_on_termination:
+            self.members = ()
+        if self.failure == 'late_member':
+            self.total_processes += 1
+        return self.failure != 'TerminateJobObject'
+
+    def QueryInformationJobObject(self, job, kind, pointer, size, returned):
+        assert job == 101 and kind in (1, 3)
+        if kind == 1:
+            self.events.append('lifetime queried')
+            if self.failure == 'QueryAccounting':
+                self.error = 5
+                return False
+            ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32))[9] = self.total_processes
+            return True
+        self.events.append('members queried')
+        if self.failure == 'QueryInformationJobObject':
+            self.error = 5
+            return False
+        header = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32 * 2)).contents
+        capacity = (size - 8) // ctypes.sizeof(ctypes.c_size_t)
+        header[0] = 65537 if self.failure == 'too_many_members' else len(self.members)
+        header[1] = min(capacity, len(self.members))
+        pids = (ctypes.c_size_t * capacity).from_address(ctypes.addressof(header) + 8)
+        for index, pid in enumerate(self.members[:capacity]):
+            pids[index] = pid
+        if self.failure == 'truncated_members':
+            header[1] = capacity + 1
+            return True
+        self.error = 234
+        return capacity >= header[0]
+
+    def OpenProcess(self, rights, inherit, pid):
+        if rights == 0x101:
+            return super().OpenProcess(rights, inherit, pid)
+        assert (rights, inherit) == (0x101000, False)
+        self.events.append(('member opened', pid))
+        if self.failure in ('OpenProcess(member)', 'member_gone'):
+            self.error = 87 if self.failure == 'member_gone' else 5
+            return 0
+        handle = pid + 1000
+        self.handles.add(handle)
+        return handle
+
+    def IsProcessInJob(self, process, job, pointer):
+        assert job == 101 and process in self.handles
+        self.events.append(('member checked', process))
+        outside = self.failure in ('member_reused', 'member_retired', 'member_status_failed')
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int32)).contents.value = not outside
+        return self.failure != 'IsProcessInJob'
+
+    def WaitForSingleObject(self, process, milliseconds):
+        assert process in self.handles and 0 <= milliseconds <= 3000
+        self.waits.append((process, milliseconds))
+        if self.failure in ('wait_failed', 'member_status_failed'):
+            return 0xFFFFFFFF
+        return 258 if self.failure in ('wait_timeout', 'member_reused') else 0
+
+
+def _shutdown_job(monkeypatch, failure=None, members=(731, 732)):
+    from aegis_core.ast import windows_job
+
+    kernel = ShutdownKernel(failure, members)
+    monkeypatch.setattr(windows_job, '_load_kernel32', lambda: kernel)
+    job = windows_job.WindowsJob()
+    job.assign_and_resume(731)
+    return job, kernel
+
+
+def test_shutdown_waits_for_every_member_before_releasing_job(monkeypatch):
+    job, kernel = _shutdown_job(monkeypatch, members=tuple(range(731, 861)))
+    try:
+        job.terminate_and_wait()
+        assert [handle - 1000 for handle, _ in kernel.waits] == list(range(731, 861))
+        assert kernel.events.index('members queried') < kernel.events.index('terminate requested')
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+    assert not kernel.handles
+
+
+def test_pretermination_handles_survive_members_disappearing_from_the_job_list(monkeypatch):
+    job, kernel = _shutdown_job(monkeypatch)
+    kernel.clear_on_termination = True
+    try:
+        job.terminate_and_wait()
+        assert [handle - 1000 for handle, _ in kernel.waits] == [731, 732]
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
+@pytest.mark.parametrize('late', [False, True])
+def test_unobserved_historical_or_late_descendant_cannot_pass_shutdown(monkeypatch, late):
+    job, kernel = _shutdown_job(monkeypatch, 'late_member' if late else None, members=())
+    if not late:
+        kernel.total_processes = 2  # a prior child vanished before handle collection
+    try:
+        with pytest.raises(OSError, match='cannot verify complete Windows descendant termination'):
+            job.terminate_and_wait()
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
+def test_lifetime_accounting_is_checked_again_after_member_waits(monkeypatch):
+    job, kernel = _shutdown_job(monkeypatch)
+    original = kernel.WaitForSingleObject
+
+    def wait(handle, milliseconds):
+        result = original(handle, milliseconds)
+        kernel.total_processes += 1
+        return result
+
+    monkeypatch.setattr(kernel, 'WaitForSingleObject', wait)
+    try:
+        with pytest.raises(OSError, match='cannot verify complete Windows descendant termination'):
+            job.terminate_and_wait()
+        assert len(kernel.waits) == 2
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
+def test_shutdown_waits_share_one_deadline(monkeypatch):
+    from aegis_core.ast import windows_job
+
+    job, kernel = _shutdown_job(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(windows_job, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    original = kernel.WaitForSingleObject
+
+    def wait(handle, milliseconds):
+        result = original(handle, milliseconds)
+        clock[0] += 0.5
+        return result
+
+    monkeypatch.setattr(kernel, 'WaitForSingleObject', wait)
+    try:
+        job.terminate_and_wait()
+        assert [milliseconds for _, milliseconds in kernel.waits] == [3000, 2500]
+    finally:
+        job.close()
+
+
+def test_shutdown_deadline_also_bounds_already_signaled_members(monkeypatch):
+    from aegis_core.ast import windows_job
+
+    job, kernel = _shutdown_job(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(windows_job, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    original = kernel.WaitForSingleObject
+
+    def wait(handle, milliseconds):
+        result = original(handle, milliseconds)
+        clock[0] += 3.0
+        return result
+
+    monkeypatch.setattr(kernel, 'WaitForSingleObject', wait)
+    try:
+        with pytest.raises(OSError, match='timed out.*termination'):
+            job.terminate_and_wait()
+        assert len(kernel.waits) == 1
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
+@pytest.mark.parametrize('failure,reason', [
+    ('TerminateJobObject', 'TerminateJobObject failed'),
+    ('QueryInformationJobObject', 'QueryInformationJobObject failed'),
+    ('QueryAccounting', 'QueryInformationJobObject.*failed'),
+    ('OpenProcess(member)', 'OpenProcess.*failed'),
+    ('IsProcessInJob', 'IsProcessInJob failed'),
+    ('wait_failed', 'WaitForSingleObject failed'),
+    ('member_status_failed', 'WaitForSingleObject failed'),
+    ('wait_timeout', 'timed out.*termination'),
+    ('too_many_members', 'process list exceeds'),
+    ('truncated_members', 'invalid.*process list'),
+])
+def test_shutdown_os_failures_remain_visible_and_release_transient_handles(monkeypatch, failure, reason):
+    job, kernel = _shutdown_job(monkeypatch, failure)
+    try:
+        with pytest.raises(OSError, match=reason):
+            job.terminate_and_wait()
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+    assert not kernel.handles
+
+
+@pytest.mark.parametrize('failure', ['member_gone', 'member_retired'])
+def test_shutdown_accepts_only_provably_gone_or_signaled_former_members(monkeypatch, failure):
+    job, kernel = _shutdown_job(monkeypatch, failure)
+    try:
+        job.terminate_and_wait()
+        assert all(milliseconds == 0 for _, milliseconds in kernel.waits)
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
+def test_unowned_nonsignaled_process_cannot_pass_shutdown_or_receive_a_timed_wait(monkeypatch):
+    job, kernel = _shutdown_job(monkeypatch, 'member_reused')
+    try:
+        with pytest.raises(OSError, match='cannot verify complete Windows descendant termination'):
+            job.terminate_and_wait()
+        assert len(kernel.waits) == 1 and kernel.waits[0][1] == 0
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
 
 def _kernel(monkeypatch, failure=None):
     from aegis_core.ast import windows_job

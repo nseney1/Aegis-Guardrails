@@ -152,11 +152,14 @@ def test_group_termination_failure_still_reaps_and_cleans_scratch(tmp_path, monk
     scratch = Path(tree.metadata['cwd'])
     if os.name == 'nt':
         kernel = driver._windows_job._kernel
+        job_handle = driver._windows_job._handle
         close_handle = kernel.CloseHandle
         closed = False
 
         def failed_close(handle):
             nonlocal closed
+            if handle != job_handle:
+                return close_handle(handle)
             if not closed:
                 assert close_handle(handle)
                 closed = True
@@ -194,15 +197,24 @@ def test_closing_a_session_terminates_its_process_group(tmp_path):
         pytest.fail('driver process survived close')
 
 
-def test_windows_close_retains_tree_ownership_after_driver_root_exits(tmp_path, monkeypatch):
+@pytest.mark.parametrize('termination_fails', [False, True])
+def test_windows_close_retains_tree_ownership_after_driver_root_exits(tmp_path, monkeypatch, termination_fails):
     """The Windows process boundary has already exited when public close runs."""
     import io
     from types import ModuleType, SimpleNamespace
     from aegis_core.ast import batch
 
     events = []
+    scratch = []
+
+    def terminate():
+        events.append('tree stopped')
+        if termination_fails:
+            raise OSError('job termination failed')
+
     job = SimpleNamespace(
         assign_and_resume=lambda pid: events.append(('assigned', pid)),
+        terminate_and_wait=terminate,
         close=lambda: events.append('job closed'),
     )
     module = ModuleType('aegis_core.ast.windows_job')
@@ -227,13 +239,22 @@ def test_windows_close_retains_tree_ownership_after_driver_root_exits(tmp_path, 
 
     def spawn(*args, **kwargs):
         events.append(('spawn', kwargs.get('creationflags', 0)))
+        scratch.append(Path(kwargs['cwd']))
         return proc
 
     monkeypatch.setattr(batch.subprocess, 'Popen', spawn)
-    with batch.BatchDriver((sys.executable,), label='fixture') as driver:
-        assert driver.parse(path).file_path == str(path)
+    driver = batch.BatchDriver((sys.executable,), label='fixture')
+    assert driver.parse(path).file_path == str(path)
+    if termination_fails:
+        from aegis_core.ast.driver_errors import ASTDriverError
+
+        with pytest.raises(ASTDriverError, match='cleanup failed:.*job termination failed'):
+            driver.close()
+    else:
+        driver.close()
     assert 'job closed' in events, 'exited root left its descendant tree unowned'
-    assert events == ['job created', ('spawn', 516), ('assigned', 731), 'job closed']
+    assert events == ['job created', ('spawn', 516), ('assigned', 731), 'tree stopped', 'job closed']
+    assert all(not path.exists() for path in scratch)
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='native Windows job ownership')
@@ -265,8 +286,9 @@ def test_windows_job_terminates_descendant_after_root_exit(tmp_path, mode):
                 driver.close()
         else:
             driver.close()
-        assert kernel.WaitForSingleObject(root_handle, 2000) == 0
-        assert kernel.WaitForSingleObject(child_handle, 2000) == 0
+        assert not Path(tree.metadata['cwd']).exists()
+        assert kernel.WaitForSingleObject(root_handle, 0) == 0
+        assert kernel.WaitForSingleObject(child_handle, 0) == 0
     finally:
         try:
             driver.close()

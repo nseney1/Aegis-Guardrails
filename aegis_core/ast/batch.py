@@ -171,6 +171,7 @@ class BatchDriver:
 
     def _terminate_group(self, proc: subprocess.Popen) -> None:
         if self._windows_job is not None:
+            self._windows_job.terminate_and_wait()
             self._windows_job.close()
             self._windows_job = None
         elif os.name != 'nt':
