@@ -669,6 +669,7 @@ class Extractor:
 
     def collect_calls(self, scopes):
         called_new, ordinary, constructors = set(), [], []
+        has_new = bool(self.new_indices)
         for index in self.call_indices:
             token = self.tokens[index]
             caller = scopes[index] if scopes is not None else None
@@ -690,7 +691,8 @@ class Extractor:
                 new = self.constructor_site(index, index, called_new) if before in ('new', '(') else None
                 if new is not None:
                     called_new.add(new)
-                ordinary.append((index, CallSiteNode(target, token.line, caller, args, kind='new' if new is not None else None)))
+                node = CallSiteNode(target, token.line, caller, args, kind='new' if new is not None else None)
+                ordinary.append((index, node) if has_new else node)
             elif token.kind == 'punct' and token.value == '(' and index not in self.definition_opens and token.role not in ('control', 'parameters_decl', 'parameters_expr', 'parameters_method'):
                 if self.arrow_parameters(index):
                     continue
@@ -700,11 +702,13 @@ class Extractor:
                 new = self.constructor_site(start, index, called_new)
                 if new is not None:
                     called_new.add(new)
-                ordinary.append((index, CallSiteNode(target, self.tokens[start].line, caller, self.arguments(index), kind='new' if new is not None else None)))
+                node = CallSiteNode(target, self.tokens[start].line, caller, self.arguments(index), kind='new' if new is not None else None)
+                ordinary.append((index, node) if has_new else node)
             elif token.kind == 'template_start':
                 target, start = self.target(index - 1)
                 if target and target not in _NOT_CALL:
-                    ordinary.append((index, CallSiteNode(target, self.tokens[start].line, caller, {'#0': UNKNOWN, '*': UNKNOWN})))
+                    node = CallSiteNode(target, self.tokens[start].line, caller, {'#0': UNKNOWN, '*': UNKNOWN})
+                    ordinary.append((index, node) if has_new else node)
         for index in self.new_indices:
             token = self.tokens[index]
             if index in called_new:
@@ -725,7 +729,7 @@ class Extractor:
                     break
             target, _ = self.target(end) if self.value(end) != 'new' else ('<computed>', end)
             constructors.append((index, CallSiteNode(target, token.line, scopes[index] if scopes is not None else None, {}, kind='new')))
-        self.calls = [node for _, node in heapq.merge(ordinary, constructors)]
+        self.calls = [node for _, node in heapq.merge(ordinary, constructors)] if has_new else ordinary
 
     def mutation_operand(self, index, *, left):
         if not 0 <= index < len(self.tokens):

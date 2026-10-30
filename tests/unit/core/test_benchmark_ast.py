@@ -90,6 +90,46 @@ def test_python_source_timings_use_real_extraction_and_exclude_io():
         assert row["witness"]["calls"] > row["witness"]["definitions"]
 
 
+@pytest.mark.parametrize("language", ["typescript", "javascript", "rust"])
+def test_native_source_timings_use_real_extraction_and_matching_corpus(language):
+    from aegis_core import benchmark_ast
+
+    clock = Ticks()
+    result = benchmark_ast.measure(language, 2, clock=clock, summarize=benchmark.summarize)
+    assert result["language"] == language and result["implementation"] == ("aegis-native-rust" if language == "rust" else "aegis-native-js")
+    assert result["corpus_sha256"] == AST_SHA256 and result["acceptance"] == "not evaluated"
+    assert "I/O excluded" in result["mode"]
+    assert clock.calls == 20
+    assert [row["lines"] for row in result["cases"]] == SIZES
+    for row in result["cases"]:
+        assert row["latency_ms"] == {"p50": 2.0, "p95": 2.0, "min": 2.0, "max": 2.0}
+        assert row["witness"]["imports"] > 0
+        assert row["witness"]["calls"] > row["witness"]["definitions"] > 0
+
+
+@pytest.mark.parametrize("language", ["typescript", "javascript"])
+def test_invalid_native_js_with_valid_corpus_digest_is_a_benchmark_error(tmp_path, monkeypatch, language):
+    from aegis_core import benchmark_ast
+
+    data = json.loads(MANIFEST.read_text())
+    # The native extractor is token-level: only lexical errors fail closed (spec 5.3.1, AC-5).
+    old, malformed = "function transform_", "/* function transform_"
+    data["languages"][language]["block"] = data["languages"][language]["block"].replace(old, malformed)
+    cases = [{key: case[key] for key in ("language", "lines", "path", "source")}
+             for case in benchmark_ast.load_corpus()["cases"]]
+    for case in cases:
+        if case["language"] == language:
+            case["source"] = case["source"].replace(old, malformed)
+    data["sha256"] = hashlib.sha256(json.dumps(cases, sort_keys=True, separators=(",", ":"),
+                                              ensure_ascii=True).encode("ascii")).hexdigest()
+    resource = tmp_path / "benchmark_corpus"
+    resource.mkdir()
+    (resource / "ast.json").write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(importlib.resources, "files", lambda package: tmp_path)
+    with pytest.raises(benchmark_ast.ASTBenchmarkError, match="AST benchmark parsing failed"):
+        benchmark_ast.measure(language, 1, clock=Ticks(), summarize=benchmark.summarize)
+
+
 def test_invalid_python_with_a_valid_digest_is_a_clear_benchmark_error(tmp_path, monkeypatch):
     from aegis_core import benchmark_ast
 
@@ -121,6 +161,14 @@ def test_empty_or_wrong_extraction_cannot_supply_a_witness(ast):
         benchmark_ast.check_witness(ast)
 
 
+@pytest.mark.parametrize("language", ["typescript", "javascript"])
+def test_empty_native_js_extraction_cannot_supply_a_witness(language):
+    from aegis_core import benchmark_ast
+
+    with pytest.raises(benchmark_ast.ASTBenchmarkError, match=language + " extraction witness failed"):
+        benchmark_ast.check_witness(NormalizedAST(language=language), language)
+
+
 def test_cli_selection_is_reported_and_recorded_without_changing_layer1(tmp_path, capsys):
     (tmp_path / ".aegis").mkdir()
     rc = main(["benchmark", "--workspace", str(tmp_path), "--runs", "1", "--ast-language", "python", "--json"])
@@ -135,7 +183,7 @@ def test_cli_selection_is_reported_and_recorded_without_changing_layer1(tmp_path
     assert row["detail"]["ast"] == doc["ast"]
 
 
-@pytest.mark.parametrize("language", ["typescript", "javascript", "go", "rust"])
+@pytest.mark.parametrize("language", ["go"])
 def test_unavailable_cli_selection_is_an_error_and_writes_no_event(tmp_path, capsys, language):
     (tmp_path / ".aegis").mkdir()
     rc = main(["benchmark", "--workspace", str(tmp_path), "--ast-language", language, "--json"])
@@ -143,6 +191,19 @@ def test_unavailable_cli_selection_is_an_error_and_writes_no_event(tmp_path, cap
     assert rc == 1 and doc["status"] == "error"
     assert doc["error"] == language + " native parser implementation unavailable"
     assert events.read(tmp_path).rows == []
+
+
+@pytest.mark.parametrize("language", ["typescript", "javascript", "rust"])
+def test_native_js_cli_selection_records_extraction_without_claiming_acceptance(tmp_path, capsys, language):
+    (tmp_path / ".aegis").mkdir()
+    rc = main(["benchmark", "--workspace", str(tmp_path), "--runs", "1", "--ast-language", language, "--json"])
+    output = capsys.readouterr()
+    assert rc == 0 and output.err == ""
+    doc = json.loads(output.out)
+    assert doc["ast"]["language"] == language and doc["ast"]["acceptance"] == "not evaluated"
+    assert doc["ast"]["corpus_sha256"] == AST_SHA256
+    row, = events.read(tmp_path, "benchmark").rows
+    assert row["detail"]["ast"] == doc["ast"]
 
 
 def test_default_run_never_imports_the_ast_benchmark_helper(tmp_path):

@@ -587,6 +587,19 @@ def test_repeated_flat_calls_keep_independent_argument_dictionaries():
 
 
 @pytest.mark.parametrize('source,expected', [
+    ('first(true); second(false);', [('first', None), ('second', None)]),
+    ('head(); obj.new\nnext(); tail();', [('head', None), ('next', None), ('tail', None)]),
+    ('head(); obj. /* boundary */ new\nnext(); tail();', [('head', None), ('next', 'new'), ('tail', None)]),
+    ('head(); new Worker(value); tail();', [('head', None), ('Worker', 'new'), ('tail', None)]),
+    ('head(); new Worker; factory(value)(other); tail();', [('head', None), ('Worker', 'new'), ('factory', None), ('<computed>', None), ('tail', None)]),
+    ('head(); tag`plain ${nested()}`; tail();', [('head', None), ('tag', None), ('nested', None), ('tail', None)]),
+])
+def test_ordered_call_facts_preserve_constructor_and_property_new_contexts(source, expected):
+    tree = parse(source)
+    assert [(site.target, site.kind) for site in tree.call_sites] == expected
+
+
+@pytest.mark.parametrize('source,expected', [
     ('new (factory(value));', [('<computed>', 'new'), ('factory', None)]),
     ('new (Worker);', [('Worker', 'new')]),
     ('new obj[key];', [('.<computed>', 'new')]),

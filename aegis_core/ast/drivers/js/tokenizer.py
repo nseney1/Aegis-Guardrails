@@ -39,11 +39,12 @@ _SYNTAX_WORDS = _NON_LABEL | _TYPE_DECLARATIONS | {'break', 'continue', 'async',
 _LINE_END = re.compile(r'[\r\n\u2028\u2029]')
 _STRING_MARKS = {'"': re.compile(r'["\\\r\n\u2028\u2029]'), "'": re.compile(r"['\\\r\n\u2028\u2029]")}
 _TEMPLATE_MARKS = re.compile(r'\\[\s\S]?|`|\$\{')
+_TEMPLATE_CHUNK_EDGE = re.compile(r'\\|`|\$\{|[\r\n\u2028\u2029]')
 _SIMPLE = r'[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*'
 # Each blank run is optional at exactly one position, so a failed match backtracks in linear time.
 _FLAT_ARGUMENTS = r'[ \t]*(?:' + _SIMPLE + r'(?:[ \t]*,[ \t]*' + _SIMPLE + r')*[ \t]*)?'
 _DECLARATION = r'(?P<decl_word>const|let|var)[ \t]+(?P<decl_name>' + _IDENT.pattern + r')[ \t]*=(?!=|>)'
-_COMPACT_CODE = re.compile(_WHITESPACE_PREFIX + r'(?P<declaration>' + _DECLARATION + r')|(?P<reference>' + _SIMPLE + r')(?P<call>\((?P<arguments>' + _FLAT_ARGUMENTS + r')\))?|' + _CODE_TAIL + _WHITESPACE_FALLBACK)
+_COMPACT_CODE = re.compile(_WHITESPACE_PREFIX + r'(?P<declaration>' + _DECLARATION + r')|(?P<reference>' + _SIMPLE + r')(?P<call>\((?P<arguments>' + _FLAT_ARGUMENTS + r')\))?(?P<delimiter>[ \t]*[;,])?|' + _CODE_TAIL + _WHITESPACE_FALLBACK)
 _GROUP = re.compile(r'(?P<opens>\({3,})(?P<body>' + _SIMPLE + r'(?:\(' + _FLAT_ARGUMENTS + r'\))?)(?P<closes>\){3,})')
 _PAREN_RUN = re.compile(r'\(+')
 _PLAIN_QUOTED = r'''(?:"[^"\\\r\n\u2028\u2029]*"|'[^'\\\r\n\u2028\u2029]*')'''
@@ -149,8 +150,12 @@ class Lexer:
         scanner = (_COMPACT_CODE if self.compact else _CODE).scanner(source, self.i)
         size = len(source)
         while match := scanner.match():
-            match_end = match.end()
+            match_end = scan_end = match.end()
             begin, end, kind = self.i, match_end, match.lastgroup
+            delimiter = kind == 'delimiter'
+            if delimiter:
+                kind = 'call' if match['call'] else 'reference'
+                end = match_end = match.end(kind)
             prefix = match['prefix']
             if prefix:
                 if '\n' in prefix or '\r' in prefix:
@@ -176,6 +181,8 @@ class Lexer:
                 if syntax_word:
                     value, end, dotted = head, begin + len(head), False
                 elif kind == 'call' and self.compact_call(value, match['arguments'], match_end):
+                    if delimiter and not self.fast_operator(match['delimiter'][-1], scan_end - 1, scan_end):
+                        return
                     continue
                 self.i = end
                 role = 'reference' if dotted else (self.identifier_role() if syntax_word else '')
@@ -187,6 +194,9 @@ class Lexer:
                     self.declaration_prefix, self.previous = False, value.rsplit('.', 1)[-1] if dotted else value
                 if end != match_end:
                     return
+                if delimiter:
+                    if syntax_word or not self.fast_operator(match['delimiter'][-1], scan_end - 1, scan_end):
+                        return
             elif kind == 'space':
                 if '\n' in value or '\r' in value:
                     self.line += value.count('\n') + value.count('\r') - value.count('\r\n')
@@ -233,6 +243,19 @@ class Lexer:
                     return
         if self.i < size:
             self.code_boundary()
+
+    def fast_operator(self, value, begin, end):
+        """Share the ordinary punctuation transition with co-scanned delimiters."""
+        if value not in _FAST_OPERATORS or self.body is not None or self.class_fields:
+            return False
+        self.tokens.append(_TOKEN_NEW(Token, ('punct', value, self.line, begin, end, '', None)))
+        self.i, self.previous = end, value
+        self.expr, self.statement = value not in ('.', '?.'), value == ';'
+        if value == ';':
+            self.declaration_prefix, self.module_clause = False, None
+        if self.arrow_markers or self.module_clause:
+            self.after_operator(value)
+        return True
 
     def code_boundary(self):
         source, i = self.source, self.i
@@ -668,13 +691,21 @@ class Lexer:
 
     def template(self):
         begin, line = self.i, self.line
-        self.i = next((m.start() for m in _TEMPLATE_MARKS.finditer(self.source, self.i) if m[0][0] != '\\'), len(self.source))
-        chunk = self.source[begin:self.i]
-        self.line += line_breaks(chunk)
+        edge = _TEMPLATE_CHUNK_EDGE.search(self.source, self.i) if self.compact else None
+        simple = self.compact and (edge is None or edge[0] in ('`', '${'))
+        if simple:
+            self.i = edge.start() if edge else len(self.source)
+            chunk = ''
+        else:
+            self.i = next((m.start() for m in _TEMPLATE_MARKS.finditer(self.source, self.i) if m[0][0] != '\\'), len(self.source))
+            chunk = self.source[begin:self.i]
+            self.line += line_breaks(chunk)
         if self.compact and self.frames[-1][2] == 'literal' and self.source.startswith('${', self.i):
             self.frames[-1] = ('`', 'template', 'interpolated')
+        if simple and self.frames[-1][2] == 'literal':
+            chunk = self.source[begin:self.i]
         if chunk:
-            if '\\' in chunk and self.frames[-1][2] != 'tagged':
+            if not simple and '\\' in chunk and self.frames[-1][2] != 'tagged':
                 try:
                     decode_string('`' + chunk + '`')
                 except ValueError as exc:

@@ -212,7 +212,7 @@ PLAIN_FORM_GOLDEN = [
     ("import builtins\nbuiltins.eval('1')\n", ["Forbidden call 'eval' matched rule forbid_ast.calls"]),
     ("from . import sibling\nsibling.run()\n", ["Forbidden call 'run' matched rule forbid_ast.calls"]),
     ("from .pkg import helper\nhelper()\n", []),
-    ("from datetime import datetime\ndatetime.now()\n", ["Forbidden import 'datetime.datetime' matched rule forbid_ast.imports", "Forbidden call 'datetime.now' matched rule forbid_ast.calls"]),
+    ("from datetime import datetime\ndatetime.now()\n", ["Forbidden import 'datetime.datetime' matched rule forbid_ast.imports", "Forbidden call 'datetime.now' matched rule forbid_ast.calls", "Forbidden call 'datetime.datetime.now' matched rule forbid_ast.calls"]),
     ("import pytest\n@pytest.mark.xfail\ndef test_a():\n    pass\n", ["Forbidden import 'pytest' matched rule forbid_ast.imports", "Forbidden decorator 'pytest.mark.xfail' matched rule forbid_ast.decorators", "Forbidden decorator 'mark.xfail' matched rule forbid_ast.decorators", "Forbidden decorator 'xfail' matched rule forbid_ast.decorators"]),
     ("from pytest import mark\n@mark.xfail\ndef test_a():\n    pass\n", ["Forbidden import 'pytest' matched rule forbid_ast.imports", "Forbidden decorator 'mark.xfail' matched rule forbid_ast.decorators", "Forbidden decorator 'xfail' matched rule forbid_ast.decorators"]),
     ("from functools import lru_cache\n@lru_cache(maxsize=1)\ndef f():\n    return 1\n", ["Forbidden decorator 'functools.lru_cache' matched rule forbid_ast.decorators", "Forbidden decorator 'lru_cache' matched rule forbid_ast.decorators"]),
@@ -1081,10 +1081,10 @@ class TestExternalDriverAliases:
         ids=["use-item-as", "use-module-as"],
     )
     def test_rust_alias_is_judged_like_the_plain_use(self, plain, aliased, pattern):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         def violations(src: str) -> list[str]:
-            return evaluate_forbid_ast(NormalizedAST.from_dict(parse_rust_source(src, "m.rs")), {"calls": [pattern]})
+            return evaluate_forbid_ast(parse_rust_source(src, "m.rs"), {"calls": [pattern]})
 
         assert violations(plain) == [f"Forbidden call '{pattern}' matched rule forbid_ast.calls"]
         assert violations(aliased) == violations(plain)
@@ -1137,19 +1137,19 @@ class TestRustGroupMemberAliases:
                 'use std::process;\nfn main() { process::Command::new("ls"); }\n',
                 'use std::process::{self as p, exit};\nfn main() { p::Command::new("ls"); }\n',
                 "process::Command::new",
-                ("std::process", ["p", "exit"], [["p", "process"]]),
+                ("std::process", ["p", "exit"], [["p", "std::process"]]),
             ),
         ],
         ids=["member-as", "self-as"],
     )
     def test_group_member_alias_is_judged_like_the_plain_use(self, plain, aliased, pattern, record):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
-        (imp,) = parse_rust_source(aliased, "m.rs")["imports"]
-        assert (imp["module"], imp["imported_names"], imp["aliases"]) == record
+        (imp,) = parse_rust_source(aliased, "m.rs").imports
+        assert (imp.source, list(imp.imported_symbols), [list(pair) for pair in imp.aliases]) == record
 
         def violations(src: str) -> list[str]:
-            return evaluate_forbid_ast(NormalizedAST.from_dict(parse_rust_source(src, "m.rs")), {"calls": [pattern]})
+            return evaluate_forbid_ast(parse_rust_source(src, "m.rs"), {"calls": [pattern]})
 
         assert violations(plain) == [f"Forbidden call '{pattern}' matched rule forbid_ast.calls"]
         assert violations(aliased) == violations(plain)
@@ -1197,31 +1197,31 @@ class TestRustGroupMemberAliases:
         ids=["nested-as", "nested-comma-self", "path-member-as", "path-member", "nested-self-as", "leading-brace"],
     )
     def test_nested_and_path_members_are_judged_like_the_flat_group(self, grouped, flat):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         def violations(src: str) -> list[list[str]]:
-            norm = NormalizedAST.from_dict(parse_rust_source(src, "m.rs"))
+            norm = parse_rust_source(src, "m.rs")
             return [evaluate_forbid_ast(norm, spec) for spec in self.SPECS]
 
         assert violations(grouped) == violations(flat)
         assert any("matched rule forbid_ast.calls" in v for found in violations(grouped) for v in found)
 
     def test_no_member_text_leaks_into_a_bound_name(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
-        imports = parse_rust_source("use std::{process::{Command as Cmd, exit}, io::*};\n", "m.rs")["imports"]
-        names = [n for imp in imports for n in imp["imported_names"]]
-        pairs = [a for imp in imports for pair in imp.get("aliases", []) for a in pair]
+        imports = parse_rust_source("use std::{process::{Command as Cmd, exit}, io::*};\n", "m.rs").imports
+        names = [n for imp in imports for n in imp.imported_symbols]
+        pairs = [a for imp in imports for pair in imp.aliases for a in pair]
         assert all(not set(n) & set("{}:, ") for n in names + pairs), (names, pairs)
-        assert sorted((imp["module"], imp["is_wildcard"]) for imp in imports) == [
-            ("std", False), ("std::io", True), ("std::process", False)
+        assert sorted((imp.source, "*" in imp.imported_symbols) for imp in imports) == [
+            ("std::io", True), ("std::process", False)
         ]
 
     def test_a_plain_self_member_binds_the_module_name(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         def violations(src: str) -> list[str]:
-            norm = NormalizedAST.from_dict(parse_rust_source(src, "m.rs"))
+            norm = parse_rust_source(src, "m.rs")
             return evaluate_forbid_ast(norm, {"imports": ["process"], "calls": ["process::Command::new"]})
 
         plain = 'use std::process;\nfn main() { process::Command::new("ls"); }\n'
@@ -1236,31 +1236,38 @@ class TestRustCallSites:
     """Every Rust call is a call site, and only calls are (b1-verify fix round 2)."""
 
     def test_a_call_to_a_function_defined_below_it_is_seen(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         src = "fn main() { helper(); }\nfn helper() {}\n"
-        norm = NormalizedAST.from_dict(parse_rust_source(src, "m.rs"))
+        norm = parse_rust_source(src, "m.rs")
         assert evaluate_forbid_ast(norm, {"calls": ["helper"]}) == [
             "Forbidden call 'helper' matched rule forbid_ast.calls"
         ]
 
-    @pytest.mark.timing
-    def test_a_large_generated_file_parses_in_linear_time(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+    @pytest.mark.parametrize('calls', [3_125, 25_000])
+    def test_large_generated_files_preserve_complete_facts_at_eightfold_size(self, calls):
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
-        def run(calls: int) -> None:
-            src = "fn main() {\n" + "".join(f"    helper({i});\n" for i in range(calls)) + "}\nfn helper(x: u32) {}\n"
-            data = parse_rust_source(src, "m.rs")
-            assert len(data["call_sites"]) == calls and data["call_sites"][-1]["line"] == calls + 1
-
-        ratio = _scaling_ratio(run, 3_125)
-        assert ratio < 24, f"eight times the calls multiplied the parse time by {ratio:.1f}"
+        src = "fn main() {\n" + "".join(f"    helper({i});\n" for i in range(calls)) + "}\nfn helper(x: u32) {}\n"
+        data = parse_rust_source(src, "m.rs")
+        assert data.to_dict() == {
+            'version': '1.0', 'file_path': 'm.rs', 'language': 'rust',
+            'definitions': [
+                {'name': 'main', 'kind': 'function', 'line': 1, 'is_exported': False, 'class_name': None},
+                {'name': 'helper', 'kind': 'function', 'line': calls + 3, 'is_exported': False, 'class_name': None},
+            ],
+            'call_sites': [{'target': 'helper', 'line': i + 2, 'caller_scope': 'main', 'args': {'#0': str(i)}}
+                           for i in range(calls)],
+            'imports': [], 'mutation_points': [],
+            'metadata': {'capabilities': ['allow_comments', 'args', 'decorators', 'test_module'],
+                         'allow_comments': {}, 'decorators': [], 'test_module': False, 'test_functions': []},
+        }
 
     def test_control_flow_keywords_are_not_calls(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         src = "fn main() { if (a) { b(); } while (c) {} match (d, e) { _ => {} } }\nfn b() {}\n"
-        assert [c["target"] for c in parse_rust_source(src, "m.rs")["call_sites"]] == ["b"]
+        assert [c.target for c in parse_rust_source(src, "m.rs").call_sites] == ["b"]
 
 
 # ── Review round 3: the decorator fallback read must not fail open ────────────

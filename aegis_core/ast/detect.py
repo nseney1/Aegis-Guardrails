@@ -18,6 +18,7 @@ __all__ = [
     "LANGUAGE_DEFINITIONS",
     "iter_project_files",
     "NATIVE_JS_EXTENSIONS",
+    "NATIVE_SOURCE_EXTENSIONS",
 ]
 
 _SKIP_DIRS = {
@@ -36,9 +37,9 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "manifests": ["Cargo.toml", "Cargo.lock"],
         "extensions": [".rs"],
         "toolchains": ["cargo", "rustc"],
-        "driver_slot": "ast_driver_rs",
-        "default_command": f"{{python}} {_SELECTOR_DIR}/rust_ast.py",
-        "driver_filename": "rust_ast.py",
+        "driver_slot": None,
+        "default_command": None,
+        "driver_filename": None,
     },
     "typescript": {
         "manifests": ["tsconfig.json"],
@@ -75,6 +76,7 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 }
 NATIVE_JS_EXTENSIONS = frozenset(extension for language in ('typescript', 'javascript')
                                  for extension in LANGUAGE_DEFINITIONS[language]['extensions'])
+NATIVE_SOURCE_EXTENSIONS = NATIVE_JS_EXTENSIONS | frozenset(LANGUAGE_DEFINITIONS['rust']['extensions'])
 
 
 def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
@@ -91,7 +93,7 @@ def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
 
 
 def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
-    """True for a selector `aegis init` provisioned, including legacy forms like 'python3 .soma/drivers/rust_ast.py'."""
+    """True for a selector `aegis init` provisioned, including legacy .soma paths."""
     if not config.get('driver_filename') or not config.get('default_command'):
         return False
     parts = value.split()

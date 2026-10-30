@@ -232,6 +232,7 @@ class _PythonASTVisitor:
                     imported_symbols=imported,
                     line=node.lineno,
                     aliases=_alias_pairs([alias]),
+                    is_namespace=True,
                 )
             )
 
@@ -244,6 +245,7 @@ class _PythonASTVisitor:
                 imported_symbols=symbols,
                 line=node.lineno,
                 aliases=_alias_pairs(node.names),
+                is_namespace=False,
             )
         )
 

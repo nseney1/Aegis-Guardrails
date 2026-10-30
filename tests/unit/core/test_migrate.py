@@ -44,7 +44,7 @@ def _v1(cell, signal, ts, event_id, weight=1.0, with_rule_id=True, **meta):
 def _packaged_template(name: str) -> bytes:
     from aegis_core.ast.drivers import templates
 
-    return (Path(templates.__file__).resolve().parent / name).read_bytes()
+    return _v3_3_template(name) if name == "rust_ast.py" else (Path(templates.__file__).resolve().parent / name).read_bytes()
 
 
 def _write_jsonl(path: Path, rows) -> None:
@@ -183,7 +183,7 @@ def test_dry_run_reports_everything_and_writes_nothing(legacy: Path):
         ".aegis/handoffs", ".aegis/insight_cursor", ".aegis/jobs_state.json", ".aegis/keys",
         ".aegis/locks", ".aegis/receipts.jsonl", ".aegis/slots.yaml", ".aegis/telemetry", "aegis.conf",
     ])
-    assert report["config"] == {"v": 1, "jit": {"max_tokens": 1500}, "ast": {"packaged_drivers": ["rs"]}}
+    assert report["config"] == {"v": 1, "jit": {"max_tokens": 1500}}
     assert report["user_config"] == {
         "drivers": {"md": "touch /tmp/PWNED"},
         "slots": {"TOOL_RUN": "Bash", "TEST_RUNNER": "cargo test"},
@@ -248,7 +248,7 @@ def test_apply_writes_config_without_any_command(legacy: Path):
     result = migrate.apply(migrate.plan(legacy))
 
     config = json.loads((legacy / ".aegis" / "config.json").read_text(encoding="utf-8"))
-    assert config == {"v": 1, "jit": {"max_tokens": 1500}, "ast": {"packaged_drivers": ["rs"]}}
+    assert config == {"v": 1, "jit": {"max_tokens": 1500}}
     assert "touch" not in (legacy / ".aegis" / "config.json").read_text(encoding="utf-8")
     assert result.plan.user_config["drivers"] == {"md": "touch /tmp/PWNED"}
     assert not (Path.home() / ".aegis" / "config.json").exists() or "touch" not in (
@@ -627,7 +627,7 @@ def test_apply_merges_into_the_config_as_it_is_when_applying(legacy: Path):
     migrate.apply(plan)
 
     config = json.loads((legacy / ".aegis" / "config.json").read_text(encoding="utf-8"))
-    assert config == {"v": 1, "hosts": ["codex"], "jit": {"max_tokens": 900}, "ast": {"packaged_drivers": ["go", "rs"]}}
+    assert config == {"v": 1, "hosts": ["codex"], "jit": {"max_tokens": 900}, "ast": {"packaged_drivers": ["go"]}}
 
 
 # ── A ledger write torn at a row boundary (review B2a-2) ─────────────────────
@@ -887,7 +887,8 @@ def _assert_staged_copy_is_removed(tmp_path: Path, name: str, shipped: bytes, eo
 
 def test_a_driver_staged_by_v3_3_is_recognized(tmp_path: Path):
     shipped = _v3_3_template("rust_ast.py")
-    assert shipped != _packaged_template("rust_ast.py")  # v4 changed the template since
+    from aegis_core.ast.drivers import templates
+    assert not (Path(templates.__file__).resolve().parent / "rust_ast.py").exists()
     root = tmp_path / "ws"
     driver = root / ".aegis" / "drivers" / "rust_ast.py"
     driver.parent.mkdir(parents=True)
@@ -1052,15 +1053,17 @@ def test_the_v3_enforcement_artifact_key_is_stripped(tmp_path: Path):
     assert load_rules(root).needs_migrate == ()
 
 
-@pytest.mark.parametrize("extension", ["ts", "js"])
+@pytest.mark.parametrize("extension", ["ts", "js", "rs"])
 @pytest.mark.parametrize("eol", [b"\n", b"\r\n"])
-def test_retired_native_selectors_are_removed_with_their_shipped_copies(tmp_path, extension, eol):
+@pytest.mark.parametrize("selector_dir", [".aegis", ".soma"])
+def test_retired_native_selectors_are_removed_with_their_shipped_copies(tmp_path, extension, eol, selector_dir):
     root = tmp_path / "ws"
-    driver = root / ".aegis/drivers/ts_ast.js"
+    filename, executable = ("rust_ast.py", "python3") if extension == "rs" else ("ts_ast.js", "node")
+    driver = root / ".aegis/drivers" / filename
     driver.parent.mkdir(parents=True)
-    driver.write_bytes(_v3_3_template("ts_ast.js").replace(b"\r\n", b"\n").replace(b"\n", eol))
+    driver.write_bytes(_v3_3_template(filename).replace(b"\r\n", b"\n").replace(b"\n", eol))
     slots = root / ".aegis/slots.yaml"
-    slots.write_bytes(f'slots:\n  ast_driver_{extension}: "node .aegis/drivers/ts_ast.js"\n'.encode().replace(b"\n", eol))
+    slots.write_bytes(f'slots:\n  ast_driver_{extension}: "{executable} {selector_dir}/drivers/{filename}"\n'.encode().replace(b"\n", eol))
 
     plan = migrate.plan(root)
     report = plan.to_dict()
@@ -1076,6 +1079,8 @@ def test_retired_native_selectors_are_removed_with_their_shipped_copies(tmp_path
     ("ts", "node --trace-warnings .aegis/drivers/ts_ast.js"),
     ("ts", "node .aegis/drivers/custom.js"),
     ("external", "node .aegis/drivers/ts_ast.js"),
+    ("rs", "python3 -O .aegis/drivers/rust_ast.py"),
+    ("rs", "python3 .aegis/drivers/custom.py"),
 ])
 def test_retired_native_selector_detection_preserves_custom_commands(tmp_path, extension, command):
     root = tmp_path / "ws"
@@ -1093,7 +1098,8 @@ def test_retired_native_selector_does_not_remove_the_go_opt_in(tmp_path):
     slots = root / ".aegis/slots.yaml"
     slots.parent.mkdir(parents=True)
     slots.write_text('slots:\n  ast_driver_ts: "node .aegis/drivers/ts_ast.js"\n'
-                     '  ast_driver_go: "go run .aegis/drivers/go_ast.go"\n', encoding="utf-8")
+                     '  ast_driver_go: "go run .aegis/drivers/go_ast.go"\n'
+                     '  ast_driver_.go: "go run .aegis/drivers/go_ast.go"\n', encoding="utf-8")
 
     report = migrate.plan(root).to_dict()
     assert report["config"] == {"v": 1, "ast": {"packaged_drivers": ["go"]}}

@@ -455,7 +455,7 @@ Category: Plumbing.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--ast-language` | one of `python`, `typescript`, `javascript`, `go`, `rust` |  | Also measure matched AST source fixtures; only Python is available in this phase |
+| `--ast-language` | one of `python`, `typescript`, `javascript`, `go`, `rust` |  | Also measure matched AST source fixtures; Python, JS/TS and Rust native parsers are available |
 | `--runs` | `N` | `20` | Timed runs of each measurement, 1 to 1000 (default 20); one untimed warm-up of the hook and Layer 1 comes first |
 
 ### `aegis hook`

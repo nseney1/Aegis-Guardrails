@@ -256,11 +256,11 @@ def _append_step_summary(document: dict, root: str) -> None:
         print(f"note: the step summary could not be written ({type(exc).__name__})", file=sys.stderr)
 
 
-def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool, root: str) -> None:
+def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool, root: str, pairing_info: list) -> None:
     """``--format github|sarif`` for Layer 1: one report on stdout, and the step summary."""
     from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, layer1_report_document
 
-    document = layer1_report_document(passed, owned, issues, strict)
+    document = layer1_report_document(passed, owned, issues, strict, checkpoint_info=pairing_info)
     print(format_sarif_report(document, workspace_root=root) if fmt == "sarif" else "\n".join(github_annotation_lines(document)))
     _append_step_summary(document, root)
 
@@ -286,6 +286,16 @@ def _print_checkpoint(issues: list[dict], strict: bool) -> None:
     for issue in issues:
         label = "[FAIL]" if is_blocking(issue, strict) else "[WARN]"
         print(f"{label} {issue['message']}")
+
+
+def _workspace_checkpoint(root: str, strict: bool, machine: bool) -> tuple[list, bool, list]:
+    pairing_info: list[dict] = []
+    issues, blocking = run_checkpoint(Path(root), strict=strict, pairing_info=pairing_info)
+    if not machine:
+        _print_checkpoint(issues, strict)
+        for note in pairing_info:
+            print(f"[INFO] {_shown(note['message'], 1000)}")
+    return issues, blocking, pairing_info
 
 
 _MODE_FLAGS = (
@@ -811,9 +821,7 @@ def run_verify(args: argparse.Namespace) -> int:
         return 0
 
     # ── Layer 1: workspace checkpoint, then the per-file tools ────────────
-    issues, blocking = run_checkpoint(Path(repo_root), strict=strict)
-    if not machine:
-        _print_checkpoint(issues, strict)
+    issues, blocking, pairing_info = _workspace_checkpoint(repo_root, strict, machine)
 
     if not target_files:
         if staged:
@@ -825,10 +833,11 @@ def run_verify(args: argparse.Namespace) -> int:
         # Say so: a Layer 2 run that reviewed nothing must not read like a Layer 1-only pass.
         layer2_summary = "Layer 2: no changed files to review"
         if report_fmt:
-            _emit_report(report_fmt, not blocking, [], issues, strict, repo_root)
+            _emit_report(report_fmt, not blocking, [], issues, strict, repo_root, pairing_info)
         elif use_json:
             payload = format_layer1_json_payload(not blocking, [], [], summary)
             payload["checkpoint_issues"] = issues
+            payload["checkpoint_info"] = pairing_info
             if held.active:
                 payload["baseline"] = {**held.as_dict(), "grandfathered": 0, "new": [], "blocked": []}
             if layer2:
@@ -908,6 +917,7 @@ def run_verify(args: argparse.Namespace) -> int:
     def _emit_json(passed: bool, layer2_result: Any = None, vendor: str = "") -> None:
         payload = format_layer1_json_payload(passed, target_files, results, summary)
         payload["checkpoint_issues"] = issues
+        payload["checkpoint_info"] = pairing_info
         if applied is not None:
             payload["baseline"] = {
                 **held.as_dict(),
@@ -924,7 +934,7 @@ def run_verify(args: argparse.Namespace) -> int:
         _record_baseline(layer1_pass)
         if report_fmt:  # baseline.apply keeps one item per pair, in order
             _emit_report(report_fmt, layer1_pass, [(path, e) for (path, _), e in zip(pairs, results)], issues, strict,
-                         repo_root)
+                         repo_root, pairing_info)
         elif use_json:
             _emit_json(layer1_pass)
         return 0 if layer1_pass else 1

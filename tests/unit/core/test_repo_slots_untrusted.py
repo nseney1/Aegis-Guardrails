@@ -44,6 +44,8 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
     return home
 
 
@@ -646,7 +648,6 @@ def test_workspace_driver_keys_are_ignored_and_only_packaged_opt_ins_count(ws: P
 
     slots = reg.to_dict()
     assert slots == {
-        "ast_driver_rs": "{python} .aegis/drivers/rust_ast.py",
         "ast_driver_go": "go run .aegis/drivers/go_ast.go",
     }
     assert reg.get_configured_extensions() == {".py", ".rs", ".go", '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'}
@@ -1096,5 +1097,5 @@ def test_repo_config_symlink_within_the_workspace_is_honored(ws: Path):
 
     reg = SlotRegistry.load(ws)
 
-    assert reg.get_ast_driver(".rs") == "{python} .aegis/drivers/rust_ast.py"
+    assert reg.get_ast_driver(".rs") is None
     assert reg.warnings == []

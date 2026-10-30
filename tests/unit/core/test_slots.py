@@ -28,11 +28,11 @@ def test_slot_registry_load_nonexistent(tmp_path):
 def test_slot_registry_load_reads_packaged_driver_opt_ins(tmp_path):
     (tmp_path / ".aegis").mkdir()
     (tmp_path / ".aegis" / "config.json").write_text(
-        json.dumps({"v": 1, "ast": {"packaged_drivers": ["rs"]}}), encoding="utf-8"
+        json.dumps({"v": 1, "ast": {"packaged_drivers": ["go", "rs"]}}), encoding="utf-8"
     )
 
     reg = SlotRegistry.load(tmp_path)
-    assert reg.to_dict() == {"ast_driver_rs": "{python} .aegis/drivers/rust_ast.py"}
+    assert reg.to_dict() == {"ast_driver_go": "go run .aegis/drivers/go_ast.go"}
 
 
 def test_an_extension_without_a_packaged_driver_is_ignored_with_a_warning(tmp_path):
@@ -42,7 +42,7 @@ def test_an_extension_without_a_packaged_driver_is_ignored_with_a_warning(tmp_pa
     )
 
     reg = SlotRegistry.load(tmp_path)
-    assert reg.to_dict() == {"ast_driver_rs": "{python} .aegis/drivers/rust_ast.py"}
+    assert reg.to_dict() == {}
     assert reg.warnings == [
         "ignored 1 'ast.packaged_drivers' entry in .aegis/config.json: "
         "only extensions with a driver that ships inside aegis can be enabled"
@@ -93,9 +93,9 @@ def test_slot_registry_get_ast_driver():
     assert reg.get_ast_driver("py") is None
     assert reg.get_ast_driver(".py") is None
 
-    # Specific extension resolves ast_driver_<ext>
-    assert reg.get_ast_driver("rs") == "cargo_driver"
-    assert reg.get_ast_driver(".rs") == "cargo_driver"
+    # Rust is native and ignores obsolete commands
+    assert reg.get_ast_driver("rs") is None
+    assert reg.get_ast_driver(".rs") is None
 
     # Fallback to ast_driver for an extension without a native parser
     assert reg.get_ast_driver("kt") == "default_driver"
@@ -108,8 +108,8 @@ def test_slot_registry_get_ast_driver():
 def test_slot_registry_get_configured_extensions():
     from aegis_core.ast.runner import NATIVE_JS_EXTENSIONS
 
-    native = {".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
-    assert NATIVE_JS_EXTENSIONS | {".py"} == native
+    native = {".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".rs"}
+    assert NATIVE_JS_EXTENSIONS | {".py", ".rs"} == native
     # Empty registry always includes the in-process languages
     empty_reg = SlotRegistry({})
     assert empty_reg.get_configured_extensions() == native

@@ -353,7 +353,7 @@ def test_the_notice_says_this_is_latency_and_size_never_efficacy():
     assert "same corpus" in notice and "same machine" in notice
 
 
-@pytest.mark.parametrize("language", ["typescript", "javascript", "go", "rust"])
+@pytest.mark.parametrize("language", ["go"])  # JS/TS: test_benchmark_ast.py
 def test_unavailable_native_parsers_are_refused_instead_of_timing_legacy_drivers(language):
     with pytest.raises(BenchmarkError, match=language + " native parser implementation unavailable"):
         benchmark.run_benchmark(1, ast_language=language)

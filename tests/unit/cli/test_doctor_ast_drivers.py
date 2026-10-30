@@ -58,7 +58,10 @@ def test_legacy_packaged_js_opt_in_reports_the_native_parser_not_node(project, m
     (root / ".aegis" / "config.json").write_bytes(b'{"v":1,"ast":{"packaged_drivers":["js"]}}\n')
     code, check = _doctor(root, capsys)
     assert (code, check["status"]) == (0, "pass")
-    assert check["detail"] == ["✅ AST driver (.js): native JavaScript/TypeScript (in-process)"]
+    assert check["detail"] == [
+        "javascript: parser in-process; pack 5; tests not configured; coverage not configured",
+        "✅ AST driver (.js): native JavaScript/TypeScript (in-process)",
+    ]
     assert _card_reason(root, "javascript") == ("ready", None)
 
 
@@ -78,7 +81,10 @@ def test_packaged_driver_report_checks_its_installation(project, monkeypatch, ca
     reason = (f"the packaged go_ast.go driver is installed inside the workspace ({templates}), "
               "where go would load modules from the repository; install aegis outside it")
     assert (code, check["status"]) == (1, "warn")
-    assert check["detail"] == [f"⚠️  AST driver (.go): {reason}"]
+    assert check["detail"] == [
+        "go: parser unavailable; pack 4; tests go test (default); coverage coverprofile (default)",
+        f"⚠️  AST driver (.go): {reason}",
+    ]
     assert _card_reason(root, "go") == ("unavailable", reason)
 
 
@@ -95,11 +101,17 @@ def test_custom_driver_report_checks_its_script(project, capsys, inside):
     if inside:
         reason = "the ~/.aegis/config.json driver for '.go' passes driver.script, which is inside the workspace"
         assert (code, check["status"]) == (1, "warn")
-        assert check["detail"] == [f"⚠️  AST driver (.go): {reason}"]
+        assert check["detail"] == [
+            "go: parser unavailable; pack 4; tests go test (default); coverage coverprofile (default)",
+            f"⚠️  AST driver (.go): {reason}",
+        ]
         assert _card_reason(root, "go") == ("unavailable", reason)
     else:
         assert (code, check["status"]) == (0, "pass")
-        assert check["detail"] == [f"✅ AST driver (.go): node resolvable ({node})"]
+        assert check["detail"] == [
+            "go: parser user driver; pack 4; tests go test (default); coverage coverprofile (default)",
+            f"✅ AST driver (.go): node resolvable ({node})",
+        ]
         assert _card_reason(root, "go") == ("ready", None)
 
 
@@ -111,7 +123,10 @@ def test_malformed_custom_driver_reports_the_planner_refusal(project, capsys):
     code, check = _doctor(root, capsys)
     reason = "the driver command cannot be parsed: No closing quotation"
     assert (code, check["status"]) == (1, "warn")
-    assert check["detail"] == [f"⚠️  AST driver (.go): {reason}"]
+    assert check["detail"] == [
+        "go: parser unavailable; pack 4; tests go test (default); coverage coverprofile (default)",
+        f"⚠️  AST driver (.go): {reason}",
+    ]
     assert _card_reason(root, "go") == ("unavailable", reason)
 
 
@@ -126,4 +141,7 @@ def test_driver_planning_failure_keeps_the_public_warning_document(project, caps
     status, reason = _card_reason(root, "go")
     assert status == "unavailable" and reason.startswith("RuntimeError: Symlink loop")
     assert "loop.js" in reason
-    assert check["detail"] == [f"⚠️  AST driver (.go): {reason}"]
+    assert check["detail"] == [
+        "go: parser unavailable; pack 4; tests go test (default); coverage coverprofile (default)",
+        f"⚠️  AST driver (.go): {reason}",
+    ]

@@ -242,3 +242,100 @@ def test_declaration_scanning_preserves_exact_default_and_compact_tokens(source)
     from aegis_core.ast.drivers.js.tokenizer import tokenize
 
     assert tokenize(source, 'fixture.tsx', compact=True) == tokenize(source, 'fixture.tsx')
+
+
+@pytest.mark.parametrize('source', [
+    'first; second, third;', 'first \t ; second \t, third;',
+    'first\n; second\r\n, third;', 'first /* retain */; second // retain\n, third;',
+    'const first = one, second = two;',
+    'function f(a,b) { return one; }',
+    'class C { field = one; method() { return two; } }',
+    'const f = () => one, other = two;',
+    'for (let x = one; two; three) {}',
+    'require(value);', "import type from 'worker'; type;",
+    'value++; other + +third; value / divisor;',
+])
+def test_compact_reference_delimiters_preserve_complete_public_tokens(source):
+    from aegis_core.ast.drivers.js.tokenizer import tokenize
+
+    assert tokenize(source, 'fixture.tsx', compact=True) == tokenize(source, 'fixture.tsx')
+
+
+@pytest.mark.parametrize('separator', [';', ','])
+def test_compact_call_delimiters_keep_inner_call_and_punctuation_spans(separator):
+    from aegis_core.ast.drivers.js.tokenizer import tokenize
+
+    source = 'client.run(first, second) \t ' + separator + ' next'
+    tokens = tokenize(source, 'fixture.ts', compact=True)
+    closing = source.index(')') + 1
+    delimiter = source.index(separator, closing)
+    following = source.index('next')
+    assert [tuple(token) for token in tokens] == [
+        ('flat_call', 'client.run', 1, 0, closing, 'expression', ('first', 'second')),
+        ('punct', separator, 1, delimiter, delimiter + 1, '', None),
+        ('identifier', 'next', 1, following, len(source), '', None),
+    ]
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r', '\r\n', '\u2028', '\u2029'])
+@pytest.mark.parametrize('escaped', [False, True])
+def test_template_chunks_keep_physical_lines_and_raw_spans(newline, escaped):
+    from aegis_core.ast.drivers.js.tokenizer import tokenize
+
+    first = 'first' + ('\\' if escaped else '') + newline + 'second '
+    source = 'const text=`' + first + '${visible(value + 1)} tail`;\nlast();'
+    for compact in (False, True):
+        result = tokenize(source, 'fixture.ts', compact=compact)
+        chunks = [t for t in result if t.kind == 'template_text']
+        assert [(t.value, t.line) for t in chunks] == ([] if compact else [(first, 1), (' tail', 2)])
+        assert all(source[t.start:t.end] == t.value for t in chunks)
+        assert [(t.value, t.line) for t in result if t.value in ('visible', 'last')] == [('visible', 2), ('last', 3)]
+
+
+@pytest.mark.parametrize('source,expected', [
+    ('const text=``; finish();', ['finish']),
+    ('const text=`plain λ`; finish();', ['finish']),
+    ('const text=`${one()}${two()}`; finish();', ['one', 'two', 'finish']),
+    ('const text=`outer ${`inner ${one()}`} ${two()} tail`; finish();', ['one', 'two', 'finish']),
+    (r'const text=`escaped \` \${hidden()}`; finish();', ['finish']),
+    (r'const text=`\\${visible()}`; finish();', ['visible', 'finish']),
+    (r'const text=`\\\${hidden()}`; finish();', ['finish']),
+    (r'tag`\uZZZZ ${visible()} tail`; finish();', ['tag', 'visible', 'finish']),
+    ('const cp=require(`node:child_process`); cp.exec(`plain`);', ['require', 'cp.exec']),
+])
+def test_template_boundaries_preserve_nested_calls_and_constant_literals(source, expected):
+    from aegis_core.ast.drivers.js import parse
+    from aegis_core.ast.drivers.js.tokenizer import tokenize
+
+    assert [site.target for site in parse(source, 'fixture.ts').call_sites] == expected
+    assert all(source[t.start:t.end] == t.value for t in tokenize(source) if t.kind == 'template_text')
+
+
+@pytest.mark.parametrize('source,reason', [
+    (r'const text=`\uZZZZ`;', 'template_escape'),
+    ('const text=`plain', 'unterminated_template'),
+    ('const text=`tail\\', 'template_escape'),
+    ('const text=`${one()', 'unterminated_template'),
+    ('tag`tail\\', 'unterminated_template'),
+])
+def test_template_failures_keep_typed_boundaries_in_both_token_modes(source, reason):
+    from aegis_core.ast.drivers.js.tokenizer import tokenize
+
+    errors = []
+    for compact in (False, True):
+        with pytest.raises(ASTDriverError, match=reason) as raised:
+            tokenize(source, 'fixture.ts', compact=compact)
+        error = raised.value
+        errors.append((error.reason, error.line, error.offset, str(error)))
+    assert errors[0] == errors[1]
+
+
+@pytest.mark.parametrize('unit', ['x', '\n', '\\\r\n'])
+def test_large_template_chunks_keep_exact_tokens_with_a_bounded_process(unit):
+    source = '`' + unit * ((2 * 1024 * 1024 - 2) // len(unit)) + '`'
+    code = ('import json,sys; from aegis_core.ast.drivers.js.tokenizer import tokenize; '
+            's=sys.stdin.buffer.read().decode("utf-8"); a=tokenize(s,compact=False); b=tokenize(s,compact=True); '
+            'assert a==b; print(json.dumps([len(a),a[1].start,a[1].end,len(a[1].value)]))')
+    completed = subprocess.run([sys.executable, '-c', code], input=source.encode('utf-8'),
+                               capture_output=True, check=True, timeout=20)
+    assert json.loads(completed.stdout) == [3, 1, len(source) - 1, len(source) - 2]

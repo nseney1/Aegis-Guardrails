@@ -46,8 +46,7 @@ def test_rust_ast_driver_runner_integration(tmp_path: Path):
     source_file = tmp_path / "worker.rs"
     source_file.write_text(RUST_CODE, encoding="utf-8")
 
-    driver_path = Path(__file__).resolve().parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "rust_ast.py"
-    registry = ASTDriverRegistry({".rs": f"python3 {driver_path}"})
+    registry = ASTDriverRegistry()
     runner = ASTDriverRunner(registry=registry)
 
     ast: NormalizedAST = runner.parse_file(source_file, workspace_root=tmp_path)
@@ -68,8 +67,7 @@ def test_rust_ast_driver_runner_integration(tmp_path: Path):
     assert proc_def.is_exported is True
 
     # Check imports
-    import_sources = [i.source for i in ast.imports]
-    assert any("HashMap" in s for s in import_sources)
+    assert any(i.source == 'std::collections' and 'HashMap' in i.imported_symbols for i in ast.imports)
 
     # Check call sites
     callees = [c.target for c in ast.call_sites]
@@ -87,8 +85,7 @@ def test_rust_call_graph_reachability(tmp_path: Path):
     source_file = tmp_path / "worker.rs"
     source_file.write_text(RUST_CODE, encoding="utf-8")
 
-    driver_path = Path(__file__).resolve().parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "rust_ast.py"
-    registry = ASTDriverRegistry({".rs": f"python3 {driver_path}"})
+    registry = ASTDriverRegistry()
     runner = ASTDriverRunner(registry=registry)
     ast = runner.parse_file(source_file, workspace_root=tmp_path)
 
@@ -100,11 +97,11 @@ def test_rust_call_graph_reachability(tmp_path: Path):
     assert "dead_uncalled_fn" in evidence.detail
 
 
-def test_a_malformed_use_statement_does_not_stop_the_parse():
-    """Code mid-edit still parses: a use with a stray brace is recorded as written."""
-    from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+def test_a_malformed_use_statement_fails_closed():
+    """A stray brace cannot supply verification evidence from a partial parse."""
+    from aegis_core.ast.driver_errors import ASTDriverError
+    from aegis_core.ast.drivers.rust import parse
 
-    result = parse_rust_source("use crate::net::client};\nfn run() {}\n", "lib.rs")
-
-    assert [d["name"] for d in result["definitions"]] == ["run"]
-    assert [i["module"] for i in result["imports"]] == ["crate::net::client}"]
+    with pytest.raises(ASTDriverError, match='mismatched delimiter at line 1') as error:
+        parse("use crate::net::client};\nfn run() {}\n", "lib.rs")
+    assert error.value.reason == 'syntax'

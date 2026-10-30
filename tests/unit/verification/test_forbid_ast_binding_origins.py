@@ -101,3 +101,40 @@ def test_go_namespace_bindings_keep_their_normalized_driver_contract():
     })
     findings = evaluate_forbid_ast_structured(tree, {"calls": ["crypto/sha1.New", "crypto/sha256.New"]}, source="")
     assert [(f["pattern"], f["line"]) for f in findings] == [("crypto/sha1.New", 3), ("crypto/sha256.New", 4)]
+
+
+@pytest.mark.parametrize('representation', ['native', 'json', 'mapping'])
+@pytest.mark.parametrize('source,pattern,count', [
+    ("from copy import copy as cp; cp('member')", 'copy.copy', 1),
+    ("import copy as cp; cp('namespace')", 'copy.copy', 0),
+    ("from copy import copy; copy('member')", 'copy.copy', 1),
+    ("import copy; copy('namespace')", 'copy.copy', 0),
+    ("import copy as cp; cp.copy('member')", 'copy.copy', 1),
+    ("from copy import copy as cp; cp.copy('child')", 'copy.copy.copy', 1),
+])
+def test_python_same_named_members_and_namespaces_keep_distinct_origins(source, pattern, count, representation):
+    tree = _tree(source, representation)
+    findings = evaluate_forbid_ast_structured(tree, {'calls': [pattern]}, source=source)
+    assert len(findings) == count
+    assert all(finding['unknown'] is False for finding in findings)
+
+
+@pytest.mark.parametrize('representation', ['native', 'json', 'mapping'])
+@pytest.mark.parametrize('source', [
+    "import ns, {copy as cp} from 'copy'; ns('namespace'); cp('member');",
+    "import ns, {copy} from 'copy'; ns('namespace'); copy('member');",
+    "import * as ns from 'copy'; ns('namespace'); ns.copy('member');",
+])
+def test_js_same_named_members_and_namespaces_keep_distinct_origins(source, representation):
+    from aegis_core.ast.drivers.js import parse
+
+    tree = parse(source, 'origins.js')
+    if representation == 'json':
+        tree = NormalizedAST.from_json(tree.to_json())
+    elif representation == 'mapping':
+        tree = NormalizedAST.from_dict(tree.to_dict())
+    for value, count in [('namespace', 0), ('member', 1)]:
+        findings = evaluate_forbid_ast_structured(
+            tree, {'calls': [{'name': 'copy.copy', 'where': {'#0': value}}]}, source=source)
+        assert len(findings) == count
+        assert all(finding['unknown'] is False for finding in findings)
