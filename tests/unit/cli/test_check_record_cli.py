@@ -58,6 +58,41 @@ def test_without_tests_only_layer_one_runs(tmp_path, capsys):
 
 
 @needs_git
+def test_record_preserves_no_driver_language_and_reason(tmp_path, capsys):
+    repo = hv.make_project(tmp_path)
+    repo.write(".aegis/rules/invariants/no-reflection.md",
+               '---\nid: no-reflection\ntype: invariant\nenforcement: gate\n'
+               'target_paths: ["src/*.kt"]\nforbid_ast:\n  calls: [danger]\n---\n# No reflection\n')
+    repo.write("src/app.kt", "danger()\n")
+
+    rc, out = _run(repo, capsys, "--json")
+
+    doc = json.loads(out.out)
+    assert rc == 0 and doc["check"]["layer1"]["findings"] == 0
+    note, = [row for row in doc["check"]["layer1"]["evidence"] if row.get("reason") == "no_driver:.kt"]
+    assert note == {"tool": "forbid_ast_no_driver", "target": "src/app.kt", "verdict": True,
+                    "language": "unknown", "reason": "no_driver:.kt"}
+    assert hv.rows_of(repo.root, "check")[0]["layer1"]["evidence"] == doc["check"]["layer1"]["evidence"]
+
+
+@needs_git
+def test_record_preserves_the_language_of_a_failing_rule(tmp_path, capsys):
+    repo = hv.make_project(tmp_path)
+    repo.write(".aegis/rules/invariants/no-eval.md",
+               '---\nid: no-eval\ntype: invariant\nenforcement: gate\n'
+               'target_paths: ["src/*.py"]\nforbid_ast:\n  calls: [eval]\n---\n# No eval\n')
+    repo.write("src/app.py", 'def app():\n    return eval("1")\n')
+
+    rc, out = _run(repo, capsys, "--json")
+
+    doc = json.loads(out.out)
+    assert rc == 1 and doc["check"]["passed"] is False
+    finding, = [row for row in doc["check"]["layer1"]["evidence"] if row["tool"] == "forbid_ast:no-eval"]
+    assert finding["language"] == "python" and finding["verdict"] is False
+    assert doc["check"]["layer1"]["findings"] >= 1
+
+
+@needs_git
 def test_an_unbindable_tree_writes_no_row_and_says_why(tmp_path, capsys):
     repo = hv.make_project(tmp_path)
     repo.git("update-index", "--assume-unchanged", "src/app.py")

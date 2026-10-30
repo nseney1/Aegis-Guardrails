@@ -365,7 +365,7 @@
             "flags": [
               "--strict"
             ],
-            "help": "Fail on checkpoint warnings too (missing tests, hardcoded paths, stub tests...)",
+            "help": "Fail on checkpoint warnings and missing AST driver coverage",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,

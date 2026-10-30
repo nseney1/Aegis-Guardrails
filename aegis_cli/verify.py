@@ -871,10 +871,10 @@ def run_verify(args: argparse.Namespace) -> int:
             return _unjudged(report_fmt, "the baseline could not be applied")
         results = list(applied.effective)
 
-    tools_pass = runner.gate_verdict(results)
+    tools_pass = runner.gate_verdict(results, **({"strict": True} if strict else {}))
     layer1_pass = tools_pass and not blocking
     if results:
-        summary = runner.format_summary(results)
+        summary = runner.format_summary(results, **({"strict": True} if strict else {}))
     else:
         n = len(target_files)
         summary = f"Layer 1: no check applies to the {n} target file{'' if n == 1 else 's'} (0 checks run, PASSED)"

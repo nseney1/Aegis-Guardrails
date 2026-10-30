@@ -44,7 +44,7 @@ PYTHON_SECURITY_RULES: List[Dict[str, Any]] = [
           "Disallow hashlib.md5, hashlib.sha1, and hashlib.new('md5'|'sha1') unless usedforsecurity=False.",
           [{"name": "hashlib.md5", "where": {"usedforsecurity": {"not": False}}},
            {"name": "hashlib.sha1", "where": {"usedforsecurity": {"not": False}}},
-           {"name": "hashlib.new", "where": {"name|#0": {"in": ["'md5'", "'sha1'", "'MD5'", "'SHA1'"]}, "usedforsecurity": {"not": False}}}]),
+           {"name": "hashlib.new", "where": {"name|#0": {"in": ["md5", "sha1", "MD5", "SHA1"]}, "usedforsecurity": {"not": False}}}]),
     _rule("sec-py-tempfile-mktemp", "Forbid Insecure tempfile.mktemp",
           "Disallow tempfile.mktemp() due to race conditions; use NamedTemporaryFile or mkstemp.",
           ["tempfile.mktemp"]),

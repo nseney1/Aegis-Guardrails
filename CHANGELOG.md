@@ -6,7 +6,14 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Added
 
+- Bounded protocol v2 driver sessions and per-check parse reuse, with additive AST capabilities, canonical matching and typed literal conditions.
+- Explicit missing-driver evidence in checks and receipts; ordinary `--strict` blocks missing AST coverage. Receipts retain per-file language and missing-driver reasons.
+- Offline standard-library Go build checks and exact packaged-asset dependency gates.
 - Optional AST source benchmarks with matched language fixtures, content digests and extraction witnesses: `aegis benchmark --ast-language python`. Python measurements are available; other selections explicitly report unavailable parsers.
+
+### Changed
+
+- Wave pull requests retain base-sourced governance checks while full audit, build, test and regression validation runs on develop pushes and downstream stages.
 
 ## [4.4.0] - 2026-10-29
 

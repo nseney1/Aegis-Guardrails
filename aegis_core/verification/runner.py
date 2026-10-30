@@ -20,6 +20,8 @@ from . import persistence_checker
 from . import call_graph
 from . import import_guard
 from . import mutation_tester
+from . import ast_checks, structural_checks
+from .ast_checks import NO_DRIVER_NOTE_TOOL
 
 VerificationResult = ToolEvidence
 
@@ -530,126 +532,23 @@ def run_layer1(
             if os.path.exists(full_path):
                 results.append(persistence_checker.check(full_path, dict_name))
 
-    # ── Call Graph Completeness ───────────────────────────────────────
     from aegis_core.ast.runner import ASTDriverRunner
-    ast_runner = ASTDriverRunner()
+    from aegis_core.ast.session import ASTParseSession
 
+    paths = []
     for filepath in changed_files:
         full_path = os.path.join(repo_root_str, filepath)
-        if not os.path.exists(full_path):
-            continue
-        if _is_test_or_support(filepath):
-            continue
-        ext = os.path.splitext(filepath)[1].lower()
-        try:
-            if ext == ".py":
-                results.append(call_graph.check(
-                    full_path, repo_root_str,
-                    exclude_names={'main', '_parse_args', 'parse_args'},
-                    fast_mode=fast_mode,
-                ))
-            elif ast_runner.registry.resolve_driver(ext, workspace_root=repo_root_str):
-                results.append(call_graph.check(
-                    full_path, repo_root_str,
-                    exclude_names={'main', '_parse_args', 'parse_args'},
-                    fast_mode=fast_mode,
-                    ast_runner=ast_runner,
-                ))
-        except Exception as exc:
-            results.append(_tool_failure("call_graph", filepath, exc))
-
-    # ── Import Guards ─────────────────────────────────────────────────
-    for filepath in changed_files:
-        full_path = os.path.join(repo_root_str, filepath)
-        if os.path.exists(full_path) and filepath.endswith('.py'):
-            if _is_test_or_support(filepath):
-                continue
-            try:
-                results.append(import_guard.check(full_path, project_root=repo_root_str))
-            except Exception as exc:
-                results.append(_tool_failure("import_guard", filepath, exc))
-
-    # ── Declarative Rule-Level forbid_ast ─────────────────────────────
-    from aegis_core.ast.policy import ASTExtractionError, evaluate_forbid_ast_structured, extract_normalized_ast
-
-    try:
-        # The default keeps the one-argument call that stand-ins for the discovery replace.
-        forbid_rules, broken_rules = _discover_forbid_ast_rules(*((repo_root_str,) if reviewed else (repo_root_str, False)))
-    except Exception as exc:
-        # The rules are gate rules: if they cannot be read, nothing may pass unchecked.
-        forbid_rules = []
-        broken_rules = []
-        results.append(ToolEvidence(
-            tool="forbid_ast",
-            target=RULES_RELDIR,
-            verdict=False,
-            detail=f"forbid_ast: cannot load rules: {type(exc).__name__}: {exc}",
-        ))
-    for rule_path, reason in broken_rules:
-        results.append(ToolEvidence(
-            tool="forbid_ast",
-            target=rule_path,
-            verdict=False,
-            detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
-        ))
-    owned: set[tuple[str, int, str]] = set()  # (file, line, pattern) a user forbid_ast rule judged
-    if forbid_rules:
-        ast_cache: dict[str, object] = {}
-        checked_paths: list[str] = []
-        for filepath in changed_files:
-            full_path = filepath if os.path.isabs(filepath) else os.path.join(repo_root_str, filepath)
-            if not os.path.isfile(full_path):
-                continue
-            try:
-                rel_path = os.path.relpath(full_path, repo_root_str).replace("\\", "/")
-            except ValueError:
-                rel_path = filepath.replace("\\", "/")
-            checked_paths.append(rel_path)
-            for rule, forbid_spec in forbid_rules:
-                rule_id = rule.id
-                # Rule.applies_to: target_paths ("**" when a forbid_ast rule names none),
-                # and test files only when the patterns name tests. Scan, telemetry and
-                # coverage ask the same question.
-                if not rule.applies_to(rel_path):
-                    continue
-
-                try:
-                    if full_path not in ast_cache:
-                        try:
-                            ast_cache[full_path] = extract_normalized_ast(
-                                full_path, workspace_root=repo_root_str, ast_runner=ast_runner
-                            )
-                        except ASTExtractionError as exc:
-                            ast_cache[full_path] = exc
-                    norm_ast = ast_cache[full_path]
-                    if norm_ast is None:  # no AST driver for this file type: rule does not apply
-                        continue
-                    findings: list[dict[str, Any]] = []
-                    if not isinstance(norm_ast, ASTExtractionError):
-                        try:
-                            findings = evaluate_forbid_ast_structured(norm_ast, forbid_spec, rule_id=rule_id)
-                            owned.update((rel_path, f["line"], f["pattern"]) for f in findings if not f["unknown"])
-                        except ASTExtractionError as exc:  # decorators had to be re-read from disk
-                            norm_ast = exc
-                except Exception as exc:
-                    results.append(_tool_failure(f"forbid_ast:{rule_id}", rel_path, exc))
-                    continue
-                if isinstance(norm_ast, ASTExtractionError):
-                    # Fail closed: a gate rule that cannot read the file must not pass it.
-                    results.append(
-                        VerificationResult(
-                            tool=f"forbid_ast:{rule_id}",
-                            target=rel_path,
-                            verdict=False,
-                            detail=f"forbid_ast: cannot verify {rel_path}: {norm_ast.reason}",
-                        )
-                    )
-                    continue
-                results.extend(_forbid_or_failure(repo_root_str, rule_id, rel_path, findings))
-        try:
-            results.extend(_exempt_notes(forbid_rules, checked_paths))
-        except Exception as exc:
-            results.append(_tool_failure("forbid_ast", RULES_RELDIR, exc))
+        if os.path.isfile(full_path):
+            rel = os.path.relpath(full_path, repo_root_str).replace("\\", "/")
+            paths.append((rel, full_path))
+    with ASTParseSession(repo_root_str, runner=ASTDriverRunner()) as session:
+        results.extend(structural_checks.run_checks(paths, repo_root_str, session,
+                                                    fast_mode=fast_mode, failure=_tool_failure))
+        checks, owned = ast_checks.run_checks(
+            paths, repo_root_str, session, discover_rules=_discover_forbid_ast_rules,
+            evidence=_forbid_or_failure, exempt_notes=_exempt_notes, failure=_tool_failure, reviewed=reviewed,
+        )
+        results.extend(checks)
 
     # ── T7: the security pack and the secret scan, on what the change introduces ──
     t7_rels = []
@@ -809,7 +708,7 @@ def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Opti
     hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
     notes: dict[str, list[str]] = {}
     for hit in pack.get("violations", ()):
-        if (hit["file"], hit["line"], hit["pattern"]) not in owned:
+        if ast_checks.site_key(hit["file"], hit["line"], hit["pattern"]) not in owned:
             hits.setdefault((f"security_pack:{hit['rule_id']}", hit["file"]), []).append(hit)
     for hit in pack.get("unverified_findings", ()):
         if hit["kind"] == "file":
@@ -837,24 +736,27 @@ def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Opti
     return out
 
 
-def gate_verdict(results: list[ToolEvidence]) -> bool:
+def gate_verdict(results: list[ToolEvidence], *, strict: bool = False) -> bool:
     """Simple gate: PASS if all tools pass. Empty results (no changed files) is a clean pass."""
     if not results:
         return True
-    return all(r.verdict for r in results)
+    return all(r.verdict and not (strict and r.tool == NO_DRIVER_NOTE_TOOL) for r in results)
 
 
-def format_summary(results: list[ToolEvidence]) -> str:
+def format_summary(results: list[ToolEvidence], *, strict: bool = False) -> str:
     """One-line summary of Layer 1 results."""
     if not results:
         return "Layer 1: No changed files to verify (0 checks run, PASSED)"
-    passed = sum(1 for r in results if r.verdict)
-    failed = sum(1 for r in results if not r.verdict)
+    failed_rows = [r for r in results if not r.verdict or (strict and r.tool == NO_DRIVER_NOTE_TOOL)]
+    failed = len(failed_rows)
+    passed = len(results) - failed
     total = len(results)
-    unverified = sum(1 for r in results if r.tool == UNVERIFIED_NOTE_TOOL)
+    unverified = sum(1 for r in results if r.tool in (UNVERIFIED_NOTE_TOOL, NO_DRIVER_NOTE_TOOL))
     notes = f" ({unverified} unverified, see notes)" if unverified else ""
+    if strict and any(r.tool == NO_DRIVER_NOTE_TOOL for r in results):
+        notes += " (strict: no-driver coverage blocks)"
     if failed:
-        return f"Layer 1: {failed}/{total} FAILED — {', '.join(r.tool for r in results if not r.verdict)}{notes}"
+        return f"Layer 1: {failed}/{total} FAILED — {', '.join(r.tool for r in failed_rows)}{notes}"
     return f"Layer 1: {passed}/{total} PASSED{notes}"
 
 
@@ -873,7 +775,7 @@ INDEX_BLOB_LIMIT_BYTES = 5 * 1024 * 1024
 INDEX_NOTE_TOOL = "index"  # passing evidence that says what the hook did not check
 UNVERIFIED_NOTE_TOOL = "forbid_ast_unverified"  # sites a forbid_ast where clause could not decide
 EXEMPT_NOTE_TOOL = "forbid_ast_exempt"  # test files a forbid_ast rule skipped
-NOTE_TOOLS = frozenset({INDEX_NOTE_TOOL, UNVERIFIED_NOTE_TOOL, EXEMPT_NOTE_TOOL})
+NOTE_TOOLS = frozenset({INDEX_NOTE_TOOL, UNVERIFIED_NOTE_TOOL, EXEMPT_NOTE_TOOL, NO_DRIVER_NOTE_TOOL})
 _UNVERIFIED_SHOWN = 5
 
 
@@ -1073,106 +975,23 @@ def _layer1_on_snapshot(
     A file in ``too_large`` was not read: a forbid_ast gate rule that covers it fails
     closed; otherwise the call_graph and import_guard checks it would get are skipped,
     and passing INDEX_NOTE_TOOL evidence says so."""
-    from aegis_core.ast.policy import ASTExtractionError, evaluate_forbid_ast_structured, extract_normalized_ast
+    from aegis_core.ast.session import ASTParseSession
 
-    results: list[ToolEvidence] = []
-    checked = [
-        (rel, _snapshot_file(snapshot, rel)) for rel in files
-        if not (is_test_path(rel) or posixpath.basename(rel) == "__init__.py")
-    ]
-    entry_points = {"main", "_parse_args", "parse_args"}
-    for rel, full_path in checked:
-        ext = os.path.splitext(rel)[1].lower()
-        try:
-            if ext == ".py":
-                results.append(call_graph.check(full_path, repo_root, exclude_names=entry_points, fast_mode=True))
-            elif ast_runner.registry.resolve_driver(ext, workspace_root=repo_root):
-                # The snapshot sits outside the repository: confine to it, resolve drivers from the repo.
-                results.append(call_graph.check(
-                    full_path, repo_root, exclude_names=entry_points, fast_mode=True, ast_runner=ast_runner,
-                    confine_root=snapshot,
-                ))
-        except Exception as exc:
-            results.append(_tool_failure("call_graph", rel, exc))
-    for rel, full_path in checked:
-        if rel.endswith(".py"):
-            try:
-                result = import_guard.check(full_path, project_root=repo_root)
-            except Exception as exc:
-                results.append(_tool_failure("import_guard", rel, exc))
-                continue
-            missing = _not_in_the_commit(rel, full_path, repo_root) if not result.verdict else []
-            if missing:
-                result.detail += (f"; {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not staged or "
-                                  "tracked, so the commit would not include it")
-            results.append(result)
-
-    try:
-        forbid_rules, broken_rules = _discover_forbid_ast_rules(repo_root)
-    except Exception as exc:
-        forbid_rules = []
-        broken_rules = []
-        results.append(ToolEvidence(
-            tool="forbid_ast", target=RULES_RELDIR, verdict=False,
-            detail=f"forbid_ast: cannot load rules: {type(exc).__name__}: {exc}",
-        ))
-    for rule_path, reason in broken_rules:
-        results.append(ToolEvidence(
-            tool="forbid_ast", target=rule_path, verdict=False,
-            detail=f"forbid_ast: cannot load rule {rule_path}: {reason}",
-        ))
-    owned: set[tuple[str, int, str]] = set()  # (file, line, pattern) a user forbid_ast rule judged
+    paths = [(rel, _snapshot_file(snapshot, rel)) for rel in files]
+    with ASTParseSession(repo_root, confine_root=snapshot, runner=ast_runner) as session:
+        results = structural_checks.run_checks(paths, repo_root, session, fast_mode=True,
+                                               failure=_tool_failure, not_in_commit=_not_in_the_commit)
+        checks, owned = ast_checks.run_checks(
+            paths, repo_root, session, discover_rules=_discover_forbid_ast_rules,
+            evidence=_forbid_or_failure, exempt_notes=_exempt_notes, failure=_tool_failure,
+            too_large={rel: _not_read(size) for rel, size in too_large.items()},
+        )
+        results.extend(checks)
     for rel, size in too_large.items():
-        why = _not_read(size)
-        covering = [rule for rule, _spec in forbid_rules if rule.applies_to(rel)]
-        for rule in covering:  # a gate rule that cannot read the file must not pass it
-            results.append(ToolEvidence(
-                tool=f"forbid_ast:{rule.id}", target=rel, verdict=False, detail=f"forbid_ast: cannot verify {rel}: {why}",
-            ))
-        if not covering and not (is_test_path(rel) or posixpath.basename(rel) == "__init__.py"):
-            results.append(ToolEvidence(tool=INDEX_NOTE_TOOL, target=rel, verdict=True, detail=f"{rel} not checked: {why}"))
-    for rel in files:
-        # Rule.applies_to: target_paths, and test files only when the patterns name tests.
-        applicable = [(rule, spec) for rule, spec in forbid_rules if rule.applies_to(rel)]
-        if not applicable:
-            continue
-        try:
-            norm_ast = extract_normalized_ast(
-                _snapshot_file(snapshot, rel), workspace_root=repo_root, ast_runner=ast_runner, confine_root=snapshot,
-            )
-        except ASTExtractionError as exc:
-            norm_ast = exc
-        except Exception as exc:
-            results.extend(_tool_failure(f"forbid_ast:{rule.id}", rel, exc) for rule, _spec in applicable)
-            continue
-        if norm_ast is None:  # no AST driver for this file type: the rules do not apply
-            continue
-        for rule, forbid_spec in applicable:
-            tool = f"forbid_ast:{rule.id}"
-            failure = norm_ast if isinstance(norm_ast, ASTExtractionError) else None
-            findings: list[dict[str, Any]] = []
-            if failure is None:
-                try:
-                    findings = evaluate_forbid_ast_structured(norm_ast, forbid_spec, rule_id=rule.id)
-                    owned.update((rel, f["line"], f["pattern"]) for f in findings if not f["unknown"])
-                except ASTExtractionError as exc:  # decorators had to be re-read from the file
-                    failure = exc
-                except Exception as exc:
-                    results.append(_tool_failure(tool, rel, exc))
-                    continue
-            if failure is not None:
-                # Fail closed: a gate rule that cannot read the file must not pass it.
-                results.append(ToolEvidence(
-                    tool=tool, target=rel, verdict=False, detail=f"forbid_ast: cannot verify {rel}: {failure.reason}",
-                ))
-                continue
-            results.extend(_forbid_or_failure(repo_root, rule.id, rel, findings))
-    try:
-        results.extend(_exempt_notes(forbid_rules, files))
-    except Exception as exc:
-        results.append(_tool_failure("forbid_ast", RULES_RELDIR, exc))
+        if not any(row.target == rel for row in checks) and not (is_test_path(rel) or posixpath.basename(rel) == "__init__.py"):
+            results.append(ToolEvidence(tool=INDEX_NOTE_TOOL, target=rel, verdict=True, detail=f"{rel} not checked: {_not_read(size)}"))
     t7_rels = [rel for rel in files if os.path.isfile(_snapshot_file(snapshot, rel))]
-    if t7_rels:  # the staged text, against HEAD first
+    if t7_rels:
         results.extend(_t7_evidence(repo_root, t7_rels, snapshot, None, owned, present=entries.__contains__))
     return results
 
@@ -1181,8 +1000,8 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
     """Layer 1 in fast mode on the staged content of ``changed_files`` (paths relative to
     ``repo_root``): exactly what ``git commit`` records, whatever the working tree holds.
 
-    Python and the types an AST driver handles are written to a snapshot for call_graph,
-    import_guard, forbid_ast and T7; every other staged file goes to T7 alone (the secret
+    Python, driven files and non-driver files covered by a forbid_ast rule are written
+    to a snapshot for structural checks and T7; other staged files go to T7 alone (the secret
     scan reads any type, as plain ``aegis check`` does) and is never written (_t7_on_index).
     A path the index does not hold as a regular file (a deletion, a symlink, a submodule)
     has no content to check. Raises GitError when git cannot list or read the index, so
@@ -1193,22 +1012,23 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
     from aegis_core.ast.runner import ASTDriverRunner
 
     repo_root_str = str(getattr(repo_root, "root", repo_root))
-    ast_runner = ASTDriverRunner()
-    driven: dict[str, bool] = {".py": True}
+    with ASTDriverRunner() as ast_runner:
+        covered = ast_checks.covered_paths(changed_files, repo_root_str, _discover_forbid_ast_rules)
+        driven: dict[str, bool] = {".py": True}
 
-    def readable(rel: str) -> bool:
-        ext = os.path.splitext(rel)[1].lower()
-        if ext not in driven:
-            try:
-                driven[ext] = bool(ast_runner.registry.resolve_driver(ext, workspace_root=repo_root_str))
-            except Exception:
-                driven[ext] = True  # read it: call_graph meets the same error and fails closed on it
-        return driven[ext]
+        def readable(rel: str) -> bool:
+            ext = os.path.splitext(rel)[1].lower()
+            if ext not in driven:
+                try:
+                    driven[ext] = bool(ast_runner.resolve_driver(ext, workspace_root=repo_root_str))
+                except Exception:
+                    driven[ext] = True  # read it: call_graph meets the same error and fails closed on it
+            return driven[ext]
 
-    entries = _index_entries(repo_root_str)
-    with tempfile.TemporaryDirectory(prefix=SNAPSHOT_PREFIX) as snapshot:
-        typed = [rel for rel in changed_files if readable(rel)]
-        staged, too_large = snapshot_index(repo_root_str, typed, snapshot, entries)
-        results = _layer1_on_snapshot(staged, repo_root_str, snapshot, ast_runner, too_large, entries)
-        results = _without_snapshot(results, snapshot)
-    return results + _t7_on_index(repo_root_str, [rel for rel in changed_files if not readable(rel)], entries)
+        entries = _index_entries(repo_root_str)
+        with tempfile.TemporaryDirectory(prefix=SNAPSHOT_PREFIX) as snapshot:
+            typed = [rel for rel in changed_files if readable(rel) or rel in covered]
+            staged, too_large = snapshot_index(repo_root_str, typed, snapshot, entries)
+            results = _layer1_on_snapshot(staged, repo_root_str, snapshot, ast_runner, too_large, entries)
+            results = _without_snapshot(results, snapshot)
+        return results + _t7_on_index(repo_root_str, [rel for rel in changed_files if rel not in typed], entries)

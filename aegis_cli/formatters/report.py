@@ -111,6 +111,7 @@ def format_layer1_json_payload(
                 "verdict": bool(r.verdict),
                 "detail": r.detail,
                 "lines": list(r.lines),
+                **({"language": r.language} if getattr(r, "language", None) else {}),
             }
             for r in results
         ],
@@ -188,7 +189,7 @@ def layer1_report_document(passed: bool, owned: list, checkpoint_issues: list, s
 
     return {"passed": passed,
             "layer1": [{"tool": e.tool, "target": path or e.target, "verdict": bool(e.verdict), "detail": e.detail,
-                        "lines": list(e.lines)} for path, e in owned],
+                        "lines": list(e.lines), **({"language": e.language} if getattr(e, "language", None) else {})} for path, e in owned],
             "findings": [{"rule": f"checkpoint:{issue.get('check', '')}", "message": issue.get("message", ""),
                           "level": "error" if is_blocking(issue, strict) else "warning"} for issue in checkpoint_issues]}
 
