@@ -55,7 +55,7 @@ class _DriverPlan:
     cwd: Optional[str] = None  # None: the workspace root
     isolated_cwd: bool = False  # run in a fresh empty directory instead of ``cwd``
     in_process_rust: bool = False
-    go_template: Optional[str] = None  # packaged Go source, compiled before running
+    packaged_go: bool = False  # prepared lazily, never by descriptions or diagnostics
     unavailable: Optional[str] = None  # why the chosen driver cannot run here
     protocol: int = 1  # v2 is registered in code; user config remains v1
 
@@ -137,6 +137,8 @@ def _packaged_plan(ext: str, ws_root: Path) -> Optional[_DriverPlan]:
                 f"where {interpreter} would load modules from the repository; install aegis outside it"
             ),
         )
+    if filename == "go_ast.go":
+        return _DriverPlan(label=label, packaged_go=True, protocol=2)
     exe = _trusted_interpreter(interpreter, ws_root)
     if exe is None:
         return _DriverPlan(
@@ -146,8 +148,6 @@ def _packaged_plan(ext: str, ws_root: Path) -> Optional[_DriverPlan]:
     template = str(_TEMPLATES_DIR / filename)
     # cwd is the template dir, never the repo: ts_ast.js require()s from process.cwd(),
     # and go resolves go.mod/go.work (and toolchain downloads) from it.
-    if filename == "go_ast.go":
-        return _DriverPlan(label=label, argv=(exe,), cwd=str(_TEMPLATES_DIR), go_template=template)
     return _DriverPlan(label=label, argv=(exe, template), cwd=str(_TEMPLATES_DIR))
 
 
@@ -323,12 +323,14 @@ def resolve_driver_executable(name: str, workspace: Optional[Union[Path, str]] =
 class ASTDriverRunner:
     """Dispatches AST parsing to native Python or external driver subprocesses."""
 
-    def __init__(self, registry: Optional[ASTDriverRegistry] = None):
+    def __init__(self, registry: Optional[ASTDriverRegistry] = None, *, allow_build: bool = True):
         self.registry = registry or ASTDriverRegistry()
+        self.allow_build = allow_build
         self._active = False
         self._plans: dict[tuple[str, str], Union[_DriverPlan, Exception, None]] = {}
         self._batches: dict[tuple[str, ...], object] = {}
         self._configs: dict[tuple[str, str], Any] = {}
+        self._go_plans: dict[str, Union[_DriverPlan, Exception]] = {}
 
     def __enter__(self):
         self._active = True
@@ -349,6 +351,7 @@ class ASTDriverRunner:
             self._batches.clear()
             self._plans.clear()
             self._configs.clear()
+            self._go_plans.clear()
             self._active = False
         if failure is not None:
             raise failure
@@ -406,6 +409,33 @@ class ASTDriverRunner:
             self._batches[plan.argv] = BatchDriver(plan.argv, label=plan.label, timeout=timeout)
         return self._batches[plan.argv].parse(target_path)
 
+    def _prepare_go(self, plan: _DriverPlan, workspace: Path) -> _DriverPlan:
+        from aegis_core.ast.gobuild import GoDriverUnavailableError, inspect_go_driver, prepare_go_driver
+
+        key = str(workspace.resolve())
+        if not self._active or key not in self._go_plans:
+            try:
+                if self.allow_build:
+                    binary = prepare_go_driver(workspace)
+                else:
+                    status = inspect_go_driver(workspace)
+                    if not status.cache_hit:
+                        raise GoDriverUnavailableError('build_failed',
+                                                       'Go driver cache is cold; run aegis doctor --drivers --fix')
+                    binary = status.binary
+                prepared = replace(plan, argv=(str(binary),))
+            except GoDriverUnavailableError as exc:
+                prepared = ASTDriverError(str(exc))
+            if not self._active:
+                if isinstance(prepared, Exception):
+                    raise prepared
+                return prepared
+            self._go_plans[key] = prepared
+        prepared = self._go_plans[key]
+        if isinstance(prepared, Exception):
+            raise prepared
+        return prepared
+
     def parse_file(
         self,
         file_path: Union[Path, str],
@@ -458,6 +488,8 @@ class ASTDriverRunner:
             raise NoDriverConfiguredError(
                 f"No AST driver configured for extension '{ext}' on {target_path.name}{reason}"
             )
+        if plan.packaged_go:
+            plan = self._prepare_go(plan, ws_root)
         if plan.protocol == 2:
             return self._parse_batch(plan, target_path, timeout)
 
@@ -492,12 +524,6 @@ class ASTDriverRunner:
 
 
 def _run_plan(plan: _DriverPlan, cwd: str, timeout: float, target_path: Path) -> str:
-    if plan.go_template:
-        # Not 'go run': it takes every leading *.go argument, the target included, as a source file.
-        with tempfile.TemporaryDirectory(prefix="aegis-go-ast-") as tmp:
-            exe = os.path.join(tmp, "go_ast.exe" if os.name == "nt" else "go_ast")
-            _run_driver([plan.argv[0], "build", "-o", exe, plan.go_template], cwd, timeout, plan.label, target_path.name)
-            return _run_driver([exe, str(target_path)], cwd, timeout, plan.label, target_path.name)
     return _run_driver(list(plan.argv) + [str(target_path)], cwd, timeout, plan.label, target_path.name)
 
 

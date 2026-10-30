@@ -335,3 +335,7 @@ Flags and defaults for every command are in the [reference](reference.md); this 
 | upgrade a v3 workspace | `aegis migrate`, then `aegis migrate --apply`, `aegis init --host ...` and `aegis doctor --fix` |
 | remove Aegis from a repo | `aegis uninstall` (keeps `.aegis/`) |
 | use Aegis from Python | `from aegis_sdk import Governance; Governance(project_root=".").scan(["app.py"])` |
+
+### Packaged Go driver cache
+
+Go parsing stays opt-in through `ast.packaged_drivers`. Aegis builds its own standard-library Go parser outside the workspace with dependency and toolchain fetching disabled, then reuses one bounded protocol-v2 process per check. The cache key includes packaged source bytes, Go version, OS and architecture. Ordinary `aegis doctor` and `aegis check --card` inspect the cache without building; `aegis doctor --drivers --fix` prepares it after confirmation. Configuration changes are backed up; generated cache binaries are rebuilt. Cached code has the same user-level trust as the Aegis installation. User-configured drivers keep protocol v1.

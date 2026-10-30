@@ -13,8 +13,8 @@
       "stmts": 79
     },
     "aegis_cli/verify.py:run_verify": {
-      "lines": 296,
-      "stmts": 201
+      "lines": 284,
+      "stmts": 199
     },
     "aegis_core/command_safety/lexer.py:extract_subshell_commands": {
       "lines": 150,
@@ -99,8 +99,8 @@
       "stmts": 770
     },
     "aegis_core/verification/runner.py": {
-      "lines": 1034,
-      "stmts": 665
+      "lines": 1030,
+      "stmts": 661
     }
   }
 }
