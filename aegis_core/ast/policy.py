@@ -15,7 +15,7 @@ from aegis_core.ast.literals import compare_literal, compare_options
 from aegis_core.ast.schema import (
     NormalizedAST, _SpellingIndex, add_binding, _call_target, _decorator_name,
     _decorator_pattern, _extract_import_tuple, _extract_python_decorators_from_file,
-    _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, _spellings, canonical_spelling,
+    _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, canonical_spelling,
 )
 
 __all__ = ["ASTExtractionError", "_match_ImportNode_against_pattern", "evaluate_forbid_ast", "evaluate_forbid_ast_delta", "evaluate_forbid_ast_structured", "extract_normalized_ast", "parse_allow_comments", "violation_messages"]
@@ -135,7 +135,7 @@ def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
     return any(s == mod or s.startswith(f"{mod}.") or (src and (f"{src}.{s}" == mod or f"{src}.{s}".startswith(f"{mod}."))) for s in syms)
 
 
-def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str], args_known: bool = True) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
+def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, defined_names: set[str], args_known: bool = True) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
     if isinstance(raw_call, str):
         call = _normalize_ast_token(raw_call)
         where = None
@@ -154,10 +154,10 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
         if not target or not call_index.matches(target, call):
             continue
         if builtin_only:
-            spelled = _spellings(target, imported_qual_map, aliases, qualify_heads=True)
+            spelled = call_index.spellings(target)
             shadowed = site.get("shadowed") if isinstance(site, Mapping) else getattr(site, "shadowed", None)
             if not isinstance(shadowed, bool):  # no driver verdict: the legacy file-wide test
-                shadowed = call in imported_qual_map or call in aliases or call in defined_names
+                shadowed = call_index.is_bound(call) or call in defined_names
             if not (any(s in (f"builtins.{call}", f"__builtins__.{call}") for s in spelled) or (target == call and not shadowed)):
                 continue
         verdict = _match_where(site, where, args_known) if where else True
@@ -188,7 +188,7 @@ def _snippet(text: str) -> str:
     return f"{collapsed[:_SNIPPET_KEEP]}#{hashlib.sha256(collapsed.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}"
 
 
-def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any]) -> List[str]:
+def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], bound_origins: Mapping[str, Any]) -> List[str]:
     if not isinstance(forbidden, (list, tuple, set)) or not forbidden:
         return []
     try:
@@ -208,7 +208,7 @@ def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, impo
         except Exception as exc:
             raise ASTExtractionError(fp, f"{type(exc).__name__}: {exc}") from exc
     names = list(dict.fromkeys(n for n in map(_decorator_name, raw_decs) if n))
-    index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=False)
+    index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=False, bound_origins=bound_origins)
     pats = (_decorator_pattern(raw) if isinstance(raw, str) else "" for raw in forbidden)
     return [dec for dec in pats if dec and any(index.matches(name, _decorator_pattern(dec)) for name in names)]
 
@@ -229,13 +229,21 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     parsed_imports: list[Any] = []
     imported_qual_map: dict[str, Any] = {}
     aliases: dict[str, Any] = {}
+    bound_origins: dict[str, Any] = {}
     for imp in getattr(normalized_ast, "imports", ()) or ():
         src, syms = _extract_import_tuple(imp)
-        for name, originals in _import_aliases(imp).items():
+        bindings = _import_aliases(imp)
+        for name, originals in bindings.items():
             for orig in originals:
-                add_binding(aliases, name, orig)
+                add_binding(bound_origins if src else aliases, name, f"{src}.{orig}" if src and orig != src else orig)
         parsed_imports.append((imp, (src, syms)))
+        # Only actual plain bindings may qualify another reference's head. Aliased
+        # originals belong to their own bound name, not a global table of leaf names.
+        aliased_symbols = Counter(orig for originals in bindings.values() for orig in originals)
         for sym in syms if src else ():
+            if aliased_symbols[sym]:
+                aliased_symbols[sym] -= 1
+                continue
             if sym and sym != src:
                 add_binding(imported_qual_map, sym, f"{src}.{sym}")
     by_line = lambda hit: _line_of(hit[0]) or 0
@@ -247,12 +255,12 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
                               if t[0] == "<expr>" or _match_ImportNode_against_pattern(t, mod)), key=by_line)
             hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
     raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
-    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
+    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True, bound_origins=bound_origins)
     defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, matched = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
+        call, matched = _eval_call_entry(raw_call, raw_call_sites, call_index, defined_names, _driver_extracts_args(normalized_ast))
         hits.extend(("calls", call, site, verdict) for site, verdict in sorted(matched, key=by_line))
-    hits.extend(("decorators", dec, None, True) for dec in _decorator_hits(normalized_ast, forbid_spec.get("decorators"), fp, imported_qual_map, aliases))
+    hits.extend(("decorators", dec, None, True) for dec in _decorator_hits(normalized_ast, forbid_spec.get("decorators"), fp, imported_qual_map, aliases, bound_origins))
     if not hits:
         return []
     meta = getattr(normalized_ast, "metadata", None)

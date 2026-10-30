@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 import ast
 import json
 import os
@@ -132,19 +133,23 @@ def _driver_alias_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     return pairs
 
 
+def _import_alias_pairs(imp: Any) -> Tuple[Tuple[str, str], ...]:
+    """Canonical alias pairs, preserving repeated bindings for occurrence counts."""
+    pairs = _driver_alias_pairs(imp) if isinstance(imp, Mapping) else (getattr(imp, "aliases", None) or ())
+    if isinstance(pairs, Mapping):
+        pairs = pairs.items()
+    return tuple((canonical_spelling(str(a)), canonical_spelling(str(o))) for a, o in pairs if a and o)
+
+
 def _import_aliases(imp: Any) -> Dict[str, Tuple[str, ...]]:
     """Map each name an import binds via ``as`` to every name it aliases.
 
     Multi-valued because one statement may bind a name twice
     (``from m import a as x, b as x``); keeping only one original would hide the other.
     """
-    pairs = _driver_alias_pairs(imp) if isinstance(imp, Mapping) else (getattr(imp, "aliases", None) or ())
-    if isinstance(pairs, Mapping):
-        pairs = pairs.items()
     table: Dict[str, List[str]] = {}
-    for a, o in pairs:
-        if a and o:
-            add_binding(table, canonical_spelling(str(a)), canonical_spelling(str(o)))
+    for a, o in _import_alias_pairs(imp):
+        add_binding(table, a, o)
     return {name: tuple(originals) for name, originals in table.items()}
 
 
@@ -162,6 +167,8 @@ def _extract_import_tuple(imp: Any) -> Tuple[str, Tuple[str, ...]]:
         raw_syms = getattr(imp, "imported_symbols", ()) or getattr(imp, "imported_names", ()) or ()
     aliases = _import_aliases(imp)
     syms = [canonical_spelling(str(s)) for s in raw_syms if s]
+    occurrences = Counter(syms)
+    aliased = Counter(a for a, _ in _import_alias_pairs(imp))
     out: List[str] = []
     expanded: set = set()
     for sym in syms:
@@ -175,7 +182,7 @@ def _extract_import_tuple(imp: Any) -> Tuple[str, Tuple[str, ...]]:
         out.extend(originals)
         # One bound name per alias pair; a surplus occurrence is a plain binding of the
         # same name in this statement (``from m import a as b, b``) and must be kept.
-        if syms.count(sym) > len(originals):
+        if occurrences[sym] > aliased[sym]:
             out.append(sym)
     return src, tuple(out)
 
@@ -218,6 +225,7 @@ def _spellings(
     aliases: Optional[Mapping[str, Any]],
     *,
     qualify_heads: bool,
+    bound_origins: Optional[Mapping[str, Any]] = None,
 ) -> list[str]:
     """Every spelling of ``ref``: as written and through each alias original, each also
     qualified through the import map (an exact key, else, for calls, its part before the
@@ -233,6 +241,9 @@ def _spellings(
                 head, tail = spelled.split(".", 1)
                 if head in imported_qual_map:
                     out.extend(f"{qual}.{tail}" for qual in _as_names(imported_qual_map[head]))
+    # A source-backed import's original is already qualified. Its source namespace is
+    # not another local name to resolve through an unrelated import.
+    out.extend(_dealias(ref, bound_origins))
     return out
 
 
@@ -254,15 +265,25 @@ class _SpellingIndex:
         aliases: Optional[Mapping[str, Any]],
         *,
         qualify_heads: bool,
+        bound_origins: Optional[Mapping[str, Any]] = None,
     ):
         self._quals = {canonical_spelling(k): tuple(canonical_spelling(v) for v in _as_names(values))
                        for k, values in (imported_qual_map or {}).items()}
         self._aliases = {canonical_spelling(k): tuple(canonical_spelling(v) for v in _as_names(values))
                          for k, values in (aliases or {}).items()}
+        self._origins = {canonical_spelling(k): tuple(canonical_spelling(v) for v in _as_names(values))
+                         for k, values in (bound_origins or {}).items()}
         self._qualify_heads = qualify_heads
         self._enumerate = any("." in key or "::" in key for key in self._quals)
         self._heads: dict[tuple[str, bool], tuple[frozenset[str], dict[str, frozenset[str]]]] = {}
         self._qual_suffixes: dict[str, frozenset[str]] = {}
+
+    def spellings(self, ref: str) -> list[str]:
+        return _spellings(ref, self._quals, self._aliases, qualify_heads=self._qualify_heads,
+                          bound_origins=self._origins)
+
+    def is_bound(self, name: str) -> bool:
+        return name in self._quals or name in self._aliases or name in self._origins
 
     def matches(self, ref: str, pattern: str) -> bool:
         # An empty pattern names nothing. An empty reference needs no guard: it has no
@@ -271,7 +292,7 @@ class _SpellingIndex:
         if not pattern:
             return False
         if self._enumerate:
-            spellings = _spellings(ref, self._quals, self._aliases, qualify_heads=self._qualify_heads)
+            spellings = self.spellings(ref)
             return any(_suffix_match(s, pattern) for s in spellings)
         if _suffix_match(ref, pattern):  # covers the suffixes that lie inside ``rest``
             return True
@@ -306,7 +327,7 @@ class _SpellingIndex:
                 elif mode and origin in self._quals:
                     members.setdefault("", set()).add(origin)
             self._heads[key] = (
-                frozenset(s for origin in origins for s in _dot_suffixes(origin)),
+                frozenset(s for origin in [*origins, *_as_names(self._origins.get(head))] for s in _dot_suffixes(origin)),
                 {w: self._suffixes_of(names) for w, names in members.items()},
             )
         return self._heads[key]
