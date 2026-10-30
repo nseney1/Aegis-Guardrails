@@ -26,6 +26,9 @@ def _init(root, capsys, *extra):
 
 
 def test_init_reports_each_language_and_suggests_vitest_without_writing_user_config(project, capsys):
+    # Exercise JSON escaping on POSIX too; Windows paths also contain backslashes.
+    project = project / 'caf\u00e9'
+    project.mkdir()
     (project / 'go.mod').write_text('module example.com/app\ngo 1.21\n')
     (project / 'Cargo.toml').write_text('[package]\nname="app"\n')
     (project / 'main.py').write_text('value = 1\n')
@@ -40,7 +43,11 @@ def test_init_reports_each_language_and_suggests_vitest_without_writing_user_con
     assert 'pack 5; tests not configured; coverage not configured' in out
     assert 'pack 4; tests go test (default); coverage coverprofile (default)' in out
     assert 'Suggested user configuration' in out and '~/.aegis/config.json' in out
-    assert str(project / 'node_modules/vitest/vitest.mjs') in out
+    suggestion, = [json.loads(line) for line in out.splitlines() if line.lstrip().startswith('{"tests":')]
+    assert suggestion['tests']['languages']['ts']['command'] == [
+        'node', str(project / 'node_modules/vitest/vitest.mjs'), 'run',
+        '--reporter=junit', '--outputFile={junit}', '{files}',
+    ]
     assert '--reporter=junit' in out and '--outputFile={junit}' in out
     assert 'touch WRONG' not in out and not user.exists()
     config = json.loads((project / '.aegis/config.json').read_text())
