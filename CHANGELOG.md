@@ -4,6 +4,10 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ## [Unreleased]
 
+### Added
+
+- Optional AST source benchmarks with matched language fixtures, content digests and extraction witnesses: `aegis benchmark --ast-language python`. Python measurements are available; other selections explicitly report unavailable parsers.
+
 ## [4.4.0] - 2026-10-29
 
 ### Security

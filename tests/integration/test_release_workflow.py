@@ -97,6 +97,14 @@ def test_verify_dist_accepts_recorded_artifacts(tmp_path):
     assert len(proc.stdout.split()) == 2
 
 
+def test_record_accepts_the_exact_first_party_ast_corpus(tmp_path):
+    d = _dist(tmp_path, extra=("aegis_core/benchmark_corpus/ast.json",))
+    proc = _verify("record", str(d))
+    assert proc.returncode == 0, proc.stderr
+    proc = _verify("verify", str(d))
+    assert proc.returncode == 0 and len(proc.stdout.split()) == 2, proc.stderr
+
+
 @pytest.mark.parametrize("prefix", ["", "licenses/"])
 def test_verify_dist_accepts_packaged_first_party_license_and_notice(tmp_path, prefix):
     d = _dist(tmp_path, extra=["aegis_guardrails-0.0.0.dist-info/" + prefix + name
@@ -129,7 +137,8 @@ def test_verify_dist_rejects_unlisted_artifact(tmp_path):
     "aegis_core/x.so", "aegis_core/x.pyd", "aegis_core/x.dll", "aegis_core/x.dylib",
     "aegis_core/x.wasm", "aegis_core/x.node", "aegis_core/x.jar", "aegis_core/x.js",
     "aegis_core/ast/drivers/templates/extra.py", "aegis_core/ast/drivers/templates/nested/x.go",
-    "aegis_core/unexpected.json", "foreign/__init__.py", "../aegis_core/x.py",
+    "aegis_core/unexpected.json", "aegis_core/benchmark_corpus/adjacent.json",
+    "foreign/__init__.py", "../aegis_core/x.py",
     "aegis_core/../x.py", "aegis_core\\x.py", "aegis_core/_data/rules/injected.md",
     "aegis_guardrails-0.0.0.dist-info/vendor.py",
     "aegis_core//x.py", "aegis_guardrails-9.9.9.dist-info/WHEEL",

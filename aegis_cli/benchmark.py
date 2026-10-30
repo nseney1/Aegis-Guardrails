@@ -66,6 +66,12 @@ def _report(result: Dict[str, Any], recorded: bool) -> List[str]:
         f"{layer1['findings']} findings)",
         benchmark.NOTICE,
     ]
+    if "ast" in result:
+        ast = result["ast"]
+        lines.append(f"  AST source parsing  {ast['language']} ({ast['implementation']}; {ast['mode']}; "
+                     f"corpus sha256 {ast['corpus_sha256']}; performance acceptance {ast['acceptance']})")
+        lines.extend(f"    {row['lines']} lines  p50 {row['latency_ms']['p50']} ms  "
+                     f"p95 {row['latency_ms']['p95']} ms; sha256 {row['sha256']}" for row in ast["cases"])
     if recorded:
         lines.append("Recorded a benchmark event.")
     return lines
@@ -79,7 +85,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
         print(f"Error: not an Aegis workspace (no .aegis/ in {root}); run aegis init", file=sys.stderr)
         return EXIT_USAGE
     try:
-        result = benchmark.run_benchmark(runs)
+        language = getattr(args, "ast_language", None)
+        result = benchmark.run_benchmark(runs, **({"ast_language": language} if language is not None else {}))
     except benchmark.BenchmarkError as exc:
         if use_json:
             print(json.dumps({**_benchmark_payload(root, runs), "status": "error", "error": str(exc)}, indent=2))
@@ -99,6 +106,9 @@ def run_benchmark(args: argparse.Namespace) -> int:
         doc.update({"status": "ok", "notice": benchmark.NOTICE, "measures": MEASURES, "not_measured": NOT_MEASURED,
                     "recorded": not warnings, "warnings": warnings})
         doc.update({key: result[key] for key in ("runs", "python", "platform", "corpus", "scan", "hook_run", "layer1")})
+        if "ast" in result:
+            doc["ast"] = result["ast"]
+            doc["measures"] = MEASURES + ["AST source parsing (I/O excluded); performance acceptance not evaluated"]
         print(json.dumps(doc, indent=2))
         return EXIT_OK
     for line in _report(result, recorded=not warnings):
@@ -124,6 +134,8 @@ class BenchmarkCommand(AegisCommand):
     )
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--ast-language", choices=("python", "typescript", "javascript", "go", "rust"),
+                            help="Also measure matched AST source fixtures; only Python is available in this phase")
         parser.add_argument("--runs", type=_runs, default=benchmark.DEFAULT_RUNS, metavar="N",
                             help=f"Timed runs of each measurement, 1 to {benchmark.MAX_RUNS} "
                                  f"(default {benchmark.DEFAULT_RUNS}); one untimed warm-up of the hook and Layer 1 comes first")

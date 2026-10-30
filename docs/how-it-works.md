@@ -174,6 +174,8 @@ An advisory model review does not replace independent human review. `aegis check
 
 `aegis rule export` and `aegis rule import` move rules in digest-checked bundles; packs are not signed. `aegis benchmark` measures scan, hook and check performance, not whether rules improve development outcomes. Experimental host registration and packaging are covered in [hosts and hooks](hosts-and-hooks.md).
 
+Add `--ast-language python` to measure native source parsing at 300, 600, 1,200, 2,500 and 5,000 lines, with matching fixture digests and extraction witnesses. These timings exclude file I/O and leave performance acceptance unevaluated. The corpus also includes TypeScript, JavaScript, Go and Rust fixtures; their native benchmark selections currently report unavailable parsers.
+
 ## CI governance
 
 `aegis init --ci` writes `.github/workflows/aegis.yml`: an `aegis-check` job that checks out with `fetch-depth: 0` (so the base branch is there), installs the Aegis version that wrote it, and runs `aegis check` and then `aegis check --ci` with `GH_TOKEN` and `pull-requests: read`, plus an `aegis-sarif` job that uploads code-scanning annotations.

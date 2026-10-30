@@ -23,7 +23,8 @@ TEMPLATE_PREFIX = "aegis_core/ast/drivers/templates/"
 # M1 baseline. M2a removes ts_ast.js; M2b removes rust_ast.py here and in package-data.
 TEMPLATES = {TEMPLATE_PREFIX + name for name in (
     "__init__.py", "ts_ast.js", "rust_ast.py", "go_ast.go", "go.mod")}
-ASSETS = {"aegis_sdk/py.typed", "aegis_core/benchmark_corpus/corpus.json"}
+ASSETS = {"aegis_sdk/py.typed", "aegis_core/benchmark_corpus/corpus.json",
+          "aegis_core/benchmark_corpus/ast.json"}
 ASSETS.update("aegis_core/_data/rules/" + name for name in (
     "__init__.py", "META.md", "cost-optimization.md", "destructive-ops.md", "no-eval.md",
     "providence.md", "subagent-delegation.md", ".oracles/architectural-tenets.md",

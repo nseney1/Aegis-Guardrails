@@ -245,6 +245,25 @@
             "type": "str"
           },
           {
+            "choices": [
+              "python",
+              "typescript",
+              "javascript",
+              "go",
+              "rust"
+            ],
+            "default": null,
+            "dest": "ast_language",
+            "flags": [
+              "--ast-language"
+            ],
+            "help": "Also measure matched AST source fixtures; only Python is available in this phase",
+            "kind": "store",
+            "metavar": null,
+            "nargs": null,
+            "required": false
+          },
+          {
             "default": 20,
             "dest": "runs",
             "flags": [

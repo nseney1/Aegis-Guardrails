@@ -104,6 +104,7 @@ aegis_core = [
     "ast/drivers/templates/ts_ast.js",
     "ast/drivers/templates/rust_ast.py",
     "benchmark_corpus/corpus.json",
+    "benchmark_corpus/ast.json",
 ]
 "aegis_core._data.rules" = ["*.md", ".oracles/*.md"]
 "aegis_core._data.skills" = ["*/SKILL.md"]

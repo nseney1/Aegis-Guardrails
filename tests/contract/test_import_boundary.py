@@ -119,6 +119,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.packs": 2,
     # The benchmark: scan, Layer 1 and events over a fixture corpus it ships as package data.
     "aegis_core.benchmark": 2,
+    "aegis_core.benchmark_ast": 2,
     # The Claude Code plugin dir (aegis package): pure builders plus an atomic writer over storage.
     "aegis_core.packaging": 1,
 }
