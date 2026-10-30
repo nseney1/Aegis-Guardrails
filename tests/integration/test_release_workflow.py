@@ -44,7 +44,11 @@ def _dist(tmp_path, extra=(), metadata=""):
                        "Metadata-Version: 2.1\nName: aegis-guardrails\nVersion: 0.0.0\n"
                        "Provides-Extra: dev\nRequires-Dist: pytest; extra == 'dev'\n" + metadata)
         for name in extra:
-            wheel.writestr(name, "injected")
+            member = zipfile.ZipInfo(name)
+            # Preserve malformed archive bytes: ZipInfo otherwise normalizes
+            # backslashes on Windows and truncates names at NUL on every OS.
+            member.filename = name
+            wheel.writestr(member, "injected")
     (d / "soma_governance-0.0.0.tar.gz").write_bytes(b"sdist bytes")
     return d
 
@@ -142,6 +146,7 @@ def test_verify_dist_rejects_unlisted_artifact(tmp_path):
     "aegis_core/../x.py", "aegis_core\\x.py", "aegis_core/_data/rules/injected.md",
     "aegis_guardrails-0.0.0.dist-info/vendor.py",
     "aegis_core//x.py", "aegis_guardrails-9.9.9.dist-info/WHEEL",
+    "aegis_core/x.py\x00hidden.py",
 ])
 def test_record_rejects_injected_wheel_members_before_signing(tmp_path, name):
     d = _dist(tmp_path, extra=[name])
