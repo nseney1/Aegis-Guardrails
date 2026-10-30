@@ -174,6 +174,26 @@ def test_prepare_builds_complete_binary_once_and_reuses_it(compiler):
     assert compiler.workspace not in first.parents
 
 
+def test_prepare_publishes_complete_binary_when_flush_requires_write_access(compiler, monkeypatch):
+    from aegis_core.ast.gobuild import prepare_go_driver
+
+    fsync = os.fsync
+
+    def flush_writable_file(fd):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            # Windows cannot flush a read-only file handle. A zero-byte write
+            # enforces the same access requirement without changing its bytes.
+            os.write(fd, b"")
+        fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", flush_writable_file)
+    binary = prepare_go_driver(compiler.workspace)
+
+    assert binary.read_bytes() == b"complete fake driver"
+    assert prepare_go_driver(compiler.workspace) == binary
+    assert not list(compiler.cache.glob(".go-build-*"))
+
+
 def test_build_is_private_offline_and_retains_only_safe_environment(compiler, monkeypatch):
     from aegis_core.ast.gobuild import prepare_go_driver
 
