@@ -7,11 +7,12 @@ hypothesis: The MCP server tools must expose the same capabilities as the CLI co
 prediction: New CLI features added without corresponding MCP tool updates create feature gaps for non-Gemini users
 falsification: MCP and CLI are intentionally divergent by design → reclassify
 target_paths:
-  - aegis_mcp/tools.py
-  - aegis_cli/check.py
-  - aegis_cli/verify.py
-  - aegis_cli/scan.py
-  - aegis_core/telemetry_engine/ledger.py
+  - "aegis_cli/registry.py"
+  - "aegis_cli/commands_table.py"
+  - "aegis_mcp/registry.py"
+  - "aegis_mcp/schemas.py"
+  - "aegis_mcp/tools.py"
+  - "tests/contract/**"
 expiry_sessions: 15
 expiry_days: 60
 created: 2026-09-28
@@ -23,9 +24,15 @@ tags:
   - parity
   - cross-service
 ---
+## Do
+Keep shared CLI, MCP and SDK operations on the same core semantics, normalized arguments and authorization boundaries; document intentional surface differences and regenerate public contracts.
 
-The MCP server (aegis_mcp/tools.py) is the API contract for external agents.
-When a new CLI command is added or an existing command gains new features, the
-corresponding MCP tool should be updated to maintain feature parity.
-Current MCP tools (v4.0, D4): aegis_scan, aegis_report_outcome, aegis_create_rule,
-aegis_list_rules.
+Read the current registries and schemas instead of duplicating a historical tool count. A new alias must not bypass write classification, session attribution or validation. Do not add a redundant MCP command solely because a CLI-only operation exists.
+
+Verify: Exercise overlapping public calls, aliases, error/status behavior and mutation boundaries; regenerate affected CLI/MCP/reference contracts rather than hand-editing snapshots.
+
+Owner instructions and existing approval/release boundaries remain authoritative.
+
+## Evidence
+- aegis_cli/registry.py and commands_table.py declare the CLI; aegis_mcp/registry.py and schemas.py declare MCP tools.
+- CONTRIBUTING.md describes public-surface regeneration and compatibility requirements.

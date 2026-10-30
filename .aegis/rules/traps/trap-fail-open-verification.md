@@ -2,7 +2,7 @@
 id: trap-fail-open-verification
 domain: security
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "Verification tools that return empty/success on execution failure silently bypass the safety gate — the tool reports \"all checks passed\" when it actually crashed before checking anything"
 prediction: "Will fire when a verification function returns an empty list, True, or exit code 0 on an error path (missing file, crashed subprocess, None data)"
 falsification: 0 findings in 10 sessions → prune

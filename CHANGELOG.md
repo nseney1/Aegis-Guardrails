@@ -14,6 +14,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Changed
 
+- Project governance rules now pair focused source contracts with default-budget delivery regressions and advisory baseline coverage. Fourteen prose-only trap gates become advisory; narrowed process scopes and updated ledger/command/parity guidance require maintainer approval.
 - Wave pull requests retain base-sourced governance checks while full audit, build, test and regression validation runs on develop pushes and downstream stages.
 
 ### Fixed
