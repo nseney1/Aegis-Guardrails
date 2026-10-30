@@ -216,7 +216,7 @@ def _build(compiler: str, cwd: Path, env: dict[str, str], timeout: float,
         raise GoDriverUnavailableError("build_failed", "go build did not produce a complete executable")
     if os.name == "posix":
         output.chmod(0o700)
-    with output.open("rb") as stream:
+    with output.open("r+b") as stream:
         os.fsync(stream.fileno())
     _safe_path(binary, workspace)
     os.replace(output, binary)

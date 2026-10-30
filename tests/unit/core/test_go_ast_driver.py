@@ -40,9 +40,11 @@ def go_driver_binary(tmp_path_factory):
 
 
 def exchange(binary, requests):
+    # Python 3.9 on Windows cannot reliably launch with an empty environment.
+    env = {"SystemRoot": os.environ["SystemRoot"]} if os.name == "nt" else {}
     completed = subprocess.run([str(binary)], input="".join(json.dumps(r) + "\n" for r in requests),
-                               capture_output=True, text=True, timeout=10,
-                               cwd=binary.parent, env={})
+                               capture_output=True, text=True, encoding="utf-8", timeout=10,
+                               cwd=binary.parent, env=env)
     assert completed.returncode == 0, completed.stderr
     return [json.loads(line) for line in completed.stdout.splitlines()]
 
