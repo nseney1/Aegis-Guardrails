@@ -8,6 +8,7 @@ every slot value inlined into agent-facing scan output is sanitized.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -259,23 +260,40 @@ def test_packaged_ts_driver_does_not_load_repo_node_modules(ws: Path, tmp_path: 
 def test_packaged_go_driver_is_built_from_the_package_template(ws: Path, tmp_path: Path, monkeypatch):
     """Mocked at the process boundary: a stub 'go' records argv/cwd and emits a fake driver binary."""
     log = tmp_path / "go-calls.jsonl"
+    driver = textwrap.dedent('''\
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request['op'] == 'hello':
+                reply = {'aegis_ast': 2, 'op': 'hello', 'driver': 'fixture',
+                         'driver_version': '2.0.0', 'languages': ['go'], 'capabilities': ['args']}
+            else:
+                reply = {'op': 'parse', 'id': request['id'], 'ok': True,
+                         'ast': {'version': '1.0', 'language': 'go', 'file_path': request['path'],
+                                 'definitions': [{'name': 'fromStub', 'kind': 'function',
+                                                  'line': 1, 'is_exported': True}],
+                                 'call_sites': [], 'imports': [], 'mutation_points': []}}
+            print(json.dumps(reply), flush=True)
+        ''')
     stub = (
-        "import json, os, sys\n"
-        "with open(os.environ['AEGIS_TEST_GO_LOG'], 'a') as fh:\n"
-        "    fh.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n"
+        "import hashlib, json, os, sys\n"
+        "row = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
+        "if sys.argv[1:2] == ['build']:\n"
+        "    row['sources'] = {name: hashlib.sha256(open(name, 'rb').read()).hexdigest() "
+        "for name in ('go_ast.go', 'go.mod')}\n"
+        f"with open({str(log)!r}, 'a') as fh:\n"
+        "    fh.write(json.dumps(row) + '\\n')\n"
+        "if sys.argv[1:2] == ['env']:\n"
+        "    print('go1.22.2\\nlinux\\namd64'); sys.exit(0)\n"
         "if sys.argv[1:2] != ['build']:\n"
         "    sys.exit(3)\n"
         "out = sys.argv[sys.argv.index('-o') + 1]\n"
         "with open(out, 'w') as fh:\n"
-        f"    fh.write('#!{sys.executable}\\n' + 'import json, sys\\n' + "
-        "\"print(json.dumps({'version': '1.0', 'language': 'go', 'file_path': sys.argv[1], "
-        "'definitions': [{'name': 'fromStub', 'kind': 'function', 'line': 1, 'is_exported': True}], "
-        "'call_sites': [], 'imports': [], 'mutation_points': []}))\\n\")\n"
+        f"    fh.write({('#!' + sys.executable + chr(10) + driver)!r})\n"
         "os.chmod(out, 0o755)\n"
     )
     _write_executable(tmp_path / "fakebin" / "go", stub)
     monkeypatch.setenv("PATH", str(tmp_path / "fakebin"))
-    monkeypatch.setenv("AEGIS_TEST_GO_LOG", str(log))
     _opt_in(ws, "go")
     main_go = ws / "main.go"
     main_go.write_text("package main\nfunc main() {}\n", encoding="utf-8")
@@ -285,10 +303,12 @@ def test_packaged_go_driver_is_built_from_the_package_template(ws: Path, tmp_pat
     assert error is None, error
     assert [d.name for d in result.definitions] == ["fromStub"]
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert len(calls) == 1
-    argv = calls[0]["argv"]
-    assert argv[:2] == ["build", "-o"]
-    assert Path(argv[-1]).resolve() == (PACKAGED_TEMPLATES / "go_ast.go").resolve()
+    assert [call['argv'][0] for call in calls] == ['env', 'build']
+    argv = calls[1]["argv"]
+    assert argv[:2] == ["build", "-trimpath"] and argv[-1] == '.'
+    assert calls[1]['sources'] == {name: hashlib.sha256((PACKAGED_TEMPLATES / name).read_bytes()).hexdigest()
+                                  for name in ('go_ast.go', 'go.mod')}
+    assert not Path(calls[1]['cwd']).is_relative_to(ws)
     assert str(ws) not in " ".join(argv)
     assert not Path(calls[0]["cwd"]).resolve().is_relative_to(ws.resolve())
 

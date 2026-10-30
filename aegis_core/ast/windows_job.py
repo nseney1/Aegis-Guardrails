@@ -1,6 +1,6 @@
-"""Retain Windows batch descendants in a non-inheritable, kill-on-close job.
+"""Retain Windows driver/compiler descendants in a non-inheritable, kill-on-close job.
 
-Only imported by Windows batch execution. Popen closes the primary thread
+Only imported for Windows execution. Popen closes the primary thread
 handle, so a suspended root is assigned before its sole thread is found using
 Toolhelp and resumed. No driver instruction can run before job assignment.
 
@@ -221,16 +221,20 @@ class WindowsJob:
             capacity = max(capacity * 2, info.assigned)
         raise OSError('Windows job process list exceeds 65536 members')
 
-    def _check_process_census(self, observed, deadline):
+    def _process_count(self, deadline):
         _remaining_milliseconds(deadline)
         info = JobBasicAccountingInformation()
         if not self._kernel.QueryInformationJobObject(
                 self._handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
             raise self._error('QueryInformationJobObject(accounting)')
         _remaining_milliseconds(deadline)
-        if info.TotalProcesses != len(observed):
+        return info.TotalProcesses
+
+    def _check_process_census(self, expected, deadline):
+        total = self._process_count(deadline)
+        if total != expected:
             raise OSError('cannot verify complete Windows descendant termination: '
-                          f'job admitted {info.TotalProcesses} processes; observed {len(observed)} identities')
+                          f'job admitted {total} processes; accounted for {expected} identities')
 
     def terminate_and_wait(self) -> None:
         """Wait for process exits, rather than asynchronous kill-on-close.
@@ -247,11 +251,39 @@ class WindowsJob:
         https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
         https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information
         """
+        self._terminate_and_wait()
+
+    def terminate_completed_go_compiler_and_wait(self, root) -> None:
+        """Clean up a successful, fully waited trusted Go compiler, never an AST driver.
+
+        The caller must execute only trusted ``go env`` or the packaged stdlib-only
+        ``go build``, with CGO disabled and repository/tool-exec configuration excluded.
+        Go's build scheduler runs compiler/linker commands synchronously through
+        os/exec.Cmd.Run; successful completion therefore witnesses its historical
+        child exits. This is a compiler protocol precondition, not a Windows census
+        guarantee for arbitrary programs. The caller retains the root Popen handle.
+
+        Still retain/terminate/wait current member handles. Freeze the lifetime
+        count before cleanup and reject any later admission or OS wait failure.
+        Timeout, cancellation, nonzero exit and AST drivers use terminate_and_wait.
+
+        https://go.dev/src/cmd/go/internal/work/shell.go (Shell.runOut, cmd.Run)
+        https://pkg.go.dev/os/exec#Cmd.Wait
+        """
+        if (root.pid != self._root_pid or root.returncode != 0 or root.wait(timeout=0) != 0):
+            raise OSError('successful completed Go compiler root required')
+        self._terminate_and_wait(completed_go_parent=True)
+
+    def _terminate_and_wait(self, *, completed_go_parent=False) -> None:
         if self._handle is None or not self._assigned:
             return
         deadline = time.monotonic() + 3.0
+        trusted_total = self._process_count(deadline) if completed_go_parent else None
         pids = self._process_ids(deadline)
         observed = set(pids) | {self._root_pid}
+        expected = len(observed) if trusted_total is None else trusted_total
+        if expected < len(observed):
+            raise OSError('invalid Windows compiler lifetime process count')
         with ExitStack() as owners:
             processes = []
             for pid in pids:
@@ -277,7 +309,7 @@ class WindowsJob:
                                       'former member is not signaled')
             if not self._kernel.TerminateJobObject(self._handle, 1):
                 raise self._error('TerminateJobObject')
-            self._check_process_census(observed, deadline)
+            self._check_process_census(expected, deadline)
             for process in processes:
                 milliseconds = _remaining_milliseconds(deadline)
                 result = self._kernel.WaitForSingleObject(process, milliseconds)
@@ -287,7 +319,7 @@ class WindowsJob:
                     raise OSError('timed out waiting for Windows job termination')
                 if result != 0:
                     raise OSError(f'WaitForSingleObject returned unexpected result {result}')
-            self._check_process_census(observed, deadline)
+            self._check_process_census(expected, deadline)
 
     def close(self) -> None:
         if self._handle is not None:

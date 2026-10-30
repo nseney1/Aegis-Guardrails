@@ -6,6 +6,7 @@ The output feeds directly into the Arbiter as Layer 1 evidence.
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import posixpath
@@ -15,12 +16,7 @@ from aegis_core.primitives import is_within, safe_parts
 from aegis_core.workspace.layout import RULES_RELDIR
 from typing import Any, Optional
 
-from . import ToolEvidence
-from . import persistence_checker
-from . import call_graph
-from . import import_guard
-from . import mutation_tester
-from . import ast_checks, structural_checks
+from . import ToolEvidence, persistence_checker, call_graph, import_guard, mutation_tester, ast_checks, structural_checks
 from .ast_checks import NO_DRIVER_NOTE_TOOL
 
 VerificationResult = ToolEvidence
@@ -499,7 +495,7 @@ def run_layer1(
     fast_mode: bool = False,
     diff_base: Optional[str] = None,
     reviewed: bool = True,
-    git_root: Optional[str] = None,
+    git_root: Optional[str] = None, allow_build: bool = True, ast_runner: Any = None, ast_results: Optional[dict] = None,
 ) -> list[ToolEvidence]:
     """Run all Layer 1 verification tools. ``git_root`` is where the history lives when ``repo_root``
     is an export of a tree (``check --record``): the T7 delta reads its base text there.
@@ -541,7 +537,7 @@ def run_layer1(
         if os.path.isfile(full_path):
             rel = os.path.relpath(full_path, repo_root_str).replace("\\", "/")
             paths.append((rel, full_path))
-    with ASTParseSession(repo_root_str, runner=ASTDriverRunner()) as session:
+    with ASTParseSession(repo_root_str, runner=ast_runner if ast_runner is not None else (ASTDriverRunner() if allow_build else ASTDriverRunner(allow_build=False)), owns_runner=ast_runner is None, result_sink=ast_results) as session:
         results.extend(structural_checks.run_checks(paths, repo_root_str, session,
                                                     fast_mode=fast_mode, failure=_tool_failure))
         checks, owned = ast_checks.run_checks(
@@ -965,7 +961,7 @@ def _t7_on_index(repo_root: str, rels: list[str], entries: dict[str, tuple[str, 
 
 def _layer1_on_snapshot(
     files: list[str], repo_root: str, snapshot: str, ast_runner: Any, too_large: dict[str, int],
-    entries: dict[str, tuple[str, str]],
+    entries: dict[str, tuple[str, str]], ast_results: Optional[dict] = None,
 ) -> list[ToolEvidence]:
     """run_layer1 in fast mode (call_graph, import_guard, forbid_ast) with each file read
     from ``snapshot`` and everything else (rules, drivers, local packages) from ``repo_root``.
@@ -978,7 +974,7 @@ def _layer1_on_snapshot(
     from aegis_core.ast.session import ASTParseSession
 
     paths = [(rel, _snapshot_file(snapshot, rel)) for rel in files]
-    with ASTParseSession(repo_root, confine_root=snapshot, runner=ast_runner) as session:
+    with ASTParseSession(repo_root, confine_root=snapshot, runner=ast_runner, owns_runner=False, result_sink=ast_results) as session:
         results = structural_checks.run_checks(paths, repo_root, session, fast_mode=True,
                                                failure=_tool_failure, not_in_commit=_not_in_the_commit)
         checks, owned = ast_checks.run_checks(
@@ -996,7 +992,7 @@ def _layer1_on_snapshot(
     return results
 
 
-def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEvidence]:
+def run_layer1_on_index(changed_files: list[str], repo_root: str, *, ast_runner: Any = None, ast_results: Optional[dict] = None) -> list[ToolEvidence]:
     """Layer 1 in fast mode on the staged content of ``changed_files`` (paths relative to
     ``repo_root``): exactly what ``git commit`` records, whatever the working tree holds.
 
@@ -1012,7 +1008,7 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
     from aegis_core.ast.runner import ASTDriverRunner
 
     repo_root_str = str(getattr(repo_root, "root", repo_root))
-    with ASTDriverRunner() as ast_runner:
+    with (nullcontext(ast_runner) if ast_runner is not None else ASTDriverRunner()) as ast_runner:
         covered = ast_checks.covered_paths(changed_files, repo_root_str, _discover_forbid_ast_rules)
         driven: dict[str, bool] = {".py": True}
 
@@ -1029,6 +1025,6 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str) -> list[ToolEv
         with tempfile.TemporaryDirectory(prefix=SNAPSHOT_PREFIX) as snapshot:
             typed = [rel for rel in changed_files if readable(rel) or rel in covered]
             staged, too_large = snapshot_index(repo_root_str, typed, snapshot, entries)
-            results = _layer1_on_snapshot(staged, repo_root_str, snapshot, ast_runner, too_large, entries)
+            results = _layer1_on_snapshot(staged, repo_root_str, snapshot, ast_runner, too_large, entries, ast_results)
             results = _without_snapshot(results, snapshot)
         return results + _t7_on_index(repo_root_str, [rel for rel in changed_files if rel not in typed], entries)

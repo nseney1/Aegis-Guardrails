@@ -239,6 +239,49 @@ def test_unobserved_historical_or_late_descendant_cannot_pass_shutdown(monkeypat
         job.close()
 
 
+def test_completed_trusted_go_parent_accounts_for_its_waited_historical_children(monkeypatch):
+    job, kernel = _shutdown_job(monkeypatch, members=(732,))
+    kernel.total_processes = 4  # root + two completed Go tools + one retained live member
+    waits = []
+    root = SimpleNamespace(pid=731, returncode=0, wait=lambda **kw: waits.append(kw) or 0)
+    try:
+        job.terminate_completed_go_compiler_and_wait(root)
+        assert waits == [{'timeout': 0}]
+        assert [handle - 1000 for handle, _ in kernel.waits] == [732]
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
+@pytest.mark.parametrize('pid,returncode', [(731, None), (731, 1), (999, 0)])
+def test_completed_go_cleanup_requires_the_successfully_waited_owned_root(monkeypatch, pid, returncode):
+    job, kernel = _shutdown_job(monkeypatch)
+    root = SimpleNamespace(pid=pid, returncode=returncode, wait=lambda **kw: returncode)
+    try:
+        with pytest.raises(OSError, match='successful completed Go compiler root required'):
+            job.terminate_completed_go_compiler_and_wait(root)
+        assert 'terminate requested' not in kernel.events
+    finally:
+        job.close()
+
+
+@pytest.mark.parametrize('failure,reason', [
+    ('late_member', 'cannot verify complete Windows descendant termination'),
+    ('wait_timeout', 'timed out.*termination'),
+    ('QueryAccounting', 'QueryInformationJobObject.*failed'),
+])
+def test_completed_go_cleanup_still_rejects_new_admissions_and_os_wait_failures(monkeypatch, failure, reason):
+    job, kernel = _shutdown_job(monkeypatch, failure)
+    kernel.total_processes += 3  # historical children are trusted only before the cleanup census
+    root = SimpleNamespace(pid=731, returncode=0, wait=lambda **kw: 0)
+    try:
+        with pytest.raises(OSError, match=reason):
+            job.terminate_completed_go_compiler_and_wait(root)
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+
+
 def test_lifetime_accounting_is_checked_again_after_member_waits(monkeypatch):
     job, kernel = _shutdown_job(monkeypatch)
     original = kernel.WaitForSingleObject

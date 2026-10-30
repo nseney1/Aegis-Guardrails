@@ -52,13 +52,13 @@ Every command also accepts `-h/--help`, `--json`, `--plain` and `--workspace`.
 
 System health and governance audit
 
-Read-only health checks, the host matrix (binary, registration, identity, workspace, bootstrap, budget per host) and the enforcement tiers in force here. --fix changes only what doctor reported (stale v3 and misplaced MCP entries, v3 hook entries, legacy rule blocks, unedited v3 rule copies, missing packaged AST drivers), after confirmation, backing each file up to ~/.aegis/backups/<UTC stamp>/ first.
+Read-only health checks, the host matrix (binary, registration, identity, workspace, bootstrap, budget per host) and the enforcement tiers in force here. --fix changes only what doctor reported (stale v3 and misplaced MCP entries, v3 hook entries, legacy rule blocks, unedited v3 rule copies, missing packaged AST drivers and Go cache entries), after confirmation. Configuration files are backed up to ~/.aegis/backups/<UTC stamp>/ first; generated cache entries are rebuilt.
 
 Category: Setup & Environment.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--fix` |  |  | Repair what doctor reported, after confirmation; every file is backed up first |
+| `--fix` |  |  | Repair after confirmation; configuration files are backed up and generated Go caches are rebuilt |
 | `--yes` |  |  | With --fix: apply without asking (required with --json or without a terminal) |
 | `--drivers` |  |  | Run only AST driver and language detection health check |
 | `--github` |  |  | Print what trust tiers A and B need: the ruleset JSON, CODEOWNERS lines and signing setup |

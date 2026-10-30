@@ -843,20 +843,8 @@ def run_verify(args: argparse.Namespace) -> int:
         return 1 if blocking else 0
 
     try:
-        if staged:
-            # What `git commit` records is the index, not the working tree.
-            pairs = baseline.run_grouped(
-                lambda group: runner.run_layer1_on_index(group, repo_root), target_files, root=repo_root)
-        else:
-            # Mutation testing is slow; it runs only behind --full (fast_mode otherwise).
-            pairs = baseline.run_grouped(
-                lambda group: runner.run_layer1(
-                    changed_files=group,
-                    repo_root=repo_root,
-                    fast_mode=not layer2,
-                    diff_base=getattr(args, "_diff_base", None),
-                ),
-                target_files, root=repo_root)
+        pairs, sources = baseline.run_checks(repo_root, target_files, staged=staged, fast_mode=not layer2,
+                                             diff_base=getattr(args, "_diff_base", None))
     except Exception as exc:
         print(f"Error: Layer 1 could not run: {exc}", file=sys.stderr)
         return _unjudged(report_fmt, "Layer 1 could not run")
@@ -865,7 +853,7 @@ def run_verify(args: argparse.Namespace) -> int:
     if held.active:
         # The baseline decides which failed checks count. Evidence it does not hold stays failing.
         try:
-            applied = baseline.apply(pairs, baseline.Sources(repo_root, staged=staged), held)
+            applied = baseline.apply(pairs, sources, held)
         except Exception as exc:  # fail closed: a baseline that cannot be applied excuses nothing
             print(f"Error: the baseline could not be applied: {_shown(str(exc), 300)}", file=sys.stderr)
             return _unjudged(report_fmt, "the baseline could not be applied")

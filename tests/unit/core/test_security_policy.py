@@ -122,6 +122,7 @@ SPAWN_SITES = {
     "aegis_cli/doctor.py": ("`codex`, `claude`",),
     "aegis_core/ast/runner.py": ("AST drivers",),
     "aegis_core/ast/batch.py": ("AST drivers",),
+    "aegis_core/ast/gobuild.py": ("Packaged Go build",),
     "aegis_core/verification/test_runner.py": ("`pytest`",),
     "aegis_core/verification/mutation_tester.py": ("`pytest`",),
     "aegis_core/inference_provider.py": ("your model command",),

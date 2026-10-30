@@ -6,6 +6,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Added
 
+- Opted-in Go parsing uses one cached, offline-built protocol-v2 driver per check; ordinary doctor and card inspect without building, and confirmed doctor repair can prepare the cache.
 - Bounded protocol v2 driver sessions and per-check parse reuse, with additive AST capabilities, canonical matching and typed literal conditions.
 - Explicit missing-driver evidence in checks and receipts; ordinary `--strict` blocks missing AST coverage. Receipts retain per-file language and missing-driver reasons.
 - Offline standard-library Go build checks and exact packaged-asset dependency gates.
@@ -17,6 +18,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Fixed
 
+- Go literals use canonical Python string rendering, and locally shadowed import receivers retain method matching without producing imported-call findings.
 - Windows AST driver cleanup retains process handles before termination, waits before removing its temporary directory, and reports descendants it cannot account for.
 - Distribution checks reject original ZIP member names changed by separator normalization or NUL truncation.
 

@@ -43,6 +43,10 @@
     "count": 1,
     "reason": "Deferred Popen argument annotation for driver cleanup; no process starts at this reference."
   },
+  "process:aegis_core/ast/gobuild.py:_run:subprocess.Popen": {
+    "count": 1,
+    "reason": "Trusted offline Go env/build in a private cwd; owns a POSIX session or suspended Windows job before execution, bounded communication and tree cleanup on every exit. Successful Go parents witness historical child waits; errors/cancellation retain strict job census."
+  },
   "process:aegis_core/ast/runner.py:_run_driver:subprocess.run": {
     "count": 1,
     "reason": "Configured AST driver process boundary."
