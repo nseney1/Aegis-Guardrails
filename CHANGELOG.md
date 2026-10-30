@@ -6,6 +6,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Added
 
+- TypeScript/JavaScript AST checks use Aegis's own in-process parser by default across all eight source extensions, without Node or parser dependencies. Imports, arguments, decorators, allow comments and mutation points retain source positions.
 - Opted-in Go parsing uses one cached, offline-built protocol-v2 driver per check; ordinary doctor and card inspect without building, and confirmed doctor repair can prepare the cache.
 - Bounded protocol v2 driver sessions and per-check parse reuse, with additive AST capabilities, canonical matching and typed literal conditions.
 - Explicit missing-driver evidence in checks and receipts; ordinary `--strict` blocks missing AST coverage. Receipts retain per-file language and missing-driver reasons.
@@ -19,6 +20,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Fixed
 
+- Unresolved JS import/call targets retain advisory UNKNOWN evidence; source files above the native parser's 2 MiB limit report `unverified too_large` with an exclusion hint, and `check --record` receipts keep reason `too_large` on those rows.
+- The security pack does not parse TypeScript/JavaScript files, which have no pack rules yet; as for Go, it only confines them to the workspace and reports the 2 MiB advisory instead of failing on files it cannot parse.
 - Go literals use canonical Python string rendering, and locally shadowed import receivers retain method matching without producing imported-call findings.
 - Windows AST driver cleanup retains process handles before termination, waits before removing its temporary directory, and reports descendants it cannot account for.
 - Distribution checks reject original ZIP member names changed by separator normalization or NUL truncation.

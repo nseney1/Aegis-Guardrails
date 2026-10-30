@@ -123,6 +123,47 @@ class ASTExtractionError(AegisError):
         super().__init__(f"cannot verify {path}: {reason}", code="AST_UNVERIFIABLE", path=path, reason=reason)
 
 
+def is_size_limit_error(exc: BaseException) -> bool:
+    """Recognize the typed native size reason through extraction wrappers."""
+    from aegis_core.ast.driver_errors import ASTDriverError
+
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ASTDriverError) and getattr(exc, 'reason', None) == 'too_large':
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def _uncertain_path_matches(target: str, pattern: str, *, prefix: bool = False) -> bool:
+    """Unknown segments may expand; known components still rule out incompatible names."""
+    target, pattern = canonical_spelling(target), canonical_spelling(pattern)
+    if prefix and target.startswith('.') and not pattern.startswith('.'):
+        return False
+    parts = target.strip('.').split('.')
+    wanted = pattern.strip('.').split('.')
+    suffix = not prefix and (pattern.startswith('.') or '.' not in pattern)
+    if suffix:
+        parts.reverse()
+        wanted.reverse()
+    positions = {0}
+    for part in parts:
+        if (prefix or suffix) and len(wanted) in positions:
+            return True
+        if part in ('<expr>', '<computed>'):
+            positions = set(range(min(positions), len(wanted) + 1)) if positions else set()
+        else:
+            positions = {index + 1 for index in positions if index < len(wanted) and wanted[index] == part}
+        if not positions:
+            return False
+    return len(wanted) in positions
+
+
+def _uncertain_token(value: str) -> bool:
+    return '<expr>' in value or '<computed>' in value
+
+
 def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
     mod = canonical_spelling(pattern)
     if not mod:
@@ -148,10 +189,33 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
         return "", []
     if not call:
         return "", []
+    origins_by_head = {}
+    possible_by_head = {}
+    canonical_call = canonical_spelling(call)
+    method_pattern = canonical_call.startswith('.') or '.' not in canonical_call
     hits: List[Tuple[Any, Optional[bool]]] = []
     for site in raw_call_sites:
         target = _call_target(site)
-        if not target or not call_index.matches(target, call):
+        normalized = canonical_spelling(target)
+        head, separator, tail = normalized.partition('.')
+        if head not in origins_by_head:
+            origins = call_index.spellings(head) if call_index.is_bound(head) else [head]
+            origins_by_head[head] = origins, [name for name in origins if _uncertain_token(name)]
+        origins, unknown_origins = origins_by_head[head]
+        raw_unknown = _uncertain_token(normalized)
+        uncertain = raw_unknown or bool(unknown_origins)
+        candidates = []
+        if raw_unknown and method_pattern:
+            candidates = [normalized]
+        elif raw_unknown:
+            if head not in possible_by_head:
+                possible_by_head[head] = [name for name in origins
+                                          if _uncertain_path_matches(name + '.<expr>', call)]
+            candidates = [name + separator + tail for name in possible_by_head[head]]
+        elif unknown_origins:
+            candidates = [name + separator + tail for name in unknown_origins]
+        compatible = call_index.matches(target, call) or any(_uncertain_path_matches(name, call) for name in candidates)
+        if not target or not compatible:
             continue
         if builtin_only:
             spelled = call_index.spellings(target)
@@ -161,6 +225,10 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
             if not (any(s in (f"builtins.{call}", f"__builtins__.{call}") for s in spelled) or (target == call and not shadowed)):
                 continue
         verdict = _match_where(site, where, args_known) if where else True
+        if verdict is not False and uncertain and not (
+            method_pattern and call_index.matches(target, call)
+        ):
+            verdict = None
         if verdict is not False:
             hits.append((site, verdict))
     return call, hits
@@ -251,8 +319,9 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
         mod = _normalize_ast_token(raw_mod) if isinstance(raw_mod, str) else ""
         if mod:
-            matched = sorted(((r, None if t[0] == "<expr>" else True) for r, t in parsed_imports
-                              if t[0] == "<expr>" or _match_ImportNode_against_pattern(t, mod)), key=by_line)
+            matched = sorted(((r, None if _uncertain_token(t[0]) else True) for r, t in parsed_imports
+                              if (_uncertain_path_matches(t[0], mod, prefix=True) if _uncertain_token(t[0])
+                                  else _match_ImportNode_against_pattern(t, mod))), key=by_line)
             hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
     raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
     call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True, bound_origins=bound_origins)
@@ -346,6 +415,10 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
     path_str = str(file_path)
     ext = os.path.splitext(path_str)[1].lower()
     try:
+        if code is not None and ext in ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'):
+            from aegis_core.ast.drivers.js import parse
+
+            return parse(code, path_str)
         if code is not None and ext != ".py":
             raise ASTExtractionError(path_str, f"source parsing unsupported for extension '{ext}' until a native source parser is available")
         if ext == ".py":

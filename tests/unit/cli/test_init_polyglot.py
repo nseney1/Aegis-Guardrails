@@ -66,6 +66,7 @@ def test_init_provisions_polyglot_ts_go_drivers(tmp_path: Path, monkeypatch):
     assert exit_code == 0
 
     registry = SlotRegistry.load(tmp_path)
-    assert registry.get_ast_driver(".ts") is not None
+    assert registry.get_ast_driver(".ts") is None
+    assert '.ts' in registry.get_configured_extensions()
     assert registry.get_ast_driver(".go") is not None
     assert not (tmp_path / ".aegis" / "drivers").exists()

@@ -20,9 +20,9 @@ import zipfile
 SUMS = "SHA256SUMS"
 PACKAGES = {"aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"}
 TEMPLATE_PREFIX = "aegis_core/ast/drivers/templates/"
-# M1 baseline. M2a removes ts_ast.js; M2b removes rust_ast.py here and in package-data.
+# Native JS ships as Python modules; the legacy Rust template remains until M2b.
 TEMPLATES = {TEMPLATE_PREFIX + name for name in (
-    "__init__.py", "ts_ast.js", "rust_ast.py", "go_ast.go", "go.mod")}
+    "__init__.py", "rust_ast.py", "go_ast.go", "go.mod")}
 ASSETS = {"aegis_sdk/py.typed", "aegis_core/benchmark_corpus/corpus.json",
           "aegis_core/benchmark_corpus/ast.json"}
 ASSETS.update("aegis_core/_data/rules/" + name for name in (

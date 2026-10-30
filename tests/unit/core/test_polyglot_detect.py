@@ -10,6 +10,36 @@ from aegis_core.ast.detect import (
 from aegis_core.skills.slots import SlotRegistry
 
 
+def test_native_js_has_no_external_recipe_and_needs_no_provisioning(tmp_path: Path):
+    from aegis_core.ast.detect import LANGUAGE_DEFINITIONS, names_packaged_driver
+
+    (tmp_path / 'index.ts').write_text('export const value = 1', encoding='utf-8')
+    for language in ('typescript', 'javascript'):
+        assert LANGUAGE_DEFINITIONS[language]['driver_slot'] is None
+        assert LANGUAGE_DEFINITIONS[language]['default_command'] is None
+        assert LANGUAGE_DEFINITIONS[language]['driver_filename'] is None
+        assert not names_packaged_driver('.aegis/drivers/None', LANGUAGE_DEFINITIONS[language])
+    assert provision_ast_driver_slots(tmp_path) == ({}, [])
+    assert not (tmp_path / '.aegis').exists()
+
+
+def test_native_js_ignores_legacy_slot_commands_and_opt_ins(tmp_path: Path):
+    config = tmp_path / '.aegis/config.json'
+    config.parent.mkdir()
+    config.write_text('{"v":1,"ast":{"packaged_drivers":["ts","tsx","js","go","rs"]}}')
+    registry = SlotRegistry.load(tmp_path)
+    assert not registry.warnings
+    assert registry.get_ast_driver('.go') is not None
+    assert registry.get_ast_driver('.rs') is not None
+    assert registry.get_ast_driver('.ts') is None
+    assert not any('ts_ast' in value for value in registry.to_dict().values())
+    explicit = SlotRegistry({'ast_driver_ts': 'must-not-execute', 'ast_driver': 'external-fallback'})
+    assert explicit.get_ast_driver('.ts') is None
+    assert 'ast_driver_ts' not in explicit.to_dict()
+    assert explicit.get_ast_driver('.external') == 'external-fallback'
+    assert {'.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'} <= explicit.get_configured_extensions()
+
+
 def test_detect_project_languages_python(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='foo'\n", encoding="utf-8")
     (tmp_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
@@ -73,9 +103,9 @@ def test_resolve_recommended_drivers():
     drivers = resolve_recommended_drivers(languages)
     # Python is handled in-process; no external slot needed
     assert "ast_driver_py" not in drivers
-    # Other languages have recommended slot commands
+    # External parsers retain opt-in commands; native JS needs none.
     assert "ast_driver_rs" in drivers
-    assert "ast_driver_ts" in drivers
+    assert "ast_driver_ts" not in drivers
     assert "ast_driver_go" in drivers
 
 
@@ -85,14 +115,14 @@ def test_provision_ast_driver_slots(tmp_path: Path):
     (tmp_path / "tsconfig.json").write_text("{}", encoding="utf-8")
 
     slots, created_files = provision_ast_driver_slots(tmp_path)
-    assert {"ast_driver_rs", "ast_driver_ts", "ast_driver_js"} <= set(slots)
+    assert set(slots) == {"ast_driver_rs"}
 
     # The opt-ins live in .aegis/config.json and SlotRegistry reads them back
     config = tmp_path / ".aegis" / "config.json"
     assert created_files == [str(config)]
     registry = SlotRegistry.load(tmp_path)
     assert registry.get_ast_driver(".rs") is not None
-    assert registry.get_ast_driver(".ts") is not None
+    assert registry.get_ast_driver(".ts") is None
     # Nothing is staged in the repository: the packaged templates are what runs
     assert not (tmp_path / ".aegis" / "drivers").exists()
 

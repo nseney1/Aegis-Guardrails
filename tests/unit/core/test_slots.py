@@ -97,14 +97,22 @@ def test_slot_registry_get_ast_driver():
     assert reg.get_ast_driver("rs") == "cargo_driver"
     assert reg.get_ast_driver(".rs") == "cargo_driver"
 
-    # Fallback to ast_driver
-    assert reg.get_ast_driver("ts") == "default_driver"
+    # Fallback to ast_driver for an extension without a native parser
+    assert reg.get_ast_driver("kt") == "default_driver"
+
+    # Native JS/TS never takes a command slot, even when one is configured
+    assert SlotRegistry({"ast_driver": "d", "ast_driver_ts": "node ts.js"}).get_ast_driver("ts") is None
+    assert reg.get_ast_driver(".mjs") is None
 
 
 def test_slot_registry_get_configured_extensions():
-    # Empty registry always includes .py
+    from aegis_core.ast.runner import NATIVE_JS_EXTENSIONS
+
+    native = {".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
+    assert NATIVE_JS_EXTENSIONS | {".py"} == native
+    # Empty registry always includes the in-process languages
     empty_reg = SlotRegistry({})
-    assert empty_reg.get_configured_extensions() == {".py"}
+    assert empty_reg.get_configured_extensions() == native
 
     # Configured slots add extensions
     reg = SlotRegistry({
@@ -114,7 +122,7 @@ def test_slot_registry_get_configured_extensions():
         "unrelated_slot": "some_value",
     })
     exts = reg.get_configured_extensions()
-    assert exts == {".py", ".rs", ".go", ".ts"}
+    assert exts == native | {".rs", ".go"}
 
 
 @pytest.mark.parametrize("host, profile", [

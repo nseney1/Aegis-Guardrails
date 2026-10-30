@@ -212,7 +212,7 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
     from aegis_cli.doctor import _check_ast_drivers
     home = tmp_path / "home"
     (home / ".aegis").mkdir(parents=True)
-    (home / ".aegis" / "config.json").write_text('{"v": 1, "drivers": {"ts": "node runner.js"}}')
+    (home / ".aegis" / "config.json").write_text('{"v": 1, "drivers": {"external": "node runner.js"}}')
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     ws = tmp_path / "ws"
@@ -224,7 +224,7 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
     monkeypatch.setenv("PATH", str(node.parent))
     assert _check_ast_drivers(tmp_path) is True
     out = capsys.readouterr().out
-    assert f"AST driver (.ts): node resolvable ({node})" in out
+    assert f"AST driver (.external): node resolvable ({node})" in out
 
     # With missing binary
     (tmp_path.parent / "empty").mkdir()
@@ -242,7 +242,7 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
         monkeypatch.setenv("PATH", entry)
         assert _check_ast_drivers(tmp_path) is False
         out = capsys.readouterr().out
-        assert f"AST driver (.ts): executable 'node' is found only at {where}, where aegis never runs it" in out
+        assert f"AST driver (.external): executable 'node' is found only at {where}, where aegis never runs it" in out
 
     # An unreadable config is reported, not a crash
     (tmp_path / ".aegis").mkdir()
@@ -254,10 +254,10 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
 def test_doctor_warns_when_ast_drivers_unresolvable(tmp_path, monkeypatch, capsys):
     _governed(tmp_path)
 
-    # H5: a repo config can only opt in to a packaged driver (here ts_ast.js, which
-    # needs node); an arbitrary repo-defined driver command is dropped before doctor sees it.
+    # H5: an external packaged driver (Go) remains opt-in; arbitrary repo
+    # commands are dropped before doctor sees them.
     config = tmp_path / ".aegis" / "config.json"
-    config.write_text('{"v": 1, "ast": {"packaged_drivers": ["ts"]}, "drivers": {"ts": "evil"}}')
+    config.write_text('{"v": 1, "ast": {"packaged_drivers": ["go"]}, "drivers": {"go": "evil"}}')
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "empty").mkdir()
@@ -265,24 +265,24 @@ def test_doctor_warns_when_ast_drivers_unresolvable(tmp_path, monkeypatch, capsy
     result = run_doctor(argparse.Namespace())
     assert result == 0
     captured = capsys.readouterr().out
-    assert "AST driver (.ts): executable 'node' not found on PATH" in captured
+    assert 'go' in captured and 'not found on PATH' in captured
 
 
 def test_check_ast_drivers_missing_driver_warns_and_fixes(tmp_path, capsys):
     from aegis_cli.doctor import _check_ast_drivers
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "index.ts").write_text("const x = 1;")
+    (tmp_path / "src" / "main.go").write_text("package fixture\n")
 
     # The check warns and returns False
     assert _check_ast_drivers(tmp_path) is False
     out = capsys.readouterr().out
-    assert "unconfigured driver for detected source extension(s): .ts" in out
+    assert "unconfigured driver for detected source extension(s): .go" in out
     assert "Run 'aegis doctor --fix' to provision" in out
 
     # --fix provisions the packaged driver through the backed-up plan
     run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
     out = capsys.readouterr().out
-    assert "enable the packaged AST drivers for .ts" in out
+    assert "enable the packaged AST drivers for .go" in out
     assert (tmp_path / ".aegis" / "config.json").is_file()
 
 
@@ -317,8 +317,8 @@ def test_run_doctor_with_fix_flag(tmp_path, monkeypatch, capsys):
     res = run_doctor(argparse.Namespace(fix=True, yes=True))
     assert res == 0
     captured = capsys.readouterr().out
-    assert "enable the packaged AST drivers for .ts" in captured
-    assert (tmp_path / ".aegis" / "config.json").is_file()
+    assert "native JavaScript/TypeScript (in-process)" in captured
+    assert not (tmp_path / ".aegis" / "config.json").exists()
 
 
 def test_run_doctor_without_fix_flag_does_not_provision(tmp_path, monkeypatch, capsys):
@@ -330,7 +330,7 @@ def test_run_doctor_without_fix_flag_does_not_provision(tmp_path, monkeypatch, c
     run_doctor(argparse.Namespace())
     assert not (tmp_path / ".aegis" / "config.json").exists()
     out = capsys.readouterr().out
-    assert "Run 'aegis doctor --fix' to provision" in out
+    assert "native JavaScript/TypeScript (in-process)" in out
 
 
 

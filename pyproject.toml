@@ -73,6 +73,7 @@ packages = [
     "aegis_core._data.skills",
     "aegis_core.ast",
     "aegis_core.ast.drivers",
+    "aegis_core.ast.drivers.js",
     "aegis_core.ast.drivers.templates",
     "aegis_core.command_safety",
     "aegis_core.insights",
@@ -101,7 +102,6 @@ aegis_sdk = ["py.typed"]
 aegis_core = [
     "ast/drivers/templates/go_ast.go",
     "ast/drivers/templates/go.mod",
-    "ast/drivers/templates/ts_ast.js",
     "ast/drivers/templates/rust_ast.py",
     "benchmark_corpus/corpus.json",
     "benchmark_corpus/ast.json",

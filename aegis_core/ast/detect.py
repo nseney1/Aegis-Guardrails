@@ -14,8 +14,10 @@ __all__ = [
     "provision_ast_driver_slots",
     "packaged_driver_for_extension",
     "names_packaged_driver",
+    "names_retired_native_driver",
     "LANGUAGE_DEFINITIONS",
     "iter_project_files",
+    "NATIVE_JS_EXTENSIONS",
 ]
 
 _SKIP_DIRS = {
@@ -42,17 +44,17 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "manifests": ["tsconfig.json"],
         "extensions": [".ts", ".tsx", ".mts", ".cts"],
         "toolchains": ["node"],
-        "driver_slot": "ast_driver_ts",
-        "default_command": f"node {_SELECTOR_DIR}/ts_ast.js",
-        "driver_filename": "ts_ast.js",
+        "driver_slot": None,
+        "default_command": None,
+        "driver_filename": None,
     },
     "javascript": {
         "manifests": ["package.json"],
         "extensions": [".js", ".jsx", ".mjs", ".cjs"],
         "toolchains": ["node"],
-        "driver_slot": "ast_driver_js",
-        "default_command": f"node {_SELECTOR_DIR}/ts_ast.js",
-        "driver_filename": "ts_ast.js",
+        "driver_slot": None,
+        "default_command": None,
+        "driver_filename": None,
     },
     "go": {
         "manifests": ["go.mod", "go.sum"],
@@ -71,6 +73,8 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "driver_filename": None,
     },
 }
+NATIVE_JS_EXTENSIONS = frozenset(extension for language in ('typescript', 'javascript')
+                                 for extension in LANGUAGE_DEFINITIONS[language]['extensions'])
 
 
 def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
@@ -88,6 +92,8 @@ def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
 
 def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
     """True for a selector `aegis init` provisioned, including legacy forms like 'python3 .soma/drivers/rust_ast.py'."""
+    if not config.get('driver_filename') or not config.get('default_command'):
+        return False
     parts = value.split()
     canonical = str(config["default_command"]).split()
     if len(parts) != len(canonical):
@@ -97,6 +103,19 @@ def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
     if canonical[0] == "{python}" and parts[0] in ("python3", "python"):
         return True
     return parts[:-1] == canonical[:-1]
+
+
+def names_retired_native_driver(value: str, extension: str) -> bool:
+    """Recognize exact staged selectors replaced by an available native parser."""
+    ext = '.' + extension.strip().lower().lstrip('.')
+    if packaged_driver_for_extension(ext) is not None:
+        return False
+    filename = 'rust_ast.py' if ext == '.rs' else 'ts_ast.js' if ext in NATIVE_JS_EXTENSIONS else None
+    if filename is None:
+        return False
+    executable = '{python}' if ext == '.rs' else 'node'
+    return names_packaged_driver(value, {'driver_filename': filename,
+        'default_command': f'{executable} {_SELECTOR_DIR}/{filename}'})
 
 
 def iter_project_files(project_root: Path | str):

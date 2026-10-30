@@ -12,9 +12,9 @@ from aegis_core.ast.runner import ASTDriverRegistry, ASTDriverRunner
 
 
 def test_supplied_nonpython_source_never_parses_python_or_disk(tmp_path):
-    target = tmp_path / 'source.ts'
+    target = tmp_path / 'source.external'
     target.write_text('const harmless = 1;', encoding='utf-8')
-    with pytest.raises(ASTExtractionError, match="source parsing unsupported for extension '.ts'"):
+    with pytest.raises(ASTExtractionError, match="source parsing unsupported for extension '.external'"):
         extract_normalized_ast(target, code='eval(dangerous)')
 
 

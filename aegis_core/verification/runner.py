@@ -421,6 +421,10 @@ def _get_modified_lines(filepath: str, repo_root: str, diff_base: Optional[str] 
 
 def _tool_failure(tool: str, target: str, exc: Exception) -> ToolEvidence:
     """A Layer 1 tool that raised fails the gate; it must never abort the run or pass silently."""
+    from aegis_core.ast.policy import is_size_limit_error
+
+    if is_size_limit_error(exc):
+        return ast_checks.too_large_note(target, ast_checks.source_language(target))
     return ToolEvidence(
         tool=tool,
         target=target,
@@ -683,53 +687,9 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
 def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
                  owned: set[tuple[str, int, str]], contents: Optional[dict[str, bytes]] = None,
                  present: Any = None) -> list[ToolEvidence]:
-    """T7 on ``rels``: the Python security pack and the Tier A secret scan, each against the file's
-    text before the change, so only what it introduces fails (spec T7, D-delta: user forbid_ast rules
-    keep whole-file judgment). Test-path hits and undecidable sites are reported on a passing row; an
-    ``# aegis: allow`` hit passes unrecorded (no credit for pack rows); an unreadable file and any
-    failure to run fail closed. A call a user forbid_ast rule judged at a site, failed or allowed (the
-    seeded no-eval rule's eval), is that rule's: the pack neither reports it twice nor second-guesses
-    its allow. Another call on the same line (``pickle.loads(eval(s))``) stays the pack's.
-    ``contents`` holds the bytes of files not on disk under ``work_root`` (non-Python only), and
-    ``present`` says which paths the checked tree holds (_base_sources)."""
-    from aegis_core.verification import scanners, security_pack
-
-    try:
-        base_sources = _base_sources(git_root, rels, work_root, diff_base, contents, present)
-        py = [rel for rel in rels if rel.endswith(".py")]
-        pack = security_pack.evaluate_security_pack(work_root, py, base_sources) if py else {}
-        secrets = scanners.scan_secrets_delta(work_root, rels, {p: b.decode("utf-8", "replace") for p, b in base_sources.items()}, contents)
-    except Exception as exc:
-        return [_tool_failure("security_pack", "changed files", exc)]
-    hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    notes: dict[str, list[str]] = {}
-    for hit in pack.get("violations", ()):
-        if ast_checks.site_key(hit["file"], hit["line"], hit["pattern"]) not in owned:
-            hits.setdefault((f"security_pack:{hit['rule_id']}", hit["file"]), []).append(hit)
-    for hit in pack.get("unverified_findings", ()):
-        if hit["kind"] == "file":
-            hits.setdefault(("security_pack", hit["file"]), []).append(hit)
-        else:
-            notes.setdefault(hit["file"], []).append(f"unverified (advisory): {hit['rule_id']} line {hit['line']}")
-    for hit in pack.get("exempted_test_findings", ()):
-        notes.setdefault(hit["file"], []).append(f"exempted in a test path: {hit['rule_id']} line {hit['line']}")
-    for f in secrets:
-        if is_test_path(f.path):
-            notes.setdefault(f.path, []).append(f"exempted in a test path: {f.rule_id} line {f.line}")
-        else:  # named by rule and line only: no repository text, masked or not, reaches the detail
-            hits.setdefault((f"secret_scan:{f.rule_id}", f.path), []).append({"line": f.line, "pattern": f.rule_id})
-    out = []
-    for (tool, rel), found in hits.items():
-        if tool == "security_pack":
-            detail = f"security_pack: cannot verify {rel}: {found[0]['reason']}"
-        else:
-            # No line number: SARIF fingerprints hash the message, and the lines are in ``lines``.
-            detail = "; ".join(dict.fromkeys(f"{h['pattern']} introduced by this change" for h in found))
-        out.append(ToolEvidence(tool=tool, target=rel, verdict=False, detail=detail,
-                                lines=sorted({h["line"] for h in found if h["line"] > 0})))
-    out.extend(ToolEvidence(tool="security_pack", target=rel, verdict=True, detail="; ".join(items))
-               for rel, items in sorted(notes.items()))
-    return out
+    """Run delta-aware security checks with this runner's base and failure boundaries."""
+    return ast_checks.run_security_checks(git_root, rels, work_root, diff_base, owned, contents,
+                                          present, read_base=_base_sources, failure=_tool_failure)
 
 
 def gate_verdict(results: list[ToolEvidence], *, strict: bool = False) -> bool:
@@ -747,7 +707,7 @@ def format_summary(results: list[ToolEvidence], *, strict: bool = False) -> str:
     failed = len(failed_rows)
     passed = len(results) - failed
     total = len(results)
-    unverified = sum(1 for r in results if r.tool in (UNVERIFIED_NOTE_TOOL, NO_DRIVER_NOTE_TOOL))
+    unverified = sum(1 for r in results if r.tool in (UNVERIFIED_NOTE_TOOL, NO_DRIVER_NOTE_TOOL, ast_checks.AST_SIZE_NOTE_TOOL))
     notes = f" ({unverified} unverified, see notes)" if unverified else ""
     if strict and any(r.tool == NO_DRIVER_NOTE_TOOL for r in results):
         notes += " (strict: no-driver coverage blocks)"
@@ -771,7 +731,7 @@ INDEX_BLOB_LIMIT_BYTES = 5 * 1024 * 1024
 INDEX_NOTE_TOOL = "index"  # passing evidence that says what the hook did not check
 UNVERIFIED_NOTE_TOOL = "forbid_ast_unverified"  # sites a forbid_ast where clause could not decide
 EXEMPT_NOTE_TOOL = "forbid_ast_exempt"  # test files a forbid_ast rule skipped
-NOTE_TOOLS = frozenset({INDEX_NOTE_TOOL, UNVERIFIED_NOTE_TOOL, EXEMPT_NOTE_TOOL, NO_DRIVER_NOTE_TOOL})
+NOTE_TOOLS = frozenset({INDEX_NOTE_TOOL, UNVERIFIED_NOTE_TOOL, EXEMPT_NOTE_TOOL, NO_DRIVER_NOTE_TOOL, ast_checks.AST_SIZE_NOTE_TOOL})
 _UNVERIFIED_SHOWN = 5
 
 
