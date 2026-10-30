@@ -550,14 +550,10 @@ def run_layer1(
         )
         results.extend(checks)
 
-    # ── T7: the security pack and the secret scan, on what the change introduces ──
-    t7_rels = []
-    for filepath in changed_files:
-        full_path = filepath if os.path.isabs(filepath) else os.path.join(repo_root_str, filepath)
-        if os.path.isfile(full_path):
-            t7_rels.append(os.path.relpath(full_path, repo_root_str).replace("\\", "/"))
-    if t7_rels:
-        results.extend(_t7_evidence(git_root or repo_root_str, t7_rels, repo_root_str, diff_base, owned))
+        # T7 shares the head parse results and live driver with structural/user checks.
+        if paths:
+            results.extend(_t7_evidence(git_root or repo_root_str, [rel for rel, _ in paths],
+                                        repo_root_str, diff_base, owned, session=session))
 
     # ── Mutation Testing ───────────────────────────────────────────────
     if not fast_mode:
@@ -686,10 +682,10 @@ def _base_sources(git_root: str, rels: list[str], work_root: str, diff_base: Opt
 
 def _t7_evidence(git_root: str, rels: list[str], work_root: str, diff_base: Optional[str],
                  owned: set[tuple[str, int, str]], contents: Optional[dict[str, bytes]] = None,
-                 present: Any = None) -> list[ToolEvidence]:
+                 present: Any = None, *, session: Any = None) -> list[ToolEvidence]:
     """Run delta-aware security checks with this runner's base and failure boundaries."""
     return ast_checks.run_security_checks(git_root, rels, work_root, diff_base, owned, contents,
-                                          present, read_base=_base_sources, failure=_tool_failure)
+                                          present, read_base=_base_sources, failure=_tool_failure, session=session)
 
 
 def gate_verdict(results: list[ToolEvidence], *, strict: bool = False) -> bool:
@@ -943,12 +939,12 @@ def _layer1_on_snapshot(
             too_large={rel: _not_read(size) for rel, size in too_large.items()},
         )
         results.extend(checks)
+        t7_rels = [rel for rel in files if os.path.isfile(_snapshot_file(snapshot, rel))]
+        if t7_rels:
+            results.extend(_t7_evidence(repo_root, t7_rels, snapshot, None, owned, present=entries.__contains__, session=session))
     for rel, size in too_large.items():
         if not any(row.target == rel for row in checks) and not (is_test_path(rel) or posixpath.basename(rel) == "__init__.py"):
             results.append(ToolEvidence(tool=INDEX_NOTE_TOOL, target=rel, verdict=True, detail=f"{rel} not checked: {_not_read(size)}"))
-    t7_rels = [rel for rel in files if os.path.isfile(_snapshot_file(snapshot, rel))]
-    if t7_rels:
-        results.extend(_t7_evidence(repo_root, t7_rels, snapshot, None, owned, present=entries.__contains__))
     return results
 
 
@@ -970,7 +966,7 @@ def run_layer1_on_index(changed_files: list[str], repo_root: str, *, ast_runner:
     repo_root_str = str(getattr(repo_root, "root", repo_root))
     with (nullcontext(ast_runner) if ast_runner is not None else ASTDriverRunner()) as ast_runner:
         covered = ast_checks.covered_paths(changed_files, repo_root_str, _discover_forbid_ast_rules)
-        driven: dict[str, bool] = {".py": True}
+        driven: dict[str, bool] = dict.fromkeys(ast_checks.PACK_EXTENSIONS, True)
 
         def readable(rel: str) -> bool:
             ext = os.path.splitext(rel)[1].lower()

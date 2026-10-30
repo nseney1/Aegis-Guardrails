@@ -1,4 +1,4 @@
-"""First-party Python rules, native-source diagnostics and delta-aware evaluation."""
+"""First-party per-language security rules and delta-aware shared-session evaluation."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,7 +15,7 @@ from aegis_core.ast.source import decode_python_source
 from aegis_core.match import is_test_path, workspace_files
 from aegis_core.primitives import is_within
 
-__all__ = ["evaluate_security_pack"]
+__all__ = ["evaluate_security_pack", "SECURITY_RULES_BY_LANGUAGE", "PACK_EXTENSIONS"]
 
 _REQ_METHODS = ("request", "get", "post", "put", "delete", "head", "options", "patch")
 _SUB_FUNCS = ("run", "Popen", "call", "check_call", "check_output")
@@ -58,6 +58,51 @@ PYTHON_SECURITY_RULES: List[Dict[str, Any]] = [
 ]
 
 
+_SHELLS = ["sh", "bash", "zsh", "/bin/sh", "/bin/bash", "cmd", "cmd.exe", "powershell", "pwsh"]
+JS_SECURITY_RULES = [
+    _rule("sec-js-eval", "Forbid dynamic JavaScript execution", "Disallow eval, Function and VM execution.",
+          [{"name": "eval", "builtin": True}, {"name": "Function", "builtin": True},
+           *[f"vm.{name}" for name in ("runInThisContext", "runInNewContext", "runInContext", "compileFunction", "Script")]]),
+    _rule("sec-js-child-process-shell", "Forbid child-process shells", "Disallow implicit and explicit shell execution.",
+          ["child_process.exec", "child_process.execSync",
+           *[{"name": f"child_process.{name}", "where": {"shell": True}}
+             for name in ("spawn", "spawnSync", "execFile", "execFileSync")]]),
+    _rule("sec-js-weak-hash", "Forbid weak hashes", "Disallow MD5 and SHA1 hashes.",
+          [{"name": "crypto.createHash", "where": {"#0": {"in": ["md5", "sha1", "MD5", "SHA1"]}}}]),
+    _rule("sec-js-tls-reject-unauthorized", "Require TLS certificate verification", "Disallow rejectUnauthorized false.",
+          [{"name": name, "where": {"rejectUnauthorized": False}}
+           for name in ("https.request", "https.get", "https.Agent", "tls.connect", "tls.createSecureContext")]),
+    {**_rule("sec-js-node-serialize", "Forbid node-serialize", "Disallow unsafe node-serialize deserialization.", []),
+     "forbid_ast": {"imports": ["node-serialize"]}},
+]
+GO_SECURITY_RULES = [
+    _rule("sec-go-exec-shell", "Forbid shell commands", "Disallow shells invoked through os/exec.",
+          [{"name": f"os/exec.{name}", "where": {position: {"in": _SHELLS}}}
+           for name, position in (("Command", "#0"), ("CommandContext", "#1"))]),
+    _rule("sec-go-weak-hash", "Forbid weak hashes", "Disallow MD5 and SHA1 hashes.",
+          [f"crypto/{algorithm}.{name}" for algorithm in ("md5", "sha1") for name in ("New", "Sum")]),
+    _rule("sec-go-tls-insecure", "Require TLS certificate verification", "Disallow InsecureSkipVerify true.",
+          [{"name": "crypto/tls.Config", "where": {"InsecureSkipVerify": True}}]),
+    _rule("sec-go-ssh-insecure-hostkey", "Require SSH host verification", "Disallow InsecureIgnoreHostKey.",
+          ["golang.org/x/crypto/ssh.InsecureIgnoreHostKey"]),
+]
+RUST_SECURITY_RULES = [
+    _rule("sec-rs-command-shell", "Forbid shell commands", "Disallow shells invoked through process::Command.",
+          [{"name": "std::process::Command::new", "where": {"#0": {"in": _SHELLS}}}]),
+    _rule("sec-rs-tls-danger", "Require TLS verification", "Disallow disabled certificate or hostname verification.",
+          [{"name": f".{name}", "where": {"#0": True}}
+           for name in ("danger_accept_invalid_certs", "danger_accept_invalid_hostnames")]),
+    # Weak hashes are omitted: Git-compatible SHA1 failed the approved precision gate.
+
+]
+SECURITY_RULES_BY_LANGUAGE = {"python": PYTHON_SECURITY_RULES, "javascript": JS_SECURITY_RULES,
+                            "typescript": JS_SECURITY_RULES, "go": GO_SECURITY_RULES, "rust": RUST_SECURITY_RULES}
+_PACK_LANGUAGES = {".py": "python", ".go": "go", ".rs": "rust",
+                   **{ext: "typescript" for ext in (".ts", ".tsx", ".mts", ".cts")},
+                   **{ext: "javascript" for ext in (".js", ".jsx", ".mjs", ".cjs")}}
+PACK_EXTENSIONS = frozenset(_PACK_LANGUAGES)
+
+
 def _record(finding: Mapping[str, Any], rel_path: str, rule: Mapping[str, Any]) -> Dict[str, Any]:
     return {"rule_id": finding["rule"], "file": rel_path, "line": finding["line"], "kind": finding["kind"],
             "pattern": finding["pattern"], "snippet": finding["snippet"], "severity": rule["severity"]}
@@ -68,53 +113,74 @@ def _unverified_file(path: str, reason: str) -> dict[str, Any]:
             'status': 'unverified', 'reason': reason, 'severity': 'high'}
 
 
+def _base_tree(rel_path: str, source: str | bytes | None, session: Any) -> tuple[Any, str | None]:
+    """Parse bounded base bytes with the head's driver, without loading repository code."""
+    if source is None:
+        return None, None
+    extension = Path(rel_path).suffix.lower()
+    text = decode_python_source(source) if isinstance(source, bytes) and extension == '.py' else (
+        source.decode('utf-8') if isinstance(source, bytes) else source)
+    if extension != '.go':
+        return extract_normalized_ast(rel_path, code=text), text
+    from tempfile import TemporaryDirectory
+    from aegis_core.ast.runner import SOURCE_LIMIT_BYTES, ASTDriverError
+    from aegis_core.storage import atomic_write_bytes
+
+    data = text.encode('utf-8')
+    if len(data) > SOURCE_LIMIT_BYTES:
+        raise ASTDriverError('base source exceeds 2 MiB', reason='too_large')
+    with TemporaryDirectory(prefix='aegis-security-base-') as temporary:
+        path = Path(temporary) / 'base.go'
+        atomic_write_bytes(path, data)
+        tree = session.runner.parse_file(path, workspace_root=session.workspace_root, confine_root=temporary)
+    return tree, text
+
+
 def evaluate_security_pack(
     workspace_root: Union[str, Path], changed_files: Iterable[str], base_sources: Mapping[str, Optional[Union[str, bytes]]],
+    *, session: Any = None,
 ) -> Dict[str, Any]:
-    """The pack's findings in what ``changed_files`` introduce over ``base_sources`` (each path's
-    source text or bytes at the base, read through gitsafe; None or absent: a new file).
+    """Evaluate introduced security findings with a check-local shared AST session.
 
-    Every changed Python file inside the workspace is evaluated, reported unverified (one
-    ``kind: "file"`` record when it cannot be read or parsed) or absent (deleted), never
-    skipped as clean. Go, native JS/TS and Rust have no pack rules yet (v4.5 M3 adds them):
-    they are only confined to the workspace and given the 2 MiB size advisory, never parsed
-    here, so a parser gap cannot fail T7 (user forbid_ast rules still parse them and fail closed).
-    Test files are reported in ``exempted_test_findings``."""
+    Missing drivers are unverified; configured driver and source errors fail closed in
+    Layer 1. Test paths remain visible as exemptions. An invalid base suppresses nothing.
+    A caller checking an index snapshot supplies its repository-bound session.
+    """
+    from aegis_core.ast.runner import ASTDriverError, enforce_source_size
+    from aegis_core.ast.session import ASTParseSession
+
     root = Path(workspace_root).resolve()
+    if session is None:
+        with ASTParseSession(str(root)) as owned_session:
+            return evaluate_security_pack(root, changed_files, base_sources, session=owned_session)
     violations: List[Dict[str, Any]] = []
     exempted_test_findings: List[Dict[str, Any]] = []
     unverified_findings: List[Dict[str, Any]] = []
-    for rel_path in sorted(f for f in workspace_files(root, changed_files)
-                           if f.endswith(('.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.go', '.rs'))):
+    for rel_path in sorted(f for f in workspace_files(root, changed_files) if Path(f).suffix.lower() in PACK_EXTENSIONS):
         full_path = root.joinpath(*rel_path.split("/"))
         if not full_path.is_file():
             continue
         if not is_within(full_path, root, unresolvable=False):
             unverified_findings.append(_unverified_file(rel_path, 'source escapes workspace'))
             continue
-        if not rel_path.endswith('.py'):
-            from aegis_core.ast.runner import ASTDriverError, enforce_source_size
-
-            try:
-                enforce_source_size(full_path)
-            except (ASTDriverError, OSError) as exc:
-                reason = 'too_large' if is_size_limit_error(exc) else str(exc)
-                unverified_findings.append(_unverified_file(rel_path, reason))
-            continue
+        extension = full_path.suffix.lower()
         try:
-            head_ast = extract_normalized_ast(str(full_path), workspace_root=str(root))
-        except ASTExtractionError as exc:  # exc.reason: str(exc) names the absolute path
-            reason = 'too_large' if is_size_limit_error(exc) else exc.reason
+            if extension != '.py':
+                enforce_source_size(full_path)
+            head_ast = session.get(str(full_path))
+        except (ASTExtractionError, ASTDriverError, OSError) as exc:
+            reason = 'too_large' if is_size_limit_error(exc) else getattr(exc, 'reason', str(exc))
             unverified_findings.append(_unverified_file(rel_path, reason))
             continue
-        base_text = base_sources.get(rel_path)
+        if head_ast is None:
+            unverified_findings.append(_unverified_file(rel_path, f'no_driver:{extension}'))
+            continue
         try:
-            base_text = decode_python_source(base_text) if isinstance(base_text, bytes) else base_text
-            base_ast = extract_normalized_ast(rel_path, code=base_text) if base_text is not None else None
-        except (ASTExtractionError, SyntaxError, UnicodeError):
-            base_ast = None  # a base that does not parse accounts for nothing: every head finding is new
+            base_ast, base_text = _base_tree(rel_path, base_sources.get(rel_path), session)
+        except (ASTExtractionError, ASTDriverError, SyntaxError, UnicodeError):
+            base_ast, base_text = None, None
         is_test = is_test_path(rel_path)
-        for rule in PYTHON_SECURITY_RULES:
+        for rule in SECURITY_RULES_BY_LANGUAGE[_PACK_LANGUAGES[extension]]:
             rid, spec = rule["id"], rule["forbid_ast"]
             head = evaluate_forbid_ast_structured(head_ast, spec, rule_id=rid)
             base = evaluate_forbid_ast_structured(base_ast, spec, rule_id=rid, source=base_text) if base_ast is not None else None

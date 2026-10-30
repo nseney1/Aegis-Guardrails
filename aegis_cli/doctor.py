@@ -356,6 +356,10 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
     except SlotResolutionError as exc:
         print(f"  ❌ AST drivers: {exc}")
         return False
+    from aegis_cli.language_capabilities import capability_lines, runner_suggestion
+
+    for line in capability_lines(ws_root) + runner_suggestion(ws_root):
+        print(line)
     if missing:
         reasons = ', '.join(f'no_driver:{ext}' for ext in missing)
         print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. "
@@ -386,7 +390,7 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
                 if status.cache_hit:
                     print(f"  ✅ AST driver ({ext}): {status.goversion} ({status.compiler}); cache hit ({status.binary})")
                 else:
-                    print(f"  ⚠️  AST driver ({ext}): {status.goversion}; Go driver cache is cold; "
+                    print(f"  ⚠️  AST driver ({ext}): {status.goversion} ({status.compiler}); Go driver cache is cold; "
                           "run aegis doctor --drivers --fix")
                     all_resolvable = False
             except GoDriverUnavailableError as exc:

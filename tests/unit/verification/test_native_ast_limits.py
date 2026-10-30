@@ -88,15 +88,18 @@ def test_native_depth_error_still_blocks(tmp_path):
 
 @pytest.mark.parametrize('extension', ['ts', 'tsx', 'js', 'mjs'])
 def test_t7_checks_only_size_and_containment_for_native_js_until_js_rules_ship(tmp_path, extension):
-    # T7 has no JS/TS rule pack yet, so a source the native parser rejects is not a T7 failure
-    # (a user forbid_ast rule targeting it still fails closed: test_native_lexical_error_still_blocks;
-    # structural checks such as call_graph still fail closed, as they do on a Python SyntaxError).
+    # Native packs now ship: retain this migration control and require the parser
+    # failure to remain visible in both the pack and the full Layer 1 entry point.
     target = tmp_path / ('app.' + extension)
     target.write_text('/* unterminated', encoding='utf-8')
     pack = security_pack.evaluate_security_pack(tmp_path, [target.name], {})
-    assert pack == {'passed': True, 'violations': [], 'exempted_test_findings': [], 'unverified_findings': []}
+    assert pack['violations'] == [] and pack['exempted_test_findings'] == []
+    assert pack['unverified_findings'] == [{
+        'rule_id': '', 'file': target.name, 'line': 0, 'kind': 'file', 'status': 'unverified',
+        'reason': 'JSLexError: syntax:unterminated_comment at line 1, offset 0', 'severity': 'high',
+    }]
     rows = runner.run_layer1([target.name], str(tmp_path), fast_mode=True, reviewed=False)
-    assert [row.tool for row in rows if not row.verdict] == ['call_graph']
+    assert [row.tool for row in rows if not row.verdict] == ['call_graph', 'security_pack']
 
 
 def test_staged_index_limit_still_fails_closed_above_five_mib(tmp_path):

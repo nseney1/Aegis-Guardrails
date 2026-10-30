@@ -6,6 +6,9 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Added
 
+- Language security packs add five JS/TS rules, four Go rules and two Rust rules, with shared head/base parsing, introduced-findings checks and explicit unavailable-driver evidence. Rust weak-hash matching is omitted after its precision fixtures rejected legitimate Git-compatible SHA1 use.
+- Test-file pairing covers all eight JS/TS extensions, Go packages and Rust inline or integration tests. Successful Go package pairing is informational and never claims tests ran or earns receipt credit.
+- Init and doctor show language capabilities and suggest user-owned Vitest/Jest runner configuration without writing commands selected by repository metadata. Generated check and SARIF workflows prepare Go only when needed.
 - TypeScript/JavaScript AST checks use Aegis's own in-process parser by default across all eight source extensions, without Node or parser dependencies. Imports, arguments, decorators, allow comments and mutation points retain source positions.
 - Rust AST checks now use the native in-process parser by default, without Cargo, rustc or repository dependencies. Imports, arguments, attributes, test functions and inline test modules retain their source positions.
 - Opted-in Go parsing uses one cached, offline-built protocol-v2 driver per check; ordinary doctor and card inspect without building, and confirmed doctor repair can prepare the cache.
@@ -23,7 +26,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 ### Fixed
 
 - Unresolved JS import/call targets retain advisory UNKNOWN evidence; source files above the native parser's 2 MiB limit report `unverified too_large` with an exclusion hint, and `check --record` receipts keep reason `too_large` on those rows.
-- The security pack does not parse TypeScript/JavaScript files, which have no pack rules yet; as for Go, it only confines them to the workspace and reports the 2 MiB advisory instead of failing on files it cannot parse.
+- Security checks retain native files in staged snapshots, share the check-local AST session with other checks, and distinguish missing drivers from configured-driver failures while preserving the 2 MiB advisory.
 - Go literals use canonical Python string rendering, and locally shadowed import receivers retain method matching without producing imported-call findings.
 - Windows AST driver cleanup retains process handles before termination, waits before removing its temporary directory, and reports descendants it cannot account for.
 - Distribution checks reject original ZIP member names changed by separator normalization or NUL truncation.

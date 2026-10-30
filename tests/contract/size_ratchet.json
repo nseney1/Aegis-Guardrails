@@ -73,8 +73,8 @@
       "stmts": 15
     },
     "aegis_core/verification/runner.py:run_layer1": {
-      "lines": 104,
-      "stmts": 54
+      "lines": 100,
+      "stmts": 49
     },
     "aegis_core/workspace/binding.py:resolve_binding": {
       "lines": 122,
@@ -99,8 +99,8 @@
       "stmts": 770
     },
     "aegis_core/verification/runner.py": {
-      "lines": 990,
-      "stmts": 635
+      "lines": 986,
+      "stmts": 630
     }
   }
 }

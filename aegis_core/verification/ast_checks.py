@@ -9,6 +9,7 @@ from aegis_core.ast.detect import LANGUAGE_DEFINITIONS
 from aegis_core.ast.schema import canonical_spelling
 from aegis_core.match import is_test_path
 from aegis_core.verification import ToolEvidence
+from aegis_core.verification.security_pack import PACK_EXTENSIONS
 from aegis_core.workspace.layout import RULES_RELDIR
 
 NO_DRIVER_NOTE_TOOL = 'forbid_ast_no_driver'
@@ -110,6 +111,8 @@ def run_checks(paths: list[tuple[str, str]], root: str, session: Any, *, discove
         results.extend(ToolEvidence(f'forbid_ast:{rule.id}', rel, False,
                                     f'forbid_ast: cannot verify {rel}: {why}',
                                     language=source_language(rel)) for rule in covering)
+        if not covering and Path(rel).suffix.lower() in PACK_EXTENSIONS - {'.py'}:
+            results.append(too_large_note(rel, source_language(rel)))
     for rel, path in paths:
         applicable = [(rule, spec) for rule, spec in rules if rule.applies_to(rel)]
         if not applicable:
@@ -122,8 +125,6 @@ def run_checks(paths: list[tuple[str, str]], root: str, session: Any, *, discove
             continue
         for rule, spec in applicable:
             if tree is None:
-                from pathlib import Path
-
                 ext = Path(rel).suffix.lower()
                 results.append(ToolEvidence(NO_DRIVER_NOTE_TOOL, rel, True,
                                f'unverified no_driver:{ext}: {rel} matched forbid_ast:{rule.id}; no AST driver configured',
@@ -147,8 +148,8 @@ def run_checks(paths: list[tuple[str, str]], root: str, session: Any, *, discove
 
 def run_security_checks(git_root: str, rels: list[str], work_root: str, diff_base: str | None,
                         owned: set[tuple[str, int, str]], contents: dict[str, bytes] | None,
-                        present: Any, *, read_base: Any, failure: Any) -> list[ToolEvidence]:
-    """T7 on ``rels``: the Python security pack and the Tier A secret scan, each against the file's
+                        present: Any, *, read_base: Any, failure: Any, session: Any = None) -> list[ToolEvidence]:
+    """T7 on ``rels``: the language security packs and the Tier A secret scan, each against the file's
     text before the change, so only what it introduces fails (spec T7, D-delta: user forbid_ast rules
     keep whole-file judgment). Test-path hits and undecidable sites are reported on a passing row; an
     ``# aegis: allow`` hit passes unrecorded (no credit for pack rows); an unreadable file and any
@@ -161,8 +162,8 @@ def run_security_checks(git_root: str, rels: list[str], work_root: str, diff_bas
 
     try:
         base_sources = read_base(git_root, rels, work_root, diff_base, contents, present)
-        typed = [rel for rel in rels if rel.endswith(('.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.go'))]
-        pack = security_pack.evaluate_security_pack(work_root, typed, base_sources) if typed else {}
+        typed = [rel for rel in rels if Path(rel).suffix.lower() in PACK_EXTENSIONS]
+        pack = security_pack.evaluate_security_pack(work_root, typed, base_sources, session=session) if typed else {}
         secrets = scanners.scan_secrets_delta(work_root, rels, {p: b.decode("utf-8", "replace") for p, b in base_sources.items()}, contents)
     except Exception as exc:
         return [failure("security_pack", "changed files", exc)]
@@ -175,6 +176,10 @@ def run_security_checks(git_root: str, rels: list[str], work_root: str, diff_bas
     for hit in pack.get("unverified_findings", ()):
         if hit.get('reason') == 'too_large':
             advisory.append(too_large_note(hit['file'], source_language(hit['file'])))
+        elif hit.get('reason', '').startswith('no_driver:'):
+            advisory.append(ToolEvidence(NO_DRIVER_NOTE_TOOL, hit['file'], True,
+                f"unverified {hit['reason']}: {hit['file']} has a security pack; no AST driver configured",
+                language=source_language(hit['file'])))
         elif hit["kind"] == "file":
             hits.setdefault(("security_pack", hit["file"]), []).append(hit)
         else:
@@ -194,7 +199,7 @@ def run_security_checks(git_root: str, rels: list[str], work_root: str, diff_bas
             # No line number: SARIF fingerprints hash the message, and the lines are in ``lines``.
             detail = "; ".join(dict.fromkeys(f"{h['pattern']} introduced by this change" for h in found))
         out.append(ToolEvidence(tool=tool, target=rel, verdict=False, detail=detail,
-                                lines=sorted({h["line"] for h in found if h["line"] > 0})))
-    out.extend(ToolEvidence(tool="security_pack", target=rel, verdict=True, detail="; ".join(items))
+                                lines=sorted({h["line"] for h in found if h["line"] > 0}), language=source_language(rel)))
+    out.extend(ToolEvidence(tool="security_pack", target=rel, verdict=True, detail="; ".join(items), language=source_language(rel))
                for rel, items in sorted(notes.items()))
     return out

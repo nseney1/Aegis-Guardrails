@@ -181,13 +181,15 @@ def layer1_findings(document: dict[str, Any], workspace_root: Optional[str | Pat
     return found
 
 
-def layer1_report_document(passed: bool, owned: list, checkpoint_issues: list, strict: bool) -> dict[str, Any]:
+def layer1_report_document(passed: bool, owned: list, checkpoint_issues: list, strict: bool,
+                           *, checkpoint_info: Optional[list] = None) -> dict[str, Any]:
     """The document ``check FILES --format github|sarif`` reports: each piece of Layer 1 evidence under
     its workspace-relative file (``owned``: (path or None, ToolEvidence)) with its lines, and each
     checkpoint issue as a line-less finding (an error when it blocks)."""
     from aegis_cli.checkpoint import is_blocking
 
     return {"passed": passed,
+            "checkpoint_info": list(checkpoint_info or ()),
             "layer1": [{"tool": e.tool, "target": path or e.target, "verdict": bool(e.verdict), "detail": e.detail,
                         "lines": list(e.lines), **({"language": e.language} if getattr(e, "language", None) else {})} for path, e in owned],
             "findings": [{"rule": f"checkpoint:{issue.get('check', '')}", "message": issue.get("message", ""),
@@ -282,6 +284,8 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
             out.append(line("error", row["tool"], row["detail"], row["target"], lines[0] if lines else 0))
     for issue in document.get("findings", ()):
         out.append(line(issue.get("level", "error"), issue["rule"], issue["message"]))
+    for note in document.get("checkpoint_info", ()):
+        out.append(line("notice", f"checkpoint:{note['check']}", note["message"], note["file"]))
     return out
 
 
@@ -340,6 +344,9 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
         lines.extend([f"### Performance: {({'pass': 'PASS', 'fail': 'FAIL'}).get(perf.get('status'), 'UNVERIFIED')}", ""])
     if not anchored and not lineless and not isinstance(cov, dict) and not isinstance(perf, dict):
         lines.append("No findings reported.")
+    if report_dict.get("checkpoint_info"):
+        lines.extend(["", "### Test Pairing (information only)"])
+        lines.extend(f"- {_md_code(note['message'])}" for note in report_dict["checkpoint_info"])
     return "\n".join(lines).strip() + "\n"
 
 
@@ -381,5 +388,8 @@ def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[st
     if error:
         run["invocations"] = [{"executionSuccessful": False, "toolExecutionNotifications": [
             {"level": "error", "message": {"text": error}}]}]
+    elif report_dict.get("checkpoint_info"):
+        run["invocations"] = [{"executionSuccessful": True, "toolExecutionNotifications": [
+            {"level": "note", "message": {"text": note["message"]}} for note in report_dict["checkpoint_info"]]}]
     return json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [run]},
                       indent=2)

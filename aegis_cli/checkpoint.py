@@ -24,7 +24,7 @@ def is_blocking(issue: dict, strict: bool) -> bool:
     return strict or issue.get("check") in GATE_CHECKS
 
 
-def run_checkpoint(root: Path, *, strict: bool) -> tuple[list[dict], bool]:
-    """Run every checkpoint check on *root*; return (issues, blocking)."""
-    issues = run_all_checks(root)
+def run_checkpoint(root: Path, *, strict: bool, pairing_info: list[dict] | None = None) -> tuple[list[dict], bool]:
+    """Return (issues, blocking); successful pairing information never affects either."""
+    issues = run_all_checks(root, pairing_info=pairing_info)
     return issues, any(is_blocking(issue, strict) for issue in issues)
