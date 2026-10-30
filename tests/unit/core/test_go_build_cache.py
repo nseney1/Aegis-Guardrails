@@ -38,18 +38,89 @@ def _process_running(pid):
             return result == 258
         finally:
             assert kernel.CloseHandle(handle)
+    return _posix_process_running(pid)
+
+
+def _posix_process_running(pid):
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     # A terminated orphan may remain a zombie under a container's non-reaping init.
     status = Path(f"/proc/{pid}/stat")
-    if status.is_file():
+    try:
+        return status.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        # The process may have exited, or this platform may have no procfs.
         try:
-            return status.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-        except FileNotFoundError:
+            os.kill(pid, 0)
+        except ProcessLookupError:
             return False
-    return True
+        return True
+
+
+def _cleanup_child(pid):
+    if _process_running(pid):
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass  # Exit between the liveness query and kill already satisfies cleanup.
+
+
+@pytest.mark.parametrize("exited", [True, False])
+def test_process_state_rechecks_a_missing_status_file(monkeypatch, exited):
+    calls = []
+    original = Path.read_text
+
+    def kill(pid, sig):
+        assert (pid, sig) == (987654321, 0)
+        calls.append(sig)
+        if exited and len(calls) > 1:
+            raise ProcessLookupError("exited between process and status queries")
+
+    def read(path, *args, **kwargs):
+        if path == Path("/proc/987654321/stat"):
+            raise FileNotFoundError("process exited or procfs unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(Path, "read_text", read)
+    assert _posix_process_running(987654321) is not exited
+    assert calls == [0, 0]
+
+
+def test_process_status_permission_failure_is_not_treated_as_exit(monkeypatch):
+    original = Path.read_text
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    def read(path, *args, **kwargs):
+        if path == Path("/proc/987654321/stat"):
+            raise PermissionError("status access denied")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    with pytest.raises(PermissionError, match="^status access denied$"):
+        _posix_process_running(987654321)
+
+
+@pytest.mark.parametrize("failure", [ProcessLookupError, PermissionError])
+def test_child_cleanup_handles_only_a_process_that_already_exited(monkeypatch, failure):
+    calls = []
+
+    def kill(pid, sig):
+        assert pid == 987654321
+        calls.append(sig)
+        if sig == 9:
+            raise failure("cleanup boundary")
+
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(sys.modules[__name__], "_process_running", lambda pid: True)
+    if failure is PermissionError:
+        with pytest.raises(PermissionError, match="^cleanup boundary$"):
+            _cleanup_child(987654321)
+    else:
+        _cleanup_child(987654321)
+    assert calls[-1] == 9
 
 
 @pytest.mark.parametrize("ending", ["timeout", "failure", "success"])
@@ -104,8 +175,7 @@ def test_public_build_terminates_ordinary_compiler_descendants_before_return(tmp
     finally:
         if pidfile.exists():
             child_pid = int(pidfile.read_text())
-            if _process_running(child_pid):
-                os.kill(child_pid, 9)
+            _cleanup_child(child_pid)
 
 
 @pytest.fixture

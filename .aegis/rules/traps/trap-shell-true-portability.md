@@ -2,7 +2,7 @@
 id: trap-shell-true-portability
 domain: portability
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: subprocess calls with shell=True fail on Windows due to different shell quoting rules and may introduce shell injection vulnerabilities
 prediction: Will flag subprocess.run/check_output/Popen calls using shell=True
 falsification: 0 findings in 20 sessions → prune

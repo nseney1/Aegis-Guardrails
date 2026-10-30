@@ -11,45 +11,28 @@ expiry_days: 60
 created: "2026-10-15T16:11:59Z"
 impact_weight: 1.0
 tags: ["debrief", "citadel", "ledger", "locking"]
-target_paths: ["aegis_core/telemetry_engine/ledger.py", "aegis_core/workspace/layout.py", "aegis_mcp/handlers/governance.py", "aegis_mcp/handlers/telemetry.py", "tests/unit/core/**"]
+target_paths:
+  - "aegis_core/telemetry_engine/ledger.py"
+  - "aegis_core/storage.py"
+  - "tests/unit/core/test_ledger*.py"
+  - "tests/unit/core/test_shared_ledger.py"
+  - "tests/helpers_ledgerrace.py"
 lineage:
   parent_id: null
   created_by: "manual"
   generation: 0
   siblings: []
 ---
-# Invariant: one canonical ledger, mutated only under its lock
+## Do
+Resolve one shared ledger through ledger_site and mutate it under ledger_locked; preserve append-only rows, ordered lock ownership and stable idempotency identity for each logical report.
 
-**Rule**: A ledger has exactly one canonical file. Every reader, writer and
-compactor resolves it from `WorkspaceLayout` and mutates it only inside
-`evidence_lock`. Reads tolerate bad bytes and a BOM line by line. Idempotency
-keys are deterministic or required, never random. Each mutation path has a
-multi-round test with appends between rounds.
+Worktrees share the repository ledger while retaining attribution. Replays of one report must not add credit, and conflicting payloads under one key must fail. Decode legacy/malformed rows according to the canonical reader without rewriting history; use one coherent view for a calculation.
 
-## Incident (v4 Citadel review)
+Verify: Exercise interleaved worktree writers, replay/conflict keys, BOM/bad/torn rows, legacy versions and fresh versus retained snapshots through public ledger/storage calls.
 
-- `compact_signals` read `telemetry/` first while live writers used
-  `evidence/`, then wrote the same bytes to both, so a stale snapshot overwrote
-  the live ledger (6 records to 0). It ran without `evidence_lock`, so
-  concurrent appends were lost.
-- One invalid UTF-8 byte killed `read_signals`, `get_rule_stats` and compaction,
-  and a BOM dropped the first record. `append_signals` rewrote and fsynced the
-  whole file on every call.
-- `aegis_report_outcome` generated a random uuid4 idempotency key when none was
-  given, so retries inflated fitness counts, and a call with no rule ids
-  silently recorded nothing.
-- It was missed because compaction was tested only as a single run against one
-  directory, with no two-round, interleaved-append or concurrent-writer test,
-  and the writer and reader paths never had to share one path constant.
+Owner instructions and existing approval/release boundaries remain authoritative.
 
-v4.0 deleted compaction and rollup (D7, #22). The ledger stays and gets
-versioned rows in wave B2 (D13).
-
-## Check
-
-1. Every reference to a ledger file in `aegis_*` resolves its path through
-   `WorkspaceLayout`; a second literal path to the same ledger fails review.
-2. Every write path holds `evidence_lock`. Test: two writers append N rows each
-   and all 2N rows survive.
-3. A ledger with a BOM and one invalid byte still yields every valid row.
-4. Reporting the same outcome twice records one row.
+## Evidence
+- aegis_core/telemetry_engine/ledger.py documents ledger_site, ledger_locked, shared worktree attribution and the (key, rule) identity.
+- tests/unit/core/test_shared_ledger.py and test_ledger_merge.py cover sharing/idempotency; test_scan_ledger_reads.py covers coherent snapshots.
+- This replaces obsolete WorkspaceLayout/evidence_lock-only guidance without changing ledger implementation.

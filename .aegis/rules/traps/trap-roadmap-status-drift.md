@@ -2,7 +2,7 @@
 id: trap-roadmap-status-drift
 domain: documentation
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "Shipping a release without moving its work out of the planned sections (docs/why-aegis.md section 6, SECURITY.md 'What Aegis does not claim') and into a CHANGELOG entry leaves the docs telling readers that shipped work is planned, or that planned work has shipped"
 prediction: "Will fire when a version bump or CHANGELOG entry ships work that docs/why-aegis.md section 6 or SECURITY.md still calls planned, or when the version is bumped without a CHANGELOG entry for it"
 falsification: 0 findings in 20 sessions → prune

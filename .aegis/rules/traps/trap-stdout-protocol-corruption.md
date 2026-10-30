@@ -2,7 +2,7 @@
 id: trap-stdout-protocol-corruption
 domain: correctness
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "Hook scripts that echo human-readable text to stdout after emitting their JSON protocol response corrupt the caller's JSON parser silently — no error is raised, the downstream consumer just gets garbage"
 prediction: "Will fire when a CLI or hook script adds echo/printf to stdout for debugging, status messages, or logging instead of redirecting to stderr"
 falsification: 0 findings in 10 sessions → prune

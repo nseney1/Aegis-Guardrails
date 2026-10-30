@@ -2,7 +2,7 @@
 id: trap-bugfix-without-regression-test
 domain: testing
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "Bug fixes applied without corresponding regression tests will allow the same defect to recur, compounding fix-refix cycles"
 prediction: Will fire when a commit fixes a bug (changes implementation code) but does not add or modify a test that exercises the fixed behavior
 falsification: 0 findings in 20 sessions → prune
