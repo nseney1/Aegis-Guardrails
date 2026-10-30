@@ -1,7 +1,7 @@
 """Matched AST source fixtures and optional measurements; no performance acceptance claim.
 
-Only Python's native source parser is available in M1. Other implementations must
-be enabled with their own witnesses when they land; legacy parsers are never timed.
+Native Python and JS/TS parsers have language-specific extraction witnesses.
+Unavailable implementations and legacy parsers are never timed.
 """
 from __future__ import annotations
 
@@ -81,14 +81,17 @@ def load_corpus(raw=None):
     return {"name": data["name"], "sha256": digest, "cases": cases}
 
 
-def check_witness(parsed):
+def check_witness(parsed, language="python"):
     """Require recognizable extraction, including the import alias and its source-spelled calls."""
-    if (getattr(parsed, "language", None) != "python" or
+    source, names = ({"python": ("json", ("dumps", "loads")), "rust": ("std::cmp", ("max", "min"))}
+                     .get(language, ("querystring", ("stringify", "parse"))))
+    separator = '::' if language == 'rust' else '.'
+    if (getattr(parsed, "language", None) != language or
             "transform_0" not in {d.name for d in parsed.definitions} or
-            "json" not in {i.source for i in parsed.imports} or
-            not any(("codec", "json") in i.aliases for i in parsed.imports) or
-            not {"codec.dumps", "codec.loads"} <= {c.target for c in parsed.call_sites}):
-        raise ASTBenchmarkError("python extraction witness failed")
+            source not in {i.source for i in parsed.imports} or
+            not any(("codec", source) in i.aliases for i in parsed.imports) or
+            not {"codec" + separator + name for name in names} <= {c.target for c in parsed.call_sites}):
+        raise ASTBenchmarkError(language + " extraction witness failed")
     return {"definitions": len(parsed.definitions), "imports": len(parsed.imports), "calls": len(parsed.call_sites)}
 
 
@@ -96,11 +99,17 @@ def measure(language, runs, *, clock, summarize):
     """Time source parsing after an untimed witnessed warm-up; file I/O is excluded."""
     if not isinstance(language, str) or language not in LANGUAGES:
         raise ASTBenchmarkError("unknown AST benchmark language: " + str(language))
-    if language != "python":
+    if language not in ("python", "typescript", "javascript", "rust"):
         raise ASTBenchmarkError(language + " native parser implementation unavailable")
     if type(runs) is not int or not 1 <= runs <= 1000:
         raise ASTBenchmarkError("AST benchmark runs must be a whole number from 1 to 1000")
-    from aegis_core.ast.drivers.python import parse_python_ast
+    from aegis_core.ast.driver_errors import ASTDriverError
+    if language == "python":
+        from aegis_core.ast.drivers.python import parse_python_ast as parse
+    elif language == 'rust':
+        from aegis_core.ast.drivers.rust import parse
+    else:
+        from aegis_core.ast.drivers.js import parse
 
     corpus = load_corpus()
     rows = []
@@ -109,20 +118,21 @@ def measure(language, runs, *, clock, summarize):
             continue
         source, path = case["source"], case["path"]
         try:
-            check_witness(parse_python_ast(source, path))
+            check_witness(parse(source, path), language)
             timings = []
             for _ in range(runs):
                 start = clock()
-                parsed = parse_python_ast(source, path)
+                parsed = parse(source, path)
                 elapsed = clock() - start
-                witness = check_witness(parsed)
+                witness = check_witness(parsed, language)
                 timings.append(elapsed)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, ASTDriverError) as exc:
             raise ASTBenchmarkError("AST benchmark parsing failed: " + str(exc)) from exc
         latency = summarize(timings)
         rows.append({"lines": case["lines"], "path": path, "sha256": case["sha256"], "runs": runs,
                      "latency_ms": latency, "ms_per_line": round(latency["p50"] / case["lines"], 9),
                      "witness": witness})
-    return {"language": language, "implementation": "python-stdlib-ast", "corpus_sha256": corpus["sha256"],
+    implementation = 'python-stdlib-ast' if language == 'python' else 'aegis-native-rust' if language == 'rust' else 'aegis-native-js'
+    return {"language": language, "implementation": implementation, "corpus_sha256": corpus["sha256"],
             "mode": "in-process source parsing; I/O excluded; untimed witnessed warm-up",
             "acceptance": "not evaluated", "cases": rows}

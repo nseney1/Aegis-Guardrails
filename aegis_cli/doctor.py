@@ -375,7 +375,7 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
             print(f"  ⚠️  AST driver ({ext}): {type(exc).__name__}: {exc}")
             all_resolvable = False
             continue
-        if plan is not None and plan.in_process_js:
+        if plan is not None and (plan.in_process_js or plan.in_process_rust):
             print(f"  ✅ AST driver ({ext}): {plan.label}")
             continue
         if plan is not None and plan.packaged_go:

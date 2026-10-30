@@ -1,6 +1,6 @@
 """AST Driver Runner and Registry for polyglot NormalizedAST execution.
 
-Python and JavaScript/TypeScript parse in-process. External driver argv never
+Python, JavaScript/TypeScript and Rust parse in-process. External driver argv never
 comes from repository content (H5, D10). It comes from drivers
 registered in code, from the user-scope ~/.aegis/config.json, or from the packaged
 templates in aegis_core/ast/drivers/templates, which a repo can only opt in to
@@ -21,7 +21,7 @@ import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from aegis_core.ast.drivers.python import parse_python_ast
-from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS
+from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS, NATIVE_SOURCE_EXTENSIONS
 from aegis_core.ast.schema import NormalizedAST
 from aegis_core.ast.driver_errors import ASTDriverError, ASTDriverTimeoutError, NoDriverConfiguredError
 from aegis_core.pathlookup import is_bare, INSIDE_FENCE, only_skipped, which
@@ -40,7 +40,7 @@ __all__ = [
 
 _PYTHON_NAMES = frozenset({"{python}", "python3", "python", "python.exe", "python3.exe"})
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "drivers" / "templates"
-# Packaged template -> interpreter looked up on PATH. rust_ast.py runs in-process.
+# Packaged external template -> interpreter looked up on PATH.
 _PACKAGED_INTERPRETERS = {"go_ast.go": "go"}
 SOURCE_LIMIT_BYTES = 2 * 1024 * 1024
 
@@ -78,8 +78,6 @@ def _command_plan(command: str, ext: str, ws_root: Optional[Path] = None, where:
     ``ws_root``: left to the child, an empty or relative entry (and on Windows the
     current directory) would resolve against the workspace.
     """
-    if ext == ".rs" and "rust_ast.py" in command:
-        return _DriverPlan(label=command, in_process_rust=True)
     try:
         parts = _split_command(command)
     except ValueError as exc:  # unbalanced quotes
@@ -123,8 +121,6 @@ def _packaged_plan(ext: str, ws_root: Path) -> Optional[_DriverPlan]:
         return None
     filename = config["driver_filename"]
     label = f"packaged {filename}"
-    if filename == "rust_ast.py":
-        return _DriverPlan(label=label, in_process_rust=True)
     interpreter = _PACKAGED_INTERPRETERS.get(filename)
     if interpreter is None:
         return None
@@ -160,7 +156,7 @@ def _user_command_plan(command: str, ext: str, ws_root: Path) -> Optional[_Drive
 
     where = f"the ~/.aegis/config.json driver for '{ext}'"
     plan = _command_plan(command, ext, ws_root, where)
-    if plan.in_process_rust or plan.unavailable or not plan.argv:
+    if plan.unavailable or not plan.argv:
         return plan
     argv = list(plan.argv)
     first = _split_command(command)[0]
@@ -205,12 +201,14 @@ class ASTDriverRegistry:
         *,
         _slot_loader: Optional[Callable[[str, Path], Any]] = None,
     ) -> Optional[_DriverPlan]:
-        """Choose the driver for an extension: registered, then user scope, then packaged opt-in."""
+        """Choose a native parser first, else registered, user-scope or packaged opt-in."""
         clean_ext = extension if extension.startswith(".") else f".{extension}"
         clean_ext = clean_ext.lower()
 
         if clean_ext in NATIVE_JS_EXTENSIONS:
             return _DriverPlan(label='native JavaScript/TypeScript (in-process)', in_process_js=True)
+        if clean_ext == '.rs':
+            return _DriverPlan(label='native Rust (in-process)', in_process_rust=True)
         if clean_ext in self._drivers:
             fence = None
             if workspace_root:
@@ -252,7 +250,7 @@ class ASTDriverRegistry:
         workspace_root: Optional[Union[Path, str, Workspace]] = None,
     ) -> set[str]:
         """Return all active source extensions from in-memory registry and workspace slots."""
-        exts = set(self._drivers.keys()) | NATIVE_JS_EXTENSIONS
+        exts = set(self._drivers.keys()) | NATIVE_SOURCE_EXTENSIONS
         exts.add(".py")
         if workspace_root:
             try:
@@ -314,7 +312,7 @@ def resolve_driver_executable(name: str, workspace: Optional[Union[Path, str]] =
 
 
 class ASTDriverRunner:
-    """Dispatches AST parsing to native Python or external driver subprocesses."""
+    """Dispatch AST parsing to native parsers or configured external driver subprocesses."""
 
     def __init__(self, registry: Optional[ASTDriverRegistry] = None, *, allow_build: bool = True):
         self.registry = registry or ASTDriverRegistry()
@@ -387,7 +385,7 @@ class ASTDriverRunner:
     def get_configured_extensions(self, workspace_root: Union[Path, str]) -> set[str]:
         if not self._active:
             return self.registry.get_configured_extensions(workspace_root)
-        extensions = set(self.registry._drivers) | NATIVE_JS_EXTENSIONS | {'.py'}
+        extensions = set(self.registry._drivers) | NATIVE_SOURCE_EXTENSIONS | {'.py'}
         for kind in ('user', 'repo'):
             extensions.update(self._slots(kind, Path(workspace_root)).get_configured_extensions())
         return extensions
@@ -476,8 +474,11 @@ class ASTDriverRunner:
         # Fast path 1: Native Python driver
         if ext == ".py":
             return parse_python_ast(target_path)
-        if ext in NATIVE_JS_EXTENSIONS:
-            from aegis_core.ast.drivers.js import parse
+        if ext in NATIVE_SOURCE_EXTENSIONS:
+            if ext == '.rs':
+                from aegis_core.ast.drivers.rust import parse
+            else:
+                from aegis_core.ast.drivers.js import parse
 
             with target_path.open('rb') as stream:
                 data = stream.read(SOURCE_LIMIT_BYTES + 1)
@@ -499,19 +500,6 @@ class ASTDriverRunner:
             plan = self._prepare_go(plan, ws_root)
         if plan.protocol == 2:
             return self._parse_batch(plan, target_path, timeout)
-
-        # Fast path 2: Built-in Rust driver executed in-process
-        if plan.in_process_rust:
-            try:
-                from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
-
-                source = target_path.read_text(encoding="utf-8", errors="replace")
-                ast_dict = parse_rust_source(source, str(target_path))
-                return NormalizedAST.from_dict(ast_dict)
-            except Exception as exc:
-                raise ASTDriverError(
-                    f"In-process Rust AST driver failed on {target_path.name}: {exc}"
-                ) from exc
 
         if not plan.argv:
             raise ASTDriverError(f"Empty driver command for extension '{ext}'")

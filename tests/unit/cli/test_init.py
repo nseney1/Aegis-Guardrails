@@ -628,14 +628,15 @@ class TestPolyglot:
         assert run_init(_args(project)) == 0
         out = capsys.readouterr().out
         assert "Detected language(s): Rust" in out
-        assert "Configured AST driver (.rs):" in out
-        assert SlotRegistry.load(project).get_ast_driver(".rs") is not None
+        assert "Configured AST driver (.rs):" not in out
+        assert SlotRegistry.load(project).get_ast_driver(".rs") is None
+        assert ".rs" in SlotRegistry.load(project).get_configured_extensions()
         assert not (project / ".aegis" / "drivers").exists()
 
     def test_dry_run_only_says_it_would_configure(self, project, capsys):
-        (project / "Cargo.toml").write_text("[package]\nname = 'rust_app'\n", encoding="utf-8")
+        (project / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
         assert run_init(_args(project, "--dry-run")) == 0
-        assert "Would configure AST driver (.rs):" in capsys.readouterr().out
+        assert "Would configure AST driver (.go):" in capsys.readouterr().out
         assert not (project / ".aegis" / "config.json").exists()
 
     def test_unknown_project_type(self, project, capsys):

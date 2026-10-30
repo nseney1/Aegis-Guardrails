@@ -76,7 +76,7 @@ def evaluate_security_pack(
 
     Every changed Python file inside the workspace is evaluated, reported unverified (one
     ``kind: "file"`` record when it cannot be read or parsed) or absent (deleted), never
-    skipped as clean. Go and native JS/TS files have no pack rules yet (v4.5 M3 adds them):
+    skipped as clean. Go, native JS/TS and Rust have no pack rules yet (v4.5 M3 adds them):
     they are only confined to the workspace and given the 2 MiB size advisory, never parsed
     here, so a parser gap cannot fail T7 (user forbid_ast rules still parse them and fail closed).
     Test files are reported in ``exempted_test_findings``."""
@@ -85,7 +85,7 @@ def evaluate_security_pack(
     exempted_test_findings: List[Dict[str, Any]] = []
     unverified_findings: List[Dict[str, Any]] = []
     for rel_path in sorted(f for f in workspace_files(root, changed_files)
-                           if f.endswith(('.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.go'))):
+                           if f.endswith(('.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.go', '.rs'))):
         full_path = root.joinpath(*rel_path.split("/"))
         if not full_path.is_file():
             continue

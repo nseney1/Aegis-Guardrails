@@ -70,7 +70,7 @@ def test_python_has_its_builtin_driver_and_others_say_whether_one_is_enabled(rep
     write(repo, "svc/lib.rs", "pub fn f() {}\n")
     drivers = {row["language"]: row for row in card.build(repo).as_dict()["drivers"]}
     assert drivers["python"]["status"] == "ready" and "in-process" in drivers["python"]["driver"]
-    assert drivers["rust"]["status"] == "not enabled" and drivers["rust"]["driver"] is None
+    assert drivers["rust"]["status"] == "ready" and drivers["rust"]["driver"] == "native Rust (in-process)"
     write(repo, ".aegis/config.json", json.dumps({"v": 1, "ast": {"packaged_drivers": ["rs"]}}))
     drivers = {row["language"]: row for row in card.build(repo).as_dict()["drivers"]}
     assert drivers["rust"]["status"] == "ready" and drivers["rust"]["driver"]

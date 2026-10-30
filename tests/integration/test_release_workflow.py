@@ -38,7 +38,7 @@ def _dist(tmp_path, extra=(), metadata=""):
     d = tmp_path / "dist"
     d.mkdir()
     with zipfile.ZipFile(d / "soma_governance-0.0.0-py3-none-any.whl", "w") as wheel:
-        for name in ("__init__.py", "rust_ast.py", "go_ast.go", "go.mod"):
+        for name in ("__init__.py", "go_ast.go", "go.mod"):
             wheel.writestr("aegis_core/ast/drivers/templates/" + name, "")
         wheel.writestr("aegis_guardrails-0.0.0.dist-info/METADATA",
                        "Metadata-Version: 2.1\nName: aegis-guardrails\nVersion: 0.0.0\n"
@@ -142,6 +142,7 @@ def test_verify_dist_rejects_unlisted_artifact(tmp_path):
     "aegis_core/x.wasm", "aegis_core/x.node", "aegis_core/x.jar", "aegis_core/x.js",
     "aegis_core/ast/drivers/templates/extra.py", "aegis_core/ast/drivers/templates/nested/x.go",
     "aegis_core/ast/drivers/templates/ts_ast.js",
+    "aegis_core/ast/drivers/templates/rust_ast.py",
     "aegis_core/unexpected.json", "aegis_core/benchmark_corpus/adjacent.json",
     "foreign/__init__.py", "../aegis_core/x.py",
     "aegis_core/../x.py", "aegis_core\\x.py", "aegis_core/_data/rules/injected.md",
@@ -181,7 +182,7 @@ def test_record_rejects_a_missing_phase_template(tmp_path):
     d = _dist(tmp_path)
     path = next(d.glob("*.whl"))
     with zipfile.ZipFile(path) as wheel:
-        members = {name: wheel.read(name) for name in wheel.namelist() if not name.endswith("/rust_ast.py")}
+        members = {name: wheel.read(name) for name in wheel.namelist() if not name.endswith("/go_ast.go")}
     with zipfile.ZipFile(path, "w") as wheel:
         for name, content in members.items():
             wheel.writestr(name, content)

@@ -135,7 +135,7 @@ class BenchmarkCommand(AegisCommand):
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--ast-language", choices=("python", "typescript", "javascript", "go", "rust"),
-                            help="Also measure matched AST source fixtures; only Python is available in this phase")
+                            help="Also measure matched AST source fixtures; Python, JS/TS and Rust native parsers are available")
         parser.add_argument("--runs", type=_runs, default=benchmark.DEFAULT_RUNS, metavar="N",
                             help=f"Timed runs of each measurement, 1 to {benchmark.MAX_RUNS} "
                                  f"(default {benchmark.DEFAULT_RUNS}); one untimed warm-up of the hook and Layer 1 comes first")

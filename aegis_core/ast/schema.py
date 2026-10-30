@@ -457,6 +457,9 @@ class ImportNode:
     the plain form, so renaming an import cannot hide a forbidden API. ``from_dict``
     also turns the single ``alias`` of the TypeScript, Rust and Go drivers into a pair
     (``_driver_alias_pairs``); grouped member aliases use explicit pairs.
+
+    ``is_namespace`` distinguishes a whole-module Python import from a member
+    import with the same spelling. None preserves legacy driver payloads.
     """
 
     source: str
@@ -464,6 +467,7 @@ class ImportNode:
     line: int = 1
     is_type_only: bool = False
     aliases: Tuple[Tuple[str, str], ...] = ()
+    is_namespace: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res: Dict[str, Any] = {
@@ -475,6 +479,8 @@ class ImportNode:
         # Omitted when empty so plain imports serialize exactly as before aliases existed.
         if self.aliases:
             res["aliases"] = [list(pair) for pair in self.aliases]
+        if self.is_namespace is not None:
+            res["is_namespace"] = self.is_namespace
         return res
 
     @classmethod
@@ -487,6 +493,7 @@ class ImportNode:
             line=int(data.get("line", 1)),
             is_type_only=bool(data.get("is_type_only", False)),
             aliases=tuple(_driver_alias_pairs(data)),
+            is_namespace=data["is_namespace"] if isinstance(data.get("is_namespace"), bool) else None,
         )
 
 

@@ -19,7 +19,7 @@ import unicodedata
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core import hosts
-from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS
+from aegis_core.ast.detect import NATIVE_SOURCE_EXTENSIONS
 from aegis_core.errors import AegisValidationError
 from aegis_core.hosts import GENERIC
 
@@ -191,7 +191,7 @@ class SlotRegistry:
         self._slots: Dict[str, str] = {
             str(k): str(v) for k, v in (slots or {}).items() if v is not None and not (
                 str(k).lower().startswith('ast_driver_')
-                and '.' + str(k)[len('ast_driver_'):].lstrip('.').lower() in NATIVE_JS_EXTENSIONS)
+                and '.' + str(k)[len('ast_driver_'):].lstrip('.').lower() in NATIVE_SOURCE_EXTENSIONS)
         }
         self._warnings: List[str] = list(warnings or [])
 
@@ -219,7 +219,7 @@ class SlotRegistry:
         warnings = list(repo.warnings)
         unknown = 0
         for ext in repo.packaged_drivers:
-            if '.' + ext.lstrip('.').lower() in NATIVE_JS_EXTENSIONS:
+            if '.' + ext.lstrip('.').lower() in NATIVE_SOURCE_EXTENSIONS:
                 continue  # obsolete opt-in; the built-in parser already handles this extension
             config = packaged_driver_for_extension(ext)
             if config is not None:
@@ -310,15 +310,15 @@ class SlotRegistry:
         return dict(self._slots)
 
     def get_ast_driver(self, extension: str) -> Optional[str]:
-        """Resolve external commands; native Python and JS/TS need no command slot."""
+        """Resolve external commands; native Python, JS/TS and Rust need no command slot."""
         clean_ext = extension.lstrip(".").lower()
-        if clean_ext == "py" or f'.{clean_ext}' in NATIVE_JS_EXTENSIONS:
+        if clean_ext == "py" or f'.{clean_ext}' in NATIVE_SOURCE_EXTENSIONS:
             return None
         return self.get(f"ast_driver_{clean_ext}") or self.get("ast_driver")
 
     def get_configured_extensions(self) -> set[str]:
         """Return native source extensions and configured external-driver extensions."""
-        exts = {".py"} | NATIVE_JS_EXTENSIONS
+        exts = {".py"} | NATIVE_SOURCE_EXTENSIONS
         for key in self._slots:
             if key.startswith("ast_driver_"):
                 ext = key[len("ast_driver_"):].strip().lower()

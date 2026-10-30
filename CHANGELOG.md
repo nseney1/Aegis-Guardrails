@@ -7,14 +7,16 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 ### Added
 
 - TypeScript/JavaScript AST checks use Aegis's own in-process parser by default across all eight source extensions, without Node or parser dependencies. Imports, arguments, decorators, allow comments and mutation points retain source positions.
+- Rust AST checks now use the native in-process parser by default, without Cargo, rustc or repository dependencies. Imports, arguments, attributes, test functions and inline test modules retain their source positions.
 - Opted-in Go parsing uses one cached, offline-built protocol-v2 driver per check; ordinary doctor and card inspect without building, and confirmed doctor repair can prepare the cache.
 - Bounded protocol v2 driver sessions and per-check parse reuse, with additive AST capabilities, canonical matching and typed literal conditions.
 - Explicit missing-driver evidence in checks and receipts; ordinary `--strict` blocks missing AST coverage. Receipts retain per-file language and missing-driver reasons.
 - Offline standard-library Go build checks and exact packaged-asset dependency gates.
-- Optional AST source benchmarks with matched language fixtures, content digests and extraction witnesses: `aegis benchmark --ast-language python`. Python measurements are available; other selections explicitly report unavailable parsers.
+- Optional AST source benchmarks with matched language fixtures, content digests and extraction witnesses: `aegis benchmark --ast-language python`, `typescript`, `javascript` or `rust`. Measurements do not claim performance acceptance; unavailable implementations remain explicit errors.
 
 ### Changed
 
+- Native Rust replaces the shipped `rust_ast.py` template. Exact legacy Rust selectors and unedited staged copies are retired during migration; custom commands and the Go opt-in are preserved.
 - Project governance rules now pair focused source contracts with default-budget delivery regressions and advisory baseline coverage. Fourteen prose-only trap gates become advisory; narrowed process scopes and updated ledger/command/parity guidance require maintainer approval.
 - Wave pull requests retain base-sourced governance checks while full audit, build, test and regression validation runs on develop pushes and downstream stages.
 

@@ -60,7 +60,7 @@ def driver_availability(ws_root: Path) -> Tuple[Dict[str, str], List[str]]:
     non-Python source extensions that have none): the one definition the driver check and the
     --fix plan share. A config that cannot be read raises SlotResolutionError."""
     from aegis_core.ast.detect import detect_project_languages
-    from aegis_core.ast.runner import NATIVE_JS_EXTENSIONS, ASTDriverRegistry
+    from aegis_core.ast.runner import NATIVE_SOURCE_EXTENSIONS, ASTDriverRegistry
     from aegis_core.skills.slots import SlotRegistry
 
     langs = detect_project_languages(ws_root)
@@ -74,7 +74,7 @@ def driver_availability(ws_root: Path) -> Tuple[Dict[str, str], List[str]]:
     native = ASTDriverRegistry()
     for info in langs.values():
         for ext in info.get('extensions', []):
-            if ext in NATIVE_JS_EXTENSIONS:
+            if ext in NATIVE_SOURCE_EXTENSIONS:
                 drivers[ext] = native.resolve_driver(ext)
     if "default" in drivers:
         return drivers, []

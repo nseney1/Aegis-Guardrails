@@ -176,6 +176,16 @@ def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
     return any(s == mod or s.startswith(f"{mod}.") or (src and (f"{src}.{s}" == mod or f"{src}.{s}".startswith(f"{mod}."))) for s in syms)
 
 
+def _namespace_alias(imp: Any, source: str, bound: str, original: str, language: str) -> bool:
+    marker = imp.get('is_namespace') if isinstance(imp, Mapping) else getattr(imp, 'is_namespace', None)
+    if isinstance(marker, bool):
+        return marker
+    if language in ('javascript', 'typescript'):
+        symbols = imp.get('imported_symbols', ()) if isinstance(imp, Mapping) else getattr(imp, 'imported_symbols', ())
+        return bound not in {canonical_spelling(str(name)) for name in symbols or ()}
+    return original == source
+
+
 def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, defined_names: set[str], args_known: bool = True) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
     if isinstance(raw_call, str):
         call = _normalize_ast_token(raw_call)
@@ -301,27 +311,46 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     for imp in getattr(normalized_ast, "imports", ()) or ():
         src, syms = _extract_import_tuple(imp)
         bindings = _import_aliases(imp)
+        member_aliases = []
+        namespace_symbols = Counter()
+        marker = imp.get('is_namespace') if isinstance(imp, Mapping) else getattr(imp, 'is_namespace', None)
         for name, originals in bindings.items():
             for orig in originals:
-                add_binding(bound_origins if src else aliases, name, f"{src}.{orig}" if src and orig != src else orig)
-        parsed_imports.append((imp, (src, syms)))
+                namespace = _namespace_alias(imp, src, name, orig, normalized_ast.language)
+                add_binding(bound_origins if src else aliases, name, f"{src}.{orig}" if src and not namespace else orig)
+                if not namespace:
+                    member_aliases.append(orig)
+                elif normalized_ast.language == 'rust':
+                    namespace_symbols[orig] += 1
+        # A whole-module Rust alias also matches the bare module leaf. This is
+        # an alternate import spelling, never a member to append to the source.
+        module_leaf = src.rsplit('.', 1)[-1] if normalized_ast.language == 'rust' and any(
+            src in originals for originals in bindings.values()) else ''
+        import_syms = []
+        for sym in () if marker is True else syms:
+            if namespace_symbols[sym]:
+                namespace_symbols[sym] -= 1
+            else:
+                import_syms.append(sym)
+        parsed_imports.append((imp, (src, tuple(import_syms)), module_leaf))
         # Only actual plain bindings may qualify another reference's head. Aliased
         # originals belong to their own bound name, not a global table of leaf names.
-        aliased_symbols = Counter(orig for originals in bindings.values() for orig in originals)
+        aliased_symbols = Counter(member_aliases if normalized_ast.language in ('javascript', 'typescript')
+                                  else (orig for originals in bindings.values() for orig in originals))
         for sym in syms if src else ():
             if aliased_symbols[sym]:
                 aliased_symbols[sym] -= 1
                 continue
-            if sym and sym != src:
+            if sym and marker is not True and (sym != src or marker is False or normalized_ast.language in ('javascript', 'typescript', 'rust')):
                 add_binding(imported_qual_map, sym, f"{src}.{sym}")
     by_line = lambda hit: _line_of(hit[0]) or 0
     hits: List[Tuple[str, str, Any, Optional[bool]]] = []
     for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
         mod = _normalize_ast_token(raw_mod) if isinstance(raw_mod, str) else ""
         if mod:
-            matched = sorted(((r, None if _uncertain_token(t[0]) else True) for r, t in parsed_imports
+            matched = sorted(((r, None if _uncertain_token(t[0]) else True) for r, t, leaf in parsed_imports
                               if (_uncertain_path_matches(t[0], mod, prefix=True) if _uncertain_token(t[0])
-                                  else _match_ImportNode_against_pattern(t, mod))), key=by_line)
+                                  else _match_ImportNode_against_pattern(t, mod) or mod == leaf)), key=by_line)
             hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
     raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
     call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True, bound_origins=bound_origins)
@@ -415,8 +444,11 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
     path_str = str(file_path)
     ext = os.path.splitext(path_str)[1].lower()
     try:
-        if code is not None and ext in ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'):
-            from aegis_core.ast.drivers.js import parse
+        if code is not None and ext in ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.rs'):
+            if ext == '.rs':
+                from aegis_core.ast.drivers.rust import parse
+            else:
+                from aegis_core.ast.drivers.js import parse
 
             return parse(code, path_str)
         if code is not None and ext != ".py":

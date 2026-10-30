@@ -257,7 +257,7 @@
             "flags": [
               "--ast-language"
             ],
-            "help": "Also measure matched AST source fixtures; only Python is available in this phase",
+            "help": "Also measure matched AST source fixtures; Python, JS/TS and Rust native parsers are available",
             "kind": "store",
             "metavar": null,
             "nargs": null,

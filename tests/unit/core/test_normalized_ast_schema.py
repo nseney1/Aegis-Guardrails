@@ -185,3 +185,24 @@ def test_python_driver_records_import_aliases():
         ("os", ("sep", "p"), (("p", "path"),)),
         ("json", ("json",), ()),
     ]
+
+
+def test_python_same_named_imports_preserve_binding_facts_and_namespace_provenance():
+    source = 'import copy as cp\nfrom copy import copy as cp\n'
+    tree = parse_python_ast(source, file_path='origins.py')
+    rows = tree.to_dict()['imports']
+    assert [(row['source'], row['imported_symbols'], row['aliases']) for row in rows] == [
+        ('copy', ['cp'], [['cp', 'copy']]), ('copy', ['cp'], [['cp', 'copy']]),
+    ]
+    assert [row['is_namespace'] for row in rows] == [True, False]
+    assert NormalizedAST.from_json(tree.to_json()) == tree
+
+
+@pytest.mark.parametrize('marker', [True, False, None, 'false'])
+def test_optional_import_namespace_marker_roundtrips_without_changing_legacy_payloads(marker):
+    payload = {'source': 'copy', 'imported_symbols': ['cp'], 'line': 1,
+               'is_type_only': False, 'aliases': [['cp', 'copy']]}
+    supplied = dict(payload, is_namespace=marker)
+    expected = supplied if isinstance(marker, bool) else payload
+    assert ImportNode.from_dict(supplied).to_dict() == expected
+    assert ImportNode.from_dict(payload).to_dict() == payload
