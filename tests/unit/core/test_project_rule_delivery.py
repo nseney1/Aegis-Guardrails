@@ -52,3 +52,12 @@ def test_metadata_and_future_paths_receive_baseline(project_catalog, path):
     assert "persona-repository-baseline" in [
         rule["name"] for rule in result["relevant_rules"]
     ]
+
+
+@pytest.mark.parametrize("path", [
+    "CONTRIBUTING.md", "README.md", "docs/teams.md",
+    "skills/adaptive-reviewer/SKILL.md", ".aegis/rules/README.md",
+])
+def test_process_rules_do_not_crowd_policy_documents(project_catalog, path):
+    result = scan(project_catalog, changed_files=[path])
+    assert not result["omitted_mandatory"]

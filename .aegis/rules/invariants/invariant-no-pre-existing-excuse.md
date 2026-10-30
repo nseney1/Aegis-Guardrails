@@ -12,8 +12,7 @@ created: "2026-10-15T16:18:02Z"
 impact_weight: 1.0
 tags: ["dogfood", "process", "ownership"]
 target_paths:
-  - "CONTRIBUTING.md"
-  - ".aegis/rules/invariants/invariant-no-pre-existing-excuse.md"
+  - "docs/how-it-works.md"
 lineage:
   parent_id: null
   created_by: "manual"

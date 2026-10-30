@@ -7,9 +7,7 @@ hypothesis: "Orchestrators that implement multi-file tasks directly in the prima
 prediction: "Enforcing the Delegation-First Mandate for plans spanning >= 2 disjoint files prevents primary context bloat, reduces token waste, and accelerates execution"
 falsification: "Direct single-threaded execution achieves lower total latency, lower token cost, and higher verification pass rates than subagent fan-out across 20 multi-file tasks -> prune"
 target_paths:
-  - "CONTRIBUTING.md"
   - "docs/teams.md"
-  - "skills/adaptive-reviewer/SKILL.md"
 triggers:
   - feature_implementation
   - refactor
