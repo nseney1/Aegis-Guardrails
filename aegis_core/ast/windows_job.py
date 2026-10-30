@@ -213,10 +213,15 @@ class WindowsJob:
             if self._kernel.QueryInformationJobObject(
                     self._handle, _JOB_OBJECT_BASIC_PROCESS_ID_LIST,
                     ctypes.byref(info), ctypes.sizeof(info), None):
-                if info.count > capacity or info.assigned != info.count:
-                    raise OSError('invalid Windows job process list')
-                return list(info.pids[:info.count])
-            if self._kernel.GetLastError() != 234:  # ERROR_MORE_DATA
+                if info.count > capacity or info.count > info.assigned:
+                    raise OSError('invalid Windows job process list: '
+                                  f'returned {info.count}, assigned {info.assigned}, capacity {capacity}')
+                if info.count == info.assigned:
+                    return list(info.pids[:info.count])
+                # Win32 requires a larger buffer whenever returned < assigned,
+                # including successful queries; never accept a partial snapshot.
+                # https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_process_id_list
+            elif self._kernel.GetLastError() != 234:  # ERROR_MORE_DATA
                 raise self._error('QueryInformationJobObject')
             capacity = max(capacity * 2, info.assigned)
         raise OSError('Windows job process list exceeds 65536 members')

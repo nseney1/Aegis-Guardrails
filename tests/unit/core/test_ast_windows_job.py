@@ -130,6 +130,7 @@ class ShutdownKernel(KernelBoundary):
         self.waits = []
         self.total_processes = len(set(members) | {731})
         self.clear_on_termination = False
+        self.query_capacities = []
 
     def TerminateJobObject(self, job, code):
         assert (job, code) == (101, 1)
@@ -155,6 +156,7 @@ class ShutdownKernel(KernelBoundary):
             return False
         header = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32 * 2)).contents
         capacity = (size - 8) // ctypes.sizeof(ctypes.c_size_t)
+        self.query_capacities.append(capacity)
         header[0] = 65537 if self.failure == 'too_many_members' else len(self.members)
         header[1] = min(capacity, len(self.members))
         pids = (ctypes.c_size_t * capacity).from_address(ctypes.addressof(header) + 8)
@@ -162,6 +164,13 @@ class ShutdownKernel(KernelBoundary):
             pids[index] = pid
         if self.failure == 'truncated_members':
             header[1] = capacity + 1
+            return True
+        if self.failure == 'count_exceeds_assigned':
+            header[0] = 0
+            return True
+        if self.failure == 'partial_members' or (
+                self.failure == 'partial_members_once' and len(self.query_capacities) == 1):
+            header[1] -= 1
             return True
         self.error = 234
         return capacity >= header[0]
@@ -224,6 +233,63 @@ def test_pretermination_handles_survive_members_disappearing_from_the_job_list(m
         assert kernel.handles == {101}
     finally:
         job.close()
+
+
+@pytest.mark.parametrize('completed_go', [False, True])
+def test_shutdown_grows_a_successfully_returned_partial_member_list(monkeypatch, completed_go):
+    job, kernel = _shutdown_job(monkeypatch, 'partial_members_once')
+    root = SimpleNamespace(pid=731, returncode=0, wait=lambda **kw: 0)
+    try:
+        if completed_go:
+            job.terminate_completed_go_compiler_and_wait(root)
+        else:
+            job.terminate_and_wait()
+        assert len(kernel.query_capacities) == 2
+        assert kernel.query_capacities[1] > kernel.query_capacities[0]
+        assert [handle - 1000 for handle, _ in kernel.waits] == [731, 732]
+        assert kernel.handles == {101}
+    finally:
+        job.close()
+    assert not kernel.handles
+
+
+def test_a_permanently_partial_member_list_cannot_pass_shutdown_or_exceed_the_cap(monkeypatch):
+    job, kernel = _shutdown_job(monkeypatch, 'partial_members')
+    try:
+        with pytest.raises(OSError, match=r'^Windows job process list exceeds 65536 members$'):
+            job.terminate_and_wait()
+        assert len(kernel.query_capacities) > 1
+        assert max(kernel.query_capacities) <= 65536
+        assert 'terminate requested' not in kernel.events
+        assert not kernel.waits and kernel.handles == {101}
+    finally:
+        job.close()
+    assert not kernel.handles
+
+
+def test_partial_member_list_growth_obeys_the_shared_shutdown_deadline(monkeypatch):
+    from aegis_core.ast import windows_job
+
+    job, kernel = _shutdown_job(monkeypatch, 'partial_members')
+    clock = [100.0]
+    monkeypatch.setattr(windows_job, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    original = kernel.QueryInformationJobObject
+
+    def query(*args):
+        result = original(*args)
+        clock[0] += 3.0
+        return result
+
+    monkeypatch.setattr(kernel, 'QueryInformationJobObject', query)
+    try:
+        with pytest.raises(OSError, match=r'^timed out waiting for Windows job termination$'):
+            job.terminate_and_wait()
+        assert len(kernel.query_capacities) == 1
+        assert 'terminate requested' not in kernel.events
+        assert not kernel.waits and kernel.handles == {101}
+    finally:
+        job.close()
+    assert not kernel.handles
 
 
 @pytest.mark.parametrize('late', [False, True])
@@ -356,6 +422,7 @@ def test_shutdown_deadline_also_bounds_already_signaled_members(monkeypatch):
     ('wait_timeout', 'timed out.*termination'),
     ('too_many_members', 'process list exceeds'),
     ('truncated_members', 'invalid.*process list'),
+    ('count_exceeds_assigned', '^invalid Windows job process list: returned 2, assigned 0, capacity 64$'),
 ])
 def test_shutdown_os_failures_remain_visible_and_release_transient_handles(monkeypatch, failure, reason):
     job, kernel = _shutdown_job(monkeypatch, failure)
