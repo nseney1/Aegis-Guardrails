@@ -6,6 +6,10 @@ PyYAML parses the workflow key ``on`` as boolean ``True``; ``_triggers`` reads e
 """
 import os
 import re
+import json
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -45,6 +49,67 @@ def _triggers(workflow):
 
 def _step_using(job, prefix):
     return [s for s in job.get("steps", []) if s.get("uses", "").startswith(prefix + "@")]
+
+
+FULL_VALIDATION = "github.event_name != 'pull_request' || github.base_ref != 'develop'"
+WAVE_PR = "github.event_name == 'pull_request' && github.base_ref == 'develop'"
+
+
+def test_wave_prs_keep_governance_while_full_validation_runs_on_develop_and_downstream():
+    workflow = _load("validate.yml")
+    triggers = _triggers(workflow)
+    assert triggers["push"]["branches"] == ["main", "develop", "release/**"]
+    assert triggers["pull_request"]["branches"] == ["main", "develop", "release/**"]
+    assert {"workflow_call", "workflow_dispatch"} <= set(triggers)
+    jobs = workflow["jobs"]
+    for name in ("dependency-audit", "build-wheel", "validate", "test-windows"):
+        assert jobs[name].get("if") == FULL_VALIDATION, name
+    check = jobs["aegis-check"]
+    assert check.get("if") == "always()"
+    upstream = next(s for s in check["steps"] if s["name"] == "Verify upstream jobs succeeded")
+    assert upstream["env"]["EXPECTED_RESULT"] == "${{ " + WAVE_PR + " && 'skipped' || 'success' }}"
+    assert 'os.environ["EXPECTED_RESULT"]' in upstream["run"]
+    # The required check must still reject a failed no-exec comparison on a wave PR.
+    checks = _check_ci_steps(check)
+    base = [s for s in checks if "--no-exec" in s["run"]]
+    assert len(base) == 1 and "if" not in base[0]
+    assert base[0]["run"] == "python3 -m aegis_cli.cli check --ci --no-exec"
+    checkout = _step_using(check, "actions/checkout")[0]
+    assert checkout["with"]["ref"] == "${{ " + WAVE_PR + " && github.event.pull_request.base.sha || github.sha }}"
+    fetch = next(s for s in check["steps"] if s.get("name") == "Fetch wave pull request head as data")
+    assert fetch.get("if") == WAVE_PR
+    assert fetch["env"] == {"PR_NUMBER": "${{ github.event.pull_request.number }}"}
+    assert fetch["run"] == 'git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"'
+    for step in check["steps"]:
+        if step.get("uses", "").startswith(("actions/setup-python@", "actions/download-artifact@")) or any(
+                text in step.get("run", "") for text in ("pip install", "verify_dist.py", "python3 -I")):
+            assert step.get("if") == FULL_VALIDATION, step
+    governance = _triggers(_load("aegis-governance.yml"))
+    assert governance == {"pull_request_target": {"branches": ["main", "develop", "release/**"]}}
+
+
+@pytest.mark.parametrize("expected,actual,passed", [
+    ("skipped", "skipped", True), ("success", "success", True),
+    ("skipped", "success", False), ("success", "skipped", False),
+    ("success", "failure", False), ("skipped", "cancelled", False),
+])
+def test_required_check_rejects_unexpected_upstream_results(expected, actual, passed):
+    step = _load("validate.yml")["jobs"]["aegis-check"]["steps"][0]
+    argv = shlex.split(step["run"])
+    env = dict(os.environ, EXPECTED_RESULT=expected, NEEDS_JSON=json.dumps({"build-wheel": {"result": actual}}))
+    proc = subprocess.run([sys.executable, *argv[1:]], env=env, capture_output=True, text=True, timeout=10)
+    assert (proc.returncode == 0) is passed, proc.stderr
+    if not passed:
+        assert "build-wheel" in proc.stderr and "Unexpected upstream job results" in proc.stderr
+
+
+def test_wave_governance_cannot_be_skipped_while_keeping_the_required_check():
+    from aegis_core import human_gate
+    body = _read("validate.yml")
+    weakened = body.replace("      - name: Run CI governance without execution\n",
+                            "      - name: Run CI governance without execution\n        if: false\n")
+    assert weakened != body
+    assert human_gate.aegis_check_jobs(weakened) == []
 
 
 def test_top_level_permissions_are_read_only():
@@ -365,9 +430,10 @@ def test_windows_runs_the_same_wheel_smoke_as_the_other_legs():
 
 def test_aegis_check_runs_the_installed_wheel_and_is_the_only_check_ci():
     jobs = _load("validate.yml")["jobs"]
-    cli = [s["run"].strip() for s in jobs["aegis-check"]["steps"] if "aegis_cli.cli" in s.get("run", "")]
+    cli = [s["run"].strip() for s in jobs["aegis-check"]["steps"]
+           if "aegis_cli.cli" in s.get("run", "") and "--no-exec" not in s["run"]]
     # -I keeps the checkout off sys.path, so the wheel, not the source tree, is what runs.
-    assert cli and all(re.match(r"python3 -I -m aegis_cli\.cli check(\s|$)", r) for r in cli), cli
+    assert cli == ["python3 -I -m aegis_cli.cli check", "python3 -I -m aegis_cli.cli check --ci"]
     with_ci = [name for name, job in jobs.items()
                if any(re.search(r"aegis_cli\.cli check --ci\b", s.get("run", "")) for s in job.get("steps", []))]
     assert with_ci == ["aegis-check"]
@@ -389,8 +455,8 @@ def test_the_check_ci_job_can_read_reviews_with_a_read_only_token(load):
     job = load()["jobs"]["aegis-check"]
     assert job.get("permissions") == {"contents": "read", "pull-requests": "read"}
     steps = _check_ci_steps(job)
-    assert len(steps) == 1, steps
-    assert steps[0].get("env") == {"GH_TOKEN": "${{ github.token }}"}
+    assert steps
+    assert all(s.get("env") == {"GH_TOKEN": "${{ github.token }}"} for s in steps)
 
 
 # --- R-trust-13 (c)-(f): a base-sourced, no-exec governance check ----------------------------
@@ -458,6 +524,7 @@ def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
 def test_the_check_ci_step_has_no_condition_and_stays_the_required_check(text):
     from aegis_core import human_gate
     body = text()
-    (step,) = _check_ci_steps(yaml.safe_load(body)["jobs"]["aegis-check"])
-    assert "if" not in step and "continue-on-error" not in step
+    steps = _check_ci_steps(yaml.safe_load(body)["jobs"]["aegis-check"])
+    assert any("if" not in step for step in steps)
+    assert all("continue-on-error" not in step for step in steps)
     assert human_gate.aegis_check_jobs(body) == ["aegis-check"]
