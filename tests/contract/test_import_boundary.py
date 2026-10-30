@@ -273,6 +273,15 @@ def test_runtime_imports_only_the_standard_library(edges):
     assert offenders == [], "runtime dependencies are not allowed:\n" + "\n".join(offenders)
 
 
+@pytest.mark.parametrize("name", ["drivers/js/tokenizer.py", "drivers/rust/extract.py", "gobuild.py"])
+def test_new_ast_drivers_cannot_escape_the_import_graph(tmp_path, name):
+    path = tmp_path / "aegis_core" / "ast" / name
+    path.parent.mkdir(parents=True)
+    path.write_text("import forbidden_parser\n", encoding="utf-8")
+    found = third_party_imports(import_edges(tmp_path))
+    assert len(found) == 1 and "forbidden_parser" in found[0] and path.name in found[0]
+
+
 # The checker itself, on edges that would break each rule.
 @pytest.mark.parametrize(
     "source,target",
