@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import ctypes
+import errno
 from pathlib import Path
 import stat
 import subprocess
@@ -50,7 +51,7 @@ def _posix_process_running(pid):
     status = Path(f"/proc/{pid}/stat")
     try:
         return status.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         # The process may have exited, or this platform may have no procfs.
         try:
             os.kill(pid, 0)
@@ -68,7 +69,8 @@ def _cleanup_child(pid):
 
 
 @pytest.mark.parametrize("exited", [True, False])
-def test_process_state_rechecks_a_missing_status_file(monkeypatch, exited):
+@pytest.mark.parametrize("failure", [FileNotFoundError, ProcessLookupError])
+def test_process_state_rechecks_a_missing_status_file(monkeypatch, exited, failure):
     calls = []
     original = Path.read_text
 
@@ -80,7 +82,7 @@ def test_process_state_rechecks_a_missing_status_file(monkeypatch, exited):
 
     def read(path, *args, **kwargs):
         if path == Path("/proc/987654321/stat"):
-            raise FileNotFoundError("process exited or procfs unavailable")
+            raise failure("process exited or procfs unavailable")
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "kill", kill)
@@ -89,17 +91,18 @@ def test_process_state_rechecks_a_missing_status_file(monkeypatch, exited):
     assert calls == [0, 0]
 
 
-def test_process_status_permission_failure_is_not_treated_as_exit(monkeypatch):
+@pytest.mark.parametrize("failure", [PermissionError, OSError])
+def test_process_status_permission_failure_is_not_treated_as_exit(monkeypatch, failure):
     original = Path.read_text
     monkeypatch.setattr(os, "kill", lambda pid, sig: None)
 
     def read(path, *args, **kwargs):
         if path == Path("/proc/987654321/stat"):
-            raise PermissionError("status access denied")
+            raise failure("status access denied")
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", read)
-    with pytest.raises(PermissionError, match="^status access denied$"):
+    with pytest.raises(failure, match="^status access denied$"):
         _posix_process_running(987654321)
 
 
@@ -124,7 +127,9 @@ def test_child_cleanup_handles_only_a_process_that_already_exited(monkeypatch, f
 
 
 @pytest.mark.parametrize("ending", ["timeout", "failure", "success"])
-def test_public_build_terminates_ordinary_compiler_descendants_before_return(tmp_path, monkeypatch, ending):
+@pytest.mark.parametrize("status_race", [False, True] if os.name == "posix" else [False])
+def test_public_build_terminates_ordinary_compiler_descendants_before_return(
+        tmp_path, monkeypatch, ending, status_race):
     from aegis_core.ast.gobuild import GoDriverUnavailableError, prepare_go_driver
 
     home, workspace, tools = [tmp_path / name for name in ("home", "workspace", "tools")]
@@ -158,6 +163,23 @@ def test_public_build_terminates_ordinary_compiler_descendants_before_return(tmp
         return real_popen(argv, *args, **options)
 
     monkeypatch.setattr(subprocess, "Popen", spawn)
+    status_reads = []
+    if status_race:
+        kill, read_text = os.kill, Path.read_text
+
+        def check(pid, sig):
+            if sig == 0 and not status_reads and pidfile.exists() and pid == int(read_text(pidfile)):
+                return  # The child existed immediately before its procfs status vanished.
+            return kill(pid, sig)
+
+        def read(path, *args, **kwargs):
+            if not status_reads and pidfile.exists() and path == Path(f"/proc/{read_text(pidfile)}/stat"):
+                status_reads.append(path)
+                raise ProcessLookupError(errno.ESRCH, "process exited during status read", str(path))
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "kill", check)
+        monkeypatch.setattr(Path, "read_text", read)
     try:
         if ending == "success":
             assert prepare_go_driver(workspace, timeout=0.5).read_bytes() == b"complete"
@@ -171,6 +193,8 @@ def test_public_build_terminates_ordinary_compiler_descendants_before_return(tmp
         while _process_running(child_pid) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert not _process_running(child_pid), "compiler descendant survived the public build call"
+        if status_race:
+            assert status_reads == [Path(f"/proc/{child_pid}/stat")]
         assert not list(home.rglob(".go-build-*"))
     finally:
         if pidfile.exists():
