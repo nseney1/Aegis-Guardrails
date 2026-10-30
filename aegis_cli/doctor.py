@@ -356,7 +356,9 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
         print(f"  ❌ AST drivers: {exc}")
         return False
     if missing:
-        print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. Run 'aegis doctor --fix' to provision.")
+        reasons = ', '.join(f'no_driver:{ext}' for ext in missing)
+        print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. "
+              f"Run 'aegis doctor --fix' to provision packaged drivers; other languages need a user-scope driver ({reasons}).")
         return False
 
     if not ast_drivers:

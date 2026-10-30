@@ -167,7 +167,7 @@ Category: Daily Workflow & Verification.
 | --- | --- | --- | --- |
 | `files` | `[FILES ...]` |  | Files to check (default: changed against HEAD, staged, or against the branch base) |
 | `--hook` |  |  | Git pre-commit mode: Layer 1 only, never a model call |
-| `--strict` |  |  | Fail on checkpoint warnings too (missing tests, hardcoded paths, stub tests...) |
+| `--strict` |  |  | Fail on checkpoint warnings and missing AST driver coverage |
 | `--full` |  |  | Add Layer 2: adversarial review of the change by the --llm-cmd model |
 | `--plan` | `TEXT` |  | Task plan for Layer 2 (implies --full) |
 | `--plan-file` | `PATH` |  | File holding the task plan (implies --full) |
@@ -455,6 +455,7 @@ Category: Plumbing.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
+| `--ast-language` | one of `python`, `typescript`, `javascript`, `go`, `rust` |  | Also measure matched AST source fixtures; only Python is available in this phase |
 | `--runs` | `N` | `20` | Timed runs of each measurement, 1 to 1000 (default 20); one untimed warm-up of the hook and Layer 1 comes first |
 
 ### `aegis hook`

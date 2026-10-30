@@ -709,12 +709,17 @@ def test_provision_writes_a_regular_config_and_copies_no_driver(ws: Path):
     slots, created = provision_ast_driver_slots(ws)
 
     config = ws / ".aegis" / "config.json"
-    assert slots == {"ast_driver_ts": "node .aegis/drivers/ts_ast.js"}
+    extensions = ("ts", "tsx", "mts", "cts")
+    assert slots == {f"ast_driver_{ext}": "node .aegis/drivers/ts_ast.js" for ext in extensions}
     assert created == [str(config)]
     assert config.is_file() and not config.is_symlink()
-    assert json.loads(config.read_text(encoding="utf-8")) == {"v": 1, "ast": {"packaged_drivers": ["ts"]}}
+    assert json.loads(config.read_text(encoding="utf-8")) == {
+        "v": 1, "ast": {"packaged_drivers": list(extensions)}
+    }
     assert not (ws / ".aegis" / "drivers").exists()
-    assert SlotRegistry.load(ws).get_ast_driver(".ts") == "node .aegis/drivers/ts_ast.js"
+    registry = SlotRegistry.load(ws)
+    for ext in extensions:
+        assert registry.get_ast_driver(f".{ext}") == "node .aegis/drivers/ts_ast.js"
 
 
 # ── JIT scan output ──────────────────────────────────────────────────────────

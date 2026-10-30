@@ -15,6 +15,7 @@ __all__ = [
     "packaged_driver_for_extension",
     "names_packaged_driver",
     "LANGUAGE_DEFINITIONS",
+    "iter_project_files",
 ]
 
 _SKIP_DIRS = {
@@ -39,7 +40,7 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "typescript": {
         "manifests": ["tsconfig.json"],
-        "extensions": [".ts", ".tsx"],
+        "extensions": [".ts", ".tsx", ".mts", ".cts"],
         "toolchains": ["node"],
         "driver_slot": "ast_driver_ts",
         "default_command": f"node {_SELECTOR_DIR}/ts_ast.js",
@@ -98,6 +99,16 @@ def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
     return parts[:-1] == canonical[:-1]
 
 
+def iter_project_files(project_root: Path | str):
+    """Regular project files, without build directories or filesystem links."""
+    for dirpath, dirnames, filenames in os.walk(Path(project_root).resolve(), followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not Path(dirpath, d).is_symlink()]
+        for name in filenames:
+            path = Path(dirpath, name)
+            if not path.is_symlink() and path.is_file():
+                yield path
+
+
 def detect_project_languages(project_root: Path | str) -> Dict[str, Dict[str, Any]]:
     """Detect all active programming languages in a project using manifests and source scan."""
     root = Path(project_root).resolve()
@@ -126,21 +137,19 @@ def detect_project_languages(project_root: Path | str) -> Dict[str, Dict[str, An
         for ext in config["extensions"]:
             ext_to_lang[ext] = lang
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        for fn in filenames:
-            ext = Path(fn).suffix.lower()
-            if ext in ext_to_lang:
-                lang = ext_to_lang[ext]
-                if lang not in detected:
-                    detected[lang] = {
-                        "manifests": [],
-                        "extensions": set(),
-                        "file_count": 0,
-                        "toolchains": installed(LANGUAGE_DEFINITIONS[lang]["toolchains"]),
-                    }
-                detected[lang]["extensions"].add(ext)
-                detected[lang]["file_count"] += 1
+    for path in iter_project_files(root):
+        ext = path.suffix.lower()
+        if ext in ext_to_lang:
+            lang = ext_to_lang[ext]
+            if lang not in detected:
+                detected[lang] = {
+                    "manifests": [],
+                    "extensions": set(),
+                    "file_count": 0,
+                    "toolchains": installed(LANGUAGE_DEFINITIONS[lang]["toolchains"]),
+                }
+            detected[lang]["extensions"].add(ext)
+            detected[lang]["file_count"] += 1
 
     # Normalize sets to sorted lists for JSON serialization
     for lang_data in detected.values():
@@ -156,7 +165,8 @@ def resolve_recommended_drivers(languages: Dict[str, Any]) -> Dict[str, str]:
         config = LANGUAGE_DEFINITIONS.get(lang)
         if not config or not config.get("driver_slot") or not config.get("default_command"):
             continue
-        recommended[config["driver_slot"]] = config["default_command"]
+        for extension in config["extensions"]:
+            recommended[f"ast_driver_{extension.lstrip('.')}"] = config["default_command"]
     return recommended
 
 

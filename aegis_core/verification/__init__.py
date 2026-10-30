@@ -138,6 +138,7 @@ class ToolEvidence:
     verdict: bool           # PASS=True, FAIL=False
     detail: str             # Human-readable detail
     lines: list[int] = field(default_factory=list)  # Relevant line numbers
+    language: Optional[str] = field(default=None, compare=False)  # Descriptive metadata, not verdict identity
 
 
 @dataclass

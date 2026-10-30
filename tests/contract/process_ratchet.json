@@ -31,6 +31,18 @@
     "count": 1,
     "reason": "Host installation command boundary."
   },
+  "process:aegis_core/ast/batch.py:BatchDriver.__init__:subprocess.Popen": {
+    "count": 1,
+    "reason": "Deferred Popen type annotation for the bounded protocol-v2 lifecycle; no process starts here."
+  },
+  "process:aegis_core/ast/batch.py:BatchDriver._start:subprocess.Popen": {
+    "count": 1,
+    "reason": "Trusted code-selected protocol-v2 driver in an empty private cwd and minimal environment, bounded responses and process-group cleanup."
+  },
+  "process:aegis_core/ast/batch.py:BatchDriver._terminate_group:subprocess.Popen": {
+    "count": 1,
+    "reason": "Deferred Popen argument annotation for driver cleanup; no process starts at this reference."
+  },
   "process:aegis_core/ast/runner.py:_run_driver:subprocess.run": {
     "count": 1,
     "reason": "Configured AST driver process boundary."

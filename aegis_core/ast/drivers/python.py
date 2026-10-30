@@ -20,6 +20,8 @@ from aegis_core.ast.schema import (
     add_binding,
 )
 
+CAPABILITIES = ("allow_comments", "args", "decorators")
+
 
 # Callables that import the module named by their literal first argument (or ``name=``).
 # "module": returns that module; "package" (the __import__ family): returns its top-level
@@ -63,9 +65,10 @@ def _call_argument(call: ast.Call, position: int, keyword: str) -> Optional[ast.
 
 def _render_arg(node: ast.AST) -> str:
     if isinstance(node, ast.Constant):
-        return repr(node.value)[:64]
+        rendered = repr(node.value)
+        return rendered if type(node.value) in (int, float, bool, type(None)) else rendered[:64]
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)):
-        return f"-{node.operand.value!r}"[:64]
+        return f"-{node.operand.value!r}"
     chain: List[str] = []
     cur = node
     while isinstance(cur, ast.Attribute):
@@ -454,5 +457,5 @@ def parse_python_ast(
         call_sites=tuple(visitor.call_sites),
         imports=tuple(visitor.imports),
         mutation_points=tuple(visitor.mutation_points),
-        metadata={"parser": "stdlib_ast"},
+        metadata={"parser": "stdlib_ast", "capabilities": list(CAPABILITIES)},
     )

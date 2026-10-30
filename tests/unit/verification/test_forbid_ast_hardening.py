@@ -383,6 +383,7 @@ class TestFailClosed:
         assert results[0].target == "src/broken.py"
         assert results[0].verdict is False
         assert results[0].detail.startswith("forbid_ast: cannot verify src/broken.py: SyntaxError: ")
+        assert (results[0].tool, results[0].language) == ("forbid_ast:no-subprocess-run", "python")
         assert gate_verdict(evidence) is False
 
     def test_undecodable_file_yields_failing_unverifiable_finding(self, ws: Path):
@@ -849,9 +850,9 @@ class TestBindingFanOutStaysLinear:
         assert ratio < 24, f"eight times the bindings and uses multiplied the cost by {ratio:.1f}"
 
 
-# Reference semantics, written out longhand: a reference ``head + rest`` (the head ends at
-# the first "." or "::") is spelled as written and with each alias original in place of the
-# head; each spelling is also qualified through the import map (an exact key, else its part
+# Reference semantics, written out longhand: language separators are canonical dots and
+# Node's builtin prefix is removed. A reference ``head + rest`` is spelled as written and
+# with each alias original replacing its head, then qualified through the import map (an exact key, else its part
 # before the first "."); a pattern matches a spelling it equals or is a dot-suffix of.
 def _reference_split(ref: str) -> tuple[str, str]:
     cuts = [i for i in (ref.find("."), ref.find("::")) if i != -1]
@@ -873,11 +874,28 @@ def _reference_spellings(ref: str, quals: dict, aliases: dict, *, calls: bool) -
 
 
 def _reference_violations(quals, aliases, call_targets, decorators, spec) -> list[str]:
+    def canonical(text):
+        if text.startswith("node:"):
+            text = text[5:]
+        if text.startswith("::"):
+            text = text[2:]
+        return text.replace("::", ".").replace("/", ".")
+
+    def bindings(mapping):
+        result = {}
+        for name, originals in mapping.items():
+            for original in originals:
+                result.setdefault(canonical(name), []).append(canonical(original))
+        return result
+
+    quals, aliases = bindings(quals), bindings(aliases)
+
     def hit(refs, pattern, calls):
+        pattern = canonical(pattern)
         return any(
             s == pattern or s.endswith("." + pattern)
             for ref in refs
-            for s in _reference_spellings(ref, quals, aliases, calls=calls)
+            for s in _reference_spellings(canonical(ref), quals, aliases, calls=calls)
         )
 
     out = [f"Forbidden call '{p}' matched rule forbid_ast.calls" for p in spec["calls"] if hit(call_targets, p, True)]

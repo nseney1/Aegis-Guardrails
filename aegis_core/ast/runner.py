@@ -17,11 +17,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.schema import NormalizedAST
-from aegis_core.errors import AegisError
+from aegis_core.ast.driver_errors import ASTDriverError, ASTDriverTimeoutError, NoDriverConfiguredError
 from aegis_core.pathlookup import is_bare, INSIDE_FENCE, only_skipped, which
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace import as_workspace
@@ -46,18 +46,6 @@ def _is_python_name(name: str) -> bool:
     return clean in _PYTHON_NAMES
 
 
-class ASTDriverError(AegisError):
-    """Raised when an external AST driver execution fails."""
-
-
-class ASTDriverTimeoutError(ASTDriverError):
-    """Raised when an external AST driver exceeds its execution timeout."""
-
-
-class NoDriverConfiguredError(ASTDriverError):
-    """Raised when no AST driver is available for a requested file extension."""
-
-
 @dataclass(frozen=True)
 class _DriverPlan:
     """How to run the driver chosen for one extension."""
@@ -69,6 +57,7 @@ class _DriverPlan:
     in_process_rust: bool = False
     go_template: Optional[str] = None  # packaged Go source, compiled before running
     unavailable: Optional[str] = None  # why the chosen driver cannot run here
+    protocol: int = 1  # v2 is registered in code; user config remains v1
 
 
 def _command_plan(command: str, ext: str, ws_root: Optional[Path] = None, where: str = "the driver") -> _DriverPlan:
@@ -206,18 +195,24 @@ class ASTDriverRegistry:
 
     def __init__(self, drivers: Optional[Mapping[str, str]] = None):
         self._drivers: Dict[str, str] = {}
+        self._protocols: Dict[str, int] = {}
         if drivers:
             for ext, cmd in drivers.items():
                 self.register_driver(ext, cmd)
 
-    def register_driver(self, extension: str, command: str) -> None:
+    def register_driver(self, extension: str, command: str, *, protocol: int = 1) -> None:
+        if type(protocol) is not int or protocol not in (1, 2):
+            raise ValueError('driver protocol must be 1 or 2')
         clean_ext = extension if extension.startswith(".") else f".{extension}"
         self._drivers[clean_ext.lower()] = str(command).strip()
+        self._protocols[clean_ext.lower()] = protocol
 
     def plan_driver(
         self,
         extension: str,
         workspace_root: Optional[Union[Path, str, Workspace]] = None,
+        *,
+        _slot_loader: Optional[Callable[[str, Path], Any]] = None,
     ) -> Optional[_DriverPlan]:
         """Choose the driver for an extension: registered, then user scope, then packaged opt-in."""
         clean_ext = extension if extension.startswith(".") else f".{extension}"
@@ -227,19 +222,22 @@ class ASTDriverRegistry:
             fence = None
             if workspace_root:
                 fence = Path(workspace_root.root if isinstance(workspace_root, Workspace) else workspace_root)
-            return _command_plan(self._drivers[clean_ext], clean_ext, fence,
+            plan = _command_plan(self._drivers[clean_ext], clean_ext, fence,
                                  f"the driver registered for '{clean_ext}'")
+            return replace(plan, protocol=self._protocols[clean_ext])
         if not workspace_root:
             return None
 
         from aegis_core.skills.slots import SlotRegistry
 
         ws_root = Path(as_workspace(workspace_root).root)
-        user_cmd = SlotRegistry.load_user(ws_root).get_ast_driver(clean_ext)
+        user = _slot_loader('user', ws_root) if _slot_loader else SlotRegistry.load_user(ws_root)
+        user_cmd = user.get_ast_driver(clean_ext)
         if user_cmd:
             return _user_command_plan(user_cmd, clean_ext, ws_root)
         # A repo opt-in selects the packaged driver; nothing from the repo is run.
-        if SlotRegistry.load(ws_root).get_ast_driver(clean_ext):
+        repo = _slot_loader('repo', ws_root) if _slot_loader else SlotRegistry.load(ws_root)
+        if repo.get_ast_driver(clean_ext):
             return _packaged_plan(clean_ext, ws_root)
         return None
 
@@ -327,6 +325,86 @@ class ASTDriverRunner:
 
     def __init__(self, registry: Optional[ASTDriverRegistry] = None):
         self.registry = registry or ASTDriverRegistry()
+        self._active = False
+        self._plans: dict[tuple[str, str], Union[_DriverPlan, Exception, None]] = {}
+        self._batches: dict[tuple[str, ...], object] = {}
+        self._configs: dict[tuple[str, str], Any] = {}
+
+    def __enter__(self):
+        self._active = True
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def close(self) -> None:
+        failure = None
+        try:
+            for batch in self._batches.values():
+                try:
+                    batch.close()
+                except Exception as exc:
+                    failure = failure or exc
+        finally:
+            self._batches.clear()
+            self._plans.clear()
+            self._configs.clear()
+            self._active = False
+        if failure is not None:
+            raise failure
+
+    def _plan(self, ext: str, workspace_root: Path) -> Optional[_DriverPlan]:
+        key = (str(workspace_root.resolve()), ext)
+        if not self._active:
+            return self.registry.plan_driver(ext, workspace_root=workspace_root)
+        if key not in self._plans:
+            try:
+                self._plans[key] = self.registry.plan_driver(ext, workspace_root=workspace_root,
+                                                             _slot_loader=self._slots)
+            except Exception as exc:
+                self._plans[key] = exc
+        plan = self._plans[key]
+        if isinstance(plan, Exception):
+            raise plan
+        return plan
+
+    def _slots(self, kind: str, root: Path):
+        from aegis_core.skills.slots import SlotRegistry
+
+        key = (str(root.resolve()), kind)
+        if key not in self._configs:
+            try:
+                loader = SlotRegistry.load_user if kind == 'user' else SlotRegistry.load
+                self._configs[key] = loader(root)
+            except Exception as exc:
+                self._configs[key] = exc
+        value = self._configs[key]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def resolve_driver(self, ext: str, workspace_root: Optional[Union[Path, str]] = None) -> Optional[str]:
+        plan = (self._plan(ext, Path(workspace_root)) if workspace_root is not None
+                else self.registry.plan_driver(ext))
+        return plan.label if plan is not None else None
+
+    def get_configured_extensions(self, workspace_root: Union[Path, str]) -> set[str]:
+        if not self._active:
+            return self.registry.get_configured_extensions(workspace_root)
+        extensions = set(self.registry._drivers) | {'.py'}
+        for kind in ('user', 'repo'):
+            extensions.update(self._slots(kind, Path(workspace_root)).get_configured_extensions())
+        return extensions
+
+    def _parse_batch(self, plan: _DriverPlan, target_path: Path, timeout: float) -> NormalizedAST:
+        from aegis_core.ast.batch import BatchDriver
+
+        if not self._active:
+            with BatchDriver(plan.argv, label=plan.label, timeout=timeout) as batch:
+                return batch.parse(target_path)
+        if plan.argv not in self._batches:
+            self._batches[plan.argv] = BatchDriver(plan.argv, label=plan.label, timeout=timeout)
+        return self._batches[plan.argv].parse(target_path)
 
     def parse_file(
         self,
@@ -374,12 +452,14 @@ class ASTDriverRunner:
         if ext == ".py":
             return parse_python_ast(target_path)
 
-        plan = self.registry.plan_driver(ext, workspace_root=ws_root)
+        plan = self._plan(ext, ws_root)
         if plan is None or plan.unavailable:
             reason = f": {plan.unavailable}" if plan is not None else ""
             raise NoDriverConfiguredError(
                 f"No AST driver configured for extension '{ext}' on {target_path.name}{reason}"
             )
+        if plan.protocol == 2:
+            return self._parse_batch(plan, target_path, timeout)
 
         # Fast path 2: Built-in Rust driver executed in-process
         if plan.in_process_rust:

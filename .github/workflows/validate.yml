@@ -20,6 +20,7 @@ jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
   dependency-audit:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -36,6 +37,7 @@ jobs:
         run: pip-audit --strict .
 
   build-wheel:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: dependency-audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -55,6 +57,10 @@ jobs:
           python-version: '3.11'
       - name: Install build tools
         run: pip install build==1.6.1
+      - name: Enforce zero runtime dependencies and offline Go build
+        run: |
+          python .github/scripts/check_zero_dependencies.py source .
+          python .github/scripts/check_zero_dependencies.py go .
       - name: Build wheel and sdist (the only build of this release)
         run: python -m build
       - name: Record artifact digests
@@ -97,39 +103,59 @@ jobs:
       - name: Verify upstream jobs succeeded
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EXPECTED_RESULT: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && 'skipped' || 'success' }}
         run: |
-          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != "success"}; sys.exit(f"Upstream jobs did not succeed: {bad}" if bad else 0)'
+          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != expected}; sys.exit(f"Unexpected upstream job results (expected {expected}): {bad}" if bad else 0)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch wave pull request head as data
+        if: github.event_name == 'pull_request' && github.base_ref == 'develop'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
+      # Wave tests run locally. This unconditional, base-sourced comparison keeps
+      # the required aegis-check context without executing the wave's code.
+      - name: Run CI governance without execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m aegis_cli.cli check --ci --no-exec
       - name: Set up Python
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
       - name: Download wheel artifact
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: aegis-wheel
           path: dist/
       - name: Verify artifact digests
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: python .github/scripts/verify_dist.py verify dist
       # Same text as the other test jobs (a workflow test compares them): check --ci reruns the
       # head commit's trailer snapshot here, which must collect what those jobs collect.
       - name: Install test dependencies
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: |
           pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
           pip install dist/*.whl
       # -I keeps the checkout off sys.path: the installed wheel is what runs. check --ci runs only
       # in this job (its id is the required context); each OS leg keeps Layer 1.
       - name: Run Layer 1 Deterministic Verification
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: python3 -I -m aegis_cli.cli check
       - name: Run CI Governance & Regression Check
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: python3 -I -m aegis_cli.cli check --ci
         env:
           GH_TOKEN: ${{ github.token }}
 
   validate:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: [build-wheel, dependency-audit]
     timeout-minutes: 300
     strategy:
@@ -205,6 +231,7 @@ jobs:
   # continue-on-error. Steps run under Git Bash (as on a contributor's machine);
   # tests that drive PowerShell spawn it themselves.
   test-windows:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: build-wheel
     runs-on: windows-latest
     timeout-minutes: 45

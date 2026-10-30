@@ -11,23 +11,16 @@ import tokenize
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core.errors import AegisError
+from aegis_core.ast.literals import compare_literal, compare_options
 from aegis_core.ast.schema import (
     NormalizedAST, _SpellingIndex, add_binding, _call_target, _decorator_name,
     _decorator_pattern, _extract_import_tuple, _extract_python_decorators_from_file,
-    _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, _spellings,
+    _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, _spellings, canonical_spelling,
 )
 
 __all__ = ["ASTExtractionError", "_match_ImportNode_against_pattern", "evaluate_forbid_ast", "evaluate_forbid_ast_delta", "evaluate_forbid_ast_structured", "extract_normalized_ast", "parse_allow_comments", "violation_messages"]
 _ALLOW_COMMENT_RE = re.compile(r"#\s*aegis:\s*allow(?:\[([^\]]+)\])?(?:\s*[:\-]?\s*(.*))?$", re.IGNORECASE)
 _ABSENT = object()
-
-
-def _is_literal(val: Any) -> bool:
-    return isinstance(val, str) and val != "<expr>" and (val in ("True", "False", "None") or val[:1] in ("'", '"', "-", *"0123456789") or val[:2] in ("b'", 'b"'))
-
-
-def _unquote(val: str) -> str:
-    return val[2:-1] if val[:2] in ("b'", 'b"') and len(val) >= 3 else (val[1:-1] if val[:1] in ("'", '"') and len(val) >= 2 else val)
 
 
 def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
@@ -37,9 +30,7 @@ def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
     if not isinstance(cond, Mapping):
         if value is _ABSENT:
             return None if has_splat else False
-        if not _is_literal(value):
-            return True if isinstance(cond, str) and isinstance(value, str) and value != "<expr>" and (value == cond or value.endswith(f".{cond}")) else None
-        return value == repr(cond) or value == str(cond) or _unquote(value) == cond
+        return compare_literal(value, cond)
     res: Optional[bool] = True
     for op, target in cond.items():
         if op == "not":
@@ -49,12 +40,7 @@ def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
             v = None if (value is _ABSENT and has_splat) else ((value is _ABSENT) == bool(target))
         elif op == "in":
             opts = target if isinstance(target, (list, tuple, set, frozenset)) else ()
-            if value is _ABSENT or not isinstance(value, str) or value == "<expr>":
-                v = (None if has_splat else False) if value is _ABSENT else None
-            elif any(value == str(c) or value == repr(c) or _unquote(value) == str(c) or value.endswith(f".{c}") for c in opts):
-                v = True
-            else:
-                v = False if (_is_literal(value) or value.rpartition(".")[2][:1].isupper()) else None
+            v = (None if has_splat else False) if value is _ABSENT else compare_options(value, opts)
         else:
             v = None
         if v is False:
@@ -70,13 +56,14 @@ def _site_args(site: Any) -> Dict[str, Any]:
 
 
 def _driver_extracts_args(normalized_ast: Any) -> bool:
-    # Only the Python driver records call arguments; elsewhere an empty map means "not extracted".
-    return str(getattr(normalized_ast, "language", "") or "").lower() == "python"
+    meta = getattr(normalized_ast, "metadata", None)
+    capabilities = meta.get("capabilities", ()) if isinstance(meta, Mapping) else ()
+    return isinstance(capabilities, (list, tuple, set, frozenset)) and "args" in capabilities
 
 
 def _match_where(site: Any, where: Mapping[str, Any], args_known: bool = True) -> Optional[bool]:
     args = _site_args(site)
-    if not args and not args_known:
+    if not args_known:
         return None
     has_splat = "*" in args or "**" in args
     res: Optional[bool] = True
@@ -96,7 +83,11 @@ def _add_allow(by_line: Dict[int, List[Dict[str, Any]]], line_no: int, text: str
         by_line.setdefault(int(line_no), []).append({"rules": rules, "reason": (m.group(2) or "").strip()})
 
 
-def parse_allow_comments(source: str) -> Dict[int, List[Dict[str, Any]]]:
+def parse_allow_comments(source: str, language: str = "python") -> Dict[int, List[Dict[str, Any]]]:
+    # Non-Python overrides come only from parser comment tokens in metadata. Their
+    # lexical boundaries (JS regex/templates, Rust raw strings) belong to each driver.
+    if language.lower() != "python":
+        return {}
     if not source or "aegis" not in source.lower():
         return {}
     by_line: Dict[int, List[Dict[str, Any]]] = {}
@@ -117,7 +108,12 @@ def _line_of(item: Any) -> Optional[int]:
 
 def _allow_reason_for_line(allow_map: Mapping[int, List[Dict[str, Any]]], line: Optional[int], rule_id: Optional[str]) -> Optional[str]:
     for entry in (allow_map.get(line) or ()) if line else ():
-        if entry.get("rules") is None or not rule_id or rule_id in entry["rules"]:
+        if not isinstance(entry, Mapping):
+            continue
+        rules = entry.get("rules")
+        if rules is not None and not isinstance(rules, (list, tuple, set, frozenset)):
+            continue
+        if rules is None or not rule_id or rule_id in rules:
             return str(entry.get("reason") or "")
     return None
 
@@ -128,10 +124,12 @@ class ASTExtractionError(AegisError):
 
 
 def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
-    mod = _normalize_ast_token(pattern)
+    mod = canonical_spelling(pattern)
     if not mod:
         return False
     src, syms = _extract_import_tuple(imp)
+    if src.startswith(".") and not mod.startswith("."):
+        return False
     if src and (src == mod or src.startswith(f"{mod}.")):
         return True
     return any(s == mod or s.startswith(f"{mod}.") or (src and (f"{src}.{s}" == mod or f"{src}.{s}".startswith(f"{mod}."))) for s in syms)
@@ -245,7 +243,8 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
         mod = _normalize_ast_token(raw_mod) if isinstance(raw_mod, str) else ""
         if mod:
-            matched = sorted(((r, True) for r, t in parsed_imports if _match_ImportNode_against_pattern(t, mod)), key=by_line)
+            matched = sorted(((r, None if t[0] == "<expr>" else True) for r, t in parsed_imports
+                              if t[0] == "<expr>" or _match_ImportNode_against_pattern(t, mod)), key=by_line)
             hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
     raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
     call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
@@ -258,12 +257,15 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
         return []
     meta = getattr(normalized_ast, "metadata", None)
     text = source if isinstance(source, str) else _read_source(fp)
-    if isinstance(source, str):
-        allows = parse_allow_comments(source)
+    language = str(getattr(normalized_ast, "language", "") or "").lower()
+    if language != "python" and isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
+        allows = meta["allow_comments"]
+    elif isinstance(source, str):
+        allows = parse_allow_comments(source, language)
     elif isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
         allows = meta["allow_comments"]
     else:
-        allows = parse_allow_comments(text or "")
+        allows = parse_allow_comments(text or "", language)
     # Universal newlines, as the parsers count lines; split once per call, never per finding.
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if text else []
     findings: list[dict[str, Any]] = []
@@ -336,12 +338,18 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
     path_str = str(file_path)
     ext = os.path.splitext(path_str)[1].lower()
     try:
-        if code is not None or ext == ".py":
+        if code is not None and ext != ".py":
+            raise ASTExtractionError(path_str, f"source parsing unsupported for extension '{ext}' until a native source parser is available")
+        if ext == ".py":
             source_text = code if code is not None else read_python_source(path_str)
             tree = ast.parse(source_text, filename=path_str)
             norm_ast = parse_python_ast(source_text, file_path=path_str)
             decs = _extract_python_decorators_from_tree(tree)
-            allows = parse_allow_comments(source_text)
+            allows = {
+                line: [{**entry, "rules": sorted(entry["rules"]) if entry["rules"] is not None else None}
+                       for entry in entries]
+                for line, entries in parse_allow_comments(source_text).items()
+            }
             if decs or allows:
                 meta = {**norm_ast.metadata, **({"decorators": list(decs)} if decs else {}), **({"allow_comments": allows} if allows else {})}
                 object.__setattr__(norm_ast, "metadata", meta)
@@ -349,7 +357,8 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
         if ast_runner is None:
             from aegis_core.ast.runner import ASTDriverRunner
             ast_runner = ASTDriverRunner()
-        if not ast_runner.registry.resolve_driver(ext, workspace_root=workspace_root):
+        resolve = getattr(ast_runner, "resolve_driver", ast_runner.registry.resolve_driver)
+        if not resolve(ext, workspace_root=workspace_root):
             return None
         return ast_runner.parse_file(path_str, workspace_root=workspace_root, **({"confine_root": confine_root} if confine_root is not None else {}))
     except Exception as exc:

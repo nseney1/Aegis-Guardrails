@@ -315,7 +315,7 @@ def test_the_hook_and_the_record_take_a_binary_file_and_note_one_over_the_size_c
     assert notes == [("index", "data/big.yaml", True)]
     _git(repo, "commit", "-q", "-m", "assets")
     rc, row, _ = _record(repo, capsys)
-    assert (rc, row["passed"], row["layer1"]) == (0, True, {"findings": 0, "files": 2})
+    assert (rc, row["passed"], row["layer1"]) == (0, True, {"findings": 0, "files": 2, "evidence": []})
 
 
 def test_a_crlf_checkout_of_a_committed_change_is_judged_against_the_same_base_as_an_lf_one(repo, capsys):
