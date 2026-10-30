@@ -76,6 +76,24 @@ def test_record_preserves_no_driver_language_and_reason(tmp_path, capsys):
 
 
 @needs_git
+def test_record_preserves_too_large_language_and_reason(tmp_path, capsys):
+    repo = hv.make_project(tmp_path)
+    repo.write(".aegis/rules/invariants/no-danger.md",
+               '---\nid: no-danger\ntype: invariant\nenforcement: gate\n'
+               'target_paths: ["src/*.ts"]\nforbid_ast:\n  calls: [danger]\n---\n# No danger\n')
+    repo.write("src/big.ts", "danger();\n" + "// pad\n" * (2 * 1024 * 1024 // 7 + 1))
+
+    rc, out = _run(repo, capsys, "--json")
+
+    doc = json.loads(out.out)
+    assert rc == 0 and doc["check"]["layer1"]["findings"] == 0
+    notes = [row for row in doc["check"]["layer1"]["evidence"] if row["tool"] == "ast_unverified"]
+    assert notes and all(note == {"tool": "ast_unverified", "target": "src/big.ts", "verdict": True,
+                                  "language": "typescript", "reason": "too_large"} for note in notes)
+    assert hv.rows_of(repo.root, "check")[0]["layer1"]["evidence"] == doc["check"]["layer1"]["evidence"]
+
+
+@needs_git
 def test_record_preserves_the_language_of_a_failing_rule(tmp_path, capsys):
     repo = hv.make_project(tmp_path)
     repo.write(".aegis/rules/invariants/no-eval.md",

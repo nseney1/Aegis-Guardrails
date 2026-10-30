@@ -375,6 +375,9 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
             print(f"  ⚠️  AST driver ({ext}): {type(exc).__name__}: {exc}")
             all_resolvable = False
             continue
+        if plan is not None and plan.in_process_js:
+            print(f"  ✅ AST driver ({ext}): {plan.label}")
+            continue
         if plan is not None and plan.packaged_go:
             from aegis_core.ast.gobuild import GoDriverUnavailableError, inspect_go_driver
 

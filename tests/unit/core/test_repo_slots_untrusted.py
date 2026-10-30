@@ -199,12 +199,14 @@ def test_repo_custom_command_for_packaged_extension_uses_packaged_driver(ws: Pat
     assert [d.name for d in result.definitions] == ["calculate"]
 
 
-def test_interpreter_found_inside_workspace_is_not_executed(ws: Path, tmp_path: Path, monkeypatch):
+def test_interpreter_found_inside_workspace_is_not_executed(ws: Path, tmp_path: Path, isolated_home: Path, monkeypatch):
     pwned = tmp_path / "PWNED"
     _write_executable(ws / "bin" / "node", f"open({str(pwned)!r}, 'w').close()\n")
     monkeypatch.setenv("PATH", str(ws / "bin"))
-    _opt_in(ws, "ts")
-    app = ws / "app.ts"
+    driver = tmp_path / 'external.js'
+    driver.write_text('// fixture driver', encoding='utf-8')
+    _user_drivers(isolated_home, external=f'node "{driver}"')
+    app = ws / "app.external"
     app.write_text("export function run(): void {}\n", encoding="utf-8")
 
     _, error = _parse(app, ws)
@@ -214,7 +216,6 @@ def test_interpreter_found_inside_workspace_is_not_executed(ws: Path, tmp_path: 
     assert "node" in str(error)
 
 
-@needs_node
 def test_tampered_repo_copy_of_packaged_driver_is_not_executed(ws: Path, tmp_path: Path):
     pwned = tmp_path / "PWNED"
     evil = (
@@ -237,7 +238,6 @@ def test_tampered_repo_copy_of_packaged_driver_is_not_executed(ws: Path, tmp_pat
     assert "evil" not in {d.name for d in result.definitions}
 
 
-@needs_node
 def test_packaged_ts_driver_does_not_load_repo_node_modules(ws: Path, tmp_path: Path):
     pwned = tmp_path / "PWNED"
     _plant_repo_typescript(ws, pwned)
@@ -345,34 +345,50 @@ def _call_graph_evidence(ws: Path, rel_path: str) -> list:
     return [r for r in run_layer1([rel_path], str(ws), fast_mode=True) if r.tool == "call_graph"]
 
 
-def test_run_layer1_fails_closed_when_packaged_interpreter_is_missing(ws: Path, tmp_path: Path, monkeypatch):
+def test_run_layer1_fails_closed_when_external_interpreter_is_missing(ws: Path, tmp_path: Path, isolated_home: Path, monkeypatch):
     empty_bin = tmp_path / "emptybin"
     empty_bin.mkdir()
     monkeypatch.setenv("PATH", str(empty_bin))
-    _opt_in(ws, "ts")
-    (ws / "app.ts").write_text("export function run(): void {}\n", encoding="utf-8")
+    driver = tmp_path / 'external.js'
+    driver.write_text('// fixture driver', encoding='utf-8')
+    _user_drivers(isolated_home, external=f'node "{driver}"')
+    (ws / "app.external").write_text("export function run(): void {}\n", encoding="utf-8")
 
-    evidence = _call_graph_evidence(ws, "app.ts")
+    evidence = _call_graph_evidence(ws, "app.external")
 
     assert len(evidence) == 1, "a configured but unrunnable driver must not skip the file"
     assert evidence[0].verdict is False
-    assert "needs 'node' on PATH" in evidence[0].detail
+    assert "NoDriverConfiguredError" in evidence[0].detail
+    assert "needs 'node', which was not found on PATH" in evidence[0].detail
 
 
-def test_run_layer1_fails_closed_when_only_interpreter_is_inside_workspace(ws: Path, tmp_path: Path, monkeypatch):
+def test_run_layer1_fails_closed_when_packaged_interpreter_is_missing(ws: Path, monkeypatch):
+    _opt_in(ws, "go")
+    monkeypatch.setenv("PATH", "")
+    (ws / "app.go").write_text("package main\n", encoding="utf-8")
+    evidence = _call_graph_evidence(ws, "app.go")
+    assert len(evidence) == 1
+    assert evidence[0].verdict is False
+    assert "driver_unavailable:go_missing: go was not found on PATH outside the workspace" in evidence[0].detail
+
+
+def test_run_layer1_fails_closed_when_only_interpreter_is_inside_workspace(ws: Path, tmp_path: Path, isolated_home: Path, monkeypatch):
     pwned = tmp_path / "PWNED"
     repo_bin = ws / "node_modules" / ".bin"
     _write_executable(repo_bin / "node", f"open({str(pwned)!r}, 'w').close()\n")
     monkeypatch.setenv("PATH", str(repo_bin))
-    _opt_in(ws, "ts")
-    (ws / "app.ts").write_text("export function run(): void {}\n", encoding="utf-8")
+    driver = tmp_path / 'external.js'
+    driver.write_text('// fixture driver', encoding='utf-8')
+    _user_drivers(isolated_home, external=f'node "{driver}"')
+    (ws / "app.external").write_text("export function run(): void {}\n", encoding="utf-8")
 
-    evidence = _call_graph_evidence(ws, "app.ts")
+    evidence = _call_graph_evidence(ws, "app.external")
 
     assert not pwned.exists(), "a node binary inside the workspace was executed"
     assert len(evidence) == 1, "a configured but unrunnable driver must not skip the file"
     assert evidence[0].verdict is False
-    assert "outside the workspace" in evidence[0].detail
+    assert "NoDriverConfiguredError" in evidence[0].detail
+    assert "inside the workspace" in evidence[0].detail
 
 
 # ── Packaged drivers installed inside the workspace (project-local venv) ────
@@ -393,6 +409,11 @@ print(json.dumps(out))
 def _install_aegis_inside(ws: Path) -> Path:
     site = ws / ".venv" / "lib" / "python3" / "site-packages"
     shutil.copytree(AEGIS_CORE_SRC, site / "aegis_core", ignore=shutil.ignore_patterns("__pycache__"))
+    destination = site / 'aegis_core/ast/drivers/js'
+    if not destination.exists():
+        from aegis_core.ast.drivers import js
+
+        shutil.copytree(Path(js.__file__).parent, destination, ignore=shutil.ignore_patterns('__pycache__'))
     return site
 
 
@@ -434,11 +455,13 @@ def test_packaged_driver_installed_inside_workspace_is_not_run(
     out = _parse_with_installed_package(site, target, ws, str(tmp_path / "fakebin"), isolated_home, elsewhere)
 
     assert not log.exists(), f"{interpreter} ran a packaged template that lives inside the workspace"
+    if ext == 'ts':
+        assert out['error'] is None, out
+        return
     assert out["error"] is not None and out["error"].startswith("NoDriverConfiguredError"), out
     assert "installed inside the workspace" in out["error"]
 
 
-@needs_node
 def test_packaged_ts_driver_installed_inside_workspace_does_not_load_repo_typescript(
     ws: Path, tmp_path: Path, isolated_home: Path
 ):
@@ -450,12 +473,10 @@ def test_packaged_ts_driver_installed_inside_workspace_does_not_load_repo_typesc
     app.write_text("export function run(): void {}\n", encoding="utf-8")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    node_dir = str(Path(shutil.which("node")).parent)
-
-    out = _parse_with_installed_package(site, app, ws, node_dir, isolated_home, elsewhere)
+    out = _parse_with_installed_package(site, app, ws, '', isolated_home, elsewhere)
 
     assert not pwned.exists(), "repo node_modules/typescript was loaded by an in-repo packaged driver"
-    assert "installed inside the workspace" in (out["error"] or "")
+    assert out['error'] is None, out
 
 
 # ── User-scope slot file (outside the repo) may define commands ─────────────
@@ -498,7 +519,7 @@ def test_user_scope_file_inside_workspace_is_treated_as_repo(ws: Path, tmp_path:
 def test_user_scope_provisioned_selector_runs_packaged_driver_not_repo_copy(
     ws: Path, tmp_path: Path, isolated_home: Path, monkeypatch
 ):
-    """'node .aegis/drivers/ts_ast.js' in ~/.aegis/config.json would run each repo's own copy (cwd = repo)."""
+    """The legacy Node selector cannot override native parsing or execute a repo copy."""
     log = tmp_path / "node-calls.jsonl"
     _stub_interpreter(tmp_path / "fakebin", "node", log)
     monkeypatch.setenv("PATH", str(tmp_path / "fakebin"))
@@ -511,13 +532,10 @@ def test_user_scope_provisioned_selector_runs_packaged_driver_not_repo_copy(
     result, error = _parse(app, ws)
 
     assert error is None, error
-    assert [d.name for d in result.definitions] == ["fromStub"]
-    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert len(calls) == 1
-    assert Path(calls[0][0]).resolve() == (PACKAGED_TEMPLATES / "ts_ast.js").resolve()
+    assert [d.name for d in result.definitions] == ["run"]
+    assert not log.exists(), 'native parsing started the legacy Node selector'
 
 
-@needs_node
 def test_user_scope_provisioned_selector_does_not_execute_repo_driver_copy(
     ws: Path, tmp_path: Path, isolated_home: Path
 ):
@@ -630,9 +648,8 @@ def test_workspace_driver_keys_are_ignored_and_only_packaged_opt_ins_count(ws: P
     assert slots == {
         "ast_driver_rs": "{python} .aegis/drivers/rust_ast.py",
         "ast_driver_go": "go run .aegis/drivers/go_ast.go",
-        "ast_driver_ts": "node .aegis/drivers/ts_ast.js",
     }
-    assert reg.get_configured_extensions() == {".py", ".ts", ".rs", ".go"}
+    assert reg.get_configured_extensions() == {".py", ".rs", ".go", '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'}
     joined = "\n".join(reg.warnings)
     assert "'drivers'" in joined and "'ast_driver'" in joined
     assert "touch" not in joined and "evil.js" not in joined
@@ -690,15 +707,15 @@ def test_sanitize_slot_value(key: str, value: str, expected: Optional[str]):
 # ── Provisioning never writes through repo symlinks ──────────────────────────
 
 
-def _ts_project(root: Path) -> None:
-    (root / "tsconfig.json").write_text("{}", encoding="utf-8")
-    (root / "index.ts").write_text("export const x = 1;\n", encoding="utf-8")
+def _go_project(root: Path) -> None:
+    (root / "go.mod").write_text("module fixture\n", encoding="utf-8")
+    (root / "main.go").write_text("package fixture\nfunc Example() {}\n", encoding="utf-8")
 
 
 def test_provision_refuses_config_file_symlinked_to_user_scope(ws: Path, isolated_home: Path):
     """A committed .aegis/config.json -> ~/.aegis/config.json would plant a trusted user-scope driver."""
     (isolated_home / ".aegis").mkdir()
-    _ts_project(ws)
+    _go_project(ws)
     link = ws / ".aegis" / "config.json"
     link.symlink_to(Path("..") / ".." / isolated_home.name / ".aegis" / "config.json")
 
@@ -712,7 +729,7 @@ def test_provision_refuses_config_file_symlinked_to_user_scope(ws: Path, isolate
 def test_provision_refuses_a_symlinked_aegis_dir(tmp_path: Path, isolated_home: Path):
     repo = tmp_path / "proj"
     repo.mkdir()
-    _ts_project(repo)
+    _go_project(repo)
     outside = isolated_home / "outside"
     outside.mkdir()
     (repo / ".aegis").symlink_to(outside, target_is_directory=True)
@@ -724,22 +741,20 @@ def test_provision_refuses_a_symlinked_aegis_dir(tmp_path: Path, isolated_home: 
 
 
 def test_provision_writes_a_regular_config_and_copies_no_driver(ws: Path):
-    _ts_project(ws)
+    _go_project(ws)
 
     slots, created = provision_ast_driver_slots(ws)
 
     config = ws / ".aegis" / "config.json"
-    extensions = ("ts", "tsx", "mts", "cts")
-    assert slots == {f"ast_driver_{ext}": "node .aegis/drivers/ts_ast.js" for ext in extensions}
+    assert slots == {'ast_driver_go': 'go run .aegis/drivers/go_ast.go'}
     assert created == [str(config)]
     assert config.is_file() and not config.is_symlink()
     assert json.loads(config.read_text(encoding="utf-8")) == {
-        "v": 1, "ast": {"packaged_drivers": list(extensions)}
+        "v": 1, "ast": {"packaged_drivers": ['go']}
     }
     assert not (ws / ".aegis" / "drivers").exists()
     registry = SlotRegistry.load(ws)
-    for ext in extensions:
-        assert registry.get_ast_driver(f".{ext}") == "node .aegis/drivers/ts_ast.js"
+    assert registry.get_ast_driver('.go') == 'go run .aegis/drivers/go_ast.go'
 
 
 # ── JIT scan output ──────────────────────────────────────────────────────────

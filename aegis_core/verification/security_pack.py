@@ -1,4 +1,4 @@
-"""First-party Python AST security rule pack and delta-aware evaluator (v4.3 T7)."""
+"""First-party Python rules, native-source diagnostics and delta-aware evaluation."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,9 +9,11 @@ from aegis_core.ast.policy import (
     _new_findings,
     evaluate_forbid_ast_structured,
     extract_normalized_ast,
+    is_size_limit_error,
 )
 from aegis_core.ast.source import decode_python_source
 from aegis_core.match import is_test_path, workspace_files
+from aegis_core.primitives import is_within
 
 __all__ = ["evaluate_security_pack"]
 
@@ -61,6 +63,11 @@ def _record(finding: Mapping[str, Any], rel_path: str, rule: Mapping[str, Any]) 
             "pattern": finding["pattern"], "snippet": finding["snippet"], "severity": rule["severity"]}
 
 
+def _unverified_file(path: str, reason: str) -> dict[str, Any]:
+    return {'rule_id': '', 'file': path, 'line': 0, 'kind': 'file',
+            'status': 'unverified', 'reason': reason, 'severity': 'high'}
+
+
 def evaluate_security_pack(
     workspace_root: Union[str, Path], changed_files: Iterable[str], base_sources: Mapping[str, Optional[Union[str, bytes]]],
 ) -> Dict[str, Any]:
@@ -69,20 +76,36 @@ def evaluate_security_pack(
 
     Every changed Python file inside the workspace is evaluated, reported unverified (one
     ``kind: "file"`` record when it cannot be read or parsed) or absent (deleted), never
-    skipped as clean. Test files are reported in ``exempted_test_findings``."""
+    skipped as clean. Go and native JS/TS files have no pack rules yet (v4.5 M3 adds them):
+    they are only confined to the workspace and given the 2 MiB size advisory, never parsed
+    here, so a parser gap cannot fail T7 (user forbid_ast rules still parse them and fail closed).
+    Test files are reported in ``exempted_test_findings``."""
     root = Path(workspace_root).resolve()
     violations: List[Dict[str, Any]] = []
     exempted_test_findings: List[Dict[str, Any]] = []
     unverified_findings: List[Dict[str, Any]] = []
-    for rel_path in sorted(f for f in workspace_files(root, changed_files) if f.endswith(".py")):
+    for rel_path in sorted(f for f in workspace_files(root, changed_files)
+                           if f.endswith(('.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.go'))):
         full_path = root.joinpath(*rel_path.split("/"))
         if not full_path.is_file():
+            continue
+        if not is_within(full_path, root, unresolvable=False):
+            unverified_findings.append(_unverified_file(rel_path, 'source escapes workspace'))
+            continue
+        if not rel_path.endswith('.py'):
+            from aegis_core.ast.runner import ASTDriverError, enforce_source_size
+
+            try:
+                enforce_source_size(full_path)
+            except (ASTDriverError, OSError) as exc:
+                reason = 'too_large' if is_size_limit_error(exc) else str(exc)
+                unverified_findings.append(_unverified_file(rel_path, reason))
             continue
         try:
             head_ast = extract_normalized_ast(str(full_path), workspace_root=str(root))
         except ASTExtractionError as exc:  # exc.reason: str(exc) names the absolute path
-            unverified_findings.append({"rule_id": "", "file": rel_path, "line": 0, "kind": "file",
-                                        "status": "unverified", "reason": exc.reason, "severity": "high"})
+            reason = 'too_large' if is_size_limit_error(exc) else exc.reason
+            unverified_findings.append(_unverified_file(rel_path, reason))
             continue
         base_text = base_sources.get(rel_path)
         try:

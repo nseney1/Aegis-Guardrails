@@ -1,6 +1,7 @@
 """AST Driver Runner and Registry for polyglot NormalizedAST execution.
 
-Driver argv never comes from repository content (H5, D10). It comes from drivers
+Python and JavaScript/TypeScript parse in-process. External driver argv never
+comes from repository content (H5, D10). It comes from drivers
 registered in code, from the user-scope ~/.aegis/config.json, or from the packaged
 templates in aegis_core/ast/drivers/templates, which a repo can only opt in to
 (.aegis/config.json ``ast.packaged_drivers``).
@@ -20,6 +21,7 @@ import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from aegis_core.ast.drivers.python import parse_python_ast
+from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS
 from aegis_core.ast.schema import NormalizedAST
 from aegis_core.ast.driver_errors import ASTDriverError, ASTDriverTimeoutError, NoDriverConfiguredError
 from aegis_core.pathlookup import is_bare, INSIDE_FENCE, only_skipped, which
@@ -33,12 +35,20 @@ __all__ = [
     "ASTDriverRegistry",
     "ASTDriverRunner",
     "resolve_driver_executable",
+    "enforce_source_size",
 ]
 
 _PYTHON_NAMES = frozenset({"{python}", "python3", "python", "python.exe", "python3.exe"})
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "drivers" / "templates"
 # Packaged template -> interpreter looked up on PATH. rust_ast.py runs in-process.
-_PACKAGED_INTERPRETERS = {"ts_ast.js": "node", "go_ast.go": "go"}
+_PACKAGED_INTERPRETERS = {"go_ast.go": "go"}
+SOURCE_LIMIT_BYTES = 2 * 1024 * 1024
+
+
+def enforce_source_size(file_path: Path | str) -> None:
+    """Apply the byte-size policy after the caller confines the source path."""
+    if Path(file_path).stat().st_size > SOURCE_LIMIT_BYTES:
+        raise ASTDriverError('source exceeds 2 MiB', reason='too_large')
 
 
 def _is_python_name(name: str) -> bool:
@@ -56,6 +66,7 @@ class _DriverPlan:
     isolated_cwd: bool = False  # run in a fresh empty directory instead of ``cwd``
     in_process_rust: bool = False
     packaged_go: bool = False  # prepared lazily, never by descriptions or diagnostics
+    in_process_js: bool = False
     unavailable: Optional[str] = None  # why the chosen driver cannot run here
     protocol: int = 1  # v2 is registered in code; user config remains v1
 
@@ -104,15 +115,6 @@ def _inside_workspace(path: Union[Path, str], ws_root: Path) -> bool:
     return False
 
 
-def _trusted_interpreter(name: str, ws_root: Path) -> Optional[str]:
-    """Resolve an interpreter through absolute PATH entries outside the workspace; one
-    whose file links back into the workspace is refused too."""
-    found = which(name, outside=ws_root)
-    if not found or _inside_workspace(found, ws_root):
-        return None
-    return found
-
-
 def _packaged_plan(ext: str, ws_root: Path) -> Optional[_DriverPlan]:
     from aegis_core.ast.detect import packaged_driver_for_extension
 
@@ -127,9 +129,8 @@ def _packaged_plan(ext: str, ws_root: Path) -> Optional[_DriverPlan]:
     if interpreter is None:
         return None
     if _inside_workspace(_TEMPLATES_DIR, ws_root):
-        # node resolves require('typescript') by walking up from the script's real path, and
-        # go reads go.mod/go.work (and their toolchain lines) upward from the template dir:
-        # from a project-local venv both walks reach the repo's own node_modules or go.mod.
+        # Go reads go.mod/go.work upward from the template directory, which must
+        # remain outside repository-controlled module and toolchain pins.
         return _DriverPlan(
             label=label,
             unavailable=(
@@ -137,18 +138,8 @@ def _packaged_plan(ext: str, ws_root: Path) -> Optional[_DriverPlan]:
                 f"where {interpreter} would load modules from the repository; install aegis outside it"
             ),
         )
-    if filename == "go_ast.go":
-        return _DriverPlan(label=label, packaged_go=True, protocol=2)
-    exe = _trusted_interpreter(interpreter, ws_root)
-    if exe is None:
-        return _DriverPlan(
-            label=label,
-            unavailable=f"the packaged {filename} driver needs '{interpreter}' on PATH, outside the workspace",
-        )
-    template = str(_TEMPLATES_DIR / filename)
-    # cwd is the template dir, never the repo: ts_ast.js require()s from process.cwd(),
-    # and go resolves go.mod/go.work (and toolchain downloads) from it.
-    return _DriverPlan(label=label, argv=(exe, template), cwd=str(_TEMPLATES_DIR))
+    # Go is the only packaged external driver; it is compiled lazily from the template.
+    return _DriverPlan(label=label, packaged_go=True, protocol=2)
 
 
 def _user_command_plan(command: str, ext: str, ws_root: Path) -> Optional[_DriverPlan]:
@@ -158,7 +149,7 @@ def _user_command_plan(command: str, ext: str, ws_root: Path) -> Optional[_Drive
     '--flag=path' argument) inside the repo would let repo content pick the code that
     runs, so such commands are refused. The process runs in a fresh empty directory, not
     the workspace: 'python -m mod', 'node --require ./x.js' and similar lookups resolve
-    against the cwd. A provisioned selector such as 'node .aegis/drivers/ts_ast.js'
+    against the cwd. A provisioned selector such as 'go run .aegis/drivers/go_ast.go'
     means the packaged driver, never the repo's copy.
     """
     from aegis_core.ast.detect import names_packaged_driver, packaged_driver_for_extension
@@ -218,6 +209,8 @@ class ASTDriverRegistry:
         clean_ext = extension if extension.startswith(".") else f".{extension}"
         clean_ext = clean_ext.lower()
 
+        if clean_ext in NATIVE_JS_EXTENSIONS:
+            return _DriverPlan(label='native JavaScript/TypeScript (in-process)', in_process_js=True)
         if clean_ext in self._drivers:
             fence = None
             if workspace_root:
@@ -259,7 +252,7 @@ class ASTDriverRegistry:
         workspace_root: Optional[Union[Path, str, Workspace]] = None,
     ) -> set[str]:
         """Return all active source extensions from in-memory registry and workspace slots."""
-        exts = set(self._drivers.keys())
+        exts = set(self._drivers.keys()) | NATIVE_JS_EXTENSIONS
         exts.add(".py")
         if workspace_root:
             try:
@@ -394,7 +387,7 @@ class ASTDriverRunner:
     def get_configured_extensions(self, workspace_root: Union[Path, str]) -> set[str]:
         if not self._active:
             return self.registry.get_configured_extensions(workspace_root)
-        extensions = set(self.registry._drivers) | {'.py'}
+        extensions = set(self.registry._drivers) | NATIVE_JS_EXTENSIONS | {'.py'}
         for kind in ('user', 'repo'):
             extensions.update(self._slots(kind, Path(workspace_root)).get_configured_extensions())
         return extensions
@@ -477,10 +470,24 @@ class ASTDriverRunner:
             raise FileNotFoundError(f"File not found: {target_path}")
 
         ext = target_path.suffix.lower()
+        if ext == '.go':
+            enforce_source_size(target_path)
 
         # Fast path 1: Native Python driver
         if ext == ".py":
             return parse_python_ast(target_path)
+        if ext in NATIVE_JS_EXTENSIONS:
+            from aegis_core.ast.drivers.js import parse
+
+            with target_path.open('rb') as stream:
+                data = stream.read(SOURCE_LIMIT_BYTES + 1)
+            if len(data) > SOURCE_LIMIT_BYTES:
+                raise ASTDriverError('native source exceeds 2 MiB', reason='too_large')
+            try:
+                source = data.decode('utf-8')
+            except UnicodeError as exc:
+                raise ASTDriverError(f'invalid UTF-8: {exc}', reason='syntax') from exc
+            return parse(source, str(target_path))
 
         plan = self._plan(ext, ws_root)
         if plan is None or plan.unavailable:

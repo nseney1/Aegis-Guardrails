@@ -56,7 +56,7 @@ class CheckOutcome:
 
 def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, Any]:
     from aegis_core import baseline
-    from aegis_core.verification.ast_checks import NO_DRIVER_NOTE_TOOL, source_language
+    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL, NO_DRIVER_NOTE_TOOL, source_language
 
     # Every changed file, as plain check takes them: the secret scan reads any type.
     targets = [p for p in changed if (snapshot / p).is_file()]
@@ -73,6 +73,8 @@ def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -
                "language": evidence.language or source_language(target)}
         if evidence.tool == NO_DRIVER_NOTE_TOOL:
             row["reason"] = "no_driver:" + Path(target).suffix.lower()
+        elif evidence.tool == AST_SIZE_NOTE_TOOL:
+            row["reason"] = "too_large"
         rows.append(row)
     return {"findings": sum(1 for row in rows if not row["verdict"]), "files": len(targets), "evidence": rows}
 

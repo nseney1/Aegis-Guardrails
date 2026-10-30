@@ -10,10 +10,7 @@ instead of being skipped.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
-import shutil
-import subprocess
 import gc
 import time
 
@@ -1095,91 +1092,35 @@ class TestExternalDriverAliases:
 
 # ── Wave A F1 (d): renamed members of a TypeScript or Rust import group ──────
 
-_TS_DRIVER = Path(__file__).resolve().parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "ts_ast.js"
-_NODE = shutil.which("node")
+def _parse_ts(source: str) -> NormalizedAST:
+    from aegis_core.ast.drivers.js import parse
 
-# Stand-in for the `typescript` package with only the API ts_ast.js calls. It returns the
-# tree of `import { exec as run, spawn } from "child_process"; run("ls");` so the compiler
-# path can be tested where the real package is not installed.
-_TS_COMPILER_STUB = """\
-"use strict";
-const K = { SourceFile: 1, ImportDeclaration: 2, NamedImports: 3, Identifier: 4, Call: 5 };
-const node = (kind, props, children = []) =>
-  Object.assign({ kind, children, getStart: () => 0, getEnd: () => 0 }, props);
-const id = (text) => node(K.Identifier, { text });
-module.exports = {
-  ScriptTarget: { Latest: 99 },
-  SyntaxKind: { ExportKeyword: 100 },
-  createSourceFile() {
-    const named = node(K.NamedImports, {
-      elements: [{ name: id("run"), propertyName: id("exec") }, { name: id("spawn") }],
-    });
-    const imp = node(K.ImportDeclaration, {
-      moduleSpecifier: { text: "child_process" }, importClause: { namedBindings: named },
-    });
-    const sf = node(K.SourceFile, {}, [imp, node(K.Call, { expression: id("run") })]);
-    sf.getLineAndCharacterOfPosition = () => ({ line: 0, character: 0 });
-    return sf;
-  },
-  forEachChild(n, cb) { for (const c of n.children) cb(c); },
-  isImportDeclaration: (n) => n.kind === K.ImportDeclaration,
-  isNamespaceImport: () => false,
-  isNamedImports: (n) => n.kind === K.NamedImports,
-  isCallExpression: (n) => n.kind === K.Call,
-  isIdentifier: (n) => n.kind === K.Identifier,
-  isFunctionDeclaration: () => false,
-  isClassDeclaration: () => false,
-  isMethodDeclaration: () => false,
-  isPropertyAccessExpression: () => false,
-  isBinaryExpression: () => false,
-};
-"""
+    return parse(source, "mod.ts")
 
 
-def _run_ts_driver(cwd: Path, source: str) -> dict:
-    target = cwd / "mod.ts"
-    target.write_text(source, encoding="utf-8")
-    proc = subprocess.run(
-        [_NODE, str(_TS_DRIVER), str(target)], cwd=cwd, capture_output=True, text=True, timeout=60, check=True
-    )
-    return json.loads(proc.stdout)
-
-
-@pytest.mark.skipif(_NODE is None, reason="node is not installed; the TypeScript driver needs it")
 class TestTypeScriptGroupMemberAliases:
     ALIASED = "import { exec as run, spawn } from 'child_process';\nrun('ls');\n"
     PLAIN = "import { exec, spawn } from 'child_process';\nexec('ls');\n"
     SPEC = {"calls": ["child_process.exec"], "imports": ["exec"]}
 
-    def _violations(self, data: dict) -> list[str]:
-        return evaluate_forbid_ast(NormalizedAST.from_dict(data), self.SPEC)
+    def _violations(self, tree: NormalizedAST) -> list[str]:
+        return evaluate_forbid_ast(tree, self.SPEC)
 
-    def test_builtin_lexer_emits_the_alias_pair(self, tmp_path):
-        data = _run_ts_driver(tmp_path, self.ALIASED)
-        (record,) = data["imports"]
-        assert (record["imported_symbols"], record["aliases"]) == (["run", "spawn"], [["run", "exec"]])
-        assert self._violations(data) == self._violations(_run_ts_driver(tmp_path, self.PLAIN))
-        assert self._violations(data) == [
+    def test_builtin_lexer_emits_the_alias_pair(self):
+        tree = _parse_ts(self.ALIASED)
+        (record,) = tree.imports
+        assert (list(record.imported_symbols), [list(pair) for pair in record.aliases]) == (
+            ["run", "spawn"], [["run", "exec"]])
+        assert self._violations(tree) == self._violations(_parse_ts(self.PLAIN))
+        assert self._violations(tree) == [
             "Forbidden import 'exec' matched rule forbid_ast.imports",
             "Forbidden call 'child_process.exec' matched rule forbid_ast.calls",
         ]
 
-    def test_compiler_path_emits_the_alias_pair(self, tmp_path):
-        stub = tmp_path / "node_modules" / "typescript"
-        stub.mkdir(parents=True)
-        (stub / "index.js").write_text(_TS_COMPILER_STUB, encoding="utf-8")
-        data = _run_ts_driver(tmp_path, self.ALIASED)
-        (record,) = data["imports"]
-        assert (record["imported_symbols"], record["aliases"]) == (["run", "spawn"], [["run", "exec"]])
-        assert self._violations(data) == [
-            "Forbidden import 'exec' matched rule forbid_ast.imports",
-            "Forbidden call 'child_process.exec' matched rule forbid_ast.calls",
-        ]
-
-    def test_plain_named_import_has_no_alias_pairs(self, tmp_path):
-        (record,) = _run_ts_driver(tmp_path, self.PLAIN)["imports"]
-        assert record["imported_symbols"] == ["exec", "spawn"]
-        assert record.get("aliases", []) == []
+    def test_plain_named_import_has_no_alias_pairs(self):
+        (record,) = _parse_ts(self.PLAIN).imports
+        assert list(record.imported_symbols) == ["exec", "spawn"]
+        assert list(record.aliases or []) == []
 
 
 class TestRustGroupMemberAliases:
