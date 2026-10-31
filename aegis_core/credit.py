@@ -110,14 +110,16 @@ def _passed(check: Mapping[str, Any]) -> bool:
 
 
 def _tested(check: Mapping[str, Any]) -> bool:
-    """Whether ``check`` holds a tests run that is evidence (TestsRun.evidence: exit 0 in time, a test
-    passed). A Layer-1-only row, 4.3.x included, says nothing about the tests and never credits."""
+    """A complete passing test receipt; historical rows may omit the optional completeness field.
+    A Layer-1-only row says nothing about the tests and never credits."""
     tests = check.get("tests")
     if not isinstance(tests, dict):
         return False
     exit_code, passed = tests.get("exit"), tests.get("passed")
+    failed = tests.get("failed", 0)
     return (type(exit_code) is int and exit_code == 0 and not tests.get("timed_out")
-            and type(passed) is int and passed > 0)
+            and type(passed) is int and passed > 0 and type(failed) is int and failed == 0
+            and tests.get("complete", True) is True)
 
 
 def _sign(claimed: Any, check: Mapping[str, Any]) -> str:

@@ -155,7 +155,7 @@
     "count": 1,
     "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
   },
-  "typeerror:aegis_core/verification/coverage_check.py:run_diff_coverage:TypeError": {
+  "typeerror:aegis_core/verification/coverage_check.py:_python_coverage:TypeError": {
     "count": 1,
     "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
   },

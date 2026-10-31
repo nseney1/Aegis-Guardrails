@@ -12,15 +12,30 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
+import xml.etree.ElementTree as ET
 
 from tests import helpers_humangate as hg
 
 APP = "def app():\n    return 1\n"
-# What the stub prints is what a real pytest would: a summary line and an exit status.
-PASSING = "import sys\nprint('3 passed in 0.01s')\nsys.exit(0)\n"
-FAILING = "import sys\nprint('2 passed, 1 failed in 0.01s')\nsys.exit(1)\n"
-NO_TESTS = "import sys\nprint('no tests ran in 0.01s')\nsys.exit(5)\n"
-ZERO_PASSED = "import sys\nprint('0 passed in 0.01s')\nsys.exit(0)\n"
+
+def _runner_script(passed: int, failed: int, code: int, summary: str) -> str:
+    """A synthetic command boundary with explicit case-level results, never log-only evidence."""
+    suite = ET.Element("testsuite", name="stub", tests=str(passed + failed), failures=str(failed),
+                       errors="0", skipped="0")
+    for index in range(passed + failed):
+        case = ET.SubElement(suite, "testcase", classname="stub", name=f"test_{index}")
+        if index >= passed:
+            ET.SubElement(case, "failure", message="stub failure")
+    report = ET.tostring(suite, encoding="unicode")
+    return ("import sys\nfrom pathlib import Path\n"
+            f"Path(sys.argv[1]).write_text({report!r}, encoding='utf-8')\n"
+            f"print({summary!r})\nsys.exit({code})\n")
+
+
+PASSING = _runner_script(3, 0, 0, "3 passed in 0.01s")
+FAILING = _runner_script(2, 1, 1, "2 passed, 1 failed in 0.01s")
+NO_TESTS = _runner_script(0, 0, 5, "no tests ran in 0.01s")
+ZERO_PASSED = _runner_script(0, 0, 0, "0 passed in 0.01s")
 PYTEST_INI = "[pytest]\npythonpath = .\n"
 REAL_TEST = "from src.app import app\n\n\ndef test_app():\n    assert app() == 1\n\n\ndef test_other():\n    assert True\n"
 CI_WORKFLOW = "validate.yml"
@@ -60,7 +75,7 @@ def write_user_config(home: Path, **config: Any) -> Path:
 
 
 def use_stub_runner(home: Path, script: str = "run_checks.py") -> None:
-    write_user_config(home, tests={"command": f"python {script}"})
+    write_user_config(home, tests={"command": ["python", script, "{junit}"]})
 
 
 def ledger_rows(root: Path) -> List[Dict[str, Any]]:

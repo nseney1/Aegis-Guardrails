@@ -377,3 +377,8 @@ def test_update_leaves_an_unreadable_config_alone(ws: Path):
     with pytest.raises(ConfigError):
         update_repo_config(ws, lambda c: c.update(hosts=["x"]))
     assert path.read_text(encoding="utf-8") == "{hand-edited"
+
+
+def test_user_coverage_language_config_is_a_known_key():
+    config = UserConfig.parse({"v": 1, "coverage": {"languages": {"ts": {"command": ["node", "runner.mjs"]}}}})
+    assert config.warnings == ()

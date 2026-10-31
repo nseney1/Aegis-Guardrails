@@ -59,6 +59,9 @@ CORE_LAYERS: Dict[str, int] = {
     # The one secret-redaction table and its entry points (stdlib only).
     "aegis_core.redaction": 0,
     "aegis_core.config": 0,
+    # User-scoped argv planning and environment policy; no process execution.
+    "aegis_core.testplans": 0,
+    "aegis_core.language_runtime": 1,
     # The events log (prune metrics): storage and gitsafe only, so any layer may record.
     "aegis_core.events": 0,
     "aegis_core.stats": 0,
@@ -91,6 +94,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.credit": 1,
     "aegis_core.checkrun": 2,
     "aegis_core.testexec": 1,
+    # Standalone stdlib unittest reporting, launched by the L1 test execution service.
+    "aegis_core.unittest_runner": 1,
     # GitHub ruleset administration uses the transport and trust-policy constants.
     "aegis_core.github_ruleset": 2,
     # v4.3 T3: rank 2+ rules served from the reviewed BASE (the loader, the inventory, gitsafe), under scan.
