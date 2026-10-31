@@ -501,6 +501,59 @@ def test_the_cli_blocks_with_exit_2_and_nothing_on_stdout(ws, home):
     assert proc.stderr.decode().startswith("aegis: blocked git-clean-force")
 
 
+@pytest.mark.parametrize("route", ["write", "direct-patch", "shell", "pure-patch", "compound-patch"])
+@pytest.mark.parametrize("covered", [True, False], ids=["scanned", "unscanned"])
+def test_the_cli_loads_command_parsing_only_for_shell_routes(ws, home, tmp_path, route, covered):
+    """Observe the real import boundary in a fresh CLI process, without replacing the
+    parser: direct edits need only the scan gate; shell and shell-patch routes still
+    classify destructive commands and distinguish patch content from commands."""
+    if covered:
+        scan_compliance.record(ws, "scan", host="cli", session="s", files=["src/a.py"])
+    patch = "*** Begin Patch\n*** Update File: src/a.py\n@@\n-a\n+git reset --hard\n*** End Patch\n"
+    command = "apply_patch <<'EOF'\n" + patch + "EOF"
+    host = "claude-code" if route in ("write", "shell") else "codex-cli"
+    payload = {
+        "write": claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")}),
+        "direct-patch": codex(ws, "apply_patch", patch),
+        "shell": claude(ws, "Bash", {"command": "git reset --hard"}),
+        "pure-patch": codex(ws, "Bash", command),
+        "compound-patch": codex(ws, "Bash", command + "\ngit reset --hard"),
+    }[route]
+    report = tmp_path / "imports.json"
+    script = """
+import builtins, json, runpy, sys
+report, host = sys.argv[1:]
+real_import = builtins.__import__
+requested = []
+def observe(name, globals=None, locals=None, fromlist=(), level=0):
+    if name.startswith('aegis_core.command_safety') or (name == 'aegis_core' and 'command_safety' in (fromlist or ())):
+        requested.append(name)
+    return real_import(name, globals, locals, fromlist, level)
+builtins.__import__ = observe
+sys.argv = ['aegis', 'hook', 'run', 'pre-tool', '--host', host]
+try:
+    runpy.run_module('aegis_cli', run_name='__main__', alter_sys=True)
+finally:
+    with open(report, 'w', encoding='utf-8') as stream:
+        json.dump(requested, stream)
+"""
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO), env.get("PYTHONPATH", "")) if p)
+    for key in ("AEGIS_WORKSPACE", "CLAUDE_PROJECT_DIR"):
+        env.pop(key, None)
+    proc = subprocess.run([sys.executable, "-c", script, str(report), host], input=json.dumps(payload).encode("utf-8"),
+                          cwd=str(ws), env=env, capture_output=True, timeout=60)
+    guarded = route in ("shell", "compound-patch")
+    expected = 2 if guarded or not covered else 0
+    assert (proc.returncode, proc.stdout) == (expected, b""), proc.stderr
+    reason = b"aegis: blocked git-reset-hard" if guarded else b"aegis: call aegis_scan with src/a.py"
+    assert proc.stderr.startswith(reason) if expected else proc.stderr == b""
+    rows = events.read(ws).rows
+    assert [(r["event"], r["result"]) for r in rows] == [
+        ("guard_match", "block") if guarded else ("scan_gate", "pass" if covered else "block")]
+    assert bool(json.loads(report.read_text(encoding="utf-8"))) is (route not in ("write", "direct-patch"))
+
+
 def test_the_cli_blocks_agy_with_exit_75_from_a_cwd_outside_the_repository(ws, home, tmp_path):
     """With the global agy hooks file the hook runs outside the repository (LIVE): the
     workspace comes from workspacePaths[0]."""

@@ -165,3 +165,29 @@ def test_namespace_imports_in_js_keep_the_existing_prefix_semantics():
     assert not evaluate_forbid_ast_structured(tree, {'imports': ['promises']}, source=source)
     found = evaluate_forbid_ast_structured(tree, {'imports': ['fs/promises']}, source=source)
     assert len(found) == 1 and found[0]['kind'] == 'imports'
+
+
+def test_ac6_grouped_command_alias_is_a_confirmed_shell_finding(tmp_path):
+    source = tmp_path / 'lib.rs'
+    source.write_text('use std::process::{Command as Cmd, Stdio};\nfn run() { Cmd::new("sh"); }\n',
+                      encoding='utf-8')
+    result = security_pack.evaluate_security_pack(tmp_path, [source.name], {})
+    assert result['passed'] is False
+    assert [(row['rule_id'], row['kind'], row['pattern'], row['line'])
+            for row in result['violations']] == [
+        ('sec-rs-command-shell', 'calls', 'std::process::Command::new', 2),
+    ]
+    assert result['unverified_findings'] == []
+    assert result['exempted_test_findings'] == []
+
+
+def test_ac6_absolute_command_matches_import_and_call_without_use():
+    source = 'fn run() {\n std::process::Command::new("sh");\n}\n'
+    tree = extract_normalized_ast('src/lib.rs', code=source)
+    found = evaluate_forbid_ast_structured(
+        tree, {'imports': ['std::process'], 'calls': ['std::process::Command::new']}, source=source)
+    assert [(row['kind'], row['pattern'], row['line'], row['unknown'], row['override'])
+            for row in found] == [
+        ('imports', 'std::process', 2, False, None),
+        ('calls', 'std::process::Command::new', 2, False, None),
+    ]

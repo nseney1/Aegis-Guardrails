@@ -74,3 +74,20 @@ def test_real_native_uncertain_calls_reach_the_shared_evaluator(tmp_path, code, 
     tree = extract_normalized_ast(tmp_path / 'virtual.ts', code=code)
     found = evaluate_forbid_ast_structured(tree, {'calls': [pattern]}, source=code)
     assert len(found) == 1 and found[0]['unknown'] is unknown
+
+
+def test_ac1_import_policy_reports_all_three_import_sites(tmp_path):
+    source = """import {
+ exec as run,
+} from 'child_process'
+const cp = require("node:child_process")
+const {execSync} = require('child_process')
+"""
+    tree = extract_normalized_ast(tmp_path / 'virtual.ts', code=source)
+    found = evaluate_forbid_ast_structured(tree, {'imports': ['child_process']}, source=source)
+    assert [(row['kind'], row['pattern'], row['line'], row['unknown'], row['override'])
+            for row in found] == [
+        ('imports', 'child_process', 1, False, None),
+        ('imports', 'child_process', 4, False, None),
+        ('imports', 'child_process', 5, False, None),
+    ]

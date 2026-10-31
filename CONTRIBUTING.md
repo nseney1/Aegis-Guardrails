@@ -18,6 +18,8 @@ On Windows, use Git Bash for these shell examples, create the environment with `
 
 From this development checkout, `./aegis` or `python -m aegis_cli` runs the CLI. When changing worktrees, check the import location with `python -c "import aegis_core; print(aegis_core.__file__)"`: an editable install for another checkout can otherwise test the wrong code. Install into an environment for the checkout you are testing.
 
+Native JS/TS and Rust parser tests need only Python. Real Go parser/runtime tests need installed Go ≥1.21; TS/JS runner tests need Node and the selected runner/reporter already installed; Rust execution tests need Cargo, Rustup, an installed default toolchain and cached dependencies. Missing-tool skips are not evidence that those integrations passed. Aegis never downloads tools or dependencies during these checks. See [Language checks](docs/languages.md) for offline environments and runner contracts.
+
 Tests must never read or write your real `~/.aegis`, `~/.claude`, `~/.codex` or `~/.gemini`. Use `tmp_path`, a temporary `HOME` and `USERPROFILE`, and mock host CLIs at the subprocess boundary. This focused-test recipe preserves the active interpreter and isolates the child process's home:
 
 ```bash
@@ -32,6 +34,8 @@ import tempfile
 with tempfile.TemporaryDirectory(prefix="aegis-test-") as test_home:
     test_env = dict(os.environ, HOME=test_home, USERPROFILE=test_home,
                     XDG_CONFIG_HOME=str(Path(test_home) / ".config"),
+                    XDG_CACHE_HOME=str(Path(test_home) / ".cache"),
+                    LOCALAPPDATA=str(Path(test_home) / "AppData" / "Local"),
                     PYTHONUSERBASE=os.environ.get("PYTHONUSERBASE", site.getuserbase()))
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/unit/test_docs_claims.py", "-q"],
@@ -81,6 +85,8 @@ PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write
 ```
 
 The reference generator writes [docs/reference.md](docs/reference.md); never edit that file by hand. The legacy ratchet records lower counts of retired v3 words and refuses increases. Removing or renaming a public name pinned in `tests/contract/public_names_4_3_3.json` needs a `removed` entry there and a `Breaking:` line in the CHANGELOG. Keep `.github/scripts/wheel_smoke.py` in step with public-surface changes: it calls the CLI, the MCP tools and the SDK against the built wheel in CI.
+
+Shared CLI, MCP and SDK operations must keep equivalent semantics, argument normalization and authorization. Document intentional surface differences instead of adding a redundant MCP tool for every CLI command; keep aliases subject to the same validation and write classification.
 
 Docs: relative links must resolve (`tests/unit/test_docs_links.py`), the README must not repeat a retracted claim (`tests/unit/core/test_readme_claims.py`), and `rules/`, `skills/`, `docs/` and the README may not contain a path under `/home/` (a CI step greps for it).
 

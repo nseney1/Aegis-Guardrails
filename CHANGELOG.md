@@ -2,9 +2,13 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
-## [Unreleased]
+## [4.5.0] - 2026-10-31
 
 ### Added
+
+- Native regression adapters use Go package/subtest identities, Cargo integration-target identities and user-configured TS/JS JUnit with `witness: repo-runner`. They preserve mapping, build, timeout, incomplete-output and conflicting-result evidence; a compilation failure alone is not fail-to-pass.
+- Recorded checks and commit replay aggregate complete native language outcomes when no global test command is set. Pytest and `python -m unittest` produce complete JUnit receipts; text summaries alone no longer qualify.
+- Diff coverage reads Go coverprofiles and user-command LCOV for TS/JS and Rust, preserving unmeasured files and partial per-language results. Python keeps coverage.py with pytest-based `tests.command`.
 
 - Language security packs add five JS/TS rules, four Go rules and two Rust rules, with shared head/base parsing, introduced-findings checks and explicit unavailable-driver evidence. Rust weak-hash matching is omitted after its precision fixtures rejected legitimate Git-compatible SHA1 use.
 - Test-file pairing covers all eight JS/TS extensions, Go packages and Rust inline or integration tests. Successful Go package pairing is informational and never claims tests ran or earns receipt credit.
@@ -30,6 +34,14 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Go literals use canonical Python string rendering, and locally shadowed import receivers retain method matching without producing imported-call findings.
 - Windows AST driver cleanup retains process handles before termination, waits before removing its temporary directory, and reports descendants it cannot account for.
 - Distribution checks reject original ZIP member names changed by separator normalization or NUL truncation.
+
+### Configuration and upgrade notes
+
+- JS/TS and Rust AST checks are default-on. Existing `forbid_ast` rules naming those files now enforce without a configured driver. Go remains opt-in and requires an installed Go ≥1.21; no Node or Rust toolchain is needed for parsing.
+- Missing AST drivers produce `unverified no_driver:<ext>` rather than a silent skip; ordinary `--strict` makes that gap blocking. Native sources above 2 MiB remain advisory `too_large`, not verified.
+- User `tests.command` retains precedence over language adapters. Otherwise configure `tests.languages.ts|go|rust`; coverage uses `coverage.languages.ts|go|rust`. These settings never come from repository config. Aegis's default commands do not fetch dependencies or toolchains; user commands and repository tests are not a network sandbox.
+- The former `tests_not_pytest` catch-all is replaced by actionable regression reasons including `tests_runner_not_configured`, `tests_runner_unsupported`, `tests_inline_with_source`, `deps_unavailable`, `test_ids_unmapped`, `incomplete_test_output` and `conflicting_test_results`. Rust inline tests remain eligible for pairing but not independent fail-to-pass overlays.
+- MCP/CLI parity guidance now describes equivalent shared operations and intentional surface differences; no redundant MCP tools are added. The project-rule frontmatter alignment requires final maintainer governance review.
 
 ## [4.4.0] - 2026-10-29
 

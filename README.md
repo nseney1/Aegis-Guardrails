@@ -96,7 +96,7 @@ Run `aegis doctor` to check registrations. `git commit --no-verify` skips the lo
 4. **Commit and review.** The hook checks staged content; CI checks the commit and governance changes. Optional Layer 2 model review is advisory.
 5. **Review the evidence.** `aegis sync` derives fitness and suggests lifecycle changes. A person reviews and applies them; Aegis never promotes rules automatically.
 
-Passing a check, recording a test run and earning CI-confirmed rule credit are separate results. The current test runner recognizes pytest/JUnit evidence, with limited text-summary fallback; configuring a mixed Rust/Python or unittest command does not add reliable combined receipts. See [Evidence and outcomes](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/how-it-works.md#evidence-and-outcomes).
+Passing a check, recording a test run and earning CI-confirmed rule credit are separate results. Automatic test runs retain complete per-language evidence; an explicit global test command takes precedence and needs complete JUnit for a receipt. Test pairing alone is not execution evidence. See [Evidence and outcomes](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/how-it-works.md#evidence-and-outcomes).
 
 Read [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/how-it-works.md) for the concepts and examples, or [Architecture](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md) for components and data flow.
 
@@ -105,9 +105,17 @@ Read [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/doc
 - **A CLI** with 15 commands (`init`, `uninstall`, `doctor`, `migrate`, `check`, `approve`, `scan`, `status`, `rule`, `sync`, `hook`, `team`, `skills`, `benchmark`, `package`) and **an MCP server** with 5 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`, `aegis_capture_insight`).
 - **12 starter [rules](https://github.com/nseney1/Aegis-Guardrails/tree/main/rules)**: grounding claims in code, dry runs before destructive commands, behavioral tests, TDD, git hygiene and more (`aegis init --rules minimal|standard|full` seeds 2, 5 or all 12; set `target_paths` to activate them).
 - **15 [skills](https://github.com/nseney1/Aegis-Guardrails/tree/main/skills)**: `SKILL.md` playbooks synced by `aegis skills sync` (or `aegis init --skills`) into `.claude/skills/` and `.agents/skills/`.
-- **Built-in security checks**: a seven-rule Python security pack and a known-format secret scan run in every `aegis check` on what your change adds (`# aegis: allow[rule]` and `# gitleaks:allow` suppress a finding).
-- **Multi-language AST checks**: Python (in-process), plus packaged drivers for Rust, TypeScript/JavaScript (`node`) and Go (`go`).
+- **Built-in security checks**: language security packs and a known-format secret scan check what your change introduces; explicit allow comments record suppressions.
 - **A Python SDK facade**, `aegis_sdk.Governance`, for tools that query rules and fitness.
+
+| Language | Parsing | Security rules | Regression tests (fail-to-pass) | Coverage | Test pairing |
+|---|---|---:|---|---|---|
+| Python | In process | 7 | pytest | coverage.py | Filename lookup |
+| TS/JS | In process, default on | 5 | User JUnit runner | User LCOV command | `.test` / `.spec`, test directories |
+| Go | Opt-in cached parser | 4 | `go test -json` | Go coverprofile | Same package |
+| Rust | In process, default on | 2 | Cargo integration targets | User LCOV command | Inline / integration |
+
+Go parsing needs Go ≥1.21. JS/TS and Rust parsing need no Node or Rust toolchain; executing their tests needs installed tools and dependencies. See [Language checks](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/languages.md) for extraction limits, configuration, unavailable evidence and receipt requirements.
 
 ## Agent teams
 
@@ -117,7 +125,7 @@ Verify containment with `aegis check --lane docs`: every path changed since the 
 
 ## Limits and trust
 
-Aegis checks explicit patterns; a rule written only as prose remains guidance. Python AST matching is syntactic, not a proof about runtime behavior. Packaged drivers need their runtimes and activation; unparsed TypeScript/JavaScript and Go files are skipped when no driver is enabled.
+Aegis checks explicit patterns; a rule written only as prose remains guidance. AST matching is syntactic, not a proof about runtime behavior. Missing driver coverage is reported as `unverified no_driver`; ordinary `--strict` makes it blocking. Native files over 2 MiB produce advisory `too_large` evidence, and active parser failures fail closed.
 
 `aegis doctor` reports four enforcement tiers:
 
@@ -146,7 +154,7 @@ Aegis does not sandbox processes or authenticate its mutable local ledger. CI-co
 
 **What is AGENTS.md?** A markdown instructions file in the repository root that coding agents (Codex CLI, Antigravity, Claude Code) read at session start. Aegis writes only a small bootstrap block into it; rules stay in `.aegis/rules/` and are served just-in-time via `aegis_scan`.
 
-**Does Aegis send my code anywhere?** Not by itself. Aegis opens no network connection of its own, and the ledger stays on your machine, in your git directory. Three things can reach the network, all started by you: `aegis check --full --llm-cmd ...` pipes your plan, the source of the changed non-test Python files (not the diff; `__init__.py` is skipped), the test output and the Layer 1 results to the command you name; the commands listed in [PRIVACY.md](https://github.com/nseney1/Aegis-Guardrails/blob/main/PRIVACY.md) run your own `gh`; and `aegis sync --pr` pushes one branch to your remote. Your agent host sends what Aegis returns to its own model provider.
+**Does Aegis send my code anywhere?** Not by itself. Aegis opens no network connection of its own, and the ledger stays on your machine, in your git directory. Programs you authorize can reach the network: `aegis check --full --llm-cmd ...` sends your plan, changed non-test Python source, test output and Layer 1 results to your model command; test, coverage, perf and custom-driver commands can run code with network access; the commands listed in [PRIVACY.md](https://github.com/nseney1/Aegis-Guardrails/blob/main/PRIVACY.md) run your own `gh`; and `aegis sync --pr` pushes one branch to your remote. Your agent host sends what Aegis returns to its own model provider.
 
 **I used Aegis 3.x. How do I upgrade?** Run `aegis migrate`, then `aegis migrate --apply`, `aegis init --host <your hosts>`, and `aegis doctor --fix`. See the [changelog](https://github.com/nseney1/Aegis-Guardrails/blob/main/CHANGELOG.md#upgrading-from-3x) for details.
 
