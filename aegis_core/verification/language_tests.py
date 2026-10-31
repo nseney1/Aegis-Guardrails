@@ -184,19 +184,28 @@ def _dependencies(snapshot: Path, workspace: Path, enabled: bool):
         raise _Unavailable("deps_unavailable", "node_modules unavailable")
     if os.path.lexists(link):
         raise _Unavailable("deps_unavailable", "snapshot node_modules already exists")
+    junction = os.name == "nt"
     try:
-        link.symlink_to(source.resolve(), target_is_directory=True)
+        if junction:
+            from aegis_core.verification.windows_junction import create_directory_junction
+
+            create_directory_junction(source.resolve(), link)
+        else:
+            link.symlink_to(source.resolve(), target_is_directory=True)
     except OSError as exc:
         raise _Unavailable("deps_unavailable", f"node_modules link unavailable: {exc}") from exc
     owned = link.lstat()
+    owned_target = os.readlink(link)
     try:
         yield
     finally:
         if os.path.lexists(link):
             current = link.lstat()
-            if not link.is_symlink() or (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
+            expected_kind = getattr(current, "st_reparse_tag", 0) == 0xA0000003 if junction else link.is_symlink()
+            if (not expected_kind or (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino)
+                    or os.readlink(link) != owned_target):
                 raise _Unavailable("deps_unavailable", "snapshot node_modules link changed during execution")
-            link.unlink()
+            link.rmdir() if junction else link.unlink()
 
 
 def _unavailable(plan: LanguageTestPlan, reason: str, detail: str = "", outcome: RunOutcome | None = None) -> RunOutcome:
@@ -213,7 +222,7 @@ def run_language_snapshot(plan: LanguageTestPlan, snapshot: Path, workspace: Pat
 
     The caller owns head/base coordination and supplies an optional aggregate
     monotonic deadline. No snapshot retry or per-test subprocess is started.
-    TS dependency links require OS support; Windows privilege failure is explicit.
+    TS dependencies use POSIX symlinks or Windows junctions; link failures are explicit.
     """
     if not plan.available:
         return _unavailable(plan, plan.reason, plan.detail)

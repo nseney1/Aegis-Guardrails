@@ -340,7 +340,7 @@ def test_go_and_rust_record_limits_cannot_return_partial_pass_evidence():
 @pytest.mark.parametrize("text", [
     '<testsuite>' * 129 + '</testsuite>' * 129,
     '<testsuite>' + '<property/>' * 100_001 + '</testsuite>',
-])
+], ids=['depth-limit', 'element-limit'])
 def test_junit_depth_and_element_limits_are_explicit(text):
     run = parse_junit(text, repo_files={"tests/a.test.ts"}, exit_code=0)
     assert run.incomplete_errors == frozenset({"xml_structure_limit"}) and not run.evidence

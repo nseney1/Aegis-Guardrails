@@ -132,7 +132,7 @@ def prepare_language_runtime(workspace: Path, language: str, command: Sequence[s
         if go is None:
             raise RuntimeUnavailable("deps_unavailable", "Go cache discovery requires installed Go")
         probe_env = language_environment("go", env, parent=parent, executable=go)
-        probe_env.update((key, parent[key]) for key in ("HOME", "USERPROFILE", "GOPATH") if parent.get(key))
+        probe_env.update((key, parent[key]) for key in ("HOME", "USERPROFILE", "GOPATH", "LOCALAPPDATA", "XDG_CACHE_HOME") if parent.get(key))
         values = _probe((go, "env", "GOCACHE", "GOMODCACHE"), scratch, probe_env).strip().splitlines()
         if len(values) != 2 or not all(os.path.isabs(value) for value in values):
             raise RuntimeUnavailable("deps_unavailable", "Go cache probe returned invalid paths")

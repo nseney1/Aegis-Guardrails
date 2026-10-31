@@ -13,11 +13,19 @@ from aegis_core.testplans import rebase_snapshot_arguments
 
 _BOOTSTRAP = (
     "import json,os,sys\n"
-    "snap,ws,ext=sys.argv[1],sys.argv[2],json.loads(sys.argv[3])\n"
+    "snap,ws,ext,count=sys.argv[1],sys.argv[2],json.loads(sys.argv[3]),int(sys.argv[4])\n"
     "key=lambda p:os.path.normcase(os.path.realpath(p))\n"
     "within=lambda p,d:key(p)==key(d) or key(p).startswith(key(d).rstrip(os.sep)+os.sep)\n"
     "sys.path[:]=[snap]+[p for p in (*sys.path,*ext) if p and (within(p,snap) or not within(p,ws))]\n"
-    "import pytest\nraise SystemExit(pytest.main(sys.argv[4:]))\n"
+    "import pytest\n"
+    "class Selection:\n"
+    " def pytest_configure(self,config):\n"
+    "  if not count: return\n"
+    "  chosen=config.args[:-count]\n"
+    "  paths=[word.partition('::')[0] for word in chosen]\n"
+    "  covered=lambda file:any(key(file)==key(path) or (os.path.isdir(path) and within(file,path)) for path in paths)\n"
+    "  config.args[:]=chosen+[file for file in config.args[-count:] if not covered(file)]\n"
+    "raise SystemExit(pytest.main(sys.argv[5:],plugins=[Selection()]))\n"
 )
 
 
@@ -34,6 +42,7 @@ class CommandOutcome:
 def run_configured_snapshot(command: Sequence[str], snapshot: Path, files: Sequence[str], workspace: Path,
                              scratch: Path, timeout: float) -> CommandOutcome:
     """Unknown wrappers execute once but cannot prove fail-to-pass from a success summary."""
+    snapshot, workspace, scratch = Path(snapshot).resolve(), Path(workspace).resolve(), Path(scratch).resolve()
     scratch.mkdir(parents=True)
     home, tmp, junit = scratch / "home", scratch / "tmp", scratch / "results.xml"
     home.mkdir()
@@ -48,9 +57,14 @@ def run_configured_snapshot(command: Sequence[str], snapshot: Path, files: Seque
         # Preserve the configured pytest selection and interpreter options, while keeping live editable installs out.
         module = testexec.python_module_index(logical[1:])
         before = rebase_snapshot_arguments(logical[1:1 + module], workspace, snapshot) if module >= 0 else []
+        # Let pytest parse positional selections; option values must never be guessed to be paths.
+        delimiter = arguments.index("--") if "--" in arguments else len(arguments)
+        selections = arguments[delimiter + 1:]
+        arguments = arguments[:delimiter]
         argv = [argv[0], "-I", "-S", "-B", *before, "-c", _BOOTSTRAP, str(snapshot), str(workspace), json.dumps(external),
+                str(len(files)),
                 *arguments, "-p", "no:cacheprovider", "-o", "addopts=", "--continue-on-collection-errors",
-                "--rootdir=" + str(snapshot), "--junitxml=" + str(junit), "--", *files]
+                "--rootdir=" + str(snapshot), "--junitxml=" + str(junit), "--", *selections, *files]
     result = testexec.run_tests(argv, snapshot, testexec.hermetic_env(home, tmp), timeout, junit, scratch / "output.log")
     if arguments is None:
         return CommandOutcome(result.exit, result.timed_out, reason="tests_runner_unsupported")
