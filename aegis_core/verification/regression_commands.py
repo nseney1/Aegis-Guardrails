@@ -59,12 +59,14 @@ def run_configured_snapshot(command: Sequence[str], snapshot: Path, files: Seque
         before = rebase_snapshot_arguments(logical[1:1 + module], workspace, snapshot) if module >= 0 else []
         # Let pytest parse positional selections; option values must never be guessed to be paths.
         delimiter = arguments.index("--") if "--" in arguments else len(arguments)
-        selections = arguments[delimiter + 1:]
+        selections = arguments[delimiter:]
         arguments = arguments[:delimiter]
+        # pytest 8 rejects a new delimiter after interspersed positional arguments and options.
+        # Preserve the user's delimiter and shield automatic paths with an explicit relative prefix.
         argv = [argv[0], "-I", "-S", "-B", *before, "-c", _BOOTSTRAP, str(snapshot), str(workspace), json.dumps(external),
                 str(len(files)),
                 *arguments, "-p", "no:cacheprovider", "-o", "addopts=", "--continue-on-collection-errors",
-                "--rootdir=" + str(snapshot), "--junitxml=" + str(junit), "--", *selections, *files]
+                "--rootdir=" + str(snapshot), "--junitxml=" + str(junit), *selections, *("./" + file for file in files)]
     result = testexec.run_tests(argv, snapshot, testexec.hermetic_env(home, tmp), timeout, junit, scratch / "output.log")
     if arguments is None:
         return CommandOutcome(result.exit, result.timed_out, reason="tests_runner_unsupported")
