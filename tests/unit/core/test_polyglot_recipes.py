@@ -1,17 +1,10 @@
 """Unit tests for polyglot AST recipe drivers and mutation testing adaptations."""
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
 from pathlib import Path
-import pytest
 
 from aegis_core.ast.runner import ASTDriverRegistry, ASTDriverRunner
 from aegis_core.ast.schema import (
-    CallSiteNode,
-    DefinitionNode,
-    ImportNode,
     MutationPoint,
     NormalizedAST,
 )
@@ -93,12 +86,10 @@ class TestMutationPointApplication:
 
 
 class TestPolyglotRecipes:
-    """Test Node.js/TypeScript and Go driver recipes."""
+    """Test native TypeScript extraction and the packaged Go source."""
 
     def test_ts_ast_recipe_execution(self, tmp_path):
-        node_bin = shutil.which("node")
-        if not node_bin:
-            pytest.skip("node is not available on PATH")
+        from aegis_core.ast.drivers.js import parse
 
         ts_code = (
             "import { helper } from './utils';\n"
@@ -112,20 +103,7 @@ class TestPolyglotRecipes:
         sample_ts = tmp_path / "calc.ts"
         sample_ts.write_text(ts_code, encoding="utf-8")
 
-        recipe_path = Path(__file__).parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "ts_ast.js"
-        assert recipe_path.is_file(), f"Recipe file missing at {recipe_path}"
-
-        proc = subprocess.run(
-            [node_bin, str(recipe_path), str(sample_ts)],
-            capture_output=True,
-            text=True,
-            timeout=_HANG_CEILING,
-            stdin=subprocess.DEVNULL,
-        )
-        assert proc.returncode == 0, f"Driver failed with stderr: {proc.stderr}"
-
-        data = json.loads(proc.stdout)
-        norm_ast = NormalizedAST.from_dict(data)
+        norm_ast = NormalizedAST.from_json(parse(ts_code, str(sample_ts)).to_json())
 
         assert norm_ast.language == "typescript"
         assert any(d.name == "calculate" and d.is_exported for d in norm_ast.definitions)
@@ -134,18 +112,11 @@ class TestPolyglotRecipes:
         assert any(m.original_op == "===" and m.replacement_op == "!==" for m in norm_ast.mutation_points)
 
     def test_ast_driver_runner_with_ts_recipe(self, tmp_path):
-        node_bin = shutil.which("node")
-        if not node_bin:
-            pytest.skip("node is not available on PATH")
-
         ts_code = "export function run(): void { console.log('hello'); }"
         sample_ts = tmp_path / "app.ts"
         sample_ts.write_text(ts_code, encoding="utf-8")
 
-        recipe_path = Path(__file__).parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "ts_ast.js"
-        driver_cmd = f'"{node_bin}" "{recipe_path}"'
-
-        registry = ASTDriverRegistry(drivers={".ts": driver_cmd})
+        registry = ASTDriverRegistry(drivers={".ts": 'must-never-execute'})
         runner = ASTDriverRunner(registry=registry)
         norm_ast = runner.parse_file(str(sample_ts), workspace_root=str(tmp_path), timeout=_HANG_CEILING)
 

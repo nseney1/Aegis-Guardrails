@@ -243,7 +243,9 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
             raise InstallError(f"{label}: resolves outside the repository; aegis init --ci writes the workflow only "
                                "inside it. Re-run without --ci.")
     dest = workflows / "aegis.yml"
-    data = ci_workflow().encode("utf-8")
+    from aegis_cli.language_capabilities import needs_go_setup
+
+    data = ci_workflow(go_enabled=needs_go_setup(root)).encode("utf-8")
     if os.path.lexists(dest):
         try:
             same = not dest.is_symlink() and dest.is_file() and dest.read_bytes() == data
@@ -677,6 +679,10 @@ def _announce(report: Report, root: Path, selected: List[str], detected: List[st
         report.say(f"  Detected language(s): {', '.join(k.title() for k in sorted(languages))}")
     else:
         report.say("  Project type: unknown (rules are language-agnostic)")
+    from aegis_cli.language_capabilities import capability_lines, runner_suggestion
+
+    for line in capability_lines(root, languages) + runner_suggestion(root):
+        report.say(line)
     if selected:
         report.say(f"  Hosts: {_with_surfaces(selected)}")
     else:

@@ -50,7 +50,11 @@ __all__ = [
 
 Patterns = Union[str, Iterable[object], None]
 
-_TEST_SUFFIXES = ("_test.py", "_test.go", ".test.ts", ".spec.ts", ".test.js", ".spec.js")
+_TEST_SUFFIXES = ("_test.py", "_test.go") + tuple(
+    f".{kind}.{extension}"
+    for kind in ("test", "spec")
+    for extension in ("ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs")
+)
 
 
 def normalize_path(path: str) -> str:
@@ -350,7 +354,7 @@ def credit_weights(rules: Mapping[str, Patterns], files: Iterable[str]) -> Dict[
 
 
 def is_test_path(path: str) -> bool:
-    """Whether ``path`` is a test file: under a ``tests/`` directory, ``test_*``,
+    """Whether ``path`` is a test file: under ``tests/`` or ``__tests__/``, ``test_*``,
     ``conftest.py``, or a ``*_test.py``/``*_test.go``/``*.test.ts``/``*.spec.js`` style name.
 
     The one test-file predicate (defense #25); callers that also skip support files
@@ -360,7 +364,7 @@ def is_test_path(path: str) -> bool:
     parts = rel.split("/")
     base = parts[-1]
     return (
-        "tests" in parts[:-1]
+        any(part in ("tests", "__tests__") for part in parts[:-1])
         or base.startswith("test_")
         or base == "conftest.py"
         or base.endswith(_TEST_SUFFIXES)

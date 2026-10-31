@@ -341,7 +341,7 @@ def test_fix_refuses_a_symlinked_user_plane(env, tmp_path):
 
 def test_the_ast_driver_fix_also_needs_yes_and_backs_up_the_config(env, monkeypatch):
     (env.ws / "src").mkdir()
-    (env.ws / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (env.ws / "src" / "main.go").write_text("package main\nfunc main() {}\n", encoding="utf-8")
     config = env.ws / ".aegis" / "config.json"
     config.write_bytes(b'{"v": 1, "hosts": []}\n')
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
@@ -349,7 +349,7 @@ def test_the_ast_driver_fix_also_needs_yes_and_backs_up_the_config(env, monkeypa
     assert rc == 1 and config.read_bytes() == b'{"v": 1, "hosts": []}\n'
 
     payload = env.fix()
-    assert '"rs"' in config.read_text()
+    assert '"go"' in config.read_text()
     (backup,) = env.backups()
     assert b'{"v": 1, "hosts": []}\n' in [p.read_bytes() for p in backup.rglob("*") if p.is_file()]
     assert any(f["action"] == "enable_packaged_ast_drivers" and f["status"] == "applied" for f in payload["fixes"])

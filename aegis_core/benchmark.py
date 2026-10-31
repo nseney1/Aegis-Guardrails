@@ -309,10 +309,18 @@ def _check_runs(runs: Any) -> int:
 
 
 def run_benchmark(runs: int = DEFAULT_RUNS, *, clock: Callable[[], float] = time.perf_counter,
-                  spawn: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+                  spawn: Callable[..., Any] = subprocess.run, ast_language: Optional[str] = None) -> Dict[str, Any]:
     """Measure the scan, Layer 1 and the hook on the fixture corpus; BenchmarkError when any
     cannot be measured honestly. The temporary workspace is removed whatever happens."""
     runs = _check_runs(runs)
+    ast_result = None
+    if ast_language is not None:
+        from aegis_core import benchmark_ast
+
+        try:
+            ast_result = benchmark_ast.measure(ast_language, runs, clock=clock, summarize=summarize)
+        except benchmark_ast.ASTBenchmarkError as exc:
+            raise BenchmarkError(str(exc)) from exc
     corpus = load_corpus()
     base = tempfile.mkdtemp(prefix="aegis-bench-")
     try:
@@ -323,7 +331,7 @@ def run_benchmark(runs: int = DEFAULT_RUNS, *, clock: Callable[[], float] = time
         hook = measure_hook(root, corpus, runs, clock, spawn)
     finally:
         shutil.rmtree(base, ignore_errors=True)
-    return {
+    result = {
         "runs": runs,
         "python": sys.version.split()[0],
         "platform": sys.platform,
@@ -333,11 +341,14 @@ def run_benchmark(runs: int = DEFAULT_RUNS, *, clock: Callable[[], float] = time
         "hook_run": hook,
         "layer1": layer1,
     }
+    if ast_result is not None:
+        result["ast"] = ast_result
+    return result
 
 
 def event_detail(result: Mapping[str, Any]) -> Dict[str, Any]:
     """The numbers a later run is compared with: the ``benchmark`` event's detail."""
-    return {
+    detail = {
         "runs": result["runs"],
         "corpus_sha256": result["corpus"]["sha256"],
         "scan_p50_ms": result["scan"]["latency_ms"]["p50"],
@@ -350,6 +361,9 @@ def event_detail(result: Mapping[str, Any]) -> Dict[str, Any]:
         "python": result["python"],
         "platform": result["platform"],
     }
+    if "ast" in result:
+        detail["ast"] = result["ast"]
+    return detail
 
 
 def record(workspace: Any, result: Mapping[str, Any]) -> Optional[Exception]:

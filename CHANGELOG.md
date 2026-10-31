@@ -2,7 +2,46 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
-## [Unreleased]
+## [4.5.0] - 2026-10-31
+
+### Added
+
+- Native regression adapters use Go package/subtest identities, Cargo integration-target identities and user-configured TS/JS JUnit with `witness: repo-runner`. They preserve mapping, build, timeout, incomplete-output and conflicting-result evidence; a compilation failure alone is not fail-to-pass.
+- Recorded checks and commit replay aggregate complete native language outcomes when no global test command is set. Pytest and `python -m unittest` produce complete JUnit receipts; text summaries alone no longer qualify.
+- Diff coverage reads Go coverprofiles and user-command LCOV for TS/JS and Rust, preserving unmeasured files and partial per-language results. Python keeps coverage.py with pytest-based `tests.command`.
+
+- Language security packs add five JS/TS rules, four Go rules and two Rust rules, with shared head/base parsing, introduced-findings checks and explicit unavailable-driver evidence. Rust weak-hash matching is omitted after its precision fixtures rejected legitimate Git-compatible SHA1 use.
+- Test-file pairing covers all eight JS/TS extensions, Go packages and Rust inline or integration tests. Successful Go package pairing is informational and never claims tests ran or earns receipt credit.
+- Init and doctor show language capabilities and suggest user-owned Vitest/Jest runner configuration without writing commands selected by repository metadata. Generated check and SARIF workflows prepare Go only when needed.
+- TypeScript/JavaScript AST checks use Aegis's own in-process parser by default across all eight source extensions, without Node or parser dependencies. Imports, arguments, decorators, allow comments and mutation points retain source positions.
+- Rust AST checks now use the native in-process parser by default, without Cargo, rustc or repository dependencies. Imports, arguments, attributes, test functions and inline test modules retain their source positions.
+- Opted-in Go parsing uses one cached, offline-built protocol-v2 driver per check; ordinary doctor and card inspect without building, and confirmed doctor repair can prepare the cache.
+- Bounded protocol v2 driver sessions and per-check parse reuse, with additive AST capabilities, canonical matching and typed literal conditions.
+- Explicit missing-driver evidence in checks and receipts; ordinary `--strict` blocks missing AST coverage. Receipts retain per-file language and missing-driver reasons.
+- Offline standard-library Go build checks and exact packaged-asset dependency gates.
+- Optional AST source benchmarks with matched language fixtures, content digests and extraction witnesses: `aegis benchmark --ast-language python`, `typescript`, `javascript` or `rust`. Measurements do not claim performance acceptance; unavailable implementations remain explicit errors.
+
+### Changed
+
+- Native Rust replaces the shipped `rust_ast.py` template. Exact legacy Rust selectors and unedited staged copies are retired during migration; custom commands and the Go opt-in are preserved.
+- Project governance rules now pair focused source contracts with default-budget delivery regressions and advisory baseline coverage. Fourteen prose-only trap gates become advisory; narrowed process scopes and updated ledger/command/parity guidance require maintainer approval.
+- Wave pull requests retain base-sourced governance checks while full audit, build, test and regression validation runs on develop pushes and downstream stages.
+
+### Fixed
+
+- Unresolved JS import/call targets retain advisory UNKNOWN evidence; source files above the native parser's 2 MiB limit report `unverified too_large` with an exclusion hint, and `check --record` receipts keep reason `too_large` on those rows.
+- Security checks retain native files in staged snapshots, share the check-local AST session with other checks, and distinguish missing drivers from configured-driver failures while preserving the 2 MiB advisory.
+- Go literals use canonical Python string rendering, and locally shadowed import receivers retain method matching without producing imported-call findings.
+- Windows AST driver cleanup retains process handles before termination, waits before removing its temporary directory, and reports descendants it cannot account for.
+- Distribution checks reject original ZIP member names changed by separator normalization or NUL truncation.
+
+### Configuration and upgrade notes
+
+- JS/TS and Rust AST checks are default-on. Existing `forbid_ast` rules naming those files now enforce without a configured driver. Go remains opt-in and requires an installed Go ≥1.21; no Node or Rust toolchain is needed for parsing.
+- Missing AST drivers produce `unverified no_driver:<ext>` rather than a silent skip; ordinary `--strict` makes that gap blocking. Native sources above 2 MiB remain advisory `too_large`, not verified.
+- User `tests.command` retains precedence over language adapters. Otherwise configure `tests.languages.ts|go|rust`; coverage uses `coverage.languages.ts|go|rust`. These settings never come from repository config. Aegis's default commands do not fetch dependencies or toolchains; user commands and repository tests are not a network sandbox.
+- The former `tests_not_pytest` catch-all is replaced by actionable regression reasons including `tests_runner_not_configured`, `tests_runner_unsupported`, `tests_inline_with_source`, `deps_unavailable`, `test_ids_unmapped`, `incomplete_test_output` and `conflicting_test_results`. Rust inline tests remain eligible for pairing but not independent fail-to-pass overlays.
+- MCP/CLI parity guidance now describes equivalent shared operations and intentional surface differences; no redundant MCP tools are added. The project-rule frontmatter alignment requires final maintainer governance review.
 
 ## [4.4.0] - 2026-10-29
 

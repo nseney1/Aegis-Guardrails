@@ -94,9 +94,10 @@ launcher check compares what each host registered with what ``aegis init --host`
 register from this install.
 
 ``--fix`` changes only what a finding reported as fixable, after confirmation (``--yes``
-skips it). Every file is first copied to ``~/.aegis/backups/<UTC stamp>/`` with a manifest;
+skips it). Configuration files are first copied to ``~/.aegis/backups/<UTC stamp>/`` with a manifest;
 writes are atomic; a symlink, a hard link or a file that changed since the check is never
-written. It never edits shell rc files (D17) and never writes TOML.
+written. Generated Go driver cache entries are rebuilt, without a binary backup.
+It never edits shell rc files (D17) and never writes TOML.
 """
 from __future__ import annotations
 
@@ -355,8 +356,14 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
     except SlotResolutionError as exc:
         print(f"  ❌ AST drivers: {exc}")
         return False
+    from aegis_cli.language_capabilities import capability_lines, runner_suggestion
+
+    for line in capability_lines(ws_root) + runner_suggestion(ws_root):
+        print(line)
     if missing:
-        print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. Run 'aegis doctor --fix' to provision.")
+        reasons = ', '.join(f'no_driver:{ext}' for ext in missing)
+        print(f"  ⚠️  AST drivers: unconfigured driver for detected source extension(s): {', '.join(missing)}. "
+              f"Run 'aegis doctor --fix' to provision packaged drivers; other languages need a user-scope driver ({reasons}).")
         return False
 
     if not ast_drivers:
@@ -371,6 +378,24 @@ def _check_ast_drivers(project_root: Path) -> Optional[bool]:
         except Exception as exc:  # like the card, keep a failed plan visible in the diagnostic
             print(f"  ⚠️  AST driver ({ext}): {type(exc).__name__}: {exc}")
             all_resolvable = False
+            continue
+        if plan is not None and (plan.in_process_js or plan.in_process_rust):
+            print(f"  ✅ AST driver ({ext}): {plan.label}")
+            continue
+        if plan is not None and plan.packaged_go:
+            from aegis_core.ast.gobuild import GoDriverUnavailableError, inspect_go_driver
+
+            try:
+                status = inspect_go_driver(ws_root)
+                if status.cache_hit:
+                    print(f"  ✅ AST driver ({ext}): {status.goversion} ({status.compiler}); cache hit ({status.binary})")
+                else:
+                    print(f"  ⚠️  AST driver ({ext}): {status.goversion} ({status.compiler}); Go driver cache is cold; "
+                          "run aegis doctor --drivers --fix")
+                    all_resolvable = False
+            except GoDriverUnavailableError as exc:
+                print(f"  ⚠️  AST driver ({ext}): {exc}")
+                all_resolvable = False
             continue
         try:
             parts = (
@@ -828,15 +853,15 @@ class DoctorCommand(AegisCommand):
         "Read-only health checks, the host matrix (binary, registration, identity, workspace, "
         "bootstrap, budget per host) and the enforcement tiers in force here. --fix changes only "
         "what doctor reported (stale v3 and misplaced MCP entries, v3 hook entries, legacy rule "
-        "blocks, unedited v3 rule copies, missing packaged AST drivers), after confirmation, backing each file up "
-        "to ~/.aegis/backups/<UTC stamp>/ first."
+        "blocks, unedited v3 rule copies, missing packaged AST drivers and Go cache entries), after confirmation. "
+        "Configuration files are backed up to ~/.aegis/backups/<UTC stamp>/ first; generated cache entries are rebuilt."
     )
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--fix",
             action="store_true",
-            help="Repair what doctor reported, after confirmation; every file is backed up first",
+            help="Repair after confirmation; configuration files are backed up and generated Go caches are rebuilt",
         )
         parser.add_argument(
             "--yes",

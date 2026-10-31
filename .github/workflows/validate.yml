@@ -20,6 +20,7 @@ jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
   dependency-audit:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -36,6 +37,7 @@ jobs:
         run: pip-audit --strict .
 
   build-wheel:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: dependency-audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -55,6 +57,10 @@ jobs:
           python-version: '3.11'
       - name: Install build tools
         run: pip install build==1.6.1
+      - name: Enforce zero runtime dependencies and offline Go build
+        run: |
+          python .github/scripts/check_zero_dependencies.py source .
+          python .github/scripts/check_zero_dependencies.py go .
       - name: Build wheel and sdist (the only build of this release)
         run: python -m build
       - name: Record artifact digests
@@ -97,39 +103,59 @@ jobs:
       - name: Verify upstream jobs succeeded
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EXPECTED_RESULT: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && 'skipped' || 'success' }}
         run: |
-          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != "success"}; sys.exit(f"Upstream jobs did not succeed: {bad}" if bad else 0)'
+          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != expected}; sys.exit(f"Unexpected upstream job results (expected {expected}): {bad}" if bad else 0)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch wave pull request head as data
+        if: github.event_name == 'pull_request' && github.base_ref == 'develop'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
+      # Wave tests run locally. This unconditional, base-sourced comparison keeps
+      # the required aegis-check context without executing the wave's code.
+      - name: Run CI governance without execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m aegis_cli.cli check --ci --no-exec
       - name: Set up Python
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
       - name: Download wheel artifact
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: aegis-wheel
           path: dist/
       - name: Verify artifact digests
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: python .github/scripts/verify_dist.py verify dist
       # Same text as the other test jobs (a workflow test compares them): check --ci reruns the
       # head commit's trailer snapshot here, which must collect what those jobs collect.
       - name: Install test dependencies
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: |
           pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
           pip install dist/*.whl
       # -I keeps the checkout off sys.path: the installed wheel is what runs. check --ci runs only
       # in this job (its id is the required context); each OS leg keeps Layer 1.
       - name: Run Layer 1 Deterministic Verification
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: python3 -I -m aegis_cli.cli check
       - name: Run CI Governance & Regression Check
+        if: github.event_name != 'pull_request' || github.base_ref != 'develop'
         run: python3 -I -m aegis_cli.cli check --ci
         env:
           GH_TOKEN: ${{ github.token }}
 
   validate:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: [build-wheel, dependency-audit]
     timeout-minutes: 300
     strategy:
@@ -205,6 +231,7 @@ jobs:
   # continue-on-error. Steps run under Git Bash (as on a contributor's machine);
   # tests that drive PowerShell spawn it themselves.
   test-windows:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: build-wheel
     runs-on: windows-latest
     timeout-minutes: 45
@@ -260,6 +287,118 @@ jobs:
         run: |
           python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
           python -m pytest tests/ -q -n auto
+
+      # Shared source preparation for Go and P6. The identical pinned AC24 helper
+      # is a proposed common payload; the separate acquisition patch remains held.
+      - name: Prepare clean tracked source for language acceptance
+        id: language-source
+        env:
+          AEGIS_SOURCE_AUDIT: ${{ github.sha }}
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          PREP="$RUNNER_TEMP/aegis-language-prepare-$AEGIS_PYTHON_LEG.py"
+          git show "${AEGIS_SOURCE_AUDIT}:.github/scripts/prepare_language_acceptance.py" > "$PREP"
+          TREE="$(git rev-parse "${AEGIS_SOURCE_AUDIT}^{tree}")"
+          OWNER_ARGS=()
+          if [ -n "${AEGIS_ACCEPTANCE_OWNER:-}" ]; then
+            OWNER_ARGS=(--ownership-helper "$AEGIS_ACCEPTANCE_OWNER")
+          fi
+          python -I -S -B "$PREP" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --source "$RUNNER_TEMP/aegis-language-source-$AEGIS_PYTHON_LEG" \
+            --audit "$AEGIS_SOURCE_AUDIT" --tree "$TREE" \
+            --evidence "$RUNNER_TEMP/aegis-language-preparation-$AEGIS_PYTHON_LEG" \
+            --require-platform win32 --github-output "$GITHUB_OUTPUT" "${OWNER_ARGS[@]}"
+
+      - name: Verify real Go CLI cache and generated hooks
+        env:
+          AEGIS_LANGUAGE_SOURCE: ${{ steps.language-source.outputs.source }}
+          AEGIS_LANGUAGE_AUDIT: ${{ steps.language-source.outputs.audit }}
+          AEGIS_LANGUAGE_TREE: ${{ steps.language-source.outputs.tree }}
+          AEGIS_GO_EXECUTABLE: ${{ steps.language-source.outputs.go }}
+          AEGIS_GIT_EXECUTABLE: ${{ steps.language-source.outputs.git }}
+          AEGIS_BASH_EXECUTABLE: ${{ steps.language-source.outputs.bash }}
+          AEGIS_OWNER_HELPER: ${{ steps.language-source.outputs.owner }}
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          python -I -S -B "$AEGIS_LANGUAGE_SOURCE/.github/fixtures/go-functional/acceptance.py" \
+            --source "$AEGIS_LANGUAGE_SOURCE" \
+            --audit "$AEGIS_LANGUAGE_AUDIT" --tree "$AEGIS_LANGUAGE_TREE" \
+            --go "$AEGIS_GO_EXECUTABLE" --git "$AEGIS_GIT_EXECUTABLE" --bash "$AEGIS_BASH_EXECUTABLE" \
+            --ownership-helper "$AEGIS_OWNER_HELPER" \
+            --evidence "$RUNNER_TEMP/aegis-go-functional-$AEGIS_PYTHON_LEG" \
+            --require-platform win32 --mode acceptance --root-inspected
+
+      - name: Verify junction creation with a restricted effective token
+        env:
+          AEGIS_LANGUAGE_SOURCE: ${{ steps.language-source.outputs.source }}
+          AEGIS_LANGUAGE_AUDIT: ${{ steps.language-source.outputs.audit }}
+          AEGIS_LANGUAGE_TREE: ${{ steps.language-source.outputs.tree }}
+          AEGIS_SOURCE_RECEIPT: ${{ steps.language-source.outputs.receipt }}
+          AEGIS_RECEIPT_SHA256: ${{ steps.language-source.outputs.receipt_sha256 }}
+          AEGIS_OWNER_HELPER: ${{ steps.language-source.outputs.owner }}
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          python -I -S -B "$AEGIS_LANGUAGE_SOURCE/.github/scripts/p6_noadmin.py" \
+            --source "$AEGIS_LANGUAGE_SOURCE" --owner-helper "$AEGIS_OWNER_HELPER" \
+            --source-receipt "$AEGIS_SOURCE_RECEIPT" --expected-receipt-sha256 "$AEGIS_RECEIPT_SHA256" \
+            --expected-audit "$AEGIS_LANGUAGE_AUDIT" --expected-tree "$AEGIS_LANGUAGE_TREE" \
+            --evidence "$RUNNER_TEMP/aegis-p6-noadmin-$AEGIS_PYTHON_LEG"
+
+      - name: Curate Go and P6 acceptance JSON and logs
+        if: always()
+        env:
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          python -I -S -B - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          leg = os.environ["AEGIS_PYTHON_LEG"]
+          output = root / ("aegis-go-curated-" + leg)
+          output.mkdir()
+          files, hooks, absent = {}, {}, []
+          for prefix in ("aegis-language-preparation-", "aegis-go-functional-", "aegis-p6-noadmin-"):
+              source = root / (prefix + leg)
+              if not source.is_dir():
+                  absent.append(source.name)
+                  continue
+              target = output / source.name
+              target.mkdir()
+              for path in sorted(source.iterdir()):
+                  if not path.is_file() or path.is_symlink():
+                      continue
+                  key = str(path.relative_to(root)).replace("\\", "/")
+                  if path.suffix in (".json", ".jsonl", ".log"):
+                      copied = target / path.name
+                      shutil.copy2(path, copied)
+                      files[str(copied.relative_to(output)).replace("\\", "/")] = {
+                          "sha256": hashlib.sha256(copied.read_bytes()).hexdigest(),
+                          "bytes": copied.stat().st_size}
+                  elif path.name.endswith("-generated-hook.sh"):
+                      hooks[key] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                    "text": path.read_text(encoding="utf-8")}
+          payload = output / "generated-hooks.json"
+          payload.write_text(json.dumps(hooks, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          files[payload.name] = {"sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+                                "bytes": payload.stat().st_size}
+          manifest = {"status": "CURATED_ONLY", "files": files, "absent_directories": absent,
+                      "excludes": ["source checkout", "venv", "fixture repositories", "compiler caches",
+                                   "executable payloads"],
+                      "scope": "Curation is not acceptance; inspect the preserved execution and preparation statuses."}
+          (output / "curated-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                                                        encoding="utf-8")
+          PY
+
+      - name: Preserve Go and P6 acceptance JSON and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: aegis-go-windows-${{ matrix.python-version }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/aegis-go-curated-${{ matrix.python-version }}/
 
   # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
   # once every job passed, only on the events doctor --release consumes (not release, not PRs).

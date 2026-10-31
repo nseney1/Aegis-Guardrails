@@ -73,6 +73,8 @@ packages = [
     "aegis_core._data.skills",
     "aegis_core.ast",
     "aegis_core.ast.drivers",
+    "aegis_core.ast.drivers.js",
+    "aegis_core.ast.drivers.rust",
     "aegis_core.ast.drivers.templates",
     "aegis_core.command_safety",
     "aegis_core.insights",
@@ -98,7 +100,12 @@ version = {attr = "aegis_core._version.__version__"}
 
 [tool.setuptools.package-data]
 aegis_sdk = ["py.typed"]
-aegis_core = ["ast/drivers/templates/*", "benchmark_corpus/corpus.json"]
+aegis_core = [
+    "ast/drivers/templates/go_ast.go",
+    "ast/drivers/templates/go.mod",
+    "benchmark_corpus/corpus.json",
+    "benchmark_corpus/ast.json",
+]
 "aegis_core._data.rules" = ["*.md", ".oracles/*.md"]
 "aegis_core._data.skills" = ["*/SKILL.md"]
 

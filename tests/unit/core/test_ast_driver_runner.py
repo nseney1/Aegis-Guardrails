@@ -58,11 +58,11 @@ print(json.dumps(result))
 """
     driver_script.write_text(driver_code, encoding="utf-8")
 
-    target_ts = tmp_path / "app.ts"
+    target_ts = tmp_path / "app.external"
     target_ts.write_text("export function mockFunc() {}", encoding="utf-8")
 
     registry = ASTDriverRegistry()
-    registry.register_driver(".ts", f"{sys.executable} {driver_script}")
+    registry.register_driver(".external", f"{sys.executable} {driver_script}")
 
     runner = ASTDriverRunner(registry=registry)
     result = runner.parse_file(target_ts, workspace_root=tmp_path)
@@ -76,11 +76,11 @@ def test_external_driver_timeout(tmp_path):
     driver_script = tmp_path / "sleep_driver.py"
     driver_script.write_text("import time; time.sleep(5)", encoding="utf-8")
 
-    target_ts = tmp_path / "slow.ts"
+    target_ts = tmp_path / "slow.external"
     target_ts.write_text("// slow", encoding="utf-8")
 
     registry = ASTDriverRegistry()
-    registry.register_driver(".ts", f"{sys.executable} {driver_script}")
+    registry.register_driver(".external", f"{sys.executable} {driver_script}")
 
     runner = ASTDriverRunner(registry=registry)
     with pytest.raises(ASTDriverTimeoutError, match="timed out"):
@@ -91,11 +91,11 @@ def test_external_driver_crash_fails_closed(tmp_path):
     driver_script = tmp_path / "failing_driver.py"
     driver_script.write_text("import sys; sys.stderr.write('Fatal crash'); sys.exit(2)", encoding="utf-8")
 
-    target_ts = tmp_path / "fail.ts"
+    target_ts = tmp_path / "fail.external"
     target_ts.write_text("// fail", encoding="utf-8")
 
     registry = ASTDriverRegistry()
-    registry.register_driver(".ts", f"{sys.executable} {driver_script}")
+    registry.register_driver(".external", f"{sys.executable} {driver_script}")
 
     runner = ASTDriverRunner(registry=registry)
     with pytest.raises(ASTDriverError, match="failed with exit code 2"):
@@ -103,11 +103,11 @@ def test_external_driver_crash_fails_closed(tmp_path):
 
 
 def test_no_driver_configured_raises_expected_error(tmp_path):
-    target_rs = tmp_path / "main.rs"
+    target_rs = tmp_path / "main.external"
     target_rs.write_text("fn main() {}", encoding="utf-8")
 
     runner = ASTDriverRunner()
-    with pytest.raises(NoDriverConfiguredError, match="No AST driver configured for extension '.rs'"):
+    with pytest.raises(NoDriverConfiguredError, match="No AST driver configured for extension '.external'"):
         runner.parse_file(target_rs, workspace_root=tmp_path)
 
 
@@ -141,7 +141,7 @@ def test_split_command_windows(monkeypatch):
         assert parts2 == [r"C:\Python312\python.exe", r"D:\driver.py"]
 
 
-RUST_DRIVER = Path(__file__).resolve().parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "rust_ast.py"
+RUST_DRIVER = "must-not-execute-legacy-rust-driver"
 
 
 @pytest.mark.parametrize("interpreter", ["python3", "python"])

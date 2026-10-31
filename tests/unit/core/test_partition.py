@@ -380,11 +380,12 @@ def test_rust_files_are_analyzed_when_the_driver_is_enabled(tmp_path: Path):
     assert frozen["Config"]["signature"] == "pub struct Config"
 
 
-def test_rust_files_are_listed_as_not_analyzed_when_the_driver_is_not_enabled(tmp_path: Path):
+def test_rust_files_are_analyzed_without_an_opt_in(tmp_path: Path):
     root = _rust(tmp_path, enabled=False)
     data = partition.check(root, _splits(A="src/a.rs", B="src/b.rs"), record=False).as_dict()
-    assert data["edges"] == [] and data["scope"]["files_analyzed"] == 0
-    assert all("no AST driver for .rs" in row["reason"] for row in data["not_analyzed"]) and len(data["not_analyzed"]) == 2
+    assert data["edges"] and data["scope"]["files_analyzed"] == 2
+    assert data["not_analyzed"] == []
+    assert data["scope"]["languages"] == {"rust": 2}
 
 
 # ── The event, the documents, side effects ───────────────────────────────────

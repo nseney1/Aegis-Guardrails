@@ -7,6 +7,7 @@ import stat
 from pathlib import Path
 from typing import List
 
+from aegis_core.match import is_test_path
 from aegis_core.taxonomy import RULE_TYPES
 from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME
 
@@ -16,6 +17,8 @@ SKIP_DIRS = {
     "__pycache__", ".git", LEGACY_SOMA_DIRNAME, AEGIS_DIRNAME, "node_modules", ".venv", "venv",
     ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", "egg-info",
 }
+_JS_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+_POLYGLOT_EXTENSIONS = (*_JS_EXTENSIONS, ".go", ".rs")
 
 
 def _relative(root: Path, path: Path) -> str:
@@ -325,7 +328,88 @@ def _aegis_suite_candidates(test_dir: Path, parts: List[str], stem: str, parent_
     return candidates
 
 
-def check_test_coverage(root: Path) -> list[dict]:
+def _polyglot_files(root: Path) -> list[Path]:
+    """Discover pairing inputs without following directory links or build trees."""
+    def walk_error(exc: OSError) -> None:
+        raise exc
+
+    files = []
+    for directory, names, filenames in os.walk(root, followlinks=False, onerror=walk_error):
+        names[:] = sorted(name for name in names if name not in SKIP_DIRS and name != "target")
+        files.extend(Path(directory) / name for name in sorted(filenames)
+                     if Path(name).suffix in _POLYGLOT_EXTENSIONS)
+    return files
+
+
+def _polyglot_test_candidates(root: Path, source: Path, files: list[Path]) -> list[Path]:
+    if source.suffix == ".go":
+        exact = source.with_name(f"{source.stem}_test.go")
+        candidates = list(dict.fromkeys([exact, *sorted(source.parent.glob("*_test.go"))]))
+        if _relative(root, source) == "aegis_core/ast/drivers/templates/go_ast.go":
+            # This harness builds the packaged template and exercises its NDJSON protocol.
+            candidates.append(root / "tests/unit/core/test_go_ast_driver.py")
+        return candidates
+    if source.suffix == ".rs":
+        return [root / "tests" / source.name]
+    names = [f"{source.stem}.{kind}{extension}"
+             for kind in ("test", "spec") for extension in _JS_EXTENSIONS]
+    candidates = [source.parent / name for name in names]
+    candidates.extend(source.parent / "__tests__" / name for name in names)
+    candidates.extend(source.parent / "__tests__" / f"{source.stem}{extension}"
+                      for extension in _JS_EXTENSIONS)
+    candidates.extend(path for path in files if path.name in names
+                      and path.relative_to(root).parts[0] in ("test", "tests"))
+    return candidates
+
+
+def _coverage_candidate(root: Path, candidate: Path, issues: list[dict]) -> bool:
+    """Return whether a candidate exists; unsafe inputs produce a visible issue."""
+    ancestor = root
+    try:
+        for part in candidate.relative_to(root).parts[:-1]:
+            ancestor = ancestor / part
+            info = os.stat(ancestor, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                issues.append({"check": "test_coverage", "file": _relative(root, candidate),
+                               "message": f"{_relative(root, candidate)}: symlinked test directory does not satisfy coverage"})
+                return True
+        info = os.stat(candidate, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError) as exc:
+        issues.append(_failure("test_coverage", root, candidate, "stat", exc))
+        return True
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        kind = "symlinked" if stat.S_ISLNK(info.st_mode) else "non-regular"
+        issues.append({"check": "test_coverage", "file": _relative(root, candidate),
+                       "message": f"{_relative(root, candidate)}: {kind} test file does not satisfy coverage"})
+    return True
+
+
+def _inline_rust_tests(root: Path, source: Path, ast_runner: object, issues: list[dict]) -> bool | None:
+    from aegis_core.ast.policy import ASTExtractionError, extract_normalized_ast
+
+    try:
+        tree = extract_normalized_ast(source, workspace_root=root, ast_runner=ast_runner)
+    except (ASTExtractionError, OSError, UnicodeError) as exc:
+        issues.append(_failure("test_coverage", root, source, "parse inline test module", exc))
+        return None
+    return tree is not None and tree.metadata.get("test_module") is True
+
+
+def _pairing_hint(source: Path) -> str:
+    if source.suffix == ".py":
+        return f"expected tests/test_{source.stem}.py"
+    if source.suffix == ".go":
+        return f"expected {source.stem}_test.go or another *_test.go in the same package"
+    if source.suffix == ".rs":
+        return f"expected tests/{source.name} or an inline #[cfg(test)] module"
+    return (f"expected {source.stem}.test.* or {source.stem}.spec.* beside the source, "
+            f"under __tests__/, or under test(s)/")
+
+
+def check_test_coverage(root: Path, *, ast_runner: object = None, pairing_info: list[dict] | None = None) -> list[dict]:
+    """Return pairing issues only; optional successful Go notes never establish test execution."""
     issues = []  # type: List[dict]
     source_files = []  # type: List[Path]
     for source_dir in _source_dirs(root, "test_coverage", issues):
@@ -335,6 +419,12 @@ def check_test_coverage(root: Path) -> list[dict]:
             issues.append(_failure(
                 "test_coverage", root, root / source_dir, "list", exc
             ))
+    try:
+        polyglot = _polyglot_files(root)
+    except (OSError, UnicodeError) as exc:
+        issues.append(_failure("test_coverage", root, root, "list", exc))
+        polyglot = []
+    source_files.extend(path for path in polyglot if not is_test_path(_relative(root, path)))
 
     for source_file in source_files:
         if not _is_regular_file(
@@ -342,38 +432,38 @@ def check_test_coverage(root: Path) -> list[dict]:
         ):
             continue
 
-        candidates = _resolve_canonical_test_candidates(root, source_file)
+        try:
+            candidates = (_resolve_canonical_test_candidates(root, source_file) if source_file.suffix == ".py"
+                          else _polyglot_test_candidates(root, source_file, polyglot))
+        except (OSError, UnicodeError) as exc:
+            issues.append(_failure("test_coverage", root, source_file, "list tests", exc))
+            continue
         matched = False
         for expected in candidates:
-            try:
-                expected_info = os.stat(expected, follow_symlinks=False)
-            except FileNotFoundError:
+            previous = len(issues)
+            if _coverage_candidate(root, expected, issues):
+                matched = True
+                if pairing_info is not None and len(issues) == previous and source_file.suffix == ".go":
+                    if expected != source_file.with_name(f"{source_file.stem}_test.go"):
+                        source_name, test_name = _relative(root, source_file), _relative(root, expected)
+                        harness = expected.suffix == ".py"
+                        kind = "Python protocol harness" if harness else "Go package"
+                        pairing_info.append({"check": "test_pairing", "file": source_name, "tests": [test_name],
+                                             "pairing": "python_harness" if harness else "go_package",
+                                             "message": f"{source_name}: paired by {kind} with {test_name} "
+                                                        "(conventional pairing; tests not executed)"})
+                break
+        if not matched and source_file.suffix == ".rs":
+            matched = _inline_rust_tests(root, source_file, ast_runner, issues)
+            if matched is None:
                 continue
-            except (OSError, UnicodeError) as exc:
-                issues.append(_failure("test_coverage", root, expected, "stat", exc))
-                matched = True
-                break
-            else:
-                if stat.S_ISLNK(expected_info.st_mode) or not stat.S_ISREG(expected_info.st_mode):
-                    kind = "symlinked" if stat.S_ISLNK(expected_info.st_mode) else "non-regular"
-                    issues.append({
-                        "check": "test_coverage",
-                        "file": _relative(root, expected),
-                        "message": (
-                            f"{_relative(root, expected)}: {kind} test file "
-                            "does not satisfy coverage"
-                        ),
-                    })
-                matched = True
-                break
 
         if not matched:
             issues.append({
                 "check": "test_coverage",
                 "file": _relative(root, source_file),
                 "message": (
-                    f"Missing test file for {source_file.name}: "
-                    f"expected tests/test_{source_file.stem}.py"
+                    f"Missing test file for {source_file.name}: {_pairing_hint(source_file)}"
                 ),
             })
     return issues
@@ -576,12 +666,13 @@ CHECK_NAMES = [
 ]
 
 
-def run_all_checks(root: Path) -> list[dict]:
+def run_all_checks(root: Path, *, pairing_info: list[dict] | None = None) -> list[dict]:
     """Run every check and convert unexpected check failures into issues."""
     issues = []  # type: List[dict]
     for check_fn in ALL_CHECKS:
         try:
-            issues.extend(check_fn(root))
+            issues.extend(check_fn(root, pairing_info=pairing_info) if check_fn is check_test_coverage
+                          else check_fn(root))
         except Exception as exc:
             check_name = check_fn.__name__.replace("check_", "", 1)
             issues.append(_failure(check_name, root, root, "check", exc))

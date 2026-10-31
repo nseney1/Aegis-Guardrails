@@ -121,7 +121,6 @@ PRIVATE_IMPORTS = {'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1
  'aegis_core/ast/policy.py:aegis_core.ast.schema._extract_python_decorators_from_tree': 1,
  'aegis_core/ast/policy.py:aegis_core.ast.schema._import_aliases': 1,
  'aegis_core/ast/policy.py:aegis_core.ast.schema._normalize_ast_token': 1,
- 'aegis_core/ast/policy.py:aegis_core.ast.schema._spellings': 1,
  'aegis_core/baseline.py:aegis_core.ast.detect._SKIP_DIRS': 1,
  'aegis_core/baseline.py:aegis_core.verification.runner._discover_forbid_ast_rules': 1,
  'aegis_core/command_safety/analyzer.py:aegis_core.command_safety.lexer._GIT_SHORT_VALUES': 1,

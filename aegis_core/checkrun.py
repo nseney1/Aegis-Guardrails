@@ -8,8 +8,9 @@ point the run back at files outside the snapshot. What it records is a **label**
 agent can write any row, so a ``check`` row is evidence only once CI on the landing commit
 confirms it (``aegis_core.credit``).
 
-The tests run through ``aegis_core.testexec``: the user-scope ``tests.command`` (never the
-repository's), a fixed environment and a process-group timeout.
+The shared snapshot recipe runs a global user-scope ``tests.command`` once, or each
+supported test language with its configured adapter. Execution uses ``testexec``'s
+fixed environment and process-group timeout; repository config never selects commands.
 
 ``exit 5`` (no tests collected) and ``passed == 0`` are never evidence, and neither is a run that
 timed out or a Layer 1 finding.
@@ -54,18 +55,29 @@ class CheckOutcome:
 
 # ── The record ───────────────────────────────────────────────────────────────
 
-def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, int]:
+def _layer1(snapshot: Path, changed: Sequence[str], git_root: Path, base: str) -> Dict[str, Any]:
     from aegis_core import baseline
+    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL, NO_DRIVER_NOTE_TOOL, source_language
 
     # Every changed file, as plain check takes them: the secret scan reads any type.
     targets = [p for p in changed if (snapshot / p).is_file()]
     if not targets:
-        return {"findings": 0, "files": 0}
+        return {"findings": 0, "files": 0, "evidence": []}
     # The snapshot is a plain directory: git would answer for whatever repository encloses the temp dir,
     # so the snapshot's own rules are enforced (CI's check --ci guards their weakening).
     # git_root and base give the export its history, so the T7 delta judges it as aegis check does.
     pairs, _sources = baseline.run_fast(snapshot, targets, reviewed=False, git_root=os.fspath(git_root), diff_base=base)
-    return {"findings": sum(1 for _path, evidence in pairs if not evidence.verdict), "files": len(targets)}
+    rows = []
+    for path, evidence in pairs:
+        target = path or evidence.target
+        row = {"tool": evidence.tool, "target": target, "verdict": bool(evidence.verdict),
+               "language": evidence.language or source_language(target)}
+        if evidence.tool == NO_DRIVER_NOTE_TOOL:
+            row["reason"] = "no_driver:" + Path(target).suffix.lower()
+        elif evidence.tool == AST_SIZE_NOTE_TOOL:
+            row["reason"] = "too_large"
+        rows.append(row)
+    return {"findings": sum(1 for row in rows if not row["verdict"]), "files": len(targets), "evidence": rows}
 
 
 @gitsafe.scrubbed()
@@ -137,7 +149,7 @@ def record(root: object, *, tests: bool = False, base: Optional[str] = None, tim
 
 
 def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tests: bool, timeout: Optional[float],
-                    top: Path, base_commit: str) -> Tuple[Dict[str, int], Optional[testexec.TestsRun], List[str]]:
+                    top: Path, base_commit: str) -> Tuple[Dict[str, Any], Optional[testexec.TestsRun], List[str]]:
     """Export a tree with ``export_fn`` and run Layer 1 and, with ``tests``, the user's test command
     on it: the one recipe ``record`` and the trailer rerun share, so CI falsifies the same check."""
     scratch = Path(tempfile.mkdtemp(prefix="aegis-check-"))
@@ -148,15 +160,9 @@ def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tes
         run: Optional[testexec.TestsRun] = None
         logical = list(testexec.DEFAULT_COMMAND)
         if tests:
-            junit = scratch / "junit.xml"
-            argv, logical = testexec.plan_command(testexec.user_test_command(workspace), junit)
-            home = scratch / "home"
-            tmp = scratch / "tmp"
-            home.mkdir(mode=0o700)
-            tmp.mkdir(mode=0o700)
-            run = testexec.run_tests(argv, snapshot, testexec.hermetic_env(home, tmp),
-                                     testexec.DEFAULT_TIMEOUT_S if timeout is None else timeout, junit,
-                                     scratch / "output.txt")
+            from aegis_core.verification.snapshot_tests import run_snapshot_tests
+
+            run, logical = run_snapshot_tests(workspace, snapshot, scratch, timeout=timeout)
         return layer1, run, logical
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

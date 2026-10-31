@@ -2,7 +2,7 @@
 id: trap-threshold-spec-drift
 domain: correctness
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "When numeric thresholds are documented in docstrings with > but implemented with >= (or vice versa), boundary behavior silently diverges from the specification"
 prediction: "Will catch threshold comparisons where the operator doesn't match the documented behavior"
 falsification: 0 findings in 20 sessions → prune

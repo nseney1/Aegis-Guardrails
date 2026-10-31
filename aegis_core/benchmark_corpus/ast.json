@@ -1,0 +1,39 @@
+{
+  "v": 1,
+  "name": "aegis-ast-matched-v1",
+  "sizes": [
+    300,
+    600,
+    1200,
+    2500,
+    5000
+  ],
+  "languages": {
+    "python": {
+      "path": "src/sample.py",
+      "header": "import json as codec\n\n\n",
+      "block": "def transform___ID__(value):\n    payload = {\"value\": value, \"tag\": \"sample\"}\n    text = codec.dumps(payload)\n    decoded = codec.loads(text)\n    selected = decoded[\"value\"]\n    if selected > 0x10:\n        selected = selected + 1\n    else:\n        selected = len(text)\n    return selected\n"
+    },
+    "typescript": {
+      "path": "src/sample.ts",
+      "header": "import * as codec from \"node:querystring\";\n\n\n",
+      "block": "function transform___ID__(value: number): number {\n  const payload = {value: value, tag: \"sample\"};\n  const text = codec.stringify(payload);\n  const decoded = codec.parse(text);\n  let selected = Number(decoded.value);\n  if (selected > 0x10) {\n    selected = selected + 1;\n  } else {\n    selected = text.length; }\n  return selected; }\n"
+    },
+    "javascript": {
+      "path": "src/sample.js",
+      "header": "import * as codec from \"node:querystring\";\n\n\n",
+      "block": "function transform___ID__(value) {\n  const payload = {value: value, tag: \"sample\"};\n  const text = codec.stringify(payload);\n  const decoded = codec.parse(text);\n  let selected = Number(decoded.value);\n  if (selected > 0x10) {\n    selected = selected + 1;\n  } else {\n    selected = text.length; }\n  return selected; }\n"
+    },
+    "go": {
+      "path": "src/sample.go",
+      "header": "package benchmark\nimport codec \"strings\"\n\n",
+      "block": "func transform___ID__(value int) int {\n  payload := \"sample\"\n  text := codec.ToUpper(payload)\n  decoded := codec.ToLower(text)\n  selected := value + len(decoded)\n  if selected > 0x10 {\n    selected = selected + 1\n  } else {\n    selected = len(text) }\n  return selected }\n"
+    },
+    "rust": {
+      "path": "src/sample.rs",
+      "header": "use std::cmp as codec;\n\n\n",
+      "block": "fn transform___ID__(value: i64) -> i64 {\n  let payload = value + 1_000;\n  let text = payload.to_string();\n  let decoded = text.len() as i64;\n  let mut selected = codec::max(value, decoded);\n  if selected > 0x10 {\n    selected = selected + 1;\n  } else {\n    selected = codec::min(value, decoded); }\n  selected }\n"
+    }
+  },
+  "sha256": "34fe5d8b9cf92237421c0d2ea9f86fa328d606f4caf5e33fc68dc2becaff86b8"
+}

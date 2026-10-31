@@ -13,8 +13,8 @@
       "stmts": 79
     },
     "aegis_cli/verify.py:run_verify": {
-      "lines": 296,
-      "stmts": 201
+      "lines": 284,
+      "stmts": 199
     },
     "aegis_core/command_safety/lexer.py:extract_subshell_commands": {
       "lines": 150,
@@ -69,12 +69,12 @@
       "stmts": 79
     },
     "aegis_core/verification/runner.py:_layer1_on_snapshot": {
-      "lines": 114,
-      "stmts": 72
+      "lines": 31,
+      "stmts": 15
     },
     "aegis_core/verification/runner.py:run_layer1": {
-      "lines": 207,
-      "stmts": 112
+      "lines": 100,
+      "stmts": 49
     },
     "aegis_core/workspace/binding.py:resolve_binding": {
       "lines": 122,
@@ -99,8 +99,8 @@
       "stmts": 770
     },
     "aegis_core/verification/runner.py": {
-      "lines": 1214,
-      "stmts": 774
+      "lines": 986,
+      "stmts": 630
     }
   }
 }

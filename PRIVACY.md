@@ -12,6 +12,7 @@ Aegis runs on your machine. It has no service, no account and no telemetry, and 
 In your git directory, `<git common dir>/aegis/`, which every worktree of the repository shares and which `git status` never shows (directories `0700`, files `0600`):
 
 - `state/<ws-id>/ledger.jsonl`: outcome rows with the rule id, outcome, source, host, session id, time, the checked file paths and verdict, and the absolute path of the work tree that wrote the row. Outside a git repository the ledger is `.aegis/state/ledger.jsonl`.
+- Check receipts additionally retain per-file tool, verdict, language and missing-driver reason. These evidence rows omit source snippets and diagnostic text.
 - `events.jsonl`: one row per event (lease claims and denials, `aegis check --lane` and `--partition`, the hooks' scan-gate and guard decisions, skills sync, host setup, baseline, pack, benchmark and package runs) with the time, event kind, absolute work tree path, host, result and a small detail object. The detail holds counts, lane names and globs, rule ids and lease owner labels; for `lane_check` also the label, the base branch name and the commit ids of the range; for `package` the output path; for `partition_check` the file paths and symbol names of up to 200 predicted call and import edges. It never holds file contents or command text. Outside git it is `.aegis/state/events.jsonl`.
 
 In the repository, under `.aegis/state/` (git-ignored by `aegis init`):

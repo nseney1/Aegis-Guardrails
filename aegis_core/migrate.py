@@ -609,7 +609,7 @@ def _parse_conf(path: Path) -> Dict[str, str]:
 
 
 def _plan_config(result: MigrationPlan, layout: WorkspaceLayout) -> None:
-    from aegis_core.ast.detect import names_packaged_driver, packaged_driver_for_extension
+    from aegis_core.ast.detect import names_packaged_driver, names_retired_native_driver, packaged_driver_for_extension
     from aegis_core.config import ConfigError, _read_json
     from aegis_core.yaml_engine.frontmatter import AegisYAML
     from aegis_core.yaml_engine.parser import parse_yaml_subset
@@ -685,10 +685,10 @@ def _plan_config(result: MigrationPlan, layout: WorkspaceLayout) -> None:
             key, value = str(key), str(value)
             if key.startswith("ast_driver_"):
                 ext = key[len("ast_driver_"):].strip().lower().lstrip(".")
-                packaged_config = packaged_driver_for_extension(ext)
-                if packaged_config is not None and names_packaged_driver(value, packaged_config):
-                    if ext not in packaged:
-                        packaged.append(ext)
+                if names_retired_native_driver(value, ext):
+                    continue
+                if (packaged_config := packaged_driver_for_extension(ext)) is not None and names_packaged_driver(value, packaged_config):
+                    packaged.append(ext)
                 else:
                     drivers[ext] = value
             elif key == "ast_driver":
@@ -696,7 +696,7 @@ def _plan_config(result: MigrationPlan, layout: WorkspaceLayout) -> None:
             else:
                 slots[key] = value
         if packaged:
-            changes.setdefault("ast", {})["packaged_drivers"] = packaged
+            changes.setdefault("ast", {})["packaged_drivers"] = list(dict.fromkeys(packaged))
 
     other = layout.legacy("config.yaml")
     if other.is_file():
@@ -903,17 +903,17 @@ def _is_shipped_driver(name: str, data: bytes) -> bool:
 
 
 def _plan_drivers(result: MigrationPlan, drivers: Path) -> None:
-    """v3 `aegis init` staged copies of the packaged drivers in .aegis/drivers/; v4 runs
-    the templates inside aegis. Only those copies go: unmodified (byte for byte a version
-    aegis shipped) and named by no printed driver command. Anything else there is the
-    user's and stays; a staged name with other content is reported, since v4 never runs
-    it."""
+    """Remove staged v3 driver copies, including drivers retired by v4.
+    Only byte-for-byte shipped copies named by no printed command go. User changes
+    and other files stay; unknown content under a shipped name is reported because
+    v4 never executes staged repository driver files."""
     from aegis_core.ast.detect import LANGUAGE_DEFINITIONS
 
     if drivers.is_symlink() or not drivers.is_dir():
         result.removals.append(result._rel(drivers))  # a link is removed, never followed
         return
-    staged = {c["driver_filename"] for c in LANGUAGE_DEFINITIONS.values() if c.get("driver_filename")}
+    # Names aegis ever shipped, including drivers it no longer has (ts_ast.js since v4.5).
+    staged = {c["driver_filename"] for c in LANGUAGE_DEFINITIONS.values() if c.get("driver_filename")} | set(_SHIPPED_DRIVER_SHA256)
     commands = [str(value).replace("\\", "/") for section in result.user_config.values() for value in section.values()]
     removable: List[str] = []
     kept: List[str] = []

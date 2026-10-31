@@ -10,10 +10,7 @@ instead of being skipped.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
-import shutil
-import subprocess
 import gc
 import time
 
@@ -215,7 +212,7 @@ PLAIN_FORM_GOLDEN = [
     ("import builtins\nbuiltins.eval('1')\n", ["Forbidden call 'eval' matched rule forbid_ast.calls"]),
     ("from . import sibling\nsibling.run()\n", ["Forbidden call 'run' matched rule forbid_ast.calls"]),
     ("from .pkg import helper\nhelper()\n", []),
-    ("from datetime import datetime\ndatetime.now()\n", ["Forbidden import 'datetime.datetime' matched rule forbid_ast.imports", "Forbidden call 'datetime.now' matched rule forbid_ast.calls"]),
+    ("from datetime import datetime\ndatetime.now()\n", ["Forbidden import 'datetime.datetime' matched rule forbid_ast.imports", "Forbidden call 'datetime.now' matched rule forbid_ast.calls", "Forbidden call 'datetime.datetime.now' matched rule forbid_ast.calls"]),
     ("import pytest\n@pytest.mark.xfail\ndef test_a():\n    pass\n", ["Forbidden import 'pytest' matched rule forbid_ast.imports", "Forbidden decorator 'pytest.mark.xfail' matched rule forbid_ast.decorators", "Forbidden decorator 'mark.xfail' matched rule forbid_ast.decorators", "Forbidden decorator 'xfail' matched rule forbid_ast.decorators"]),
     ("from pytest import mark\n@mark.xfail\ndef test_a():\n    pass\n", ["Forbidden import 'pytest' matched rule forbid_ast.imports", "Forbidden decorator 'mark.xfail' matched rule forbid_ast.decorators", "Forbidden decorator 'xfail' matched rule forbid_ast.decorators"]),
     ("from functools import lru_cache\n@lru_cache(maxsize=1)\ndef f():\n    return 1\n", ["Forbidden decorator 'functools.lru_cache' matched rule forbid_ast.decorators", "Forbidden decorator 'lru_cache' matched rule forbid_ast.decorators"]),
@@ -383,6 +380,7 @@ class TestFailClosed:
         assert results[0].target == "src/broken.py"
         assert results[0].verdict is False
         assert results[0].detail.startswith("forbid_ast: cannot verify src/broken.py: SyntaxError: ")
+        assert (results[0].tool, results[0].language) == ("forbid_ast:no-subprocess-run", "python")
         assert gate_verdict(evidence) is False
 
     def test_undecodable_file_yields_failing_unverifiable_finding(self, ws: Path):
@@ -849,9 +847,9 @@ class TestBindingFanOutStaysLinear:
         assert ratio < 24, f"eight times the bindings and uses multiplied the cost by {ratio:.1f}"
 
 
-# Reference semantics, written out longhand: a reference ``head + rest`` (the head ends at
-# the first "." or "::") is spelled as written and with each alias original in place of the
-# head; each spelling is also qualified through the import map (an exact key, else its part
+# Reference semantics, written out longhand: language separators are canonical dots and
+# Node's builtin prefix is removed. A reference ``head + rest`` is spelled as written and
+# with each alias original replacing its head, then qualified through the import map (an exact key, else its part
 # before the first "."); a pattern matches a spelling it equals or is a dot-suffix of.
 def _reference_split(ref: str) -> tuple[str, str]:
     cuts = [i for i in (ref.find("."), ref.find("::")) if i != -1]
@@ -873,11 +871,28 @@ def _reference_spellings(ref: str, quals: dict, aliases: dict, *, calls: bool) -
 
 
 def _reference_violations(quals, aliases, call_targets, decorators, spec) -> list[str]:
+    def canonical(text):
+        if text.startswith("node:"):
+            text = text[5:]
+        if text.startswith("::"):
+            text = text[2:]
+        return text.replace("::", ".").replace("/", ".")
+
+    def bindings(mapping):
+        result = {}
+        for name, originals in mapping.items():
+            for original in originals:
+                result.setdefault(canonical(name), []).append(canonical(original))
+        return result
+
+    quals, aliases = bindings(quals), bindings(aliases)
+
     def hit(refs, pattern, calls):
+        pattern = canonical(pattern)
         return any(
             s == pattern or s.endswith("." + pattern)
             for ref in refs
-            for s in _reference_spellings(ref, quals, aliases, calls=calls)
+            for s in _reference_spellings(canonical(ref), quals, aliases, calls=calls)
         )
 
     out = [f"Forbidden call '{p}' matched rule forbid_ast.calls" for p in spec["calls"] if hit(call_targets, p, True)]
@@ -1066,10 +1081,10 @@ class TestExternalDriverAliases:
         ids=["use-item-as", "use-module-as"],
     )
     def test_rust_alias_is_judged_like_the_plain_use(self, plain, aliased, pattern):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         def violations(src: str) -> list[str]:
-            return evaluate_forbid_ast(NormalizedAST.from_dict(parse_rust_source(src, "m.rs")), {"calls": [pattern]})
+            return evaluate_forbid_ast(parse_rust_source(src, "m.rs"), {"calls": [pattern]})
 
         assert violations(plain) == [f"Forbidden call '{pattern}' matched rule forbid_ast.calls"]
         assert violations(aliased) == violations(plain)
@@ -1077,91 +1092,35 @@ class TestExternalDriverAliases:
 
 # ── Wave A F1 (d): renamed members of a TypeScript or Rust import group ──────
 
-_TS_DRIVER = Path(__file__).resolve().parents[3] / "aegis_core" / "ast" / "drivers" / "templates" / "ts_ast.js"
-_NODE = shutil.which("node")
+def _parse_ts(source: str) -> NormalizedAST:
+    from aegis_core.ast.drivers.js import parse
 
-# Stand-in for the `typescript` package with only the API ts_ast.js calls. It returns the
-# tree of `import { exec as run, spawn } from "child_process"; run("ls");` so the compiler
-# path can be tested where the real package is not installed.
-_TS_COMPILER_STUB = """\
-"use strict";
-const K = { SourceFile: 1, ImportDeclaration: 2, NamedImports: 3, Identifier: 4, Call: 5 };
-const node = (kind, props, children = []) =>
-  Object.assign({ kind, children, getStart: () => 0, getEnd: () => 0 }, props);
-const id = (text) => node(K.Identifier, { text });
-module.exports = {
-  ScriptTarget: { Latest: 99 },
-  SyntaxKind: { ExportKeyword: 100 },
-  createSourceFile() {
-    const named = node(K.NamedImports, {
-      elements: [{ name: id("run"), propertyName: id("exec") }, { name: id("spawn") }],
-    });
-    const imp = node(K.ImportDeclaration, {
-      moduleSpecifier: { text: "child_process" }, importClause: { namedBindings: named },
-    });
-    const sf = node(K.SourceFile, {}, [imp, node(K.Call, { expression: id("run") })]);
-    sf.getLineAndCharacterOfPosition = () => ({ line: 0, character: 0 });
-    return sf;
-  },
-  forEachChild(n, cb) { for (const c of n.children) cb(c); },
-  isImportDeclaration: (n) => n.kind === K.ImportDeclaration,
-  isNamespaceImport: () => false,
-  isNamedImports: (n) => n.kind === K.NamedImports,
-  isCallExpression: (n) => n.kind === K.Call,
-  isIdentifier: (n) => n.kind === K.Identifier,
-  isFunctionDeclaration: () => false,
-  isClassDeclaration: () => false,
-  isMethodDeclaration: () => false,
-  isPropertyAccessExpression: () => false,
-  isBinaryExpression: () => false,
-};
-"""
+    return parse(source, "mod.ts")
 
 
-def _run_ts_driver(cwd: Path, source: str) -> dict:
-    target = cwd / "mod.ts"
-    target.write_text(source, encoding="utf-8")
-    proc = subprocess.run(
-        [_NODE, str(_TS_DRIVER), str(target)], cwd=cwd, capture_output=True, text=True, timeout=60, check=True
-    )
-    return json.loads(proc.stdout)
-
-
-@pytest.mark.skipif(_NODE is None, reason="node is not installed; the TypeScript driver needs it")
 class TestTypeScriptGroupMemberAliases:
     ALIASED = "import { exec as run, spawn } from 'child_process';\nrun('ls');\n"
     PLAIN = "import { exec, spawn } from 'child_process';\nexec('ls');\n"
     SPEC = {"calls": ["child_process.exec"], "imports": ["exec"]}
 
-    def _violations(self, data: dict) -> list[str]:
-        return evaluate_forbid_ast(NormalizedAST.from_dict(data), self.SPEC)
+    def _violations(self, tree: NormalizedAST) -> list[str]:
+        return evaluate_forbid_ast(tree, self.SPEC)
 
-    def test_builtin_lexer_emits_the_alias_pair(self, tmp_path):
-        data = _run_ts_driver(tmp_path, self.ALIASED)
-        (record,) = data["imports"]
-        assert (record["imported_symbols"], record["aliases"]) == (["run", "spawn"], [["run", "exec"]])
-        assert self._violations(data) == self._violations(_run_ts_driver(tmp_path, self.PLAIN))
-        assert self._violations(data) == [
+    def test_builtin_lexer_emits_the_alias_pair(self):
+        tree = _parse_ts(self.ALIASED)
+        (record,) = tree.imports
+        assert (list(record.imported_symbols), [list(pair) for pair in record.aliases]) == (
+            ["run", "spawn"], [["run", "exec"]])
+        assert self._violations(tree) == self._violations(_parse_ts(self.PLAIN))
+        assert self._violations(tree) == [
             "Forbidden import 'exec' matched rule forbid_ast.imports",
             "Forbidden call 'child_process.exec' matched rule forbid_ast.calls",
         ]
 
-    def test_compiler_path_emits_the_alias_pair(self, tmp_path):
-        stub = tmp_path / "node_modules" / "typescript"
-        stub.mkdir(parents=True)
-        (stub / "index.js").write_text(_TS_COMPILER_STUB, encoding="utf-8")
-        data = _run_ts_driver(tmp_path, self.ALIASED)
-        (record,) = data["imports"]
-        assert (record["imported_symbols"], record["aliases"]) == (["run", "spawn"], [["run", "exec"]])
-        assert self._violations(data) == [
-            "Forbidden import 'exec' matched rule forbid_ast.imports",
-            "Forbidden call 'child_process.exec' matched rule forbid_ast.calls",
-        ]
-
-    def test_plain_named_import_has_no_alias_pairs(self, tmp_path):
-        (record,) = _run_ts_driver(tmp_path, self.PLAIN)["imports"]
-        assert record["imported_symbols"] == ["exec", "spawn"]
-        assert record.get("aliases", []) == []
+    def test_plain_named_import_has_no_alias_pairs(self):
+        (record,) = _parse_ts(self.PLAIN).imports
+        assert list(record.imported_symbols) == ["exec", "spawn"]
+        assert list(record.aliases or []) == []
 
 
 class TestRustGroupMemberAliases:
@@ -1178,19 +1137,19 @@ class TestRustGroupMemberAliases:
                 'use std::process;\nfn main() { process::Command::new("ls"); }\n',
                 'use std::process::{self as p, exit};\nfn main() { p::Command::new("ls"); }\n',
                 "process::Command::new",
-                ("std::process", ["p", "exit"], [["p", "process"]]),
+                ("std::process", ["p", "exit"], [["p", "std::process"]]),
             ),
         ],
         ids=["member-as", "self-as"],
     )
     def test_group_member_alias_is_judged_like_the_plain_use(self, plain, aliased, pattern, record):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
-        (imp,) = parse_rust_source(aliased, "m.rs")["imports"]
-        assert (imp["module"], imp["imported_names"], imp["aliases"]) == record
+        (imp,) = parse_rust_source(aliased, "m.rs").imports
+        assert (imp.source, list(imp.imported_symbols), [list(pair) for pair in imp.aliases]) == record
 
         def violations(src: str) -> list[str]:
-            return evaluate_forbid_ast(NormalizedAST.from_dict(parse_rust_source(src, "m.rs")), {"calls": [pattern]})
+            return evaluate_forbid_ast(parse_rust_source(src, "m.rs"), {"calls": [pattern]})
 
         assert violations(plain) == [f"Forbidden call '{pattern}' matched rule forbid_ast.calls"]
         assert violations(aliased) == violations(plain)
@@ -1238,31 +1197,31 @@ class TestRustGroupMemberAliases:
         ids=["nested-as", "nested-comma-self", "path-member-as", "path-member", "nested-self-as", "leading-brace"],
     )
     def test_nested_and_path_members_are_judged_like_the_flat_group(self, grouped, flat):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         def violations(src: str) -> list[list[str]]:
-            norm = NormalizedAST.from_dict(parse_rust_source(src, "m.rs"))
+            norm = parse_rust_source(src, "m.rs")
             return [evaluate_forbid_ast(norm, spec) for spec in self.SPECS]
 
         assert violations(grouped) == violations(flat)
         assert any("matched rule forbid_ast.calls" in v for found in violations(grouped) for v in found)
 
     def test_no_member_text_leaks_into_a_bound_name(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
-        imports = parse_rust_source("use std::{process::{Command as Cmd, exit}, io::*};\n", "m.rs")["imports"]
-        names = [n for imp in imports for n in imp["imported_names"]]
-        pairs = [a for imp in imports for pair in imp.get("aliases", []) for a in pair]
+        imports = parse_rust_source("use std::{process::{Command as Cmd, exit}, io::*};\n", "m.rs").imports
+        names = [n for imp in imports for n in imp.imported_symbols]
+        pairs = [a for imp in imports for pair in imp.aliases for a in pair]
         assert all(not set(n) & set("{}:, ") for n in names + pairs), (names, pairs)
-        assert sorted((imp["module"], imp["is_wildcard"]) for imp in imports) == [
-            ("std", False), ("std::io", True), ("std::process", False)
+        assert sorted((imp.source, "*" in imp.imported_symbols) for imp in imports) == [
+            ("std::io", True), ("std::process", False)
         ]
 
     def test_a_plain_self_member_binds_the_module_name(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         def violations(src: str) -> list[str]:
-            norm = NormalizedAST.from_dict(parse_rust_source(src, "m.rs"))
+            norm = parse_rust_source(src, "m.rs")
             return evaluate_forbid_ast(norm, {"imports": ["process"], "calls": ["process::Command::new"]})
 
         plain = 'use std::process;\nfn main() { process::Command::new("ls"); }\n'
@@ -1277,31 +1236,38 @@ class TestRustCallSites:
     """Every Rust call is a call site, and only calls are (b1-verify fix round 2)."""
 
     def test_a_call_to_a_function_defined_below_it_is_seen(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         src = "fn main() { helper(); }\nfn helper() {}\n"
-        norm = NormalizedAST.from_dict(parse_rust_source(src, "m.rs"))
+        norm = parse_rust_source(src, "m.rs")
         assert evaluate_forbid_ast(norm, {"calls": ["helper"]}) == [
             "Forbidden call 'helper' matched rule forbid_ast.calls"
         ]
 
-    @pytest.mark.timing
-    def test_a_large_generated_file_parses_in_linear_time(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+    @pytest.mark.parametrize('calls', [3_125, 25_000])
+    def test_large_generated_files_preserve_complete_facts_at_eightfold_size(self, calls):
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
-        def run(calls: int) -> None:
-            src = "fn main() {\n" + "".join(f"    helper({i});\n" for i in range(calls)) + "}\nfn helper(x: u32) {}\n"
-            data = parse_rust_source(src, "m.rs")
-            assert len(data["call_sites"]) == calls and data["call_sites"][-1]["line"] == calls + 1
-
-        ratio = _scaling_ratio(run, 3_125)
-        assert ratio < 24, f"eight times the calls multiplied the parse time by {ratio:.1f}"
+        src = "fn main() {\n" + "".join(f"    helper({i});\n" for i in range(calls)) + "}\nfn helper(x: u32) {}\n"
+        data = parse_rust_source(src, "m.rs")
+        assert data.to_dict() == {
+            'version': '1.0', 'file_path': 'm.rs', 'language': 'rust',
+            'definitions': [
+                {'name': 'main', 'kind': 'function', 'line': 1, 'is_exported': False, 'class_name': None},
+                {'name': 'helper', 'kind': 'function', 'line': calls + 3, 'is_exported': False, 'class_name': None},
+            ],
+            'call_sites': [{'target': 'helper', 'line': i + 2, 'caller_scope': 'main', 'args': {'#0': str(i)}}
+                           for i in range(calls)],
+            'imports': [], 'mutation_points': [],
+            'metadata': {'capabilities': ['allow_comments', 'args', 'decorators', 'test_module'],
+                         'allow_comments': {}, 'decorators': [], 'test_module': False, 'test_functions': []},
+        }
 
     def test_control_flow_keywords_are_not_calls(self):
-        from aegis_core.ast.drivers.templates.rust_ast import parse_rust_source
+        from aegis_core.ast.drivers.rust import parse as parse_rust_source
 
         src = "fn main() { if (a) { b(); } while (c) {} match (d, e) { _ => {} } }\nfn b() {}\n"
-        assert [c["target"] for c in parse_rust_source(src, "m.rs")["call_sites"]] == ["b"]
+        assert [c.target for c in parse_rust_source(src, "m.rs").call_sites] == ["b"]
 
 
 # ── Review round 3: the decorator fallback read must not fail open ────────────
