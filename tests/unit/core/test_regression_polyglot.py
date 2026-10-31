@@ -437,7 +437,7 @@ def test_unknown_python_wrapper_is_unverifiable_instead_of_a_test_failure(projec
     assert counter.read_text() == "xx"
 
 
-@pytest.mark.parametrize("selection", ["file", "directory", "node", "delimited"])
+@pytest.mark.parametrize("selection", ["file", "directory", "node", "delimited", "intermixed"])
 def test_configured_absolute_pytest_paths_run_snapshot_tests_instead_of_dirty_live_files(project, selection):
     project.write("src/app.py", "def value(): return 2\n")
     body = "from src.app import value\ndef test_value(): assert value()==2\n"
@@ -450,11 +450,24 @@ def test_configured_absolute_pytest_paths_run_snapshot_tests_instead_of_dirty_li
         chosen += "::test_value"
     # pytest 8 collects duplicate selections; pytest 9 otherwise hides this defect.
     selectors = ["--", chosen] if selection == "delimited" else [chosen]
+    if selection == "intermixed":
+        selectors += ["-k", "test_value"]
     configure(project, command=[sys.executable, "-m", "pytest", "--keep-duplicates", *selectors])
     project.write("tests/test_app.py", "def test_value(): assert False, 'dirty live source was used'\n")
     result = check_ci_regressions(project.root, "main").commits[0]
     assert result.status == "passed" and result.reason == "ok"
     assert result.fail_to_pass_tests == ("tests.test_app::test_value",)
+
+
+def test_configured_pytest_automatic_selection_protects_leading_dash_directories(project):
+    configure(project, command=[sys.executable, "-m", "pytest"])
+    project.write("src/app.py", "def value(): return 2\n")
+    project.write("-nested/tests/test_app.py", "from src.app import value\ndef test_value(): assert value()==2\n")
+    project.commit("fix: value")
+    project.write("-nested/tests/test_app.py", "def test_value(): assert False, 'dirty live source was used'\n")
+    result = check_ci_regressions(project.root, "main").commits[0]
+    assert (result.status, result.reason) == ("passed", "ok")
+    assert result.fail_to_pass_tests == ("-nested.tests.test_app::test_value",)
 
 
 def test_configured_pytest_option_value_is_not_a_directory_selection(project):

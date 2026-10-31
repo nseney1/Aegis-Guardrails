@@ -4,7 +4,9 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+import stat
 import struct
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +27,7 @@ class JunctionKernel:
         self.failure = None
         self.filesystem = "NTFS"
         self.identity_override = None
+        self.stat_version = sys.version_info[:2]
         self.CreateFileW = NativeFunction(self.open)
         self.DeviceIoControl = NativeFunction(self.set_reparse)
         self.CloseHandle = NativeFunction(self.close)
@@ -85,10 +88,19 @@ class JunctionKernel:
 def junction_kernel(monkeypatch):
     kernel = JunctionKernel()
     monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kwargs: kernel, raising=False)
-    original, readlink = Path.lstat, os.readlink
+    original, readlink, identities = Path.lstat, os.readlink, {}
 
     def lstat(path):
         info = original(path)
+        if stat.S_ISDIR(info.st_mode):
+            # Model the selected Python's stat layout independently of the host.
+            # Stable real-entry keys preserve replacement/race distinctions.
+            key = (info.st_dev, info.st_ino)
+            ordinal = identities.setdefault(key, len(identities) + 1)
+            device, inode = ((17, (1 << 40) + ordinal) if kernel.stat_version < (3, 12)
+                             else ((1 << 48) + 17, (1 << 96) + ordinal))
+            fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+            info = SimpleNamespace(**(fields | {"st_dev": device, "st_ino": inode}))
         if kernel.links.get(str(path)) == (info.st_dev, info.st_ino):
             fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
             return SimpleNamespace(**(fields | {"st_reparse_tag": 0xA0000003}))
@@ -118,6 +130,46 @@ def test_junction_sends_mount_point_utf16_offsets_and_closes_its_handle(tmp_path
     assert opened[2:] == (0x40000080, 3, 3, 0x02200000)
     assert operation == ("set", 123, 0x000900A4, len(raw)) and closed == ("close", 123)
     assert link.lstat().st_reparse_tag == 0xA0000003
+
+
+@pytest.mark.parametrize("version", [(3, 9), (3, 12)])
+def test_identity_fixture_models_python_widths_when_host_identifiers_are_wide(tmp_path, monkeypatch, request, version):
+    from aegis_core.verification import windows_junction
+
+    original, host_identities = Path.lstat, {}
+
+    def wide_host_lstat(path):
+        info = original(path)
+        key = (info.st_dev, info.st_ino)
+        ordinal = host_identities.setdefault(key, len(host_identities) + 1)
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        return SimpleNamespace(**(fields | {"st_dev": (1 << 48) + 17, "st_ino": (1 << 96) + ordinal}))
+
+    # Install the host boundary before constructing the native-kernel fixture.
+    monkeypatch.setattr(Path, "lstat", wide_host_lstat)
+    kernel = request.getfixturevalue("junction_kernel")
+    kernel.stat_version = version
+    monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version))
+    target, link = tmp_path / "dependencies", tmp_path / "node_modules"
+    target.mkdir()
+    (target / "keep").write_text("dependency")
+    windows_junction.create_directory_junction(target, link)
+    assert host_identities and link.lstat().st_reparse_tag == 0xA0000003
+    device, inode = kernel.opened_info.st_dev, kernel.opened_info.st_ino
+    if version < (3, 12):
+        assert 0 < device < (1 << 32) and 0 < inode < (1 << 64)
+        assert any(call[0] == "legacy_identity" for call in kernel.calls)
+    else:
+        assert (1 << 32) < device < (1 << 64) and (1 << 64) < inode < (1 << 128)
+        assert any(call[0] == "identity" for call in kernel.calls)
+    moved = tmp_path / "moved-entry"
+    link.rename(moved)
+    link.mkdir()
+    assert (moved.lstat().st_dev, moved.lstat().st_ino) == (device, inode)
+    assert (link.lstat().st_dev, link.lstat().st_ino) != (device, inode)
+    link.rmdir()
+    moved.rmdir()
+    assert not link.exists() and (target / "keep").read_text() == "dependency"
 
 
 @pytest.mark.parametrize("failure,operation,closes", [("open", "CreateFileW", 0),
@@ -220,6 +272,7 @@ def test_handle_identity_failure_preserves_entry_without_writing(tmp_path, monke
     from aegis_core.verification import windows_junction
 
     monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version), raising=False)
+    junction_kernel.stat_version = version
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
     original = junction_kernel.CreateFileW.function
@@ -253,6 +306,7 @@ def test_legacy_ambiguous_filesystem_never_authorizes_write_or_rollback(tmp_path
     from aegis_core.verification import windows_junction
 
     monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=(3, 9)), raising=False)
+    junction_kernel.stat_version = (3, 9)
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
     junction_kernel.filesystem = filesystem
@@ -270,6 +324,7 @@ def test_matching_native_identity_is_verified_before_the_write(tmp_path, monkeyp
     from aegis_core.verification import windows_junction
 
     monkeypatch.setattr(windows_junction, "sys", SimpleNamespace(version_info=version), raising=False)
+    junction_kernel.stat_version = version
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
     windows_junction.create_directory_junction(target, link)
