@@ -3,9 +3,9 @@ id: contract-mcp-cli-parity
 domain: correctness
 type: contract
 enforcement: advisory
-hypothesis: The MCP server tools must expose the same capabilities as the CLI commands
-prediction: New CLI features added without corresponding MCP tool updates create feature gaps for non-Gemini users
-falsification: MCP and CLI are intentionally divergent by design → reclassify
+hypothesis: Shared CLI, MCP and SDK operations can drift in semantics or authorization when adapters duplicate behavior
+prediction: An overlapping operation or alias diverges in validation, normalized arguments, write classification or authorization
+falsification: Public overlap tests and regenerated contracts show equivalent shared behavior with documented intentional surface differences
 target_paths:
   - "aegis_cli/registry.py"
   - "aegis_cli/commands_table.py"

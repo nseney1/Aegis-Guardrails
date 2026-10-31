@@ -8,8 +8,9 @@ point the run back at files outside the snapshot. What it records is a **label**
 agent can write any row, so a ``check`` row is evidence only once CI on the landing commit
 confirms it (``aegis_core.credit``).
 
-The tests run through ``aegis_core.testexec``: the user-scope ``tests.command`` (never the
-repository's), a fixed environment and a process-group timeout.
+The shared snapshot recipe runs a global user-scope ``tests.command`` once, or each
+supported test language with its configured adapter. Execution uses ``testexec``'s
+fixed environment and process-group timeout; repository config never selects commands.
 
 ``exit 5`` (no tests collected) and ``passed == 0`` are never evidence, and neither is a run that
 timed out or a Layer 1 finding.
@@ -159,15 +160,9 @@ def _snapshot_check(workspace: Path, export_fn: Any, changed: Sequence[str], tes
         run: Optional[testexec.TestsRun] = None
         logical = list(testexec.DEFAULT_COMMAND)
         if tests:
-            junit = scratch / "junit.xml"
-            argv, logical = testexec.plan_command(testexec.user_test_command(workspace), junit)
-            home = scratch / "home"
-            tmp = scratch / "tmp"
-            home.mkdir(mode=0o700)
-            tmp.mkdir(mode=0o700)
-            run = testexec.run_tests(argv, snapshot, testexec.hermetic_env(home, tmp),
-                                     testexec.DEFAULT_TIMEOUT_S if timeout is None else timeout, junit,
-                                     scratch / "output.txt")
+            from aegis_core.verification.snapshot_tests import run_snapshot_tests
+
+            run, logical = run_snapshot_tests(workspace, snapshot, scratch, timeout=timeout)
         return layer1, run, logical
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

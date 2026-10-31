@@ -50,7 +50,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, BinaryIO, Dict, Iterator, List, Mapping, Optional, Sequence, Union
 
-from aegis_core import command_safety, events, hook_events, scan_compliance
+from aegis_core import events, hook_events, scan_compliance
 from aegis_core.config import env_workspace, scan_window_s
 from aegis_core.workspace.binding import Attested, read_registry, resolve_binding
 from aegis_core.workspace.confinement import confine_path_internal
@@ -136,6 +136,8 @@ def _root(call: hook_events.HookCall, environ: Mapping[str, str]) -> Optional[Pa
 
 
 def _guard(call: hook_events.HookCall, environ: Mapping[str, str]) -> _Decision:
+    from aegis_core import command_safety
+
     rule = command_safety.classify_command(call.command)
     if rule is None:
         return _ALLOW

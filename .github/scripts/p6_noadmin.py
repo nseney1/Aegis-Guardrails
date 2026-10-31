@@ -103,9 +103,10 @@ class Token:
         return buffer, size.value
 
     def scalar(self, token, kind):
-        value, size = self.query(token, kind)
-        require(size == 4, 'GetTokenInformation invalid DWORD width')
-        return struct.unpack('<I', value.raw[:4])[0]
+        value, size = DWORD(), DWORD()
+        self.checked('GetTokenInformation', token, kind, C.byref(value), C.sizeof(value), C.byref(size))
+        require(size.value == C.sizeof(value), 'GetTokenInformation invalid DWORD width')
+        return value.value
 
     def sid_bytes(self, pointer):
         require(pointer and self.adv.IsValidSid(pointer), 'invalid token SID')

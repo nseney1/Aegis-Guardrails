@@ -108,6 +108,24 @@ now = datetime.now(tz=timezone.utc)
 
 The check matches syntax, including import aliases; it does not prove that a supplied timezone is semantically correct. A pattern using `where` cannot establish a result when a non-Python driver supplies no argument information.
 
+The same argument predicate can govern Python and Node calls:
+
+```yaml
+forbid_ast:
+  calls:
+    - name: subprocess.run
+      where: {shell: true}
+    - name: child_process.execSync
+      where: {shell: true}
+```
+
+It matches Python `subprocess.run(command, shell=True)` and Node
+`child_process.execSync(command, {shell: true})`. Static object fields are exposed
+as argument names; spread/computed values remain UNKNOWN. Use a same-line
+`# aegis: allow[rule-id] reason` in Python or `// aegis: allow[rule-id] reason` in
+TS/JS, Go and Rust. [Language checks](languages.md#parsing-and-rule-matching)
+covers canonical names, parser-recognized comments and evasion bounds.
+
 ## Delivery over MCP
 
 **The bootstrap.** `aegis init` writes a small marked `AGENTS.md` block. The MCP server sends the same guidance as its `initialize` instructions, which editing files cannot remove. Rule text is never inlined into an instructions file, so it never pushes a host past its size limit.
@@ -152,10 +170,10 @@ Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-
 
 **Which files.** Files you name; with `--hook` (the pre-commit hook), the staged files, read as staged; or else the working-tree changes (`git diff HEAD` plus staged), or else what the branch adds to its base (`origin/$GITHUB_BASE_REF` in a GitHub pull request, then the branch `origin/HEAD` names, then `main`, `develop` or `master`), or else the last commit. Untracked files are never picked up on their own: `git add` a new file or name it (`aegis check app.py`).
 
-**Layer 1** runs without a network or a model:
+**Layer 1** needs no model or Aegis-initiated network access. Custom drivers remain user-authorized programs:
 
 - **Checkpoint checks** over the repository: a test file for each source file, hard-coded absolute paths, assertions per test, rules the ledger says misfire, rule conventions and paper gates. They warn unless you pass `--strict`; a paper gate and a rule file that cannot be loaded always block.
-- **Security pack and secrets** on what the change introduces: the 7-rule Python security pack and the known-format secret scan run in every `aegis check` (also `--hook` and `--record`), judged against the diff base, so code that was already there is not flagged again. Test paths are exempt but reported, `# aegis: allow[rule]` and `# gitleaks:allow` are honoured, and a baseline never grandfathers these rows. Your own `forbid_ast` rules keep whole-file judgment. Go and TypeScript/JavaScript files have no pack rules yet: the pack only confirms they stay inside the workspace and reports `unverified too_large` above 2 MiB, so a file the native parser rejects fails your `forbid_ast` rules and structural checks, not the pack.
+- **Security packs and secrets** on introduced findings: seven Python, five JS/TS, four Go and two Rust rules, plus the known-format secret scan, run in every `aegis check` (also `--hook` and `--record`). Head and base share parsed facts, so unchanged legacy findings do not become new failures. Test-path exemptions and allow comments are reported; a baseline never grandfathers these rows. Your own `forbid_ast` rules keep whole-file judgment. Missing drivers and files above the 2 MiB native limit retain explicit unverified evidence. See [Language checks](languages.md) for pack limits and syntax coverage.
 - **Per changed file**: a call-graph check (code that is defined but never wired in), an import guard (in non-test Python files, every import must be standard library, a module or package in the repository, or inside a `try`/`except ImportError`; a third-party import is flagged even when your dependency file lists it) and every `forbid_ast` rule that applies. With an active AST backend, a file a `forbid_ast` rule cannot parse fails. When a `forbid_ast` rule matches a file without a driver, its evidence includes `unverified no_driver:<ext>`. Ordinary `--strict` makes this note blocking; default checks keep it advisory. Mutation tests run only with `--full`.
 - **Languages**: Python, TypeScript/JavaScript and Rust parse in process. JS/TS checks are available by default for `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` and `.cjs`; Rust checks are available for `.rs`, without Cargo or rustc. These parsers need no repository dependencies. Bundled Go (needs Go ≥1.21) stays opt-in for detected projects through `aegis init` (`ast.packaged_drivers`). A repository can only select packaged drivers; custom external commands come from `~/.aegis/config.json`, so a cloned repository cannot choose an executable. Oversized native sources produce advisory `unverified too_large` evidence with an exclusion hint; syntax and lexical ambiguity still fail closed. Native Rust extraction is syntactic: it does not expand macros or resolve types, and only test modules with inline bodies supply inline-test metadata.
 
@@ -199,9 +217,9 @@ Trust tiers describe who can change the checks: Tier C is self-attested; Tier B 
 
 - **Rule integrity and human approvals** (`aegis_scan`, `aegis check --ci`, `aegis approve`): `aegis_scan` serves gates and invariants from the reviewed base commit (`rules_base`), listing branch-local mandatory edits only in `unreviewed_rules`. `aegis check --ci` flags rule weakenings (a deleted, archived or lower-ranked rule, a dropped `target_paths` pattern, a narrowed `forbid_ast` call entry, a widening past the two-mandatory-rule cap). `aegis doctor` checks governance/workflow coverage in `CODEOWNERS`; an unowned file alone is not a `check --ci` failure. When the base branch lists a key in `allowed_signers`, it also fails any change to the governance set (`allowed_signers`, `CODEOWNERS`, workflows, `.aegis` config, team and baseline files at any depth, test infrastructure including root runner modules, and deleted tests) unless the change is signed with `aegis approve` (`Aegis-Approve: <governance tree hash>`) by a key already on the base (an SSH signature only; at Tier B this holds only while the pull request leaves `.github/workflows/**` and aegis alone). Rule edits stay under the weakening check, and `pyproject.toml`, `setup.cfg` and `tox.ini` count only when their pytest section changes. With no key on the base, a governance-file change is only noted and passes; a rule weakening still fails, because nothing can approve it (at tier A a qualifying review can). An approval covers the whole of `pyproject.toml`, `setup.cfg` and `tox.ini`, so after the base changes one of them the approval is re-signed on the new head. Comparing by pytest section leaves the rest of those files ungated by design: a `[project.entry-points.pytest11]` plugin, a dependency change or `tox.ini [testenv] commands` can still change what a test run does.
 
-- **Regression discipline** (`aegis check --ci`): a fix commit is a non-merge commit with a Conventional `fix` subject or a `Fixes:` trailer, with a scope outside `ci, build, docs, deps, release, chore, tests`, that changes a source file; `Closes:` and a `Fixes:` line outside the trailer block do not count. It needs a test that fails on `base` and passes at the pull-request head in an isolated snapshot, or a commit-scoped signed `Aegis-Exempt-Test: <fix-sha> <reason>` approval from `aegis approve --exempt-test`. This is advisory, at warning tier (no setting makes it block): judged once against the head with at most 2 pytest runs, `UNVERIFIED` for fixes whose only tests are not Python, with progress on stderr.
+- **Regression discipline** (`aegis check --ci`): a fix commit is a non-merge commit with a Conventional `fix` subject or a `Fixes:` trailer, with a scope outside `ci, build, docs, deps, release, chore, tests`, that changes a source file; `Closes:` and a `Fixes:` line outside the trailer block do not count. It needs a test that fails on `base` and passes at the pull-request head in an isolated snapshot, or a commit-scoped signed `Aegis-Exempt-Test: <fix-sha> <reason>` approval from `aegis approve --exempt-test`. This is advisory, at warning tier (no setting makes it block): judged against the head with at most one head and one base test command per affected language, with progress on stderr. Python uses pytest; Go and Rust integration tests use native identities; TS/JS uses a configured JUnit runner with `witness: repo-runner`. Unsupported runners, inline Rust overlays, missing dependencies and incomplete results remain explicit non-passing outcomes. See [regression tests](languages.md#regression-tests-and-recorded-runs).
 
-- **Security checks, coverage and perf** (`aegis check --ci [--format github|sarif] [--coverage] [--perf]`): one verdict that the text, JSON (`blocking` lists the causes), GitHub annotations and step summary agree on; delta-evaluated structured `forbid_ast.calls` predicates, the security pack and secret delta of Layer 1, optional `ruff`/`gitleaks` presets named by the user-scope `scanners` key (only findings new against the merge base fail; an UNVERIFIED scanner never blocks), schema-valid SARIF 2.1.0 output with anchored findings only (also `aegis check FILES --format sarif` for Layer 1) and ingest, diff coverage on changed executable lines since merge-base(base, head) under the user-scope `tests.command` (`--coverage`; a report that never changes the exit code, `UNVERIFIED` with a reason when it cannot be measured), and paired interleaved base-vs-head benchmarking (`--perf`: the user-scope `perf.command`, or pytest-benchmark when installed; UNVERIFIED never blocks). `--coverage` and `--perf` exit 2 outside `--ci`. `aegis init --ci` adds an `aegis-sarif` job that uploads the SARIF log to code scanning, with `security-events: write` kept out of the job that runs repository code.
+- **Security checks, coverage and perf** (`aegis check --ci [--format github|sarif] [--coverage] [--perf]`): one verdict that the text, JSON (`blocking` lists the causes), GitHub annotations and step summary agree on; delta-evaluated structured `forbid_ast.calls` predicates, the security pack and secret delta of Layer 1, optional `ruff`/`gitleaks` presets named by the user-scope `scanners` key (only findings new against the merge base fail; an UNVERIFIED scanner never blocks), schema-valid SARIF 2.1.0 output with anchored findings only (also `aegis check FILES --format sarif` for Layer 1) and ingest, diff coverage on changed executable lines since merge-base(base, head), using coverage.py with pytest-based `tests.command` for Python, Go coverprofile or user-command LCOV for TS/JS and Rust (`--coverage`; a report that never changes the exit code, `UNVERIFIED` with a reason when it cannot be measured), and paired interleaved base-vs-head benchmarking (`--perf`: the user-scope `perf.command`, or pytest-benchmark when installed; UNVERIFIED never blocks). `--coverage` and `--perf` exit 2 outside `--ci`. `aegis init --ci` adds an `aegis-sarif` job that uploads the SARIF log to code scanning, with `security-events: write` kept out of the job that runs repository code.
 
 - **Release verification** (`aegis doctor --release <sha>`): verifies the GitHub Actions `verdict` attestation emitted on a push to the default branch, with its source ref pinned to GitHub's default branch, using `gh attestation verify` (`gh >= 2.93.0`), failing closed at Tiers B and C (`agent_editable`: the required check runs the pull request's own workflow) or when `gh` is missing or older.
 
@@ -223,13 +241,30 @@ A report without a matching passing test receipt is `claimed` and earns no rule 
 
 `check --record` retains `layer1.evidence` rows with each tool, target, verdict and language, plus a missing-driver reason when applicable. The row keeps the existing file/finding counts and omits source snippets. A passing aggregate result can still contain advisory coverage gaps.
 
-### The test command and its current limits
+### Test commands and complete evidence
 
-`tests.command` is read only from `~/.aegis/config.json`, outside the workspace. A repository config cannot select a program to run. The default is `python -m pytest` under the Python running Aegis. To use a different environment, name its **absolute Python interpreter** as the first word of the command; even an absolute `pytest` launcher is otherwise run under Aegis's Python. Python runs use `-s` and that interpreter's site directories, so a pytest installed only in the user site is unavailable.
+An explicit `tests.command` in user `~/.aegis/config.json` takes precedence and runs
+once per snapshot. Without it, Aegis selects supported language suites and keeps
+separate outcomes; every selected language needs complete passing evidence for an
+aggregate receipt. A passing suite cannot hide another language's unavailable run.
+Repository config never chooses the command.
 
-The receipt runs in an isolated snapshot with a temporary HOME and restricted PATH, rather than your interactive shell environment. It does not install dependencies. User-installed tools such as Cargo/Rustup may therefore be unavailable even when they work in your normal shell.
+Python defaults to `python -m pytest` under Aegis's interpreter. To choose another
+environment, name its absolute Python interpreter first; an absolute pytest launcher
+still uses Aegis's Python. Python runs disable the user site. Pytest and explicit
+`python -m unittest` commands produce JUnit; custom wrappers must write a complete
+report to `{junit}`. Text-summary counts alone cannot qualify for credit.
 
-For a pytest command Aegis requests JUnit output. Otherwise it falls back to the last recognizable timed summary line with counts such as `N passed`. A passing receipt requires exit 0, no timeout, and at least one recognized passing test. Normal `unittest` output (`Ran N tests`, then `OK`) does not supply that count. A Cargo summary may match the text fallback, but there is no native Rust/Python suite aggregation: a combined command can expose only the last recognized summary. **Changing `tests.command` alone does not fix these receipt limitations.** Run and report each native suite explicitly; do not claim combined evidence from a receipt that represents only one suite.
+Go uses native package/test identities; Rust uses Cargo integration targets; TS/JS
+requires `tests.languages.ts.command` and complete file-attributed JUnit, labelled
+`witness: repo-runner`. Rust inline tests count for pairing but not independent
+fail-to-pass overlays. Global wrappers other than pytest can supply a receipt with
+complete JUnit but remain unsupported for fail-to-pass judgment.
+
+Snapshot runs use temporary HOME, bounded execution and existing dependencies.
+Aegis's defaults do not fetch packages or toolchains; user commands execute repository
+code and are not a network sandbox. [Language checks](languages.md) provides
+configuration examples, precedence, timeouts, coverage readers and evidence codes.
 
 ### Landing and confirmation
 
@@ -241,7 +276,7 @@ The local ledger is mutable and includes legacy rows and detector replay. Its fi
 
 ### Fitness and human review
 
-**Fitness and sample-size states** are computed on read: `aegis sync` evaluates CI-confirmed checks, git detector replay over merged history for `forbid_ast` rules (`caught` vs `leaked`), and human-adjudicated labels, with session-count decay `w = 2^(-delta / H)`, where H is `expiry.half_life_sessions`, over every exposed session (exposure rows carry no liveness flag yet; silence earns no credit in 4.4.0). Each rule reports one of four sample-size states: `untestable`, `insufficient (n=K)`, `inconclusive` or `decided`. Below `n = 25` verdicts (`MIN_N`) no precision number is shown (`reported_score` is empty) and no promotion, demotion, tier change or archive by misfire happens. A landed (leaked) violation is a disposition, not a false positive. Decay counts sessions; calendar days never decay a rule. A plain `aegis check` and native session reports record triggers only, never tp or fp. Frontmatter is not evidence: `prior`, `pack_prior`, `trigger_rate_per_day`, `expected_triggers_per_day` and `expiry.*` are accepted and ignored.
+**Fitness and sample-size states** are computed on read: `aegis sync` evaluates CI-confirmed checks, git detector replay over merged history for `forbid_ast` rules (`caught` vs `leaked`), and human-adjudicated labels, with session-count decay `w = 2^(-delta / H)`, where H is `expiry.half_life_sessions`, over every exposed session (exposure rows carry no liveness flag yet; silence earns no credit). Each rule reports one of four sample-size states: `untestable`, `insufficient (n=K)`, `inconclusive` or `decided`. Below `n = 25` verdicts (`MIN_N`) no precision number is shown (`reported_score` is empty) and no promotion, demotion, tier change or archive by misfire happens. A landed (leaked) violation is a disposition, not a false positive. Decay counts sessions; calendar days never decay a rule. A plain `aegis check` and native session reports record triggers only, never tp or fp. Frontmatter is not evidence: `prior`, `pack_prior`, `trigger_rate_per_day`, `expected_triggers_per_day` and `expiry.*` are accepted and ignored.
 
 Promotion is suggested only for a promotable rule with enough evidence and reviewed adjudication labels: **at least 25 true-positive labels and no false positives, or at least 42 total labels with at most one false positive**. Those labels must span **at least 3 sessions**, plus **at least 2 repositories or 14 days**. A rule must be at least 30 days old according to its `created` date. A missing or invalid `created` date is treated as age zero and blocks promotion. CI results and replay alone cannot satisfy the label requirement. Incomplete evidence suppresses a decision; adverse evidence can instead produce a demotion or archive suggestion.
 
@@ -267,7 +302,7 @@ See [Why Aegis is built this way](why-aegis.md) for the reasoning and statistica
 
 `aegis init` registers hosts and installs the git hook. `aegis hook install --host <host>` adds a host pre-tool hook. They serve different purposes: the git hook checks staged content, while supported host hooks can check scan-before-edit and destructive commands earlier.
 
-Host hooks fail open on Aegis errors and do not see edits made through shell commands. Codex hooks must be trusted in `/hooks`; Antigravity's scan gate records only, and its hooks are unavailable on Windows. A registered hook is not proof that enforcement is active. `aegis doctor` reports registration, unsafe launches, known gaps and the trust tier; review its findings before using `--fix`.
+Host hooks fail open on Aegis errors and do not see edits made through shell commands. Codex hooks must be trusted in `/hooks`; Antigravity's scan gate records only, and its hooks are unavailable on Windows. A registered hook is not proof that enforcement is active. `aegis doctor` reports registration, unsafe launches, known gaps and the trust tier; review its findings before using `--fix`. Its language rows show parser, pack size, test and coverage configuration. Go diagnostics include compiler/cache state without building; confirmed repair can build the cache. Init suggests user-scope TS/JS commands without writing them. Generated CI adds Go setup to both check jobs when Go is enabled, preserving an existing workflow.
 
 See [Hosts and hooks](hosts-and-hooks.md) for safe registrations, backups, instruction limits, runtime behavior and skill syncing. For parallel worktrees, [Agent teams](teams.md) explains cooperative leases, containment checks and their CI limits.
 
@@ -293,8 +328,9 @@ See [Hosts and hooks](hosts-and-hooks.md) for safe registrations, backups, instr
 | `~/.aegis/link.key` | user | 32 random bytes (`0600` on POSIX) that `aegis init` and `aegis rule insight enable` create (and the first insight capture that carries a session id, when it is missing) to pseudonymize host session ids; it stays on the machine |
 | `~/.aegis/insights/<workspace-id>.jsonl` | user | the opt-in redacted corrections of `aegis rule insight` ([Evidence and outcomes](#evidence-and-outcomes)) |
 | `~/.aegis/rules/` | user | an optional personal rule layer, served read-only where no repo is governed |
-| `~/.aegis/config.json` | user | the only place for command-like settings, `tests.command`, `perf.command`, scanner commands and AST driver commands; also `ci.workflow` for receipt confirmation |
+| `~/.aegis/config.json` | user | the only place for command-like settings: `tests.command`, `tests.languages`, `coverage.languages`, `perf.command`, scanner and AST driver commands; also `ci.workflow` for receipt confirmation |
 | `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.codex/rules/aegis.rules`, `~/.gemini/config/hooks.json` | user | the hook entries `aegis hook install --host` writes (or the repository's `.claude/settings.json`, `.codex/hooks.json` and `.agents/hooks.json` with `--scope project`) |
+| `$XDG_CACHE_HOME/aegis/drivers` (default `~/.cache/aegis/drivers`), `~/Library/Caches/aegis/drivers` or `%LOCALAPPDATA%\aegis\Cache\drivers` | no | cached Go parser, keyed by packaged source and toolchain; unsafe or workspace-contained cache paths are refused |
 | `~/.aegis/backups/` | user | a copy of each file taken before Aegis changes it, one timestamped folder per run: the host config `aegis init --host` and `aegis uninstall` merge (Antigravity's `mcp_config.json`), the files `aegis doctor --fix` edits, the host hook files `aegis hook install --host`, `aegis rule insight enable` and `uninstall --host` change, and the pre-commit hook `aegis hook install` (or `init`) rewrites |
 
 Aegis reads four variables of its own (hosts and GitHub Actions supply others, such as `CLAUDE_PROJECT_DIR`, `GITHUB_BASE_REF` and `GH_TOKEN`): `AEGIS_WORKSPACE` (pin the server to one repo, which must hold `.aegis/`; `aegis init --pin` writes it into the registration, and the CLI honors it too, as [Delivery over MCP](#delivery-over-mcp) describes), `AEGIS_CLIENT` (host identity, written by `aegis init`), `AEGIS_MAX_JIT_TOKENS` (scan budget) and `AEGIS_LLM_CMD` (the Layer 2 model command).
