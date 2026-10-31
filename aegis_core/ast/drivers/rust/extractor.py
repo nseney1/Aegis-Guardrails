@@ -226,16 +226,27 @@ class Extractor:
         self.import_bindings.update(name for item in self.imports for name, _ in item.aliases)
 
     def _angle_end(self, start):
-        depth, i = 0, start
+        depth, i, groups = 0, start, []
         while i < len(self.t):
             value = self.t[i].value
+            if value in ('(', '['):
+                groups.append((self.pairs[i], depth, value))
+            elif value in (')', ']'):
+                if not groups or groups[-1][:2] != (i, depth):
+                    error('invalid generic arguments', self.t[start].line)
+                groups.pop()
+            elif value == '>' and groups and depth <= groups[-1][1]:
+                error('invalid generic arguments', self.t[start].line)
             if value in ('<', '>'):
                 self.generic_punct.add(i)
             depth += value == '<'
             depth -= value == '>'
             if depth == 0:
+                self._validate_types(start, i + 1)
                 return i + 1
-            if value in (';', '{', '}'):
+            # Array separators belong to that array, never a surrounding generic.
+            array_separator = groups and groups[-1][1:] == (depth, '[')
+            if value in ('{', '}') or (value == ';' and not array_separator):
                 if value == '{':
                     error('unsupported_lexical_context: const expression in type', self.t[i].line)
                 error('invalid generic arguments', self.t[start].line)
@@ -277,9 +288,20 @@ class Extractor:
         for index in range(lo, hi):
             if self.t[index].value != '[' or index not in self.pairs:
                 continue
+            opaque_array = index in self.opaque or index in self.skip
             closing = self.pairs[index]
-            separator = next((i for i in range(index + 1, closing) if self.t[i].value == ';'), None)
-            if separator is not None and any(self.t[i].value in ('(', '{') for i in range(separator + 1, closing)):
+            separator, i = None, index + 1
+            while i < closing:
+                if self.t[i].value == ';':
+                    if separator is None:
+                        separator = i
+                    elif not opaque_array:
+                        error('invalid array type', self.t[index].line)
+                i = self.pairs[i] + 1 if i in self.pairs and self.pairs[i] > i else i + 1
+            if not opaque_array and (closing == index + 1 or separator in (index + 1, closing - 1)):
+                error('invalid array type', self.t[index].line)
+            if separator is not None and any(self.t[i].value in ('(', '{') or (not opaque_array and i in self.opaque)
+                                             for i in range(separator + 1, closing)):
                 error('unsupported_lexical_context: const expression in type', self.t[index].line)
 
     def _impl_type(self, start, end):
@@ -317,13 +339,19 @@ class Extractor:
     def _type_alias(self, start):
         if start + 1 < len(self.t) and self.t[start + 1].kind == 'ident':
             self.local.add(self.t[start + 1].value)
-        end = start + 1
-        while end < len(self.t) and self.t[end].value != ';':
+        end, groups = start + 1, []
+        while end < len(self.t):
+            if self.t[end].value == ';' and not groups:
+                break
             if self.t[end].value == '{':
                 error('unsupported_lexical_context: block in type', self.t[end].line)
             if self.t[end].value == '<':
                 end = self._angle_end(end)
                 continue
+            if self.t[end].value in ('(', '['):
+                groups.append(self.pairs[end])
+            elif groups and end == groups[-1]:
+                groups.pop()
             end += 1
         self._validate_types(start, end)
         self.skip.update(range(start, end + 1))

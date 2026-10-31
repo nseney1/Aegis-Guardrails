@@ -105,3 +105,93 @@ def test_a_malformed_use_statement_fails_closed():
     with pytest.raises(ASTDriverError, match='mismatched delimiter at line 1') as error:
         parse("use crate::net::client};\nfn run() {}\n", "lib.rs")
     assert error.value.reason == 'syntax'
+
+
+@pytest.mark.parametrize('source', [
+    'fn ppm_rgb(bytes: &[u8]) -> Result<([u32; 2], &[u8])> { body() }',
+    'fn run() -> Result<[([u8; 2], (u8, u8)); 4]> { body() }',
+    'fn run(values: [([u8; 2], (u8, u8)); 4]) { body(); }',
+    'struct Data { values: [([u8; 2], (u8, u8)); 4] } fn run() { body(); }',
+    'enum Data { Values([([u8; 2], (u8, u8)); 4]) } fn run() { body(); }',
+    'type Data = [([u8; 2], (u8, u8)); 4]; fn run() { body(); }',
+    'type Data = Result<([u32; 2], &[u8])>; fn run() { body(); }',
+    'type Data = [fn(u8) -> Result<[u8; 2]>; 4]; fn run() { body(); }',
+    'fn run() { body::<Result<[([u8; 2], (u8, u8)); 4]>>(); }',
+    'fn run() -> Result<([Vec<[u8; 2]>; 4], fn(u8) -> u8)> { body() }',
+    'fn run() -> Result<[u8; module::COUNT]> { body() }',
+    'fn run() -> Result<[u8; COUNT + 1]> { body() }',
+    'type Data = [u8; COUNT * 2]; fn run() { body(); }',
+    'fn run() { body::<[u8; COUNT + 1]>(); }',
+    'fn run() -> Result<[u8; !0usize]> { body() }',
+    'type Data = [u8; !COUNT]; fn run() { body(); }',
+    'fn run() { body::<[u8; !0usize]>(); }',
+    'fn run() { body::<Kind![]>(); }',
+    'type Data = Kind!([[]]); fn run() { body(); }',
+    'fn run() -> Result<Kind!([[]])> { body() }',
+    'type Data = [Kind!(); 2]; fn run() { body(); }',
+    'type Data = Kind!([u8; inner![]]); fn run() { body(); }',
+])
+def test_public_rust_extraction_preserves_nested_array_types_and_body_calls(source):
+    from aegis_core.ast.policy import extract_normalized_ast
+
+    tree = extract_normalized_ast('src/array_types.rs', code=source)
+    assert tree.language == 'rust'
+    assert [call.target for call in tree.call_sites] == ['body']
+
+
+@pytest.mark.parametrize('source,detail', [
+    ('fn run() -> Result<([u8; 2], &[u8]) { body() }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run() -> Result<([u8; 2], &[u8]> { body() }', 'unclosed delimiter'),
+    ('type Data = Result<[u8; 2];', 'invalid generic arguments'),
+    ('fn run() -> Result<(u8; u8)> { body() }', 'invalid generic arguments'),
+    ('fn run() -> Result<(u8>, u8)> { body() }', 'invalid generic arguments'),
+    ('fn run() -> Result<[Vec<u8; 2>; 4]> { body() }', 'invalid generic arguments'),
+    ('fn run() -> Result<[u8; 2; 3]> { body() }', 'invalid array type'),
+    ('fn run() { body::<[u8; 2; 3]>(); }', 'invalid array type'),
+    ('type Data = [u8; 2; 3];', 'invalid array type'),
+    ('fn run() -> Result<[; 2]> { body() }', 'invalid array type'),
+    ('fn run() { body::<[u8; ]>(); }', 'invalid array type'),
+    ('type Data = [; 2];', 'invalid array type'),
+    ('type Data = [u8; ];', 'invalid array type'),
+    ('fn run() -> Result<[]> { body() }', 'invalid array type'),
+    ('fn run() -> Result<[u8; dangerous()]> { body() }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run() -> Result<[([u8; 2], u8); dangerous()]> { body() }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run() -> Result<[u8; { dangerous() }]> { body() }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run() { body::<Result<[u8; dangerous()]>>(); }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run() -> Result<[u8; dangerous![]]> { body() }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run(values: [([u8; dangerous![]], u8); 4]) {}',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = [u8; dangerous![]];',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = Result<[([u8; 2], u8); dangerous![]]>;',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run() { body::<Result<[u8; dangerous![]]>>(); }',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = [([u8; 2], u8); dangerous()];',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = ([u8; 2], Holder<{ dangerous() }>);',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = ([u8; 2], { dangerous() });',
+     'unsupported_lexical_context: block in type'),
+    ('type Data = [Kind!([u8; dangerous()]); 2]; fn run() { body(); }',
+     'unsupported_lexical_context: const expression in type'),
+    ('fn run(values: [Kind!([u8; dangerous()]); 2]) { body(); }',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = Kind!([u8; dangerous()]); fn run() { body(); }',
+     'unsupported_lexical_context: const expression in type'),
+    ('type Data = Kind!([u8; dangerous(); 0]); fn run() { body(); }',
+     'unsupported_lexical_context: const expression in type'),
+])
+def test_public_rust_nested_array_types_keep_malformed_and_executable_types_closed(source, detail):
+    from aegis_core.ast.policy import ASTExtractionError, extract_normalized_ast
+
+    with pytest.raises(ASTExtractionError) as raised:
+        extract_normalized_ast('src/array_types.rs', code=source)
+    assert str(raised.value) == f'cannot verify src/array_types.rs: ASTDriverError: {detail} at line 1'
+    assert raised.value.__cause__.reason == 'syntax'

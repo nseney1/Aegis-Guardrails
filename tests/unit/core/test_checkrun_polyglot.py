@@ -209,7 +209,7 @@ def test_go_full_tree_receipt_uses_real_default_runner(project):
 
 
 @pytest.mark.parametrize('extra', [
-    'func ExampleWorks() { println("wrong")\n // Output: expected\n}\n',
+    'func Example() { println("wrong")\n // Output: expected\n}\n',
     'func FuzzWorks(f *testing.F) { f.Add("seed"); f.Fuzz(func(t *testing.T, s string) { t.Fatal("fails") }) }\n',
 ])
 def test_go_receipt_does_not_filter_failing_examples_or_fuzz_seeds(project, extra):
