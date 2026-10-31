@@ -108,6 +108,15 @@ class Token:
         require(size.value == C.sizeof(value), 'GetTokenInformation invalid DWORD width')
         return value.value
 
+    def has_restrictions(self, token):
+        # Class 21 returns a BOOLEAN at a DWORD-aligned address, not a DWORD:
+        # https://github.com/microsoft/win32metadata/discussions/2308
+        value, size = DWORD(), DWORD()
+        self.checked('GetTokenInformation', token, 21, C.byref(value), C.sizeof(value), C.byref(size))
+        require(size.value == C.sizeof(C.c_ubyte),
+                'GetTokenInformation class 21 invalid BOOLEAN width: ' + str(size.value))
+        return C.c_ubyte.from_buffer(value).value
+
     def sid_bytes(self, pointer):
         require(pointer and self.adv.IsValidSid(pointer), 'invalid token SID')
         size = self.adv.GetLengthSid(pointer)
@@ -183,7 +192,7 @@ class Token:
             row = {'user_sid': user.hex(), 'integrity_sid': integrity.hex(), 'groups': groups,
                    'restricting_sids': restricted, 'elevated': self.scalar(token, 20),
                    'ui_access': self.scalar(token, 26), 'type': self.scalar(token, 8),
-                   'impersonation_level': self.scalar(token, 9), 'filtered': self.scalar(token, 21)}
+                   'impersonation_level': self.scalar(token, 9), 'filtered': self.has_restrictions(token)}
             self.record[label] = row
             require(user == self.sid_bytes(self.user), 'effective token user differs')
             require(row['type'] == 2 and row['impersonation_level'] >= 2, 'effective token cannot impersonate')
