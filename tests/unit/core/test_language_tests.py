@@ -14,6 +14,7 @@ import pytest
 from aegis_core.verification.language_tests import GoTest, prepare_language_tests, run_language_snapshot
 from aegis_core.verification.test_outcomes import RustTarget
 from tests.conftest import symlink_or_skip
+from tests.unit.core.test_windows_junction import junction_kernel
 
 
 @pytest.fixture
@@ -59,7 +60,8 @@ def project(tmp_path, monkeypatch):
         " if mode=='missing': raise SystemExit(0)\n"
         " report=next(a.split('=',1)[1] for a in args if a.startswith('--report='))\n"
         " pathlib.Path(report).write_text('<testsuite file=\"tests/a.test.ts\" name=\"suite\"><testcase name=\"works\"/></testsuite>')\n"
-        " if mode=='replace_link': pathlib.Path('node_modules').unlink(); pathlib.Path('node_modules').mkdir()\n"
+        " if mode=='replace_link':\n"
+        "  link=pathlib.Path('node_modules'); link.unlink() if link.is_symlink() else link.rmdir(); link.mkdir()\n"
         "raise SystemExit(1 if mode=='fail' else 0)\n", encoding="utf-8")
     paths = {}
     for name in ("go", "cargo", "rustup", "node"):
@@ -104,6 +106,8 @@ def execute(project, plan, name="head", **options):
 
 
 def require_directory_link(project):
+    if os.name == "nt":
+        return  # Windows must exercise junctions, without a symlink-privilege skip.
     probe = project["scratch"] / "directory-link-probe"
     symlink_or_skip(project["workspace"] / "node_modules", probe, target_is_directory=True)
     probe.unlink()
@@ -208,6 +212,73 @@ def test_ts_user_command_runs_once_with_snapshot_dependencies_and_junit_identity
     assert (project["workspace"] / "node_modules").is_dir()
 
 
+def test_windows_snapshot_dependencies_use_junction_when_symlink_privilege_is_absent(project, monkeypatch, junction_kernel):
+    from aegis_core.verification import language_tests
+
+    configure(project, "ts", ["node", "runner.mjs", "--report={junit}", "{files}"])
+    plan = prepare(project, "ts")
+    platform = SimpleNamespace(**vars(os))
+    platform.name = "nt"
+    monkeypatch.setattr(language_tests, "os", platform)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("symlink privilege unavailable")
+
+    monkeypatch.setattr(Path, "symlink_to", denied)
+    target = project["workspace"] / "node_modules" / "keep"
+    target.write_text("dependency content")
+    outcome = execute(project, plan)
+    assert outcome.evidence, sorted(outcome.build_errors)
+    assert outcome.passed_ids == frozenset({("tests/a.test.ts", "suite", "works")})
+    assert len(project["calls"]) == 1 and junction_kernel.buffers
+    assert not (project["snapshot"] / "node_modules").exists()
+    assert target.read_text() == "dependency content"
+
+
+@pytest.mark.parametrize("condition", ["retargeted", "dangling", "timeout", "missing_report"])
+def test_windows_junction_lifecycle_preserves_targets_and_detects_retargeting(project, monkeypatch, junction_kernel, condition):
+    from dataclasses import replace
+    from aegis_core.verification import language_tests
+
+    configure(project, "ts", ["node", "runner.mjs", "--report={junit}", "{files}"])
+    plan = prepare(project, "ts")
+    platform = SimpleNamespace(**vars(os))
+    platform.name = "nt"
+    monkeypatch.setattr(language_tests, "os", platform)
+    target, link = project["workspace"] / "node_modules", project["snapshot"] / "node_modules"
+    (target / "keep").write_text("dependency")
+    readlink, reads = os.readlink, []
+
+    def observed(path, *args, **kwargs):
+        value = readlink(path, *args, **kwargs)
+        if Path(path) == link:
+            reads.append(value)
+            if len(reads) == 2 and condition == "retargeted":
+                junction_kernel.targets[str(link)] = value + "-changed"
+                return value + "-changed"
+            if len(reads) == 2 and condition == "dangling":
+                target.rename(target.with_name("moved-dependencies"))
+        return value
+
+    monkeypatch.setattr(os, "readlink", observed)
+    platform.readlink = observed
+    if condition == "timeout":
+        plan = replace(plan, timeout_s=0.1)
+        (project["tools"] / "runtime.py").write_text("import time\ntime.sleep(60)\n")
+    elif condition == "missing_report":
+        project["scenario"].write_text('{"mode":"missing"}')
+    outcome = execute(project, plan)
+    if condition == "retargeted":
+        assert not outcome.evidence and any("link changed" in error for error in outcome.build_errors)
+        assert link.exists()
+    else:
+        assert not link.exists()
+        assert outcome.evidence == (condition == "dangling")
+        assert outcome.timed_out == (condition == "timeout")
+    retained = target.with_name("moved-dependencies") if condition == "dangling" else target
+    assert (retained / "keep").read_text() == "dependency"
+
+
 @pytest.mark.parametrize("kind", ["existing", "denied", "replace_link", "missing"])
 def test_ts_link_and_report_failures_are_explicit_and_preserve_snapshot_entries(project, monkeypatch, kind):
     if kind in ("replace_link", "missing"):
@@ -221,7 +292,12 @@ def test_ts_link_and_report_failures_are_explicit_and_preserve_snapshot_entries(
     elif kind == "denied":
         def denied(*args, **kwargs):
             raise PermissionError("link privilege unavailable")
-        monkeypatch.setattr(os, "symlink", denied)
+        if os.name == "nt":
+            import ctypes
+
+            monkeypatch.setattr(ctypes, "WinDLL", denied)
+        else:
+            monkeypatch.setattr(Path, "symlink_to", denied)
     else:
         project["scenario"].write_text(json.dumps({"mode": kind}))
     outcome = execute(project, plan)
@@ -326,15 +402,17 @@ def test_deadline_expiring_during_dependency_setup_never_starts_the_command(proj
     require_directory_link(project)
     configure(project, "ts", ["node", "runner.mjs", "--report={junit}", "{files}"])
     plan = prepare(project, "ts")
-    clock, symlink = [100.0], os.symlink
+    operation = "mkdir" if os.name == "nt" else "symlink_to"
+    clock, create = [100.0], getattr(Path, operation)
     monkeypatch.setattr(language_tests, "time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     def slow_link(*args, **kwargs):
-        result = symlink(*args, **kwargs)
-        clock[0] = 102.0
+        result = create(*args, **kwargs)
+        if operation == "symlink_to" or Path(args[0]) == project["snapshot"] / "node_modules":
+            clock[0] = 102.0
         return result
 
-    monkeypatch.setattr(os, "symlink", slow_link)
+    monkeypatch.setattr(Path, operation, slow_link)
     outcome = execute(project, plan, deadline=101.0)
     assert outcome.timed_out and not outcome.evidence and not project["calls"]
     assert not (project["snapshot"] / "node_modules").exists()

@@ -30,6 +30,46 @@ def test_go_runtime_prepares_without_test_identities_and_preserves_offline_polic
     assert Path(project["calls"][0][1]["cwd"]).name == "neutral"
 
 
+@pytest.mark.parametrize("cache_variable", ["LOCALAPPDATA", "XDG_CACHE_HOME"])
+def test_go_cache_discovery_uses_parent_location_only_for_the_metadata_probe(project, cache_variable):
+    from aegis_core.language_runtime import language_runtime_environment, prepare_language_runtime
+
+    cache = project["tools"] / "parent-cache"
+    (project["tools"] / "runtime.py").write_text(
+        "import os\n"
+        f"cache = os.environ.get({cache_variable!r})\n"
+        "print(os.path.join(cache, 'go-build') if cache else 'off')\n"
+        "print(os.path.join(cache, 'go-modules') if cache else 'off')\n")
+    runtime = prepare_language_runtime(project["workspace"], "go", ["go", "test"],
+        scratch=project["scratch"] / "runtime", parent={cache_variable: str(cache)})
+    execution = language_runtime_environment(runtime, project["scratch"] / "execute")
+    assert dict(runtime.parent_caches) == {
+        "GOCACHE": str(cache / "go-build"), "GOMODCACHE": str(cache / "go-modules")}
+    (argv, options), = project["calls"]
+    assert argv[1:] == ["env", "GOCACHE", "GOMODCACHE"]
+    assert Path(options["cwd"]).name == "neutral"
+    assert options["env"][cache_variable] == str(cache)
+    for env in (options["env"], execution):
+        assert {name: env[name] for name in ("GOTOOLCHAIN", "GOFLAGS", "GOPROXY", "GOWORK", "GOENV")} == {
+            "GOTOOLCHAIN": "local", "GOFLAGS": "-mod=readonly", "GOPROXY": "off", "GOWORK": "off", "GOENV": "off"}
+    assert "LOCALAPPDATA" not in execution and "XDG_CACHE_HOME" not in execution
+    assert execution["HOME"] == str(project["scratch"] / "execute" / "home")
+
+
+@pytest.mark.parametrize("cache", ["off", "relative-cache", ""])
+def test_go_cache_discovery_rejects_nonabsolute_probe_output(project, cache):
+    from aegis_core.language_runtime import RuntimeUnavailable, prepare_language_runtime
+
+    (project["tools"] / "runtime.py").write_text(
+        f"print({cache!r})\nprint({str(project['tools'] / 'go-modules')!r})\n")
+    with pytest.raises(RuntimeUnavailable) as error:
+        prepare_language_runtime(project["workspace"], "go", ["go", "test"],
+                                 scratch=project["scratch"] / "runtime", parent={})
+    assert (error.value.reason, error.value.detail) == (
+        "deps_unavailable", "Go cache probe returned invalid paths")
+    assert len(project["calls"]) == 1
+
+
 def test_rust_runtime_ignores_repository_pin_and_uses_installed_default(project):
     from aegis_core.language_runtime import (
         language_runtime_environment,

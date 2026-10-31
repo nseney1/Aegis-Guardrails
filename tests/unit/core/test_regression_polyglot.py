@@ -437,14 +437,67 @@ def test_unknown_python_wrapper_is_unverifiable_instead_of_a_test_failure(projec
     assert counter.read_text() == "xx"
 
 
-def test_configured_absolute_pytest_paths_run_snapshot_tests_instead_of_dirty_live_files(project):
+@pytest.mark.parametrize("selection", ["file", "directory", "node", "delimited"])
+def test_configured_absolute_pytest_paths_run_snapshot_tests_instead_of_dirty_live_files(project, selection):
     project.write("src/app.py", "def value(): return 2\n")
-    project.write("tests/test_app.py", "from src.app import value\ndef test_value(): assert value()==2\n")
+    body = "from src.app import value\ndef test_value(): assert value()==2\n"
+    if selection == "node":
+        body += "def test_unselected(): assert False, 'explicit node selection was broadened'\n"
+    project.write("tests/test_app.py", body)
     project.commit("fix: value")
-    configure(project, command=[sys.executable, "-m", "pytest", str(project.root / "tests/test_app.py")])
+    chosen = str(project.root / ("tests" if selection == "directory" else "tests/test_app.py"))
+    if selection == "node":
+        chosen += "::test_value"
+    # pytest 8 collects duplicate selections; pytest 9 otherwise hides this defect.
+    selectors = ["--", chosen] if selection == "delimited" else [chosen]
+    configure(project, command=[sys.executable, "-m", "pytest", "--keep-duplicates", *selectors])
     project.write("tests/test_app.py", "def test_value(): assert False, 'dirty live source was used'\n")
     result = check_ci_regressions(project.root, "main").commits[0]
     assert result.status == "passed" and result.reason == "ok"
+    assert result.fail_to_pass_tests == ("tests.test_app::test_value",)
+
+
+def test_configured_pytest_option_value_is_not_a_directory_selection(project):
+    project.write("tests/test_untouched.py", "def test_existing_failure(): assert False\n")
+    project.commit("test: keep an unrelated existing failure")
+    project.git("update-ref", "refs/heads/main", "HEAD")
+    configure(project, command=[sys.executable, "-m", "pytest", "-k", "tests"])
+    project.write("src/app.py", "def value(): return 2\n")
+    project.write("tests/test_app.py", "from src.app import value\ndef test_value(): assert value()==2\n")
+    project.commit("fix: value")
+    result = check_ci_regressions(project.root, "main").commits[0]
+    assert (result.status, result.reason) == ("passed", "ok")
+    assert result.fail_to_pass_tests == ("tests.test_app::test_value",)
+
+
+def test_configured_pytest_explicit_duplicate_selections_cannot_prove_a_transition(project):
+    project.write("src/app.py", "def value(): return 2\n")
+    project.write("tests/test_app.py", "from src.app import value\ndef test_value(): assert value()==2\n")
+    project.commit("fix: value")
+    selected = str(project.root / "tests/test_app.py")
+    configure(project, command=[sys.executable, "-m", "pytest", "--keep-duplicates", selected, selected])
+    result = check_ci_regressions(project.root, "main").commits[0]
+    assert (result.status, result.reason) == ("unverifiable", "incomplete_test_output")
+    assert result.fail_to_pass_tests == ()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX temporary-directory alias models macOS /var")
+@pytest.mark.parametrize("option", [None, "-W", "-X"])
+def test_configured_python_snapshot_identity_survives_a_temporary_directory_alias(project, tmp_path, monkeypatch, option):
+    import tempfile
+
+    physical, alias = tmp_path / "physical-temp", tmp_path / "alias-temp"
+    physical.mkdir()
+    alias.symlink_to(physical, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    flags = [] if option is None else [option, "-m"]
+    configure(project, command=[sys.executable, *flags, "-m", "pytest"])
+    project.write("src/app.py", "def value(): return 2\n")
+    project.write("tests/test_app.py", "from src.app import value\ndef test_value(): assert value()==2\n")
+    project.commit("fix: value")
+    result = check_ci_regressions(project.root, "main").commits[0]
+    assert (result.status, result.reason) == ("passed", "ok")
+    assert result.fail_to_pass_tests == ("tests.test_app::test_value",)
 
 
 def test_rust_fail_to_pass_overlays_only_owned_test_files(project, rust_metadata, monkeypatch):
