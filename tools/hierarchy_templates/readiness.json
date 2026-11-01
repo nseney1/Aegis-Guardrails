@@ -1,0 +1,13 @@
+{
+  "worktree": "/absolute/aegis-lanes/a-f2",
+  "branch": "lane/a-f2",
+  "base_revision": "REPLACE_WITH_FULL_BASE_COMMIT_ID",
+  "lease_ref": "refs/aegis/lanes/a-f2",
+  "lease_oid": "REPLACE_WITH_FULL_LEASE_OBJECT_ID",
+  "lease_expires_at": "REPLACE_WITH_OBSERVED_UTC_EXPIRY",
+  "owned_paths": ["REPLACE_WITH_EXPLICIT_OWNED_PATH_OR_GLOB"],
+  "scan_workspace": "/absolute/aegis-lanes/a-f2",
+  "scan_evidence": "REPLACE_WITH_SCAN_EVIDENCE_REFERENCE",
+  "enforcement_tier": "advisory",
+  "hook_evidence": "REPLACE_WITH_HOOK_PROBE_OR_UNAVAILABLE_EVIDENCE_REFERENCE"
+}

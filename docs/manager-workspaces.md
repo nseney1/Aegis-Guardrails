@@ -185,6 +185,11 @@ operational success grants zero fitness and no repository witness. Native caller
 binding, permission/endpoint isolation, lifecycle enforcement and comparative
 hierarchy acceptance remain separate work.
 
+The [host-neutral hierarchy prototype](agent-hierarchies.md) adds source-checkout
+role prompts, mailbox tooling and checkpoint handoffs outside Aegis core. It can
+reference management audit decisions without changing this API or activating policy.
+Its delivery and completion claims confer no manager membership or repository credit.
+
 POSIX directory-descriptor confinement is covered by the local store tests. Windows
 ancestor-swap races remain unsupported and unverified by this prototype; passing
 Linux tests provides no Windows security guarantee. Native Windows acceptance

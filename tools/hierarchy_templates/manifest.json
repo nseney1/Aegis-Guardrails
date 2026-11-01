@@ -1,0 +1,23 @@
+{
+  "schema": "aegis.hierarchy-pilot/v1",
+  "writer_limit": 3,
+  "endpoints": {
+    "a/front-door": {},
+    "a/orchestrator": {},
+    "a/lane/f2": {"kind": "implementer"},
+    "a/lane/integration": {"kind": "integrator"},
+    "a/lane/review": {"kind": "reviewer"},
+    "b/front-door": {},
+    "b/orchestrator": {},
+    "b/lane/f6": {"kind": "implementer"},
+    "b/lane/integration": {"kind": "integrator"},
+    "b/lane/review": {"kind": "reviewer"}
+  },
+  "counterparts": [
+    ["a/front-door", "b/front-door"],
+    ["a/orchestrator", "b/orchestrator"],
+    ["a/lane/f2", "b/lane/f6"],
+    ["a/lane/integration", "b/lane/integration"],
+    ["a/lane/review", "b/lane/review"]
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "outgoing_stopped": true,
+  "briefs": [
+    {
+      "path": "/absolute/aegis-guides/briefs/a-f2-v1.md",
+      "sha256": "REPLACE_WITH_RAW_BYTE_SHA256"
+    }
+  ],
+  "sources": [
+    {
+      "worktree": "/absolute/aegis-lanes/a-f2",
+      "source_revision": "REPLACE_WITH_FULL_COMMIT_ID",
+      "source_tree": "REPLACE_WITH_FULL_TREE_ID",
+      "dirty_state": "REPLACE_WITH_OBSERVED_DIRTY_STATE"
+    }
+  ],
+  "lease_refs": ["refs/aegis/lanes/a-f2"],
+  "completed_checks": [],
+  "pending_message_ids": ["a-f2-dispatch-001"],
+  "last_acknowledgment_ids": []
+}
