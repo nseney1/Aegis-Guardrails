@@ -77,6 +77,13 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
     "aegis_core.team": 1,
+    # Manager-only policy and append-only audit domain; no repository credit imports.
+    "aegis_core.manager_policy": 1,
+    "aegis_core.manager_store": 1,
+    # Startup-pinned configuration and owner approval over the audit domain.
+    "aegis_core.manager_config": 2,
+    # Shared manager decision/report service over the pinned activation service.
+    "aegis_core.manager": 3,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
     # Pure AST inspection of lane declarations and pytest configuration.

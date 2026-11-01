@@ -31,7 +31,7 @@ from urllib.request import url2pathname
 from aegis_core import hosts
 from aegis_core._version import __version__
 from aegis_core.bootstrap import instructions_text
-from aegis_core.config import env_client, env_workspace
+from aegis_core.config import env_client, env_manager_registration, env_workspace
 from aegis_core.taxonomy import MCP_DEFAULT_RATE_LIMITS
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace.binding import Attested, Registry, WorkspaceBinding, read_registry, resolve_binding
@@ -75,6 +75,9 @@ _pending: Dict[str, str] = {}
 _request_seq: int = 0
 _workspaces: Dict[Tuple[str, str], Workspace] = {}
 _registry_cache: Optional[Tuple[Tuple[Any, ...], Registry]] = None
+_manager_config: Optional[str] = None
+_manager_digest: Optional[str] = None
+_manager_error: Optional[Dict[str, str]] = None
 
 
 def fresh_state() -> Dict[str, Any]:
@@ -95,6 +98,9 @@ def fresh_state() -> Dict[str, Any]:
         "_request_seq": 0,
         "_workspaces": {},
         "_registry_cache": None,
+        "_manager_config": None,
+        "_manager_digest": None,
+        "_manager_error": None,
     }
 
 _RATE_LIMITS = {
@@ -191,7 +197,7 @@ def take_outbox() -> List[Dict[str, Any]]:
 
 def _request_roots() -> None:
     global _request_seq
-    if not _roots_capable or _session_id is None:
+    if _manager_config is not None or not _roots_capable or _session_id is None:
         return
     _request_seq += 1
     request_id = f"aegis-roots-{_request_seq}"
@@ -324,8 +330,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "result": {
                 "protocolVersion": negotiate_protocol(params.get("protocolVersion")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "aegis-mcp", "version": __version__},
-                "instructions": instructions_text(),
+                "serverInfo": {"name": "aegis-manager-mcp" if _manager_config is not None else "aegis-mcp",
+                               "version": __version__},
+                "instructions": _instructions(),
             },
         }
     if method in ("notifications/initialized", "notifications/roots/list_changed"):
@@ -338,7 +345,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _session_id is None:
         return _error(req_id, -32002, "Server not initialized")
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_DEFINITIONS}}
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": _tool_definitions()}}
+    if _manager_config is not None:
+        return _manager_call(req_id, params)
 
     if _workspace_error is not None:
         return _tool_result(req_id, json.dumps(_unbound_result(_workspace_error)), True)
@@ -357,6 +366,10 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         max_calls, window = _RATE_LIMITS[name]
         return _error(req_id, -32000, f"Rate limit exceeded for '{name}': max {max_calls} calls per {window}s")
 
+    return _repository_call(req_id, params, name, args)
+
+
+def _repository_call(req_id, params, name, args):
     # The client never chooses the workspace or the attribution of what it reports.
     args = strip_server_owned(args)
     binding = _bind(params, args)
@@ -382,9 +395,52 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return _tool_result(req_id, json.dumps(result), is_error_result(result))
 
 
+
+def _tool_definitions():
+    if _manager_config is None:
+        return TOOL_DEFINITIONS
+    from .manager import TOOL_DEFINITIONS as manager_tools
+
+    return manager_tools
+
+
+def _instructions():
+    if _manager_config is None:
+        return instructions_text()
+    from .manager import INSTRUCTIONS
+
+    return INSTRUCTIONS
+
+
+def _manager_call(req_id, params):
+    from .manager import execute, validate_call
+
+    if not isinstance(params, dict):
+        return _error(req_id, -32602, "Tool call params must be an object.")
+    name, args = params.get("name"), params.get("arguments", {})
+    try:
+        validate_call(name, args)
+    except ValueError as exc:
+        return _error(req_id, -32602, str(exc))
+    if _manager_error is not None:
+        return _tool_result(req_id, json.dumps(_manager_error), True)
+    if not _check_rate_limit(name):
+        return _error(req_id, -32000, f"Rate limit exceeded for '{name}'")
+    provenance = {"transport": "mcp", "host": _client_platform, "session_id": _session_id,
+                  "client_name": _client_name, "client_version": _client_version,
+                  "client_identity": "self_reported", "native_identity": None}
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            result = execute(_manager_config, _manager_digest, provenance, name, args)
+    except (ValueError, OSError) as exc:
+        return _tool_result(req_id, json.dumps({"status": "FAIL", "error": str(exc)}), True)
+    return _tool_result(req_id, json.dumps(result), is_error_result(result))
+
+
 def _start(environ: Optional[Dict[str, str]] = None) -> None:
     """Reset the connection state and read what the process was started with."""
     global _canonical_workspace, _workspace_error, _server_cwd, _claude_project_dir
+    global _manager_config, _manager_digest, _manager_error
     for attr, value in fresh_state().items():
         globals()[attr] = value
     env = os.environ if environ is None else environ
@@ -394,6 +450,16 @@ def _start(environ: Optional[Dict[str, str]] = None) -> None:
         _server_cwd = None
     _claude_project_dir = env.get("CLAUDE_PROJECT_DIR") or None
     pin = env_workspace(env)
+    registration = env_manager_registration(env)
+    if registration is not None:
+        _manager_config, _manager_digest = registration
+        if pin:
+            _manager_error = {"status": "FAIL", "reason": "conflicting_manager_scope",
+                              "error": "manager mode cannot use AEGIS_WORKSPACE"}
+        elif not os.path.isabs(_manager_config) or not re.fullmatch(r"[0-9a-f]{64}", _manager_digest):
+            _manager_error = {"status": "FAIL", "reason": "invalid_manager_registration",
+                              "error": "manager registration requires an absolute config path and its SHA256"}
+        return
     if pin:
         checked = resolve_binding(pin=pin)
         if checked.status == "error":
@@ -430,7 +496,12 @@ def run_stdio_server():
             if not line:
                 continue
             try:
-                request = json.loads(line)
+                if _manager_config is None:
+                    request = json.loads(line)
+                else:
+                    from .manager import decode_frame
+
+                    request = decode_frame(line)
             except (ValueError, RecursionError):
                 # A deeply nested line exhausts the decoder's recursion budget: answer it
                 # as unparseable and keep serving.

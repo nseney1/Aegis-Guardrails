@@ -2,6 +2,12 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
+## [Unreleased]
+
+### Added
+
+- Isolated manager workspace audit prototype: explicit `aegis workspace` commands and a separately pinned manager MCP registration serve owner-approved management rules across Aegis worktrees. Signed activation, immutable decisions, confined audit replay and qualified evidence remain separate from repository fitness; every outcome earns zero credit. Native Teams enforcement and the 4.7 release gates remain open.
+
 ## [4.5.0] - 2026-10-31
 
 ### Added

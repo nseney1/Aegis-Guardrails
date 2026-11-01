@@ -169,7 +169,8 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
     lines += [
         "### Global options",
         "",
-        "Every command also accepts `-h/--help`, `--json`, `--plain` and `--workspace`.",
+        "Repository commands also accept `-h/--help`, `--json`, `--plain` and `--workspace`.",
+        "The manager `workspace` namespace requires `--config` and refuses `--workspace`.",
         "",
         *_arguments_table(parser["arguments"], skip_common=False),
         "### Commands",
@@ -202,7 +203,10 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
             *[f"| `aegis {name}` | {_cell(pointer)} |" for name, pointer in removed.items()],
             "",
         ]
-    lines += ["## MCP server: `aegis-mcp`", ""]
+    lines += ["## MCP server: `aegis-mcp`", "",
+              "This section describes repository mode. The separately registered manager audit surface is",
+              "documented in [Manager workspaces](manager-workspaces.md) and pinned in",
+              "`tests/contract/manager_mcp_tools.json`.", ""]
     tools = mcp.get("tools", [])
     if tools:
         lines += [

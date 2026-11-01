@@ -144,6 +144,7 @@ def create_default_registry() -> CommandRegistry:
     from aegis_cli.sync import SyncCommand
     from aegis_cli.team import TeamCommand
     from aegis_cli.uninstall import UninstallCommand
+    from aegis_cli.workspace import WorkspaceCommand
 
     for cmd_cls in (
         InitCommand,
@@ -161,6 +162,7 @@ def create_default_registry() -> CommandRegistry:
         SkillsCommand,
         BenchmarkCommand,
         PackageCommand,
+        WorkspaceCommand,
     ):
         reg.register(cmd_cls)
 
