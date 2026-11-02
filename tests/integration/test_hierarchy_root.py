@@ -302,6 +302,20 @@ def test_launch_refuses_a_prompt_that_does_not_rehash(tmp_path, stub, prompt_fil
     assert not stub.launched() and not Path(spec["record_out"]).exists()
 
 
+def test_launch_reports_a_leaked_first_prompt_and_prints_the_stop_command(tmp_path, stub, prompt_file):
+    spec_path, spec = launch_spec(tmp_path, prompt_file)
+    # The stub closes stdin like the real host, so the leaked transcript is planted where the tool looks
+    # and the stub writes its own copy elsewhere.
+    transcript = stub.projects / spec["cwd"].replace("/", "-") / (SESSION + ".jsonl")
+    write_transcript(transcript, [user_record(prompt_file.read_text(encoding="utf-8") + LAUNCHER_TEXT)])
+    stub.serve("launch.json", {"session": SESSION, "projects": str(tmp_path / "elsewhere"), "assistant": True})
+    code, out, err = launch(stub, spec_path)
+    assert code == 2, (out, err)
+    record = json.loads(Path(spec["record_out"]).read_text(encoding="utf-8"))
+    assert record["first_prompt_check"]["extra_chars"] == 2308
+    assert record["stop_command"] == "claude stop " + SESSION[:8]
+
+
 def test_launch_refuses_when_free_space_is_below_the_threshold(tmp_path, stub, prompt_file):
     spec_path, spec = launch_spec(tmp_path, prompt_file)
     code, out, _ = run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects,
@@ -309,3 +323,111 @@ def test_launch_refuses_when_free_space_is_below_the_threshold(tmp_path, stub, p
     assert code == 4
     assert "free" in out["error"]
     assert not stub.launched() and not Path(spec["record_out"]).exists()
+
+
+# --- item 3: lanes-health (F-B, T10, T26) -----------------------------------------------------
+
+NOW = "2026-11-02T17:00:00.000Z"
+IDS = {name: "%08x-0000-4000-8000-%012x" % (index + 0xa0000000, index) for index, name in enumerate(
+    ["answered", "stalled", "young", "max", "torn", "notice", "norequest", "blocked", "missing"])}
+
+
+def request(ts, ident, effort="xhigh"):
+    return {"type": "api-request", "id": ident, "timestamp": ts, "querySource": "repl_main_thread",
+            "sessionId": "s", "params": {"model": "claude-opus-5-5", "output_config": {"effort": effort}}}
+
+
+def answer(ts, ref):
+    return {"type": "assistant", "uuid": "a-" + ref, "requestRef": ref, "timestamp": ts,
+            "message": {"role": "assistant", "content": []}}
+
+
+def queue(ts, operation, content=None):
+    record = {"type": "queue-operation", "operation": operation, "timestamp": ts}
+    if content is not None:
+        record["content"] = content
+    return record
+
+
+@pytest.fixture
+def lanes(stub):
+    folder = stub.projects / "-home-x-workspace"
+    first = user_record("lane prompt", ts="2026-11-02T16:30:00.000Z")
+    fixtures = {
+        "answered": [first, request("2026-11-02T16:55:00.000Z", "r1"), answer("2026-11-02T16:55:05.000Z", "r1")],
+        "stalled": [first, request("2026-11-02T16:35:00.000Z", "r1")],
+        "young": [first, request("2026-11-02T16:45:00.000Z", "r1")],
+        "max": [first, request("2026-11-02T16:36:40.000Z", "r1", effort="max")],
+        "torn": [first, request("2026-11-02T16:58:00.000Z", "r1"), answer("2026-11-02T16:58:30.000Z", "r1")],
+        "notice": [first, request("2026-11-02T16:50:00.000Z", "r1"), answer("2026-11-02T16:50:09.000Z", "r1"),
+                   queue("2026-11-02T16:51:00.000Z", "enqueue", "<task-notification>subagent done</task-notification>"),
+                   queue("2026-11-02T16:52:00.000Z", "enqueue", "nudge from orchestrator"),
+                   queue("2026-11-02T16:52:01.000Z", "remove", "nudge from orchestrator")],
+        "norequest": [first],
+        "blocked": [first, request("2026-11-02T16:58:00.000Z", "r1")],
+    }
+    for name, records in fixtures.items():
+        write_transcript(folder / (IDS[name] + ".jsonl"), records,
+                         torn_tail='{"type": "assist' if name == "torn" else None)
+    stub.serve("agents.json", [agent_row(IDS["answered"], "lane a", state="blocked", status="idle"),
+                               agent_row(IDS["stalled"], "lane b"),
+                               agent_row(IDS["blocked"], "lane h", state="blocked", status="waiting",
+                                         waitingFor="permission prompt")])
+    stub.serve("logs.txt", "spinner " * 50 + DIALOG_SCREEN)
+    return stub
+
+
+def health(stub, *names, extra=()):
+    argv = ["lanes-health", "--projects-dir", stub.projects, "--now", NOW, *extra]
+    for name in names:
+        argv += ["--session", IDS[name] + "=" + name]
+    code, out, err = run_tool(*argv, env=stub.env())
+    assert code == 0, (out, err)
+    return {row["label"]: row for row in out["sessions"]}
+
+
+def test_lanes_health_reports_answered_open_and_stalled_requests(lanes):
+    rows = health(lanes, "answered", "stalled", "young", "max")
+    answered = rows["answered"]
+    assert answered["open_request_s"] is None and answered["stalled"] is False
+    assert answered["last_record_ts"] == "2026-11-02T16:55:05.000Z" and answered["silent_s"] == 295
+    assert answered["silent"] is False and answered["effort"] == "xhigh"
+    assert answered["agents_state"]["state"] == "blocked" and answered["waiting_on_human"] is False
+    stalled = rows["stalled"]
+    assert stalled["open_request_s"] == 1500 and stalled["stalled"] is True and stalled["silent"] is True
+    assert stalled["agents_state"]["state"] == "working" and stalled["waiting_on_human"] is False
+    young = rows["young"]
+    assert young["open_request_s"] == 900 and young["stalled"] is False and young["silent"] is False
+    assert young["agents_state"] is None
+    assert rows["max"]["effort"] == "max" and rows["max"]["open_request_s"] == 1400
+    assert rows["max"]["stalled"] is False
+
+
+def test_lanes_health_thresholds_are_options(lanes):
+    rows = health(lanes, "young", extra=["--stall-s", "600", "--silent-s", "60"])
+    assert rows["young"]["stalled"] is True and rows["young"]["silent"] is True
+
+
+def test_lanes_health_tolerates_a_torn_tail_and_counts_enqueued_notices(lanes):
+    rows = health(lanes, "torn", "notice", "norequest")
+    assert rows["torn"]["torn_tail"] is True and rows["torn"]["open_request_s"] is None
+    notices = rows["notice"]["enqueued_notices"]
+    assert [n["head"] for n in notices] == ["<task-notification>subagent done</task-notification>"]
+    assert notices[0]["timestamp"] == "2026-11-02T16:51:00.000Z"
+    assert rows["norequest"]["open_request_s"] is None and rows["norequest"]["effort"] is None
+    assert rows["norequest"]["stalled"] is False
+
+
+def test_lanes_health_flags_a_session_waiting_on_a_human(lanes):
+    rows = health(lanes, "blocked", "missing")
+    blocked = rows["blocked"]
+    assert blocked["waiting_on_human"] is True and blocked["stalled"] is False
+    assert blocked["agents_state"]["waitingFor"] == "permission prompt"
+    assert "Do you want to proceed?" in blocked["dialog"]["text"] and "\x1b" not in blocked["dialog"]["text"]
+    assert json.loads((lanes.dir / "logs-args.json").read_text()) == ["logs", IDS["blocked"][:8]]
+    assert rows["missing"]["transcript"] is None and "not found" in rows["missing"]["error"]
+
+
+def test_lanes_health_refuses_a_session_id_that_is_not_an_id(lanes):
+    code, out, _ = run_tool("lanes-health", "--projects-dir", lanes.projects, "--session", "*", env=lanes.env())
+    assert code == 2

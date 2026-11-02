@@ -396,6 +396,105 @@ def cmd_launch(args):
                   "record": record}
 
 
+def transcript_activity(rows):
+    """Last record time, the last main-thread request and whether it was answered, pending notices."""
+    last_ts = last_request = None
+    answered = False
+    pending = []
+    for _line, record in rows:
+        if not isinstance(record, dict):
+            continue
+        when = parse_utc(record.get("timestamp"))
+        if when is not None and (last_ts is None or when >= last_ts[0]):
+            last_ts = (when, record["timestamp"])
+        kind = record.get("type")
+        if kind == "api-request":
+            last_request, answered = record, False
+        elif kind == "assistant" and last_request is not None:
+            answered = True
+        elif kind == "queue-operation":
+            operation, content = record.get("operation"), record.get("content")
+            if operation == "enqueue":
+                pending.append({"timestamp": record.get("timestamp"), "content": content})
+            elif operation in ("dequeue", "remove") and pending:
+                match = next((item for item in pending if content is not None and item["content"] == content), None)
+                pending.remove(match if match is not None else pending[0])
+    notices = [{"timestamp": item["timestamp"],
+                "head": (item["content"] if isinstance(item["content"], str)
+                         else json.dumps(item["content"]))[:HEAD_CHARS]} for item in pending]
+    return last_ts, last_request, answered, notices
+
+
+def lane_health(session, label, agents, args, now):
+    """One session's liveness verdict (F-B).
+
+    A request open past the effort's normal ceiling is "stalled"; it cannot read messages,
+    so only a relaunch recovers it. A blocked agents state with the last request
+    unanswered is a session parked on a dialog: only a human can answer it (T10).
+    """
+    entry = {"session": session, "label": label, "transcript": None, "torn_tail": False, "last_record_ts": None,
+             "silent_s": None, "open_request_s": None, "open_request_id": None, "effort": None,
+             "enqueued_notices": [], "agents_state": None, "stalled": False, "silent": False,
+             "waiting_on_human": False, "dialog": None}
+    if agents is not None:
+        row = agent_row(agents, session)
+        if row is not None:
+            entry["agents_state"] = {key: row.get(key) for key in ("id", "name", "pid", "status", "state", "waitingFor")}
+    transcript = find_transcript(args.projects_dir, session)
+    if transcript is None:
+        entry["error"] = "transcript not found under " + str(args.projects_dir)
+        return entry
+    entry["transcript"] = str(transcript)
+    try:
+        rows, entry["torn_tail"] = read_jsonl(transcript)
+    except (Failure, OSError) as exc:
+        entry["error"] = str(exc)
+        return entry
+    last_ts, request, answered, entry["enqueued_notices"] = transcript_activity(rows)
+    if last_ts is not None:
+        entry["last_record_ts"] = last_ts[1]
+        entry["silent_s"] = round((now - last_ts[0]).total_seconds(), 3)
+        entry["silent"] = entry["silent_s"] > args.silent_s
+    if request is not None:
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        config = params.get("output_config") if isinstance(params.get("output_config"), dict) else {}
+        entry["effort"] = config.get("effort")
+        opened = parse_utc(request.get("timestamp"))
+        if not answered and opened is not None:
+            entry["open_request_s"] = round((now - opened).total_seconds(), 3)
+            entry["open_request_id"] = request.get("id")
+            limit = args.stall_max_s if entry["effort"] == "max" else args.stall_s
+            entry["stalled"] = entry["open_request_s"] > limit
+    state = entry["agents_state"]
+    if state is not None and state.get("state") == "blocked" and entry["open_request_s"] is not None:
+        entry["waiting_on_human"] = True
+        screen = run_claude(["logs", state.get("id") or session[:8]], timeout=30)
+        excerpt = dialog_excerpt(screen["stdout"])
+        if excerpt is not None:
+            entry["dialog"] = {"text": excerpt}
+    return entry
+
+
+def session_argument(value):
+    session, _, label = value.partition("=")
+    require(SESSION_ID.fullmatch(session) is not None, "invalid session id: " + session[:80])
+    return session, label or session
+
+
+def cmd_lanes_health(args):
+    now = parse_utc(args.now) if args.now else datetime.now(timezone.utc)
+    require(now is not None, "--now must be a UTC timestamp ending in Z")
+    sessions = [session_argument(value) for value in args.session]
+    result = {"ok": True, "now": now.isoformat().replace("+00:00", "Z"),
+              "thresholds": {"stall_s": args.stall_s, "stall_max_s": args.stall_max_s, "silent_s": args.silent_s}}
+    try:
+        agents = agents_rows()
+    except (Failure, OSError) as exc:
+        agents, result["agents_error"] = None, str(exc)
+    result["sessions"] = [lane_health(session, label, agents, args, now) for session, label in sessions]
+    return EXIT_OK, result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -415,6 +514,15 @@ def build_parser():
     launch.add_argument("--poll-s", type=float, default=2.0)
     launch.add_argument("--min-free-mb", type=int, default=512)
     launch.set_defaults(handler=cmd_launch)
+
+    health = commands.add_parser("lanes-health", help="Report stalled, silent or dialog-blocked sessions; always exit 0")
+    health.add_argument("--session", action="append", required=True, metavar="ID[=LABEL]")
+    health.add_argument("--projects-dir", default=str(Path.home() / ".claude" / "projects"))
+    health.add_argument("--stall-s", type=float, default=1200.0, help="Open request ceiling at xhigh or below")
+    health.add_argument("--stall-max-s", type=float, default=1500.0, help="Open request ceiling at max effort")
+    health.add_argument("--silent-s", type=float, default=900.0, help="No-record ceiling")
+    health.add_argument("--now", help="UTC timestamp to measure ages from (default: the clock)")
+    health.set_defaults(handler=cmd_lanes_health)
     return parser
 
 
