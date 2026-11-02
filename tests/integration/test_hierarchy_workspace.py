@@ -635,6 +635,60 @@ def test_the_last_free_event_is_still_accepted(workspace):
     assert status["seq"] == 10000 and status["initiatives"]["a1"]["priority"] == 1
 
 
+LIMITS_SOURCE = "owner-writers-5 requests/root-c6-owner-decisions-20261102.json"
+
+
+def test_set_limits_raises_writers_to_five_and_a_reload_keeps_them(tmp_path):
+    space = Workspace(tmp_path)
+    space.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    space.register("a1")
+    for index in range(6):
+        space.ask("a1", holder="a1/lane-%d" % index)
+    answer = space.run("set-limits", {"source": LIMITS_SOURCE, "writer_limit": 5})
+    assert answer["limits"] == {"writer": 5, "heavy": 3, "heavy-tests": 1}
+    assert answer["capacity"]["writer"]["limit"] == 5 and answer["capacity"]["writer"]["free"] == 5
+    held = [space.grant()["request_id"] for _ in range(5)]
+    assert space.run("grant-next", kind="writer", expect=3)["reason"] == "capacity_full"
+    refused = space.run("set-limits", {"source": "owner", "writer_limit": 4}, expect=2)
+    assert refused["error"] == "writer_limit 4 is below the 5 granted writer requests"
+    space.release(held[0])
+    space.run("set-limits", {"source": "owner", "writer_limit": 4, "heavy_limit": 2})
+    capacity = space.run("status")["capacity"]
+    assert (capacity["writer"]["limit"], capacity["writer"]["used"], capacity["heavy"]["limit"]) == (4, 4, 2)
+    assert json.loads(event_files(space)[-1].read_text())["kind"] == "set_limits"
+
+
+@pytest.mark.parametrize("body,error", [
+    ({"source": LIMITS_SOURCE, "writer_limit": 1}, "writer_limit 1 is below the 2 granted writer requests"),
+    ({"source": LIMITS_SOURCE, "writer_limit": 6}, "invalid writer_limit"),
+    ({"source": LIMITS_SOURCE, "writer_limit": 0}, "invalid writer_limit"),
+    ({"source": LIMITS_SOURCE, "heavy_limit": 4}, "invalid heavy_limit"),
+    ({"source": LIMITS_SOURCE, "heavy_tests_limit": 2}, "invalid heavy_tests_limit"),
+    ({"source": LIMITS_SOURCE, "writer_limit": 4, "gpu_limit": 1}, "unexpected fields: gpu_limit"),
+    ({"writer_limit": 4}, "missing fields: source"),
+    ({"source": "", "writer_limit": 4}, "invalid source"),
+    ({"source": LIMITS_SOURCE}, "set-limits needs at least one limit"),
+])
+def test_set_limits_refuses_a_bad_change_and_writes_nothing(workspace, body, error):
+    workspace.register("a1")
+    for index in range(2):
+        workspace.ask("a1", holder="a1/lane-%d" % index)
+        workspace.grant()
+    before = event_files(workspace)
+    assert workspace.run("set-limits", body, expect=2)["error"] == error
+    assert event_files(workspace) == before
+    assert workspace.run("status")["capacity"]["writer"]["limit"] == 3
+
+
+def test_a_full_store_refuses_set_limits_and_stays_readable(workspace):
+    workspace.register("a1")
+    fill_store_to_the_limit(workspace, "a1")
+    refused = workspace.run("set-limits", {"source": LIMITS_SOURCE, "writer_limit": 5}, expect=2)
+    assert refused["error"] == "workspace event history limit reached"
+    status = workspace.run("status")
+    assert status["seq"] == 10000 and status["capacity"]["writer"]["limit"] == 3
+
+
 def test_a_busy_store_refuses_writes_but_still_answers_reads(workspace):
     workspace.register("a1")
     (workspace.store / ".write.lock").write_text("fixture active writer")

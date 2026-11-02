@@ -149,6 +149,26 @@ def apply_init(ledger, data, _event):
     ledger.limits = {"writer": data["writer_limit"], "heavy": data["heavy_limit"], "heavy-tests": heavy_tests}
 
 
+LIMIT_FIELDS = {"writer_limit": ("writer", MAX_WRITERS), "heavy_limit": ("heavy", MAX_HEAVY),
+                "heavy_tests_limit": ("heavy-tests", MAX_HEAVY_TESTS)}
+
+
+def apply_set_limits(ledger, data, _event):
+    """A reviewed change to an initialized store's limits. Lowering below the work already granted would
+    leave the replayed ledger over capacity, and accepted work is never preempted, so that is refused."""
+    fields(data, {"source"}, set(LIMIT_FIELDS))
+    text(data["source"], "source")
+    changes = sorted(data.keys() - {"source"})
+    require(changes, "set-limits needs at least one limit")
+    for name in changes:
+        kind, ceiling = LIMIT_FIELDS[name]
+        integer(data[name], name, maximum=ceiling)
+        held = len(ledger.held(kind))
+        require(data[name] >= held, "%s %d is below the %d granted %s requests" % (name, data[name], held, kind))
+    for name in changes:
+        ledger.limits[LIMIT_FIELDS[name][0]] = data[name]
+
+
 def require_unclaimed_lanes(ledger, repository, lanes, identifier):
     for other in ledger.initiatives.values():
         if other["id"] != identifier and other["repository"] == repository:
@@ -247,7 +267,7 @@ def apply_clear(ledger, data, _event):
 
 APPLY = {"init": apply_init, "register": apply_register, "update": apply_update, "request": apply_request,
          "withdraw": apply_withdraw, "grant": apply_grant, "release": apply_release, "merge": apply_merge,
-         "clear_base_moved": apply_clear}
+         "clear_base_moved": apply_clear, "set_limits": apply_set_limits}
 
 
 class Store:
@@ -531,6 +551,9 @@ def run(args):
             store.append(ledger, "merge", request)
             marked = [i["id"] for i in ledger.initiatives.values() if i["base_moved"] != before[i["id"]]]
             return 0, {"marked": marked}
+        if command == "set-limits":
+            store.append(ledger, "set_limits", request)
+            return 0, {"limits": ledger.limits, "capacity": capacity_view(ledger)}
         fields(request, {"initiative", "base_commit", "evidence", "source"})
         verify_evidence(request["evidence"])
         store.append(ledger, "clear_base_moved", request)
@@ -542,7 +565,7 @@ def main(argv=None):
     parser.add_argument("--store", required=True, help="Absolute path to the workspace store")
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "register", "update", "request", "withdraw", "release", "check-paths", "mark-merge",
-                 "clear-base-moved"):
+                 "clear-base-moved", "set-limits"):
         commands.add_parser(name).add_argument("--request", required=True, help="Absolute path to a strict JSON request")
     commands.add_parser("grant-next").add_argument("--kind", required=True)
     commands.add_parser("status")
