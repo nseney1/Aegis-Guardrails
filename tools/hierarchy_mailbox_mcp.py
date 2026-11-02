@@ -6,7 +6,7 @@ The configured sender is provenance, not an authenticated native host identity.
 import json
 import sys
 
-from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, fields, integer, matching,
+from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, endpoint_parts, fields, integer, matching,
                                require, SHA256, strict_json, text, writer_lock)
 
 
@@ -22,11 +22,12 @@ def definitions():
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
         "to": {"type": "string", "maxLength": 256},
-        "type": {"type": "string", "enum": ["info", "brief", "dispatch", "result", "review", "escalation", "ack"]},
+        "type": {"type": "string", "enum": ["info", "brief", "dispatch", "result", "review", "escalation", "ack",
+                                            "job_request", "job_receipt"]},
         "body": {"type": "string", "maxLength": 65536},
         "brief": {"type": "object"}, "in_reply_to": {"type": "string", "maxLength": 80},
         "acknowledgment": {"type": "string", "enum": ["received", "accepted", "completed"]},
-        "readiness": {"type": "object"}, "result": {"type": "object"},
+        "readiness": {"type": "object"}, "result": {"type": "object"}, "receipt": {"type": "object"},
     }
     specs = [
         ("mailbox_inbox", True, "Read only this endpoint's mailbox; optionally include its hash-verified briefs.",
@@ -45,6 +46,8 @@ def definitions():
 
 class Connection:
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None):
+        # Grants and job runs stay out of anything a model session can call, so root has no adapter.
+        require(endpoint_parts(endpoint)[1] != "root", "root uses the controller, not the mailbox adapter")
         self.root = root
         self.sender = {"from": endpoint, "host": host, "session": session, "binding_generation": generation}
         mailbox = Mailbox(root)
@@ -82,7 +85,7 @@ class Connection:
                                                limit=arguments.get("limit", 20), after=arguments.get("after_message_id"))
         if name == "mailbox_publish":
             fields(arguments, {"message_id", "to", "type", "body"},
-                   {"brief", "in_reply_to", "acknowledgment", "readiness", "result"})
+                   {"brief", "in_reply_to", "acknowledgment", "readiness", "result", "receipt"})
             with writer_lock(self.root):
                 return self.checked_mailbox().publish({**arguments, **self.sender})
         if name == "mailbox_ack_handoff":

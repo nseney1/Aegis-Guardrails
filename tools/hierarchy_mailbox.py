@@ -27,8 +27,12 @@ MAX_RECORDS = 10000
 SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 GIT_ID = re.compile(r"[0-9a-f]{40}")
-MESSAGE_TYPES = {"info", "brief", "dispatch", "result", "review", "escalation", "ack"}
+MESSAGE_TYPES = {"info", "brief", "dispatch", "result", "review", "escalation", "ack", "job_request", "job_receipt"}
 STAGES = {"received", "accepted", "completed"}
+JOB_STATES = {"started", "unknown", "refused", "completed", "failed"}
+# "unknown" stays open on purpose: an uncertain job keeps its reservation until terminal evidence exists.
+TERMINAL_JOB_STATES = {"refused", "completed", "failed"}
+MAX_JOB_EVIDENCE = 64
 VERIFICATION = {"lease": "reference_only", "scan": "sender_claim", "hook": "sender_claim",
                 "tests": "sender_claim", "human_approval": "not_established", "fitness_credit": 0}
 DELIVERY_RECEIPT = "aegis.hierarchy-delivery-receipt/v1"
@@ -176,7 +180,7 @@ def endpoint_parts(endpoint):
     require(len(parts) in (2, 3), "invalid endpoint")
     matching(parts[0], SLUG, "hierarchy")
     require(parts[0] not in {"across", "bindings"}, "reserved hierarchy name")
-    require(parts[1] in {"front-door", "orchestrator", "lane"}, "invalid endpoint role")
+    require(parts[1] in {"front-door", "orchestrator", "root", "lane"}, "invalid endpoint role")
     require((parts[1] == "lane") == (len(parts) == 3), "invalid endpoint")
     if len(parts) == 3:
         matching(parts[2], SLUG, "lane id")
@@ -209,6 +213,7 @@ def validate_manifest(manifest):
         require(isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p in endpoints for p in pair),
                 "counterparts must name two endpoints")
         left, right = (endpoint_parts(p) for p in pair)
+        require("root" not in (left[1], right[1]), "root endpoints cannot be counterparts")
         require(left[0] != right[0] and left[1] == right[1], "counterparts must have the same role across hierarchies")
         require(not any(p in paired for p in pair), "endpoint has more than one counterpart")
         paired.update(pair)
@@ -292,7 +297,7 @@ class Mailbox:
         self.endpoint(recipient)
         left, right = endpoint_parts(sender), endpoint_parts(recipient)
         vertical = left[0] == right[0] and {left[1], right[1]} in (
-            {"front-door", "orchestrator"}, {"orchestrator", "lane"})
+            {"front-door", "orchestrator"}, {"orchestrator", "lane"}, {"orchestrator", "root"})
         across = any({sender, recipient} == set(pair) for pair in self.manifest["counterparts"])
         require(vertical or across, "route is not vertical or an explicit counterpart")
         return self.root / ("across" if across else right[0]) / right[1]
@@ -401,7 +406,7 @@ class Mailbox:
 
     def validate_message(self, message, *, stored=False):
         required = {"message_id", "from", "to", "host", "session", "binding_generation", "type", "body"}
-        optional = {"brief", "in_reply_to", "acknowledgment", "readiness", "result"}
+        optional = {"brief", "in_reply_to", "acknowledgment", "readiness", "result", "receipt"}
         if stored:
             required |= {"schema", "created_at", "authority", "verification"}
         fields(message, required, optional)
@@ -416,6 +421,18 @@ class Mailbox:
             self.brief(message["brief"], verify=not stored)
         if "in_reply_to" in message:
             matching(message["in_reply_to"], SLUG, "in_reply_to")
+        if message["type"] == "job_request":
+            left, right = endpoint_parts(message["from"]), endpoint_parts(message["to"])
+            require(left[0] == right[0] and left[1] == "orchestrator" and right[1] == "root",
+                    "only an orchestrator can request a job from its own root")
+            require("brief" in message, "job request requires a hash-bound packet")
+        if message["type"] == "job_receipt":
+            left, right = endpoint_parts(message["from"]), endpoint_parts(message["to"])
+            require(left[1] == "root" and right[1] == "orchestrator" and "in_reply_to" in message,
+                    "job receipt must come from root and reply to a job request")
+            self.job_receipt(message.get("receipt"))
+        elif "receipt" in message:
+            raise ValueError("receipt field requires job_receipt type")
         if message["type"] in {"brief", "dispatch"}:
             require("brief" in message, "brief or dispatch message requires a brief hash")
         if message["type"] == "dispatch":
@@ -493,7 +510,46 @@ class Mailbox:
                     and records[r["message"]["in_reply_to"]]["message"]["type"] == "dispatch"]
         return closed, accepted
 
+    @staticmethod
+    def job_receipt(receipt):
+        """Structure only. Evidence paths stay inert: nothing here reads them or trusts the claim."""
+        fields(receipt, {"state"}, {"exit_code", "evidence", "reason"})
+        state = receipt["state"]
+        require(isinstance(state, str) and state in JOB_STATES, "invalid job state")
+        exit_code = receipt.get("exit_code")
+        if state == "completed":
+            require(type(exit_code) is int and exit_code == 0, "completed job requires exit code 0")
+        elif state == "failed":
+            require(type(exit_code) is int and exit_code != 0, "failed job requires a nonzero exit code")
+        else:
+            require(exit_code is None or type(exit_code) is int, "invalid exit code")
+        if state in {"completed", "failed"}:
+            require(isinstance(receipt.get("evidence"), list) and bool(receipt["evidence"]),
+                    "job receipt requires evidence")
+        if state in {"refused", "unknown"}:
+            require(isinstance(receipt.get("reason"), str) and bool(receipt["reason"]), "job receipt requires a reason")
+        if "reason" in receipt:
+            text(receipt["reason"], "reason")
+        evidence = receipt.get("evidence", [])
+        require(isinstance(evidence, list) and len(evidence) <= MAX_JOB_EVIDENCE, "invalid evidence list")
+        for item in evidence:
+            fields(item, {"path", "sha256"})
+            matching(item["sha256"], SHA256, "evidence sha256")
+            path = Path(text(item["path"], "evidence path"))
+            require(path.is_absolute() and ".." not in path.parts, "evidence path must be absolute")
+
+    @staticmethod
+    def open_job_requests(records):
+        terminal = {r["message"]["in_reply_to"] for r in records.values() if r["message"]["type"] == "job_receipt"
+                    and r["message"]["receipt"]["state"] in TERMINAL_JOB_STATES}
+        return sorted((r["message"] for r in records.values()
+                       if r["message"]["type"] == "job_request" and r["message"]["message_id"] not in terminal),
+                      key=lambda message: (message["created_at"], message["message_id"]))
+
     def checkpoint_assignments(self, endpoint, checkpoint, records):
+        for job in self.open_job_requests(records):
+            if endpoint in (job["from"], job["to"]):
+                require(job["message_id"] in checkpoint["pending_message_ids"], "checkpoint omits open job request")
         closed, accepted = self.dispatch_history(records)
         pending = [r["message"] for r in records.values() if r["message"]["type"] == "dispatch"
                    and r["message"]["message_id"] not in closed and endpoint in (r["message"]["from"], r["message"]["to"])]
@@ -611,8 +667,9 @@ class Mailbox:
             if brief not in briefs:
                 briefs.append(brief)
 
-        for dispatch in active:
-            add_brief(dispatch["brief"])
+        jobs = [job for job in self.open_job_requests(records) if endpoint in (job["from"], job["to"])]
+        for assignment in active + jobs:
+            add_brief(assignment["brief"])
         for brief in request.get("briefs", []):
             add_brief(brief)
         for brief in (history[-1]["checkpoint"] or {}).get("briefs", []):
@@ -633,6 +690,7 @@ class Mailbox:
             if readiness["worktree"] not in worktrees:
                 worktrees.add(readiness["worktree"])
                 sources.append(self.source_witness(readiness["worktree"], request.get("evidence_dir")))
+        pending.extend(job["message_id"] for job in jobs)
         if "delivery_dir" in request:
             _, summary = self.endpoint_delivery(request["delivery_dir"], endpoint, records)
             pending.extend(identifier for identifier in summary["unread"] if identifier not in pending)
@@ -706,6 +764,10 @@ class Mailbox:
         if request["type"] == "dispatch":
             require(self.ready(recipient), "recipient has not acknowledged its handoff checkpoint")
         original = self.reply(request, records) if "in_reply_to" in request else None
+        if request["type"] == "job_receipt":
+            require(original["type"] == "job_request", "job receipt must reply to a job request")
+            require(any(job["message_id"] == original["message_id"] for job in self.open_job_requests(records)),
+                    "job request already has a terminal receipt")
         kind = self.endpoint(request["from"]).get("kind")
         stage = request.get("acknowledgment")
         observed_git = False
@@ -768,6 +830,8 @@ class Mailbox:
         return {"schema": "aegis.hierarchy-status/v1", "manifest_sha256": digest(self.manifest),
                 "bindings": bindings, "messages": len(records), "verification": dict(VERIFICATION),
                 "mailbox_message_counts": counts, "accepted_writers": writers,
+                "open_job_requests": [{key: job[key] for key in ("message_id", "from", "to", "created_at")}
+                                      for job in self.open_job_requests(records)][:MAX_DELIVERY_IDS],
                 "native_enforcement_ready": False, "manager_membership": "unchanged"}
 
     def inbox(self, endpoint, *, include_briefs=False, limit=20, after=None):
