@@ -1227,17 +1227,25 @@ print(json.dumps(checks))
 
 @needs_bubblewrap
 def test_a_sandboxed_job_is_contained(shop):
-    try:
-        # Outside /tmp when possible, so only `hide` can be what conceals it. A full-suite job runs
-        # with the host read-only, and its own temporary folder is already outside /tmp.
-        hidden = Path(tempfile.mkdtemp(prefix="hierarchy-jobs-hidden-", dir="/var/tmp"))
-    except OSError:
-        hidden = shop.tmp / "hidden"
-        hidden.mkdir()
+    # The job sandbox gives /tmp and /dev private mounts, and bwrap makes the parents of its bind points in
+    # them, so a write below either succeeds unseen and shows nothing about `hide` or the read-only host.
+    # pytest's basetemp can itself be in /tmp: a full-suite job puts it there, with the host read-only and
+    # its own TMPDIR outside /tmp. So take the first writable folder outside both, in this order.
+    def private(folder):
+        return any(folder.resolve().is_relative_to(root) for root in (Path("/tmp"), Path("/dev")))
+
+    for folder in sorted([Path("/var/tmp"), Path(tempfile.gettempdir()), shop.tmp], key=private):
+        try:
+            hidden = Path(tempfile.mkdtemp(prefix="hierarchy-jobs-hidden-", dir=folder))
+            break
+        except OSError:
+            continue
+    else:
+        pytest.fail("no writable folder for the hidden secret")
+    outside = hidden.parent / (hidden.name + "-outside")
     try:
         secret = hidden / "credentials"
         secret.write_text("secret\n")
-        outside = hidden.parent / (hidden.name + "-outside")
         shop.recipes["hide"] = [str(hidden)]
         shop.recipes["recipes"]["boxed"] = shop.command(
             ["$python", "-I", "-c", PROBE, str(shop.checkout), str(outside), str(secret)], sandbox="bwrap")
@@ -1247,7 +1255,11 @@ def test_a_sandboxed_job_is_contained(shop):
         log = verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
         checks = json.loads(log.strip().splitlines()[-1])
         assert checks["write_checkout"] in ("OSError", "PermissionError")
-        assert checks["write_outside"] in ("OSError", "PermissionError")
+        if private(hidden):
+            # Last resort: the write lands in the job's own private /tmp, so only the host side can show it is contained.
+            assert checks["write_outside"] in ("OSError", "PermissionError", "allowed")
+        else:
+            assert checks["write_outside"] in ("OSError", "PermissionError")
         assert checks["read_hidden"] == "FileNotFoundError"
         assert checks["write_job_home"] == "allowed" and checks["write_tmp"] == "allowed"
         assert checks["read_checkout"] == "allowed"
@@ -1255,6 +1267,7 @@ def test_a_sandboxed_job_is_contained(shop):
         assert not (shop.checkout / "planted").exists() and not outside.exists()
     finally:
         shutil.rmtree(hidden, ignore_errors=True)
+        outside.unlink(missing_ok=True)
 
 
 FORGER = """
