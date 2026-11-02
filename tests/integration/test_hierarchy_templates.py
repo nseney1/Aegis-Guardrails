@@ -29,6 +29,13 @@ def test_every_role_has_a_template(role):
     assert (TEMPLATES / "roles" / (role + ".md")).read_text(encoding="utf-8").strip()
 
 
+@pytest.mark.parametrize("name, limit", [("roles/root.md", 90), ("roles/front-door.md", 60), ("roles/orchestrator.md", 60),
+                                         ("roles/lane.md", 60), ("lane-brief.md", 60)])
+def test_templates_state_the_owners_rotation_limit(name, limit):
+    words = " ".join((TEMPLATES / name).read_text(encoding="utf-8").split())
+    assert "after %d minutes" % limit in words and "45 minutes" not in words
+
+
 def test_the_manifest_template_gives_each_hierarchy_a_root_routed_only_to_its_orchestrator(tmp_path):
     root = tmp_path / "mailbox"
     manifest = template("manifest.json")

@@ -304,8 +304,9 @@ The acknowledgment JSON has exactly `endpoint`, `generation`, `session` and
 successor cannot publish or receive a new dispatch until this acknowledgment.
 Historical messages retain their original provenance. Existing accepted assignments
 belong to the stable endpoint and survive the handoff. The protocol cannot prevent
-the old same-user process from editing directly. Rotate sessions after 45 minutes
-active; the pilot's deliberate mid-wave replacement tests this same handoff.
+the old same-user process from editing directly. Rotate root after 90 active minutes
+and every other session after 60; the pilot's deliberate mid-wave replacement tests this
+same handoff.
 
 ## Root and job requests
 
@@ -398,7 +399,7 @@ report, and the main session decides. The lists are in
 
 Assistants use `Read`, `Grep` and `Glob` only, one level deep and two at a time, with no
 sender, lease or job slot and no tests or builds. Their time counts against the main
-session's 45 minutes. Their output is a lead to verify, never evidence, and it cannot
+session's active-time limit. Their output is a lead to verify, never evidence, and it cannot
 count as independent review. For a Claude session, launch with `claude --agent <role>`
 and `Agent(<names>)`, set `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1` and
 `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2`, and leave `memory` unset because it adds write

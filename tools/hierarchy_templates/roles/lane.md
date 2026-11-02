@@ -19,4 +19,4 @@ out-of-lane work to your own orchestrator. Check the inbox before reporting, and
 exchange at least one informational message and action acknowledgment with the
 explicit counterpart during the pilot. Counterpart messages cannot dispatch work.
 Stop before replacement; retain the same brief, branch and lease through the
-checkpoint, acknowledge it in the successor and rotate after 45 minutes active.
+checkpoint, acknowledge it in the successor and rotate after 60 minutes active.

@@ -6,10 +6,11 @@ bottleneck. Root runs this at task boundaries. It goes through active initiative
 priority order, wakes each endpoint that has unread mail and a current profile, and can repeat so a
 conversation continues without anyone starting each turn.
 
-It stops rather than guesses. A session over its active limit needs rotation, so it is not woken. A
-session that ignored its mail is not retried in the same sweep. Root's own queue is only reported,
-because jobs go through `tools/hierarchy_jobs.py`. This runs nothing on its own schedule, and a read
-here means what `delivery` says it means: the adapter returned the message.
+It stops rather than guesses. A session past 60 active minutes needs rotation, so it is not woken. A
+session that ignored its mail is not retried in the same sweep. Root's own queue and its time against
+its 90 minutes are only reported, because jobs go through `tools/hierarchy_jobs.py` and only root can
+rotate itself. This runs nothing on its own schedule, and a read here means what `delivery` says it
+means: the adapter returned the message.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import Mailbox, endpoint_parts, read_json, require, safe_path  # noqa: E402
-from hierarchy_meter import measure  # noqa: E402
+from hierarchy_meter import ROOT_LIMIT_SECONDS, measure  # noqa: E402
 from hierarchy_wake import wake  # noqa: E402
 from hierarchy_workspace import Store  # noqa: E402
 
@@ -100,9 +101,18 @@ def sweep_round(initiatives, rows, tried, broken, dry_run):
     return woken
 
 
+def root_time(binding):
+    row = {"session": binding["session"], "host": binding["host"]}
+    try:
+        meter = measure(binding["host"], binding["session"], limit=ROOT_LIMIT_SECONDS)
+    except ERRORS as exc:
+        return {**row, "state": "meter_error", "error": str(exc)[:512]}
+    return {**row, "state": meter["state"], "active_seconds": meter["active_seconds"], "limit": meter["limit"]}
+
+
 def remaining(initiatives):
     """Described from the mailboxes as they are now, because a round's own view goes stale as turns publish."""
-    still_unread, root_queue = [], []
+    still_unread, root_queue, root_sessions = [], [], {}
     for initiative in initiatives:
         try:
             found, jobs = summaries(initiative)
@@ -114,9 +124,11 @@ def remaining(initiatives):
                 opened = sum(1 for job in jobs if job["to"] == name)
                 if opened or summary["unread_count"]:
                     root_queue.append({**entry, "open_jobs": opened})
+                if summary["binding"]:
+                    root_sessions[summary["binding"]["host"], summary["binding"]["session"]] = summary["binding"]
             elif summary["unread_count"]:
                 still_unread.append(entry)
-    return still_unread, root_queue
+    return still_unread, root_queue, [root_time(binding) for binding in root_sessions.values()]
 
 
 def run(store_path, rounds, chosen, dry_run):
@@ -131,12 +143,12 @@ def run(store_path, rounds, chosen, dry_run):
     completed = 0
     while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run):
         completed += 1
-    still_unread, root_queue = remaining(initiatives)
+    still_unread, root_queue, root_times = remaining(initiatives)
     rotate = [{key: row[key] for key in ("initiative", "endpoint", "session")}
               for row in rows if row["state"] == "rotate_needed"]
     quiet = not still_unread and not broken
     return (0 if quiet else 3), {"rounds": completed, "quiet": quiet, "rows": rows, "still_unread": still_unread,
-                                 "root_queue": root_queue, "rotate_needed": rotate}
+                                 "root_queue": root_queue, "root_time": root_times, "rotate_needed": rotate}
 
 
 def main(argv=None):

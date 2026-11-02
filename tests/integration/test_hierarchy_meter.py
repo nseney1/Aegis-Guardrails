@@ -127,15 +127,22 @@ def test_records_without_timestamps_and_meta_prompts_are_ignored(tmp_path):
     assert result["active_seconds"] == 10 and result["turns"] == 1
 
 
-@pytest.mark.parametrize("seconds,state,code", [(2159, "ok", 0), (2160, "rotate_soon", 0), (2699, "rotate_soon", 0),
-                                                (2700, "rotate_now", 3), (4000, "rotate_now", 3)])
-def test_the_state_follows_the_45_minute_limit(tmp_path, seconds, state, code):
+@pytest.mark.parametrize("seconds,state,code", [(2879, "ok", 0), (2880, "rotate_soon", 0), (3599, "rotate_soon", 0),
+                                                (3600, "rotate_now", 3), (4000, "rotate_now", 3)])
+def test_a_session_rotates_after_60_active_minutes(tmp_path, seconds, state, code):
     result = run_codex(tmp_path, [codex_event(0, "task_started"), codex_event(seconds, "task_complete")], expect=code)
-    assert result["state"] == state and result["limit"] == 2700
+    assert result["state"] == state and result["limit"] == 3600
+
+
+@pytest.mark.parametrize("seconds,state,code", [(4319, "ok", 0), (4320, "rotate_soon", 0), (5399, "rotate_soon", 0),
+                                                (5400, "rotate_now", 3), (6000, "rotate_now", 3)])
+def test_root_rotates_after_90_active_minutes(tmp_path, seconds, state, code):
+    result = run_codex(tmp_path, [codex_event(0, "task_started"), codex_event(seconds, "task_complete")], "--role", "root", expect=code)
+    assert result["state"] == state and result["limit"] == 5400
 
 
 def test_unknown_time_that_could_reach_the_limit_warns_without_claiming_the_limit_was_hit(tmp_path):
-    result = run_codex(tmp_path, [codex_event(0, "task_started"), codex_event(3000, "token_count")])
+    result = run_codex(tmp_path, [codex_event(0, "task_started"), codex_event(3600, "token_count")])
     assert result["active_seconds"] == 0 and result["state"] == "rotate_soon"
 
 

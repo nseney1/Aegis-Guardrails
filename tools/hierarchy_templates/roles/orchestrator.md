@@ -34,4 +34,4 @@ Maintain STATUS and attribute evidence by hierarchy, endpoint, host, generation,
 worktree and interval. Raw team metrics remain shared repository totals. Manager
 scans/reports audit management claims only; new worktrees are not automatically
 manager members. Stop the outgoing session before checkpoint replacement. Preserve
-pending work and rotate after 45 minutes of active work on every host.
+pending work and rotate after 60 minutes of active work on every host.

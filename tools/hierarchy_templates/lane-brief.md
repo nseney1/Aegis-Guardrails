@@ -40,5 +40,5 @@ base; a verdict on an unchanged HEAD does not check uncommitted edits.
 Check the inbox before reporting. Send separate received and accepted messages;
 include readiness with acceptance for a writing lane. Send source/check evidence
 with completion, plus out-of-lane findings and proposed changelog text. Do not push,
-use GitHub, sign, merge a PR or activate policy. Rotate after 45 minutes of active
+use GitHub, sign, merge a PR or activate policy. Rotate after 60 minutes of active
 work through a stopped-session checkpoint; do not silently reuse a stale binding.

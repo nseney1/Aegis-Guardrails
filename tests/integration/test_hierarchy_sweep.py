@@ -130,20 +130,58 @@ def test_a_new_message_gives_an_ignoring_session_another_wake_in_a_later_sweep(f
     assert len(fleet.launches()) == 2
 
 
-@posix_only
-def test_a_session_over_the_active_limit_is_not_woken_and_needs_rotation(fleet):
-    session = fleet.orchestrator["session"]
+def claude_transcript(fleet, session, minutes):
     folder = fleet.claude_home / "projects" / "-pilot"
-    folder.mkdir(parents=True)
+    folder.mkdir(parents=True, exist_ok=True)
     rows = [{"type": "user", "timestamp": "2026-11-02T00:00:00.000Z", "message": {"content": "work"}},
-            {"type": "assistant", "timestamp": "2026-11-02T00:50:00.000Z", "message": {"content": []}}]
+            {"type": "assistant", "timestamp": "2026-11-02T%02d:%02d:00.000Z" % (minutes // 60, minutes % 60), "message": {"content": []}}]
     (folder / (session + ".jsonl")).write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def codex_transcript(fleet, session, minutes):
+    folder = fleet.tmp / "codex-home" / "sessions" / "2026"
+    folder.mkdir(parents=True, exist_ok=True)
+    rows = [{"type": "event_msg", "timestamp": "2026-11-02T00:00:00.000Z", "payload": {"type": "task_started"}},
+            {"type": "event_msg", "timestamp": "2026-11-02T%02d:%02d:00.000Z" % (minutes // 60, minutes % 60), "payload": {"type": "task_complete"}}]
+    (folder / ("rollout-2026-" + session + ".jsonl")).write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+@posix_only
+def test_a_session_over_60_active_minutes_is_not_woken_and_needs_rotation(fleet):
+    session = fleet.orchestrator["session"]
+    claude_transcript(fleet, session, 60)
     fleet.send("pilot/front-door", "pilot/orchestrator", "hello")
     result = fleet.sweep(expect=3)
     assert fleet.launches() == []
     assert result["rows"][0]["state"] == "rotate_needed"
-    assert result["rows"][0]["active_seconds"] == 3000
+    assert result["rows"][0]["active_seconds"] == 3600
     assert result["rotate_needed"] == [{"initiative": "pilot", "endpoint": "pilot/orchestrator", "session": session}]
+
+
+@posix_only
+def test_a_session_under_60_active_minutes_is_woken_with_a_warning(fleet):
+    claude_transcript(fleet, fleet.orchestrator["session"], 50)
+    fleet.send("pilot/front-door", "pilot/orchestrator", "hello")
+    row = fleet.sweep()["rows"][0]
+    assert row["state"] == "read" and row["meter_before"] == "rotate_soon" and row["active_seconds_before"] == 3000
+
+
+@pytest.mark.parametrize("minutes, state", [(70, "ok"), (80, "rotate_soon"), (90, "rotate_now")])
+def test_the_sweep_tells_root_its_own_time_against_90_minutes(fleet, minutes, state):
+    fleet.add_role("pilot/root", "codex-cli", session="root-session")
+    codex_transcript(fleet, "root-session", minutes)
+    result = fleet.sweep()
+    assert result["root_time"] == [{"session": "root-session", "host": "codex-cli", "state": state,
+                                    "active_seconds": minutes * 60, "limit": 5400}]
+
+
+def test_one_root_serving_two_initiatives_is_reported_once(fleet):
+    fleet.add_role("pilot/root", "codex-cli", session="root-session")
+    second_initiative(fleet)
+    provision("add-role", fleet.request(base=str(fleet.tmp / "initiatives" / "second"), endpoint="second/root", host="codex-cli",
+                                        session="root-session"))
+    codex_transcript(fleet, "root-session", 10)
+    assert [row["session"] for row in fleet.sweep()["root_time"]] == ["root-session"]
 
 
 @posix_only

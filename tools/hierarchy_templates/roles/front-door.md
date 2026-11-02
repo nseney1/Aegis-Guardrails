@@ -25,5 +25,5 @@ Mailbox and brief directory ownership is separate from repository leases.
 
 At a host/session change, stop the outgoing session and preserve brief hashes,
 source/dirty-state snapshots where applicable, leases, checks and pending messages.
-The successor acknowledges the checkpoint before continuing. Rotate after 45
+The successor acknowledges the checkpoint before continuing. Rotate after 60
 minutes of active work. Do not rely on a host-native goal or messaging feature.

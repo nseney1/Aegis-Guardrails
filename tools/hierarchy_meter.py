@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Meter a session's active time from its host transcript, for the 45-minute rotation rule.
+"""Meter a session's active time from its host transcript, for the owner's rotation limits.
+
+Root rotates after 90 active minutes and every other session after 60.
 
 Session age is the wrong measure: an idle session uses no budget. This sums finished turns from
 the transcript itself. A turn with no recorded end stays unknown instead of getting an invented
@@ -21,7 +23,8 @@ import sys
 
 CLAUDE_HOSTS = {"claude-code"}
 CODEX_HOSTS = {"codex", "codex-cli"}
-DEFAULT_LIMIT_SECONDS = 2700
+SESSION_LIMIT_SECONDS = 3600
+ROOT_LIMIT_SECONDS = 5400
 WARN_FRACTION = 0.8
 SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 CODEX_ENDS = {"task_complete", "turn_aborted"}
@@ -123,7 +126,7 @@ def find_transcript(host, session):
     return max(found, key=lambda path: path.stat().st_mtime) if found else None
 
 
-def measure(host, session, transcript=None, limit=DEFAULT_LIMIT_SECONDS):
+def measure(host, session, transcript=None, limit=SESSION_LIMIT_SECONDS):
     if host not in CLAUDE_HOSTS | CODEX_HOSTS:
         raise ValueError("unsupported host: " + str(host))
     if not isinstance(session, str) or SESSION.fullmatch(session) is None:
@@ -156,10 +159,12 @@ def main(argv=None):
     parser.add_argument("--host", required=True)
     parser.add_argument("--session", required=True)
     parser.add_argument("--transcript", default=None, help="Read this file instead of the host's usual location")
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT_SECONDS)
+    parser.add_argument("--role", choices=("session", "root"), default="session", help="Which rotation limit applies")
+    parser.add_argument("--limit", type=int, default=None, help="Seconds, replacing the role's limit")
     args = parser.parse_args(argv)
+    limit = args.limit if args.limit is not None else ROOT_LIMIT_SECONDS if args.role == "root" else SESSION_LIMIT_SECONDS
     try:
-        result = measure(args.host, args.session, args.transcript, args.limit)
+        result = measure(args.host, args.session, args.transcript, limit)
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True))
         return 2

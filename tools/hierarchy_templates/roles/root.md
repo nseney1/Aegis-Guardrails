@@ -30,4 +30,4 @@ root, check that its process has stopped before removing the file.
 
 Update `STATUS.md` at every binding, keeping it to the current state, or generate it
 with `report`. Mark merges with `mark-merge`. Only the owner signs, merges and
-releases. Stop before replacement and rotate after 45 minutes of active work.
+releases. Stop before replacement and rotate after 90 minutes of active work.
