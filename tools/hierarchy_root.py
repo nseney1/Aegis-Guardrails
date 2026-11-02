@@ -231,11 +231,24 @@ def agents_rows():
     return [row for row in rows if isinstance(row, dict)]
 
 
+def matching_rows(rows, session):
+    """Rows whose sessionId starts with session (a full id or a prefix of one).
+
+    Real rows carry name, pid, sessionId, state and status but no id, so matching an id
+    field never fired and a short id found nothing: a live session read as gone (P2-2).
+    """
+    return [row for row in rows if session and isinstance(row.get("sessionId"), str)
+            and row["sessionId"].startswith(session)]
+
+
 def agent_row(rows, session):
-    for row in rows:
-        if session and (row.get("sessionId") == session or row.get("id") == session[:8]):
-            return row
-    return None
+    """The one row for session; a prefix shared by several sessions is refused (exit 2)."""
+    found = matching_rows(rows, session)
+    sessions = sorted({row["sessionId"] for row in found})
+    if len(sessions) > 1:
+        raise Failure(EXIT_CRITICAL, "ambiguous session prefix %s: %d sessions match" % (session, len(sessions)),
+                      matching_sessions=sessions)
+    return found[0] if found else None
 
 
 def strip_ansi(screen):
@@ -339,6 +352,14 @@ def cmd_first_prompt_check(args):
 
 
 SESSION_ID = re.compile(r"[0-9a-f][0-9a-f-]{3,63}")
+FULL_SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def full_session(value, label):
+    """Steps that record a stop or move custody take only a full id: a prefix fails open (P2-2)."""
+    require(isinstance(value, str) and FULL_SESSION_ID.fullmatch(value) is not None,
+            "%s must be a full 36-character session id, not a prefix" % label)
+    return value
 
 
 def read_launch_spec(path):
@@ -491,9 +512,12 @@ def lane_health(session, label, agents, args, now):
     entry = {"session": session, "label": label, "transcript": None, "torn_tail": False, "last_record_ts": None,
              "silent_s": None, "open_request_s": None, "open_request_id": None, "effort": None,
              "enqueued_notices": [], "agents_state": None, "stalled": False, "silent": False,
-             "waiting_on_human": False, "dialog": None}
+             "waiting_on_human": False, "dialog": None, "agents_error": None}
     if agents is not None:
-        row = agent_row(agents, session)
+        try:
+            row = agent_row(agents, session)
+        except Failure as exc:
+            row, entry["agents_error"] = None, str(exc)
         if row is not None:
             entry["agents_state"] = {key: row.get(key) for key in ("id", "name", "pid", "status", "state", "waitingFor")}
     transcript = find_transcript(args.projects_dir, session)
@@ -673,14 +697,13 @@ def cmd_verify_retired(args):
     no longer lists it. While it is not, this prints the stop command for a human or ROOT
     to run and exits 2: the tool never stops a session itself (T27, T13).
     """
-    session = args.session
-    require(SESSION_ID.fullmatch(session) is not None, "invalid session id")
+    session = full_session(args.session, "--session")
     require((args.custody is None) == (args.expect_custody_sha256 is None),
             "--custody and --expect-custody-sha256 go together")
     alive, ticks = process_state(args.pid)
     if alive and args.start_ticks is not None and ticks is not None and ticks != args.start_ticks:
         alive = False
-    listed = [row for row in agents_rows() if row.get("sessionId") == session or row.get("id") == session[:8]]
+    listed = matching_rows(agents_rows(), session)
     result = {"session": session, "pid": args.pid, "pid_alive": alive, "pid_start_ticks": ticks,
               "agents_listed": bool(listed), "agents_rows": listed, "retired": not alive and not listed}
     result["verdict"] = ("retired" if result["retired"] else "alive" if alive else "listed_but_pid_gone")
@@ -757,8 +780,7 @@ def read_transfer_facts(path):
     fields(facts["incoming"], {"host", "session", "label"}, {"pid", "start_ticks", "job_dir"})
     fields(facts["handoff"], {"path", "sha256"})
     for side in ("outgoing", "incoming"):
-        require(SESSION_ID.fullmatch(text(facts[side]["session"], side + " session")) is not None,
-                "invalid %s session" % side)
+        full_session(text(facts[side]["session"], side + " session"), side + " session")
         require(re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", text(facts[side]["label"], side + " label")) is not None,
                 "invalid %s label" % side)
     return facts

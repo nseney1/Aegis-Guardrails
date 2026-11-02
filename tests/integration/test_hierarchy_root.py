@@ -200,8 +200,8 @@ def stub(tmp_path):
 
 
 def agent_row(session, name, state="working", status="busy", **extra):
-    return {"pid": 4242, "id": session[:8], "cwd": "/w", "kind": "background", "startedAt": 1793632625309,
-            "sessionId": session, "name": name, "status": status, "state": state, **extra}
+    """Shaped like the real rows recorded in requests/root-c6-*-launch.json: no id (review P2-2)."""
+    return {"pid": 4242, "sessionId": session, "name": name, "status": status, "state": state, **extra}
 
 
 # --- item 2: launch (F-A, F1) ----------------------------------------------------------------
@@ -426,6 +426,17 @@ def test_lanes_health_flags_a_session_waiting_on_a_human(lanes):
     assert "Do you want to proceed?" in blocked["dialog"]["text"] and "\x1b" not in blocked["dialog"]["text"]
     assert json.loads((lanes.dir / "logs-args.json").read_text()) == ["logs", IDS["blocked"][:8]]
     assert rows["missing"]["transcript"] is None and "not found" in rows["missing"]["error"]
+
+
+def test_lanes_health_matches_a_short_id_by_prefix_and_refuses_an_ambiguous_one(lanes):
+    """P2-2: rows carry no id, so a short id matches by sessionId prefix; a prefix of several is refused."""
+    code, out, err = run_tool("lanes-health", "--projects-dir", lanes.projects, "--now", NOW,
+                              "--session", IDS["blocked"][:8] + "=short", "--session", "a000000=ambiguous",
+                              env=lanes.env())
+    assert code == 0, (out, err)
+    rows = {row["label"]: row for row in out["sessions"]}
+    assert rows["short"]["agents_state"]["state"] == "blocked" and rows["short"]["waiting_on_human"] is True
+    assert rows["ambiguous"]["agents_state"] is None and "ambiguous" in rows["ambiguous"]["agents_error"]
 
 
 def test_lanes_health_refuses_a_session_id_that_is_not_an_id(lanes):
@@ -673,7 +684,20 @@ def test_verify_retired_refuses_a_session_still_listed_after_its_pid_is_gone(tmp
     assert custody.read_bytes() == before
 
 
-INCOMING = "c9e38364-ac3f-4720-ba74-44318c7bfcac"
+def test_verify_retired_refuses_a_short_session_id_before_reading_agents(tmp_path, stub):
+    """P2-2: with a short id and rows without id, no row matched and a live session read as retired."""
+    custody = custody_file(tmp_path)
+    before = custody.read_bytes()
+    stub.serve("agents.json", [agent_row(OUTGOING, "ROOT C5", state="blocked", status="idle")])
+    code, out, _ = run_tool("verify-retired", "--session", OUTGOING[:8], "--pid", finished_pid(), "--custody", custody,
+                            "--expect-custody-sha256", sha(before), "--min-free-mb", "1", env=stub.env())
+    assert code == 2, out
+    assert "full 36-character session id" in out["error"]
+    assert custody.read_bytes() == before
+    assert not (stub.dir / "calls.jsonl").exists()
+
+
+INCOMING ="c9e38364-ac3f-4720-ba74-44318c7bfcac"
 
 
 def ack_body(packet):
@@ -789,6 +813,18 @@ def test_transfer_refuses_an_ack_that_does_not_vouch_for_the_facts(rotation, bad
     code, out, _ = transfer(rotation)
     assert code == 2, out
     assert out["error"].startswith("startup ACK does not vouch for this transfer")
+    assert rotation["custody"].read_bytes() == before
+    assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
+
+
+@pytest.mark.parametrize("side", ["outgoing", "incoming"])
+def test_transfer_refuses_a_short_session_id_in_the_facts(rotation, side):
+    facts = json.loads(rotation["facts"].read_text(encoding="utf-8"))
+    facts[side]["session"] = facts[side]["session"][:8]
+    rotation["facts"].write_text(json.dumps(facts), encoding="utf-8")
+    before = rotation["custody"].read_bytes()
+    code, out, _ = transfer(rotation)
+    assert code == 2 and "full 36-character session id" in out["error"], out
     assert rotation["custody"].read_bytes() == before
     assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
 
