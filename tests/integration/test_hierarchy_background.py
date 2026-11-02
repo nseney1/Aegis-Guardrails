@@ -88,6 +88,9 @@ with open(record, "w", encoding="utf-8") as stream:
 if mode == "launch-fails":
     sys.exit(7)
 identifier = session[-8:]
+if mode == "unlisted":  # the launcher reports success, but the host never lists the session
+    print(identifier)
+    sys.exit(0)
 save({"id": identifier, "sessionId": session, "status": "busy", "state": "working", "kind": "background",
       "name": words[words.index("--name") + 1], "pid": -1})
 child = subprocess.Popen([sys.executable, __file__, state, "turn", identifier, mode, helper, root, endpoint, host, session,
@@ -243,6 +246,27 @@ def test_a_background_turn_reports_its_exit_status_as_unknown_not_success(backgr
     assert result["exit_code"] is None and result["background"]["exit_status"] == "unknown"
     finished = [r for r in wake_receipts(background) if r["state"] != "started"]
     assert len(finished) == 1 and finished[0]["exit_code"] is None, finished
+
+
+def test_a_session_never_listed_before_a_short_timeout_is_reported_not_crashed(background):
+    background.pilot.publish()
+    code, result = background.wake(background.profile(stub_mode="unlisted", timeout_seconds=3))
+    assert code == 3 and result["state"] == "timed_out" and result["timed_out"] is True, result
+    assert result["background"]["id"] is None and result["background"]["ended"] == "timeout"
+    assert result["background"]["stop_confirmed"] is True and result["exit_code"] is None
+    assert not [call for call in background.calls() if call[0] in ("stop", "logs")], "there was no listed session to stop"
+    assert [r["state"] for r in wake_receipts(background)] == ["started", "timed_out"]
+    background.pilot.publish("note-2")
+    again_code, again = background.wake(background.profile(stub_mode="unlisted", timeout_seconds=3))
+    assert "a wake is already in progress" not in again.get("error", ""), "the lock must be released"
+
+
+def test_a_null_timeout_is_refused_at_the_profile_boundary(background):
+    background.pilot.publish()
+    path = background.profile(timeout_seconds=None)
+    code, result = background.wake(path)
+    assert code == 2 and "invalid timeout_seconds" in result["error"], result
+    assert not background.pilot.record.exists()
 
 
 @pytest.mark.parametrize("change,error", [

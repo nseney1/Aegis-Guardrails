@@ -316,7 +316,10 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
     # An error while following the turn leaves the lock in place: the session may still be working.
     ended, entry = await_background(profile, before)
     timed_out = ended == "timeout"
-    if ended in ("idle", "timeout"):
+    if ended == "timeout" and entry is None:
+        # A short timeout can pass before the host lists the session; one late listing must still be stopped.
+        entry = background_entry(profile)
+    if ended in ("idle", "timeout") and entry is not None:
         save_terminal_output(profile, entry, log)
         stop_confirmed = stop_background(profile, entry)
     else:
