@@ -24,7 +24,10 @@ import uuid
 MAX_BYTES = 262144
 MAX_INBOX_RESPONSE_BYTES = 4194304
 MAX_RECORDS = 10000
-SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
+# The owner's writer ceiling (owner-writers-5, requests/root-c6-owner-decisions-20261102.json). The
+# workspace ledger imports it, so a manifest and the store it is built from cannot disagree.
+MAX_WRITERS = 5
+SLUG =re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 GIT_ID = re.compile(r"[0-9a-f]{40}")
 MESSAGE_TYPES = {"info", "brief", "dispatch", "result", "review", "escalation", "ack", "job_request", "job_receipt"}
@@ -191,7 +194,7 @@ def endpoint_parts(endpoint):
 def validate_manifest(manifest):
     fields(manifest, {"schema", "endpoints", "counterparts", "writer_limit"})
     require(manifest["schema"] == "aegis.hierarchy-pilot/v1", "unsupported manifest schema")
-    integer(manifest["writer_limit"], "writer_limit", maximum=3)
+    integer(manifest["writer_limit"], "writer_limit", maximum=MAX_WRITERS)
     endpoints = manifest["endpoints"]
     require(isinstance(endpoints, dict) and 0 < len(endpoints) <= 256, "invalid endpoints")
     hierarchies = set()

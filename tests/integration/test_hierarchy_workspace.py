@@ -73,7 +73,7 @@ def workspace(tmp_path):
 
 
 @pytest.mark.parametrize("request_body,error", [
-    ({"writer_limit": 4, "heavy_limit": 1}, "invalid writer_limit"),
+    ({"writer_limit": 6, "heavy_limit": 1}, "invalid writer_limit"),
     ({"writer_limit": 3, "heavy_limit": 4}, "invalid heavy_limit"),
     ({"writer_limit": 3, "heavy_limit": 0}, "invalid heavy_limit"),
     ({"writer_limit": 0, "heavy_limit": 1}, "invalid writer_limit"),
@@ -83,6 +83,12 @@ def test_init_refuses_caps_beyond_the_owner_limits(tmp_path, request_body, error
     space = Workspace(tmp_path)
     assert error in space.run("init", request_body, expect=2)["error"]
     assert not (space.store / "events").exists() or not list((space.store / "events").iterdir())
+
+
+def test_init_accepts_the_owners_five_writers(tmp_path):
+    space = Workspace(tmp_path)
+    assert space.run("init", {"writer_limit": 5, "heavy_limit": 3})["limits"]["writer"] == 5
+    assert space.run("status")["capacity"]["writer"]["limit"] == 5
 
 
 def test_three_heavy_jobs_can_run_at_the_owners_limit_and_a_fourth_waits(tmp_path):

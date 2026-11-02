@@ -30,15 +30,16 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
-from hierarchy_mailbox import (GIT_ID, MAX_RECORDS, SHA256, SLUG, Mailbox, encoded, fields, integer,  # noqa: E402
-                               matching, parse_time, publish_file, read_json, require, safe_path, strings, text,
-                               timestamp)
+from hierarchy_mailbox import (GIT_ID, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG, Mailbox, encoded, fields,  # noqa: E402
+                               integer, matching, parse_time, publish_file, read_json, require, safe_path, strings,
+                               text, timestamp)
 
 
 EVENT_SCHEMA = "aegis.hierarchy-workspace-event/v1"
 # Ceilings for a store's limits. They are the owner's current limits, and raising them is an owner
-# decision after measuring the machine, so it takes a reviewed code change.
-MAX_WRITERS = 3
+# decision after measuring the machine, so it takes a reviewed code change. MAX_WRITERS is 5 by
+# owner-writers-5 (requests/root-c6-owner-decisions-20261102.json) and lives in hierarchy_mailbox,
+# because a manifest's writer_limit is built from the store's and the two must agree.
 MAX_HEAVY = 3
 MAX_PRIORITY = 1000
 MAX_VIEW_ROWS = 100
