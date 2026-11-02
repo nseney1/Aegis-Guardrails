@@ -68,6 +68,10 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
                    "argument. After its turn the session stays idle until the next wake stops and resumes it. Proven "
                    "with a stand-in host only, so check one real session first.")
 
+# Generic levels from ADR-TEAM-CONFIG-20261102. Claude has no "ultra" effort: it runs max with ultracode on.
+TEAM_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
+
 
 def git(cwd, *arguments):
     return subprocess.run(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", *arguments], cwd=cwd,
@@ -216,6 +220,41 @@ def codex_servers(setup, endpoint, session, generation, tools, board):
     return "mcp_servers={" + servers + "}"
 
 
+def team_settings(base, host, request):
+    """Fill the model and effort a request leaves out from the initiative's team.json.
+
+    Returns the options to build the argv from and a record of what was resolved, or None when the file was not used.
+    """
+    if "model" in request and "effort" in request:
+        return request, None
+    path = base / "team.json"
+    if not path.exists():
+        return request, None
+    team = read_json(path)
+    fields(team, {"model", "reasoning"})
+    model = text(team["model"], "team.json model", 128)
+    reasoning = team["reasoning"]
+    require(reasoning in TEAM_LEVELS, "unknown reasoning level in team.json: " + str(reasoning)[:40])
+    wanted = CLAUDE if model.startswith("claude-") else CODEX
+    # A mismatch means team.json and the role hosts disagree, which the owner resolves; never start the role anyway.
+    require(wanted == host, "team.json model %s needs host %s, not %s" % (model, wanted, host))
+    options = dict(request)
+    record = {"model_from": "request" if "model" in request else "team.json",
+              "effort_from": "request" if "effort" in request else "team.json"}
+    options.setdefault("model", model)
+    if "effort" in request:
+        reasoning = request["effort"]
+    else:
+        options["effort"] = "max" if reasoning == "ultra" else reasoning
+        if reasoning == "ultra" and host == CLAUDE:
+            options["ultracode"] = True
+        elif reasoning == "ultra":
+            # Never silently lower a level: say that it ran lower and why.
+            record["downgrade"] = "ultra ran as max: Codex has no ultracode"
+    record.update(model=options["model"], effort=options["effort"], reasoning=reasoning)
+    return options, dict(sorted(record.items()))
+
+
 def claude_argv(session_flags, connection, tools, allowed, request, assistants, name=None):
     """A named session runs in the background, where the owner's session list shows it."""
     argv = list(ASSISTANT_ENV) if assistants else []
@@ -232,6 +271,8 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants, 
         argv += ["--model", request["model"]]
     if "effort" in request:
         argv += ["--effort", request["effort"]]
+    if request.get("ultracode"):
+        argv += ["--settings", ULTRACODE_SETTINGS]
     for directory in request.get("add_dirs", []):
         argv += ["--add-dir", directory]
     if assistants:
@@ -338,6 +379,10 @@ def add_role(request):
     mailbox.endpoint(endpoint)
     cwd, timeout, assistants = check_role_request(request, setup)
     host = request["host"]
+    team = None
+    if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
+        # Before binding, so a bad team.json leaves the endpoint unbound.
+        request, team = team_settings(base, host, request)
     session = request.get("session") or str(uuid.uuid4())
     tools, writer = role_tools(endpoint, mailbox, request.get("tools"))
     root = Path(setup["mailbox_root"])
@@ -351,6 +396,8 @@ def add_role(request):
             binding = mailbox.bind({"endpoint": endpoint, "host": host, "session": session, "expected_generation": 0})
     generation = binding["generation"]
     answer = {"endpoint": endpoint, "host": host, "session": session, "generation": generation}
+    if team is not None:
+        answer["team"] = team
     if endpoint_parts(endpoint)[1] == "root":
         return answer
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
@@ -406,18 +453,21 @@ def add_role(request):
 
 def codex_start(request):
     fields(request, {"base", "endpoint"}, {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"})
-    setup = read_json(safe_path(text(request["base"], "base")) / "provision.json")
+    base = safe_path(text(request["base"], "base"))
+    setup = read_json(base / "provision.json")
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
+    options, team = team_settings(base, CODEX, request)
     writer = mailbox.endpoint(request["endpoint"]).get("kind") in ("implementer", "integrator")
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     if not request.get("skip_git_repo_check"):
         require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
-    return {"start_argv": codex_argv(str(cwd), writer=writer, settings="mcp_servers={}", tail=[], options=request),
-            "cwd": str(cwd),
-            "prompt_via": "argv",
-            "next": "Read the session ID from the first JSON event, then run add-role with that session."}
+    answer = {"start_argv": codex_argv(str(cwd), writer=writer, settings="mcp_servers={}", tail=[], options=options),
+              "cwd": str(cwd),
+              "prompt_via": "argv",
+              "next": "Read the session ID from the first JSON event, then run add-role with that session."}
+    return {**answer, "team": team} if team is not None else answer
 
 
 def old_root_state(old_root, hierarchy):
