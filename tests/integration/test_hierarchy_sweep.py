@@ -185,6 +185,24 @@ def test_one_root_serving_two_initiatives_is_reported_once(fleet):
     assert [row["session"] for row in fleet.sweep()["root_time"]] == ["root-session"]
 
 
+def test_a_native_thread_with_unread_mail_is_left_for_root_to_message(fleet):
+    fleet.add_role("pilot/lane/review", "codex", session="native-review")
+    invoke(fleet.root, "publish", {"message_id": "for-review", "from": "pilot/orchestrator", "to": "pilot/lane/review", "host": "claude-code",
+                                   "session": fleet.orchestrator["session"], "binding_generation": 1, "type": "info", "body": "Look."})
+    result = fleet.sweep(expect=3)
+    assert result["rows"] == [{"initiative": "pilot", "endpoint": "pilot/lane/review", "state": "message_thread", "session": "native-review",
+                               "unread_count": 1, "meter_before": "no_transcript", "active_seconds_before": None}]
+    assert fleet.launches() == []
+
+
+def test_a_native_thread_past_its_limit_needs_rotation_instead(fleet):
+    fleet.add_role("pilot/lane/review", "codex", session="native-review")
+    codex_transcript(fleet, "native-review", 60)
+    invoke(fleet.root, "publish", {"message_id": "for-review", "from": "pilot/orchestrator", "to": "pilot/lane/review", "host": "claude-code",
+                                   "session": fleet.orchestrator["session"], "binding_generation": 1, "type": "info", "body": "Look."})
+    assert fleet.sweep(expect=3)["rows"][0]["state"] == "rotate_needed"
+
+
 @posix_only
 def test_a_session_whose_active_time_cannot_be_measured_is_not_woken(fleet):
     session = str(uuid.uuid4())

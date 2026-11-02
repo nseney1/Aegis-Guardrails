@@ -1044,7 +1044,7 @@ def main(argv=None):
     server.add_argument("--delivery-dir", default=None, help="Record read receipts here; omitted means no receipts")
     server.add_argument("--workspace-store", default=None, help="Offer this role's read-only workspace views")
     server.add_argument("--initiative", default=None, help="The initiative these views belong to")
-    server.add_argument("--board", default=None, help="Offer the workspace board tools from this board folder")
+    server.add_argument("--board", default=None, help="Serve only the workspace board tools, from this board folder")
     args = parser.parse_args(argv)
     try:
         root = safe_path(args.root)

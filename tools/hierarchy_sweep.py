@@ -30,6 +30,7 @@ from hierarchy_workspace import Store  # noqa: E402
 
 
 MAX_ROUNDS = 100
+NATIVE_HOST = "codex"
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError)
 
 
@@ -45,8 +46,7 @@ def profile_for(mailbox_root, endpoint, binding):
 def wake_endpoint(initiative, name, summary, dry_run):
     binding = summary["binding"]
     row = {"initiative": initiative["id"], "endpoint": name}
-    path = profile_for(initiative["mailbox_root"], name, binding) if binding else None
-    if path is None:
+    if binding is None:
         return {**row, "state": "no_profile", "unread_count": summary["unread_count"]}
     try:
         meter = measure(binding["host"], binding["session"])
@@ -55,6 +55,13 @@ def wake_endpoint(initiative, name, summary, dry_run):
         return {**row, "state": "meter_error", "error": str(exc)[:512]}
     if meter["state"] == "rotate_now":
         return {**row, "state": "rotate_needed", "session": binding["session"], "active_seconds": meter["active_seconds"]}
+    if binding["host"] == NATIVE_HOST:
+        # Its app server hosts it, so a second process resuming it could race that. Root messages it instead.
+        return {**row, "state": "message_thread", "session": binding["session"], "unread_count": summary["unread_count"],
+                "meter_before": meter["state"], "active_seconds_before": meter["active_seconds"]}
+    path = profile_for(initiative["mailbox_root"], name, binding)
+    if path is None:
+        return {**row, "state": "no_profile", "unread_count": summary["unread_count"]}
     if dry_run:
         return {**row, "state": "would_wake", "unread": summary["unread"]}
     try:

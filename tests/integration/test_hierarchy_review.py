@@ -306,12 +306,21 @@ def test_a_codex_reviewer_can_read_the_copy_only_through_a_read_only_shell(repos
     assert not any("writable_roots" in word for word in argv)
 
 
+def test_a_codex_orchestrator_can_read_files_through_a_read_only_shell(tmp_path):
+    setup = Reviewer(tmp_path)
+    setup.init()
+    role = setup.add_role("pilot/orchestrator", "codex-cli", session="orchestrator-session", cwd=str(setup.source), reader_shell=True)
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "shell_tool" not in [argv[index + 1] for index, word in enumerate(argv) if word == "--disable"]
+
+
 @pytest.mark.parametrize("endpoint, host, session", [
     ("pilot/lane/f2", "codex-cli", "writer-session"),
-    ("pilot/orchestrator", "codex-cli", "orchestrator-session"),
+    ("pilot/front-door", "codex-cli", "front-door-session"),
     ("pilot/lane/review", "claude-code", None),
 ])
-def test_only_a_codex_reviewer_can_ask_for_a_read_only_shell(repository, tmp_path, endpoint, host, session):
+def test_only_a_codex_reader_can_ask_for_a_read_only_shell(repository, tmp_path, endpoint, host, session):
     setup = Reviewer(tmp_path)
     setup.init()
     options = {"session": session} if session else {}

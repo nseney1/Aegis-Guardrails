@@ -675,13 +675,52 @@ def board_setup(tmp_path):
     return BoardSetup(tmp_path)
 
 
+def test_a_board_server_offers_only_board_tools(hall):
+    client = hall.client()
+    assert client.tools() == BOARD_TOOLS
+    assert "unknown mailbox tool" in client.refused("mailbox_inbox")
+
+
+def tools_of(definition):
+    frame = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    return subprocess.run([definition["command"], *definition["args"]], input=json.dumps(frame) + "\n", capture_output=True, text=True, timeout=20,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+
+def test_a_damaged_board_stops_only_the_board_server(board_setup):
+    provision("init", board_setup.init_request(board=str(board_setup.board)))
+    role = board_setup.add_role("pilot/orchestrator", cwd=str(board_setup.tmp))
+    servers = json.loads(Path(role["connection"]).read_text())["mcpServers"]
+    (board_setup.board / "events" / "00000001.json").write_text("{damaged")
+    mailbox = tools_of(servers["aegis_mailbox"])
+    assert mailbox.returncode == 0 and "mailbox_inbox" in mailbox.stdout and "board_publish" not in mailbox.stdout
+    assert tools_of(servers["aegis_board"]).returncode == 2
+
+
+def test_a_native_thread_gets_a_separate_board_connection(board_setup):
+    provision("init", board_setup.init_request(board=str(board_setup.board)))
+    role = board_setup.add_role("pilot/orchestrator", "codex", session="native-session")
+    assert "--board" not in json.loads(Path(role["connection"]).read_text())["args"]
+    board = json.loads(Path(role["board_connection"]).read_text())
+    assert board["args"][board["args"].index("--board") + 1] == str(board_setup.board)
+    assert "board_publish" in tools_of(board).stdout
+
+
+def test_a_reviewer_gets_no_board_because_its_verdict_stays_independent(board_setup):
+    provision("init", board_setup.init_request(board=str(board_setup.board)))
+    role = board_setup.add_role("pilot/lane/review", cwd=str(board_setup.tmp))
+    assert list(json.loads(Path(role["connection"]).read_text())["mcpServers"]) == ["aegis_mailbox"]
+    native = board_setup.add_role("pilot/lane/integration", "codex", session="native-lane")
+    assert "board_connection" in native
+
+
 def test_provisioning_with_a_board_adds_its_tools_to_a_working_connection(board_setup):
     provision("init", board_setup.init_request(board=str(board_setup.board)))
     role = board_setup.add_role("pilot/orchestrator", cwd=str(board_setup.tmp))
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
     allowed = argv[argv.index("--allowedTools") + 1].split(",")
-    assert {"mcp__aegis_mailbox__" + name for name in BOARD_TOOLS} <= set(allowed)
-    definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_mailbox"]
+    assert {"mcp__aegis_board__" + name for name in BOARD_TOOLS} <= set(allowed)
+    definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_board"]
     assert definition["args"][definition["args"].index("--board") + 1] == str(board_setup.board)
     subprocess.run([sys.executable, "-I", str(BOARD), "--board", str(board_setup.board), "add-channel", "--request",
                     str(write_json(board_setup.tmp / "channel.json", {"channel": "alpha", "orchestrator": "pilot/orchestrator", "source": "owner"}))],
@@ -701,8 +740,10 @@ def write_json(path, value):
 def test_a_codex_connection_approves_board_writes_and_enables_the_tools(board_setup):
     provision("init", board_setup.init_request(board=str(board_setup.board)))
     role = board_setup.add_role("pilot/orchestrator", "codex-cli", session="codex-session", cwd=str(board_setup.source))
-    server = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]["aegis_mailbox"]
-    assert BOARD_TOOLS <= set(server["enabled_tools"])
+    servers = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]
+    assert "--board" not in servers["aegis_mailbox"]["args"]
+    server = servers["aegis_board"]
+    assert BOARD_TOOLS == set(server["enabled_tools"])
     assert server["tools"]["board_publish"]["approval_mode"] == "approve"
     assert server["tools"]["board_disposition"]["approval_mode"] == "approve"
     assert "--board" in server["args"]
@@ -714,7 +755,7 @@ def test_without_a_board_a_connection_offers_no_board_tools(tmp_path):
     role = setup.add_role("pilot/orchestrator", cwd=str(tmp_path))
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
     assert "board_publish" not in argv[argv.index("--allowedTools") + 1]
-    assert "--board" not in json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_mailbox"]["args"]
+    assert list(json.loads(Path(role["connection"]).read_text())["mcpServers"]) == ["aegis_mailbox"]
 
 
 def test_provisioning_refuses_a_board_that_is_not_initialized(tmp_path):

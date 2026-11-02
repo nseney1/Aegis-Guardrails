@@ -50,6 +50,7 @@ def role_workspace_tools(mailbox, endpoint):
 
 
 def definitions(extra=(), board_specs=None):
+    """A connection is either a role's mailbox or the board, because they fail and change separately."""
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
         "to": {"type": "string", "maxLength": 256},
@@ -60,7 +61,7 @@ def definitions(extra=(), board_specs=None):
         "acknowledgment": {"type": "string", "enum": ["received", "accepted", "completed"]},
         "readiness": {"type": "object"}, "result": {"type": "object"}, "receipt": {"type": "object"},
     }
-    specs = [
+    specs = [] if board_specs else [
         ("mailbox_inbox", True, "Read only this endpoint's mailbox; optionally include its hash-verified briefs.",
          {"include_briefs": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
           "after_message_id": {"type": "string", "maxLength": 80}}, []),
@@ -83,6 +84,7 @@ class Connection:
                  initiative=None, board=None):
         # Grants and job runs stay out of anything a model session can call, so root has no adapter.
         require(endpoint_parts(endpoint)[1] != "root", "root uses the controller, not the mailbox adapter")
+        require(board is None or (delivery_dir is None and workspace_store is None), "a board connection takes no mailbox options")
         require((workspace_store is None) == (initiative is None),
                 "workspace store and initiative must be given together")
         self.root = root
@@ -167,6 +169,9 @@ class Connection:
 
     def call(self, name, arguments, render=None):
         text(name, "tool name", 128)
+        if self.board is not None:
+            require(name in self.board_specs, "unknown mailbox tool: " + name)
+            return self.board_call(name, arguments, render)
         if name == "mailbox_inbox":
             fields(arguments, set(), {"include_briefs", "limit", "after_message_id"})
             include_briefs = arguments.get("include_briefs", False)
@@ -187,8 +192,6 @@ class Connection:
                     "generation": self.sender["binding_generation"], **arguments})
         if name in self.workspace_tools:
             return self.workspace_view(name, arguments)
-        if name in self.board_specs:
-            return self.board_call(name, arguments, render)
         raise ValueError("unknown mailbox tool: " + name)
 
 

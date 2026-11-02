@@ -14,19 +14,20 @@ import subprocess
 import sys
 
 
-def server_definition(argv):
+def server_definitions(argv):
     if "--mcp-config" in argv:
-        return json.load(open(argv[argv.index("--mcp-config") + 1], encoding="utf-8"))["mcpServers"]["aegis_mailbox"]
+        return json.load(open(argv[argv.index("--mcp-config") + 1], encoding="utf-8"))["mcpServers"]
     for index, word in enumerate(argv):
         if word == "-c" and argv[index + 1].startswith("mcp_servers="):
             import tomllib  # Python 3.11+, and only Codex connections need it.
-            return tomllib.loads(argv[index + 1])["mcp_servers"]["aegis_mailbox"]
+            return tomllib.loads(argv[index + 1])["mcp_servers"]
     raise SystemExit("no mailbox connection on the command line")
 
 
 def main():
     argv = sys.argv[1:]
-    definition = server_definition(argv)
+    definitions = server_definitions(argv)
+    definition = definitions["aegis_mailbox"]
     arguments = definition["args"]
     endpoint = arguments[arguments.index("--endpoint") + 1]
     stdin_prompt = sys.stdin.read()
@@ -39,16 +40,25 @@ def main():
     if plan.get("ignore"):
         return
     adapter = subprocess.Popen([definition["command"], *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    servers = {"aegis_mailbox": adapter}
 
-    def call(identifier, method, params=None):
-        adapter.stdin.write(json.dumps({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params or {}}) + "\n")
-        adapter.stdin.flush()
-        return json.loads(adapter.stdout.readline())
+    def server_for(name):
+        key = "aegis_board" if name.startswith("board_") else "aegis_mailbox"
+        if key not in servers:
+            servers[key] = subprocess.Popen([definitions[key]["command"], *definitions[key]["args"]], stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, text=True)
+        return servers[key]
+
+    def call(server, identifier, method, params=None):
+        server.stdin.write(json.dumps({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params or {}}) + "\n")
+        server.stdin.flush()
+        return json.loads(server.stdout.readline())
 
     def tool(identifier, name, tool_arguments):
-        return json.loads(call(identifier, "tools/call", {"name": name, "arguments": tool_arguments})["result"]["content"][0]["text"])
+        response = call(server_for(name), identifier, "tools/call", {"name": name, "arguments": tool_arguments})
+        return json.loads(response["result"]["content"][0]["text"])
 
-    call(1, "initialize")
+    call(adapter, 1, "initialize")
     inbox = tool(2, "mailbox_inbox", {"limit": 100})
     binding = inbox.get("binding") or {}
     if binding.get("ready") is False:
@@ -82,9 +92,10 @@ def main():
         results[item["name"]] = tool(number, item["tool"], arguments)
         with open(results_path, "w", encoding="utf-8") as stream:
             json.dump(results, stream)
-    adapter.stdin.close()
-    adapter.wait(timeout=10)
-    adapter.stdout.close()
+    for server in servers.values():
+        server.stdin.close()
+        server.wait(timeout=10)
+        server.stdout.close()
 
 
 if __name__ == "__main__":

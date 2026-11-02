@@ -216,6 +216,63 @@ def test_the_generated_wake_profile_is_accepted_by_the_wake_tool(setup):
     assert json.loads(result.stdout)["would_wake"] == ["hello"]
 
 
+def test_a_native_thread_gets_a_flat_connection_and_no_wake_profile(setup):
+    role = setup.add_role("pilot/orchestrator", "codex", session="01a19a9d-b1ad-7b22-bec1-5e465d490ae6")
+    assert role["wake"] == "native" and "wake_profile" not in role and "start_argv" not in role
+    definition = json.loads(Path(role["connection"]).read_text())
+    assert definition["command"] == "/usr/bin/python3" or Path(definition["command"]).is_absolute()
+    arguments = definition["args"]
+    assert arguments[arguments.index("--host") + 1] == "codex"
+    assert arguments[arguments.index("--session") + 1] == "01a19a9d-b1ad-7b22-bec1-5e465d490ae6"
+    assert not list((setup.base / "profiles").glob("*")) if (setup.base / "profiles").exists() else True
+    frame = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    done = subprocess.run([definition["command"], *arguments], input=json.dumps(frame) + "\n", capture_output=True, text=True, timeout=20,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert {"mailbox_inbox", "mailbox_publish", "workspace_capacity"} <= {tool["name"] for tool in json.loads(done.stdout)["result"]["tools"]}
+
+
+def test_a_native_thread_needs_its_actual_session(setup):
+    assert "actual session" in setup.add_role("pilot/orchestrator", "codex", expect=2)["error"]
+
+
+def test_root_may_be_a_native_thread(setup):
+    role = setup.add_role("pilot/root", "codex", session="01a19a8e-3073-7af2-b5c0-d0c41fe82ada")
+    assert role["host"] == "codex" and "connection" not in role
+
+
+def test_a_moved_writer_keeps_its_real_sandbox_options(setup, tmp_path):
+    writable, tmp = tmp_path / "integration", tmp_path / "private-tmp"
+    writable.mkdir()
+    tmp.mkdir()
+    role = setup.add_role("pilot/lane/f2", "codex-cli", session="01a19969-41df-7631-8ecd-57add111e96b", cwd=str(setup.source), writable_roots=[str(writable)],
+                          add_dirs=[str(writable)], tmpdir=str(tmp), effort="medium", skip_git_repo_check=True)
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    settings = [argv[index + 1] for index, word in enumerate(argv) if word == "-c"]
+    assert 'sandbox_workspace_write.writable_roots=["%s"]' % writable in settings
+    assert 'shell_environment_policy.set.TMPDIR="%s"' % tmp in settings
+    assert 'shell_environment_policy.set.TMPPREFIX="%s/zsh"' % tmp in settings
+    assert 'model_reasoning_effort="medium"' in settings
+    assert argv[argv.index("--add-dir") + 1] == str(writable)
+    assert "--skip-git-repo-check" in argv
+    assert argv[-2:] == ["resume", "01a19969-41df-7631-8ecd-57add111e96b"]
+
+
+def test_writer_options_are_checked(setup, tmp_path):
+    missing = str(tmp_path / "no-such-folder")
+    options = {"session": "writer-session", "cwd": str(setup.source)}
+    assert "writable_roots" in setup.add_role("pilot/lane/f2", "codex-cli", writable_roots=[missing], expect=2, **options)["error"]
+    assert "tmpdir" in setup.add_role("pilot/lane/f2", "codex-cli", tmpdir=missing, expect=2, **options)["error"]
+    assert "writable_roots" in setup.add_role("pilot/orchestrator", "codex-cli", writable_roots=[str(tmp_path)], expect=2, **options)["error"]
+    assert "skip_git_repo_check" in setup.add_role("pilot/lane/f2", "claude-code", skip_git_repo_check=True, cwd=str(tmp_path), expect=2)["error"]
+
+
+def test_codex_needs_a_git_cwd_unless_a_real_lane_says_otherwise(setup, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert "git checkout" in setup.add_role("pilot/lane/f2", "codex-cli", session="writer-session", cwd=str(plain), expect=2)["error"]
+    assert setup.add_role("pilot/lane/f2", "codex-cli", session="writer-session", cwd=str(plain), skip_git_repo_check=True)["cwd"] == str(plain)
+
+
 def codex_config(argv):
     tomllib = pytest.importorskip("tomllib", reason="Codex settings are read with tomllib, Python 3.11+")
 
