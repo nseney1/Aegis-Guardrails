@@ -126,9 +126,20 @@ def stop_background(profile, entry):
         time.sleep(BACKGROUND_POLL_SECONDS / 4)
 
 
+def listed_within(profile, looks, pause):
+    """The host's listing of the session, or None once `looks` consecutive looks all missed it."""
+    for look in range(looks):
+        if look:
+            time.sleep(pause)
+        entry = background_entry(profile)
+        if entry is not None:
+            return entry
+    return None
+
+
 def clear_idle(profile):
     """A session left idle by an earlier turn must stop before it can be resumed under the same ID."""
-    entry = background_entry(profile)
+    entry = listed_within(profile, GONE_LOOKS, BACKGROUND_POLL_SECONDS / 4)
     if entry is None:
         return None
     require(entry.get("status") != "busy", "the background session is still working; wake it after its turn ends")
@@ -221,6 +232,30 @@ def claude_table_lists_session(session):
     return False
 
 
+def session_process_found(session):
+    """The positive check behind every release of the lock: absence from the host's list alone is not enough."""
+    return process_names_session(session) or claude_table_lists_session(session)
+
+
+def settle_failed_launch(profile, may_exist):
+    """After a failed or unrecorded launch: (ID of a stopped leftover or None, True once nothing is left running).
+
+    A launcher that returned 0, or whose outcome is unknown, may have started a session the host lists late, so
+    it is followed for as long as a start may take, as await_background does. Any session seen is stopped."""
+    started = time.monotonic()
+    gone_looks = 0
+    while True:
+        entry = background_entry(profile)
+        if entry is not None:
+            if not stop_background(profile, entry):
+                return entry["id"], False
+            return entry["id"], not session_process_found(profile["session"])
+        gone_looks += 1
+        if gone_looks >= GONE_LOOKS and (not may_exist or time.monotonic() - started >= BACKGROUND_START_SECONDS):
+            return None, not session_process_found(profile["session"])
+        time.sleep(BACKGROUND_POLL_SECONDS if may_exist else BACKGROUND_POLL_SECONDS / 4)
+
+
 def claim_wake(mailbox, endpoint):
     marker = mailbox.wake_marker(endpoint)
     try:
@@ -294,13 +329,17 @@ def start_background(profile, log_directory, wake_id):
 
 def launch_background(mailbox, directory, profile, base, wake_id, marker, log_directory, answer, failed_start):
     """Start the turn as a background session. Returns (failure, log); a failure is the wake's answer."""
-    recorded = True
+    recorded, may_exist = True, True
     try:
         code, log = start_background(profile, log_directory, wake_id)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.SubprocessError as exc:
+        # A launcher that timed out may already have created the session: its outcome is unknown.
         reason, log = "background launch failed: " + str(exc)[:300], None
+    except OSError as exc:
+        reason, log, may_exist = "background launch failed: " + str(exc)[:300], None, False
     else:
         reason = None if code == 0 else "background launch failed: exit %d" % code
+        may_exist = code == 0
     if reason is None:
         try:
             # Recorded only once the launcher reports a session, because launch intent is not launch evidence.
@@ -309,13 +348,15 @@ def launch_background(mailbox, directory, profile, base, wake_id, marker, log_di
         except (ValueError, OSError) as exc:
             reason, recorded = "could not record the start: " + str(exc), False
     # A launcher that failed or went unrecorded may still have left a session, and none may run without a record.
-    leftover = background_entry(profile)
-    if leftover is not None and not stop_background(profile, leftover):
-        return (3, {**answer, "state": "stop_unconfirmed", "error": reason + "; the session it left could not be "
-                    "confirmed stopped, so the wake lock stays", "exit_code": None, "timed_out": False, "read": [],
-                    "still_unread": answer["message_ids"]}), log
+    leftover, stop_confirmed = settle_failed_launch(profile, may_exist)
+    background = {"id": leftover, "ended": "launch_failed", "stop_confirmed": stop_confirmed, "exit_status": "unknown"}
+    if not stop_confirmed:
+        return (3, {**answer, "state": "stop_unconfirmed", "error": reason + "; the session it may have left could "
+                    "not be confirmed stopped, so the wake lock stays", "exit_code": None, "timed_out": False,
+                    "read": [], "still_unread": answer["message_ids"], "background": background}), log
     marker.unlink()
-    return failed_start(reason, record=recorded), log
+    failed_code, result = failed_start(reason, record=recorded)
+    return (failed_code, {**result, "background": background}), log
 
 
 def finish_background(mailbox, directory, endpoint, profile, base, wake_id, marker, log, before, answer, stopped_idle):
@@ -330,7 +371,7 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
         stop_confirmed = stop_background(profile, entry)
     else:
         # Gone from the host's list, or never in it: check the process table too before releasing the lock.
-        stop_confirmed = not (process_names_session(profile["session"]) or claude_table_lists_session(profile["session"]))
+        stop_confirmed = not session_process_found(profile["session"])
     try:
         # The launcher returned and the session was stopped or vanished; its own exit status was never seen.
         mailbox.write_delivery_receipt(directory, "wakes", {

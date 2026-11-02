@@ -114,7 +114,11 @@ child = subprocess.Popen([sys.executable, __file__, state, "turn", identifier, m
 row = next(row for row in rows() if row["id"] == identifier)
 row["pid"] = child.pid
 save(row)
+if os.path.exists(os.path.join(state, "hide-after-launch")):
+    open(os.path.join(state, "hide-next"), "w").close()  # the host's first look after the launch misses the session
 print(identifier)
+if mode == "orphan":
+    sys.exit(7)  # the launcher fails after it has already started the session
 '''
 
 
@@ -236,6 +240,59 @@ def test_a_failed_background_launch_is_recorded_as_failed_to_start(background):
     assert not [call for call in background.calls() if call[0] == "stop"]
     receipts = [json.loads(p.read_text()) for p in sorted((background.pilot.delivery / "wakes").rglob("*.json"))]
     assert [r["state"] for r in receipts] == ["failed_to_start"]
+
+
+def wake_lock(background):
+    return background.pilot.root / (".wake-" + TARGET.replace("/", "%2F") + ".lock")
+
+
+def test_a_failed_launch_that_left_a_session_stops_it_before_releasing_the_lock(background):
+    background.pilot.publish()
+    (background.state / "hide-after-launch").write_text("")
+    code, result = background.wake(background.profile(stub_mode="orphan"))
+    identifier = background.pilot.session[-8:]
+    assert code == 3 and "exit 7" in result["error"], result
+    # One missing look is not proof that the failed launcher left nothing running.
+    assert ["stop", identifier] in background.calls(), result
+    assert all(row["status"] == "stopped" for row in background.rows())
+    assert result["state"] == "failed_to_start" and not wake_lock(background).exists()
+    assert result["background"] == {"id": identifier, "ended": "launch_failed", "stop_confirmed": True,
+                                    "exit_status": "unknown"}
+
+
+def test_a_launch_whose_start_cannot_be_recorded_stops_the_session_it_started(background):
+    background.pilot.publish()
+    (background.state / "hide-after-launch").write_text("")
+    # A folder where the wakes ledger takes its lock makes the "started" write fail after the launch.
+    (background.pilot.delivery / "wakes" / TARGET / ".write.lock").mkdir(parents=True)
+    code, result = background.wake(background.profile())
+    identifier = background.pilot.session[-8:]
+    assert code == 3 and "could not record the start" in result["error"], result
+    assert ["stop", identifier] in background.calls(), result
+    assert all(row["status"] == "stopped" for row in background.rows())
+    assert result["state"] == "failed_to_start" and result["background"]["stop_confirmed"] is True
+
+
+def test_a_failed_launch_whose_leftover_cannot_be_stopped_keeps_the_lock(background):
+    background.pilot.publish()
+    (background.state / "hide-after-launch").write_text("")
+    (background.state / "ignore-stop").write_text("")
+    code, result = background.wake(background.profile(stub_mode="orphan"))
+    assert code == 3 and result["state"] == "stop_unconfirmed", result
+    assert result["background"]["stop_confirmed"] is False and wake_lock(background).exists()
+
+
+def test_a_busy_session_missing_from_one_look_is_still_not_woken_again(background):
+    background.pilot.publish()
+    holder = background.plant("busy")
+    (background.state / "hide-next").write_text("")
+    try:
+        code, result = background.wake(background.profile())
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+    assert code == 2 and "still working" in result["error"], result
+    assert not background.pilot.record.exists(), "one missing look is not proof that nothing runs"
 
 
 def test_an_unconfirmed_stop_keeps_the_wake_lock(background):
