@@ -248,9 +248,11 @@ def team_settings(base, host, request, kind=None):
         require(level in TEAM_LEVELS, "unknown reasoning level in team.json: " + str(level)[:40])
     require(team["reasoning"] in TEAM_LEVELS, "unknown reasoning level in team.json: " + str(team["reasoning"])[:40])
     reasoning = by_kind.get(kind, team["reasoning"])
-    wanted = CLAUDE if model.startswith("claude-") else CODEX
-    # A mismatch means team.json and the role hosts disagree, which the owner resolves; never start the role anyway.
-    require(wanted == host, "team.json model %s needs host %s, not %s" % (model, wanted, host))
+    if "model" not in request:
+        # A mismatch means team.json and the role hosts disagree, which the owner resolves; never start the role
+        # anyway. A request that names its own model does not use the team's, so only the reasoning applies.
+        wanted = CLAUDE if model.startswith("claude-") else CODEX
+        require(wanted == host, "team.json model %s needs host %s, not %s" % (model, wanted, host))
     options = dict(request)
     record = {"model_from": "request" if "model" in request else "team.json",
               "effort_from": "request" if "effort" in request else "team.json"}

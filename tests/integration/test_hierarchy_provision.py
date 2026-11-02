@@ -498,6 +498,16 @@ def test_codex_start_refuses_a_claude_team_model(setup):
     assert "needs host claude-code" in codex_start(setup, expect=2)["error"]
 
 
+def test_a_request_model_for_another_host_still_takes_the_team_reasoning(setup):
+    # The team's model is not used, so its host does not bind this role; its reasoning still does (review r2 R1).
+    write_team(setup, model="claude-opus-5-5", reasoning="high")
+    role = setup.add_role("pilot/lane/f2", "codex-cli", session=CODEX_SESSION, cwd=str(setup.source),
+                          model="gpt-5.5-codex")
+    settings = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])
+    assert settings["model"] == "gpt-5.5-codex" and settings["model_reasoning_effort"] == "high"
+    assert role["team"]["model_from"] == "request" and role["team"]["effort_from"] == "team.json"
+
+
 def test_a_full_request_does_not_read_team_config(setup):
     (setup.base / "team.json").write_text("not json", encoding="utf-8")
     role = setup.add_role("pilot/orchestrator", cwd=str(setup.tmp), model="claude-opus-5-5", effort="high")
