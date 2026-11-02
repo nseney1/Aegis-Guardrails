@@ -826,6 +826,13 @@ def test_binding_only_inbox_is_small_hash_checked_and_read_only(pilot):
     assert invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)["checkpoint_briefs"][0]["ok"] is False
 
 
+def test_inbox_help_states_the_limit_default_and_maximum():
+    result = subprocess.run([sys.executable, "-B", str(HELPER), "--root", "/unused", "inbox", "--help"],
+                            capture_output=True, text=True, timeout=15, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 0 and not result.stderr
+    assert "default 20, maximum 100" in " ".join(result.stdout.split())
+
+
 @pytest.mark.parametrize("flags", [{"include_briefs": True}, {"limit": 5}, {"after": "one"},
                                    {"mark_read": True, "delivery_dir": "/tmp/unused"}])
 def test_binding_only_inbox_refuses_paging_flags(pilot, flags):

@@ -1053,7 +1053,7 @@ def main(argv=None):
     inbox.add_argument("--include-briefs", action="store_true")
     inbox.add_argument("--binding-only", action="store_true",
                        help="Only the binding, a hash check per checkpoint brief and the message count; no messages")
-    inbox.add_argument("--limit", type=int, default=None)
+    inbox.add_argument("--limit", type=int, default=None, help="Messages per page: default 20, maximum 100")
     inbox.add_argument("--after", default=None)
     inbox.add_argument("--delivery-dir", default=None, help="With --mark-read, where root's read receipts go")
     inbox.add_argument("--mark-read", action="store_true", help="Root only: record what this page returned as read")
