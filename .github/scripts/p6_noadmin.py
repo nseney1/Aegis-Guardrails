@@ -18,7 +18,7 @@ import sys
 import traceback
 
 
-HELPER_SHA = '692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474'
+HELPER_SHA = 'db2995e528007c2bb17fabada5e708c3107e83607efd4a6acad4ad35d0f9cf7b'
 DWORD, BOOL, HANDLE = C.c_uint32, C.c_int32, C.c_void_p
 
 
