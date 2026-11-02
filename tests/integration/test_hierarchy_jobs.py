@@ -120,7 +120,8 @@ class Shop(Setup):
         return {"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1", "SECRET_TOKEN": "must-not-reach-a-job"}
 
     def jobs(self, command, *flags, expect=0, census=(), lock_wait=None, env=None, timeout=90):
-        result = subprocess.run(self.argv(command, *flags, census=None if census is None else list(census), lock_wait=lock_wait),
+        census = census if census is None or isinstance(census, dict) else list(census)
+        result = subprocess.run(self.argv(command, *flags, census=census, lock_wait=lock_wait),
                                 capture_output=True, text=True, timeout=timeout, env=env or self.env())
         assert not result.stderr, result.stderr
         assert result.returncode == expect, result.stdout
@@ -532,6 +533,62 @@ def test_a_full_ledger_makes_the_job_wait(shop):
     assert result["rows"][0]["state"] == "waiting"
     assert result["rows"][0]["capacity"]["held"] == 3
     assert shop.receipts("job-1") == []
+
+
+def cargo_and_pytest_jobs(shop):
+    """Job "cargo" stands in for a cargo test: it takes Heavy-Tests without running cargo. Job "pytest" takes heavy."""
+    shop.recipes["recipes"]["fake-cargo"] = shop.command(["$python", "-c", "print('cargo output')"], heavy=True,
+                                                         heavy_tests=True)
+    shop.save_recipes()
+    shop.request_job("cargo", "fake-cargo")
+    shop.request_job("pytest", "heavy")
+
+
+def kinds_requested(shop):
+    return {event["data"]["holder"]: event["data"]["kind"] for event in shop.events() if event["kind"] == "request"}
+
+
+def test_a_heavy_tests_job_waits_for_its_own_slot_while_a_test_job_runs(shop):
+    shop.workspace.run("request", {"initiative": "pilot", "kind": "heavy-tests", "holder": "other-cargo"})
+    shop.workspace.run("grant-next", kind="heavy-tests")
+    cargo_and_pytest_jobs(shop)
+    rows = {row["job"]: row for row in shop.run_open(expect=3)["rows"]}
+    assert rows["pilot/cargo"]["state"] == "waiting" and rows["pilot/cargo"]["reason"] == "capacity_full"
+    assert rows["pilot/cargo"]["kind"] == "heavy-tests"
+    assert rows["pilot/cargo"]["capacity"] == {"limit": 1, "held": 1, "external_roots": [], "census": "fixture"}
+    assert rows["pilot/pytest"]["state"] == "completed", "a full Heavy-Tests slot never blocks the test slots"
+    assert kinds_requested(shop)["job:pilot/cargo"] == "heavy-tests"
+    assert kinds_requested(shop)["job:pilot/pytest"] == "heavy"
+    assert shop.receipts("cargo") == [] and shop.heavy()["used"] == 0
+
+
+@pytest.mark.parametrize("census, blocked", [
+    ({"external_roots": {"heavy-tests": [201]}}, "cargo"),
+    ({"external_roots": {"heavy": [101, 102, 103]}}, "pytest"),
+    ([101, 102, 103], "pytest"),
+    ({"external_roots": [101, 102, 103]}, "pytest"),
+])
+def test_outside_work_counts_only_against_its_own_kind(shop, census, blocked):
+    cargo_and_pytest_jobs(shop)
+    rows = {row["job"].split("/")[1]: row for row in shop.run_open(census=census, expect=3)["rows"]}
+    assert rows[blocked]["state"] == "waiting" and rows[blocked]["reason"] == "capacity_full"
+    other = "pytest" if blocked == "cargo" else "cargo"
+    assert rows[other]["state"] == "completed"
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+
+
+def test_low_disk_holds_both_heavy_kinds(shop):
+    shop.recipes["min_free_gigabytes"] = 1000000
+    cargo_and_pytest_jobs(shop)
+    rows = shop.run_open(expect=3)["rows"]
+    assert sorted((row["job"], row["state"], row["reason"]) for row in rows) == [
+        ("pilot/cargo", "waiting", "low_disk"), ("pilot/pytest", "waiting", "low_disk")]
+
+
+def test_a_census_fixture_names_only_known_kinds(shop):
+    cargo_and_pytest_jobs(shop)
+    refused = shop.run_open(census={"external_roots": {"writer": [1]}}, expect=2)
+    assert "census fixture kind" in refused["error"]
 
 
 def test_the_real_census_finds_outside_heavy_processes(shop, tmp_path):

@@ -54,6 +54,8 @@ RESULT_SCHEMA = "aegis.hierarchy-job-result/v1"
 COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout"}
 ENV_TOKENS = {"$scratch", "$checkout"}
 SANDBOXES = ("bwrap", "none")
+# The ledger kinds a heavy job can wait for, in the order they are granted. Each has its own limit.
+HEAVY_KINDS = ("heavy", "heavy-tests")
 # Cargo subcommands and aliases that compile. fmt, metadata, tree and --version stay light.
 CARGO_COMPILING = {"build", "b", "test", "t", "check", "c", "run", "r", "bench", "clippy", "doc", "d", "rustc", "install",
                    "nextest", "miri"}
@@ -172,6 +174,11 @@ def load_recipes(path):
 
 def is_heavy(recipe):
     return recipe.get("heavy", False)
+
+
+def job_kind(recipe):
+    """The ledger kind a heavy job waits for. Cargo has the single Heavy-Tests slot; other test jobs share heavy."""
+    return "heavy-tests" if recipe.get("heavy_tests", False) else "heavy"
 
 
 def packet_text(raw):
@@ -345,12 +352,15 @@ def group_members(group):
     return members
 
 
-def heavy_command(words):
-    """Root's census rule, kept identical so this and root's own controller count the same work."""
+def census_command(words, kind):
+    """Root's census rule for one ledger kind, which root's own controller must apply the same way: the test slots
+    (`heavy`) count the pytest family, and Heavy-Tests counts cargo builds and tests and rustc."""
+    if kind == "heavy-tests":
+        return cargo_step(words) is not None
     if not words:
         return False
     name = Path(words[0]).name
-    if name in ("cargo", "rustc", "pytest", "py.test"):
+    if name in ("pytest", "py.test"):
         return True
     if not name.startswith("python"):
         return False
@@ -372,8 +382,8 @@ def heavy_command(words):
     return False
 
 
-def outside_heavy_roots(owners):
-    """Topmost heavy processes that no running job of this ledger started."""
+def outside_roots(owners, kind):
+    """Topmost processes of this kind that no running job of this ledger started."""
     parents, heavy = {}, set()
     for item in Path("/proc").glob("[0-9]*/cmdline"):
         pid = int(item.parent.name)
@@ -383,7 +393,7 @@ def outside_heavy_roots(owners):
                                .rpartition(")")[2].split()[1])
         except (OSError, ValueError, IndexError):
             continue
-        if heavy_command(words):
+        if census_command(words, kind):
             heavy.add(pid)
     roots = []
     for pid in heavy:
@@ -918,45 +928,62 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
     return ready
 
 
-def enqueue(store, job, wait):
+def enqueue(store, job, kind, wait):
     def attempt():
         with store.lock():
             ledger = store.load()
             if not any(r["holder"] == job.holder and r["state"] in ("queued", "granted") for r in ledger.requests.values()):
                 store.append(ledger, "request", {"request_id": "req-%08d" % (ledger.seq + 1), "initiative": job.initiative["id"],
-                                                 "kind": "heavy", "holder": job.holder, "reference": job.id})
+                                                 "kind": kind, "holder": job.holder, "reference": job.id})
 
     patient(attempt, wait)
 
 
-def fixture_roots(fixture):
-    """For tests: a list of PIDs, or {"external_roots": [...], "delay_seconds": n} to make the census take time like a real one."""
+def fixture_roots(fixture, kind):
+    """For tests: a list of PIDs, or {"external_roots": ..., "delay_seconds": n} to make the census take time like a
+    real one. external_roots is a list, or an object of lists by kind; a bare list counts against heavy only."""
     data = read_json(fixture)
     if isinstance(data, list):
-        return sorted(data)
+        return sorted(data) if kind == "heavy" else []
     fields(data, {"external_roots"}, {"delay_seconds"})
     delay = data.get("delay_seconds", 0)
     require(isinstance(delay, (int, float)) and 0 <= delay <= 5, "invalid delay_seconds")
     time.sleep(delay)
-    return sorted(data["external_roots"])
+    roots = data["external_roots"]
+    if isinstance(roots, list):
+        roots = {"heavy": roots}
+    require(isinstance(roots, dict), "invalid census fixture")
+    unknown = sorted(set(roots) - set(HEAVY_KINDS))
+    require(not unknown, "unknown census fixture kind: " + ", ".join(unknown)[:256])
+    return sorted(roots.get(kind, []))
 
 
-def census(store_path, ledger, fixture):
-    held = ledger.held("heavy")
+def census(store_path, ledger, fixture, kind):
+    held = ledger.held(kind)
     if fixture is not None:
-        return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": fixture_roots(fixture), "census": "fixture"}
+        return {"limit": ledger.limits[kind], "held": len(held), "external_roots": fixture_roots(fixture, kind),
+                "census": "fixture"}
     owners = set()
-    for request in held:
+    # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
+    for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
         if request["holder"].startswith("job:"):
             claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
             if claim.exists():
                 owners.add(read_json(claim)["pid"])
-    return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": outside_heavy_roots(owners), "census": "proc"}
+    return {"limit": ledger.limits[kind], "held": len(held), "external_roots": outside_roots(owners, kind), "census": "proc"}
 
 
 def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=False):
+    """Each kind is a slot class of its own, so one kind being full never holds the other. Returns the budget left."""
+    for kind in HEAVY_KINDS:
+        waiting = {holder: entry for holder, entry in heavy.items()
+                   if job_kind(recipes["recipes"][entry[1]["recipe"]]) == kind}
+        budget = run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy)
+    return budget
+
+
+def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy):
     """Grant in the ledger's own order, which applies the owner's priorities, until nothing more can start."""
-    waiting = dict(heavy)
     held_reason = "store_busy" if store_busy else None
     capacity = None
     minimum = recipes.get("min_free_gigabytes", 0)
@@ -973,11 +1000,11 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
             def outside(locked):
                 # Counted under the store lock, together with the grant, so another runner cannot take the
                 # same free slot between this count and the grant.
-                seen.update(census(store.path, locked, fixture))
+                seen.update(census(store.path, locked, fixture, kind))
                 return seen["external_roots"]
 
             try:
-                code, answer = patient(lambda: grant_next(store, "heavy", outside=outside), wait)
+                code, answer = patient(lambda: grant_next(store, kind, outside=outside), wait)
             except ValueError as exc:
                 if "busy" not in str(exc):
                     raise
@@ -998,10 +1025,11 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
         except ERRORS as exc:
             rows.append(blocked_row(job, exc))
     for job, _, _ in waiting.values():
-        row = {"job": job.id, "state": "waiting", "reason": held_reason or "job_limit"}
+        row = {"job": job.id, "state": "waiting", "kind": kind, "reason": held_reason or "job_limit"}
         if capacity is not None:
             row["capacity"] = capacity
         rows.append(row)
+    return budget
 
 
 NEEDS_ROOT = {"waiting", "running", "abandoned", "settle_pending", "mailbox_error", "granted_elsewhere"}
@@ -1023,10 +1051,11 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait):
     heavy = {}
     store_busy = False
     for job, packet, raw in ready:
-        if is_heavy(recipes["recipes"][packet["recipe"]]):
+        recipe = recipes["recipes"][packet["recipe"]]
+        if is_heavy(recipe):
             heavy[job.holder] = (job, packet, raw)
             try:
-                enqueue(store, job, wait)
+                enqueue(store, job, job_kind(recipe), wait)
             except ValueError as exc:
                 # Nothing has started, so this job just waits. Other work still gets done and reported.
                 if "busy" not in str(exc):
@@ -1083,7 +1112,8 @@ def main(argv=None):
     parser.add_argument("--recipes", help="Absolute path to root's recipe file")
     parser.add_argument("--lock-wait", type=float, default=DEFAULT_LOCK_WAIT_SECONDS,
                         help="Seconds to wait for a busy mailbox or store before leaving a receipt for the next run")
-    parser.add_argument("--census-fixture", help="For tests: a JSON list of PIDs that replaces the process census")
+    parser.add_argument("--census-fixture", help="For tests: JSON that replaces the process census, a list of PIDs for "
+                        "heavy or {\"external_roots\": {\"heavy\": [...], \"heavy-tests\": [...]}}")
     commands = parser.add_subparsers(dest="command", required=True)
     opened = commands.add_parser("run-open", help="Run every job request that can run now")
     opened.add_argument("--initiative", action="append", default=[], help="Only this initiative; can repeat")
