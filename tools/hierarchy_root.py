@@ -30,21 +30,25 @@ What exit 2 leaves behind, per subcommand (never assume "no side effects" on a r
       nothing: every check runs before the only write (the ACK; the custody CAS; --out).
   launch
       refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree; the
-      prompt's own hashes exit 6): nothing, and no session. After claude --bg (launch failed, first prompt unverified): the
-      record is written and a session may be running; see record.stop_command. Exit 3
+      prompt's own hashes exit 6): nothing, and no session. After claude --bg the
+      record is written. If claude --bg printed its id (first prompt unverified):
+      a session may be running; see record.stop_command. If it timed out or printed
+      no id ("launch failed"), a session may still be running and the record has no
+      stop_command: find the session with `claude agents` by the spec's name. Exit 3
       or 4 after claude --bg means the record could not be written: the error output
-      carries the whole record, stop_command included.
+      carries the whole record, with stop_command when the id was parsed.
   rebind
       a spec refusal writes nothing. Otherwise the handoff may already have bound
       endpoints, ack requests may be written and acknowledged, and --result-out is
       written; entries[].ready says which endpoints are not ready.
   transfer
-      refused before the first write (facts, ACK, packet, custody checks): nothing.
+      refused before the first write (facts, ACK, packet, custody checks, including
+      custody_history is not a list and the handoff key is not an object): nothing.
       Refused by the final custody CAS (custody changed during the run): --spec-out and
       --transfer-out are written and custody is unchanged.
 
-launch takes --test-tmp-root only in tests: it replaces /tmp in the refused-cwd check,
-because pytest's tmp_path is under /tmp.
+transfer --ack takes the ACK startup-ack wrote; hand-written ACKs are refused, because
+transfer checks that the ACK is consistent, not who ran its critical checks.
 
 These tools never stop, attach to or answer a session: a host may refuse a stop, so a
 stop stays a visible, explicit command (T27, T13). Where one is needed the tool prints
@@ -607,17 +611,18 @@ def read_launch_spec(path):
 TMP_ROOT = "/tmp"
 
 
-def untrusted_cwd_reason(cwd, tmp_root=TMP_ROOT):
+def untrusted_cwd_reason(cwd, tmp_root=None):
     """Why a background session cannot start in cwd, or None (probes E/F, layout f).
 
     A session started under /tmp, inside .claude/worktrees or in a git checkout stopped at
     a trust prompt before its first record; launch could then only report "first prompt
     unverified" for a live session it never stops (P2-4). Layout (f) launches in the
-    workspace and lets the lane cd into its registered worktree. tmp_root is /tmp except
-    through the test-only --test-tmp-root seam, because pytest's tmp_path is under /tmp.
+    workspace and lets the lane cd into its registered worktree. TMP_ROOT is read at call
+    time, so tests can replace it in-process; no command-line flag turns the check off
+    (D-P3-1).
     """
     resolved = Path(cwd).resolve()
-    root = Path(tmp_root).resolve()
+    root = Path(tmp_root or TMP_ROOT).resolve()
     if resolved == root or root in resolved.parents:
         return "cwd is under %s" % root
     parts = resolved.parts
@@ -678,7 +683,7 @@ def cmd_launch(args):
         raise Failure(EXIT_UNMATCHED_HASH, "prompt hash check failed, nothing launched: " + hashes["error"],
                       prompt_hashes=hashes)
     prompt_hashes = {key: hashes[key] for key in ("tokens", "checked", "sources", "refused_paths")}
-    reason = untrusted_cwd_reason(spec["cwd"], args.test_tmp_root or TMP_ROOT)
+    reason = untrusted_cwd_reason(spec["cwd"])
     if reason is not None:
         raise Failure(EXIT_CRITICAL, "refused cwd for a background session: " + reason, cwd=spec["cwd"])
     if spec["uses_enter_worktree"]:
@@ -696,8 +701,9 @@ def cmd_launch(args):
                          "target_exists": record_out.exists(), "prompt_hashes": prompt_hashes}
     if record_out.exists():
         raise Failure(EXIT_CONFLICT, "launch record already exists: %s" % record_out, path=str(record_out))
-    probe_folder_writable(record_out.parent, "launch record")
+    # Free space first: the probe creates a temp, and exit 4 promises the check before any write.
     check_free_space([record_out], args.min_free_mb)
+    probe_folder_writable(record_out.parent, "launch record")
     live = [row.get("sessionId") for row in agents_rows() if row.get("name") == spec["name"]]
     if live:
         raise Failure(EXIT_CONFLICT, "a live session already has this name", name=spec["name"], live_sessions=live)
@@ -904,6 +910,9 @@ def rebind_entry(spec, entry, row, ack_dir):
     return out
 
 
+VERIFY_RETIRED_BY = "hierarchy_root.py verify-retired"
+
+
 def outgoing_stop_check(custody_path, session):
     """Does custody record the stop of the root this session replaced? (P3-9)
 
@@ -923,10 +932,15 @@ def outgoing_stop_check(custody_path, session):
     if not entries:
         return check, ["custody_history has no entry with incoming_root %s: outgoing stop unverified" % session]
     check["outgoing_root"] = entries[-1].get("outgoing_root")
-    check["verified"] = bool(entries[-1].get("outgoing_stopped"))
+    # Only verify-retired's own record counts: a hand-written true or "pending" is the same
+    # unverified assertion P3-9 was about, moved from the spec into custody (D-P3-3).
+    stopped = entries[-1].get("outgoing_stopped")
+    check["verified"] = (isinstance(stopped, dict) and stopped.get("by") == VERIFY_RETIRED_BY
+                         and stopped.get("evidence") == {"pid_alive": False, "agents_listed": False})
     if not check["verified"]:
-        return check, ["custody_history entry for outgoing root %s lacks outgoing_stopped: verify-retired has not "
-                       "recorded its stop, so the spec's outgoing_stopped: true is unverified" % check["outgoing_root"]]
+        return check, ["custody_history entry for outgoing root %s lacks outgoing_stopped as verify-retired writes "
+                       "it (found %s), so the spec's outgoing_stopped: true is unverified"
+                       % (check["outgoing_root"], json.dumps(stopped)[:120])]
     return check, []
 
 
@@ -1016,8 +1030,7 @@ def cmd_verify_retired(args):
     if args.custody is not None:
         check_free_space([args.custody], args.min_free_mb)
         stopped = {"verified_at": utc_now(), "pid": args.pid, "start_ticks": args.start_ticks,
-                   "evidence": {"pid_alive": False, "agents_listed": False},
-                   "by": "hierarchy_root.py verify-retired"}
+                   "evidence": {"pid_alive": False, "agents_listed": False}, "by": VERIFY_RETIRED_BY}
 
         def record(custody):
             history = custody.get("custody_history") if isinstance(custody, dict) else None
@@ -1117,6 +1130,10 @@ def cmd_transfer(args):
                       actual_sha256=sha256_bytes(custody_raw))
     custody = json.loads(custody_raw)
     require(custody.get("active_root_session") == out["session"], "custody does not name the outgoing root")
+    key = "claude_%s_to_%s_handoff" % (out["label"].lower(), inc["label"].lower())
+    # The CAS mutate repeats these; checked here too so they refuse before the first write (D-P3-6).
+    require(isinstance(custody.get("custody_history", []), list), "custody_history must be a list")
+    require(isinstance(custody.get(key, {}), dict), key + " must be an object")
     prev = read_json(args.prev_spec)
     fields(prev, {"schema", "host", "session", "outgoing_stopped", "entries"})
     require(prev["schema"] == hierarchy_handoff.SPEC_SCHEMA, "unsupported previous spec schema")
@@ -1146,7 +1163,6 @@ def cmd_transfer(args):
     record["outgoing"]["scope"] = "retired: no further root action; stop pending verify-retired"
     atomic_write_json(args.transfer_out, record)
     transfer_ref = file_ref(args.transfer_out)
-    key = "claude_%s_to_%s_handoff" % (out["label"].lower(), inc["label"].lower())
 
     def move(custody):
         require(custody.get("active_root_session") == out["session"], "custody does not name the outgoing root")
@@ -1170,10 +1186,15 @@ def cmd_transfer(args):
     update = cas_update_json(args.custody, args.expect_custody_sha256, move)
     return EXIT_OK, {"ok": True, "spec_out": file_ref(args.spec_out), "transfer_out": transfer_ref,
                      "custody_update": update, "stop_command": stop_command,
+                     # rebind's outgoing-stop warning fires on every rotation in this order, so only
+                     # the re-check after verify-retired tells a refused stop apart (D-P3-2).
                      "next": ("After the incoming ROOT acknowledges every endpoint, a human or ROOT runs `%s`, then "
                               "hierarchy_root.py verify-retired --session %s --pid %d --custody %s "
-                              "--expect-custody-sha256 %s" % (stop_command, out["session"], out["pid"], args.custody,
-                                                             update["sha256"]))}
+                              "--expect-custody-sha256 %s; then the incoming ROOT reruns hierarchy_root.py "
+                              "rebind --plan --spec %s --custody %s (with its own --result-out and --ack-dir) and "
+                              "expects outgoing_stop.verified: true; false means the stop was refused or not "
+                              "recorded" % (stop_command, out["session"], out["pid"], args.custody, update["sha256"],
+                                            args.spec_out, args.custody))}
 
 
 GOAL_MARKERS = ("<command-name>/goal</command-name>", "Goal set:")
@@ -1350,8 +1371,6 @@ def build_parser():
     launch.add_argument("--dialog-wait-s", type=float, default=90.0, help="How long to wait for a first answer")
     launch.add_argument("--poll-s", type=float, default=2.0)
     launch.add_argument("--min-free-mb", type=int, default=512)
-    launch.add_argument("--test-tmp-root", metavar="DIR",
-                        help="Test-only seam: refuse a cwd under DIR instead of /tmp (pytest's tmp_path is under /tmp)")
     launch.set_defaults(handler=cmd_launch)
 
     health = commands.add_parser("lanes-health", help="Report stalled, silent or dialog-blocked sessions; always exit 0")
@@ -1384,7 +1403,7 @@ def build_parser():
 
     move = commands.add_parser("transfer", help="Outgoing ROOT: write spec and transfer, move custody by CAS")
     move.add_argument("--facts", required=True, help="JSON: outgoing, incoming, handoff, authority")
-    move.add_argument("--ack", required=True)
+    move.add_argument("--ack", required=True, help="Must be the ACK startup-ack wrote; hand-written ACKs are refused")
     move.add_argument("--ack-sha256", required=True)
     move.add_argument("--final-delta", required=True)
     move.add_argument("--prev-spec", required=True)

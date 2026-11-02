@@ -20,8 +20,20 @@ SESSION = "5daa90d5-59c3-4bc9-ac88-2bd3454167e8"
 LAUNCHER_TEXT = ("import hashlib, json, os, subprocess\n" + "x = 1\n" * 400)[:2308]
 
 
-def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None):
-    proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *[str(a) for a in args]], input=stdin,
+# D-P3-1: pytest's tmp_path is under /tmp, which launch refuses as a cwd. Tests replace
+# TMP_ROOT inside the tool's own process; the command line has no seam that turns it off.
+DRIVER = ("import importlib.util, sys\n"
+          "spec = importlib.util.spec_from_file_location('hierarchy_root', sys.argv[1])\n"
+          "tool = importlib.util.module_from_spec(spec)\n"
+          "spec.loader.exec_module(tool)\n"
+          "tool.TMP_ROOT = sys.argv[2]\n"
+          "sys.exit(tool.main(sys.argv[3:]))\n")
+
+
+def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None, tmp_root=None):
+    head = [sys.executable, "-B", "-I", str(TOOL)] if tmp_root is None else \
+        [sys.executable, "-B", "-I", "-c", DRIVER, str(TOOL), str(tmp_root)]
+    proc = subprocess.run([*head, *[str(a) for a in args]], input=stdin,
                           capture_output=True, timeout=timeout, env=env if env is not None else dict(os.environ),
                           cwd=cwd)
     out = proc.stdout.decode("utf-8")
@@ -375,8 +387,7 @@ class Stub:
         claude.chmod(0o755)
         self.projects = tmp_path / "projects"
         self.projects.mkdir()
-        # pytest's tmp_path is under /tmp, which launch refuses as a cwd; tests pass this
-        # folder through the documented test-only --test-tmp-root seam instead.
+        # Launch tests refuse cwds under this folder instead of /tmp (see DRIVER, D-P3-1).
         self.tmp_root = tmp_path / "tmp-root"
 
     def env(self):
@@ -421,7 +432,29 @@ def launch_spec(tmp_path, prompt_file, **changes):
 def launch(stub, spec_path, *extra, stdin=b"import hashlib, json, os, subprocess  # launcher\n"):
     return run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects, "--poll-s", "0.05",
                     "--wait-s", "5", "--dialog-wait-s", "1", "--min-free-mb", "1",
-                    "--test-tmp-root", stub.tmp_root, *extra, stdin=stdin, env=stub.env())
+                    *extra, stdin=stdin, env=stub.env(), tmp_root=stub.tmp_root)
+
+
+def test_launch_has_no_tmp_seam_on_its_command_line(tmp_path, stub, prompt_file):
+    """D-P3-1: --test-tmp-root turned the /tmp refusal off in production and left no trace."""
+    for argv in (["--help"], ["launch", "--help"]):
+        proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *argv], capture_output=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0 and b"tmp-root" not in proc.stdout and b"Test-only" not in proc.stdout
+    spec_path, _ = launch_spec(tmp_path, prompt_file)
+    code, out, err = run_tool("launch", "--spec", spec_path, "--plan", "--test-tmp-root", tmp_path, env=stub.env())
+    assert code == 2 and out is None and "unrecognized arguments: --test-tmp-root" in err
+    assert not stub.launched()
+
+
+def test_launch_checks_free_space_before_probing_the_record_folder(tmp_path, stub, prompt_file):
+    """D-P3-6: exit 4's "checked before the first write" held only while the probe came second."""
+    spec_path, spec = launch_spec(tmp_path, prompt_file, record_out=str(tmp_path / "missing" / "record.json"))
+    code, out, _ = run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects,
+                            "--min-free-mb", str(10 ** 12), env=stub.env(), tmp_root=stub.tmp_root)
+    assert code == 4, out
+    assert out["error"].startswith("free space below --min-free-mb")
+    assert not stub.launched()
 
 
 def test_launch_records_an_exact_first_prompt_with_no_inherited_stdin(tmp_path, stub, prompt_file):
@@ -641,7 +674,7 @@ def test_launch_reports_a_leaked_first_prompt_and_prints_the_stop_command(tmp_pa
 def test_launch_refuses_when_free_space_is_below_the_threshold(tmp_path, stub, prompt_file):
     spec_path, spec = launch_spec(tmp_path, prompt_file)
     code, out, _ = run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects,
-                            "--min-free-mb", str(10 ** 12), "--test-tmp-root", stub.tmp_root, env=stub.env())
+                            "--min-free-mb", str(10 ** 12), env=stub.env(), tmp_root=stub.tmp_root)
     assert code == 4
     assert "free" in out["error"]
     assert not stub.launched() and not Path(spec["record_out"]).exists()
@@ -943,11 +976,29 @@ def test_rebind_warns_until_custody_records_the_outgoing_stop(tmp_path):
     assert out["outgoing_stop"] == {"custody": str(custody), "outgoing_root": entry["outgoing_root"],
                                     "verified": False}
     assert len(out["warnings"]) == 1 and "lacks outgoing_stopped" in out["warnings"][0]
-    entry["outgoing_stopped"] = {"verified_at": "2026-11-02T17:00:00.000Z", "by": "hierarchy_root.py verify-retired"}
+    entry["outgoing_stopped"] = {"verified_at": "2026-11-02T17:00:00.000Z", "by": "hierarchy_root.py verify-retired",
+                                 "evidence": {"pid_alive": False, "agents_listed": False}}
     custody.write_text(json.dumps({"active_root_session": spec["session"], "custody_history": [entry]}),
                        encoding="utf-8")
     code, out, _ = rebind(spec_path, tmp_path / "result-2.json", acks, "--custody", custody)
     assert code == 0 and out["outgoing_stop"]["verified"] is True and out["warnings"] == []
+
+
+@pytest.mark.parametrize("stopped", [True, "pending", {"by": "hierarchy_root.py verify-retired"},
+                                     {"by": "by hand", "evidence": {"pid_alive": False, "agents_listed": False}},
+                                     {"by": "hierarchy_root.py verify-retired",
+                                      "evidence": {"pid_alive": True, "agents_listed": False}}])
+def test_rebind_counts_only_a_verify_retired_record_as_the_outgoing_stop(tmp_path, stopped):
+    """D-P3-3: a hand-written outgoing_stopped: true read as verified, the P3-9 assertion moved into custody."""
+    _, _, spec, spec_path, acks = rebind_setup(tmp_path, messages=1)
+    custody = tmp_path / "custody.json"
+    custody.write_text(json.dumps({"active_root_session": spec["session"], "custody_history": [
+        {"outgoing_root": "d6b2a18b-e242-4ecb-ac63-baab549cf112", "incoming_root": spec["session"],
+         "outgoing_stopped": stopped}]}), encoding="utf-8")
+    code, out, err = rebind(spec_path, tmp_path / "result.json", acks, "--plan", "--custody", custody)
+    assert code == 0, (out, err)
+    assert out["outgoing_stop"]["verified"] is False
+    assert len(out["warnings"]) == 1 and "verify-retired" in out["warnings"][0]
 
 
 def test_rebind_plan_writes_nothing(tmp_path):
@@ -1127,6 +1178,51 @@ def test_transfer_writes_spec_and_transfer_and_syncs_every_custody_field(rotatio
     assert "verify-retired" in out["next"]
 
 
+def test_transfer_next_names_the_outgoing_stop_recheck(rotation):
+    """D-P3-2: rebind's warning fires on every rotation in the tool's own order; the re-check tells them apart."""
+    code, out, err = transfer(rotation)
+    assert code == 0, (out, err)
+    assert "rebind --plan --spec %s" % rotation["spec_out"] in out["next"]
+    assert "--custody %s" % rotation["custody"] in out["next"]
+    assert "outgoing_stop.verified: true" in out["next"]
+
+
+@pytest.mark.parametrize("bad", ["history_not_a_list", "handoff_not_an_object"])
+def test_transfer_checks_custody_shapes_before_its_first_write(rotation, bad):
+    """D-P3-6: these failed only inside the final CAS, after spec and transfer were written."""
+    custody = json.loads(rotation["custody"].read_text(encoding="utf-8"))
+    if bad == "history_not_a_list":
+        custody["custody_history"] = {}
+    else:
+        custody["claude_c5_to_c6_handoff"] = "prepared"
+    rotation["custody"].write_text(json.dumps(custody), encoding="utf-8")
+    before = rotation["custody"].read_bytes()
+    code, out, _ = transfer(rotation)
+    assert code == 2, out
+    assert rotation["custody"].read_bytes() == before
+    assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
+
+
+def help_page(*argv):
+    proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *argv, "--help"], capture_output=True, timeout=60,
+                          stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0
+    return " ".join(proc.stdout.decode("utf-8").split())
+
+
+def test_transfer_help_says_the_ack_must_come_from_startup_ack():
+    """D-P3-5: ROOTs hand-wrote ACKs; the tempting fix was a hand-written critical_checks entry."""
+    for page in (help_page("transfer"), help_page()):
+        assert "the ACK startup-ack wrote; hand-written ACKs are refused" in page
+
+
+def test_help_says_a_launch_without_a_parsed_id_has_no_stop_command():
+    """D-P3-6: after a claude --bg timeout a session may run although the record has no stop_command."""
+    page = help_page()
+    assert "no stop_command" in page and "claude agents" in page
+    assert "custody_history is not a list" in page
+
+
 @pytest.mark.parametrize("bad", ["ack", "custody"])
 def test_transfer_writes_nothing_when_a_critical_hash_differs(rotation, bad):
     before = rotation["custody"].read_bytes()
@@ -1289,6 +1385,21 @@ def test_startup_ack_refuses_a_packet_the_rendezvous_does_not_name(stub, startup
     checks = {check["name"]: check for check in out["critical_checks"]}
     assert checks["rendezvous_names_packet"]["ok"] is False and checks["packet_sha256"]["ok"] is True
     assert not startup["out"].exists()
+
+
+def test_transfer_accepts_the_ack_startup_ack_writes(stub, startup, rotation):
+    """D-P3-4: transfer was tested only with a hand-built ACK; a rename on either side passed both suites.
+
+    Both fixtures use the same tmp_path, so they share packet.json (same bytes) and custody.json
+    (rotation's, which still names OUTGOING); the rendezvous names that packet.
+    """
+    code, out, err = startup_ack(stub, startup)
+    assert code == 0, (out, err)
+    rotation["ack"] = startup["out"]
+    code, out, err = transfer(rotation)
+    assert code == 0, (out, err)
+    record = json.loads(rotation["transfer_out"].read_text(encoding="utf-8"))
+    assert record["incoming"]["startup_ack"] == {"path": str(startup["out"]), "sha256": sha(startup["out"].read_bytes())}
 
 
 def test_startup_ack_requires_the_rendezvous_sha256_and_refuses_changed_bytes(stub, startup):
