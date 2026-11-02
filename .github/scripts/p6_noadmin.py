@@ -177,6 +177,9 @@ class Token:
         label = SID_AND_ATTRIBUTES(C.cast(self.medium, HANDLE), 0x20)
         self.checked('SetTokenInformation', self.restricted, 25, C.byref(label),
                      C.sizeof(label) + self.adv.GetLengthSid(self.medium))
+        allowed = LUID()
+        self.checked('LookupPrivilegeValueW', None, 'SeChangeNotifyPrivilege', C.byref(allowed))
+        self.change_notify_luid = (allowed.LowPart, allowed.HighPart)
 
     def enter(self):
         self.checked('ImpersonateLoggedOnUser', self.restricted)
@@ -208,9 +211,7 @@ class Token:
             self.checked('CheckTokenMembership', None, self.admin, C.byref(member))
             require(not member.value, 'effective Administrators membership is enabled')
             row['privileges'] = self.privileges(token)
-            allowed = LUID()
-            self.checked('LookupPrivilegeValueW', None, 'SeChangeNotifyPrivilege', C.byref(allowed))
-            require(all(not p['attributes'] & 2 or (p['low'], p['high']) == (allowed.LowPart, allowed.HighPart)
+            require(all(not p['attributes'] & 2 or (p['low'], p['high']) == self.change_notify_luid
                         for p in row['privileges']), 'unexpected enabled privilege')
         finally:
             self.checked('CloseHandle', token)
