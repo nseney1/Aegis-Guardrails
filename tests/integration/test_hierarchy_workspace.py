@@ -74,7 +74,8 @@ def workspace(tmp_path):
 
 @pytest.mark.parametrize("request_body,error", [
     ({"writer_limit": 4, "heavy_limit": 1}, "invalid writer_limit"),
-    ({"writer_limit": 3, "heavy_limit": 2}, "invalid heavy_limit"),
+    ({"writer_limit": 3, "heavy_limit": 4}, "invalid heavy_limit"),
+    ({"writer_limit": 3, "heavy_limit": 0}, "invalid heavy_limit"),
     ({"writer_limit": 0, "heavy_limit": 1}, "invalid writer_limit"),
     ({"writer_limit": 3}, "missing fields"),
 ])
@@ -82,6 +83,18 @@ def test_init_refuses_caps_beyond_the_owner_limits(tmp_path, request_body, error
     space = Workspace(tmp_path)
     assert error in space.run("init", request_body, expect=2)["error"]
     assert not (space.store / "events").exists() or not list((space.store / "events").iterdir())
+
+
+def test_three_heavy_jobs_can_run_at_the_owners_limit_and_a_fourth_waits(tmp_path):
+    space = Workspace(tmp_path)
+    assert space.run("init", {"writer_limit": 3, "heavy_limit": 3})["limits"]["heavy"] == 3
+    space.register("a1")
+    for index in range(4):
+        space.ask("a1", "heavy", "a1/job-%d" % index)
+    for _ in range(3):
+        space.grant("heavy")
+    assert space.run("grant-next", kind="heavy", expect=3)["reason"] == "capacity_full"
+    assert space.run("status")["capacity"]["heavy"]["used"] == 3
 
 
 def test_init_does_not_replace_an_existing_store(workspace):

@@ -372,8 +372,9 @@ The other commands are `update`, `withdraw`, `release`, `status`, `mark-merge`,
   each project's own orchestrator, because separate mailbox roots have no route and an
   endpoint can have only one counterpart.
 
-Many initiatives can be open at once, but only three can be writing at any moment and
-heavy jobs run one at a time. The limits are code constants, so raising them is a
+Many initiatives can be open at once, but at most three can be writing at any moment and
+at most three heavy jobs can run at once. Those are the owner's current limits. A store
+sets its own limits at `init`, up to those ceilings, and raising the ceilings is a
 reviewed change for the owner to decide after measuring the machine. The store is a
 same-user record, not a security boundary, and it detects damage only when that breaks
 its history. A store holds at most 10,000 events. A full store refuses every further

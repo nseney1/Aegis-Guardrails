@@ -36,9 +36,10 @@ from hierarchy_mailbox import (GIT_ID, MAX_RECORDS, SHA256, SLUG, Mailbox, encod
 
 
 EVENT_SCHEMA = "aegis.hierarchy-workspace-event/v1"
-# Raising these is an owner decision after measuring the machine, so it takes a reviewed code change.
+# Ceilings for a store's limits. They are the owner's current limits, and raising them is an owner
+# decision after measuring the machine, so it takes a reviewed code change.
 MAX_WRITERS = 3
-MAX_HEAVY = 1
+MAX_HEAVY = 3
 MAX_PRIORITY = 1000
 MAX_VIEW_ROWS = 100
 MAX_EVIDENCE_BYTES = 67108864
