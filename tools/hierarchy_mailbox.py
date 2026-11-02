@@ -1029,6 +1029,8 @@ def main(argv=None):
     inbox.add_argument("--include-briefs", action="store_true")
     inbox.add_argument("--limit", type=int, default=20)
     inbox.add_argument("--after", default=None)
+    inbox.add_argument("--delivery-dir", default=None, help="With --mark-read, where root's read receipts go")
+    inbox.add_argument("--mark-read", action="store_true", help="Root only: record what this page returned as read")
     commands.add_parser("status")
     delivery = commands.add_parser("delivery", help="Report published, woken and read states separately")
     delivery.add_argument("--delivery-dir", required=True)
@@ -1065,6 +1067,10 @@ def main(argv=None):
             elif args.command == "delivery":
                 result = mailbox.delivery(args.delivery_dir, endpoint=args.endpoint, message_id=args.message_id)
             else:
+                if args.mark_read:
+                    require(args.delivery_dir is not None, "--mark-read needs --delivery-dir")
+                    require(endpoint_parts(args.endpoint)[1] == "root",
+                            "only root reads through the CLI with a receipt; a session's adapter records its own")
                 result = mailbox.inbox(args.endpoint, include_briefs=args.include_briefs,
                                        limit=args.limit, after=args.after)
                 result = _bounded_inbox(result, _cli_line)
@@ -1079,6 +1085,17 @@ def main(argv=None):
                 else:
                     result = mailbox.publish(request)
         sys.stdout.buffer.write(_cli_line(result))
+        if args.command == "inbox" and args.mark_read:
+            # Root has no adapter, so this does the adapter's job in the same order: flushed first,
+            # and a lost receipt only means root sees the message listed as unread again.
+            sys.stdout.buffer.flush()
+            binding = result["binding"]
+            try:
+                mailbox.record_read(args.delivery_dir, {"from": args.endpoint, "host": binding["host"], "session": binding["session"],
+                                                        "binding_generation": binding["generation"]},
+                                    [row["message"]["message_id"] for row in result["messages"]])
+            except (ValueError, OSError, UnicodeError) as exc:
+                print("read receipt not recorded: " + str(exc), file=sys.stderr, flush=True)
         return 0
     except (ValueError, OSError, UnicodeError, RecursionError) as exc:
         sys.stdout.buffer.write(_cli_line({"error": str(exc)}))

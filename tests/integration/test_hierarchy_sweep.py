@@ -189,8 +189,38 @@ def test_root_is_never_woken_and_its_queue_is_reported(fleet):
                                    "brief": {"path": str(brief), "sha256": hashlib.sha256(b"Run it.\n").hexdigest()}})
     result = fleet.sweep()
     assert fleet.launches() == [] and result["rows"] == []
-    assert result["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root", "unread_count": 1}]
+    assert result["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root", "unread_count": 1, "open_jobs": 1}]
     assert result["quiet"] is True
+
+
+def test_root_reading_its_mail_clears_unread_but_not_its_open_jobs(fleet):
+    fleet.add_role("pilot/root", "codex-cli", session="root-session")
+    brief = fleet.base / "packet.md"
+    brief.write_bytes(b"Run it.\n")
+    orchestrator = {"from": "pilot/orchestrator", "to": "pilot/root", "host": "claude-code",
+                    "session": fleet.orchestrator["session"], "binding_generation": 1}
+    invoke(fleet.root, "publish", {**orchestrator, "message_id": "note", "type": "info", "body": "Please add a lane."})
+    invoke(fleet.root, "publish", {**orchestrator, "message_id": "job-1", "type": "job_request", "body": "Run.",
+                                   "brief": {"path": str(brief), "sha256": hashlib.sha256(b"Run it.\n").hexdigest()}})
+    entry = {"initiative": "pilot", "endpoint": "pilot/root"}
+    assert fleet.sweep()["root_queue"] == [{**entry, "unread_count": 2, "open_jobs": 1}]
+    delivery = str(fleet.base / "delivery")
+    page = invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True, limit=1)
+    assert [row["message"]["message_id"] for row in page["messages"]] == ["note"]
+    assert fleet.sweep()["root_queue"] == [{**entry, "unread_count": 1, "open_jobs": 1}]
+    invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True)
+    assert fleet.sweep()["root_queue"] == [{**entry, "unread_count": 0, "open_jobs": 1}]
+
+
+def test_only_root_marks_mail_read_through_the_cli(fleet):
+    delivery = str(fleet.base / "delivery")
+    fleet.send("pilot/front-door", "pilot/orchestrator", "hello")
+    refused = invoke(fleet.root, "inbox", endpoint="pilot/orchestrator", delivery_dir=delivery, mark_read=True, ok=False)
+    assert "only root reads through the CLI" in refused["error"]
+    fleet.add_role("pilot/root", "codex-cli", session="root-session")
+    refused = invoke(fleet.root, "inbox", endpoint="pilot/root", mark_read=True, ok=False)
+    assert refused["error"] == "--mark-read needs --delivery-dir"
+    assert fleet.sweep("--dry-run", expect=3)["still_unread"][0]["endpoint"] == "pilot/orchestrator"
 
 
 @posix_only

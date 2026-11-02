@@ -8,8 +8,8 @@ conversation continues without anyone starting each turn.
 
 It stops rather than guesses. A session over its active limit needs rotation, so it is not woken. A
 session that ignored its mail is not retried in the same sweep. Root's own queue is only reported,
-because jobs go through the job runner. This runs nothing on its own schedule, and a read here means
-what `delivery` says it means: the adapter returned the message.
+because jobs go through `tools/hierarchy_jobs.py`. This runs nothing on its own schedule, and a read
+here means what `delivery` says it means: the adapter returned the message.
 """
 from __future__ import annotations
 
@@ -68,8 +68,8 @@ def wake_endpoint(initiative, name, summary, dry_run):
 def summaries(initiative):
     mailbox = Mailbox(initiative["mailbox_root"])
     records = mailbox.messages()
-    return {name: mailbox.endpoint_delivery(initiative["delivery_dir"], name, records)[1]
-            for name in sorted(mailbox.manifest["endpoints"])}
+    return ({name: mailbox.endpoint_delivery(initiative["delivery_dir"], name, records)[1]
+             for name in sorted(mailbox.manifest["endpoints"])}, mailbox.open_job_requests(records))
 
 
 def is_root(endpoint):
@@ -81,7 +81,7 @@ def sweep_round(initiatives, rows, tried, broken, dry_run):
     woken = 0
     for initiative in initiatives:
         try:
-            found = summaries(initiative)
+            found, _ = summaries(initiative)
         except ERRORS as exc:
             if initiative["id"] not in broken:
                 broken.add(initiative["id"])
@@ -105,13 +105,17 @@ def remaining(initiatives):
     still_unread, root_queue = [], []
     for initiative in initiatives:
         try:
-            found = summaries(initiative)
+            found, jobs = summaries(initiative)
         except ERRORS:
             continue  # Already reported as a mailbox_error row.
         for name, summary in found.items():
-            if summary["unread_count"]:
-                entry = {"initiative": initiative["id"], "endpoint": name, "unread_count": summary["unread_count"]}
-                (root_queue if is_root(name) else still_unread).append(entry)
+            entry = {"initiative": initiative["id"], "endpoint": name, "unread_count": summary["unread_count"]}
+            if is_root(name):
+                opened = sum(1 for job in jobs if job["to"] == name)
+                if opened or summary["unread_count"]:
+                    root_queue.append({**entry, "open_jobs": opened})
+            elif summary["unread_count"]:
+                still_unread.append(entry)
     return still_unread, root_queue
 
 
