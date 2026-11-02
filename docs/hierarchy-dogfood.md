@@ -336,6 +336,34 @@ tool meter --host codex-cli --session <id> --role root    # exit 3 means rotate 
 3. Run `add-role` with the new session, which writes the new connection and wake profile.
 4. Start the successor. It inspects the checkpoint and acknowledges it before continuing.
 
+## ROOT launch checks (`hierarchy_root.py`)
+
+ROOT launches and rotates Claude sessions with `tools/hierarchy_root.py`. Every subcommand prints
+one JSON object; `--help` lists the exit codes and what each subcommand leaves behind on exit 2.
+
+Never type a hash into a prompt. A ROOT once completed a hash from its 8-character prefix, and
+nothing caught it (T92). Render prompts from a template instead, and check them before launch:
+
+```sh
+python3 -B -I tools/hierarchy_root.py render-prompt --template /abs/lane-prompt.template \
+  --path brief=/abs/brief.md --path role=/abs/roles/lane.md --out /abs/requests/lane-prompt.txt
+python3 -B -I tools/hierarchy_root.py check-hashes /abs/requests/lane-prompt.txt
+```
+
+- **Templates** write `{path:key}` and `{sha256:key}`; each `--path key=...` fills both from that
+  file's bytes. Put each `{sha256:key}` on the same line as its `{path:key}`, or on the line below.
+- **render-prompt** refuses a relative or `..` path (naming the argument), an unused or unfilled
+  key, an existing `--out` (exit 3), and output that would fail `check-hashes` (exit 6).
+- **check-hashes** needs every 64-hex token to re-hash from a file named by an absolute path on
+  its line or the line above, or from a `--source` file. It exits 6 and lists each unmatched
+  token with its line, the candidate paths and their real sha256. Relative paths never count (T100).
+- **launch** runs the same check on the spec's prompt before it calls `claude`, and exits 6
+  without starting anything. A spec may list `hash_sources` (absolute paths) for hashes of files
+  the prompt does not name beside them. The launch record lists every checked token, path and line.
+- **Rotations:** after `verify-retired`, the incoming ROOT reruns `rebind --plan --custody` and
+  expects `outgoing_stop.verified: true`. Only the record `verify-retired` writes counts, and
+  `transfer --ack` takes only the ACK `startup-ack` wrote.
+
 ## Measure the trial
 
 Compare with the same counting method against this baseline from 489 mailbox messages:
