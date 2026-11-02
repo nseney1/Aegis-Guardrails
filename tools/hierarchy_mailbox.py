@@ -178,6 +178,16 @@ def read_json(path):
     return strict_json(read_bytes(path).decode("utf-8"))
 
 
+STDIN_COMMANDS = ("publish", "ack-handoff")
+
+
+def read_stdin_json():
+    """`--request -` is read before the writer lock: a caller that holds stdin open must never hold .write.lock."""
+    raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+    require(len(raw) <= MAX_BYTES, "input exceeds 262144 bytes")
+    return strict_json(raw.decode("utf-8"))
+
+
 def endpoint_parts(endpoint):
     require(isinstance(endpoint, str), "invalid endpoint")
     parts = endpoint.split("/")
@@ -1047,7 +1057,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "bind", "publish", "ack-handoff", "draft-handoff"):
         commands.add_parser(name).add_argument("--request", "--request-file", required=True,
-                                              help="Absolute path to a strict JSON request file")
+                                              help="Absolute path to a strict JSON request file"
+                                              + (", or - to read it from stdin" if name in STDIN_COMMANDS else ""))
     inbox = commands.add_parser("inbox")
     inbox.add_argument("--endpoint", required=True)
     inbox.add_argument("--include-briefs", action="store_true")
@@ -1074,6 +1085,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         root = safe_path(args.root)
+        stdin_request = None
+        if getattr(args, "request", None) == "-":
+            require(args.command in STDIN_COMMANDS, "--request - (stdin) is only for publish and ack-handoff")
+            stdin_request = read_stdin_json()
         if args.command == "serve":
             # With -I the script directory is absent from sys.path. Add only the
             # exact reviewed sibling-tool directory, never cwd or PYTHONPATH.
@@ -1108,7 +1123,7 @@ def main(argv=None):
         else:
             with writer_lock(root):
                 mailbox = Mailbox(root)
-                request = read_json(args.request)
+                request = stdin_request if args.request == "-" else read_json(args.request)
                 if args.command == "bind":
                     result = mailbox.bind(request)
                 elif args.command == "ack-handoff":
