@@ -26,6 +26,10 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def require_existing_npm(version):
+    require(version.split('.')[0] in ('10', '11'), 'proposal requires existing npm 10 or 11; no upgrade is authorized')
+
+
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -107,7 +111,9 @@ def main():
         require(npm_cli is not None, 'existing npm-cli.js unavailable; no npm install is authorized')
         npm_package = npm_cli.parent.parent / 'package.json'
         npm_version = json.loads(npm_package.read_text(encoding='utf-8'))['version']
-        require(npm_version.split('.')[0] == '11', 'proposal requires existing npm 11; no upgrade is authorized')
+        # Hosted windows-latest Node 22 bundles npm 10 (run 41498053375). npm 10 and 11 both install this
+        # lockfileVersion 3 lock, and the frozen-lock and installed-version checks below bind the result.
+        require_existing_npm(npm_version)
         env = helper.neutral_environment(root, node, source)
         git_path = shutil.which('git', path=env['PATH'])
         require(git_path is not None, 'Git unavailable for source witnesses')
