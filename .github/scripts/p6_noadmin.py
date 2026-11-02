@@ -324,7 +324,8 @@ def worker(config):
                     'attributes': getattr(owned, 'st_file_attributes', None)}
                 require(result['junction']['tag'] == 0xA0000003 and result['junction']['attributes'] & 0x400,
                         'created entry is not a mount-point junction')
-                require(link.resolve() == target.resolve(), 'junction target differs')
+                # Python 3.9's Path.resolve() raises under this token; 3.10+ resolve() is realpath.
+                require(Path(os.path.realpath(link)) == Path(os.path.realpath(target)), 'junction target differs')
                 require((link / 'sentinel.txt').read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'junction traversal failed')
                 current = link.lstat()
                 require((current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino)

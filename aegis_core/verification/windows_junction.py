@@ -8,6 +8,7 @@ https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_r
 from __future__ import annotations
 
 from pathlib import Path
+import codecs
 import os
 import struct
 import sys
@@ -15,6 +16,9 @@ import sys
 __all__ = ["create_directory_junction"]
 
 _MOUNT_POINT = 0xA0000003
+# Callers may create the junction after impersonating a restricted token that cannot import
+# stdlib codec modules, so cache the lazily imported UTF-16-LE codec while this module loads.
+codecs.lookup("utf-16-le")
 
 
 def _kernel32():
@@ -96,7 +100,9 @@ def create_directory_junction(target: Path, link: Path) -> None:
 
     if not target.is_dir():
         raise NotADirectoryError(str(target))
-    data = _mount_point_data(str(target.resolve()))
+    # Path.resolve() on Python 3.9 raises when a restricted token cannot query the final path;
+    # 3.10+ resolve() is this realpath call, which falls back. is_dir() above excludes loops.
+    data = _mount_point_data(os.path.realpath(target))
     kernel = _kernel32()
     link.mkdir()
     owned = link.lstat()

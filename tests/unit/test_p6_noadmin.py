@@ -211,9 +211,12 @@ def run_worker(tmp_path, monkeypatch):
     modeled_sys.getwindowsversion = lambda: version
     monkeypatch.setattr(probe, "sys", modeled_sys)
 
-    def run(**options):
+    def run(junction=None, **options):
         boundary = WindowsBoundary(**options)
         monkeypatch.setattr(C, "WinDLL", boundary.dll, raising=False)
+        if junction is not None:
+            # Replace only the product helper the worker loads by path; its own checks still run.
+            monkeypatch.setattr(probe, "load", lambda path, name: junction(boundary))
         fatal_calls = []
 
         def fatal_exit(code):
@@ -399,3 +402,62 @@ def test_failed_reversion_remains_terminal_without_closing_unrestored_token_hand
     assert code == 3 and fatal == [3] and report["error"] == "RevertToSelf failed: Windows error 5"
     assert not report["junction_called"] and boundary.active
     assert 101 not in boundary.closed and 102 not in boundary.closed
+
+
+def python39_junction(monkeypatch, destination=None):
+    """A followable directory link stands in for the product junction. Under the restricted
+    token, Python 3.9's Windows Path.resolve lets _getfinalpathname's WinError 5 escape
+    (pathlib catches only FileNotFoundError); 3.10+ resolves through os.path.realpath."""
+    resolve, lstat, rmdir = Path.resolve, Path.lstat, Path.rmdir
+    created = []
+
+    def install(boundary):
+        def restricted_resolve(path, *args, **kwargs):
+            if boundary.active:
+                raise PermissionError(13, "Access is denied", str(path))
+            return resolve(path, *args, **kwargs)
+
+        def junction_lstat(path):
+            info = lstat(path)
+            if path not in created:
+                return info
+            fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+            return SimpleNamespace(**(fields | {"st_reparse_tag": 0xA0000003, "st_file_attributes": 0x400}))
+
+        def cleanup_boundary(path):
+            if path in created:
+                # Stop before cleanup so this control keeps FAIL and cannot manufacture acceptance.
+                raise RuntimeError("modeled cleanup boundary")
+            return rmdir(path)
+
+        def create_directory_junction(target, link):
+            os.symlink(destination or target, link, target_is_directory=True)
+            created.append(link)
+
+        monkeypatch.setattr(Path, "resolve", restricted_resolve)
+        monkeypatch.setattr(Path, "lstat", junction_lstat)
+        monkeypatch.setattr(Path, "rmdir", cleanup_boundary)
+        return SimpleNamespace(create_directory_junction=create_directory_junction)
+
+    return install
+
+
+@pytest.mark.parametrize("elsewhere,message", [(False, "modeled cleanup boundary"),
+                                               (True, "junction target differs")])
+def test_junction_target_check_survives_python39_resolution_under_the_token(run_worker, monkeypatch, tmp_path,
+                                                                           elsewhere, message):
+    """P6 on Python 3.9 (Validate runs 41454378514, 41482747131): the worker verifies the junction
+    target without Path.resolve under the token and still rejects a junction that points elsewhere."""
+    from tests.conftest import symlink_or_skip
+
+    symlink_or_skip(tmp_path, tmp_path / "link-probe", target_is_directory=True)
+    destination = None
+    if elsewhere:
+        destination = tmp_path / "elsewhere"
+        destination.mkdir()
+        # A matching sentinel leaves the target comparison as the only check that can reject it.
+        (destination / "sentinel.txt").write_text("P6 owned sentinel\n", encoding="utf-8")
+    boundary, code, report, fatal = run_worker(junction=python39_junction(monkeypatch, destination))
+    assert code == 1 and (report["error_type"], report["error"]) == ("RuntimeError", message)
+    assert report["junction_called"] and report["junction"]["tag"] == 0xA0000003
+    assert not boundary.active and boundary.impersonations == boundary.reverts == 2 and not fatal
