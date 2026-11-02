@@ -17,14 +17,17 @@ from tests.integration.test_hierarchy_mailbox import (
 )
 
 
-def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None):
+def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None,
+             delivery=None):
     frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
               {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
     frames.extend({"jsonrpc": "2.0", "id": index + 3, "method": "tools/call", "params": {
         "name": name, "arguments": arguments}} for index, (name, arguments) in enumerate(calls))
+    receipts = [] if delivery is None else ["--delivery-dir", str(delivery)]
     result = subprocess.run([sys.executable, "-I", str(HELPER), "--root", str(root), "serve",
                              "--endpoint", endpoint, "--host", host, "--session", session or endpoint,
-                             "--generation", str(generation)], input=raw or "".join(json.dumps(f) + "\n" for f in frames),
+                             "--generation", str(generation), *receipts],
+                            input=raw or "".join(json.dumps(f) + "\n" for f in frames),
                             capture_output=True, text=True, timeout=15,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 0, result.stdout + result.stderr
@@ -96,6 +99,31 @@ def test_successor_can_acknowledge_before_becoming_ready(pilot):
                          host="host-two", session="replacement", generation=2)
     assert payload(responses[-1])["ready"] is True
     assert own["binding"]["checkpoint_sha256"] == binding["checkpoint_sha256"]
+
+
+def test_binding_only_inbox_returns_no_messages_and_records_no_read(pilot):
+    root, _ = pilot
+    invoke(root, "publish", message(recipient="a/lane/review"))
+    delivery = root.parent / "delivery"
+    view = payload(exchange(root, [("mailbox_inbox", {"binding_only": True})], delivery=delivery)[-1])
+    assert view == {"endpoint": "a/lane/review", "binding": invoke(root, "status")["bindings"]["a/lane/review"],
+                    "checkpoint_briefs": [], "messages_total": 1}
+    assert not (delivery / "reads").exists()
+    page = payload(exchange(root, [("mailbox_inbox", {})], delivery=delivery)[-1])
+    assert [row["message"]["message_id"] for row in page["messages"]] == ["dispatch-1"]
+    assert len(list((delivery / "reads" / "a/lane/review").iterdir())) == 1  # The control: a real page is recorded.
+
+
+@pytest.mark.parametrize("arguments,error", [
+    ({"binding_only": "yes"}, "binding_only must be boolean"),
+    ({"binding_only": True, "include_briefs": False}, "binding_only takes no include_briefs, limit or after_message_id"),
+    ({"binding_only": True, "limit": 5}, "binding_only takes no include_briefs, limit or after_message_id"),
+])
+def test_binding_only_inbox_refuses_other_arguments(pilot, arguments, error):
+    root, _ = pilot
+    response = exchange(root, [("mailbox_inbox", arguments)])[-1]
+    assert response["result"]["isError"] is True
+    assert payload(response) == {"error": error}
 
 
 def test_malformed_frame_is_explicit_and_next_request_still_works(pilot):

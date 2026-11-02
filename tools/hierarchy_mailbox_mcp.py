@@ -62,9 +62,11 @@ def definitions(extra=(), board_specs=None):
         "readiness": {"type": "object"}, "result": {"type": "object"}, "receipt": {"type": "object"},
     }
     specs = [] if board_specs else [
-        ("mailbox_inbox", True, "Read only this endpoint's mailbox; optionally include its hash-verified briefs.",
+        ("mailbox_inbox", True, "Read only this endpoint's mailbox; optionally include its hash-verified briefs. "
+                                "binding_only returns just the binding, a hash check per checkpoint brief and the "
+                                "message count.",
          {"include_briefs": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-          "after_message_id": {"type": "string", "maxLength": 80}}, []),
+          "after_message_id": {"type": "string", "maxLength": 80}, "binding_only": {"type": "boolean"}}, []),
         ("mailbox_publish", False, "Publish information under the configured sender; grants no approval or verified completion.",
          properties, ["message_id", "to", "type", "body"]),
         ("mailbox_ack_handoff", False, "Acknowledge this configured successor's checkpoint; grants no owner approval.",
@@ -181,7 +183,13 @@ class Connection:
             require(name in self.board_specs, "unknown mailbox tool: " + name)
             return self.board_call(name, arguments, render)
         if name == "mailbox_inbox":
-            fields(arguments, set(), {"include_briefs", "limit", "after_message_id"})
+            fields(arguments, set(), {"include_briefs", "limit", "after_message_id", "binding_only"})
+            binding_only = arguments.get("binding_only", False)
+            require(type(binding_only) is bool, "binding_only must be boolean")
+            if binding_only:
+                require(arguments.keys() == {"binding_only"},
+                        "binding_only takes no include_briefs, limit or after_message_id")
+                return self.checked_mailbox().binding_view(self.sender["from"])
             include_briefs = arguments.get("include_briefs", False)
             require(type(include_briefs) is bool, "include_briefs must be boolean")
             return self.checked_mailbox().inbox(self.sender["from"], include_briefs=include_briefs,
@@ -233,7 +241,8 @@ def handle(connection, request):
 
         try:
             result = connection.call(params["name"], params.get("arguments", {}), render)
-            if params["name"] == "mailbox_inbox":
+            # A binding-only view has no messages to page and nothing to record as read.
+            if params["name"] == "mailbox_inbox" and not params.get("arguments", {}).get("binding_only"):
                 result = _bounded_inbox(result, render)
                 connection.note_returned(result)
             return _tool_result(result)

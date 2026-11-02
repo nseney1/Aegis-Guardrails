@@ -873,6 +873,27 @@ class Mailbox:
                 "binding": binding, "checkpoint_briefs": checkpoint_briefs,
                 "next_after": selected[-1]["message"]["message_id"] if len(records) > limit else None}
 
+    def binding_view(self, endpoint):
+        """Startup and triage view (T23): pages ran past 100 KB, and every rotation read them.
+
+        Each checkpoint brief is re-hashed and reported as `ok` instead of refusing, so a
+        changed brief is visible here without its text. No message is returned, so an
+        adapter has nothing to record as read.
+        """
+        self.endpoint(endpoint)
+        total = sum(1 for record in self.messages().values() if record["message"]["to"] == endpoint)
+        history = self.bindings(endpoint)
+        binding = {**history[-1], "ready": self.ready(history[-1])} if history else None
+        briefs = []
+        for brief in binding["checkpoint"]["briefs"] if binding is not None and binding["checkpoint"] is not None else ():
+            try:
+                self.brief(brief)
+            except (ValueError, OSError):
+                briefs.append({**brief, "ok": False})
+            else:
+                briefs.append({**brief, "ok": True})
+        return {"endpoint": endpoint, "binding": binding, "checkpoint_briefs": briefs, "messages_total": total}
+
     def outside_mailbox(self, directory, label):
         """Derived files must never reach mailbox history, so overlap is refused in both directions.
 
@@ -1030,7 +1051,9 @@ def main(argv=None):
     inbox = commands.add_parser("inbox")
     inbox.add_argument("--endpoint", required=True)
     inbox.add_argument("--include-briefs", action="store_true")
-    inbox.add_argument("--limit", type=int, default=20)
+    inbox.add_argument("--binding-only", action="store_true",
+                       help="Only the binding, a hash check per checkpoint brief and the message count; no messages")
+    inbox.add_argument("--limit", type=int, default=None)
     inbox.add_argument("--after", default=None)
     inbox.add_argument("--delivery-dir", default=None, help="With --mark-read, where root's read receipts go")
     inbox.add_argument("--mark-read", action="store_true", help="Root only: record what this page returned as read")
@@ -1070,13 +1093,17 @@ def main(argv=None):
                 result = mailbox.status()
             elif args.command == "delivery":
                 result = mailbox.delivery(args.delivery_dir, endpoint=args.endpoint, message_id=args.message_id)
+            elif args.binding_only:
+                require(not (args.include_briefs or args.limit is not None or args.after is not None or args.mark_read),
+                        "--binding-only takes no --include-briefs, --limit, --after or --mark-read")
+                result = mailbox.binding_view(args.endpoint)
             else:
                 if args.mark_read:
                     require(args.delivery_dir is not None, "--mark-read needs --delivery-dir")
                     require(endpoint_parts(args.endpoint)[1] == "root",
                             "only root reads through the CLI with a receipt; a session's adapter records its own")
                 result = mailbox.inbox(args.endpoint, include_briefs=args.include_briefs,
-                                       limit=args.limit, after=args.after)
+                                       limit=20 if args.limit is None else args.limit, after=args.after)
                 result = _bounded_inbox(result, _cli_line)
         else:
             with writer_lock(root):

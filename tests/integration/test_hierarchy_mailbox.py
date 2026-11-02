@@ -802,3 +802,34 @@ def test_cli_bounded_inbox_does_not_hide_corruption(pilot, kind):
     _, result = cli_inbox_wire(root, ok=False)
     assert result == {"error": error}
     assert mailbox_snapshot(root) == before
+
+
+def test_binding_only_inbox_is_small_hash_checked_and_read_only(pilot):
+    root, _ = pilot
+    for identifier in ("one", "two", "three"):
+        invoke(root, "publish", message(identifier=identifier))
+    binding = checkpoint_wire_binding(root, "x" * 200000, 2)
+    brief = binding["checkpoint"]["briefs"][0]
+    before = mailbox_snapshot(root)
+    view = invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)
+    assert view == {"endpoint": "a/lane/f2", "binding": binding, "messages_total": 3,
+                    "checkpoint_briefs": [{**brief, "ok": True}, {**brief, "ok": True}]}
+    assert len(json.dumps(view)) < 4096  # A 200 KB brief is hashed, never returned.
+    assert mailbox_snapshot(root) == before
+    assert invoke(root, "inbox", endpoint="a/lane/review", binding_only=True) == {
+        "endpoint": "a/lane/review", "binding": invoke(root, "status")["bindings"]["a/lane/review"],
+        "checkpoint_briefs": [], "messages_total": 0}
+    Path(brief["path"]).write_text("Changed after the handoff\n")
+    changed = invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)
+    assert changed["checkpoint_briefs"] == [{**brief, "ok": False}, {**brief, "ok": False}]
+    Path(brief["path"]).unlink()
+    assert invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)["checkpoint_briefs"][0]["ok"] is False
+
+
+@pytest.mark.parametrize("flags", [{"include_briefs": True}, {"limit": 5}, {"after": "one"},
+                                   {"mark_read": True, "delivery_dir": "/tmp/unused"}])
+def test_binding_only_inbox_refuses_paging_flags(pilot, flags):
+    root, _ = pilot
+    invoke(root, "publish", message(identifier="one"))
+    result = invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True, ok=False, **flags)
+    assert result == {"error": "--binding-only takes no --include-briefs, --limit, --after or --mark-read"}
