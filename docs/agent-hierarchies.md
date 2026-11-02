@@ -188,7 +188,9 @@ or the Claude session table lists it as live, stops the turn's whole process gro
 before reporting, and exits 0 only if the messages were read, 3 if they were not, and
 2 if it refused. Use `--dry-run` to see what would happen. It supports POSIX only.
 
-Hosts offer no handshake, so a wake receipt proves a process existed, not that the host
+Each endpoint keeps at most 10,000 read receipts and 10,000 wake receipts. A full ledger
+refuses more and stays readable: new reads stay unread, and a wake refuses before it
+launches. Hosts offer no handshake, so a wake receipt proves a process existed, not that the host
 ran a turn; check `last_wake` for its exit code. If the process cannot be created, the
 message is not counted as woken. If its start cannot be recorded, the process is stopped.
 A read receipt shows the adapter returned the message to the connection configured for
@@ -367,7 +369,9 @@ Many initiatives can be open at once, but only three can be writing at any momen
 heavy jobs run one at a time. The limits are code constants, so raising them is a
 reviewed change for the owner to decide after measuring the machine. The store is a
 same-user record, not a security boundary, and it detects damage only when that breaks
-its history.
+its history. A store holds at most 10,000 events. A full store refuses every further
+change, including capacity releases, and stays readable, so plan to start a new one
+before it fills.
 
 ## Role-based assistants
 

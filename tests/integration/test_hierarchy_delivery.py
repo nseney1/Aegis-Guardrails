@@ -257,6 +257,70 @@ def test_a_message_whose_response_failed_can_still_be_delivered_by_a_wake(pilot)
     assert code == 0 and result["state"] == "read" and result["read"] == ["note-1"]
 
 
+def fill_receipts(pilot, kind, count, **extra):
+    folder = pilot.delivery / kind / TARGET
+    folder.mkdir(parents=True)
+    receipt = {"schema": "aegis.hierarchy-delivery-receipt/v1", "endpoint": TARGET, "host": pilot.host,
+               "session": pilot.session, "generation": 1, "at": "2026-11-02T00:00:00.000000Z",
+               "message_ids": ["seed-note"], **extra}
+    raw = json.dumps(receipt)
+    for number in range(count):
+        (folder / ("20261102T000000000000Z-%05d.json" % number)).write_text(raw)
+    return folder
+
+
+def test_a_full_read_ledger_refuses_more_receipts_and_stays_readable(pilot):
+    pilot.publish("seed-note")
+    pilot.publish()
+    folder = fill_receipts(pilot, "reads", 10000)
+    result = pilot.adapter([("mailbox_inbox", {})])
+    assert result.returncode == 0
+    delivered = json.loads(json.loads(result.stdout.splitlines()[-1])["result"]["content"][0]["text"])["messages"]
+    assert [row["message"]["message_id"] for row in delivered] == ["seed-note", "note-1"]
+    assert "read receipt not recorded: delivery receipt history limit reached" in result.stderr
+    assert len(list(folder.glob("*.json"))) == 10000
+    summary = pilot.summary()
+    assert summary["read"] == 1 and summary["unread"] == ["note-1"]
+    assert not (folder / ".write.lock").exists()
+
+
+def test_a_busy_receipt_folder_leaves_the_message_unread(pilot):
+    pilot.publish()
+    folder = pilot.delivery / "reads" / TARGET
+    folder.mkdir(parents=True)
+    lock = folder / ".write.lock"
+    lock.write_text("fixture active writer")
+    result = pilot.adapter([("mailbox_inbox", {})])
+    assert result.returncode == 0 and "read receipt not recorded" in result.stderr
+    assert pilot.state()["state"] == "published"
+    assert lock.read_text() == "fixture active writer"
+
+
+WAKE_RECEIPT = {"wake_id": "wake-old", "state": "exited", "exit_code": 0, "timed_out": False}
+
+
+@posix_only
+def test_a_wake_needs_room_for_both_receipts_before_it_launches(pilot):
+    pilot.publish("seed-note")
+    pilot.publish()
+    folder = fill_receipts(pilot, "wakes", 9999, **WAKE_RECEIPT)
+    code, result = pilot.wake(pilot.profile())
+    assert code == 2 and result["error"] == "delivery receipt history limit reached"
+    assert not pilot.record.exists()
+    assert len(list(folder.glob("*.json"))) == 9999
+    assert pilot.summary()["unread"] == ["seed-note", "note-1"]
+
+
+@posix_only
+def test_a_wake_can_use_the_last_two_receipts(pilot):
+    pilot.publish("seed-note")
+    folder = fill_receipts(pilot, "wakes", 9998, **WAKE_RECEIPT)
+    code, result = pilot.wake(pilot.profile(mode="ignore"), timeout=60)
+    assert code == 3 and result["state"] == "woken_unread"
+    assert len(list(folder.glob("*.json"))) == 10000
+    assert pilot.summary()["last_wake"]["state"] == "exited"
+
+
 @pytest.mark.parametrize("change,error", [
     ({"session": "someone-else"}, "receipt does not match binding history"),
     ({"generation": 9}, "receipt does not match binding history"),

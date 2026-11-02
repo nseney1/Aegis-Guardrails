@@ -285,6 +285,9 @@ class Store:
 
     def append(self, ledger, kind, data):
         """Apply first, so a refused change writes nothing. Hard-link publication refuses a duplicate sequence."""
+        # Runs under the store lock. One event past the limit would make every later load fail,
+        # including the release that frees capacity, so a full store refuses and stays readable.
+        require(ledger.seq < MAX_RECORDS, "workspace event history limit reached")
         event = {"schema": EVENT_SCHEMA, "seq": ledger.seq + 1, "at": timestamp(), "kind": kind, "data": data}
         ledger.apply(event)
         publish_file(self.events / ("%08d.json" % event["seq"]), encoded(event) + b"\n")

@@ -173,6 +173,8 @@ def wake(root, directory, endpoint, profile_path, dry_run=False):
     if dry_run:
         return 0, {**answer, "state": "dry_run", "would_wake": identifiers, "argv": profile["argv"]}
     require(os.name == "posix", "the wake tool supports POSIX process groups only")
+    # A wake writes a start and a finish receipt, so both must fit before anything launches.
+    mailbox.require_receipt_room(directory, "wakes", endpoint, needed=2)
     running = process_names_session(profile["session"])
     if not running and profile["host"] == "claude-code":
         running = claude_table_lists_session(profile["session"])

@@ -916,10 +916,20 @@ class Mailbox:
                 raise ValueError("malformed delivery receipt: " + str(path) + ": " + str(exc)) from exc
         return receipts
 
+    def require_receipt_room(self, directory, kind, endpoint, needed=1):
+        folder = safe_path(self.delivery_directory(directory) / kind / endpoint)
+        count = sum(1 for path in folder.iterdir() if not path.name.startswith(".")) if folder.exists() else 0
+        require(count + needed <= MAX_RECORDS, "delivery receipt history limit reached")
+
     def write_delivery_receipt(self, directory, kind, receipt):
-        name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex + ".json"
-        path = self.delivery_directory(directory) / kind / receipt["endpoint"] / name
-        publish_file(path, encoded({"schema": DELIVERY_RECEIPT, "at": timestamp(), **receipt}) + b"\n")
+        folder = safe_path(self.delivery_directory(directory) / kind / receipt["endpoint"])
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Each ledger has its own lock, so adapter reads never contend with mailbox publishers. Past
+        # the limit the reader would refuse the whole ledger, so a full one refuses here instead.
+        with writer_lock(folder):
+            self.require_receipt_room(directory, kind, receipt["endpoint"])
+            name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex + ".json"
+            publish_file(folder / name, encoded({"schema": DELIVERY_RECEIPT, "at": timestamp(), **receipt}) + b"\n")
 
     def record_read(self, directory, sender, message_ids):
         """Record what the adapter returned to this connection, never what the session did with it."""

@@ -555,6 +555,41 @@ def test_a_hand_edited_grant_beyond_the_cap_is_detected(workspace):
     assert "ledger grant exceeds capacity" in workspace.run("status", expect=2)["error"]
 
 
+def fill_store_to_the_limit(workspace, initiative):
+    template = json.loads(event_files(workspace)[-1].read_text())
+    for sequence in range(len(event_files(workspace)) + 1, 10001):
+        event = {**template, "seq": sequence, "kind": "update", "data": {"initiative": initiative, "source": "fixture"}}
+        (workspace.store / "events" / ("%08d.json" % sequence)).write_text(json.dumps(event))
+
+
+def test_a_full_store_refuses_more_events_and_stays_readable(workspace):
+    workspace.register("a1")
+    workspace.ask("a1", "heavy")
+    held = workspace.grant("heavy")["request_id"]
+    fill_store_to_the_limit(workspace, "a1")
+    assert workspace.run("status")["seq"] == 10000
+    refused = workspace.run("update", {"initiative": "a1", "source": "owner", "priority": 1}, expect=2)
+    assert refused["error"] == "workspace event history limit reached"
+    assert not (workspace.store / "events" / "00010001.json").exists()
+    status = workspace.run("status")
+    assert status["seq"] == 10000 and status["capacity"]["heavy"]["used"] == 1
+    assert status["initiatives"]["a1"]["priority"] == 10
+    for command, request, flags in (("request", {"initiative": "a1", "kind": "writer", "holder": "x"}, {}),
+                                    ("release", {"request_id": held, "evidence": workspace.evidence()}, {})):
+        assert workspace.run(command, request, expect=2, **flags)["error"] == "workspace event history limit reached"
+    assert workspace.run("report")["capacity"]["heavy"]["used"] == 1
+    assert (workspace.store / ".write.lock").exists() is False
+
+
+def test_the_last_free_event_is_still_accepted(workspace):
+    workspace.register("a1")
+    fill_store_to_the_limit(workspace, "a1")
+    (workspace.store / "events" / "00010000.json").unlink()
+    workspace.run("update", {"initiative": "a1", "source": "owner", "priority": 1})
+    status = workspace.run("status")
+    assert status["seq"] == 10000 and status["initiatives"]["a1"]["priority"] == 1
+
+
 def test_a_busy_store_refuses_writes_but_still_answers_reads(workspace):
     workspace.register("a1")
     (workspace.store / ".write.lock").write_text("fixture active writer")
