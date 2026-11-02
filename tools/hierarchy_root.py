@@ -14,7 +14,8 @@ Every subcommand prints one JSON object. Exit codes:
   4  IO or disk error, including free space below --min-free-mb (checked before the first write)
   5  a human-answerable dialog is pending (the record is still written)
   6  a 64-hex token matches no file named on its line or the line above, nor any
-     --source (check-hashes); nothing is written
+     --source (check-hashes; launch checks its prompt the same way, with the spec's
+     optional hash_sources, before any claude call); nothing is written, nothing starts
 
 check-hashes takes absolute paths only, without '..' (T100): a relative path in the
 checked file is never a candidate, and the output lists it under refused_paths.
@@ -25,8 +26,8 @@ What exit 2 leaves behind, per subcommand (never assume "no side effects" on a r
   startup-ack, verify-retired
       nothing: every check runs before the only write (the ACK; the custody CAS).
   launch
-      refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree): nothing,
-      and no session. After claude --bg (launch failed, first prompt unverified): the
+      refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree; the
+      prompt's own hashes exit 6): nothing, and no session. After claude --bg (launch failed, first prompt unverified): the
       record is written and a session may be running; see record.stop_command. Exit 3
       or 4 after claude --bg means the record could not be written: the error output
       carries the whole record, stop_command included.
@@ -509,7 +510,12 @@ def full_session(value, label):
 
 def read_launch_spec(path):
     spec = read_json(path)
-    fields(spec, {"name", "model", "effort", "cwd", "add_dirs", "prompt", "uses_enter_worktree", "record_out"})
+    fields(spec, {"name", "model", "effort", "cwd", "add_dirs", "prompt", "uses_enter_worktree", "record_out"},
+           {"hash_sources"})
+    sources = spec.setdefault("hash_sources", [])
+    require(isinstance(sources, list) and len(sources) <= 64, "hash_sources must be a list")
+    for source in sources:
+        absolute_argument(text(source, "hash_sources entry"), "hash_sources entry")
     text(spec["name"], "name", 256)
     text(spec["model"], "model", 128)
     require(spec["effort"] in EFFORTS, "effort must be one of " + ", ".join(EFFORTS))
@@ -594,6 +600,11 @@ def cmd_launch(args):
     if sha256_bytes(raw) != spec["prompt"]["sha256"]:
         raise Failure(EXIT_CRITICAL, "prompt does not re-hash to its recorded sha256",
                       prompt_sha256=sha256_bytes(raw))
+    hashes = check_hashes(raw.decode("utf-8"), [Path(source) for source in spec["hash_sources"]])
+    if not hashes["ok"]:
+        raise Failure(EXIT_UNMATCHED_HASH, "prompt hash check failed, nothing launched: " + hashes["error"],
+                      prompt_hashes=hashes)
+    prompt_hashes = {key: hashes[key] for key in ("tokens", "checked", "sources", "refused_paths")}
     reason = untrusted_cwd_reason(spec["cwd"], args.test_tmp_root or TMP_ROOT)
     if reason is not None:
         raise Failure(EXIT_CRITICAL, "refused cwd for a background session: " + reason, cwd=spec["cwd"])
@@ -609,7 +620,7 @@ def cmd_launch(args):
     record_out = Path(spec["record_out"])
     if args.plan:
         return EXIT_OK, {"ok": True, "plan": True, "writes": [str(record_out)], "argv": shown, "cwd": spec["cwd"],
-                         "target_exists": record_out.exists()}
+                         "target_exists": record_out.exists(), "prompt_hashes": prompt_hashes}
     if record_out.exists():
         raise Failure(EXIT_CONFLICT, "launch record already exists: %s" % record_out, path=str(record_out))
     probe_folder_writable(record_out.parent, "launch record")
@@ -620,7 +631,7 @@ def cmd_launch(args):
     started = time.monotonic()
     record = {"schema": "aegis.hierarchy-launch-record/v1", "at": utc_now(), "name": spec["name"], "argv": shown,
               "cwd": spec["cwd"], "stdin": "DEVNULL", "env": "CLAUDE_* unset",
-              "prompt": {**spec["prompt"], "chars": len(raw.decode("utf-8"))},
+              "prompt": {**spec["prompt"], "chars": len(raw.decode("utf-8"))}, "prompt_hashes": prompt_hashes,
               "uses_enter_worktree": spec["uses_enter_worktree"], "id": None, "session": None, "transcript": None,
               "first_prompt_check": None, "first_assistant_line": None, "agents_row": None, "dialog": None}
     result = run_claude(argv, cwd=spec["cwd"])
@@ -1249,7 +1260,8 @@ def build_parser():
     hashes.set_defaults(handler=cmd_check_hashes)
 
     launch = commands.add_parser("launch", help="Start one claude --bg session from a spec and verify its start")
-    launch.add_argument("--spec", required=True, help="Absolute path to a strict JSON launch spec")
+    launch.add_argument("--spec", required=True, help="Absolute path to a strict JSON launch spec; its prompt must "
+                        "pass check-hashes (optional hash_sources: absolute paths, as --source) or launch exits 6")
     launch.add_argument("--plan", action="store_true", help="Print the paths and argv a run would use; write nothing")
     launch.add_argument("--projects-dir", default=str(Path.home() / ".claude" / "projects"))
     launch.add_argument("--wait-s", type=float, default=30.0, help="How long to wait for the first prompt")

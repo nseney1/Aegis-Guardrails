@@ -355,6 +355,50 @@ def test_launch_records_an_exact_first_prompt_with_no_inherited_stdin(tmp_path, 
     assert record["dialog"] is None
 
 
+def test_launch_refuses_an_unmatched_hash_in_the_prompt_and_starts_nothing(tmp_path, stub, named):
+    """T92: the C7 prompt carried a typed hash; launch must refuse before claude is called at all."""
+    prompt = tmp_path / "typed-prompt.txt"
+    prompt.write_text("You are a lane.\nBrief %s (sha256 %s)\n" % (named, FABRICATED), encoding="utf-8")
+    spec_path, spec = launch_spec(tmp_path, prompt)
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
+    for extra in (["--plan"], []):
+        code, out, _ = launch(stub, spec_path, *extra)
+        assert code == 6, out
+        assert "nothing launched" in out["error"] and "line 2" in out["error"]
+        [miss] = out["prompt_hashes"]["unmatched"]
+        assert miss["token"] == FABRICATED and miss["candidates"][0]["sha256"] == sha(named.read_bytes())
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+    assert not (stub.dir / "calls.jsonl").exists()
+
+
+def test_launch_records_every_checked_hash_pair(tmp_path, stub, named):
+    source = tmp_path / "checkpoint.json"
+    source.write_text('{"checkpoint": 1}\n', encoding="utf-8")
+    prompt = tmp_path / "hashed-prompt.txt"
+    prompt.write_text("You are a lane.\nBrief %s\n(sha256 %s)\nCheckpoint sha256 %s.\n"
+                      % (named, sha(named.read_bytes()), sha(source.read_bytes())), encoding="utf-8")
+    spec_path, spec = launch_spec(tmp_path, prompt, hash_sources=[str(source)])
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
+    code, out, _ = launch(stub, spec_path, "--plan")
+    assert code == 0 and out["prompt_hashes"]["tokens"] == 2, out
+    code, out, err = launch(stub, spec_path)
+    assert code == 0, (out, err)
+    record = json.loads(Path(spec["record_out"]).read_text(encoding="utf-8"))
+    assert record["prompt_hashes"]["checked"] == [
+        {"token": sha(named.read_bytes()), "path": str(named), "line": 3, "via": "line_above"},
+        {"token": sha(source.read_bytes()), "path": str(source), "line": 4, "via": "source"}]
+    assert record["prompt_hashes"]["sources"] == [{"path": str(source), "sha256": sha(source.read_bytes())}]
+
+
+def test_launch_refuses_a_relative_hash_source(tmp_path, stub, prompt_file):
+    spec_path, _ = launch_spec(tmp_path, prompt_file, hash_sources=["checkpoint.json"])
+    code, out, _ = launch(stub, spec_path, "--plan")
+    assert code == 2 and "hash_sources entry" in out["error"] and "checkpoint.json" in out["error"], out
+    assert not stub.launched()
+
+
 def test_launch_refuses_an_existing_record_path_before_launching(tmp_path, stub, prompt_file):
     spec_path, spec = launch_spec(tmp_path, prompt_file)
     Path(spec["record_out"]).write_text("{}\n", encoding="utf-8")
