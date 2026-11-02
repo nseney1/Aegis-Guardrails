@@ -44,12 +44,24 @@ def definitions():
 
 
 class Connection:
-    def __init__(self, root, endpoint, host, session, generation):
+    def __init__(self, root, endpoint, host, session, generation, delivery_dir=None):
         self.root = root
         self.sender = {"from": endpoint, "host": host, "session": session, "binding_generation": generation}
         mailbox = Mailbox(root)
         self.manifest_digest = digest(mailbox.manifest)
+        self.delivery_dir = mailbox.delivery_directory(delivery_dir) if delivery_dir is not None else None
         self.checked_mailbox()
+
+    def record_read(self, page):
+        # A lost receipt must not cost the session its mail. It only makes the message
+        # look unread, which errs toward waking the session again.
+        identifiers = [row["message"]["message_id"] for row in page["messages"]]
+        if self.delivery_dir is None or not identifiers:
+            return
+        try:
+            Mailbox(self.root).record_read(self.delivery_dir, self.sender, identifiers)
+        except (ValueError, OSError, UnicodeError) as exc:
+            print("read receipt not recorded: " + str(exc), file=sys.stderr, flush=True)
 
     def checked_mailbox(self):
         mailbox = Mailbox(self.root)
@@ -113,15 +125,16 @@ def handle(connection, request):
             if params["name"] == "mailbox_inbox":
                 result = _bounded_inbox(result, lambda page: _response_line({
                     "jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)}))
+                connection.record_read(result)
             return _tool_result(result)
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
             return {"content": [{"type": "text", "text": json.dumps({"error": str(exc)})}], "isError": True}
     raise ValueError("unsupported mailbox method: " + method)
 
 
-def serve(root, endpoint, host, session, generation):
+def serve(root, endpoint, host, session, generation, delivery_dir=None):
     integer(generation, "binding generation")
-    connection = Connection(root, endpoint, host, session, generation)
+    connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir)
     while True:
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:

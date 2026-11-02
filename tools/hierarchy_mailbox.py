@@ -31,6 +31,11 @@ MESSAGE_TYPES = {"info", "brief", "dispatch", "result", "review", "escalation", 
 STAGES = {"received", "accepted", "completed"}
 VERIFICATION = {"lease": "reference_only", "scan": "sender_claim", "hook": "sender_claim",
                 "tests": "sender_claim", "human_approval": "not_established", "fitness_credit": 0}
+DELIVERY_RECEIPT = "aegis.hierarchy-delivery-receipt/v1"
+WAKE_STATES = {"started", "exited", "timed_out", "failed_to_start"}
+MAX_DELIVERY_IDS = 100
+DELIVERY_MEANING = ("read means the adapter returned the message to the connection configured for this binding; "
+                    "it does not prove the session understood or acted on it. woken means a turn was started.")
 
 
 def require(condition, message):
@@ -669,6 +674,122 @@ class Mailbox:
                 "binding": binding, "checkpoint_briefs": checkpoint_briefs,
                 "next_after": selected[-1]["message"]["message_id"] if len(records) > limit else None}
 
+    def delivery_directory(self, directory):
+        # Receipts live outside the root so the mailbox history stays immutable and
+        # an adapter without a delivery directory stays strictly read-only.
+        directory = safe_path(directory)
+        require(directory != self.root and self.root not in directory.parents,
+                "delivery directory must be outside the mailbox root")
+        return directory
+
+    @staticmethod
+    def _delivery_receipt(receipt, kind, endpoint, history, records):
+        extra = {"wake_id", "state", "exit_code", "timed_out"} if kind == "wakes" else set()
+        fields(receipt, {"schema", "endpoint", "host", "session", "generation", "at", "message_ids"}, extra)
+        require(receipt["schema"] == DELIVERY_RECEIPT and receipt["endpoint"] == endpoint,
+                "wrong receipt schema or endpoint")
+        integer(receipt["generation"], "receipt generation")
+        require(receipt["generation"] <= len(history) and all(
+            history[receipt["generation"] - 1][key] == receipt[key] for key in ("host", "session")),
+                "receipt does not match binding history")
+        parse_time(receipt["at"])
+        strings(receipt["message_ids"], "receipt message ids")
+        for identifier in receipt["message_ids"]:
+            record = records.get(identifier)
+            require(record is not None and record["message"]["to"] == endpoint,
+                    "receipt names a message not addressed to this endpoint")
+        if kind == "wakes":
+            matching(receipt.get("wake_id"), SLUG, "wake id")
+            require(receipt.get("state") in WAKE_STATES, "invalid wake state")
+        return receipt
+
+    def delivery_receipts(self, directory, kind, endpoint, records):
+        folder = safe_path(self.delivery_directory(directory) / kind / endpoint)
+        if not folder.exists():
+            return []
+        history = self.bindings(endpoint)
+        receipts = []
+        for path in sorted(folder.iterdir()):
+            safe_path(path)
+            if path.name.startswith("."):
+                continue
+            require(len(receipts) < MAX_RECORDS, "delivery receipt history exceeds record limit")
+            try:
+                receipts.append(self._delivery_receipt(read_json(path), kind, endpoint, history, records))
+            except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+                raise ValueError("malformed delivery receipt: " + str(path) + ": " + str(exc)) from exc
+        return receipts
+
+    def write_delivery_receipt(self, directory, kind, receipt):
+        name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex + ".json"
+        path = self.delivery_directory(directory) / kind / receipt["endpoint"] / name
+        publish_file(path, encoded({"schema": DELIVERY_RECEIPT, "at": timestamp(), **receipt}) + b"\n")
+
+    def record_read(self, directory, sender, message_ids):
+        """Record what the adapter returned to this connection, never what the session did with it."""
+        endpoint = sender["from"]
+        records = self.messages()
+        seen = {identifier for receipt in self.delivery_receipts(directory, "reads", endpoint, records)
+                if receipt["generation"] == sender["binding_generation"] for identifier in receipt["message_ids"]}
+        fresh = [identifier for identifier in message_ids if identifier not in seen]
+        if fresh:
+            self.write_delivery_receipt(directory, "reads", {
+                "endpoint": endpoint, "host": sender["host"], "session": sender["session"],
+                "generation": sender["binding_generation"], "message_ids": fresh})
+
+    def endpoint_delivery(self, directory, endpoint, records):
+        """Per-message rows and an endpoint summary; published, woken and read stay separate."""
+        reads = self.delivery_receipts(directory, "reads", endpoint, records)
+        wakes = self.delivery_receipts(directory, "wakes", endpoint, records)
+        failed = {wake["wake_id"] for wake in wakes if wake["state"] == "failed_to_start"}
+        read_at, read_by, woken_at = {}, {}, {}
+        for receipt in reads:
+            for identifier in receipt["message_ids"]:
+                if identifier not in read_at:
+                    read_at[identifier] = receipt["at"]
+                    read_by[identifier] = {key: receipt[key] for key in ("host", "session", "generation")}
+        for wake in wakes:
+            if wake["state"] == "started" and wake["wake_id"] not in failed:
+                for identifier in wake["message_ids"]:
+                    woken_at.setdefault(identifier, wake["at"])
+        incoming = sorted((r["message"] for r in records.values() if r["message"]["to"] == endpoint),
+                          key=lambda message: (message["created_at"], message["message_id"]))
+        rows = {}
+        for message in incoming:
+            identifier = message["message_id"]
+            state = "read" if identifier in read_at else "woken" if identifier in woken_at else "published"
+            rows[identifier] = {"message_id": identifier, "to": endpoint, "state": state,
+                                "published_at": message["created_at"], "woken_at": woken_at.get(identifier),
+                                "read_at": read_at.get(identifier), "read_by": read_by.get(identifier)}
+        unread = [message["message_id"] for message in incoming if message["message_id"] not in read_at]
+        history = self.bindings(endpoint)
+        binding = None
+        if history:
+            binding = {"host": history[-1]["host"], "session": history[-1]["session"],
+                       "generation": history[-1]["generation"], "ready": self.ready(history[-1])}
+        last_wake = None
+        if wakes:
+            last_wake = {key: wakes[-1].get(key) for key in ("wake_id", "state", "at", "exit_code", "timed_out")}
+        return rows, {"binding": binding, "published": len(incoming), "read": len(incoming) - len(unread),
+                      "unread_count": len(unread), "unread": unread[:MAX_DELIVERY_IDS],
+                      "woken_unread": [i for i in unread if i in woken_at][:MAX_DELIVERY_IDS],
+                      "oldest_unread_at": rows[unread[0]]["published_at"] if unread else None,
+                      "last_read_at": reads[-1]["at"] if reads else None, "last_wake": last_wake}
+
+    def delivery(self, directory, endpoint=None, message_id=None):
+        self.delivery_directory(directory)
+        records = self.messages()
+        answer = {"schema": "aegis.hierarchy-delivery/v1", "meaning": DELIVERY_MEANING}
+        if message_id is not None:
+            matching(message_id, SLUG, "message id")
+            require(message_id in records, "unknown message: " + message_id)
+            rows, _ = self.endpoint_delivery(directory, records[message_id]["message"]["to"], records)
+            return {**answer, "message": rows[message_id]}
+        if endpoint is not None:
+            self.endpoint(endpoint)
+        names = [endpoint] if endpoint is not None else sorted(self.manifest["endpoints"])
+        return {**answer, "endpoints": {name: self.endpoint_delivery(directory, name, records)[1] for name in names}}
+
 
 def initialize(root, request):
     validate_manifest(request)
@@ -697,11 +818,16 @@ def main(argv=None):
     inbox.add_argument("--limit", type=int, default=20)
     inbox.add_argument("--after", default=None)
     commands.add_parser("status")
+    delivery = commands.add_parser("delivery", help="Report published, woken and read states separately")
+    delivery.add_argument("--delivery-dir", required=True)
+    delivery.add_argument("--endpoint", default=None)
+    delivery.add_argument("--message-id", default=None)
     server = commands.add_parser("serve", help="Scoped mailbox-only stdio MCP adapter")
     server.add_argument("--endpoint", required=True)
     server.add_argument("--host", required=True)
     server.add_argument("--session", required=True)
     server.add_argument("--generation", required=True, type=int)
+    server.add_argument("--delivery-dir", default=None, help="Record read receipts here; omitted means no receipts")
     args = parser.parse_args(argv)
     try:
         root = safe_path(args.root)
@@ -712,13 +838,15 @@ def main(argv=None):
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from hierarchy_mailbox_mcp import serve
 
-            return serve(root, args.endpoint, args.host, args.session, args.generation)
+            return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir)
         if args.command == "init":
             result = initialize(root, read_json(args.request))
-        elif args.command in {"status", "inbox"}:
+        elif args.command in {"status", "inbox", "delivery"}:
             mailbox = Mailbox(root)
             if args.command == "status":
                 result = mailbox.status()
+            elif args.command == "delivery":
+                result = mailbox.delivery(args.delivery_dir, endpoint=args.endpoint, message_id=args.message_id)
             else:
                 result = mailbox.inbox(args.endpoint, include_briefs=args.include_briefs,
                                        limit=args.limit, after=args.after)
