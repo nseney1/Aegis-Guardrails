@@ -80,16 +80,17 @@ def claude_table_lists_session(session):
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        pid = record.get("pid") if isinstance(record, dict) else None
-        if record.get("sessionId") == session if isinstance(record, dict) else False:
-            if type(pid) is int and pid > 0:
-                try:
-                    os.kill(pid, 0)
-                    return True
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    return True
+        if not isinstance(record, dict) or record.get("sessionId") != session:
+            continue
+        pid = record.get("pid")
+        if type(pid) is int and pid > 0:
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                return True
     return False
 
 

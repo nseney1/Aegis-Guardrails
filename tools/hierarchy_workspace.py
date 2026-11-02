@@ -73,7 +73,9 @@ def verify_evidence(value):
 
 def validate_initiative(data):
     fields(data, {"id", "project", "repository", "priority", "target_branch"},
-           {"touched_paths", "blocked_by", "checkouts", "mailbox_root", "delivery_dir"})
+           {"touched_paths", "blocked_by", "checkouts", "mailbox_root", "delivery_dir", "source"})
+    if "source" in data:
+        text(data["source"], "source")
     matching(data["id"], SLUG, "initiative id")
     matching(data["project"], SLUG, "project")
     text(data["repository"], "repository", 256)
@@ -338,7 +340,10 @@ def lease_tools():
     root = str(TOOLS.parent)
     if root not in sys.path:
         sys.path.insert(0, root)
-    from aegis_core import match, team
+    try:
+        from aegis_core import match, team
+    except ImportError as exc:
+        raise ValueError("the Aegis lease reader is unavailable from this checkout") from exc
     return match, team
 
 

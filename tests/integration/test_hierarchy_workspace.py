@@ -387,6 +387,29 @@ def test_malformed_path_checks_are_refused(workspace, paths, error):
     assert error in workspace.run("check-paths", {"initiative": "first", "paths": paths}, expect=2)["error"]
 
 
+def test_a_missing_lease_reader_is_a_clear_error(workspace, tmp_path):
+    workspace.register("first")
+    copy = tmp_path / "copied-tools"
+    copy.mkdir()
+    for name in ("hierarchy_mailbox.py", "hierarchy_workspace.py"):
+        (copy / name).write_bytes((CONTROLLER.parent / name).read_bytes())
+    request = tmp_path / "paths.json"
+    request.write_text(json.dumps({"initiative": "first", "paths": ["x.txt"]}), encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", str(copy / "hierarchy_workspace.py"), "--store", str(workspace.store),
+                             "check-paths", "--request", str(request)], capture_output=True, text=True, timeout=20,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2 and not result.stderr
+    assert json.loads(result.stdout)["error"] == "the Aegis lease reader is unavailable from this checkout"
+
+
+def test_an_initial_priority_can_name_its_source(workspace):
+    workspace.register("a1", source="owner chat 2026-11-02")
+    assert workspace.run("status")["initiatives"]["a1"]["source"] == "owner chat 2026-11-02"
+    refused = workspace.run("register", {"id": "a2", "project": "aegis", "repository": "aegis", "priority": 5,
+                                         "target_branch": "develop", "source": ""}, expect=2)
+    assert refused["error"] == "invalid source"
+
+
 def test_a_merge_marks_only_other_initiatives_on_that_branch(workspace):
     workspace.register("merged")
     workspace.register("same-branch")
