@@ -21,7 +21,7 @@ import sys
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import Mailbox, fields, read_json, require, safe_path, text, writer_lock  # noqa: E402
+from hierarchy_mailbox import Mailbox, cli_path, fields, read_json, require, safe_path, text, writer_lock  # noqa: E402
 
 
 SPEC_SCHEMA = "aegis.hierarchy-handoff/v1"
@@ -82,7 +82,7 @@ def main(argv=None):
     parser.add_argument("--spec", required=True, help="Absolute path to a strict JSON handoff spec")
     args = parser.parse_args(argv)
     try:
-        result = run(args.spec)
+        result = run(cli_path(args.spec, "--spec"))
     except (ValueError, OSError, UnicodeError, RecursionError) as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True))
         return 2

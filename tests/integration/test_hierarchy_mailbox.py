@@ -893,6 +893,25 @@ def test_held_open_stdin_never_holds_the_writer_lock(pilot):
     assert json.loads(stdout)["message"]["message_id"] == "dispatch-1"
 
 
+@pytest.mark.parametrize("argv,error", [
+    (["--root", "rel/mailbox", "status"], "--root must be absolute without traversal: got 'rel/mailbox'"),
+    (["--root", "/abs/../mailbox", "status"], "--root must be absolute without traversal: got '/abs/../mailbox'"),
+    (["publish", "--request", "rel.json"], "--request must be absolute without traversal: got 'rel.json'"),
+    (["init", "--request", "requests/x.json"], "--request must be absolute without traversal: got 'requests/x.json'"),
+    (["bind", "--request", "/abs/../x.json"], "--request must be absolute without traversal: got '/abs/../x.json'"),
+])
+def test_cli_path_refusals_name_the_argument_and_its_value(pilot, argv, error):
+    root, _ = pilot
+    if argv[0] != "--root":
+        argv = ["--root", str(root), *argv]
+    before = mailbox_snapshot(root)
+    result = subprocess.run([sys.executable, "-B", str(HELPER), *argv], capture_output=True, text=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2 and not result.stderr
+    assert json.loads(result.stdout) == {"error": error}
+    assert mailbox_snapshot(root) == before
+
+
 def test_inbox_help_states_the_limit_default_and_maximum():
     result = subprocess.run([sys.executable, "-B", str(HELPER), "--root", "/unused", "inbox", "--help"],
                             capture_output=True, text=True, timeout=15, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})

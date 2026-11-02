@@ -162,6 +162,14 @@ def safe_path(path):
     return path
 
 
+def cli_path(value, flag):
+    """A CLI refusal names the argument and its value (T100); safe_path keeps its text for its importers."""
+    path = Path(value)
+    require(path.is_absolute() and ".." not in path.parts,
+            flag + " must be absolute without traversal: got " + repr(value))
+    return safe_path(path)
+
+
 def read_bytes(path):
     path = safe_path(path)
     try:
@@ -1084,11 +1092,13 @@ def main(argv=None):
     server.add_argument("--board", default=None, help="Serve only the workspace board tools, from this board folder")
     args = parser.parse_args(argv)
     try:
-        root = safe_path(args.root)
+        root = cli_path(args.root, "--root")
         stdin_request = None
         if getattr(args, "request", None) == "-":
             require(args.command in STDIN_COMMANDS, "--request - (stdin) is only for publish and ack-handoff")
             stdin_request = read_stdin_json()
+        elif getattr(args, "request", None) is not None:
+            cli_path(args.request, "--request")
         if args.command == "serve":
             # With -I the script directory is absent from sys.path. Add only the
             # exact reviewed sibling-tool directory, never cwd or PYTHONPATH.

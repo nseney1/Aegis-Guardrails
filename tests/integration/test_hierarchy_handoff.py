@@ -322,3 +322,11 @@ def test_an_entry_with_a_relative_root_or_extra_field_is_reported_per_entry(tmp_
     assert "path must be absolute" in rows[0]["error"]
     assert "unexpected fields" in rows[1]["error"]
     assert rows[2]["ok"] is True
+
+
+@pytest.mark.parametrize("value", ["requests/x.json", "/abs/../x.json"])
+def test_a_relative_or_traversing_spec_is_refused_by_name_and_value(value):
+    result = subprocess.run([sys.executable, "-I", str(HANDOFF), "--spec", value], capture_output=True,
+                            text=True, timeout=60, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2 and not result.stderr
+    assert json.loads(result.stdout) == {"error": "--spec must be absolute without traversal: got " + repr(value)}
