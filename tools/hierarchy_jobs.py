@@ -54,7 +54,7 @@ from hierarchy_workspace import Store, absolute, check_paths, grant_next, verify
 RECIPES_SCHEMA = "aegis.hierarchy-job-recipes/v1"
 PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
 RESULT_SCHEMA = "aegis.hierarchy-job-result/v1"
-COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout"}
+COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout", "$cargo_target"}
 ENV_TOKENS = {"$scratch", "$checkout"}
 SANDBOXES = ("bwrap", "none")
 # The ledger kinds a heavy job can wait for, in the order they are granted. Each has its own limit.
@@ -715,6 +715,11 @@ def scratch_argument(job):
     return str(job.folder / "scratch" / "run")
 
 
+def cargo_target(job):
+    """One path for both CARGO_TARGET_DIR and $cargo_target, so a runner's --target-dir never splits the cache."""
+    return str(job.folder / "cargo-target")
+
+
 def job_environment(recipes, job, checkout):
     for name in WORK_FOLDERS:
         (job.folder / name).mkdir(mode=0o700, exist_ok=True)
@@ -726,7 +731,7 @@ def job_environment(recipes, job, checkout):
            "PYTHONNOUSERSITE": "1", "GIT_OPTIONAL_LOCKS": "0", "TMP": str(scratch_tmp), "TEMP": str(scratch_tmp),
            "TMPDIR": str(scratch_tmp),
            # These tools otherwise write beside the source, and a job usually cannot write there.
-           "CARGO_TARGET_DIR": str(job.folder / "cargo-target"), "RUFF_CACHE_DIR": str(job.folder / "ruff-cache"),
+           "CARGO_TARGET_DIR": cargo_target(job), "RUFF_CACHE_DIR": str(job.folder / "ruff-cache"),
            "HYPOTHESIS_STORAGE_DIRECTORY": str(job.folder / "hypothesis")}
     for name, folder in HOME_FOLDERS.items():
         path = home / folder
@@ -764,9 +769,9 @@ def stop_for_certain(process):
         raise StillRunning(process.pid, "members were left after the stop")
 
 
-def command_steps(recipe, packet, recipes, scratch):
-    tokens = {"$python": [recipes["python"]], "$paths": packet["paths"], "$scratch": [scratch],
-              "$checkout": [packet["checkout"]]}
+def command_steps(recipe, packet, recipes, job):
+    tokens = {"$python": [recipes["python"]], "$paths": packet["paths"], "$scratch": [scratch_argument(job)],
+              "$checkout": [packet["checkout"]], "$cargo_target": [cargo_target(job)]}
     for step in recipe["steps"]:
         yield Step([part for word in step for part in tokens.get(word, [word])])
     return None
@@ -841,7 +846,7 @@ def execute(job, recipe, packet, recipes, on_start):
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
     commit = recipe["kind"] == "commit"
-    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, scratch_argument(job))
+    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, job)
     rows, reason, exit_code, created, output = [], None, 0, None, None
     started = False
 

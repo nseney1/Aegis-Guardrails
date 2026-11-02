@@ -843,6 +843,17 @@ def test_a_kept_file_survives_cleanup_with_its_hash(shop, exit_code, heavy_tests
     assert "run/missing.txt (missing)" in shop.receipts("job-1")[-1]["body"]
 
 
+def test_a_step_can_name_the_job_cargo_target_folder(shop):
+    script = "import os, sys; print('target', sys.argv[1:], os.environ['CARGO_TARGET_DIR'])"
+    shop.recipes["recipes"]["target"] = shop.command(["$python", "-c", script, "--target-dir", "$cargo_target"])
+    shop.save_recipes()
+    shop.request_job("job-1", "target")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    folder = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "cargo-target")
+    log = verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+    assert "target %r %s" % (["--target-dir", folder], folder) in log
+
+
 def test_clean_refuses_a_job_that_has_not_finished(shop, tmp_path):
     assert "no job here" in shop.jobs("clean", "--job", "pilot/job-1", expect=2)["error"]
     assert "invalid job" in shop.jobs("clean", "--job", "../../etc", expect=2)["error"]
