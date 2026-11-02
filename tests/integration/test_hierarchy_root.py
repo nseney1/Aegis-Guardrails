@@ -532,3 +532,78 @@ def test_verify_briefs_accepts_a_superset_and_rejects_missing_or_changed_briefs(
     changed = tool.verify_briefs([briefs[0]], briefs)
     assert changed["ok"] is False
     assert [row["ok"] for row in changed["rehash"]] == [True, True, False]
+
+
+# --- item 5: rebind (C2 section 3, F2, F9, T15, T28) -------------------------------------------
+
+
+def rebind_setup(tmp_path, messages=25):
+    from tests.integration.test_hierarchy_handoff import make_root, spec_for
+    from tests.integration.test_hierarchy_mailbox import invoke, message
+
+    root, brief = make_root(tmp_path / "alpha", "alpha")
+    for index in range(messages):
+        invoke(root, "publish", message("alpha/orchestrator", "alpha/front-door", identifier="m-%02d" % index))
+    spec = spec_for([(root, brief)])
+    path = tmp_path / "rebind-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    acks = tmp_path / "acks"
+    acks.mkdir()
+    return root, brief, spec, path, acks
+
+
+def rebind(spec_path, result_out, acks, *extra):
+    return run_tool("rebind", "--spec", spec_path, "--result-out", result_out, "--ack-dir", acks,
+                    "--min-free-mb", "1", *extra)
+
+
+def test_rebind_pages_the_whole_inbox_then_acknowledges(tmp_path):
+    from tests.integration.test_hierarchy_mailbox import invoke
+
+    root, _, spec, spec_path, acks = rebind_setup(tmp_path)
+    code, out, err = rebind(spec_path, tmp_path / "result-1.json", acks)
+    assert code == 0, (out, err)
+    row = out["entries"][0]
+    assert row["ready"] is True and row["generation"] == 2
+    assert row["messages_read"] == 25 and row["pages"] == 2 and row["remaining"] == 0
+    assert row["briefs"]["ok"] is True
+    assert invoke(root, "status")["bindings"]["alpha/front-door"]["ready"] is True
+    ack = json.loads(Path(row["ack_request"]).read_text(encoding="utf-8"))
+    assert ack == {"endpoint": "alpha/front-door", "session": "new-front-door", "generation": 2,
+                   "checkpoint_sha256": row["checkpoint_sha256"]}
+    assert json.loads((tmp_path / "result-1.json").read_text(encoding="utf-8")) == out
+    again_code, again, _ = rebind(spec_path, tmp_path / "result-2.json", acks)
+    assert again_code == 0 and again["entries"][0]["ready"] is True
+
+
+def test_rebind_does_not_acknowledge_when_a_spec_brief_is_missing_from_the_checkpoint(tmp_path):
+    from tests.integration.test_hierarchy_mailbox import invoke
+
+    root, brief, spec, spec_path, acks = rebind_setup(tmp_path, messages=3)
+    first = tmp_path / "first-spec.json"
+    first.write_text(json.dumps(spec), encoding="utf-8")
+    subprocess.run([sys.executable, "-I", str(ROOT / "tools" / "hierarchy_handoff.py"), "--spec", str(first)],
+                   capture_output=True, check=True, timeout=60, stdin=subprocess.DEVNULL)
+    extra = tmp_path / "alpha" / "extra.md"
+    extra.write_text("A brief the checkpoint never carried.\n", encoding="utf-8")
+    spec["entries"][0]["briefs"].append({"path": str(extra), "sha256": sha(extra.read_bytes())})
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    code, out, _ = rebind(spec_path, tmp_path / "result.json", acks)
+    assert code == 2
+    row = out["entries"][0]
+    assert row["ready"] is False and row["briefs"]["missing_from_checkpoint"] == [sha(extra.read_bytes())]
+    assert invoke(root, "status")["bindings"]["alpha/front-door"]["ready"] is False
+    assert list(acks.iterdir()) == []
+
+
+def test_rebind_plan_writes_nothing(tmp_path):
+    from tests.integration.test_hierarchy_mailbox import invoke
+
+    root, _, _, spec_path, acks = rebind_setup(tmp_path, messages=1)
+    before = invoke(root, "status")["bindings"]["alpha/front-door"]
+    code, out, _ = rebind(spec_path, tmp_path / "result.json", acks, "--plan")
+    assert code == 0 and out["plan"] is True
+    assert out["writes"][0] == str(tmp_path / "result.json")
+    assert out["writes"][1] == str(acks / "ack-alpha-front-door-g2.json")
+    assert invoke(root, "status")["bindings"]["alpha/front-door"] == before
+    assert not (tmp_path / "result.json").exists() and list(acks.iterdir()) == []

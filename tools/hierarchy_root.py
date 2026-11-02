@@ -35,7 +35,9 @@ import uuid
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import SHA256, fields, matching, read_bytes, read_json, require, safe_path, text  # noqa: E402
+import hierarchy_handoff  # noqa: E402
+from hierarchy_mailbox import (  # noqa: E402
+    SHA256, Mailbox, fields, matching, read_bytes, read_json, require, safe_path, text, writer_lock)
 
 EXIT_OK, EXIT_CRITICAL, EXIT_CONFLICT, EXIT_IO, EXIT_DIALOG = 0, 2, 3, 4, 5
 HEAD_CHARS = 120
@@ -549,6 +551,102 @@ def cmd_lanes_health(args):
     return EXIT_OK, result
 
 
+INBOX_PAGE = 20  # the mailbox caps a page at 100; 500 fails with "invalid inbox limit" (C5 F3)
+MAX_INBOX_PAGES = 1000
+
+
+def ack_request_path(ack_dir, endpoint, generation):
+    return Path(ack_dir) / ("ack-%s-g%d.json" % (endpoint.replace("/", "-"), generation))
+
+
+def read_whole_inbox(mailbox, endpoint):
+    """Follow next_after until remaining is 0: one default page hid 4 of 24 messages (T15, T28)."""
+    after, messages, pages = None, [], 0
+    while True:
+        page = mailbox.inbox(endpoint, include_briefs=True, limit=INBOX_PAGE, after=after)
+        pages += 1
+        messages += page["messages"]
+        if page["remaining"] == 0:
+            return page, messages, pages
+        require(page["next_after"] is not None and pages < MAX_INBOX_PAGES, "inbox paging did not reach remaining 0")
+        after = page["next_after"]
+
+
+def rebind_entry(spec, entry, row, ack_dir):
+    endpoint = entry["endpoint"]
+    out = {"root": entry["root"], "endpoint": endpoint, "ready": False}
+    if not row.get("ok"):
+        out["error"] = row.get("error", "handoff failed")
+        return out
+    page, messages, pages = read_whole_inbox(Mailbox(entry["root"]), endpoint)
+    binding = page["binding"]
+    out.update(generation=binding["generation"], checkpoint_sha256=binding["checkpoint_sha256"], pages=pages,
+               messages_read=len(messages), remaining=page["remaining"])
+    expected = {"host": spec["host"], "session": spec["session"], "generation": row["generation"],
+                "checkpoint_sha256": row["checkpoint_sha256"]}
+    differing = sorted(key for key, value in expected.items() if binding.get(key) != value)
+    if differing:
+        out["error"] = "binding differs from the handoff result: " + ", ".join(differing)
+        return out
+    out["briefs"] = verify_briefs(entry.get("briefs", []), (binding["checkpoint"] or {}).get("briefs", []))
+    if not out["briefs"]["ok"]:
+        out["error"] = "brief check failed: spec briefs must be in the checkpoint and every brief must re-hash"
+        return out
+    request = row["acknowledge"]
+    if request is None:
+        out["ready"] = binding["ready"]
+        return out
+    path = ack_request_path(ack_dir, endpoint, request["generation"])
+    atomic_write_json(path, request)
+    out["ack_request"] = str(path)
+    if binding["ready"]:
+        out.update(ready=True, already_acknowledged=True)
+        return out
+    with writer_lock(safe_path(entry["root"])):
+        out["ready"] = Mailbox(entry["root"]).acknowledge_handoff(request)["ready"]
+    return out
+
+
+def planned_generation(spec, entry):
+    current = Mailbox(entry["root"]).bindings(entry["endpoint"])[-1]
+    same = current["host"] == spec["host"] and current["session"] == spec["session"]
+    return current["generation"] if same else current["generation"] + 1
+
+
+def cmd_rebind(args):
+    """Bind every spec endpoint to this session, read each inbox to the end, check, acknowledge.
+
+    The incoming session runs this through its own connection; it replaces the three-step
+    loop each ROOT typed by hand (C2 section 3).
+    """
+    spec = read_json(args.spec)
+    fields(spec, {"schema", "host", "session", "outgoing_stopped", "entries"})
+    require(spec["schema"] == hierarchy_handoff.SPEC_SCHEMA, "unsupported handoff spec schema")
+    require(isinstance(spec["entries"], list) and spec["entries"], "handoff spec requires entries")
+    for entry in spec["entries"]:
+        require(isinstance(entry, dict) and {"root", "endpoint"} <= entry.keys(), "entries need root and endpoint")
+    result_out = Path(args.result_out)
+    if args.plan:
+        acks = [str(ack_request_path(args.ack_dir, entry["endpoint"], planned_generation(spec, entry)))
+                for entry in spec["entries"]]
+        return EXIT_OK, {"ok": True, "plan": True, "writes": [str(result_out), *acks],
+                         "mailbox_roots": [entry["root"] for entry in spec["entries"]]}
+    if result_out.exists():
+        raise Failure(EXIT_CONFLICT, "result already exists: %s" % result_out, path=str(result_out))
+    check_free_space([result_out, Path(args.ack_dir) / "ack.json"], args.min_free_mb)
+    handoff = hierarchy_handoff.run(args.spec)
+    rows = []
+    for entry, row in zip(spec["entries"], handoff["entries"]):
+        try:
+            rows.append(rebind_entry(spec, entry, row, args.ack_dir))
+        except (Failure, ValueError, OSError, UnicodeError) as exc:
+            rows.append({"root": entry["root"], "endpoint": entry["endpoint"], "ready": False, "error": str(exc)})
+    result = {"schema": "aegis.hierarchy-rebind-result/v1", "host": spec["host"], "session": spec["session"],
+              "ok": all(row["ready"] for row in rows), "handoff": handoff, "entries": rows}
+    atomic_write_json(result_out, result)
+    return (EXIT_OK if result["ok"] else EXIT_CRITICAL), result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -577,6 +675,14 @@ def build_parser():
     health.add_argument("--silent-s", type=float, default=900.0, help="No-record ceiling")
     health.add_argument("--now", help="UTC timestamp to measure ages from (default: the clock)")
     health.set_defaults(handler=cmd_lanes_health)
+
+    rebind = commands.add_parser("rebind", help="Bind, read every inbox page, check briefs and acknowledge")
+    rebind.add_argument("--spec", required=True, help="Absolute path to an aegis.hierarchy-handoff/v1 spec")
+    rebind.add_argument("--result-out", required=True)
+    rebind.add_argument("--ack-dir", required=True, help="Folder for the acknowledgment requests")
+    rebind.add_argument("--plan", action="store_true", help="Print the paths a run would write; write nothing")
+    rebind.add_argument("--min-free-mb", type=int, default=512)
+    rebind.set_defaults(handler=cmd_rebind)
     return parser
 
 
