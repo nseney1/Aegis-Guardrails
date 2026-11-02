@@ -647,6 +647,66 @@ def cmd_rebind(args):
     return (EXIT_OK if result["ok"] else EXIT_CRITICAL), result
 
 
+def process_state(pid):
+    """(alive, start_ticks). A zombie is gone; start ticks are field 22 of /proc/<pid>/stat,
+    read after the last ")" because the command name may itself contain one."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        pass
+    try:
+        stat = Path("/proc/%d/stat" % pid).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True, None
+    after = stat[stat.rfind(")") + 2:].split()
+    if after and after[0] == "Z":
+        return False, None
+    return True, int(after[19]) if len(after) > 19 and after[19].isdigit() else None
+
+
+def cmd_verify_retired(args):
+    """Check an outgoing session is really gone before anyone records it as stopped (F5).
+
+    Retired means its PID is gone (or reused, when --start-ticks is given) and claude agents
+    no longer lists it. While it is not, this prints the stop command for a human or ROOT
+    to run and exits 2: the tool never stops a session itself (T27, T13).
+    """
+    session = args.session
+    require(SESSION_ID.fullmatch(session) is not None, "invalid session id")
+    require((args.custody is None) == (args.expect_custody_sha256 is None),
+            "--custody and --expect-custody-sha256 go together")
+    alive, ticks = process_state(args.pid)
+    if alive and args.start_ticks is not None and ticks is not None and ticks != args.start_ticks:
+        alive = False
+    listed = [row for row in agents_rows() if row.get("sessionId") == session or row.get("id") == session[:8]]
+    result = {"session": session, "pid": args.pid, "pid_alive": alive, "pid_start_ticks": ticks,
+              "agents_listed": bool(listed), "agents_rows": listed, "retired": not alive and not listed}
+    result["verdict"] = ("retired" if result["retired"] else "alive" if alive else "listed_but_pid_gone")
+    if not result["retired"]:
+        result["stop_command"] = "claude stop " + session[:8]
+        result["ok"] = False
+        return EXIT_CRITICAL, result
+    if args.custody is not None:
+        check_free_space([args.custody], args.min_free_mb)
+        stopped = {"verified_at": utc_now(), "pid": args.pid, "start_ticks": args.start_ticks,
+                   "evidence": {"pid_alive": False, "agents_listed": False},
+                   "by": "hierarchy_root.py verify-retired"}
+
+        def record(custody):
+            history = custody.get("custody_history") if isinstance(custody, dict) else None
+            entries = [entry for entry in history or [] if isinstance(entry, dict)
+                       and entry.get("outgoing_root") == session]
+            require(bool(entries), "custody_history has no entry for outgoing root " + session)
+            entries[-1]["outgoing_stopped"] = stopped
+            return custody
+
+        result["custody_update"] = cas_update_json(args.custody, args.expect_custody_sha256, record)
+    result["ok"] = True
+    return EXIT_OK, result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -683,6 +743,15 @@ def build_parser():
     rebind.add_argument("--plan", action="store_true", help="Print the paths a run would write; write nothing")
     rebind.add_argument("--min-free-mb", type=int, default=512)
     rebind.set_defaults(handler=cmd_rebind)
+
+    retired = commands.add_parser("verify-retired", help="Verify an outgoing session is gone; record it via CAS")
+    retired.add_argument("--session", required=True)
+    retired.add_argument("--pid", type=int, required=True)
+    retired.add_argument("--start-ticks", type=int, help="Expected /proc start ticks; a different value is a reused PID")
+    retired.add_argument("--custody", help="Custody file whose custody_history entry receives outgoing_stopped")
+    retired.add_argument("--expect-custody-sha256")
+    retired.add_argument("--min-free-mb", type=int, default=512)
+    retired.set_defaults(handler=cmd_verify_retired)
     return parser
 
 

@@ -607,3 +607,75 @@ def test_rebind_plan_writes_nothing(tmp_path):
     assert out["writes"][1] == str(acks / "ack-alpha-front-door-g2.json")
     assert invoke(root, "status")["bindings"]["alpha/front-door"] == before
     assert not (tmp_path / "result.json").exists() and list(acks.iterdir()) == []
+
+
+# --- item 6 (retire step): verify-retired (F5, T30) --------------------------------------------
+
+OUTGOING = "d6b2a18b-e242-4ecb-ac63-baab549cf112"
+
+
+def custody_file(tmp_path):
+    path = tmp_path / "custody.json"
+    path.write_text(json.dumps({"active_root_session": "c9e38364", "custody_history": [
+        {"outgoing_root": "69958d8f", "incoming_root": OUTGOING},
+        {"outgoing_root": OUTGOING, "incoming_root": "c9e38364"}]}, indent=1) + "\n", encoding="utf-8")
+    return path
+
+
+def finished_pid():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+    proc.wait(timeout=30)
+    return proc.pid
+
+
+def retired(stub, pid, custody=None, expect=None):
+    argv = ["verify-retired", "--session", OUTGOING, "--pid", pid, "--min-free-mb", "1"]
+    if custody is not None:
+        argv += ["--custody", custody, "--expect-custody-sha256", expect or sha(custody.read_bytes())]
+    return run_tool(*argv, env=stub.env())
+
+
+def test_verify_retired_refuses_while_the_process_is_alive(tmp_path, stub):
+    custody = custody_file(tmp_path)
+    before = custody.read_bytes()
+    alive = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL)
+    try:
+        code, out, err = retired(stub, alive.pid, custody)
+    finally:
+        alive.kill()
+        alive.wait(timeout=30)
+    assert code == 2, (out, err)
+    assert out["verdict"] == "alive" and out["pid_alive"] is True and out["retired"] is False
+    assert out["stop_command"] == "claude stop " + OUTGOING[:8]
+    assert custody.read_bytes() == before
+
+
+def test_verify_retired_records_outgoing_stopped_when_gone(tmp_path, stub):
+    custody = custody_file(tmp_path)
+    pid = finished_pid()
+    code, out, err = retired(stub, pid, custody)
+    assert code == 0, (out, err)
+    assert out["verdict"] == "retired" and out["pid_alive"] is False and out["agents_listed"] is False
+    history = json.loads(custody.read_text(encoding="utf-8"))["custody_history"]
+    stopped = history[1]["outgoing_stopped"]
+    assert stopped["pid"] == pid and stopped["evidence"] == {"pid_alive": False, "agents_listed": False}
+    assert stopped["verified_at"].endswith("Z") and "outgoing_stopped" not in history[0]
+    assert out["custody_update"]["sha256"] == sha(custody.read_bytes())
+
+
+def test_verify_retired_refuses_a_session_still_listed_after_its_pid_is_gone(tmp_path, stub):
+    custody = custody_file(tmp_path)
+    before = custody.read_bytes()
+    stub.serve("agents.json", [agent_row(OUTGOING, "ROOT C5", state="blocked", status="idle")])
+    code, out, _ = retired(stub, finished_pid(), custody)
+    assert code == 2
+    assert out["verdict"] == "listed_but_pid_gone" and out["agents_listed"] is True
+    assert custody.read_bytes() == before
+
+
+def test_verify_retired_leaves_a_changed_custody_untouched(tmp_path, stub):
+    custody = custody_file(tmp_path)
+    before = custody.read_bytes()
+    code, out, _ = retired(stub, finished_pid(), custody, expect="0" * 64)
+    assert code == 2
+    assert custody.read_bytes() == before
