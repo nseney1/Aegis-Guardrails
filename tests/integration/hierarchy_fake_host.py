@@ -3,6 +3,10 @@
 It finds its mailbox connection the way a host does, from --mcp-config or Codex's mcp_servers
 setting, then talks to the real adapter. A plan file says what each endpoint does in its turn.
 It proves the tools and adapter work together, not that a real host behaves this way.
+
+A plan entry's `send` list publishes messages. Its `calls` list runs any tool once, with `name`
+to find the result later, `brief_from` to attach an earlier result as a hash-bound brief the way a
+read-only role must, and `when_inbox` to wait for a message of a given type and receipt state.
 """
 import json
 import os
@@ -27,7 +31,8 @@ def main():
     endpoint = arguments[arguments.index("--endpoint") + 1]
     stdin_prompt = sys.stdin.read()
     with open(os.environ["FAKE_HOST_LOG"], "a", encoding="utf-8") as log:
-        log.write(json.dumps({"endpoint": endpoint, "argv": argv, "stdin": stdin_prompt}) + "\n")
+        log.write(json.dumps({"endpoint": endpoint, "program": os.path.basename(sys.argv[0]), "cwd": os.getcwd(), "argv": argv,
+                              "stdin": stdin_prompt}) + "\n")
     plan = json.load(open(os.environ["FAKE_HOST_PLAN"], encoding="utf-8")).get(endpoint, {})
     if plan.get("exit") is not None:
         sys.exit(plan["exit"])
@@ -60,6 +65,23 @@ def main():
             stream.write(send["message_id"] + "\n")
         with open(os.environ["FAKE_HOST_LOG"] + ".published", "a", encoding="utf-8") as stream:
             stream.write(json.dumps({"endpoint": endpoint, "result": result}) + "\n")
+    results_path = os.environ["FAKE_HOST_LOG"] + "." + endpoint.replace("/", "%2F") + ".results"
+    results = json.load(open(results_path, encoding="utf-8")) if os.path.exists(results_path) else {}
+    for item in plan.get("calls", []):
+        if item["name"] in results:
+            continue
+        wanted = item.get("when_inbox")
+        if wanted and not any(row["message"]["type"] == wanted["type"]
+                              and row["message"].get("receipt", {}).get("state") == wanted.get("state")
+                              for row in inbox["messages"]):
+            continue
+        arguments = dict(item["arguments"])
+        if "brief_from" in item:
+            arguments["brief"] = {key: results[item["brief_from"]][key] for key in ("path", "sha256")}
+        number += 1
+        results[item["name"]] = tool(number, item["tool"], arguments)
+        with open(results_path, "w", encoding="utf-8") as stream:
+            json.dump(results, stream)
     adapter.stdin.close()
     adapter.wait(timeout=10)
     adapter.stdout.close()

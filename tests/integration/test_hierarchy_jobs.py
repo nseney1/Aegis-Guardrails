@@ -756,7 +756,13 @@ print(json.dumps(checks))
 
 @needs_bubblewrap
 def test_a_sandboxed_job_is_contained(shop):
-    hidden = Path(tempfile.mkdtemp(prefix="hierarchy-jobs-hidden-", dir="/var/tmp"))
+    try:
+        # Outside /tmp when possible, so only `hide` can be what conceals it. A full-suite job runs
+        # with the host read-only, and its own temporary folder is already outside /tmp.
+        hidden = Path(tempfile.mkdtemp(prefix="hierarchy-jobs-hidden-", dir="/var/tmp"))
+    except OSError:
+        hidden = shop.tmp / "hidden"
+        hidden.mkdir()
     try:
         secret = hidden / "credentials"
         secret.write_text("secret\n")

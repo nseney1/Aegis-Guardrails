@@ -654,17 +654,20 @@ def test_the_board_files_are_private_to_this_user(hall):
         assert not stat.S_IMODE(path.stat().st_mode) & 0o077
 
 
-class BoardSetup(Setup):
+def add_board_to_source(setup):
     """Adapters run from the pinned checkout, and the board's secret patterns live in aegis_core."""
+    shutil.copytree(ROOT / "aegis_core", setup.source / "aegis_core", ignore=shutil.ignore_patterns("__pycache__"))
+    subprocess.run(["git", "add", "aegis_core"], cwd=setup.source, check=True, capture_output=True, timeout=30)
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm",
+                    "add patterns"], cwd=setup.source, check=True, capture_output=True, timeout=30)
+    setup.board = setup.tmp / "shared-board"
+    subprocess.run([sys.executable, "-I", str(BOARD), "--board", str(setup.board), "init"], check=True, capture_output=True, timeout=20)
 
+
+class BoardSetup(Setup):
     def __init__(self, tmp_path):
         super().__init__(tmp_path)
-        shutil.copytree(ROOT / "aegis_core", self.source / "aegis_core", ignore=shutil.ignore_patterns("__pycache__"))
-        subprocess.run(["git", "add", "aegis_core"], cwd=self.source, check=True, capture_output=True, timeout=30)
-        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm",
-                        "add patterns"], cwd=self.source, check=True, capture_output=True, timeout=30)
-        self.board = tmp_path / "shared-board"
-        subprocess.run([sys.executable, "-I", str(BOARD), "--board", str(self.board), "init"], check=True, capture_output=True, timeout=20)
+        add_board_to_source(self)
 
 
 @pytest.fixture
