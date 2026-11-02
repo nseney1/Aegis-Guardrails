@@ -109,5 +109,25 @@ def test_assistant_lists_match_the_approved_roles_and_stay_read_only(role, expec
         assert "read-only" in definition["prompt"] and "untrusted" in definition["prompt"]
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the job runner reads /proc")
+def test_the_job_recipe_template_needs_local_values_then_passes_its_own_check(tmp_path):
+    recipes = template("job-recipes.json")
+    source = tmp_path / "recipes.json"
+
+    def check():
+        source.write_text(json.dumps(recipes), encoding="utf-8")
+        return subprocess.run([sys.executable, "-I", str(ROOT / "tools" / "hierarchy_jobs.py"), "--store", str(tmp_path / "store"),
+                               "--recipes", str(source), "check-recipes"], capture_output=True, text=True, timeout=20,
+                              env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+    assert check().returncode == 2, "the placeholder paths must not pass as real ones"
+    recipes.update(python=sys.executable, hide=[str(tmp_path)])
+    result = check()
+    assert result.returncode == 0, result.stdout
+    assert set(json.loads(result.stdout)["recipes"]) == {"targeted-tests", "full-suite", "lint", "commit-exact"}
+    assert not any(word == "push" for recipe in recipes["recipes"].values() for step in recipe.get("steps", []) for word in step)
+    assert all(recipe["sandbox"] == "bwrap" for recipe in recipes["recipes"].values())
+
+
 def test_root_has_no_assistant_list():
     assert not (TEMPLATES / "claude-agents" / "assistants-root.json").exists()
