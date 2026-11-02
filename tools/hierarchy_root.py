@@ -116,6 +116,20 @@ def _temp_beside(path, raw):
     return temp
 
 
+def probe_folder_writable(folder, what):
+    """Create and remove an O_EXCL temp in folder; refuse (exit 4) when that fails.
+
+    launch checked only the free space, then started the session and lost its record
+    (and the stop command in it) to a missing or read-only folder (P2-3).
+    """
+    try:
+        temp = _temp_beside(Path(folder) / "probe", b"")
+    except OSError as exc:
+        raise Failure(EXIT_IO, "%s folder is missing or not writable: %s (%s)" % (what, folder, exc.strerror or exc),
+                      path=str(folder)) from None
+    temp.unlink()
+
+
 def atomic_write_json(path, obj, expect_absent=True):
     """Write JSON through an O_EXCL temp, fsync and an atomic rename.
 
@@ -436,6 +450,7 @@ def cmd_launch(args):
                          "target_exists": record_out.exists()}
     if record_out.exists():
         raise Failure(EXIT_CONFLICT, "launch record already exists: %s" % record_out, path=str(record_out))
+    probe_folder_writable(record_out.parent, "launch record")
     check_free_space([record_out], args.min_free_mb)
     live = [row.get("sessionId") for row in agents_rows() if row.get("name") == spec["name"]]
     if live:
@@ -468,7 +483,19 @@ def cmd_launch(args):
         # Printed, never run: a stop may be refused and must stay a visible human or ROOT action.
         record["attach_command"] = "claude attach " + record["id"]
         record["stop_command"] = "claude stop " + record["id"]
-    written = atomic_write_json(record_out, record)
+    try:
+        written = atomic_write_json(record_out, record)
+    except (Failure, OSError) as exc:
+        # The session may already run: print the whole record, stop command included, so it
+        # is never lost with the file (P2-3).
+        running = ""
+        if record["id"] is not None:
+            record.setdefault("attach_command", "claude attach " + record["id"])
+            record.setdefault("stop_command", "claude stop " + record["id"])
+            running = "; a session may be running: see record.stop_command"
+        raise Failure(exc.code if isinstance(exc, Failure) else EXIT_IO,
+                      "launch record not written: %s%s" % (exc, running), record=record,
+                      record_out=str(record_out)) from None
     return code, {"ok": code == EXIT_OK, "verdict": verdict, "record_out": str(record_out), "written": written,
                   "record": record}
 

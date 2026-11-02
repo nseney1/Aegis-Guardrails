@@ -157,6 +157,8 @@ if argv[:1] == ["--bg"]:
     folder = pathlib.Path(cfg["projects"]) / os.getcwd().replace("/", "-")
     folder.mkdir(parents=True, exist_ok=True)
     (folder / (cfg["session"] + ".jsonl")).write_text("".join(json.dumps(r) + "\n" for r in records))
+    if cfg.get("plant"):  # another writer creates the record path while the launch is observed
+        pathlib.Path(cfg["plant"]).write_text("{}\n")
     (d / "launched").write_text("1")
     short = cfg["session"][:8]
     sys.stdout.write("backgrounded · %s · %s\n  claude agents             list sessions\n"
@@ -257,6 +259,44 @@ def test_launch_refuses_an_existing_record_path_before_launching(tmp_path, stub,
     assert code == 3
     assert not stub.launched()
     assert Path(spec["record_out"]).read_text(encoding="utf-8") == "{}\n"
+
+
+@pytest.mark.parametrize("problem", ["missing", "read_only"])
+def test_launch_refuses_an_unwritable_record_folder_before_launching(tmp_path, stub, prompt_file, problem):
+    """P2-3: the record (with its stop command) was lost after the session had started."""
+    folder = tmp_path / "records"
+    if problem == "read_only":
+        if os.geteuid() == 0:
+            pytest.skip("root ignores folder permissions")
+        folder.mkdir()
+        folder.chmod(0o500)
+    spec_path, spec = launch_spec(tmp_path, prompt_file, record_out=str(folder / "launch-record.json"))
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
+    try:
+        code, out, _ = launch(stub, spec_path)
+    finally:
+        if folder.exists():
+            folder.chmod(0o700)
+    assert code == 4, out
+    assert "record folder is missing or not writable" in out["error"]
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+    assert not folder.exists() or list(folder.iterdir()) == []
+
+
+def test_launch_prints_the_whole_record_when_its_write_fails_after_the_launch(tmp_path, stub, prompt_file):
+    spec_path, spec = launch_spec(tmp_path, prompt_file)
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True,
+                               "plant": spec["record_out"]})
+    stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
+    code, out, _ = launch(stub, spec_path)
+    assert code == 3, out
+    assert stub.launched() and Path(spec["record_out"]).read_text(encoding="utf-8") == "{}\n"
+    assert "a session may be running" in out["error"]
+    record = out["record"]
+    assert record["session"] == SESSION and record["verdict"] == "launched"
+    assert record["stop_command"] == "claude stop " + SESSION[:8]
+    assert record["attach_command"] == "claude attach " + SESSION[:8]
 
 
 def test_launch_refuses_a_name_that_is_already_live(tmp_path, stub, prompt_file):
