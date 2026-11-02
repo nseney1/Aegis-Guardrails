@@ -78,6 +78,8 @@ def workspace(tmp_path):
     ({"writer_limit": 3, "heavy_limit": 0}, "invalid heavy_limit"),
     ({"writer_limit": 0, "heavy_limit": 1}, "invalid writer_limit"),
     ({"writer_limit": 3}, "missing fields"),
+    ({"writer_limit": 3, "heavy_limit": 1, "heavy_tests_limit": 2}, "invalid heavy_tests_limit"),
+    ({"writer_limit": 3, "heavy_limit": 1, "heavy_tests_limit": 0}, "invalid heavy_tests_limit"),
 ])
 def test_init_refuses_caps_beyond_the_owner_limits(tmp_path, request_body, error):
     space = Workspace(tmp_path)
@@ -89,6 +91,30 @@ def test_init_accepts_the_owners_five_writers(tmp_path):
     space = Workspace(tmp_path)
     assert space.run("init", {"writer_limit": 5, "heavy_limit": 3})["limits"]["writer"] == 5
     assert space.run("status")["capacity"]["writer"]["limit"] == 5
+
+
+def test_init_accepts_an_explicit_heavy_tests_limit_of_one(tmp_path):
+    limits = Workspace(tmp_path).run("init", {"writer_limit": 5, "heavy_limit": 3, "heavy_tests_limit": 1})["limits"]
+    assert limits == {"writer": 5, "heavy": 3, "heavy-tests": 1}
+
+
+def test_heavy_tests_is_one_separate_slot_and_an_old_store_loads_with_it(tmp_path):
+    space = Workspace(tmp_path)
+    space.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    assert json.loads(event_files(space)[0].read_text())["data"] == {"writer_limit": 3, "heavy_limit": 3}
+    assert space.run("status")["capacity"]["heavy-tests"] == {"limit": 1, "used": 0, "free": 1, "holders": []}
+    space.register("a1")
+    cargo = [space.ask("a1", "heavy-tests", "a1/cargo-%d" % index) for index in range(2)]
+    space.ask("a1", "heavy", "a1/pytest")
+    assert space.grant("heavy-tests")["request_id"] == cargo[0]
+    assert space.run("grant-next", kind="heavy-tests", expect=3)["reason"] == "capacity_full"
+    assert space.grant("heavy")["holder"] == "a1/pytest"
+    capacity = space.run("status")["capacity"]
+    assert capacity["heavy"]["used"] == 1 and capacity["heavy-tests"]["used"] == 1
+    assert "Heavy-Tests 1/1" in space.run("report", raw=True, format="text")
+    space.release(cargo[0])
+    assert space.run("status")["capacity"]["heavy-tests"]["used"] == 0
+    assert space.grant("heavy-tests")["request_id"] == cargo[1]
 
 
 def test_three_heavy_jobs_can_run_at_the_owners_limit_and_a_fourth_waits(tmp_path):
@@ -646,7 +672,8 @@ def test_the_report_gives_one_ordered_view_including_mailbox_facts(workspace, tm
     assert [row["id"] for row in report["initiatives"]] == ["urgent", "gone", "low"]
     low, urgent, gone = report["initiatives"][2], report["initiatives"][0], report["initiatives"][1]
     assert urgent["blocked_by"] == ["pr-259"]
-    assert low["holds"] == {"writer": 1, "heavy": 0} and low["queued"] == {"writer": 0, "heavy": 1}
+    assert low["holds"] == {"writer": 1, "heavy": 0, "heavy-tests": 0}
+    assert low["queued"] == {"writer": 0, "heavy": 1, "heavy-tests": 0}
     assert low["base_moved"]["commit"] == COMMIT
     assert low["mailbox"] == {"open_job_requests": 1, "accepted_writers": 0, "unread": 2, "messages": 2}
     assert "error" in gone["mailbox"]
