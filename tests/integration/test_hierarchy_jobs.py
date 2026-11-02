@@ -366,6 +366,35 @@ def test_paths_arrive_as_separate_arguments_and_cannot_add_options(shop):
     assert "['src/app.py', 'tests/test_app.py::test_app']" in output
 
 
+def test_a_large_valid_result_settles_and_frees_its_slot(shop):
+    names = ["src/%03d-%s.py" % (number, "x" * 150) for number in range(256)]
+    for name in names:
+        (shop.checkout / name).write_text("")
+    git(shop.checkout, "add", ".")
+    git(shop.checkout, "commit", "-qm", "many long names")
+    shop.recipes["recipes"]["wide"] = {"kind": "command", "heavy": True, "sandbox": "none", "timeout_seconds": 60,
+                                       "steps": [["$python", "-c", "pass", "$paths"]] * 20}
+    shop.save_recipes()
+    shop.request_job("job-1", "wide", paths=names)
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    final = shop.receipts("job-1")[-1]
+    assert final["receipt"]["state"] == "completed"
+    assert verified_evidence(final)["result.json"].stat().st_size > 262144
+    assert shop.heavy()["used"] == 0
+
+
+def test_paths_over_their_total_budget_are_refused(shop):
+    """A message body cannot carry this many, so the packet comes as a file, which allows more bytes."""
+    names = ["src/%03d-%s.py" % (number, "y" * 300) for number in range(256)]
+    packet = shop.base / "packet.md"
+    raw = json.dumps({"schema": PACKET_SCHEMA, "recipe": "with-paths", **shop.head(), "paths": names}).encode()
+    packet.write_bytes(raw)
+    shop.publish("job-1", "job_request", "Run.", brief={"path": str(packet), "sha256": hashlib.sha256(raw).hexdigest()})
+    shop.run_open()
+    assert "too long together" in shop.receipts("job-1")[-1]["receipt"]["reason"]
+    assert not shop.sentinel.exists()
+
+
 def test_a_job_sees_only_the_fixed_environment(shop):
     shop.recipes["recipes"]["probe"] = shop.command(["$python", "-c", "import json, os; print(json.dumps(dict(os.environ)))"])
     shop.recipes["env"] = {"PYTHONPATH": "$checkout", "CUSTOM": "fixed"}

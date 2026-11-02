@@ -60,6 +60,8 @@ EMPTY_STATUS = hashlib.sha256(b"").hexdigest()
 # A result this tool decided, where no command's own exit says what happened.
 NO_VERDICT_EXIT = -1
 MAX_PATHS = 256
+# Every step can repeat the paths, so their total is bounded to keep a result well under its write limit.
+MAX_PATHS_BYTES = 65536
 # Each step leaves up to two files, and a receipt can reference 64.
 MAX_STEPS = 20
 # A claim this old with nothing readable in it was left by a runner that died while writing it.
@@ -166,6 +168,7 @@ def checked_paths(packet, recipe, checkout):
         return []
     require(isinstance(paths, list) and bool(paths), "this recipe needs paths")
     require(len(paths) <= MAX_PATHS, "too many paths")
+    require(len(json.dumps(paths)) <= MAX_PATHS_BYTES, "paths are too long together: the limit is %d bytes" % MAX_PATHS_BYTES)
     for path in paths:
         require(isinstance(path, str) and PATH_ARGUMENT.fullmatch(path) is not None, "invalid path: " + str(path))
         name, _, selector = path.partition("::")
@@ -373,7 +376,12 @@ class Job:
         self.process_path = self.folder / "process.json"
 
     def result(self):
-        return read_json(self.result_path) if self.result_path.exists() else None
+        """Read with the same limit it was written with, or a valid large result could never be settled."""
+        if not self.result_path.exists():
+            return None
+        info = os.lstat(self.result_path)
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
+        return strict_json(self.result_path.read_bytes().decode("utf-8"))
 
     def claim(self, packet_raw):
         """Exclusive, so two runners or a retry can never start the same job twice."""
