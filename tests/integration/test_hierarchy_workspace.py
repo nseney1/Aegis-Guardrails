@@ -348,20 +348,86 @@ def test_an_unavailable_checkout_counts_as_a_conflict(workspace, tmp_path):
 
 def test_an_initiatives_own_lease_is_reported_but_is_not_a_conflict(workspace, two_clones):
     first, _ = two_clones
+    workspace.run("update", {"initiative": "first", "source": "root", "lanes": ["first-lane"]})
     write_lease(first, "first-lane", ["src/**"])
     result = workspace.run("check-paths", {"initiative": "first", "paths": ["src/x.txt"]})
     assert result["conflict"] is False
     assert result["own_overlaps"][0]["lane"] == "first-lane"
+    assert result["own_overlaps"][0]["assigned_to"] == "first"
 
 
-def test_a_shared_git_directory_does_not_turn_an_own_lease_into_a_conflict(workspace, tmp_path):
+def shared_git_initiatives(workspace, tmp_path):
     first, _ = clone_pair(tmp_path)
     linked = tmp_path / "linked-worktree"
     git(first, "worktree", "add", "-q", str(linked), "-b", "lane/other")
-    workspace.register("own", checkouts=[str(first)])
-    workspace.register("peer", checkouts=[str(linked)])
+    workspace.register("own", checkouts=[str(first)], lanes=["own-lane"])
+    workspace.register("peer", checkouts=[str(linked)], lanes=["peer-lane"])
     write_lease(first, "own-lane", ["src/**"])
-    assert workspace.run("check-paths", {"initiative": "own", "paths": ["src/x.txt"]})["conflict"] is False
+    return first, linked
+
+
+def test_a_shared_git_directory_does_not_turn_an_own_lease_into_a_conflict(workspace, tmp_path):
+    shared_git_initiatives(workspace, tmp_path)
+    result = workspace.run("check-paths", {"initiative": "own", "paths": ["src/x.txt"]})
+    assert result["conflict"] is False
+    assert [row["lane"] for row in result["own_overlaps"]] == ["own-lane"]
+
+
+def test_the_other_initiative_sees_that_same_lease_as_a_conflict_with_its_owner(workspace, tmp_path):
+    shared_git_initiatives(workspace, tmp_path)
+    conflict = workspace.run("check-paths", {"initiative": "peer", "paths": ["src/x.txt"]}, expect=3)
+    assert conflict["own_overlaps"] == []
+    row = conflict["conflicts"][0]
+    assert row["lane"] == "own-lane" and row["assigned_to"] == "own"
+
+
+def test_an_unassigned_lease_in_your_own_checkout_is_a_conflict(workspace, two_clones):
+    first, _ = two_clones
+    write_lease(first, "nobodys-lane", ["src/**"])
+    conflict = workspace.run("check-paths", {"initiative": "first", "paths": ["src/x.txt"]}, expect=3)
+    assert conflict["conflicts"][0]["assigned_to"] is None
+    assert conflict["own_overlaps"] == []
+
+
+def test_your_lane_name_in_a_clone_you_do_not_use_is_a_conflict(workspace, two_clones):
+    _, second = two_clones
+    workspace.run("update", {"initiative": "first", "source": "root", "lanes": ["reused-name"]})
+    write_lease(second, "reused-name", ["src/**"])
+    conflict = workspace.run("check-paths", {"initiative": "first", "paths": ["src/x.txt"]}, expect=3)
+    assert conflict["conflicts"][0]["lane"] == "reused-name"
+    assert conflict["own_overlaps"] == []
+
+
+def test_a_lane_has_one_owner_per_repository(workspace):
+    workspace.register("first", lanes=["shared-name"])
+    refused = workspace.run("register", {"id": "second", "project": "aegis", "repository": "aegis", "priority": 5,
+                                         "target_branch": "develop", "lanes": ["shared-name"]}, expect=2)
+    assert refused["error"] == "lane already belongs to initiative first: shared-name"
+    workspace.register("second")
+    refused = workspace.run("update", {"initiative": "second", "source": "root", "lanes": ["shared-name"]}, expect=2)
+    assert refused["error"] == "lane already belongs to initiative first: shared-name"
+    workspace.register("elsewhere", project="stormheir", lanes=["shared-name"])
+    workspace.run("update", {"initiative": "first", "source": "root", "lanes": ["shared-name", "extra"]})
+    assert workspace.run("status")["initiatives"]["first"]["lanes"] == ["shared-name", "extra"]
+
+
+def test_malformed_lane_lists_are_refused(workspace):
+    workspace.register("first")
+    refused = workspace.run("update", {"initiative": "first", "source": "root", "lanes": "one-lane"}, expect=2)
+    assert "invalid lanes" in refused["error"]
+
+
+def test_visibility_through_a_shared_git_directory_is_not_ownership(workspace, tmp_path):
+    first, _ = clone_pair(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    git(first, "worktree", "add", "-q", str(linked), "-b", "lane/other")
+    workspace.register("holder", checkouts=[str(first)])
+    workspace.register("peer", checkouts=[str(linked)])
+    write_lease(first, "holder-lane", ["src/**"])
+    conflict = workspace.run("check-paths", {"initiative": "peer", "paths": ["src/x.txt"]}, expect=3)
+    assert conflict["conflict"] is True
+    assert [row["lane"] for row in conflict["conflicts"]] == ["holder-lane"]
+    assert conflict["own_overlaps"] == []
 
 
 def test_another_repository_never_conflicts(workspace, tmp_path):

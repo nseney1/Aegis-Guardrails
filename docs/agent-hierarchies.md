@@ -341,9 +341,12 @@ The other commands are `update`, `withdraw`, `release`, `status`, `mark-merge`,
 
 - **Same repository:** `check-paths` reads leases from every registered checkout, using
   the real Aegis reader and overlap rule, because leases in independent clones cannot
-  see each other. A conflict or an unreadable checkout is a refusal, and the shared
-  front door settles it using the owner's priority order. Declared `touched_paths` only
-  warn. A clear result is advice, not a lock.
+  see each other. Each initiative lists its `lanes`, because linked worktrees share
+  lease refs, so seeing a lease proves nothing about who holds it. A lease is an
+  initiative's own only if its lane is assigned there and it is visible through that
+  initiative's checkout. Any other overlapping lease, or an unreadable checkout, is a
+  refusal, and the shared front door settles it using the owner's priority order.
+  Declared `touched_paths` only warn. A clear result is advice, not a lock.
 - **Writers and heavy jobs:** `grant-next` applies the owner's priority, oldest request
   first. Accepted work is not preempted, and an unlisted initiative is refused. A
   reservation is released only with terminal evidence whose hash matches.

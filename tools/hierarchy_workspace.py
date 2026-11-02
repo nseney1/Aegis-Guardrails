@@ -73,7 +73,7 @@ def verify_evidence(value):
 
 def validate_initiative(data):
     fields(data, {"id", "project", "repository", "priority", "target_branch"},
-           {"touched_paths", "blocked_by", "checkouts", "mailbox_root", "delivery_dir", "source"})
+           {"touched_paths", "blocked_by", "checkouts", "lanes", "mailbox_root", "delivery_dir", "source"})
     if "source" in data:
         text(data["source"], "source")
     matching(data["id"], SLUG, "initiative id")
@@ -92,6 +92,8 @@ def validate_lists(data):
         strings(data["touched_paths"], "touched paths")
     if "blocked_by" in data:
         strings(data["blocked_by"], "blocked_by")
+    if "lanes" in data:
+        strings(data["lanes"], "lanes")
     if "checkouts" in data:
         strings(data["checkouts"], "checkouts")
         for checkout in data["checkouts"]:
@@ -137,19 +139,28 @@ def apply_init(ledger, data, _event):
     ledger.limits = {"writer": data["writer_limit"], "heavy": data["heavy_limit"]}
 
 
+def require_unclaimed_lanes(ledger, repository, lanes, identifier):
+    for other in ledger.initiatives.values():
+        if other["id"] != identifier and other["repository"] == repository:
+            taken = sorted(set(lanes) & set(other["lanes"]))
+            require(not taken, "lane already belongs to initiative " + other["id"] + ": " + ", ".join(taken))
+
+
 def apply_register(ledger, data, event):
     validate_initiative(data)
     require(data["id"] not in ledger.initiatives, "initiative already registered: " + data["id"])
+    require_unclaimed_lanes(ledger, data["repository"], data.get("lanes", []), data["id"])
     ledger.initiatives[data["id"]] = {
-        "touched_paths": [], "blocked_by": [], "checkouts": [], **data, "state": "active", "base_moved": None,
-        "registered_at": event["at"]}
+        "touched_paths": [], "blocked_by": [], "checkouts": [], "lanes": [], **data, "state": "active",
+        "base_moved": None, "registered_at": event["at"]}
 
 
 def apply_update(ledger, data, _event):
-    fields(data, {"initiative", "source"}, {"priority", "state", "blocked_by", "touched_paths", "checkouts"})
+    fields(data, {"initiative", "source"}, {"priority", "state", "blocked_by", "touched_paths", "checkouts", "lanes"})
     initiative = ledger.initiative(data["initiative"])
     text(data["source"], "source")
     validate_lists(data)
+    require_unclaimed_lanes(ledger, initiative["repository"], data.get("lanes", []), initiative["id"])
     if "priority" in data:
         integer(data["priority"], "priority", maximum=MAX_PRIORITY)
     if "state" in data:
@@ -302,7 +313,7 @@ def initiative_view(ledger, identifier):
                                 and r["kind"] == kind and r["state"] == state) for kind in KINDS}
               for state in ("granted", "queued")}
     return {key: initiative[key] for key in ("id", "project", "repository", "priority", "state", "target_branch",
-                                             "touched_paths", "base_moved")} | {
+                                             "touched_paths", "lanes", "base_moved")} | {
         "blocked_by": ledger.unresolved(initiative), "holds": counts["granted"], "queued": counts["queued"]}
 
 
@@ -358,10 +369,12 @@ def check_paths(ledger, identifier, paths):
     now = int(time.time())
     peers = [i for i in ledger.initiatives.values()
              if i["repository"] == initiative["repository"] and i["state"] != "done"]
-    # A linked worktree shares its leases with its main checkout, so the initiative's own leases
-    # are collected first and recognized by lane and blob wherever else they show up.
+    # Seeing a lease through a checkout proves nothing about who holds it, because linked worktrees
+    # share lease refs. A lease is this initiative's own only if its lane is assigned here and it is
+    # visible through this initiative's checkout. Everything else conflicts: unsure means conflict.
+    assigned = {lane: peer["id"] for peer in peers for lane in peer["lanes"]}
     ordered = [initiative] + [peer for peer in peers if peer["id"] != identifier]
-    own, seen, conflicts, own_overlaps, unreadable_checkouts = set(), set(), [], [], []
+    visible_here, seen, conflicts, own_overlaps, unreadable_checkouts = set(), set(), [], [], []
     checked = 0
     for peer in ordered:
         for checkout in peer["checkouts"]:
@@ -374,13 +387,14 @@ def check_paths(ledger, identifier, paths):
             for lease in found.leases:
                 key = (lease.lane, lease.oid)
                 if peer["id"] == identifier:
-                    own.add(key)
+                    visible_here.add(key)
                 if key in seen or lease.expired(now) or not match.sets_overlap(lease.paths, paths):
                     continue
                 seen.add(key)
                 row = {"lane": lease.lane, "paths": list(lease.paths), "owner": lease.owner, "initiative": peer["id"],
-                       "checkout": checkout, "expires_at": lease.expires_at}
-                (own_overlaps if key in own else conflicts).append(row)
+                       "assigned_to": assigned.get(lease.lane), "checkout": checkout, "expires_at": lease.expires_at}
+                mine = assigned.get(lease.lane) == identifier and key in visible_here
+                (own_overlaps if mine else conflicts).append(row)
             for bad in found.unreadable:
                 key = (bad.lane, bad.oid)
                 if key not in seen:
