@@ -64,6 +64,9 @@ CODEX_SHELL = ["shell_tool", "unified_exec"]
 ASSISTANT_ENV = ["env", "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2"]
 ASSISTANT_BLOCKED = "Agent(general-purpose),Agent(Explore),Agent(Plan)"
 ASSISTANT_NOTE = "enabled; using them needs the owner's go-ahead and a live probe"
+BACKGROUND_NOTE = ("runs as a background session that the owner's session list shows; append the start prompt as the last "
+                   "argument. After its turn the session stays idle until the next wake stops and resumes it. Proven "
+                   "with a stand-in host only, so check one real session first.")
 
 
 def git(cwd, *arguments):
@@ -213,11 +216,18 @@ def codex_servers(setup, endpoint, session, generation, tools, board):
     return "mcp_servers={" + servers + "}"
 
 
-def claude_argv(session_flags, connection, tools, allowed, request, assistants):
+def claude_argv(session_flags, connection, tools, allowed, request, assistants, name=None):
+    """A named session runs in the background, where the owner's session list shows it."""
     argv = list(ASSISTANT_ENV) if assistants else []
-    argv += ["claude", "--restricted", "--tools=" + ",".join(tools), "--strict-mcp-config", "--mcp-config", connection,
-             "--permission-mode", "manual", "--permission-prompts", "none", *session_flags, "--print",
-             "--output-format", "stream-json", "--verbose", "--disable-slash-commands"]
+    if name is None:
+        argv += ["claude", "--restricted", "--tools=" + ",".join(tools), "--strict-mcp-config", "--mcp-config", connection,
+                 "--permission-mode", "manual", "--permission-prompts", "none", *session_flags, "--print",
+                 "--output-format", "stream-json", "--verbose", "--disable-slash-commands"]
+    else:
+        # --permission-prompts only applies with --print. dontAsk denies anything outside --allowedTools
+        # instead of leaving the session waiting for someone to answer a prompt.
+        argv += ["claude", "--bg", "--name", name, "--restricted", "--tools=" + ",".join(tools), "--strict-mcp-config",
+                 "--mcp-config", connection, "--permission-mode", "dontAsk", *session_flags, "--disable-slash-commands"]
     if "model" in request:
         argv += ["--model", request["model"]]
     if "effort" in request:
@@ -226,7 +236,10 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants):
         argv += ["--add-dir", directory]
     if assistants:
         argv += ["--agents", assistants, "--disallowedTools", ASSISTANT_BLOCKED]
-    return argv + ["--allowedTools", ",".join(allowed)]
+    argv += ["--allowedTools", ",".join(allowed)]
+    # The variadic --allowedTools swallowed a trailing prompt on a real host. A background start takes its
+    # prompt as an argument, so the options end first.
+    return argv + (["--"] if name is not None else [])
 
 
 def role_tools(endpoint, mailbox, requested):
@@ -276,9 +289,14 @@ def check_codex_options(request, mailbox, endpoint, host):
 
 def check_role_request(request, setup):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort", "timeout_seconds", "assistants",
-                                                   "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check"})
+                                                   "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background"})
     host = request["host"]
     require(host in (CLAUDE, CODEX, NATIVE), "unsupported host: " + str(host))
+    require(type(request.get("background", False)) is bool, "invalid background")
+    if request.get("background"):
+        # Root has no profile, and a Codex lane shows in its own app only as a native thread.
+        require(host == CLAUDE and endpoint_parts(request["endpoint"])[1] != "root",
+                "background is only for claude-code roles")
     check_codex_options(request, Mailbox(setup["mailbox_root"]), request["endpoint"], host)
     for name in ("model", "effort"):
         if name in request:
@@ -362,9 +380,12 @@ def add_role(request):
         allowed = (["mcp__aegis_mailbox__" + name for name in enabled] +
                    (["mcp__aegis_board__" + name for name in BOARD_TOOL_SPECS] if board else []) +
                    [name for name in tools if name in WRITE_TOOLS])
-        wake_argv = claude_argv(["--resume", session], str(connection), names, allowed, request, catalog)
-        answer["start_argv"] = claude_argv(["--session-id", session], str(connection), names, allowed, request, catalog)
-        prompt_via = "stdin"
+        label = endpoint + "-g%d" % generation if request.get("background") else None
+        wake_argv = claude_argv(["--resume", session], str(connection), names, allowed, request, catalog, label)
+        answer["start_argv"] = claude_argv(["--session-id", session], str(connection), names, allowed, request, catalog, label)
+        prompt_via = "argv" if label else "stdin"
+        if label:
+            answer.update(start_prompt_via="argv", background=BACKGROUND_NOTE)
         if assistants:
             answer["assistants"] = ASSISTANT_NOTE
     else:
@@ -373,10 +394,12 @@ def add_role(request):
         prompt_via = "argv"
     wake_profile = base / "profiles" / (stem + ".wake.json")
     wake_profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    wake_profile.write_text(json.dumps({
-        "schema": "aegis.hierarchy-wake-profile/v1", "endpoint": endpoint, "host": host, "session": session,
-        "generation": generation, "argv": wake_argv, "cwd": str(cwd), "timeout_seconds": timeout,
-        "prompt_via": prompt_via}, indent=2) + "\n", encoding="utf-8")
+    profile = {"schema": "aegis.hierarchy-wake-profile/v1", "endpoint": endpoint, "host": host, "session": session,
+               "generation": generation, "argv": wake_argv, "cwd": str(cwd), "timeout_seconds": timeout,
+               "prompt_via": prompt_via}
+    if host == CLAUDE and request.get("background"):
+        profile.update(mode="background", control=["claude"])
+    wake_profile.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
     return {**answer, "connection": str(connection), "wake_profile": str(wake_profile), "cwd": str(cwd),
             "prompt_via": prompt_via}
 

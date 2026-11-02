@@ -138,6 +138,21 @@ The answer holds the session ID, the connection file, the wake profile and, for 
 
 - **Start a Claude role:** run `start_argv` from the role's `cwd`, with the role's template on
   stdin (`tools/hierarchy_templates/roles/<role>.md`).
+- **Show a Claude role in the owner's session list:** add `"background": true` to its `add-role`
+  request. A `--print` turn never appears there. A background role runs with `claude --bg`, named
+  `<endpoint>-g<generation>`, so `claude agents` and the owner's app list it and `claude attach`
+  opens it. Pass its template as the last argument of `start_argv`, after the closing `--`, not on
+  stdin.
+  - **Permissions:** `--permission-mode dontAsk` replaces the prompt flags that only apply with `--print`.
+  - **Each wake:** it starts a turn, follows it in `claude agents --json` until the session is no
+    longer busy, saves `claude logs` beside the wake log, then stops the session.
+  - **Safety:** an idle session is stopped before the next wake, a busy one is not woken, and a stop
+    that cannot be confirmed keeps the wake lock.
+  - **Switching:** run `add-role` again with the same `"session"` to switch a bound role in place.
+  - **Unproven:** only a stand-in host has run this, so run the first-run checks on one role first.
+- **Show a Codex role in the Codex app:** only native app-server threads (`"host": "codex"`) appear
+  there. `codex exec` lanes do not. A native thread keeps the app server's tools unless its thread
+  is created with the lane's limits.
 - **Start a Codex role:** Codex assigns its own session ID, so a session has to exist before it
   can be bound. Run `tool provision codex-start --request <file>`, run the `start_argv` it
   returns, read the session ID from the first JSON event, then call `add-role` with that
@@ -155,6 +170,10 @@ at the first one that fails.
 1. The session's reported tool catalog matches what its profile asked for, and nothing else.
 2. A published message reaches a stopped session: after `sweep`, `delivery` shows it as `read`.
 3. A stopped role is replaced on the other host, keeps its assignment and acknowledges the checkpoint.
+4. For a background Claude role:
+   - `claude agents --json` lists the session as busy while it works.
+   - The wake result shows `"stop_confirmed": true`.
+   - `delivery` shows the mail as `read`, which proves the prompt after `--` reached the session.
 
 ## The root loop
 
