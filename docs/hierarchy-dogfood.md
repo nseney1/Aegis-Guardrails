@@ -183,6 +183,7 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 | `message_thread` | A native thread has unread mail, and its app server hosts it | Send it a message with `send_message_to_thread` |
 | `no_profile` | The current binding has no wake profile | Run `add-role` for that session |
 | `meter_error` | Active time could not be measured, so it was not woken | Find out why |
+| `time_unknown` | No transcript was found for a CLI session, so its active time is unknown and it was not woken | Start it once with its start command, or check `CLAUDE_CONFIG_DIR` and `CODEX_HOME` |
 | `root_queue` | Open jobs and unread mail for root | `run-open`, then `tool mailbox --root <mailbox> inbox --endpoint <hierarchy>/root --delivery-dir <dir> --mark-read` |
 
 A full test run can leave about 2 GB in its job folder. A completed job removes that itself and

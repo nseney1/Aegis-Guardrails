@@ -41,6 +41,12 @@ class Fleet(Setup):
     def plan(self, plan):
         self.plan_path.write_text(json.dumps(plan), encoding="utf-8")
 
+    def add_role(self, endpoint, host="claude-code", *, expect=0, **changes):
+        role = super().add_role(endpoint, host, expect=expect, **changes)
+        if expect == 0:
+            started(self, host, role["session"])
+        return role
+
     def env(self):
         return {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1",
                 "FAKE_HOST_LOG": str(self.log), "FAKE_HOST_PLAN": str(self.plan_path),
@@ -62,6 +68,21 @@ class Fleet(Setup):
         return invoke(root, "publish", {"message_id": identifier, "from": sender, "to": recipient, "host": binding["host"],
                                         "session": binding["session"], "binding_generation": binding["generation"],
                                         "type": "info", "body": "UNTRUSTED-BODY", **extra})
+
+
+def started(fleet, host, session):
+    """A real session has a transcript from its first turn, which is how the meter finds its active time."""
+    if host == "claude-code":
+        folder = fleet.claude_home / "projects" / "-pilot"
+        name = session + ".jsonl"
+    elif host == "codex-cli":
+        folder = fleet.tmp / "codex-home" / "sessions" / "2026"
+        name = "rollout-2026-" + session + ".jsonl"
+    else:
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    if not (folder / name).exists():
+        (folder / name).write_text("")
 
 
 @pytest.fixture
@@ -204,6 +225,18 @@ def test_a_native_thread_past_its_limit_needs_rotation_instead(fleet):
 
 
 @posix_only
+def test_a_cli_session_with_no_transcript_is_not_woken(fleet):
+    """Its active time is unknown, so a wake could carry it past its limit."""
+    session = fleet.orchestrator["session"]
+    (fleet.claude_home / "projects" / "-pilot" / (session + ".jsonl")).unlink()
+    fleet.send("pilot/front-door", "pilot/orchestrator", "hello")
+    result = fleet.sweep(expect=3)
+    assert result["rows"] == [{"initiative": "pilot", "endpoint": "pilot/orchestrator", "state": "time_unknown", "session": session,
+                               "unread_count": 1}]
+    assert fleet.launches() == []
+
+
+@posix_only
 def test_a_session_whose_active_time_cannot_be_measured_is_not_woken(fleet):
     session = str(uuid.uuid4())
     invoke(fleet.root, "bind", {"endpoint": "pilot/lane/review", "host": "other-host", "session": session,
@@ -299,8 +332,9 @@ def second_initiative(fleet, identifier="second", priority=1, project="stormheir
                                     initiative={**INITIATIVE, "id": identifier, "priority": priority, "project": project,
                                                 "repository": project}))
     for role in ("front-door", "orchestrator"):
-        provision("add-role", fleet.request(base=str(base), endpoint=identifier + "/" + role, host="claude-code",
-                                            cwd=str(fleet.tmp)))
+        made = provision("add-role", fleet.request(base=str(base), endpoint=identifier + "/" + role, host="claude-code",
+                                                   cwd=str(fleet.tmp)))
+        started(fleet, "claude-code", made["session"])
     return base / "mailbox"
 
 

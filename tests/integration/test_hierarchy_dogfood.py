@@ -15,7 +15,7 @@ from tests.integration.test_hierarchy_board import add_board_to_source
 from tests.integration.test_hierarchy_jobs import bubblewrap_works
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, mailbox_snapshot
 from tests.integration.test_hierarchy_provision import INITIATIVE, provision
-from tests.integration.test_hierarchy_sweep import Fleet
+from tests.integration.test_hierarchy_sweep import Fleet, started
 from tests.integration.test_hierarchy_workspace import write_lease
 
 
@@ -217,7 +217,8 @@ def second_initiative(trial, identifier="second", repository="aegis", priority=1
                                                 "priority": priority, "checkouts": [str(checkout)]}))
     for role, host, extra in (("front-door", "claude-code", {"cwd": str(trial.tmp)}), ("orchestrator", "claude-code", {"cwd": str(trial.tmp)}),
                               ("root", "codex-cli", {"session": "root-session"})):
-        provision("add-role", trial.request(base=str(base), endpoint=identifier + "/" + role, host=host, **extra))
+        made = provision("add-role", trial.request(base=str(base), endpoint=identifier + "/" + role, host=host, **extra))
+        started(trial, host, made["session"])
     return base, checkout
 
 

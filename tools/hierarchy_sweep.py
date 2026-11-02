@@ -6,7 +6,7 @@ bottleneck. Root runs this at task boundaries. It goes through active initiative
 priority order, wakes each endpoint that has unread mail and a current profile, and can repeat so a
 conversation continues without anyone starting each turn.
 
-It stops rather than guesses. A session past 60 active minutes needs rotation, so it is not woken. A
+It stops rather than guesses. A session past 60 active minutes, or one with no transcript to measure, is not woken. A
 session that ignored its mail is not retried in the same sweep. Root's own queue and its time against
 its 90 minutes are only reported, because jobs go through `tools/hierarchy_jobs.py` and only root can
 rotate itself. This runs nothing on its own schedule, and a read here means what `delivery` says it
@@ -62,6 +62,9 @@ def wake_endpoint(initiative, name, summary, dry_run):
     path = profile_for(initiative["mailbox_root"], name, binding)
     if path is None:
         return {**row, "state": "no_profile", "unread_count": summary["unread_count"]}
+    if meter["state"] == "no_transcript":
+        # Without a transcript its active time is unknown, so a wake could carry it past its limit.
+        return {**row, "state": "time_unknown", "session": binding["session"], "unread_count": summary["unread_count"]}
     if dry_run:
         return {**row, "state": "would_wake", "unread": summary["unread"]}
     try:
