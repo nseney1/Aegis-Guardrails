@@ -823,6 +823,129 @@ def test_a_runner_that_dies_leaves_a_clear_unknown_and_keeps_the_slot_until_root
     assert shop.run_open()["rows"] == []
 
 
+def wait_until(check, seconds, message):
+    deadline = time.monotonic() + seconds
+    while not check():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.02)
+
+
+def two_step_job(shop, first, second, marker):
+    shop.recipes["recipes"]["two"] = {"kind": "command", "heavy": True, "sandbox": "none", "timeout_seconds": 50,
+                                      "steps": [["$python", "-c", first], ["$python", "-c", second, marker]]}
+    shop.save_recipes()
+    shop.request_job("job-1", "two")
+
+
+def after_own_record(folder, action):
+    # The first step plants its obstacle only once the runner recorded the first step's own group, so the obstacle
+    # meets the second step's launch and not the first step's record.
+    return ("import json, os, time\nfor _ in range(1000):\n    try:\n"
+            "        if json.load(open(%r)).get('group') == os.getpgrp():\n            break\n"
+            "    except (OSError, ValueError):\n        pass\n    time.sleep(0.01)\n%s\n" % (str(folder / "process.json"), action))
+
+
+def start_runner(shop, **options):
+    return subprocess.Popen(shop.argv("run-open", census=[]), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=shop.env(), start_new_session=True, **options)
+
+
+def stop_runner(runner):
+    if runner.returncode is None:
+        try:
+            os.killpg(runner.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        runner.communicate(timeout=10)
+
+
+def release_count(shop):
+    return sum(1 for event in shop.events() if event["kind"] == "release")
+
+
+def assert_held_until_root_confirms(shop, marker):
+    """The later step's own group was never recorded, so neither its runner's loss nor the earlier step's dead
+    group may free the slot or send a final receipt. Only root's explicit confirmation does, exactly once."""
+    assert processes_with(marker), "the later step outlives its runner"
+    assert shop.run_open(expect=3)["rows"][0]["state"] == "abandoned"
+    assert shop.heavy()["used"] == 1 and shop.states("job-1") == ["started", "unknown"]
+    refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", expect=2)
+    assert "--process-stopped" in refused["error"]
+    for pid in processes_with(marker):
+        os.kill(pid, signal.SIGKILL)
+    wait_until(lambda: not processes_with(marker), 5, "the later step did not stop")
+    refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", expect=2)
+    assert "--process-stopped" in refused["error"], "a dead earlier group proves nothing about the later step"
+    assert shop.heavy()["used"] == 1 and shop.states("job-1") == ["started", "unknown"] and release_count(shop) == 0
+    resolved = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", "--process-stopped")
+    assert resolved["state"] == "failed"
+    assert shop.heavy()["used"] == 0 and shop.states("job-1") == ["started", "unknown", "failed"]
+    assert release_count(shop) == 1
+    assert shop.run_open()["rows"] == [] and release_count(shop) == 1
+    again = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "Again.", "--process-stopped", expect=2)
+    assert "already finished" in again["error"] and release_count(shop) == 1
+
+
+def test_a_runner_lost_between_a_later_launch_and_its_record_keeps_the_slot_until_root_confirms(shop):
+    marker = "marker-" + uuid.uuid4().hex
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    # A pipe nobody reads, where the second step's record is written, holds the runner just after that launch.
+    two_step_job(shop, after_own_record(folder, "os.mkfifo(%r)" % str(folder / "process.pending")),
+                 "import time; time.sleep(60)", marker)
+    runner = start_runner(shop)
+    try:
+        wait_until(lambda: processes_with(marker), 10, "the second step never started")
+        stop_runner(runner)
+        assert_held_until_root_confirms(shop, marker)
+    finally:
+        stop_runner(runner)
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_later_step_whose_record_fails_and_whose_stop_is_lost_keeps_the_slot_until_root_confirms(shop):
+    marker = "marker-" + uuid.uuid4().hex
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    two_step_job(shop, after_own_record(folder, "os.mkdir(%r)" % str(folder / "process.pending")),
+                 "import time; time.sleep(60)", marker)
+    # An ignored SIGTERM is inherited, so the second step outlasts the polite part of its stop, and the runner is
+    # lost inside that 5 s grace, before the stop was confirmed.
+    runner = start_runner(shop, preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN))
+    try:
+        wait_until(lambda: processes_with(marker), 10, "the second step never started")
+        time.sleep(1)
+        stop_runner(runner)
+        assert_held_until_root_confirms(shop, marker)
+    finally:
+        stop_runner(runner)
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_step_whose_launch_cannot_be_recorded_first_never_starts(shop, tmp_path):
+    marker = "marker-" + uuid.uuid4().hex
+    proof = tmp_path / "second-step-ran"
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    two_step_job(shop, after_own_record(folder, "os.mkdir(%r)" % str(folder / "process.intent")),
+                 "open(%r, 'w').close()" % str(proof), marker)
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and "could not run" in row["reason"]
+    assert not proof.exists(), "a step must not start before its launch is on record"
+    assert shop.heavy()["used"] == 0 and release_count(shop) == 1
+
+
+def test_a_later_step_that_cannot_launch_is_an_ordinary_failure(shop, tmp_path):
+    missing = str(tmp_path / ("no-such-program-" + uuid.uuid4().hex))
+    shop.recipes["recipes"]["two"] = {"kind": "command", "heavy": True, "sandbox": "none", "timeout_seconds": 30,
+                                      "steps": [["$python", "-c", "print('first')"], [missing]]}
+    shop.save_recipes()
+    shop.request_job("job-1", "two")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and "could not run" in row["reason"]
+    assert shop.states("job-1") == ["started", "failed"]
+    assert shop.heavy()["used"] == 0 and release_count(shop) == 1
+
+
 def test_resolve_refuses_a_job_with_no_claim_or_one_already_finished(shop):
     assert "no running job" in shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "x", expect=2)["error"]
     shop.request_job("job-1", "ok")
