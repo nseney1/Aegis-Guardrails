@@ -161,7 +161,7 @@ receives nothing until something starts a turn for it, so report three states:
 | State | Meaning | Evidence |
 | --- | --- | --- |
 | Published | The file exists | The mailbox message |
-| Woken | A turn was started | A wake receipt |
+| Woken | A host process was started for a turn | A wake receipt, written once the process exists |
 | Read | The session's adapter returned the message | A read receipt |
 
 Start each role's adapter with `--delivery-dir /absolute/delivery` to record read
@@ -188,6 +188,9 @@ or the Claude session table lists it as live, stops the turn's whole process gro
 before reporting, and exits 0 only if the messages were read, 3 if they were not, and
 2 if it refused. Use `--dry-run` to see what would happen. It supports POSIX only.
 
+Hosts offer no handshake, so a wake receipt proves a process existed, not that the host
+ran a turn; check `last_wake` for its exit code. If the process cannot be created, the
+message is not counted as woken. If its start cannot be recorded, the process is stopped.
 A read receipt shows the adapter returned the message to the connection configured for
 that binding. It does not prove the session understood or acted on it, and a session
 that reads the mailbox files directly leaves no receipt.

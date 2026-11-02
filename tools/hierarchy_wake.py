@@ -129,27 +129,35 @@ def stop_group(process):
     process.wait(timeout=STOP_GRACE_SECONDS)
 
 
-def run_turn(profile, log_directory, wake_id):
+def start_turn(profile, log_directory, wake_id):
+    """Create the turn's process. Hosts offer no handshake, so this proves a process exists, not that a turn ran."""
     log_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     logs = {name: safe_path(log_directory / (wake_id + "." + name)) for name in ("stdout", "stderr")}
     via_stdin = profile["prompt_via"] == "stdin"
     argv = profile["argv"] + ([] if via_stdin else [PROMPT])
-    outcome = {"log": {name: str(path) for name, path in logs.items()}, "exit_code": None, "timed_out": False}
     with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr:
-        try:
-            process = subprocess.Popen(argv, cwd=profile["cwd"], stdout=stdout, stderr=stderr,
-                                       stdin=subprocess.PIPE if via_stdin else subprocess.DEVNULL,
-                                       start_new_session=True)
-        except OSError as exc:
-            return {**outcome, "error": str(exc)}
-        try:
-            process.communicate(input=PROMPT.encode("utf-8") if via_stdin else None,
-                                timeout=profile["timeout_seconds"])
-        except subprocess.TimeoutExpired:
-            outcome["timed_out"] = True
-        stop_group(process)
-    outcome["exit_code"] = process.returncode
-    return outcome
+        process = subprocess.Popen(argv, cwd=profile["cwd"], stdout=stdout, stderr=stderr,
+                                   stdin=subprocess.PIPE if via_stdin else subprocess.DEVNULL,
+                                   start_new_session=True)
+    return process, {name: str(path) for name, path in logs.items()}
+
+
+def finish_turn(process, profile):
+    timed_out = False
+    try:
+        process.communicate(input=PROMPT.encode("utf-8") if profile["prompt_via"] == "stdin" else None,
+                            timeout=profile["timeout_seconds"])
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    stop_group(process)
+    return process.returncode, timed_out
+
+
+def abandon_turn(process):
+    """Stop a process whose start could not be recorded, so nothing runs without a record."""
+    if process.stdin is not None:
+        process.stdin.close()
+    stop_group(process)
 
 
 def wake(root, directory, endpoint, profile_path, dry_run=False):
@@ -174,27 +182,43 @@ def wake(root, directory, endpoint, profile_path, dry_run=False):
             "generation": profile["generation"], "message_ids": identifiers}
     wake_id = "wake-" + uuid.uuid4().hex
     delivery_root = mailbox.delivery_directory(directory)
-    with wake_lock(delivery_root / "wakes" / endpoint):
-        mailbox.write_delivery_receipt(directory, "wakes", {**base, "wake_id": wake_id, "state": "started"})
-        outcome = run_turn(profile, delivery_root / "wake-logs" / endpoint, wake_id)
-        started = outcome["exit_code"] is not None
-        finished = "failed_to_start" if not started else "timed_out" if outcome["timed_out"] else "exited"
+    answer.update(wake_id=wake_id, message_ids=identifiers, liveness="no_running_session_found")
+
+    def failed_start(reason, record=True):
+        if record:
+            try:
+                mailbox.write_delivery_receipt(directory, "wakes", {
+                    **base, "wake_id": wake_id, "state": "failed_to_start", "exit_code": None, "timed_out": False})
+            except (ValueError, OSError):
+                pass  # Nothing was woken either way, and the result below says why.
+        return 3, {**answer, "state": "failed_to_start", "error": reason, "exit_code": None, "timed_out": False,
+                   "read": [], "still_unread": identifiers}
+
+    with wake_lock(delivery_root / "wake-locks" / endpoint):
+        try:
+            process, log = start_turn(profile, delivery_root / "wake-logs" / endpoint, wake_id)
+        except OSError as exc:
+            return failed_start(str(exc))
+        try:
+            # Recorded only once a process exists, because launch intent is not launch evidence.
+            mailbox.write_delivery_receipt(directory, "wakes", {**base, "wake_id": wake_id, "state": "started"})
+        except (ValueError, OSError) as exc:
+            abandon_turn(process)
+            return failed_start("could not record the start: " + str(exc), record=False)
+        exit_code, timed_out = finish_turn(process, profile)
         mailbox.write_delivery_receipt(directory, "wakes", {
-            **base, "wake_id": wake_id, "state": finished,
-            "exit_code": outcome["exit_code"], "timed_out": outcome["timed_out"]})
+            **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited",
+            "exit_code": exit_code, "timed_out": timed_out})
     fresh = Mailbox(root)
     rows, _ = fresh.endpoint_delivery(directory, endpoint, fresh.messages())
     read = [identifier for identifier in identifiers if rows[identifier]["state"] == "read"]
     unread = [identifier for identifier in identifiers if rows[identifier]["state"] != "read"]
-    if not started:
-        state = "failed_to_start"
-    elif not unread:
+    if not unread:
         state = "read"
     else:
-        state = "timed_out" if outcome["timed_out"] else "woken_unread"
-    result = {**answer, **outcome, "state": state, "wake_id": wake_id, "message_ids": identifiers,
-              "read": read, "still_unread": unread, "liveness": "no_running_session_found"}
-    return (0 if not unread else 3), result
+        state = "timed_out" if timed_out else "woken_unread"
+    return (0 if not unread else 3), {**answer, "log": log, "exit_code": exit_code, "timed_out": timed_out,
+                                      "state": state, "read": read, "still_unread": unread}
 
 
 def main(argv=None):

@@ -325,6 +325,49 @@ def test_a_missing_host_binary_never_counts_as_woken(pilot):
     assert pilot.summary()["last_wake"]["state"] == "failed_to_start"
 
 
+@posix_only
+def test_an_unusable_log_location_never_counts_as_woken(pilot):
+    pilot.publish()
+    pilot.delivery.mkdir()
+    (pilot.delivery / "wake-logs").write_text("a file where the log directory belongs")
+    code, result = pilot.wake(pilot.profile())
+    assert not pilot.record.exists()
+    state = pilot.state()
+    assert state["state"] == "published" and state["woken_at"] is None
+    assert pilot.summary()["woken_unread"] == []
+    assert code == 3 and result["state"] == "failed_to_start" and result["exit_code"] is None
+    assert result["error"]
+    assert pilot.summary()["last_wake"]["state"] == "failed_to_start"
+
+
+def session_process_exists(session, deadline=2.0):
+    stop = time.monotonic() + deadline
+    while time.monotonic() < stop:
+        listing = subprocess.run(["ps", "-ax", "-ww", "-o", "stat=,args="], capture_output=True, text=True).stdout
+        if not any(session in line.split() and not line.lstrip().startswith("Z") for line in listing.splitlines()):
+            return False
+        time.sleep(0.05)
+    return True
+
+
+@posix_only
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the directory permission")
+def test_a_process_whose_start_cannot_be_recorded_is_stopped_and_not_counted(pilot):
+    pilot.publish()
+    folder = pilot.delivery / "wakes" / TARGET
+    folder.mkdir(parents=True)
+    folder.chmod(0o555)
+    try:
+        code, result = pilot.wake(pilot.profile(mode="sleeper"), timeout=20)
+    finally:
+        folder.chmod(0o755)
+    assert code == 3 and result["state"] == "failed_to_start"
+    assert "could not record the start" in result["error"]
+    assert not session_process_exists(pilot.session)
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["last_wake"] is None
+
+
 def process_gone(pid, deadline=2.0):
     stop = time.monotonic() + deadline
     while time.monotonic() < stop:
@@ -408,7 +451,7 @@ def test_claude_session_table_blocks_only_a_live_session(tmp_path, alive, expect
 @posix_only
 def test_a_wake_in_progress_is_not_doubled_and_its_lock_is_left_for_inspection(pilot):
     pilot.publish()
-    folder = pilot.delivery / "wakes" / TARGET
+    folder = pilot.delivery / "wake-locks" / TARGET
     folder.mkdir(parents=True)
     lock = folder / ".wake.lock"
     lock.write_text("fixture active wake")

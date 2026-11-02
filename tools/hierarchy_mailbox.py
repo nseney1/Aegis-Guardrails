@@ -43,7 +43,8 @@ MAX_DIRTY_ENTRIES = 100000000
 GIT_STATUS_TIMEOUT_SECONDS = 60
 MAX_RECENT_ACKNOWLEDGMENTS = 20
 DELIVERY_MEANING = ("read means the adapter returned the message to the connection configured for this binding; "
-                    "it does not prove the session understood or acted on it. woken means a turn was started.")
+                    "it does not prove the session understood or acted on it. woken means a host process was started "
+                    "for a turn; hosts offer no handshake, so it does not prove the turn ran.")
 
 
 def require(condition, message):
