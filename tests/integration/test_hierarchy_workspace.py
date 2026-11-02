@@ -73,16 +73,48 @@ def workspace(tmp_path):
 
 
 @pytest.mark.parametrize("request_body,error", [
-    ({"writer_limit": 4, "heavy_limit": 1}, "invalid writer_limit"),
+    ({"writer_limit": 6, "heavy_limit": 1}, "invalid writer_limit"),
     ({"writer_limit": 3, "heavy_limit": 4}, "invalid heavy_limit"),
     ({"writer_limit": 3, "heavy_limit": 0}, "invalid heavy_limit"),
     ({"writer_limit": 0, "heavy_limit": 1}, "invalid writer_limit"),
     ({"writer_limit": 3}, "missing fields"),
+    ({"writer_limit": 3, "heavy_limit": 1, "heavy_tests_limit": 2}, "invalid heavy_tests_limit"),
+    ({"writer_limit": 3, "heavy_limit": 1, "heavy_tests_limit": 0}, "invalid heavy_tests_limit"),
 ])
 def test_init_refuses_caps_beyond_the_owner_limits(tmp_path, request_body, error):
     space = Workspace(tmp_path)
     assert error in space.run("init", request_body, expect=2)["error"]
     assert not (space.store / "events").exists() or not list((space.store / "events").iterdir())
+
+
+def test_init_accepts_the_owners_five_writers(tmp_path):
+    space = Workspace(tmp_path)
+    assert space.run("init", {"writer_limit": 5, "heavy_limit": 3})["limits"]["writer"] == 5
+    assert space.run("status")["capacity"]["writer"]["limit"] == 5
+
+
+def test_init_accepts_an_explicit_heavy_tests_limit_of_one(tmp_path):
+    limits = Workspace(tmp_path).run("init", {"writer_limit": 5, "heavy_limit": 3, "heavy_tests_limit": 1})["limits"]
+    assert limits == {"writer": 5, "heavy": 3, "heavy-tests": 1}
+
+
+def test_heavy_tests_is_one_separate_slot_and_an_old_store_loads_with_it(tmp_path):
+    space = Workspace(tmp_path)
+    space.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    assert json.loads(event_files(space)[0].read_text())["data"] == {"writer_limit": 3, "heavy_limit": 3}
+    assert space.run("status")["capacity"]["heavy-tests"] == {"limit": 1, "used": 0, "free": 1, "holders": []}
+    space.register("a1")
+    cargo = [space.ask("a1", "heavy-tests", "a1/cargo-%d" % index) for index in range(2)]
+    space.ask("a1", "heavy", "a1/pytest")
+    assert space.grant("heavy-tests")["request_id"] == cargo[0]
+    assert space.run("grant-next", kind="heavy-tests", expect=3)["reason"] == "capacity_full"
+    assert space.grant("heavy")["holder"] == "a1/pytest"
+    capacity = space.run("status")["capacity"]
+    assert capacity["heavy"]["used"] == 1 and capacity["heavy-tests"]["used"] == 1
+    assert "Heavy-Tests 1/1" in space.run("report", raw=True, format="text")
+    space.release(cargo[0])
+    assert space.run("status")["capacity"]["heavy-tests"]["used"] == 0
+    assert space.grant("heavy-tests")["request_id"] == cargo[1]
 
 
 def test_three_heavy_jobs_can_run_at_the_owners_limit_and_a_fourth_waits(tmp_path):
@@ -553,6 +585,18 @@ def test_a_damaged_store_fails_loudly_for_reads_and_writes(workspace, damage, er
         assert error in workspace.run(command, request, expect=2, **flags)["error"]
 
 
+@pytest.mark.parametrize("name", ["00000002.json", ".pending-00000002.json"])
+def test_a_symlinked_store_entry_fails_loudly(workspace, tmp_path, name):
+    workspace.register("a1")
+    target = event_files(workspace)[1]
+    copy = tmp_path / "elsewhere.json"
+    copy.write_bytes(target.read_bytes())
+    if not name.startswith(".pending-"):
+        target.unlink()
+    (workspace.store / "events" / name).symlink_to(copy)
+    assert "symlink paths are not supported" in workspace.run("status", expect=2)["error"]
+
+
 def test_a_hand_edited_grant_beyond_the_cap_is_detected(workspace):
     workspace.register("a1")
     for index in range(4):
@@ -603,6 +647,60 @@ def test_the_last_free_event_is_still_accepted(workspace):
     assert status["seq"] == 10000 and status["initiatives"]["a1"]["priority"] == 1
 
 
+LIMITS_SOURCE = "owner-writers-5 requests/root-c6-owner-decisions-20261102.json"
+
+
+def test_set_limits_raises_writers_to_five_and_a_reload_keeps_them(tmp_path):
+    space = Workspace(tmp_path)
+    space.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    space.register("a1")
+    for index in range(6):
+        space.ask("a1", holder="a1/lane-%d" % index)
+    answer = space.run("set-limits", {"source": LIMITS_SOURCE, "writer_limit": 5})
+    assert answer["limits"] == {"writer": 5, "heavy": 3, "heavy-tests": 1}
+    assert answer["capacity"]["writer"]["limit"] == 5 and answer["capacity"]["writer"]["free"] == 5
+    held = [space.grant()["request_id"] for _ in range(5)]
+    assert space.run("grant-next", kind="writer", expect=3)["reason"] == "capacity_full"
+    refused = space.run("set-limits", {"source": "owner", "writer_limit": 4}, expect=2)
+    assert refused["error"] == "writer_limit 4 is below the 5 granted writer requests"
+    space.release(held[0])
+    space.run("set-limits", {"source": "owner", "writer_limit": 4, "heavy_limit": 2})
+    capacity = space.run("status")["capacity"]
+    assert (capacity["writer"]["limit"], capacity["writer"]["used"], capacity["heavy"]["limit"]) == (4, 4, 2)
+    assert json.loads(event_files(space)[-1].read_text())["kind"] == "set_limits"
+
+
+@pytest.mark.parametrize("body,error", [
+    ({"source": LIMITS_SOURCE, "writer_limit": 1}, "writer_limit 1 is below the 2 granted writer requests"),
+    ({"source": LIMITS_SOURCE, "writer_limit": 6}, "invalid writer_limit"),
+    ({"source": LIMITS_SOURCE, "writer_limit": 0}, "invalid writer_limit"),
+    ({"source": LIMITS_SOURCE, "heavy_limit": 4}, "invalid heavy_limit"),
+    ({"source": LIMITS_SOURCE, "heavy_tests_limit": 2}, "invalid heavy_tests_limit"),
+    ({"source": LIMITS_SOURCE, "writer_limit": 4, "gpu_limit": 1}, "unexpected fields: gpu_limit"),
+    ({"writer_limit": 4}, "missing fields: source"),
+    ({"source": "", "writer_limit": 4}, "invalid source"),
+    ({"source": LIMITS_SOURCE}, "set-limits needs at least one limit"),
+])
+def test_set_limits_refuses_a_bad_change_and_writes_nothing(workspace, body, error):
+    workspace.register("a1")
+    for index in range(2):
+        workspace.ask("a1", holder="a1/lane-%d" % index)
+        workspace.grant()
+    before = event_files(workspace)
+    assert workspace.run("set-limits", body, expect=2)["error"] == error
+    assert event_files(workspace) == before
+    assert workspace.run("status")["capacity"]["writer"]["limit"] == 3
+
+
+def test_a_full_store_refuses_set_limits_and_stays_readable(workspace):
+    workspace.register("a1")
+    fill_store_to_the_limit(workspace, "a1")
+    refused = workspace.run("set-limits", {"source": LIMITS_SOURCE, "writer_limit": 5}, expect=2)
+    assert refused["error"] == "workspace event history limit reached"
+    status = workspace.run("status")
+    assert status["seq"] == 10000 and status["capacity"]["writer"]["limit"] == 3
+
+
 def test_a_busy_store_refuses_writes_but_still_answers_reads(workspace):
     workspace.register("a1")
     (workspace.store / ".write.lock").write_text("fixture active writer")
@@ -640,7 +738,8 @@ def test_the_report_gives_one_ordered_view_including_mailbox_facts(workspace, tm
     assert [row["id"] for row in report["initiatives"]] == ["urgent", "gone", "low"]
     low, urgent, gone = report["initiatives"][2], report["initiatives"][0], report["initiatives"][1]
     assert urgent["blocked_by"] == ["pr-259"]
-    assert low["holds"] == {"writer": 1, "heavy": 0} and low["queued"] == {"writer": 0, "heavy": 1}
+    assert low["holds"] == {"writer": 1, "heavy": 0, "heavy-tests": 0}
+    assert low["queued"] == {"writer": 0, "heavy": 1, "heavy-tests": 0}
     assert low["base_moved"]["commit"] == COMMIT
     assert low["mailbox"] == {"open_job_requests": 1, "accepted_writers": 0, "unread": 2, "messages": 2}
     assert "error" in gone["mailbox"]

@@ -494,6 +494,16 @@ def test_malformed_manifest_does_not_create_partial_mailbox(tmp_path):
     assert not root.exists()
 
 
+def test_a_manifest_may_allow_the_owners_five_writers_but_not_six(tmp_path):
+    manifest = json.loads((ROOT / "tools/hierarchy_templates/manifest.json").read_text())
+    manifest["writer_limit"] = 5
+    invoke(tmp_path / "five", "init", manifest)
+    assert json.loads((tmp_path / "five" / "manifest.json").read_text())["writer_limit"] == 5
+    manifest["writer_limit"] = 6
+    assert invoke(tmp_path / "six", "init", manifest, ok=False)["error"] == "invalid writer_limit"
+    assert not (tmp_path / "six").exists()
+
+
 def test_unicode_checkpoint_expansion_cannot_publish_an_unreadable_binding(pilot, tmp_path):
     root, brief = pilot
     checkpoint = {"outgoing_stopped": True, "briefs": [brief], "sources": [], "lease_refs": [],
