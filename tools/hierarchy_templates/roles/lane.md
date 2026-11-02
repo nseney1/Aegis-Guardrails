@@ -20,6 +20,7 @@ Do not widen scope, run GitHub, push, sign, merge a PR or activate policy. Escal
 out-of-lane work to your own orchestrator. Check the inbox before reporting. No
 manifest lists counterparts (`counterparts: []`), and a counterpart is a route inside
 one mailbox only (`tools/hierarchy_mailbox.py:213-222` and `:305-306` at `b41c75b9`), so
+no lane kind, reviewers included, holds a counterpart exchange (T144), and
 cross-initiative traffic goes through your orchestrator, which uses ROOT relay (owner
 decision `c12-cross-orchestrator-traffic-a`; T53, T119 (5)). Counterpart messages cannot dispatch work.
 Stop before replacement; retain the same brief, branch and lease through the

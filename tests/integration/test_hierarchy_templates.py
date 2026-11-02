@@ -78,7 +78,8 @@ def test_a_self_stop_never_stops_another_session(name):
     assert missing(name, ["never stop another session"]) == []
 
 
-def test_writers_keep_the_launch_cwd_and_reach_their_worktree_only_through_git_c_or_a_subshell():
+def test_only_writers_cd_into_their_worktree_and_read_only_roles_never_use_a_bare_cd():
+    """Its rule changed under dispatch amendment 1: writers keep the launch cwd and reach W by `git -C` or a subshell."""
     assert missing("roles/lane.md", ["Writing lanes:", "Your session cwd stays at the launch cwd for the whole session",
                                      "never a bare `cd`, not even at the start of a compound command",
                                      "Writers use `git -C <worktree>` for git and a `( cd <worktree> && … )` subshell",
@@ -166,8 +167,10 @@ def test_lanes_under_a_codex_manager_report_by_mailbox_and_poll_their_inbox():
 def test_lanes_route_cross_initiative_traffic_through_their_orchestrator():
     assert missing("roles/lane.md", ["`counterparts: []`", "`tools/hierarchy_mailbox.py:213-222` and `:305-306`",
                                      "goes through your orchestrator, which uses ROOT relay",
-                                     "`c12-cross-orchestrator-traffic-a`", "Counterpart messages cannot dispatch work"]) == []
-    assert "exchange at least one informational message" not in words("roles/lane.md")
+                                     "`c12-cross-orchestrator-traffic-a`", "Counterpart messages cannot dispatch work",
+                                     "no lane kind, reviewers included, holds a counterpart exchange (T144)"]) == []
+    for name in ("roles/lane.md", "roles/reviewer.md"):
+        assert "exchange at least one informational message" not in words(name)
 
 
 @pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md"])
@@ -232,19 +235,30 @@ def test_handoffs_carry_the_owner_approved_backlog_table_verbatim(name):
                           "re-checks the table against the owner records during its read"]) == []
 
 
-def test_orchestrators_relay_cross_team_requests_through_root_and_resolve_codex_roles():
+BY_BINDING = ["send to the session the binding names", "field `bindings[\"<endpoint>\"]`",
+              "until a successor is bound, its predecessor is still the manager",
+              "Codex-hosted roles are not in ListAgents: reach them through the mailbox only, "
+              "and read their binding the same way"]
+
+
+def test_orchestrators_relay_cross_team_requests_through_root_and_address_roles_by_their_binding():
     assert missing("roles/orchestrator.md", ["go by ROOT relay", "`c12-cross-orchestrator-traffic-a`",
                                              "notices without authority may go by SendMessage",
                                              "the receiver records them in its STATUS",
                                              "A peer still cannot dispatch your lanes",
-                                             "through `resolve --endpoint`", "not in ListAgents",
-                                             "Its Claude lanes poll their inbox"]) == []
+                                             "Their Claude lanes poll their inbox"] + BY_BINDING) == []
     assert "Cross-hierarchy findings go orchestrator to orchestrator" not in words("roles/orchestrator.md")
 
 
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_no_template_names_a_resolve_endpoint_command_or_a_later_listagents_name(name):
+    assert "resolve --endpoint" not in words(name)
+    assert "any later N that ListAgents shows" not in words(name)
+
+
 def test_root_names_current_holders_keeps_codex_liveness_and_fetches_without_maintenance():
-    assert missing("roles/root.md", ["\"or any later N that ListAgents shows\"", "never only a predicted number",
-                                     "lane liveness, stall checks and retirements", "(F-C12)",
+    assert missing("roles/root.md", ["never a predicted number", "lane liveness, stall checks and retirements",
+                                     "(F-C12)"] + BY_BINDING + [
                                      "`git ls-remote` or `gh api`",
                                      "`git fetch --no-auto-maintenance --no-write-fetch-head origin <full sha>`",
                                      "(the T14 trap)"]) == []
