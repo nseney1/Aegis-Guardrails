@@ -117,8 +117,8 @@ def toml_list(values):
     return "[" + ", ".join(json.dumps(value) for value in values) + "]"
 
 
-def codex_argv(cwd, *, writer, settings, tail):
-    disabled = CODEX_DISABLED + ([] if writer else CODEX_SHELL)
+def codex_argv(cwd, *, writer, settings, tail, reader_shell=False):
+    disabled = CODEX_DISABLED + ([] if writer or reader_shell else CODEX_SHELL)
     argv = ["codex"]
     for feature in disabled:
         argv += ["--disable", feature]
@@ -180,9 +180,15 @@ def assistant_catalog(setup, endpoint, mailbox):
 
 def check_role_request(request, setup):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort",
-                                                   "timeout_seconds", "assistants"})
+                                                   "timeout_seconds", "assistants", "reader_shell"})
     host = request["host"]
     require(host in (CLAUDE, CODEX), "unsupported host: " + str(host))
+    if "reader_shell" in request:
+        # Codex has no file tools without its shell, so a reviewer that reads files needs one. Its
+        # sandbox stays read-only with no network, and a writer already has the shell it needs.
+        require(type(request["reader_shell"]) is bool and host == CODEX
+                and Mailbox(setup["mailbox_root"]).endpoint(request["endpoint"]).get("kind") == "reviewer",
+                "reader_shell is only for a Codex reviewer")
     for name in ("model", "effort"):
         if name in request:
             text(request[name], name, 128)
@@ -254,7 +260,8 @@ def add_role(request):
             answer["assistants"] = ASSISTANT_NOTE
     else:
         settings = codex_servers(setup, endpoint, session, generation, enabled)
-        wake_argv = codex_argv(str(cwd), writer=writer, settings=settings, tail=["resume", session])
+        wake_argv = codex_argv(str(cwd), writer=writer, settings=settings, tail=["resume", session],
+                               reader_shell=request.get("reader_shell", False))
         prompt_via = "argv"
     wake_profile = base / "profiles" / (stem + ".wake.json")
     wake_profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -267,14 +274,18 @@ def add_role(request):
 
 
 def codex_start(request):
-    fields(request, {"base", "endpoint"}, {"cwd"})
+    fields(request, {"base", "endpoint"}, {"cwd", "reader_shell"})
     setup = read_json(safe_path(text(request["base"], "base")) / "provision.json")
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     writer = mailbox.endpoint(request["endpoint"]).get("kind") in ("implementer", "integrator")
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
-    return {"start_argv": codex_argv(str(cwd), writer=writer, settings="mcp_servers={}", tail=[]), "cwd": str(cwd),
+    reader_shell = request.get("reader_shell", False)
+    require(type(reader_shell) is bool and (not reader_shell or mailbox.endpoint(request["endpoint"]).get("kind") == "reviewer"),
+            "reader_shell is only for a Codex reviewer")
+    return {"start_argv": codex_argv(str(cwd), writer=writer, settings="mcp_servers={}", tail=[], reader_shell=reader_shell),
+            "cwd": str(cwd),
             "prompt_via": "argv",
             "next": "Read the session ID from the first JSON event, then run add-role with that session."}
 
