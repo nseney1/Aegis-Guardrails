@@ -153,7 +153,7 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 | `woken_unread` or `timed_out` | A turn ran and the mail stayed unread | Read the turn's log. It gets no second turn for that mail in this sweep |
 | `no_profile` | The current binding has no wake profile | Run `add-role` for that session |
 | `meter_error` | Active time could not be measured, so it was not woken | Find out why |
-| `root_queue` | Open jobs and unread mail for root | `run-open`, and `hierarchy_mailbox.py inbox --endpoint <hierarchy>/root --delivery-dir <dir> --mark-read` |
+| `root_queue` | Open jobs and unread mail for root | `run-open`, then `tool mailbox --root <mailbox> inbox --endpoint <hierarchy>/root --delivery-dir <dir> --mark-read` |
 
 A runner works through jobs one at a time, so start a second `run-open` to use more than one
 heavy slot. A sweep also runs turns one at a time, so use `--initiative` to sweep initiatives
@@ -244,8 +244,8 @@ live prototype needs no undoing.
 - Git inspection of a checkout runs outside the sandbox, so a process that edits that checkout's
   `.git/config` could run code there.
 - A process that starts its own session escapes the stop at the end of a job step.
-- The census counts a heavy process that started after its last check against the next job, not
-  this one, so root's limit can briefly be exceeded when outside work starts at the same moment.
+- The census looks once before each grant, so outside heavy work that starts right after it can
+  briefly put the total over the limit.
 - A store, a board and a mailbox each stop accepting records at 10,000. Start a new one before
   that.
 - Assistants stay off until the owner lifts the no-subagent rule for that trial.

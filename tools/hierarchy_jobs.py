@@ -482,8 +482,9 @@ def job_environment(recipes, job, checkout):
     env = {"PATH": os.pathsep.join(recipes["path"]), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONNOUSERSITE": "1", "GIT_OPTIONAL_LOCKS": "0", "TMP": str(scratch_tmp), "TEMP": str(scratch_tmp),
            "TMPDIR": str(scratch_tmp),
-           # Otherwise Cargo builds in the checkout, which a job usually cannot write to.
-           "CARGO_TARGET_DIR": str(job.folder / "cargo-target")}
+           # These tools otherwise write beside the source, and a job usually cannot write there.
+           "CARGO_TARGET_DIR": str(job.folder / "cargo-target"), "RUFF_CACHE_DIR": str(job.folder / "ruff-cache"),
+           "HYPOTHESIS_STORAGE_DIRECTORY": str(job.folder / "hypothesis")}
     for name, folder in HOME_FOLDERS.items():
         path = home / folder
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
