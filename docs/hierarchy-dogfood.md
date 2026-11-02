@@ -96,6 +96,29 @@ The template offers `targeted-tests`, `full-suite`, `lint`, `aegis-check` and `c
 has no push recipe on purpose. Pushing stays with root, and merges and signatures stay with the
 owner.
 
+### Capacity limits
+
+The code caps a store's limits at 5 writers, 3 `heavy` and 1 `heavy-tests`. `init` takes
+`writer_limit`, `heavy_limit` and an optional `heavy_tests_limit`; a store initialized without
+it gets a Heavy-Tests limit of 1.
+
+- `heavy` is the 3 test slots: pytest suites, targeted tests and other test jobs.
+- `heavy-tests` (Heavy-Tests) is the single slot where cargo builds and tests run.
+
+So at most 4 test jobs run at once, and at most 1 of them is cargo. Binding recipes to
+`heavy-tests` and cleaning up after heavy jobs come in a later change.
+
+To change an initialized store's limits, append a `set-limits` event that names its source:
+
+```sh
+printf '{"source": "owner-writers-5 requests/root-c6-owner-decisions-20261102.json", "writer_limit": 5}\n' \
+  > "$TRIAL/set-limits.json"
+tool workspace --store "$TRIAL/store" set-limits --request "$TRIAL/set-limits.json"
+```
+
+Each value must be within its cap and at least the number already granted for that kind, and a
+refused change writes nothing. Raising a cap itself is an owner decision and a reviewed code change.
+
 ## Add an initiative
 
 `$TRIAL/init.json`:
