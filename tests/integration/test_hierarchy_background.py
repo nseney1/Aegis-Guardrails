@@ -51,8 +51,13 @@ if words[0] == "control":
     with open(os.path.join(state, "calls.log"), "a", encoding="utf-8") as log:
         log.write(json.dumps(words[1:]) + "\n")
     if words[1] == "agents":
+        # A host list can briefly leave out a session that is still running; "hide-next" makes one look do that.
+        hide = os.path.join(state, "hide-next")
+        hidden = os.path.exists(hide)
+        if hidden:
+            os.remove(hide)
         print(json.dumps([{key: row[key] for key in ("id", "sessionId", "status", "state", "kind", "name", "pid")}
-                          for row in rows() if row["status"] != "stopped" and alive(row["pid"])]))
+                          for row in rows() if row["status"] != "stopped" and alive(row["pid"]) and not hidden]))
     elif words[1] == "stop":
         for row in rows():
             if row["id"] == words[2] and not os.path.exists(os.path.join(state, "ignore-stop")):
@@ -62,18 +67,28 @@ if words[0] == "control":
                     pass
                 row["status"] = "stopped"
                 save(row)
+            if row["id"] == words[2] and os.path.exists(os.path.join(state, "hide-on-stop")):
+                open(os.path.join(state, "hide-next"), "w").close()
     elif words[1] == "logs":
         print("terminal output of " + words[2])
     sys.exit(0)
 
 if words[0] == "turn":
-    identifier, mode, helper, root, endpoint, host, session, delivery = words[1:9]
-    if mode == "reader":
+    # Like a real background session, the turn's process does not carry its session ID in argv.
+    identifier, mode, helper, root, endpoint, host, delivery = words[1:8]
+    session = os.environ["STUB_SESSION"]
+    if mode in ("reader", "flicker", "exits"):
         frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                   {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "mailbox_inbox", "arguments": {}}}]
         subprocess.run([sys.executable, "-I", helper, "--root", root, "serve", "--endpoint", endpoint, "--host", host,
                         "--session", session, "--generation", "1", "--delivery-dir", delivery],
                        input="".join(json.dumps(f) + "\n" for f in frames), text=True, capture_output=True, check=True)
+    if mode == "flicker":
+        time.sleep(1.5)
+        open(os.path.join(state, "hide-next"), "w").close()
+    if mode == "exits":
+        time.sleep(1.5)
+        sys.exit(0)  # the session ends on its own; the host stops listing it
     if mode != "hang":
         time.sleep(2.5)  # visibly busy across more than one poll
         row = next(row for row in rows() if row["id"] == identifier)
@@ -93,9 +108,9 @@ if mode == "unlisted":  # the launcher reports success, but the host never lists
     sys.exit(0)
 save({"id": identifier, "sessionId": session, "status": "busy", "state": "working", "kind": "background",
       "name": words[words.index("--name") + 1], "pid": -1})
-child = subprocess.Popen([sys.executable, __file__, state, "turn", identifier, mode, helper, root, endpoint, host, session,
+child = subprocess.Popen([sys.executable, __file__, state, "turn", identifier, mode, helper, root, endpoint, host,
                           delivery], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+                         stderr=subprocess.DEVNULL, env={**os.environ, "STUB_SESSION": session})
 row = next(row for row in rows() if row["id"] == identifier)
 row["pid"] = child.pid
 save(row)
@@ -267,6 +282,38 @@ def test_a_null_timeout_is_refused_at_the_profile_boundary(background):
     code, result = background.wake(path)
     assert code == 2 and "invalid timeout_seconds" in result["error"], result
     assert not background.pilot.record.exists()
+
+
+def test_a_session_briefly_missing_from_the_host_list_is_still_followed_and_stopped(background):
+    background.pilot.publish()
+    code, result = background.wake(background.profile(stub_mode="flicker"))
+    assert code == 0 and result["state"] == "read", result
+    identifier = background.pilot.session[-8:]
+    assert result["background"]["ended"] == "idle" and result["background"]["stop_confirmed"] is True
+    assert ["stop", identifier] in background.calls(), "a session that was only briefly unlisted must still be stopped"
+    assert all(row["status"] == "stopped" for row in background.rows())
+
+
+def test_a_session_that_really_ends_is_reported_exited_after_repeated_absence(background):
+    background.pilot.publish()
+    code, result = background.wake(background.profile(stub_mode="exits"))
+    assert code == 0 and result["state"] == "read", result
+    assert result["background"]["ended"] == "exited" and result["background"]["stop_confirmed"] is True, result
+    assert result["exit_code"] is None and result["background"]["exit_status"] == "unknown"
+    assert not [call for call in background.calls() if call[0] == "stop"]
+    looks = [call for call in background.calls() if call[0] == "agents"]
+    assert len(looks) >= 4, "one missing look is not an end"
+
+
+def test_one_missing_look_after_stop_does_not_confirm_the_stop(background):
+    background.pilot.publish()
+    (background.state / "ignore-stop").write_text("")
+    (background.state / "hide-on-stop").write_text("")
+    code, result = background.wake(background.profile())
+    assert code == 3 and result["state"] == "stop_unconfirmed", result
+    background.pilot.publish("note-2")
+    again_code, again = background.wake(background.profile())
+    assert again_code == 2 and "a wake is already in progress" in again["error"], "the lock must stay"
 
 
 @pytest.mark.parametrize("change,error", [

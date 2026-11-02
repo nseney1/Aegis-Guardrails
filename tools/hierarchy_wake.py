@@ -47,6 +47,8 @@ BACKGROUND_POLL_SECONDS = 1.0
 BACKGROUND_START_SECONDS = 60.0
 BACKGROUND_STOP_SECONDS = 15.0
 IDLE_LOOKS = 3
+# The host list can leave out a running session for a moment, so one missing look never ends a turn or confirms a stop.
+GONE_LOOKS = 3
 # The host prints these IDs. One that starts with a dash would be read as an option by `claude stop`.
 SHORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 MODES = ("print", "background")
@@ -114,8 +116,10 @@ def stop_background(profile, entry):
     """True only once the host no longer lists the session, so an unconfirmed stop is never reported as done."""
     control_command(profile, "stop", entry["id"])
     deadline = time.monotonic() + BACKGROUND_STOP_SECONDS
+    gone_looks = 0
     while True:
-        if background_entry(profile) is None:
+        gone_looks = gone_looks + 1 if background_entry(profile) is None else 0
+        if gone_looks >= GONE_LOOKS:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -148,11 +152,11 @@ def await_background(profile, before):
     A turn short enough to finish between two looks still moves the transcript, so either sign counts.
     """
     started = time.monotonic()
-    seen, busy, idle_looks = None, False, 0
+    seen, busy, idle_looks, gone_looks = None, False, 0, 0
     while True:
         entry = background_entry(profile)
         if entry is not None:
-            seen = entry
+            seen, gone_looks = entry, 0
             if entry.get("status") == "busy":
                 busy, idle_looks = True, 0
             elif busy or transcript_mark(profile) != before:
@@ -161,7 +165,9 @@ def await_background(profile, before):
                 if idle_looks >= IDLE_LOOKS:
                     return "idle", seen
         elif seen is not None:
-            return "exited", seen
+            gone_looks += 1
+            if gone_looks >= GONE_LOOKS:
+                return "exited", seen
         elapsed = time.monotonic() - started
         if elapsed >= profile["timeout_seconds"]:
             return "timeout", seen
