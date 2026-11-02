@@ -712,6 +712,32 @@ def rebind_entry(spec, entry, row, ack_dir):
     return out
 
 
+def outgoing_stop_check(custody_path, session):
+    """Does custody record the stop of the root this session replaced? (P3-9)
+
+    transfer writes outgoing_stopped: true into the spec before the stop, and the gates
+    accept only true, so that flag tells a reader nothing. The record is the
+    custody_history entry's outgoing_stopped, which verify-retired writes. A missing one
+    is a warning, not a refusal: the stop may still be pending, or may have been refused.
+    """
+    check = {"custody": str(custody_path), "outgoing_root": None, "verified": False}
+    try:
+        custody = read_json(custody_path)
+    except (ValueError, OSError) as exc:
+        return check, ["custody not readable, outgoing stop unverified: %s" % exc]
+    history = custody.get("custody_history") if isinstance(custody, dict) else None
+    entries = [entry for entry in history if isinstance(entry, dict) and entry.get("incoming_root") == session] \
+        if isinstance(history, list) else []
+    if not entries:
+        return check, ["custody_history has no entry with incoming_root %s: outgoing stop unverified" % session]
+    check["outgoing_root"] = entries[-1].get("outgoing_root")
+    check["verified"] = bool(entries[-1].get("outgoing_stopped"))
+    if not check["verified"]:
+        return check, ["custody_history entry for outgoing root %s lacks outgoing_stopped: verify-retired has not "
+                       "recorded its stop, so the spec's outgoing_stopped: true is unverified" % check["outgoing_root"]]
+    return check, []
+
+
 def planned_generation(spec, entry):
     current = Mailbox(entry["root"]).bindings(entry["endpoint"])[-1]
     same = current["host"] == spec["host"] and current["session"] == spec["session"]
@@ -731,11 +757,13 @@ def cmd_rebind(args):
     for entry in spec["entries"]:
         require(isinstance(entry, dict) and {"root", "endpoint"} <= entry.keys(), "entries need root and endpoint")
     result_out = Path(args.result_out)
+    stop, warnings = outgoing_stop_check(args.custody, spec["session"]) if args.custody else (None, [])
     if args.plan:
         acks = [str(ack_request_path(args.ack_dir, entry["endpoint"], planned_generation(spec, entry)))
                 for entry in spec["entries"]]
         return EXIT_OK, {"ok": True, "plan": True, "writes": [str(result_out), *acks],
-                         "mailbox_roots": [entry["root"] for entry in spec["entries"]]}
+                         "mailbox_roots": [entry["root"] for entry in spec["entries"]], "outgoing_stop": stop,
+                         "warnings": warnings}
     if result_out.exists():
         raise Failure(EXIT_CONFLICT, "result already exists: %s" % result_out, path=str(result_out))
     check_free_space([result_out, Path(args.ack_dir) / "ack.json"], args.min_free_mb)
@@ -747,7 +775,8 @@ def cmd_rebind(args):
         except (Failure, ValueError, OSError, UnicodeError) as exc:
             rows.append({"root": entry["root"], "endpoint": entry["endpoint"], "ready": False, "error": str(exc)})
     result = {"schema": "aegis.hierarchy-rebind-result/v1", "host": spec["host"], "session": spec["session"],
-              "ok": all(row["ready"] for row in rows), "handoff": handoff, "entries": rows}
+              "ok": all(row["ready"] for row in rows), "handoff": handoff, "entries": rows,
+              "outgoing_stop": stop, "warnings": warnings}
     atomic_write_json(result_out, result)
     return (EXIT_OK if result["ok"] else EXIT_CRITICAL), result
 
@@ -1130,6 +1159,8 @@ def build_parser():
     rebind.add_argument("--result-out", required=True)
     rebind.add_argument("--ack-dir", required=True, help="Folder for the acknowledgment requests")
     rebind.add_argument("--plan", action="store_true", help="Print the paths a run would write; write nothing")
+    rebind.add_argument("--custody", help="ROOT rotations: custody file whose custody_history must record the "
+                        "outgoing root's stop; a missing record is reported in warnings")
     rebind.add_argument("--min-free-mb", type=int, default=512)
     rebind.set_defaults(handler=cmd_rebind)
 

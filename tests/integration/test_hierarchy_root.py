@@ -696,6 +696,25 @@ def test_rebind_does_not_acknowledge_when_a_spec_brief_is_missing_from_the_check
     assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8")) == out
 
 
+def test_rebind_warns_until_custody_records_the_outgoing_stop(tmp_path):
+    """P3-9: the spec's outgoing_stopped: true is asserted before the stop; custody is the record."""
+    _, _, spec, spec_path, acks = rebind_setup(tmp_path, messages=1)
+    custody = tmp_path / "custody.json"
+    entry = {"outgoing_root": "d6b2a18b-e242-4ecb-ac63-baab549cf112", "incoming_root": spec["session"]}
+    custody.write_text(json.dumps({"active_root_session": spec["session"], "custody_history": [entry]}),
+                       encoding="utf-8")
+    code, out, err = rebind(spec_path, tmp_path / "result-1.json", acks, "--custody", custody)
+    assert code == 0, (out, err)
+    assert out["outgoing_stop"] == {"custody": str(custody), "outgoing_root": entry["outgoing_root"],
+                                    "verified": False}
+    assert len(out["warnings"]) == 1 and "lacks outgoing_stopped" in out["warnings"][0]
+    entry["outgoing_stopped"] = {"verified_at": "2026-11-02T17:00:00.000Z", "by": "hierarchy_root.py verify-retired"}
+    custody.write_text(json.dumps({"active_root_session": spec["session"], "custody_history": [entry]}),
+                       encoding="utf-8")
+    code, out, _ = rebind(spec_path, tmp_path / "result-2.json", acks, "--custody", custody)
+    assert code == 0 and out["outgoing_stop"]["verified"] is True and out["warnings"] == []
+
+
 def test_rebind_plan_writes_nothing(tmp_path):
     from tests.integration.test_hierarchy_mailbox import invoke
 
