@@ -1170,3 +1170,47 @@ def test_two_processes_appending_at_once_leave_100_whole_rows(tmp_path: Path, hb
     read = read_jsonl(path)
     assert (len(read.rows), read.skipped_lines, read.torn_tail) == (100, [], False)
     assert {r["event"] for r in read.rows} == {"heartbeat"} and len({r["hs"] for r in read.rows}) == 100
+
+
+_HOLD = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.storage import file_lock
+
+with file_lock(Path(sys.argv[2])):
+    sys.stdout.write("held\n")
+    sys.stdout.flush()
+    time.sleep(float(sys.argv[3]))
+"""
+
+
+def test_a_prompt_waits_out_a_lock_held_past_5s_and_keeps_its_row(tmp_path: Path, hb_home: Path):
+    """Sad path, deterministic stand-in for the two-process race above (which once lost a row to
+    a 5 s LockTimeoutError under suite load): Given another process holding the insight log's
+    lock for 6 s, longer than file_lock's generic 5 s, When a prompt is recorded, Then it waits
+    for the lock instead of raising, and its heartbeat is appended whole."""
+    import time
+
+    from aegis_core.storage import read_jsonl
+
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    create_link_key(hb_home)
+    prompt = {"prompt": "Please run the tests.", "cwd": str(ws)}
+    record_hook_prompt("claude-code", {**prompt, "session_id": "s-0"}, workspace=ws, excerpts=False, home=hb_home)
+    path = insights_path(ws, home=hb_home)
+    holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(REPO), str(path.with_suffix(".lock")), "6"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=_child_env(hb_home), cwd=str(ws))
+    try:
+        assert holder.stdout.readline() == b"held\n", holder.stderr.read().decode("utf-8", "replace")
+        started = time.monotonic()
+        record_hook_prompt("claude-code", {**prompt, "session_id": "s-1"}, workspace=ws, excerpts=False, home=hb_home)
+        assert time.monotonic() - started > 5.0  # it really waited past the generic budget
+    finally:
+        _, err = holder.communicate(timeout=60)
+    assert holder.returncode == 0, err.decode("utf-8", "replace")
+    read = read_jsonl(path)
+    assert (len(read.rows), read.skipped_lines, read.torn_tail) == (2, [], False)
+    assert [r["event"] for r in read.rows] == ["heartbeat", "heartbeat"]
