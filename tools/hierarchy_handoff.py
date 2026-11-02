@@ -36,11 +36,13 @@ def acknowledgment(binding):
 
 
 def hand_off(spec, entry):
-    fields(entry, {"root", "endpoint"}, {"completed_checks", "briefs", "evidence_dir", "delivery_dir"})
+    fields(entry, {"root", "endpoint"}, {"completed_checks", "briefs", "evidence_dir", "delivery_dir", "kind"})
     root = safe_path(text(entry["root"], "root"))
     with writer_lock(root):
         mailbox = Mailbox(root)
         mailbox.endpoint(entry["endpoint"])
+        if "kind" in entry:
+            mailbox.require_kind(entry["endpoint"], entry["kind"])
         history = mailbox.bindings(entry["endpoint"])
         require(bool(history), "endpoint has no binding to replace: " + entry["endpoint"])
         current = history[-1]

@@ -324,6 +324,21 @@ def test_an_entry_with_a_relative_root_or_extra_field_is_reported_per_entry(tmp_
     assert rows[2]["ok"] is True
 
 
+def test_an_entry_kind_must_match_the_manifest_kind(tmp_path, pilot):  # noqa: F811
+    root, brief = pilot
+    entries = [{"root": str(root), "endpoint": endpoint, "kind": kind, "briefs": [brief]} for endpoint, kind in (
+        ("a/lane/review", "reviewer"), ("a/lane/f2", "reviewer"), ("a/orchestrator", "implementer"))]
+    spec = {"schema": "aegis.hierarchy-handoff/v1", "host": "host-two", "session": "new-lane",
+            "outgoing_stopped": True, "entries": entries}
+    rows = handoff(tmp_path, spec, 3)["entries"]
+    assert rows[0]["ok"] is True and rows[0]["generation"] == 2
+    assert rows[1] == {"root": str(root), "endpoint": "a/lane/f2", "ok": False,
+                       "error": "kind 'reviewer' does not match the manifest kind 'implementer' of a/lane/f2"}
+    assert rows[2]["error"] == "kind 'implementer' does not match the manifest kind (none) of a/orchestrator"
+    bindings = invoke(root, "status")["bindings"]
+    assert (bindings["a/lane/f2"]["generation"], bindings["a/orchestrator"]["generation"]) == (1, 1)
+
+
 @pytest.mark.parametrize("value", ["requests/x.json", "/abs/../x.json"])
 def test_a_relative_or_traversing_spec_is_refused_by_name_and_value(value):
     result = subprocess.run([sys.executable, "-I", str(HANDOFF), "--spec", value], capture_output=True,

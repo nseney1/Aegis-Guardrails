@@ -314,6 +314,16 @@ class Mailbox:
         require(endpoint in self.manifest["endpoints"], "unknown endpoint: " + endpoint)
         return self.manifest["endpoints"][endpoint]
 
+    def require_kind(self, endpoint, kind):
+        """Bind-by-kind interim (T112 H1): a request that names a kind is refused when the manifest disagrees.
+
+        Only lanes declare a kind, so a kind given for any other role is refused too.
+        """
+        text(kind, "kind", 64)
+        declared = self.endpoint(endpoint).get("kind")
+        require(kind == declared, "kind " + repr(kind) + " does not match the manifest kind "
+                + ("(none)" if declared is None else repr(declared)) + " of " + endpoint)
+
     def route(self, sender, recipient):
         self.endpoint(sender)
         self.endpoint(recipient)

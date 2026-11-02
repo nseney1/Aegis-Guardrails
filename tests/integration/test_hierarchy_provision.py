@@ -335,6 +335,20 @@ def test_root_gets_a_binding_but_no_connection_or_profile(setup):
     assert not list((setup.base / "connections").glob("*root*"))
 
 
+def test_add_role_with_the_manifest_kind_is_accepted(setup):
+    assert setup.add_role("pilot/lane/f2", cwd=str(setup.tmp), kind="implementer")["generation"] == 1
+
+
+@pytest.mark.parametrize("endpoint,kind,error", [
+    ("pilot/lane/f2", "reviewer", "kind 'reviewer' does not match the manifest kind 'implementer' of pilot/lane/f2"),
+    ("pilot/orchestrator", "implementer", "kind 'implementer' does not match the manifest kind (none) of pilot/orchestrator"),
+    ("pilot/lane/review", 7, "invalid kind"),
+])
+def test_add_role_with_another_kind_is_refused_and_binds_nothing(setup, endpoint, kind, error):
+    assert setup.add_role(endpoint, cwd=str(setup.tmp), kind=kind, expect=2)["error"] == error
+    assert not (setup.root / "bindings" / endpoint).exists()
+
+
 def test_adding_a_role_again_keeps_its_session_and_a_different_session_is_refused(setup):
     first = setup.add_role("pilot/orchestrator", cwd=str(setup.tmp))
     again = setup.add_role("pilot/orchestrator", session=first["session"], cwd=str(setup.tmp))
