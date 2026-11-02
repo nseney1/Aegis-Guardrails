@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 import pytest
 
@@ -711,6 +712,58 @@ def test_a_running_job_is_reported_and_not_started_again(shop, tmp_path):
         runner.communicate()
         if group:
             os.killpg(group, signal.SIGKILL)
+
+
+def processes_with(marker):
+    found = []
+    for item in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            if marker.encode() in item.read_bytes():
+                found.append(int(item.parent.name))
+        except OSError:
+            pass
+    return found
+
+
+def test_a_step_whose_process_record_cannot_be_written_is_stopped_before_its_slot_is_freed(shop):
+    marker = "marker-" + uuid.uuid4().hex
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    # The first step blocks the second step's record by putting a folder where the record is written.
+    first = ("import os, time\nfor _ in range(500):\n    if os.path.exists(%r):\n        break\n    time.sleep(0.01)\nos.mkdir(%r)\n"
+             % (str(folder / "process.json"), str(folder / "process.pending")))
+    shop.recipes["recipes"]["two"] = {"kind": "command", "heavy": True, "sandbox": "none", "timeout_seconds": 30,
+                                      "steps": [["$python", "-c", first], ["$python", "-c", "import time; time.sleep(40)", marker]]}
+    shop.save_recipes()
+    shop.request_job("job-1", "two")
+    try:
+        assert shop.run_open()["rows"][0]["state"] == "failed"
+        assert "could not run" in shop.receipts("job-1")[-1]["receipt"]["reason"]
+        deadline = time.monotonic() + 5
+        while processes_with(marker):
+            assert time.monotonic() < deadline, "the second step kept running after its job was reported"
+            time.sleep(0.05)
+        assert shop.heavy()["used"] == 0
+    finally:
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_resolve_needs_a_confirmation_when_no_process_was_ever_recorded(shop, tmp_path):
+    runner = start_stuck_job(shop, tmp_path)
+    group = shop.run_open(expect=3)["rows"][0]["process_group"]
+    os.killpg(runner.pid, signal.SIGKILL)
+    runner.communicate()
+    os.killpg(group, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while shop.run_open(expect=3)["rows"][0]["process_alive"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    (shop.workspace.store / "jobs" / "pilot" / "job-1" / "process.json").unlink()
+    refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", expect=2)
+    assert "--process-stopped" in refused["error"]
+    assert shop.heavy()["used"] == 1
+    assert shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", "--process-stopped")["state"] == "failed"
+    assert shop.heavy()["used"] == 0
 
 
 def test_a_runner_that_dies_leaves_a_clear_unknown_and_keeps_the_slot_until_root_resolves_it(shop, tmp_path):

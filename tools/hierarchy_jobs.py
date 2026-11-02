@@ -593,6 +593,23 @@ class Halt(Exception):
     """A recipe's own check failed, so later steps must not run and nothing further should change."""
 
 
+class StillRunning(Exception):
+    """A step's processes could not be confirmed stopped, so the job must keep its slot and get no result."""
+
+    def __init__(self, group, reason):
+        super().__init__("process group %d may still be running: %s" % (group, reason))
+        self.group = group
+
+
+def stop_for_certain(process):
+    try:
+        stop_group(process)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise StillRunning(process.pid, str(exc)[:512]) from exc
+    if group_members(process.pid):
+        raise StillRunning(process.pid, "members were left after the stop")
+
+
 def command_steps(recipe, packet, recipes, scratch):
     tokens = {"$python": [recipes["python"]], "$paths": packet["paths"], "$scratch": [scratch],
               "$checkout": [packet["checkout"]]}
@@ -632,22 +649,23 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     with open(log_path, "xb") as log, open(out_path, "xb") if step.capture else open(os.devnull, "wb") as out:
         process = subprocess.Popen(argv, cwd=checkout, env={**env, **step.env}, stdin=subprocess.DEVNULL,
                                    stdout=out if step.capture else log, stderr=log, start_new_session=True)
-    held = encoded({"group": process.pid, "step": number, "at": timestamp()})
-    pending = job.process_path.with_suffix(".pending")
-    pending.write_bytes(held)
-    pending.replace(job.process_path)
     try:
+        # Everything after the launch is guarded: a process must never outlive a job that is reported over.
+        held = encoded({"group": process.pid, "step": number, "at": timestamp()})
+        pending = job.process_path.with_suffix(".pending")
+        pending.write_bytes(held)
+        pending.replace(job.process_path)
         on_start()
-    except ERRORS:
-        stop_group(process)  # A job that could not be recorded must not keep running.
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining)
+            row["stopped_leftovers"] = bool(group_members(process.pid))
+        except subprocess.TimeoutExpired:
+            row["timed_out"] = True
+    except BaseException:
+        stop_for_certain(process)
         raise
-    remaining = max(0.0, deadline - time.monotonic())
-    try:
-        process.wait(timeout=remaining)
-        row["stopped_leftovers"] = bool(group_members(process.pid))
-    except subprocess.TimeoutExpired:
-        row["timed_out"] = True
-    stop_group(process)
+    stop_for_certain(process)
     row["exit_code"] = process.returncode
     row["seconds"] = round(time.monotonic() - began, 3)
     return row, out_path.read_text(encoding="utf-8", errors="replace").strip() if step.capture else None
@@ -712,6 +730,9 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
 
     try:
         rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce)
+    except StillRunning as exc:
+        # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
+        return {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
     except ERRORS as exc:
         rows, reason, exit_code, created = [], "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT, None
     try:
@@ -939,7 +960,7 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait):
     return (3 if any(row["state"] in NEEDS_ROOT for row in rows) else 0), {"rows": rows}
 
 
-def resolve(store_path, identifier, reason, wait):
+def resolve(store_path, identifier, reason, wait, process_stopped=False):
     require(isinstance(identifier, str) and JOB_ID.fullmatch(identifier) is not None, "invalid job: " + str(identifier)[:128])
     text(reason, "reason")
     initiative_id, message_id = identifier.split("/")
@@ -954,6 +975,8 @@ def resolve(store_path, identifier, reason, wait):
     require(not job.runner_alive(), "its runner is still running: " + identifier)
     group = job.process_group()
     require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
+    if group is None and any(job.folder.glob("step-*.log")):
+        require(process_stopped, "a step started but its process was never recorded; check by hand that it stopped, then pass --process-stopped")
     write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True)
     return 0, settle(store, job, wait)
 
@@ -983,6 +1006,7 @@ def main(argv=None):
     resolved = commands.add_parser("resolve", help="Close a job whose runner stopped, once nothing of it is running")
     resolved.add_argument("--job", required=True, help="<initiative>/<message-id>")
     resolved.add_argument("--reason", required=True)
+    resolved.add_argument("--process-stopped", action="store_true", help="Confirm by hand that an unrecorded process has stopped")
     commands.add_parser("clean", help="Remove a finished job's work folders, keeping its logs and result").add_argument(
         "--job", required=True, help="<initiative>/<message-id>")
     commands.add_parser("source-digest", help="Print the commit, tree and uncommitted-content digest a packet needs").add_argument(
@@ -993,7 +1017,7 @@ def main(argv=None):
         if args.command == "source-digest":
             code, result = source_digest(args.checkout)
         elif args.command == "resolve":
-            code, result = resolve(args.store, args.job, args.reason, args.lock_wait)
+            code, result = resolve(args.store, args.job, args.reason, args.lock_wait, args.process_stopped)
         elif args.command == "clean":
             code, result = clean(args.store, args.job)
         else:
