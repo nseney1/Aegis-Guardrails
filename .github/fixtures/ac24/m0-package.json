@@ -1,0 +1,10 @@
+{
+  "name": "aegis-v45-m0-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "devDependencies": {
+    "vitest": "5.0.5",
+    "jest": "30.5.2",
+    "jest-junit": "17.0.0"
+  }
+}
