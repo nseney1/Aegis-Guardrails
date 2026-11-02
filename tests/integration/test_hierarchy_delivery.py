@@ -44,10 +44,10 @@ elif mode == "sleeper":
 
 
 class Pilot:
-    def __init__(self, tmp_path, host="host-one"):
+    def __init__(self, tmp_path, host="host-one", root=None, delivery=None):
         self.tmp = tmp_path
-        self.root = tmp_path / "mailbox"
-        self.delivery = tmp_path / "delivery"
+        self.root = root or tmp_path / "mailbox"
+        self.delivery = delivery or tmp_path / "delivery"
         self.host = host
         self.session = "session-" + uuid.uuid4().hex
         self.record = tmp_path / "stub-record.json"
@@ -178,6 +178,36 @@ def test_delivery_dir_inside_the_mailbox_is_refused(pilot):
     refused = invoke(pilot.root, "delivery", delivery_dir=inside, ok=False)
     assert refused["error"] == "delivery directory must be outside the mailbox root"
     assert not inside.exists()
+
+
+def test_a_delivery_dir_above_the_mailbox_is_refused_by_every_tool(pilot):
+    above = pilot.root.parent
+    expected = "delivery directory must not contain the mailbox root"
+    result = pilot.adapter([], delivery=above)
+    assert result.returncode == 2 and json.loads(result.stdout)["error"] == expected
+    assert invoke(pilot.root, "delivery", delivery_dir=above, ok=False)["error"] == expected
+
+
+def test_the_mailbox_root_itself_is_not_a_delivery_dir(pilot):
+    refused = invoke(pilot.root, "delivery", delivery_dir=pilot.root, ok=False)
+    assert refused["error"] == "delivery directory must be outside the mailbox root"
+
+
+def test_a_sibling_delivery_dir_is_accepted(pilot):
+    pilot.publish()
+    assert invoke(pilot.root, "delivery", delivery_dir=pilot.root.parent / "sibling")["endpoints"][TARGET]["published"] == 1
+
+
+@posix_only
+def test_wake_logs_cannot_land_inside_mailbox_history(tmp_path):
+    parent = tmp_path / "pilot"
+    parent.mkdir()
+    pilot = Pilot(tmp_path, root=parent / "wake-logs", delivery=parent)
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(mode="ignore"))
+    assert [row["message"]["message_id"] for row in invoke(pilot.root, "inbox", endpoint=TARGET)["messages"]] == ["note-1"]
+    assert code == 2 and result["error"] == "delivery directory must not contain the mailbox root"
+    assert not pilot.record.exists()
 
 
 def test_unwritable_receipt_keeps_the_read_and_leaves_the_message_unread(pilot, tmp_path):

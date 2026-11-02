@@ -60,6 +60,18 @@ def test_a_dirty_state_over_three_megabytes_binds_through_a_digest(pilot, tmp_pa
     assert invoke(root, "status", process_timeout=60)["bindings"]["a/lane/f2"]["ready"] is True
 
 
+@pytest.mark.parametrize("place,error", [
+    (lambda root: root / "a" / "lane", "evidence directory must be outside the mailbox root"),
+    (lambda root: root.parent, "evidence directory must not contain the mailbox root"),
+])
+def test_status_evidence_cannot_land_in_or_above_mailbox_history(pilot, tmp_path, place, error):  # noqa: F811
+    root, _, ready = active_writer(pilot, tmp_path)
+    (Path(ready["worktree"]) / "untracked.txt").write_text("makes the status non-empty")
+    refused = invoke(root, "draft-handoff", draft(root, evidence_dir=str(place(root))), ok=False)
+    assert refused["error"] == error
+    assert invoke(root, "inbox", endpoint="a/lane/f2")["messages"]
+
+
 def test_status_that_changes_after_the_draft_is_refused(pilot, tmp_path):  # noqa: F811
     root, _, ready = active_writer(pilot, tmp_path)
     request = invoke(root, "draft-handoff", draft(root))

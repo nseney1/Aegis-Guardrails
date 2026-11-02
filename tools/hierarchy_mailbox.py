@@ -655,6 +655,8 @@ class Mailbox:
         for name in ("evidence_dir", "delivery_dir"):
             if name in request:
                 text(request[name], name)
+        if "evidence_dir" in request:
+            self.outside_mailbox(request["evidence_dir"], "evidence directory")
         history = self.bindings(endpoint)
         require(bool(history), "endpoint has no binding to replace: " + endpoint)
         records = self.messages()
@@ -862,13 +864,19 @@ class Mailbox:
                 "binding": binding, "checkpoint_briefs": checkpoint_briefs,
                 "next_after": selected[-1]["message"]["message_id"] if len(records) > limit else None}
 
-    def delivery_directory(self, directory):
-        # Receipts live outside the root so the mailbox history stays immutable and
-        # an adapter without a delivery directory stays strictly read-only.
+    def outside_mailbox(self, directory, label):
+        """Derived files must never reach mailbox history, so overlap is refused in both directions.
+
+        A directory above the root is unsafe too: a derived folder name can equal the root's own name.
+        """
         directory = safe_path(directory)
         require(directory != self.root and self.root not in directory.parents,
-                "delivery directory must be outside the mailbox root")
+                label + " must be outside the mailbox root")
+        require(directory not in self.root.parents, label + " must not contain the mailbox root")
         return directory
+
+    def delivery_directory(self, directory):
+        return self.outside_mailbox(directory, "delivery directory")
 
     @staticmethod
     def _delivery_receipt(receipt, kind, endpoint, history, records):
