@@ -578,7 +578,10 @@ class Mailbox:
                        if r["message"]["type"] == "job_request" and r["message"]["message_id"] not in terminal),
                       key=lambda message: (message["created_at"], message["message_id"]))
 
-    def checkpoint_assignments(self, endpoint, checkpoint, records):
+    def checkpoint_assignments(self, endpoint, checkpoint, records, *, lineage=False):
+        """Exact by default: bind and draft-handoff anchor the snapshot. With lineage (ack-handoff only),
+        a still-open lane may have moved forward on its branch since then; the observed witnesses are returned."""
+        witnesses = {}
         for job in self.open_job_requests(records):
             if endpoint in (job["from"], job["to"]):
                 require(job["message_id"] in checkpoint["pending_message_ids"], "checkpoint omits open job request")
@@ -597,6 +600,14 @@ class Mailbox:
                 worktree = safe_path(source["worktree"])
                 require(self.git(worktree, "branch", "--show-current") == readiness["branch"],
                         "checkpoint branch changed since acceptance")
+                if lineage:
+                    if source["worktree"] not in witnesses:
+                        witnesses[source["worktree"]] = self.source_witness(worktree)
+                    # Test the HEAD the witness recorded, so the reported state is the state that passed.
+                    require(self.git_is_ancestor(worktree, source["source_revision"],
+                                                 witnesses[source["worktree"]]["source_revision"]),
+                            "checkpoint source moved off its snapshot: " + str(worktree))
+                    continue
                 if "dirty_state" in source:
                     observed = {"source_revision": self.git(worktree, "rev-parse", "HEAD"),
                                 "source_tree": self.git(worktree, "rev-parse", "HEAD^{tree}"),
@@ -607,6 +618,9 @@ class Mailbox:
                                                               "dirty_state_sha256", "dirty_entries")}
                 require(all(source[key] == value for key, value in observed.items()),
                         "checkpoint source snapshot does not match worktree")
+        keys = ("worktree", "source_revision", "source_tree", "dirty_entries", "dirty_state_sha256")
+        return [{key: witnesses[name][key] for key in keys}
+                for name in dict.fromkeys(source["worktree"] for source in checkpoint["sources"]) if name in witnesses]
 
     def wake_marker(self, endpoint):
         """Sits beside .write.lock, outside the routing folders, and is held from launch until the turn ends."""
@@ -646,10 +660,12 @@ class Mailbox:
                 "handoff acknowledgment does not match binding")
         records = self.messages()
         self.checkpoint(binding["checkpoint"], records)
-        self.checkpoint_assignments(request["endpoint"], binding["checkpoint"], records)
+        observed = self.checkpoint_assignments(request["endpoint"], binding["checkpoint"], records, lineage=True)
         path = self.root / "bindings" / request["endpoint"] / ("%06d.ack" % request["generation"])
         publish_file(path, encoded(request) + b"\n")
-        return {"endpoint": request["endpoint"], "generation": request["generation"], "ready": True}
+        # The witness is output only: the .ack file and the immutable binding keep their strict shapes.
+        return {"endpoint": request["endpoint"], "generation": request["generation"], "ready": True,
+                "observed_sources": observed}
 
     @staticmethod
     def git(worktree, *arguments):
@@ -660,6 +676,17 @@ class Mailbox:
             raise ValueError("git identity check timed out") from exc
         require(result.returncode == 0, "git identity check failed")
         return result.stdout.rstrip("\r\n")
+
+    @staticmethod
+    def git_is_ancestor(worktree, ancestor, descendant):
+        """`merge-base --is-ancestor` answers by exit code: 1 means "no"; any other nonzero exit is a failure."""
+        try:
+            result = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "merge-base",
+                                     "--is-ancestor", ancestor, descendant], cwd=worktree, capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("git identity check timed out") from exc
+        require(result.returncode in (0, 1), "git identity check failed")
+        return result.returncode == 0
 
     def source_witness(self, worktree, evidence_dir=None):
         """Revision, tree and an exact-byte status digest. Nothing is trimmed before hashing."""

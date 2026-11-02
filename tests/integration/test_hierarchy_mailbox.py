@@ -851,7 +851,7 @@ def test_publish_and_ack_handoff_read_the_request_from_stdin(pilot):
     ack = {"endpoint": "a/lane/f2", "session": "replacement", "generation": 2,
            "checkpoint_sha256": replacement["checkpoint_sha256"]}
     assert invoke_stdin(root, "ack-handoff", json.dumps(ack).encode("utf-8")) == {
-        "endpoint": "a/lane/f2", "generation": 2, "ready": True}
+        "endpoint": "a/lane/f2", "generation": 2, "ready": True, "observed_sources": []}
 
 
 @pytest.mark.parametrize("command,raw,error", [

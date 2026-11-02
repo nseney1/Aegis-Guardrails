@@ -325,6 +325,17 @@ python3 /absolute/prototype/tools/hierarchy_mailbox.py \
   --request /absolute/aegis-guides/requests/a-f2-handoff-ack.json
 ```
 
+Bind checks each snapshot exactly, but a writing lane that is still working keeps
+moving after the draft. So, for each open accepted dispatch, acknowledgment checks
+lineage instead: the branch still matches the acceptance, the lease ref is in the
+checkpoint, and the snapshot's `source_revision` is HEAD or an ancestor of it. The tree
+and dirty state may differ. A lane reset off its snapshot is refused with
+`checkpoint source moved off its snapshot: <worktree>`. Dispatches already closed by a
+result, a review or a `completed` ack are not checked. The ack output adds
+`observed_sources`: one `{worktree, source_revision, source_tree, dirty_entries,
+dirty_state_sha256}` per checked worktree, in checkpoint order, or an empty list. The
+`.ack` file and the binding are unchanged.
+
 The acknowledgment JSON has exactly `endpoint`, `generation`, `session` and
 `checkpoint_sha256`. The old sender generation is rejected after replacement; the
 successor cannot publish or receive a new dispatch until this acknowledgment.

@@ -468,7 +468,7 @@ def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):
     for index in (1, 2):
         assert responses[index]["result"].get("isError", False) is False
         assert responses[index]["id"] == frames[index]["id"]
-    assert payload(responses[1]) == {"endpoint": "a/lane/f2", "generation": 2, "ready": True}
+    assert payload(responses[1]) == {"endpoint": "a/lane/f2", "generation": 2, "ready": True, "observed_sources": []}
     receipt = payload(responses[2])
     assert receipt["message"]["body"] == body
     assert receipt["message"]["message_id"] == "after-overflow"
