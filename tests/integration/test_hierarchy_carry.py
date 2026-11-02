@@ -288,3 +288,119 @@ def test_one_native_session_can_hold_endpoints_in_two_new_roots(move):
     assert first["connection"] != second["connection"]
     assert adapter_call(first["connection"], "mailbox_inbox", {})["endpoint"] == "a/front-door"
     assert adapter_call(second["connection"], "mailbox_inbox", {})["endpoint"] == "c/front-door"
+
+
+def test_a_move_that_stopped_before_its_record_starts_over_cleanly(move, tmp_path):
+    move.old_dispatch("build-1", "a/lane/build")
+    move.old_accept("build-1", "a/lane/build", readiness(tmp_path, "build-worktree", "feature/build"))
+    move.bind_new()
+    first = move.carry()
+    (move.base / "carried" / "carry.json").unlink()
+    second = move.carry()
+    assert second["brief"]["sha256"] == first["brief"]["sha256"]
+    assert move.carried_message(), "still exactly one"
+    assert move.writers()["used"] == 1
+
+
+def test_a_damaged_store_does_not_stop_a_sessions_mailbox(move):
+    roles = move.bind_new()
+    move.carry()
+    (move.workspace.store / "events" / "00000001.json").write_text("{damaged")
+    connection = roles["a/orchestrator"]["connection"]
+    assert adapter_call(connection, "mailbox_inbox", {})["endpoint"] == "a/orchestrator"
+    definition = json.loads(Path(connection).read_text())
+    frame = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "workspace_capacity", "arguments": {}}}
+    done = subprocess.run([definition["command"], *definition["args"]], input=json.dumps(frame) + "\n", capture_output=True, text=True, timeout=20,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    answer = json.loads(done.stdout)["result"]
+    assert answer["isError"] is True and "malformed workspace event" in answer["content"][0]["text"]
+
+
+UUID_A = "01a19a9d-b1ad-7b22-bec1-5e465d490ae6"
+UUID_B = "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"
+
+
+def move_request(move, **changes):
+    body = {"store": str(move.workspace.store), "base": str(move.tmp / "initiatives" / "moved" / "a"), "source": str(move.source), "old_root": str(move.old),
+            "hierarchy": "a", "note": "The owner approved this move.", "root": {"host": "codex", "session": UUID_B},
+            "initiative": {"project": "aegis", "repository": "aegis", "priority": 5, "target_branch": "develop", "source": "owner"}, **changes}
+    return move.request(**body)
+
+
+@pytest.fixture
+def fresh(tmp_path):
+    """The old root only, because `move` makes the new initiative itself."""
+    built = Move.__new__(Move)
+    Setup.__init__(built, tmp_path)
+    (tmp_path / "old").mkdir()
+    built.old = tmp_path / "old" / "mailbox"
+    endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/lane/build": {"kind": "implementer"}, "a/lane/fix": {"kind": "integrator"},
+                 "a/lane/look": {"kind": "reviewer"}, "b/front-door": {}, "b/orchestrator": {}}
+    invoke(built.old, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "writer_limit": 3, "counterparts": [["a/front-door", "b/front-door"]]})
+    for endpoint, host, session in (("a/front-door", "codex", "native-front-door"), ("a/orchestrator", "codex", "native-orchestrator"),
+                                    ("a/lane/build", "codex-cli", "cli-build"), ("a/lane/look", "codex-cli", "cli-look"), ("b/front-door", "codex", "other")):
+        invoke(built.old, "bind", {"endpoint": endpoint, "host": host, "session": session, "expected_generation": 0})
+    raw = b"Do the work.\n"
+    built.brief_path = tmp_path / "old" / "brief.md"
+    built.brief_path.write_bytes(raw)
+    built.brief = {"path": str(built.brief_path), "sha256": hashlib.sha256(raw).hexdigest()}
+    return built
+
+
+def test_one_command_moves_a_hierarchy_keeping_every_session(fresh):
+    before = mailbox_snapshot(fresh.old)
+    result = provision("move", move_request(fresh, roles={"a/lane/look": {"cwd": str(fresh.source), "reader_shell": True}}))
+    assert mailbox_snapshot(fresh.old) == before
+    roles = result["roles"]
+    assert sorted(roles) == ["a/front-door", "a/lane/build", "a/lane/look", "a/orchestrator", "a/root"]
+    assert roles["a/orchestrator"]["session"] == "native-orchestrator" and roles["a/orchestrator"]["wake"] == "native"
+    assert roles["a/root"]["session"] == UUID_B
+    assert "wake_profile" in roles["a/lane/look"]
+    assert result["needs_profile"] == ["a/lane/build"], "an idle CLI lane is bound, and gets its profile when it has a worktree"
+    assert roles["a/orchestrator"]["connection"] in result["tell"]["a/orchestrator"] and str(fresh.old) in result["tell"]["a/orchestrator"]
+    assert "a/lane/build" not in result["tell"]
+    assert result["carry"]["open_dispatches"] == []
+    root = Path(result["mailbox_root"])
+    assert invoke(root, "status")["bindings"]["a/lane/fix"] is None
+    assert adapter_call(roles["a/orchestrator"]["connection"], "mailbox_inbox", {})["messages"][0]["message"]["type"] == "brief"
+
+
+def test_moving_again_repeats_nothing(fresh):
+    first = provision("move", move_request(fresh))
+    second = provision("move", move_request(fresh))
+    assert second["carry"]["brief"] == first["carry"]["brief"]
+    assert second["roles"]["a/orchestrator"]["connection"] == first["roles"]["a/orchestrator"]["connection"]
+    page = invoke(Path(first["mailbox_root"]), "inbox", endpoint="a/orchestrator", limit=100)
+    assert len(page["messages"]) == 1
+
+
+def test_a_role_can_move_to_a_named_replacement_with_a_real_session(fresh):
+    replaced = {"a/orchestrator": {"host": "codex", "session": UUID_A, "reason": "Root keeps its hold on the old session."}}
+    result = provision("move", move_request(fresh, replaced=replaced))
+    assert result["roles"]["a/orchestrator"]["session"] == UUID_A
+    assert result["carry"]["replaced"] == ["a/orchestrator"]
+    placeholder = {"a/orchestrator": {"host": "codex", "session": "REPLACE_WITH_THE_ACTUAL_THREAD_ID", "reason": "x"}}
+    other = move_request(fresh, replaced=placeholder, base=str(fresh.tmp / "initiatives" / "moved" / "second"))
+    assert "actual" in provision("move", other, expect=2)["error"]
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"hierarchy": "none"}, "no such hierarchy"),
+    ({"roles": {"a/lane/nope": {"cwd": "/tmp"}}}, "a/lane/nope"),
+    ({"replaced": {"a/lane/nope": {"host": "codex", "session": UUID_A, "reason": "x"}}}, "a/lane/nope"),
+    ({"root": {"host": "codex"}}, "missing fields"),
+    ({"initiative": {"project": "aegis"}}, "missing fields"),
+    ({"root": {"host": "codex", "session": "REPLACE_WITH_THE_ACTIVE_ROOT"}}, "actual"),
+    ({"surprise": 1}, "unexpected"),
+])
+def test_a_bad_move_request_is_refused_and_binds_nothing(fresh, changes, reason):
+    request = move_request(fresh, **changes)
+    assert reason in provision("move", request, expect=2)["error"]
+    assert not (fresh.tmp / "initiatives" / "moved").exists()
+
+
+def test_a_writer_cannot_default_to_running_in_the_pinned_tools_checkout(fresh):
+    result = provision("move", move_request(fresh, roles={"a/lane/look": {"reader_shell": True, "cwd": str(fresh.source)}}))
+    assert "a/lane/build" in result["needs_profile"]
+    profiles = Path(result["mailbox_root"]).parent / "profiles"
+    assert not list(profiles.glob("a%2Flane%2Fbuild*"))

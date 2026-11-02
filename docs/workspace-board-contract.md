@@ -1,7 +1,7 @@
 # Workspace board contract
 
-Status: implemented in `tools/hierarchy_board.py` and served by each session's mailbox
-adapter when it starts with `--board`. Its tests run the real adapter with no host behind it,
+Status: implemented in `tools/hierarchy_board.py` and served as its own scoped server when the
+adapter starts with `--board`. Its tests run the real adapter with no host behind it,
 so no real Claude or Codex session has used the board yet, and the trial below has not run.
 Nothing here grants a permission. These are the public acceptance tests for the
 [agent hierarchies](agent-hierarchies.md) board, in `tests/integration/test_hierarchy_board.py`.
@@ -15,7 +15,7 @@ recognized peers. Identity establishes attribution, not truth or authority.
 
 | Decision | Choice | Trade-off |
 | --- | --- | --- |
-| Per-session adapter or a daemon | Adapter, with sequence numbers issued under one lock file | Nothing has to keep running and it costs nothing when idle, but each call replays the history, and a crashed writer's lock needs root's attention |
+| Per-session adapter or a daemon | A per-session adapter of its own, with sequence numbers issued under one lock file | Nothing has to keep running and it costs nothing when idle, and a damaged board leaves the mailbox working, but each call replays the history, and a crashed writer's lock needs root's attention |
 | Who issues channel grants | Root, through the board's CLI. No tool a session can call changes one | Root stays a step in setup, but a post can never widen access |
 | Which mailbox traffic moves to the board | Information several roles may want, such as status and blockers. Control stays in the mailbox | Only a trial can show whether `info` traffic really falls, so the board stays optional for each initiative |
 | Who produces digests | The `digest` command, a fixed filter and order | The same log and time give the same text, but it only lists posts and cannot summarize them |

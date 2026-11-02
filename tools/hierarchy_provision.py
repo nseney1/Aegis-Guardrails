@@ -507,9 +507,12 @@ def carry(request):
                   "message_ids": [row["message"]["message_id"] for row in in_order], "open_dispatches": carried, "open_job_requests": jobs,
                   "replaced": sorted(replaced)}
         raw_brief = carry_text(request, record, old, names, in_order, new).encode("utf-8")
-        brief_path = folder / "carried-work.md"
-        publish_file(brief_path, raw_brief)
-        record["brief"] = {"path": str(brief_path), "sha256": hashlib.sha256(raw_brief).hexdigest()}
+        sha256 = hashlib.sha256(raw_brief).hexdigest()
+        # Named by content, so a run that stopped before its record can start over and find the same file.
+        brief_path = folder / ("carried-work-" + sha256 + ".md")
+        if not brief_path.exists():
+            publish_file(brief_path, raw_brief)
+        record["brief"] = {"path": str(brief_path), "sha256": sha256}
         # Last, so a run that stopped before here simply starts over. Files above are safe to find again.
         publish_file(record_path, encoded(record) + b"\n", limit=MAX_RECORDS * 1024)
     take_writer_slots(store, hierarchy, record["open_dispatches"])
@@ -524,6 +527,67 @@ def carry(request):
     return {"hierarchy": hierarchy, "brief": record["brief"], "message_id": message_id, "old_root": record["old_root"], "replaced": record["replaced"],
             "open_dispatches": [{key: row[key] for key in ("dispatch", "lane", "accepted", "brief", "readiness")} for row in record["open_dispatches"]],
             "open_job_requests": record["open_job_requests"], "messages_seen": len(record["message_ids"])}
+
+
+def move(request):
+    """One idempotent command per hierarchy, so a rotating root repeats exactly what was rehearsed."""
+    fields(request, {"store", "base", "source", "old_root", "hierarchy", "note", "root", "initiative"}, {"board", "python", "roles", "replaced"})
+    hierarchy, note = request["hierarchy"], request["note"]
+    text(note, "note")
+    fields(request["root"], {"host", "session"})
+    # Root rotates often, so a prepared request leaves a placeholder that must not get bound by accident.
+    require(isinstance(request["root"]["session"], str) and UUID.fullmatch(request["root"]["session"]) is not None,
+            "root needs the actual session ID of the active root")
+    old = Mailbox(safe_path(text(request["old_root"], "old_root")))
+    endpoints = {name: spec for name, spec in old.manifest["endpoints"].items() if name.split("/")[0] == hierarchy}
+    require(bool(endpoints), "the old root has no such hierarchy: " + str(hierarchy))
+    roles, replaced = request.get("roles", {}), request.get("replaced", {})
+    require(isinstance(roles, dict) and isinstance(replaced, dict), "invalid roles or replaced")
+    for name in (*roles, *replaced):
+        require(name in endpoints, "the old root has no endpoint " + str(name)[:256])
+    for name, replacement in replaced.items():
+        fields(replacement, {"host", "session", "reason"})
+        require(isinstance(replacement["session"], str) and UUID.fullmatch(replacement["session"]) is not None,
+                "a replacement needs the actual session ID from its host, for " + name)
+    initiative = request["initiative"]
+    fields(initiative, {"project", "repository", "priority", "target_branch"}, {"touched_paths", "blocked_by", "checkouts", "lanes", "source"})
+    base = safe_path(text(request["base"], "base"))
+    if not (base / "provision.json").exists():
+        lanes = {name.split("/")[2]: spec["kind"] for name, spec in endpoints.items() if name.split("/")[1] == "lane"}
+        init({key: request[key] for key in ("store", "base", "source") } | {
+            "lanes": lanes, "initiative": {**initiative, "id": hierarchy},
+            **{key: request[key] for key in ("board", "python") if key in request}})
+    setup = read_json(base / "provision.json")
+    new = Mailbox(setup["mailbox_root"])
+    answers, needs_profile, tell = {}, [], {}
+    for name in sorted(endpoints):
+        history = old.bindings(name)
+        if not history:
+            continue
+        current = replaced.get(name) or {"host": history[-1]["host"], "session": history[-1]["session"]}
+        options = {"base": str(base), "endpoint": name, "host": current["host"], "session": current["session"], **roles.get(name, {})}
+        if current["host"] != NATIVE and name not in roles:
+            # An idle lane has no worktree to run in, and defaulting a writer to the pinned tools checkout
+            # could let it edit the code every adapter runs. So it is bound now and profiled when assigned.
+            with writer_lock(new.root):
+                bound = Mailbox(new.root).bindings(name)
+                if not bound:
+                    Mailbox(new.root).bind({"endpoint": name, "host": current["host"], "session": current["session"], "expected_generation": 0})
+            answers[name] = {"endpoint": name, "host": current["host"], "session": current["session"]}
+            needs_profile.append(name)
+            continue
+        answers[name] = add_role(options)
+        if current["host"] == NATIVE:
+            board = answers[name].get("board_connection")
+            tell[name] = ("Your mailbox moved. From now on use the connection file " + answers[name]["connection"] +
+                          (" and the board connection file " + board if board else "") + ", and read your inbox there now. Use only those. " +
+                          "Never publish to the old mailbox root " + request["old_root"] + ", which stays readable as history.")
+    root_endpoint = hierarchy + "/root"
+    answers[root_endpoint] = add_role({"base": str(base), "endpoint": root_endpoint, **request["root"]})
+    moved = carry({"base": str(base), "old_root": request["old_root"], "hierarchy": hierarchy, "note": note,
+                   **({"replaced": {name: row["reason"] for name, row in replaced.items()}} if replaced else {})})
+    return {"hierarchy": hierarchy, "mailbox_root": setup["mailbox_root"], "delivery_dir": setup["delivery_dir"], "roles": answers,
+            "needs_profile": needs_profile, "tell": tell, "carry": moved}
 
 
 def carry_check(request):
@@ -543,7 +607,7 @@ def carry_check(request):
     return {"clean": not late and not changed, "late_messages": late, "changed_bindings": changed}
 
 
-COMMANDS = {"init": init, "add-role": add_role, "codex-start": codex_start, "carry": carry, "carry-check": carry_check}
+COMMANDS = {"init": init, "add-role": add_role, "codex-start": codex_start, "carry": carry, "carry-check": carry_check, "move": move}
 
 
 def main(argv=None):

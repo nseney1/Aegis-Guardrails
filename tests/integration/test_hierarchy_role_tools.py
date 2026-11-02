@@ -187,11 +187,12 @@ def test_an_unregistered_initiative_or_missing_store_stops_startup(team, tmp_pat
     assert json.loads(result.stdout)["error"] == "workspace store is not initialized"
 
 
-def test_a_damaged_store_stops_startup(team):
+def test_a_damaged_store_fails_on_workspace_tools_and_leaves_the_mailbox_working(team):
+    """A session must keep its mail even when root's records are damaged, and the damage still shows loudly."""
     (team.workspace.store / "events" / "00000002.json").write_text("{truncated")
     result = team.serve("a/orchestrator")
-    assert result.returncode == 2
-    assert "malformed workspace event" in json.loads(result.stdout)["error"]
+    assert result.returncode == 0, result.stdout
+    assert not result.stderr
 
 
 def test_a_store_damaged_after_startup_fails_loudly_for_that_call(team):

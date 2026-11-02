@@ -1,30 +1,63 @@
 # Dogfooding the agent hierarchy
 
-This is how root runs a trial of the [agent hierarchy](agent-hierarchies.md) with real
-sessions. Every tool here has tests, but those tests use a fake host, so **no real Claude or
-Codex session has run this flow yet**. The first-run checks below are what would show that it
-works. Configuration and acknowledgments alone never count as proof.
+This is how root moves live sessions onto the [agent hierarchy](agent-hierarchies.md) tools, and how it
+runs them afterward. Every tool here has tests, but those tests use a fake host, so **no real Claude or
+Codex session has run this flow yet**. The checks below are what would show that it works.
+Configuration and acknowledgments alone never count as proof.
 
-## Run it beside the live prototype
+## Move the live sessions
 
-A trial uses new folders and leaves the running prototype alone. Don't move running work into
-it.
+The owner approved this move. It keeps every session. A live front door or orchestrator is a thread
+hosted by Codex's app server, which runs the mailbox adapter from a connection file in its own shell, so
+it moves by getting a new connection file. It keeps its thread, its context and its tools. A CLI lane
+gets a new wake profile with the sandbox options it already runs with.
 
-- **Start with one initiative that has nothing in flight.** Aegis 4.7 fits, because its
-  dispatches are held.
-- **Leave Stormheir and Aegis 4.5 where they are for now.** Move each one only at a natural
-  stopping point, after the trial has run clean.
-- **Expect new mailbox roots.** The live manifests have no `<hierarchy>/root` endpoint, so job
-  requests cannot be routed in them. Old roots stay readable.
-- **Count all work against the limits.** The job runner counts outside heavy processes using
-  root's census rule. Writers in the live prototype are not in this ledger, so root still has
-  to keep the workspace total at three.
-
-| | Beside the live prototype | Replacing it in place |
+| | Changes | Stays the same |
 | --- | --- | --- |
-| Latency | Root runs two loops for a while | One loop, once it works |
-| Complexity | Two sets of folders to keep apart | Rebinding running sessions, with no way back mid-work |
-| Cost | One extra initiative's sessions | None extra, but a failure stops all three initiatives |
+| Native thread | Connection file, mailbox root, tool commit | Thread, context, tools, how root messages it |
+| CLI lane | Wake profile, mailbox root | Session, worktree, branch, lease, sandbox options |
+| Open dispatch | Continues as a new dispatch of the same brief | Worktree, branch, lease |
+| Old mailbox root | Nothing. It stays readable as history | All of it |
+| Cross-hierarchy messages | The counterpart route is gone, so use a board channel, and root for resources | |
+
+| | Moving sessions in place (this) | Fresh narrow-profile sessions |
+| --- | --- | --- |
+| Latency | One command per hierarchy, at a task boundary | A startup and handoff for every role |
+| Complexity | Host mechanics do not change, so there is little new to prove | Every profile needs real-host proof first |
+| Cost | No new sessions | One new session per role |
+| What you give up | Native threads keep their broad tools for now | |
+
+**Order:** `prototype47` first, because nothing is in flight there, then `stormheir`, then `aegis`, which
+has an accepted writer. Stop at the first check that fails, and leave the rest where they are.
+
+For each hierarchy, when root tracks no running turn for its sessions:
+
+1. Fill in the request. `root.session` must be the active root's real ID, and a placeholder is refused.
+   Root will not resume Claude session `446f22db`, so `prototype47/orchestrator` moves to a fresh native
+   thread named under `replaced`, with its real ID.
+2. Run it. It is safe to repeat, and it only reads the old root:
+   ```sh
+   tool provision move --request <request file>
+   ```
+3. Send each thread in `tell` that exact text with `send_message_to_thread`.
+4. Run `tool provision carry-check --request <file with {"base": ...}>` now and at each loop. Exit 3 means
+   mail reached the old root afterward, or a binding changed there, so deal with those before going on.
+5. For each lane in `needs_profile`, run `add-role` with its worktree when it is next assigned.
+6. If the orchestrator continues an open dispatch from its carried brief, the lane accepts again with fresh
+   readiness. Its writer slot is already in the ledger, so release it with evidence when that work ends.
+7. When root rotates, bind its successor on each moved initiative with `tool handoff --spec <file>`.
+
+Then check, on real sessions:
+
+1. A moved orchestrator reads its carried brief through the new connection, and `delivery` shows it as `read`.
+2. `sweep` wakes a moved CLI lane from its profile, and `delivery` shows its mail as `read`.
+3. A job request produces a receipt whose evidence hashes match the files.
+4. A sandboxed job cannot write to its checkout, reach the network or read a `hide` folder.
+5. A reviewer reads a review copy, and `verify` still passes afterward.
+6. A fourth writer across initiatives is refused, and a forged approval on the board changes no control state.
+
+**To go back:** tell the moved sessions their old connection files again. The old root was never changed,
+so only mail published in the new root in the meantime needs carrying back by hand.
 
 ## Prerequisites
 
@@ -55,6 +88,7 @@ cp "$TOOLS/tools/hierarchy_templates/job-recipes.json" "$TRIAL/recipes.json"
 tool jobs --store "$TRIAL/store" --recipes "$TRIAL/recipes.json" check-recipes
 ```
 
+The board is its own server with its own connection, so a damaged board cannot stop a session's mailbox.
 `hide` lists folders a job must not see, such as your home folder, which holds credentials.
 If the interpreter, a virtual environment or a Rust toolchain lives inside one, add that folder
 to `ro_binds`, and set `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN` in `env` for Rust tests.
@@ -97,10 +131,10 @@ The answer holds the session ID, the connection file, the wake profile and, for 
 
 | Role | Host to start with | Why |
 | --- | --- | --- |
-| Front door, Orchestrator | Claude or Codex | Mailbox and file reading only |
+| Front door, Orchestrator | Claude, or Codex with `"reader_shell": true` for an orchestrator | Mailbox and file reading only. Codex has no file tools without its shell |
 | Builder, Integrator | Codex | Its OS sandbox lets it run tests in its worktree. A generated Claude writer can edit but has no shell, so every test becomes a job |
 | Reviewer | Claude, with `cwd` set to a review copy | It has native file tools. A Codex reviewer needs `"reader_shell": true`, and no real host has run that profile yet |
-| Root | Any | Bound with `"session"` and no adapter. Root uses these tools directly |
+| Root | Any, including a native thread (`"host": "codex"`) | Bound with `"session"` and no adapter. Root uses these tools directly |
 
 - **Start a Claude role:** run `start_argv` from the role's `cwd`, with the role's template on
   stdin (`tools/hierarchy_templates/roles/<role>.md`).
@@ -113,20 +147,14 @@ The answer holds the session ID, the connection file, the wake profile and, for 
   `{"channel", "endpoint", "access", "source"}`, where `access` is `read` or `post`. Grants
   apply to endpoints, so they survive a rotation.
 
-## First-run checks
+## First-run checks for a new profile
 
-Run these once on real sessions before trusting anything else, and keep the evidence. Stop at
-the first one that fails.
+Run these once on real sessions before trusting a generated narrow profile, and keep the evidence. Stop
+at the first one that fails.
 
-1. Each session's reported tool catalog matches what its profile asked for, and nothing else.
+1. The session's reported tool catalog matches what its profile asked for, and nothing else.
 2. A published message reaches a stopped session: after `sweep`, `delivery` shows it as `read`.
-3. A job request produces a receipt whose evidence hashes match the files.
-4. A sandboxed job cannot write to its checkout, reach the network or read a `hide` folder.
-5. A reviewer reads a review copy, and `verify` still passes afterward.
-6. A stopped role is replaced on the other host, keeps its assignment and acknowledges the
-   checkpoint.
-7. A fourth writer across two initiatives is refused.
-8. A forged approval on the board leaves bindings, dispatches and leases byte-identical.
+3. A stopped role is replaced on the other host, keeps its assignment and acknowledges the checkpoint.
 
 ## The root loop
 
@@ -152,6 +180,7 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 | `rotate_needed` | The session passed 60 active minutes, so it was not woken | Rotate it |
 | `root_time` with `rotate_now` | Root passed its own 90 minutes | Rotate root |
 | `woken_unread` or `timed_out` | A turn ran and the mail stayed unread | Read the turn's log. It gets no second turn for that mail in this sweep |
+| `message_thread` | A native thread has unread mail, and its app server hosts it | Send it a message with `send_message_to_thread` |
 | `no_profile` | The current binding has no wake profile | Run `add-role` for that session |
 | `meter_error` | Active time could not be measured, so it was not woken | Find out why |
 | `root_queue` | Open jobs and unread mail for root | `run-open`, then `tool mailbox --root <mailbox> inbox --endpoint <hierarchy>/root --delivery-dir <dir> --mark-read` |
@@ -254,3 +283,6 @@ live prototype needs no undoing.
 - A store, a board and a mailbox each stop accepting records at 10,000. Start a new one before
   that.
 - Assistants stay off until the owner lifts the no-subagent rule for that trial.
+- A moved native thread keeps its broad tools, so nothing in this move narrows what it can do.
+- The ledger only counts writers in moved initiatives. Until all three have moved, root still has to keep
+  the workspace total at three across the old and new roots.

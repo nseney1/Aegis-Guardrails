@@ -101,7 +101,15 @@ class Connection:
             import hierarchy_workspace
             self.workspace = hierarchy_workspace
             self.store = hierarchy_workspace.Store(workspace_store)
-            self.store.load().initiative(initiative)
+            try:
+                ledger = self.store.load()
+            except ValueError as exc:
+                # A session must keep its mail even if root's records are damaged. An absent store is a
+                # wrong connection and refuses, while damage shows up on the workspace tools themselves.
+                if "malformed" not in str(exc):
+                    raise
+            else:
+                ledger.initiative(initiative)
             self.workspace_tools = role_workspace_tools(mailbox, endpoint)
         self.board = None
         self.board_specs = {}

@@ -7,11 +7,11 @@ in the wheel. No process watches folders or tracks repository work for Aegis, an
 `tools/hierarchy_wake.py` starts a host, when root runs it with a reviewed profile.
 Host configuration, manager policy/membership and release gates are unchanged.
 
-To run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
+To move live sessions or run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
 
 | Tool | Root uses it to |
 | --- | --- |
-| `tools/hierarchy_provision.py` | Set up an initiative and generate each role's connection and wake profile |
+| `tools/hierarchy_provision.py` | Set up an initiative, generate each role's connection and wake profile, and move a live hierarchy to a new root |
 | `tools/hierarchy_sweep.py` | Wake sessions with unread mail across initiatives |
 | `tools/hierarchy_jobs.py` | Run job requests through fixed recipes and answer them |
 | `tools/hierarchy_review.py` | Prepare exact read-only copies for reviewers |
@@ -416,7 +416,8 @@ root's unread mail, open jobs and active time against its 90 minutes. Root reads
 with `inbox --mark-read`, so its unread count means what it means for everyone else.
 
 The [workspace board](workspace-board-contract.md) carries information across initiatives
-when a connection starts with `--board`. It cannot change bindings, dispatches or leases.
+through a server of its own, when a connection starts with `--board`. It cannot change bindings,
+dispatches or leases.
 
 ## Role-based assistants
 
