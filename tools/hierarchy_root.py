@@ -712,6 +712,44 @@ def file_ref(path):
     return {"path": str(path), "sha256": sha256_bytes(path.read_bytes())}
 
 
+ACK_SCHEMA = "aegis.claude-root-startup-ack/v1"
+
+
+def ack_problems(ack, facts):
+    """Why a startup ACK does not vouch for this transfer; empty when it does (P2-1).
+
+    Finding the incoming session's bytes in the file accepted an ACK left from an earlier
+    attempt, or one about a packet regenerated after it was written, so custody could move
+    to a ROOT that never verified the packet the facts name. The ACK has to be about these
+    two sessions and this packet, and every critical check it ran has to have passed; a
+    hand-written ACK without critical_checks is refused, not assumed fine.
+    """
+    if not isinstance(ack, dict):
+        return ["the ACK is not a JSON object"]
+
+    def at(*keys):
+        value = ack
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        return value
+
+    problems = [] if ack.get("schema") == ACK_SCHEMA else ["schema is not " + ACK_SCHEMA]
+    for side in ("incoming", "outgoing"):
+        if at(side, "session") != facts[side]["session"]:
+            problems.append("%s.session is not the facts' %s session" % (side, side))
+    if at("observed", "handoff", "sha256") != facts["handoff"]["sha256"]:
+        problems.append("observed.handoff.sha256 is not the facts' handoff sha256")
+    checks = ack.get("critical_checks")
+    if not isinstance(checks, list) or not checks:
+        problems.append("critical_checks is missing or empty")
+    else:
+        failed = [check.get("name") if isinstance(check, dict) else check for check in checks
+                  if not (isinstance(check, dict) and check.get("ok") is True)]
+        if failed:
+            problems.append("critical checks not ok: " + json.dumps(failed)[:200])
+    return problems
+
+
 def read_transfer_facts(path):
     facts = read_json(path)
     fields(facts, {"outgoing", "incoming", "handoff", "authority"}, {"goal", "invariants", "transferred_at"})
@@ -739,7 +777,14 @@ def cmd_transfer(args):
     ack_raw = Path(args.ack).read_bytes()
     if sha256_bytes(ack_raw) != args.ack_sha256:
         raise Failure(EXIT_CRITICAL, "startup ACK does not re-hash to --ack-sha256", ack_sha256=sha256_bytes(ack_raw))
-    require(inc["session"].encode("utf-8") in ack_raw, "startup ACK does not name the incoming session")
+    try:
+        ack = json.loads(ack_raw)
+    except ValueError:
+        ack = None
+    problems = ack_problems(ack, facts)
+    if problems:
+        raise Failure(EXIT_CRITICAL, "startup ACK does not vouch for this transfer: " + "; ".join(problems),
+                      problems=problems)
     if sha256_bytes(Path(facts["handoff"]["path"]).read_bytes()) != facts["handoff"]["sha256"]:
         raise Failure(EXIT_CRITICAL, "handoff packet does not re-hash to its recorded sha256")
     custody_raw = Path(args.custody).read_bytes()
@@ -895,12 +940,18 @@ def cmd_startup_ack(args):
     critical("packet_sha256", sha256_bytes(packet_raw) == args.packet_sha256, actual=sha256_bytes(packet_raw))
     rendezvous_raw = Path(args.rendezvous).read_bytes()
     rendezvous = json.loads(rendezvous_raw)
+    require(isinstance(rendezvous, dict), "the rendezvous file is not a JSON object")
+    # --packet and --packet-sha256 come from the operator; the rendezvous says which packet
+    # the outgoing ROOT means, so a stale or regenerated packet is refused here (P2-1).
+    named = rendezvous.get("handoff") if isinstance(rendezvous.get("handoff"), dict) else {}
+    critical("rendezvous_names_packet", named.get("sha256") == sha256_bytes(packet_raw)
+             and isinstance(named.get("path"), str) and Path(named["path"]).resolve() == Path(args.packet).resolve(),
+             rendezvous_handoff=named or None)
     session, proof, identity_ok, rows, torn = session_identity(args.projects_dir)
     critical("own_identity", identity_ok, session=session)
     waiting = (str(rendezvous.get("state", "")).startswith("WAITING") and rendezvous.get("incoming_host") == args.host
-               and rendezvous.get("incoming_session") in (None, session))
-    if args.rendezvous_sha256:
-        waiting = waiting and sha256_bytes(rendezvous_raw) == args.rendezvous_sha256
+               and rendezvous.get("incoming_session") in (None, session)
+               and sha256_bytes(rendezvous_raw) == args.rendezvous_sha256)
     critical("rendezvous_awaits_this_host", waiting, state=rendezvous.get("state"))
     custody_raw = Path(args.custody).read_bytes()
     custody = json.loads(custody_raw)
@@ -921,7 +972,7 @@ def cmd_startup_ack(args):
     observations = ["source missing: " + s["path"] for s in sources if not s["present"]]
     if torn:
         observations.append("own transcript has a torn last line (skipped)")
-    ack = {"schema": "aegis.claude-root-startup-ack/v1", "startup_only": True, "custody_transfer": False,
+    ack = {"schema": ACK_SCHEMA, "startup_only": True, "custody_transfer": False,
            "at": utc_now(),
            "incoming": {"role": args.role, "host": args.host, "session": session, "identity_proof": proof},
            "outgoing": {"host": rendezvous.get("outgoing_host"), "session": outgoing},
@@ -1004,7 +1055,7 @@ def build_parser():
     ack.add_argument("--packet", required=True)
     ack.add_argument("--packet-sha256", required=True)
     ack.add_argument("--rendezvous", required=True)
-    ack.add_argument("--rendezvous-sha256", help="Optional: the rendezvous must still have these bytes")
+    ack.add_argument("--rendezvous-sha256", required=True, help="The rendezvous must still have these bytes")
     ack.add_argument("--custody", required=True)
     ack.add_argument("--tools-pin", required=True, help="Pinned tools checkout; must be clean, ignored files included")
     ack.add_argument("--sources", help="JSON list of absolute source checkouts to observe read-only")

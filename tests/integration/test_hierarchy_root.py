@@ -676,13 +676,22 @@ def test_verify_retired_refuses_a_session_still_listed_after_its_pid_is_gone(tmp
 INCOMING = "c9e38364-ac3f-4720-ba74-44318c7bfcac"
 
 
+def ack_body(packet):
+    """The fields transfer cross-checks, shaped like the ACK startup-ack writes."""
+    return {"schema": "aegis.claude-root-startup-ack/v1", "incoming": {"session": INCOMING},
+            "outgoing": {"session": OUTGOING},
+            "observed": {"handoff": {"path": str(packet), "sha256": sha(packet.read_bytes())}},
+            "critical_checks": [{"name": "packet_sha256", "ok": True}]}
+
+
 @pytest.fixture
 def rotation(tmp_path):
     files = {}
-    for name, body in (("ack", '{"incoming": {"session": "%s"}}\n' % INCOMING), ("delta", '{"delta": 1}\n'),
-                       ("packet", '{"packet": 1}\n'), ("brief", "Root brief.\n")):
+    for name, body in (("delta", '{"delta": 1}\n'), ("packet", '{"packet": 1}\n'), ("brief", "Root brief.\n")):
         files[name] = tmp_path / (name + (".md" if name == "brief" else ".json"))
         files[name].write_text(body, encoding="utf-8")
+    files["ack"] = tmp_path / "ack.json"
+    files["ack"].write_text(json.dumps(ack_body(files["packet"])) + "\n", encoding="utf-8")
     brief = {"path": str(files["brief"]), "sha256": sha(files["brief"].read_bytes())}
     prev = {"schema": "aegis.hierarchy-handoff/v1", "host": "claude-code", "session": OUTGOING,
             "outgoing_stopped": True, "entries": [
@@ -755,6 +764,35 @@ def test_transfer_writes_nothing_when_a_critical_hash_differs(rotation, bad):
     assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
 
 
+@pytest.mark.parametrize("bad", ["one_key", "schema", "incoming", "outgoing", "handoff_sha256", "failed_check",
+                                 "no_checks", "not_json"])
+def test_transfer_refuses_an_ack_that_does_not_vouch_for_the_facts(rotation, bad):
+    """P2-1: a stale or foreign ACK that merely names the incoming session must not move custody."""
+    body = ack_body(rotation["packet"])
+    if bad == "one_key":  # the fixture ACK before the fix: only the incoming session
+        body = {"incoming": {"session": INCOMING}}
+    elif bad == "schema":
+        body["schema"] = "aegis.claude-root-rendezvous/v1"
+    elif bad == "incoming":
+        body["incoming"]["session"], body["note"] = "7e0dc264-eaca-48a3-babe-9a0f6f7f74ba", INCOMING
+    elif bad == "outgoing":
+        body["outgoing"]["session"] = "7e0dc264-eaca-48a3-babe-9a0f6f7f74ba"
+    elif bad == "handoff_sha256":  # an ACK about an earlier packet
+        body["observed"]["handoff"]["sha256"] = "0" * 64
+    elif bad == "failed_check":
+        body["critical_checks"].append({"name": "tools_pin_clean", "ok": False})
+    elif bad == "no_checks":
+        del body["critical_checks"]
+    raw = ("[" + INCOMING + "\n") if bad == "not_json" else json.dumps(body) + "\n"
+    rotation["ack"].write_text(raw, encoding="utf-8")
+    before = rotation["custody"].read_bytes()
+    code, out, _ = transfer(rotation)
+    assert code == 2, out
+    assert out["error"].startswith("startup ACK does not vouch for this transfer")
+    assert rotation["custody"].read_bytes() == before
+    assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
+
+
 def test_transfer_plan_writes_nothing(rotation):
     before = rotation["custody"].read_bytes()
     code, out, _ = transfer(rotation, "--plan")
@@ -780,6 +818,8 @@ def startup(tmp_path, stub):
     files["packet"].write_text('{"packet": 1}\n', encoding="utf-8")
     files["rendezvous"].write_text(json.dumps({"schema": "aegis.claude-root-rendezvous/v1",
                                                "state": "WAITING_FOR_ACTUAL_CLAUDE_STARTUP_ACK",
+                                               "handoff": {"path": str(files["packet"]),
+                                                           "sha256": sha(files["packet"].read_bytes())},
                                                "outgoing_host": "claude-code", "outgoing_session": OUTGOING,
                                                "incoming_host": "claude-code", "incoming_session": None}),
                                    encoding="utf-8")
@@ -798,11 +838,16 @@ def startup(tmp_path, stub):
     return files
 
 
-def startup_ack(stub, files, *extra, packet_sha=None, env=None):
+def startup_ack(stub, files, *extra, packet_sha=None, rendezvous_sha=None, env=None):
+    """rendezvous_sha None hashes the current rendezvous file; False leaves the flag out."""
     environment = {**stub.env(), "CLAUDE_CODE_SESSION_ID": INCOMING, "CLAUDE_PID": str(os.getpid()), **(env or {})}
+    if rendezvous_sha is None:
+        rendezvous_sha = sha(files["rendezvous"].read_bytes())
+    pinned = [] if rendezvous_sha is False else ["--rendezvous-sha256", rendezvous_sha]
     return run_tool("startup-ack", "--packet", files["packet"],
                     "--packet-sha256", packet_sha or sha(files["packet"].read_bytes()),
-                    "--rendezvous", files["rendezvous"], "--custody", files["custody"], "--tools-pin", files["pin"],
+                    "--rendezvous", files["rendezvous"], *pinned, "--custody", files["custody"],
+                    "--tools-pin", files["pin"],
                     "--sources", files["sources"], "--role", "ROOT C6", "--out", files["out"],
                     "--projects-dir", stub.projects, "--min-free-mb", "1", *extra, env=environment)
 
@@ -815,6 +860,7 @@ def test_startup_ack_writes_live_facts_and_observes_missing_sources(stub, startu
     assert ack["schema"] == "aegis.claude-root-startup-ack/v1" and ack["startup_only"] is True
     assert ack["custody_transfer"] is False
     assert all(check["ok"] for check in ack["critical_checks"])
+    assert "rendezvous_names_packet" in [check["name"] for check in ack["critical_checks"]]
     assert ack["incoming"]["session"] == INCOMING and ack["outgoing"]["session"] == OUTGOING
     proof = ack["incoming"]["identity_proof"]
     assert proof["transcript_line1"]["sessionId"] == INCOMING and proof["host_process"]["alive"] is True
@@ -840,6 +886,33 @@ def test_startup_ack_fails_a_critical_check_and_writes_nothing(stub, startup, br
         kwargs["env"] = {"CLAUDE_CODE_SESSION_ID": OUTGOING}
     code, out, _ = startup_ack(stub, startup, **kwargs)
     assert code == 2
+    assert not startup["out"].exists()
+
+
+@pytest.mark.parametrize("field", ["sha256", "path"])
+def test_startup_ack_refuses_a_packet_the_rendezvous_does_not_name(stub, startup, tmp_path, field):
+    """P2-1: --packet-sha256 is operator-supplied; the rendezvous file says which packet is meant."""
+    rendezvous = json.loads(startup["rendezvous"].read_text(encoding="utf-8"))
+    if field == "sha256":  # the rendezvous names a regenerated packet
+        rendezvous["handoff"]["sha256"] = "0" * 64
+    else:  # same bytes, but the rendezvous names another file (e.g. the previous rotation's packet)
+        other = tmp_path / "previous-packet.json"
+        other.write_bytes(startup["packet"].read_bytes())
+        rendezvous["handoff"]["path"] = str(other)
+    startup["rendezvous"].write_text(json.dumps(rendezvous), encoding="utf-8")
+    code, out, _ = startup_ack(stub, startup)
+    assert code == 2, out
+    checks = {check["name"]: check for check in out["critical_checks"]}
+    assert checks["rendezvous_names_packet"]["ok"] is False and checks["packet_sha256"]["ok"] is True
+    assert not startup["out"].exists()
+
+
+def test_startup_ack_requires_the_rendezvous_sha256_and_refuses_changed_bytes(stub, startup):
+    code, out, err = startup_ack(stub, startup, rendezvous_sha=False)
+    assert code == 2 and out is None and "--rendezvous-sha256" in err
+    code, out, _ = startup_ack(stub, startup, rendezvous_sha="0" * 64)
+    assert code == 2
+    assert {c["name"]: c["ok"] for c in out["critical_checks"]}["rendezvous_awaits_this_host"] is False
     assert not startup["out"].exists()
 
 
