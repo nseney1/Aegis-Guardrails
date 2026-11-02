@@ -275,6 +275,8 @@ def verify(args):
     else:
         if scaffold_digest(git_folder) != manifest["git_scaffold_sha256"]:
             problems.append(".git changed")
+        if stat.S_IMODE(git_folder.lstat().st_mode) & 0o222:
+            problems.append(".git is writable")
         for current, folders, files in os.walk(git_folder):
             for name in folders + files:
                 path = Path(current) / name
