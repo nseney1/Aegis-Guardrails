@@ -167,8 +167,9 @@ receives nothing until something starts a turn for it, so report three states:
 Start each role's adapter with `--delivery-dir /absolute/delivery` to record read
 receipts. The directory must be outside the mailbox root, which stays immutable, and
 an adapter without the flag writes nothing. A CLI `inbox` never counts as a read,
-because root and other tools use it too. If a receipt cannot be written, the session
-still gets its mail and the message stays unread, which errs toward waking it again.
+because root and other tools use it too. A receipt is written only after the response
+has been written and flushed. If the response fails, or a receipt cannot be written, the
+message stays unread, which errs toward waking the session again.
 
 ```sh
 python3 /absolute/prototype/tools/hierarchy_mailbox.py --root /absolute/mailbox \

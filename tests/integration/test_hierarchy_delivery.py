@@ -74,17 +74,21 @@ class Pilot:
         data = invoke(self.root, "delivery", delivery_dir=self.delivery, endpoint=TARGET)
         return data["endpoints"][TARGET]
 
+    def adapter_argv(self, delivery=True):
+        argv = [sys.executable, "-I", str(HELPER), "--root", str(self.root), "serve", "--endpoint", TARGET,
+                "--host", self.host, "--session", self.session, "--generation", "1"]
+        if delivery:
+            argv += ["--delivery-dir", str(self.delivery if delivery is True else delivery)]
+        return argv
+
     def adapter(self, calls, *, delivery=True):
         frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}]
         frames += [{"jsonrpc": "2.0", "id": index + 2, "method": "tools/call",
                     "params": {"name": name, "arguments": arguments}}
                    for index, (name, arguments) in enumerate(calls)]
-        argv = [sys.executable, "-I", str(HELPER), "--root", str(self.root), "serve", "--endpoint", TARGET,
-                "--host", self.host, "--session", self.session, "--generation", "1"]
-        if delivery:
-            argv += ["--delivery-dir", str(self.delivery if delivery is True else delivery)]
-        return subprocess.run(argv, input="".join(json.dumps(f) + "\n" for f in frames), capture_output=True,
-                              text=True, timeout=15, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        return subprocess.run(self.adapter_argv(delivery), input="".join(json.dumps(f) + "\n" for f in frames),
+                              capture_output=True, text=True, timeout=15,
+                              env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
     def read_inbox(self, **arguments):
         result = self.adapter([("mailbox_inbox", arguments)])
@@ -187,6 +191,40 @@ def test_unwritable_receipt_keeps_the_read_and_leaves_the_message_unread(pilot, 
     assert [r["message"]["message_id"] for r in json.loads(response["content"][0]["text"])["messages"]] == ["note-1"]
     assert "read receipt not recorded" in result.stderr
     assert pilot.state()["state"] == "published"
+
+
+def read_with_a_connection_that_closes_first(pilot):
+    process = subprocess.Popen(pilot.adapter_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n")
+    process.stdin.flush()
+    assert json.loads(process.stdout.readline())["id"] == 1
+    process.stdout.close()
+    process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                    "params": {"name": "mailbox_inbox", "arguments": {}}}) + "\n")
+    process.stdin.close()
+    process.wait(timeout=15)
+    stderr = process.stderr.read()
+    process.stderr.close()
+    return process.returncode, stderr
+
+
+def test_a_response_that_never_reaches_the_connection_leaves_the_message_unread(pilot):
+    pilot.publish()
+    code, stderr = read_with_a_connection_that_closes_first(pilot)
+    assert code == 0
+    assert "Traceback" not in stderr and "Exception ignored" not in stderr
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["unread"] == ["note-1"]
+    assert not (pilot.delivery / "reads").exists()
+
+
+@posix_only
+def test_a_message_whose_response_failed_can_still_be_delivered_by_a_wake(pilot):
+    pilot.publish()
+    read_with_a_connection_that_closes_first(pilot)
+    code, result = pilot.wake(pilot.profile())
+    assert code == 0 and result["state"] == "read" and result["read"] == ["note-1"]
 
 
 @pytest.mark.parametrize("change,error", [

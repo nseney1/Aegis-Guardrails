@@ -4,6 +4,7 @@ Launch through hierarchy_mailbox.py serve, which supports isolated Python import
 The configured sender is provenance, not an authenticated native host identity.
 """
 import json
+import os
 import sys
 
 from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, endpoint_parts, fields, integer, matching,
@@ -82,6 +83,7 @@ class Connection:
         mailbox = Mailbox(root)
         self.manifest_digest = digest(mailbox.manifest)
         self.delivery_dir = mailbox.delivery_directory(delivery_dir) if delivery_dir is not None else None
+        self.returned = []
         self.checked_mailbox()
         self.initiative = initiative
         self.workspace_tools = ()
@@ -108,10 +110,14 @@ class Connection:
             return self.workspace.capacity_view(ledger)
         return self.workspace.initiative_view(ledger, self.initiative)
 
-    def record_read(self, page):
-        # A lost receipt must not cost the session its mail. It only makes the message
-        # look unread, which errs toward waking the session again.
-        identifiers = [row["message"]["message_id"] for row in page["messages"]]
+    def note_returned(self, page):
+        self.returned = [row["message"]["message_id"] for row in page["messages"]]
+
+    def record_read(self):
+        # Called only after the response is written and flushed. A failure or crash before then
+        # leaves the message unread, and a lost receipt must not cost the session its mail. Both
+        # err toward waking the session again.
+        identifiers, self.returned = self.returned, []
         if self.delivery_dir is None or not identifiers:
             return
         try:
@@ -183,7 +189,7 @@ def handle(connection, request):
             if params["name"] == "mailbox_inbox":
                 result = _bounded_inbox(result, lambda page: _response_line({
                     "jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)}))
-                connection.record_read(result)
+                connection.note_returned(result)
             return _tool_result(result)
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
             return {"content": [{"type": "text", "text": json.dumps({"error": str(exc)})}], "isError": True}
@@ -216,7 +222,14 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
                 response["error"] = {"code": -32602, "message": str(exc)}
                 if isinstance(request, dict) and type(request.get("id")) in (str, int):
                     response["id"] = request["id"]
-        sys.stdout.buffer.write(_response_line(response))
-        sys.stdout.buffer.flush()
+        try:
+            sys.stdout.buffer.write(_response_line(response))
+            sys.stdout.buffer.flush()
+        except OSError:
+            # The connection is gone, so nothing was delivered. Point stdout at nothing so the
+            # interpreter's own flush at exit cannot fail too.
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            return 0
+        connection.record_read()
         if oversized:
             return 0  # close the channel rather than interpret frame fragments as requests
