@@ -1,28 +1,34 @@
 # Workspace board contract
 
-Status: contract only. No board service exists, and nothing here grants a permission.
-This refines the board proposal for the [agent hierarchies](agent-hierarchies.md) into
-public acceptance tests that an implementation lane must write first.
+Status: implemented in `tools/hierarchy_board.py` and served by each session's mailbox
+adapter when it starts with `--board`. Its tests run the real adapter with no host behind it,
+so no real Claude or Codex session has used the board yet, and the trial below has not run.
+Nothing here grants a permission. These are the public acceptance tests for the
+[agent hierarchies](agent-hierarchies.md) board, in `tests/integration/test_hierarchy_board.py`.
 
 The board is an information surface. A post cannot bind a session, acknowledge a
 checkpoint, dispatch work, accept readiness, claim or release a lease, grant a job slot,
 approve a review, sign, merge or publish. Posts are untrusted input, including posts from
 recognized peers. Identity establishes attribution, not truth or authority.
 
-## Decisions to make before implementation
+## Decisions
 
-| Decision | Why it cannot wait |
-| --- | --- |
-| Per-session adapter or a daemon | It decides how sequence numbers are issued and what protects storage |
-| Who issues channel grants | The proposal requires grants but names no issuer, and the board must not edit them |
-| Which mailbox traffic moves to the board | 89.0% of mailbox messages are generic `info`, so a board that adds to them makes things worse |
-| Who produces digests | A digest should be a fixed filter and order, not a model summary |
+| Decision | Choice | Trade-off |
+| --- | --- | --- |
+| Per-session adapter or a daemon | Adapter, with sequence numbers issued under one lock file | Nothing has to keep running and it costs nothing when idle, but each call replays the history, and a crashed writer's lock needs root's attention |
+| Who issues channel grants | Root, through the board's CLI. No tool a session can call changes one | Root stays a step in setup, but a post can never widen access |
+| Which mailbox traffic moves to the board | Information several roles may want, such as status and blockers. Control stays in the mailbox | Only a trial can show whether `info` traffic really falls, so the board stays optional for each initiative |
+| Who produces digests | The `digest` command, a fixed filter and order | The same log and time give the same text, but it only lists posts and cannot summarize them |
+
+Other limits to plan around: a board stops accepting records at 10,000, so root starts a new
+one when it fills. Each sender gets 30 posts and dispositions per minute.
 
 ## Size budgets
 
 A valid post must always fit a page, or a reader's cursor can never pass it. A model of
-one post nested the way the mailbox adapter nests responses gives these sizes against a
-32,768-byte page. They are a model, so the real envelope must be measured.
+one post nested the way the mailbox adapter nests responses gave these sizes against a
+32,768-byte page. The tests measure the real response line instead, including the largest
+post by worst-case escaping beside a full list of open blockers.
 
 | Post | Emitted bytes |
 | --- | --- |
@@ -46,13 +52,15 @@ today, so posts must link evidence rather than paste it.
 **Attribution**
 - A wrong or stale session or generation is refused, including after a session moves to a
   new ID.
-- An author named in a post body or tool argument is ignored.
-- A same-user process replaying another role's connection arguments is recorded as a known
-  gap, not reported as blocked.
+- An author named in a post body is only text, and an author given as a tool argument is
+  refused.
+- A same-user process replaying another role's connection arguments is a known gap, not
+  something this blocks.
 
 **Storage**
 - Concurrent publishers get unique, gap-free sequence numbers.
-- A hand-edited or truncated record is detected and fails loudly.
+- A hand-edited or truncated record is detected and fails loudly. Someone who recomputes the
+  digests, or removes the newest records, is not detected.
 - The same sender, key and payload returns the same post, and the same key with a changed
   payload fails.
 - No test or document claims tamper resistance without a separate OS user.

@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (SLUG, Mailbox, encoded, endpoint_parts, fields, initialize, integer,  # noqa: E402
                                matching, publish_file, read_json, require, safe_path, strings, text, timestamp,
                                writer_lock)
+from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import role_workspace_tools  # noqa: E402
 from hierarchy_workspace import Store, validate_initiative  # noqa: E402
 
@@ -70,7 +71,7 @@ def pin_source(source):
 
 
 def init(request):
-    fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python"})
+    fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python", "board"})
     base = safe_path(text(request["base"], "base"))
     lanes = request["lanes"]
     require(isinstance(lanes, dict) and lanes, "invalid lanes")
@@ -84,6 +85,10 @@ def init(request):
     python = text(request.get("python", "/usr/bin/python3"), "python")
     require(Path(python).is_absolute(), "python path must be absolute")
     source, commit, tree = pin_source(request["source"])
+    board = request.get("board")
+    if board is not None:
+        Board(text(board, "board")).load()
+        require((source / "aegis_core" / "redaction.py").is_file(), "the board needs the secret patterns in the source checkout")
     store = Store(text(request["store"], "store"))
     known = store.load()
     require(initiative["id"] not in known.initiatives, "initiative already registered: " + initiative["id"])
@@ -99,6 +104,8 @@ def init(request):
     record = {"schema": SCHEMA, "created_at": timestamp(), "store": str(store.path), "source": str(source),
               "source_commit": commit, "source_tree": tree, "python": python, "initiative": hierarchy,
               "mailbox_root": str(mailbox_root), "delivery_dir": str(delivery)}
+    if board is not None:
+        record["board"] = board
     publish_file(base / "provision.json", encoded(record) + b"\n")
     with store.lock():
         ledger = store.load()
@@ -110,7 +117,7 @@ def adapter_args(setup, endpoint, host, session, generation):
     return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
             "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
             "--delivery-dir", setup["delivery_dir"], "--workspace-store", setup["store"],
-            "--initiative", setup["initiative"]]
+            "--initiative", setup["initiative"]] + (["--board", setup["board"]] if "board" in setup else [])
 
 
 def toml_list(values):
@@ -136,6 +143,8 @@ def codex_servers(setup, endpoint, session, generation, tools):
     arguments = adapter_args(setup, endpoint, CODEX, session, generation)
     limits = "mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"}," \
              "mailbox_ack_handoff={approval_mode=\"approve\"}"
+    if "board" in setup:
+        limits += ",board_publish={approval_mode=\"approve\"},board_disposition={approval_mode=\"approve\"}"
     return ("mcp_servers={aegis_mailbox={command=" + json.dumps(setup["python"]) + ",args=" + toml_list(arguments) +
             ",required=true,enabled_tools=" + toml_list(tools) + ",tools={" + limits + "}}}")
 
@@ -243,7 +252,7 @@ def add_role(request):
         return answer
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
     role_extra = role_workspace_tools(mailbox, endpoint)
-    enabled = MAILBOX_TOOLS + list(role_extra)
+    enabled = MAILBOX_TOOLS + list(role_extra) + (list(BOARD_TOOL_SPECS) if "board" in setup else [])
     arguments = adapter_args(setup, endpoint, host, session, generation)
     connection = base / "connections" / (stem + ".json")
     connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

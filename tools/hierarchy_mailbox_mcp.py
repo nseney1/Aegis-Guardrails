@@ -19,6 +19,11 @@ def _tool_result(result):
     return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
 
 
+def _error_text(exc):
+    # Some errors repeat the input, and a response must stay within a page whatever was sent.
+    return str(exc)[:1024]
+
+
 MAX_OVERLAP_PATHS = 64
 MAX_OVERLAP_PATH_CHARS = 1024
 WORKSPACE_TOOL_SPECS = {
@@ -44,7 +49,7 @@ def role_workspace_tools(mailbox, endpoint):
     return ()
 
 
-def definitions(extra=()):
+def definitions(extra=(), board_specs=None):
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
         "to": {"type": "string", "maxLength": 256},
@@ -65,6 +70,8 @@ def definitions(extra=()):
          {"checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, ["checkpoint_sha256"]),
     ]
     specs += [(name, True, *WORKSPACE_TOOL_SPECS[name]) for name in extra]
+    specs += [(name, readonly, description, props, required)
+              for name, (readonly, description, props, required) in (board_specs or {}).items()]
     return [{"name": name, "description": description, "annotations": {"readOnlyHint": readonly},
              "inputSchema": {"type": "object", "properties": props, "required": required,
                              "additionalProperties": False}}
@@ -73,7 +80,7 @@ def definitions(extra=()):
 
 class Connection:
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
-                 initiative=None):
+                 initiative=None, board=None):
         # Grants and job runs stay out of anything a model session can call, so root has no adapter.
         require(endpoint_parts(endpoint)[1] != "root", "root uses the controller, not the mailbox adapter")
         require((workspace_store is None) == (initiative is None),
@@ -94,6 +101,30 @@ class Connection:
             self.store = hierarchy_workspace.Store(workspace_store)
             self.store.load().initiative(initiative)
             self.workspace_tools = role_workspace_tools(mailbox, endpoint)
+        self.board = None
+        self.board_specs = {}
+        self.pending_position = None
+        if board is not None:
+            import hierarchy_board
+            self.board = hierarchy_board.Board(board)
+            self.board.load()
+            self.board_specs = hierarchy_board.TOOL_SPECS
+
+    def board_call(self, name, arguments, render):
+        self.checked_mailbox()
+        result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
+        return result
+
+    def record_position(self):
+        # Called only after the response is written and flushed, like record_read, so a page that
+        # never arrived is offered again.
+        position, self.pending_position = self.pending_position, None
+        if position is None:
+            return
+        try:
+            self.board.move_position(self.sender["from"], *position)
+        except (ValueError, OSError, UnicodeError) as exc:
+            print("board position not recorded: " + str(exc), file=sys.stderr, flush=True)
 
     def workspace_view(self, name, arguments):
         self.checked_mailbox()
@@ -134,7 +165,7 @@ class Connection:
                 "stale or mismatched sender binding")
         return mailbox
 
-    def call(self, name, arguments):
+    def call(self, name, arguments, render=None):
         text(name, "tool name", 128)
         if name == "mailbox_inbox":
             fields(arguments, set(), {"include_briefs", "limit", "after_message_id"})
@@ -156,6 +187,8 @@ class Connection:
                     "generation": self.sender["binding_generation"], **arguments})
         if name in self.workspace_tools:
             return self.workspace_view(name, arguments)
+        if name in self.board_specs:
+            return self.board_call(name, arguments, render)
         raise ValueError("unknown mailbox tool: " + name)
 
 
@@ -181,25 +214,27 @@ def handle(connection, request):
         return {}
     if method == "tools/list":
         connection.checked_mailbox()
-        return {"tools": definitions(connection.workspace_tools)}
+        return {"tools": definitions(connection.workspace_tools, connection.board_specs)}
     if method == "tools/call":
         fields(params, {"name"}, {"arguments", "_meta"})
+        def render(page):
+            return _response_line({"jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)})
+
         try:
-            result = connection.call(params["name"], params.get("arguments", {}))
+            result = connection.call(params["name"], params.get("arguments", {}), render)
             if params["name"] == "mailbox_inbox":
-                result = _bounded_inbox(result, lambda page: _response_line({
-                    "jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)}))
+                result = _bounded_inbox(result, render)
                 connection.note_returned(result)
             return _tool_result(result)
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
-            return {"content": [{"type": "text", "text": json.dumps({"error": str(exc)})}], "isError": True}
+            return {"content": [{"type": "text", "text": json.dumps({"error": _error_text(exc)})}], "isError": True}
     raise ValueError("unsupported mailbox method: " + method)
 
 
-def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None):
+def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None, board=None):
     integer(generation, "binding generation")
     connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
-                            workspace_store=workspace_store, initiative=initiative)
+                            workspace_store=workspace_store, initiative=initiative, board=board)
     while True:
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:
@@ -210,7 +245,7 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
             require(not oversized, "mailbox frame exceeds 262144 bytes")
             request = strict_json(raw.decode("utf-8"))
         except (ValueError, UnicodeError, RecursionError) as exc:
-            response["error"] = {"code": -32700, "message": str(exc)}
+            response["error"] = {"code": -32700, "message": _error_text(exc)}
         else:
             try:
                 result = handle(connection, request)
@@ -219,7 +254,7 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
                 response["id"] = request["id"]
                 response["result"] = result
             except (ValueError, OSError, UnicodeError, RecursionError) as exc:
-                response["error"] = {"code": -32602, "message": str(exc)}
+                response["error"] = {"code": -32602, "message": _error_text(exc)}
                 if isinstance(request, dict) and type(request.get("id")) in (str, int):
                     response["id"] = request["id"]
         try:
@@ -231,5 +266,6 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
             return 0
         connection.record_read()
+        connection.record_position()
         if oversized:
             return 0  # close the channel rather than interpret frame fragments as requests
