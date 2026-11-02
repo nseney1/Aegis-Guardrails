@@ -114,6 +114,23 @@ def file_digest(path):
     return digest.hexdigest()
 
 
+def scaffold_digest(folder):
+    """The empty Git folder holds no commits, so any file there beyond what `git init` made is a change.
+    Modes are left out here because the read-only check reports them."""
+    digest = hashlib.sha256()
+    for current, folders, files in os.walk(folder):
+        folders.sort()
+        for name in sorted(folders + files):
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            digest.update(os.fsencode(os.path.relpath(path, folder)) + b"\0" + str(stat.S_IFMT(info.st_mode)).encode() + b"\0")
+            if stat.S_ISREG(info.st_mode):
+                digest.update(file_digest(path).encode())
+            elif stat.S_ISLNK(info.st_mode):
+                digest.update(os.fsencode(os.readlink(path)))
+    return digest.hexdigest()
+
+
 def write_output(repository, path, *arguments):
     with open(path, "xb") as stream:
         done = subprocess.run([*GIT, *arguments], cwd=repository, stdout=stream, stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_SECONDS)
@@ -173,14 +190,14 @@ def prepare(args):
         changed = git(repository, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", base, candidate)
         require(changed.returncode == 0, "could not list the changed files")
         count = sum(1 for name in changed.stdout.split(b"\0") if name)
-        manifest = {"schema": SCHEMA, "created_at": timestamp(), "repository": str(repository), "base": sides["base"],
-                    "candidate": sides["candidate"], "diff_sha256": diff, "commits_sha256": commits, "changed_files": count,
-                    "meaning": MEANING}
-        raw = encoded(manifest) + b"\n"
-        publish_file(pending / "manifest.json", raw)
         made = subprocess.run(["git", "init", "-q", "--template=", str(pending)], capture_output=True, timeout=60,
                               env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
         require(made.returncode == 0, "could not create the empty Git folder")
+        manifest = {"schema": SCHEMA, "created_at": timestamp(), "repository": str(repository), "base": sides["base"],
+                    "candidate": sides["candidate"], "diff_sha256": diff, "commits_sha256": commits, "changed_files": count,
+                    "git_scaffold_sha256": scaffold_digest(pending / ".git"), "meaning": MEANING}
+        raw = encoded(manifest) + b"\n"
+        publish_file(pending / "manifest.json", raw)
         lock_down(pending)
         pending.rename(out)
         os.chmod(out, 0o555)
@@ -214,6 +231,13 @@ def side_problems(out, side, listing_expected):
         rows = [json.loads(line) for line in listing.read_text(encoding="ascii").splitlines()]
     expected = {row["path"]: row["sha256"] for row in rows if "sha256" in row}
     folder = out / side
+    # Checked first: walking a symlinked side would hash a same-content copy somewhere else and pass.
+    if folder.is_symlink():
+        return problems + [side + " became a symlink"]
+    if not folder.is_dir():
+        return problems + [side + " is missing"]
+    if stat.S_IMODE(folder.lstat().st_mode) & 0o222:
+        problems.append(side + " is writable")
     seen = set()
     for current, folders, files in os.walk(folder):
         for name in folders + files:
@@ -241,9 +265,26 @@ def verify(args):
     problems = []
     if args.expect_manifest is not None and recorded != args.expect_manifest:
         problems.append("manifest.json does not match the recorded hash")
+    git_folder = out / ".git"
+    if git_folder.is_symlink():
+        problems.append(".git became a symlink")
+    elif not git_folder.is_dir():
+        problems.append(".git is missing")
+    elif "git_scaffold_sha256" not in manifest:
+        problems.append("the manifest has no record of .git, so it cannot be checked")
+    else:
+        if scaffold_digest(git_folder) != manifest["git_scaffold_sha256"]:
+            problems.append(".git changed")
+        for current, folders, files in os.walk(git_folder):
+            for name in folders + files:
+                path = Path(current) / name
+                if not path.is_symlink() and stat.S_IMODE(path.lstat().st_mode) & 0o222:
+                    problems.append(".git/%s is writable" % path.relative_to(git_folder))
     for name, field in (("changes.diff", "diff_sha256"), ("commits.txt", "commits_sha256")):
         path = out / name
-        if not path.is_file():
+        if path.is_symlink():
+            problems.append(name + " became a symlink")
+        elif not path.is_file():
             problems.append(name + " is missing")
         elif file_digest(path) != manifest[field]:
             problems.append(name + " changed")

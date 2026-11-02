@@ -229,6 +229,21 @@ def test_an_unchanged_copy_verifies(repository):
     assert checked["ok"] is True and checked["manifest_sha256"] == result["manifest_sha256"]
 
 
+def plant_hook(out):
+    os.chmod(out / ".git", 0o755)
+    (out / ".git" / "hooks").mkdir(exist_ok=True)
+    (out / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\necho planted\n")
+
+
+def replace_with_link(out, name):
+    """A same-content copy behind a symlink, so every file inside still hashes the same."""
+    os.chmod(out, 0o755)
+    os.chmod(out / name, 0o755)  # Moving a folder to another parent needs write access to the folder itself.
+    moved = out.parent / (out.name + "-moved-" + name.strip("."))
+    (out / name).rename(moved)
+    (out / name).symlink_to(moved)
+
+
 def force_write(path, data):
     os.chmod(path.parent, 0o755)
     if path.exists():
@@ -243,6 +258,11 @@ def force_write(path, data):
     (lambda out: force_write(out / "changes.diff", b"nothing to see"), "changes.diff"),
     (lambda out: force_write(out / "commits.txt", b"nothing to see"), "commits.txt"),
     (lambda out: force_write(out / "candidate.files.jsonl", b""), "candidate.files.jsonl"),
+    (lambda out: plant_hook(out), ".git changed"),
+    (lambda out: force_write(out / ".git" / "config", b"[core]\n\thooksPath = /tmp\n"), ".git changed"),
+    (lambda out: replace_with_link(out, "candidate"), "candidate became a symlink"),
+    (lambda out: os.chmod(out / "candidate", 0o755), "candidate is writable"),
+    (lambda out: replace_with_link(out, ".git"), ".git became a symlink"),
 ])
 def test_a_changed_copy_fails_verification_and_names_the_change(repository, damage, problem):
     repository.prepare()
