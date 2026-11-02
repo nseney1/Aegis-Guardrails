@@ -35,7 +35,7 @@ import uuid
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import fields, read_json, require, text  # noqa: E402
+from hierarchy_mailbox import SHA256, fields, matching, read_bytes, read_json, require, safe_path, text  # noqa: E402
 
 EXIT_OK, EXIT_CRITICAL, EXIT_CONFLICT, EXIT_IO, EXIT_DIALOG = 0, 2, 3, 4, 5
 HEAD_CHARS = 120
@@ -144,6 +144,60 @@ def atomic_write_json(path, obj, expect_absent=True):
             temp.unlink()
     _fsync_folder(path.parent)
     return {"path": str(path), "written": True, "identical": False, "sha256": sha256_bytes(raw)}
+
+
+def cas_update_json(path, expect_sha256, mutate):
+    """Replace a shared JSON file (custody, rendezvous) only if it still has the bytes read.
+
+    mutate receives the parsed object and returns the new one (or edits it in place and
+    returns None). The file is re-hashed just before os.replace; a change in between
+    exits 2 and leaves the other writer's bytes untouched (C2 F6). Without a lock a
+    window of one rename remains; the tool narrows it, it cannot close it.
+    """
+    path = Path(path)
+    raw = path.read_bytes()
+    if sha256_bytes(raw) != expect_sha256:
+        raise Failure(EXIT_CRITICAL, "%s changed before the update" % path, expected_sha256=expect_sha256,
+                      actual_sha256=sha256_bytes(raw))
+    current = json.loads(raw)
+    changed = mutate(current)
+    updated = encode_json(current if changed is None else changed)
+    temp = _temp_beside(path, updated)
+    try:
+        now = sha256_bytes(path.read_bytes())
+        if now != expect_sha256:
+            raise Failure(EXIT_CRITICAL, "%s changed during the update" % path, expected_sha256=expect_sha256,
+                          actual_sha256=now)
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    _fsync_folder(path.parent)
+    return {"path": str(path), "previous_sha256": expect_sha256, "sha256": sha256_bytes(updated)}
+
+
+def verify_briefs(spec_briefs, checkpoint_briefs):
+    """Every checkpoint brief re-hashes, and the spec's briefs are a subset of the checkpoint's.
+
+    Requiring equality aborted a rotation whose checkpoint carried 3 briefs against the
+    spec's 1 (C2 F2); a checkpoint may legitimately carry more.
+    """
+    for brief in [*spec_briefs, *checkpoint_briefs]:
+        fields(brief, {"path", "sha256"})
+        matching(brief["sha256"], SHA256, "brief sha256")
+    rehash = []
+    for brief in checkpoint_briefs:
+        row = {"path": brief["path"], "sha256": brief["sha256"], "actual_sha256": None}
+        try:
+            row["actual_sha256"] = sha256_bytes(read_bytes(safe_path(text(brief["path"], "brief path"))))
+        except (ValueError, OSError) as exc:
+            row["error"] = str(exc)
+        row["ok"] = row["actual_sha256"] == brief["sha256"]
+        rehash.append(row)
+    held = {brief["sha256"] for brief in checkpoint_briefs}
+    missing = [brief["sha256"] for brief in spec_briefs if brief["sha256"] not in held]
+    return {"ok": not missing and all(row["ok"] for row in rehash), "missing_from_checkpoint": missing,
+            "rehash": rehash}
 
 
 def claude_env():

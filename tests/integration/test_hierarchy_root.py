@@ -431,3 +431,104 @@ def test_lanes_health_flags_a_session_waiting_on_a_human(lanes):
 def test_lanes_health_refuses_a_session_id_that_is_not_an_id(lanes):
     code, out, _ = run_tool("lanes-health", "--projects-dir", lanes.projects, "--session", "*", env=lanes.env())
     assert code == 2
+
+
+# --- item 4: shared helpers (C2 section 2.1) ---------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tool():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("hierarchy_root_under_test", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def failure_code(tool, call):
+    with pytest.raises(tool.Failure) as caught:
+        call()
+    return caught.value.code
+
+
+def leftovers(folder):
+    return sorted(p.name for p in folder.iterdir() if p.name.endswith(".tmp"))
+
+
+def test_read_jsonl_skips_only_a_torn_last_line(tool, tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_text('{"a": 1}\n{"b": 2}\n{"c": ', encoding="utf-8")
+    rows, torn = tool.read_jsonl(path)
+    assert rows == [(1, {"a": 1}), (2, {"b": 2})] and torn is True
+    assert failure_code(tool, lambda: tool.read_jsonl(path, tolerate_torn_tail=False)) == 2
+    path.write_text('{"a": 1}\n{"b": \n{"c": 3}\n', encoding="utf-8")
+    assert failure_code(tool, lambda: tool.read_jsonl(path)) == 2
+
+
+def test_atomic_write_is_idempotent_and_refuses_a_differing_target(tool, tmp_path):
+    path = tmp_path / "ack.json"
+    first = tool.atomic_write_json(path, {"a": 1})
+    assert first["written"] is True and json.loads(path.read_text(encoding="utf-8")) == {"a": 1}
+    again = tool.atomic_write_json(path, {"a": 1})
+    assert again["written"] is False and again["identical"] is True and again["sha256"] == first["sha256"]
+    before = path.read_bytes()
+    assert failure_code(tool, lambda: tool.atomic_write_json(path, {"a": 2})) == 3
+    assert path.read_bytes() == before and leftovers(tmp_path) == []
+
+
+def test_cas_update_replaces_only_the_bytes_the_caller_read(tool, tmp_path):
+    path = tmp_path / "custody.json"
+    path.write_text('{"active_root_session": "c4"}\n', encoding="utf-8")
+    expected = sha(path.read_bytes())
+
+    def promote(custody):
+        custody["active_root_session"] = "c5"
+        return custody
+
+    result = tool.cas_update_json(path, expected, promote)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"active_root_session": "c5"}
+    assert result["previous_sha256"] == expected and result["sha256"] == sha(path.read_bytes())
+    stale = path.read_bytes()
+    assert failure_code(tool, lambda: tool.cas_update_json(path, expected, promote)) == 2
+    assert path.read_bytes() == stale and leftovers(tmp_path) == []
+
+
+def test_cas_update_refuses_a_change_between_read_and_replace(tool, tmp_path):
+    path = tmp_path / "custody.json"
+    path.write_text('{"active_root_session": "c4"}\n', encoding="utf-8")
+    expected = sha(path.read_bytes())
+    concurrent = b'{"active_root_session": "other"}\n'
+
+    def racing(custody):
+        path.write_bytes(concurrent)
+        return {"active_root_session": "c5"}
+
+    assert failure_code(tool, lambda: tool.cas_update_json(path, expected, racing)) == 2
+    assert path.read_bytes() == concurrent and leftovers(tmp_path) == []
+
+
+def test_free_space_precheck_refuses_below_the_threshold(tool, tmp_path):
+    class Stats:
+        f_bavail, f_frsize = 100, 1024 * 1024
+
+    target = tmp_path / "missing-folder" / "ack.json"
+    assert failure_code(tool, lambda: tool.check_free_space([target], 512, statvfs=lambda _: Stats)) == 4
+    assert tool.check_free_space([target], 64, statvfs=lambda _: Stats) is None
+    assert not target.parent.exists()
+
+
+def test_verify_briefs_accepts_a_superset_and_rejects_missing_or_changed_briefs(tool, tmp_path):
+    briefs = []
+    for name in ("a", "b", "c"):
+        path = tmp_path / (name + ".md")
+        path.write_text("brief " + name, encoding="utf-8")
+        briefs.append({"path": str(path), "sha256": sha(path.read_bytes())})
+    ok = tool.verify_briefs([briefs[0]], briefs)
+    assert ok["ok"] is True and ok["missing_from_checkpoint"] == []
+    missing = tool.verify_briefs([briefs[0]], briefs[1:])
+    assert missing["ok"] is False and missing["missing_from_checkpoint"] == [briefs[0]["sha256"]]
+    Path(briefs[2]["path"]).write_text("edited", encoding="utf-8")
+    changed = tool.verify_briefs([briefs[0]], briefs)
+    assert changed["ok"] is False
+    assert [row["ok"] for row in changed["rehash"]] == [True, True, False]
