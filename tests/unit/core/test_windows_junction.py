@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import stat
 import struct
+import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -402,3 +404,62 @@ def test_real_windows_junction_reads_target_without_symlink_privilege_and_remove
         link.rmdir()
     retained = tmp_path / "moved-dependencies" if dangling else target
     assert not link.exists() and (retained / "keep").read_text() == "dependency"
+
+
+_RESTRICTED_TOKEN_PROBE = textwrap.dedent('''
+    import ctypes
+    import importlib.util
+    from pathlib import Path
+    import sys
+
+    class DenyCodecImports:
+        def find_spec(self, name, path=None, target=None):
+            if name.startswith("encodings."):
+                raise ImportError("restricted token cannot read " + name)
+            return None
+
+    def impersonate():
+        sys.meta_path.insert(0, DenyCodecImports())
+        for name in [name for name in sys.modules if name.startswith("encodings.utf_16")]:
+            del sys.modules[name]
+
+    def kernel_boundary(*args, **kwargs):
+        raise RuntimeError("kernel boundary reached")
+
+    module, target, link = sys.argv[1:]
+    try:
+        if module == "-":
+            impersonate()
+            target.encode("utf-16-le")
+        else:
+            # Load by path before impersonation, as .github/scripts/p6_noadmin.py does.
+            spec = importlib.util.spec_from_file_location("p6_product_junction", module)
+            junction = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(junction)
+            ctypes.WinDLL = kernel_boundary
+            impersonate()
+            junction.create_directory_junction(Path(target), Path(link))
+        print("no error")
+    except Exception as error:
+        print(type(error).__name__ + ": " + str(error))
+''')
+
+
+def test_junction_encodes_its_target_after_a_restricted_token_blocks_codec_imports(tmp_path):
+    """P6 regression (Validate run 41454388514): Windows CI creates the junction after
+    impersonating a restricted token that can no longer import stdlib codec modules."""
+    from aegis_core.verification import windows_junction
+
+    target, link = tmp_path / "dependencies", tmp_path / "node_modules"
+    target.mkdir()
+
+    def probe(module):
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _RESTRICTED_TOKEN_PROBE,
+                                 module, str(target), str(link)], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    # The control proves the probe reproduces CI's failure when nothing resolved the codec first.
+    assert probe("-") == "LookupError: unknown encoding: utf-16-le"
+    assert probe(windows_junction.__file__) == "RuntimeError: kernel boundary reached"
+    assert not link.exists()

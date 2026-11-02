@@ -8,6 +8,7 @@ https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_r
 from __future__ import annotations
 
 from pathlib import Path
+import codecs
 import os
 import struct
 import sys
@@ -15,6 +16,9 @@ import sys
 __all__ = ["create_directory_junction"]
 
 _MOUNT_POINT = 0xA0000003
+# Callers may create the junction after impersonating a restricted token that cannot import
+# stdlib codec modules, so cache the lazily imported UTF-16-LE codec while this module loads.
+codecs.lookup("utf-16-le")
 
 
 def _kernel32():
