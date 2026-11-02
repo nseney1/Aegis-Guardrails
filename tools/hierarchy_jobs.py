@@ -7,8 +7,8 @@ packet; root's recipe file says what that recipe runs. The argv comes only from 
 exact-word substitution and no shell, so nothing in a message can become a command or an option.
 
 A job is refused unless the checkout is registered for the initiative and its revision, tree and
-status digest match the packet exactly. The source is witnessed again afterward, so a clean exit
-over changed source is not reported as success. A heavy job takes a ledger slot, and processes the
+the bytes of its uncommitted files match the packet exactly. The source is witnessed again afterward,
+so a clean exit over changed source is not reported as success. Files Git ignores are not covered. A heavy job takes a ledger slot, and processes the
 census finds outside the ledger count against the same limit. A slot is freed only with evidence: a
 lost runner leaves `unknown` and keeps the slot until root runs `resolve`.
 
@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -174,6 +175,58 @@ def checked_paths(packet, recipe, checkout):
     return paths
 
 
+def path_fingerprint(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return b"absent"
+    if stat.S_ISLNK(info.st_mode):
+        return b"link:" + os.fsencode(os.readlink(path))
+    if not stat.S_ISREG(info.st_mode):
+        return b"other"
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1048576), b""):
+            digest.update(chunk)
+    return b"file:" + (b"x" if info.st_mode & 0o111 else b"-") + b":" + digest.hexdigest().encode()
+
+
+def uncommitted_content(checkout):
+    """Git status names the paths that differ, not their bytes, so one status can hide different content."""
+    status = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                            cwd=checkout, capture_output=True, timeout=120)
+    require(status.returncode == 0, "could not read the status of " + str(checkout))
+    tokens = status.stdout.split(b"\0")
+    digest = hashlib.sha256()
+    count = index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token:
+            continue
+        count += 1
+        names = [token[3:]]
+        if token[:1] in (b"R", b"C") or token[1:2] in (b"R", b"C"):
+            names.append(tokens[index])
+            index += 1
+        digest.update(token[:2] + b"\0")
+        for name in names:
+            digest.update(name + b"\0" + path_fingerprint(os.path.join(os.fsencode(checkout), name)) + b"\0")
+    return digest.hexdigest(), count
+
+
+def source_state(mailbox, checkout):
+    return {**mailbox.source_witness(checkout), "dirty_content_sha256": uncommitted_content(checkout)[0]}
+
+
+def source_digest(checkout):
+    """What an orchestrator needs for a packet. A lane with a shell can run this and report it."""
+    path = safe_path(text(checkout, "checkout"))
+    digest, count = uncommitted_content(path)
+    return 0, {"commit": Mailbox.git(path, "rev-parse", "HEAD"), "tree": Mailbox.git(path, "rev-parse", "HEAD^{tree}"),
+               "dirty_content_sha256": digest, "dirty_entries": count}
+
+
 def admit(ledger, initiative, message, mailbox, recipes):
     """Everything a job must satisfy before it runs. A ValueError here becomes the refusal's reason."""
     raw = mailbox.brief(message["brief"])
@@ -184,7 +237,7 @@ def admit(ledger, initiative, message, mailbox, recipes):
     except json.JSONDecodeError as exc:
         raise ValueError("packet is not valid JSON") from exc
     fields(packet, {"schema", "recipe", "checkout", "commit", "tree"},
-           {"dirty_state_sha256", "paths", "expected_tree", "message"})
+           {"dirty_content_sha256", "paths", "expected_tree", "message"})
     require(packet["schema"] == PACKET_SCHEMA, "unsupported packet schema")
     name = packet["recipe"]
     require(isinstance(name, str) and name in recipes["recipes"], "unknown recipe: " + str(name)[:128])
@@ -193,8 +246,8 @@ def admit(ledger, initiative, message, mailbox, recipes):
     require(checkout in initiative["checkouts"], "checkout is not registered for this initiative: " + checkout)
     matching(packet["commit"], GIT_ID, "commit")
     matching(packet["tree"], GIT_ID, "tree")
-    dirty = packet.get("dirty_state_sha256", EMPTY_STATUS)
-    matching(dirty, SHA256, "dirty_state_sha256")
+    dirty = packet.get("dirty_content_sha256", EMPTY_STATUS)
+    matching(dirty, SHA256, "dirty_content_sha256")
     paths = checked_paths(packet, recipe, checkout)
     if recipe["kind"] == "commit":
         require("expected_tree" in packet and "message" in packet, "a commit recipe needs expected_tree and message")
@@ -209,10 +262,10 @@ def admit(ledger, initiative, message, mailbox, recipes):
                 "only a commit recipe takes expected_tree or message")
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
-    witness = mailbox.source_witness(checkout)
-    require((witness["source_revision"], witness["source_tree"], witness["dirty_state_sha256"]) ==
+    witness = source_state(mailbox, checkout)
+    require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
             (packet["commit"], packet["tree"], dirty), "source does not match the packet")
-    return {**packet, "dirty_state_sha256": dirty, "paths": paths}, raw
+    return {**packet, "dirty_content_sha256": dirty, "paths": paths}, raw
 
 
 def patient(action, wait):
@@ -644,12 +697,12 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
     try:
-        before = mailbox.source_witness(checkout)
+        before = source_state(mailbox, checkout)
     except ERRORS as exc:
         write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048])
         return settle(store, job, wait)
-    if (before["source_revision"], before["source_tree"], before["dirty_state_sha256"]) != (
-            packet["commit"], packet["tree"], packet["dirty_state_sha256"]):
+    if (before["source_revision"], before["source_tree"], before["dirty_content_sha256"]) != (
+            packet["commit"], packet["tree"], packet["dirty_content_sha256"]):
         # The job may have waited hours for a slot, so the exact source is checked again here.
         write_result(job, "refused", None, reason="source does not match the packet: it changed while the job waited")
         return settle(store, job, wait)
@@ -662,7 +715,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     except ERRORS as exc:
         rows, reason, exit_code, created = [], "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT, None
     try:
-        after = mailbox.source_witness(checkout)
+        after = source_state(mailbox, checkout)
     except ERRORS as exc:
         # Without this the job would have no result, and so no receipt, and would hold its slot.
         after = None
@@ -900,7 +953,7 @@ def clean(store_path, identifier):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--store", required=True, help="Absolute path to the workspace store")
+    parser.add_argument("--store", help="Absolute path to the workspace store")
     parser.add_argument("--recipes", help="Absolute path to root's recipe file")
     parser.add_argument("--lock-wait", type=float, default=DEFAULT_LOCK_WAIT_SECONDS,
                         help="Seconds to wait for a busy mailbox or store before leaving a receipt for the next run")
@@ -915,9 +968,14 @@ def main(argv=None):
     resolved.add_argument("--reason", required=True)
     commands.add_parser("clean", help="Remove a finished job's work folders, keeping its logs and result").add_argument(
         "--job", required=True, help="<initiative>/<message-id>")
+    commands.add_parser("source-digest", help="Print the commit, tree and uncommitted-content digest a packet needs").add_argument(
+        "--checkout", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "resolve":
+        require(args.command == "source-digest" or args.store is not None, "--store is required")
+        if args.command == "source-digest":
+            code, result = source_digest(args.checkout)
+        elif args.command == "resolve":
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait)
         elif args.command == "clean":
             code, result = clean(args.store, args.job)

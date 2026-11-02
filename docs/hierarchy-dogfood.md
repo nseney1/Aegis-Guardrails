@@ -204,8 +204,10 @@ separately when a long turn would hold the others up.
 ```
 
 Publish that JSON as the body of an `info` message to `<hierarchy>/root`. Then publish a
-`job_request` whose `brief` is the `path` and `sha256` the first publish returned. Add
-`dirty_state_sha256` to run on uncommitted changes. Without it, the checkout must be clean.
+`job_request` whose `brief` is the `path` and `sha256` the first publish returned. To run on
+uncommitted changes, add `dirty_content_sha256` from `tool jobs source-digest --checkout <path>`, which a
+lane with a shell can run and report. It covers the bytes of every changed and untracked file. Without
+it, the checkout must be clean. Files Git ignores are not covered.
 Nothing in a message body is ever run, and only root's recipe file decides commands.
 
 **Commit jobs.** `commit-exact` also needs `expected_tree` and `message`, and `paths` lists the

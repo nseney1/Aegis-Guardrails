@@ -226,7 +226,8 @@ def test_the_message_body_is_never_acted_on(shop):
     ("does-not-exist", {}, "unknown recipe"),
     ("with-paths", {"paths": ["src/app.py"], "commit": "0" * 40}, "source does not match"),
     ("with-paths", {"paths": ["src/app.py"], "tree": "0" * 40}, "source does not match"),
-    ("with-paths", {"paths": ["src/app.py"], "dirty_state_sha256": "0" * 64}, "source does not match"),
+    ("with-paths", {"paths": ["src/app.py"], "dirty_content_sha256": "0" * 64}, "source does not match"),
+    ("with-paths", {"paths": ["src/app.py"], "dirty_state_sha256": "0" * 64}, "unexpected"),
     ("with-paths", {"paths": ["--rootdir=/etc"]}, "invalid path"),
     ("with-paths", {"paths": ["-x"]}, "invalid path"),
     ("with-paths", {"paths": ["../outside.py"]}, "invalid path"),
@@ -278,13 +279,71 @@ def test_uncommitted_changes_refuse_a_request_that_named_a_clean_checkout(shop):
     assert not shop.sentinel.exists()
 
 
-def test_a_request_can_name_an_exact_dirty_state(shop):
+def source_digest(shop, checkout=None, *, expect=0):
+    done = subprocess.run([sys.executable, "-I", str(JOBS), "source-digest", "--checkout", str(checkout or shop.checkout)],
+                          capture_output=True, text=True, timeout=30, env=shop.env())
+    assert not done.stderr, done.stderr
+    assert done.returncode == expect, done.stdout
+    return json.loads(done.stdout)
+
+
+def test_a_request_can_name_exact_uncommitted_bytes(shop):
     (shop.checkout / "src" / "app.py").write_text("value = 2\n")
-    status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=shop.checkout,
-                            capture_output=True, check=True, timeout=10).stdout
-    shop.request_job("job-1", "touch", dirty_state_sha256=hashlib.sha256(status).hexdigest())
+    shop.request_job("job-1", "touch", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
     assert shop.run_open()["rows"][0]["state"] == "completed"
     assert shop.sentinel.exists()
+
+
+def test_the_source_digest_gives_what_a_packet_needs(shop):
+    clean = source_digest(shop)
+    assert clean == {"commit": shop.head()["commit"], "tree": shop.head()["tree"], "dirty_entries": 0, "dirty_content_sha256": EMPTY}
+    (shop.checkout / "src" / "app.py").write_text("value = 2\n")
+    assert source_digest(shop)["dirty_entries"] == 1
+    plain = shop.tmp / "not-a-checkout"
+    plain.mkdir()
+    assert "status" in source_digest(shop, plain, expect=2)["error"]
+
+
+def test_changing_an_already_changed_file_refuses_a_request_bound_to_its_old_bytes(shop):
+    """The status looks identical in both states, so only the content can tell them apart."""
+    target = shop.checkout / "src" / "app.py"
+    target.write_text("value = 2\n")
+    status_before = subprocess.run(["git", "status", "--porcelain=v1", "-z"], cwd=shop.checkout, capture_output=True, check=True, timeout=10).stdout
+    shop.request_job("job-1", "touch", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    target.write_text("value = 3\n")
+    assert subprocess.run(["git", "status", "--porcelain=v1", "-z"], cwd=shop.checkout, capture_output=True, check=True, timeout=10).stdout == status_before
+    assert shop.run_open()["rows"][0]["state"] == "refused"
+    assert "source does not match" in shop.receipts("job-1")[-1]["receipt"]["reason"]
+    assert not shop.sentinel.exists()
+
+
+def test_changing_an_already_changed_file_during_a_job_fails_it(shop):
+    target = shop.checkout / "src" / "app.py"
+    target.write_text("value = 2\n")
+    shop.recipes["recipes"]["edits"] = shop.command(["$python", "-c", "open(%r, 'w').write('value = 3\\n')" % str(target)])
+    shop.save_recipes()
+    shop.request_job("job-1", "edits", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    assert shop.run_open()["rows"][0]["state"] == "failed"
+    final = shop.receipts("job-1")[-1]
+    assert "source changed during the job" in final["receipt"]["reason"]
+    recorded = json.loads(verified_evidence(final)["result.json"].read_text())
+    assert recorded["before"]["dirty_content_sha256"] != recorded["after"]["dirty_content_sha256"]
+    assert recorded["before"]["dirty_state_sha256"] == recorded["after"]["dirty_state_sha256"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda checkout: (checkout / "src" / "new.py").write_text("x\n"),
+    lambda checkout: (checkout / "src" / "app.py").unlink(),
+    lambda checkout: (checkout / "src" / "app.py").chmod(0o755),
+    lambda checkout: (checkout / "untracked.txt").write_text("other\n"),
+    lambda checkout: (checkout / "linked").unlink() or (checkout / "linked").symlink_to("elsewhere"),
+])
+def test_every_kind_of_uncommitted_change_moves_the_digest(shop, change):
+    (shop.checkout / "untracked.txt").write_text("first\n")
+    (shop.checkout / "linked").symlink_to("somewhere")
+    before = source_digest(shop)["dirty_content_sha256"]
+    change(shop.checkout)
+    assert source_digest(shop)["dirty_content_sha256"] != before
 
 
 def test_a_changed_packet_file_is_refused(shop):
@@ -694,8 +753,6 @@ def commit_request(shop, **changes):
     (shop.checkout / "src" / "app.py").write_text("value = 2\n")
     (shop.checkout / "src" / "other.py").write_text("not part of this commit\n")
     (shop.checkout / "tests" / "test_app.py").write_text("def test_app():\n    assert True\n")
-    status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=shop.checkout,
-                            capture_output=True, check=True, timeout=10).stdout
     # The expected tree comes from a throwaway index, which is how a lane computes it.
     index = shop.tmp / ("lane-index-%d" % time.monotonic_ns())
     env = {**os.environ, "GIT_INDEX_FILE": str(index)}
@@ -705,7 +762,7 @@ def commit_request(shop, **changes):
     run("add", "--", "src/app.py", "tests/test_app.py")
     tree = run("write-tree")
     packet = {"paths": ["src/app.py", "tests/test_app.py"], "expected_tree": tree, "message": "fix: raise value\n\nExact text; $(not run).\n",
-              "dirty_state_sha256": hashlib.sha256(status).hexdigest(), **changes}
+              "dirty_content_sha256": source_digest(shop)["dirty_content_sha256"], **changes}
     shop.request_job("job-1", "commit", **packet)
     return tree
 
@@ -951,8 +1008,6 @@ def test_a_sandboxed_commit_works_from_a_linked_worktree(shop):
     shop.recipes["recipes"]["commit"]["sandbox"] = "bwrap"
     shop.save_recipes()
     (linked / "src" / "app.py").write_text("value = 5\n")
-    status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=linked,
-                            capture_output=True, check=True, timeout=10).stdout
     env = {**os.environ, "GIT_INDEX_FILE": str(shop.tmp / "linked-index")}
     run = lambda *args: subprocess.run(["git", *args], cwd=linked, env=env, capture_output=True, text=True,  # noqa: E731
                                        check=True, timeout=10).stdout.strip()
@@ -960,7 +1015,7 @@ def test_a_sandboxed_commit_works_from_a_linked_worktree(shop):
     run("add", "--", "src/app.py")
     tree = run("write-tree")
     shop.request_job("job-1", "commit", checkout=linked, paths=["src/app.py"], expected_tree=tree, message="fix: from a worktree",
-                     dirty_state_sha256=hashlib.sha256(status).hexdigest())
+                     dirty_content_sha256=source_digest(shop, linked)["dirty_content_sha256"])
     result = shop.run_open()
     assert result["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
     assert git(linked, "rev-parse", "HEAD^{tree}") == tree
