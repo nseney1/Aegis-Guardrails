@@ -10,10 +10,12 @@ install: ## Editable install with the dev tools
 
 # HOME points at a throwaway directory so no test can read or write the real
 # ~/.aegis, ~/.claude, ~/.gemini or ~/.codex. PYTHONUSERBASE is resolved first,
-# so packages installed with `pip install --user` stay importable.
+# so packages installed with `pip install --user` stay importable. The HOME is
+# made in /tmp, never under $TMPDIR: a TMPDIR inside the real home would put the
+# isolated HOME there too, and discovery would walk up into the real ~/.aegis.
 test: ## Run the full suite with an isolated HOME
 	@userbase="$${PYTHONUSERBASE:-$$($(PYTHON) -m site --user-base)}"; \
-	home="$$(mktemp -d)"; trap 'rm -rf "$$home"' EXIT; \
+	home="$$(mktemp -d /tmp/aegis-test-home.XXXXXX)"; trap 'rm -rf "$$home"' EXIT; \
 	xdist=""; if $(PYTHON) -c "import xdist" >/dev/null 2>&1; then xdist="-n auto"; fi; \
 	HOME="$$home" USERPROFILE="$$home" XDG_CONFIG_HOME="$$home/.config" PYTHONUSERBASE="$$userbase" \
 	  $(PYTHON) -m pytest tests -q $$xdist
