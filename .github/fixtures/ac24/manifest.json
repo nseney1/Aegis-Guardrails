@@ -1,0 +1,47 @@
+{
+  "dependency_payload_included": false,
+  "files": {
+    "acceptance.py": {
+      "bytes": 30823,
+      "sha256": "692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474"
+    },
+    "fixture/.aegis/config.json": {
+      "bytes": 8,
+      "sha256": "2b4248702881de2f5638efe96b233de1c0dd9be5dd24ec35ad030d6b06aede9a"
+    },
+    "fixture/.aegis/rules/traps/trap-sample.md": {
+      "bytes": 146,
+      "sha256": "f19179c04b1d4c89d5028d455df57cb3c2cba73401577e46ba9716c9fb11d307"
+    },
+    "fixture/base-app.ts": {
+      "bytes": 46,
+      "sha256": "2ed50b54ffe4b41ddca7172862e92fdbe37ce728db7f08f12c2ff4ed8b03e259"
+    },
+    "fixture/package.json": {
+      "bytes": 61,
+      "sha256": "513ac4a1a7e2461f3899f1e8c54fbaac1292b4ea7ba7e07ffb1011fd0f7b1ecb"
+    },
+    "fixture/src/app.ts": {
+      "bytes": 46,
+      "sha256": "fcf25d602ba9e69589a659abd53f3debb4be6240b972aaeb4b45828c9945b639"
+    },
+    "fixture/tests/app.test.ts": {
+      "bytes": 175,
+      "sha256": "36eb5325a4dc7ee2b7f19b6962d6727dd7b9c8e3d93487b4c04a1db17398160f"
+    },
+    "fixture/vitest.config.mjs": {
+      "bytes": 83,
+      "sha256": "0dd1a5d587d754d79ace1be4523109f5db3e7233fc273a29500e5e1ed160eb12"
+    },
+    "m0-package-lock.json": {
+      "bytes": 197035,
+      "sha256": "82ecce1b7005a50e5ac6142fa296066ed7193ce5679b4dfd6ae7ebaf29e2ef9c"
+    },
+    "m0-package.json": {
+      "bytes": 178,
+      "sha256": "ad37e2a5634ac28d9b3e6619414cc7c547e7c13c9ad542e84b1f1a3af37e5ee0"
+    }
+  },
+  "purpose": "Reviewed external acceptance kit; this manifest is not an acceptance verdict",
+  "schema": 1
+}
