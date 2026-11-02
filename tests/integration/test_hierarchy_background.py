@@ -56,8 +56,9 @@ if words[0] == "control":
         hidden = os.path.exists(hide)
         if hidden:
             os.remove(hide)
-        print(json.dumps([{key: row[key] for key in ("id", "sessionId", "status", "state", "kind", "name", "pid",
-                                                    "waitingFor") if key in row}
+        # The real row's fields; waitingFor appears only while the session waits, e.g. at a dialog.
+        print(json.dumps([{key: row[key] for key in ("cwd", "id", "kind", "name", "pid", "sessionId", "startedAt",
+                                                    "state", "status", "waitingFor") if key in row}
                           for row in rows() if row["status"] != "stopped" and alive(row["pid"]) and not hidden]))
     elif words[1] == "stop":
         for row in rows():
@@ -112,12 +113,12 @@ with open(record, "w", encoding="utf-8") as stream:
     json.dump({"argv": words}, stream)
 if mode == "launch-fails":
     sys.exit(7)
-identifier = session[-8:]
+identifier = session[:8]  # the real host lists the first 8 characters of the session ID
 if mode == "unlisted":  # the launcher reports success, but the host never lists the session
     print(identifier)
     sys.exit(0)
-save({"id": identifier, "sessionId": session, "status": "busy", "state": "working", "kind": "background",
-      "name": words[words.index("--name") + 1], "pid": -1})
+save({"cwd": os.getcwd(), "id": identifier, "kind": "background", "name": words[words.index("--name") + 1], "pid": -1,
+      "sessionId": session, "startedAt": int(time.time() * 1000), "state": "working", "status": "busy"})
 child = subprocess.Popen([sys.executable, __file__, state, "turn", identifier, mode, helper, root, endpoint, host,
                           delivery], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, env={**os.environ, "STUB_SESSION": session})
@@ -170,8 +171,8 @@ class Background:
         """A background session for the same ID that is already alive, as the host would list it."""
         holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
         (self.state / "old00000.row").write_text(json.dumps({
-            "id": "old00000", "sessionId": self.pilot.session, "status": status, "state": "blocked", "kind": "background",
-            "name": TARGET + "-g1", "pid": holder.pid, **extra}))
+            "cwd": str(self.pilot.tmp), "id": "old00000", "kind": "background", "name": TARGET + "-g1", "pid": holder.pid,
+            "sessionId": self.pilot.session, "startedAt": 1793635000000, "state": "blocked", "status": status, **extra}))
         return holder
 
     def cleanup(self):
@@ -195,7 +196,7 @@ def test_a_background_turn_is_waited_for_then_stopped_and_its_mail_reported_read
     code, result = background.wake(background.profile())
     assert code == 0, result
     assert result["state"] == "read" and result["read"] == ["note-1"] and result["timed_out"] is False
-    identifier = background.pilot.session[-8:]
+    identifier = background.pilot.session[:8]
     assert result["background"] == {"id": identifier, "ended": "idle", "stop_confirmed": True,
                                     "exit_status": "unknown"}
     assert ["stop", identifier] in background.calls() and ["logs", identifier] in background.calls()
@@ -240,7 +241,7 @@ def test_a_background_turn_that_outlives_its_timeout_is_stopped_and_reported(bac
     code, result = background.wake(background.profile(stub_mode="hang", timeout_seconds=4))
     assert code == 3 and result["state"] == "timed_out" and result["timed_out"] is True
     assert result["background"]["ended"] == "timeout" and result["background"]["stop_confirmed"] is True
-    assert ["stop", background.pilot.session[-8:]] in background.calls()
+    assert ["stop", background.pilot.session[:8]] in background.calls()
 
 
 def test_a_failed_background_launch_is_recorded_as_failed_to_start(background):
@@ -260,7 +261,7 @@ def test_a_failed_launch_that_left_a_session_stops_it_before_releasing_the_lock(
     background.pilot.publish()
     (background.state / "hide-after-launch").write_text("")
     code, result = background.wake(background.profile(stub_mode="orphan"))
-    identifier = background.pilot.session[-8:]
+    identifier = background.pilot.session[:8]
     assert code == 3 and "exit 7" in result["error"], result
     # One missing look is not proof that the failed launcher left nothing running.
     assert ["stop", identifier] in background.calls(), result
@@ -276,7 +277,7 @@ def test_a_launch_whose_start_cannot_be_recorded_stops_the_session_it_started(ba
     # A folder where the wakes ledger takes its lock makes the "started" write fail after the launch.
     (background.pilot.delivery / "wakes" / TARGET / ".write.lock").mkdir(parents=True)
     code, result = background.wake(background.profile())
-    identifier = background.pilot.session[-8:]
+    identifier = background.pilot.session[:8]
     assert code == 3 and "could not record the start" in result["error"], result
     assert ["stop", identifier] in background.calls(), result
     assert all(row["status"] == "stopped" for row in background.rows())
@@ -315,7 +316,7 @@ def test_a_turn_stopped_at_a_dialog_keeps_its_session_and_lock_and_asks_the_owne
     (background.state / "turn-ends.json").write_text(json.dumps(ends))
     (background.state / "logs-extra").write_text("\x1b[1mDo you want to proceed?\x1b[0m\n")
     code, result = background.wake(background.profile())
-    identifier = background.pilot.session[-8:]
+    identifier = background.pilot.session[:8]
     assert code == 3 and result["state"] == "needs_owner", result
     assert result["background"]["ended"] == "blocked" and result["background"]["dialog_prompt_seen"] is True
     assert ["stop", identifier] not in background.calls(), "a session waiting on a human is not stopped"
@@ -347,6 +348,36 @@ def test_a_session_waiting_on_its_owner_is_neither_stopped_nor_woken_again(backg
         holder.wait(timeout=5)
     assert code == 2 and "waiting on its owner" in result["error"], result
     assert not background.pilot.record.exists() and ["stop", "old00000"] not in background.calls()
+
+
+# One live `claude agents --json` row in the shape the orchestrator's sweep read at 15:59Z and 16:04Z: these fields,
+# kind "background", and an id equal to the FIRST 8 characters of sessionId. The values are illustrative;
+# startedAt is in epoch milliseconds, as this host's session table records it.
+REAL_ROW = {"cwd": "/home/owner/workspace", "id": "e07ab3e2", "kind": "background", "name": "aegis47-live reviewer r2",
+            "pid": 4094706, "sessionId": "e07ab3e2-0000-4000-8000-000000000000", "startedAt": 1793635000000,
+            "state": "blocked", "status": "idle"}
+
+
+@pytest.mark.parametrize("extra", [{}, {"waitingFor": "permission prompt"}])
+def test_a_row_in_the_real_host_shape_drives_the_idle_stop_and_the_owner_wait(background, extra):
+    background.pilot.publish()
+    session = background.pilot.session
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    row = {**REAL_ROW, **extra, "sessionId": session, "id": session[:8], "pid": holder.pid}
+    assert row["id"] == row["sessionId"][:8] and sorted(REAL_ROW) == [
+        "cwd", "id", "kind", "name", "pid", "sessionId", "startedAt", "state", "status"]
+    (background.state / (row["id"] + ".row")).write_text(json.dumps(row))
+    try:
+        code, result = background.wake(background.profile())
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+    if extra:
+        assert code == 2 and "waiting on its owner" in result["error"], result
+        assert ["stop", session[:8]] not in background.calls() and not background.pilot.record.exists()
+    else:
+        assert code == 0 and result["state"] == "read" and result["stopped_idle"] == session[:8], result
+        assert result["background"]["id"] == session[:8] and result["background"]["ended"] == "idle"
 
 
 def test_an_unconfirmed_stop_keeps_the_wake_lock(background):
@@ -399,7 +430,7 @@ def test_a_session_briefly_missing_from_the_host_list_is_still_followed_and_stop
     background.pilot.publish()
     code, result = background.wake(background.profile(stub_mode="flicker"))
     assert code == 0 and result["state"] == "read", result
-    identifier = background.pilot.session[-8:]
+    identifier = background.pilot.session[:8]
     assert result["background"]["ended"] == "idle" and result["background"]["stop_confirmed"] is True
     assert ["stop", identifier] in background.calls(), "a session that was only briefly unlisted must still be stopped"
     assert all(row["status"] == "stopped" for row in background.rows())
