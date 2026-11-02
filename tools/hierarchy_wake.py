@@ -47,6 +47,8 @@ BACKGROUND_POLL_SECONDS = 1.0
 BACKGROUND_START_SECONDS = 60.0
 BACKGROUND_STOP_SECONDS = 15.0
 IDLE_LOOKS = 3
+# The host list can leave out a running session for a moment, so one missing look never ends a turn or confirms a stop.
+GONE_LOOKS = 3
 # The host prints these IDs. One that starts with a dash would be read as an option by `claude stop`.
 SHORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 MODES = ("print", "background")
@@ -114,8 +116,10 @@ def stop_background(profile, entry):
     """True only once the host no longer lists the session, so an unconfirmed stop is never reported as done."""
     control_command(profile, "stop", entry["id"])
     deadline = time.monotonic() + BACKGROUND_STOP_SECONDS
+    gone_looks = 0
     while True:
-        if background_entry(profile) is None:
+        gone_looks = gone_looks + 1 if background_entry(profile) is None else 0
+        if gone_looks >= GONE_LOOKS:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -148,11 +152,11 @@ def await_background(profile, before):
     A turn short enough to finish between two looks still moves the transcript, so either sign counts.
     """
     started = time.monotonic()
-    seen, busy, idle_looks = None, False, 0
+    seen, busy, idle_looks, gone_looks = None, False, 0, 0
     while True:
         entry = background_entry(profile)
         if entry is not None:
-            seen = entry
+            seen, gone_looks = entry, 0
             if entry.get("status") == "busy":
                 busy, idle_looks = True, 0
             elif busy or transcript_mark(profile) != before:
@@ -161,7 +165,9 @@ def await_background(profile, before):
                 if idle_looks >= IDLE_LOOKS:
                     return "idle", seen
         elif seen is not None:
-            return "exited", seen
+            gone_looks += 1
+            if gone_looks >= GONE_LOOKS:
+                return "exited", seen
         elapsed = time.monotonic() - started
         if elapsed >= profile["timeout_seconds"]:
             return "timeout", seen
@@ -316,15 +322,19 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
     # An error while following the turn leaves the lock in place: the session may still be working.
     ended, entry = await_background(profile, before)
     timed_out = ended == "timeout"
-    if ended in ("idle", "timeout"):
+    if ended == "timeout" and entry is None:
+        # A short timeout can pass before the host lists the session; one late listing must still be stopped.
+        entry = background_entry(profile)
+    if ended in ("idle", "timeout") and entry is not None:
         save_terminal_output(profile, entry, log)
         stop_confirmed = stop_background(profile, entry)
     else:
         # Gone from the host's list, or never in it: check the process table too before releasing the lock.
         stop_confirmed = not (process_names_session(profile["session"]) or claude_table_lists_session(profile["session"]))
     try:
+        # The launcher returned and the session was stopped or vanished; its own exit status was never seen.
         mailbox.write_delivery_receipt(directory, "wakes", {
-            **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited", "exit_code": 0,
+            **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited", "exit_code": None,
             "timed_out": timed_out})
     finally:
         if stop_confirmed:
@@ -340,9 +350,10 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
         state = "read"
     else:
         state = "timed_out" if timed_out else "woken_unread"
-    result = {**answer, "log": log, "exit_code": 0, "timed_out": timed_out, "state": state, "read": read,
+    result = {**answer, "log": log, "exit_code": None, "timed_out": timed_out, "state": state, "read": read,
               "still_unread": unread,
-              "background": {"id": entry["id"] if entry else None, "ended": ended, "stop_confirmed": stop_confirmed}}
+              "background": {"id": entry["id"] if entry else None, "ended": ended, "stop_confirmed": stop_confirmed,
+                             "exit_status": "unknown"}}
     if stopped_idle is not None:
         result["stopped_idle"] = stopped_idle
     return (0 if state == "read" else 3), result
