@@ -453,6 +453,47 @@ def test_the_real_census_finds_outside_heavy_processes(shop, tmp_path):
             os.kill(pid, signal.SIGKILL)
 
 
+SPAN = ("import os, time\nname = str(os.getpid())\nopen(%r, 'a').write('start ' + name + '\\n')\ntime.sleep(0.6)\n"
+        "open(%r, 'a').write('end ' + name + '\\n')\n")
+
+
+def peak(log):
+    running = most = 0
+    for line in log.read_text().splitlines():
+        running += 1 if line.startswith("start") else -1
+        most = max(most, running)
+    return most
+
+
+def test_concurrent_runners_never_exceed_the_combined_cap(shop, tmp_path):
+    """The census takes time. If it ran outside the grant lock, runners that counted at once would all see room."""
+    log = tmp_path / "spans.log"
+    shop.recipes["recipes"]["span"] = shop.command(["$python", "-c", SPAN % (str(log), str(log))], heavy=True)
+    shop.save_recipes()
+    for number in range(4):
+        shop.request_job("job-%d" % number, "span")
+    fixture = tmp_path / "slow-census.json"
+    fixture.write_text(json.dumps({"external_roots": [101, 102], "delay_seconds": 0.4}))
+    argv = [sys.executable, "-I", str(JOBS), "--store", str(shop.workspace.store), "--recipes", str(shop.recipes_path),
+            "--census-fixture", str(fixture), "run-open", "--max-jobs", "1"]
+    runners = [subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=shop.env()) for _ in range(4)]
+    for runner in runners:
+        runner.communicate(timeout=120)
+    assert peak(log) == 1, "two outside roots and a limit of three leave room for one job at a time"
+    while shop.open_jobs():
+        shop.jobs("run-open", census=[101, 102], expect=0)
+    assert shop.heavy()["used"] == 0 and peak(log) == 1
+
+
+def test_a_census_fixture_is_checked(shop, tmp_path):
+    fixture = tmp_path / "bad-census.json"
+    fixture.write_text(json.dumps({"external_roots": [101], "delay_seconds": 60}))
+    shop.request_job("job-1", "heavy")
+    argv_error = subprocess.run([sys.executable, "-I", str(JOBS), "--store", str(shop.workspace.store), "--recipes", str(shop.recipes_path),
+                                 "--census-fixture", str(fixture), "run-open"], capture_output=True, text=True, timeout=60, env=shop.env())
+    assert argv_error.returncode == 2 and "delay_seconds" in argv_error.stdout
+
+
 def add_initiative(shop, identifier, priority):
     base = shop.tmp / "initiatives" / identifier
     checkout = shop.make_checkout(identifier + "-checkout")

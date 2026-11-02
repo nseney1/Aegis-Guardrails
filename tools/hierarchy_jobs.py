@@ -824,10 +824,22 @@ def enqueue(store, job, wait):
     patient(attempt, wait)
 
 
+def fixture_roots(fixture):
+    """For tests: a list of PIDs, or {"external_roots": [...], "delay_seconds": n} to make the census take time like a real one."""
+    data = read_json(fixture)
+    if isinstance(data, list):
+        return sorted(data)
+    fields(data, {"external_roots"}, {"delay_seconds"})
+    delay = data.get("delay_seconds", 0)
+    require(isinstance(delay, (int, float)) and 0 <= delay <= 5, "invalid delay_seconds")
+    time.sleep(delay)
+    return sorted(data["external_roots"])
+
+
 def census(store_path, ledger, fixture):
     held = ledger.held("heavy")
     if fixture is not None:
-        return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": sorted(read_json(fixture)), "census": "fixture"}
+        return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": fixture_roots(fixture), "census": "fixture"}
     owners = set()
     for request in held:
         if request["holder"].startswith("job:"):
@@ -848,20 +860,25 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
             held_reason = "low_disk"
             break
         ledger = store.load()
-        capacity = census(store.path, ledger, fixture)
         granted = next((holder for holder in waiting
                         if any(r["holder"] == holder and r["state"] == "granted" for r in ledger.requests.values())), None)
         if granted is None:
-            if capacity["held"] + len(capacity["external_roots"]) >= capacity["limit"]:
-                held_reason = "capacity_full"
-                break
+            seen = {}
+
+            def outside(locked):
+                # Counted under the store lock, together with the grant, so another runner cannot take the
+                # same free slot between this count and the grant.
+                seen.update(census(store.path, locked, fixture))
+                return seen["external_roots"]
+
             try:
-                code, answer = patient(lambda: grant_next(store, "heavy"), wait)
+                code, answer = patient(lambda: grant_next(store, "heavy", outside=outside), wait)
             except ValueError as exc:
                 if "busy" not in str(exc):
                     raise
                 held_reason = "store_busy"
                 break
+            capacity = dict(seen) or capacity
             if code != 0:
                 held_reason = answer.get("reason", "not_granted")
                 break

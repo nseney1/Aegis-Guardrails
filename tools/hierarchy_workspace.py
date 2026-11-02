@@ -321,10 +321,13 @@ def initiative_view(ledger, identifier):
         "blocked_by": ledger.unresolved(initiative), "holds": counts["granted"], "queued": counts["queued"]}
 
 
-def grant_next(store, kind):
+def grant_next(store, kind, outside=None):
+    """`outside` counts heavy work this ledger does not hold. It runs inside the same lock as the grant, so two
+    callers counting at the same moment cannot both see room for one slot."""
     require(kind in KINDS, "invalid kind")
     with store.lock():
         ledger = store.load()
+        others = outside(ledger) if outside is not None else []
         waiting, eligible = [], []
         for request in ledger.requests.values():
             if request["kind"] != kind or request["state"] != "queued":
@@ -338,9 +341,9 @@ def grant_next(store, kind):
             else:
                 eligible.append(request)
         answer = {"kind": kind, "granted": None, "waiting": waiting[:MAX_VIEW_ROWS]}
-        if len(ledger.held(kind)) >= ledger.limits[kind]:
+        if len(ledger.held(kind)) + len(others) >= ledger.limits[kind]:
             # Full means full: a higher priority request waits, because accepted work is never preempted.
-            return 3, {**answer, "reason": "capacity_full",
+            return 3, {**answer, "reason": "capacity_full", "outside": others[:MAX_VIEW_ROWS],
                        "holders": [request_view(r) for r in ledger.held(kind)][:MAX_VIEW_ROWS]}
         if not eligible:
             return 3, {**answer, "reason": "all_blocked" if waiting else "queue_empty"}
