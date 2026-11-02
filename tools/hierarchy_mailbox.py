@@ -162,6 +162,14 @@ def safe_path(path):
     return path
 
 
+def cli_path(value, flag):
+    """A CLI refusal names the argument and its value (T100); safe_path keeps its text for its importers."""
+    path = Path(value)
+    require(path.is_absolute() and ".." not in path.parts,
+            flag + " must be absolute without traversal: got " + repr(value))
+    return safe_path(path)
+
+
 def read_bytes(path):
     path = safe_path(path)
     try:
@@ -176,6 +184,16 @@ def read_bytes(path):
 
 def read_json(path):
     return strict_json(read_bytes(path).decode("utf-8"))
+
+
+STDIN_COMMANDS = ("publish", "ack-handoff")
+
+
+def read_stdin_json():
+    """`--request -` is read before the writer lock: a caller that holds stdin open must never hold .write.lock."""
+    raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+    require(len(raw) <= MAX_BYTES, "input exceeds 262144 bytes")
+    return strict_json(raw.decode("utf-8"))
 
 
 def endpoint_parts(endpoint):
@@ -295,6 +313,16 @@ class Mailbox:
         endpoint_parts(endpoint)
         require(endpoint in self.manifest["endpoints"], "unknown endpoint: " + endpoint)
         return self.manifest["endpoints"][endpoint]
+
+    def require_kind(self, endpoint, kind):
+        """Bind-by-kind interim (T112 H1): a request that names a kind is refused when the manifest disagrees.
+
+        Only lanes declare a kind, so a kind given for any other role is refused too.
+        """
+        text(kind, "kind", 64)
+        declared = self.endpoint(endpoint).get("kind")
+        require(kind == declared, "kind " + repr(kind) + " does not match the manifest kind "
+                + ("(none)" if declared is None else repr(declared)) + " of " + endpoint)
 
     def route(self, sender, recipient):
         self.endpoint(sender)
@@ -550,7 +578,10 @@ class Mailbox:
                        if r["message"]["type"] == "job_request" and r["message"]["message_id"] not in terminal),
                       key=lambda message: (message["created_at"], message["message_id"]))
 
-    def checkpoint_assignments(self, endpoint, checkpoint, records):
+    def checkpoint_assignments(self, endpoint, checkpoint, records, *, lineage=False):
+        """Exact by default: bind and draft-handoff anchor the snapshot. With lineage (ack-handoff only),
+        a still-open lane may have moved forward on its branch since then; the observed witnesses are returned."""
+        witnesses = {}
         for job in self.open_job_requests(records):
             if endpoint in (job["from"], job["to"]):
                 require(job["message_id"] in checkpoint["pending_message_ids"], "checkpoint omits open job request")
@@ -569,6 +600,14 @@ class Mailbox:
                 worktree = safe_path(source["worktree"])
                 require(self.git(worktree, "branch", "--show-current") == readiness["branch"],
                         "checkpoint branch changed since acceptance")
+                if lineage:
+                    if source["worktree"] not in witnesses:
+                        witnesses[source["worktree"]] = self.source_witness(worktree)
+                    # Test the HEAD the witness recorded, so the reported state is the state that passed.
+                    require(self.git_is_ancestor(worktree, source["source_revision"],
+                                                 witnesses[source["worktree"]]["source_revision"]),
+                            "checkpoint source moved off its snapshot: " + str(worktree))
+                    continue
                 if "dirty_state" in source:
                     observed = {"source_revision": self.git(worktree, "rev-parse", "HEAD"),
                                 "source_tree": self.git(worktree, "rev-parse", "HEAD^{tree}"),
@@ -579,6 +618,9 @@ class Mailbox:
                                                               "dirty_state_sha256", "dirty_entries")}
                 require(all(source[key] == value for key, value in observed.items()),
                         "checkpoint source snapshot does not match worktree")
+        keys = ("worktree", "source_revision", "source_tree", "dirty_entries", "dirty_state_sha256")
+        return [{key: witnesses[name][key] for key in keys}
+                for name in dict.fromkeys(source["worktree"] for source in checkpoint["sources"]) if name in witnesses]
 
     def wake_marker(self, endpoint):
         """Sits beside .write.lock, outside the routing folders, and is held from launch until the turn ends."""
@@ -618,10 +660,12 @@ class Mailbox:
                 "handoff acknowledgment does not match binding")
         records = self.messages()
         self.checkpoint(binding["checkpoint"], records)
-        self.checkpoint_assignments(request["endpoint"], binding["checkpoint"], records)
+        observed = self.checkpoint_assignments(request["endpoint"], binding["checkpoint"], records, lineage=True)
         path = self.root / "bindings" / request["endpoint"] / ("%06d.ack" % request["generation"])
         publish_file(path, encoded(request) + b"\n")
-        return {"endpoint": request["endpoint"], "generation": request["generation"], "ready": True}
+        # The witness is output only: the .ack file and the immutable binding keep their strict shapes.
+        return {"endpoint": request["endpoint"], "generation": request["generation"], "ready": True,
+                "observed_sources": observed}
 
     @staticmethod
     def git(worktree, *arguments):
@@ -632,6 +676,17 @@ class Mailbox:
             raise ValueError("git identity check timed out") from exc
         require(result.returncode == 0, "git identity check failed")
         return result.stdout.rstrip("\r\n")
+
+    @staticmethod
+    def git_is_ancestor(worktree, ancestor, descendant):
+        """`merge-base --is-ancestor` answers by exit code: 1 means "no"; any other nonzero exit is a failure."""
+        try:
+            result = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "merge-base",
+                                     "--is-ancestor", ancestor, descendant], cwd=worktree, capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("git identity check timed out") from exc
+        require(result.returncode in (0, 1), "git identity check failed")
+        return result.returncode == 0
 
     def source_witness(self, worktree, evidence_dir=None):
         """Revision, tree and an exact-byte status digest. Nothing is trimmed before hashing."""
@@ -873,6 +928,27 @@ class Mailbox:
                 "binding": binding, "checkpoint_briefs": checkpoint_briefs,
                 "next_after": selected[-1]["message"]["message_id"] if len(records) > limit else None}
 
+    def binding_view(self, endpoint):
+        """Startup and triage view (T23): pages ran past 100 KB, and every rotation read them.
+
+        Each checkpoint brief is re-hashed and reported as `ok` instead of refusing, so a
+        changed brief is visible here without its text. No message is returned, so an
+        adapter has nothing to record as read.
+        """
+        self.endpoint(endpoint)
+        total = sum(1 for record in self.messages().values() if record["message"]["to"] == endpoint)
+        history = self.bindings(endpoint)
+        binding = {**history[-1], "ready": self.ready(history[-1])} if history else None
+        briefs = []
+        for brief in binding["checkpoint"]["briefs"] if binding is not None and binding["checkpoint"] is not None else ():
+            try:
+                self.brief(brief)
+            except (ValueError, OSError):
+                briefs.append({**brief, "ok": False})
+            else:
+                briefs.append({**brief, "ok": True})
+        return {"endpoint": endpoint, "binding": binding, "checkpoint_briefs": briefs, "messages_total": total}
+
     def outside_mailbox(self, directory, label):
         """Derived files must never reach mailbox history, so overlap is refused in both directions.
 
@@ -1026,11 +1102,14 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "bind", "publish", "ack-handoff", "draft-handoff"):
         commands.add_parser(name).add_argument("--request", "--request-file", required=True,
-                                              help="Absolute path to a strict JSON request file")
+                                              help="Absolute path to a strict JSON request file"
+                                              + (", or - to read it from stdin" if name in STDIN_COMMANDS else ""))
     inbox = commands.add_parser("inbox")
     inbox.add_argument("--endpoint", required=True)
     inbox.add_argument("--include-briefs", action="store_true")
-    inbox.add_argument("--limit", type=int, default=20)
+    inbox.add_argument("--binding-only", action="store_true",
+                       help="Only the binding, a hash check per checkpoint brief and the message count; no messages")
+    inbox.add_argument("--limit", type=int, default=None, help="Messages per page: default 20, maximum 100")
     inbox.add_argument("--after", default=None)
     inbox.add_argument("--delivery-dir", default=None, help="With --mark-read, where root's read receipts go")
     inbox.add_argument("--mark-read", action="store_true", help="Root only: record what this page returned as read")
@@ -1050,7 +1129,13 @@ def main(argv=None):
     server.add_argument("--board", default=None, help="Serve only the workspace board tools, from this board folder")
     args = parser.parse_args(argv)
     try:
-        root = safe_path(args.root)
+        root = cli_path(args.root, "--root")
+        stdin_request = None
+        if getattr(args, "request", None) == "-":
+            require(args.command in STDIN_COMMANDS, "--request - (stdin) is only for publish and ack-handoff")
+            stdin_request = read_stdin_json()
+        elif getattr(args, "request", None) is not None:
+            cli_path(args.request, "--request")
         if args.command == "serve":
             # With -I the script directory is absent from sys.path. Add only the
             # exact reviewed sibling-tool directory, never cwd or PYTHONPATH.
@@ -1070,18 +1155,22 @@ def main(argv=None):
                 result = mailbox.status()
             elif args.command == "delivery":
                 result = mailbox.delivery(args.delivery_dir, endpoint=args.endpoint, message_id=args.message_id)
+            elif args.binding_only:
+                require(not (args.include_briefs or args.limit is not None or args.after is not None or args.mark_read),
+                        "--binding-only takes no --include-briefs, --limit, --after or --mark-read")
+                result = mailbox.binding_view(args.endpoint)
             else:
                 if args.mark_read:
                     require(args.delivery_dir is not None, "--mark-read needs --delivery-dir")
                     require(endpoint_parts(args.endpoint)[1] == "root",
                             "only root reads through the CLI with a receipt; a session's adapter records its own")
                 result = mailbox.inbox(args.endpoint, include_briefs=args.include_briefs,
-                                       limit=args.limit, after=args.after)
+                                       limit=20 if args.limit is None else args.limit, after=args.after)
                 result = _bounded_inbox(result, _cli_line)
         else:
             with writer_lock(root):
                 mailbox = Mailbox(root)
-                request = read_json(args.request)
+                request = stdin_request if args.request == "-" else read_json(args.request)
                 if args.command == "bind":
                     result = mailbox.bind(request)
                 elif args.command == "ack-handoff":

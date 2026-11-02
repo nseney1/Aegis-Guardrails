@@ -138,6 +138,19 @@ python3 /absolute/prototype/tools/hierarchy_mailbox.py \
   --root /absolute/aegis-guides/mailbox status
 ```
 
+`publish` and `ack-handoff` also take `--request -`, which reads the same strict JSON
+(at most 262144 bytes) from stdin before taking the writer lock, so a caller that keeps
+stdin open never blocks other writers. `init`, `bind` and `draft-handoff` still need an
+absolute file. A relative or traversing `--root`, `--request` or `--spec` is refused
+with the argument and its value named. `inbox --limit` defaults to 20, at most 100.
+`inbox --binding-only` (the adapter's `binding_only`) is the startup and triage view:
+the binding, each checkpoint brief as `{path, sha256, ok}`, where `ok` means the file
+still hashes to `sha256`, and `messages_total`. It returns no messages or brief text,
+records no read, and refuses `--include-briefs`, `--limit`, `--after` and `--mark-read`.
+A `hierarchy_handoff.py` spec entry and an `add-role` request may carry `kind`. When
+present it must equal the endpoint's manifest kind (only lanes declare one), or that
+entry or request is refused with both kinds named.
+
 Inside one hierarchy, front door and orchestrator communicate vertically, as do
 orchestrator and lanes. Across hierarchies, only explicitly paired counterparts
 communicate. No front-door/lane or cross-hierarchy diagonal route is accepted.
@@ -311,6 +324,17 @@ python3 /absolute/prototype/tools/hierarchy_mailbox.py \
   --root /absolute/aegis-guides/mailbox ack-handoff \
   --request /absolute/aegis-guides/requests/a-f2-handoff-ack.json
 ```
+
+Bind checks each snapshot exactly, but a writing lane that is still working keeps
+moving after the draft. So, for each open accepted dispatch, acknowledgment checks
+lineage instead: the branch still matches the acceptance, the lease ref is in the
+checkpoint, and the snapshot's `source_revision` is HEAD or an ancestor of it. The tree
+and dirty state may differ. A lane reset off its snapshot is refused with
+`checkpoint source moved off its snapshot: <worktree>`. Dispatches already closed by a
+result, a review or a `completed` ack are not checked. The ack output adds
+`observed_sources`: one `{worktree, source_revision, source_tree, dirty_entries,
+dirty_state_sha256}` per checked worktree, in checkpoint order, or an empty list. The
+`.ack` file and the binding are unchanged.
 
 The acknowledgment JSON has exactly `endpoint`, `generation`, `session` and
 `checkpoint_sha256`. The old sender generation is rejected after replacement; the

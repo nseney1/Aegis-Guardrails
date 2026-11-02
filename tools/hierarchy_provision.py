@@ -346,7 +346,8 @@ def check_codex_options(request, mailbox, endpoint, host):
 
 def check_role_request(request, setup):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort", "timeout_seconds", "assistants",
-                                                   "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background"})
+                                                   "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background",
+                                                   "kind"})
     host = request["host"]
     require(host in (CLAUDE, CODEX, NATIVE), "unsupported host: " + str(host))
     require(type(request.get("background", False)) is bool, "invalid background")
@@ -354,7 +355,10 @@ def check_role_request(request, setup):
         # Root has no profile, and a Codex lane shows in its own app only as a native thread.
         require(host == CLAUDE and endpoint_parts(request["endpoint"])[1] != "root",
                 "background is only for claude-code roles")
-    check_codex_options(request, Mailbox(setup["mailbox_root"]), request["endpoint"], host)
+    mailbox = Mailbox(setup["mailbox_root"])
+    if "kind" in request:
+        mailbox.require_kind(request["endpoint"], request["kind"])
+    check_codex_options(request, mailbox, request["endpoint"], host)
     for name in ("model", "effort"):
         if name in request:
             text(request[name], name, 128)

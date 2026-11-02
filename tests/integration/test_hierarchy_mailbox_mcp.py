@@ -17,14 +17,17 @@ from tests.integration.test_hierarchy_mailbox import (
 )
 
 
-def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None):
+def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None,
+             delivery=None):
     frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
               {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
     frames.extend({"jsonrpc": "2.0", "id": index + 3, "method": "tools/call", "params": {
         "name": name, "arguments": arguments}} for index, (name, arguments) in enumerate(calls))
+    receipts = [] if delivery is None else ["--delivery-dir", str(delivery)]
     result = subprocess.run([sys.executable, "-I", str(HELPER), "--root", str(root), "serve",
                              "--endpoint", endpoint, "--host", host, "--session", session or endpoint,
-                             "--generation", str(generation)], input=raw or "".join(json.dumps(f) + "\n" for f in frames),
+                             "--generation", str(generation), *receipts],
+                            input=raw or "".join(json.dumps(f) + "\n" for f in frames),
                             capture_output=True, text=True, timeout=15,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 0, result.stdout + result.stderr
@@ -36,7 +39,7 @@ def payload(response):
     return json.loads(response["result"]["content"][0]["text"])
 
 
-def test_transport_advertises_only_scoped_mailbox_tools(pilot):
+def test_transport_advertises_only_scoped_mailbox_tools(pilot):  # noqa: F811
     root, _ = pilot
     responses = exchange(root)
     assert responses[0]["result"]["serverInfo"]["name"] == "aegis-hierarchy-mailbox"
@@ -49,7 +52,7 @@ def test_transport_advertises_only_scoped_mailbox_tools(pilot):
         tools["mailbox_publish"]["inputSchema"]["properties"])
 
 
-def test_reviewer_reads_its_brief_and_reports_without_source_write_tools(pilot):
+def test_reviewer_reads_its_brief_and_reports_without_source_write_tools(pilot):  # noqa: F811
     root, brief = pilot
     invoke(root, "publish", message(recipient="a/lane/review", kind="dispatch", brief=brief))
     invoke(root, "publish", message(identifier="another-recipient"))
@@ -72,7 +75,7 @@ def test_reviewer_reads_its_brief_and_reports_without_source_write_tools(pilot):
 
 
 @pytest.mark.parametrize("field", ["from", "host", "session", "binding_generation", "root", "approved"])
-def test_tool_arguments_cannot_override_startup_identity_or_authority(pilot, field):
+def test_tool_arguments_cannot_override_startup_identity_or_authority(pilot, field):  # noqa: F811
     root, _ = pilot
     request = {"message_id": "forged", "to": "a/orchestrator", "type": "info", "body": "data", field: "forged"}
     response = exchange(root, [("mailbox_publish", request)])[-1]
@@ -81,7 +84,7 @@ def test_tool_arguments_cannot_override_startup_identity_or_authority(pilot, fie
     assert list(root.glob("**/*.md")) == []
 
 
-def test_successor_can_acknowledge_before_becoming_ready(pilot):
+def test_successor_can_acknowledge_before_becoming_ready(pilot):  # noqa: F811
     root, brief = pilot
     checkpoint = {"outgoing_stopped": True, "briefs": [brief], "sources": [], "lease_refs": [],
                   "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}
@@ -98,7 +101,32 @@ def test_successor_can_acknowledge_before_becoming_ready(pilot):
     assert own["binding"]["checkpoint_sha256"] == binding["checkpoint_sha256"]
 
 
-def test_malformed_frame_is_explicit_and_next_request_still_works(pilot):
+def test_binding_only_inbox_returns_no_messages_and_records_no_read(pilot):  # noqa: F811
+    root, _ = pilot
+    invoke(root, "publish", message(recipient="a/lane/review"))
+    delivery = root.parent / "delivery"
+    view = payload(exchange(root, [("mailbox_inbox", {"binding_only": True})], delivery=delivery)[-1])
+    assert view == {"endpoint": "a/lane/review", "binding": invoke(root, "status")["bindings"]["a/lane/review"],
+                    "checkpoint_briefs": [], "messages_total": 1}
+    assert not (delivery / "reads").exists()
+    page = payload(exchange(root, [("mailbox_inbox", {})], delivery=delivery)[-1])
+    assert [row["message"]["message_id"] for row in page["messages"]] == ["dispatch-1"]
+    assert len(list((delivery / "reads" / "a/lane/review").iterdir())) == 1  # The control: a real page is recorded.
+
+
+@pytest.mark.parametrize("arguments,error", [
+    ({"binding_only": "yes"}, "binding_only must be boolean"),
+    ({"binding_only": True, "include_briefs": False}, "binding_only takes no include_briefs, limit or after_message_id"),
+    ({"binding_only": True, "limit": 5}, "binding_only takes no include_briefs, limit or after_message_id"),
+])
+def test_binding_only_inbox_refuses_other_arguments(pilot, arguments, error):  # noqa: F811
+    root, _ = pilot
+    response = exchange(root, [("mailbox_inbox", arguments)])[-1]
+    assert response["result"]["isError"] is True
+    assert payload(response) == {"error": error}
+
+
+def test_malformed_frame_is_explicit_and_next_request_still_works(pilot):  # noqa: F811
     root, _ = pilot
     raw = '{"jsonrpc":"2.0","id":1,"id":2}\n' + json.dumps({"jsonrpc": "2.0", "id": 3, "method": "ping"}) + "\n"
     responses = exchange(root, raw=raw)
@@ -107,7 +135,7 @@ def test_malformed_frame_is_explicit_and_next_request_still_works(pilot):
     assert responses[1] == {"jsonrpc": "2.0", "id": 3, "result": {}}
 
 
-def test_running_adapter_rejects_replaced_sender_and_changed_manifest(pilot):
+def test_running_adapter_rejects_replaced_sender_and_changed_manifest(pilot):  # noqa: F811
     root, brief = pilot
     seed_wire_inbox(root, "x" * 262144, endpoint="a/lane/review")
     process = subprocess.Popen([sys.executable, "-I", str(HELPER), "--root", str(root), "serve",
@@ -151,7 +179,7 @@ def test_running_adapter_rejects_replaced_sender_and_changed_manifest(pilot):
         assert not process.stderr.read()
 
 
-def test_scoped_adapter_does_not_write_python_cache_in_source_checkout(pilot, tmp_path):
+def test_scoped_adapter_does_not_write_python_cache_in_source_checkout(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     source = tmp_path / "source-copy"
     source.mkdir()
@@ -166,14 +194,14 @@ def test_scoped_adapter_does_not_write_python_cache_in_source_checkout(pilot, tm
     assert sorted(p.name for p in source.iterdir()) == ["hierarchy_mailbox.py", "hierarchy_mailbox_mcp.py"]
 
 
-def test_oversized_frame_closes_without_parsing_fragments(pilot):
+def test_oversized_frame_closes_without_parsing_fragments(pilot):  # noqa: F811
     root, _ = pilot
     responses = exchange(root, raw="x" * 262145 + "\n" + json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}) + "\n")
     assert responses == [{"jsonrpc": "2.0", "id": None, "error": {
         "code": -32700, "message": "mailbox frame exceeds 262144 bytes"}}]
 
 
-def test_locked_mailbox_refuses_mutation_without_partial_files(pilot):
+def test_locked_mailbox_refuses_mutation_without_partial_files(pilot):  # noqa: F811
     root, _ = pilot
     (root / ".write.lock").write_text("fixture active writer")
     response = exchange(root, [("mailbox_publish", {"message_id": "busy", "to": "a/orchestrator",
@@ -182,7 +210,7 @@ def test_locked_mailbox_refuses_mutation_without_partial_files(pilot):
     assert list(root.glob("**/*.md")) == []
 
 
-def test_front_door_authors_hash_bound_brief_using_only_scoped_tools(pilot):
+def test_front_door_authors_hash_bound_brief_using_only_scoped_tools(pilot):  # noqa: F811
     root, _ = pilot
     intent = {"message_id": "intent-file", "to": "a/orchestrator", "type": "info",
               "body": "Goal: improve diagnostics.\nAcceptance: retain conservative overlap evidence.\n"}
@@ -236,7 +264,7 @@ def mcp_inbox_wire(root, arguments, *, identifier="inbox", **identity):
 
 
 @pytest.mark.parametrize("content", WIRE_PAYLOADS)
-def test_mcp_bounded_inbox_wire_pages_are_lossless(pilot, content):
+def test_mcp_bounded_inbox_wire_pages_are_lossless(pilot, content):  # noqa: F811
     root, _ = pilot
     expected = seed_wire_inbox(root, content)
     binding = invoke(root, "status")["bindings"]["a/lane/f2"]
@@ -284,7 +312,7 @@ def test_mcp_bounded_inbox_wire_pages_are_lossless(pilot, content):
     assert mailbox_snapshot(root) == before
 
 
-def test_mcp_bounded_inbox_checkpoint_metadata_is_mandatory(pilot):
+def test_mcp_bounded_inbox_checkpoint_metadata_is_mandatory(pilot):  # noqa: F811
     root, _ = pilot
     binding = checkpoint_wire_binding(root, "x" * 262144, 20)
     identity = {"host": "host-two", "session": "replacement", "generation": 2}
@@ -300,7 +328,7 @@ def test_mcp_bounded_inbox_checkpoint_metadata_is_mandatory(pilot):
     assert mailbox_snapshot(root) == before
 
 
-def test_mcp_bounded_inbox_exact_wire_boundary(pilot):
+def test_mcp_bounded_inbox_exact_wire_boundary(pilot):  # noqa: F811
     root, _ = pilot
     identifier = 'edge-é"\\\n😀'
     # Calibrate from the real outer JSON-RPC line, including the escaped ID,
@@ -336,7 +364,7 @@ def test_mcp_bounded_inbox_exact_wire_boundary(pilot):
     assert mailbox_snapshot(over) == before
 
 
-def test_mcp_bounded_inbox_first_message_cannot_be_skipped(pilot):
+def test_mcp_bounded_inbox_first_message_cannot_be_skipped(pilot):  # noqa: F811
     root, _ = pilot
     binding = checkpoint_wire_binding(root, "x" * 262144, 15)
     identity = {"host": "host-two", "session": "replacement", "generation": 2}
@@ -368,7 +396,7 @@ def test_mcp_bounded_inbox_first_message_cannot_be_skipped(pilot):
     ({"after_message_id": "missing"}, "inbox cursor does not name a received message"),
     ({"after_message_id": "foreign"}, "inbox cursor does not name a received message"),
 ])
-def test_mcp_bounded_inbox_retains_argument_errors(pilot, arguments, error):
+def test_mcp_bounded_inbox_retains_argument_errors(pilot, arguments, error):  # noqa: F811
     root, _ = pilot
     seed_wire_inbox(root, "x" * 262144)
     invoke(root, "publish", message(recipient="a/lane/review", identifier="foreign"))
@@ -381,7 +409,7 @@ def test_mcp_bounded_inbox_retains_argument_errors(pilot, arguments, error):
 
 
 @pytest.mark.parametrize("kind", ["first-brief", "deferred-brief", "missing-brief", "history"])
-def test_mcp_bounded_inbox_does_not_hide_corruption(pilot, kind):
+def test_mcp_bounded_inbox_does_not_hide_corruption(pilot, kind):  # noqa: F811
     root, _ = pilot
     rows = seed_wire_inbox(root, "x" * 262144)
     error = corrupt_wire_fixture(root, rows, kind)
@@ -393,7 +421,7 @@ def test_mcp_bounded_inbox_does_not_hide_corruption(pilot, kind):
     assert mailbox_snapshot(root) == before
 
 
-def test_mcp_bounded_inbox_preserves_malformed_frame_and_cross_role_errors(pilot):
+def test_mcp_bounded_inbox_preserves_malformed_frame_and_cross_role_errors(pilot):  # noqa: F811
     root, _ = pilot
     expected = seed_wire_inbox(root, "x" * 262144)
     frames = [inbox_frame({"include_briefs": True}),
@@ -420,7 +448,7 @@ def test_mcp_bounded_inbox_preserves_malformed_frame_and_cross_role_errors(pilot
     assert mailbox_snapshot(root) == before
 
 
-def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):
+def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):  # noqa: F811
     root, _ = pilot
     binding = checkpoint_wire_binding(root, "x" * 262144, 20)
     body = 'é"\\\n😀' * 4096
@@ -440,7 +468,7 @@ def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):
     for index in (1, 2):
         assert responses[index]["result"].get("isError", False) is False
         assert responses[index]["id"] == frames[index]["id"]
-    assert payload(responses[1]) == {"endpoint": "a/lane/f2", "generation": 2, "ready": True}
+    assert payload(responses[1]) == {"endpoint": "a/lane/f2", "generation": 2, "ready": True, "observed_sources": []}
     receipt = payload(responses[2])
     assert receipt["message"]["body"] == body
     assert receipt["message"]["message_id"] == "after-overflow"

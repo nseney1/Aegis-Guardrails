@@ -172,6 +172,120 @@ def test_the_orchestrator_draft_also_covers_its_active_lane(pilot, tmp_path):  #
     assert invoke(root, "bind", request)["generation"] == 2
 
 
+def orchestrator_successor(root, brief, ready, shape="digest"):
+    """Bind the orchestrator's successor at generation 2, unacked, over a snapshot of the lane as it is now."""
+    if shape == "digest":
+        request = invoke(root, "draft-handoff", draft(root, endpoint="a/orchestrator"))
+    else:
+        worktree = ready["worktree"]
+        literal = {"worktree": worktree, "source_revision": git(worktree, "rev-parse", "HEAD"),
+                   "source_tree": git(worktree, "rev-parse", "HEAD^{tree}"), "dirty_state": "clean"}
+        request = {"endpoint": "a/orchestrator", "host": "host-two", "session": "successor", "expected_generation": 1,
+                   "checkpoint": {"outgoing_stopped": True, "briefs": [brief], "sources": [literal],
+                                  "lease_refs": [ready["lease_ref"]], "completed_checks": [],
+                                  "pending_message_ids": ["dispatch-1"], "last_acknowledgment_ids": ["accepted"]}}
+    binding = invoke(root, "bind", request)
+    assert binding["generation"] == 2 and binding["ready"] is False
+    return {"endpoint": "a/orchestrator", "session": "successor", "generation": 2,
+            "checkpoint_sha256": binding["checkpoint_sha256"]}
+
+
+def orchestrator_ack(root):
+    return root / "bindings" / "a" / "orchestrator" / "000002.ack"
+
+
+def commit(worktree, text, subject):
+    (Path(worktree) / "source.txt").write_text(text)
+    git(worktree, "commit", "-qam", subject)
+    return git(worktree, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("shape", ["digest", "literal"])
+def test_an_unacked_successor_acks_while_its_lane_moves_forward(pilot, tmp_path, shape):  # noqa: F811
+    # Given a successor whose checkpoint snapshots the accepted lane at commit A, clean
+    root, brief, ready = active_writer(pilot, tmp_path)
+    worktree = ready["worktree"]
+    snapshot = git(worktree, "rev-parse", "HEAD")
+    ack = orchestrator_successor(root, brief, ready, shape)
+    # When the lane commits B on A and leaves one dirty file
+    head = commit(worktree, "moved forward\n", "B")
+    assert git(worktree, "rev-parse", "HEAD^") == snapshot
+    (Path(worktree) / "notes.txt").write_text("still editing\n")
+    acknowledged = invoke(root, "ack-handoff", ack)
+    # Then the ack passes, reports what it saw, and the .ack file keeps exactly its four keys
+    assert acknowledged["ready"] is True
+    assert acknowledged["observed_sources"] == [{
+        "worktree": worktree, "source_revision": head, "source_tree": git(worktree, "rev-parse", "HEAD^{tree}"),
+        "dirty_entries": 1, "dirty_state_sha256": hashlib.sha256(raw_status(worktree)).hexdigest()}]
+    assert json.loads(orchestrator_ack(root).read_text(encoding="utf-8")) == ack
+    assert sorted(ack) == ["checkpoint_sha256", "endpoint", "generation", "session"]
+    assert invoke(root, "status")["bindings"]["a/orchestrator"]["ready"] is True
+
+
+@pytest.mark.parametrize("shape", ["digest", "literal"])
+def test_a_lane_reset_off_its_snapshot_refuses_the_ack(pilot, tmp_path, shape):  # noqa: F811
+    root, brief, ready = active_writer(pilot, tmp_path)
+    worktree = ready["worktree"]
+    baseline = git(worktree, "rev-parse", "HEAD")
+    commit(worktree, "A\n", "A")
+    ack = orchestrator_successor(root, brief, ready, shape)
+    git(worktree, "reset", "-q", "--hard", baseline)
+    commit(worktree, "C, a sibling of A\n", "C")
+    refused = invoke(root, "ack-handoff", ack, ok=False)
+    assert refused["error"] == "checkpoint source moved off its snapshot: " + worktree
+    assert not orchestrator_ack(root).exists()
+    assert invoke(root, "status")["bindings"]["a/orchestrator"]["ready"] is False
+
+
+def test_a_snapshot_revision_git_cannot_read_is_a_git_failure_not_a_lineage_refusal(pilot, tmp_path):  # noqa: F811
+    root, brief, ready = active_writer(pilot, tmp_path)
+    worktree = ready["worktree"]
+    baseline = git(worktree, "rev-parse", "HEAD")
+    commit(worktree, "A\n", "A")
+    ack = orchestrator_successor(root, brief, ready)
+    git(worktree, "reset", "-q", "--hard", baseline)
+    git(worktree, "reflog", "expire", "--expire=now", "--all")
+    git(worktree, "gc", "-q", "--prune=now")
+    refused = invoke(root, "ack-handoff", ack, ok=False)
+    assert refused["error"] == "git identity check failed"
+    assert not orchestrator_ack(root).exists()
+
+
+def test_a_lane_on_another_branch_refuses_the_ack(pilot, tmp_path):  # noqa: F811
+    root, brief, ready = active_writer(pilot, tmp_path)
+    ack = orchestrator_successor(root, brief, ready)
+    git(ready["worktree"], "switch", "-q", "-c", "elsewhere")
+    refused = invoke(root, "ack-handoff", ack, ok=False)
+    assert refused["error"] == "checkpoint branch changed since acceptance"
+    assert not orchestrator_ack(root).exists()
+
+
+def test_bind_still_refuses_a_lane_that_moved_forward(pilot, tmp_path):  # noqa: F811
+    root, _, ready = active_writer(pilot, tmp_path)
+    request = invoke(root, "draft-handoff", draft(root, endpoint="a/orchestrator"))
+    commit(ready["worktree"], "moved forward\n", "B")
+    refused = invoke(root, "bind", request, ok=False)
+    assert refused["error"] == "checkpoint source snapshot does not match worktree"
+    assert invoke(root, "status")["bindings"]["a/orchestrator"]["generation"] == 1
+
+
+def test_a_dispatch_closed_by_its_result_is_not_checked_at_ack(pilot, tmp_path):  # noqa: F811
+    root, brief, ready = active_writer(pilot, tmp_path)
+    worktree = ready["worktree"]
+    ack = orchestrator_successor(root, brief, ready)
+    result = {"source_revision": git(worktree, "rev-parse", "HEAD"),
+              "source_tree": git(worktree, "rev-parse", "HEAD^{tree}"),
+              "checks": [{"check": "tests", "outcome": "pass", "reference": "evidence/tests.json"}],
+              "lane_check": "evidence/lane.json"}
+    invoke(root, "publish", message("a/lane/f2", "a/orchestrator", identifier="result", kind="result",
+                                    in_reply_to="dispatch-1", result=result))
+    git(worktree, "switch", "-q", "--orphan", "elsewhere")
+    (Path(worktree) / "notes.txt").write_text("no commit, other branch, dirty\n")
+    acknowledged = invoke(root, "ack-handoff", ack)
+    assert acknowledged["ready"] is True
+    assert acknowledged["observed_sources"] == []
+
+
 def test_the_draft_requires_a_stopped_outgoing_session(pilot, tmp_path):  # noqa: F811
     root, _, _ = active_writer(pilot, tmp_path)
     refused = invoke(root, "draft-handoff", draft(root, outgoing_stopped=False), ok=False)
@@ -322,3 +436,26 @@ def test_an_entry_with_a_relative_root_or_extra_field_is_reported_per_entry(tmp_
     assert "path must be absolute" in rows[0]["error"]
     assert "unexpected fields" in rows[1]["error"]
     assert rows[2]["ok"] is True
+
+
+def test_an_entry_kind_must_match_the_manifest_kind(tmp_path, pilot):  # noqa: F811
+    root, brief = pilot
+    entries = [{"root": str(root), "endpoint": endpoint, "kind": kind, "briefs": [brief]} for endpoint, kind in (
+        ("a/lane/review", "reviewer"), ("a/lane/f2", "reviewer"), ("a/orchestrator", "implementer"))]
+    spec = {"schema": "aegis.hierarchy-handoff/v1", "host": "host-two", "session": "new-lane",
+            "outgoing_stopped": True, "entries": entries}
+    rows = handoff(tmp_path, spec, 3)["entries"]
+    assert rows[0]["ok"] is True and rows[0]["generation"] == 2
+    assert rows[1] == {"root": str(root), "endpoint": "a/lane/f2", "ok": False,
+                       "error": "kind 'reviewer' does not match the manifest kind 'implementer' of a/lane/f2"}
+    assert rows[2]["error"] == "kind 'implementer' does not match the manifest kind (none) of a/orchestrator"
+    bindings = invoke(root, "status")["bindings"]
+    assert (bindings["a/lane/f2"]["generation"], bindings["a/orchestrator"]["generation"]) == (1, 1)
+
+
+@pytest.mark.parametrize("value", ["requests/x.json", "/abs/../x.json"])
+def test_a_relative_or_traversing_spec_is_refused_by_name_and_value(value):
+    result = subprocess.run([sys.executable, "-I", str(HANDOFF), "--spec", value], capture_output=True,
+                            text=True, timeout=60, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2 and not result.stderr
+    assert json.loads(result.stdout) == {"error": "--spec must be absolute without traversal: got " + repr(value)}

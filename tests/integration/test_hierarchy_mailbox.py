@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -802,3 +803,126 @@ def test_cli_bounded_inbox_does_not_hide_corruption(pilot, kind):
     _, result = cli_inbox_wire(root, ok=False)
     assert result == {"error": error}
     assert mailbox_snapshot(root) == before
+
+
+def test_binding_only_inbox_is_small_hash_checked_and_read_only(pilot):
+    root, _ = pilot
+    for identifier in ("one", "two", "three"):
+        invoke(root, "publish", message(identifier=identifier))
+    binding = checkpoint_wire_binding(root, "x" * 200000, 2)
+    brief = binding["checkpoint"]["briefs"][0]
+    before = mailbox_snapshot(root)
+    view = invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)
+    assert view == {"endpoint": "a/lane/f2", "binding": binding, "messages_total": 3,
+                    "checkpoint_briefs": [{**brief, "ok": True}, {**brief, "ok": True}]}
+    assert len(json.dumps(view)) < 4096  # A 200 KB brief is hashed, never returned.
+    assert mailbox_snapshot(root) == before
+    assert invoke(root, "inbox", endpoint="a/lane/review", binding_only=True) == {
+        "endpoint": "a/lane/review", "binding": invoke(root, "status")["bindings"]["a/lane/review"],
+        "checkpoint_briefs": [], "messages_total": 0}
+    Path(brief["path"]).write_text("Changed after the handoff\n")
+    changed = invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)
+    assert changed["checkpoint_briefs"] == [{**brief, "ok": False}, {**brief, "ok": False}]
+    Path(brief["path"]).unlink()
+    assert invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True)["checkpoint_briefs"][0]["ok"] is False
+
+
+def stdin_argv(root, command):
+    return [sys.executable, "-B", str(HELPER), "--root", str(root), command, "--request", "-"]
+
+
+def invoke_stdin(root, command, raw, *, ok=True):
+    result = subprocess.run(stdin_argv(root, command), input=raw, capture_output=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == (0 if ok else 2), result.stdout[:2048] + result.stderr[:2048]
+    assert result.stderr == b""
+    return json.loads(result.stdout)
+
+
+def test_publish_and_ack_handoff_read_the_request_from_stdin(pilot):
+    root, brief = pilot
+    receipt = invoke_stdin(root, "publish", json.dumps(message()).encode("utf-8"))
+    assert hashlib.sha256(Path(receipt["path"]).read_bytes()).hexdigest() == receipt["sha256"]
+    assert receipt["message"]["message_id"] == "dispatch-1"
+    checkpoint = {"outgoing_stopped": True, "briefs": [brief], "sources": [], "lease_refs": [],
+                  "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}
+    replacement = invoke(root, "bind", {"endpoint": "a/lane/f2", "host": "host-two", "session": "replacement",
+                                        "expected_generation": 1, "checkpoint": checkpoint})
+    ack = {"endpoint": "a/lane/f2", "session": "replacement", "generation": 2,
+           "checkpoint_sha256": replacement["checkpoint_sha256"]}
+    assert invoke_stdin(root, "ack-handoff", json.dumps(ack).encode("utf-8")) == {
+        "endpoint": "a/lane/f2", "generation": 2, "ready": True, "observed_sources": []}
+
+
+@pytest.mark.parametrize("command,raw,error", [
+    ("publish", b" " * 262145, "input exceeds 262144 bytes"),
+    ("publish", b"", "Expecting value: line 1 column 1 (char 0)"),
+    ("ack-handoff", b'{"endpoint": "a", "endpoint": "b"}', "duplicate JSON key: endpoint"),
+    ("bind", b"{}", "--request - (stdin) is only for publish and ack-handoff"),
+    ("draft-handoff", b"{}", "--request - (stdin) is only for publish and ack-handoff"),
+    ("init", b"{}", "--request - (stdin) is only for publish and ack-handoff"),
+], ids=["oversized", "empty", "duplicate-key", "bind", "draft-handoff", "init"])
+def test_stdin_requests_are_bounded_strict_and_limited_to_two_commands(pilot, command, raw, error):
+    root, _ = pilot
+    before = mailbox_snapshot(root)
+    assert invoke_stdin(root, command, raw, ok=False) == {"error": error}
+    assert mailbox_snapshot(root) == before
+    assert not (root / ".write.lock").exists()
+
+
+def test_held_open_stdin_never_holds_the_writer_lock(pilot):
+    root, _ = pilot
+    raw = json.dumps(message()).encode("utf-8")
+    process = subprocess.Popen(stdin_argv(root, "publish"), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    try:
+        process.stdin.write(raw[:10])
+        process.stdin.flush()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            assert process.poll() is None
+            assert not (root / ".write.lock").exists()
+            time.sleep(0.05)
+        invoke(root, "publish", message(identifier="other-writer"))  # Not refused as busy meanwhile.
+        stdout, stderr = process.communicate(input=raw[10:], timeout=15)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    assert process.returncode == 0 and stderr == b""
+    assert json.loads(stdout)["message"]["message_id"] == "dispatch-1"
+
+
+@pytest.mark.parametrize("argv,error", [
+    (["--root", "rel/mailbox", "status"], "--root must be absolute without traversal: got 'rel/mailbox'"),
+    (["--root", "/abs/../mailbox", "status"], "--root must be absolute without traversal: got '/abs/../mailbox'"),
+    (["publish", "--request", "rel.json"], "--request must be absolute without traversal: got 'rel.json'"),
+    (["init", "--request", "requests/x.json"], "--request must be absolute without traversal: got 'requests/x.json'"),
+    (["bind", "--request", "/abs/../x.json"], "--request must be absolute without traversal: got '/abs/../x.json'"),
+])
+def test_cli_path_refusals_name_the_argument_and_its_value(pilot, argv, error):
+    root, _ = pilot
+    if argv[0] != "--root":
+        argv = ["--root", str(root), *argv]
+    before = mailbox_snapshot(root)
+    result = subprocess.run([sys.executable, "-B", str(HELPER), *argv], capture_output=True, text=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2 and not result.stderr
+    assert json.loads(result.stdout) == {"error": error}
+    assert mailbox_snapshot(root) == before
+
+
+def test_inbox_help_states_the_limit_default_and_maximum():
+    result = subprocess.run([sys.executable, "-B", str(HELPER), "--root", "/unused", "inbox", "--help"],
+                            capture_output=True, text=True, timeout=15, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 0 and not result.stderr
+    assert "default 20, maximum 100" in " ".join(result.stdout.split())
+
+
+@pytest.mark.parametrize("flags", [{"include_briefs": True}, {"limit": 5}, {"after": "one"},
+                                   {"mark_read": True, "delivery_dir": "/tmp/unused"}])
+def test_binding_only_inbox_refuses_paging_flags(pilot, flags):
+    root, _ = pilot
+    invoke(root, "publish", message(identifier="one"))
+    result = invoke(root, "inbox", endpoint="a/lane/f2", binding_only=True, ok=False, **flags)
+    assert result == {"error": "--binding-only takes no --include-briefs, --limit, --after or --mark-read"}
