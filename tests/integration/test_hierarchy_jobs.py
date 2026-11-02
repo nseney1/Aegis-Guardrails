@@ -347,6 +347,70 @@ def test_every_kind_of_uncommitted_change_moves_the_digest(shop, change):
     assert source_digest(shop)["dirty_content_sha256"] != before
 
 
+def add_submodule(shop, name="sub"):
+    origin = shop.tmp / ("origin-" + name)
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    (origin / "data.txt").write_text("one\n")
+    git(origin, "add", ".")
+    git(origin, "commit", "-qm", "origin")
+    git(shop.checkout, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), name)
+    git(shop.checkout, "commit", "-qm", "add a submodule")
+    return shop.checkout / name
+
+
+def digest_or_error(shop):
+    done = subprocess.run([sys.executable, "-I", str(JOBS), "source-digest", "--checkout", str(shop.checkout)],
+                          capture_output=True, text=True, timeout=30, env=shop.env())
+    assert not done.stderr, done.stderr
+    return done.returncode, json.loads(done.stdout)
+
+
+def test_a_submodule_is_refused_by_path_instead_of_hiding_its_bytes(shop):
+    """The parent's status shows only ` M sub` for any content or revision inside it, so no digest can bind it."""
+    sub = add_submodule(shop)
+    seen = {"clean": digest_or_error(shop)}
+    (sub / "data.txt").write_text("two\n")
+    seen["dirty-a"] = digest_or_error(shop)
+    (sub / "data.txt").write_text("three\n")
+    seen["dirty-b"] = digest_or_error(shop)
+    git(sub, "commit", "-qam", "moved")
+    seen["new-revision"] = digest_or_error(shop)
+    git(shop.checkout, "submodule", "deinit", "-q", "-f", "sub")
+    seen["uninitialized"] = digest_or_error(shop)
+    assert all(code == 2 and "submodule" in out["error"] and "sub" in out["error"] for code, out in seen.values()), seen
+
+
+def test_a_nested_repository_is_refused_by_path_and_ordinary_bytes_still_count(shop):
+    nested = shop.checkout / "nested"
+    nested.mkdir()
+    git(nested, "init", "-q", "-b", "main")
+    (nested / "inner.txt").write_text("a\n")
+    code, out = digest_or_error(shop)
+    assert code == 2 and "nested" in out["error"] and "byte for byte" in out["error"], out
+    shutil.rmtree(nested)
+    target = shop.checkout / "src" / "app.py"
+    digests = []
+    for content in ("value = 2\n", "value = 3\n"):
+        target.write_text(content)
+        digests.append(source_digest(shop)["dirty_content_sha256"])
+    (shop.checkout / "linked").symlink_to("app.py")
+    digests.append(source_digest(shop)["dirty_content_sha256"])
+    assert len(set(digests)) == 3
+
+
+def test_a_job_on_a_checkout_with_a_submodule_is_refused_by_path_and_holds_nothing(shop, tmp_path):
+    add_submodule(shop)
+    proof = tmp_path / "recipe-ran"
+    shop.recipes["recipes"]["probe"] = shop.command(["$python", "-c", "open(%r, 'w').close()" % str(proof)], heavy=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "probe")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and "submodule" in row["reason"] and "sub" in row["reason"], row
+    assert not proof.exists() and shop.states("job-1") == ["refused"]
+    assert shop.heavy()["used"] == 0 and not [event for event in shop.events() if event["kind"] == "grant"]
+
+
 def test_a_changed_packet_file_is_refused(shop):
     packet = shop.base / "packet.md"
     raw = json.dumps({"schema": PACKET_SCHEMA, "recipe": "touch", **shop.head()}).encode()

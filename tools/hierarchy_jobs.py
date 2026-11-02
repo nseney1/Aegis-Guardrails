@@ -178,7 +178,7 @@ def checked_paths(packet, recipe, checkout):
     return paths
 
 
-def path_fingerprint(path):
+def path_fingerprint(path, name):
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -186,7 +186,9 @@ def path_fingerprint(path):
     if stat.S_ISLNK(info.st_mode):
         return b"link:" + os.fsencode(os.readlink(path))
     if not stat.S_ISREG(info.st_mode):
-        return b"other"
+        # A constant here would let any content behind the entry, such as a nested repository, pass as the same source.
+        raise ValueError("cannot witness %s byte for byte: only regular files and symlinks can be witnessed, so nested "
+                         "repositories, submodules and special files are not supported" % os.fsdecode(name)[:512])
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1048576), b""):
@@ -194,11 +196,24 @@ def path_fingerprint(path):
     return b"file:" + (b"x" if info.st_mode & 0o111 else b"-") + b":" + digest.hexdigest().encode()
 
 
+def refuse_submodules(checkout):
+    """A submodule's bytes and revision live in another repository, and the parent's status shows the same ` M sub`
+    for any of them, while a clean or uninitialized one shows nothing. None can be bound to a packet, so all are
+    refused by path. The submodule itself is never read, so nothing outside the checkout is followed."""
+    listed = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
+                            cwd=checkout, capture_output=True, timeout=120)
+    require(listed.returncode == 0, "could not read the index of " + str(checkout))
+    gitlinks = [entry.partition(b"\t")[2] for entry in listed.stdout.split(b"\0") if entry.startswith(b"160000 ")]
+    require(not gitlinks, "submodules are not supported, because their content cannot be witnessed byte for byte: "
+            + ", ".join(os.fsdecode(path) for path in gitlinks)[:1024])
+
+
 def uncommitted_content(checkout):
     """Git status names the paths that differ, not their bytes, so one status can hide different content."""
     status = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
                             cwd=checkout, capture_output=True, timeout=120)
     require(status.returncode == 0, "could not read the status of " + str(checkout))
+    refuse_submodules(checkout)
     tokens = status.stdout.split(b"\0")
     digest = hashlib.sha256()
     count = index = 0
@@ -214,7 +229,7 @@ def uncommitted_content(checkout):
             index += 1
         digest.update(token[:2] + b"\0")
         for name in names:
-            digest.update(name + b"\0" + path_fingerprint(os.path.join(os.fsencode(checkout), name)) + b"\0")
+            digest.update(name + b"\0" + path_fingerprint(os.path.join(os.fsencode(checkout), name), name) + b"\0")
     return digest.hexdigest(), count
 
 
