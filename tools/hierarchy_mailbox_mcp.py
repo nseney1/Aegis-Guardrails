@@ -18,7 +18,32 @@ def _tool_result(result):
     return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
 
 
-def definitions():
+MAX_OVERLAP_PATHS = 64
+MAX_OVERLAP_PATH_CHARS = 1024
+WORKSPACE_TOOL_SPECS = {
+    "workspace_capacity": ("Read shared writer and heavy-job capacity and the queue. Grants nothing.", {}, []),
+    "workspace_initiative": ("Read this connection's own initiative record. Changes nothing.", {}, []),
+    "workspace_path_overlap": (
+        "Check paths against live leases in every registered clone of this repository. A conflict is a normal "
+        "answer. A clear result is advice: it claims nothing and is not a lock.",
+        {"paths": {"type": "array", "minItems": 1, "maxItems": MAX_OVERLAP_PATHS,
+                   "items": {"type": "string", "maxLength": MAX_OVERLAP_PATH_CHARS}}}, ["paths"]),
+}
+
+
+def role_workspace_tools(mailbox, endpoint):
+    """Read-only views by role. Reviewers get none, and grants are never offered to any role."""
+    role = endpoint_parts(endpoint)[1]
+    if role == "orchestrator":
+        return ("workspace_capacity", "workspace_initiative")
+    if role == "front-door":
+        return ("workspace_initiative",)
+    if mailbox.endpoint(endpoint).get("kind") in ("implementer", "integrator"):
+        return ("workspace_path_overlap",)
+    return ()
+
+
+def definitions(extra=()):
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
         "to": {"type": "string", "maxLength": 256},
@@ -38,6 +63,7 @@ def definitions():
         ("mailbox_ack_handoff", False, "Acknowledge this configured successor's checkpoint; grants no owner approval.",
          {"checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, ["checkpoint_sha256"]),
     ]
+    specs += [(name, True, *WORKSPACE_TOOL_SPECS[name]) for name in extra]
     return [{"name": name, "description": description, "annotations": {"readOnlyHint": readonly},
              "inputSchema": {"type": "object", "properties": props, "required": required,
                              "additionalProperties": False}}
@@ -45,15 +71,42 @@ def definitions():
 
 
 class Connection:
-    def __init__(self, root, endpoint, host, session, generation, delivery_dir=None):
+    def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
+                 initiative=None):
         # Grants and job runs stay out of anything a model session can call, so root has no adapter.
         require(endpoint_parts(endpoint)[1] != "root", "root uses the controller, not the mailbox adapter")
+        require((workspace_store is None) == (initiative is None),
+                "workspace store and initiative must be given together")
         self.root = root
         self.sender = {"from": endpoint, "host": host, "session": session, "binding_generation": generation}
         mailbox = Mailbox(root)
         self.manifest_digest = digest(mailbox.manifest)
         self.delivery_dir = mailbox.delivery_directory(delivery_dir) if delivery_dir is not None else None
         self.checked_mailbox()
+        self.initiative = initiative
+        self.workspace_tools = ()
+        if workspace_store is not None:
+            # Imported only when configured, so the default adapter needs just the two mailbox files.
+            import hierarchy_workspace
+            self.workspace = hierarchy_workspace
+            self.store = hierarchy_workspace.Store(workspace_store)
+            self.store.load().initiative(initiative)
+            self.workspace_tools = role_workspace_tools(mailbox, endpoint)
+
+    def workspace_view(self, name, arguments):
+        self.checked_mailbox()
+        ledger = self.store.load()
+        if name == "workspace_path_overlap":
+            fields(arguments, {"paths"})
+            paths = arguments["paths"]
+            require(isinstance(paths, list) and len(paths) <= MAX_OVERLAP_PATHS, "invalid paths")
+            for path in paths:
+                text(path, "path", MAX_OVERLAP_PATH_CHARS)
+            return self.workspace.check_paths(ledger, self.initiative, paths)[1]
+        fields(arguments, set())
+        if name == "workspace_capacity":
+            return self.workspace.capacity_view(ledger)
+        return self.workspace.initiative_view(ledger, self.initiative)
 
     def record_read(self, page):
         # A lost receipt must not cost the session its mail. It only makes the message
@@ -95,6 +148,8 @@ class Connection:
                 return self.checked_mailbox().acknowledge_handoff({
                     "endpoint": self.sender["from"], "session": self.sender["session"],
                     "generation": self.sender["binding_generation"], **arguments})
+        if name in self.workspace_tools:
+            return self.workspace_view(name, arguments)
         raise ValueError("unknown mailbox tool: " + name)
 
 
@@ -120,7 +175,7 @@ def handle(connection, request):
         return {}
     if method == "tools/list":
         connection.checked_mailbox()
-        return {"tools": definitions()}
+        return {"tools": definitions(connection.workspace_tools)}
     if method == "tools/call":
         fields(params, {"name"}, {"arguments", "_meta"})
         try:
@@ -135,9 +190,10 @@ def handle(connection, request):
     raise ValueError("unsupported mailbox method: " + method)
 
 
-def serve(root, endpoint, host, session, generation, delivery_dir=None):
+def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None):
     integer(generation, "binding generation")
-    connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir)
+    connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
+                            workspace_store=workspace_store, initiative=initiative)
     while True:
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:

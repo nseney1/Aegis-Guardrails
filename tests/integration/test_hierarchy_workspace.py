@@ -98,9 +98,8 @@ def test_registered_initiatives_are_listed_and_duplicates_refused(workspace):
     record = workspace.run("status")["initiatives"]["aegis-47"]
     assert record["priority"] == 5 and record["state"] == "active"
     assert record["touched_paths"] == ["tools/**"] and record["base_moved"] is None
-    refused = workspace.register.__wrapped__ if False else workspace.run(
-        "register", {"id": "aegis-47", "project": "aegis", "repository": "aegis", "priority": 5,
-                     "target_branch": "develop"}, expect=2)
+    refused = workspace.run("register", {"id": "aegis-47", "project": "aegis", "repository": "aegis", "priority": 5,
+                                         "target_branch": "develop"}, expect=2)
     assert refused["error"] == "initiative already registered: aegis-47"
 
 

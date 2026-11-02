@@ -1015,6 +1015,8 @@ def main(argv=None):
     server.add_argument("--session", required=True)
     server.add_argument("--generation", required=True, type=int)
     server.add_argument("--delivery-dir", default=None, help="Record read receipts here; omitted means no receipts")
+    server.add_argument("--workspace-store", default=None, help="Offer this role's read-only workspace views")
+    server.add_argument("--initiative", default=None, help="The initiative these views belong to")
     args = parser.parse_args(argv)
     try:
         root = safe_path(args.root)
@@ -1025,7 +1027,8 @@ def main(argv=None):
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from hierarchy_mailbox_mcp import serve
 
-            return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir)
+            return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir,
+                         workspace_store=args.workspace_store, initiative=args.initiative)
         if args.command == "init":
             result = initialize(root, read_json(args.request))
         elif args.command == "draft-handoff":
