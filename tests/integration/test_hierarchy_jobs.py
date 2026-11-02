@@ -31,7 +31,8 @@ EMPTY = hashlib.sha256(b"").hexdigest()
 def bubblewrap_works():
     if shutil.which("bwrap") is None:
         return False
-    probe = subprocess.run(["bwrap", "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
+    probe = subprocess.run(["bwrap", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+                            "true"],
                            capture_output=True, timeout=10)
     return probe.returncode == 0
 
@@ -120,7 +121,8 @@ class Shop(Setup):
         return {"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1", "SECRET_TOKEN": "must-not-reach-a-job"}
 
     def jobs(self, command, *flags, expect=0, census=(), lock_wait=None, env=None, timeout=90):
-        result = subprocess.run(self.argv(command, *flags, census=None if census is None else list(census), lock_wait=lock_wait),
+        census = census if census is None or isinstance(census, dict) else list(census)
+        result = subprocess.run(self.argv(command, *flags, census=census, lock_wait=lock_wait),
                                 capture_output=True, text=True, timeout=timeout, env=env or self.env())
         assert not result.stderr, result.stderr
         assert result.returncode == expect, result.stdout
@@ -534,6 +536,62 @@ def test_a_full_ledger_makes_the_job_wait(shop):
     assert shop.receipts("job-1") == []
 
 
+def cargo_and_pytest_jobs(shop):
+    """Job "cargo" stands in for a cargo test: it takes Heavy-Tests without running cargo. Job "pytest" takes heavy."""
+    shop.recipes["recipes"]["fake-cargo"] = shop.command(["$python", "-c", "print('cargo output')"], heavy=True,
+                                                         heavy_tests=True)
+    shop.save_recipes()
+    shop.request_job("cargo", "fake-cargo")
+    shop.request_job("pytest", "heavy")
+
+
+def kinds_requested(shop):
+    return {event["data"]["holder"]: event["data"]["kind"] for event in shop.events() if event["kind"] == "request"}
+
+
+def test_a_heavy_tests_job_waits_for_its_own_slot_while_a_test_job_runs(shop):
+    shop.workspace.run("request", {"initiative": "pilot", "kind": "heavy-tests", "holder": "other-cargo"})
+    shop.workspace.run("grant-next", kind="heavy-tests")
+    cargo_and_pytest_jobs(shop)
+    rows = {row["job"]: row for row in shop.run_open(expect=3)["rows"]}
+    assert rows["pilot/cargo"]["state"] == "waiting" and rows["pilot/cargo"]["reason"] == "capacity_full"
+    assert rows["pilot/cargo"]["kind"] == "heavy-tests"
+    assert rows["pilot/cargo"]["capacity"] == {"limit": 1, "held": 1, "external_roots": [], "census": "fixture"}
+    assert rows["pilot/pytest"]["state"] == "completed", "a full Heavy-Tests slot never blocks the test slots"
+    assert kinds_requested(shop)["job:pilot/cargo"] == "heavy-tests"
+    assert kinds_requested(shop)["job:pilot/pytest"] == "heavy"
+    assert shop.receipts("cargo") == [] and shop.heavy()["used"] == 0
+
+
+@pytest.mark.parametrize("census, blocked", [
+    ({"external_roots": {"heavy-tests": [201]}}, "cargo"),
+    ({"external_roots": {"heavy": [101, 102, 103]}}, "pytest"),
+    ([101, 102, 103], "pytest"),
+    ({"external_roots": [101, 102, 103]}, "pytest"),
+])
+def test_outside_work_counts_only_against_its_own_kind(shop, census, blocked):
+    cargo_and_pytest_jobs(shop)
+    rows = {row["job"].split("/")[1]: row for row in shop.run_open(census=census, expect=3)["rows"]}
+    assert rows[blocked]["state"] == "waiting" and rows[blocked]["reason"] == "capacity_full"
+    other = "pytest" if blocked == "cargo" else "cargo"
+    assert rows[other]["state"] == "completed"
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+
+
+def test_low_disk_holds_both_heavy_kinds(shop):
+    shop.recipes["min_free_gigabytes"] = 1000000
+    cargo_and_pytest_jobs(shop)
+    rows = shop.run_open(expect=3)["rows"]
+    assert sorted((row["job"], row["state"], row["reason"]) for row in rows) == [
+        ("pilot/cargo", "waiting", "low_disk"), ("pilot/pytest", "waiting", "low_disk")]
+
+
+def test_a_census_fixture_names_only_known_kinds(shop):
+    cargo_and_pytest_jobs(shop)
+    refused = shop.run_open(census={"external_roots": {"writer": [1]}}, expect=2)
+    assert "census fixture kind" in refused["error"]
+
+
 def test_the_real_census_finds_outside_heavy_processes(shop, tmp_path):
     pids = [spawn_fake_heavy(tmp_path, "pytest") for _ in range(3)]
     try:
@@ -720,13 +778,80 @@ def test_a_failed_job_keeps_its_work_folders_until_root_cleans_them(shop):
     shop.save_recipes()
     shop.request_job("job-1", "works")
     row = shop.run_open()["rows"][0]
-    assert row["state"] == "failed" and row["work_kept"] is True
-    assert {"home", "tmp", "scratch"} <= set(work_names(shop))
+    assert row["state"] == "failed" and row["removed"] == ["cargo-target"], "a build cache is never evidence"
+    assert row["work_kept"] == ["scratch", "tmp", "home", "ruff-cache", "hypothesis"]
+    assert {"home", "tmp", "scratch"} <= set(work_names(shop)) and "cargo-target" not in work_names(shop)
     cleaned = shop.jobs("clean", "--job", "pilot/job-1")
     assert {"home", "tmp", "scratch"} <= set(cleaned["removed"])
     assert work_names(shop) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
     assert verified_evidence(shop.receipts("job-1")[-1])
     assert shop.jobs("clean", "--job", "pilot/job-1")["removed"] == []
+
+
+def test_a_failed_heavy_tests_job_leaves_no_work_folders_and_keeps_its_evidence(shop):
+    shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK + "sys.exit(4)\n"], heavy=True,
+                                                    heavy_tests=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "works")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and "work_kept" not in row and "cleanup_error" not in row
+    assert row["removed"] == ["scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis"]
+    assert work_names(shop) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
+    assert "made work" in verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+
+
+TAGS = ("import os\nfor name in ('CARGO_TARGET_DIR', 'RUFF_CACHE_DIR', 'HYPOTHESIS_STORAGE_DIRECTORY'):\n"
+        "    print(name, open(os.path.join(os.environ[name], 'CACHEDIR.TAG')).readline().strip())\n")
+
+
+def test_a_new_job_folder_marks_its_cache_folders_for_backup_tools(shop):
+    shop.recipes["recipes"]["tags"] = shop.command(["$python", "-c", TAGS])
+    shop.save_recipes()
+    shop.request_job("job-1", "tags")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    log = verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+    for name in ("CARGO_TARGET_DIR", "RUFF_CACHE_DIR", "HYPOTHESIS_STORAGE_DIRECTORY"):
+        assert name + " Signature: 8a477f597d28d172789f06886806bc55" in log
+
+
+KEEPS = ("import os, sys\nfolder = sys.argv[1]\nos.makedirs(folder)\n"
+         "open(os.path.join(folder, 'report.xml'), 'w').write('<testsuite/>')\n"
+         "with open(os.path.join(folder, 'huge.bin'), 'wb') as stream:\n    stream.truncate(64 * 1048576 + 1)\n"
+         "os.symlink('/etc/hostname', os.path.join(folder, 'link'))\n"
+         "sys.exit(int(sys.argv[2]))\n")
+
+
+@pytest.mark.parametrize("exit_code, heavy_tests", [(0, False), (3, True)])
+def test_a_kept_file_survives_cleanup_with_its_hash(shop, exit_code, heavy_tests):
+    keep = ["run/report.xml", "run/missing.txt", "run/huge.bin", "run/link"]
+    shop.recipes["recipes"]["keeps"] = shop.command(["$python", "-c", KEEPS, "$scratch", str(exit_code)], heavy=heavy_tests,
+                                                    heavy_tests=heavy_tests, keep=keep)
+    shop.save_recipes()
+    shop.request_job("job-1", "keeps")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == ("failed" if exit_code else "completed") and "scratch" in row["removed"]
+    result = json.loads(verified_evidence(shop.receipts("job-1")[-1])["result.json"].read_text())
+    kept = {item["path"]: item for item in result["kept"]}
+    copy = shop.workspace.store / "jobs" / "pilot" / "job-1" / "evidence" / "run" / "report.xml"
+    assert copy.read_text() == "<testsuite/>"
+    assert kept["run/report.xml"] == {"path": "run/report.xml", "bytes": 12, "copy": str(copy),
+                                      "sha256": hashlib.sha256(b"<testsuite/>").hexdigest()}
+    assert kept["run/missing.txt"]["error"] == "missing"
+    assert "keep limit" in kept["run/huge.bin"]["error"], "an oversized file is reported, never truncated"
+    assert kept["run/link"]["error"] == "not a regular file inside scratch"
+    assert sorted(path.name for path in copy.parent.iterdir()) == ["report.xml"]
+    assert "run/missing.txt (missing)" in shop.receipts("job-1")[-1]["body"]
+
+
+def test_a_step_can_name_the_job_cargo_target_folder(shop):
+    script = "import os, sys; print('target', sys.argv[1:], os.environ['CARGO_TARGET_DIR'])"
+    shop.recipes["recipes"]["target"] = shop.command(["$python", "-c", script, "--target-dir", "$cargo_target"])
+    shop.save_recipes()
+    shop.request_job("job-1", "target")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    folder = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "cargo-target")
+    log = verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+    assert "target %r %s" % (["--target-dir", folder], folder) in log
 
 
 def test_clean_refuses_a_job_that_has_not_finished(shop, tmp_path):
@@ -790,6 +915,34 @@ def start_stuck_job(shop, tmp_path):
         assert time.monotonic() < deadline, "the started receipt never appeared"
         time.sleep(0.02)
     return runner
+
+
+def test_clean_finished_frees_every_finished_job_of_an_initiative_and_skips_running_ones(shop, tmp_path):
+    shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK + "sys.exit(4)\n"])
+    shop.save_recipes()
+    shop.request_job("job-a", "works")
+    shop.request_job("job-b", "works")
+    assert [row["state"] for row in shop.run_open()["rows"]] == ["failed", "failed"]
+    runner = start_stuck_job(shop, tmp_path)
+    group = shop.run_open(expect=3)["rows"][0]["process_group"]
+    try:
+        cleaned = shop.jobs("clean", "--initiative", "pilot", "--finished")
+        assert [row["job"] for row in cleaned["jobs"]] == ["pilot/job-a", "pilot/job-b"]
+        assert all(row["removed"] == ["scratch", "tmp", "home", "ruff-cache", "hypothesis"] and row["freed_bytes"] >= 1000
+                   for row in cleaned["jobs"])
+        assert cleaned["freed_bytes"] == sum(row["freed_bytes"] for row in cleaned["jobs"])
+        assert cleaned["not_finished"] == ["pilot/job-1"], "a running job is never cleaned"
+        for identifier in ("job-a", "job-b"):
+            assert work_names(shop, identifier) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
+        assert {"scratch", "home"} <= set(work_names(shop, "job-1"))
+        assert shop.jobs("clean", "--initiative", "pilot", "--finished")["jobs"] == []
+    finally:
+        os.killpg(runner.pid, signal.SIGKILL)
+        runner.communicate()
+        os.killpg(group, signal.SIGKILL)
+    assert "--finished" in shop.jobs("clean", "--initiative", "pilot", expect=2)["error"]
+    assert "--job" in shop.jobs("clean", expect=2)["error"]
+    assert "initiative" in shop.jobs("clean", "--initiative", "../x", "--finished", expect=2)["error"]
 
 
 def test_a_running_job_is_reported_and_not_started_again(shop, tmp_path):
@@ -1173,6 +1326,12 @@ def test_a_commit_recipe_needs_an_identity(shop):
     (lambda r: r.update(ro_binds=["relative"]), "ro_binds"),
     (lambda r: r.update(env={"X": "$unknown"}), "token"),
     (lambda r: r.update(min_free_gigabytes="lots"), "min_free_gigabytes"),
+    (lambda r: r["recipes"]["ok"].update(heavy_tests="yes"), "heavy_tests"),
+    (lambda r: r["recipes"]["ok"].update(heavy_tests=True), "heavy_tests needs heavy"),
+    (lambda r: r["recipes"]["ok"].update(keep=["run/../../secret"]), "invalid keep"),
+    (lambda r: r["recipes"]["ok"].update(keep=["/etc/passwd"]), "invalid keep"),
+    (lambda r: r["recipes"]["ok"].update(keep=["file-%d" % n for n in range(17)]), "invalid keep"),
+    (lambda r: r["recipes"]["commit"].update(keep=["report.xml"]), "unexpected"),
 ])
 def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
     change(shop.recipes)
@@ -1186,6 +1345,45 @@ def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
 def test_good_recipes_pass_the_check_with_a_summary(shop):
     summary = shop.jobs("check-recipes")
     assert summary["recipes"]["heavy"]["heavy"] is True and summary["recipes"]["commit"]["kind"] == "commit"
+
+
+def test_a_cargo_test_step_runs_only_in_a_heavy_tests_recipe(shop):
+    shop.recipes["recipes"]["storm"] = shop.command(["/opt/rust/bin/cargo", "test", "--quiet"], heavy=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "ok")
+    refused = shop.jobs("run-open", expect=2)
+    assert refused["error"] == ("recipe storm step 1 runs a cargo build or test (cargo test), which only a heavy_tests "
+                                "recipe may run")
+    assert shop.states("job-1") == [] and shop.jobs("check-recipes", expect=2) == refused
+    shop.recipes["recipes"]["storm"]["heavy_tests"] = True
+    shop.save_recipes()
+    summary = shop.jobs("check-recipes")["recipes"]
+    assert summary["storm"]["heavy_tests"] is True and summary["heavy"]["heavy_tests"] is False
+
+
+@pytest.mark.parametrize("step, compiles", [
+    (["cargo", "test"], True),
+    (["/opt/rust/bin/cargo", "+nightly", "--locked", "build", "--release"], True),
+    (["cargo", "t"], True),
+    (["cargo", "nextest", "run"], True),
+    (["cargo", "clippy", "--", "-D", "warnings"], True),
+    (["/usr/bin/rustc", "main.rs"], True),
+    (["rustc", "--version"], True),
+    (["cargo", "fmt", "--all", "--", "--check"], False),
+    (["cargo", "metadata", "--format-version", "1"], False),
+    (["cargo", "tree"], False),
+    (["cargo", "--version"], False),
+    (["$python", "-c", "print('cargo test')"], False),
+])
+def test_only_a_heavy_tests_recipe_may_compile_with_cargo_or_rustc(shop, step, compiles):
+    """A script that runs cargo itself is not seen: only the step's own program and subcommand are read."""
+    shop.recipes["recipes"]["probe"] = shop.command(step)
+    shop.save_recipes()
+    answer = shop.jobs("check-recipes", expect=2 if compiles else 0)
+    assert ("only a heavy_tests recipe may run" in answer.get("error", "")) is compiles, answer
+    shop.recipes["recipes"]["probe"].update(heavy=True, heavy_tests=True)
+    shop.save_recipes()
+    assert shop.jobs("check-recipes")["recipes"]["probe"]["heavy_tests"] is True
 
 
 def test_a_recipe_that_needs_a_sandbox_is_refused_when_none_is_available(shop, tmp_path):
@@ -1268,6 +1466,31 @@ def test_a_sandboxed_job_is_contained(shop):
     finally:
         shutil.rmtree(hidden, ignore_errors=True)
         outside.unlink(missing_ok=True)
+
+
+ORPHAN = ("import subprocess, sys, time\n"
+          "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', sys.argv[1]], start_new_session=True)\n"
+          "print('started', flush=True)\ntime.sleep(60)\n")
+
+
+@needs_bubblewrap
+def test_a_sandboxed_step_past_its_timeout_takes_its_own_sessions_with_it(shop):
+    """The stop at the end of a step reaches the step's group. A child that called setsid left that group, so only
+    the sandbox's own PID namespace can take it down with the job."""
+    marker = "marker-" + uuid.uuid4().hex
+    shop.recipes["recipes"]["escapes"] = shop.command(["$python", "-c", ORPHAN, marker], sandbox="bwrap", timeout_seconds=2)
+    shop.save_recipes()
+    shop.request_job("job-1", "escapes")
+    try:
+        assert shop.run_open()["rows"][0]["state"] == "failed"
+        assert "timed out" in shop.receipts("job-1")[-1]["receipt"]["reason"]
+        deadline = time.monotonic() + 5
+        while processes_with(marker) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert processes_with(marker) == []
+    finally:
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
 
 
 FORGER = """

@@ -16,12 +16,15 @@ Every result lands in `<store>/jobs/<initiative>/<message-id>/` before its recei
 receipt that cannot be published is retried by the next run instead of being lost.
 
 A completed job removes its work folders, because one full test run can leave gigabytes, and keeps its
-logs and result. A failed job keeps them until root runs `clean`, because they may be evidence.
+logs and result. Every job removes `cargo-target/`, a build cache that is never evidence, and a Heavy-Tests job
+removes all of its work folders, failed or not. Another failed job keeps the rest until root runs `clean`,
+because they may be evidence. Files a recipe names in `keep` are copied to `evidence/` before any cleanup.
 
 A receipt is a claim with evidence references, never a verdict on the work. Bubblewrap keeps
 accidents contained, but this runs under one OS user and is not a security boundary: Git inspection
 of a checkout runs outside the sandbox, so a process that edits that checkout's `.git/config` could
-run code there. A process that starts its own session also escapes the stop at the end of a step.
+run code there. In a bubblewrap recipe every process of the job lives in the sandbox's PID namespace and
+ends with it. Under `sandbox: none` a process that starts its own session escapes the stop at the end of a step.
 Linux only, because the census and the liveness checks read /proc.
 """
 from __future__ import annotations
@@ -51,9 +54,14 @@ from hierarchy_workspace import Store, absolute, check_paths, grant_next, verify
 RECIPES_SCHEMA = "aegis.hierarchy-job-recipes/v1"
 PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
 RESULT_SCHEMA = "aegis.hierarchy-job-result/v1"
-COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout"}
+COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout", "$cargo_target"}
 ENV_TOKENS = {"$scratch", "$checkout"}
 SANDBOXES = ("bwrap", "none")
+# The ledger kinds a heavy job can wait for, in the order they are granted. Each has its own limit.
+HEAVY_KINDS = ("heavy", "heavy-tests")
+# Cargo subcommands and aliases that compile. fmt, metadata, tree and --version stay light.
+CARGO_COMPILING = {"build", "b", "test", "t", "check", "c", "run", "r", "bench", "clippy", "doc", "d", "rustc", "install",
+                   "nextest", "miri"}
 # The orchestrator only needs a summary; the full output stays in the evidence files.
 TAIL_BYTES = 2000
 EMPTY_STATUS = hashlib.sha256(b"").hexdigest()
@@ -75,6 +83,14 @@ PATH_ARGUMENT = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./@+-]*(::[^\x00-\x1f]{1,51
 JOB_ID = re.compile(SLUG.pattern + "/" + SLUG.pattern)
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError, TypeError, KeyError, subprocess.SubprocessError)
 WORK_FOLDERS = ("scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis")
+# Tagged so backup and indexing tools skip them (https://bford.info/cachedir/). Only the first line is the standard.
+CACHE_FOLDERS = ("cargo-target", "ruff-cache", "hypothesis")
+CACHEDIR_TAG = (b"Signature: 8a477f597d28d172789f06886806bc55\n"
+                b"# This file is a cache directory tag created by the hierarchy job runner.\n"
+                b"# For information about cache directory tags see https://bford.info/cachedir/\n")
+# A recipe's kept files are evidence a green runner may never print, so they are copied out before cleanup.
+MAX_KEEP = 16
+MAX_KEEP_BYTES = 67108864
 HOME_FOLDERS = {"HOME": "", "USERPROFILE": "", "APPDATA": "AppData/Roaming", "LOCALAPPDATA": "AppData/Local",
                 "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude", "XDG_CONFIG_HOME": ".config",
                 "XDG_CACHE_HOME": ".cache", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
@@ -88,6 +104,20 @@ def checked_words(words, allowed, label):
         require("$" not in word or word in allowed, "unsupported token in " + label + ": " + word)
 
 
+def cargo_step(words):
+    """A step that compiles Rust: rustc itself, or cargo with a subcommand that builds. Only the step's own program
+    and subcommand are read, so a script that runs cargo inside it is not seen. Returns what it matched, else None."""
+    if not words:
+        return None
+    name = Path(words[0]).name
+    if name == "rustc":
+        return name
+    if name != "cargo":
+        return None
+    subcommand = next((word for word in words[1:] if not word.startswith(("-", "+"))), None)
+    return name + " " + subcommand if subcommand in CARGO_COMPILING else None
+
+
 def validate_recipe(name, recipe):
     matching(name, SLUG, "recipe name")
     require(isinstance(recipe, dict) and recipe.get("kind") in ("command", "commit"), "invalid kind for recipe " + name)
@@ -96,14 +126,28 @@ def validate_recipe(name, recipe):
     if recipe["kind"] == "commit":
         fields(recipe, {"kind", "timeout_seconds", "sandbox"})
         return
-    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout"})
+    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout", "heavy_tests", "keep"})
+    keep = recipe.get("keep", [])
+    require(isinstance(keep, list) and len(keep) <= MAX_KEEP, "invalid keep for recipe %s: at most %d paths" % (name, MAX_KEEP))
+    for entry in keep:
+        # Relative to scratch/ and plain, so a kept path can neither leave scratch nor name it twice.
+        require(isinstance(entry, str) and "\0" not in entry and all(part not in ("", ".", "..") for part in entry.split("/")),
+                "invalid keep for recipe %s: %s" % (name, str(entry)[:256]))
     require(type(recipe["heavy"]) is bool, "invalid heavy flag for recipe " + name)
     require(type(recipe.get("writable_checkout", False)) is bool, "invalid writable_checkout for recipe " + name)
+    require(type(recipe.get("heavy_tests", False)) is bool, "invalid heavy_tests flag for recipe " + name)
+    # Heavy-Tests is a heavy slot of its own, so a recipe that is light cannot claim it.
+    require(recipe["heavy"] or not recipe.get("heavy_tests", False), "heavy_tests needs heavy for recipe " + name)
     steps = recipe["steps"]
     require(isinstance(steps, list) and 0 < len(steps) <= MAX_STEPS and all(isinstance(step, list) and step for step in steps),
             "invalid steps for recipe " + name)
-    for step in steps:
+    for number, step in enumerate(steps, 1):
         checked_words(step, COMMAND_TOKENS, "recipe " + name)
+        # Cargo fills gigabytes and saturates the machine, so the owner allows it only in the single Heavy-Tests slot.
+        compiles = cargo_step(step)
+        require(not compiles or recipe.get("heavy_tests", False),
+                "recipe %s step %d runs a cargo build or test (%s), which only a heavy_tests recipe may run"
+                % (name, number, compiles))
 
 
 def existing_folders(value, label):
@@ -147,6 +191,11 @@ def load_recipes(path):
 
 def is_heavy(recipe):
     return recipe.get("heavy", False)
+
+
+def job_kind(recipe):
+    """The ledger kind a heavy job waits for. Cargo has the single Heavy-Tests slot; other test jobs share heavy."""
+    return "heavy-tests" if recipe.get("heavy_tests", False) else "heavy"
 
 
 def packet_text(raw):
@@ -320,12 +369,15 @@ def group_members(group):
     return members
 
 
-def heavy_command(words):
-    """Root's census rule, kept identical so this and root's own controller count the same work."""
+def census_command(words, kind):
+    """Root's census rule for one ledger kind, which root's own controller must apply the same way: the test slots
+    (`heavy`) count the pytest family, and Heavy-Tests counts cargo builds and tests and rustc."""
+    if kind == "heavy-tests":
+        return cargo_step(words) is not None
     if not words:
         return False
     name = Path(words[0]).name
-    if name in ("cargo", "rustc", "pytest", "py.test"):
+    if name in ("pytest", "py.test"):
         return True
     if not name.startswith("python"):
         return False
@@ -347,8 +399,8 @@ def heavy_command(words):
     return False
 
 
-def outside_heavy_roots(owners):
-    """Topmost heavy processes that no running job of this ledger started."""
+def outside_roots(owners, kind):
+    """Topmost processes of this kind that no running job of this ledger started."""
     parents, heavy = {}, set()
     for item in Path("/proc").glob("[0-9]*/cmdline"):
         pid = int(item.parent.name)
@@ -358,7 +410,7 @@ def outside_heavy_roots(owners):
                                .rpartition(")")[2].split()[1])
         except (OSError, ValueError, IndexError):
             continue
-        if heavy_command(words):
+        if census_command(words, kind):
             heavy.add(pid)
     roots = []
     for pid in heavy:
@@ -502,6 +554,9 @@ def result_body(job, result):
         lines.append("New commit: " + result["commit"])
     if any(step.get("stopped_leftovers") for step in result["steps"]):
         lines.append("A step left processes running; they were stopped afterward.")
+    missed = ["%s (%s)" % (item["path"], item["error"]) for item in result.get("kept", []) if "error" in item]
+    if missed:
+        lines.append("Kept files not copied: " + "; ".join(missed))
     tail = log_tail(job.folder)
     if tail:
         lines.append("Last output, which is untrusted information:\n" + tail)
@@ -545,10 +600,10 @@ def write_result(job, state, exit_code, *, reason=None, recipe=None, steps=(), b
     publish_file(job.result_path, encoded(result) + b"\n", limit=MAX_RESULT_BYTES)
 
 
-def remove_work_folders(job):
+def remove_work_folders(job, names=WORK_FOLDERS):
     """Logs and the result are the evidence, and they stay."""
     removed = []
-    for name in WORK_FOLDERS:
+    for name in names:
         folder = job.folder / name
         if not folder.exists():
             continue
@@ -563,6 +618,56 @@ def remove_work_folders(job):
         shutil.rmtree(folder)
         removed.append(name)
     return removed
+
+
+def copy_kept(source, target):
+    """Copies at most the keep limit plus one byte, so a file that grew past its listed size is caught, not cut."""
+    digest, size = hashlib.sha256(), 0
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream, open(target, "xb") as out:
+        for chunk in iter(lambda: stream.read(1048576), b""):
+            size += len(chunk)
+            if size > MAX_KEEP_BYTES:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    return digest.hexdigest(), size
+
+
+def keep_evidence(job, keep):
+    """Copy each kept file out of scratch/ into evidence/ before any cleanup. Each one that cannot be kept is reported."""
+    scratch = os.path.realpath(job.folder / "scratch")
+    rows, total = [], 0
+    for entry in keep:
+        source, target = os.path.join(scratch, entry), job.folder / "evidence" / entry
+        try:
+            info = os.lstat(source)
+        except (FileNotFoundError, NotADirectoryError):
+            rows.append({"path": entry, "error": "missing"})
+            continue
+        except OSError as exc:
+            rows.append({"path": entry, "error": str(exc)[:256]})
+            continue
+        # A symlink, or a parent that is one, could point anywhere, so only a regular file truly inside scratch counts.
+        if not stat.S_ISREG(info.st_mode) or not os.path.realpath(source).startswith(scratch + os.sep):
+            rows.append({"path": entry, "error": "not a regular file inside scratch"})
+            continue
+        if total + info.st_size > MAX_KEEP_BYTES:
+            rows.append({"path": entry, "bytes": info.st_size,
+                         "error": "over the keep limit of %d bytes together" % MAX_KEEP_BYTES})
+            continue
+        try:
+            sha256, size = copy_kept(source, target)
+        except OSError as exc:
+            rows.append({"path": entry, "error": "could not copy: " + str(exc)[:256]})
+            continue
+        if total + size > MAX_KEEP_BYTES:
+            target.unlink()
+            rows.append({"path": entry, "error": "over the keep limit of %d bytes together" % MAX_KEEP_BYTES})
+            continue
+        total += size
+        rows.append({"path": entry, "sha256": sha256, "bytes": size, "copy": str(target)})
+    return rows
 
 
 def refuse(store, job, reason, wait):
@@ -585,8 +690,10 @@ def sandbox_prefix(recipes, recipe, job, checkout):
     bwrap = shutil.which("bwrap")
     require(bwrap is not None, "this recipe needs bubblewrap, which is not available")
     # No --new-session: the job runs in a session of its own with no terminal, and staying in one
-    # process group is what lets the stop at the end of a step reach every child.
-    argv = [bwrap, "--die-with-parent", "--unshare-net", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
+    # process group is what lets the stop at the end of a step reach every child. A child that calls
+    # setsid leaves that group, so the PID namespace is what takes it down: when the stop ends bwrap,
+    # --die-with-parent ends the namespace's first process and the kernel ends every other one in it.
+    argv = [bwrap, "--die-with-parent", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
     for folder in recipes.get("hide", []):
         argv += ["--tmpfs", folder]
     argv += ["--dev", "/dev", "--proc", "/proc"]
@@ -608,16 +715,23 @@ def scratch_argument(job):
     return str(job.folder / "scratch" / "run")
 
 
+def cargo_target(job):
+    """One path for both CARGO_TARGET_DIR and $cargo_target, so a runner's --target-dir never splits the cache."""
+    return str(job.folder / "cargo-target")
+
+
 def job_environment(recipes, job, checkout):
     for name in WORK_FOLDERS:
         (job.folder / name).mkdir(mode=0o700, exist_ok=True)
+    for name in CACHE_FOLDERS:
+        (job.folder / name / "CACHEDIR.TAG").write_bytes(CACHEDIR_TAG)
     home = job.folder / "home"
     scratch_tmp = job.folder / "tmp"
     env = {"PATH": os.pathsep.join(recipes["path"]), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONNOUSERSITE": "1", "GIT_OPTIONAL_LOCKS": "0", "TMP": str(scratch_tmp), "TEMP": str(scratch_tmp),
            "TMPDIR": str(scratch_tmp),
            # These tools otherwise write beside the source, and a job usually cannot write there.
-           "CARGO_TARGET_DIR": str(job.folder / "cargo-target"), "RUFF_CACHE_DIR": str(job.folder / "ruff-cache"),
+           "CARGO_TARGET_DIR": cargo_target(job), "RUFF_CACHE_DIR": str(job.folder / "ruff-cache"),
            "HYPOTHESIS_STORAGE_DIRECTORY": str(job.folder / "hypothesis")}
     for name, folder in HOME_FOLDERS.items():
         path = home / folder
@@ -655,9 +769,9 @@ def stop_for_certain(process):
         raise StillRunning(process.pid, "members were left after the stop")
 
 
-def command_steps(recipe, packet, recipes, scratch):
-    tokens = {"$python": [recipes["python"]], "$paths": packet["paths"], "$scratch": [scratch],
-              "$checkout": [packet["checkout"]]}
+def command_steps(recipe, packet, recipes, job):
+    tokens = {"$python": [recipes["python"]], "$paths": packet["paths"], "$scratch": [scratch_argument(job)],
+              "$checkout": [packet["checkout"]], "$cargo_target": [cargo_target(job)]}
     for step in recipe["steps"]:
         yield Step([part for word in step for part in tokens.get(word, [word])])
     return None
@@ -732,7 +846,7 @@ def execute(job, recipe, packet, recipes, on_start):
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
     commit = recipe["kind"] == "commit"
-    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, scratch_argument(job))
+    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, job)
     rows, reason, exit_code, created, output = [], None, 0, None, None
     started = False
 
@@ -802,18 +916,24 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
                 reason, exit_code = "the checkout does not show the new commit afterward", NO_VERDICT_EXIT
         elif after != before:
             reason, exit_code = "source changed during the job, so its exit proves nothing", NO_VERDICT_EXIT
+    extra = {"kept": keep_evidence(job, recipe["keep"])} if recipe.get("keep") else {}
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
-                 steps=rows, before=before, after=after, commit=created if not reason else None)
-    cleanup_error = None
-    if not reason:
+                 steps=rows, before=before, after=after, commit=created if not reason else None, **extra)
+    # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other
+    # failed jobs keep the rest of their work for diagnosis until root runs clean.
+    names = WORK_FOLDERS if not reason or recipe.get("heavy_tests", False) else ("cargo-target",)
+    removed, cleanup_error = [], None
+    for name in names:
         try:
-            remove_work_folders(job)
+            removed += remove_work_folders(job, (name,))
         except OSError as exc:
             # The result stands either way, so this only tells root that space was not freed.
-            cleanup_error = str(exc)[:512]
+            cleanup_error = cleanup_error or str(exc)[:512]
     row = settle(store, job, wait)
-    if reason:
-        row["work_kept"] = True
+    row["removed"] = removed
+    kept = [name for name in WORK_FOLDERS if (job.folder / name).exists()]
+    if kept:
+        row["work_kept"] = kept
     if cleanup_error:
         row["cleanup_error"] = cleanup_error
     return row
@@ -893,45 +1013,62 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
     return ready
 
 
-def enqueue(store, job, wait):
+def enqueue(store, job, kind, wait):
     def attempt():
         with store.lock():
             ledger = store.load()
             if not any(r["holder"] == job.holder and r["state"] in ("queued", "granted") for r in ledger.requests.values()):
                 store.append(ledger, "request", {"request_id": "req-%08d" % (ledger.seq + 1), "initiative": job.initiative["id"],
-                                                 "kind": "heavy", "holder": job.holder, "reference": job.id})
+                                                 "kind": kind, "holder": job.holder, "reference": job.id})
 
     patient(attempt, wait)
 
 
-def fixture_roots(fixture):
-    """For tests: a list of PIDs, or {"external_roots": [...], "delay_seconds": n} to make the census take time like a real one."""
+def fixture_roots(fixture, kind):
+    """For tests: a list of PIDs, or {"external_roots": ..., "delay_seconds": n} to make the census take time like a
+    real one. external_roots is a list, or an object of lists by kind; a bare list counts against heavy only."""
     data = read_json(fixture)
     if isinstance(data, list):
-        return sorted(data)
+        return sorted(data) if kind == "heavy" else []
     fields(data, {"external_roots"}, {"delay_seconds"})
     delay = data.get("delay_seconds", 0)
     require(isinstance(delay, (int, float)) and 0 <= delay <= 5, "invalid delay_seconds")
     time.sleep(delay)
-    return sorted(data["external_roots"])
+    roots = data["external_roots"]
+    if isinstance(roots, list):
+        roots = {"heavy": roots}
+    require(isinstance(roots, dict), "invalid census fixture")
+    unknown = sorted(set(roots) - set(HEAVY_KINDS))
+    require(not unknown, "unknown census fixture kind: " + ", ".join(unknown)[:256])
+    return sorted(roots.get(kind, []))
 
 
-def census(store_path, ledger, fixture):
-    held = ledger.held("heavy")
+def census(store_path, ledger, fixture, kind):
+    held = ledger.held(kind)
     if fixture is not None:
-        return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": fixture_roots(fixture), "census": "fixture"}
+        return {"limit": ledger.limits[kind], "held": len(held), "external_roots": fixture_roots(fixture, kind),
+                "census": "fixture"}
     owners = set()
-    for request in held:
+    # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
+    for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
         if request["holder"].startswith("job:"):
             claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
             if claim.exists():
                 owners.add(read_json(claim)["pid"])
-    return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": outside_heavy_roots(owners), "census": "proc"}
+    return {"limit": ledger.limits[kind], "held": len(held), "external_roots": outside_roots(owners, kind), "census": "proc"}
 
 
 def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=False):
+    """Each kind is a slot class of its own, so one kind being full never holds the other. Returns the budget left."""
+    for kind in HEAVY_KINDS:
+        waiting = {holder: entry for holder, entry in heavy.items()
+                   if job_kind(recipes["recipes"][entry[1]["recipe"]]) == kind}
+        budget = run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy)
+    return budget
+
+
+def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy):
     """Grant in the ledger's own order, which applies the owner's priorities, until nothing more can start."""
-    waiting = dict(heavy)
     held_reason = "store_busy" if store_busy else None
     capacity = None
     minimum = recipes.get("min_free_gigabytes", 0)
@@ -948,11 +1085,11 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
             def outside(locked):
                 # Counted under the store lock, together with the grant, so another runner cannot take the
                 # same free slot between this count and the grant.
-                seen.update(census(store.path, locked, fixture))
+                seen.update(census(store.path, locked, fixture, kind))
                 return seen["external_roots"]
 
             try:
-                code, answer = patient(lambda: grant_next(store, "heavy", outside=outside), wait)
+                code, answer = patient(lambda: grant_next(store, kind, outside=outside), wait)
             except ValueError as exc:
                 if "busy" not in str(exc):
                     raise
@@ -973,10 +1110,11 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
         except ERRORS as exc:
             rows.append(blocked_row(job, exc))
     for job, _, _ in waiting.values():
-        row = {"job": job.id, "state": "waiting", "reason": held_reason or "job_limit"}
+        row = {"job": job.id, "state": "waiting", "kind": kind, "reason": held_reason or "job_limit"}
         if capacity is not None:
             row["capacity"] = capacity
         rows.append(row)
+    return budget
 
 
 NEEDS_ROOT = {"waiting", "running", "abandoned", "settle_pending", "mailbox_error", "granted_elsewhere"}
@@ -998,10 +1136,11 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait):
     heavy = {}
     store_busy = False
     for job, packet, raw in ready:
-        if is_heavy(recipes["recipes"][packet["recipe"]]):
+        recipe = recipes["recipes"][packet["recipe"]]
+        if is_heavy(recipe):
             heavy[job.holder] = (job, packet, raw)
             try:
-                enqueue(store, job, wait)
+                enqueue(store, job, job_kind(recipe), wait)
             except ValueError as exc:
                 # Nothing has started, so this job just waits. Other work still gets done and reported.
                 if "busy" not in str(exc):
@@ -1052,13 +1191,51 @@ def clean(store_path, identifier):
     return 0, {"job": identifier, "removed": remove_work_folders(job)}
 
 
+def work_bytes(folder):
+    """Bytes the work folders hold, counted without following a symlink out of them."""
+    total = 0
+    for name in WORK_FOLDERS:
+        path = folder / name
+        if path.is_symlink() or not path.is_dir():
+            continue
+        for current, _, files in os.walk(path):
+            for item in files:
+                try:
+                    total += os.lstat(os.path.join(current, item)).st_size
+                except OSError:
+                    continue
+    return total
+
+
+def clean_finished(store_path, initiative_id):
+    """Root's batch cleanup. Only a job with a result is finished; any other may still be running, so it is skipped."""
+    matching(initiative_id, SLUG, "initiative")
+    store = Store(store_path)
+    base = safe_path(store.path / "jobs" / initiative_id)
+    rows, not_finished = [], []
+    for folder in sorted(base.iterdir()) if base.is_dir() else []:
+        if folder.is_symlink() or not folder.is_dir() or SLUG.fullmatch(folder.name) is None:
+            continue
+        identifier = initiative_id + "/" + folder.name
+        if not (folder / "result.json").exists():
+            not_finished.append(identifier)
+            continue
+        freed = work_bytes(folder)
+        removed = remove_work_folders(Job(store.path, {"id": initiative_id}, {"message_id": folder.name}))
+        if removed:
+            rows.append({"job": identifier, "removed": removed, "freed_bytes": freed})
+    return 0, {"initiative": initiative_id, "jobs": rows, "freed_bytes": sum(row["freed_bytes"] for row in rows),
+               "not_finished": not_finished}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--store", help="Absolute path to the workspace store")
     parser.add_argument("--recipes", help="Absolute path to root's recipe file")
     parser.add_argument("--lock-wait", type=float, default=DEFAULT_LOCK_WAIT_SECONDS,
                         help="Seconds to wait for a busy mailbox or store before leaving a receipt for the next run")
-    parser.add_argument("--census-fixture", help="For tests: a JSON list of PIDs that replaces the process census")
+    parser.add_argument("--census-fixture", help="For tests: JSON that replaces the process census, a list of PIDs for "
+                        "heavy or {\"external_roots\": {\"heavy\": [...], \"heavy-tests\": [...]}}")
     commands = parser.add_subparsers(dest="command", required=True)
     opened = commands.add_parser("run-open", help="Run every job request that can run now")
     opened.add_argument("--initiative", action="append", default=[], help="Only this initiative; can repeat")
@@ -1068,8 +1245,10 @@ def main(argv=None):
     resolved.add_argument("--job", required=True, help="<initiative>/<message-id>")
     resolved.add_argument("--reason", required=True)
     resolved.add_argument("--process-stopped", action="store_true", help="Confirm by hand that an unrecorded process has stopped")
-    commands.add_parser("clean", help="Remove a finished job's work folders, keeping its logs and result").add_argument(
-        "--job", required=True, help="<initiative>/<message-id>")
+    cleaned = commands.add_parser("clean", help="Remove finished jobs' work folders, keeping their logs and results")
+    cleaned.add_argument("--job", help="<initiative>/<message-id>")
+    cleaned.add_argument("--initiative", help="With --finished: every finished job of this initiative")
+    cleaned.add_argument("--finished", action="store_true", help="Clean every finished job of --initiative; skip the rest")
     commands.add_parser("source-digest", help="Print the commit, tree and uncommitted-content digest a packet needs").add_argument(
         "--checkout", required=True)
     args = parser.parse_args(argv)
@@ -1079,13 +1258,19 @@ def main(argv=None):
             code, result = source_digest(args.checkout)
         elif args.command == "resolve":
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait, args.process_stopped)
+        elif args.command == "clean" and args.job is None:
+            require(args.initiative is not None, "clean needs --job, or --initiative with --finished")
+            require(args.finished, "clean --initiative needs --finished")
+            code, result = clean_finished(args.store, args.initiative)
         elif args.command == "clean":
+            require(args.initiative is None and not args.finished, "clean takes --job or --initiative, not both")
             code, result = clean(args.store, args.job)
         else:
             require(args.recipes is not None, "--recipes is required")
             if args.command == "check-recipes":
                 recipes = load_recipes(args.recipes)
                 code, result = 0, {"recipes": {name: {"kind": recipe["kind"], "heavy": is_heavy(recipe),
+                                                      "heavy_tests": recipe.get("heavy_tests", False),
                                                       "sandbox": recipe["sandbox"]}
                                                for name, recipe in recipes["recipes"].items()}}
             else:

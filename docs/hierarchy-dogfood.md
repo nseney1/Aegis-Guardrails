@@ -105,8 +105,8 @@ it gets a Heavy-Tests limit of 1.
 - `heavy` is the 3 test slots: pytest suites, targeted tests and other test jobs.
 - `heavy-tests` (Heavy-Tests) is the single slot where cargo builds and tests run.
 
-So at most 4 test jobs run at once, and at most 1 of them is cargo. Binding recipes to
-`heavy-tests` and cleaning up after heavy jobs come in a later change.
+So at most 4 test jobs run at once, and at most 1 of them is cargo. A recipe takes
+`heavy-tests` with `"heavy_tests": true`; see [Heavy-Tests jobs](#heavy-tests-jobs).
 
 To change an initialized store's limits, append a `set-limits` event that names its source:
 
@@ -118,6 +118,43 @@ tool workspace --store "$TRIAL/store" set-limits --request "$TRIAL/set-limits.js
 
 Each value must be within its cap and at least the number already granted for that kind, and a
 refused change writes nothing. Raising a cap itself is an owner decision and a reviewed code change.
+
+### Heavy-Tests jobs
+
+A command recipe with `"heavy_tests": true`, which needs `"heavy": true`, waits for `heavy-tests`;
+every other heavy recipe waits for `heavy`. Each kind is granted on its own, so a full Heavy-Tests
+slot never holds a pytest job, and `min_free_gigabytes` holds both. The census counts outside work
+per kind: pytest-family roots against `heavy`, cargo build/test and `rustc` roots against
+`heavy-tests`. A waiting row names its `kind`.
+
+- **Cargo rule.** A step whose program is `rustc`, or `cargo` whose first later word not starting
+  with `-` or `+` is one of `build b test t check c run r bench clippy doc d rustc install nextest
+  miri`, runs only in a `heavy_tests` recipe. `check-recipes` and `run-open` refuse any other
+  recipe and name the recipe and step. `cargo fmt`, `metadata`, `tree` and `--version` stay light.
+  Limits: a script that runs cargo inside it is not seen, and an option with a separate value
+  before the subcommand (`cargo --manifest-path x test`) hides it, so write `--manifest-path=x`.
+- **Cleanup.** After the result is written, every job removes `cargo-target/`, and a Heavy-Tests job
+  removes all of its work folders, failed or not. Other failed jobs keep `scratch`, `tmp`, `home`,
+  `ruff-cache` and `hypothesis` until `clean`. Logs and `result.json` always stay. The run row lists
+  `removed`, `work_kept` names what stayed, and `cleanup_error` says why space was not freed.
+  `cargo-target/`, `ruff-cache/` and `hypothesis/` carry a standard `CACHEDIR.TAG`.
+- **`keep`.** Up to 16 paths relative to `scratch/`, with no `..`, at most 64 MiB together. Before
+  any cleanup, success or failure, each regular file is copied to `<job>/evidence/` and listed
+  with its `sha256` under `kept` in `result.json`. A missing, linked or oversized file is reported
+  there and in the receipt, never truncated.
+- **`$cargo_target`.** A step word that becomes the job's `cargo-target` folder, the same path
+  `CARGO_TARGET_DIR` gets, for a runner that needs `--target-dir`.
+- **PID namespace.** A `bwrap` recipe runs with `--unshare-pid`, so a process that calls `setsid`
+  still ends with its job. `sandbox: none` recipes are unchanged.
+- **Batch clean.** `tool jobs --store ... clean --initiative <id> --finished` removes the work
+  folders of every finished job of that initiative, reports `freed_bytes`, and lists jobs without
+  a result under `not_finished` without touching them.
+
+**Re-pin step for root.** The new `load_recipes` refuses the live `recipes.json`, because its
+`storm-settings-*` recipes run `cargo test`. In the same step as the re-pin, add
+`"heavy_tests": true` to `storm-settings-focused`, `storm-settings-sadpaths` and
+`storm-settings-regression`, then run `check-recipes`. `storm-fmt-check` (`cargo fmt`,
+`heavy: false`) needs no change.
 
 ## Add an initiative
 
@@ -213,7 +250,7 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 
 | You see | It means | Do this |
 | --- | --- | --- |
-| `waiting` with `capacity_full` | All heavy slots are taken, counting outside work | Run again later |
+| `waiting` with `capacity_full` | All slots of the row's `kind` are taken, counting outside work | Run again later |
 | `waiting` with `low_disk` | Free space is under `min_free_gigabytes`, so no heavy job starts | Free some space. `tool jobs --store ... clean --job <initiative>/<message-id>` removes a finished job's work folders |
 | `running` | Another runner has it | Nothing |
 | `abandoned` | The runner stopped, and the slot stays held | Stop `process_group` if `process_alive`, then run `tool jobs --store ... resolve --job <initiative>/<message-id> --reason "..."` |
@@ -229,8 +266,9 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 | `root_queue` | Open jobs and unread mail for root | `run-open`, then `tool mailbox --root <mailbox> inbox --endpoint <hierarchy>/root --delivery-dir <dir> --mark-read` |
 
 A full test run can leave about 2 GB in its job folder. A completed job removes that itself and
-keeps its logs and result. A failed job (`work_kept`) keeps it as possible evidence until you run
-`clean`.
+keeps its logs and result. A failed job removes `cargo-target/`, and a failed Heavy-Tests job
+removes everything; another failed job keeps the rest (`work_kept`) as possible evidence until you
+run `clean --job`, or `clean --initiative <id> --finished` for all of them.
 
 A runner works through jobs one at a time, so start a second `run-open` to use more than one
 heavy slot. A sweep also runs turns one at a time, so use `--initiative` to sweep initiatives
@@ -322,7 +360,10 @@ live prototype needs no undoing.
   security boundary, and a same-user process can edit these files.
 - Git inspection of a checkout runs outside the sandbox, so a process that edits that checkout's
   `.git/config` could run code there.
-- A process that starts its own session escapes the stop at the end of a job step.
+- Under `sandbox: none`, a process that starts its own session escapes the stop at the end of a
+  job step. A `bwrap` recipe's PID namespace ends it with the job.
+- The cargo rule reads only a step's own program and subcommand, so a script that runs cargo
+  inside it can compile outside the Heavy-Tests slot.
 - The census looks once before each grant, so outside heavy work that starts right after it can
   briefly put the total over the limit.
 - A store, a board and a mailbox each stop accepting records at 10,000. Start a new one before
