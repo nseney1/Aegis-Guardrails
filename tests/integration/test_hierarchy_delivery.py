@@ -3,6 +3,7 @@
 Host processes here are stubs at the subprocess boundary. They show how the tools report
 delivery, not that a real Claude or Codex session reads its mail.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,17 @@ elif mode == "sleeper":
     with open(record + ".child", "w", encoding="utf-8") as stream:
         stream.write(str(child.pid))
     time.sleep(60)
+elif mode in ("bind", "publish"):
+    outcome = subprocess.run([sys.executable, "-I", helper, "--root", root, mode, "--request", record + ".request"],
+                             text=True, capture_output=True)
+    with open(record + ".result", "w", encoding="utf-8") as stream:
+        stream.write(outcome.stdout)
+'''
+
+# Stands in for the liveness census, which runs between the first binding check and the launch.
+FAKE_PS = '''
+import json, os, subprocess
+subprocess.run(json.loads(os.environ["FAKE_PS_ARGV"]), check=True, capture_output=True)
 '''
 
 
@@ -106,8 +118,8 @@ class Pilot:
         path.write_text(json.dumps(document), encoding="utf-8")
         return path
 
-    def wake(self, profile, *flags, home=None, timeout=30):
-        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    def wake(self, profile, *flags, home=None, timeout=30, extra_env=None):
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
         if home is not None:
             env["HOME"] = str(home)
         result = subprocess.run([sys.executable, "-I", str(WAKE), "--root", str(self.root), "--delivery-dir",
@@ -542,17 +554,102 @@ def test_claude_session_table_blocks_only_a_live_session(tmp_path, alive, expect
         assert result["state"] == "read"
 
 
+def replacement_request(pilot):
+    brief = pilot.tmp / "handoff-brief.md"
+    brief.write_bytes(b"Handoff.\n")
+    return invoke(pilot.root, "draft-handoff", {
+        "endpoint": TARGET, "host": "host-two", "session": "replacement-session", "outgoing_stopped": True,
+        "briefs": [{"path": str(brief), "sha256": hashlib.sha256(b"Handoff.\n").hexdigest()}]})
+
+
+def current_session(pilot):
+    return invoke(pilot.root, "status")["bindings"][TARGET]["session"]
+
+
+def wake_locks(pilot):
+    return list(pilot.root.glob(".wake-*"))
+
+
 @posix_only
-def test_a_wake_in_progress_is_not_doubled_and_its_lock_is_left_for_inspection(pilot):
+def test_a_binding_replaced_after_the_first_check_stops_the_launch(pilot, tmp_path):
     pilot.publish()
-    folder = pilot.delivery / "wake-locks" / TARGET
-    folder.mkdir(parents=True)
-    lock = folder / ".wake.lock"
-    lock.write_text("fixture active wake")
+    profile = pilot.profile()
+    request = tmp_path / "replacement.json"
+    request.write_text(json.dumps(replacement_request(pilot)), encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text("#!" + sys.executable + "\n" + FAKE_PS, encoding="utf-8")
+    fake_ps.chmod(0o755)
+    code, result = pilot.wake(profile, extra_env={
+        "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+        "FAKE_PS_ARGV": json.dumps([sys.executable, "-I", str(HELPER), "--root", str(pilot.root), "bind",
+                                    "--request", str(request)])})
+    assert current_session(pilot) == "replacement-session"
+    assert not pilot.record.exists(), "the outgoing session was started after its binding was replaced"
+    assert code == 2 and result["error"] == "binding changed before launch; the outgoing session was not started"
+    assert not (pilot.delivery / "wakes").exists()
+    assert wake_locks(pilot) == []
+
+
+@posix_only
+def test_a_replacement_is_refused_while_a_wake_is_running_and_works_afterward(pilot):
+    pilot.publish()
+    request = replacement_request(pilot)
+    Path(str(pilot.record) + ".request").write_text(json.dumps(request), encoding="utf-8")
+    code, result = pilot.wake(pilot.profile(mode="bind"))
+    during = json.loads(Path(str(pilot.record) + ".result").read_text())
+    assert during.get("error") == "a wake is in progress for this endpoint; stop it and remove its lock before replacing the session"
+    assert current_session(pilot) == pilot.session
+    assert code == 3 and result["state"] == "woken_unread"
+    assert invoke(pilot.root, "bind", request)["generation"] == 2
+
+
+@posix_only
+def test_mailbox_writers_keep_working_during_a_turn(pilot):
+    pilot.publish()
+    Path(str(pilot.record) + ".request").write_text(
+        json.dumps(message(recipient=TARGET, identifier="sent-during-turn")), encoding="utf-8")
+    pilot.wake(pilot.profile(mode="publish"))
+    during = json.loads(Path(str(pilot.record) + ".result").read_text())
+    assert during["message"]["message_id"] == "sent-during-turn"
+
+
+@posix_only
+def test_a_busy_mailbox_writer_stops_the_launch(pilot):
+    pilot.publish()
+    lock = pilot.root / ".write.lock"
+    lock.write_text("fixture active writer")
+    code, result = pilot.wake(pilot.profile())
+    assert code == 2 and "writer is busy" in result["error"]
+    assert not pilot.record.exists()
+    assert lock.read_text() == "fixture active writer"
+
+
+@posix_only
+@pytest.mark.parametrize("mode,argv", [("ignore", None), ("crash", None), (None, ["/no/such/host", "SESSION"])])
+def test_a_finished_or_failed_wake_leaves_the_mailbox_root_as_it_was(pilot, mode, argv):
+    pilot.publish()
+    before = sorted(path.name for path in pilot.root.iterdir())
+    changes = {} if argv is None else {"argv": [item.replace("SESSION", pilot.session) for item in argv]}
+    pilot.wake(pilot.profile(mode=mode or "ignore", **changes))
+    assert sorted(path.name for path in pilot.root.iterdir()) == before
+
+
+@posix_only
+def test_an_abandoned_wake_lock_blocks_both_sides_and_keeps_history_readable(pilot):
+    pilot.publish()
+    request = replacement_request(pilot)
+    lock = pilot.root / (".wake-" + TARGET.replace("/", "%2F") + ".lock")
+    lock.write_text("left by a crashed wake")
     code, result = pilot.wake(pilot.profile())
     assert code == 2 and "a wake is already in progress" in result["error"]
     assert not pilot.record.exists()
-    assert lock.read_text() == "fixture active wake"
+    assert "a wake is in progress" in invoke(pilot.root, "bind", request, ok=False)["error"]
+    assert lock.read_text() == "left by a crashed wake"
+    assert invoke(pilot.root, "inbox", endpoint=TARGET)["messages"]
+    lock.unlink()
+    assert invoke(pilot.root, "bind", request)["generation"] == 2
 
 
 @posix_only

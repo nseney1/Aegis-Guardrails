@@ -577,9 +577,15 @@ class Mailbox:
                 require(all(source[key] == value for key, value in observed.items()),
                         "checkpoint source snapshot does not match worktree")
 
+    def wake_marker(self, endpoint):
+        """Sits beside .write.lock, outside the routing folders, and is held from launch until the turn ends."""
+        return safe_path(self.root / (".wake-" + endpoint.replace("/", "%2F") + ".lock"))
+
     def bind(self, request):
         fields(request, {"endpoint", "host", "session", "expected_generation"}, {"checkpoint"})
         self.endpoint(request["endpoint"])
+        require(not self.wake_marker(request["endpoint"]).exists(),
+                "a wake is in progress for this endpoint; stop it and remove its lock before replacing the session")
         text(request["host"], "host", 128)
         text(request["session"], "session", 256)
         integer(request["expected_generation"], "expected generation", minimum=0)

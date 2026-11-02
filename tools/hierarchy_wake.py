@@ -15,7 +15,6 @@ authorization boundary and grants no approval, lease or resource.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -29,7 +28,7 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (Mailbox, encoded, fields, integer, read_json, require,  # noqa: E402
-                               safe_path, timestamp)
+                               safe_path, timestamp, writer_lock)
 
 
 PROFILE_SCHEMA = "aegis.hierarchy-wake-profile/v1"
@@ -94,20 +93,15 @@ def claude_table_lists_session(session):
     return False
 
 
-@contextmanager
-def wake_lock(folder):
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock = safe_path(folder / ".wake.lock")
+def claim_wake(mailbox, endpoint):
+    marker = mailbox.wake_marker(endpoint)
     try:
-        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as exc:
         raise ValueError("a wake is already in progress for this endpoint; inspect the lock before retrying") from exc
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
-        yield
-    finally:
-        lock.unlink()
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
+    return marker
 
 
 def stop_group(process):
@@ -196,21 +190,35 @@ def wake(root, directory, endpoint, profile_path, dry_run=False):
         return 3, {**answer, "state": "failed_to_start", "error": reason, "exit_code": None, "timed_out": False,
                    "read": [], "still_unread": identifiers}
 
-    with wake_lock(delivery_root / "wake-locks" / endpoint):
+    # bind takes this same lock, so a replacement cannot slip between this check and the launch. The
+    # marker then blocks bind until the turn ends, and the lock is released so writers keep working.
+    with writer_lock(root):
+        current = Mailbox(root).current_binding(endpoint)
+        require(all(profile[key] == current[key] for key in ("host", "session", "generation")),
+                "binding changed before launch; the outgoing session was not started")
+        marker = claim_wake(mailbox, endpoint)
+        failure = None
         try:
             process, log = start_turn(profile, delivery_root / "wake-logs" / endpoint, wake_id)
         except OSError as exc:
-            return failed_start(str(exc))
-        try:
-            # Recorded only once a process exists, because launch intent is not launch evidence.
-            mailbox.write_delivery_receipt(directory, "wakes", {**base, "wake_id": wake_id, "state": "started"})
-        except (ValueError, OSError) as exc:
-            abandon_turn(process)
-            return failed_start("could not record the start: " + str(exc), record=False)
+            failure = failed_start(str(exc))
+        else:
+            try:
+                # Recorded only once a process exists, because launch intent is not launch evidence.
+                mailbox.write_delivery_receipt(directory, "wakes", {**base, "wake_id": wake_id, "state": "started"})
+            except (ValueError, OSError) as exc:
+                abandon_turn(process)
+                failure = failed_start("could not record the start: " + str(exc), record=False)
+        if failure is not None:
+            marker.unlink()
+            return failure
+    try:
         exit_code, timed_out = finish_turn(process, profile)
         mailbox.write_delivery_receipt(directory, "wakes", {
             **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited",
             "exit_code": exit_code, "timed_out": timed_out})
+    finally:
+        marker.unlink()
     fresh = Mailbox(root)
     rows, _ = fresh.endpoint_delivery(directory, endpoint, fresh.messages())
     read = [identifier for identifier in identifiers if rows[identifier]["state"] == "read"]
