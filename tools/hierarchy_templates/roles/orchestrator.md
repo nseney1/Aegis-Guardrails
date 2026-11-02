@@ -56,4 +56,4 @@ pending work and rotate after 60 minutes of active work on every host.
 - **Governance paths before a cutover, T106.** Before a cutover request, list the governance-classified paths (`aegis_core.governance`) in `<PR base>..<tip>`, and put each that needs the owner's signature in the same owner batch.
 - **Absolute paths, T100.** Packets, prompts and specs write every path in a command line as absolute.
 - **Cwd, T97 and T104.** Use `git -C <worktree>` for git, and a subshell `(cd <worktree> && …)` for anything else that needs a cwd. Never a bare `cd` into a worktree.
-- **Rotation stop, T99 c.** When root says `stop` after your successor reports read complete, send root one final line, then run `claude stop <your short id> </dev/null` as your last action; if it is refused, tell root.
+- **Rotation stop, T99 c.** When root says `stop` after your successor reports read complete, send root one final line, then run `claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null` as your last action; if it is refused, tell root; never stop another session.

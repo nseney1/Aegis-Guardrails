@@ -65,10 +65,20 @@ def test_lanes_put_evidence_too_long_for_a_field_in_a_cited_file():
     assert missing("roles/lane.md", ["4096 characters", "absolute path, its sha256 and the rule ids"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md"])
+@pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md", "roles/orchestrator.md"])
 def test_lane_kinds_end_with_the_self_stop_line(name):
     last = (TEMPLATES / name).read_text(encoding="utf-8").rstrip().splitlines()[-1]
     assert SELF_STOP in last
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "roles/orchestrator.md"])
+def test_a_self_stop_never_stops_another_session(name):
+    assert missing(name, ["never stop another session"]) == []
+
+
+def test_only_writers_cd_into_their_worktree_and_read_only_roles_never_use_a_bare_cd():
+    assert missing("roles/lane.md", ["Writing lanes:", "the first-step `cd` is into your own worktree only",
+                                     "read-only roles never use a bare `cd`"]) == []
 
 
 def test_orchestrators_read_a_dialog_from_waiting_for_not_from_blocked_alone():
@@ -87,7 +97,9 @@ def test_root_stops_the_outgoing_session_and_checks_its_pid():
 
 def test_root_releases_a_live_lanes_grant_only_on_all_four_conditions():
     assert missing("roles/root.md", ["only when all four hold", "it reported done", "verified the report against git",
-                                     "no `waitingFor`", "no claimed job and no open accepted dispatch"]) == []
+                                     "no `waitingFor`", "no claimed job and no open accepted dispatch",
+                                     "with the session id and the verified tip and tree",
+                                     "Nobody messages a released lane", "only its verified tip merges"]) == []
 
 
 def test_reviewers_fall_back_to_exact_commits_without_a_prepared_copy():

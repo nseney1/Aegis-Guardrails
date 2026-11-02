@@ -25,7 +25,7 @@ checkpoint, acknowledge it in the successor and rotate after 60 minutes active.
 
 ## Working rules
 
-- **Layout (f), T38.** You are launched in the trusted workspace. Work only in the ROOT-registered worktree under `<repo>/.claude/worktrees/`; your first step is a Bash `cd` into it. Never call `EnterWorktree`: its dialog cannot be answered remotely.
+- **Layout (f), T38.** Writing lanes: you are launched in the trusted workspace. Work only in the ROOT-registered worktree under `<repo>/.claude/worktrees/`; your first step is a Bash `cd` into it. Never call `EnterWorktree`: its dialog cannot be answered remotely.
 - **Refusals, T13.** If Edit or Write is refused, or a permission dialog appears, report the exact text and stop. Never work around a refused tool, guard or classifier decision, and never fall back to shell writes.
 - **Shell output, T54.** Redirecting command output into your own job temp dir (or a `mktemp` dir under `/tmp`) is allowed; writing repository, brief or report files with the shell is not.
 - **Scan, T50, T76 and T109.** Scan each path you will edit on its own, and follow the union of the rule ids: a combined scan can drop rules without printing an "omitted" line. If the MCP scan says not governed for your worktree, use the repository's CLI scan from the worktree with `AEGIS_MAX_JIT_TOKENS=8000`. Record which scans you used.
@@ -39,6 +39,6 @@ checkpoint, acknowledge it in the successor and rotate after 60 minutes active.
 - **Diff before commit, T83.** Before each commit, read `git diff <base> -- <file>` for every file you changed. Never end an Edit anchor in whitespace (an anchor `"SLUG = "` lost its space and ruff did not notice).
 - **Hashes and times, T92.** Never type a hash or a time: copy each from command output in the same turn, and mark a shortened hash as a prefix (`933fd497…`).
 - **Absolute paths, T100.** Every path in a command line, packet, spec or prompt is absolute; placeholders say so (`<absolute spec path>`).
-- **Cwd, T97.** Each Bash call that needs your worktree starts with `cd <worktree> && …` or uses absolute paths. Never rely on a `cd` made by an earlier or a parallel call.
+- **Cwd, T97, T104 and T111.** Writers: the first-step `cd` is into your own worktree only; every later call still starts with `cd <worktree> && …` or uses absolute paths; read-only roles never use a bare `cd`. Read-only kinds follow `reviewer.md` (`git -C` or a subshell, never a bare `cd`). Never rely on a `cd` made by an earlier or a parallel call.
 - **Files outside the repository, T101 and T104.** Scan the repository paths you edit. For files outside every repository (requests, reports, scratch) the scan answers `not_governed`: record that and continue.
 - **Last action, T99 c.** After your final SendMessage, run `claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null` once; if it is refused, send one line saying so, and never stop another session.

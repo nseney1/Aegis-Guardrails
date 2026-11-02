@@ -47,6 +47,6 @@ releases. Stop before replacement and rotate after 90 minutes of active work.
   - `claude agents --json` shows it idle, with no `waitingFor`;
   - it holds no claimed job and no open accepted dispatch.
 
-  The evidence file says "done and verified; process alive, idle, not stopped" and lists the session for a stop.
+  The evidence file says "done and verified; process alive, idle, not stopped", with the session id and the verified tip and tree, and lists the session for a stop. Nobody messages a released lane, and only its verified tip merges.
 - **Launch prompts, T99 c and T92.** Every launch prompt ends with the self-stop line. Compute every hash in a prompt from its file in the same turn.
 - **Absolute paths, T100.** The handoff example, and every command in a packet or spec, use absolute paths.
