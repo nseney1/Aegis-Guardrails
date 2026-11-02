@@ -34,6 +34,10 @@ VERIFICATION = {"lease": "reference_only", "scan": "sender_claim", "hook": "send
 DELIVERY_RECEIPT = "aegis.hierarchy-delivery-receipt/v1"
 WAKE_STATES = {"started", "exited", "timed_out", "failed_to_start"}
 MAX_DELIVERY_IDS = 100
+MAX_STATUS_EVIDENCE_BYTES = 67108864
+MAX_DIRTY_ENTRIES = 100000000
+GIT_STATUS_TIMEOUT_SECONDS = 60
+MAX_RECENT_ACKNOWLEDGMENTS = 20
 DELIVERY_MEANING = ("read means the adapter returned the message to the connection configured for this binding; "
                     "it does not prove the session understood or acted on it. woken means a turn was started.")
 
@@ -226,13 +230,38 @@ def writer_lock(root):
         lock.unlink()
 
 
-def publish_file(path, raw):
+def status_entries(raw):
+    """Count `git status --porcelain=v1 -z` entries; a rename or copy carries an extra path field."""
+    tokens = raw.split(b"\0")
+    count = index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if token:
+            count += 1
+            if token[:1] in (b"R", b"C") or token[1:2] in (b"R", b"C"):
+                index += 1
+    return count
+
+
+def publish_status_evidence(directory, raw, sha256):
+    """Content-addressed raw status, kept outside the checkpoint so its size cannot block a rotation."""
+    path = safe_path(Path(directory) / (sha256 + ".status"))
+    if path.exists():
+        require(hashlib.sha256(path.read_bytes()).hexdigest() == sha256,
+                "status evidence exists with different bytes: " + str(path))
+    else:
+        publish_file(path, raw, limit=MAX_STATUS_EVIDENCE_BYTES)
+    return str(path)
+
+
+def publish_file(path, raw, *, limit=MAX_BYTES):
     """Publish a complete file with hard-link no-replace semantics on the same FS.
 
     No non-atomic fallback: an unsupported filesystem fails explicitly. Same-user
     storage is not a hostile-process security boundary or authenticated transport.
     """
-    require(len(raw) <= MAX_BYTES, "record exceeds 262144 bytes")
+    require(len(raw) <= limit, "record exceeds %d bytes" % limit)
     path = safe_path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     pending = path.parent / (".pending-" + uuid.uuid4().hex)
@@ -293,11 +322,22 @@ class Mailbox:
         sources = checkpoint["sources"]
         require(isinstance(sources, list) and len(sources) <= 256, "invalid checkpoint sources")
         for source in sources:
-            fields(source, {"worktree", "source_revision", "source_tree", "dirty_state"})
+            fields(source, {"worktree", "source_revision", "source_tree"},
+                   {"dirty_state", "dirty_state_sha256", "dirty_entries", "dirty_evidence"})
             text(source["worktree"], "checkpoint worktree")
             matching(source["source_revision"], GIT_ID, "source revision")
             matching(source["source_tree"], GIT_ID, "source tree")
-            text(source["dirty_state"], "dirty state")
+            if "dirty_state" in source:
+                # Earlier bindings hold the literal status. Its 4096 limit blocked real rotations,
+                # so new checkpoints use the digest form, but history must stay readable.
+                require(not {"dirty_state_sha256", "dirty_entries", "dirty_evidence"} & source.keys(),
+                        "checkpoint source mixes literal and digest dirty state")
+                text(source["dirty_state"], "dirty state")
+            else:
+                matching(source.get("dirty_state_sha256"), SHA256, "dirty state digest")
+                integer(source.get("dirty_entries"), "dirty entries", minimum=0, maximum=MAX_DIRTY_ENTRIES)
+                if "dirty_evidence" in source:
+                    text(source["dirty_evidence"], "dirty evidence")
         for name in ("lease_refs", "completed_checks", "pending_message_ids", "last_acknowledgment_ids"):
             strings(checkpoint[name], name)
         if verify:
@@ -469,9 +509,14 @@ class Mailbox:
                 worktree = safe_path(source["worktree"])
                 require(self.git(worktree, "branch", "--show-current") == readiness["branch"],
                         "checkpoint branch changed since acceptance")
-                observed = {"source_revision": self.git(worktree, "rev-parse", "HEAD"),
-                            "source_tree": self.git(worktree, "rev-parse", "HEAD^{tree}"),
-                            "dirty_state": self.git(worktree, "status", "--porcelain=v1", "--untracked-files=all") or "clean"}
+                if "dirty_state" in source:
+                    observed = {"source_revision": self.git(worktree, "rev-parse", "HEAD"),
+                                "source_tree": self.git(worktree, "rev-parse", "HEAD^{tree}"),
+                                "dirty_state": self.git(worktree, "status", "--porcelain=v1", "--untracked-files=all") or "clean"}
+                else:
+                    witness = self.source_witness(worktree)
+                    observed = {key: witness[key] for key in ("source_revision", "source_tree",
+                                                              "dirty_state_sha256", "dirty_entries")}
                 require(all(source[key] == value for key, value in observed.items()),
                         "checkpoint source snapshot does not match worktree")
 
@@ -521,6 +566,84 @@ class Mailbox:
             raise ValueError("git identity check timed out") from exc
         require(result.returncode == 0, "git identity check failed")
         return result.stdout.rstrip("\r\n")
+
+    def source_witness(self, worktree, evidence_dir=None):
+        """Revision, tree and an exact-byte status digest. Nothing is trimmed before hashing."""
+        worktree = safe_path(worktree)
+        try:
+            status = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status",
+                                     "--porcelain=v1", "-z", "--untracked-files=all"], cwd=worktree,
+                                    capture_output=True, timeout=GIT_STATUS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("git identity check timed out") from exc
+        require(status.returncode == 0, "git identity check failed")
+        sha256 = hashlib.sha256(status.stdout).hexdigest()
+        witness = {"worktree": str(worktree), "source_revision": self.git(worktree, "rev-parse", "HEAD"),
+                   "source_tree": self.git(worktree, "rev-parse", "HEAD^{tree}"),
+                   "dirty_state_sha256": sha256, "dirty_entries": status_entries(status.stdout)}
+        if evidence_dir is not None and status.stdout:
+            witness["dirty_evidence"] = publish_status_evidence(evidence_dir, status.stdout, sha256)
+        return witness
+
+    def draft_handoff(self, request):
+        """Build a complete replacement binding request from the record, so no model has to author one."""
+        fields(request, {"endpoint", "host", "session", "outgoing_stopped"},
+               {"completed_checks", "briefs", "evidence_dir", "delivery_dir"})
+        endpoint = request["endpoint"]
+        self.endpoint(endpoint)
+        require(request["outgoing_stopped"] is True, "outgoing session must be stopped before replacement")
+        text(request["host"], "host", 128)
+        text(request["session"], "session", 256)
+        require(isinstance(request.get("briefs", []), list), "invalid briefs")
+        for name in ("evidence_dir", "delivery_dir"):
+            if name in request:
+                text(request[name], name)
+        history = self.bindings(endpoint)
+        require(bool(history), "endpoint has no binding to replace: " + endpoint)
+        records = self.messages()
+        closed, accepted = self.dispatch_history(records)
+        touching = sorted((r["message"] for r in records.values() if endpoint in (r["message"]["from"], r["message"]["to"])),
+                          key=lambda message: (message["created_at"], message["message_id"]))
+        active = [m for m in touching if m["type"] == "dispatch" and m["message_id"] not in closed]
+        briefs = []
+
+        def add_brief(brief):
+            if brief not in briefs:
+                briefs.append(brief)
+
+        for dispatch in active:
+            add_brief(dispatch["brief"])
+        for brief in request.get("briefs", []):
+            add_brief(brief)
+        for brief in (history[-1]["checkpoint"] or {}).get("briefs", []):
+            add_brief(brief)
+        for message in reversed(touching):
+            if "brief" in message:
+                add_brief(message["brief"])
+                break
+        pending, lease_refs, sources, worktrees = [], [], [], set()
+        for dispatch in active:
+            pending.append(dispatch["message_id"])
+            readiness = next((m["readiness"] for m in accepted
+                              if m["in_reply_to"] == dispatch["message_id"] and "readiness" in m), None)
+            if readiness is None:
+                continue
+            if readiness["lease_ref"] not in lease_refs:
+                lease_refs.append(readiness["lease_ref"])
+            if readiness["worktree"] not in worktrees:
+                worktrees.add(readiness["worktree"])
+                sources.append(self.source_witness(readiness["worktree"], request.get("evidence_dir")))
+        if "delivery_dir" in request:
+            _, summary = self.endpoint_delivery(request["delivery_dir"], endpoint, records)
+            pending.extend(identifier for identifier in summary["unread"] if identifier not in pending)
+        acknowledgments = [m["message_id"] for m in touching if m["type"] == "ack"]
+        checkpoint = {"outgoing_stopped": True, "briefs": briefs[:256], "sources": sources, "lease_refs": lease_refs,
+                      "completed_checks": request.get("completed_checks", []), "pending_message_ids": pending[:256],
+                      "last_acknowledgment_ids": acknowledgments[-MAX_RECENT_ACKNOWLEDGMENTS:]}
+        self.checkpoint(checkpoint, records)
+        self.checkpoint_assignments(endpoint, checkpoint, records)
+        return {"endpoint": endpoint, "host": request["host"], "session": request["session"],
+                "expected_generation": len(history), "checkpoint": checkpoint}
 
     def readiness(self, readiness, *, observe=True):
         fields(readiness, {"worktree", "branch", "base_revision", "lease_ref", "lease_oid", "lease_expires_at",
@@ -809,7 +932,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, help="Absolute path to the external pilot mailbox")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("init", "bind", "publish", "ack-handoff"):
+    for name in ("init", "bind", "publish", "ack-handoff", "draft-handoff"):
         commands.add_parser(name).add_argument("--request", "--request-file", required=True,
                                               help="Absolute path to a strict JSON request file")
     inbox = commands.add_parser("inbox")
@@ -841,6 +964,8 @@ def main(argv=None):
             return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir)
         if args.command == "init":
             result = initialize(root, read_json(args.request))
+        elif args.command == "draft-handoff":
+            result = Mailbox(root).draft_handoff(read_json(args.request))
         elif args.command in {"status", "inbox", "delivery"}:
             mailbox = Mailbox(root)
             if args.command == "status":
