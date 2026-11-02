@@ -56,7 +56,8 @@ if words[0] == "control":
         hidden = os.path.exists(hide)
         if hidden:
             os.remove(hide)
-        print(json.dumps([{key: row[key] for key in ("id", "sessionId", "status", "state", "kind", "name", "pid")}
+        print(json.dumps([{key: row[key] for key in ("id", "sessionId", "status", "state", "kind", "name", "pid",
+                                                    "waitingFor") if key in row}
                           for row in rows() if row["status"] != "stopped" and alive(row["pid"]) and not hidden]))
     elif words[1] == "stop":
         for row in rows():
@@ -71,6 +72,10 @@ if words[0] == "control":
                 open(os.path.join(state, "hide-next"), "w").close()
     elif words[1] == "logs":
         print("terminal output of " + words[2])
+        extra = os.path.join(state, "logs-extra")
+        if os.path.exists(extra):
+            with open(extra, encoding="utf-8") as stream:
+                print(stream.read())
     sys.exit(0)
 
 if words[0] == "turn":
@@ -92,7 +97,12 @@ if words[0] == "turn":
     if mode != "hang":
         time.sleep(2.5)  # visibly busy across more than one poll
         row = next(row for row in rows() if row["id"] == identifier)
-        row["status"], row["state"] = "idle", "blocked"
+        ends = os.path.join(state, "turn-ends.json")
+        if os.path.exists(ends):  # the turn stops mid-way in the listed shape, e.g. at a dialog
+            with open(ends, encoding="utf-8") as stream:
+                row.update(json.load(stream))
+        else:  # an idle session also shows state "blocked" on the real host
+            row["status"], row["state"] = "idle", "blocked"
         save(row)
     while True:  # a background session stays alive after its turn until it is stopped
         time.sleep(1)
@@ -156,12 +166,12 @@ class Background:
     def rows(self):
         return [json.loads(path.read_text()) for path in sorted(self.state.glob("*.row"))]
 
-    def plant(self, status):
+    def plant(self, status, **extra):
         """A background session for the same ID that is already alive, as the host would list it."""
         holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
         (self.state / "old00000.row").write_text(json.dumps({
             "id": "old00000", "sessionId": self.pilot.session, "status": status, "state": "blocked", "kind": "background",
-            "name": TARGET + "-g1", "pid": holder.pid}))
+            "name": TARGET + "-g1", "pid": holder.pid, **extra}))
         return holder
 
     def cleanup(self):
@@ -293,6 +303,50 @@ def test_a_busy_session_missing_from_one_look_is_still_not_woken_again(backgroun
         holder.wait(timeout=5)
     assert code == 2 and "still working" in result["error"], result
     assert not background.pilot.record.exists(), "one missing look is not proof that nothing runs"
+
+
+@pytest.mark.parametrize("ends", [
+    {"status": "waiting", "state": "blocked"},  # seen live at a dialog (review r2 P2-2)
+    {"status": "busy", "state": "blocked", "waitingFor": "permission prompt"},
+    {"status": "idle", "state": "blocked", "waitingFor": "permission prompt"},
+])
+def test_a_turn_stopped_at_a_dialog_keeps_its_session_and_lock_and_asks_the_owner(background, ends):
+    background.pilot.publish()
+    (background.state / "turn-ends.json").write_text(json.dumps(ends))
+    (background.state / "logs-extra").write_text("\x1b[1mDo you want to proceed?\x1b[0m\n")
+    code, result = background.wake(background.profile())
+    identifier = background.pilot.session[-8:]
+    assert code == 3 and result["state"] == "needs_owner", result
+    assert result["background"]["ended"] == "blocked" and result["background"]["dialog_prompt_seen"] is True
+    assert ["stop", identifier] not in background.calls(), "a session waiting on a human is not stopped"
+    assert ["logs", identifier] in background.calls() and wake_lock(background).exists()
+    saved = Path(result["log"]["stdout"]).read_text()
+    assert "Do you want to proceed?" in saved and "\x1b" not in saved
+
+
+def test_an_unknown_host_status_is_never_taken_for_idle(background):
+    background.pilot.publish()
+    (background.state / "turn-ends.json").write_text(json.dumps({"status": "thinking", "state": "working"}))
+    code, result = background.wake(background.profile(timeout_seconds=8))
+    assert code == 3 and result["state"] == "needs_owner", result
+    assert result["background"]["dialog_prompt_seen"] is False
+    assert not [call for call in background.calls() if call[0] == "stop"], "no stop before the timeout"
+    assert wake_lock(background).exists()
+
+
+@pytest.mark.parametrize("status,extra", [
+    ("waiting", {}), ("idle", {"waitingFor": "permission prompt"}), ("paused", {}),
+])
+def test_a_session_waiting_on_its_owner_is_neither_stopped_nor_woken_again(background, status, extra):
+    background.pilot.publish()
+    holder = background.plant(status, **extra)
+    try:
+        code, result = background.wake(background.profile())
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+    assert code == 2 and "waiting on its owner" in result["error"], result
+    assert not background.pilot.record.exists() and ["stop", "old00000"] not in background.calls()
 
 
 def test_an_unconfirmed_stop_keeps_the_wake_lock(background):

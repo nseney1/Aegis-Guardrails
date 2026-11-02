@@ -52,6 +52,10 @@ GONE_LOOKS = 3
 # The host prints these IDs. One that starts with a dash would be read as an option by `claude stop`.
 SHORT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 MODES = ("print", "background")
+# claude logs prints terminal output with escape codes; saved output drops them and keeps the last part.
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+MAX_SAVED_OUTPUT = 1000000
+DIALOG_TEXT = "Do you want to proceed?"
 # Fixed text: deliberately no message IDs, senders or bodies.
 PROMPT = ("You have unread messages at your mailbox endpoint. Call mailbox_inbox on your own connection and read "
           "them. If your binding shows an unacknowledged handoff, inspect the checkpoint before acknowledging it. "
@@ -112,6 +116,18 @@ def background_entry(profile):
     return matches[0] if matches else None
 
 
+def look_of(entry):
+    """How the host shows a listed session: "busy", "idle" or "blocked".
+
+    A dialog shows a waitingFor field (the real host prints "permission prompt"). An idle session also shows
+    state "blocked", so the state field decides nothing. Only the exact words idle and busy count as such;
+    any other status, such as "waiting" or one this tool does not know, is someone else's to answer."""
+    if entry.get("waitingFor"):
+        return "blocked"
+    status = entry.get("status")
+    return status if status in ("busy", "idle") else "blocked"
+
+
 def stop_background(profile, entry):
     """True only once the host no longer lists the session, so an unconfirmed stop is never reported as done."""
     control_command(profile, "stop", entry["id"])
@@ -142,7 +158,11 @@ def clear_idle(profile):
     entry = listed_within(profile, GONE_LOOKS, BACKGROUND_POLL_SECONDS / 4)
     if entry is None:
         return None
-    require(entry.get("status") != "busy", "the background session is still working; wake it after its turn ends")
+    look = look_of(entry)
+    require(look != "busy", "the background session is still working; wake it after its turn ends")
+    # A session at a dialog, or in a state this tool does not know, is waiting on a human: it is not stopped.
+    require(look == "idle", "the background session is waiting on its owner (a dialog or an unknown status); "
+            "it was not stopped, so answer it before the next wake")
     # The owner may have this session open in a terminal, and that is theirs to end.
     require(entry.get("kind") == "background", "an interactive session has this ID; do not start a second copy")
     require(stop_background(profile, entry), "could not confirm that the idle background session stopped")
@@ -163,18 +183,20 @@ def await_background(profile, before):
     A turn short enough to finish between two looks still moves the transcript, so either sign counts.
     """
     started = time.monotonic()
-    seen, busy, idle_looks, gone_looks = None, False, 0, 0
+    seen, busy, idle_looks, blocked_looks, gone_looks = None, False, 0, 0, 0
     while True:
         entry = background_entry(profile)
         if entry is not None:
             seen, gone_looks = entry, 0
-            if entry.get("status") == "busy":
-                busy, idle_looks = True, 0
-            elif busy or transcript_mark(profile) != before:
-                # A session can look idle for a moment while it starts or between steps, so one look is not enough.
-                idle_looks += 1
-                if idle_looks >= IDLE_LOOKS:
-                    return "idle", seen
+            look = look_of(entry)
+            # A session can show any state for a moment while it starts or between steps, so one look is not enough.
+            idle_looks = idle_looks + 1 if look == "idle" and (busy or transcript_mark(profile) != before) else 0
+            blocked_looks = blocked_looks + 1 if look == "blocked" else 0
+            busy = busy or look == "busy"
+            if blocked_looks >= IDLE_LOOKS:
+                return "blocked", seen
+            if idle_looks >= IDLE_LOOKS:
+                return "idle", seen
         elif seen is not None:
             gone_looks += 1
             if gone_looks >= GONE_LOOKS:
@@ -188,13 +210,15 @@ def await_background(profile, before):
 
 
 def save_terminal_output(profile, entry, log):
+    """Append the session's terminal output to the wake log; True when it shows a dialog, None if not saved."""
     try:
         shown = control_command(profile, "logs", entry["id"])
+        text = ANSI.sub("", shown.stdout)[-MAX_SAVED_OUTPUT:]
         with open(log["stdout"], "a", encoding="utf-8") as stream:
-            stream.write("\n--- claude logs %s (exit %d) ---\n%s" % (entry["id"], shown.returncode, shown.stdout[-1000000:]))
-        return True
+            stream.write("\n--- claude logs %s (exit %d) ---\n%s" % (entry["id"], shown.returncode, text))
+        return DIALOG_TEXT in text
     except (ValueError, OSError):
-        return False
+        return None
 
 
 def process_names_session(session):
@@ -366,26 +390,35 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
     if ended == "timeout" and entry is None:
         # A short timeout can pass before the host lists the session; one late listing must still be stopped.
         entry = background_entry(profile)
-    if ended in ("idle", "timeout") and entry is not None:
-        save_terminal_output(profile, entry, log)
-        stop_confirmed = stop_background(profile, entry)
+    dialog = None
+    if ended == "blocked":
+        # Someone must answer this session. Stopping it would discard the question, so it keeps running, the lock
+        # stays and no finish receipt is written: the turn has not ended (orchestrator decision, review r2 P2-2).
+        dialog = save_terminal_output(profile, entry, log)
+        stop_confirmed = False
     else:
-        # Gone from the host's list, or never in it: check the process table too before releasing the lock.
-        stop_confirmed = not session_process_found(profile["session"])
-    try:
-        # The launcher returned and the session was stopped or vanished; its own exit status was never seen.
-        mailbox.write_delivery_receipt(directory, "wakes", {
-            **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited", "exit_code": None,
-            "timed_out": timed_out})
-    finally:
-        if stop_confirmed:
-            marker.unlink()
+        if ended in ("idle", "timeout") and entry is not None:
+            save_terminal_output(profile, entry, log)
+            stop_confirmed = stop_background(profile, entry)
+        else:
+            # Gone from the host's list, or never in it: check the process table too before releasing the lock.
+            stop_confirmed = not session_process_found(profile["session"])
+        try:
+            # The launcher returned and the session was stopped or vanished; its own exit status was never seen.
+            mailbox.write_delivery_receipt(directory, "wakes", {
+                **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited", "exit_code": None,
+                "timed_out": timed_out})
+        finally:
+            if stop_confirmed:
+                marker.unlink()
     fresh = Mailbox(mailbox.root)
     rows, _ = fresh.endpoint_delivery(directory, endpoint, fresh.messages())
     identifiers = answer["message_ids"]
     read = [identifier for identifier in identifiers if rows[identifier]["state"] == "read"]
     unread = [identifier for identifier in identifiers if rows[identifier]["state"] != "read"]
-    if not stop_confirmed:
+    if ended == "blocked":
+        state = "needs_owner"
+    elif not stop_confirmed:
         state = "stop_unconfirmed"
     elif not unread:
         state = "read"
@@ -395,6 +428,8 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
               "still_unread": unread,
               "background": {"id": entry["id"] if entry else None, "ended": ended, "stop_confirmed": stop_confirmed,
                              "exit_status": "unknown"}}
+    if ended == "blocked":
+        result["background"]["dialog_prompt_seen"] = dialog is True
     if stopped_idle is not None:
         result["stopped_idle"] = stopped_idle
     return (0 if state == "read" else 3), result
