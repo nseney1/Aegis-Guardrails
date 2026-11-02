@@ -26,8 +26,9 @@ Create writing worktrees manually from the approved develop/wave base;
 do not rely on host-generated branches. Claim leases serially with stable endpoint
 owner labels, then re-read shared refs for unresolved overlaps before dispatch.
 Inspect effective scan/MCP binding and live hook evidence for each writing lane.
-Writers are one global limit that root sets from the owner's decision (`set-limits`),
-and integration lanes count.
+Writers are one global limit that root sets from the owner's decision (`set-limits`,
+T59 and T63), and integration lanes count; each manifest's `writer_limit` also caps
+that hierarchy's accepted writer dispatches.
 
 Read every inbox page before an ack, a dispatch or opening a PR, using
 `--after <next_after>` until `remaining` is 0 (T15, T28). Use the same mailbox for
@@ -47,9 +48,9 @@ pending work and rotate after 60 minutes of active work on every host.
 ## Working rules
 
 - **Stalls, T3.** A lane whose request has been open longer than 20 minutes (xhigh) or 25 minutes (max), or that has been silent for 15 minutes, cannot read messages: ask root to stop and relaunch it.
-- **Dialogs, T10, T26 and T62.** Decide on `status` first: `idle` is idle and `busy` is busy, whatever `state` says (an idle session also shows `state: blocked`). A dialog is `waitingFor` (e.g. `"permission prompt"`), or a non-idle status with an unanswered request. Then read `claude logs` and tell root, which tells the owner.
+- **Dialogs, T10, T26 and T62.** A present `waitingFor` is a dialog whatever `status` says (e.g. `"permission prompt"`). Otherwise decide on `status`: `idle` is idle and `busy` is busy, whatever `state` says (an idle session also shows `state: blocked`), and a non-idle status with an unanswered request is a dialog. Then read `claude logs` and tell root, which tells the owner.
 - **Refusals, T13.** No brief or prompt may tell a lane to work around a refused tool, guard, classifier decision or write.
-- **Writing lanes, T38.** Writing lanes use layout (f): launched in the trusted workspace, working in a ROOT-registered worktree, never calling `EnterWorktree`.
+- **Writing lanes, T38 and T48.** Writing lanes use layout (f): launched in the trusted workspace, working in a ROOT-registered worktree, never calling `EnterWorktree`.
 - **Endpoints, T61 and T87.** Name only endpoints the manifest declares. For a new lane, ask root to rebind a finished endpoint of the lane's kind whose holder is stopped, and expect the launch prompt to state the binding.
 - **Bind by kind, T87.** Implementer work goes only to implementer-kind endpoints, reviews only to reviewer-kind endpoints, and `lane/integration` only to integration. Writer holder labels name the real lane, and launch prompts state the kind. If no free endpoint of the right kind exists, wait or ask the owner; never bind the wrong kind.
 - **Hashes and times, T92.** Send full hashes copied from command output in the same turn, or only the path. Never type a hash or a time, and mark prefixes as prefixes.
