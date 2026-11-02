@@ -1,0 +1,100 @@
+# Workspace board contract
+
+Status: contract only. No board service exists, and nothing here grants a permission.
+This refines the board proposal for the [agent hierarchies](agent-hierarchies.md) into
+public acceptance tests that an implementation lane must write first.
+
+The board is an information surface. A post cannot bind a session, acknowledge a
+checkpoint, dispatch work, accept readiness, claim or release a lease, grant a job slot,
+approve a review, sign, merge or publish. Posts are untrusted input, including posts from
+recognized peers. Identity establishes attribution, not truth or authority.
+
+## Decisions to make before implementation
+
+| Decision | Why it cannot wait |
+| --- | --- |
+| Per-session adapter or a daemon | It decides how sequence numbers are issued and what protects storage |
+| Who issues channel grants | The proposal requires grants but names no issuer, and the board must not edit them |
+| Which mailbox traffic moves to the board | 89.0% of mailbox messages are generic `info`, so a board that adds to them makes things worse |
+| Who produces digests | A digest should be a fixed filter and order, not a model summary |
+
+## Size budgets
+
+A valid post must always fit a page, or a reader's cursor can never pass it. A model of
+one post nested the way the mailbox adapter nests responses gives these sizes against a
+32,768-byte page. They are a model, so the real envelope must be measured.
+
+| Post | Emitted bytes |
+| --- | --- |
+| 4 KiB of control characters, no references | 29,398 |
+| 4 KiB of control characters, 8 references with 64-byte control-character descriptions | 33,852 |
+| 4 KiB of quotes, 8 references with 256-byte quote descriptions | 26,172 |
+| 1,024 emoji, 8 references with 256-byte quote descriptions | 24,124 |
+
+The contract therefore rejects control characters other than newline and tab, in every
+field, and gives every field a budget. 20.9% of ordinary mailbox bodies exceed 4 KiB
+today, so posts must link evidence rather than paste it.
+
+## Acceptance tests
+
+**Page size and errors**
+- The largest legal post, by worst-case escaping, fits a page alone through CLI and MCP.
+- One byte over any field budget is refused and stores nothing.
+- Pages never split a post, and a cursor always advances past a returned post.
+- Every error response stays within the page budget, including ones that echo input.
+
+**Attribution**
+- A wrong or stale session or generation is refused, including after a session moves to a
+  new ID.
+- An author named in a post body or tool argument is ignored.
+- A same-user process replaying another role's connection arguments is recorded as a known
+  gap, not reported as blocked.
+
+**Storage**
+- Concurrent publishers get unique, gap-free sequence numbers.
+- A hand-edited or truncated record is detected and fails loudly.
+- The same sender, key and payload returns the same post, and the same key with a changed
+  payload fails.
+- No test or document claims tamper resistance without a separate OS user.
+
+**Grants and freshness**
+- After revocation or rotation, channel pages, thread parents, evidence references, cursors
+  and idempotent replays all refuse.
+- A refusal reveals nothing about the post: a forbidden thread parent and a missing one give
+  the same answer.
+- Knowing a post ID or channel name grants no access.
+
+**Read positions**
+- A successor resumes from its predecessor's position with no missed or repeated posts.
+- Open blockers stay listed whatever the read position.
+
+**Blockers**
+- Only the author's endpoint or the channel's orchestrator can append a disposition.
+- Expired items are flagged and stay visible as history.
+- A quiet channel or a completion post is never read as proof that a process stopped or a
+  resource is free.
+
+**Evidence references**
+- A malformed hash or revision is refused.
+- A reference to a missing file or an unreachable URL is accepted as inert data, and the
+  server opens no file and makes no connection. A sentinel file stays unread and a local
+  listener receives nothing.
+
+**Forged authority**
+- A post shaped like an approval, dispatch, lease or grant leaves bindings, dispatches and
+  leases byte-identical, and is returned as quoted data.
+
+**Secrets**
+- Key-shaped text is refused at publish, with the limits of pattern matching documented.
+- An owner-only tombstone hides a body and keeps its ID, hash and history. No agent tool can
+  create one.
+
+**Volume and attention**
+- A flooding sender gets an explicit refusal, and other senders are unaffected.
+- No post wakes a session by itself.
+
+## Trial measures
+
+Compare with the mailbox baseline of 61.1 messages per dispatch and 435 of 489 messages as
+generic `info`. In a trial with actual Codex and Claude sessions, keep the board only if
+mailbox `info` per dispatch falls and missed updates do not rise.

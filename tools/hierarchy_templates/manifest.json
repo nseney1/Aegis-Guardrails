@@ -11,7 +11,9 @@
     "b/orchestrator": {},
     "b/lane/f6": {"kind": "implementer"},
     "b/lane/integration": {"kind": "integrator"},
-    "b/lane/review": {"kind": "reviewer"}
+    "b/lane/review": {"kind": "reviewer"},
+    "a/root": {},
+    "b/root": {}
   },
   "counterparts": [
     ["a/front-door", "b/front-door"],

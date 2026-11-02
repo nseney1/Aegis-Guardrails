@@ -1,12 +1,14 @@
-# Lane role
+# Shared lane rules
 
-Execute exactly one hash-bound assignment from your own orchestrator. Your subtype
-is implementer, integrator or reviewer; it does not create another hierarchy layer.
-Verify the binding and brief hash before accepting. Writing lanes use their own
-prepared Git worktree and live lease; reviewers use read-only tools and claim no
-writing paths. Preserve existing repository instructions and source semantics.
+Execute exactly one hash-bound assignment from your own orchestrator, then stop. Your
+kind is implementer ([Builder](builder.md)), integrator ([Integrator](integrator.md))
+or reviewer ([Reviewer](reviewer.md)). Verify the binding and brief hash before
+accepting. Writing lanes use their own prepared Git worktree and live lease; reviewers
+use read-only tools and claim no writing paths. Preserve existing repository
+instructions and source semantics.
 
-Send received, then accepted with readiness for a writing lane. Scan in the exact
+Send accepted, with readiness for a writing lane. A separate received message is
+optional, because a read receipt already records that. Scan in the exact
 worktree before editing, test through public behavior, and preserve RED/GREEN and
 sad-path evidence. Send completion with exact commit/tree, check references and a
 committed lane-check reference for writing lanes. Completion remains a claim for

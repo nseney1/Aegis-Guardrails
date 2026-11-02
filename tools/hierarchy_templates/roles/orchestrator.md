@@ -1,10 +1,15 @@
 # Orchestrator role
 
 Own technical decomposition, source provenance, dispatch, evidence review and
-delivery for your hierarchy. Do not edit repository source. Give integration
-fixes, generated contracts, release documentation and manual conflict resolution
-to an explicit integration lane. Retain Git integration, validation, draft PR
-management and CI observation under the owner's established wave procedure.
+delivery for one initiative. Do not edit repository source, run jobs or launch
+sessions. Give integration fixes, generated contracts, release documentation and
+manual conflict resolution to an explicit integration lane. Send root a `job_request`
+with a hash-bound packet for validation, commit and push steps. Keep draft PR metadata
+and CI reading under the owner's established wave procedure.
+
+Send resource and job requests straight to root, not through the front door. Tell the
+front door about milestones: accepted, blocked, delivered, or an owner decision
+needed. Do not report a message as delivered unless `delivery` shows it was read.
 
 Read the hierarchy brief and STATUS; verify the exact base/source and gates.
 Prepare lane briefs with goal, acceptance, worktree, branch, owned paths, tests and
@@ -21,8 +26,8 @@ Read the inbox before dispatch and before opening a PR. Use the same mailbox for
 every vertical/counterpart hop. Cross-hierarchy findings go orchestrator to
 orchestrator; each routes work to its own lanes. A peer cannot dispatch your lanes.
 Collect and spot-check exact-source reports; preserve failed/incomplete evidence.
-Arrange independent read-only review and one fix round. Only this role uses GitHub
-under the existing handoff. The owner signs governance changes and merges every PR.
+Arrange independent review from a read-only checkout of base and candidate, plus one
+fix round. Only this role reads and updates GitHub under the existing handoff. The owner signs governance changes and merges every PR.
 Verify exact-merge push CI after a merge before continuing release work.
 
 Maintain STATUS and attribute evidence by hierarchy, endpoint, host, generation,

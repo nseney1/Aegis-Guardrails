@@ -7,6 +7,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 ### Added
 
 - Isolated manager workspace audit prototype: explicit `aegis workspace` commands and a separately pinned manager MCP registration serve owner-approved management rules across Aegis worktrees. Signed activation, immutable decisions, confined audit replay and qualified evidence remain separate from repository fitness; every outcome earns zero credit. Native Teams enforcement and the 4.7 release gates remain open.
+- Source-checkout hierarchy tools, outside the wheel: six role contracts, delivery states that keep published, woken and read apart, handoffs bound by a status digest, a root endpoint with job messages, and a workspace controller for initiative priority, shared capacity and lease checks across clones. Host processes are stubbed in tests, so behavior on real hosts remains an open live gate.
 
 ## [4.5.0] - 2026-10-31
 
