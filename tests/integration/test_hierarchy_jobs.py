@@ -890,6 +890,38 @@ def test_a_sandboxed_job_is_contained(shop):
         shutil.rmtree(hidden, ignore_errors=True)
 
 
+FORGER = """
+import json, os, sys
+folder, attempts = sys.argv[1], {}
+for name in ("result.json", "claim.json", "process.json", "packet.md", "step-1.log", "step-9.log", "planted"):
+    try:
+        with open(os.path.join(folder, name), "a") as stream:
+            stream.write("forged")
+        attempts[name] = "written"
+    except OSError as error:
+        attempts[name] = type(error).__name__
+attempts["work"] = "written"
+open(os.path.join(os.environ["HOME"], "ok"), "w").close()
+print(json.dumps(attempts))
+"""
+
+
+@needs_bubblewrap
+def test_a_sandboxed_job_cannot_write_its_own_verdict_or_records(shop):
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    shop.recipes["recipes"]["forges"] = shop.command(["$python", "-I", "-c", FORGER, str(folder)], sandbox="bwrap")
+    shop.save_recipes()
+    shop.request_job("job-1", "forges")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    evidence = verified_evidence(shop.receipts("job-1")[-1])
+    attempts = json.loads(evidence["step-1.log"].read_text().strip().splitlines()[-1])
+    for name in ("result.json", "claim.json", "process.json", "packet.md", "step-1.log", "step-9.log", "planted"):
+        assert attempts[name] != "written", name
+    assert json.loads(evidence["result.json"].read_text())["state"] == "completed"
+    assert not (folder / "planted").exists() and not (folder / "step-9.log").exists()
+    assert json.loads((folder / "claim.json").read_text())["job"] == "pilot/job-1"
+
+
 @needs_bubblewrap
 def test_a_recipe_can_allow_writing_to_its_checkout_and_the_source_check_still_applies(shop):
     target = shop.checkout / "planted"

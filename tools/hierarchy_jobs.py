@@ -498,13 +498,23 @@ def sandbox_prefix(recipes, recipe, job, checkout):
     argv += ["--bind" if recipe.get("writable_checkout") else "--ro-bind", checkout, checkout]
     for folder in git_folders(checkout):
         argv += ["--bind" if commit else "--ro-bind", folder, folder]
-    return argv + ["--bind", str(job.folder), str(job.folder), "--chdir", checkout, "--"]
+    # The job folder itself stays read-only inside, so a job cannot write its own result, claim or logs.
+    argv += ["--ro-bind", str(job.folder), str(job.folder)]
+    for name in WORK_FOLDERS:
+        argv += ["--bind", str(job.folder / name), str(job.folder / name)]
+    return argv + ["--chdir", checkout, "--"]
+
+
+def scratch_argument(job):
+    # Below the bound folder, because pytest removes and recreates --basetemp, and a mount point cannot be removed.
+    return str(job.folder / "scratch" / "run")
 
 
 def job_environment(recipes, job, checkout):
+    for name in WORK_FOLDERS:
+        (job.folder / name).mkdir(mode=0o700, exist_ok=True)
     home = job.folder / "home"
     scratch_tmp = job.folder / "tmp"
-    scratch_tmp.mkdir(mode=0o700)
     env = {"PATH": os.pathsep.join(recipes["path"]), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONNOUSERSITE": "1", "GIT_OPTIONAL_LOCKS": "0", "TMP": str(scratch_tmp), "TEMP": str(scratch_tmp),
            "TMPDIR": str(scratch_tmp),
@@ -515,7 +525,7 @@ def job_environment(recipes, job, checkout):
         path = home / folder
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         env[name] = str(path)
-    tokens = {"$checkout": checkout, "$scratch": str(job.folder / "scratch")}
+    tokens = {"$checkout": checkout, "$scratch": scratch_argument(job)}
     for key, value in recipes.get("env", {}).items():
         env[key] = tokens.get(value, value)
     return env
@@ -592,13 +602,12 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
 
 def execute(job, recipe, packet, recipes, on_start):
     checkout = packet["checkout"]
-    (job.folder / "scratch").mkdir(mode=0o700, exist_ok=True)
     env = job_environment(recipes, job, checkout)
     sandbox = sandbox_prefix(recipes, recipe, job, checkout)
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
     commit = recipe["kind"] == "commit"
-    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, str(job.folder / "scratch"))
+    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, scratch_argument(job))
     rows, reason, exit_code, created, output = [], None, 0, None, None
     started = False
 
