@@ -404,3 +404,28 @@ def test_a_writer_cannot_default_to_running_in_the_pinned_tools_checkout(fresh):
     assert "a/lane/build" in result["needs_profile"]
     profiles = Path(result["mailbox_root"]).parent / "profiles"
     assert not list(profiles.glob("a%2Flane%2Fbuild*"))
+
+
+def test_a_writer_already_queued_is_granted_by_the_move(move, tmp_path):
+    """Capacity counts only granted requests, so a queued one left by an earlier attempt must not pass for a held slot."""
+    move.old_dispatch("build-1", "a/lane/build")
+    move.old_accept("build-1", "a/lane/build", readiness(tmp_path, "build-worktree", "feature/build"))
+    move.bind_new()
+    move.workspace.run("request", {"initiative": "a", "kind": "writer", "holder": "a/lane/build"})
+    move.carry()
+    writers = move.writers()
+    assert writers["used"] == 1 and writers["holders"][0]["holder"] == "a/lane/build"
+    assert [row for row in move.workspace.run("status")["capacity"]["queue"] if row["holder"] == "a/lane/build"] == []
+
+
+def test_a_queued_writer_with_no_room_refuses_the_move(move, tmp_path):
+    for number in range(3):
+        move.workspace.run("request", {"initiative": "a", "kind": "writer", "holder": "other-%d" % number})
+        move.workspace.run("grant-next", kind="writer")
+    move.old_dispatch("build-1", "a/lane/build")
+    move.old_accept("build-1", "a/lane/build", readiness(tmp_path, "build-worktree", "feature/build"))
+    move.bind_new()
+    move.workspace.run("request", {"initiative": "a", "kind": "writer", "holder": "a/lane/build"})
+    assert "no writer capacity" in move.carry(expect=2)["error"]
+    assert not (move.base / "carried").exists()
+

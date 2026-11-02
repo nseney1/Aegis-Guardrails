@@ -400,28 +400,35 @@ def old_root_state(old_root, hierarchy):
     return old, names, in_order, dispatches, jobs
 
 
-def require_writer_room(store, initiative, rows):
-    holders = [row["lane"] for row in rows if row["readiness"]]
-    with store.lock():
-        ledger = store.load()
-        taken = {r["holder"] for r in ledger.requests.values() if r["kind"] == "writer" and r["state"] in ("queued", "granted")}
-        missing = [holder for holder in holders if holder not in taken]
-        require(len(ledger.held("writer")) + len(missing) <= ledger.limits["writer"],
-                "no writer capacity for the writers already at work: " + ", ".join(missing))
-    return holders
+def writer_slots_needed(ledger, rows):
+    """Writers already at work that hold no granted slot. A queued request holds nothing, because capacity counts only grants."""
+    needed = []
+    for row in rows:
+        if not row["readiness"]:
+            continue
+        mine = [r for r in ledger.requests.values() if r["kind"] == "writer" and r["holder"] == row["lane"] and r["state"] in ("queued", "granted")]
+        if not any(r["state"] == "granted" for r in mine):
+            needed.append((row, next((r for r in mine if r["state"] == "queued"), None)))
+    return needed
+
+
+def require_writer_room(ledger, rows):
+    needed = writer_slots_needed(ledger, rows)
+    require(len(ledger.held("writer")) + len(needed) <= ledger.limits["writer"],
+            "no writer capacity for the writers already at work: " + ", ".join(row["lane"] for row, _ in needed))
+    return needed
 
 
 def take_writer_slots(store, initiative, rows):
     """They are already at work and accepted work is never preempted, so these skip the queue. Their slots stay held until released with evidence."""
     with store.lock():
         ledger = store.load()
-        taken = {r["holder"] for r in ledger.requests.values() if r["kind"] == "writer" and r["state"] in ("queued", "granted")}
-        for row in rows:
-            if row["readiness"] and row["lane"] not in taken:
-                identifier = "req-%08d" % (ledger.seq + 1)
+        for row, queued in require_writer_room(ledger, rows):
+            identifier = queued["request_id"] if queued else "req-%08d" % (ledger.seq + 1)
+            if queued is None:
                 store.append(ledger, "request", {"request_id": identifier, "initiative": initiative, "kind": "writer", "holder": row["lane"],
                                                  "reference": "carried dispatch " + row["dispatch"]})
-                store.append(ledger, "grant", {"request_id": identifier})
+            store.append(ledger, "grant", {"request_id": identifier})
 
 
 def carry_text(request, record, old, names, in_order, new):
@@ -492,7 +499,8 @@ def carry(request):
             require(bool(bound), name + " is bound in the old root but not in the new one; run add-role for it first")
             if bound[-1]["session"] != history[-1]["session"]:
                 require(name in replaced, name + " is bound to another session in the new root; name it under replaced if that is intended")
-        require_writer_room(store, hierarchy, dispatches)
+        with store.lock():
+            require_writer_room(store.load(), dispatches)
         carried = []
         for row in dispatches:
             raw = old.brief(row["old_brief"])
