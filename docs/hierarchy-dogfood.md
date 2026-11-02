@@ -144,6 +144,7 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 | You see | It means | Do this |
 | --- | --- | --- |
 | `waiting` with `capacity_full` | All heavy slots are taken, counting outside work | Run again later |
+| `waiting` with `low_disk` | Free space is under `min_free_gigabytes`, so no heavy job starts | Free some space. `tool jobs --store ... clean --job <initiative>/<message-id>` removes a finished job's work folders |
 | `running` | Another runner has it | Nothing |
 | `abandoned` | The runner stopped, and the slot stays held | Stop `process_group` if `process_alive`, then run `tool jobs --store ... resolve --job <initiative>/<message-id> --reason "..."` |
 | `settle_pending` | A busy mailbox or store delayed the receipt or the release | Run `run-open` again |
@@ -154,6 +155,10 @@ changed nothing. A failed job is still exit 0, because the receipt reports it.
 | `no_profile` | The current binding has no wake profile | Run `add-role` for that session |
 | `meter_error` | Active time could not be measured, so it was not woken | Find out why |
 | `root_queue` | Open jobs and unread mail for root | `run-open`, then `tool mailbox --root <mailbox> inbox --endpoint <hierarchy>/root --delivery-dir <dir> --mark-read` |
+
+A full test run can leave about 2 GB in its job folder. A completed job removes that itself and
+keeps its logs and result. A failed job (`work_kept`) keeps it as possible evidence until you run
+`clean`.
 
 A runner works through jobs one at a time, so start a second `run-open` to use more than one
 heavy slot. A sweep also runs turns one at a time, so use `--initiative` to sweep initiatives

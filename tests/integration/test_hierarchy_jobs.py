@@ -499,6 +499,82 @@ def test_a_busy_store_leaves_a_heavy_job_waiting_and_loses_nothing(shop):
     assert shop.heavy()["used"] == 0
 
 
+MAKES_WORK = ("import os, sys, stat\n"
+              "folder = os.path.join(os.environ['TMPDIR'], 'nested')\n"
+              "os.makedirs(folder)\n"
+              "open(os.path.join(folder, 'big'), 'w').write('x' * 1000)\n"
+              "os.chmod(folder, 0o500)\n"
+              "open(os.path.join(os.environ['HOME'], 'dropped'), 'w').close()\n"
+              "print('made work')\n")
+
+
+def work_names(shop, identifier="job-1"):
+    return sorted(path.name for path in (shop.workspace.store / "jobs" / "pilot" / identifier).iterdir())
+
+
+def test_a_completed_job_keeps_its_evidence_and_removes_its_work_folders(shop):
+    shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK])
+    shop.save_recipes()
+    shop.request_job("job-1", "works")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    assert work_names(shop) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
+    assert "made work" in verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+
+
+def test_a_failed_job_keeps_its_work_folders_until_root_cleans_them(shop):
+    shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK + "sys.exit(4)\n"])
+    shop.save_recipes()
+    shop.request_job("job-1", "works")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and row["work_kept"] is True
+    assert {"home", "tmp", "scratch"} <= set(work_names(shop))
+    cleaned = shop.jobs("clean", "--job", "pilot/job-1")
+    assert {"home", "tmp", "scratch"} <= set(cleaned["removed"])
+    assert work_names(shop) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
+    assert verified_evidence(shop.receipts("job-1")[-1])
+    assert shop.jobs("clean", "--job", "pilot/job-1")["removed"] == []
+
+
+def test_clean_refuses_a_job_that_has_not_finished(shop, tmp_path):
+    assert "no job here" in shop.jobs("clean", "--job", "pilot/job-1", expect=2)["error"]
+    assert "invalid job" in shop.jobs("clean", "--job", "../../etc", expect=2)["error"]
+    runner = start_stuck_job(shop, tmp_path)
+    group = shop.run_open(expect=3)["rows"][0]["process_group"]
+    try:
+        assert "not finished" in shop.jobs("clean", "--job", "pilot/job-1", expect=2)["error"]
+    finally:
+        os.killpg(runner.pid, signal.SIGKILL)
+        runner.communicate()
+        os.killpg(group, signal.SIGKILL)
+
+
+def test_clean_does_not_follow_a_symlink_out_of_a_work_folder(shop, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o500)
+    script = ("import os, sys\nos.symlink(%r, os.path.join(os.environ['HOME'], 'link'))\nsys.exit(4)\n" % str(outside))
+    shop.recipes["recipes"]["links"] = shop.command(["$python", "-c", script])
+    shop.save_recipes()
+    shop.request_job("job-1", "links")
+    shop.run_open()
+    shop.jobs("clean", "--job", "pilot/job-1")
+    assert outside.exists() and not outside.stat().st_mode & 0o200, "its mode must stay as it was"
+    outside.chmod(0o700)
+
+
+def test_a_heavy_job_waits_when_the_disk_is_low(shop):
+    shop.recipes["min_free_gigabytes"] = 1000000
+    shop.save_recipes()
+    shop.request_job("job-1", "heavy")
+    shop.request_job("job-2", "ok")
+    rows = {row["job"]: row for row in shop.run_open(expect=3)["rows"]}
+    assert rows["pilot/job-1"]["state"] == "waiting" and rows["pilot/job-1"]["reason"] == "low_disk"
+    assert rows["pilot/job-2"]["state"] == "completed", "a light job still runs"
+    assert shop.receipts("job-1") == []
+    shop.recipes["min_free_gigabytes"] = 1
+    shop.save_recipes()
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+
+
 def wait_for(path, seconds=10):
     deadline = time.monotonic() + seconds
     while not path.exists():
@@ -729,6 +805,7 @@ def test_a_commit_recipe_needs_an_identity(shop):
     (lambda r: r.update(hide=["/no/such/folder"]), "hide"),
     (lambda r: r.update(ro_binds=["relative"]), "ro_binds"),
     (lambda r: r.update(env={"X": "$unknown"}), "token"),
+    (lambda r: r.update(min_free_gigabytes="lots"), "min_free_gigabytes"),
 ])
 def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
     change(shop.recipes)

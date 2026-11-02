@@ -16,6 +16,7 @@
     "-n",
     "7"
   ],
+  "min_free_gigabytes": 5,
   "hide": [
     "/REPLACE/WITH/your/home/folder"
   ],

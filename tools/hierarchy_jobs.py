@@ -15,6 +15,9 @@ lost runner leaves `unknown` and keeps the slot until root runs `resolve`.
 Every result lands in `<store>/jobs/<initiative>/<message-id>/` before its receipt goes out, so a
 receipt that cannot be published is retried by the next run instead of being lost.
 
+A completed job removes its work folders, because one full test run can leave gigabytes, and keeps its
+logs and result. A failed job keeps them until root runs `clean`, because they may be evidence.
+
 A receipt is a claim with evidence references, never a verdict on the work. Bubblewrap keeps
 accidents contained, but this runs under one OS user and is not a security boundary: Git inspection
 of a checkout runs outside the sandbox, so a process that edits that checkout's `.git/config` could
@@ -68,6 +71,7 @@ DEFAULT_LOCK_WAIT_SECONDS = 30.0
 PATH_ARGUMENT = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./@+-]*(::[^\x00-\x1f]{1,512})?")
 JOB_ID = re.compile(SLUG.pattern + "/" + SLUG.pattern)
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError, TypeError, KeyError, subprocess.SubprocessError)
+WORK_FOLDERS = ("scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis")
 HOME_FOLDERS = {"HOME": "", "USERPROFILE": "", "APPDATA": "AppData/Roaming", "LOCALAPPDATA": "AppData/Local",
                 "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude", "XDG_CONFIG_HOME": ".config",
                 "XDG_CACHE_HOME": ".cache", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
@@ -108,7 +112,9 @@ def existing_folders(value, label):
 
 def load_recipes(path):
     recipes = read_json(path)
-    fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix"})
+    fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
+    if "min_free_gigabytes" in recipes:
+        integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
     require(recipes["schema"] == RECIPES_SCHEMA, "unsupported recipes schema")
     require(isinstance(recipes["python"], str) and Path(recipes["python"]).is_absolute(), "python must be an absolute path")
     strings(recipes["path"], "path", nonempty=True)
@@ -441,6 +447,26 @@ def write_result(job, state, exit_code, *, reason=None, recipe=None, steps=(), b
     publish_file(job.result_path, encoded(result) + b"\n", limit=MAX_RESULT_BYTES)
 
 
+def remove_work_folders(job):
+    """Logs and the result are the evidence, and they stay."""
+    removed = []
+    for name in WORK_FOLDERS:
+        folder = job.folder / name
+        if not folder.exists():
+            continue
+        # Test fixtures can leave read-only folders, which would stop a plain removal. A symlink
+        # is skipped, because changing its mode would change whatever it points at.
+        os.chmod(folder, 0o700)
+        for current, folders, _ in os.walk(folder):
+            for child in folders:
+                path = os.path.join(current, child)
+                if not os.path.islink(path):
+                    os.chmod(path, 0o700)
+        shutil.rmtree(folder)
+        removed.append(name)
+    return removed
+
+
 def refuse(store, job, reason, wait):
     if not job.claim(None):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
@@ -641,7 +667,19 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             reason, exit_code = "source changed during the job, so its exit proves nothing", NO_VERDICT_EXIT
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
                  steps=rows, before=before, after=after, commit=created if not reason else None)
-    return settle(store, job, wait)
+    cleanup_error = None
+    if not reason:
+        try:
+            remove_work_folders(job)
+        except OSError as exc:
+            # The result stands either way, so this only tells root that space was not freed.
+            cleanup_error = str(exc)[:512]
+    row = settle(store, job, wait)
+    if reason:
+        row["work_kept"] = True
+    if cleanup_error:
+        row["cleanup_error"] = cleanup_error
+    return row
 
 
 def blocked_row(job, exc):
@@ -742,7 +780,11 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
     waiting = dict(heavy)
     held_reason = "store_busy" if store_busy else None
     capacity = None
+    minimum = recipes.get("min_free_gigabytes", 0)
     while waiting and budget > 0 and not store_busy:
+        if shutil.disk_usage(store.path).free < minimum * 1000000000:
+            held_reason = "low_disk"
+            break
         ledger = store.load()
         capacity = census(store.path, ledger, fixture)
         granted = next((holder for holder in waiting
@@ -837,6 +879,16 @@ def resolve(store_path, identifier, reason, wait):
     return 0, settle(store, job, wait)
 
 
+def clean(store_path, identifier):
+    require(isinstance(identifier, str) and JOB_ID.fullmatch(identifier) is not None, "invalid job: " + str(identifier)[:128])
+    initiative_id, message_id = identifier.split("/")
+    job_folder = safe_path(Store(store_path).path / "jobs" / initiative_id / message_id)
+    require(job_folder.is_dir(), "no job here: " + identifier)
+    require((job_folder / "result.json").exists(), "job is not finished: " + identifier)
+    job = Job(store_path, {"id": initiative_id}, {"message_id": message_id})
+    return 0, {"job": identifier, "removed": remove_work_folders(job)}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--store", required=True, help="Absolute path to the workspace store")
@@ -852,10 +904,14 @@ def main(argv=None):
     resolved = commands.add_parser("resolve", help="Close a job whose runner stopped, once nothing of it is running")
     resolved.add_argument("--job", required=True, help="<initiative>/<message-id>")
     resolved.add_argument("--reason", required=True)
+    commands.add_parser("clean", help="Remove a finished job's work folders, keeping its logs and result").add_argument(
+        "--job", required=True, help="<initiative>/<message-id>")
     args = parser.parse_args(argv)
     try:
         if args.command == "resolve":
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait)
+        elif args.command == "clean":
+            code, result = clean(args.store, args.job)
         else:
             require(args.recipes is not None, "--recipes is required")
             if args.command == "check-recipes":
