@@ -27,6 +27,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -34,7 +35,7 @@ import uuid
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, encoded, endpoint_parts, fields, initialize, integer,  # noqa: E402
+from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endpoint_parts, fields, initialize, integer,  # noqa: E402
                                matching, publish_file, read_json, require, safe_path, strict_json, strings, text,
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
@@ -103,27 +104,47 @@ def init(request):
         Board(text(board, "board")).load()
         require((source / "aegis_core" / "redaction.py").is_file(), "the board needs the secret patterns in the source checkout")
     store = Store(text(request["store"], "store"))
-    known = store.load()
-    require(initiative["id"] not in known.initiatives, "initiative already registered: " + initiative["id"])
-    require(not base.exists(), "initiative base already exists: " + str(base))
     hierarchy = initiative["id"]
     endpoints = {hierarchy + "/front-door": {}, hierarchy + "/orchestrator": {}, hierarchy + "/root": {}}
     endpoints.update({hierarchy + "/lane/" + lane: {"kind": kind} for lane, kind in lanes.items()})
-    base.mkdir(parents=True, mode=0o700)
-    mailbox_root = base / "mailbox"
-    delivery = base / "delivery"
-    created = initialize(mailbox_root, {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "counterparts": [],
-                                        "writer_limit": known.limits["writer"]})
-    record = {"schema": SCHEMA, "created_at": timestamp(), "store": str(store.path), "source": str(source),
-              "source_commit": commit, "source_tree": tree, "python": python, "initiative": hierarchy,
-              "mailbox_root": str(mailbox_root), "delivery_dir": str(delivery)}
-    if board is not None:
-        record["board"] = board
-    publish_file(base / "provision.json", encoded(record) + b"\n")
+    record_path = base / "provision.json"
+    store.load()  # A missing store is reported as such, before the lock would fail on its absent folder.
+    # Under the store lock from the start, so a busy store stops this before anything exists, and registration
+    # happens in the same step as the setup it describes.
     with store.lock():
-        ledger = store.load()
-        store.append(ledger, "register", {**initiative, "mailbox_root": str(mailbox_root), "delivery_dir": str(delivery)})
-    return {**record, "manifest_sha256": created["manifest_sha256"], "endpoints": sorted(endpoints)}
+        known = store.load()
+        require(hierarchy not in known.initiatives, "initiative already registered: " + hierarchy)
+        if record_path.exists():
+            # An earlier run set this up and stopped before registering it, so this run finishes that one.
+            record = read_json(record_path)
+            require(record.get("initiative") == hierarchy and record.get("store") == str(store.path),
+                    "initiative base already exists: " + str(base))
+        else:
+            require(not base.exists(), "initiative base already exists: " + str(base))
+            record = {"schema": SCHEMA, "created_at": timestamp(), "store": str(store.path), "source": str(source),
+                      "source_commit": commit, "source_tree": tree, "python": python, "initiative": hierarchy,
+                      "mailbox_root": str(base / "mailbox"), "delivery_dir": str(base / "delivery")}
+            if board is not None:
+                record["board"] = board
+            build_base(base, endpoints, known.limits["writer"], record)
+        store.append(known, "register", {**initiative, "mailbox_root": record["mailbox_root"], "delivery_dir": record["delivery_dir"]})
+    manifest = Mailbox(record["mailbox_root"]).manifest
+    return {**record, "manifest_sha256": digest(manifest), "endpoints": sorted(manifest["endpoints"])}
+
+
+def build_base(base, endpoints, writer_limit, record):
+    """Built beside its final place and renamed in, so a run that stops leaves nothing or a complete setup."""
+    base.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pending = base.parent / (".pending-" + uuid.uuid4().hex)
+    pending.mkdir(mode=0o700)
+    try:
+        initialize(pending / "mailbox", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "counterparts": [],
+                                         "writer_limit": writer_limit})
+        publish_file(pending / "provision.json", encoded(record) + b"\n")
+        pending.rename(base)
+    except BaseException:
+        shutil.rmtree(pending, ignore_errors=True)
+        raise
 
 
 def adapter_args(setup, endpoint, host, session, generation):
@@ -477,6 +498,8 @@ def carry(request):
     setup = read_json(base / "provision.json")
     hierarchy = request["hierarchy"]
     require(setup["initiative"] == hierarchy, "this initiative is %s, so it can only take over that hierarchy, not %s" % (setup["initiative"], hierarchy))
+    # Jobs and sweeps only see registered initiatives, so a move must not finish without one.
+    Store(setup["store"]).load().initiative(hierarchy)
     replaced = request.get("replaced", {})
     require(isinstance(replaced, dict) and all(isinstance(reason, str) and reason for reason in replaced.values()), "invalid replaced")
     store = Store(setup["store"])
@@ -560,7 +583,8 @@ def move(request):
     initiative = request["initiative"]
     fields(initiative, {"project", "repository", "priority", "target_branch"}, {"touched_paths", "blocked_by", "checkouts", "lanes", "source"})
     base = safe_path(text(request["base"], "base"))
-    if not (base / "provision.json").exists():
+    if hierarchy not in Store(text(request["store"], "store")).load().initiatives:
+        # Sets it up, or finishes registering a setup that an earlier run left unregistered.
         lanes = {name.split("/")[2]: spec["kind"] for name, spec in endpoints.items() if name.split("/")[1] == "lane"}
         init({key: request[key] for key in ("store", "base", "source") } | {
             "lanes": lanes, "initiative": {**initiative, "id": hierarchy},

@@ -429,3 +429,30 @@ def test_a_queued_writer_with_no_room_refuses_the_move(move, tmp_path):
     assert "no writer capacity" in move.carry(expect=2)["error"]
     assert not (move.base / "carried").exists()
 
+
+def test_a_busy_store_stops_a_move_before_it_creates_anything(fresh):
+    lock = fresh.workspace.store / ".write.lock"
+    lock.write_text("fixture")
+    assert "busy" in provision("move", move_request(fresh), expect=2)["error"]
+    assert not (fresh.tmp / "initiatives" / "moved" / "a").exists()
+    lock.unlink()
+    provision("move", move_request(fresh))
+    assert "a" in fresh.workspace.run("status")["initiatives"]
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores file modes")
+def test_a_registration_that_failed_after_setup_is_finished_by_the_next_move(fresh):
+    events = fresh.workspace.store / "events"
+    base = fresh.tmp / "initiatives" / "moved" / "a"
+    events.chmod(0o500)
+    try:
+        provision("move", move_request(fresh), expect=2)
+    finally:
+        events.chmod(0o700)
+    assert (base / "provision.json").exists() and "a" not in fresh.workspace.run("status")["initiatives"]
+    refused = provision("carry", fresh.request(base=str(base), old_root=str(fresh.old), hierarchy="a", note="Retry."), expect=2)
+    assert "not registered" in refused["error"]
+    provision("move", move_request(fresh))
+    assert "a" in fresh.workspace.run("status")["initiatives"]
+    assert "a" in [row["id"] for row in fresh.workspace.run("report")["initiatives"]]
+
