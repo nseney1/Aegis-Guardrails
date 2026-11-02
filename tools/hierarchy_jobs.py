@@ -178,7 +178,7 @@ def checked_paths(packet, recipe, checkout):
     return paths
 
 
-def path_fingerprint(path):
+def path_fingerprint(path, name):
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -186,7 +186,9 @@ def path_fingerprint(path):
     if stat.S_ISLNK(info.st_mode):
         return b"link:" + os.fsencode(os.readlink(path))
     if not stat.S_ISREG(info.st_mode):
-        return b"other"
+        # A constant here would let any content behind the entry, such as a nested repository, pass as the same source.
+        raise ValueError("cannot witness %s byte for byte: only regular files and symlinks can be witnessed, so nested "
+                         "repositories, submodules and special files are not supported" % os.fsdecode(name)[:512])
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1048576), b""):
@@ -194,11 +196,24 @@ def path_fingerprint(path):
     return b"file:" + (b"x" if info.st_mode & 0o111 else b"-") + b":" + digest.hexdigest().encode()
 
 
+def refuse_submodules(checkout):
+    """A submodule's bytes and revision live in another repository, and the parent's status shows the same ` M sub`
+    for any of them, while a clean or uninitialized one shows nothing. None can be bound to a packet, so all are
+    refused by path. The submodule itself is never read, so nothing outside the checkout is followed."""
+    listed = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
+                            cwd=checkout, capture_output=True, timeout=120)
+    require(listed.returncode == 0, "could not read the index of " + str(checkout))
+    gitlinks = [entry.partition(b"\t")[2] for entry in listed.stdout.split(b"\0") if entry.startswith(b"160000 ")]
+    require(not gitlinks, "submodules are not supported, because their content cannot be witnessed byte for byte: "
+            + ", ".join(os.fsdecode(path) for path in gitlinks)[:1024])
+
+
 def uncommitted_content(checkout):
     """Git status names the paths that differ, not their bytes, so one status can hide different content."""
     status = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
                             cwd=checkout, capture_output=True, timeout=120)
     require(status.returncode == 0, "could not read the status of " + str(checkout))
+    refuse_submodules(checkout)
     tokens = status.stdout.split(b"\0")
     digest = hashlib.sha256()
     count = index = 0
@@ -214,7 +229,7 @@ def uncommitted_content(checkout):
             index += 1
         digest.update(token[:2] + b"\0")
         for name in names:
-            digest.update(name + b"\0" + path_fingerprint(os.path.join(os.fsencode(checkout), name)) + b"\0")
+            digest.update(name + b"\0" + path_fingerprint(os.path.join(os.fsencode(checkout), name), name) + b"\0")
     return digest.hexdigest(), count
 
 
@@ -404,11 +419,33 @@ class Job:
             return time.time() - self.folder.stat().st_mtime < CLAIM_GRACE_SECONDS
         return process_start(claim["pid"]) == claim["start"]
 
-    def process_group(self):
+    def process_record(self):
         try:
-            return read_json(self.process_path)["group"]
+            record = read_json(self.process_path)
         except (ValueError, OSError):
             return None
+        return record if isinstance(record, dict) else None
+
+    def process_group(self):
+        return (self.process_record() or {}).get("group")
+
+    def unrecorded_step(self):
+        """The latest step that may have started while its own group is not on record, else None.
+
+        A step's launch is recorded before its log is opened and its process started, and its group once it runs. A
+        record naming an earlier step, or this step without a group, means the runner was lost in between, and an
+        earlier step's stopped group says nothing about whether this one still runs."""
+        numbers = [int(path.name[5:-4]) for path in self.folder.glob("step-*.log") if path.name[5:-4].isdigit()]
+        latest = max(numbers, default=0)
+        record = self.process_record()
+        if not latest:
+            return None
+        if record is None or not isinstance(record.get("step"), int) or record["step"] < latest:
+            return latest
+        if record["step"] == latest and not record.get("group"):
+            return latest
+        # A later recorded launch whose log was never opened never started, and its earlier steps were confirmed stopped.
+        return None
 
     def evidence(self):
         names = sorted(path for path in self.folder.iterdir() if path.name.startswith("step-") or path.name == "result.json")
@@ -648,21 +685,30 @@ def commit_steps(packet, recipes, job):
     return commit
 
 
+def record_process(job, record, suffix):
+    """Replaced whole, so a reader sees the earlier record or the new one, never part of either."""
+    temporary = job.process_path.with_suffix(suffix)
+    temporary.write_bytes(encoded(record))
+    temporary.replace(job.process_path)
+
+
 def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, prefix):
     log_path = job.folder / ("step-%d.log" % number)
     out_path = job.folder / ("step-%d.out" % number)
     argv = prefix + sandbox + step.argv
     began = time.monotonic()
     row = {"argv": step.argv, "exit_code": None, "timed_out": False, "stopped_leftovers": False}
+    # On record before anything starts, so a runner lost at any later moment leaves a record naming this step rather
+    # than the previous step's stopped group. If this cannot be written, the step does not start.
+    launch = {"step": number, "group": None, "at": timestamp()}
+    record_process(job, launch, ".intent")
     with open(log_path, "xb") as log, open(out_path, "xb") if step.capture else open(os.devnull, "wb") as out:
         process = subprocess.Popen(argv, cwd=checkout, env={**env, **step.env}, stdin=subprocess.DEVNULL,
                                    stdout=out if step.capture else log, stderr=log, start_new_session=True)
     try:
         # Everything after the launch is guarded: a process must never outlive a job that is reported over.
-        held = encoded({"group": process.pid, "step": number, "at": timestamp()})
-        pending = job.process_path.with_suffix(".pending")
-        pending.write_bytes(held)
-        pending.replace(job.process_path)
+        record_process(job, {**launch, "group": process.pid, "start": process_start(process.pid), "at": timestamp()},
+                       ".pending")
         on_start()
         remaining = max(0.0, deadline - time.monotonic())
         try:
@@ -790,12 +836,17 @@ def visit_existing(store, job, wait):
     if job.runner_alive():
         return {"job": job.id, "state": "running", "process_group": group}
     alive = bool(group and group_members(group))
+    unrecorded = job.unrecorded_step()
     try:
         publish_receipt(job, "unknown", "Job %s has no result: its runner stopped before reporting. Root must "
                         "resolve it." % job.id, wait, reason="the runner stopped before the job reported an exit")
     except ERRORS as exc:
         return blocked_row(job, exc)
-    return {"job": job.id, "state": "abandoned", "process_group": group, "process_alive": alive}
+    row = {"job": job.id, "state": "abandoned", "process_group": group, "process_alive": alive}
+    if unrecorded and not alive:
+        # Unknown, not stopped: the step that may still run was never recorded.
+        row.update(process_alive=None, unrecorded_step=unrecorded)
+    return row
 
 
 def finish_closed_jobs(store, ledger, initiative, records, open_ids, wait, rows):
@@ -983,8 +1034,10 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     require(not job.runner_alive(), "its runner is still running: " + identifier)
     group = job.process_group()
     require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
-    if group is None and any(job.folder.glob("step-*.log")):
-        require(process_stopped, "a step started but its process was never recorded; check by hand that it stopped, then pass --process-stopped")
+    unrecorded = job.unrecorded_step()
+    if unrecorded:
+        require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
+                "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
     write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True)
     return 0, settle(store, job, wait)
 

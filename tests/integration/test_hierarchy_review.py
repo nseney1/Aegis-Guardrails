@@ -260,6 +260,7 @@ def force_write(path, data):
     (lambda out: force_write(out / "candidate.files.jsonl", b""), "candidate.files.jsonl"),
     (lambda out: plant_hook(out), ".git changed"),
     (lambda out: force_write(out / ".git" / "config", b"[core]\n\thooksPath = /tmp\n"), ".git changed"),
+    (lambda out: os.chmod(out / ".git" / "config", 0o644), ".git/config is writable"),
     (lambda out: replace_with_link(out, "candidate"), "candidate became a symlink"),
     (lambda out: os.chmod(out / "candidate", 0o755), "candidate is writable"),
     (lambda out: replace_with_link(out, ".git"), ".git became a symlink"),
@@ -270,6 +271,16 @@ def test_a_changed_copy_fails_verification_and_names_the_change(repository, dama
     result = review("verify", "--out", str(repository.out), expect=3)
     assert result["ok"] is False
     assert any(problem in row for row in result["problems"]), result
+
+
+def test_a_writable_top_git_folder_fails_verification(repository):
+    """A writable `.git` lets anything plant hooks or config later. Its children were checked; it was not."""
+    repository.prepare()
+    assert review("verify", "--out", str(repository.out))["ok"] is True
+    os.chmod(repository.out / ".git", 0o755)
+    result = review("verify", "--out", str(repository.out), expect=3)
+    assert result["ok"] is False
+    assert result["problems"] == [".git is writable"], result
 
 
 def test_an_edited_manifest_fails_against_the_recorded_hash(repository):

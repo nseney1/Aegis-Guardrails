@@ -347,6 +347,70 @@ def test_every_kind_of_uncommitted_change_moves_the_digest(shop, change):
     assert source_digest(shop)["dirty_content_sha256"] != before
 
 
+def add_submodule(shop, name="sub"):
+    origin = shop.tmp / ("origin-" + name)
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    (origin / "data.txt").write_text("one\n")
+    git(origin, "add", ".")
+    git(origin, "commit", "-qm", "origin")
+    git(shop.checkout, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), name)
+    git(shop.checkout, "commit", "-qm", "add a submodule")
+    return shop.checkout / name
+
+
+def digest_or_error(shop):
+    done = subprocess.run([sys.executable, "-I", str(JOBS), "source-digest", "--checkout", str(shop.checkout)],
+                          capture_output=True, text=True, timeout=30, env=shop.env())
+    assert not done.stderr, done.stderr
+    return done.returncode, json.loads(done.stdout)
+
+
+def test_a_submodule_is_refused_by_path_instead_of_hiding_its_bytes(shop):
+    """The parent's status shows only ` M sub` for any content or revision inside it, so no digest can bind it."""
+    sub = add_submodule(shop)
+    seen = {"clean": digest_or_error(shop)}
+    (sub / "data.txt").write_text("two\n")
+    seen["dirty-a"] = digest_or_error(shop)
+    (sub / "data.txt").write_text("three\n")
+    seen["dirty-b"] = digest_or_error(shop)
+    git(sub, "commit", "-qam", "moved")
+    seen["new-revision"] = digest_or_error(shop)
+    git(shop.checkout, "submodule", "deinit", "-q", "-f", "sub")
+    seen["uninitialized"] = digest_or_error(shop)
+    assert all(code == 2 and "submodule" in out["error"] and "sub" in out["error"] for code, out in seen.values()), seen
+
+
+def test_a_nested_repository_is_refused_by_path_and_ordinary_bytes_still_count(shop):
+    nested = shop.checkout / "nested"
+    nested.mkdir()
+    git(nested, "init", "-q", "-b", "main")
+    (nested / "inner.txt").write_text("a\n")
+    code, out = digest_or_error(shop)
+    assert code == 2 and "nested" in out["error"] and "byte for byte" in out["error"], out
+    shutil.rmtree(nested)
+    target = shop.checkout / "src" / "app.py"
+    digests = []
+    for content in ("value = 2\n", "value = 3\n"):
+        target.write_text(content)
+        digests.append(source_digest(shop)["dirty_content_sha256"])
+    (shop.checkout / "linked").symlink_to("app.py")
+    digests.append(source_digest(shop)["dirty_content_sha256"])
+    assert len(set(digests)) == 3
+
+
+def test_a_job_on_a_checkout_with_a_submodule_is_refused_by_path_and_holds_nothing(shop, tmp_path):
+    add_submodule(shop)
+    proof = tmp_path / "recipe-ran"
+    shop.recipes["recipes"]["probe"] = shop.command(["$python", "-c", "open(%r, 'w').close()" % str(proof)], heavy=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "probe")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and "submodule" in row["reason"] and "sub" in row["reason"], row
+    assert not proof.exists() and shop.states("job-1") == ["refused"]
+    assert shop.heavy()["used"] == 0 and not [event for event in shop.events() if event["kind"] == "grant"]
+
+
 def test_a_changed_packet_file_is_refused(shop):
     packet = shop.base / "packet.md"
     raw = json.dumps({"schema": PACKET_SCHEMA, "recipe": "touch", **shop.head()}).encode()
@@ -821,6 +885,129 @@ def test_a_runner_that_dies_leaves_a_clear_unknown_and_keeps_the_slot_until_root
     assert "The runner crashed." in final["receipt"]["reason"] and verified_evidence(final)
     assert shop.heavy()["used"] == 0 and shop.open_jobs() == []
     assert shop.run_open()["rows"] == []
+
+
+def wait_until(check, seconds, message):
+    deadline = time.monotonic() + seconds
+    while not check():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.02)
+
+
+def two_step_job(shop, first, second, marker):
+    shop.recipes["recipes"]["two"] = {"kind": "command", "heavy": True, "sandbox": "none", "timeout_seconds": 50,
+                                      "steps": [["$python", "-c", first], ["$python", "-c", second, marker]]}
+    shop.save_recipes()
+    shop.request_job("job-1", "two")
+
+
+def after_own_record(folder, action):
+    # The first step plants its obstacle only once the runner recorded the first step's own group, so the obstacle
+    # meets the second step's launch and not the first step's record.
+    return ("import json, os, time\nfor _ in range(1000):\n    try:\n"
+            "        if json.load(open(%r)).get('group') == os.getpgrp():\n            break\n"
+            "    except (OSError, ValueError):\n        pass\n    time.sleep(0.01)\n%s\n" % (str(folder / "process.json"), action))
+
+
+def start_runner(shop, **options):
+    return subprocess.Popen(shop.argv("run-open", census=[]), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=shop.env(), start_new_session=True, **options)
+
+
+def stop_runner(runner):
+    if runner.returncode is None:
+        try:
+            os.killpg(runner.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        runner.communicate(timeout=10)
+
+
+def release_count(shop):
+    return sum(1 for event in shop.events() if event["kind"] == "release")
+
+
+def assert_held_until_root_confirms(shop, marker):
+    """The later step's own group was never recorded, so neither its runner's loss nor the earlier step's dead
+    group may free the slot or send a final receipt. Only root's explicit confirmation does, exactly once."""
+    assert processes_with(marker), "the later step outlives its runner"
+    assert shop.run_open(expect=3)["rows"][0]["state"] == "abandoned"
+    assert shop.heavy()["used"] == 1 and shop.states("job-1") == ["started", "unknown"]
+    refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", expect=2)
+    assert "--process-stopped" in refused["error"]
+    for pid in processes_with(marker):
+        os.kill(pid, signal.SIGKILL)
+    wait_until(lambda: not processes_with(marker), 5, "the later step did not stop")
+    refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", expect=2)
+    assert "--process-stopped" in refused["error"], "a dead earlier group proves nothing about the later step"
+    assert shop.heavy()["used"] == 1 and shop.states("job-1") == ["started", "unknown"] and release_count(shop) == 0
+    resolved = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", "--process-stopped")
+    assert resolved["state"] == "failed"
+    assert shop.heavy()["used"] == 0 and shop.states("job-1") == ["started", "unknown", "failed"]
+    assert release_count(shop) == 1
+    assert shop.run_open()["rows"] == [] and release_count(shop) == 1
+    again = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "Again.", "--process-stopped", expect=2)
+    assert "already finished" in again["error"] and release_count(shop) == 1
+
+
+def test_a_runner_lost_between_a_later_launch_and_its_record_keeps_the_slot_until_root_confirms(shop):
+    marker = "marker-" + uuid.uuid4().hex
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    # A pipe nobody reads, where the second step's record is written, holds the runner just after that launch.
+    two_step_job(shop, after_own_record(folder, "os.mkfifo(%r)" % str(folder / "process.pending")),
+                 "import time; time.sleep(60)", marker)
+    runner = start_runner(shop)
+    try:
+        wait_until(lambda: processes_with(marker), 10, "the second step never started")
+        stop_runner(runner)
+        assert_held_until_root_confirms(shop, marker)
+    finally:
+        stop_runner(runner)
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_later_step_whose_record_fails_and_whose_stop_is_lost_keeps_the_slot_until_root_confirms(shop):
+    marker = "marker-" + uuid.uuid4().hex
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    two_step_job(shop, after_own_record(folder, "os.mkdir(%r)" % str(folder / "process.pending")),
+                 "import time; time.sleep(60)", marker)
+    # An ignored SIGTERM is inherited, so the second step outlasts the polite part of its stop, and the runner is
+    # lost inside that 5 s grace, before the stop was confirmed.
+    runner = start_runner(shop, preexec_fn=lambda: signal.signal(signal.SIGTERM, signal.SIG_IGN))
+    try:
+        wait_until(lambda: processes_with(marker), 10, "the second step never started")
+        time.sleep(1)
+        stop_runner(runner)
+        assert_held_until_root_confirms(shop, marker)
+    finally:
+        stop_runner(runner)
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_step_whose_launch_cannot_be_recorded_first_never_starts(shop, tmp_path):
+    marker = "marker-" + uuid.uuid4().hex
+    proof = tmp_path / "second-step-ran"
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    two_step_job(shop, after_own_record(folder, "os.mkdir(%r)" % str(folder / "process.intent")),
+                 "open(%r, 'w').close()" % str(proof), marker)
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and "could not run" in row["reason"]
+    assert not proof.exists(), "a step must not start before its launch is on record"
+    assert shop.heavy()["used"] == 0 and release_count(shop) == 1
+
+
+def test_a_later_step_that_cannot_launch_is_an_ordinary_failure(shop, tmp_path):
+    missing = str(tmp_path / ("no-such-program-" + uuid.uuid4().hex))
+    shop.recipes["recipes"]["two"] = {"kind": "command", "heavy": True, "sandbox": "none", "timeout_seconds": 30,
+                                      "steps": [["$python", "-c", "print('first')"], [missing]]}
+    shop.save_recipes()
+    shop.request_job("job-1", "two")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and "could not run" in row["reason"]
+    assert shop.states("job-1") == ["started", "failed"]
+    assert shop.heavy()["used"] == 0 and release_count(shop) == 1
 
 
 def test_resolve_refuses_a_job_with_no_claim_or_one_already_finished(shop):
