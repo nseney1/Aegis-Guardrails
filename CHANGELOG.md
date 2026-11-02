@@ -2,7 +2,7 @@
 
 All notable changes to Aegis Guardrails are documented here. The project uses [Semantic Versioning](https://semver.org/). Releases before 1.0.0 are summarized at the end.
 
-## [4.5.0] - 2026-10-31
+## [4.5.0] - 2026-11-02
 
 ### Added
 
