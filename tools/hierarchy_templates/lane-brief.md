@@ -1,15 +1,19 @@
 # Lane brief: REPLACE_WITH_ENDPOINT_AND_REVISION
 
 Endpoint: a/lane/f2
-Kind: implementer
+Endpoint kind (bind by kind, T87): implementer
+Binding (T61; the launch prompt's endpoint and generation win): REPLACE_WITH_ENDPOINT_AND_GENERATION
 Hierarchy brief: REPLACE_WITH_PATH_AND_SHA256
 Goal: REPLACE_WITH_REQUESTED_OUTCOME
 Acceptance: REPLACE_WITH_OBSERVABLE_ACCEPTANCE_CHECK
 
 ## Source and ownership
 
-- Repository/worktree: REPLACE_WITH_EXACT_WORKTREE_ROOT
-- Branch and full base commit: REPLACE_WITH_BRANCH_AND_COMMIT
+- Repository and ROOT-registered worktree (layout f): REPLACE_WITH_ABSOLUTE_WORKTREE_PATH
+- Head branch (it must follow the target repo's route policy, T66; e.g. Stormheir takes only `feature/*` into develop) and full base commit: REPLACE_WITH_BRANCH_AND_COMMIT
+- Build-cache directory and free-space preflight (T42; removed at teardown unless kept as evidence): REPLACE_WITH_CACHE_DIR_OR_NONE
+- Owned governance paths (T75, T106; every `aegis_core.governance` category: `.aegis/**`, `allowed_signers`, `CODEOWNERS`, `.github/workflows/**`, and test-infra such as `Makefile`, `pyproject.toml` and `conftest.py`), the expected `aegis check --lane` outcome and the owner decision that covers it: REPLACE_WITH_PATHS_OUTCOME_AND_DECISION_OR_NONE
+- Push exception (T24; none means no push): REPLACE_WITH_OWNER_DECISION_ID_RECORD_PATH_AND_REF_PATTERN_OR_NONE
 - Lease id/ref, object id and expiry: REPLACE_WITH_OBSERVED_CLAIM
 - Owned paths and allowed shared paths: REPLACE_WITH_EXPLICIT_PATHS
 - Cross-lane interfaces and anti-goals: REPLACE_WITH_REVIEWED_BOUNDARIES

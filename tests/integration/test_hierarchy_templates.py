@@ -36,6 +36,70 @@ def test_templates_state_the_owners_rotation_limit(name, limit):
     assert "after %d minutes" % limit in words and "45 minutes" not in words
 
 
+SELF_STOP = 'claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null'
+
+
+def words(name):
+    return " ".join((TEMPLATES / name).read_text(encoding="utf-8").split())
+
+
+def missing(name, phrases):
+    text = words(name)
+    return [phrase for phrase in phrases if phrase not in text]
+
+
+def test_lanes_stop_on_a_refusal_and_never_touch_shared_worktree_admin():
+    assert missing("roles/lane.md", ["If Edit or Write is refused", "report the exact text and stop",
+                                     "Never call `EnterWorktree`", "`git worktree repair`", "`git worktree prune`"]) == []
+
+
+def test_lanes_read_their_diff_before_each_commit():
+    assert missing("roles/lane.md", ["Before each commit, read `git diff <base> -- <file>`"]) == []
+
+
+def test_lanes_scan_each_path_on_its_own_because_a_combined_scan_can_drop_rules():
+    assert missing("roles/lane.md", ["Scan each path you will edit on its own", "union of the rule ids"]) == []
+
+
+def test_lanes_put_evidence_too_long_for_a_field_in_a_cited_file():
+    assert missing("roles/lane.md", ["4096 characters", "absolute path, its sha256 and the rule ids"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md"])
+def test_lane_kinds_end_with_the_self_stop_line(name):
+    last = (TEMPLATES / name).read_text(encoding="utf-8").rstrip().splitlines()[-1]
+    assert SELF_STOP in last
+
+
+def test_orchestrators_read_a_dialog_from_waiting_for_not_from_blocked_alone():
+    assert missing("roles/orchestrator.md", ["`waitingFor`", "whatever `state` says", "`state: blocked`"]) == []
+
+
+def test_orchestrators_bind_by_kind_and_list_governance_paths_without_a_fixed_writer_count():
+    assert missing("roles/orchestrator.md", ["Bind by kind", "never bind the wrong kind",
+                                             "governance-classified paths", "`set-limits`"]) == []
+    assert "three concurrent writers" not in words("roles/orchestrator.md")
+
+
+def test_root_stops_the_outgoing_session_and_checks_its_pid():
+    assert missing("roles/root.md", ["stop the outgoing session", "verify its PID is gone"]) == []
+
+
+def test_root_releases_a_live_lanes_grant_only_on_all_four_conditions():
+    assert missing("roles/root.md", ["only when all four hold", "it reported done", "verified the report against git",
+                                     "no `waitingFor`", "no claimed job and no open accepted dispatch"]) == []
+
+
+def test_reviewers_fall_back_to_exact_commits_without_a_prepared_copy():
+    assert missing("roles/reviewer.md", ['git show "${rev}:path"', "never read the working tree"]) == []
+
+
+def test_the_lane_brief_asks_for_binding_kind_worktree_and_owner_decisions():
+    assert missing("lane-brief.md", ["launch prompt's endpoint and generation win", "Endpoint kind",
+                                     "ABSOLUTE_WORKTREE_PATH", "route policy", "Build-cache directory",
+                                     "`aegis check --lane`", "Push exception"]) == []
+
+
 def test_the_manifest_template_gives_each_hierarchy_a_root_routed_only_to_its_orchestrator(tmp_path):
     root = tmp_path / "mailbox"
     manifest = template("manifest.json")

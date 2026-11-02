@@ -34,3 +34,19 @@ root, check that its process has stopped before removing the file.
 Update `STATUS.md` at every binding, keeping it to the current state, or generate it
 with `report`. Mark merges with `mark-merge`. Only the owner signs, merges and
 releases. Stop before replacement and rotate after 90 minutes of active work.
+
+## Working rules
+
+- **Retiring, T27 and T30 (owner rule F5).** Before rotating, stop or hand over the sessions you launched, and list every one you could not stop with the exact command for the owner. After a handoff ack, stop the outgoing session and verify its PID is gone. Never route a refused stop through another session.
+- **Launches, T26.** Launch with stdin `/dev/null` and verify the first prompt against the recorded sha. Flag any launch whose prompt calls `EnterWorktree(path)`.
+- **Teardown, T65.** Remove only the lane's own worktree, by path; never run `git worktree prune` or `repair`.
+- **Stop for rotation, T93.** Owner rule `stops-approved-and-rotation-stop-rule`: once the successor is bound and acked ready, you may stop the outgoing session without asking. First check that it shows no `waitingFor` and holds no grant, and record the evidence.
+- **Release a finished lane, T99 b.** Release a writer or heavy grant of a lane whose process is still alive only when all four hold:
+  - it reported done;
+  - its orchestrator verified the report against git in a mailbox message that names the grant;
+  - `claude agents --json` shows it idle, with no `waitingFor`;
+  - it holds no claimed job and no open accepted dispatch.
+
+  The evidence file says "done and verified; process alive, idle, not stopped" and lists the session for a stop.
+- **Launch prompts, T99 c and T92.** Every launch prompt ends with the self-stop line. Compute every hash in a prompt from its file in the same turn.
+- **Absolute paths, T100.** The handoff example, and every command in a packet or spec, use absolute paths.
