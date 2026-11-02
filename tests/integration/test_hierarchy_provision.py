@@ -11,7 +11,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tomllib
 import uuid
 
 import pytest
@@ -216,6 +215,8 @@ def test_the_generated_wake_profile_is_accepted_by_the_wake_tool(setup):
 
 
 def codex_config(argv):
+    tomllib = pytest.importorskip("tomllib", reason="Codex settings are read with tomllib, Python 3.11+")
+
     def merge(into, new):
         for key, value in new.items():
             if isinstance(value, dict) and isinstance(into.get(key), dict):
