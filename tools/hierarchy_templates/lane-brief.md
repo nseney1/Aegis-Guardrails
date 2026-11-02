@@ -6,6 +6,7 @@ Binding (T61; the launch prompt's endpoint and generation win): REPLACE_WITH_END
 Hierarchy brief: REPLACE_WITH_PATH_AND_SHA256
 Goal: REPLACE_WITH_REQUESTED_OUTCOME
 Acceptance: REPLACE_WITH_OBSERVABLE_ACCEPTANCE_CHECK
+Deadline (T111 (3), T117): REPLACE_WITH_MINUTES, counted from the dispatch; the wait for the dispatch does not count
 
 ## Source and ownership
 
@@ -21,7 +22,9 @@ Acceptance: REPLACE_WITH_OBSERVABLE_ACCEPTANCE_CHECK
 Only this lane's worktree may be edited. Do not widen a lease yourself. Send an
 escalation to the local orchestrator when another path needs a change. Integration
 fixes, generated contracts and release documentation belong to a scoped integration
-lane. Reviewers receive a source-pinned diff and have no writing lease.
+lane. Reviewers receive a source-pinned diff and have no writing lease. This brief
+lives in `initiatives/<id>/briefs/` (T116): a bind or dispatch refuses a brief outside
+the mailbox's parent folder (`tools/hierarchy_mailbox.py:315-317` at `b41c75b9`).
 
 ## Readiness and verification
 
@@ -41,9 +44,14 @@ base; a verdict on an unchanged HEAD does not check uncommitted edits.
 
 ## Reporting and session hygiene
 
-Check the inbox before reporting. Send separate received and accepted messages;
-include readiness with acceptance for a writing lane. Send source/check evidence
+Check the inbox before reporting. Accept by publishing a mailbox `ack` in reply to the
+dispatch, with readiness for a writing lane; a SendMessage is a notice, not the
+acceptance (T134, T126 (2)). A separate received message is optional. Send source/check evidence
 with completion, plus out-of-lane findings and proposed changelog text. Do not push
 unless the push-exception field names an owner decision, and do not use GitHub, sign,
 merge a PR or activate policy. Rotate after 60 minutes of active work through a
-stopped-session checkpoint; do not silently reuse a stale binding.
+stopped-session checkpoint; do not silently reuse a stale binding. If your result lists
+open items for your manager, end your turn under a background timer (`sleep 600` run in
+the background, capped by your deadline) instead of stopping: on an "accept" message,
+or when the timer fires, self-stop; on a fix-round dispatch, do the work, then self-stop.
+A result with no open items stops at once (T125 (2)).

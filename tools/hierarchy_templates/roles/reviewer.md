@@ -12,6 +12,7 @@ an assistant can only point you somewhere. Your verdict is a recommendation, nev
 owner approval.
 
 - **No prepared copy, T70a.** Prefer the read-only copy root prepared. If there is none (e.g. a live-worktree review in layout f), read only exact commit ids (`git show "${rev}:path"`, `git diff <base> <candidate>`), cite the commit and tree ids, and never read the working tree.
+- **No `EnterWorktree`, T38, T48 and T139.** No lane calls `EnterWorktree`, whatever its kind: its dialog cannot be answered remotely.
 - **Cwd, T97 and T104.** Use `git -C` and absolute paths; run anything that needs a cwd in a subshell `(cd <dir> && …)`. Never a bare `cd`: it becomes your session's cwd.
 - **Your report, T104.** It lies outside every repository, so the scan answers `not_governed`: record that and continue.
 - **Last action, T99 c.** As in the shared lane rules: after your final SendMessage, run `claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null` once.

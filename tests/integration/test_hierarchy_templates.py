@@ -50,7 +50,7 @@ def missing(name, phrases):
 
 def test_lanes_stop_on_a_refusal_and_never_touch_shared_worktree_admin():
     assert missing("roles/lane.md", ["If Edit or Write is refused", "report the exact text and stop",
-                                     "Never call `EnterWorktree`", "`git worktree repair`", "`git worktree prune`"]) == []
+                                     "No lane calls `EnterWorktree`", "`git worktree repair`", "`git worktree prune`"]) == []
 
 
 def test_lanes_read_their_diff_before_each_commit():
@@ -126,6 +126,87 @@ def test_the_lane_brief_asks_for_binding_kind_worktree_and_owner_decisions():
                                      "`aegis check --lane`", "Push exception", "`tests-deleted`",
                                      "hosted `aegis check --ci` governance result",
                                      "unless the push-exception field names an owner decision"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
+def test_lanes_accept_a_dispatch_by_a_mailbox_ack_and_a_received_message_is_optional(name):
+    assert missing(name, ["publishing a mailbox `ack` in reply to the dispatch, with readiness for a writing lane",
+                          "a SendMessage is a notice, not the acceptance", "received message is optional"]) == []
+    assert "Send separate received and accepted messages" not in words(name)
+
+
+def test_deadlines_count_from_the_dispatch_and_lanes_ask_when_they_differ():
+    assert missing("lane-brief.md", ["Deadline (T111 (3), T117):",
+                                     "counted from the dispatch; the wait for the dispatch does not count"]) == []
+    assert missing("roles/lane.md", ["the prompt, the brief and the dispatch give different deadlines, "
+                                     "ask your orchestrator before you start"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
+def test_a_lane_with_open_items_waits_under_a_bounded_timer_before_its_self_stop(name):
+    assert missing(name, ["open items for your manager", "`sleep 600` run in the background, capped by your deadline",
+                          "an \"accept\" message", "when the timer fires", "fix-round dispatch",
+                          "no open items stops at once"]) == []
+
+
+def test_lanes_under_a_codex_manager_report_by_mailbox_and_poll_their_inbox():
+    assert missing("roles/lane.md", ["your manager's host is `codex`",
+                                     "report only through the mailbox (`ack`, `result`, `info`)",
+                                     "keep SendMessage for ROOT, for urgent items only",
+                                     "does not wake you",
+                                     "poll your inbox under a bounded background sleep (about 120 s, capped by your deadline)"]) == []
+
+
+def test_lanes_route_cross_initiative_traffic_through_their_orchestrator():
+    assert missing("roles/lane.md", ["`counterparts: []`", "`tools/hierarchy_mailbox.py:213-222` and `:305-306`",
+                                     "goes through your orchestrator, which uses ROOT relay",
+                                     "`c12-cross-orchestrator-traffic-a`", "Counterpart messages cannot dispatch work"]) == []
+    assert "exchange at least one informational message" not in words("roles/lane.md")
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md"])
+def test_no_lane_kind_calls_enter_worktree(name):
+    assert missing(name, ["No lane calls `EnterWorktree`"]) == []
+    layout = [line for line in (TEMPLATES / name).read_text(encoding="utf-8").splitlines() if "**Layout (f)" in line]
+    assert all("EnterWorktree" not in line for line in layout)
+
+
+def test_lanes_keep_tmpdir_and_home_out_of_slash_tmp():
+    assert missing("roles/lane.md", ["`TMPDIR` and `HOME` in a `mktemp -d /var/tmp/…` folder, not under `/tmp`",
+                                     "an empty `/tmp/.git`", "12 `test_hierarchy_root.py` tests",
+                                     "your own `$CLAUDE_JOB_DIR/tmp`"]) == []
+    assert "Keep `TMPDIR` under `/tmp`" not in words("roles/lane.md")
+    assert "`mktemp` dir under `/tmp`" not in words("roles/lane.md")
+
+
+def test_lanes_never_cd_into_the_dogfood_folder_and_check_pwd_before_writing():
+    assert missing("roles/lane.md", ["never `cd` into the dogfood folder (`aegis-hierarchy-dogfood`), even as a writer",
+                                     "run `pwd` before your first Write"]) == []
+    assert words("roles/lane.md").count("bare `cd`") == 1
+
+
+@pytest.mark.parametrize("name", ["roles/builder.md", "roles/integrator.md"])
+def test_builders_and_integrators_push_only_under_the_briefs_push_exception(name):
+    assert missing(name, ["You do not push unless the brief's push-exception field names an owner decision "
+                          "and its ref pattern (T24)"]) == []
+
+
+def test_lanes_lint_with_ruffs_defaults_and_keep_large_modules_inside_their_budget():
+    assert missing("roles/lane.md", ["`ruff check --no-cache <paths>` with ruff's default rules",
+                                     "stricter than `make lint`", "`tests/contract/test_module_size.py`",
+                                     "shrink-only"]) == []
+
+
+def test_the_lane_brief_lives_inside_the_initiative_folder():
+    assert missing("lane-brief.md", ["`initiatives/<id>/briefs/`", "refuses a brief outside the mailbox's parent folder",
+                                     "`tools/hierarchy_mailbox.py:315-317`"]) == []
+
+
+def test_the_corrected_lane_facts_and_attributions_stay_pinned():
+    assert missing("roles/lane.md", ["repair would rewrite 107 pointers", "tests (each with its digest)",
+                                     "**Absolute paths, T100.** Packets, prompts and specs write every path in a command "
+                                     "line as absolute", "**Layout (f), T38 and T48.**"]) == []
+    assert missing("lane-brief.md", ["(layout f, T38 and T48)"]) == []
 
 
 def test_the_manifest_template_gives_each_hierarchy_a_root_routed_only_to_its_orchestrator(tmp_path):

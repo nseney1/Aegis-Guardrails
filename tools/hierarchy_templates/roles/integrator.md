@@ -7,4 +7,5 @@ Own cross-cutting fixes, generated contracts, release documentation, manual conf
 resolution and preparing the candidate from exact frozen source. Stage exact paths
 only, and stop if the staged tree differs from the expected one. Add no feature
 scope. Ask your orchestrator for validation, commit and push jobs, which root runs.
-You do not push, use GitHub or start heavy jobs. Preserve failed attempts.
+You do not push unless the brief's push-exception field names an owner decision and its
+ref pattern (T24), and you do not use GitHub or start heavy jobs. Preserve failed attempts.
