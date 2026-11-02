@@ -23,7 +23,8 @@ because they may be evidence. Files a recipe names in `keep` are copied to `evid
 A receipt is a claim with evidence references, never a verdict on the work. Bubblewrap keeps
 accidents contained, but this runs under one OS user and is not a security boundary: Git inspection
 of a checkout runs outside the sandbox, so a process that edits that checkout's `.git/config` could
-run code there. A process that starts its own session also escapes the stop at the end of a step.
+run code there. In a bubblewrap recipe every process of the job lives in the sandbox's PID namespace and
+ends with it. Under `sandbox: none` a process that starts its own session escapes the stop at the end of a step.
 Linux only, because the census and the liveness checks read /proc.
 """
 from __future__ import annotations
@@ -689,8 +690,10 @@ def sandbox_prefix(recipes, recipe, job, checkout):
     bwrap = shutil.which("bwrap")
     require(bwrap is not None, "this recipe needs bubblewrap, which is not available")
     # No --new-session: the job runs in a session of its own with no terminal, and staying in one
-    # process group is what lets the stop at the end of a step reach every child.
-    argv = [bwrap, "--die-with-parent", "--unshare-net", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
+    # process group is what lets the stop at the end of a step reach every child. A child that calls
+    # setsid leaves that group, so the PID namespace is what takes it down: when the stop ends bwrap,
+    # --die-with-parent ends the namespace's first process and the kernel ends every other one in it.
+    argv = [bwrap, "--die-with-parent", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
     for folder in recipes.get("hide", []):
         argv += ["--tmpfs", folder]
     argv += ["--dev", "/dev", "--proc", "/proc"]

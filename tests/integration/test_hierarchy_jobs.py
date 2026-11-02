@@ -31,7 +31,8 @@ EMPTY = hashlib.sha256(b"").hexdigest()
 def bubblewrap_works():
     if shutil.which("bwrap") is None:
         return False
-    probe = subprocess.run(["bwrap", "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"],
+    probe = subprocess.run(["bwrap", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+                            "true"],
                            capture_output=True, timeout=10)
     return probe.returncode == 0
 
@@ -1413,6 +1414,31 @@ def test_a_sandboxed_job_is_contained(shop):
         assert not (shop.checkout / "planted").exists() and not outside.exists()
     finally:
         shutil.rmtree(hidden, ignore_errors=True)
+
+
+ORPHAN = ("import subprocess, sys, time\n"
+          "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', sys.argv[1]], start_new_session=True)\n"
+          "print('started', flush=True)\ntime.sleep(60)\n")
+
+
+@needs_bubblewrap
+def test_a_sandboxed_step_past_its_timeout_takes_its_own_sessions_with_it(shop):
+    """The stop at the end of a step reaches the step's group. A child that called setsid left that group, so only
+    the sandbox's own PID namespace can take it down with the job."""
+    marker = "marker-" + uuid.uuid4().hex
+    shop.recipes["recipes"]["escapes"] = shop.command(["$python", "-c", ORPHAN, marker], sandbox="bwrap", timeout_seconds=2)
+    shop.save_recipes()
+    shop.request_job("job-1", "escapes")
+    try:
+        assert shop.run_open()["rows"][0]["state"] == "failed"
+        assert "timed out" in shop.receipts("job-1")[-1]["receipt"]["reason"]
+        deadline = time.monotonic() + 5
+        while processes_with(marker) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert processes_with(marker) == []
+    finally:
+        for pid in processes_with(marker):
+            os.kill(pid, signal.SIGKILL)
 
 
 FORGER = """
