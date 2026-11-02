@@ -13,9 +13,9 @@ import sys
 import traceback
 
 GO_HELPER = '.github/fixtures/go-functional/acceptance.py'
-GO_SHA = 'e3ec16675589f2af65fe4c00f2bfaa3f7da372b0f8abddec567bc08eb8830cbf'
+GO_SHA = '845b08410b19d51245dce0e7fdc2f6209314ce4356e75a96382e391e8ffa2456'
 OWNER = '.github/fixtures/ac24/acceptance.py'
-OWNER_SHA = '692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474'
+OWNER_SHA = 'db2995e528007c2bb17fabada5e708c3107e83607efd4a6acad4ad35d0f9cf7b'
 COMMANDS = []
 
 
