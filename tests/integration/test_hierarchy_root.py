@@ -692,6 +692,8 @@ def test_rebind_does_not_acknowledge_when_a_spec_brief_is_missing_from_the_check
     assert row["ready"] is False and row["briefs"]["missing_from_checkpoint"] == [sha(extra.read_bytes())]
     assert invoke(root, "status")["bindings"]["alpha/front-door"]["ready"] is False
     assert list(acks.iterdir()) == []
+    # P3-1: exit 2 from rebind still leaves its result written (the documented contract).
+    assert json.loads((tmp_path / "result.json").read_text(encoding="utf-8")) == out
 
 
 def test_rebind_plan_writes_nothing(tmp_path):
@@ -829,13 +831,18 @@ def rotation(tmp_path):
     return files
 
 
+def transfer_argv(files, *extra, ack_sha=None, custody_sha=None):
+    return [str(a) for a in (
+        "transfer", "--facts", files["facts"], "--ack", files["ack"],
+        "--ack-sha256", ack_sha or sha(files["ack"].read_bytes()), "--final-delta", files["delta"],
+        "--prev-spec", files["prev"], "--spec-out", files["spec_out"],
+        "--transfer-out", files["transfer_out"], "--custody", files["custody"],
+        "--expect-custody-sha256", custody_sha or sha(files["custody"].read_bytes()),
+        "--min-free-mb", "1", *extra)]
+
+
 def transfer(files, *extra, ack_sha=None, custody_sha=None):
-    return run_tool("transfer", "--facts", files["facts"], "--ack", files["ack"],
-                    "--ack-sha256", ack_sha or sha(files["ack"].read_bytes()), "--final-delta", files["delta"],
-                    "--prev-spec", files["prev"], "--spec-out", files["spec_out"],
-                    "--transfer-out", files["transfer_out"], "--custody", files["custody"],
-                    "--expect-custody-sha256", custody_sha or sha(files["custody"].read_bytes()),
-                    "--min-free-mb", "1", *extra)
+    return run_tool(*transfer_argv(files, *extra, ack_sha=ack_sha, custody_sha=custody_sha))
 
 
 def test_transfer_writes_spec_and_transfer_and_syncs_every_custody_field(rotation):
@@ -1037,6 +1044,60 @@ def test_startup_ack_requires_the_rendezvous_sha256_and_refuses_changed_bytes(st
     assert code == 2
     assert {c["name"]: c["ok"] for c in out["critical_checks"]}["rendezvous_awaits_this_host"] is False
     assert not startup["out"].exists()
+
+
+# --- P3-1: what each subcommand leaves behind on exit 2 -----------------------------------------
+
+
+def test_help_documents_what_exit_2_leaves_behind_per_subcommand():
+    proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), "--help"], capture_output=True, timeout=60,
+                          stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0
+    page = proc.stdout.decode("utf-8")
+    assert "What exit 2 leaves behind" in page
+    section = page.split("What exit 2 leaves behind", 1)[1].split("\n\n", 1)[0]
+    assert "a session may be running; see record.stop_command" in section
+    for command in ("launch", "rebind", "transfer", "startup-ack", "verify-retired"):
+        assert command in section
+
+
+def test_exit_2_from_launch_writes_no_record_before_the_launch_and_one_after(tmp_path, stub, prompt_file):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    refused = tmp_path / ".claude" / "worktrees" / "x"
+    refused.mkdir(parents=True)
+    spec_path, _ = launch_spec(tmp_path, prompt_file, cwd=str(refused), record_out=str(out_dir / "record.json"))
+    code, out, _ = launch(stub, spec_path)
+    assert code == 2, out
+    assert list(out_dir.iterdir()) == [] and not stub.launched()
+    spec_path, spec = launch_spec(tmp_path, prompt_file, record_out=str(out_dir / "record.json"))
+    stub.serve("launch.json", {"session": SESSION, "projects": str(tmp_path / "elsewhere"), "assistant": True})
+    code, out, _ = launch(stub, spec_path, "--wait-s", "0.2")
+    assert code == 2, out
+    assert [p.name for p in out_dir.iterdir()] == ["record.json"] and stub.launched()
+    record = json.loads((out_dir / "record.json").read_text(encoding="utf-8"))
+    assert record["verdict"].startswith("first prompt unverified")
+    assert record["stop_command"] == "claude stop " + SESSION[:8]
+
+
+def test_exit_2_from_the_transfer_cas_leaves_spec_and_transfer_written(tool, rotation, monkeypatch, capsys):
+    real = tool.file_ref
+    raced = []
+
+    def racing_file_ref(path):
+        ref = real(path)
+        if Path(path) == rotation["transfer_out"]:  # another custody writer between the transfer write and the CAS
+            rotation["custody"].write_bytes(rotation["custody"].read_bytes() + b" ")
+            raced.append(rotation["custody"].read_bytes())
+        return ref
+
+    monkeypatch.setattr(tool, "file_ref", racing_file_ref)
+    code = tool.main(transfer_argv(rotation))
+    out = json.loads(capsys.readouterr().out)
+    assert code == 2, out
+    assert "changed" in out["error"] and raced
+    assert rotation["spec_out"].exists() and rotation["transfer_out"].exists()
+    assert rotation["custody"].read_bytes() == raced[0]
 
 
 def test_startup_ack_plan_writes_nothing(stub, startup):

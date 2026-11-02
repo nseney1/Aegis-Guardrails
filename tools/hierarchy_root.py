@@ -9,10 +9,33 @@ investigation F-A, F-B; ROOT C5 F1, F2, F5).
 
 Every subcommand prints one JSON object. Exit codes:
   0  ok
-  2  a critical check failed; nothing was written
+  2  a critical check failed; what may already be written depends on the subcommand
   3  the target exists and differs, or the session name is already live
-  4  IO or disk error, including free space below --min-free-mb (checked before any write)
+  4  IO or disk error, including free space below --min-free-mb (checked before the first write)
   5  a human-answerable dialog is pending (the record is still written)
+
+What exit 2 leaves behind, per subcommand (never assume "no side effects" on a retry):
+  first-prompt-check, lanes-health
+      never write.
+  startup-ack, verify-retired
+      nothing: every check runs before the only write (the ACK; the custody CAS).
+  launch
+      refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree): nothing,
+      and no session. After claude --bg (launch failed, first prompt unverified): the
+      record is written and a session may be running; see record.stop_command. Exit 3
+      or 4 after claude --bg means the record could not be written: the error output
+      carries the whole record, stop_command included.
+  rebind
+      a spec refusal writes nothing. Otherwise the handoff may already have bound
+      endpoints, ack requests may be written and acknowledged, and --result-out is
+      written; entries[].ready says which endpoints are not ready.
+  transfer
+      refused before the first write (facts, ACK, packet, custody checks): nothing.
+      Refused by the final custody CAS (custody changed during the run): --spec-out and
+      --transfer-out are written and custody is unchanged.
+
+launch takes --test-tmp-root only in tests: it replaces /tmp in the refused-cwd check,
+because pytest's tmp_path is under /tmp.
 
 These tools never stop, attach to or answer a session: a host may refuse a stop, so a
 stop stays a visible, explicit command (T27, T13). Where one is needed the tool prints
