@@ -390,7 +390,8 @@ def log_tail(folder):
 
 
 def result_body(job, result):
-    lines = ["Job %s: %s, exit %s." % (job.id, result["state"], result["exit_code"])]
+    lines = ["Job %s: %s." % (job.id, result["state"]) if result["exit_code"] is None
+             else "Job %s: %s, exit %s." % (job.id, result["state"], result["exit_code"])]
     if result.get("reason"):
         lines.append(result["reason"])
     if result.get("commit"):
@@ -424,7 +425,9 @@ def settle(store, job, wait):
                 elif request["state"] == "queued":
                     store.append(ledger, "withdraw", {"request_id": request["request_id"], "source": "job runner"})
 
-    patient(release, wait)
+    # Most jobs hold no slot, and a job that holds nothing should not wait on the store's lock.
+    if any(r["holder"] == job.holder and r["state"] in ("queued", "granted") for r in store.load().requests.values()):
+        patient(release, wait)
     row = {"job": job.id, "state": state, "exit_code": result["exit_code"], "result": str(job.result_path)}
     if result.get("reason"):
         row["reason"] = result["reason"]
@@ -438,8 +441,8 @@ def write_result(job, state, exit_code, *, reason=None, recipe=None, steps=(), b
     publish_file(job.result_path, encoded(result) + b"\n", limit=MAX_RESULT_BYTES)
 
 
-def refuse(store, job, reason, packet_raw, wait):
-    if not job.claim(packet_raw):
+def refuse(store, job, reason, wait):
+    if not job.claim(None):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     write_result(job, "refused", None, reason=reason[:4096])
     return settle(store, job, wait)
@@ -604,7 +607,11 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
-    before = mailbox.source_witness(checkout)
+    try:
+        before = mailbox.source_witness(checkout)
+    except ERRORS as exc:
+        write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048])
+        return settle(store, job, wait)
     if (before["source_revision"], before["source_tree"], before["dirty_state_sha256"]) != (
             packet["commit"], packet["tree"], packet["dirty_state_sha256"]):
         # The job may have waited hours for a slot, so the exact source is checked again here.
@@ -618,7 +625,13 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce)
     except ERRORS as exc:
         rows, reason, exit_code, created = [], "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT, None
-    after = mailbox.source_witness(checkout)
+    try:
+        after = mailbox.source_witness(checkout)
+    except ERRORS as exc:
+        # Without this the job would have no result, and so no receipt, and would hold its slot.
+        after = None
+        reason = reason or "could not witness the source afterward: " + str(exc)[:2048]
+        exit_code = exit_code or NO_VERDICT_EXIT
     if not reason:
         if recipe["kind"] == "commit":
             if (after["source_revision"], after["source_tree"]) != (created, packet["expected_tree"]):
@@ -691,7 +704,7 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
                 packet, raw = admit(ledger, initiative, message, mailbox, recipes)
             except ERRORS as exc:
                 try:
-                    rows.append(refuse(store, job, str(exc), None, wait))
+                    rows.append(refuse(store, job, str(exc), wait))
                 except ERRORS as failure:
                     rows.append(blocked_row(job, failure))
                 continue
@@ -723,12 +736,12 @@ def census(store_path, ledger, fixture):
     return {"limit": ledger.limits["heavy"], "held": len(held), "external_roots": outside_heavy_roots(owners), "census": "proc"}
 
 
-def run_heavy(store, heavy, recipes, wait, fixture, budget, rows):
+def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=False):
     """Grant in the ledger's own order, which applies the owner's priorities, until nothing more can start."""
     waiting = dict(heavy)
-    held_reason = None
+    held_reason = "store_busy" if store_busy else None
     capacity = None
-    while waiting and budget > 0:
+    while waiting and budget > 0 and not store_busy:
         ledger = store.load()
         capacity = census(store.path, ledger, fixture)
         granted = next((holder for holder in waiting
@@ -737,7 +750,13 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows):
             if capacity["held"] + len(capacity["external_roots"]) >= capacity["limit"]:
                 held_reason = "capacity_full"
                 break
-            code, answer = patient(lambda: grant_next(store, "heavy"), wait)
+            try:
+                code, answer = patient(lambda: grant_next(store, "heavy"), wait)
+            except ValueError as exc:
+                if "busy" not in str(exc):
+                    raise
+                held_reason = "store_busy"
+                break
             if code != 0:
                 held_reason = answer.get("reason", "not_granted")
                 break
@@ -756,7 +775,6 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows):
         if capacity is not None:
             row["capacity"] = capacity
         rows.append(row)
-    return budget
 
 
 NEEDS_ROOT = {"waiting", "running", "abandoned", "settle_pending", "mailbox_error", "granted_elsewhere"}
@@ -776,10 +794,17 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait):
     ready = admit_requests(store, ledger, initiatives, recipes, wait, rows)
     budget = max_jobs
     heavy = {}
+    store_busy = False
     for job, packet, raw in ready:
         if is_heavy(recipes["recipes"][packet["recipe"]]):
             heavy[job.holder] = (job, packet, raw)
-            enqueue(store, job, wait)
+            try:
+                enqueue(store, job, wait)
+            except ValueError as exc:
+                # Nothing has started, so this job just waits. Other work still gets done and reported.
+                if "busy" not in str(exc):
+                    raise
+                store_busy = True
         elif budget > 0:
             budget -= 1
             try:
@@ -788,7 +813,7 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait):
                 rows.append(blocked_row(job, exc))
         else:
             rows.append({"job": job.id, "state": "waiting", "reason": "job_limit"})
-    run_heavy(store, heavy, recipes, wait, fixture, budget, rows)
+    run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy)
     return (3 if any(row["state"] in NEEDS_ROOT for row in rows) else 0), {"rows": rows}
 
 

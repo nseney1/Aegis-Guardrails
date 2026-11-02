@@ -252,6 +252,7 @@ def test_a_bad_packet_is_refused_with_a_reason_and_nothing_runs(shop, recipe, ch
     assert shop.states("job-1") == ["refused"]
     assert not shop.sentinel.exists()
     assert shop.open_jobs() == []
+    assert "exit None" not in final["body"]
 
 
 def test_a_packet_that_is_not_json_is_refused(shop):
@@ -470,6 +471,31 @@ def test_source_that_changes_during_a_job_fails_it_even_with_a_clean_exit(shop):
     recorded = json.loads(verified_evidence(final)["result.json"].read_text())
     assert recorded["steps"][0]["exit_code"] == 0
     assert recorded["before"]["dirty_state_sha256"] != recorded["after"]["dirty_state_sha256"]
+
+
+def test_a_checkout_that_cannot_be_witnessed_afterward_fails_the_job_and_frees_its_slot(shop):
+    script = "import shutil; shutil.rmtree(%r)" % str(shop.checkout / ".git")
+    shop.recipes["recipes"]["breaks"] = shop.command(["$python", "-c", script], heavy=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "breaks")
+    assert shop.run_open()["rows"][0]["state"] == "failed"
+    final = shop.receipts("job-1")[-1]
+    assert "could not witness" in final["receipt"]["reason"]
+    assert verified_evidence(final) and shop.heavy()["used"] == 0 and shop.open_jobs() == []
+
+
+def test_a_busy_store_leaves_a_heavy_job_waiting_and_loses_nothing(shop):
+    shop.request_job("job-1", "heavy")
+    shop.request_job("job-2", "touch")
+    lock = shop.workspace.store / ".write.lock"
+    lock.write_text("fixture active writer")
+    rows = {row["job"]: row for row in shop.run_open(lock_wait=0.1, expect=3)["rows"]}
+    assert rows["pilot/job-1"]["state"] == "waiting" and rows["pilot/job-1"]["reason"] == "store_busy"
+    assert rows["pilot/job-2"]["state"] == "completed", "other work still gets done and reported"
+    assert shop.receipts("job-1") == []
+    lock.unlink()
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    assert shop.heavy()["used"] == 0
 
 
 def wait_for(path, seconds=10):

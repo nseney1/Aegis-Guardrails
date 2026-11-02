@@ -131,7 +131,7 @@ def test_the_job_recipe_template_needs_local_values_then_passes_its_own_check(tm
     recipes.update(python=sys.executable, hide=[str(tmp_path)])
     result = check()
     assert result.returncode == 0, result.stdout
-    assert set(json.loads(result.stdout)["recipes"]) == {"targeted-tests", "full-suite", "lint", "commit-exact"}
+    assert set(json.loads(result.stdout)["recipes"]) == {"targeted-tests", "full-suite", "lint", "aegis-check", "commit-exact"}
     assert not any(word == "push" for recipe in recipes["recipes"].values() for step in recipe.get("steps", []) for word in step)
     assert all(recipe["sandbox"] == "bwrap" for recipe in recipes["recipes"].values())
 

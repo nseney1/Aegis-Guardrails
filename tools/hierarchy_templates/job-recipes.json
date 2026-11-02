@@ -88,6 +88,21 @@
         ]
       ]
     },
+    "aegis-check": {
+      "kind": "command",
+      "heavy": false,
+      "sandbox": "bwrap",
+      "timeout_seconds": 300,
+      "steps": [
+        [
+          "$python",
+          "-B",
+          "-m",
+          "aegis_cli",
+          "check"
+        ]
+      ]
+    },
     "commit-exact": {
       "kind": "commit",
       "sandbox": "bwrap",

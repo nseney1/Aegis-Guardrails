@@ -19,6 +19,8 @@ from tests.integration.test_hierarchy_mailbox import HELPER, ROOT, git, invoke
 from tests.integration.test_hierarchy_workspace import Workspace
 
 
+# Generated profiles use POSIX paths and the wake tool needs POSIX process groups.
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="generated profiles and wakes are POSIX only")
 PROVISION = ROOT / "tools" / "hierarchy_provision.py"
 WAKE = ROOT / "tools" / "hierarchy_wake.py"
 INITIATIVE = {"id": "pilot", "project": "aegis", "repository": "aegis", "priority": 5, "target_branch": "develop"}

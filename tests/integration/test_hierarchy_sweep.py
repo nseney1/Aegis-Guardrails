@@ -21,6 +21,7 @@ from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup,
 SWEEP = ROOT / "tools" / "hierarchy_sweep.py"
 FAKE_HOST = Path(__file__).with_name("hierarchy_fake_host.py")
 posix_only = pytest.mark.skipif(os.name == "nt", reason="the wake tool supports POSIX process groups only")
+pytestmark = posix_only
 
 
 class Fleet(Setup):

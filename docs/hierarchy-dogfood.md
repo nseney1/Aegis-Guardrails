@@ -58,8 +58,9 @@ tool jobs --store "$TRIAL/store" --recipes "$TRIAL/recipes.json" check-recipes
 `hide` lists folders a job must not see, such as your home folder, which holds credentials.
 If the interpreter, a virtual environment or a Rust toolchain lives inside one, add that folder
 to `ro_binds`, and set `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN` in `env` for Rust tests.
-The template has no push recipe on purpose. Pushing stays with root, and merges and
-signatures stay with the owner.
+The template offers `targeted-tests`, `full-suite`, `lint`, `aegis-check` and `commit-exact`, and
+has no push recipe on purpose. Pushing stays with root, and merges and signatures stay with the
+owner.
 
 ## Add an initiative
 
