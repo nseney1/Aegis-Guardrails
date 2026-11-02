@@ -3,6 +3,7 @@
 No test starts a real claude or Codex session: launch and lanes-health read a stub
 ``claude`` placed first on PATH that serves recorded fixtures.
 """
+import errno
 import hashlib
 import json
 import os
@@ -20,9 +21,22 @@ SESSION = "5daa90d5-59c3-4bc9-ac88-2bd3454167e8"
 LAUNCHER_TEXT = ("import hashlib, json, os, subprocess\n" + "x = 1\n" * 400)[:2308]
 
 
-def run_tool(*args, stdin=b"", env=None, timeout=60):
-    proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *[str(a) for a in args]], input=stdin,
-                          capture_output=True, timeout=timeout, env=env if env is not None else dict(os.environ))
+# D-P3-1: pytest's tmp_path is under /tmp, which launch refuses as a cwd. Tests replace
+# TMP_ROOT inside the tool's own process; the command line has no seam that turns it off.
+DRIVER = ("import importlib.util, sys\n"
+          "spec = importlib.util.spec_from_file_location('hierarchy_root', sys.argv[1])\n"
+          "tool = importlib.util.module_from_spec(spec)\n"
+          "spec.loader.exec_module(tool)\n"
+          "tool.TMP_ROOT = sys.argv[2]\n"
+          "sys.exit(tool.main(sys.argv[3:]))\n")
+
+
+def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None, tmp_root=None):
+    head = [sys.executable, "-B", "-I", str(TOOL)] if tmp_root is None else \
+        [sys.executable, "-B", "-I", "-c", DRIVER, str(TOOL), str(tmp_root)]
+    proc = subprocess.run([*head, *[str(a) for a in args]], input=stdin,
+                          capture_output=True, timeout=timeout, env=env if env is not None else dict(os.environ),
+                          cwd=cwd)
     out = proc.stdout.decode("utf-8")
     return proc.returncode, (json.loads(out) if out.strip() else None), proc.stderr.decode("utf-8")
 
@@ -123,6 +137,309 @@ def test_first_prompt_check_fails_without_a_user_record(tmp_path, prompt_file):
     assert out["ok"] is False and out["first_user_record"] is None
 
 
+# --- T92, T100: check-hashes ------------------------------------------------------------------
+
+FABRICATED = "9f827392a61b2e8b8f0d8b8ec8a6a0a9c2a6b6c1e4e1f1d6bb3d8b5f8f3d2c1a"  # the C7 incident's typed value
+
+
+@pytest.fixture
+def named(tmp_path):
+    path = tmp_path / "briefs" / "lane-brief.md"
+    path.parent.mkdir()
+    path.write_text("# Lane brief\n", encoding="utf-8")
+    return path
+
+
+def check_hashes(path, *extra, cwd=None):
+    return run_tool("check-hashes", path, *extra, cwd=cwd)
+
+
+def test_check_hashes_refuses_a_typed_hash_next_to_a_real_path_naming_the_line(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("You are a lane.\nYour brief is %s (sha256 %s).\n" % (named, FABRICATED), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert out["ok"] is False and out["tokens"] == 1 and out["checked"] == []
+    [miss] = out["unmatched"]
+    assert miss["token"] == FABRICATED and miss["line"] == 2
+    assert miss["candidates"] == [{"path": str(named), "line": 2, "sha256": sha(named.read_bytes())}]
+    assert "line 2" in out["error"]
+
+
+@pytest.mark.parametrize("layout", ["same_line", "line_above"])
+def test_check_hashes_accepts_a_correct_hash_on_the_same_line_or_the_line_above(tmp_path, named, layout):
+    real = sha(named.read_bytes())
+    body = ("Brief: %s sha256 %s\n" % (named, real) if layout == "same_line"
+            else "Brief:\n- path `%s`\n- sha256 `%s`\n" % (named, real))
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text(body, encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 0, (out, err)
+    line = 1 if layout == "same_line" else 3
+    assert out["ok"] is True and out["unmatched"] == []
+    assert out["checked"] == [{"token": real, "line": line, "path": str(named),
+                               "via": layout}]
+
+
+def test_check_hashes_refuses_a_hash_whose_path_is_two_lines_up(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("%s\n\nsha256 %s\n" % (named, sha(named.read_bytes())), encoding="utf-8")
+    code, out, _ = check_hashes(prompt)
+    assert code == 6 and out["unmatched"][0]["line"] == 3 and out["unmatched"][0]["candidates"] == []
+
+
+def test_check_hashes_never_takes_a_relative_or_traversing_path_as_a_candidate(tmp_path, named):
+    """T100: a relative path resolves against whatever cwd the checker happens to run in."""
+    real = sha(named.read_bytes())
+    traversing = "%s/../briefs/%s" % (named.parent, named.name)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Brief briefs/lane-brief.md (sha256 %s)\nAgain %s (sha256 %s)\n" % (real, traversing, real),
+                      encoding="utf-8")
+    code, out, err = check_hashes(prompt, cwd=tmp_path)
+    assert code == 6, (out, err)
+    assert [miss["line"] for miss in out["unmatched"]] == [1, 2]
+    assert all(miss["candidates"] == [] for miss in out["unmatched"])
+    refused = {(row["line"], row["path"]): row["reason"] for row in out["refused_paths"]}
+    assert refused[(1, "briefs/lane-brief.md")].startswith("relative path")
+    assert refused[(2, traversing)].startswith("path with '..'")
+
+
+def test_check_hashes_matches_a_source_file_anywhere(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("checkpoint sha256 %s, no path here\n" % sha(named.read_bytes()), encoding="utf-8")
+    code, out, _ = check_hashes(prompt)
+    assert code == 6
+    code, out, err = check_hashes(prompt, "--source", named)
+    assert code == 0, (out, err)
+    assert out["checked"] == [{"token": sha(named.read_bytes()), "line": 1, "path": str(named), "via": "source"}]
+    assert out["sources"] == [{"path": str(named), "sha256": sha(named.read_bytes())}]
+
+
+@pytest.mark.parametrize("bad", ["relative", "traversal"])
+def test_check_hashes_refuses_a_relative_source_or_file_naming_the_argument(tmp_path, named, bad):
+    value = "briefs/lane-brief.md" if bad == "relative" else "%s/../briefs/lane-brief.md" % named.parent
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("nothing\n", encoding="utf-8")
+    code, out, _ = check_hashes(prompt, "--source", value, cwd=tmp_path)
+    assert code == 2, out
+    assert "--source" in out["error"] and value in out["error"]
+    code, out, _ = check_hashes("prompt.txt", cwd=tmp_path)
+    assert code == 2 and "check-hashes file" in out["error"] and "prompt.txt" in out["error"]
+
+
+def render(template, *extra, cwd=None):
+    return run_tool("render-prompt", "--template", template, *extra, cwd=cwd)
+
+
+@pytest.fixture
+def template(tmp_path):
+    path = tmp_path / "prompt.template"
+    path.write_text("You are a lane.\nYour brief is {path:brief} (sha256 {sha256:brief}).\n"
+                    "Template:\n- {path:role}\n- sha256 {sha256:role}\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def role(tmp_path):
+    path = tmp_path / "roles" / "lane.md"
+    path.parent.mkdir()
+    path.write_text("# Shared lane rules\n", encoding="utf-8")
+    return path
+
+
+def test_render_prompt_fills_paths_and_hashes_and_its_output_passes_check_hashes(tmp_path, template, named, role):
+    out_path = tmp_path / "rendered" / "prompt.txt"
+    out_path.parent.mkdir()
+    code, out, err = render(template, "--path", "brief=%s" % named, "--path", "role=%s" % role, "--out", out_path)
+    assert code == 0, (out, err)
+    expected = ("You are a lane.\nYour brief is %s (sha256 %s).\nTemplate:\n- %s\n- sha256 %s\n"
+                % (named, sha(named.read_bytes()), role, sha(role.read_bytes())))
+    assert out_path.read_text(encoding="utf-8") == expected
+    assert out["out"] == {"path": str(out_path), "sha256": sha(expected.encode("utf-8"))}
+    assert out["filled"] == [{"key": "brief", "path": str(named), "sha256": sha(named.read_bytes())},
+                             {"key": "role", "path": str(role), "sha256": sha(role.read_bytes())}]
+    code, checked, err = check_hashes(out_path)
+    assert code == 0 and checked["tokens"] == 2, (checked, err)
+    code, printed, _ = render(template, "--path", "brief=%s" % named, "--path", "role=%s" % role)
+    assert code == 0 and printed["text"] == expected and printed["out"] is None
+
+
+@pytest.mark.parametrize("argument", ["--template", "--path", "--out"])
+def test_render_prompt_refuses_a_relative_path_naming_the_argument_and_value(tmp_path, template, named, role,
+                                                                             argument):
+    args = {"--template": str(template), "brief": str(named), "role": str(role), "--out": str(tmp_path / "o.txt")}
+    value = "roles/lane.md" if argument == "--path" else ("prompt.template" if argument == "--template" else "o.txt")
+    args["role" if argument == "--path" else argument] = value
+    code, out, _ = run_tool("render-prompt", "--template", args["--template"], "--path", "brief=" + args["brief"],
+                            "--path", "role=" + args["role"], "--out", args["--out"], cwd=tmp_path)
+    assert code == 2, out
+    assert argument in out["error"] and value in out["error"]
+    assert not (tmp_path / "o.txt").exists()
+
+
+@pytest.mark.parametrize("problem", ["unused_key", "missing_path", "unknown_kind", "duplicate_key", "bad_key"])
+def test_render_prompt_refuses_unknown_unused_and_unfilled_keys(tmp_path, template, named, role, problem):
+    extra = ["--path", "brief=%s" % named, "--path", "role=%s" % role]
+    if problem == "unused_key":
+        extra += ["--path", "spare=%s" % named]
+    elif problem == "missing_path":
+        extra = extra[:2]
+    elif problem == "unknown_kind":
+        template.write_text(template.read_text(encoding="utf-8") + "md5 {md5:brief}\n", encoding="utf-8")
+    elif problem == "duplicate_key":
+        extra += ["--path", "brief=%s" % role]
+    else:
+        extra += ["--path", "=%s" % named]
+    out_path = tmp_path / "o.txt"
+    code, out, _ = render(template, *extra, "--out", out_path)
+    assert code == 2, out
+    word = {"unused_key": "unused", "missing_path": "no --path", "unknown_kind": "unknown placeholder",
+            "duplicate_key": "twice", "bad_key": "invalid --path key"}[problem]
+    assert word in out["error"]
+    assert not out_path.exists()
+
+
+def test_render_prompt_refuses_an_existing_out_file(tmp_path, template, named, role):
+    out_path = tmp_path / "o.txt"
+    out_path.write_text("keep\n", encoding="utf-8")
+    code, out, _ = render(template, "--path", "brief=%s" % named, "--path", "role=%s" % role, "--out", out_path)
+    assert code == 3, out
+    assert out_path.read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.parametrize("problem", ["typed_hash", "hash_far_from_path"])
+def test_render_prompt_refuses_output_that_would_fail_check_hashes(tmp_path, named, problem):
+    template = tmp_path / "t.template"
+    body = ("Brief {path:brief} (sha256 %s)\n" % FABRICATED if problem == "typed_hash"
+            else "Brief {path:brief}\n\nsha256 {sha256:brief}\n")
+    template.write_text(body, encoding="utf-8")
+    out_path = tmp_path / "o.txt"
+    code, out, _ = render(template, "--path", "brief=%s" % named, "--out", out_path)
+    assert code == 6, out
+    assert out["prompt_hashes"]["unmatched"] and not out_path.exists()
+
+
+STOP_LINE = 'claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null'  # the standard T99 c last action
+
+
+def test_render_prompt_leaves_shell_expansions_alone_and_its_output_passes_check_hashes(tmp_path, named):
+    """P2-1: the T99 c stop line parsed as placeholder kind CLAUDE_CODE_SESSION_ID, so no ROOT prompt rendered."""
+    template = tmp_path / "t.template"
+    template.write_text("Brief {path:brief} (sha256 {sha256:brief})\nLast action: %s\nAlso ${HOME:-/x} {md5:x}\n"
+                        % STOP_LINE, encoding="utf-8")
+    out_path = tmp_path / "o.txt"
+    code, out, _ = render(template, "--path", "brief=%s" % named, "--out", out_path)
+    assert code == 2 and "unknown placeholder kind {md5:x}" in out["error"], out
+    template.write_text("Brief {path:brief} (sha256 {sha256:brief})\nLast action: %s\nAlso ${HOME:-/x}\n"
+                        % STOP_LINE, encoding="utf-8")
+    code, out, err = render(template, "--path", "brief=%s" % named, "--out", out_path)
+    assert code == 0, (out, err)
+    assert out_path.read_text(encoding="utf-8") == ("Brief %s (sha256 %s)\nLast action: %s\nAlso ${HOME:-/x}\n"
+                                                     % (named, sha(named.read_bytes()), STOP_LINE))
+    code, checked, err = check_hashes(out_path)
+    assert code == 0 and checked["tokens"] == 1 and checked["unmatched"] == [], (checked, err)
+
+
+def test_check_hashes_counts_only_word_bounded_lowercase_64_hex(tmp_path, named):
+    """P3-1: a hash with one character dropped, doubled or uppercased passed unchecked; it is now refused."""
+    real = sha(named.read_bytes())
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("git %s, prefix %s, %s and %s\nupper %s\nlong %s\nshort %s\nmixed %s\nedges %s %s\nnone\n"
+                      % ("a" * 40, real[:8], "9" * 55, "8" * 73, "A" * 64, "b" * 65, "c" * 63, real[:63] + "F",
+                         "d" * 56, "e" * 72), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert out["ok"] is False and out["tokens"] == 0 and out["checked"] == [] and out["unmatched"] == []
+    assert [(row["line"], row["length"]) for row in out["malformed"]] == [(2, 64), (3, 65), (4, 63), (5, 64),
+                                                                          (6, 56), (6, 72)]
+    assert "malformed hash-like token" in out["error"] and "line 2" in out["error"]
+
+
+@pytest.mark.parametrize("shape", ["_%s_", "sha256_%s", "**%s**", "sha256:%s"])
+def test_check_hashes_treats_underscore_as_a_token_delimiter(tmp_path, named, shape):
+    """P3-1: `\\b` let `_<hex>_` (Markdown emphasis) and `sha256_<hex>` hide a typed hash."""
+    real = sha(named.read_bytes())
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Brief %s %s\n" % (named, shape % real), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 0, (out, err)
+    assert out["checked"] == [{"token": real, "line": 1, "path": str(named), "via": "same_line"}]
+    prompt.write_text("Brief %s %s\n" % (named, shape % FABRICATED), encoding="utf-8")
+    code, out, _ = check_hashes(prompt)
+    assert code == 6 and [miss["token"] for miss in out["unmatched"]] == [FABRICATED], out
+
+
+def test_check_hashes_accepts_a_repeat_of_a_token_matched_elsewhere_in_the_file(tmp_path, named):
+    """P3-2: a later "send ... sha256 <same hash>" exited 6 although the file already verified it."""
+    real = sha(named.read_bytes())
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Send sha256 %s first.\n\nBrief %s (sha256 %s)\n\nThen send sha256 %s.\nTyped %s twice %s\n"
+                      % (real, named, real, real, FABRICATED, FABRICATED), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert out["checked"] == [
+        {"token": real, "line": 1, "path": str(named), "via": "repeat", "match_line": 3},
+        {"token": real, "line": 3, "path": str(named), "via": "same_line"},
+        {"token": real, "line": 5, "path": str(named), "via": "repeat", "match_line": 3}]
+    assert [(miss["token"], miss["line"]) for miss in out["unmatched"]] == [(FABRICATED, 6), (FABRICATED, 6)]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "missing"])
+def test_check_hashes_follows_a_symlinked_candidate_and_refuses_a_directory_or_missing_one(tmp_path, named, kind):
+    """P3-4: a folder beside a hash never counts (the review-copy case); symlinks are followed (P3-3)."""
+    real = sha(named.read_bytes())
+    candidate = tmp_path / {"symlink": "link.md", "directory": "folder", "missing": "gone.md"}[kind]
+    if kind == "symlink":
+        candidate.symlink_to(named)
+    elif kind == "directory":
+        candidate.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Brief %s (sha256 %s)\n" % (candidate, real), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    if kind == "symlink":
+        assert code == 0, (out, err)
+        assert out["checked"] == [{"token": real, "line": 1, "path": str(candidate), "via": "same_line"}]
+        return
+    assert code == 6, (out, err)
+    [miss] = out["unmatched"]
+    error = "not a regular file" if kind == "directory" else os.strerror(errno.ENOENT)
+    assert miss["candidates"] == [{"path": str(candidate), "line": 1, "sha256": None, "error": error}]
+
+
+def test_check_hashes_never_takes_the_last_line_as_the_line_above_line_1(tmp_path, named):
+    """P3-4: without the at >= 0 guard, line 1's "line above" would be lines[-1]."""
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("sha256 %s\nmiddle\nBrief %s" % (sha(named.read_bytes()), named), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert [(miss["line"], miss["candidates"]) for miss in out["unmatched"]] == [(1, [])]
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized", "symlink"])
+def test_check_hashes_and_render_prompt_refuse_a_non_regular_or_oversized_input(tmp_path, named, kind):
+    """P3-3: Path.read_bytes() blocked forever on a FIFO and read /dev/zero without bound."""
+    target = tmp_path / "input.txt"
+    if kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "directory":
+        target.mkdir()
+    elif kind == "oversized":
+        target.write_text("x" * 262145, encoding="utf-8")
+    else:
+        real = tmp_path / "real.txt"
+        real.write_text("Brief {path:brief}\n", encoding="utf-8")
+        target.symlink_to(real)
+    word = {"fifo": "regular file", "directory": "regular file", "oversized": "exceeds 262144 bytes",
+            "symlink": "symlink"}[kind]
+    code, out, _ = run_tool("check-hashes", target, timeout=20)
+    assert code == 2 and "check-hashes file" in out["error"] and word in out["error"], out
+    out_path = tmp_path / "o.txt"
+    code, out, _ = run_tool("render-prompt", "--template", target, "--path", "brief=%s" % named, "--out", out_path,
+                            timeout=20)
+    assert code == 2 and "--template" in out["error"] and word in out["error"], out
+    assert not out_path.exists()
+
+
 # --- stub claude ------------------------------------------------------------------------------
 
 STUB = r'''
@@ -184,8 +501,7 @@ class Stub:
         claude.chmod(0o755)
         self.projects = tmp_path / "projects"
         self.projects.mkdir()
-        # pytest's tmp_path is under /tmp, which launch refuses as a cwd; tests pass this
-        # folder through the documented test-only --test-tmp-root seam instead.
+        # Launch tests refuse cwds under this folder instead of /tmp (see DRIVER, D-P3-1).
         self.tmp_root = tmp_path / "tmp-root"
 
     def env(self):
@@ -230,7 +546,29 @@ def launch_spec(tmp_path, prompt_file, **changes):
 def launch(stub, spec_path, *extra, stdin=b"import hashlib, json, os, subprocess  # launcher\n"):
     return run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects, "--poll-s", "0.05",
                     "--wait-s", "5", "--dialog-wait-s", "1", "--min-free-mb", "1",
-                    "--test-tmp-root", stub.tmp_root, *extra, stdin=stdin, env=stub.env())
+                    *extra, stdin=stdin, env=stub.env(), tmp_root=stub.tmp_root)
+
+
+def test_launch_has_no_tmp_seam_on_its_command_line(tmp_path, stub, prompt_file):
+    """D-P3-1: --test-tmp-root turned the /tmp refusal off in production and left no trace."""
+    for argv in (["--help"], ["launch", "--help"]):
+        proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *argv], capture_output=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+        assert proc.returncode == 0 and b"tmp-root" not in proc.stdout and b"Test-only" not in proc.stdout
+    spec_path, _ = launch_spec(tmp_path, prompt_file)
+    code, out, err = run_tool("launch", "--spec", spec_path, "--plan", "--test-tmp-root", tmp_path, env=stub.env())
+    assert code == 2 and out is None and "unrecognized arguments: --test-tmp-root" in err
+    assert not stub.launched()
+
+
+def test_launch_checks_free_space_before_probing_the_record_folder(tmp_path, stub, prompt_file):
+    """D-P3-6: exit 4's "checked before the first write" held only while the probe came second."""
+    spec_path, spec = launch_spec(tmp_path, prompt_file, record_out=str(tmp_path / "missing" / "record.json"))
+    code, out, _ = run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects,
+                            "--min-free-mb", str(10 ** 12), env=stub.env(), tmp_root=stub.tmp_root)
+    assert code == 4, out
+    assert out["error"].startswith("free space below --min-free-mb")
+    assert not stub.launched()
 
 
 def test_launch_records_an_exact_first_prompt_with_no_inherited_stdin(tmp_path, stub, prompt_file):
@@ -254,6 +592,64 @@ def test_launch_records_an_exact_first_prompt_with_no_inherited_stdin(tmp_path, 
     assert record["uses_enter_worktree"] is False
     assert record["first_prompt_check"]["ok"] is True and record["first_prompt_check"]["extra_chars"] == 0
     assert record["dialog"] is None
+
+
+def test_launch_refuses_an_unmatched_hash_in_the_prompt_and_starts_nothing(tmp_path, stub, named):
+    """T92: the C7 prompt carried a typed hash; launch must refuse before claude is called at all."""
+    prompt = tmp_path / "typed-prompt.txt"
+    prompt.write_text("You are a lane.\nBrief %s (sha256 %s)\n" % (named, FABRICATED), encoding="utf-8")
+    spec_path, spec = launch_spec(tmp_path, prompt)
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
+    for extra in (["--plan"], []):
+        code, out, _ = launch(stub, spec_path, *extra)
+        assert code == 6, out
+        assert "nothing launched" in out["error"] and "line 2" in out["error"]
+        [miss] = out["prompt_hashes"]["unmatched"]
+        assert miss["token"] == FABRICATED and miss["candidates"][0]["sha256"] == sha(named.read_bytes())
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+    assert not (stub.dir / "calls.jsonl").exists()
+
+
+def test_launch_records_every_checked_hash_pair(tmp_path, stub, named):
+    source = tmp_path / "checkpoint.json"
+    source.write_text('{"checkpoint": 1}\n', encoding="utf-8")
+    prompt = tmp_path / "hashed-prompt.txt"
+    prompt.write_text("You are a lane.\nBrief %s\n(sha256 %s)\nCheckpoint sha256 %s.\n"
+                      % (named, sha(named.read_bytes()), sha(source.read_bytes())), encoding="utf-8")
+    spec_path, spec = launch_spec(tmp_path, prompt, hash_sources=[str(source)])
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
+    code, out, _ = launch(stub, spec_path, "--plan")
+    assert code == 0 and out["prompt_hashes"]["tokens"] == 2, out
+    code, out, err = launch(stub, spec_path)
+    assert code == 0, (out, err)
+    record = json.loads(Path(spec["record_out"]).read_text(encoding="utf-8"))
+    assert record["prompt_hashes"]["checked"] == [
+        {"token": sha(named.read_bytes()), "path": str(named), "line": 3, "via": "line_above"},
+        {"token": sha(source.read_bytes()), "path": str(source), "line": 4, "via": "source"}]
+    assert record["prompt_hashes"]["sources"] == [{"path": str(source), "sha256": sha(source.read_bytes())}]
+
+
+def test_launch_refuses_a_relative_hash_source(tmp_path, stub, prompt_file):
+    spec_path, _ = launch_spec(tmp_path, prompt_file, hash_sources=["checkpoint.json"])
+    code, out, _ = launch(stub, spec_path, "--plan")
+    assert code == 2 and "hash_sources entry" in out["error"] and "checkpoint.json" in out["error"], out
+    assert not stub.launched()
+
+
+def test_launch_and_check_hashes_refuse_an_unhashable_source_naming_their_own_argument(tmp_path, stub, prompt_file):
+    """P3-4, P3-5: launch reported a missing hash_sources entry as "--source ... cannot be hashed"."""
+    missing = tmp_path / "missing-checkpoint.json"
+    spec_path, spec = launch_spec(tmp_path, prompt_file, hash_sources=[str(missing)])
+    for extra in (["--plan"], []):
+        code, out, _ = launch(stub, spec_path, *extra)
+        assert code == 2, out
+        assert out["error"].startswith("hash_sources entry %s cannot be hashed" % missing), out
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+    assert not (stub.dir / "calls.jsonl").exists()
+    code, out, _ = check_hashes(prompt_file, "--source", missing)
+    assert code == 2 and out["error"].startswith("--source %s cannot be hashed" % missing), out
 
 
 def test_launch_refuses_an_existing_record_path_before_launching(tmp_path, stub, prompt_file):
@@ -406,7 +802,7 @@ def test_launch_reports_a_leaked_first_prompt_and_prints_the_stop_command(tmp_pa
 def test_launch_refuses_when_free_space_is_below_the_threshold(tmp_path, stub, prompt_file):
     spec_path, spec = launch_spec(tmp_path, prompt_file)
     code, out, _ = run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects,
-                            "--min-free-mb", str(10 ** 12), "--test-tmp-root", stub.tmp_root, env=stub.env())
+                            "--min-free-mb", str(10 ** 12), env=stub.env(), tmp_root=stub.tmp_root)
     assert code == 4
     assert "free" in out["error"]
     assert not stub.launched() and not Path(spec["record_out"]).exists()
@@ -708,11 +1104,29 @@ def test_rebind_warns_until_custody_records_the_outgoing_stop(tmp_path):
     assert out["outgoing_stop"] == {"custody": str(custody), "outgoing_root": entry["outgoing_root"],
                                     "verified": False}
     assert len(out["warnings"]) == 1 and "lacks outgoing_stopped" in out["warnings"][0]
-    entry["outgoing_stopped"] = {"verified_at": "2026-11-02T17:00:00.000Z", "by": "hierarchy_root.py verify-retired"}
+    entry["outgoing_stopped"] = {"verified_at": "2026-11-02T17:00:00.000Z", "by": "hierarchy_root.py verify-retired",
+                                 "evidence": {"pid_alive": False, "agents_listed": False}}
     custody.write_text(json.dumps({"active_root_session": spec["session"], "custody_history": [entry]}),
                        encoding="utf-8")
     code, out, _ = rebind(spec_path, tmp_path / "result-2.json", acks, "--custody", custody)
     assert code == 0 and out["outgoing_stop"]["verified"] is True and out["warnings"] == []
+
+
+@pytest.mark.parametrize("stopped", [True, "pending", {"by": "hierarchy_root.py verify-retired"},
+                                     {"by": "by hand", "evidence": {"pid_alive": False, "agents_listed": False}},
+                                     {"by": "hierarchy_root.py verify-retired",
+                                      "evidence": {"pid_alive": True, "agents_listed": False}}])
+def test_rebind_counts_only_a_verify_retired_record_as_the_outgoing_stop(tmp_path, stopped):
+    """D-P3-3: a hand-written outgoing_stopped: true read as verified, the P3-9 assertion moved into custody."""
+    _, _, spec, spec_path, acks = rebind_setup(tmp_path, messages=1)
+    custody = tmp_path / "custody.json"
+    custody.write_text(json.dumps({"active_root_session": spec["session"], "custody_history": [
+        {"outgoing_root": "d6b2a18b-e242-4ecb-ac63-baab549cf112", "incoming_root": spec["session"],
+         "outgoing_stopped": stopped}]}), encoding="utf-8")
+    code, out, err = rebind(spec_path, tmp_path / "result.json", acks, "--plan", "--custody", custody)
+    assert code == 0, (out, err)
+    assert out["outgoing_stop"]["verified"] is False
+    assert len(out["warnings"]) == 1 and "verify-retired" in out["warnings"][0]
 
 
 def test_rebind_plan_writes_nothing(tmp_path):
@@ -892,6 +1306,51 @@ def test_transfer_writes_spec_and_transfer_and_syncs_every_custody_field(rotatio
     assert "verify-retired" in out["next"]
 
 
+def test_transfer_next_names_the_outgoing_stop_recheck(rotation):
+    """D-P3-2: rebind's warning fires on every rotation in the tool's own order; the re-check tells them apart."""
+    code, out, err = transfer(rotation)
+    assert code == 0, (out, err)
+    assert "rebind --plan --spec %s" % rotation["spec_out"] in out["next"]
+    assert "--custody %s" % rotation["custody"] in out["next"]
+    assert "outgoing_stop.verified: true" in out["next"]
+
+
+@pytest.mark.parametrize("bad", ["history_not_a_list", "handoff_not_an_object"])
+def test_transfer_checks_custody_shapes_before_its_first_write(rotation, bad):
+    """D-P3-6: these failed only inside the final CAS, after spec and transfer were written."""
+    custody = json.loads(rotation["custody"].read_text(encoding="utf-8"))
+    if bad == "history_not_a_list":
+        custody["custody_history"] = {}
+    else:
+        custody["claude_c5_to_c6_handoff"] = "prepared"
+    rotation["custody"].write_text(json.dumps(custody), encoding="utf-8")
+    before = rotation["custody"].read_bytes()
+    code, out, _ = transfer(rotation)
+    assert code == 2, out
+    assert rotation["custody"].read_bytes() == before
+    assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
+
+
+def help_page(*argv):
+    proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *argv, "--help"], capture_output=True, timeout=60,
+                          stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0
+    return " ".join(proc.stdout.decode("utf-8").split())
+
+
+def test_transfer_help_says_the_ack_must_come_from_startup_ack():
+    """D-P3-5: ROOTs hand-wrote ACKs; the tempting fix was a hand-written critical_checks entry."""
+    for page in (help_page("transfer"), help_page()):
+        assert "the ACK startup-ack wrote; hand-written ACKs are refused" in page
+
+
+def test_help_says_a_launch_without_a_parsed_id_has_no_stop_command():
+    """D-P3-6: after a claude --bg timeout a session may run although the record has no stop_command."""
+    page = help_page()
+    assert "no stop_command" in page and "claude agents" in page
+    assert "custody_history is not a list" in page
+
+
 @pytest.mark.parametrize("bad", ["ack", "custody"])
 def test_transfer_writes_nothing_when_a_critical_hash_differs(rotation, bad):
     before = rotation["custody"].read_bytes()
@@ -1054,6 +1513,21 @@ def test_startup_ack_refuses_a_packet_the_rendezvous_does_not_name(stub, startup
     checks = {check["name"]: check for check in out["critical_checks"]}
     assert checks["rendezvous_names_packet"]["ok"] is False and checks["packet_sha256"]["ok"] is True
     assert not startup["out"].exists()
+
+
+def test_transfer_accepts_the_ack_startup_ack_writes(stub, startup, rotation):
+    """D-P3-4: transfer was tested only with a hand-built ACK; a rename on either side passed both suites.
+
+    Both fixtures use the same tmp_path, so they share packet.json (same bytes) and custody.json
+    (rotation's, which still names OUTGOING); the rendezvous names that packet.
+    """
+    code, out, err = startup_ack(stub, startup)
+    assert code == 0, (out, err)
+    rotation["ack"] = startup["out"]
+    code, out, err = transfer(rotation)
+    assert code == 0, (out, err)
+    record = json.loads(rotation["transfer_out"].read_text(encoding="utf-8"))
+    assert record["incoming"]["startup_ack"] == {"path": str(startup["out"]), "sha256": sha(startup["out"].read_bytes())}
 
 
 def test_startup_ack_requires_the_rendezvous_sha256_and_refuses_changed_bytes(stub, startup):

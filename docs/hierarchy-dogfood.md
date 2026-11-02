@@ -336,6 +336,47 @@ tool meter --host codex-cli --session <id> --role root    # exit 3 means rotate 
 3. Run `add-role` with the new session, which writes the new connection and wake profile.
 4. Start the successor. It inspects the checkpoint and acknowledges it before continuing.
 
+## ROOT launch checks (`hierarchy_root.py`)
+
+ROOT launches and rotates Claude sessions with `tools/hierarchy_root.py`. Every subcommand prints
+one JSON object; `--help` lists the exit codes and what each subcommand leaves behind on exit 2.
+
+Never type a hash into a prompt. A ROOT once completed a hash from its 8-character prefix, and
+nothing caught it (T92). Render prompts from a template instead, and check them before launch:
+
+```sh
+python3 -B -I tools/hierarchy_root.py render-prompt --template /abs/lane-prompt.template \
+  --path brief=/abs/brief.md --path role=/abs/roles/lane.md --out /abs/requests/lane-prompt.txt
+python3 -B -I tools/hierarchy_root.py check-hashes /abs/requests/lane-prompt.txt
+```
+
+- **Templates** write `{path:key}` and `{sha256:key}`. Each `--path key=...` fills `{path:key}`
+  with the path as given and `{sha256:key}` with the sha256 of that file's bytes. Put each
+  `{sha256:key}` on the same line as its `{path:key}`, or on the line below. A shell expansion
+  such as `${CLAUDE_CODE_SESSION_ID:0:8}` is not a placeholder and is left as written.
+- **render-prompt** refuses a relative or `..` path (naming the argument), an unknown placeholder
+  kind such as `{md5:key}`, an unused or unfilled key, any existing `--out` (exit 3, even one
+  with identical bytes), and output that would fail `check-hashes` (exit 6).
+- **check-hashes** checks every token of exactly 64 lowercase hex characters bounded by anything
+  but an ASCII letter or digit, so `_` and `*` are delimiters. Each token must re-hash from a
+  file named by an absolute path on its line or the line above, repeat a token matched that way
+  elsewhere in the same file (`via: "repeat"`), or match a `--source` file. It exits 6 and lists
+  each unmatched token with its line, the candidate paths and their real sha256. It also exits 6
+  on a malformed hash-like token: a hex run of 56-72 characters that is not exactly 64 lowercase
+  ones. 40-hex git ids and short prefixes are not checked.
+- **Candidates:** relative and `..` paths never count (T100), nor do paths with spaces or
+  `key:/path` forms. A folder never counts, so a hash beside a folder stays unmatched. Symlinks
+  are followed. FILE and `--template` must be regular files of at most 262144 bytes with no
+  symlink in their path.
+- **Review copies:** cite a review copy's manifest hash beside the path of its `manifest.json`,
+  the file that hash covers, never beside the review folder.
+- **launch** runs the same check on the spec's prompt before it calls `claude`, and exits 6
+  without starting anything. A spec may list `hash_sources` (absolute paths) for hashes of files
+  the prompt does not name beside them. The launch record lists every checked token, path and line.
+- **Rotations:** after `verify-retired`, the incoming ROOT reruns `rebind --plan --custody` and
+  expects `outgoing_stop.verified: true`. Only the record `verify-retired` writes counts, and
+  `transfer --ack` takes only the ACK `startup-ack` wrote.
+
 ## Measure the trial
 
 Compare with the same counting method against this baseline from 489 mailbox messages:

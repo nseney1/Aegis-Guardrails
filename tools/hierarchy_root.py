@@ -10,32 +10,52 @@ investigation F-A, F-B; ROOT C5 F1, F2, F5).
 Every subcommand prints one JSON object. Exit codes:
   0  ok
   2  a critical check failed; what may already be written depends on the subcommand
-  3  the target exists and differs, or the session name is already live
+  3  the target exists and differs, or the session name is already live; render-prompt
+     refuses any existing --out, even one with identical bytes
   4  IO or disk error, including free space below --min-free-mb (checked before the first write)
   5  a human-answerable dialog is pending (the record is still written)
+  6  a 64-hex token matches no file named on its line or the line above, repeats no token
+     matched that way elsewhere in the file, and matches no --source; or a hex run of 56-72
+     characters is not exactly 64 lowercase ones (a malformed hash-like token).
+     check-hashes exits 6; launch checks its prompt the same way, with the spec's optional
+     hash_sources, before any claude call. Nothing is written, nothing starts.
+
+check-hashes takes absolute paths only, without '..' (T100): a relative path in the
+checked file is never a candidate, and the output lists it under refused_paths. Symlinks
+are followed for the files named in FILE and for --source and --path files. FILE and
+--template themselves must be regular files of at most 262144 bytes with no symlink in
+their path (hierarchy_mailbox.read_bytes).
+render-prompt fills {sha256:key} and {path:key} from --path KEY=ABS_PATH files and
+refuses relative paths, unknown placeholder kinds, unused or unfilled keys, an existing
+--out (exit 3) and output that would fail check-hashes (exit 6), so a rendered prompt
+passes by construction. A shell expansion such as ${VAR:0:8} is left as written.
 
 What exit 2 leaves behind, per subcommand (never assume "no side effects" on a retry):
-  first-prompt-check, lanes-health
+  first-prompt-check, lanes-health, check-hashes
       never write.
-  startup-ack, verify-retired
-      nothing: every check runs before the only write (the ACK; the custody CAS).
+  startup-ack, verify-retired, render-prompt
+      nothing: every check runs before the only write (the ACK; the custody CAS; --out).
   launch
-      refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree): nothing,
-      and no session. After claude --bg (launch failed, first prompt unverified): the
-      record is written and a session may be running; see record.stop_command. Exit 3
+      refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree; the
+      prompt's own hashes exit 6): nothing, and no session. After claude --bg the
+      record is written. If claude --bg printed its id (first prompt unverified):
+      a session may be running; see record.stop_command. If it timed out or printed
+      no id ("launch failed"), a session may still be running and the record has no
+      stop_command: find the session with `claude agents` by the spec's name. Exit 3
       or 4 after claude --bg means the record could not be written: the error output
-      carries the whole record, stop_command included.
+      carries the whole record, with stop_command when the id was parsed.
   rebind
       a spec refusal writes nothing. Otherwise the handoff may already have bound
       endpoints, ack requests may be written and acknowledged, and --result-out is
       written; entries[].ready says which endpoints are not ready.
   transfer
-      refused before the first write (facts, ACK, packet, custody checks): nothing.
+      refused before the first write (facts, ACK, packet, custody checks, including
+      custody_history is not a list and the handoff key is not an object): nothing.
       Refused by the final custody CAS (custody changed during the run): --spec-out and
       --transfer-out are written and custody is unchanged.
 
-launch takes --test-tmp-root only in tests: it replaces /tmp in the refused-cwd check,
-because pytest's tmp_path is under /tmp.
+transfer --ack takes the ACK startup-ack wrote; hand-written ACKs are refused, because
+transfer checks that the ACK is consistent, not who ran its critical checks.
 
 These tools never stop, attach to or answer a session: a host may refuse a stop, so a
 stop stays a visible, explicit command (T27, T13). Where one is needed the tool prints
@@ -50,6 +70,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -62,7 +83,7 @@ import hierarchy_handoff  # noqa: E402
 from hierarchy_mailbox import (  # noqa: E402
     SHA256, Mailbox, fields, matching, read_bytes, read_json, require, safe_path, text, writer_lock)
 
-EXIT_OK, EXIT_CRITICAL, EXIT_CONFLICT, EXIT_IO, EXIT_DIALOG = 0, 2, 3, 4, 5
+EXIT_OK, EXIT_CRITICAL, EXIT_CONFLICT, EXIT_IO, EXIT_DIALOG, EXIT_UNMATCHED_HASH = 0, 2, 3, 4, 5, 6
 HEAD_CHARS = 120
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DIALOG_PHRASE = "Do you want to proceed?"
@@ -388,6 +409,218 @@ def cmd_first_prompt_check(args):
     return (EXIT_OK if result["ok"] else EXIT_CRITICAL), result
 
 
+# Bounded by anything but an ASCII letter or digit: `\b` treated `_` as part of a word, so
+# `_<hex>_` (Markdown emphasis) and `sha256_<hex>` hid a typed hash (P3-1).
+HASH_TOKEN = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{64}(?![0-9A-Za-z])")
+# A near-hash-length hex run that is not exactly 64 lowercase characters is a hash with a
+# character dropped, doubled or uppercased: refused, never skipped (P3-1). 40-hex git ids
+# and short prefixes stay outside this range.
+HASH_LIKE = re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{56,72}(?![0-9A-Za-z])")
+# Prose, Markdown and JSON delimiters around a path; ':' stays inside so a URL is one chunk.
+PATH_SPLIT = re.compile(r"[\s`'\"()<>\[\]{},;=|]+")
+
+
+def absolute_path_problem(value):
+    """Why value may not name a file to hash or read (T100), or None.
+
+    A relative path resolves against whatever cwd the reader happens to have, so the same
+    prompt could check against one file and be read against another.
+    """
+    if not value.startswith("/"):
+        return "relative path: never a candidate (T100)"
+    if ".." in Path(value).parts:
+        return "path with '..': never a candidate (T100)"
+    return None
+
+
+def absolute_argument(value, argument):
+    require(absolute_path_problem(value) is None,
+            "%s must be an absolute path without '..', got %r" % (argument, value))
+    return Path(value)
+
+
+def line_paths(line):
+    for chunk in PATH_SPLIT.split(line):
+        chunk = chunk.strip("*_").rstrip(".:")
+        if "/" in chunk and "://" not in chunk:
+            yield chunk
+
+
+def file_sha256(path):
+    """(sha256, None) for a regular file's bytes, else (None, reason)."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None, "not a regular file"
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest(), None
+    except OSError as exc:
+        return None, exc.strerror or str(exc)
+
+
+def check_hashes(body, sources=(), source_label="--source"):
+    """Every 64-hex token must re-hash from a file named beside it, or from a source (T92).
+
+    ROOT C7 typed 56 of a hash's 64 characters into a launch prompt; the launcher only
+    compared the delivered prompt with its file, so nothing would have noticed. Beside
+    means an absolute path on the token's line or the line above. A token that matched
+    beside a path elsewhere in the same file also passes, as via "repeat" with that
+    match's line (P3-2): every value still re-hashes from a named file.
+    """
+    lines = body.split("\n")
+    source_rows, by_hash = [], {}
+    for source in sources:
+        digest, error = file_sha256(source)
+        require(digest is not None, "%s %s cannot be hashed: %s" % (source_label, source, error))
+        source_rows.append({"path": str(source), "sha256": digest})
+        by_hash.setdefault(digest, str(source))
+    cache, occurrences, matched_beside, malformed, refused = {}, [], {}, [], {}
+    for index, line in enumerate(lines):
+        for match in HASH_LIKE.finditer(line):
+            run = match.group(0)
+            if len(run) != 64 or run != run.lower():
+                malformed.append({"token": run, "line": index + 1, "length": len(run)})
+        for match in HASH_TOKEN.finditer(line):
+            token, found, candidates = match.group(0), None, []
+            for where, at in (("same_line", index), ("line_above", index - 1)):
+                for value in line_paths(lines[at]) if at >= 0 else ():
+                    problem = absolute_path_problem(value)
+                    if problem is not None:
+                        refused[(at + 1, value)] = problem
+                        continue
+                    if value not in cache:
+                        cache[value] = file_sha256(value)
+                    digest, error = cache[value]
+                    candidates.append({"path": value, "line": at + 1, "sha256": digest,
+                                       **({"error": error} if error else {})})
+                    if found is None and digest == token:
+                        found = {"token": token, "line": index + 1, "path": value, "via": where}
+            if found is not None:
+                matched_beside.setdefault(token, found)
+            elif token in by_hash:
+                found = {"token": token, "line": index + 1, "path": by_hash[token], "via": "source"}
+            occurrences.append((token, index + 1, found, candidates))
+    checked, unmatched = [], []
+    for token, line, found, candidates in occurrences:
+        if found is None and token in matched_beside:
+            first = matched_beside[token]
+            found = {"token": token, "line": line, "path": first["path"], "via": "repeat", "match_line": first["line"]}
+        if found is not None:
+            checked.append(found)
+        else:
+            unmatched.append({"token": token, "line": line, "candidates": candidates})
+    result = {"ok": not unmatched and not malformed, "tokens": len(occurrences), "checked": checked,
+              "unmatched": unmatched, "malformed": malformed,
+              "refused_paths": [{"line": line, "path": path, "reason": reason}
+                                for (line, path), reason in sorted(refused.items())],
+              "sources": source_rows}
+    problems = []
+    if malformed:
+        problems.append("%d malformed hash-like token(s), hex runs of 56-72 characters that are not exactly 64 "
+                        "lowercase ones: %s" % (len(malformed), ", ".join("line %d" % row["line"] for row in malformed)))
+    if unmatched:
+        problems.append("%d of %d sha256 tokens match no file named on their line or the line above, nor any "
+                        "source: %s" % (len(unmatched), len(occurrences),
+                                        ", ".join("line %d" % row["line"] for row in unmatched)))
+    if problems:
+        result["error"] = "; ".join(problems)
+    return result
+
+
+def read_input(path, argument):
+    """FILE and --template: a regular file of at most 262144 bytes, no symlink in its path (P3-3).
+
+    Path.read_bytes() blocked forever on a FIFO and read /dev/zero without bound;
+    hierarchy_mailbox.read_bytes refuses both, as it already does for checkpoint briefs.
+    """
+    try:
+        return read_bytes(path)
+    except ValueError as exc:
+        raise ValueError("%s %s: %s" % (argument, path, exc)) from None
+
+
+def cmd_check_hashes(args):
+    path = absolute_argument(args.file, "check-hashes file")
+    sources = [absolute_argument(value, "--source") for value in args.source or []]
+    raw = read_input(path, "check-hashes file")
+    result = {"file": str(path), "file_sha256": sha256_bytes(raw), **check_hashes(raw.decode("utf-8"), sources)}
+    return (EXIT_OK if result["ok"] else EXIT_UNMATCHED_HASH), result
+
+
+# (?<!\$): a shell expansion such as the T99 c stop line's "${CLAUDE_CODE_SESSION_ID:0:8}" is
+# prompt text, not a placeholder; without it every standard ROOT prompt was refused (P2-1).
+PLACEHOLDER = re.compile(r"(?<!\$)\{(\w+):([^{}\s]*)\}")
+TEMPLATE_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
+
+
+def create_file(path, raw):
+    """Write raw to a path that must not exist yet: an existing file is never replaced (exit 3)."""
+    path = Path(path)
+    if path.exists():
+        raise Failure(EXIT_CONFLICT, "--out already exists: %s" % path, path=str(path))
+    temp = _temp_beside(path, raw)
+    try:
+        os.link(temp, path)
+    except FileExistsError:
+        raise Failure(EXIT_CONFLICT, "--out already exists: %s" % path, path=str(path)) from None
+    finally:
+        temp.unlink()
+    _fsync_folder(path.parent)
+    return {"path": str(path), "sha256": sha256_bytes(raw)}
+
+
+def cmd_render_prompt(args):
+    """Fill {sha256:key} from the named file's bytes and {path:key} with its path, so no hash is ever typed (T92).
+
+    One substitution pass: a filled value is never expanded again. The rendered text must
+    pass check-hashes with no sources, so a typed hash left in the template, or a hash
+    placed away from its path, is refused before anything is written.
+    """
+    template = absolute_argument(args.template, "--template")
+    files = {}
+    for value in args.path or []:
+        key, separator, path = value.partition("=")
+        require(separator == "=", "--path must be KEY=ABS_PATH, got %r" % value)
+        require(TEMPLATE_KEY.fullmatch(key) is not None, "invalid --path key %r in %r" % (key, value))
+        require(key not in files, "--path key %r given twice" % key)
+        files[key] = absolute_argument(path, "--path " + key)
+    out = absolute_argument(args.out, "--out") if args.out is not None else None
+    template_raw = read_input(template, "--template")
+    body = template_raw.decode("utf-8")
+    used = set()
+    for match in PLACEHOLDER.finditer(body):
+        kind, key = match.groups()
+        require(kind in ("sha256", "path"),
+                "unknown placeholder kind %s: templates take only {sha256:key} and {path:key}" % match.group(0))
+        require(key in files, "placeholder %s has no --path %s=ABS_PATH" % (match.group(0), key))
+        used.add(key)
+    unused = sorted(set(files) - used)
+    require(not unused, "unused --path key(s), not in the template: " + ", ".join(unused))
+    digests, filled = {}, []
+    for key, path in files.items():
+        digest, error = file_sha256(path)
+        require(digest is not None, "--path %s=%s cannot be hashed: %s" % (key, path, error))
+        digests[key] = digest
+        filled.append({"key": key, "path": str(path), "sha256": digest})
+    rendered = PLACEHOLDER.sub(
+        lambda match: digests[match.group(2)] if match.group(1) == "sha256" else str(files[match.group(2)]), body)
+    raw = rendered.encode("utf-8")
+    hashes = check_hashes(rendered)
+    if not hashes["ok"]:
+        raise Failure(EXIT_UNMATCHED_HASH, "rendered prompt fails check-hashes, nothing written: " + hashes["error"],
+                      prompt_hashes=hashes)
+    result = {"ok": True, "template": {"path": str(template), "sha256": sha256_bytes(template_raw)},
+              "filled": filled, "sha256": sha256_bytes(raw), "chars": len(rendered),
+              "prompt_hashes": {key: hashes[key] for key in ("tokens", "checked", "refused_paths")}, "out": None}
+    if out is None:
+        result["text"] = rendered
+    else:
+        result["out"] = create_file(out, raw)
+    return EXIT_OK, result
+
+
 SESSION_ID = re.compile(r"[0-9a-f][0-9a-f-]{3,63}")
 FULL_SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -401,7 +634,12 @@ def full_session(value, label):
 
 def read_launch_spec(path):
     spec = read_json(path)
-    fields(spec, {"name", "model", "effort", "cwd", "add_dirs", "prompt", "uses_enter_worktree", "record_out"})
+    fields(spec, {"name", "model", "effort", "cwd", "add_dirs", "prompt", "uses_enter_worktree", "record_out"},
+           {"hash_sources"})
+    sources = spec.setdefault("hash_sources", [])
+    require(isinstance(sources, list) and len(sources) <= 64, "hash_sources must be a list")
+    for source in sources:
+        absolute_argument(text(source, "hash_sources entry"), "hash_sources entry")
     text(spec["name"], "name", 256)
     text(spec["model"], "model", 128)
     require(spec["effort"] in EFFORTS, "effort must be one of " + ", ".join(EFFORTS))
@@ -420,17 +658,18 @@ def read_launch_spec(path):
 TMP_ROOT = "/tmp"
 
 
-def untrusted_cwd_reason(cwd, tmp_root=TMP_ROOT):
+def untrusted_cwd_reason(cwd, tmp_root=None):
     """Why a background session cannot start in cwd, or None (probes E/F, layout f).
 
     A session started under /tmp, inside .claude/worktrees or in a git checkout stopped at
     a trust prompt before its first record; launch could then only report "first prompt
     unverified" for a live session it never stops (P2-4). Layout (f) launches in the
-    workspace and lets the lane cd into its registered worktree. tmp_root is /tmp except
-    through the test-only --test-tmp-root seam, because pytest's tmp_path is under /tmp.
+    workspace and lets the lane cd into its registered worktree. TMP_ROOT is read at call
+    time, so tests can replace it in-process; no command-line flag turns the check off
+    (D-P3-1).
     """
     resolved = Path(cwd).resolve()
-    root = Path(tmp_root).resolve()
+    root = Path(tmp_root or TMP_ROOT).resolve()
     if resolved == root or root in resolved.parents:
         return "cwd is under %s" % root
     parts = resolved.parts
@@ -486,7 +725,13 @@ def cmd_launch(args):
     if sha256_bytes(raw) != spec["prompt"]["sha256"]:
         raise Failure(EXIT_CRITICAL, "prompt does not re-hash to its recorded sha256",
                       prompt_sha256=sha256_bytes(raw))
-    reason = untrusted_cwd_reason(spec["cwd"], args.test_tmp_root or TMP_ROOT)
+    hashes = check_hashes(raw.decode("utf-8"), [Path(source) for source in spec["hash_sources"]],
+                          "hash_sources entry")
+    if not hashes["ok"]:
+        raise Failure(EXIT_UNMATCHED_HASH, "prompt hash check failed, nothing launched: " + hashes["error"],
+                      prompt_hashes=hashes)
+    prompt_hashes = {key: hashes[key] for key in ("tokens", "checked", "sources", "refused_paths")}
+    reason = untrusted_cwd_reason(spec["cwd"])
     if reason is not None:
         raise Failure(EXIT_CRITICAL, "refused cwd for a background session: " + reason, cwd=spec["cwd"])
     if spec["uses_enter_worktree"]:
@@ -501,18 +746,19 @@ def cmd_launch(args):
     record_out = Path(spec["record_out"])
     if args.plan:
         return EXIT_OK, {"ok": True, "plan": True, "writes": [str(record_out)], "argv": shown, "cwd": spec["cwd"],
-                         "target_exists": record_out.exists()}
+                         "target_exists": record_out.exists(), "prompt_hashes": prompt_hashes}
     if record_out.exists():
         raise Failure(EXIT_CONFLICT, "launch record already exists: %s" % record_out, path=str(record_out))
-    probe_folder_writable(record_out.parent, "launch record")
+    # Free space first: the probe creates a temp, and exit 4 promises the check before any write.
     check_free_space([record_out], args.min_free_mb)
+    probe_folder_writable(record_out.parent, "launch record")
     live = [row.get("sessionId") for row in agents_rows() if row.get("name") == spec["name"]]
     if live:
         raise Failure(EXIT_CONFLICT, "a live session already has this name", name=spec["name"], live_sessions=live)
     started = time.monotonic()
     record = {"schema": "aegis.hierarchy-launch-record/v1", "at": utc_now(), "name": spec["name"], "argv": shown,
               "cwd": spec["cwd"], "stdin": "DEVNULL", "env": "CLAUDE_* unset",
-              "prompt": {**spec["prompt"], "chars": len(raw.decode("utf-8"))},
+              "prompt": {**spec["prompt"], "chars": len(raw.decode("utf-8"))}, "prompt_hashes": prompt_hashes,
               "uses_enter_worktree": spec["uses_enter_worktree"], "id": None, "session": None, "transcript": None,
               "first_prompt_check": None, "first_assistant_line": None, "agents_row": None, "dialog": None}
     result = run_claude(argv, cwd=spec["cwd"])
@@ -712,6 +958,9 @@ def rebind_entry(spec, entry, row, ack_dir):
     return out
 
 
+VERIFY_RETIRED_BY = "hierarchy_root.py verify-retired"
+
+
 def outgoing_stop_check(custody_path, session):
     """Does custody record the stop of the root this session replaced? (P3-9)
 
@@ -731,10 +980,15 @@ def outgoing_stop_check(custody_path, session):
     if not entries:
         return check, ["custody_history has no entry with incoming_root %s: outgoing stop unverified" % session]
     check["outgoing_root"] = entries[-1].get("outgoing_root")
-    check["verified"] = bool(entries[-1].get("outgoing_stopped"))
+    # Only verify-retired's own record counts: a hand-written true or "pending" is the same
+    # unverified assertion P3-9 was about, moved from the spec into custody (D-P3-3).
+    stopped = entries[-1].get("outgoing_stopped")
+    check["verified"] = (isinstance(stopped, dict) and stopped.get("by") == VERIFY_RETIRED_BY
+                         and stopped.get("evidence") == {"pid_alive": False, "agents_listed": False})
     if not check["verified"]:
-        return check, ["custody_history entry for outgoing root %s lacks outgoing_stopped: verify-retired has not "
-                       "recorded its stop, so the spec's outgoing_stopped: true is unverified" % check["outgoing_root"]]
+        return check, ["custody_history entry for outgoing root %s lacks outgoing_stopped as verify-retired writes "
+                       "it (found %s), so the spec's outgoing_stopped: true is unverified"
+                       % (check["outgoing_root"], json.dumps(stopped)[:120])]
     return check, []
 
 
@@ -824,8 +1078,7 @@ def cmd_verify_retired(args):
     if args.custody is not None:
         check_free_space([args.custody], args.min_free_mb)
         stopped = {"verified_at": utc_now(), "pid": args.pid, "start_ticks": args.start_ticks,
-                   "evidence": {"pid_alive": False, "agents_listed": False},
-                   "by": "hierarchy_root.py verify-retired"}
+                   "evidence": {"pid_alive": False, "agents_listed": False}, "by": VERIFY_RETIRED_BY}
 
         def record(custody):
             history = custody.get("custody_history") if isinstance(custody, dict) else None
@@ -925,6 +1178,10 @@ def cmd_transfer(args):
                       actual_sha256=sha256_bytes(custody_raw))
     custody = json.loads(custody_raw)
     require(custody.get("active_root_session") == out["session"], "custody does not name the outgoing root")
+    key = "claude_%s_to_%s_handoff" % (out["label"].lower(), inc["label"].lower())
+    # The CAS mutate repeats these; checked here too so they refuse before the first write (D-P3-6).
+    require(isinstance(custody.get("custody_history", []), list), "custody_history must be a list")
+    require(isinstance(custody.get(key, {}), dict), key + " must be an object")
     prev = read_json(args.prev_spec)
     fields(prev, {"schema", "host", "session", "outgoing_stopped", "entries"})
     require(prev["schema"] == hierarchy_handoff.SPEC_SCHEMA, "unsupported previous spec schema")
@@ -954,7 +1211,6 @@ def cmd_transfer(args):
     record["outgoing"]["scope"] = "retired: no further root action; stop pending verify-retired"
     atomic_write_json(args.transfer_out, record)
     transfer_ref = file_ref(args.transfer_out)
-    key = "claude_%s_to_%s_handoff" % (out["label"].lower(), inc["label"].lower())
 
     def move(custody):
         require(custody.get("active_root_session") == out["session"], "custody does not name the outgoing root")
@@ -978,10 +1234,15 @@ def cmd_transfer(args):
     update = cas_update_json(args.custody, args.expect_custody_sha256, move)
     return EXIT_OK, {"ok": True, "spec_out": file_ref(args.spec_out), "transfer_out": transfer_ref,
                      "custody_update": update, "stop_command": stop_command,
+                     # rebind's outgoing-stop warning fires on every rotation in this order, so only
+                     # the re-check after verify-retired tells a refused stop apart (D-P3-2).
                      "next": ("After the incoming ROOT acknowledges every endpoint, a human or ROOT runs `%s`, then "
                               "hierarchy_root.py verify-retired --session %s --pid %d --custody %s "
-                              "--expect-custody-sha256 %s" % (stop_command, out["session"], out["pid"], args.custody,
-                                                             update["sha256"]))}
+                              "--expect-custody-sha256 %s; then the incoming ROOT reruns hierarchy_root.py "
+                              "rebind --plan --spec %s --custody %s (with its own --result-out and --ack-dir) and "
+                              "expects outgoing_stop.verified: true; false means the stop was refused or not "
+                              "recorded" % (stop_command, out["session"], out["pid"], args.custody, update["sha256"],
+                                            args.spec_out, args.custody))}
 
 
 GOAL_MARKERS = ("<command-name>/goal</command-name>", "Goal set:")
@@ -1133,16 +1394,36 @@ def build_parser():
     check.add_argument("--prompt-sha256", required=True)
     check.set_defaults(handler=cmd_first_prompt_check)
 
+    hashes = commands.add_parser("check-hashes", help="Check that every 64-hex token in a file re-hashes from a file "
+                                 "named beside it (symlinks are followed); exit 6 on any unmatched or malformed "
+                                 "token; never writes")
+    hashes.add_argument("file", help="Absolute path of the prompt, spec or brief to check: a regular file of at most "
+                        "262144 bytes, no symlink in its path")
+    hashes.add_argument("--source", action="append", metavar="ABS_PATH",
+                        help="A file whose sha256 may appear anywhere in FILE (absolute, no '..'; symlinks are "
+                        "followed); repeatable")
+    hashes.set_defaults(handler=cmd_check_hashes)
+
+    render = commands.add_parser("render-prompt", help="Fill {sha256:key} and {path:key} in a template from the "
+                                 "named files; the output must pass check-hashes")
+    render.add_argument("--template", required=True, help="Absolute path of the template (no '..'): a regular file "
+                        "of at most 262144 bytes, no symlink in its path")
+    render.add_argument("--path", action="append", metavar="KEY=ABS_PATH",
+                        help="The file for KEY (absolute, no '..'; symlinks are followed); repeatable; every key "
+                        "must be used")
+    render.add_argument("--out", help="Absolute path of a new file for the prompt; an existing file is refused "
+                        "(exit 3). Without it the text is printed in the JSON")
+    render.set_defaults(handler=cmd_render_prompt)
+
     launch = commands.add_parser("launch", help="Start one claude --bg session from a spec and verify its start")
-    launch.add_argument("--spec", required=True, help="Absolute path to a strict JSON launch spec")
+    launch.add_argument("--spec", required=True, help="Absolute path to a strict JSON launch spec; its prompt must "
+                        "pass check-hashes (optional hash_sources: absolute paths, as --source) or launch exits 6")
     launch.add_argument("--plan", action="store_true", help="Print the paths and argv a run would use; write nothing")
     launch.add_argument("--projects-dir", default=str(Path.home() / ".claude" / "projects"))
     launch.add_argument("--wait-s", type=float, default=30.0, help="How long to wait for the first prompt")
     launch.add_argument("--dialog-wait-s", type=float, default=90.0, help="How long to wait for a first answer")
     launch.add_argument("--poll-s", type=float, default=2.0)
     launch.add_argument("--min-free-mb", type=int, default=512)
-    launch.add_argument("--test-tmp-root", metavar="DIR",
-                        help="Test-only seam: refuse a cwd under DIR instead of /tmp (pytest's tmp_path is under /tmp)")
     launch.set_defaults(handler=cmd_launch)
 
     health = commands.add_parser("lanes-health", help="Report stalled, silent or dialog-blocked sessions; always exit 0")
@@ -1175,7 +1456,7 @@ def build_parser():
 
     move = commands.add_parser("transfer", help="Outgoing ROOT: write spec and transfer, move custody by CAS")
     move.add_argument("--facts", required=True, help="JSON: outgoing, incoming, handoff, authority")
-    move.add_argument("--ack", required=True)
+    move.add_argument("--ack", required=True, help="Must be the ACK startup-ack wrote; hand-written ACKs are refused")
     move.add_argument("--ack-sha256", required=True)
     move.add_argument("--final-delta", required=True)
     move.add_argument("--prev-spec", required=True)
