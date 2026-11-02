@@ -540,3 +540,255 @@ def test_full_history_refuses_append_and_remains_readable(pilot, kind):
         assert result["error"] == "binding history limit reached"
         assert invoke(root, "status", process_timeout=60)["bindings"]["a/front-door"]["generation"] == 10000
         assert not (folder / "010001.json").exists()
+
+
+# Public P1 contract, deliberately independent of the product's internal constants.
+INBOX_WIRE_BUDGET = 4194304
+WIRE_PAYLOADS = [
+    pytest.param("x" * 262144, id="ascii"),
+    pytest.param("é" * 131072, id="unicode"),
+    pytest.param('é"\\\n😀' * 26000, id="escapes"),
+]
+
+
+def mailbox_snapshot(root):
+    """Include referenced briefs and request fixtures as well as durable mailbox files."""
+    return {p.relative_to(root.parent).as_posix(): (p.read_bytes(), p.stat().st_mtime_ns)
+            for p in root.parent.rglob("*")
+            if p.is_file() and p.relative_to(root.parent).parts[0] != "wire-evidence"}
+
+
+def record_wire_process(root, argv, result, stdin=None):
+    """Retain exact subprocess evidence even when the next behavioral assertion fails."""
+    directory = root.parent / "wire-evidence"
+    directory.mkdir(exist_ok=True)
+    call = directory / ("%04d" % len(list(directory.iterdir())))
+    call.mkdir()
+    (call / "stdout.bin").write_bytes(result.stdout)
+    (call / "stderr.bin").write_bytes(result.stderr)
+    (call / "command.json").write_text(json.dumps({"argv": argv, "returncode": result.returncode}) + "\n")
+    if stdin is not None:
+        (call / "stdin.bin").write_bytes(stdin)
+    return call
+
+
+def wire_brief(root, name, content):
+    path = root.parent / name
+    raw = content.encode("utf-8")
+    assert len(raw) <= 262144  # A valid existing input, without relaxing its bound.
+    path.write_bytes(raw)
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def seed_wire_inbox(root, content, *, endpoint="a/lane/f2", count=20, final_content=None):
+    final_content = content if final_content is None else final_content
+    shared = wire_brief(root, root.name + "-wire-shared.md", content)
+    final = wire_brief(root, root.name + "-wire-final.md", final_content)
+    rows = []
+    for number in range(count):
+        reference = final if number == count - 1 else shared
+        request = message(recipient=endpoint, identifier="wire-%03d" % number, brief=reference)
+        request["body"] = 'Record %d: é, "quotes", \\backslash,\n😀\r\n' % number
+        receipt = invoke(root, "publish", request)
+        assert hashlib.sha256(Path(receipt["path"]).read_bytes()).hexdigest() == receipt["sha256"]
+        rows.append({"path": receipt["path"], "message": receipt["message"],
+                     "brief_text": final_content if number == count - 1 else content})
+    return rows
+
+
+def wire_peer_mailbox(root, name):
+    peer = root.parent / name
+    manifest = json.loads((root / "manifest.json").read_text())
+    invoke(peer, "init", manifest)
+    for endpoint in manifest["endpoints"]:
+        invoke(peer, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
+                              "expected_generation": 0})
+    return peer
+
+
+def checkpoint_wire_binding(root, content, copies, *, endpoint="a/lane/f2"):
+    reference = wire_brief(root, "wire-checkpoint.md", content)
+    checkpoint = {"outgoing_stopped": True, "briefs": [reference] * copies,
+                  "sources": [], "lease_refs": [], "completed_checks": [],
+                  "pending_message_ids": [], "last_acknowledgment_ids": []}
+    binding = invoke(root, "bind", {"endpoint": endpoint, "host": "host-two", "session": "replacement",
+                                   "expected_generation": 1, "checkpoint": checkpoint})
+    assert binding["checkpoint"] == checkpoint
+    assert binding["ready"] is False
+    return binding
+
+
+def cli_inbox_wire(root, *, endpoint="a/lane/f2", include_briefs=True, limit=None, after=None, ok=True):
+    argv = [sys.executable, "-B", str(HELPER), "--root", str(root), "inbox", "--endpoint", endpoint]
+    if include_briefs:
+        argv.append("--include-briefs")
+    if limit is not None:
+        argv += ["--limit", str(limit)]
+    if after is not None:
+        argv += ["--after", after]
+    result = subprocess.run(argv, capture_output=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    evidence = record_wire_process(root, argv, result)
+    assert result.returncode == (0 if ok else 2), (str(evidence), result.stdout[:2048], result.stderr[:2048])
+    assert result.stderr == b""
+    assert result.stdout.endswith(b"\n")
+    assert len(result.stdout.splitlines(keepends=True)) == 1
+    return result.stdout, json.loads(result.stdout.decode("utf-8"))
+
+
+@pytest.mark.parametrize("content", WIRE_PAYLOADS)
+def test_cli_bounded_inbox_wire_pages_are_lossless(pilot, content):
+    root, _ = pilot
+    expected = seed_wire_inbox(root, content)
+    binding = invoke(root, "status")["bindings"]["a/lane/f2"]
+    before = mailbox_snapshot(root)
+    received, cursor = [], None
+    for page_number in range(len(expected) + 1):
+        raw, page = cli_inbox_wire(root, after=cursor)
+        assert len(raw) <= INBOX_WIRE_BUDGET, "CLI inbox wire budget exceeded; raw evidence: " + str(root.parent / "wire-evidence")
+        assert page["endpoint"] == "a/lane/f2"
+        assert page["binding"] == binding
+        assert page["checkpoint_briefs"] == []
+        assert page["messages"], "nonempty eligible history must make cursor progress"
+        end = len(received) + len(page["messages"])
+        assert page["messages"] == expected[len(received):end]
+        received.extend(page["messages"])
+        assert page["remaining"] == len(expected) - len(received)
+        if page_number == 0:
+            assert 0 < len(page["messages"]) < 20
+        if not page["remaining"]:
+            assert page["next_after"] is None
+            break
+        assert page["next_after"] == received[-1]["message"]["message_id"]
+        assert page["next_after"] != cursor
+        cursor = page["next_after"]
+    assert received == expected
+    for limit in (1, 100):
+        raw, page = cli_inbox_wire(root, include_briefs=False, limit=limit)
+        count = min(limit, len(expected))
+        assert len(raw) <= INBOX_WIRE_BUDGET
+        assert page["messages"] == [{"path": r["path"], "message": r["message"]} for r in expected[:count]]
+        assert page["remaining"] == len(expected) - count
+        assert page["next_after"] == (expected[count - 1]["message"]["message_id"] if page["remaining"] else None)
+    raw, exhausted = cli_inbox_wire(root, after=expected[-1]["message"]["message_id"])
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert exhausted == {"endpoint": "a/lane/f2", "binding": binding, "checkpoint_briefs": [],
+                         "messages": [], "remaining": 0, "next_after": None}
+    assert mailbox_snapshot(root) == before
+
+
+def test_cli_bounded_inbox_checkpoint_metadata_is_mandatory(pilot):
+    root, _ = pilot
+    binding = checkpoint_wire_binding(root, "x" * 262144, 20)
+    before = mailbox_snapshot(root)
+    raw, error = cli_inbox_wire(root, ok=False)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert error == {"error": "inbox response metadata exceeds 4194304 bytes"}
+    raw, small = cli_inbox_wire(root, include_briefs=False)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert small == {"endpoint": "a/lane/f2", "binding": binding, "checkpoint_briefs": [],
+                     "messages": [], "remaining": 0, "next_after": None}
+    assert mailbox_snapshot(root) == before  # No implicit handoff ack, rewrite or history append.
+
+
+def test_cli_bounded_inbox_exact_wire_boundary(pilot):
+    root, _ = pilot
+    # Equal-length root names preserve framing overhead. Calibrate only from bytes
+    # emitted by the public CLI; do not reproduce its serializer or budget formula.
+    seed = wire_peer_mailbox(root, "edge-seed")
+    seed_wire_inbox(seed, "x" * 262144, count=16, final_content="x" * 200000)
+    raw, page = cli_inbox_wire(seed, limit=100)
+    assert len(page["messages"]) == 16
+    padding = INBOX_WIRE_BUDGET - len(raw)
+    assert 0 < padding < 262144 - 200000
+    fit = wire_peer_mailbox(root, "edge-fit0")
+    expected = seed_wire_inbox(fit, "x" * 262144, count=16, final_content="x" * (200000 + padding))
+    raw, page = cli_inbox_wire(fit, limit=100)
+    assert len(raw) == INBOX_WIRE_BUDGET  # Includes the terminating newline.
+    assert page["messages"] == expected
+    assert page["remaining"] == 0 and page["next_after"] is None
+    over = wire_peer_mailbox(root, "edge-over")
+    expected = seed_wire_inbox(over, "x" * 262144, count=16, final_content="x" * (200001 + padding))
+    before = mailbox_snapshot(over)
+    raw, page = cli_inbox_wire(over, limit=100)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert page["messages"] == expected[:-1]
+    assert page["remaining"] == 1
+    assert page["next_after"] == expected[-2]["message"]["message_id"]
+    raw, last = cli_inbox_wire(over, limit=100, after=page["next_after"])
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert last["messages"] == expected[-1:]
+    assert last["remaining"] == 0 and last["next_after"] is None
+    assert mailbox_snapshot(over) == before
+
+
+def test_cli_bounded_inbox_first_message_cannot_be_skipped(pilot):
+    root, _ = pilot
+    binding = checkpoint_wire_binding(root, "x" * 262144, 15)
+    raw, metadata = cli_inbox_wire(root)
+    assert len(raw) <= INBOX_WIRE_BUDGET  # Observe fitting mandatory state through the public CLI.
+    assert metadata["binding"] == binding
+    assert metadata["messages"] == []
+    assert metadata["checkpoint_briefs"] == [
+        {**reference, "text": "x" * 262144} for reference in binding["checkpoint"]["briefs"]]
+    expected = seed_wire_inbox(root, "x" * 262144, count=2)
+    before = mailbox_snapshot(root)
+    raw, error = cli_inbox_wire(root, ok=False)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert error == {"error": "inbox first message cannot fit 4194304 byte response budget"}
+    _, small = cli_inbox_wire(root, include_briefs=False)
+    assert small["messages"] == [{"path": r["path"], "message": r["message"]} for r in expected]
+    assert small["binding"] == binding
+    assert small["remaining"] == 0 and small["next_after"] is None
+    assert mailbox_snapshot(root) == before
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_cli_bounded_inbox_retains_limit_errors(pilot, limit):
+    root, _ = pilot
+    before = mailbox_snapshot(root)
+    _, error = cli_inbox_wire(root, limit=limit, ok=False)
+    assert error == {"error": "invalid inbox limit"}
+    assert mailbox_snapshot(root) == before
+
+
+@pytest.mark.parametrize("cursor", ["missing", "foreign"])
+def test_cli_bounded_inbox_retains_cursor_errors(pilot, cursor):
+    root, _ = pilot
+    seed_wire_inbox(root, "x" * 262144)
+    invoke(root, "publish", message(recipient="a/lane/review", identifier="foreign"))
+    before = mailbox_snapshot(root)
+    _, error = cli_inbox_wire(root, after=cursor, ok=False)
+    assert error == {"error": "inbox cursor does not name a received message"}
+    assert mailbox_snapshot(root) == before
+
+
+def corrupt_wire_fixture(root, rows, kind):
+    if kind == "missing-brief":
+        path = Path(rows[-1]["message"]["brief"]["path"])
+        path.unlink()
+        return "file unavailable: " + str(path)
+    if kind in {"first-brief", "deferred-brief"}:
+        row = rows[0] if kind == "first-brief" else rows[-1]
+        Path(row["message"]["brief"]["path"]).write_bytes(b"Changed after publication\n")
+        return "brief sha256 mismatch"
+    if kind == "history":
+        path = Path(rows[-1]["path"])
+        path.write_bytes(b"truncated message")
+        return "malformed mailbox message: " + str(path) + ": missing header"
+    path = root / "bindings/a/lane/f2/000001.json"
+    binding = json.loads(path.read_text())
+    binding["endpoint"] = "b/lane/f6"
+    path.write_text(json.dumps(binding))
+    return "malformed role binding"
+
+
+@pytest.mark.parametrize("kind", ["first-brief", "deferred-brief", "missing-brief", "history", "binding"])
+def test_cli_bounded_inbox_does_not_hide_corruption(pilot, kind):
+    root, _ = pilot
+    rows = seed_wire_inbox(root, "x" * 262144)
+    error = corrupt_wire_fixture(root, rows, kind)
+    before = mailbox_snapshot(root)
+    _, result = cli_inbox_wire(root, ok=False)
+    assert result == {"error": error}
+    assert mailbox_snapshot(root) == before

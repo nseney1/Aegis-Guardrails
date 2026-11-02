@@ -11,6 +11,10 @@ import threading
 import pytest
 
 from tests.integration.test_hierarchy_mailbox import HELPER, invoke, message, pilot  # noqa: F401
+from tests.integration.test_hierarchy_mailbox import (
+    INBOX_WIRE_BUDGET, WIRE_PAYLOADS, checkpoint_wire_binding, corrupt_wire_fixture,
+    mailbox_snapshot, record_wire_process, seed_wire_inbox, wire_peer_mailbox,
+)
 
 
 def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None):
@@ -105,6 +109,7 @@ def test_malformed_frame_is_explicit_and_next_request_still_works(pilot):
 
 def test_running_adapter_rejects_replaced_sender_and_changed_manifest(pilot):
     root, brief = pilot
+    seed_wire_inbox(root, "x" * 262144, endpoint="a/lane/review")
     process = subprocess.Popen([sys.executable, "-I", str(HELPER), "--root", str(root), "serve",
                                 "--endpoint", "a/lane/review", "--host", "host-one", "--session", "a/lane/review",
                                 "--generation", "1"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -122,9 +127,14 @@ def test_running_adapter_rejects_replaced_sender_and_changed_manifest(pilot):
                       "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}
         invoke(root, "bind", {"endpoint": "a/lane/review", "host": "host-two", "session": "successor",
                               "expected_generation": 1, "checkpoint": checkpoint})
+        before = mailbox_snapshot(root)
+        response = call("stale-inbox", "tools/call", {"name": "mailbox_inbox", "arguments": {"include_briefs": True}})
+        assert response["result"]["isError"] is True
+        assert payload(response) == {"error": "stale or mismatched sender binding"}
         response = call(2, "tools/call", {"name": "mailbox_publish", "arguments": {
             "message_id": "stale", "to": "a/orchestrator", "type": "info", "body": "stale sender"}})
         assert payload(response)["error"] == "stale or mismatched sender binding"
+        assert mailbox_snapshot(root) == before
         manifest_path = root / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
         manifest["writer_limit"] = 2
@@ -158,7 +168,7 @@ def test_scoped_adapter_does_not_write_python_cache_in_source_checkout(pilot, tm
 
 def test_oversized_frame_closes_without_parsing_fragments(pilot):
     root, _ = pilot
-    responses = exchange(root, raw="x" * 262145 + "\n")
+    responses = exchange(root, raw="x" * 262145 + "\n" + json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}) + "\n")
     assert responses == [{"jsonrpc": "2.0", "id": None, "error": {
         "code": -32700, "message": "mailbox frame exceeds 262144 bytes"}}]
 
@@ -186,3 +196,261 @@ def test_front_door_authors_hash_bound_brief_using_only_scoped_tools(pilot):
     inbox = payload(exchange(root, [("mailbox_inbox", {"include_briefs": True})], endpoint="a/orchestrator")[-1])
     delivered = next(r for r in inbox["messages"] if r["message"]["message_id"] == "intent-handoff")
     assert intent["body"] in delivered["brief_text"]
+
+
+def mcp_wire_exchange(root, frames=(), *, endpoint="a/lane/f2", host="host-one", session=None, generation=1, raw=None):
+    initialization = {"jsonrpc": "2.0", "id": "init", "method": "initialize", "params": {}}
+    prefix = (json.dumps(initialization) + "\n").encode("utf-8")
+    if raw is None:
+        lines = [(json.dumps(frame, ensure_ascii=False) + "\n").encode("utf-8") for frame in frames]
+        assert all(len(line) <= 262144 for line in lines), "fixtures must remain valid input frames"
+        raw = b"".join(lines)
+    argv = [sys.executable, "-I", str(HELPER), "--root", str(root), "serve",
+            "--endpoint", endpoint, "--host", host, "--session", session or endpoint,
+            "--generation", str(generation)]
+    result = subprocess.run(argv, input=prefix + raw, capture_output=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    evidence = record_wire_process(root, argv, result, stdin=prefix + raw)
+    assert result.returncode == 0, (str(evidence), result.stdout[:2048], result.stderr[:2048])
+    assert result.stderr == b""
+    lines = result.stdout.splitlines(keepends=True)
+    assert all(line.endswith(b"\n") for line in lines)
+    responses = [json.loads(line.decode("utf-8")) for line in lines]
+    assert responses[0]["id"] == "init"
+    assert responses[0]["result"]["serverInfo"]["name"] == "aegis-hierarchy-mailbox"
+    return lines[1:], responses[1:]
+
+
+def inbox_frame(arguments, identifier="inbox"):
+    return {"jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+            "params": {"name": "mailbox_inbox", "arguments": arguments}}
+
+
+def mcp_inbox_wire(root, arguments, *, identifier="inbox", **identity):
+    raw, responses = mcp_wire_exchange(root, [inbox_frame(arguments, identifier),
+                                           {"jsonrpc": "2.0", "id": "after-inbox", "method": "ping"}], **identity)
+    assert len(responses) == 2
+    assert responses[0]["id"] == identifier
+    assert responses[1] == {"jsonrpc": "2.0", "id": "after-inbox", "result": {}}
+    return raw[0], responses[0]
+
+
+@pytest.mark.parametrize("content", WIRE_PAYLOADS)
+def test_mcp_bounded_inbox_wire_pages_are_lossless(pilot, content):
+    root, _ = pilot
+    expected = seed_wire_inbox(root, content)
+    binding = invoke(root, "status")["bindings"]["a/lane/f2"]
+    before = mailbox_snapshot(root)
+    received, cursor = [], None
+    identifier = 'é"\\\n😀' * 2048  # Accepted request ID contributes to the real outer frame.
+    for page_number in range(len(expected) + 1):
+        arguments = {"include_briefs": True}
+        if cursor is not None:
+            arguments["after_message_id"] = cursor
+        raw, response = mcp_inbox_wire(root, arguments, identifier=identifier)
+        assert len(raw) <= INBOX_WIRE_BUDGET, "MCP outer-frame budget exceeded; raw evidence: " + str(root.parent / "wire-evidence")
+        assert response["result"].get("isError", False) is False
+        page = payload(response)
+        assert page["binding"] == binding
+        assert page["endpoint"] == "a/lane/f2"
+        assert page["checkpoint_briefs"] == []
+        assert page["messages"], "nonempty eligible history must make cursor progress"
+        end = len(received) + len(page["messages"])
+        assert page["messages"] == expected[len(received):end]
+        received.extend(page["messages"])
+        assert page["remaining"] == len(expected) - len(received)
+        if page_number == 0:
+            assert 0 < len(page["messages"]) < 20
+        if not page["remaining"]:
+            assert page["next_after"] is None
+            break
+        assert page["next_after"] == received[-1]["message"]["message_id"]
+        assert page["next_after"] != cursor
+        cursor = page["next_after"]
+    assert received == expected
+    for limit in (1, 100):
+        raw, response = mcp_inbox_wire(root, {"limit": limit})
+        assert len(raw) <= INBOX_WIRE_BUDGET
+        page = payload(response)
+        count = min(limit, len(expected))
+        assert page["messages"] == [{"path": r["path"], "message": r["message"]} for r in expected[:count]]
+        assert page["remaining"] == len(expected) - count
+        assert page["next_after"] == (expected[count - 1]["message"]["message_id"] if page["remaining"] else None)
+    raw, response = mcp_inbox_wire(root, {"include_briefs": True,
+                                         "after_message_id": expected[-1]["message"]["message_id"]})
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert payload(response) == {"endpoint": "a/lane/f2", "binding": binding, "checkpoint_briefs": [],
+                                 "messages": [], "remaining": 0, "next_after": None}
+    assert mailbox_snapshot(root) == before
+
+
+def test_mcp_bounded_inbox_checkpoint_metadata_is_mandatory(pilot):
+    root, _ = pilot
+    binding = checkpoint_wire_binding(root, "x" * 262144, 20)
+    identity = {"host": "host-two", "session": "replacement", "generation": 2}
+    before = mailbox_snapshot(root)
+    raw, response = mcp_inbox_wire(root, {"include_briefs": True}, **identity)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert response["result"]["isError"] is True
+    assert payload(response) == {"error": "inbox response metadata exceeds 4194304 bytes"}
+    raw, response = mcp_inbox_wire(root, {}, **identity)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert payload(response) == {"endpoint": "a/lane/f2", "binding": binding, "checkpoint_briefs": [],
+                                 "messages": [], "remaining": 0, "next_after": None}
+    assert mailbox_snapshot(root) == before
+
+
+def test_mcp_bounded_inbox_exact_wire_boundary(pilot):
+    root, _ = pilot
+    identifier = 'edge-é"\\\n😀'
+    # Calibrate from the real outer JSON-RPC line, including the escaped ID,
+    # inner text and newline. Equal-length roots keep path framing identical.
+    seed = wire_peer_mailbox(root, "edge-seed")
+    seed_wire_inbox(seed, "x" * 262144, count=16, final_content="x" * 200000)
+    raw, response = mcp_inbox_wire(seed, {"include_briefs": True, "limit": 100}, identifier=identifier)
+    assert len(payload(response)["messages"]) == 16
+    padding = INBOX_WIRE_BUDGET - len(raw)
+    assert 0 < padding < 262144 - 200000
+    fit = wire_peer_mailbox(root, "edge-fit0")
+    expected = seed_wire_inbox(fit, "x" * 262144, count=16, final_content="x" * (200000 + padding))
+    raw, response = mcp_inbox_wire(fit, {"include_briefs": True, "limit": 100}, identifier=identifier)
+    assert len(raw) == INBOX_WIRE_BUDGET
+    page = payload(response)
+    assert page["messages"] == expected
+    assert page["remaining"] == 0 and page["next_after"] is None
+    over = wire_peer_mailbox(root, "edge-over")
+    expected = seed_wire_inbox(over, "x" * 262144, count=16, final_content="x" * (200001 + padding))
+    before = mailbox_snapshot(over)
+    raw, response = mcp_inbox_wire(over, {"include_briefs": True, "limit": 100}, identifier=identifier)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    page = payload(response)
+    assert page["messages"] == expected[:-1]
+    assert page["remaining"] == 1
+    assert page["next_after"] == expected[-2]["message"]["message_id"]
+    raw, response = mcp_inbox_wire(over, {"include_briefs": True, "limit": 100,
+                                        "after_message_id": page["next_after"]}, identifier=identifier)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    last = payload(response)
+    assert last["messages"] == expected[-1:]
+    assert last["remaining"] == 0 and last["next_after"] is None
+    assert mailbox_snapshot(over) == before
+
+
+def test_mcp_bounded_inbox_first_message_cannot_be_skipped(pilot):
+    root, _ = pilot
+    binding = checkpoint_wire_binding(root, "x" * 262144, 15)
+    identity = {"host": "host-two", "session": "replacement", "generation": 2}
+    raw, response = mcp_inbox_wire(root, {"include_briefs": True}, **identity)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    metadata = payload(response)
+    assert metadata["binding"] == binding
+    assert metadata["messages"] == []
+    assert metadata["checkpoint_briefs"] == [
+        {**reference, "text": "x" * 262144} for reference in binding["checkpoint"]["briefs"]]
+    expected = seed_wire_inbox(root, "x" * 262144, count=2)
+    before = mailbox_snapshot(root)
+    raw, response = mcp_inbox_wire(root, {"include_briefs": True}, **identity)
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert response["result"]["isError"] is True
+    assert payload(response) == {"error": "inbox first message cannot fit 4194304 byte response budget"}
+    _, response = mcp_inbox_wire(root, {}, **identity)
+    small = payload(response)
+    assert small["messages"] == [{"path": r["path"], "message": r["message"]} for r in expected]
+    assert small["binding"] == binding
+    assert small["remaining"] == 0 and small["next_after"] is None
+    assert mailbox_snapshot(root) == before
+
+
+@pytest.mark.parametrize("arguments,error", [
+    ({"limit": True}, "invalid inbox limit"),
+    ({"limit": 0}, "invalid inbox limit"),
+    ({"limit": 101}, "invalid inbox limit"),
+    ({"after_message_id": "missing"}, "inbox cursor does not name a received message"),
+    ({"after_message_id": "foreign"}, "inbox cursor does not name a received message"),
+])
+def test_mcp_bounded_inbox_retains_argument_errors(pilot, arguments, error):
+    root, _ = pilot
+    seed_wire_inbox(root, "x" * 262144)
+    invoke(root, "publish", message(recipient="a/lane/review", identifier="foreign"))
+    before = mailbox_snapshot(root)
+    raw, response = mcp_inbox_wire(root, {"include_briefs": True, **arguments})
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert response["result"]["isError"] is True
+    assert payload(response) == {"error": error}
+    assert mailbox_snapshot(root) == before
+
+
+@pytest.mark.parametrize("kind", ["first-brief", "deferred-brief", "missing-brief", "history"])
+def test_mcp_bounded_inbox_does_not_hide_corruption(pilot, kind):
+    root, _ = pilot
+    rows = seed_wire_inbox(root, "x" * 262144)
+    error = corrupt_wire_fixture(root, rows, kind)
+    before = mailbox_snapshot(root)
+    raw, response = mcp_inbox_wire(root, {"include_briefs": True})
+    assert len(raw) <= INBOX_WIRE_BUDGET
+    assert response["result"]["isError"] is True
+    assert payload(response) == {"error": error}
+    assert mailbox_snapshot(root) == before
+
+
+def test_mcp_bounded_inbox_preserves_malformed_frame_and_cross_role_errors(pilot):
+    root, _ = pilot
+    expected = seed_wire_inbox(root, "x" * 262144)
+    frames = [inbox_frame({"include_briefs": True}),
+              {"jsonrpc": "2.0", "id": "diagonal", "method": "tools/call", "params": {
+                  "name": "mailbox_publish", "arguments": {"message_id": "forbidden", "to": "b/orchestrator",
+                                                           "type": "info", "body": "must not publish"}}},
+              {"jsonrpc": "2.0", "id": "ping", "method": "ping"}]
+    raw = b'{"jsonrpc":"2.0","id":1,"id":2}\n'
+    raw += b"".join((json.dumps(frame) + "\n").encode("utf-8") for frame in frames)
+    before = mailbox_snapshot(root)
+    lines, responses = mcp_wire_exchange(root, raw=raw)
+    assert len(responses) == 4
+    assert responses[0] == {"jsonrpc": "2.0", "id": None, "error": {
+        "code": -32700, "message": "duplicate JSON key: id"}}
+    assert len(lines[1]) <= INBOX_WIRE_BUDGET
+    page = payload(responses[1])
+    assert page["messages"] == expected[:len(page["messages"])]
+    assert 0 < len(page["messages"]) < 20
+    assert page["remaining"] == len(expected) - len(page["messages"])
+    assert page["next_after"] == page["messages"][-1]["message"]["message_id"]
+    assert responses[2]["result"]["isError"] is True
+    assert payload(responses[2]) == {"error": "route is not vertical or an explicit counterpart"}
+    assert responses[3] == {"jsonrpc": "2.0", "id": "ping", "result": {}}
+    assert mailbox_snapshot(root) == before
+
+
+def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):
+    root, _ = pilot
+    binding = checkpoint_wire_binding(root, "x" * 262144, 20)
+    body = 'é"\\\n😀' * 4096
+    publish = {"name": "mailbox_publish", "arguments": {
+        "message_id": "after-overflow", "to": "a/orchestrator", "type": "info", "body": body}}
+    frames = [inbox_frame({"include_briefs": True}),
+              {"jsonrpc": "2.0", "id": "handoff", "method": "tools/call", "params": {
+                  "name": "mailbox_ack_handoff", "arguments": {"checkpoint_sha256": binding["checkpoint_sha256"]}}},
+              {"jsonrpc": "2.0", "id": 'publish-é"\\\n😀', "method": "tools/call", "params": publish},
+              {"jsonrpc": "2.0", "id": "duplicate", "method": "tools/call", "params": publish},
+              inbox_frame({}, "metadata"), {"jsonrpc": "2.0", "id": "ping", "method": "ping"}]
+    lines, responses = mcp_wire_exchange(root, frames, host="host-two", session="replacement", generation=2)
+    assert len(responses) == len(frames)
+    assert len(lines[0]) <= INBOX_WIRE_BUDGET
+    assert responses[0]["result"]["isError"] is True
+    assert payload(responses[0]) == {"error": "inbox response metadata exceeds 4194304 bytes"}
+    for index in (1, 2):
+        assert responses[index]["result"].get("isError", False) is False
+        assert responses[index]["id"] == frames[index]["id"]
+    assert payload(responses[1]) == {"endpoint": "a/lane/f2", "generation": 2, "ready": True}
+    receipt = payload(responses[2])
+    assert receipt["message"]["body"] == body
+    assert receipt["message"]["message_id"] == "after-overflow"
+    assert receipt["sha256"] == hashlib.sha256(Path(receipt["path"]).read_bytes()).hexdigest()
+    assert responses[3]["result"]["isError"] is True
+    assert payload(responses[3]) == {"error": "message_id already exists: after-overflow"}
+    assert payload(responses[4])["binding"] == {**binding, "ready": True}
+    assert responses[5] == {"jsonrpc": "2.0", "id": "ping", "result": {}}
+    assert json.loads((root / "bindings/a/lane/f2/000002.ack").read_text()) == {
+        "endpoint": "a/lane/f2", "generation": 2, "session": "replacement",
+        "checkpoint_sha256": binding["checkpoint_sha256"]}
+    assert invoke(root, "inbox", endpoint="a/orchestrator")["messages"] == [
+        {"path": receipt["path"], "message": receipt["message"]}]

@@ -6,8 +6,16 @@ The configured sender is provenance, not an authenticated native host identity.
 import json
 import sys
 
-from hierarchy_mailbox import (MAX_BYTES, Mailbox, digest, fields, integer, matching,
+from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, fields, integer, matching,
                                require, SHA256, strict_json, text, writer_lock)
+
+
+def _response_line(response):
+    return (json.dumps(response, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _tool_result(result):
+    return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
 
 
 def definitions():
@@ -102,7 +110,10 @@ def handle(connection, request):
         fields(params, {"name"}, {"arguments", "_meta"})
         try:
             result = connection.call(params["name"], params.get("arguments", {}))
-            return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
+            if params["name"] == "mailbox_inbox":
+                result = _bounded_inbox(result, lambda page: _response_line({
+                    "jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)}))
+            return _tool_result(result)
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
             return {"content": [{"type": "text", "text": json.dumps({"error": str(exc)})}], "isError": True}
     raise ValueError("unsupported mailbox method: " + method)
@@ -133,6 +144,7 @@ def serve(root, endpoint, host, session, generation):
                 response["error"] = {"code": -32602, "message": str(exc)}
                 if isinstance(request, dict) and type(request.get("id")) in (str, int):
                     response["id"] = request["id"]
-        print(json.dumps(response, sort_keys=True), flush=True)
+        sys.stdout.buffer.write(_response_line(response))
+        sys.stdout.buffer.flush()
         if oversized:
             return 0  # close the channel rather than interpret frame fragments as requests

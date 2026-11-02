@@ -22,6 +22,7 @@ import uuid
 
 
 MAX_BYTES = 262144
+MAX_INBOX_RESPONSE_BYTES = 4194304
 MAX_RECORDS = 10000
 SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,79}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -87,6 +88,39 @@ def encoded(value):
 
 def digest(value):
     return hashlib.sha256(encoded(value)).hexdigest()
+
+
+def _cli_line(value):
+    return (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _bounded_inbox(result, render):
+    """Page a fully validated count-limited inbox using its actual transport bytes.
+
+    The caller has already checked history and expanded every requested brief in
+    the count-limited selection. Byte paging must not hide any of those errors.
+    Binding and checkpoint briefs are mandatory, including duplicate references.
+    """
+    messages = result["messages"]
+    total = len(messages) + result["remaining"]
+
+    def page(count):
+        remaining = total - count
+        return {**result, "messages": messages[:count], "remaining": remaining,
+                "next_after": messages[count - 1]["message"]["message_id"] if count and remaining else None}
+
+    selected = page(0)
+    require(len(render(selected)) <= MAX_INBOX_RESPONSE_BYTES,
+            "inbox response metadata exceeds 4194304 bytes")
+    for count in range(1, len(messages) + 1):
+        candidate = page(count)
+        if len(render(candidate)) > MAX_INBOX_RESPONSE_BYTES:
+            require(count > 1, "inbox first message cannot fit 4194304 byte response budget")
+            # A complete validated message/path record adds more bytes in either
+            # transport than any reduction of the bounded cursor/count fields.
+            break
+        selected = candidate
+    return selected
 
 
 def strict_json(raw):
@@ -609,6 +643,7 @@ class Mailbox:
                 "native_enforcement_ready": False, "manager_membership": "unchanged"}
 
     def inbox(self, endpoint, *, include_briefs=False, limit=20, after=None):
+        """Validate and expand the count-limited result before transport byte paging."""
         self.endpoint(endpoint)
         integer(limit, "inbox limit", maximum=100)
         records = sorted((r for r in self.messages().values() if r["message"]["to"] == endpoint),
@@ -687,6 +722,7 @@ def main(argv=None):
             else:
                 result = mailbox.inbox(args.endpoint, include_briefs=args.include_briefs,
                                        limit=args.limit, after=args.after)
+                result = _bounded_inbox(result, _cli_line)
         else:
             with writer_lock(root):
                 mailbox = Mailbox(root)
@@ -697,10 +733,10 @@ def main(argv=None):
                     result = mailbox.acknowledge_handoff(request)
                 else:
                     result = mailbox.publish(request)
-        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        sys.stdout.buffer.write(_cli_line(result))
         return 0
     except (ValueError, OSError, UnicodeError, RecursionError) as exc:
-        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        sys.stdout.buffer.write(_cli_line({"error": str(exc)}))
         return 2
 
 
