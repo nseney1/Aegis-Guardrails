@@ -323,8 +323,9 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
         # Gone from the host's list, or never in it: check the process table too before releasing the lock.
         stop_confirmed = not (process_names_session(profile["session"]) or claude_table_lists_session(profile["session"]))
     try:
+        # The launcher returned and the session was stopped or vanished; its own exit status was never seen.
         mailbox.write_delivery_receipt(directory, "wakes", {
-            **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited", "exit_code": 0,
+            **base, "wake_id": wake_id, "state": "timed_out" if timed_out else "exited", "exit_code": None,
             "timed_out": timed_out})
     finally:
         if stop_confirmed:
@@ -340,9 +341,10 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
         state = "read"
     else:
         state = "timed_out" if timed_out else "woken_unread"
-    result = {**answer, "log": log, "exit_code": 0, "timed_out": timed_out, "state": state, "read": read,
+    result = {**answer, "log": log, "exit_code": None, "timed_out": timed_out, "state": state, "read": read,
               "still_unread": unread,
-              "background": {"id": entry["id"] if entry else None, "ended": ended, "stop_confirmed": stop_confirmed}}
+              "background": {"id": entry["id"] if entry else None, "ended": ended, "stop_confirmed": stop_confirmed,
+                             "exit_status": "unknown"}}
     if stopped_idle is not None:
         result["stopped_idle"] = stopped_idle
     return (0 if state == "read" else 3), result

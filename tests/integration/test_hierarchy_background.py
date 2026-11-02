@@ -164,7 +164,8 @@ def test_a_background_turn_is_waited_for_then_stopped_and_its_mail_reported_read
     assert code == 0, result
     assert result["state"] == "read" and result["read"] == ["note-1"] and result["timed_out"] is False
     identifier = background.pilot.session[-8:]
-    assert result["background"] == {"id": identifier, "ended": "idle", "stop_confirmed": True}
+    assert result["background"] == {"id": identifier, "ended": "idle", "stop_confirmed": True,
+                                    "exit_status": "unknown"}
     assert ["stop", identifier] in background.calls() and ["logs", identifier] in background.calls()
     assert all(row["status"] == "stopped" for row in background.rows())
     launched = json.loads(background.pilot.record.read_text())["argv"]
@@ -228,6 +229,20 @@ def test_an_unconfirmed_stop_keeps_the_wake_lock(background):
     background.pilot.publish("note-2")
     again_code, again = background.wake(background.profile())
     assert again_code == 2 and "a wake is already in progress" in again["error"]
+
+
+def wake_receipts(background):
+    return [json.loads(p.read_text()) for p in sorted((background.pilot.delivery / "wakes").rglob("*.json"))]
+
+
+def test_a_background_turn_reports_its_exit_status_as_unknown_not_success(background):
+    background.pilot.publish()
+    code, result = background.wake(background.profile())
+    assert code == 0 and result["state"] == "read", result
+    # The launcher returned and the session was stopped; nobody saw the session's own exit status.
+    assert result["exit_code"] is None and result["background"]["exit_status"] == "unknown"
+    finished = [r for r in wake_receipts(background) if r["state"] != "started"]
+    assert len(finished) == 1 and finished[0]["exit_code"] is None, finished
 
 
 @pytest.mark.parametrize("change,error", [
