@@ -3,6 +3,7 @@
 No test starts a real claude or Codex session: launch and lanes-health read a stub
 ``claude`` placed first on PATH that serves recorded fixtures.
 """
+import errno
 import hashlib
 import json
 import os
@@ -340,11 +341,103 @@ def test_render_prompt_leaves_shell_expansions_alone_and_its_output_passes_check
 
 
 def test_check_hashes_counts_only_word_bounded_lowercase_64_hex(tmp_path, named):
+    """P3-1: a hash with one character dropped, doubled or uppercased passed unchecked; it is now refused."""
+    real = sha(named.read_bytes())
     prompt = tmp_path / "prompt.txt"
-    prompt.write_text("git %s\nupper %s\nlong %s\nnone here\n" % ("a" * 40, "A" * 64, "b" * 65), encoding="utf-8")
+    prompt.write_text("git %s, prefix %s, %s and %s\nupper %s\nlong %s\nshort %s\nmixed %s\nedges %s %s\nnone\n"
+                      % ("a" * 40, real[:8], "9" * 55, "8" * 73, "A" * 64, "b" * 65, "c" * 63, real[:63] + "F",
+                         "d" * 56, "e" * 72), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert out["ok"] is False and out["tokens"] == 0 and out["checked"] == [] and out["unmatched"] == []
+    assert [(row["line"], row["length"]) for row in out["malformed"]] == [(2, 64), (3, 65), (4, 63), (5, 64),
+                                                                          (6, 56), (6, 72)]
+    assert "malformed hash-like token" in out["error"] and "line 2" in out["error"]
+
+
+@pytest.mark.parametrize("shape", ["_%s_", "sha256_%s", "**%s**", "sha256:%s"])
+def test_check_hashes_treats_underscore_as_a_token_delimiter(tmp_path, named, shape):
+    """P3-1: `\\b` let `_<hex>_` (Markdown emphasis) and `sha256_<hex>` hide a typed hash."""
+    real = sha(named.read_bytes())
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Brief %s %s\n" % (named, shape % real), encoding="utf-8")
     code, out, err = check_hashes(prompt)
     assert code == 0, (out, err)
-    assert out["tokens"] == 0 and out["checked"] == [] and out["unmatched"] == []
+    assert out["checked"] == [{"token": real, "line": 1, "path": str(named), "via": "same_line"}]
+    prompt.write_text("Brief %s %s\n" % (named, shape % FABRICATED), encoding="utf-8")
+    code, out, _ = check_hashes(prompt)
+    assert code == 6 and [miss["token"] for miss in out["unmatched"]] == [FABRICATED], out
+
+
+def test_check_hashes_accepts_a_repeat_of_a_token_matched_elsewhere_in_the_file(tmp_path, named):
+    """P3-2: a later "send ... sha256 <same hash>" exited 6 although the file already verified it."""
+    real = sha(named.read_bytes())
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Send sha256 %s first.\n\nBrief %s (sha256 %s)\n\nThen send sha256 %s.\nTyped %s twice %s\n"
+                      % (real, named, real, real, FABRICATED, FABRICATED), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert out["checked"] == [
+        {"token": real, "line": 1, "path": str(named), "via": "repeat", "match_line": 3},
+        {"token": real, "line": 3, "path": str(named), "via": "same_line"},
+        {"token": real, "line": 5, "path": str(named), "via": "repeat", "match_line": 3}]
+    assert [(miss["token"], miss["line"]) for miss in out["unmatched"]] == [(FABRICATED, 6), (FABRICATED, 6)]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "missing"])
+def test_check_hashes_follows_a_symlinked_candidate_and_refuses_a_directory_or_missing_one(tmp_path, named, kind):
+    """P3-4: a folder beside a hash never counts (the review-copy case); symlinks are followed (P3-3)."""
+    real = sha(named.read_bytes())
+    candidate = tmp_path / {"symlink": "link.md", "directory": "folder", "missing": "gone.md"}[kind]
+    if kind == "symlink":
+        candidate.symlink_to(named)
+    elif kind == "directory":
+        candidate.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Brief %s (sha256 %s)\n" % (candidate, real), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    if kind == "symlink":
+        assert code == 0, (out, err)
+        assert out["checked"] == [{"token": real, "line": 1, "path": str(candidate), "via": "same_line"}]
+        return
+    assert code == 6, (out, err)
+    [miss] = out["unmatched"]
+    error = "not a regular file" if kind == "directory" else os.strerror(errno.ENOENT)
+    assert miss["candidates"] == [{"path": str(candidate), "line": 1, "sha256": None, "error": error}]
+
+
+def test_check_hashes_never_takes_the_last_line_as_the_line_above_line_1(tmp_path, named):
+    """P3-4: without the at >= 0 guard, line 1's "line above" would be lines[-1]."""
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("sha256 %s\nmiddle\nBrief %s" % (sha(named.read_bytes()), named), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert [(miss["line"], miss["candidates"]) for miss in out["unmatched"]] == [(1, [])]
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized", "symlink"])
+def test_check_hashes_and_render_prompt_refuse_a_non_regular_or_oversized_input(tmp_path, named, kind):
+    """P3-3: Path.read_bytes() blocked forever on a FIFO and read /dev/zero without bound."""
+    target = tmp_path / "input.txt"
+    if kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "directory":
+        target.mkdir()
+    elif kind == "oversized":
+        target.write_text("x" * 262145, encoding="utf-8")
+    else:
+        real = tmp_path / "real.txt"
+        real.write_text("Brief {path:brief}\n", encoding="utf-8")
+        target.symlink_to(real)
+    word = {"fifo": "regular file", "directory": "regular file", "oversized": "exceeds 262144 bytes",
+            "symlink": "symlink"}[kind]
+    code, out, _ = run_tool("check-hashes", target, timeout=20)
+    assert code == 2 and "check-hashes file" in out["error"] and word in out["error"], out
+    out_path = tmp_path / "o.txt"
+    code, out, _ = run_tool("render-prompt", "--template", target, "--path", "brief=%s" % named, "--out", out_path,
+                            timeout=20)
+    assert code == 2 and "--template" in out["error"] and word in out["error"], out
+    assert not out_path.exists()
 
 
 # --- stub claude ------------------------------------------------------------------------------
@@ -543,6 +636,20 @@ def test_launch_refuses_a_relative_hash_source(tmp_path, stub, prompt_file):
     code, out, _ = launch(stub, spec_path, "--plan")
     assert code == 2 and "hash_sources entry" in out["error"] and "checkpoint.json" in out["error"], out
     assert not stub.launched()
+
+
+def test_launch_and_check_hashes_refuse_an_unhashable_source_naming_their_own_argument(tmp_path, stub, prompt_file):
+    """P3-4, P3-5: launch reported a missing hash_sources entry as "--source ... cannot be hashed"."""
+    missing = tmp_path / "missing-checkpoint.json"
+    spec_path, spec = launch_spec(tmp_path, prompt_file, hash_sources=[str(missing)])
+    for extra in (["--plan"], []):
+        code, out, _ = launch(stub, spec_path, *extra)
+        assert code == 2, out
+        assert out["error"].startswith("hash_sources entry %s cannot be hashed" % missing), out
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+    assert not (stub.dir / "calls.jsonl").exists()
+    code, out, _ = check_hashes(prompt_file, "--source", missing)
+    assert code == 2 and out["error"].startswith("--source %s cannot be hashed" % missing), out
 
 
 def test_launch_refuses_an_existing_record_path_before_launching(tmp_path, stub, prompt_file):

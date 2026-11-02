@@ -10,15 +10,21 @@ investigation F-A, F-B; ROOT C5 F1, F2, F5).
 Every subcommand prints one JSON object. Exit codes:
   0  ok
   2  a critical check failed; what may already be written depends on the subcommand
-  3  the target exists and differs, or the session name is already live
+  3  the target exists and differs, or the session name is already live; render-prompt
+     refuses any existing --out, even one with identical bytes
   4  IO or disk error, including free space below --min-free-mb (checked before the first write)
   5  a human-answerable dialog is pending (the record is still written)
-  6  a 64-hex token matches no file named on its line or the line above, nor any
-     --source (check-hashes; launch checks its prompt the same way, with the spec's
-     optional hash_sources, before any claude call); nothing is written, nothing starts
+  6  a 64-hex token matches no file named on its line or the line above, repeats no token
+     matched that way elsewhere in the file, and matches no --source; or a hex run of 56-72
+     characters is not exactly 64 lowercase ones (a malformed hash-like token).
+     check-hashes exits 6; launch checks its prompt the same way, with the spec's optional
+     hash_sources, before any claude call. Nothing is written, nothing starts.
 
 check-hashes takes absolute paths only, without '..' (T100): a relative path in the
-checked file is never a candidate, and the output lists it under refused_paths.
+checked file is never a candidate, and the output lists it under refused_paths. Symlinks
+are followed for the files named in FILE and for --source and --path files. FILE and
+--template themselves must be regular files of at most 262144 bytes with no symlink in
+their path (hierarchy_mailbox.read_bytes).
 render-prompt fills {sha256:key} and {path:key} from --path KEY=ABS_PATH files and
 refuses relative paths, unknown placeholder kinds, unused or unfilled keys, an existing
 --out (exit 3) and output that would fail check-hashes (exit 6), so a rendered prompt
@@ -403,7 +409,13 @@ def cmd_first_prompt_check(args):
     return (EXIT_OK if result["ok"] else EXIT_CRITICAL), result
 
 
-HASH_TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
+# Bounded by anything but an ASCII letter or digit: `\b` treated `_` as part of a word, so
+# `_<hex>_` (Markdown emphasis) and `sha256_<hex>` hid a typed hash (P3-1).
+HASH_TOKEN = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{64}(?![0-9A-Za-z])")
+# A near-hash-length hex run that is not exactly 64 lowercase characters is a hash with a
+# character dropped, doubled or uppercased: refused, never skipped (P3-1). 40-hex git ids
+# and short prefixes stay outside this range.
+HASH_LIKE = re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{56,72}(?![0-9A-Za-z])")
 # Prose, Markdown and JSON delimiters around a path; ':' stays inside so a URL is one chunk.
 PATH_SPLIT = re.compile(r"[\s`'\"()<>\[\]{},;=|]+")
 
@@ -448,24 +460,29 @@ def file_sha256(path):
         return None, exc.strerror or str(exc)
 
 
-def check_hashes(body, sources=()):
+def check_hashes(body, sources=(), source_label="--source"):
     """Every 64-hex token must re-hash from a file named beside it, or from a source (T92).
 
     ROOT C7 typed 56 of a hash's 64 characters into a launch prompt; the launcher only
     compared the delivered prompt with its file, so nothing would have noticed. Beside
-    means an absolute path on the token's line or the line above.
+    means an absolute path on the token's line or the line above. A token that matched
+    beside a path elsewhere in the same file also passes, as via "repeat" with that
+    match's line (P3-2): every value still re-hashes from a named file.
     """
     lines = body.split("\n")
     source_rows, by_hash = [], {}
     for source in sources:
         digest, error = file_sha256(source)
-        require(digest is not None, "--source %s cannot be hashed: %s" % (source, error))
+        require(digest is not None, "%s %s cannot be hashed: %s" % (source_label, source, error))
         source_rows.append({"path": str(source), "sha256": digest})
         by_hash.setdefault(digest, str(source))
-    cache, checked, unmatched, refused, tokens = {}, [], [], {}, 0
+    cache, occurrences, matched_beside, malformed, refused = {}, [], {}, [], {}
     for index, line in enumerate(lines):
+        for match in HASH_LIKE.finditer(line):
+            run = match.group(0)
+            if len(run) != 64 or run != run.lower():
+                malformed.append({"token": run, "line": index + 1, "length": len(run)})
         for match in HASH_TOKEN.finditer(line):
-            tokens += 1
             token, found, candidates = match.group(0), None, []
             for where, at in (("same_line", index), ("line_above", index - 1)):
                 for value in line_paths(lines[at]) if at >= 0 else ():
@@ -480,27 +497,54 @@ def check_hashes(body, sources=()):
                                        **({"error": error} if error else {})})
                     if found is None and digest == token:
                         found = {"token": token, "line": index + 1, "path": value, "via": where}
-            if found is None and token in by_hash:
-                found = {"token": token, "line": index + 1, "path": by_hash[token], "via": "source"}
             if found is not None:
-                checked.append(found)
-            else:
-                unmatched.append({"token": token, "line": index + 1, "candidates": candidates})
-    result = {"ok": not unmatched, "tokens": tokens, "checked": checked, "unmatched": unmatched,
+                matched_beside.setdefault(token, found)
+            elif token in by_hash:
+                found = {"token": token, "line": index + 1, "path": by_hash[token], "via": "source"}
+            occurrences.append((token, index + 1, found, candidates))
+    checked, unmatched = [], []
+    for token, line, found, candidates in occurrences:
+        if found is None and token in matched_beside:
+            first = matched_beside[token]
+            found = {"token": token, "line": line, "path": first["path"], "via": "repeat", "match_line": first["line"]}
+        if found is not None:
+            checked.append(found)
+        else:
+            unmatched.append({"token": token, "line": line, "candidates": candidates})
+    result = {"ok": not unmatched and not malformed, "tokens": len(occurrences), "checked": checked,
+              "unmatched": unmatched, "malformed": malformed,
               "refused_paths": [{"line": line, "path": path, "reason": reason}
                                 for (line, path), reason in sorted(refused.items())],
               "sources": source_rows}
+    problems = []
+    if malformed:
+        problems.append("%d malformed hash-like token(s), hex runs of 56-72 characters that are not exactly 64 "
+                        "lowercase ones: %s" % (len(malformed), ", ".join("line %d" % row["line"] for row in malformed)))
     if unmatched:
-        result["error"] = ("%d of %d sha256 tokens match no file named on their line or the line above, nor any "
-                           "source: %s" % (len(unmatched), tokens,
-                                           ", ".join("line %d" % row["line"] for row in unmatched)))
+        problems.append("%d of %d sha256 tokens match no file named on their line or the line above, nor any "
+                        "source: %s" % (len(unmatched), len(occurrences),
+                                        ", ".join("line %d" % row["line"] for row in unmatched)))
+    if problems:
+        result["error"] = "; ".join(problems)
     return result
+
+
+def read_input(path, argument):
+    """FILE and --template: a regular file of at most 262144 bytes, no symlink in its path (P3-3).
+
+    Path.read_bytes() blocked forever on a FIFO and read /dev/zero without bound;
+    hierarchy_mailbox.read_bytes refuses both, as it already does for checkpoint briefs.
+    """
+    try:
+        return read_bytes(path)
+    except ValueError as exc:
+        raise ValueError("%s %s: %s" % (argument, path, exc)) from None
 
 
 def cmd_check_hashes(args):
     path = absolute_argument(args.file, "check-hashes file")
     sources = [absolute_argument(value, "--source") for value in args.source or []]
-    raw = path.read_bytes()
+    raw = read_input(path, "check-hashes file")
     result = {"file": str(path), "file_sha256": sha256_bytes(raw), **check_hashes(raw.decode("utf-8"), sources)}
     return (EXIT_OK if result["ok"] else EXIT_UNMATCHED_HASH), result
 
@@ -528,7 +572,7 @@ def create_file(path, raw):
 
 
 def cmd_render_prompt(args):
-    """Fill {sha256:key} and {path:key} from the named files' bytes, so no hash is ever typed (T92).
+    """Fill {sha256:key} from the named file's bytes and {path:key} with its path, so no hash is ever typed (T92).
 
     One substitution pass: a filled value is never expanded again. The rendered text must
     pass check-hashes with no sources, so a typed hash left in the template, or a hash
@@ -543,7 +587,7 @@ def cmd_render_prompt(args):
         require(key not in files, "--path key %r given twice" % key)
         files[key] = absolute_argument(path, "--path " + key)
     out = absolute_argument(args.out, "--out") if args.out is not None else None
-    template_raw = template.read_bytes()
+    template_raw = read_input(template, "--template")
     body = template_raw.decode("utf-8")
     used = set()
     for match in PLACEHOLDER.finditer(body):
@@ -681,7 +725,8 @@ def cmd_launch(args):
     if sha256_bytes(raw) != spec["prompt"]["sha256"]:
         raise Failure(EXIT_CRITICAL, "prompt does not re-hash to its recorded sha256",
                       prompt_sha256=sha256_bytes(raw))
-    hashes = check_hashes(raw.decode("utf-8"), [Path(source) for source in spec["hash_sources"]])
+    hashes = check_hashes(raw.decode("utf-8"), [Path(source) for source in spec["hash_sources"]],
+                          "hash_sources entry")
     if not hashes["ok"]:
         raise Failure(EXIT_UNMATCHED_HASH, "prompt hash check failed, nothing launched: " + hashes["error"],
                       prompt_hashes=hashes)
@@ -1350,17 +1395,22 @@ def build_parser():
     check.set_defaults(handler=cmd_first_prompt_check)
 
     hashes = commands.add_parser("check-hashes", help="Check that every 64-hex token in a file re-hashes from a file "
-                                 "named beside it; exit 6 on any unmatched token; never writes")
-    hashes.add_argument("file", help="Absolute path of the prompt, spec or brief to check")
+                                 "named beside it (symlinks are followed); exit 6 on any unmatched or malformed "
+                                 "token; never writes")
+    hashes.add_argument("file", help="Absolute path of the prompt, spec or brief to check: a regular file of at most "
+                        "262144 bytes, no symlink in its path")
     hashes.add_argument("--source", action="append", metavar="ABS_PATH",
-                        help="A file whose sha256 may appear anywhere in FILE (absolute, no '..'); repeatable")
+                        help="A file whose sha256 may appear anywhere in FILE (absolute, no '..'; symlinks are "
+                        "followed); repeatable")
     hashes.set_defaults(handler=cmd_check_hashes)
 
     render = commands.add_parser("render-prompt", help="Fill {sha256:key} and {path:key} in a template from the "
                                  "named files; the output must pass check-hashes")
-    render.add_argument("--template", required=True, help="Absolute path of the template (no '..')")
+    render.add_argument("--template", required=True, help="Absolute path of the template (no '..'): a regular file "
+                        "of at most 262144 bytes, no symlink in its path")
     render.add_argument("--path", action="append", metavar="KEY=ABS_PATH",
-                        help="The file for KEY (absolute, no '..'); repeatable; every key must be used")
+                        help="The file for KEY (absolute, no '..'; symlinks are followed); repeatable; every key "
+                        "must be used")
     render.add_argument("--out", help="Absolute path of a new file for the prompt; an existing file is refused "
                         "(exit 3). Without it the text is printed in the JSON")
     render.set_defaults(handler=cmd_render_prompt)
