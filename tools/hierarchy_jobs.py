@@ -478,7 +478,9 @@ def job_environment(recipes, job, checkout):
     scratch_tmp.mkdir(mode=0o700)
     env = {"PATH": os.pathsep.join(recipes["path"]), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONNOUSERSITE": "1", "GIT_OPTIONAL_LOCKS": "0", "TMP": str(scratch_tmp), "TEMP": str(scratch_tmp),
-           "TMPDIR": str(scratch_tmp)}
+           "TMPDIR": str(scratch_tmp),
+           # Otherwise Cargo builds in the checkout, which a job usually cannot write to.
+           "CARGO_TARGET_DIR": str(job.folder / "cargo-target")}
     for name, folder in HOME_FOLDERS.items():
         path = home / folder
         path.mkdir(parents=True, exist_ok=True, mode=0o700)

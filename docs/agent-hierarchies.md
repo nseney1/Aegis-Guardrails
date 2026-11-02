@@ -7,6 +7,19 @@ in the wheel. No process watches folders or tracks repository work for Aegis, an
 `tools/hierarchy_wake.py` starts a host, when root runs it with a reviewed profile.
 Host configuration, manager policy/membership and release gates are unchanged.
 
+To run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
+
+| Tool | Root uses it to |
+| --- | --- |
+| `tools/hierarchy_provision.py` | Set up an initiative and generate each role's connection and wake profile |
+| `tools/hierarchy_sweep.py` | Wake sessions with unread mail across initiatives |
+| `tools/hierarchy_jobs.py` | Run job requests through fixed recipes and answer them |
+| `tools/hierarchy_review.py` | Prepare exact read-only copies for reviewers |
+| `tools/hierarchy_meter.py` | Measure active time against the rotation limits |
+| `tools/hierarchy_handoff.py` | Hand a session's endpoints to its successor |
+| `tools/hierarchy_workspace.py` | Keep the initiative registry, capacity ledger and lease checks |
+| `tools/hierarchy_board.py` | Keep [board](workspace-board-contract.md) channels and grants, and read digests |
+
 ## Role contracts
 
 ```mermaid
@@ -324,8 +337,20 @@ orchestrator sends `job_request` with a hash-bound packet in `brief`. Root answe
 
 Evidence entries are `{"path", "sha256"}` references. They stay inert: the mailbox
 checks their shape and never reads them. A receipt is a claim, and it stays
-`information_only`. Open jobs must appear in a replacement checkpoint. Root publishes
-receipts with the CLI, and manifests without a root endpoint keep working.
+`information_only`. Open jobs must appear in a replacement checkpoint. Manifests without
+a root endpoint keep working, but cannot receive job requests.
+
+`tools/hierarchy_jobs.py run-open` does this work. The packet is strict JSON naming a recipe
+and an exact source, either as a whole `.md` file or as the body of an earlier message, which is
+how a role with no file writer sends one. A job is refused unless its checkout is registered
+for the initiative and its revision, tree and status digest match the packet. The argv comes
+only from root's recipe file, by exact-word substitution with no shell. The source is witnessed
+again afterward, so a clean exit over changed source is reported as `failed`, with an `exit_code`
+of -1 meaning that no command's own exit decided the result. A heavy job holds a ledger slot, and
+outside heavy processes count against the same limit. The result is written before its receipt,
+so a busy mailbox or store only delays a receipt or a release until the next run. A lost runner
+leaves `unknown` and keeps the slot until root runs `resolve`. See the
+[dogfood guide](hierarchy-dogfood.md) for packets and recipes.
 
 ## Run several initiatives
 
@@ -382,6 +407,17 @@ its history. A store holds at most 10,000 events. A full store refuses every fur
 change, including capacity releases, and stays readable, so plan to start a new one
 before it fills.
 
+`tools/hierarchy_sweep.py` goes through active initiatives in the owner's priority order and
+wakes each endpoint that has unread mail and a current wake profile, one turn at a time. With
+`--rounds` it repeats, so a conversation continues without anyone starting each turn. A session
+past 60 active minutes or one whose time cannot be measured is not woken, and one that ignored
+its mail gets no second turn for it in the same sweep. It never wakes root, and instead reports
+root's unread mail, open jobs and active time against its 90 minutes. Root reads its own mail
+with `inbox --mark-read`, so its unread count means what it means for everyone else.
+
+The [workspace board](workspace-board-contract.md) carries information across initiatives
+when a connection starts with `--board`. It cannot change bindings, dispatches or leases.
+
 ## Role-based assistants
 
 Each role can have a fixed list of assistants with one small job each. They read and
@@ -436,10 +472,12 @@ the existing separate owner review/activation. See [manager mode](manager-worksp
 
 The public subprocess suites are `tests/integration/test_hierarchy_mailbox.py`,
 `test_hierarchy_mailbox_mcp.py`, `test_hierarchy_delivery.py`, `test_hierarchy_handoff.py`,
-`test_hierarchy_root_role.py`, `test_hierarchy_workspace.py`, `test_hierarchy_role_tools.py`
-and `test_hierarchy_templates.py`. They stub host processes at the subprocess boundary, so
-they do not show that a real Claude or Codex session wakes, reads its mail or honors a
-tool list. Those are live gates and remain open for this code.
+`test_hierarchy_root_role.py`, `test_hierarchy_workspace.py`, `test_hierarchy_role_tools.py`,
+`test_hierarchy_templates.py`, `test_hierarchy_meter.py`, `test_hierarchy_provision.py`,
+`test_hierarchy_sweep.py`, `test_hierarchy_jobs.py`, `test_hierarchy_review.py`,
+`test_hierarchy_board.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
+subprocess boundary, so they do not show that a real Claude or Codex session wakes, reads its
+mail or honors a tool list. Those are live gates and remain open for this code.
 `tests/integration/test_hierarchy_scenario.py` adds a simulated two-hierarchy run
 with real linked worktrees, public Aegis lease/scan/lane commands, acted-on peer
 messages at all three layers and a host-label replacement preserving assignment.

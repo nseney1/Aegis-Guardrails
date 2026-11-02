@@ -22,7 +22,8 @@
   "ro_binds": [],
   "env": {
     "PYTHONPATH": "$checkout",
-    "CARGO_NET_OFFLINE": "true"
+    "CARGO_NET_OFFLINE": "true",
+    "RUSTUP_AUTO_INSTALL": "0"
   },
   "identity": {
     "name": "Aegis hierarchy root",

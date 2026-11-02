@@ -317,7 +317,7 @@ def test_a_job_sees_only_the_fixed_environment(shop):
     assert seen["PATH"] == "/usr/bin:/bin"
     assert seen["PYTHONPATH"] == str(shop.checkout) and seen["CUSTOM"] == "fixed"
     folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
-    for name in ("HOME", "USERPROFILE", "TMPDIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"):
+    for name in ("HOME", "USERPROFILE", "TMPDIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME", "CARGO_HOME", "CARGO_TARGET_DIR"):
         assert seen[name].startswith(str(folder)), name
 
 
