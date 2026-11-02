@@ -763,6 +763,92 @@ def test_transfer_plan_writes_nothing(rotation):
     assert rotation["custody"].read_bytes() == before and not rotation["spec_out"].exists()
 
 
+# --- item 7: startup-ack (C2 section 3, F1, F5, F6, F8) -----------------------------------------
+
+
+def clean_repo(path):
+    path.mkdir()
+    for args in (["init", "-q"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base"]):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+    return path
+
+
+@pytest.fixture
+def startup(tmp_path, stub):
+    files = {"packet": tmp_path / "packet.json", "rendezvous": tmp_path / "rendezvous.json",
+             "custody": tmp_path / "custody.json", "out": tmp_path / "ROOT-C6-STARTUP-ACK.json"}
+    files["packet"].write_text('{"packet": 1}\n', encoding="utf-8")
+    files["rendezvous"].write_text(json.dumps({"schema": "aegis.claude-root-rendezvous/v1",
+                                               "state": "WAITING_FOR_ACTUAL_CLAUDE_STARTUP_ACK",
+                                               "outgoing_host": "claude-code", "outgoing_session": OUTGOING,
+                                               "incoming_host": "claude-code", "incoming_session": None}),
+                                   encoding="utf-8")
+    files["custody"].write_text(json.dumps({"active_root_session": OUTGOING}), encoding="utf-8")
+    files["pin"] = clean_repo(tmp_path / "tools-pin")
+    files["source"] = clean_repo(tmp_path / "source")
+    files["sources"] = tmp_path / "sources.json"
+    files["sources"].write_text(json.dumps([str(files["source"]), str(tmp_path / "deleted-checkout")]), encoding="utf-8")
+    write_transcript(stub.projects / "-w" / (INCOMING + ".jsonl"), [
+        {"type": "custom-title", "customTitle": "ROOT C6", "sessionId": INCOMING},
+        user_record("You are ROOT C6.", uuid="u-first"),
+        user_record("<command-name>/goal</command-name> keep working", uuid="u-goal", ts="2026-11-02T16:10:00.000Z"),
+        {"type": "user", "uuid": "u-tool", "timestamp": "2026-11-02T16:11:00.000Z",
+         "message": {"role": "user", "content": [{"type": "tool_result", "content": "Goal set: quoted"}]}}],
+        torn_tail='{"type": "assi')
+    return files
+
+
+def startup_ack(stub, files, *extra, packet_sha=None, env=None):
+    environment = {**stub.env(), "CLAUDE_CODE_SESSION_ID": INCOMING, "CLAUDE_PID": str(os.getpid()), **(env or {})}
+    return run_tool("startup-ack", "--packet", files["packet"],
+                    "--packet-sha256", packet_sha or sha(files["packet"].read_bytes()),
+                    "--rendezvous", files["rendezvous"], "--custody", files["custody"], "--tools-pin", files["pin"],
+                    "--sources", files["sources"], "--role", "ROOT C6", "--out", files["out"],
+                    "--projects-dir", stub.projects, "--min-free-mb", "1", *extra, env=environment)
+
+
+def test_startup_ack_writes_live_facts_and_observes_missing_sources(stub, startup):
+    code, out, err = startup_ack(stub, startup)
+    assert code == 0, (out, err)
+    ack = json.loads(startup["out"].read_text(encoding="utf-8"))
+    assert ack == out["ack"]
+    assert ack["schema"] == "aegis.claude-root-startup-ack/v1" and ack["startup_only"] is True
+    assert ack["custody_transfer"] is False
+    assert all(check["ok"] for check in ack["critical_checks"])
+    assert ack["incoming"]["session"] == INCOMING and ack["outgoing"]["session"] == OUTGOING
+    proof = ack["incoming"]["identity_proof"]
+    assert proof["transcript_line1"]["sessionId"] == INCOMING and proof["host_process"]["alive"] is True
+    assert proof["transcript_first_user_record"]["uuid"] == "u-first"
+    assert ack["torn_tail"] is True
+    assert [g["uuid"] for g in ack["goal_records"]] == ["u-goal"] and ack["goal_records"][0]["line"] == 3
+    sources = {s["path"]: s for s in ack["observed"]["sources_readonly"]}
+    assert sources[str(startup["source"])]["present"] is True and sources[str(startup["source"])]["dirty_entries"] == 0
+    assert sources[str(startup.get("source").parent / "deleted-checkout")]["present"] is False
+    assert ack["observed"]["tools_pin"]["clean"] is True
+
+
+@pytest.mark.parametrize("break_it", ["packet", "pin", "custody", "identity"])
+def test_startup_ack_fails_a_critical_check_and_writes_nothing(stub, startup, break_it):
+    kwargs = {}
+    if break_it == "packet":
+        kwargs["packet_sha"] = "0" * 64
+    elif break_it == "pin":
+        (startup["pin"] / "stray.txt").write_text("x", encoding="utf-8")
+    elif break_it == "custody":
+        startup["custody"].write_text(json.dumps({"active_root_session": INCOMING}), encoding="utf-8")
+    else:
+        kwargs["env"] = {"CLAUDE_CODE_SESSION_ID": OUTGOING}
+    code, out, _ = startup_ack(stub, startup, **kwargs)
+    assert code == 2
+    assert not startup["out"].exists()
+
+
+def test_startup_ack_plan_writes_nothing(stub, startup):
+    code, out, _ = startup_ack(stub, startup, "--plan")
+    assert code == 0 and out["writes"] == [str(startup["out"])]
+    assert not startup["out"].exists()
+
+
 def test_verify_retired_leaves_a_changed_custody_untouched(tmp_path, stub):
     custody = custody_file(tmp_path)
     before = custody.read_bytes()

@@ -807,6 +807,139 @@ def cmd_transfer(args):
                                                              update["sha256"]))}
 
 
+GOAL_MARKERS = ("<command-name>/goal</command-name>", "Goal set:")
+
+
+def goal_records(rows):
+    """User records whose own text sets a goal, each cited by its own line (F8).
+
+    record_text reads only string content and text blocks, so a tool result that merely
+    quotes "Goal set:" is not a goal record.
+    """
+    found = []
+    for line, record in rows:
+        if isinstance(record, dict) and record.get("type") == "user":
+            body = record_text(record)
+            if body and any(marker in body for marker in GOAL_MARKERS):
+                found.append({"line": line, "timestamp": record.get("timestamp"), "uuid": record.get("uuid"),
+                              "head": body[:HEAD_CHARS]})
+    return found
+
+
+def session_identity(projects_dir):
+    """Who is running this tool: env, live host process and the transcript that names it."""
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID")
+    pid_text = os.environ.get("CLAUDE_PID", "")
+    pid = int(pid_text) if pid_text.isdigit() else None
+    alive, ticks = process_state(pid) if pid else (False, None)
+    proof = {"runtime_env": sorted(key for key in os.environ if key.startswith("CLAUDE_")
+                                   and "TOKEN" not in key and "SOCKET" not in key),
+             "host_process": {"pid": pid, "alive": alive, "start_ticks": ticks},
+             "job_dir": os.environ.get("CLAUDE_JOB_DIR"), "transcript": None, "transcript_line1": None,
+             "transcript_first_user_record": None}
+    rows, torn = [], False
+    transcript = find_transcript(projects_dir, session) if session and SESSION_ID.fullmatch(session) else None
+    if transcript is not None:
+        rows, torn = read_jsonl(transcript)
+        proof["transcript"] = str(transcript)
+        if rows and isinstance(rows[0][1], dict):
+            proof["transcript_line1"] = {"line": rows[0][0], "sessionId": rows[0][1].get("sessionId")}
+        proof["transcript_first_user_record"] = first_user_record(rows)[0]
+    ok = bool(session) and alive and (proof["transcript_line1"] or {}).get("sessionId") == session
+    return session, proof, ok, rows, torn
+
+
+def git_state(path, ignored=False):
+    def git(*arguments):
+        result = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *arguments], cwd=path,
+                                capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        require(result.returncode == 0, "git %s failed in %s" % (arguments[0], path))
+        return result.stdout
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all", *(["--ignored"] if ignored else []))
+    entries = len([token for token in status.split(b"\0") if token[2:3] == b" "])
+    return {"path": str(path), "commit": git("rev-parse", "HEAD").decode().strip(),
+            "tree": git("rev-parse", "HEAD^{tree}").decode().strip(), "porcelain_entries": entries,
+            "clean": entries == 0}
+
+
+def source_observation(path):
+    """Observed, never fatal: a deleted checkout is recorded, not a reason to abort (C2 F6)."""
+    if not Path(path).exists():
+        return {"path": path, "present": False}
+    try:
+        from hierarchy_jobs import uncommitted_content
+        state = git_state(path)
+        digest, count = uncommitted_content(path)
+        return {"path": path, "present": True, "commit": state["commit"], "tree": state["tree"],
+                "dirty_content_sha256": digest, "dirty_entries": count}
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        return {"path": path, "present": True, "error": str(exc)}
+
+
+def cmd_startup_ack(args):
+    """Incoming ROOT: build the startup ACK from live facts (C2 section 3).
+
+    Critical checks exit 2 and write nothing. Everything else is observed and recorded,
+    so a deleted source or a changed lease no longer aborts an ACK after every critical
+    check has passed (F1, F6).
+    """
+    out = Path(args.out)
+    if args.plan:
+        return EXIT_OK, {"ok": True, "plan": True, "writes": [str(out)]}
+    checks = []
+
+    def critical(name, ok, **detail):
+        checks.append({"name": name, "ok": bool(ok), **detail})
+
+    packet_raw = Path(args.packet).read_bytes()
+    critical("packet_sha256", sha256_bytes(packet_raw) == args.packet_sha256, actual=sha256_bytes(packet_raw))
+    rendezvous_raw = Path(args.rendezvous).read_bytes()
+    rendezvous = json.loads(rendezvous_raw)
+    session, proof, identity_ok, rows, torn = session_identity(args.projects_dir)
+    critical("own_identity", identity_ok, session=session)
+    waiting = (str(rendezvous.get("state", "")).startswith("WAITING") and rendezvous.get("incoming_host") == args.host
+               and rendezvous.get("incoming_session") in (None, session))
+    if args.rendezvous_sha256:
+        waiting = waiting and sha256_bytes(rendezvous_raw) == args.rendezvous_sha256
+    critical("rendezvous_awaits_this_host", waiting, state=rendezvous.get("state"))
+    custody_raw = Path(args.custody).read_bytes()
+    custody = json.loads(custody_raw)
+    outgoing = rendezvous.get("outgoing_session")
+    critical("custody_names_outgoing_root", outgoing is not None and custody.get("active_root_session") == outgoing,
+             active_root_session=custody.get("active_root_session"))
+    try:
+        pin = git_state(args.tools_pin, ignored=True)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        pin = {"path": str(args.tools_pin), "clean": False, "error": str(exc)}
+    critical("tools_pin_clean", pin["clean"], porcelain_entries=pin.get("porcelain_entries"))
+    if not all(check["ok"] for check in checks):
+        return EXIT_CRITICAL, {"ok": False, "error": "a critical startup check failed; nothing was written",
+                               "critical_checks": checks}
+    check_free_space([out], args.min_free_mb)
+    stats = os.statvfs(out.parent)
+    sources = [source_observation(path) for path in (read_json(args.sources) if args.sources else [])]
+    observations = ["source missing: " + s["path"] for s in sources if not s["present"]]
+    if torn:
+        observations.append("own transcript has a torn last line (skipped)")
+    ack = {"schema": "aegis.claude-root-startup-ack/v1", "startup_only": True, "custody_transfer": False,
+           "at": utc_now(),
+           "incoming": {"role": args.role, "host": args.host, "session": session, "identity_proof": proof},
+           "outgoing": {"host": rendezvous.get("outgoing_host"), "session": outgoing},
+           "observed": {"handoff": {"path": str(args.packet), "sha256": sha256_bytes(packet_raw)},
+                        "rendezvous": {"path": str(args.rendezvous), "sha256": sha256_bytes(rendezvous_raw),
+                                       "state": rendezvous.get("state"),
+                                       "incoming_session": rendezvous.get("incoming_session")},
+                        "custody": {"path": str(args.custody), "sha256": sha256_bytes(custody_raw),
+                                    "active_root_session": custody.get("active_root_session"),
+                                    "active_native_root": custody.get("active_native_root")},
+                        "tools_pin": pin, "sources_readonly": sources,
+                        "disk": {"free_mb": stats.f_bavail * stats.f_frsize // (1024 * 1024)}},
+           "goal_records": goal_records(rows), "torn_tail": torn, "critical_checks": checks,
+           "observations": observations}
+    written = atomic_write_json(out, ack)
+    return EXIT_OK, {"ok": True, "out": str(out), "written": written, "ack": ack}
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -866,6 +999,22 @@ def build_parser():
     move.add_argument("--plan", action="store_true", help="Print the paths a run would write; write nothing")
     move.add_argument("--min-free-mb", type=int, default=512)
     move.set_defaults(handler=cmd_transfer)
+
+    ack = commands.add_parser("startup-ack", help="Incoming ROOT: build the startup ACK from live facts")
+    ack.add_argument("--packet", required=True)
+    ack.add_argument("--packet-sha256", required=True)
+    ack.add_argument("--rendezvous", required=True)
+    ack.add_argument("--rendezvous-sha256", help="Optional: the rendezvous must still have these bytes")
+    ack.add_argument("--custody", required=True)
+    ack.add_argument("--tools-pin", required=True, help="Pinned tools checkout; must be clean, ignored files included")
+    ack.add_argument("--sources", help="JSON list of absolute source checkouts to observe read-only")
+    ack.add_argument("--role", required=True)
+    ack.add_argument("--host", default="claude-code")
+    ack.add_argument("--out", required=True)
+    ack.add_argument("--projects-dir", default=str(Path.home() / ".claude" / "projects"))
+    ack.add_argument("--plan", action="store_true", help="Print the paths a run would write; write nothing")
+    ack.add_argument("--min-free-mb", type=int, default=512)
+    ack.set_defaults(handler=cmd_startup_ack)
     return parser
 
 
