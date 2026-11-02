@@ -78,14 +78,19 @@ def test_a_self_stop_never_stops_another_session(name):
     assert missing(name, ["never stop another session"]) == []
 
 
-def test_only_writers_cd_into_their_worktree_and_read_only_roles_never_use_a_bare_cd():
-    assert missing("roles/lane.md", ["Writing lanes:", "the first-step `cd` is into your own worktree only",
-                                     "read-only roles never use a bare `cd`"]) == []
+def test_writers_keep_the_launch_cwd_and_reach_their_worktree_only_through_git_c_or_a_subshell():
+    assert missing("roles/lane.md", ["Writing lanes:", "Your session cwd stays at the launch cwd for the whole session",
+                                     "never a bare `cd`, not even at the start of a compound command",
+                                     "Writers use `git -C <worktree>` for git and a `( cd <worktree> && … )` subshell",
+                                     "read-only roles follow `reviewer.md`"]) == []
+    assert "first-step `cd`" not in words("roles/lane.md")
+    assert "first step is a Bash `cd`" not in words("roles/lane.md")
 
 
 def test_orchestrators_read_a_dialog_from_waiting_for_not_from_blocked_alone():
     assert missing("roles/orchestrator.md", ["`waitingFor`", "whatever `state` says", "`state: blocked`",
-                                             "A present `waitingFor` is a dialog whatever `status` says"]) == []
+                                             "A present `waitingFor` (e.g. `\"permission prompt\"`) is a dialog "
+                                             "whatever `status` says"]) == []
 
 
 def test_orchestrators_bind_by_kind_and_list_governance_paths_without_a_fixed_writer_count():
@@ -102,7 +107,8 @@ def test_root_changes_limits_and_stops_earlier_roots_lanes_only_under_owner_deci
 
 
 def test_root_launch_prompts_copy_the_briefs_deadline_and_the_exact_self_stop_line():
-    assert missing("roles/root.md", ["copy the brief's deadline", "the brief wins over a default", SELF_STOP]) == []
+    assert missing("roles/root.md", ["copy the brief's deadline", "the brief wins over a default", SELF_STOP,
+                                     "send one line saying so, and never stop another session"]) == []
 
 
 def test_root_stops_the_outgoing_session_and_checks_its_pid():
@@ -181,7 +187,8 @@ def test_lanes_keep_tmpdir_and_home_out_of_slash_tmp():
 
 def test_lanes_never_cd_into_the_dogfood_folder_and_check_pwd_before_writing():
     assert missing("roles/lane.md", ["never `cd` into the dogfood folder (`aegis-hierarchy-dogfood`), even as a writer",
-                                     "run `pwd` before your first Write"]) == []
+                                     "run `pwd` before your first Write",
+                                     "run one lone `cd <launch cwd>` and report it"]) == []
     assert words("roles/lane.md").count("bare `cd`") == 1
 
 
@@ -207,6 +214,89 @@ def test_the_corrected_lane_facts_and_attributions_stay_pinned():
                                      "**Absolute paths, T100.** Packets, prompts and specs write every path in a command "
                                      "line as absolute", "**Layout (f), T38 and T48.**"]) == []
     assert missing("lane-brief.md", ["(layout f, T38 and T48)"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_managers_follow_the_launch_order_bind_quietly_and_close_dispatches(name):
+    assert missing(name, ["worktree → lease → writer → bind → launch → dispatch → accept",
+                          "Every writing dispatch names a lease, which ROOT claims before the launch",
+                          "bind a successor orchestrator at a quiet moment",
+                          "close this dispatch with a mailbox `result` before the self-stop",
+                          "Close a dispatch before its worktree is removed", "\"git identity check failed\""]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_handoffs_carry_the_owner_approved_backlog_table_verbatim(name):
+    assert missing(name, ["\"Owner-approved backlog\" table, copied forward verbatim",
+                          "done (with evidence) or retired by a cited record",
+                          "re-checks the table against the owner records during its read"]) == []
+
+
+def test_orchestrators_relay_cross_team_requests_through_root_and_resolve_codex_roles():
+    assert missing("roles/orchestrator.md", ["go by ROOT relay", "`c12-cross-orchestrator-traffic-a`",
+                                             "notices without authority may go by SendMessage",
+                                             "the receiver records them in its STATUS",
+                                             "A peer still cannot dispatch your lanes",
+                                             "through `resolve --endpoint`", "not in ListAgents",
+                                             "Its Claude lanes poll their inbox"]) == []
+    assert "Cross-hierarchy findings go orchestrator to orchestrator" not in words("roles/orchestrator.md")
+
+
+def test_root_names_current_holders_keeps_codex_liveness_and_fetches_without_maintenance():
+    assert missing("roles/root.md", ["\"or any later N that ListAgents shows\"", "never only a predicted number",
+                                     "lane liveness, stall checks and retirements", "(F-C12)",
+                                     "`git ls-remote` or `gh api`",
+                                     "`git fetch --no-auto-maintenance --no-write-fetch-head origin <full sha>`",
+                                     "(the T14 trap)"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_managers_never_call_enter_worktree(name):
+    assert missing(name, ["Never call `EnterWorktree` and keep the launch cwd"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md", "roles/reviewer.md"])
+def test_managers_and_reviewers_keep_the_launch_cwd(name):
+    assert missing(name, ["not even inside a compound command or a subshell", "Run `pwd` before the first Write",
+                          "run one lone `cd <launch cwd>` and report it"]) == []
+    assert "subshell `(cd" not in words(name)
+
+
+def test_stop_wording_orders_the_routes_and_adds_no_new_authority():
+    assert missing("roles/orchestrator.md", ["Your outgoing session stops (root's `stop`, then T99 c) "
+                                             "before checkpoint replacement"]) == []
+    assert "Stop the outgoing session before checkpoint replacement" not in words("roles/orchestrator.md")
+    assert missing("roles/root.md", ["send `stop` first", "use your own T93 stop only if the session has not stopped",
+                                     "never send `stop` after your own stop was refused",
+                                     "T114 below for a lane an earlier ROOT launched",
+                                     "the retiring rule (F5, above) for your own launches"]) == []
+
+
+def test_root_limits_each_test_and_lets_the_briefs_run_timeout_win():
+    assert missing("roles/root.md", ["\"stop any test over N minutes\" limits each test",
+                                     "the brief's own run timeout wins"]) == []
+
+
+def test_reviewers_cite_a_manifest_or_pinned_commit_ids_as_the_brief_says():
+    assert missing("roles/reviewer.md", ["The brief names which source applies", "whose manifest hash you cite",
+                                         "pinned commit-id reads", "pins both full commit ids",
+                                         "only object reads (`git show`, `git diff`, `git ls-tree`, `git grep <rev>`)",
+                                         "cite the commit and tree ids instead of a manifest"]) == []
+
+
+def test_reviewers_publish_exactly_an_ack_and_a_review_for_a_mailbox_dispatch():
+    assert missing("roles/reviewer.md", ["publishes exactly two messages", "one `accepted` ack",
+                                         "carries no readiness", "one `review` reply to the dispatch",
+                                         "a review reply is refused until the dispatch is accepted",
+                                         "`tools/hierarchy_mailbox.py:791` and `:810`",
+                                         "A review without a mailbox dispatch publishes nothing"]) == []
+
+
+def test_the_corrected_manager_facts_and_attributions_stay_pinned():
+    assert missing("roles/root.md", ["with the T93 checks below",
+                                     "`python3 /absolute/prototype/tools/hierarchy_handoff.py --spec "
+                                     "/absolute/handoff-spec.json`", "**Launches, T1 and T26.**"]) == []
+    assert missing("roles/orchestrator.md", ["(`set-limits`, T59 and T63)", "**Writing lanes, T38 and T48.**"]) == []
 
 
 def test_the_manifest_template_gives_each_hierarchy_a_root_routed_only_to_its_orchestrator(tmp_path):
