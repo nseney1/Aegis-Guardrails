@@ -71,6 +71,7 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
 # Generic levels from ADR-TEAM-CONFIG-20261102. Claude has no "ultra" effort: it runs max with ultracode on.
 TEAM_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
+TEAM_KINDS = LANE_KINDS | {"orchestrator"}
 
 
 def git(cwd, *arguments):
@@ -220,7 +221,13 @@ def codex_servers(setup, endpoint, session, generation, tools, board):
     return "mcp_servers={" + servers + "}"
 
 
-def team_settings(base, host, request):
+def role_kind(mailbox, endpoint):
+    """The key a team.json reasoning_by_kind entry uses: a lane's kind, or "orchestrator"."""
+    role = endpoint_parts(endpoint)[1]
+    return mailbox.endpoint(endpoint).get("kind") if role == "lane" else role
+
+
+def team_settings(base, host, request, kind=None):
     """Fill the model and effort a request leaves out from the initiative's team.json.
 
     Returns the options to build the argv from and a record of what was resolved, or None when the file was not used.
@@ -231,10 +238,16 @@ def team_settings(base, host, request):
     if not path.exists():
         return request, None
     team = read_json(path)
-    fields(team, {"model", "reasoning"})
+    fields(team, {"model", "reasoning"}, {"reasoning_by_kind"})
     model = text(team["model"], "team.json model", 128)
-    reasoning = team["reasoning"]
-    require(reasoning in TEAM_LEVELS, "unknown reasoning level in team.json: " + str(reasoning)[:40])
+    by_kind = team.get("reasoning_by_kind", {})
+    require(isinstance(by_kind, dict), "invalid team.json reasoning_by_kind")
+    for key, level in by_kind.items():
+        # A typo in a key would otherwise fall back to the default level without a word.
+        require(key in TEAM_KINDS, "unknown role kind in team.json reasoning_by_kind: " + str(key)[:40])
+        require(level in TEAM_LEVELS, "unknown reasoning level in team.json: " + str(level)[:40])
+    require(team["reasoning"] in TEAM_LEVELS, "unknown reasoning level in team.json: " + str(team["reasoning"])[:40])
+    reasoning = by_kind.get(kind, team["reasoning"])
     wanted = CLAUDE if model.startswith("claude-") else CODEX
     # A mismatch means team.json and the role hosts disagree, which the owner resolves; never start the role anyway.
     require(wanted == host, "team.json model %s needs host %s, not %s" % (model, wanted, host))
@@ -242,6 +255,7 @@ def team_settings(base, host, request):
     record = {"model_from": "request" if "model" in request else "team.json",
               "effort_from": "request" if "effort" in request else "team.json"}
     options.setdefault("model", model)
+    record["reasoning_from"] = "request" if "effort" in request else "kind" if kind in by_kind else "default"
     if "effort" in request:
         reasoning = request["effort"]
     else:
@@ -382,7 +396,7 @@ def add_role(request):
     team = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
         # Before binding, so a bad team.json leaves the endpoint unbound.
-        request, team = team_settings(base, host, request)
+        request, team = team_settings(base, host, request, role_kind(mailbox, endpoint))
     session = request.get("session") or str(uuid.uuid4())
     tools, writer = role_tools(endpoint, mailbox, request.get("tools"))
     root = Path(setup["mailbox_root"])
@@ -458,7 +472,7 @@ def codex_start(request):
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
-    options, team = team_settings(base, CODEX, request)
+    options, team = team_settings(base, CODEX, request, role_kind(mailbox, request["endpoint"]))
     writer = mailbox.endpoint(request["endpoint"]).get("kind") in ("implementer", "integrator")
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     if not request.get("skip_git_repo_check"):

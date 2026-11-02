@@ -438,7 +438,7 @@ def test_a_claude_role_takes_model_and_reasoning_from_team_config(setup):
         assert flag(argv, "--model") == "claude-opus-5-5" and flag(argv, "--effort") == "max"
         assert "--settings" not in argv
     assert role["team"] == {"model": "claude-opus-5-5", "effort": "max", "reasoning": "max",
-                            "model_from": "team.json", "effort_from": "team.json"}
+                            "model_from": "team.json", "effort_from": "team.json", "reasoning_from": "default"}
 
 
 def test_request_values_win_over_team_config(setup):
@@ -474,7 +474,7 @@ def test_codex_start_takes_team_config_too(setup):
     settings = codex_config(started["start_argv"])
     assert settings["model"] == "gpt-5.5-codex" and settings["model_reasoning_effort"] == "high"
     assert started["team"] == {"model": "gpt-5.5-codex", "effort": "high", "reasoning": "high",
-                               "model_from": "team.json", "effort_from": "team.json"}
+                               "model_from": "team.json", "effort_from": "team.json", "reasoning_from": "default"}
 
 
 @pytest.mark.parametrize("team,host,error", [
@@ -507,3 +507,43 @@ def test_a_full_request_does_not_read_team_config(setup):
 def test_no_team_config_keeps_the_host_defaults(setup):
     role = setup.add_role("pilot/orchestrator", cwd=str(setup.tmp))
     assert "--model" not in role["start_argv"] and "--effort" not in role["start_argv"] and "team" not in role
+
+
+BY_KIND = {"model": "claude-opus-5-5", "reasoning": "max", "reasoning_by_kind": {"implementer": "xhigh"}}
+
+
+@pytest.mark.parametrize("endpoint,effort,source", [
+    ("pilot/lane/f2", "xhigh", "kind"),
+    ("pilot/lane/review", "max", "default"),
+    ("pilot/orchestrator", "max", "default"),
+])
+def test_team_reasoning_can_differ_by_role_kind(setup, endpoint, effort, source):
+    write_team(setup, **BY_KIND)
+    role = setup.add_role(endpoint, cwd=str(setup.tmp))
+    assert flag(role["start_argv"], "--effort") == effort
+    assert role["team"]["reasoning"] == effort and role["team"]["reasoning_from"] == source
+
+
+def test_an_explicit_effort_wins_over_the_role_kind_map(setup):
+    write_team(setup, **BY_KIND)
+    role = setup.add_role("pilot/lane/f2", cwd=str(setup.tmp), effort="low")
+    assert flag(role["start_argv"], "--effort") == "low"
+    assert role["team"]["reasoning_from"] == "request" and role["team"]["model_from"] == "team.json"
+
+
+def test_codex_start_uses_the_orchestrator_entry_of_the_role_kind_map(setup):
+    write_team(setup, model="gpt-5.5-codex", reasoning="max", reasoning_by_kind={"orchestrator": "high"})
+    started = codex_start(setup)
+    assert codex_config(started["start_argv"])["model_reasoning_effort"] == "high"
+    assert started["team"]["reasoning_from"] == "kind"
+
+
+@pytest.mark.parametrize("by_kind,error", [
+    ({"implementer": "turbo"}, "unknown reasoning level in team.json: turbo"),
+    ({"implementor": "xhigh"}, "unknown role kind in team.json reasoning_by_kind: implementor"),
+    (["xhigh"], "invalid team.json reasoning_by_kind"),
+])
+def test_a_bad_role_kind_map_is_refused(setup, by_kind, error):
+    write_team(setup, model="claude-opus-5-5", reasoning="max", reasoning_by_kind=by_kind)
+    result = setup.add_role("pilot/orchestrator", cwd=str(setup.tmp), expect=2)
+    assert error in result["error"], result
