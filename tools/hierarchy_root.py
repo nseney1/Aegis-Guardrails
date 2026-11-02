@@ -13,9 +13,14 @@ Every subcommand prints one JSON object. Exit codes:
   3  the target exists and differs, or the session name is already live
   4  IO or disk error, including free space below --min-free-mb (checked before the first write)
   5  a human-answerable dialog is pending (the record is still written)
+  6  a 64-hex token matches no file named on its line or the line above, nor any
+     --source (check-hashes); nothing is written
+
+check-hashes takes absolute paths only, without '..' (T100): a relative path in the
+checked file is never a candidate, and the output lists it under refused_paths.
 
 What exit 2 leaves behind, per subcommand (never assume "no side effects" on a retry):
-  first-prompt-check, lanes-health
+  first-prompt-check, lanes-health, check-hashes
       never write.
   startup-ack, verify-retired
       nothing: every check runs before the only write (the ACK; the custody CAS).
@@ -50,6 +55,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -62,7 +68,7 @@ import hierarchy_handoff  # noqa: E402
 from hierarchy_mailbox import (  # noqa: E402
     SHA256, Mailbox, fields, matching, read_bytes, read_json, require, safe_path, text, writer_lock)
 
-EXIT_OK, EXIT_CRITICAL, EXIT_CONFLICT, EXIT_IO, EXIT_DIALOG = 0, 2, 3, 4, 5
+EXIT_OK, EXIT_CRITICAL, EXIT_CONFLICT, EXIT_IO, EXIT_DIALOG, EXIT_UNMATCHED_HASH = 0, 2, 3, 4, 5, 6
 HEAD_CHARS = 120
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DIALOG_PHRASE = "Do you want to proceed?"
@@ -386,6 +392,108 @@ def first_prompt_check(transcript, prompt, expected_sha256):
 def cmd_first_prompt_check(args):
     result = first_prompt_check(args.transcript, args.prompt, args.prompt_sha256)
     return (EXIT_OK if result["ok"] else EXIT_CRITICAL), result
+
+
+HASH_TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
+# Prose, Markdown and JSON delimiters around a path; ':' stays inside so a URL is one chunk.
+PATH_SPLIT = re.compile(r"[\s`'\"()<>\[\]{},;=|]+")
+
+
+def absolute_path_problem(value):
+    """Why value may not name a file to hash or read (T100), or None.
+
+    A relative path resolves against whatever cwd the reader happens to have, so the same
+    prompt could check against one file and be read against another.
+    """
+    if not value.startswith("/"):
+        return "relative path: never a candidate (T100)"
+    if ".." in Path(value).parts:
+        return "path with '..': never a candidate (T100)"
+    return None
+
+
+def absolute_argument(value, argument):
+    require(absolute_path_problem(value) is None,
+            "%s must be an absolute path without '..', got %r" % (argument, value))
+    return Path(value)
+
+
+def line_paths(line):
+    for chunk in PATH_SPLIT.split(line):
+        chunk = chunk.strip("*_").rstrip(".:")
+        if "/" in chunk and "://" not in chunk:
+            yield chunk
+
+
+def file_sha256(path):
+    """(sha256, None) for a regular file's bytes, else (None, reason)."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None, "not a regular file"
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest(), None
+    except OSError as exc:
+        return None, exc.strerror or str(exc)
+
+
+def check_hashes(body, sources=()):
+    """Every 64-hex token must re-hash from a file named beside it, or from a source (T92).
+
+    ROOT C7 typed 56 of a hash's 64 characters into a launch prompt; the launcher only
+    compared the delivered prompt with its file, so nothing would have noticed. Beside
+    means an absolute path on the token's line or the line above.
+    """
+    lines = body.split("\n")
+    source_rows, by_hash = [], {}
+    for source in sources:
+        digest, error = file_sha256(source)
+        require(digest is not None, "--source %s cannot be hashed: %s" % (source, error))
+        source_rows.append({"path": str(source), "sha256": digest})
+        by_hash.setdefault(digest, str(source))
+    cache, checked, unmatched, refused, tokens = {}, [], [], {}, 0
+    for index, line in enumerate(lines):
+        for match in HASH_TOKEN.finditer(line):
+            tokens += 1
+            token, found, candidates = match.group(0), None, []
+            for where, at in (("same_line", index), ("line_above", index - 1)):
+                for value in line_paths(lines[at]) if at >= 0 else ():
+                    problem = absolute_path_problem(value)
+                    if problem is not None:
+                        refused[(at + 1, value)] = problem
+                        continue
+                    if value not in cache:
+                        cache[value] = file_sha256(value)
+                    digest, error = cache[value]
+                    candidates.append({"path": value, "line": at + 1, "sha256": digest,
+                                       **({"error": error} if error else {})})
+                    if found is None and digest == token:
+                        found = {"token": token, "line": index + 1, "path": value, "via": where}
+            if found is None and token in by_hash:
+                found = {"token": token, "line": index + 1, "path": by_hash[token], "via": "source"}
+            if found is not None:
+                checked.append(found)
+            else:
+                unmatched.append({"token": token, "line": index + 1, "candidates": candidates})
+    result = {"ok": not unmatched, "tokens": tokens, "checked": checked, "unmatched": unmatched,
+              "refused_paths": [{"line": line, "path": path, "reason": reason}
+                                for (line, path), reason in sorted(refused.items())],
+              "sources": source_rows}
+    if unmatched:
+        result["error"] = ("%d of %d sha256 tokens match no file named on their line or the line above, nor any "
+                           "source: %s" % (len(unmatched), tokens,
+                                           ", ".join("line %d" % row["line"] for row in unmatched)))
+    return result
+
+
+def cmd_check_hashes(args):
+    path = absolute_argument(args.file, "check-hashes file")
+    sources = [absolute_argument(value, "--source") for value in args.source or []]
+    raw = path.read_bytes()
+    result = {"file": str(path), "file_sha256": sha256_bytes(raw), **check_hashes(raw.decode("utf-8"), sources)}
+    return (EXIT_OK if result["ok"] else EXIT_UNMATCHED_HASH), result
 
 
 SESSION_ID = re.compile(r"[0-9a-f][0-9a-f-]{3,63}")
@@ -1132,6 +1240,13 @@ def build_parser():
     check.add_argument("--prompt", required=True)
     check.add_argument("--prompt-sha256", required=True)
     check.set_defaults(handler=cmd_first_prompt_check)
+
+    hashes = commands.add_parser("check-hashes", help="Check that every 64-hex token in a file re-hashes from a file "
+                                 "named beside it; exit 6 on any unmatched token; never writes")
+    hashes.add_argument("file", help="Absolute path of the prompt, spec or brief to check")
+    hashes.add_argument("--source", action="append", metavar="ABS_PATH",
+                        help="A file whose sha256 may appear anywhere in FILE (absolute, no '..'); repeatable")
+    hashes.set_defaults(handler=cmd_check_hashes)
 
     launch = commands.add_parser("launch", help="Start one claude --bg session from a spec and verify its start")
     launch.add_argument("--spec", required=True, help="Absolute path to a strict JSON launch spec")

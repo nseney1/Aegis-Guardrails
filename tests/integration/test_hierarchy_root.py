@@ -20,9 +20,10 @@ SESSION = "5daa90d5-59c3-4bc9-ac88-2bd3454167e8"
 LAUNCHER_TEXT = ("import hashlib, json, os, subprocess\n" + "x = 1\n" * 400)[:2308]
 
 
-def run_tool(*args, stdin=b"", env=None, timeout=60):
+def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None):
     proc = subprocess.run([sys.executable, "-B", "-I", str(TOOL), *[str(a) for a in args]], input=stdin,
-                          capture_output=True, timeout=timeout, env=env if env is not None else dict(os.environ))
+                          capture_output=True, timeout=timeout, env=env if env is not None else dict(os.environ),
+                          cwd=cwd)
     out = proc.stdout.decode("utf-8")
     return proc.returncode, (json.loads(out) if out.strip() else None), proc.stderr.decode("utf-8")
 
@@ -121,6 +122,104 @@ def test_first_prompt_check_fails_without_a_user_record(tmp_path, prompt_file):
                             "--prompt-sha256", sha(prompt_file.read_bytes()))
     assert code == 2
     assert out["ok"] is False and out["first_user_record"] is None
+
+
+# --- T92, T100: check-hashes ------------------------------------------------------------------
+
+FABRICATED = "9f827392a61b2e8b8f0d8b8ec8a6a0a9c2a6b6c1e4e1f1d6bb3d8b5f8f3d2c1a"  # the C7 incident's typed value
+
+
+@pytest.fixture
+def named(tmp_path):
+    path = tmp_path / "briefs" / "lane-brief.md"
+    path.parent.mkdir()
+    path.write_text("# Lane brief\n", encoding="utf-8")
+    return path
+
+
+def check_hashes(path, *extra, cwd=None):
+    return run_tool("check-hashes", path, *extra, cwd=cwd)
+
+
+def test_check_hashes_refuses_a_typed_hash_next_to_a_real_path_naming_the_line(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("You are a lane.\nYour brief is %s (sha256 %s).\n" % (named, FABRICATED), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 6, (out, err)
+    assert out["ok"] is False and out["tokens"] == 1 and out["checked"] == []
+    [miss] = out["unmatched"]
+    assert miss["token"] == FABRICATED and miss["line"] == 2
+    assert miss["candidates"] == [{"path": str(named), "line": 2, "sha256": sha(named.read_bytes())}]
+    assert "line 2" in out["error"]
+
+
+@pytest.mark.parametrize("layout", ["same_line", "line_above"])
+def test_check_hashes_accepts_a_correct_hash_on_the_same_line_or_the_line_above(tmp_path, named, layout):
+    real = sha(named.read_bytes())
+    body = ("Brief: %s sha256 %s\n" % (named, real) if layout == "same_line"
+            else "Brief:\n- path `%s`\n- sha256 `%s`\n" % (named, real))
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text(body, encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 0, (out, err)
+    line = 1 if layout == "same_line" else 3
+    assert out["ok"] is True and out["unmatched"] == []
+    assert out["checked"] == [{"token": real, "line": line, "path": str(named),
+                               "via": layout}]
+
+
+def test_check_hashes_refuses_a_hash_whose_path_is_two_lines_up(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("%s\n\nsha256 %s\n" % (named, sha(named.read_bytes())), encoding="utf-8")
+    code, out, _ = check_hashes(prompt)
+    assert code == 6 and out["unmatched"][0]["line"] == 3 and out["unmatched"][0]["candidates"] == []
+
+
+def test_check_hashes_never_takes_a_relative_or_traversing_path_as_a_candidate(tmp_path, named):
+    """T100: a relative path resolves against whatever cwd the checker happens to run in."""
+    real = sha(named.read_bytes())
+    traversing = "%s/../briefs/%s" % (named.parent, named.name)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Brief briefs/lane-brief.md (sha256 %s)\nAgain %s (sha256 %s)\n" % (real, traversing, real),
+                      encoding="utf-8")
+    code, out, err = check_hashes(prompt, cwd=tmp_path)
+    assert code == 6, (out, err)
+    assert [miss["line"] for miss in out["unmatched"]] == [1, 2]
+    assert all(miss["candidates"] == [] for miss in out["unmatched"])
+    refused = {(row["line"], row["path"]): row["reason"] for row in out["refused_paths"]}
+    assert refused[(1, "briefs/lane-brief.md")].startswith("relative path")
+    assert refused[(2, traversing)].startswith("path with '..'")
+
+
+def test_check_hashes_matches_a_source_file_anywhere(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("checkpoint sha256 %s, no path here\n" % sha(named.read_bytes()), encoding="utf-8")
+    code, out, _ = check_hashes(prompt)
+    assert code == 6
+    code, out, err = check_hashes(prompt, "--source", named)
+    assert code == 0, (out, err)
+    assert out["checked"] == [{"token": sha(named.read_bytes()), "line": 1, "path": str(named), "via": "source"}]
+    assert out["sources"] == [{"path": str(named), "sha256": sha(named.read_bytes())}]
+
+
+@pytest.mark.parametrize("bad", ["relative", "traversal"])
+def test_check_hashes_refuses_a_relative_source_or_file_naming_the_argument(tmp_path, named, bad):
+    value = "briefs/lane-brief.md" if bad == "relative" else "%s/../briefs/lane-brief.md" % named.parent
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("nothing\n", encoding="utf-8")
+    code, out, _ = check_hashes(prompt, "--source", value, cwd=tmp_path)
+    assert code == 2, out
+    assert "--source" in out["error"] and value in out["error"]
+    code, out, _ = check_hashes("prompt.txt", cwd=tmp_path)
+    assert code == 2 and "check-hashes file" in out["error"] and "prompt.txt" in out["error"]
+
+
+def test_check_hashes_counts_only_word_bounded_lowercase_64_hex(tmp_path, named):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("git %s\nupper %s\nlong %s\nnone here\n" % ("a" * 40, "A" * 64, "b" * 65), encoding="utf-8")
+    code, out, err = check_hashes(prompt)
+    assert code == 0, (out, err)
+    assert out["tokens"] == 0 and out["checked"] == [] and out["unmatched"] == []
 
 
 # --- stub claude ------------------------------------------------------------------------------
