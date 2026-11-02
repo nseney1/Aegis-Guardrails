@@ -8,7 +8,16 @@ exact-word substitution and no shell, so nothing in a message can become a comma
 
 A job is refused unless the checkout is registered for the initiative and its revision, tree and
 the bytes of its uncommitted files match the packet exactly. The source is witnessed again afterward,
-so a clean exit over changed source is not reported as success. Files Git ignores are not covered. A heavy job takes a ledger slot, and processes the
+so a clean exit over changed source is not reported as success. Files Git ignores are not covered.
+
+A `merge` recipe merges one commit (`merge`) into a clean checkout's HEAD (`commit`). Like a `commit` recipe it
+changes nothing until the result is checked: `git merge-tree --write-tree` must merge cleanly to exactly
+`expected_tree`, then HEAD moves by compare-and-swap, and only then do the index and files follow. A second merge is
+a second job. The orchestrator predicts `expected_tree` with the runner's pinned config and no global or system config:
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c merge.renames=true -c merge.directoryRenames=false \
+    -c merge.renameLimit=7000 -c merge.renormalize=false merge-tree --write-tree <commit> <merge>
+
+A heavy job takes a ledger slot, and processes the
 census finds outside the ledger count against the same limit. A slot is freed only with evidence: a
 lost runner leaves `unknown` and keeps the slot until root runs `resolve`.
 
@@ -91,6 +100,12 @@ CACHEDIR_TAG = (b"Signature: 8a477f597d28d172789f06886806bc55\n"
 # A recipe's kept files are evidence a green runner may never print, so they are copied out before cleanup.
 MAX_KEEP = 16
 MAX_KEEP_BYTES = 67108864
+# Rename handling is pinned so the orchestrator's merge-tree prediction and the runner's merge agree. Repository-local
+# config still applies under GIT_CONFIG_GLOBAL=/dev/null, so these go on the command line, where they win over it.
+MERGE_CONFIG = ("merge.renames=true", "merge.directoryRenames=false", "merge.renameLimit=7000", "merge.renormalize=false")
+# The built-in merge drivers as check-attr reports them: unspecified or set is text, unset is binary.
+BUILT_IN_MERGE = {b"unspecified", b"set", b"unset", b"text", b"binary"}
+PINNED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 HOME_FOLDERS = {"HOME": "", "USERPROFILE": "", "APPDATA": "AppData/Roaming", "LOCALAPPDATA": "AppData/Local",
                 "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude", "XDG_CONFIG_HOME": ".config",
                 "XDG_CACHE_HOME": ".cache", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
@@ -120,10 +135,10 @@ def cargo_step(words):
 
 def validate_recipe(name, recipe):
     matching(name, SLUG, "recipe name")
-    require(isinstance(recipe, dict) and recipe.get("kind") in ("command", "commit"), "invalid kind for recipe " + name)
+    require(isinstance(recipe, dict) and recipe.get("kind") in ("command", "commit", "merge"), "invalid kind for recipe " + name)
     integer(recipe.get("timeout_seconds"), "timeout_seconds", maximum=MAX_TIMEOUT_SECONDS)
     require(recipe.get("sandbox") in SANDBOXES, "invalid sandbox for recipe " + name)
-    if recipe["kind"] == "commit":
+    if recipe["kind"] in ("commit", "merge"):
         fields(recipe, {"kind", "timeout_seconds", "sandbox"})
         return
     fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout", "heavy_tests", "keep"})
@@ -180,9 +195,9 @@ def load_recipes(path):
     require(isinstance(table, dict) and table, "recipes must not be empty")
     for name, recipe in table.items():
         validate_recipe(name, recipe)
-    if any(recipe["kind"] == "commit" for recipe in table.values()):
+    if any(recipe["kind"] in ("commit", "merge") for recipe in table.values()):
         identity = recipes.get("identity")
-        require(isinstance(identity, dict), "a commit recipe needs an identity")
+        require(isinstance(identity, dict), "a commit or merge recipe needs an identity")
         fields(identity, {"name", "email"})
         text(identity["name"], "identity name", 256)
         text(identity["email"], "identity email", 256)
@@ -211,7 +226,7 @@ def packet_text(raw):
 def checked_paths(packet, recipe, checkout):
     paths = packet.get("paths")
     commit = recipe["kind"] == "commit"
-    takes_paths = commit or any("$paths" in step for step in recipe["steps"])
+    takes_paths = commit or (recipe["kind"] == "command" and any("$paths" in step for step in recipe["steps"]))
     if not takes_paths:
         require(not paths, "this recipe takes no paths")
         return []
@@ -245,16 +260,69 @@ def path_fingerprint(path, name):
     return b"file:" + (b"x" if info.st_mode & 0o111 else b"-") + b":" + digest.hexdigest().encode()
 
 
-def refuse_submodules(checkout):
+def refuse_submodules(checkout, revisions=()):
     """A submodule's bytes and revision live in another repository, and the parent's status shows the same ` M sub`
     for any of them, while a clean or uninitialized one shows nothing. None can be bound to a packet, so all are
-    refused by path. The submodule itself is never read, so nothing outside the checkout is followed."""
+    refused by path. The submodule itself is never read, so nothing outside the checkout is followed. A merge also
+    names commits that are not checked out, so their trees are read as well."""
     listed = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
                             cwd=checkout, capture_output=True, timeout=120)
     require(listed.returncode == 0, "could not read the index of " + str(checkout))
     gitlinks = [entry.partition(b"\t")[2] for entry in listed.stdout.split(b"\0") if entry.startswith(b"160000 ")]
+    for revision in revisions:
+        tree = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "ls-tree", "-r", "-z", "--full-tree",
+                               revision], cwd=checkout, capture_output=True, timeout=120)
+        require(tree.returncode == 0, "could not read the tree of " + revision)
+        gitlinks += [entry.partition(b"\t")[2] for entry in tree.stdout.split(b"\0") if entry.startswith(b"160000 ")]
     require(not gitlinks, "submodules are not supported, because their content cannot be witnessed byte for byte: "
-            + ", ".join(os.fsdecode(path) for path in gitlinks)[:1024])
+            + ", ".join(sorted({os.fsdecode(path) for path in gitlinks}))[:1024])
+
+
+def pinned_git(checkout, *args, stdin=None):
+    """A read with the config the merge steps see, so what admit refuses and what the merge does agree."""
+    return subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args], cwd=checkout, input=stdin,
+                          env={**os.environ, **PINNED_GIT_ENV}, capture_output=True, timeout=120)
+
+
+def refuse_attributes(checkout, paths, revisions):
+    """A filter (LFS and the like) runs outside Git's merge and would run again on checkout, and a merge driver other than
+    the built-in text or binary, union included, can turn a conflict into a result that looks clean. Each path is read as
+    each side's own attributes describe it, because either side can add the attribute."""
+    if not paths:
+        return
+    flagged = set()
+    for revision in revisions:
+        found = pinned_git(checkout, "check-attr", "-z", "--stdin", "--source", revision, "filter", "merge",
+                           stdin=b"".join(path + b"\0" for path in paths))
+        require(found.returncode == 0, "could not read the attributes of the paths the merge changes")
+        parts = found.stdout.split(b"\0")
+        for index in range(0, len(parts) - 2, 3):
+            path, name, value = parts[index:index + 3]
+            if (name == b"filter" and value not in (b"unspecified", b"unset")) or (name == b"merge" and value not in BUILT_IN_MERGE):
+                flagged.add("%s (%s=%s)" % (os.fsdecode(path), name.decode(), value.decode(errors="replace")))
+    require(not flagged, "a merge job refuses changed paths with a filter attribute or a merge attribute other than the "
+            "built-in text or binary: " + ", ".join(sorted(flagged))[:1024])
+
+
+def merge_refusals(checkout, commit, merge):
+    """J2's refusals that Git objects and attributes alone decide, before a merge job runs. `commit` is HEAD by now."""
+    found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "--end-of-options", merge + "^{commit}")
+    require(found.returncode == 0 and found.stdout.decode().strip() == merge, "merge %s is not a commit in this repository" % merge)
+    contained = pinned_git(checkout, "merge-base", "--is-ancestor", merge, commit)
+    require(contained.returncode in (0, 1), "could not tell whether merge is already in commit")
+    require(contained.returncode == 1, "merge %s is already contained in commit %s, so it would make no change" % (merge, commit))
+    found = pinned_git(checkout, "merge-base", "--all", commit, merge)
+    bases = found.stdout.decode().split()
+    require(found.returncode in (0, 1), "could not find the merge base")
+    require(bool(bases), "commit and merge have no merge base: unrelated histories are not merged")
+    refuse_submodules(checkout, (commit, merge))
+    changed = set()
+    for base in bases:
+        for side in (commit, merge):
+            listed = pinned_git(checkout, "diff-tree", "-r", "-z", "--name-only", "--no-renames", base, side)
+            require(listed.returncode == 0, "could not list the paths changed on either side")
+            changed.update(name for name in listed.stdout.split(b"\0") if name)
+    refuse_attributes(checkout, sorted(changed), (commit, merge))
 
 
 def uncommitted_content(checkout):
@@ -304,7 +372,7 @@ def admit(ledger, initiative, message, mailbox, recipes):
     except json.JSONDecodeError as exc:
         raise ValueError("packet is not valid JSON") from exc
     fields(packet, {"schema", "recipe", "checkout", "commit", "tree"},
-           {"dirty_content_sha256", "paths", "expected_tree", "message"})
+           {"dirty_content_sha256", "paths", "expected_tree", "message", "merge"})
     require(packet["schema"] == PACKET_SCHEMA, "unsupported packet schema")
     name = packet["recipe"]
     require(isinstance(name, str) and name in recipes["recipes"], "unknown recipe: " + str(name)[:128])
@@ -316,22 +384,36 @@ def admit(ledger, initiative, message, mailbox, recipes):
     dirty = packet.get("dirty_content_sha256", EMPTY_STATUS)
     matching(dirty, SHA256, "dirty_content_sha256")
     paths = checked_paths(packet, recipe, checkout)
-    if recipe["kind"] == "commit":
-        require("expected_tree" in packet and "message" in packet, "a commit recipe needs expected_tree and message")
+    kind = recipe["kind"]
+    if kind in ("commit", "merge"):
+        require("expected_tree" in packet and "message" in packet, "a %s recipe needs expected_tree and message" % kind)
         matching(packet["expected_tree"], GIT_ID, "expected_tree")
         text(packet["message"], "commit message", 65536)
+    else:
+        require("expected_tree" not in packet and "message" not in packet,
+                "only a commit recipe or a merge recipe takes expected_tree or message")
+    require(kind == "merge" or "merge" not in packet, "only a merge recipe takes merge")
+    if kind == "commit":
         require(packet["expected_tree"] != packet["tree"], "this commit would make no change")
         code, overlap = check_paths(ledger, initiative["id"], paths)
         require(code == 0, "paths overlap another lease or a checkout could not be read: " + json.dumps(
             overlap["conflicts"] + overlap["unreadable_checkouts"], sort_keys=True)[:1024])
-    else:
-        require("expected_tree" not in packet and "message" not in packet,
-                "only a commit recipe takes expected_tree or message")
+    if kind == "merge":
+        # A merge whose tree equals HEAD's still records the other history, so only merge == commit counts as no change.
+        require("merge" in packet, "a merge recipe needs merge: the commit to merge")
+        matching(packet["merge"], GIT_ID, "merge")
+        require(packet["merge"] != packet["commit"], "merge equals commit, so it would make no change")
+        # Clean before, so that afterward the checkout can be compared with exactly the merged tree.
+        count = uncommitted_content(checkout)[1]
+        require(count == 0, "a merge needs a clean worktree, and this one has %d uncommitted entries" % count)
+        require(dirty == EMPTY_STATUS, "a merge needs a clean worktree, so dirty_content_sha256 must be the empty digest")
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
     witness = source_state(mailbox, checkout)
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
             (packet["commit"], packet["tree"], dirty), "source does not match the packet")
+    if kind == "merge":
+        merge_refusals(checkout, packet["commit"], packet["merge"])
     return {**packet, "dirty_content_sha256": dirty, "paths": paths}, raw
 
 
@@ -699,10 +781,11 @@ def sandbox_prefix(recipes, recipe, job, checkout):
     argv += ["--dev", "/dev", "--proc", "/proc"]
     for folder in recipes.get("ro_binds", []):
         argv += ["--ro-bind", folder, folder]
-    commit = recipe["kind"] == "commit"
-    argv += ["--bind" if recipe.get("writable_checkout") else "--ro-bind", checkout, checkout]
+    writes_git = recipe["kind"] in ("commit", "merge")
+    # A merge brings the working tree forward itself, so it writes the checkout as well as the Git data.
+    argv += ["--bind" if recipe.get("writable_checkout") or recipe["kind"] == "merge" else "--ro-bind", checkout, checkout]
     for folder in git_folders(checkout):
-        argv += ["--bind" if commit else "--ro-bind", folder, folder]
+        argv += ["--bind" if writes_git else "--ro-bind", folder, folder]
     # The job folder itself stays read-only inside, so a job cannot write its own result, claim or logs.
     argv += ["--ro-bind", str(job.folder), str(job.folder)]
     for name in WORK_FOLDERS:
@@ -744,8 +827,10 @@ def job_environment(recipes, job, checkout):
 
 
 class Step:
-    def __init__(self, argv, env=None, capture=False):
-        self.argv, self.env, self.capture = argv, env or {}, capture
+    def __init__(self, argv, env=None, capture=False, verdict=False):
+        # A verdict step's exit is the plan's to judge: it receives (exit code, output), so a non-zero exit can halt the
+        # job with a reason of its own, such as the conflicted paths, instead of a bare exit code.
+        self.argv, self.env, self.capture, self.verdict = argv, env or {}, capture, verdict
 
 
 class Halt(Exception):
@@ -799,6 +884,46 @@ def commit_steps(packet, recipes, job):
     return commit
 
 
+def merge_steps(packet, recipes, job, details):
+    """Like commit_steps: the merged tree is checked before any ref moves, HEAD moves by compare-and-swap, and only then
+    do the index and files follow. merge-tree writes objects only, and every step before the swap has a throwaway index."""
+    identity = recipes["identity"]
+    git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+           "-c", "user.name=" + identity["name"], "-c", "user.email=" + identity["email"]]
+    plain = {"GIT_LITERAL_PATHSPECS": "1", **PINNED_GIT_ENV}
+    temporary = {**plain, "GIT_INDEX_FILE": str(job.folder / "scratch" / "index")}
+    commit, merge = packet["commit"], packet["merge"]
+    message_file = job.folder / "scratch" / "commit-message"
+    message_file.parent.mkdir(mode=0o700, exist_ok=True)
+    message_file.write_text(packet["message"], encoding="utf-8")
+    details["merge_bases"] = (yield Step(git + ["merge-base", "--all", commit, merge], temporary, capture=True)).split()
+    pinned = [part for item in MERGE_CONFIG for part in ("-c", item)]
+    code, output = yield Step(git + pinned + ["merge-tree", "--write-tree", commit, merge], temporary, capture=True, verdict=True)
+    lines = output.splitlines()
+    # A clean merge prints its tree and nothing else. A conflicted one exits 1 and still writes a tree, with markers in
+    # it, so a packet that copied that tree is refused here too.
+    if code != 0 or len(lines) != 1 or GIT_ID.fullmatch(lines[0]) is None or "CONFLICT" in output:
+        conflicted = sorted({line.partition("\t")[2] for line in lines[1:] if "\t" in line})
+        notes = " ".join(line for line in lines if line.startswith("CONFLICT"))
+        raise Halt("merge-tree did not merge cleanly (exit %d), so nothing was changed; conflicted paths: %s. %s"
+                   % (code, ", ".join(conflicted) or "none listed", notes))
+    tree = details["tree"] = lines[0]
+    listing = yield Step(git + ["ls-tree", "-r", "--full-tree", tree], temporary, capture=True)
+    gitlinks = [line.partition("\t")[2] for line in listing.splitlines() if line.startswith("160000 ")]
+    if gitlinks:
+        raise Halt("the merged tree has submodules, which are not supported: " + ", ".join(gitlinks)[:1024])
+    if tree != packet["expected_tree"]:
+        raise Halt("the merged tree %s is not the expected tree %s" % (tree, packet["expected_tree"]))
+    created = yield Step(git + ["commit-tree", tree, "-p", commit, "-p", merge, "-F", str(message_file)], plain, capture=True)
+    details["new_commit"] = created
+    code, _ = yield Step(git + ["update-ref", "-m", "hierarchy job " + job.id, "HEAD", created, commit], plain, verdict=True)
+    if code != 0:
+        raise Halt("the compare-and-swap of HEAD from %s failed (exit %d): another writer moved HEAD or held its lock, "
+                   "and the index and files were not touched" % (commit, code))
+    yield Step(git + ["read-tree", "-m", "-u", commit, created], plain)
+    return created
+
+
 def record_process(job, record, suffix):
     """Replaced whole, so a reader sees the earlier record or the new one, never part of either."""
     temporary = job.process_path.with_suffix(suffix)
@@ -839,14 +964,18 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     return row, out_path.read_text(encoding="utf-8", errors="replace").strip() if step.capture else None
 
 
-def execute(job, recipe, packet, recipes, on_start):
+def execute(job, recipe, packet, recipes, on_start, details):
     checkout = packet["checkout"]
     env = job_environment(recipes, job, checkout)
     sandbox = sandbox_prefix(recipes, recipe, job, checkout)
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
-    commit = recipe["kind"] == "commit"
-    plan = commit_steps(packet, recipes, job) if commit else command_steps(recipe, packet, recipes, job)
+    if recipe["kind"] == "commit":
+        plan = commit_steps(packet, recipes, job)
+    elif recipe["kind"] == "merge":
+        plan = merge_steps(packet, recipes, job, details)
+    else:
+        plan = command_steps(recipe, packet, recipes, job)
     rows, reason, exit_code, created, output = [], None, 0, None, None
     started = False
 
@@ -865,6 +994,9 @@ def execute(job, recipe, packet, recipes, on_start):
                 reason = "timed out after %d seconds" % recipe["timeout_seconds"]
                 exit_code = row["exit_code"] or NO_VERDICT_EXIT
                 break
+            if step.verdict:
+                step = plan.send((row["exit_code"], output))
+                continue
             if row["exit_code"] != 0:
                 reason, exit_code = "step %d exited %d" % (len(rows), row["exit_code"]), row["exit_code"]
                 break
@@ -896,8 +1028,9 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     def announce():
         publish_receipt(job, "started", "Job %s started." % job.id, wait)
 
+    details = {}
     try:
-        rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce)
+        rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce, details)
     except StillRunning as exc:
         # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
         return {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
@@ -911,12 +1044,19 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         reason = reason or "could not witness the source afterward: " + str(exc)[:2048]
         exit_code = exit_code or NO_VERDICT_EXIT
     if not reason:
-        if recipe["kind"] == "commit":
+        if recipe["kind"] in ("commit", "merge"):
             if (after["source_revision"], after["source_tree"]) != (created, packet["expected_tree"]):
                 reason, exit_code = "the checkout does not show the new commit afterward", NO_VERDICT_EXIT
+            elif recipe["kind"] == "merge" and after["dirty_content_sha256"] != EMPTY_STATUS:
+                reason, exit_code = "the worktree is not clean after the merge", NO_VERDICT_EXIT
         elif after != before:
             reason, exit_code = "source changed during the job, so its exit proves nothing", NO_VERDICT_EXIT
     extra = {"kept": keep_evidence(job, recipe["keep"])} if recipe.get("keep") else {}
+    if recipe["kind"] == "merge":
+        # Every input and the pinned config, so the receipt binds them and anyone can predict the tree again.
+        extra["merge"] = {"commit": packet["commit"], "merge": packet["merge"], "merge_bases": details.get("merge_bases"),
+                          "expected_tree": packet["expected_tree"], "tree": details.get("tree"),
+                          "new_commit": details.get("new_commit"), "config": list(MERGE_CONFIG)}
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
                  steps=rows, before=before, after=after, commit=created if not reason else None, **extra)
     # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other

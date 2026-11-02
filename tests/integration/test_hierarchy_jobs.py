@@ -1332,6 +1332,8 @@ def test_a_commit_recipe_needs_an_identity(shop):
     (lambda r: r["recipes"]["ok"].update(keep=["/etc/passwd"]), "invalid keep"),
     (lambda r: r["recipes"]["ok"].update(keep=["file-%d" % n for n in range(17)]), "invalid keep"),
     (lambda r: r["recipes"]["commit"].update(keep=["report.xml"]), "unexpected"),
+    (lambda r: r["recipes"].update(merge={"kind": "merge", "sandbox": "none", "timeout_seconds": 30, "steps": [["x"]]}),
+     "unexpected"),
 ])
 def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
     change(shop.recipes)
@@ -1580,3 +1582,254 @@ def test_a_sandboxed_pytest_job_can_run_in_a_read_only_checkout(shop):
     shop.request_job("job-1", "pytest", paths=["tests/test_app.py::test_app"])
     assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]["body"]
     assert "1 passed" in shop.receipts("job-1")[-1]["body"]
+
+
+# The merge kind (ADR D3 with J1 and J2). Written out here rather than imported, because this is the orchestrator's side
+# of the contract: its prediction must use exactly the runner's -c set, with no global or system config.
+MERGE_CONFIG = ("merge.renames=true", "merge.directoryRenames=false", "merge.renameLimit=7000", "merge.renormalize=false")
+
+
+def with_merge_recipe(shop, **extra):
+    shop.recipes["recipes"]["merge-exact"] = {"kind": "merge", "sandbox": "none", "timeout_seconds": 30, **extra}
+    shop.save_recipes()
+
+
+def side_commit(shop, branch, files, *, orphan=False, gitlink=None):
+    """A commit on another branch, made from the current HEAD; the checkout ends back on feature/x, clean."""
+    git(shop.checkout, "switch", "-q", "--orphan" if orphan else "-c", branch)
+    for name, content in files.items():
+        (shop.checkout / name).parent.mkdir(parents=True, exist_ok=True)
+        (shop.checkout / name).write_text(content)
+    git(shop.checkout, "add", "-A")
+    if gitlink:
+        git(shop.checkout, "update-index", "--add", "--cacheinfo", "160000,%s,vendored" % gitlink)
+    git(shop.checkout, "commit", "-qm", "side " + branch)
+    commit = git(shop.checkout, "rev-parse", "HEAD")
+    git(shop.checkout, "switch", "-q", "feature/x")
+    return commit
+
+
+def main_commit(shop, files):
+    for name, content in files.items():
+        (shop.checkout / name).parent.mkdir(parents=True, exist_ok=True)
+        (shop.checkout / name).write_text(content)
+    git(shop.checkout, "add", "-A")
+    git(shop.checkout, "commit", "-qm", "main")
+    return git(shop.checkout, "rev-parse", "HEAD")
+
+
+def predict(shop, commit, merge, *, pinned=True):
+    """The orchestrator's prediction, run the way it must run it."""
+    config = [part for item in MERGE_CONFIG for part in ("-c", item)] if pinned else []
+    found = subprocess.run(["git", *config, "merge-tree", "--write-tree", commit, merge], cwd=shop.checkout,
+                           env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+                           capture_output=True, text=True, timeout=10)
+    lines = found.stdout.splitlines()
+    return found.returncode, lines[0] if lines else None
+
+
+def merge_request(shop, merge, identifier="job-1", **changes):
+    if "merge-exact" not in shop.recipes["recipes"]:
+        with_merge_recipe(shop)
+    _, tree = predict(shop, shop.head()["commit"], merge)
+    packet = {"merge": merge, "expected_tree": tree, "message": "Merge side\n\nExact text; $(not run).\n", **changes}
+    shop.request_job(identifier, "merge-exact", **packet)
+    return tree
+
+
+def snapshot(shop):
+    """HEAD, the real index and every file outside .git: what a refused or halted merge must leave as it found."""
+    files = {str(path.relative_to(shop.checkout)): path.read_bytes() for path in sorted(shop.checkout.rglob("*"))
+             if path.is_file() and ".git" not in path.relative_to(shop.checkout).parts}
+    return git(shop.checkout, "rev-parse", "HEAD"), git(shop.checkout, "ls-files", "--stage"), files
+
+
+def assert_stopped(shop, before, state, *reasons):
+    final = shop.receipts("job-1")[-1]
+    assert final["receipt"]["state"] == state and all(reason in final["receipt"]["reason"] for reason in reasons), final
+    assert snapshot(shop) == before
+
+
+def two_sides(shop):
+    side = side_commit(shop, "side", {"src/app.py": "value = 3\n", "docs/side.md": "side\n"})
+    return side, main_commit(shop, {"docs/main.md": "main\n"})
+
+
+def test_a_merge_job_commits_exactly_the_predicted_tree_with_both_parents(shop):
+    side, before = two_sides(shop)
+    tree = merge_request(shop, side)
+    assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
+    head = git(shop.checkout, "rev-parse", "HEAD")
+    assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
+    assert git(shop.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split() == [head, before, side]
+    assert git(shop.checkout, "log", "-1", "--format=%B") == "Merge side\n\nExact text; $(not run)."
+    assert git(shop.checkout, "log", "-1", "--format=%an <%ae> %G?") == "Hierarchy Root <root@example.invalid> N"
+    assert git(shop.checkout, "status", "--porcelain=v1", "--untracked-files=all") == "", "index and files must match the merge"
+    assert (shop.checkout / "src" / "app.py").read_text() == "value = 3\n" and (shop.checkout / "docs" / "side.md").exists()
+    assert shop.states("job-1") == ["started", "completed"]
+    final = shop.receipts("job-1")[-1]
+    recorded = json.loads(verified_evidence(final)["result.json"].read_text())
+    assert recorded["commit"] == head and head in final["body"]
+    assert recorded["merge"] == {"commit": before, "merge": side, "merge_bases": [git(shop.checkout, "merge-base", before, side)],
+                                 "expected_tree": tree, "tree": tree, "new_commit": head, "config": list(MERGE_CONFIG)}
+
+
+def test_a_conflicting_merge_halts_with_its_paths_even_when_the_packet_names_the_conflicted_tree(shop):
+    side = side_commit(shop, "side", {"src/app.py": "value = 3\n"})
+    main_commit(shop, {"src/app.py": "value = 2\n"})
+    assert predict(shop, shop.head()["commit"], side)[0] == 1
+    merge_request(shop, side)
+    before = snapshot(shop)
+    assert shop.run_open()["rows"][0]["state"] == "failed"
+    assert_stopped(shop, before, "failed", "conflict", "src/app.py")
+
+
+def test_a_merged_tree_other_than_the_expected_one_halts_before_anything_moves(shop):
+    side, _ = two_sides(shop)
+    merge_request(shop, side, expected_tree="1" * 40)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "failed", "is not the expected tree " + "1" * 40)
+
+
+@pytest.mark.parametrize("which, reason", [("base", "already contained"), ("head", "merge equals commit")])
+def test_a_merge_that_would_change_nothing_is_refused(shop, which, reason):
+    base = shop.head()["commit"]
+    head = main_commit(shop, {"docs/main.md": "main\n"})
+    merge_request(shop, base if which == "base" else head)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", reason)
+
+
+def test_a_merge_of_unrelated_histories_is_refused(shop):
+    lonely = side_commit(shop, "lonely", {"README": "another history\n"}, orphan=True)
+    merge_request(shop, lonely, expected_tree="1" * 40)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", "unrelated histories")
+
+
+def test_a_merge_bringing_a_gitlink_is_refused(shop):
+    side = side_commit(shop, "side", {"docs/side.md": "side\n"}, gitlink=shop.head()["commit"])
+    main_commit(shop, {"docs/main.md": "main\n"})
+    merge_request(shop, side)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", "submodules", "vendored")
+
+
+@pytest.mark.parametrize("attributes, reason", [("*.bin filter=lfs -text\n", "filter=lfs"), ("*.bin merge=union\n", "merge=union")])
+def test_a_merge_touching_a_filtered_or_union_merged_path_is_refused(shop, attributes, reason):
+    side = side_commit(shop, "side", {".gitattributes": attributes, "data.bin": "payload\n"})
+    main_commit(shop, {"docs/main.md": "main\n"})
+    merge_request(shop, side)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", reason, "data.bin")
+
+
+def test_a_merge_whose_head_moved_after_the_packet_is_refused(shop):
+    side, _ = two_sides(shop)
+    merge_request(shop, side)
+    main_commit(shop, {"docs/later.md": "later\n"})
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", "source does not match")
+
+
+MOVES_HEAD = ("import os, subprocess, sys\n"
+              "if 'update-ref' in sys.argv:\n"
+              "    subprocess.run(['git', 'update-ref', 'HEAD', %r], check=True)\n"
+              "os.execvp(sys.argv[1], sys.argv[1:])\n")
+
+
+def test_a_head_moved_during_the_merge_is_never_overwritten(shop):
+    elsewhere = side_commit(shop, "elsewhere", {"docs/elsewhere.md": "another lane\n"})
+    side, _ = two_sides(shop)
+    # Every step goes through this prefix, which moves HEAD just before the compare-and-swap, as a racing lane would.
+    wrapper = shop.tmp / "moves-head.py"
+    wrapper.write_text(MOVES_HEAD % elsewhere)
+    shop.recipes["prefix"] = [sys.executable, str(wrapper)]
+    merge_request(shop, side)
+    before = snapshot(shop)
+    shop.run_open()
+    final = shop.receipts("job-1")[-1]
+    assert final["receipt"]["state"] == "failed" and "compare-and-swap" in final["receipt"]["reason"], final
+    assert git(shop.checkout, "rev-parse", "HEAD") == elsewhere, "the other lane's HEAD must stand"
+    assert snapshot(shop)[1:] == before[1:], "the index and files must not move"
+
+
+def test_a_merge_into_a_dirty_worktree_is_refused(shop):
+    side, _ = two_sides(shop)
+    (shop.checkout / "notes.txt").write_text("uncommitted\n")
+    merge_request(shop, side, dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", "clean worktree")
+
+
+def test_a_second_merge_is_a_second_job_on_the_first_merge_commit(shop):
+    first = side_commit(shop, "first", {"src/app.py": "value = 3\n"})
+    second = side_commit(shop, "second", {"docs/second.md": "second\n"})
+    main_commit(shop, {"docs/main.md": "main\n"})
+    merge_request(shop, first, "job-1")
+    assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
+    merged = git(shop.checkout, "rev-parse", "HEAD")
+    tree = merge_request(shop, second, "job-2")
+    assert [row["state"] for row in shop.run_open()["rows"]] == ["completed"], shop.receipts("job-2")[-1]
+    assert git(shop.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:] == [merged, second]
+    assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
+    assert (shop.checkout / "src" / "app.py").read_text() == "value = 3\n" and (shop.checkout / "docs" / "second.md").exists()
+
+
+def test_the_pinned_prediction_matches_the_runner_whatever_the_local_merge_config(shop):
+    git(shop.checkout, "config", "merge.directoryRenames", "true")
+    side = side_commit(shop, "side", {"src/extra.py": "extra = 1\n"})
+    git(shop.checkout, "mv", "src", "lib")
+    git(shop.checkout, "commit", "-qm", "move src to lib")
+    commit = shop.head()["commit"]
+    code, tree = predict(shop, commit, side)
+    assert code == 0
+    assert predict(shop, commit, side, pinned=False)[1] != tree, "unpinned, the local config moves the new file into lib/"
+    merge_request(shop, side)
+    assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
+    assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
+    assert (shop.checkout / "src" / "extra.py").exists() and not (shop.checkout / "lib" / "extra.py").exists()
+
+
+@pytest.mark.parametrize("recipe, changes, reason", [
+    ("merge-exact", {"merge": None}, "needs merge"),
+    ("merge-exact", {"expected_tree": None}, "merge recipe needs expected_tree"),
+    ("merge-exact", {"message": None}, "merge recipe needs expected_tree"),
+    ("merge-exact", {"paths": ["src/app.py"]}, "takes no paths"),
+    ("merge-exact", {"merge": "not-an-id"}, "invalid merge"),
+    ("touch", {"merge": "0" * 40}, "only a merge recipe"),
+    ("commit", {"merge": "0" * 40}, "only a merge recipe"),
+])
+def test_a_merge_packet_missing_or_misplacing_its_details_is_refused(shop, recipe, changes, reason):
+    side = side_commit(shop, "side", {"docs/side.md": "side\n"})
+    with_merge_recipe(shop)
+    packet = {"merge-exact": {"merge": side, "expected_tree": "1" * 40, "message": "Merge side"},
+              "commit": {"paths": ["src/app.py"], "expected_tree": "1" * 40, "message": "fix: x"}}.get(recipe, {})
+    shop.request_job("job-1", recipe, **{**packet, **changes})
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", reason)
+    assert not shop.sentinel.exists()
+
+
+def test_a_merge_recipe_needs_an_identity(shop):
+    del shop.recipes["recipes"]["commit"], shop.recipes["identity"]
+    with_merge_recipe(shop)
+    assert "identity" in shop.jobs("check-recipes", expect=2)["error"]
+
+
+@needs_bubblewrap
+def test_a_sandboxed_merge_can_bring_the_working_tree_forward(shop):
+    with_merge_recipe(shop, sandbox="bwrap")
+    side, _ = two_sides(shop)
+    tree = merge_request(shop, side)
+    assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
+    assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
+    assert git(shop.checkout, "status", "--porcelain=v1", "--untracked-files=all") == ""
