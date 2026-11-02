@@ -777,13 +777,69 @@ def test_a_failed_job_keeps_its_work_folders_until_root_cleans_them(shop):
     shop.save_recipes()
     shop.request_job("job-1", "works")
     row = shop.run_open()["rows"][0]
-    assert row["state"] == "failed" and row["work_kept"] is True
-    assert {"home", "tmp", "scratch"} <= set(work_names(shop))
+    assert row["state"] == "failed" and row["removed"] == ["cargo-target"], "a build cache is never evidence"
+    assert row["work_kept"] == ["scratch", "tmp", "home", "ruff-cache", "hypothesis"]
+    assert {"home", "tmp", "scratch"} <= set(work_names(shop)) and "cargo-target" not in work_names(shop)
     cleaned = shop.jobs("clean", "--job", "pilot/job-1")
     assert {"home", "tmp", "scratch"} <= set(cleaned["removed"])
     assert work_names(shop) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
     assert verified_evidence(shop.receipts("job-1")[-1])
     assert shop.jobs("clean", "--job", "pilot/job-1")["removed"] == []
+
+
+def test_a_failed_heavy_tests_job_leaves_no_work_folders_and_keeps_its_evidence(shop):
+    shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK + "sys.exit(4)\n"], heavy=True,
+                                                    heavy_tests=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "works")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "failed" and "work_kept" not in row and "cleanup_error" not in row
+    assert row["removed"] == ["scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis"]
+    assert work_names(shop) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
+    assert "made work" in verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+
+
+TAGS = ("import os\nfor name in ('CARGO_TARGET_DIR', 'RUFF_CACHE_DIR', 'HYPOTHESIS_STORAGE_DIRECTORY'):\n"
+        "    print(name, open(os.path.join(os.environ[name], 'CACHEDIR.TAG')).readline().strip())\n")
+
+
+def test_a_new_job_folder_marks_its_cache_folders_for_backup_tools(shop):
+    shop.recipes["recipes"]["tags"] = shop.command(["$python", "-c", TAGS])
+    shop.save_recipes()
+    shop.request_job("job-1", "tags")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    log = verified_evidence(shop.receipts("job-1")[-1])["step-1.log"].read_text()
+    for name in ("CARGO_TARGET_DIR", "RUFF_CACHE_DIR", "HYPOTHESIS_STORAGE_DIRECTORY"):
+        assert name + " Signature: 8a477f597d28d172789f06886806bc55" in log
+
+
+KEEPS = ("import os, sys\nfolder = sys.argv[1]\nos.makedirs(folder)\n"
+         "open(os.path.join(folder, 'report.xml'), 'w').write('<testsuite/>')\n"
+         "with open(os.path.join(folder, 'huge.bin'), 'wb') as stream:\n    stream.truncate(64 * 1048576 + 1)\n"
+         "os.symlink('/etc/hostname', os.path.join(folder, 'link'))\n"
+         "sys.exit(int(sys.argv[2]))\n")
+
+
+@pytest.mark.parametrize("exit_code, heavy_tests", [(0, False), (3, True)])
+def test_a_kept_file_survives_cleanup_with_its_hash(shop, exit_code, heavy_tests):
+    keep = ["run/report.xml", "run/missing.txt", "run/huge.bin", "run/link"]
+    shop.recipes["recipes"]["keeps"] = shop.command(["$python", "-c", KEEPS, "$scratch", str(exit_code)], heavy=heavy_tests,
+                                                    heavy_tests=heavy_tests, keep=keep)
+    shop.save_recipes()
+    shop.request_job("job-1", "keeps")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == ("failed" if exit_code else "completed") and "scratch" in row["removed"]
+    result = json.loads(verified_evidence(shop.receipts("job-1")[-1])["result.json"].read_text())
+    kept = {item["path"]: item for item in result["kept"]}
+    copy = shop.workspace.store / "jobs" / "pilot" / "job-1" / "evidence" / "run" / "report.xml"
+    assert copy.read_text() == "<testsuite/>"
+    assert kept["run/report.xml"] == {"path": "run/report.xml", "bytes": 12, "copy": str(copy),
+                                      "sha256": hashlib.sha256(b"<testsuite/>").hexdigest()}
+    assert kept["run/missing.txt"]["error"] == "missing"
+    assert "keep limit" in kept["run/huge.bin"]["error"], "an oversized file is reported, never truncated"
+    assert kept["run/link"]["error"] == "not a regular file inside scratch"
+    assert sorted(path.name for path in copy.parent.iterdir()) == ["report.xml"]
+    assert "run/missing.txt (missing)" in shop.receipts("job-1")[-1]["body"]
 
 
 def test_clean_refuses_a_job_that_has_not_finished(shop, tmp_path):
@@ -1232,6 +1288,10 @@ def test_a_commit_recipe_needs_an_identity(shop):
     (lambda r: r.update(min_free_gigabytes="lots"), "min_free_gigabytes"),
     (lambda r: r["recipes"]["ok"].update(heavy_tests="yes"), "heavy_tests"),
     (lambda r: r["recipes"]["ok"].update(heavy_tests=True), "heavy_tests needs heavy"),
+    (lambda r: r["recipes"]["ok"].update(keep=["run/../../secret"]), "invalid keep"),
+    (lambda r: r["recipes"]["ok"].update(keep=["/etc/passwd"]), "invalid keep"),
+    (lambda r: r["recipes"]["ok"].update(keep=["file-%d" % n for n in range(17)]), "invalid keep"),
+    (lambda r: r["recipes"]["commit"].update(keep=["report.xml"]), "unexpected"),
 ])
 def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
     change(shop.recipes)

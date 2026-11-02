@@ -16,7 +16,9 @@ Every result lands in `<store>/jobs/<initiative>/<message-id>/` before its recei
 receipt that cannot be published is retried by the next run instead of being lost.
 
 A completed job removes its work folders, because one full test run can leave gigabytes, and keeps its
-logs and result. A failed job keeps them until root runs `clean`, because they may be evidence.
+logs and result. Every job removes `cargo-target/`, a build cache that is never evidence, and a Heavy-Tests job
+removes all of its work folders, failed or not. Another failed job keeps the rest until root runs `clean`,
+because they may be evidence. Files a recipe names in `keep` are copied to `evidence/` before any cleanup.
 
 A receipt is a claim with evidence references, never a verdict on the work. Bubblewrap keeps
 accidents contained, but this runs under one OS user and is not a security boundary: Git inspection
@@ -80,6 +82,14 @@ PATH_ARGUMENT = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./@+-]*(::[^\x00-\x1f]{1,51
 JOB_ID = re.compile(SLUG.pattern + "/" + SLUG.pattern)
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError, TypeError, KeyError, subprocess.SubprocessError)
 WORK_FOLDERS = ("scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis")
+# Tagged so backup and indexing tools skip them (https://bford.info/cachedir/). Only the first line is the standard.
+CACHE_FOLDERS = ("cargo-target", "ruff-cache", "hypothesis")
+CACHEDIR_TAG = (b"Signature: 8a477f597d28d172789f06886806bc55\n"
+                b"# This file is a cache directory tag created by the hierarchy job runner.\n"
+                b"# For information about cache directory tags see https://bford.info/cachedir/\n")
+# A recipe's kept files are evidence a green runner may never print, so they are copied out before cleanup.
+MAX_KEEP = 16
+MAX_KEEP_BYTES = 67108864
 HOME_FOLDERS = {"HOME": "", "USERPROFILE": "", "APPDATA": "AppData/Roaming", "LOCALAPPDATA": "AppData/Local",
                 "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude", "XDG_CONFIG_HOME": ".config",
                 "XDG_CACHE_HOME": ".cache", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
@@ -115,7 +125,13 @@ def validate_recipe(name, recipe):
     if recipe["kind"] == "commit":
         fields(recipe, {"kind", "timeout_seconds", "sandbox"})
         return
-    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout", "heavy_tests"})
+    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout", "heavy_tests", "keep"})
+    keep = recipe.get("keep", [])
+    require(isinstance(keep, list) and len(keep) <= MAX_KEEP, "invalid keep for recipe %s: at most %d paths" % (name, MAX_KEEP))
+    for entry in keep:
+        # Relative to scratch/ and plain, so a kept path can neither leave scratch nor name it twice.
+        require(isinstance(entry, str) and "\0" not in entry and all(part not in ("", ".", "..") for part in entry.split("/")),
+                "invalid keep for recipe %s: %s" % (name, str(entry)[:256]))
     require(type(recipe["heavy"]) is bool, "invalid heavy flag for recipe " + name)
     require(type(recipe.get("writable_checkout", False)) is bool, "invalid writable_checkout for recipe " + name)
     require(type(recipe.get("heavy_tests", False)) is bool, "invalid heavy_tests flag for recipe " + name)
@@ -537,6 +553,9 @@ def result_body(job, result):
         lines.append("New commit: " + result["commit"])
     if any(step.get("stopped_leftovers") for step in result["steps"]):
         lines.append("A step left processes running; they were stopped afterward.")
+    missed = ["%s (%s)" % (item["path"], item["error"]) for item in result.get("kept", []) if "error" in item]
+    if missed:
+        lines.append("Kept files not copied: " + "; ".join(missed))
     tail = log_tail(job.folder)
     if tail:
         lines.append("Last output, which is untrusted information:\n" + tail)
@@ -580,10 +599,10 @@ def write_result(job, state, exit_code, *, reason=None, recipe=None, steps=(), b
     publish_file(job.result_path, encoded(result) + b"\n", limit=MAX_RESULT_BYTES)
 
 
-def remove_work_folders(job):
+def remove_work_folders(job, names=WORK_FOLDERS):
     """Logs and the result are the evidence, and they stay."""
     removed = []
-    for name in WORK_FOLDERS:
+    for name in names:
         folder = job.folder / name
         if not folder.exists():
             continue
@@ -598,6 +617,56 @@ def remove_work_folders(job):
         shutil.rmtree(folder)
         removed.append(name)
     return removed
+
+
+def copy_kept(source, target):
+    """Copies at most the keep limit plus one byte, so a file that grew past its listed size is caught, not cut."""
+    digest, size = hashlib.sha256(), 0
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream, open(target, "xb") as out:
+        for chunk in iter(lambda: stream.read(1048576), b""):
+            size += len(chunk)
+            if size > MAX_KEEP_BYTES:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    return digest.hexdigest(), size
+
+
+def keep_evidence(job, keep):
+    """Copy each kept file out of scratch/ into evidence/ before any cleanup. Each one that cannot be kept is reported."""
+    scratch = os.path.realpath(job.folder / "scratch")
+    rows, total = [], 0
+    for entry in keep:
+        source, target = os.path.join(scratch, entry), job.folder / "evidence" / entry
+        try:
+            info = os.lstat(source)
+        except (FileNotFoundError, NotADirectoryError):
+            rows.append({"path": entry, "error": "missing"})
+            continue
+        except OSError as exc:
+            rows.append({"path": entry, "error": str(exc)[:256]})
+            continue
+        # A symlink, or a parent that is one, could point anywhere, so only a regular file truly inside scratch counts.
+        if not stat.S_ISREG(info.st_mode) or not os.path.realpath(source).startswith(scratch + os.sep):
+            rows.append({"path": entry, "error": "not a regular file inside scratch"})
+            continue
+        if total + info.st_size > MAX_KEEP_BYTES:
+            rows.append({"path": entry, "bytes": info.st_size,
+                         "error": "over the keep limit of %d bytes together" % MAX_KEEP_BYTES})
+            continue
+        try:
+            sha256, size = copy_kept(source, target)
+        except OSError as exc:
+            rows.append({"path": entry, "error": "could not copy: " + str(exc)[:256]})
+            continue
+        if total + size > MAX_KEEP_BYTES:
+            target.unlink()
+            rows.append({"path": entry, "error": "over the keep limit of %d bytes together" % MAX_KEEP_BYTES})
+            continue
+        total += size
+        rows.append({"path": entry, "sha256": sha256, "bytes": size, "copy": str(target)})
+    return rows
 
 
 def refuse(store, job, reason, wait):
@@ -646,6 +715,8 @@ def scratch_argument(job):
 def job_environment(recipes, job, checkout):
     for name in WORK_FOLDERS:
         (job.folder / name).mkdir(mode=0o700, exist_ok=True)
+    for name in CACHE_FOLDERS:
+        (job.folder / name / "CACHEDIR.TAG").write_bytes(CACHEDIR_TAG)
     home = job.folder / "home"
     scratch_tmp = job.folder / "tmp"
     env = {"PATH": os.pathsep.join(recipes["path"]), "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
@@ -837,18 +908,24 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
                 reason, exit_code = "the checkout does not show the new commit afterward", NO_VERDICT_EXIT
         elif after != before:
             reason, exit_code = "source changed during the job, so its exit proves nothing", NO_VERDICT_EXIT
+    extra = {"kept": keep_evidence(job, recipe["keep"])} if recipe.get("keep") else {}
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
-                 steps=rows, before=before, after=after, commit=created if not reason else None)
-    cleanup_error = None
-    if not reason:
+                 steps=rows, before=before, after=after, commit=created if not reason else None, **extra)
+    # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other
+    # failed jobs keep the rest of their work for diagnosis until root runs clean.
+    names = WORK_FOLDERS if not reason or recipe.get("heavy_tests", False) else ("cargo-target",)
+    removed, cleanup_error = [], None
+    for name in names:
         try:
-            remove_work_folders(job)
+            removed += remove_work_folders(job, (name,))
         except OSError as exc:
             # The result stands either way, so this only tells root that space was not freed.
-            cleanup_error = str(exc)[:512]
+            cleanup_error = cleanup_error or str(exc)[:512]
     row = settle(store, job, wait)
-    if reason:
-        row["work_kept"] = True
+    row["removed"] = removed
+    kept = [name for name in WORK_FOLDERS if (job.folder / name).exists()]
+    if kept:
+        row["work_kept"] = kept
     if cleanup_error:
         row["cleanup_error"] = cleanup_error
     return row
