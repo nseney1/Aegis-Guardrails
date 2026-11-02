@@ -72,7 +72,10 @@ def wake_endpoint(initiative, name, summary, dry_run):
     except ERRORS + (subprocess.SubprocessError,) as exc:
         return {**row, "state": "refused", "error": str(exc)[:512]}
     return {**row, "wake_exit": code, "meter_before": meter["state"], "active_seconds_before": meter["active_seconds"],
-            **{key: result[key] for key in ("state", "wake_id", "read", "still_unread", "exit_code", "timed_out", "error")
+            # A background wake can stop a session (the idle one before it, or its own turn), and the row is
+            # what ROOT reads, so that stop and how the turn ended are carried too.
+            **{key: result[key] for key in ("state", "wake_id", "read", "still_unread", "exit_code", "timed_out", "error",
+                                            "background", "stopped_idle")
                if key in result}}
 
 

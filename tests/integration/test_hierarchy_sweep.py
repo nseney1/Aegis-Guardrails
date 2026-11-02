@@ -14,6 +14,8 @@ import uuid
 
 import pytest
 
+from tests.integration.test_hierarchy_background import STUB
+from tests.integration.test_hierarchy_delivery import HELPER
 from tests.integration.test_hierarchy_mailbox import ROOT, invoke
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
 
@@ -112,6 +114,42 @@ def test_a_session_with_unread_mail_is_woken_and_reads_it(fleet):
     assert [row["endpoint"] for row in launched] == ["pilot/orchestrator"]
     assert "UNTRUSTED-BODY" not in json.dumps(launched), "message text must never reach the command line or prompt"
     assert "mailbox_inbox" in launched[0]["stdin"]
+
+
+@posix_only
+def test_a_sweep_wake_in_background_mode_reports_the_idle_session_it_stopped(fleet):
+    stub, state = fleet.tmp / "claude_stub.py", fleet.tmp / "background-state"
+    stub.write_text(STUB, encoding="utf-8")
+    state.mkdir()
+    session, endpoint = fleet.orchestrator["session"], "pilot/orchestrator"
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    (state / "old00000.row").write_text(json.dumps({
+        "id": "old00000", "sessionId": session, "status": "idle", "state": "blocked", "kind": "background",
+        "name": endpoint + "-g1", "pid": holder.pid}))
+    path = Path(fleet.orchestrator["wake_profile"])
+    profile = json.loads(path.read_text())
+    profile.update(mode="background", prompt_via="argv", control=[sys.executable, str(stub), str(state), "control"],
+                   argv=[sys.executable, str(stub), str(state), "reader", str(HELPER), str(fleet.root), endpoint,
+                         "claude-code", session, str(fleet.base / "delivery"), str(fleet.tmp / "stub-record.json"),
+                         "--bg", "--name", endpoint + "-g1", "--resume", session, "--"])
+    path.write_text(json.dumps(profile))
+    fleet.send("pilot/front-door", endpoint, "hello")
+    try:
+        row = fleet.sweep()["rows"][0]
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+        for planted in state.glob("*.row"):
+            pid = json.loads(planted.read_text())["pid"]
+            if pid > 0:
+                try:
+                    os.killpg(pid, 9)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    assert row["state"] == "read" and row["read"] == ["hello"], row
+    # The stop of the earlier idle session and how this turn ended must reach ROOT through the sweep row.
+    assert row["stopped_idle"] == "old00000", row
+    assert row["background"]["ended"] == "idle" and row["background"]["stop_confirmed"] is True, row
 
 
 @posix_only
