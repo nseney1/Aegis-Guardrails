@@ -1173,6 +1173,8 @@ def test_a_commit_recipe_needs_an_identity(shop):
     (lambda r: r.update(ro_binds=["relative"]), "ro_binds"),
     (lambda r: r.update(env={"X": "$unknown"}), "token"),
     (lambda r: r.update(min_free_gigabytes="lots"), "min_free_gigabytes"),
+    (lambda r: r["recipes"]["ok"].update(heavy_tests="yes"), "heavy_tests"),
+    (lambda r: r["recipes"]["ok"].update(heavy_tests=True), "heavy_tests needs heavy"),
 ])
 def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
     change(shop.recipes)
@@ -1186,6 +1188,45 @@ def test_bad_recipes_are_refused_before_anything_runs(shop, change, reason):
 def test_good_recipes_pass_the_check_with_a_summary(shop):
     summary = shop.jobs("check-recipes")
     assert summary["recipes"]["heavy"]["heavy"] is True and summary["recipes"]["commit"]["kind"] == "commit"
+
+
+def test_a_cargo_test_step_runs_only_in_a_heavy_tests_recipe(shop):
+    shop.recipes["recipes"]["storm"] = shop.command(["/opt/rust/bin/cargo", "test", "--quiet"], heavy=True)
+    shop.save_recipes()
+    shop.request_job("job-1", "ok")
+    refused = shop.jobs("run-open", expect=2)
+    assert refused["error"] == ("recipe storm step 1 runs a cargo build or test (cargo test), which only a heavy_tests "
+                                "recipe may run")
+    assert shop.states("job-1") == [] and shop.jobs("check-recipes", expect=2) == refused
+    shop.recipes["recipes"]["storm"]["heavy_tests"] = True
+    shop.save_recipes()
+    summary = shop.jobs("check-recipes")["recipes"]
+    assert summary["storm"]["heavy_tests"] is True and summary["heavy"]["heavy_tests"] is False
+
+
+@pytest.mark.parametrize("step, compiles", [
+    (["cargo", "test"], True),
+    (["/opt/rust/bin/cargo", "+nightly", "--locked", "build", "--release"], True),
+    (["cargo", "t"], True),
+    (["cargo", "nextest", "run"], True),
+    (["cargo", "clippy", "--", "-D", "warnings"], True),
+    (["/usr/bin/rustc", "main.rs"], True),
+    (["rustc", "--version"], True),
+    (["cargo", "fmt", "--all", "--", "--check"], False),
+    (["cargo", "metadata", "--format-version", "1"], False),
+    (["cargo", "tree"], False),
+    (["cargo", "--version"], False),
+    (["$python", "-c", "print('cargo test')"], False),
+])
+def test_only_a_heavy_tests_recipe_may_compile_with_cargo_or_rustc(shop, step, compiles):
+    """A script that runs cargo itself is not seen: only the step's own program and subcommand are read."""
+    shop.recipes["recipes"]["probe"] = shop.command(step)
+    shop.save_recipes()
+    answer = shop.jobs("check-recipes", expect=2 if compiles else 0)
+    assert ("only a heavy_tests recipe may run" in answer.get("error", "")) is compiles, answer
+    shop.recipes["recipes"]["probe"].update(heavy=True, heavy_tests=True)
+    shop.save_recipes()
+    assert shop.jobs("check-recipes")["recipes"]["probe"]["heavy_tests"] is True
 
 
 def test_a_recipe_that_needs_a_sandbox_is_refused_when_none_is_available(shop, tmp_path):

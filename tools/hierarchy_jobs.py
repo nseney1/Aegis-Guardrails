@@ -54,6 +54,9 @@ RESULT_SCHEMA = "aegis.hierarchy-job-result/v1"
 COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout"}
 ENV_TOKENS = {"$scratch", "$checkout"}
 SANDBOXES = ("bwrap", "none")
+# Cargo subcommands and aliases that compile. fmt, metadata, tree and --version stay light.
+CARGO_COMPILING = {"build", "b", "test", "t", "check", "c", "run", "r", "bench", "clippy", "doc", "d", "rustc", "install",
+                   "nextest", "miri"}
 # The orchestrator only needs a summary; the full output stays in the evidence files.
 TAIL_BYTES = 2000
 EMPTY_STATUS = hashlib.sha256(b"").hexdigest()
@@ -88,6 +91,20 @@ def checked_words(words, allowed, label):
         require("$" not in word or word in allowed, "unsupported token in " + label + ": " + word)
 
 
+def cargo_step(words):
+    """A step that compiles Rust: rustc itself, or cargo with a subcommand that builds. Only the step's own program
+    and subcommand are read, so a script that runs cargo inside it is not seen. Returns what it matched, else None."""
+    if not words:
+        return None
+    name = Path(words[0]).name
+    if name == "rustc":
+        return name
+    if name != "cargo":
+        return None
+    subcommand = next((word for word in words[1:] if not word.startswith(("-", "+"))), None)
+    return name + " " + subcommand if subcommand in CARGO_COMPILING else None
+
+
 def validate_recipe(name, recipe):
     matching(name, SLUG, "recipe name")
     require(isinstance(recipe, dict) and recipe.get("kind") in ("command", "commit"), "invalid kind for recipe " + name)
@@ -96,14 +113,22 @@ def validate_recipe(name, recipe):
     if recipe["kind"] == "commit":
         fields(recipe, {"kind", "timeout_seconds", "sandbox"})
         return
-    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout"})
+    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout", "heavy_tests"})
     require(type(recipe["heavy"]) is bool, "invalid heavy flag for recipe " + name)
     require(type(recipe.get("writable_checkout", False)) is bool, "invalid writable_checkout for recipe " + name)
+    require(type(recipe.get("heavy_tests", False)) is bool, "invalid heavy_tests flag for recipe " + name)
+    # Heavy-Tests is a heavy slot of its own, so a recipe that is light cannot claim it.
+    require(recipe["heavy"] or not recipe.get("heavy_tests", False), "heavy_tests needs heavy for recipe " + name)
     steps = recipe["steps"]
     require(isinstance(steps, list) and 0 < len(steps) <= MAX_STEPS and all(isinstance(step, list) and step for step in steps),
             "invalid steps for recipe " + name)
-    for step in steps:
+    for number, step in enumerate(steps, 1):
         checked_words(step, COMMAND_TOKENS, "recipe " + name)
+        # Cargo fills gigabytes and saturates the machine, so the owner allows it only in the single Heavy-Tests slot.
+        compiles = cargo_step(step)
+        require(not compiles or recipe.get("heavy_tests", False),
+                "recipe %s step %d runs a cargo build or test (%s), which only a heavy_tests recipe may run"
+                % (name, number, compiles))
 
 
 def existing_folders(value, label):
@@ -1086,6 +1111,7 @@ def main(argv=None):
             if args.command == "check-recipes":
                 recipes = load_recipes(args.recipes)
                 code, result = 0, {"recipes": {name: {"kind": recipe["kind"], "heavy": is_heavy(recipe),
+                                                      "heavy_tests": recipe.get("heavy_tests", False),
                                                       "sandbox": recipe["sandbox"]}
                                                for name, recipe in recipes["recipes"].items()}}
             else:
