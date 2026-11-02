@@ -20,8 +20,9 @@ Every subcommand prints one JSON object. Exit codes:
 check-hashes takes absolute paths only, without '..' (T100): a relative path in the
 checked file is never a candidate, and the output lists it under refused_paths.
 render-prompt fills {sha256:key} and {path:key} from --path KEY=ABS_PATH files and
-refuses relative paths, unknown, unused or unfilled keys, an existing --out (exit 3) and
-output that would fail check-hashes (exit 6), so a rendered prompt passes by construction.
+refuses relative paths, unknown placeholder kinds, unused or unfilled keys, an existing
+--out (exit 3) and output that would fail check-hashes (exit 6), so a rendered prompt
+passes by construction. A shell expansion such as ${VAR:0:8} is left as written.
 
 What exit 2 leaves behind, per subcommand (never assume "no side effects" on a retry):
   first-prompt-check, lanes-health, check-hashes
@@ -504,7 +505,9 @@ def cmd_check_hashes(args):
     return (EXIT_OK if result["ok"] else EXIT_UNMATCHED_HASH), result
 
 
-PLACEHOLDER = re.compile(r"\{(\w+):([^{}\s]*)\}")
+# (?<!\$): a shell expansion such as the T99 c stop line's "${CLAUDE_CODE_SESSION_ID:0:8}" is
+# prompt text, not a placeholder; without it every standard ROOT prompt was refused (P2-1).
+PLACEHOLDER = re.compile(r"(?<!\$)\{(\w+):([^{}\s]*)\}")
 TEMPLATE_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
 
 

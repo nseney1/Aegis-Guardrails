@@ -318,6 +318,27 @@ def test_render_prompt_refuses_output_that_would_fail_check_hashes(tmp_path, nam
     assert out["prompt_hashes"]["unmatched"] and not out_path.exists()
 
 
+STOP_LINE = 'claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null'  # the standard T99 c last action
+
+
+def test_render_prompt_leaves_shell_expansions_alone_and_its_output_passes_check_hashes(tmp_path, named):
+    """P2-1: the T99 c stop line parsed as placeholder kind CLAUDE_CODE_SESSION_ID, so no ROOT prompt rendered."""
+    template = tmp_path / "t.template"
+    template.write_text("Brief {path:brief} (sha256 {sha256:brief})\nLast action: %s\nAlso ${HOME:-/x} {md5:x}\n"
+                        % STOP_LINE, encoding="utf-8")
+    out_path = tmp_path / "o.txt"
+    code, out, _ = render(template, "--path", "brief=%s" % named, "--out", out_path)
+    assert code == 2 and "unknown placeholder kind {md5:x}" in out["error"], out
+    template.write_text("Brief {path:brief} (sha256 {sha256:brief})\nLast action: %s\nAlso ${HOME:-/x}\n"
+                        % STOP_LINE, encoding="utf-8")
+    code, out, err = render(template, "--path", "brief=%s" % named, "--out", out_path)
+    assert code == 0, (out, err)
+    assert out_path.read_text(encoding="utf-8") == ("Brief %s (sha256 %s)\nLast action: %s\nAlso ${HOME:-/x}\n"
+                                                     % (named, sha(named.read_bytes()), STOP_LINE))
+    code, checked, err = check_hashes(out_path)
+    assert code == 0 and checked["tokens"] == 1 and checked["unmatched"] == [], (checked, err)
+
+
 def test_check_hashes_counts_only_word_bounded_lowercase_64_hex(tmp_path, named):
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("git %s\nupper %s\nlong %s\nnone here\n" % ("a" * 40, "A" * 64, "b" * 65), encoding="utf-8")
