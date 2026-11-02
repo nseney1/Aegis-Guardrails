@@ -585,6 +585,18 @@ def test_a_damaged_store_fails_loudly_for_reads_and_writes(workspace, damage, er
         assert error in workspace.run(command, request, expect=2, **flags)["error"]
 
 
+@pytest.mark.parametrize("name", ["00000002.json", ".pending-00000002.json"])
+def test_a_symlinked_store_entry_fails_loudly(workspace, tmp_path, name):
+    workspace.register("a1")
+    target = event_files(workspace)[1]
+    copy = tmp_path / "elsewhere.json"
+    copy.write_bytes(target.read_bytes())
+    if not name.startswith(".pending-"):
+        target.unlink()
+    (workspace.store / "events" / name).symlink_to(copy)
+    assert "symlink paths are not supported" in workspace.run("status", expect=2)["error"]
+
+
 def test_a_hand_edited_grant_beyond_the_cap_is_detected(workspace):
     workspace.register("a1")
     for index in range(4):

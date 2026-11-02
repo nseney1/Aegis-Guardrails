@@ -294,8 +294,10 @@ class Store:
         ledger = Ledger()
         count = 0
         for path in sorted(self.events.iterdir()):
-            safe_path(path)
             if path.name.startswith(".pending-"):
+                # Never read, but a planted symlink still fails loudly. Events get the same check inside
+                # read_json; checking them here too walked every ancestor twice per event on a full store.
+                safe_path(path)
                 continue
             name = EVENT_NAME.fullmatch(path.name)
             require(name is not None, "unexpected workspace store entry: " + path.name)
