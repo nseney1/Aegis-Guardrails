@@ -394,6 +394,31 @@ def read_launch_spec(path):
     return spec
 
 
+TMP_ROOT = "/tmp"
+
+
+def untrusted_cwd_reason(cwd, tmp_root=TMP_ROOT):
+    """Why a background session cannot start in cwd, or None (probes E/F, layout f).
+
+    A session started under /tmp, inside .claude/worktrees or in a git checkout stopped at
+    a trust prompt before its first record; launch could then only report "first prompt
+    unverified" for a live session it never stops (P2-4). Layout (f) launches in the
+    workspace and lets the lane cd into its registered worktree. tmp_root is /tmp except
+    through the test-only --test-tmp-root seam, because pytest's tmp_path is under /tmp.
+    """
+    resolved = Path(cwd).resolve()
+    root = Path(tmp_root).resolve()
+    if resolved == root or root in resolved.parents:
+        return "cwd is under %s" % root
+    parts = resolved.parts
+    if any(parts[index:index + 2] == (".claude", "worktrees") for index in range(len(parts) - 1)):
+        return "cwd has a .claude/worktrees component"
+    for folder in (resolved, *resolved.parents):
+        if (folder / ".git").exists():
+            return "cwd is in a git checkout (%s exists)" % (folder / ".git")
+    return None
+
+
 def observe_launch(record, spec, args, started):
     """Fill the first-prompt check and the dialog detector into a launch record.
 
@@ -438,6 +463,12 @@ def cmd_launch(args):
     if sha256_bytes(raw) != spec["prompt"]["sha256"]:
         raise Failure(EXIT_CRITICAL, "prompt does not re-hash to its recorded sha256",
                       prompt_sha256=sha256_bytes(raw))
+    reason = untrusted_cwd_reason(spec["cwd"], args.test_tmp_root or TMP_ROOT)
+    if reason is not None:
+        raise Failure(EXIT_CRITICAL, "refused cwd for a background session: " + reason, cwd=spec["cwd"])
+    if spec["uses_enter_worktree"]:
+        raise Failure(EXIT_CRITICAL, "uses_enter_worktree: true is refused under layout (f): launch in the workspace "
+                      "and cd into a registered worktree")
     argv = ["--bg", "--agent", "claude", "--permission-mode", "auto", "--model", spec["model"],
             "--effort", spec["effort"]]
     for folder in spec["add_dirs"]:
@@ -1058,6 +1089,8 @@ def build_parser():
     launch.add_argument("--dialog-wait-s", type=float, default=90.0, help="How long to wait for a first answer")
     launch.add_argument("--poll-s", type=float, default=2.0)
     launch.add_argument("--min-free-mb", type=int, default=512)
+    launch.add_argument("--test-tmp-root", metavar="DIR",
+                        help="Test-only seam: refuse a cwd under DIR instead of /tmp (pytest's tmp_path is under /tmp)")
     launch.set_defaults(handler=cmd_launch)
 
     health = commands.add_parser("lanes-health", help="Report stalled, silent or dialog-blocked sessions; always exit 0")

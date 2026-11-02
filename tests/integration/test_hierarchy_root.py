@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -183,6 +184,9 @@ class Stub:
         claude.chmod(0o755)
         self.projects = tmp_path / "projects"
         self.projects.mkdir()
+        # pytest's tmp_path is under /tmp, which launch refuses as a cwd; tests pass this
+        # folder through the documented test-only --test-tmp-root seam instead.
+        self.tmp_root = tmp_path / "tmp-root"
 
     def env(self):
         return {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
@@ -225,12 +229,12 @@ def launch_spec(tmp_path, prompt_file, **changes):
 
 def launch(stub, spec_path, *extra, stdin=b"import hashlib, json, os, subprocess  # launcher\n"):
     return run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects, "--poll-s", "0.05",
-                    "--wait-s", "5", "--dialog-wait-s", "1", "--min-free-mb", "1", *extra,
-                    stdin=stdin, env=stub.env())
+                    "--wait-s", "5", "--dialog-wait-s", "1", "--min-free-mb", "1",
+                    "--test-tmp-root", stub.tmp_root, *extra, stdin=stdin, env=stub.env())
 
 
 def test_launch_records_an_exact_first_prompt_with_no_inherited_stdin(tmp_path, stub, prompt_file):
-    spec_path, spec = launch_spec(tmp_path, prompt_file, uses_enter_worktree=True)
+    spec_path, spec = launch_spec(tmp_path, prompt_file)
     stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
     stub.serve("agents-after.json", [agent_row(SESSION, LANE)])
     code, out, err = launch(stub, spec_path)
@@ -247,7 +251,7 @@ def test_launch_records_an_exact_first_prompt_with_no_inherited_stdin(tmp_path, 
     assert record["id"] == SESSION[:8] and record["session"] == SESSION
     assert record["exit"] == 0 and record["stdout"].startswith("backgrounded · " + SESSION[:8])
     assert record["argv"][-1] == "<prompt>" and record["stdin"] == "DEVNULL"
-    assert record["uses_enter_worktree"] is True
+    assert record["uses_enter_worktree"] is False
     assert record["first_prompt_check"]["ok"] is True and record["first_prompt_check"]["extra_chars"] == 0
     assert record["dialog"] is None
 
@@ -308,8 +312,51 @@ def test_launch_refuses_a_name_that_is_already_live(tmp_path, stub, prompt_file)
     assert not stub.launched() and not Path(spec["record_out"]).exists()
 
 
-def test_launch_detects_a_pending_dialog_and_still_writes_the_record(tmp_path, stub, prompt_file):
+@pytest.mark.parametrize("where", ["git_checkout", "under_git_checkout", "claude_worktrees", "tmp_root"])
+def test_launch_refuses_a_cwd_a_background_session_cannot_trust(tmp_path, stub, prompt_file, where):
+    """P2-4, probes E/F: in such a cwd the session stops at a trust prompt before its first record."""
+    if where == "git_checkout":
+        cwd = clean_repo(tmp_path / "checkout")
+    elif where == "under_git_checkout":
+        cwd = clean_repo(tmp_path / "checkout") / "sub"
+        cwd.mkdir()
+    elif where == "claude_worktrees":
+        cwd = tmp_path / ".claude" / "worktrees" / "x"
+        cwd.mkdir(parents=True)
+    else:
+        cwd = stub.tmp_root / "lane"
+        cwd.mkdir(parents=True)
+    spec_path, spec = launch_spec(tmp_path, prompt_file, cwd=str(cwd))
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    for extra in (["--plan"], []):
+        code, out, _ = launch(stub, spec_path, *extra)
+        assert code == 2, out
+        assert out["error"].startswith("refused cwd for a background session")
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+
+
+def test_launch_refuses_a_cwd_under_tmp_without_the_test_seam(tmp_path, stub, prompt_file):
+    cwd = Path(tempfile.mkdtemp(prefix="aegis47-hfix-cwd-", dir="/tmp"))
+    try:
+        spec_path, spec = launch_spec(tmp_path, prompt_file, cwd=str(cwd))
+        code, out, _ = run_tool("launch", "--spec", spec_path, "--plan", env=stub.env())
+    finally:
+        cwd.rmdir()
+    assert code == 2, out
+    assert "under /tmp" in out["error"]
+
+
+def test_launch_refuses_uses_enter_worktree_under_layout_f(tmp_path, stub, prompt_file):
     spec_path, spec = launch_spec(tmp_path, prompt_file, uses_enter_worktree=True)
+    stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": True})
+    code, out, _ = launch(stub, spec_path)
+    assert code == 2, out
+    assert "uses_enter_worktree" in out["error"]
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+
+
+def test_launch_detects_a_pending_dialog_and_still_writes_the_record(tmp_path, stub, prompt_file):
+    spec_path, spec = launch_spec(tmp_path, prompt_file)
     stub.serve("launch.json", {"session": SESSION, "projects": str(stub.projects), "assistant": False})
     stub.serve("agents-after.json", [agent_row(SESSION, LANE, state="blocked", status="waiting",
                                                waitingFor="permission prompt")])
@@ -359,7 +406,7 @@ def test_launch_reports_a_leaked_first_prompt_and_prints_the_stop_command(tmp_pa
 def test_launch_refuses_when_free_space_is_below_the_threshold(tmp_path, stub, prompt_file):
     spec_path, spec = launch_spec(tmp_path, prompt_file)
     code, out, _ = run_tool("launch", "--spec", spec_path, "--projects-dir", stub.projects,
-                            "--min-free-mb", str(10 ** 12), env=stub.env())
+                            "--min-free-mb", str(10 ** 12), "--test-tmp-root", stub.tmp_root, env=stub.env())
     assert code == 4
     assert "free" in out["error"]
     assert not stub.launched() and not Path(spec["record_out"]).exists()
