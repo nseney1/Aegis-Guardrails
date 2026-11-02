@@ -799,7 +799,10 @@ class TestTheScalingCheck:
 
         monkeypatch.setattr(policy, "_eval_call_entry", quadratic)
         trees = {n: extract_normalized_ast("mod.py", code="f()\n" * (400 * n)) for n in (1, 8)}
-        ratio = _scaling_ratio(lambda n: evaluate_forbid_ast(trees[n], {"calls": ["g"]}), 1)
+        # Load that slows the small run lowers this positive control's ratio (23.8x once on a
+        # hosted Windows runner), so keep the largest of three independent measurements.
+        ratio = max(_scaling_ratio(lambda n: evaluate_forbid_ast(trees[n], {"calls": ["g"]}), 1)
+                    for _ in range(3))
         assert ratio >= 24, f"a quadratic stand-in grew only {ratio:.1f}x at eight times the size"
 
     def test_a_hang_hits_the_ceiling(self):

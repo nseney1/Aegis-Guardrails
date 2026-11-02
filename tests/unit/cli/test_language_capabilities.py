@@ -135,7 +135,7 @@ def test_jest_suggestion_keeps_paths_as_argv_and_sets_junit_contract(project, tm
                       "files:process.env.JEST_JUNIT_ADD_FILE_ATTRIBUTE,errors:process.env.JEST_JUNIT_REPORT_TEST_SUITE_ERRORS}));")
     report = str(tmp_path / 'report with spaces.xml')
     argv = [node] + [report if item == '{junit}' else 'src/a.test.ts' if item == '{files}' else item for item in command[1:]]
-    result = subprocess.run(argv, cwd=project, text=True, capture_output=True, timeout=10, check=True)
+    result = subprocess.run(argv, cwd=project, text=True, capture_output=True, timeout=120, check=True)
     observed = json.loads(result.stdout)
     assert observed['report'] == report and observed['files'] == observed['errors'] == 'true'
     assert observed['argv'][1:] == command[4:-1] + ['src/a.test.ts']

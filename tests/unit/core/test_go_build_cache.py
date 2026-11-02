@@ -180,13 +180,16 @@ def test_public_build_terminates_ordinary_compiler_descendants_before_return(
 
         monkeypatch.setattr(os, "kill", check)
         monkeypatch.setattr(Path, "read_text", read)
+    # Only the timeout ending is about the deadline; the other endings must run to completion
+    # however slowly the fake compiler's interpreter starts on a loaded runner.
+    budget = 0.5 if ending == "timeout" else 30
     try:
         if ending == "success":
-            assert prepare_go_driver(workspace, timeout=0.5).read_bytes() == b"complete"
+            assert prepare_go_driver(workspace, timeout=budget).read_bytes() == b"complete"
         else:
             message = "go build timed out after 0.5s" if ending == "timeout" else "fixture build failed"
             with pytest.raises(GoDriverUnavailableError, match=message) as error:
-                prepare_go_driver(workspace, timeout=0.5)
+                prepare_go_driver(workspace, timeout=budget)
             assert error.value.reason == "build_failed"
         child_pid = int(pidfile.read_text())
         deadline = time.monotonic() + 2
