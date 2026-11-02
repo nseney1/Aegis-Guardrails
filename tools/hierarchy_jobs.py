@@ -13,7 +13,8 @@ so a clean exit over changed source is not reported as success. Files Git ignore
 A `merge` recipe merges one commit (`merge`) into a clean checkout's HEAD (`commit`). Like a `commit` recipe it
 changes nothing until the result is checked: `git merge-tree --write-tree` must merge cleanly to exactly
 `expected_tree`, then HEAD moves by compare-and-swap, and only then do the index and files follow. A second merge is
-a second job. The orchestrator predicts `expected_tree` with the runner's pinned config and no global or system config:
+a second job. A change to any `.gitattributes` file on either side is refused; that merge goes to an integrator lane.
+The orchestrator predicts `expected_tree` with the runner's pinned config and no global or system config:
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c merge.renames=true -c merge.directoryRenames=false \
     -c merge.renameLimit=7000 -c merge.renormalize=false merge-tree --write-tree <commit> <merge>
 
@@ -323,6 +324,11 @@ def merge_refusals(checkout, commit, merge):
             require(listed.returncode == 0, "could not list the paths changed on either side")
             changed.update(name for name in listed.stdout.split(b"\0") if name)
     refuse_attributes(checkout, sorted(changed), (commit, merge))
+    # A .gitattributes change can give a filter or merge driver to paths neither side changed, which the per-path check
+    # above never reads; the merge would run, and only the post-run check would catch it, after HEAD had moved.
+    edited = sorted({os.fsdecode(name) for name in changed if name.rsplit(b"/", 1)[-1] == b".gitattributes"})
+    require(not edited, "a merge job refuses any .gitattributes change on either side, because it can change how paths "
+            "neither side changed are filtered or merged; send this merge to an integrator lane: " + ", ".join(edited)[:1024])
 
 
 def uncommitted_content(checkout):

@@ -1729,6 +1729,23 @@ def test_a_merge_touching_a_filtered_or_union_merged_path_is_refused(shop, attri
     assert_stopped(shop, before, "refused", reason, "data.bin")
 
 
+@pytest.mark.parametrize("side, path, attributes", [
+    ("merge", ".gitattributes", "untouched.txt filter=lfs\n"),
+    ("commit", ".gitattributes", "untouched.txt filter=lfs\n"),
+    ("merge", "src/.gitattributes", "app.py filter=lfs\n"),
+])
+def test_a_merge_changing_gitattributes_on_either_side_is_refused(shop, side, path, attributes):
+    # The new filter lands on a path neither side changes, which the per-path attribute check never reads.
+    main_commit(shop, {"untouched.txt": "the same on both sides\n"})
+    change = {path: attributes}
+    merge = side_commit(shop, "side", change if side == "merge" else {"docs/side.md": "side\n"})
+    main_commit(shop, change if side == "commit" else {"docs/main.md": "main\n"})
+    merge_request(shop, merge)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", ".gitattributes", path, "integrator lane")
+
+
 def test_a_merge_whose_head_moved_after_the_packet_is_refused(shop):
     side, _ = two_sides(shop)
     merge_request(shop, side)
