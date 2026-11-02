@@ -19,12 +19,15 @@ Every subcommand prints one JSON object. Exit codes:
 
 check-hashes takes absolute paths only, without '..' (T100): a relative path in the
 checked file is never a candidate, and the output lists it under refused_paths.
+render-prompt fills {sha256:key} and {path:key} from --path KEY=ABS_PATH files and
+refuses relative paths, unknown, unused or unfilled keys, an existing --out (exit 3) and
+output that would fail check-hashes (exit 6), so a rendered prompt passes by construction.
 
 What exit 2 leaves behind, per subcommand (never assume "no side effects" on a retry):
   first-prompt-check, lanes-health, check-hashes
       never write.
-  startup-ack, verify-retired
-      nothing: every check runs before the only write (the ACK; the custody CAS).
+  startup-ack, verify-retired, render-prompt
+      nothing: every check runs before the only write (the ACK; the custody CAS; --out).
   launch
       refused before claude --bg (spec, prompt hash, cwd, uses_enter_worktree; the
       prompt's own hashes exit 6): nothing, and no session. After claude --bg (launch failed, first prompt unverified): the
@@ -495,6 +498,76 @@ def cmd_check_hashes(args):
     raw = path.read_bytes()
     result = {"file": str(path), "file_sha256": sha256_bytes(raw), **check_hashes(raw.decode("utf-8"), sources)}
     return (EXIT_OK if result["ok"] else EXIT_UNMATCHED_HASH), result
+
+
+PLACEHOLDER = re.compile(r"\{(\w+):([^{}\s]*)\}")
+TEMPLATE_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
+
+
+def create_file(path, raw):
+    """Write raw to a path that must not exist yet: an existing file is never replaced (exit 3)."""
+    path = Path(path)
+    if path.exists():
+        raise Failure(EXIT_CONFLICT, "--out already exists: %s" % path, path=str(path))
+    temp = _temp_beside(path, raw)
+    try:
+        os.link(temp, path)
+    except FileExistsError:
+        raise Failure(EXIT_CONFLICT, "--out already exists: %s" % path, path=str(path)) from None
+    finally:
+        temp.unlink()
+    _fsync_folder(path.parent)
+    return {"path": str(path), "sha256": sha256_bytes(raw)}
+
+
+def cmd_render_prompt(args):
+    """Fill {sha256:key} and {path:key} from the named files' bytes, so no hash is ever typed (T92).
+
+    One substitution pass: a filled value is never expanded again. The rendered text must
+    pass check-hashes with no sources, so a typed hash left in the template, or a hash
+    placed away from its path, is refused before anything is written.
+    """
+    template = absolute_argument(args.template, "--template")
+    files = {}
+    for value in args.path or []:
+        key, separator, path = value.partition("=")
+        require(separator == "=", "--path must be KEY=ABS_PATH, got %r" % value)
+        require(TEMPLATE_KEY.fullmatch(key) is not None, "invalid --path key %r in %r" % (key, value))
+        require(key not in files, "--path key %r given twice" % key)
+        files[key] = absolute_argument(path, "--path " + key)
+    out = absolute_argument(args.out, "--out") if args.out is not None else None
+    template_raw = template.read_bytes()
+    body = template_raw.decode("utf-8")
+    used = set()
+    for match in PLACEHOLDER.finditer(body):
+        kind, key = match.groups()
+        require(kind in ("sha256", "path"),
+                "unknown placeholder kind %s: templates take only {sha256:key} and {path:key}" % match.group(0))
+        require(key in files, "placeholder %s has no --path %s=ABS_PATH" % (match.group(0), key))
+        used.add(key)
+    unused = sorted(set(files) - used)
+    require(not unused, "unused --path key(s), not in the template: " + ", ".join(unused))
+    digests, filled = {}, []
+    for key, path in files.items():
+        digest, error = file_sha256(path)
+        require(digest is not None, "--path %s=%s cannot be hashed: %s" % (key, path, error))
+        digests[key] = digest
+        filled.append({"key": key, "path": str(path), "sha256": digest})
+    rendered = PLACEHOLDER.sub(
+        lambda match: digests[match.group(2)] if match.group(1) == "sha256" else str(files[match.group(2)]), body)
+    raw = rendered.encode("utf-8")
+    hashes = check_hashes(rendered)
+    if not hashes["ok"]:
+        raise Failure(EXIT_UNMATCHED_HASH, "rendered prompt fails check-hashes, nothing written: " + hashes["error"],
+                      prompt_hashes=hashes)
+    result = {"ok": True, "template": {"path": str(template), "sha256": sha256_bytes(template_raw)},
+              "filled": filled, "sha256": sha256_bytes(raw), "chars": len(rendered),
+              "prompt_hashes": {key: hashes[key] for key in ("tokens", "checked", "refused_paths")}, "out": None}
+    if out is None:
+        result["text"] = rendered
+    else:
+        result["out"] = create_file(out, raw)
+    return EXIT_OK, result
 
 
 SESSION_ID = re.compile(r"[0-9a-f][0-9a-f-]{3,63}")
@@ -1258,6 +1331,15 @@ def build_parser():
     hashes.add_argument("--source", action="append", metavar="ABS_PATH",
                         help="A file whose sha256 may appear anywhere in FILE (absolute, no '..'); repeatable")
     hashes.set_defaults(handler=cmd_check_hashes)
+
+    render = commands.add_parser("render-prompt", help="Fill {sha256:key} and {path:key} in a template from the "
+                                 "named files; the output must pass check-hashes")
+    render.add_argument("--template", required=True, help="Absolute path of the template (no '..')")
+    render.add_argument("--path", action="append", metavar="KEY=ABS_PATH",
+                        help="The file for KEY (absolute, no '..'); repeatable; every key must be used")
+    render.add_argument("--out", help="Absolute path of a new file for the prompt; an existing file is refused "
+                        "(exit 3). Without it the text is printed in the JSON")
+    render.set_defaults(handler=cmd_render_prompt)
 
     launch = commands.add_parser("launch", help="Start one claude --bg session from a spec and verify its start")
     launch.add_argument("--spec", required=True, help="Absolute path to a strict JSON launch spec; its prompt must "

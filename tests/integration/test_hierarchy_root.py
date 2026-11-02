@@ -214,6 +214,98 @@ def test_check_hashes_refuses_a_relative_source_or_file_naming_the_argument(tmp_
     assert code == 2 and "check-hashes file" in out["error"] and "prompt.txt" in out["error"]
 
 
+def render(template, *extra, cwd=None):
+    return run_tool("render-prompt", "--template", template, *extra, cwd=cwd)
+
+
+@pytest.fixture
+def template(tmp_path):
+    path = tmp_path / "prompt.template"
+    path.write_text("You are a lane.\nYour brief is {path:brief} (sha256 {sha256:brief}).\n"
+                    "Template:\n- {path:role}\n- sha256 {sha256:role}\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def role(tmp_path):
+    path = tmp_path / "roles" / "lane.md"
+    path.parent.mkdir()
+    path.write_text("# Shared lane rules\n", encoding="utf-8")
+    return path
+
+
+def test_render_prompt_fills_paths_and_hashes_and_its_output_passes_check_hashes(tmp_path, template, named, role):
+    out_path = tmp_path / "rendered" / "prompt.txt"
+    out_path.parent.mkdir()
+    code, out, err = render(template, "--path", "brief=%s" % named, "--path", "role=%s" % role, "--out", out_path)
+    assert code == 0, (out, err)
+    expected = ("You are a lane.\nYour brief is %s (sha256 %s).\nTemplate:\n- %s\n- sha256 %s\n"
+                % (named, sha(named.read_bytes()), role, sha(role.read_bytes())))
+    assert out_path.read_text(encoding="utf-8") == expected
+    assert out["out"] == {"path": str(out_path), "sha256": sha(expected.encode("utf-8"))}
+    assert out["filled"] == [{"key": "brief", "path": str(named), "sha256": sha(named.read_bytes())},
+                             {"key": "role", "path": str(role), "sha256": sha(role.read_bytes())}]
+    code, checked, err = check_hashes(out_path)
+    assert code == 0 and checked["tokens"] == 2, (checked, err)
+    code, printed, _ = render(template, "--path", "brief=%s" % named, "--path", "role=%s" % role)
+    assert code == 0 and printed["text"] == expected and printed["out"] is None
+
+
+@pytest.mark.parametrize("argument", ["--template", "--path", "--out"])
+def test_render_prompt_refuses_a_relative_path_naming_the_argument_and_value(tmp_path, template, named, role,
+                                                                             argument):
+    args = {"--template": str(template), "brief": str(named), "role": str(role), "--out": str(tmp_path / "o.txt")}
+    value = "roles/lane.md" if argument == "--path" else ("prompt.template" if argument == "--template" else "o.txt")
+    args["role" if argument == "--path" else argument] = value
+    code, out, _ = run_tool("render-prompt", "--template", args["--template"], "--path", "brief=" + args["brief"],
+                            "--path", "role=" + args["role"], "--out", args["--out"], cwd=tmp_path)
+    assert code == 2, out
+    assert argument in out["error"] and value in out["error"]
+    assert not (tmp_path / "o.txt").exists()
+
+
+@pytest.mark.parametrize("problem", ["unused_key", "missing_path", "unknown_kind", "duplicate_key", "bad_key"])
+def test_render_prompt_refuses_unknown_unused_and_unfilled_keys(tmp_path, template, named, role, problem):
+    extra = ["--path", "brief=%s" % named, "--path", "role=%s" % role]
+    if problem == "unused_key":
+        extra += ["--path", "spare=%s" % named]
+    elif problem == "missing_path":
+        extra = extra[:2]
+    elif problem == "unknown_kind":
+        template.write_text(template.read_text(encoding="utf-8") + "md5 {md5:brief}\n", encoding="utf-8")
+    elif problem == "duplicate_key":
+        extra += ["--path", "brief=%s" % role]
+    else:
+        extra += ["--path", "=%s" % named]
+    out_path = tmp_path / "o.txt"
+    code, out, _ = render(template, *extra, "--out", out_path)
+    assert code == 2, out
+    word = {"unused_key": "unused", "missing_path": "no --path", "unknown_kind": "unknown placeholder",
+            "duplicate_key": "twice", "bad_key": "invalid --path key"}[problem]
+    assert word in out["error"]
+    assert not out_path.exists()
+
+
+def test_render_prompt_refuses_an_existing_out_file(tmp_path, template, named, role):
+    out_path = tmp_path / "o.txt"
+    out_path.write_text("keep\n", encoding="utf-8")
+    code, out, _ = render(template, "--path", "brief=%s" % named, "--path", "role=%s" % role, "--out", out_path)
+    assert code == 3, out
+    assert out_path.read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.parametrize("problem", ["typed_hash", "hash_far_from_path"])
+def test_render_prompt_refuses_output_that_would_fail_check_hashes(tmp_path, named, problem):
+    template = tmp_path / "t.template"
+    body = ("Brief {path:brief} (sha256 %s)\n" % FABRICATED if problem == "typed_hash"
+            else "Brief {path:brief}\n\nsha256 {sha256:brief}\n")
+    template.write_text(body, encoding="utf-8")
+    out_path = tmp_path / "o.txt"
+    code, out, _ = render(template, "--path", "brief=%s" % named, "--out", out_path)
+    assert code == 6, out
+    assert out["prompt_hashes"]["unmatched"] and not out_path.exists()
+
+
 def test_check_hashes_counts_only_word_bounded_lowercase_64_hex(tmp_path, named):
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("git %s\nupper %s\nlong %s\nnone here\n" % ("a" * 40, "A" * 64, "b" * 65), encoding="utf-8")
