@@ -100,7 +100,9 @@ def create_directory_junction(target: Path, link: Path) -> None:
 
     if not target.is_dir():
         raise NotADirectoryError(str(target))
-    data = _mount_point_data(str(target.resolve()))
+    # Path.resolve() on Python 3.9 raises when a restricted token cannot query the final path;
+    # 3.10+ resolve() is this realpath call, which falls back. is_dir() above excludes loops.
+    data = _mount_point_data(os.path.realpath(target))
     kernel = _kernel32()
     link.mkdir()
     owned = link.lstat()

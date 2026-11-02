@@ -362,12 +362,36 @@ def test_unsupported_resolved_targets_fail_before_creating_an_entry(tmp_path, mo
 
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
-    original = Path.resolve
-    monkeypatch.setattr(Path, "resolve", lambda path, *args, **kwargs:
-        Path(resolved) if path == target else original(path, *args, **kwargs))
+    original = os.path.realpath
+    monkeypatch.setattr(os.path, "realpath", lambda path, *args, **kwargs:
+        resolved if os.fspath(path) == str(target) else original(path, *args, **kwargs))
     with pytest.raises(OSError, match=message):
         create_directory_junction(target, link)
     assert not link.exists() and not junction_kernel.calls
+
+
+def test_python39_resolution_denial_still_sends_the_absolute_target(tmp_path, monkeypatch, junction_kernel):
+    """P6 on Python 3.9 (Validate runs 41454378514, 41482747131): its Windows Path.resolve lets
+    the restricted token's WinError 5 escape, where 3.10+ resolution falls back to the path."""
+    from aegis_core.verification.windows_junction import create_directory_junction
+
+    target, link = tmp_path / "dependencies", tmp_path / "node_modules"
+    target.mkdir()
+    expected = str(target.resolve()).replace("/", "\\")
+    original = Path.resolve
+
+    def python39_resolve(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(13, "Access is denied", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", python39_resolve)
+    create_directory_junction(target, link)
+    raw, = junction_kernel.buffers
+    _, _, _, sub_offset, sub_size, print_offset, print_size = struct.unpack("<LHHHHHH", raw[:16])
+    assert raw[16 + sub_offset:16 + sub_offset + sub_size].decode("utf-16-le") == "\\??\\" + expected
+    assert raw[16 + print_offset:16 + print_offset + print_size].decode("utf-16-le") == expected
+    assert link.lstat().st_reparse_tag == 0xA0000003
 
 
 def test_success_status_without_mount_point_tag_is_not_accepted(tmp_path, junction_kernel):
