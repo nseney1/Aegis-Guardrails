@@ -227,6 +227,63 @@ jobs:
           fi
           echo "No hardcoded paths found"
 
+      - name: Run source-bound Go P3
+        if: matrix.python-version == '3.11' && runner.os != 'macOS'
+        shell: bash
+        run: |
+          python -I -S -B - <<'PYCODE'
+          import hashlib, json, os, shutil, subprocess, sys, tempfile
+          from pathlib import Path
+          lane = Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+          base = Path(tempfile.mkdtemp(prefix='aegis-p3-job-', dir=os.environ['RUNNER_TEMP']))
+          bundle = base / 'bundle'
+          bundle.mkdir()
+          git_name = shutil.which('git')
+          go_name = shutil.which('go')
+          if git_name is None or go_name is None:
+              raise SystemExit('P3 requires existing Git and Go; no acquisition is permitted')
+          git = str(Path(git_name).resolve(strict=True))
+          go = str(Path(go_name).resolve(strict=True))
+          prefix = [git, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=' + os.devnull, '-C', str(lane)]
+          def git_bytes(*args):
+              return subprocess.check_output(prefix + list(args), timeout=120)
+          audit = git_bytes('rev-parse', 'HEAD').decode().strip()
+          tree = git_bytes('rev-parse', 'HEAD^{tree}').decode().strip()
+          pins = {'portable_go_p3.py': '5fd16603f08031c298fdeafa1e5669a1ee9c4cee23b8912c562c812c1b4ccde9', 'windows_acceptance.py': '692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474', 'darwin_ownership.py': '8695d8f0cdfb068ede1bbb16d29b617313acec47a555cf36ade81f3838162976', 'probe_darwin_ownership.py': 'b7f5f54cd81a30fcfc3b97b7fe1a5ab6cb2e3471129b78c02ff5913dc5ba36bc'}
+          for name, expected in pins.items():
+              value = git_bytes('show', audit + ':.github/scripts/p3/' + name)
+              if hashlib.sha256(value).hexdigest() != expected:
+                  raise SystemExit('P3 pinned helper mismatch: ' + name)
+              (bundle / name).write_bytes(value)
+          argv = [sys.executable, '-I', '-S', '-B', str(bundle / 'portable_go_p3.py'), 'measure',
+                  '--lane', str(lane), '--audit', audit, '--tree', tree, '--git', git, '--go', go,
+                  '--owner-helper', str(bundle / 'windows_acceptance.py'),
+                  '--darwin-backend', str(bundle / 'darwin_ownership.py'),
+                  '--darwin-probe', str(bundle / 'probe_darwin_ownership.py'),
+                  '--output-parent', str(base), '--lock', str(base / 'p3.lock'), '--quiet-window-confirmed']
+          (base / 'launch.json').write_text(json.dumps({'argv': argv, 'cwd': str(base), 'pins': pins}, indent=2) + '\n', encoding='utf-8')
+          # One helper owns the bounded worker and native preflights. No competing workload
+          # is launched by this step; the surrounding job must remain serial and quiet.
+          raise SystemExit(subprocess.call(argv, cwd=base))
+          PYCODE
+
+      - name: Preserve Go P3 evidence, including failures
+        if: always() && matrix.python-version == '3.11' && runner.os != 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p3-${{ runner.os }}-py${{ matrix.python-version }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/aegis-p3-job-*/launch.json
+            ${{ runner.temp }}/aegis-p3-job-*/bundle/*.py
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/*.json
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/*.jsonl
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/*.log
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.json
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.jsonl
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.stdout
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.stderr
+
   # B3: the full pytest suite on Windows. Failures fail the job; there is no
   # continue-on-error. Steps run under Git Bash (as on a contributor's machine);
   # tests that drive PowerShell spawn it themselves.
@@ -457,6 +514,70 @@ jobs:
             --fixture "$AC24_KIT/fixture" --package-lock "$AC24_KIT/m0-package-lock.json" \
             --evidence "$RUNNER_TEMP/aegis-ac24-evidence-$AEGIS_PYTHON_LEG" \
             --require-platform win32 --require-link junction
+
+      - name: Run source-bound Go P3
+        if: ${{ !cancelled() && matrix.python-version == '3.12' && steps.language-source.outcome == 'success' }}
+        timeout-minutes: 19
+        shell: bash
+        env:
+          AEGIS_P3_LANE: ${{ steps.language-source.outputs.source }}
+          AEGIS_P3_AUDIT: ${{ steps.language-source.outputs.audit }}
+          AEGIS_P3_TREE: ${{ steps.language-source.outputs.tree }}
+        run: |
+          python -I -S -B - <<'PYCODE'
+          import hashlib, json, os, shutil, subprocess, sys, tempfile
+          from pathlib import Path
+          lane = Path(os.environ['AEGIS_P3_LANE']).resolve(strict=True)
+          base = Path(tempfile.mkdtemp(prefix='aegis-p3-job-', dir=os.environ['RUNNER_TEMP']))
+          bundle = base / 'bundle'
+          bundle.mkdir()
+          git_name = shutil.which('git')
+          go_name = shutil.which('go')
+          if git_name is None or go_name is None:
+              raise SystemExit('P3 requires existing Git and Go; no acquisition is permitted')
+          git = str(Path(git_name).resolve(strict=True))
+          go = str(Path(go_name).resolve(strict=True))
+          prefix = [git, '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=' + os.devnull, '-C', str(lane)]
+          def git_bytes(*args):
+              return subprocess.check_output(prefix + list(args), timeout=120)
+          audit = git_bytes('rev-parse', 'HEAD').decode().strip()
+          tree = git_bytes('rev-parse', 'HEAD^{tree}').decode().strip()
+          if audit != os.environ['AEGIS_P3_AUDIT'] or tree != os.environ['AEGIS_P3_TREE']:
+              raise SystemExit('P3 lane does not match the language-source receipt')
+          pins = {'portable_go_p3.py': '5fd16603f08031c298fdeafa1e5669a1ee9c4cee23b8912c562c812c1b4ccde9', 'windows_acceptance.py': '692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474', 'darwin_ownership.py': '8695d8f0cdfb068ede1bbb16d29b617313acec47a555cf36ade81f3838162976', 'probe_darwin_ownership.py': 'b7f5f54cd81a30fcfc3b97b7fe1a5ab6cb2e3471129b78c02ff5913dc5ba36bc'}
+          for name, expected in pins.items():
+              value = git_bytes('show', audit + ':.github/scripts/p3/' + name)
+              if hashlib.sha256(value).hexdigest() != expected:
+                  raise SystemExit('P3 pinned helper mismatch: ' + name)
+              (bundle / name).write_bytes(value)
+          argv = [sys.executable, '-I', '-S', '-B', str(bundle / 'portable_go_p3.py'), 'measure',
+                  '--lane', str(lane), '--audit', audit, '--tree', tree, '--git', git, '--go', go,
+                  '--owner-helper', str(bundle / 'windows_acceptance.py'),
+                  '--darwin-backend', str(bundle / 'darwin_ownership.py'),
+                  '--darwin-probe', str(bundle / 'probe_darwin_ownership.py'),
+                  '--output-parent', str(base), '--lock', str(base / 'p3.lock'), '--quiet-window-confirmed']
+          (base / 'launch.json').write_text(json.dumps({'argv': argv, 'cwd': str(base), 'pins': pins}, indent=2) + '\n', encoding='utf-8')
+          # One helper owns the bounded worker and native preflights. No competing workload
+          # is launched by this step; the surrounding job must remain serial and quiet.
+          raise SystemExit(subprocess.call(argv, cwd=base))
+          PYCODE
+
+      - name: Preserve Go P3 evidence, including failures
+        if: always() && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p3-${{ runner.os }}-py${{ matrix.python-version }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/aegis-p3-job-*/launch.json
+            ${{ runner.temp }}/aegis-p3-job-*/bundle/*.py
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/*.json
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/*.jsonl
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/*.log
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.json
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.jsonl
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.stdout
+            ${{ runner.temp }}/aegis-p3-job-*/aegis-v45-portable-p3-*/darwin-preflight/**/*.stderr
 
       - name: Preserve AC24 acquisition and acceptance evidence
         if: always()
