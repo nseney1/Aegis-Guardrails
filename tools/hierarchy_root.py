@@ -707,6 +707,106 @@ def cmd_verify_retired(args):
     return EXIT_OK, result
 
 
+def file_ref(path):
+    path = Path(path)
+    return {"path": str(path), "sha256": sha256_bytes(path.read_bytes())}
+
+
+def read_transfer_facts(path):
+    facts = read_json(path)
+    fields(facts, {"outgoing", "incoming", "handoff", "authority"}, {"goal", "invariants", "transferred_at"})
+    fields(facts["outgoing"], {"host", "session", "pid", "start_ticks", "label"})
+    fields(facts["incoming"], {"host", "session", "label"}, {"pid", "start_ticks", "job_dir"})
+    fields(facts["handoff"], {"path", "sha256"})
+    for side in ("outgoing", "incoming"):
+        require(SESSION_ID.fullmatch(text(facts[side]["session"], side + " session")) is not None,
+                "invalid %s session" % side)
+        require(re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}", text(facts[side]["label"], side + " label")) is not None,
+                "invalid %s label" % side)
+    return facts
+
+
+def cmd_transfer(args):
+    """Outgoing ROOT: write the next root spec and the transfer, then move custody by CAS.
+
+    After C1's transfer custody named C2 in active_native_root but still C1 in
+    active_root_session (C2 F3); all three active_* fields move together here. The
+    outgoing session is not stopped by the tool: it prints the stop command, and
+    verify-retired records the stop once the incoming side has acknowledged (F5).
+    """
+    facts = read_transfer_facts(args.facts)
+    out, inc = facts["outgoing"], facts["incoming"]
+    ack_raw = Path(args.ack).read_bytes()
+    if sha256_bytes(ack_raw) != args.ack_sha256:
+        raise Failure(EXIT_CRITICAL, "startup ACK does not re-hash to --ack-sha256", ack_sha256=sha256_bytes(ack_raw))
+    require(inc["session"].encode("utf-8") in ack_raw, "startup ACK does not name the incoming session")
+    if sha256_bytes(Path(facts["handoff"]["path"]).read_bytes()) != facts["handoff"]["sha256"]:
+        raise Failure(EXIT_CRITICAL, "handoff packet does not re-hash to its recorded sha256")
+    custody_raw = Path(args.custody).read_bytes()
+    if sha256_bytes(custody_raw) != args.expect_custody_sha256:
+        raise Failure(EXIT_CRITICAL, "custody changed: it does not re-hash to --expect-custody-sha256",
+                      actual_sha256=sha256_bytes(custody_raw))
+    custody = json.loads(custody_raw)
+    require(custody.get("active_root_session") == out["session"], "custody does not name the outgoing root")
+    prev = read_json(args.prev_spec)
+    fields(prev, {"schema", "host", "session", "outgoing_stopped", "entries"})
+    require(prev["schema"] == hierarchy_handoff.SPEC_SCHEMA, "unsupported previous spec schema")
+    writes = [str(args.spec_out), str(args.transfer_out), str(args.custody)]
+    if args.plan:
+        return EXIT_OK, {"ok": True, "plan": True, "writes": writes}
+    check_free_space(writes, args.min_free_mb)
+    at = facts.get("transferred_at") or utc_now()
+    ack_sha, delta = sha256_bytes(ack_raw), file_ref(args.final_delta)
+    stop_command = "claude stop " + out["session"][:8]
+    checks = [
+        "Outgoing %s ROOT %s %s retires with this transfer and takes no further root action; per owner rule F5 it "
+        "is then stopped (%s) and verify-retired records the stop." % (out["host"], out["label"], out["session"],
+                                                                       stop_command),
+        "Incoming %s ROOT %s %s startup ACK verified (sha %s)." % (inc["host"], inc["label"], inc["session"], ack_sha),
+        "Final delta %s sha %s." % (delta["path"], delta["sha256"]),
+    ]
+    spec = {"schema": prev["schema"], "host": inc["host"], "session": inc["session"], "outgoing_stopped": True,
+            "entries": [{**entry, "completed_checks": checks} for entry in prev["entries"]]}
+    atomic_write_json(args.spec_out, spec)
+    record = {"schema": "aegis.claude-to-claude-root-transfer/v1", "state": "TRANSFERRED", "at": at,
+              "outgoing": {key: out[key] for key in ("host", "session", "pid", "start_ticks")},
+              "incoming": {**{key: inc[key] for key in ("host", "session", "pid", "start_ticks", "job_dir") if key in inc},
+                           "startup_ack": {"path": str(args.ack), "sha256": ack_sha}},
+              "handoff": facts["handoff"], "final_delta": delta, "root_spec": file_ref(args.spec_out),
+              "authority": facts["authority"], "goal": facts.get("goal"), "invariants": facts.get("invariants")}
+    record["outgoing"]["scope"] = "retired: no further root action; stop pending verify-retired"
+    atomic_write_json(args.transfer_out, record)
+    transfer_ref = file_ref(args.transfer_out)
+    key = "claude_%s_to_%s_handoff" % (out["label"].lower(), inc["label"].lower())
+
+    def move(custody):
+        require(custody.get("active_root_session") == out["session"], "custody does not name the outgoing root")
+        custody.update(active_native_root=inc["session"], active_root_session=inc["session"],
+                       active_root_host=inc["host"],
+                       current_root_dispatch_state="Sole Claude ROOT %s %s ACTIVE after transfer; %s retired."
+                       % (inc["label"], inc["session"], out["label"]))
+        history = custody.setdefault("custody_history", [])
+        require(isinstance(history, list), "custody_history must be a list")
+        history.append({"outgoing_host": out["host"], "outgoing_root": out["session"], "incoming_host": inc["host"],
+                        "incoming_root": inc["session"], "transferred_at": at,
+                        "handoff_path": facts["handoff"]["path"], "handoff_sha256": facts["handoff"]["sha256"],
+                        "startup_ack_sha256": ack_sha, "transfer": transfer_ref, "final_delta": delta})
+        handoff = custody.setdefault(key, {})
+        require(isinstance(handoff, dict), key + " must be an object")
+        handoff.update(state="TRANSFERRED_%s_EXECUTES_ROOT_SPEC" % inc["label"].upper(), transferred_at=at,
+                       incoming_host=inc["host"], incoming_session=inc["session"], transfer=transfer_ref,
+                       final_delta=delta, startup_ack={"path": str(args.ack), "sha256": ack_sha})
+        return custody
+
+    update = cas_update_json(args.custody, args.expect_custody_sha256, move)
+    return EXIT_OK, {"ok": True, "spec_out": file_ref(args.spec_out), "transfer_out": transfer_ref,
+                     "custody_update": update, "stop_command": stop_command,
+                     "next": ("After the incoming ROOT acknowledges every endpoint, a human or ROOT runs `%s`, then "
+                              "hierarchy_root.py verify-retired --session %s --pid %d --custody %s "
+                              "--expect-custody-sha256 %s" % (stop_command, out["session"], out["pid"], args.custody,
+                                                             update["sha256"]))}
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -752,6 +852,20 @@ def build_parser():
     retired.add_argument("--expect-custody-sha256")
     retired.add_argument("--min-free-mb", type=int, default=512)
     retired.set_defaults(handler=cmd_verify_retired)
+
+    move = commands.add_parser("transfer", help="Outgoing ROOT: write spec and transfer, move custody by CAS")
+    move.add_argument("--facts", required=True, help="JSON: outgoing, incoming, handoff, authority")
+    move.add_argument("--ack", required=True)
+    move.add_argument("--ack-sha256", required=True)
+    move.add_argument("--final-delta", required=True)
+    move.add_argument("--prev-spec", required=True)
+    move.add_argument("--spec-out", required=True)
+    move.add_argument("--transfer-out", required=True)
+    move.add_argument("--custody", required=True)
+    move.add_argument("--expect-custody-sha256", required=True)
+    move.add_argument("--plan", action="store_true", help="Print the paths a run would write; write nothing")
+    move.add_argument("--min-free-mb", type=int, default=512)
+    move.set_defaults(handler=cmd_transfer)
     return parser
 
 

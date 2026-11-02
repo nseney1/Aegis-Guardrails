@@ -673,6 +673,96 @@ def test_verify_retired_refuses_a_session_still_listed_after_its_pid_is_gone(tmp
     assert custody.read_bytes() == before
 
 
+INCOMING = "c9e38364-ac3f-4720-ba74-44318c7bfcac"
+
+
+@pytest.fixture
+def rotation(tmp_path):
+    files = {}
+    for name, body in (("ack", '{"incoming": {"session": "%s"}}\n' % INCOMING), ("delta", '{"delta": 1}\n'),
+                       ("packet", '{"packet": 1}\n'), ("brief", "Root brief.\n")):
+        files[name] = tmp_path / (name + (".md" if name == "brief" else ".json"))
+        files[name].write_text(body, encoding="utf-8")
+    brief = {"path": str(files["brief"]), "sha256": sha(files["brief"].read_bytes())}
+    prev = {"schema": "aegis.hierarchy-handoff/v1", "host": "claude-code", "session": OUTGOING,
+            "outgoing_stopped": True, "entries": [
+                {"root": "/m/%s/mailbox" % name, "endpoint": name + "/root", "briefs": [brief],
+                 "delivery_dir": "/m/%s/delivery" % name, "completed_checks": ["old check"]}
+                for name in ("aegis", "storm")]}
+    files["prev"] = tmp_path / "prev-spec.json"
+    files["prev"].write_text(json.dumps(prev), encoding="utf-8")
+    files["custody"] = tmp_path / "custody.json"
+    files["custody"].write_text(json.dumps({
+        "active_native_root": OUTGOING, "active_root_session": OUTGOING, "active_root_host": "claude-code",
+        "custody_history": [{"outgoing_root": "69958d8f", "incoming_root": OUTGOING}],
+        "claude_c5_to_c6_handoff": {"state": "PREPARED_WAITING_ACTUAL_STARTUP_ACK", "incoming_session": INCOMING},
+    }, indent=1) + "\n", encoding="utf-8")
+    facts = {"outgoing": {"host": "claude-code", "session": OUTGOING, "pid": 4059889, "start_ticks": "123",
+                          "label": "C5"},
+             "incoming": {"host": "claude-code", "session": INCOMING, "label": "C6"},
+             "handoff": {"path": str(files["packet"]), "sha256": sha(files["packet"].read_bytes())},
+             "authority": "Owner standing approval for automatic ROOT successors."}
+    files["facts"] = tmp_path / "facts.json"
+    files["facts"].write_text(json.dumps(facts), encoding="utf-8")
+    files["spec_out"] = tmp_path / "root-c5-to-c6-handoff.json"
+    files["transfer_out"] = tmp_path / "ROOT-C5-C6-TRANSFER.json"
+    return files
+
+
+def transfer(files, *extra, ack_sha=None, custody_sha=None):
+    return run_tool("transfer", "--facts", files["facts"], "--ack", files["ack"],
+                    "--ack-sha256", ack_sha or sha(files["ack"].read_bytes()), "--final-delta", files["delta"],
+                    "--prev-spec", files["prev"], "--spec-out", files["spec_out"],
+                    "--transfer-out", files["transfer_out"], "--custody", files["custody"],
+                    "--expect-custody-sha256", custody_sha or sha(files["custody"].read_bytes()),
+                    "--min-free-mb", "1", *extra)
+
+
+def test_transfer_writes_spec_and_transfer_and_syncs_every_custody_field(rotation):
+    code, out, err = transfer(rotation)
+    assert code == 0, (out, err)
+    custody = json.loads(rotation["custody"].read_text(encoding="utf-8"))
+    assert custody["active_native_root"] == custody["active_root_session"] == INCOMING
+    assert custody["active_root_host"] == "claude-code"
+    entry = custody["custody_history"][-1]
+    assert entry["outgoing_root"] == OUTGOING and entry["incoming_root"] == INCOMING
+    assert entry["transfer"] == {"path": str(rotation["transfer_out"]), "sha256": sha(rotation["transfer_out"].read_bytes())}
+    assert entry["startup_ack_sha256"] == sha(rotation["ack"].read_bytes())
+    assert custody["claude_c5_to_c6_handoff"]["state"].startswith("TRANSFERRED_C6")
+    assert custody["claude_c5_to_c6_handoff"]["incoming_session"] == INCOMING
+    spec = json.loads(rotation["spec_out"].read_text(encoding="utf-8"))
+    prev = json.loads(rotation["prev"].read_text(encoding="utf-8"))
+    assert spec["session"] == INCOMING and spec["outgoing_stopped"] is True
+    for new, old in zip(spec["entries"], prev["entries"]):
+        assert {k: v for k, v in new.items() if k != "completed_checks"} == \
+            {k: v for k, v in old.items() if k != "completed_checks"}
+        assert new["completed_checks"] != ["old check"]
+        assert any(INCOMING in check and sha(rotation["ack"].read_bytes()) in check for check in new["completed_checks"])
+    record = json.loads(rotation["transfer_out"].read_text(encoding="utf-8"))
+    assert record["schema"] == "aegis.claude-to-claude-root-transfer/v1" and record["state"] == "TRANSFERRED"
+    assert record["root_spec"] == {"path": str(rotation["spec_out"]), "sha256": sha(rotation["spec_out"].read_bytes())}
+    assert record["outgoing"]["session"] == OUTGOING and record["incoming"]["session"] == INCOMING
+    assert out["stop_command"] == "claude stop " + OUTGOING[:8]
+    assert "verify-retired" in out["next"]
+
+
+@pytest.mark.parametrize("bad", ["ack", "custody"])
+def test_transfer_writes_nothing_when_a_critical_hash_differs(rotation, bad):
+    before = rotation["custody"].read_bytes()
+    code, out, _ = transfer(rotation, **{bad + "_sha": "0" * 64})
+    assert code == 2
+    assert rotation["custody"].read_bytes() == before
+    assert not rotation["spec_out"].exists() and not rotation["transfer_out"].exists()
+
+
+def test_transfer_plan_writes_nothing(rotation):
+    before = rotation["custody"].read_bytes()
+    code, out, _ = transfer(rotation, "--plan")
+    assert code == 0 and out["writes"] == [str(rotation["spec_out"]), str(rotation["transfer_out"]),
+                                           str(rotation["custody"])]
+    assert rotation["custody"].read_bytes() == before and not rotation["spec_out"].exists()
+
+
 def test_verify_retired_leaves_a_changed_custody_untouched(tmp_path, stub):
     custody = custody_file(tmp_path)
     before = custody.read_bytes()
