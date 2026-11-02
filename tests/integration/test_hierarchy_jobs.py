@@ -917,6 +917,34 @@ def start_stuck_job(shop, tmp_path):
     return runner
 
 
+def test_clean_finished_frees_every_finished_job_of_an_initiative_and_skips_running_ones(shop, tmp_path):
+    shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK + "sys.exit(4)\n"])
+    shop.save_recipes()
+    shop.request_job("job-a", "works")
+    shop.request_job("job-b", "works")
+    assert [row["state"] for row in shop.run_open()["rows"]] == ["failed", "failed"]
+    runner = start_stuck_job(shop, tmp_path)
+    group = shop.run_open(expect=3)["rows"][0]["process_group"]
+    try:
+        cleaned = shop.jobs("clean", "--initiative", "pilot", "--finished")
+        assert [row["job"] for row in cleaned["jobs"]] == ["pilot/job-a", "pilot/job-b"]
+        assert all(row["removed"] == ["scratch", "tmp", "home", "ruff-cache", "hypothesis"] and row["freed_bytes"] >= 1000
+                   for row in cleaned["jobs"])
+        assert cleaned["freed_bytes"] == sum(row["freed_bytes"] for row in cleaned["jobs"])
+        assert cleaned["not_finished"] == ["pilot/job-1"], "a running job is never cleaned"
+        for identifier in ("job-a", "job-b"):
+            assert work_names(shop, identifier) == ["claim.json", "packet.md", "process.json", "result.json", "step-1.log"]
+        assert {"scratch", "home"} <= set(work_names(shop, "job-1"))
+        assert shop.jobs("clean", "--initiative", "pilot", "--finished")["jobs"] == []
+    finally:
+        os.killpg(runner.pid, signal.SIGKILL)
+        runner.communicate()
+        os.killpg(group, signal.SIGKILL)
+    assert "--finished" in shop.jobs("clean", "--initiative", "pilot", expect=2)["error"]
+    assert "--job" in shop.jobs("clean", expect=2)["error"]
+    assert "initiative" in shop.jobs("clean", "--initiative", "../x", "--finished", expect=2)["error"]
+
+
 def test_a_running_job_is_reported_and_not_started_again(shop, tmp_path):
     runner = start_stuck_job(shop, tmp_path)
     group = None

@@ -1191,6 +1191,43 @@ def clean(store_path, identifier):
     return 0, {"job": identifier, "removed": remove_work_folders(job)}
 
 
+def work_bytes(folder):
+    """Bytes the work folders hold, counted without following a symlink out of them."""
+    total = 0
+    for name in WORK_FOLDERS:
+        path = folder / name
+        if path.is_symlink() or not path.is_dir():
+            continue
+        for current, _, files in os.walk(path):
+            for item in files:
+                try:
+                    total += os.lstat(os.path.join(current, item)).st_size
+                except OSError:
+                    continue
+    return total
+
+
+def clean_finished(store_path, initiative_id):
+    """Root's batch cleanup. Only a job with a result is finished; any other may still be running, so it is skipped."""
+    matching(initiative_id, SLUG, "initiative")
+    store = Store(store_path)
+    base = safe_path(store.path / "jobs" / initiative_id)
+    rows, not_finished = [], []
+    for folder in sorted(base.iterdir()) if base.is_dir() else []:
+        if folder.is_symlink() or not folder.is_dir() or SLUG.fullmatch(folder.name) is None:
+            continue
+        identifier = initiative_id + "/" + folder.name
+        if not (folder / "result.json").exists():
+            not_finished.append(identifier)
+            continue
+        freed = work_bytes(folder)
+        removed = remove_work_folders(Job(store.path, {"id": initiative_id}, {"message_id": folder.name}))
+        if removed:
+            rows.append({"job": identifier, "removed": removed, "freed_bytes": freed})
+    return 0, {"initiative": initiative_id, "jobs": rows, "freed_bytes": sum(row["freed_bytes"] for row in rows),
+               "not_finished": not_finished}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--store", help="Absolute path to the workspace store")
@@ -1208,8 +1245,10 @@ def main(argv=None):
     resolved.add_argument("--job", required=True, help="<initiative>/<message-id>")
     resolved.add_argument("--reason", required=True)
     resolved.add_argument("--process-stopped", action="store_true", help="Confirm by hand that an unrecorded process has stopped")
-    commands.add_parser("clean", help="Remove a finished job's work folders, keeping its logs and result").add_argument(
-        "--job", required=True, help="<initiative>/<message-id>")
+    cleaned = commands.add_parser("clean", help="Remove finished jobs' work folders, keeping their logs and results")
+    cleaned.add_argument("--job", help="<initiative>/<message-id>")
+    cleaned.add_argument("--initiative", help="With --finished: every finished job of this initiative")
+    cleaned.add_argument("--finished", action="store_true", help="Clean every finished job of --initiative; skip the rest")
     commands.add_parser("source-digest", help="Print the commit, tree and uncommitted-content digest a packet needs").add_argument(
         "--checkout", required=True)
     args = parser.parse_args(argv)
@@ -1219,7 +1258,12 @@ def main(argv=None):
             code, result = source_digest(args.checkout)
         elif args.command == "resolve":
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait, args.process_stopped)
+        elif args.command == "clean" and args.job is None:
+            require(args.initiative is not None, "clean needs --job, or --initiative with --finished")
+            require(args.finished, "clean --initiative needs --finished")
+            code, result = clean_finished(args.store, args.initiative)
         elif args.command == "clean":
+            require(args.initiative is None and not args.finished, "clean takes --job or --initiative, not both")
             code, result = clean(args.store, args.job)
         else:
             require(args.recipes is not None, "--recipes is required")
