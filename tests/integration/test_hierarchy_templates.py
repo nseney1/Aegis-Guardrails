@@ -50,7 +50,7 @@ def missing(name, phrases):
 
 def test_lanes_stop_on_a_refusal_and_never_touch_shared_worktree_admin():
     assert missing("roles/lane.md", ["If Edit or Write is refused", "report the exact text and stop",
-                                     "Never call `EnterWorktree`", "`git worktree repair`", "`git worktree prune`"]) == []
+                                     "No lane calls `EnterWorktree`", "`git worktree repair`", "`git worktree prune`"]) == []
 
 
 def test_lanes_read_their_diff_before_each_commit():
@@ -79,13 +79,19 @@ def test_a_self_stop_never_stops_another_session(name):
 
 
 def test_only_writers_cd_into_their_worktree_and_read_only_roles_never_use_a_bare_cd():
-    assert missing("roles/lane.md", ["Writing lanes:", "the first-step `cd` is into your own worktree only",
-                                     "read-only roles never use a bare `cd`"]) == []
+    """Its rule changed under dispatch amendment 1: writers keep the launch cwd and reach W by `git -C` or a subshell."""
+    assert missing("roles/lane.md", ["Writing lanes:", "Your session cwd stays at the launch cwd for the whole session",
+                                     "never a bare `cd`, not even at the start of a compound command",
+                                     "Writers use `git -C <worktree>` for git and a `( cd <worktree> && … )` subshell",
+                                     "read-only roles follow `reviewer.md`"]) == []
+    assert "first-step `cd`" not in words("roles/lane.md")
+    assert "first step is a Bash `cd`" not in words("roles/lane.md")
 
 
 def test_orchestrators_read_a_dialog_from_waiting_for_not_from_blocked_alone():
     assert missing("roles/orchestrator.md", ["`waitingFor`", "whatever `state` says", "`state: blocked`",
-                                             "A present `waitingFor` is a dialog whatever `status` says"]) == []
+                                             "A present `waitingFor` (e.g. `\"permission prompt\"`) is a dialog "
+                                             "whatever `status` says"]) == []
 
 
 def test_orchestrators_bind_by_kind_and_list_governance_paths_without_a_fixed_writer_count():
@@ -102,7 +108,8 @@ def test_root_changes_limits_and_stops_earlier_roots_lanes_only_under_owner_deci
 
 
 def test_root_launch_prompts_copy_the_briefs_deadline_and_the_exact_self_stop_line():
-    assert missing("roles/root.md", ["copy the brief's deadline", "the brief wins over a default", SELF_STOP]) == []
+    assert missing("roles/root.md", ["copy the brief's deadline", "the brief wins over a default", SELF_STOP,
+                                     "send one line saying so, and never stop another session"]) == []
 
 
 def test_root_stops_the_outgoing_session_and_checks_its_pid():
@@ -126,6 +133,184 @@ def test_the_lane_brief_asks_for_binding_kind_worktree_and_owner_decisions():
                                      "`aegis check --lane`", "Push exception", "`tests-deleted`",
                                      "hosted `aegis check --ci` governance result",
                                      "unless the push-exception field names an owner decision"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
+def test_lanes_accept_a_dispatch_by_a_mailbox_ack_and_a_received_message_is_optional(name):
+    assert missing(name, ["publishing a mailbox `ack` in reply to the dispatch, with readiness for a writing lane",
+                          "a SendMessage is a notice, not the acceptance", "received message is optional"]) == []
+    assert "Send separate received and accepted messages" not in words(name)
+
+
+def test_deadlines_count_from_the_dispatch_and_lanes_ask_when_they_differ():
+    assert missing("lane-brief.md", ["Deadline (T111 (3), T117):",
+                                     "counted from the dispatch; the wait for the dispatch does not count"]) == []
+    assert missing("roles/lane.md", ["the prompt, the brief and the dispatch give different deadlines, "
+                                     "ask your orchestrator before you start"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
+def test_a_lane_with_open_items_waits_under_a_bounded_timer_before_its_self_stop(name):
+    assert missing(name, ["open items for your manager", "`sleep 600` run in the background, capped by your deadline",
+                          "an \"accept\" message", "when the timer fires", "fix-round dispatch",
+                          "no open items stops at once"]) == []
+
+
+def test_lanes_under_a_codex_manager_report_by_mailbox_and_poll_their_inbox():
+    assert missing("roles/lane.md", ["your manager's host is `codex`",
+                                     "report only through the mailbox (`ack`, `result`, `info`)",
+                                     "keep SendMessage for ROOT, for urgent items only",
+                                     "does not wake you",
+                                     "poll your inbox under a bounded background sleep (about 120 s, capped by your deadline)"]) == []
+
+
+def test_lanes_route_cross_initiative_traffic_through_their_orchestrator():
+    assert missing("roles/lane.md", ["`counterparts: []`", "`tools/hierarchy_mailbox.py:213-222` and `:305-306`",
+                                     "goes through your orchestrator, which uses ROOT relay",
+                                     "`c12-cross-orchestrator-traffic-a`", "Counterpart messages cannot dispatch work",
+                                     "no lane kind, reviewers included, holds a counterpart exchange (T144)"]) == []
+    for name in ("roles/lane.md", "roles/reviewer.md"):
+        assert "exchange at least one informational message" not in words(name)
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md"])
+def test_no_lane_kind_calls_enter_worktree(name):
+    assert missing(name, ["No lane calls `EnterWorktree`"]) == []
+    layout = [line for line in (TEMPLATES / name).read_text(encoding="utf-8").splitlines() if "**Layout (f)" in line]
+    assert all("EnterWorktree" not in line for line in layout)
+
+
+def test_lanes_keep_tmpdir_and_home_out_of_slash_tmp():
+    assert missing("roles/lane.md", ["`TMPDIR` and `HOME` in a `mktemp -d /var/tmp/…` folder, not under `/tmp`",
+                                     "an empty `/tmp/.git`", "12 `test_hierarchy_root.py` tests",
+                                     "your own `$CLAUDE_JOB_DIR/tmp`"]) == []
+    assert "Keep `TMPDIR` under `/tmp`" not in words("roles/lane.md")
+    assert "`mktemp` dir under `/tmp`" not in words("roles/lane.md")
+
+
+def test_lanes_never_cd_into_the_dogfood_folder_and_check_pwd_before_writing():
+    assert missing("roles/lane.md", ["never `cd` into the dogfood folder (`aegis-hierarchy-dogfood`), even as a writer",
+                                     "run `pwd` before your first Write",
+                                     "run one lone `cd <launch cwd>` and report it"]) == []
+    assert words("roles/lane.md").count("bare `cd`") == 1
+
+
+@pytest.mark.parametrize("name", ["roles/builder.md", "roles/integrator.md"])
+def test_builders_and_integrators_push_only_under_the_briefs_push_exception(name):
+    assert missing(name, ["You do not push unless the brief's push-exception field names an owner decision "
+                          "and its ref pattern (T24)"]) == []
+
+
+def test_lanes_lint_with_ruffs_defaults_and_keep_large_modules_inside_their_budget():
+    assert missing("roles/lane.md", ["`ruff check --no-cache <paths>` with ruff's default rules",
+                                     "stricter than `make lint`", "`tests/contract/test_module_size.py`",
+                                     "shrink-only"]) == []
+
+
+def test_the_lane_brief_lives_inside_the_initiative_folder():
+    assert missing("lane-brief.md", ["`initiatives/<id>/briefs/`", "refuses a brief outside the mailbox's parent folder",
+                                     "`tools/hierarchy_mailbox.py:315-317`"]) == []
+
+
+def test_the_corrected_lane_facts_and_attributions_stay_pinned():
+    assert missing("roles/lane.md", ["repair would rewrite 107 pointers", "tests (each with its digest)",
+                                     "**Absolute paths, T100.** Packets, prompts and specs write every path in a command "
+                                     "line as absolute", "**Layout (f), T38 and T48.**"]) == []
+    assert missing("lane-brief.md", ["(layout f, T38 and T48)"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_managers_follow_the_launch_order_bind_quietly_and_close_dispatches(name):
+    assert missing(name, ["worktree → lease → writer → bind → launch → dispatch → accept",
+                          "Every writing dispatch names a lease, which ROOT claims before the launch",
+                          "bind a successor orchestrator at a quiet moment",
+                          "close this dispatch with a mailbox `result` before the self-stop",
+                          "Close a dispatch before its worktree is removed", "\"git identity check failed\""]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_handoffs_carry_the_owner_approved_backlog_table_verbatim(name):
+    assert missing(name, ["\"Owner-approved backlog\" table, copied forward verbatim",
+                          "done (with evidence) or retired by a cited record",
+                          "re-checks the table against the owner records during its read"]) == []
+
+
+BY_BINDING = ["send to the session the binding names", "field `bindings[\"<endpoint>\"]`",
+              "until a successor is bound, its predecessor is still the manager",
+              "Codex-hosted roles are not in ListAgents: reach them through the mailbox only, "
+              "and read their binding the same way"]
+
+
+def test_orchestrators_relay_cross_team_requests_through_root_and_address_roles_by_their_binding():
+    assert missing("roles/orchestrator.md", ["go by ROOT relay", "`c12-cross-orchestrator-traffic-a`",
+                                             "notices without authority may go by SendMessage",
+                                             "the receiver records them in its STATUS",
+                                             "A peer still cannot dispatch your lanes",
+                                             "Their Claude lanes poll their inbox"] + BY_BINDING) == []
+    assert "Cross-hierarchy findings go orchestrator to orchestrator" not in words("roles/orchestrator.md")
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_no_template_names_a_resolve_endpoint_command_or_a_later_listagents_name(name):
+    assert "resolve --endpoint" not in words(name)
+    assert "any later N that ListAgents shows" not in words(name)
+
+
+def test_root_names_current_holders_keeps_codex_liveness_and_fetches_without_maintenance():
+    assert missing("roles/root.md", ["never a predicted number", "lane liveness, stall checks and retirements",
+                                     "(F-C12)"] + BY_BINDING + [
+                                     "`git ls-remote` or `gh api`",
+                                     "`git fetch --no-auto-maintenance --no-write-fetch-head origin <full sha>`",
+                                     "(the T14 trap)"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+def test_managers_never_call_enter_worktree(name):
+    assert missing(name, ["Never call `EnterWorktree` and keep the launch cwd"]) == []
+
+
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md", "roles/reviewer.md"])
+def test_managers_and_reviewers_keep_the_launch_cwd(name):
+    assert missing(name, ["not even inside a compound command or a subshell", "Run `pwd` before the first Write",
+                          "run one lone `cd <launch cwd>` and report it"]) == []
+    assert "subshell `(cd" not in words(name)
+
+
+def test_stop_wording_orders_the_routes_and_adds_no_new_authority():
+    assert missing("roles/orchestrator.md", ["Your outgoing session stops (root's `stop`, then T99 c) "
+                                             "before checkpoint replacement"]) == []
+    assert "Stop the outgoing session before checkpoint replacement" not in words("roles/orchestrator.md")
+    assert missing("roles/root.md", ["send `stop` first", "use your own T93 stop only if the session has not stopped",
+                                     "never send `stop` after your own stop was refused",
+                                     "T114 below for a lane an earlier ROOT launched",
+                                     "the retiring rule (F5, above) for your own launches"]) == []
+
+
+def test_root_limits_each_test_and_lets_the_briefs_run_timeout_win():
+    assert missing("roles/root.md", ["\"stop any test over N minutes\" limits each test",
+                                     "the brief's own run timeout wins"]) == []
+
+
+def test_reviewers_cite_a_manifest_or_pinned_commit_ids_as_the_brief_says():
+    assert missing("roles/reviewer.md", ["The brief names which source applies", "whose manifest hash you cite",
+                                         "pinned commit-id reads", "pins both full commit ids",
+                                         "only object reads (`git show`, `git diff`, `git ls-tree`, `git grep <rev>`)",
+                                         "cite the commit and tree ids instead of a manifest"]) == []
+
+
+def test_reviewers_publish_exactly_an_ack_and_a_review_for_a_mailbox_dispatch():
+    assert missing("roles/reviewer.md", ["publishes exactly two messages", "one `accepted` ack",
+                                         "carries no readiness", "one `review` reply to the dispatch",
+                                         "a review reply is refused until the dispatch is accepted",
+                                         "`tools/hierarchy_mailbox.py:791` and `:810`",
+                                         "A review without a mailbox dispatch publishes nothing"]) == []
+
+
+def test_the_corrected_manager_facts_and_attributions_stay_pinned():
+    assert missing("roles/root.md", ["with the T93 checks below",
+                                     "`python3 /absolute/prototype/tools/hierarchy_handoff.py --spec "
+                                     "/absolute/handoff-spec.json`", "**Launches, T1 and T26.**"]) == []
+    assert missing("roles/orchestrator.md", ["(`set-limits`, T59 and T63)", "**Writing lanes, T38 and T48.**"]) == []
 
 
 def test_the_manifest_template_gives_each_hierarchy_a_root_routed_only_to_its_orchestrator(tmp_path):
