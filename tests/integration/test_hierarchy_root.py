@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,50 @@ def user_record(content, uuid="u-1", ts="2026-11-02T16:00:01.000Z"):
 def header_records():
     return [{"type": "custom-title", "customTitle": "lane", "sessionId": SESSION},
             {"type": "permission-mode", "permissionMode": "auto", "sessionId": SESSION}]
+
+
+def git_marker_above(folder):
+    """The first .git in folder or any of its parents, walked as untrusted_cwd_reason walks them."""
+    resolved = Path(folder).resolve()
+    for parent in (resolved, *resolved.parents):
+        if (parent / ".git").exists():
+            return parent / ".git"
+    return None
+
+
+# T135: a Codex sandbox can leave an empty .git in each writable root that lacks one (/tmp/.git was
+# seen), and launch refuses any cwd with a .git in it or above it, so the launch tests failed with
+# "cwd is in a git checkout" for a .git they never made. This module's tmp_path is therefore a root
+# with no .git above it; a test that builds its own .git below that root still sees the refusal.
+TRUSTED_ROOT_CANDIDATES = (Path("/var/tmp"), Path("/dev/shm"))
+
+
+@pytest.fixture
+def tmp_path(tmp_path):
+    """Pytest's tmp_path when no .git is in it or above it, else a fresh folder under a clean candidate."""
+    found = git_marker_above(tmp_path)
+    if found is None:
+        yield tmp_path
+        return
+    checked = ["%s: %s exists" % (tmp_path, found)]
+    for candidate in TRUSTED_ROOT_CANDIDATES:
+        if not (candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK)):
+            checked.append("%s: missing or not writable" % candidate)
+            continue
+        marker = git_marker_above(candidate)
+        if marker is not None:
+            checked.append("%s: %s exists" % (candidate, marker))
+            continue
+        root = Path(tempfile.mkdtemp(prefix="t135-root-", dir=candidate))
+        try:
+            yield root
+        finally:
+            shutil.rmtree(root)
+        return
+    pytest.fail("T135: no tmp root without a .git in it or above it, so launch would refuse every test cwd as "
+                "'cwd is in a git checkout'. Checked: %s. A Codex sandbox can leave an empty .git in each "
+                "writable root: remove the stray .git or set TMPDIR under a folder with none above it."
+                % "; ".join(checked), pytrace=False)
 
 
 @pytest.fixture
