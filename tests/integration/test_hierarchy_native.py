@@ -166,3 +166,32 @@ def test_an_additional_write_root_and_tmpdir_need_explicit_expected_scope(tmp_pa
     assert invoke(path, *args, code=2)["state"] == "PROFILE_HOLD"
     result = invoke(path, *args, "--write-root", WORK, "--write-root", EXTRA, "--allow-tmpdir")
     assert result["state"] == "PROFILE_MATCH"
+
+
+@pytest.mark.parametrize("new_context", [None, "old-turn"])
+def test_new_turn_cannot_reuse_previous_turn_profile(tmp_path, new_context):
+    path = rollout(tmp_path)
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started",
+            "turn_id": "new-turn"}}) + "\n")
+        if new_context:
+            value = context()
+            value["payload"]["turn_id"] = new_context
+            stream.write(json.dumps(value) + "\n")
+    result = invoke(path, "check", "--model", "gpt-6-astra", "--effort", "ultra",
+                    "--cwd", WORK, code=2)
+    assert result["error"] == "latest started turn has no matching native context"
+
+
+def test_matching_new_turn_context_replaces_previous_profile(tmp_path):
+    path = rollout(tmp_path)
+    value = context(effort="medium", turn_id="new-turn")
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started",
+            "turn_id": "new-turn"}}) + "\n")
+        stream.write(json.dumps(value) + "\n")
+    result = invoke(path, "check", "--model", "gpt-6-astra", "--effort", "ultra",
+                    "--cwd", WORK, code=2)
+    assert result["state"] == "PROFILE_HOLD"
+    assert result["reasons"] == ["reasoning effort mismatch"]
+    assert result["observation"]["turn_record"]["line"] == 4

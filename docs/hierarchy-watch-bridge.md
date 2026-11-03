@@ -35,6 +35,54 @@ The operator provider's `execute(request, intent_id)` returns `outcome`,
 by trusted integration code, not a user-authenticated plugin or a JSON authority
 grant. The installed native path remains refused regardless of fixture claims.
 
+## Bounded disposable process port
+
+`ProcessBridge(argv, cwd=..., evidence_dir=..., timeout_seconds=30,
+stop_grace=0.2, evidence_only=True)` supplies an opt-in POSIX process boundary.
+It requires `waitid` with `WNOWAIT`, an absolute executable, a trusted argument
+vector, and explicit evidence-only operation. No shell, native session launch,
+authentication grant, service installation, or new lifecycle ledger is supplied.
+The host command must implement the port and repeat canonical Operator admission;
+the public tests run the real `OperatorBridge` in a disposable Python host.
+
+Construction refuses before creating evidence or launching a process unless the
+host exposes `waitid`, `P_PID`, `WEXITED`, `WNOHANG`, and `WNOWAIT`. In particular,
+macOS Python 3.9 and 3.11 are unsupported: Python added macOS `waitid` support in
+[3.13](https://docs.python.org/3/library/os.html#os.waitid). Public refusal tests
+exercise missing capabilities on every host. Only the subprocess execution tests
+skip when those capabilities are absent; portable input and default-refusal tests
+still run. A supported capability set is not native-host qualification.
+
+Each call receives one JSON object on stdin with schema `aegis.watch-process/v1`,
+`method` (`observe` or `continue_request`), `request_id`, `request_sha256`, and
+`operation_id` (null for observation). It returns that exact object plus `result`.
+The result follows the Python contract above and must report `native_qualified:
+false`. A zero exit code alone cannot establish a valid result. Correlation,
+JSON validity, effect/state pairs and output size are checked independently.
+
+Unique evidence directories retain `request.json`, `stdout`, `stderr`, and
+`result.json` for successes and failures. Each output has a 1 MiB acceptance limit,
+checked while polling and again after exit; this is not a disk quota. A failed
+observation is HOLD. Launch refusal or cancellation before launch is known
+no-effect. Timeout, cancellation, malformed replies and nonzero exit after launch
+leave a continuation unknown. Canonical terminal settlement can still be derived
+without rewriting that failed transport history or repeating its effect.
+
+The optional `with_control(deadline=..., stop_event=...)` returns a bounded copy.
+`Supervisor.run` passes its deadline and stop event through this port; the earlier
+of call timeout and run deadline applies. The bridge observes exit without reaping
+its direct child, keeping that PID reserved while signalling its own process group
+with TERM then KILL. Only afterward does it reap the child. This also handles a
+leader that exits while a same-group descendant remains. Cleanup allows up to two
+additional `stop_grace` periods; an unconfirmed reap is an explicit unknown HOLD.
+
+Reaping the direct child and signalling its group do not prove that descendants
+which escaped the group, a remote executor, or an uninterruptible host operation
+stopped. Those require host-specific containment and observation. Cancellation
+may leave the canonical writer's lock file behind; retain it and the unresolved
+intent for qualified reconciliation. This bridge never removes abandoned locks
+or releases capacity. Legacy synchronous Python bridges remain uninterruptible.
+
 ## Supported-host qualification matrix
 
 ```sh

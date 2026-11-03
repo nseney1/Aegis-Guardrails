@@ -10,6 +10,10 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Source-checkout hierarchy tools, outside the wheel: six role contracts, delivery states that keep published, woken and read apart, handoffs bound by a status digest, a root endpoint with job messages, a workspace controller for initiative priority, shared capacity and lease checks across clones, one-tool provisioning, a delivery sweep, a job runner with fixed recipes, exact read-only review copies, an active-time meter with explicit role caps, a workspace messageboard, and a one-command move of a live hierarchy to a new mailbox root that keeps its sessions. Claude roles can opt into background sessions so they show in the owner's session list. See `docs/hierarchy-dogfood.md`. Host processes are stubbed in tests, so behavior on real hosts remains an open live gate.
 - Standalone restart maintenance adds a canonical evidence lifecycle, native profile diagnostics with explicit admission refusal, disposable operator integration, a durable supervisor and conservative job/capacity recovery. Unknown effects remain held; source tests and mailbox reads do not establish authenticated native execution or restart approval. See `docs/hierarchy-restart.md` for remaining native gates and team-model dependencies.
 
+### Fixed
+
+- Restart maintenance now rejects a resumed turn without its matching profile context, bounds explicitly disposable provider subprocesses with retained cancellation evidence, and displays historical job results while unknown process scope keeps settlement held. The reviewed six-team cutover and rollback plan preserves native qualification and owner activation gates.
+
 ## [4.5.0] - 2026-11-02
 
 ### Added

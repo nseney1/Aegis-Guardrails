@@ -464,3 +464,52 @@ def test_status_does_not_offer_free_capacity_when_the_census_is_unavailable(shop
     assert report["process_census"]["heavy"]["state"] == "unavailable"
     assert report["process_census"]["heavy"]["admission_free"] is None
     assert any(row["reason"] == "census_unavailable" for row in report["blockers"])
+
+
+@pytest.mark.parametrize("scope", [None, {"boot_id": "old-boot", "pid_namespace": "old-namespace"}])
+def test_unknown_process_scope_preserves_failed_result_outputs_and_receipt_in_status(shop, scope):
+    script = ("import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.mkdir(); "
+              "(p/'failure.txt').write_text('Engine partial failure'); sys.exit(7)")
+    shop.recipes["recipes"]["failed-kept"] = shop.command(["$python", "-c", script, "$scratch"],
+                                                          heavy=True, keep=["run/failure.txt"])
+    shop.save_recipes()
+    shop.request_job("engine-partial", "failed-kept")
+    shop.run_open()
+    folder = shop.workspace.store / "jobs" / "pilot" / "engine-partial"
+    result = json.loads((folder / "result.json").read_text())
+    claim_path = folder / "claim.json"
+    claim = json.loads(claim_path.read_text())
+    if scope is None:
+        claim.pop("process_scope")
+    else:
+        claim["process_scope"] = scope
+    claim_path.write_text(json.dumps(claim))
+    before = snapshot(shop.workspace.store), snapshot(shop.root)
+
+    report = shop.jobs("recovery-status", expect=3)
+    row = report["jobs"][0]
+    assert row["state"] == "evidence_error"
+    assert row["error"] == "job process scope is unknown: pilot/engine-partial"
+    assert row.get("result") == {"path": str(folder / "result.json"),
+                                 "sha256": hashlib.sha256((folder / "result.json").read_bytes()).hexdigest(),
+                                 "state": "failed", "exit_code": 7}
+    assert row["retained_outputs"] == result["kept"]
+    assert row["receipt"] == "match"
+    assert (snapshot(shop.workspace.store), snapshot(shop.root)) == before
+
+
+def test_unknown_process_scope_keeps_unsettled_result_visible_and_capacity_held(shop):
+    folder, request_id = stage_interrupted_job(shop, result={"state": "failed", "exit_code": 7})
+    claim_path = folder / "claim.json"
+    claim = json.loads(claim_path.read_text())
+    claim.pop("process_scope")
+    claim_path.write_text(json.dumps(claim))
+    before = snapshot(shop.workspace.store), snapshot(shop.root)
+
+    report = shop.jobs("recovery-status", expect=3)
+    row = report["jobs"][0]
+    assert row["state"] == "evidence_error"
+    assert row.get("result", {}).get("state") == "failed"
+    assert row["receipt"] == "not_published"
+    assert report["capacity"]["heavy"]["holders"][0]["request_id"] == request_id
+    assert (snapshot(shop.workspace.store), snapshot(shop.root)) == before

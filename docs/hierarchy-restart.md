@@ -21,6 +21,11 @@ fields. Requested service tier and observed served tier remain separate. Missing
 served-tier telemetry is unknown and does not stop explicitly authorized
 standalone maintenance that requests the default tier.
 
+When a native `task_started` event is present, the context must follow it and
+name that same turn. A missing or mismatched context refuses observation; an old
+turn's profile cannot qualify a newly resumed turn. Historical records without
+turn-start events remain diagnostic observations, never admission grants.
+
 ```
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID inspect
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID check --model gpt-6-astra --effort ultra --cwd /absolute/workspace
@@ -103,3 +108,8 @@ and operator maintainers. Fixture adapters cannot close these gates. Approval
 signatures, protected merge, release and actual workflow restart remain separate
 owner actions. Existing stopped actors, live bindings, leases and failed evidence
 must remain intact during candidate validation.
+
+The reviewed [six-team cutover and rollback plan](hierarchy-six-team-cutover.md)
+maps the two Aegis and four Stormheir scopes while retaining original claims,
+partial work and independent acceptance obligations. Its dated observations
+require revalidation before separately authorized cutover.

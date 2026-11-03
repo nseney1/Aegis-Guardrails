@@ -42,6 +42,7 @@ def inspect_codex(rollout, cid, requested_tier="default"):
     require(stat.S_ISREG(path.stat().st_mode), "rollout must be a regular file")
     require(size <= MAX_ROLLOUT_BYTES, "rollout exceeds observation byte limit")
     metadata, context = None, None
+    started_turn = None
     witnesses = {}
     total = 0
     with path.open("rb") as stream:
@@ -61,9 +62,17 @@ def inspect_codex(rollout, cid, requested_tier="default"):
                 raise ValueError("malformed rollout JSON at line %d" % number) from exc
             require(isinstance(record, dict), "rollout record must be an object")
             kind = record.get("type")
+            payload = record.get("payload")
+            if kind == "event_msg" and isinstance(payload, dict) and payload.get("type") == "task_started":
+                started_turn = payload.get("turn_id")
+                require(isinstance(started_turn, str) and bool(started_turn.strip()),
+                        "native turn start has no turn identity")
+                # A resumed turn may be observed before its context is flushed.
+                # Never qualify it using a preceding turn's model/permissions.
+                context = None
+                continue
             if kind not in {"session_meta", "turn_context"}:
                 continue
-            payload = record.get("payload")
             require(isinstance(payload, dict), "native record payload must be an object")
             witness = {"path": str(path), "line": number, "sha256": hashlib.sha256(raw).hexdigest(),
                        "timestamp": record.get("timestamp")}
@@ -73,6 +82,9 @@ def inspect_codex(rollout, cid, requested_tier="default"):
             else:
                 context, witnesses["turn_record"] = payload, witness
     require(metadata is not None, "no native session identity in rollout")
+    if started_turn is not None:
+        require(context is not None and context.get("turn_id") == started_turn,
+                "latest started turn has no matching native context")
     require(context is not None, "no native turn context in rollout")
     profile = {key: context.get(key) for key in ("model", "effort", "cwd", "approval_policy",
                                                 "approvals_reviewer", "sandbox_policy", "permission_profile")}

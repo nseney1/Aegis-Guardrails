@@ -53,6 +53,10 @@ unsupported host boundary.
 - Failed logs and results remain evidence. Recipe `keep` outputs are retained with
   their hashes, including failures; copy failures remain explicit result entries.
   Acceptance, receipt publication, process exit and capacity release are separate.
+  A readable terminal result, its retained-output references and exact receipt
+  correlation remain visible even when missing or changed process scope blocks
+  settlement. The row stays `evidence_error`; these historical observations do
+  not establish stopped processes, acceptance or permission to release capacity.
 
 ## Crash and reconnect procedure
 

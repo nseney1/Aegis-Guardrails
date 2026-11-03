@@ -36,9 +36,13 @@ changing its operating authority requires the separately qualified operator.
 Stop/deadline checks run before every observation, before durable dispatch and
 immediately before the provider call. If persistence consumes the remaining
 budget, the unsent dispatch is retained as `refused` with `effect: none`.
-The synchronous port cannot interrupt an already running host call; each real
-provider must independently enforce its own timeout/cancellation. This slice
-does not claim a hard lifetime bound for an unqualified or blocking provider.
+The optional process bridge receives the run deadline and stop event and can
+cancel its owned disposable child while a call is in flight, retaining unknown
+effects and output. Its bounded cleanup follows the run deadline; see the
+[process port limits](hierarchy-watch-bridge.md#bounded-disposable-process-port).
+Legacy synchronous Python bridges cannot interrupt an already running host call.
+Each real provider still needs independently qualified timeout/cancellation and
+containment; this slice does not establish a native executor lifetime bound.
 
 For public Python integration, use `initialize(root, lifecycle_root, watch_id,
 evidence_only=True)`, then `Supervisor(root).step(generation, bridge)` or

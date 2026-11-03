@@ -1617,7 +1617,9 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                 row["state"] = "running" if row["runner_alive"] is True else "unknown_effect"
                 row["next_action"] = "Retain the original reservation; a qualified operator must reconcile process effects."
             else:
-                check_settlement_processes(job, result)
+                # Historical evidence remains useful when the original process scope
+                # cannot be observed. Record it before the independent stop check;
+                # a matching receipt alone never promotes or settles the job.
                 row["result"] = {"path": str(job.result_path), "sha256": file_sha256(job.result_path),
                                  "state": result["state"], "exit_code": result["exit_code"]}
                 row["retained_outputs"] = result.get("kept", [])
@@ -1632,6 +1634,7 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                 if prior is not None:
                     row["receipt"] = ("match" if "from" in message and receipt_matches(
                         job, prior["message"], receipt, result_body(job, result)) else "mismatch")
+                check_settlement_processes(job, result)
                 row["state"] = "finished" if row["receipt"] == "match" and not held else "settle_pending"
                 row["next_action"] = ("Retain evidence for independent acceptance." if row["state"] == "finished" else
                                       "Reconcile the exact receipt and result; run-open may settle without rerunning the job.")

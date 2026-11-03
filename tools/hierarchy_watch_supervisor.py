@@ -178,6 +178,9 @@ class Supervisor:
             return self._step(generation, bridge or NativeBridge())
 
     def _step(self, generation, bridge, *, deadline=None, stop_event=None):
+        if (deadline is not None or stop_event is not None) and hasattr(bridge, "with_control"):
+            bridge = bridge.with_control(deadline=deadline, stop_event=stop_event)
+
         def may_continue():
             return ((deadline is None or time.monotonic() < deadline)
                     and (stop_event is None or not stop_event.is_set()))
