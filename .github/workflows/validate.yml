@@ -228,7 +228,9 @@ jobs:
           echo "No hardcoded paths found"
 
       - name: Run source-bound Go P3
-        if: matrix.python-version == '3.11' && runner.os != 'macOS'
+        # H1 (S7): runs after a failed suite too, so a suite flake cannot skip the measurement;
+        # HP's source witness still fails closed on drift. macOS runs the current backend (D4 (i)).
+        if: ${{ !cancelled() && matrix.python-version == '3.11' && steps.test.outcome != 'skipped' }}
         shell: bash
         run: |
           python -I -S -B - <<'PYCODE'
@@ -268,7 +270,7 @@ jobs:
           PYCODE
 
       - name: Preserve Go P3 evidence, including failures
-        if: always() && matrix.python-version == '3.11' && runner.os != 'macOS'
+        if: always() && matrix.python-version == '3.11'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: p3-${{ runner.os }}-py${{ matrix.python-version }}-${{ github.run_attempt }}
@@ -517,7 +519,7 @@ jobs:
 
       - name: Run source-bound Go P3
         if: ${{ !cancelled() && matrix.python-version == '3.12' && steps.language-source.outcome == 'success' }}
-        timeout-minutes: 19
+        timeout-minutes: 18
         shell: bash
         env:
           AEGIS_P3_LANE: ${{ steps.language-source.outputs.source }}
