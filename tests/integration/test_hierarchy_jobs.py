@@ -1746,6 +1746,18 @@ def test_a_merge_changing_gitattributes_on_either_side_is_refused(shop, side, pa
     assert_stopped(shop, before, "refused", ".gitattributes", path, "integrator lane")
 
 
+@pytest.mark.parametrize("key, value", [("merge.default", "union"), ("merge.text.driver", "cat %A > /dev/null")])
+def test_a_merge_with_a_merge_driver_in_local_config_is_refused(shop, key, value):
+    # merge.default serves every path whose merge attribute is unspecified, and a configured driver named text wins over the
+    # built-in, so either would bring back a union or custom merge that the attribute check refuses.
+    git(shop.checkout, "config", key, value)
+    side, _ = two_sides(shop)
+    merge_request(shop, side)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "refused", key, "integrator lane")
+
+
 def test_a_merge_whose_head_moved_after_the_packet_is_refused(shop):
     side, _ = two_sides(shop)
     merge_request(shop, side)

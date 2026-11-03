@@ -310,7 +310,14 @@ def refuse_attributes(checkout, paths, revisions):
 
 
 def merge_refusals(checkout, commit, merge):
-    """J2's refusals that Git objects and attributes alone decide, before a merge job runs. `commit` is HEAD by now."""
+    """J2's refusals that Git objects, attributes and config alone decide, before a merge job runs. `commit` is HEAD by now."""
+    # An unspecified merge attribute uses merge.default, and a configured driver named text or binary wins over the
+    # built-in one, so either brings back the union or custom-driver merge the attribute check below refuses.
+    configured = pinned_git(checkout, "config", "--get-regexp", r"^merge\.(default|.+\.driver)$")
+    require(configured.returncode in (0, 1), "could not read the merge config")
+    keys = sorted({line.partition(" ")[0] for line in configured.stdout.decode(errors="replace").splitlines() if line})
+    require(not keys, "a merge job refuses merge.default and merge.<driver>.driver in the repository's config, because they "
+            "can merge a changed path by union or by a command; send this merge to an integrator lane: " + ", ".join(keys)[:1024])
     found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "--end-of-options", merge + "^{commit}")
     require(found.returncode == 0 and found.stdout.decode().strip() == merge, "merge %s is not a commit in this repository" % merge)
     contained = pinned_git(checkout, "merge-base", "--is-ancestor", merge, commit)
