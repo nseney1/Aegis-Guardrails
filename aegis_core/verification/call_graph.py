@@ -276,7 +276,8 @@ def _resolve_searchable_extensions(
     # 1. Active AST driver registry and configured workspace slots
     if ast_runner is not None and hasattr(ast_runner, "registry"):
         try:
-            exts.update(ast_runner.registry.get_configured_extensions(workspace_root=repo_root))
+            configured = getattr(ast_runner, 'get_configured_extensions', ast_runner.registry.get_configured_extensions)
+            exts.update(configured(workspace_root=repo_root))
         except Exception:
             pass
     else:

@@ -105,12 +105,14 @@ def _path(ws: Path, layout: str, real_dir: Path) -> str:
 
 
 # ── Packaged drivers (a repository opt-in) ───────────────────────────────────
+# TS/JS parse in process, so a legacy opt-in never reaches any node on PATH. Go's
+# compiler lookup has its own planted/linked-compiler tests in test_go_build_cache.py.
 
 @pytest.mark.parametrize("layout", sorted(PLANTED_ENTRIES))
-def test_a_packaged_driver_runs_the_real_interpreter_never_a_planted_one(ws, tmp_path, monkeypatch, layout):
+def test_a_legacy_packaged_ts_opt_in_never_runs_a_node_on_path(ws, tmp_path, monkeypatch, layout):
     pwned = tmp_path / "PWNED"
     _plant_everywhere(ws, "node", pwned)
-    _real(tmp_path / "real-bin", "node")
+    _planted(tmp_path / "real-bin", "node", pwned)
     monkeypatch.chdir(ws)
     monkeypatch.setenv("PATH", _path(ws, layout, tmp_path / "real-bin"))
     _write_json(ws / ".aegis" / "config.json", {"v": 1, "ast": {"packaged_drivers": ["ts"]}})
@@ -119,9 +121,9 @@ def test_a_packaged_driver_runs_the_real_interpreter_never_a_planted_one(ws, tmp
 
     result, error = _parse(app, ws)
 
-    assert not pwned.exists(), "a node planted in the repository was run"
+    assert not pwned.exists(), "a node on PATH was run for a TypeScript file"
     assert error is None, error
-    assert [d.name for d in result.definitions] == ["fromRealProgram"]
+    assert [d.name for d in result.definitions] == ["run"]
 
 
 def test_an_interpreter_outside_the_workspace_that_links_into_it_is_not_run(ws, tmp_path, monkeypatch):
@@ -137,11 +139,11 @@ def test_an_interpreter_outside_the_workspace_that_links_into_it_is_not_run(ws, 
     app = ws / "app.ts"
     app.write_text("export function run(): void {}\n", encoding="utf-8")
 
-    _, error = _parse(app, ws)
+    result, error = _parse(app, ws)
 
     assert not pwned.exists(), "a link into the repository was run"
-    assert isinstance(error, NoDriverConfiguredError)
-    assert "needs 'node' on PATH, outside the workspace" in str(error)
+    assert error is None, error
+    assert result.language == "typescript" and [d.name for d in result.definitions] == ["run"]
 
 
 # ── User-scope driver commands (~/.aegis/config.json) ────────────────────────

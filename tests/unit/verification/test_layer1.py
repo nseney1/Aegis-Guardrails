@@ -319,22 +319,48 @@ class TestRunnerCoverageEnhancements:
         # No overlap
         assert _discover_functions(str(f), target_lines={100}) == []
 
-    def test_run_layer1_polyglot_call_graph(self, tmp_path):
-        """run_layer1 invokes call_graph on polyglot files if a driver is resolved."""
+    def test_run_layer1_polyglot_call_graph(self, tmp_path, monkeypatch):
+        """A user driver supplies definitions to the real polyglot reachability check."""
+        import json
+        import os
+        import shlex
+        import subprocess
         from aegis_core.verification import runner
-        ts_file = tmp_path / "app.ts"
-        ts_file.write_text("export function run() {}\n")
+        root, home = tmp_path / "repo", tmp_path / "home"
+        root.mkdir()
+        (home / ".aegis").mkdir(parents=True)
+        for name in ("HOME", "USERPROFILE"):
+            monkeypatch.setenv(name, str(home))
+        (root / "app.ts").write_text("export function run() {}\n", encoding="utf-8")
+        driver = tmp_path / "driver.py"
+        driver.write_text(
+            'import json, sys\nprint(json.dumps({"version":"1.0","language":"typescript",'
+            '"file_path":sys.argv[1],"definitions":[{"name":"run","kind":"function",'
+            '"line":1,"is_exported":True}]}))\n', encoding="utf-8")
+        argv = [sys.executable, str(driver)]
+        command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+        (home / ".aegis/config.json").write_text(json.dumps({"drivers": {"ts": command}}), encoding="utf-8")
 
-        with patch("aegis_core.ast.runner.ASTDriverRegistry.resolve_driver", return_value="node driver.js"), \
-             patch("aegis_core.verification.call_graph.check") as mock_cg:
-            mock_cg.return_value = ToolEvidence("call_graph", str(ts_file), True, "0 orphans")
-            results = runner.run_layer1(
-                changed_files=["app.ts"],
-                repo_root=str(tmp_path),
-                fast_mode=True,
-            )
-            assert mock_cg.called
-            assert any(r.target == str(ts_file) for r in results)
+        results = runner.run_layer1(["app.ts"], str(root), fast_mode=True)
+
+        evidence, = [row for row in results if row.tool == "call_graph"]
+        assert evidence.target == "app.ts" and evidence.verdict is True
+        assert evidence.detail == "All 1 functions have call sites"
+
+    @pytest.mark.parametrize("pattern", ["subprocess.run", "subprocess::run"])
+    def test_equivalent_user_call_patterns_own_security_pack_findings(self, tmp_path, pattern):
+        rules = tmp_path / ".aegis/rules/invariants"
+        rules.mkdir(parents=True)
+        (rules / "no-shell.md").write_text(
+            '---\nid: no-shell\ntype: invariant\nenforcement: gate\n'
+            'target_paths: ["app.py"]\nforbid_ast:\n  calls: ["' + pattern + '"]\n---\n# No shell\n',
+            encoding="utf-8")
+        (tmp_path / "app.py").write_text(
+            'import subprocess\nsubprocess.run(["echo", "fixture"], shell=True)\n', encoding="utf-8")
+
+        results = runner.run_layer1(["app.py"], str(tmp_path), fast_mode=True)
+
+        assert [row.tool for row in results if not row.verdict] == ["forbid_ast:no-shell"]
 
     def test_get_modified_lines_uses_diff_base_and_head_fallback(self, tmp_path):
         """An explicit diff_base wins; a clean tree falls back to HEAD~1."""

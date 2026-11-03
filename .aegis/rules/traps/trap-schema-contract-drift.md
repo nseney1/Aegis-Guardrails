@@ -2,7 +2,7 @@
 id: trap-schema-contract-drift
 domain: correctness
 type: trap
-enforcement: gate
+enforcement: advisory
 promotion_threshold: 0.85
 demotion_threshold: 0.3
 hypothesis: "JSONL producer/consumer pairs in separate module files use mismatched field names, causing silent data loss in the fitness pipeline"

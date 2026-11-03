@@ -34,8 +34,40 @@ def isolated_hosts(tmp_path, monkeypatch):
     return home
 
 
-def test_doctor_detects_unconfigured_polyglot_language(tmp_path: Path):
-    # Setup Rust project without .aegis/config.json
+@pytest.fixture
+def go_project(tmp_path: Path, monkeypatch) -> Path:
+    (tmp_path / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+    (tmp_path / "main.go").write_text("package main\nfunc main() {}\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "")  # Provisioning is tested without starting a compiler.
+    return tmp_path
+
+
+def test_doctor_detects_unconfigured_polyglot_language(go_project: Path, capsys):
+    assert _check_ast_drivers(go_project) is False
+    assert "unconfigured driver for detected source extension(s): .go" in capsys.readouterr().out
+    assert not (go_project / ".aegis" / "config.json").exists()
+
+
+def test_doctor_fix_provisions_missing_drivers(go_project: Path):
+    rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(go_project), fix=True, yes=True))
+    registry = SlotRegistry.load(go_project)
+    assert registry.get_ast_driver(".go") == "go run .aegis/drivers/go_ast.go"
+    assert not (go_project / ".aegis" / "drivers").exists()
+    assert rc == 1  # Configuration succeeds while the absent compiler remains a warning.
+
+
+def test_doctor_fix_output_reports_provisioned_driver_status(go_project: Path, capsys):
+    rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(go_project), fix=True, yes=True))
+    out = capsys.readouterr().out
+    assert "enable the packaged AST drivers for .go" in out
+    assert "AST driver (.go)" in out
+    assert "driver_unavailable:go_missing" in out
+    assert "AST drivers: native Python stdlib (in-process)" not in out
+    assert rc == 1
+
+
+def test_doctor_reports_native_rust_without_configuration(tmp_path: Path):
+    # Rust parsing needs no .aegis/config.json
     (tmp_path / "Cargo.toml").write_text("[package]\nname = 'app'\n", encoding="utf-8")
     src = tmp_path / "src"
     src.mkdir()
@@ -43,22 +75,23 @@ def test_doctor_detects_unconfigured_polyglot_language(tmp_path: Path):
 
     # The check only reports
     ok = _check_ast_drivers(tmp_path)
-    assert ok is False
+    assert ok is True
 
 
-def test_doctor_fix_provisions_missing_drivers(tmp_path: Path):
+def test_doctor_fix_keeps_native_rust_configuration_free(tmp_path: Path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname = 'app'\n", encoding="utf-8")
     src = tmp_path / "src"
     src.mkdir()
     (src / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
 
-    # --fix provisions the slot (after a backup); the check that follows passes
+    # --fix has no Rust command or opt-in to provision
     rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
     assert rc == 0
 
-    # The repo now opts in to the packaged rust driver; nothing is staged
+    # Native Rust has no command slot and stages no driver
     registry = SlotRegistry.load(tmp_path)
-    assert registry.get_ast_driver(".rs") is not None
+    assert registry.get_ast_driver(".rs") is None
+    assert not (tmp_path / ".aegis/config.json").exists()
     assert not (tmp_path / ".aegis" / "drivers").exists()
 
 
@@ -75,7 +108,7 @@ def test_doctor_cli_fix_flag(tmp_path: Path, monkeypatch):
     assert registry.get_ast_driver(".go") is not None
 
 
-def test_doctor_fix_output_reports_provisioned_driver_status(tmp_path: Path, capsys):
+def test_doctor_fix_output_reports_native_rust_status(tmp_path: Path, capsys):
     (tmp_path / "Cargo.toml").write_text("[package]\nname = 'app'\n", encoding="utf-8")
     src = tmp_path / "src"
     src.mkdir()
@@ -84,7 +117,8 @@ def test_doctor_fix_output_reports_provisioned_driver_status(tmp_path: Path, cap
     rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
     assert rc == 0
     out = capsys.readouterr().out
-    assert "enable the packaged AST drivers for .rs" in out
+    assert "enable the packaged AST drivers for .rs" not in out
+    assert "native Rust (in-process)" in out
     assert "AST driver (.rs)" in out
     assert "AST drivers: native Python stdlib (in-process)" not in out
 
@@ -111,7 +145,7 @@ def _named(text, before, after):
 
 
 @pytest.mark.parametrize("repo_drivers,user,expected", [
-    (None, None, {".go", ".rs"}),
+    (None, None, {".go"}),
     (["rs", "go"], None, set()),
     (None, {"drivers": {"rs": "rs-driver", "go": "go-driver"}}, set()),
     (None, {"slots": {"ast_driver": "any-driver"}}, set()),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from unittest.mock import patch
@@ -212,7 +213,7 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
     from aegis_cli.doctor import _check_ast_drivers
     home = tmp_path / "home"
     (home / ".aegis").mkdir(parents=True)
-    (home / ".aegis" / "config.json").write_text('{"v": 1, "drivers": {"ts": "node runner.js"}}')
+    (home / ".aegis" / "config.json").write_text('{"v": 1, "drivers": {"external": "node runner.js"}}')
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     ws = tmp_path / "ws"
@@ -224,7 +225,7 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
     monkeypatch.setenv("PATH", str(node.parent))
     assert _check_ast_drivers(tmp_path) is True
     out = capsys.readouterr().out
-    assert f"AST driver (.ts): node resolvable ({node})" in out
+    assert f"AST driver (.external): node resolvable ({node})" in out
 
     # With missing binary
     (tmp_path.parent / "empty").mkdir()
@@ -242,7 +243,7 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
         monkeypatch.setenv("PATH", entry)
         assert _check_ast_drivers(tmp_path) is False
         out = capsys.readouterr().out
-        assert f"AST driver (.ts): executable 'node' is found only at {where}, where aegis never runs it" in out
+        assert f"AST driver (.external): executable 'node' is found only at {where}, where aegis never runs it" in out
 
     # An unreadable config is reported, not a crash
     (tmp_path / ".aegis").mkdir()
@@ -254,10 +255,10 @@ def test_check_ast_drivers_with_valid_and_invalid_slots(tmp_path, capsys, monkey
 def test_doctor_warns_when_ast_drivers_unresolvable(tmp_path, monkeypatch, capsys):
     _governed(tmp_path)
 
-    # H5: a repo config can only opt in to a packaged driver (here ts_ast.js, which
-    # needs node); an arbitrary repo-defined driver command is dropped before doctor sees it.
+    # H5: an external packaged driver (Go) remains opt-in; arbitrary repo
+    # commands are dropped before doctor sees them.
     config = tmp_path / ".aegis" / "config.json"
-    config.write_text('{"v": 1, "ast": {"packaged_drivers": ["ts"]}, "drivers": {"ts": "evil"}}')
+    config.write_text('{"v": 1, "ast": {"packaged_drivers": ["go"]}, "drivers": {"go": "evil"}}')
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "empty").mkdir()
@@ -265,47 +266,65 @@ def test_doctor_warns_when_ast_drivers_unresolvable(tmp_path, monkeypatch, capsy
     result = run_doctor(argparse.Namespace())
     assert result == 0
     captured = capsys.readouterr().out
-    assert "AST driver (.ts): executable 'node' not found on PATH" in captured
+    assert 'go' in captured and 'not found on PATH' in captured
 
 
 def test_check_ast_drivers_missing_driver_warns_and_fixes(tmp_path, capsys):
     from aegis_cli.doctor import _check_ast_drivers
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "index.ts").write_text("const x = 1;")
+    (tmp_path / "src" / "main.go").write_text("package fixture\n")
 
     # The check warns and returns False
     assert _check_ast_drivers(tmp_path) is False
     out = capsys.readouterr().out
-    assert "unconfigured driver for detected source extension(s): .ts" in out
+    assert "unconfigured driver for detected source extension(s): .go" in out
     assert "Run 'aegis doctor --fix' to provision" in out
 
     # --fix provisions the packaged driver through the backed-up plan
     run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
     out = capsys.readouterr().out
-    assert "enable the packaged AST drivers for .ts" in out
+    assert "enable the packaged AST drivers for .go" in out
     assert (tmp_path / ".aegis" / "config.json").is_file()
 
 
-def test_check_ast_drivers_missing_extension_slot_warns_and_fixes(tmp_path, capsys):
+def test_native_rust_ignores_obsolete_js_opt_ins(tmp_path, capsys):
     from aegis_cli.doctor import _check_ast_drivers
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.rs").write_text("fn main() {}")
 
-    # Existing config enables ts but not rs
+    # Existing legacy config opts in only to TS; both languages are native
     config = tmp_path / ".aegis" / "config.json"
     config.parent.mkdir(parents=True)
     config.write_text('{"v": 1, "ast": {"packaged_drivers": ["ts"]}}')
 
-    # The check warns
-    assert _check_ast_drivers(tmp_path) is False
+    # Native readiness needs no configuration change
+    assert _check_ast_drivers(tmp_path) is True
     out = capsys.readouterr().out
-    assert "unconfigured driver for detected source extension(s): .rs" in out
+    assert "native Rust (in-process)" in out
 
-    # --fix provisions the missing slot
+    # --fix leaves the existing native opt-ins unchanged
     assert run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True)) == 0
     out = capsys.readouterr().out
-    assert "enable the packaged AST drivers for .rs" in out
-    assert '"rs"' in config.read_text()
+    assert "enable the packaged AST drivers for .rs" not in out
+    assert '"rs"' not in config.read_text()
+
+
+def test_check_ast_drivers_missing_extension_slot_warns_and_fixes(tmp_path, capsys, monkeypatch):
+    from aegis_cli.doctor import _check_ast_drivers
+
+    (tmp_path / "main.go").write_text("package fixture\n", encoding="utf-8")
+    config = tmp_path / ".aegis" / "config.json"
+    config.parent.mkdir()
+    config.write_text('{"v": 1, "ast": {"packaged_drivers": ["ts"]}}', encoding="utf-8")
+    monkeypatch.setenv("PATH", "")
+
+    assert _check_ast_drivers(tmp_path) is False
+    assert "unconfigured driver for detected source extension(s): .go" in capsys.readouterr().out
+
+    rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
+    assert "enable the packaged AST drivers for .go" in capsys.readouterr().out
+    assert json.loads(config.read_text(encoding="utf-8"))["ast"]["packaged_drivers"] == ["ts", "go"]
+    assert rc == 1  # The new opt-in does not conceal the absent Go toolchain.
 
 
 def test_run_doctor_with_fix_flag(tmp_path, monkeypatch, capsys):
@@ -317,8 +336,8 @@ def test_run_doctor_with_fix_flag(tmp_path, monkeypatch, capsys):
     res = run_doctor(argparse.Namespace(fix=True, yes=True))
     assert res == 0
     captured = capsys.readouterr().out
-    assert "enable the packaged AST drivers for .ts" in captured
-    assert (tmp_path / ".aegis" / "config.json").is_file()
+    assert "native JavaScript/TypeScript (in-process)" in captured
+    assert not (tmp_path / ".aegis" / "config.json").exists()
 
 
 def test_run_doctor_without_fix_flag_does_not_provision(tmp_path, monkeypatch, capsys):
@@ -330,7 +349,7 @@ def test_run_doctor_without_fix_flag_does_not_provision(tmp_path, monkeypatch, c
     run_doctor(argparse.Namespace())
     assert not (tmp_path / ".aegis" / "config.json").exists()
     out = capsys.readouterr().out
-    assert "Run 'aegis doctor --fix' to provision" in out
+    assert "native JavaScript/TypeScript (in-process)" in out
 
 
 
@@ -348,14 +367,15 @@ def test_run_doctor_drivers_flag(tmp_path):
         mock_check.assert_called_with(tmp_path)
 
 
-def test_drivers_fix_provisions_after_a_backup(tmp_path, isolated_hosts, capsys):
+def test_drivers_fix_provisions_after_a_backup(tmp_path, isolated_hosts, capsys, monkeypatch):
     (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "main.rs").write_text("fn main() {}\n")
+    (tmp_path / "src" / "main.go").write_text("package main\n")
+    monkeypatch.setenv("PATH", "")
     rc = run_doctor(argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True))
-    assert '"rs"' in (tmp_path / ".aegis" / "config.json").read_text()
-    assert "enable the packaged AST drivers for .rs" in capsys.readouterr().out
+    assert '"go"' in (tmp_path / ".aegis" / "config.json").read_text()
+    assert "enable the packaged AST drivers for .go" in capsys.readouterr().out
     assert (isolated_hosts / ".aegis" / "backups").is_dir()
-    assert rc == 0
+    assert rc == 1  # provisioning succeeds; the absent Go toolchain remains visible
 
 
 @pytest.mark.parametrize("flag", ["--fix-path", "-y"])
@@ -386,15 +406,14 @@ def _rust_project_with_python3_driver(tmp_path, monkeypatch):
 
 
 def test_check_ast_drivers_python3_slot_resolves_without_python3_on_path(tmp_path, monkeypatch, capsys):
-    """#144: python.org installs on Windows ship no python3.exe; the driver runs
-    on the interpreter running aegis, so doctor must not report it broken."""
+    """Legacy python3 selectors do not make the native Rust parser need an executable."""
     from aegis_cli.doctor import _check_ast_drivers
     proj = _rust_project_with_python3_driver(tmp_path, monkeypatch)
 
     assert _check_ast_drivers(proj) is True
     out = capsys.readouterr().out
-    assert "AST driver (.rs): python3 resolvable" in out
-    assert sys.executable in out
+    assert "AST driver (.rs): native Rust (in-process)" in out
+    assert "resolvable" not in out
 
 
 def test_check_ast_drivers_python3_slot_unresolvable_without_any_interpreter(tmp_path, monkeypatch, capsys):
@@ -402,8 +421,8 @@ def test_check_ast_drivers_python3_slot_unresolvable_without_any_interpreter(tmp
     proj = _rust_project_with_python3_driver(tmp_path, monkeypatch)
     monkeypatch.setattr(sys, "executable", "")
 
-    assert _check_ast_drivers(proj) is False
-    assert "executable 'python3' not found on PATH" in capsys.readouterr().out
+    assert _check_ast_drivers(proj) is True
+    assert "native Rust (in-process)" in capsys.readouterr().out
 
 
 def test_check_precommit_hook_all_branches(tmp_path, capsys):
@@ -469,7 +488,7 @@ def test_doctor_fix_refuses_a_symlinked_config_without_crashing(tmp_path, capsys
 
     proj = tmp_path / "proj"
     (proj / "src").mkdir(parents=True)
-    (proj / "src" / "main.rs").write_text("fn main() {}")
+    (proj / "src" / "main.go").write_text("package main\n")
     (proj / ".aegis").mkdir()
     outside = tmp_path / "user-config.json"
     symlink_or_skip(outside, proj / ".aegis" / "config.json")

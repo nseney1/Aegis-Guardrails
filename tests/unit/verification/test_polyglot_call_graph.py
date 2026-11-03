@@ -182,17 +182,20 @@ def test_call_graph_ignores_non_source_extensions(tmp_path):
 
 
 def test_resolve_searchable_extensions_dynamic(tmp_path):
-    # 1. Default without slots or norm_ast is strictly .py
-    exts = call_graph._resolve_searchable_extensions(str(tmp_path))
-    assert exts == {".py"}
+    from aegis_core.ast.runner import NATIVE_JS_EXTENSIONS
 
-    # 2. A packaged driver enabled in .aegis/config.json dynamically adds .rs
+    # 1. Defaults include Python, JS/TS and Rust without command slots
+    exts = call_graph._resolve_searchable_extensions(str(tmp_path))
+    assert exts == {".py", ".rs"} | NATIVE_JS_EXTENSIONS
+    assert ".rs" in exts and ".ts" in exts
+
+    # 2. An obsolete Rust opt-in leaves native coverage unchanged
     aegis_dir = tmp_path / ".aegis"
     aegis_dir.mkdir()
     (aegis_dir / "config.json").write_text('{"v": 1, "ast": {"packaged_drivers": ["rs"]}}', encoding="utf-8")
 
     exts_with_slot = call_graph._resolve_searchable_extensions(str(tmp_path))
-    assert exts_with_slot == {".py", ".rs"}
+    assert exts_with_slot == {".py", ".rs"} | NATIVE_JS_EXTENSIONS
 
     # 3. Providing norm_ast for typescript adds .ts and .tsx dynamically
     target_ts = tmp_path / "index.ts"

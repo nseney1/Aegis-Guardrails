@@ -7,12 +7,17 @@ top-level packages named ``rules`` and ``skills``: pip overwrote another distrib
 ``rules`` package with them, and a repository's own ``rules/`` shadowed them (release
 review, packaging). The repository keeps both directories as the sources, and
 ``[tool.setuptools.package-dir]`` maps them into ``aegis_core/_data/`` in the wheel.
-pyproject.toml is parsed with regular expressions: Python 3.9 has no tomllib.
+The package-data table is parsed as TOML so multiline glob arrays are checked.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11, where pytest itself depends on tomli
+    import tomli as tomllib
 
 REPO_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
 AEGIS_PACKAGES = ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk")
@@ -33,10 +38,7 @@ def _strings(text: str) -> list:
 
 
 def _package_data() -> dict:
-    entries = {}
-    for name, globs in re.findall(r'(?m)^"?([A-Za-z0-9_.]+)"?\s*=\s*\[(.*?)\]', _table("tool.setuptools.package-data")):
-        entries[name] = _strings(globs)
-    return entries
+    return tomllib.loads(_pyproject())["tool"]["setuptools"]["package-data"]
 
 
 def _package_dir() -> dict:

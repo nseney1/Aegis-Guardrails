@@ -2,7 +2,7 @@
 id: trap-tautological-test
 domain: testing
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "Tests that assert only types (isinstance), test at single degenerate data points where all formulas trivially agree, or call the wrong function entirely provide zero verification value while inflating test counts and creating false confidence in suite coverage"
 prediction: "Will fire when a test asserts isinstance/type checks without behavioral assertions, or tests at boundary values where correct and incorrect implementations are indistinguishable"
 falsification: 0 findings in 10 sessions → prune

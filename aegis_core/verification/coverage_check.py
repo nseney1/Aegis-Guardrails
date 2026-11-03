@@ -1,26 +1,38 @@
-"""Opt-in diff coverage over changed lines (v4.3 spec T9): a report, never a verdict.
+"""Opt-in diff coverage over changed executable lines: a report, never a verdict.
 
-The figure is the share of the executable lines changed from merge-base(base, head) to head that the
-user-scope test command (``tests.command``, pytest-based only) executes under ``coverage``. Whatever keeps
-it from being measured is ``unverified`` with a reason, never 0% and never 100%, and it never changes the
-exit code; that includes a work tree that is not a clean checkout of head (GitHub's default pull request
-checkout is a merge commit). The tests run with the caller's environment on purpose (the project's dependencies need it):
-the figure is report-only, so forging it gains nothing. Scratch files live in a private directory under
-the confined state directory, and the repository's ``.coveragerc`` and ``coverage.json`` are never read.
+Python retains coverage.py with an isolated rcfile and the user's pytest command.
+Native reports use user-scoped coverage commands, with an offline Go default;
+missing or incomplete measurements remain explicit per language. Commands run
+repository code and are not a network sandbox. A clean checkout must match head,
+and report scratch remains under the confined state directory.
 """
 from __future__ import annotations
 
 import itertools
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any
 
 from aegis_core import gitsafe, storage, testexec
 from aegis_core.errors import PathTraversalError
+from aegis_core.language_runtime import (
+    RuntimeUnavailable,
+    language_runtime_environment,
+    prepare_language_runtime,
+    read_runtime_report,
+)
+from aegis_core.primitives import is_within
+from aegis_core.testplans import expand_command, language_settings
+from aegis_core.verification.coverage_formats import (
+    CoverageFormatError,
+    LineCoverage,
+    parse_go_coverprofile,
+    parse_lcov,
+)
 from aegis_core.verification.test_runner import run_external_cmd
 
 _GIT_TIMEOUT_S = 120.0
@@ -52,7 +64,7 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
     """``{path: added line numbers}`` of a unified diff (``git diff-tree -p -U0``). Inside a hunk every
     line is content, whatever it starts with; file headers are read only between hunks."""
     changed: dict[str, set[int]] = {}
-    current_file: Optional[str] = None
+    current_file: str | None = None
     cur_line, old_left, new_left = 0, 0, 0
     for raw in diff_text.split("\n"):
         hunk = _HUNK_RE.match(raw)
@@ -71,12 +83,12 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
                 cur_line, old_left, new_left = cur_line + 1, old_left - 1, new_left - 1
         elif raw.startswith("+++ "):
             target = _unquote_git_path(raw[4:].strip())
-            current_file = None if target == "/dev/null" else (target[2:] if target.startswith("b/") else target).replace("\\", "/")
+            current_file = None if target == "/dev/null" else (target.removeprefix("b/")).replace("\\", "/")
     return changed
 
 
-def changed_lines(root: Any, base: str, head: str) -> Optional[dict[str, set[int]]]:
-    """Added lines of the ``.py`` files changed from merge-base(base, head) to head; None when git cannot say."""
+def changed_lines(root: Any, base: str, head: str) -> dict[str, set[int]] | None:
+    """Added lines of supported source files changed from merge-base(base, head) to head; None when git cannot say."""
     try:
         merge, tip = gitsafe.merge_base(root, base, head), gitsafe.resolve_commit(root, head)
         res = gitsafe.run(["diff-tree", "-r", "-p", "-U0", "--no-ext-diff", "--no-textconv", merge, tip], root,
@@ -85,10 +97,10 @@ def changed_lines(root: Any, base: str, head: str) -> Optional[dict[str, set[int
         return None
     if res is None or res.returncode != 0:
         return None
-    return {k: v for k, v in parse_changed_lines(res.stdout.decode("utf-8", "replace")).items() if k.endswith(".py")}
+    return {k: v for k, v in parse_changed_lines(res.stdout.decode("utf-8", "replace")).items() if _language(k) is not None}
 
 
-def _z_names(root: Path, args: list[str]) -> Optional[list[str]]:
+def _z_names(root: Path, args: list[str]) -> list[str] | None:
     try:
         res = gitsafe.run(args, root, timeout=_GIT_TIMEOUT_S)
     except gitsafe.GitError:
@@ -96,7 +108,7 @@ def _z_names(root: Path, args: list[str]) -> Optional[list[str]]:
     return None if res.returncode != 0 else [os.fsdecode(p) for p in res.stdout.split(b"\0") if p]
 
 
-def _checkout_mismatch(root: Path, head: str) -> Optional[str]:
+def _checkout_mismatch(root: Path, head: str) -> str | None:
     """Why the work tree ``coverage run`` measures is not ``head``'s tree, or None. Untracked files do not
     count: a checkout routinely holds some (a virtualenv, build output), and the figure is a report."""
     tip = gitsafe.resolve_commit(root, head)
@@ -115,29 +127,20 @@ def _checkout_mismatch(root: Path, head: str) -> Optional[str]:
     return f"the work tree has uncommitted changes to tracked files: {', '.join(dirty[:3])}{more}"
 
 
-def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: Optional[dict] = None,
-            unmeasured: Optional[list] = None) -> dict[str, Any]:
+def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: dict | None = None,
+            unmeasured: list | None = None) -> dict[str, Any]:
     return {"status": status, "reason": " ".join(reason.split())[:200], "covered_lines": covered,
             "executable_lines": total, "ratio": covered / total if total else None,
             "uncovered_ranges": ranges or {}, "unmeasured": unmeasured or []}
 
 
-def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
+def _python_coverage(root: Path, changed: dict[str, set[int]]) -> dict[str, Any]:
     """Measure the changed lines of ``base..head`` (see the module docstring)."""
-    root = Path(root).resolve()
     command = testexec.user_test_command(root) or list(testexec.DEFAULT_COMMAND)
     args = testexec.pytest_args(command)
     if args is None:
         return _result("unverified", "tests.command is not pytest-based")
     python = testexec.plan_command(command)[0][0]
-    changed = changed_lines(root, base, head)
-    if changed is None:
-        return _result("unverified", f"cannot diff {base}..{head}")
-    if not changed:
-        return _result("reported", "no Python line changed")
-    mismatch = _checkout_mismatch(root, head)
-    if mismatch is not None:
-        return _result("unverified", mismatch)
     try:
         scratch = tempfile.TemporaryDirectory(dir=storage.state_dir(root))
     except (PathTraversalError, OSError) as exc:
@@ -176,3 +179,133 @@ def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
                            else last[-1] if last else "coverage wrote no readable report")
     reason = "" if run.get("returncode") == 0 else f"pytest exited {run.get('returncode')}"
     return _result("reported", reason, covered, total, ranges, unmeasured)
+
+
+
+def _language(path: str) -> str | None:
+    extension = Path(path).suffix.lower()
+    if extension in ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'):
+        return 'ts'
+    return {'.py': 'python', '.go': 'go', '.rs': 'rust'}.get(extension)
+
+
+def _module_prefix(root: Path) -> str | None:
+    path = root / 'go.mod'
+    if not path.exists():
+        return None
+    matches = re.findall(r'^\s*module\s+(?:"([^"\n]+)"|([^\s]+))', read_runtime_report(path), re.MULTILINE)
+    return (matches[0][0] or matches[0][1]).rstrip('/') if len(matches) == 1 else None
+
+
+def _report_paths(root: Path, rows: dict[str, LineCoverage], language: str) -> dict[str, LineCoverage]:
+    prefix = _module_prefix(root) if language == 'go' else None
+    mapped = {}
+    for raw, row in rows.items():
+        spelling = raw.replace('\\', '/')
+        if '..' in spelling.split('/'):
+            raise RuntimeUnavailable('coverage_paths_unmapped', 'coverage path contains a parent component')
+        names = [spelling]
+        if prefix and spelling.startswith(prefix + '/'):
+            names.append(spelling[len(prefix) + 1:])
+        candidates = set()
+        for name in names:
+            candidate = root / name
+            if not is_within(candidate, root, unresolvable=False):
+                raise RuntimeUnavailable('coverage_paths_unmapped', 'coverage path escapes the workspace')
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(root).as_posix() if candidate.is_absolute() else name
+            if any(part.is_symlink() for part in (candidate, *candidate.parents) if part != root and is_within(part, root, unresolvable=False)):
+                raise RuntimeUnavailable('coverage_paths_unmapped', 'coverage path is a symlink')
+            candidates.add(relative)
+        if len(candidates) != 1:
+            raise RuntimeUnavailable('coverage_paths_unmapped', 'coverage path is missing or ambiguous')
+        name = candidates.pop()
+        previous = mapped.get(name, LineCoverage(frozenset(), frozenset()))
+        mapped[name] = LineCoverage(previous.executable | row.executable, previous.covered | row.covered)
+    return mapped
+
+
+def _native_counts(changed: dict[str, set[int]], rows: dict[str, LineCoverage]) -> dict[str, Any]:
+    covered = total = 0
+    ranges, unmeasured = {}, []
+    for path, lines in sorted(changed.items()):
+        if path not in rows:
+            unmeasured.append(path)
+            continue
+        candidates = lines & rows[path].executable
+        hits = candidates & rows[path].covered
+        covered, total = covered + len(hits), total + len(candidates)
+        if candidates - hits:
+            ranges[path] = _to_ranges(candidates - hits)
+    return _result('reported', '', covered, total, ranges, unmeasured)
+
+
+def _native_coverage(root: Path, language: str, changed: dict[str, set[int]]) -> dict[str, Any]:
+    try:
+        settings = language_settings(root, language, coverage=True)
+        command = settings.command or (('go', 'test', '-coverprofile={out}', './...') if language == 'go' else None)
+        if command is None:
+            return _result('unverified', 'coverage_not_configured')
+        with tempfile.TemporaryDirectory(prefix='aegis-coverage-runtime-') as neutral:
+            scratch = Path(neutral)
+            runtime = prepare_language_runtime(root, language, command, scratch=scratch / 'plan')
+            with tempfile.TemporaryDirectory(dir=storage.state_dir(root)) as report_dir:
+                report = Path(report_dir) / ('coverage.out' if language == 'go' else 'coverage.lcov')
+                argv = expand_command(runtime.command, {'out': str(report), 'junit': str(report),
+                    'files': tuple(sorted(changed)), 'packages': ('./...',), 'filters': ()})
+                env = language_runtime_environment(runtime, scratch / 'execution')
+                status = testexec.run_tests(argv, root, env, settings.timeout_s, scratch / 'unused.xml', scratch / 'output.log')
+                if status.timed_out:
+                    return _result('unverified', 'timeout')
+                output = read_runtime_report(scratch / 'output.log')
+                markers = ('module lookup disabled', 'no matching package named', 'failed to download',
+                           'Cannot find module', 'ERR_MODULE_NOT_FOUND', 'Failed to resolve import', 'Cannot find package')
+                if status.exit and any(marker in output for marker in markers):
+                    return _result('unverified', 'deps_unavailable')
+                rows = (parse_go_coverprofile if language == 'go' else parse_lcov)(read_runtime_report(report))
+                result = _native_counts(changed, _report_paths(root, rows, language))
+                result['reason'] = '' if status.exit == 0 else f'{language} exited {status.exit}'
+                return result
+    except RuntimeUnavailable as exc:
+        return _result('unverified', exc.reason)
+    except CoverageFormatError:
+        return _result('unverified', 'coverage_report_invalid')
+    except ValueError:
+        return _result('unverified', 'coverage_command_invalid')
+    except (OSError, PathTraversalError):
+        return _result('unverified', 'coverage_unavailable')
+
+
+def run_diff_coverage(root: Any, base: str, head: str) -> dict[str, Any]:
+    """Report changed executable lines with independent per-language availability; never a verdict."""
+    root = Path(root).resolve()
+    changed = changed_lines(root, base, head)
+    if changed is None:
+        return _result('unverified', f'cannot diff {base}..{head}')
+    if not changed:
+        return _result('reported', 'no Python line changed')
+    mismatch = _checkout_mismatch(root, head)
+    if mismatch is not None:
+        return _result('unverified', mismatch)
+    groups = {}
+    for path, lines in changed.items():
+        groups.setdefault(_language(path), {})[path] = lines
+    if set(groups) == {'python'}:
+        return _python_coverage(root, groups['python'])
+    results = {language: (_python_coverage(root, paths) if language == 'python' else _native_coverage(root, language, paths))
+               for language, paths in sorted(groups.items())}
+    covered = total = 0
+    ranges, unmeasured = {}, []
+    for language, row in results.items():
+        covered += row['covered_lines']
+        total += row['executable_lines']
+        ranges.update(row['uncovered_ranges'])
+        unmeasured.extend(row['unmeasured'] if row['status'] == 'reported' else groups[language])
+    reported = any(row['status'] == 'reported' for row in results.values())
+    reason = 'partial_coverage' if reported and unmeasured else ''
+    if not reported:
+        reason = next(iter(results.values()))['reason'] if len(results) == 1 else 'coverage_unverified'
+    result = _result('reported' if reported else 'unverified', reason, covered, total, ranges, sorted(set(unmeasured)))
+    result['languages'] = results
+    return result

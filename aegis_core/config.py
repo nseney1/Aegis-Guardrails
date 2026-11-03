@@ -84,7 +84,7 @@ _DECAY_KEYS = ("half_life_sessions", "epsilon")
 _REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", *_DECAY_KEYS})
 # tests, rules, perf, regression, scanners and insights are read through read_user_config by their consumers.
 _USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci",
-                        "scanners", "insights"})
+                        "scanners", "insights", "coverage"})
 #: The scanner presets the user-scope ``scanners`` key may name (aegis_core.verification.scanners).
 SCANNER_PRESETS = ("ruff", "gitleaks")
 # Keys a repository might use to smuggle in a command. Only these names (aegis's own

@@ -82,6 +82,16 @@ def _drivers(root: str, languages: Sequence[Dict[str, Any]]) -> List[Dict[str, A
                          "reason": "aegis init enables the packaged driver (ast.packaged_drivers in .aegis/config.json)"})
         elif plan.unavailable:
             rows.append({"language": name, "driver": plan.label, "status": "unavailable", "reason": plan.unavailable})
+        elif plan.packaged_go:
+            from aegis_core.ast.gobuild import GoDriverUnavailableError, inspect_go_driver
+
+            try:
+                status = inspect_go_driver(root)
+                reason = None if status.cache_hit else 'Go driver cache is cold; run aegis doctor --drivers --fix'
+            except GoDriverUnavailableError as exc:
+                reason = str(exc)
+            rows.append({"language": name, "driver": plan.label,
+                         "status": "unavailable" if reason else "ready", "reason": reason})
         else:
             rows.append({"language": name, "driver": plan.label, "status": "ready", "reason": None})
     return rows
@@ -106,7 +116,7 @@ def _rules(root: str, files: Sequence[str]) -> Dict[str, Any]:
 
 def _layer1(root: str, targets: Sequence[str]) -> Dict[str, Any]:
     try:
-        pairs, sources = baseline.run_fast(root, targets)
+        pairs, sources = baseline.run_fast(root, targets, allow_build=False)
     except Exception as exc:
         return {"checked": len(targets), "passed": 0, "failed": 0, "pass_rate": None, "findings": 0,
                 "checks_that_could_not_run": [f"Layer 1 could not run: {type(exc).__name__}: {exc}"], "top": []}
@@ -118,7 +128,10 @@ def _layer1(root: str, targets: Sequence[str]) -> Dict[str, Any]:
     for (path, evidence), found in zip(pairs, collected.by_evidence):
         if path is not None and not evidence.verdict and found is None:
             per_file[path] = per_file.get(path, 0) + 1  # a check that failed without a line is one finding
-    loose = [f"{e.tool}: {e.detail}" for path, e in pairs if path is None and not e.verdict]
+    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL
+
+    loose = list(dict.fromkeys(f"{e.tool}: {e.detail}" for path, e in pairs
+                              if (path is None and not e.verdict) or e.tool == AST_SIZE_NOTE_TOOL))
     checked = len(targets)
     top = sorted(per_file.items(), key=lambda item: (-item[1], item[0]))[:TOP_FILES]
     return {

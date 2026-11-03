@@ -289,3 +289,20 @@ class TestInitWorkflowRecognition:
         action = self.init_action(project, capsys)
         assert action["result"] == "suggested"
         assert action["detail"] == "no GitHub Actions workflow runs aegis check; aegis init --ci writes one"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_generated_workflow_prepares_go_in_both_check_jobs_only_when_enabled(enabled):
+    yaml = pytest.importorskip("yaml")
+    text = ci_workflow(go_enabled=enabled)
+    if not enabled:
+        assert text == ci_workflow()
+    doc = yaml.safe_load(text)
+    for job in ("aegis-check", "aegis-sarif"):
+        steps = doc["jobs"][job]["steps"]
+        go = [step for step in steps if step.get("uses", "").startswith("actions/setup-go@")]
+        assert len(go) == int(enabled)
+        if go:
+            assert go[0]["with"] == {"go-version": "1.21.x", "cache": False}
+            assert steps.index(go[0]) < next(i for i, step in enumerate(steps) if "aegis check" in step.get("run", ""))
+    assert "setup-node" not in text and "rust-toolchain" not in text

@@ -14,7 +14,11 @@ __all__ = [
     "provision_ast_driver_slots",
     "packaged_driver_for_extension",
     "names_packaged_driver",
+    "names_retired_native_driver",
     "LANGUAGE_DEFINITIONS",
+    "iter_project_files",
+    "NATIVE_JS_EXTENSIONS",
+    "NATIVE_SOURCE_EXTENSIONS",
 ]
 
 _SKIP_DIRS = {
@@ -33,25 +37,25 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "manifests": ["Cargo.toml", "Cargo.lock"],
         "extensions": [".rs"],
         "toolchains": ["cargo", "rustc"],
-        "driver_slot": "ast_driver_rs",
-        "default_command": f"{{python}} {_SELECTOR_DIR}/rust_ast.py",
-        "driver_filename": "rust_ast.py",
+        "driver_slot": None,
+        "default_command": None,
+        "driver_filename": None,
     },
     "typescript": {
         "manifests": ["tsconfig.json"],
-        "extensions": [".ts", ".tsx"],
+        "extensions": [".ts", ".tsx", ".mts", ".cts"],
         "toolchains": ["node"],
-        "driver_slot": "ast_driver_ts",
-        "default_command": f"node {_SELECTOR_DIR}/ts_ast.js",
-        "driver_filename": "ts_ast.js",
+        "driver_slot": None,
+        "default_command": None,
+        "driver_filename": None,
     },
     "javascript": {
         "manifests": ["package.json"],
         "extensions": [".js", ".jsx", ".mjs", ".cjs"],
         "toolchains": ["node"],
-        "driver_slot": "ast_driver_js",
-        "default_command": f"node {_SELECTOR_DIR}/ts_ast.js",
-        "driver_filename": "ts_ast.js",
+        "driver_slot": None,
+        "default_command": None,
+        "driver_filename": None,
     },
     "go": {
         "manifests": ["go.mod", "go.sum"],
@@ -70,6 +74,9 @@ LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "driver_filename": None,
     },
 }
+NATIVE_JS_EXTENSIONS = frozenset(extension for language in ('typescript', 'javascript')
+                                 for extension in LANGUAGE_DEFINITIONS[language]['extensions'])
+NATIVE_SOURCE_EXTENSIONS = NATIVE_JS_EXTENSIONS | frozenset(LANGUAGE_DEFINITIONS['rust']['extensions'])
 
 
 def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
@@ -86,7 +93,9 @@ def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
 
 
 def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
-    """True for a selector `aegis init` provisioned, including legacy forms like 'python3 .soma/drivers/rust_ast.py'."""
+    """True for a selector `aegis init` provisioned, including legacy .soma paths."""
+    if not config.get('driver_filename') or not config.get('default_command'):
+        return False
     parts = value.split()
     canonical = str(config["default_command"]).split()
     if len(parts) != len(canonical):
@@ -96,6 +105,29 @@ def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
     if canonical[0] == "{python}" and parts[0] in ("python3", "python"):
         return True
     return parts[:-1] == canonical[:-1]
+
+
+def names_retired_native_driver(value: str, extension: str) -> bool:
+    """Recognize exact staged selectors replaced by an available native parser."""
+    ext = '.' + extension.strip().lower().lstrip('.')
+    if packaged_driver_for_extension(ext) is not None:
+        return False
+    filename = 'rust_ast.py' if ext == '.rs' else 'ts_ast.js' if ext in NATIVE_JS_EXTENSIONS else None
+    if filename is None:
+        return False
+    executable = '{python}' if ext == '.rs' else 'node'
+    return names_packaged_driver(value, {'driver_filename': filename,
+        'default_command': f'{executable} {_SELECTOR_DIR}/{filename}'})
+
+
+def iter_project_files(project_root: Path | str):
+    """Regular project files, without build directories or filesystem links."""
+    for dirpath, dirnames, filenames in os.walk(Path(project_root).resolve(), followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not Path(dirpath, d).is_symlink()]
+        for name in filenames:
+            path = Path(dirpath, name)
+            if not path.is_symlink() and path.is_file():
+                yield path
 
 
 def detect_project_languages(project_root: Path | str) -> Dict[str, Dict[str, Any]]:
@@ -126,21 +158,19 @@ def detect_project_languages(project_root: Path | str) -> Dict[str, Dict[str, An
         for ext in config["extensions"]:
             ext_to_lang[ext] = lang
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        for fn in filenames:
-            ext = Path(fn).suffix.lower()
-            if ext in ext_to_lang:
-                lang = ext_to_lang[ext]
-                if lang not in detected:
-                    detected[lang] = {
-                        "manifests": [],
-                        "extensions": set(),
-                        "file_count": 0,
-                        "toolchains": installed(LANGUAGE_DEFINITIONS[lang]["toolchains"]),
-                    }
-                detected[lang]["extensions"].add(ext)
-                detected[lang]["file_count"] += 1
+    for path in iter_project_files(root):
+        ext = path.suffix.lower()
+        if ext in ext_to_lang:
+            lang = ext_to_lang[ext]
+            if lang not in detected:
+                detected[lang] = {
+                    "manifests": [],
+                    "extensions": set(),
+                    "file_count": 0,
+                    "toolchains": installed(LANGUAGE_DEFINITIONS[lang]["toolchains"]),
+                }
+            detected[lang]["extensions"].add(ext)
+            detected[lang]["file_count"] += 1
 
     # Normalize sets to sorted lists for JSON serialization
     for lang_data in detected.values():
@@ -156,7 +186,8 @@ def resolve_recommended_drivers(languages: Dict[str, Any]) -> Dict[str, str]:
         config = LANGUAGE_DEFINITIONS.get(lang)
         if not config or not config.get("driver_slot") or not config.get("default_command"):
             continue
-        recommended[config["driver_slot"]] = config["default_command"]
+        for extension in config["extensions"]:
+            recommended[f"ast_driver_{extension.lstrip('.')}"] = config["default_command"]
     return recommended
 
 

@@ -1,13 +1,15 @@
-"""Regression discipline: git is the registry (v4.3 spec §3 T5).
+"""Regression discipline: git is the registry.
 
-A pull request is judged once against its head: the Python test files its fix commits changed that are
-present at the head run on an export of the head and on an export of the merge base with the head's
-copies overlaid. That is at most two pytest runs whatever the number of fix commits, so the check takes
-at most ``2 x timeout``. A test id ``classname::name`` belongs to test file ``F`` when its classname is
+A pull request is judged once against its head: changed test files present at the head run on head
+and on the merge base with the head's tests overlaid. Each affected language executes at most once
+per snapshot, with a shared native test-command deadline. A user-scoped global command takes
+precedence and executes once per snapshot. Metadata preparation has its own bounded tool probes.
+A Python test id ``classname::name`` belongs to test file ``F`` when its classname is
 ``F``'s dotted path or starts with it and a dot; a collection error names the dotted path. An id is
 fail-to-pass when it passed at head and failed on base, or its module failed collection on base. A fix
 commit passes when one of its own test files holds such an id and none of them failed at head (a
-suite-level error on the head run fails every commit). T5 is a report at warning tier in 4.4.0.
+suite-level error on the head run fails every commit). Native identities retain their package,
+target or file namespaces; infrastructure errors never supply failed test identities.
 """
 from __future__ import annotations
 
@@ -24,6 +26,13 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from aegis_core import gitsafe, governance, human_gate, match, testexec
 from aegis_core.errors import AegisError
 from aegis_core.rules import workspace_root
+from aegis_core.verification.regression_commands import run_configured_snapshot
+from aegis_core.verification.regression_identity import test_language
+from aegis_core.verification.regression_languages import (
+    UNVERIFIED_CODES as _NATIVE_UNVERIFIED_CODES,
+    language_evidence,
+    run_native_regressions,
+)
 
 __all__ = ["RegressionError", "check_ci_regressions", "is_source_file"]
 
@@ -39,10 +48,8 @@ _DOC_BASENAMES = frozenset({
     "readme", "changelog", "changes", "history", "license", "copying",
     "authors", "contributors", "code_of_conduct", "security", "notice", "patents",
 })
-# Languages Aegis has AST drivers for: a changed test in one of them is a test pytest cannot run.
-_OTHER_LANGUAGE_TESTS = frozenset({".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs"})
 # Finding codes that say a check could not run, not that a fix failed.
-UNVERIFIED_CODES = frozenset({"tests_not_pytest"})
+UNVERIFIED_CODES = _NATIVE_UNVERIFIED_CODES
 _CONFIG_EXTENSIONS = frozenset({".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".conf", ".lock", ".env", ".pth"})
 _CONFIG_BASENAMES = frozenset({
     "makefile", "dockerfile", "containerfile", "justfile", "vagrantfile", "procfile", "manifest.in",
@@ -57,7 +64,7 @@ class RegressionError(AegisError):
 
 
 def is_test_file(path: str) -> bool:
-    return bool(isinstance(path, str) and path and match.is_test_path(path))
+    return bool(isinstance(path, str) and path and (match.is_test_path(path) or test_language(path) == "ts"))
 
 
 def is_python_test_file(path: str) -> bool:
@@ -153,13 +160,14 @@ class CommitRegression:
     no_test_reason: Optional[str] = None
     approval: Optional[Any] = None
     exemption_code: Optional[str] = None
+    languages: Tuple[Any, ...] = ()
 
     @property
     def passed(self) -> bool:
         return self.status in ("passed", "exempted", "unverifiable")
 
     def as_dict(self, workspace: Any = None) -> Dict[str, Any]:
-        return {
+        result = {
             "commit": self.commit,
             "subject": self.subject,
             "status": self.status,
@@ -169,6 +177,9 @@ class CommitRegression:
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
             "exemption_code": self.exemption_code,
         }
+        if self.languages:
+            result["languages"] = list(self.languages)
+        return result
 
 
 class UntestedChange(NamedTuple):
@@ -314,12 +325,13 @@ def _resolve_commit_exemption(root: str, head_commit: str, base_commit: str, met
 
 
 def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: str, tests: Iterable[str],
-                  timeout: float, progress: Callable[[str], None]) -> Optional[Tuple[Any, Any]]:
+                  timeout: float, progress: Callable[[str], None],
+                  command: Optional[Sequence[str]] = None) -> Optional[Tuple[Any, Any]]:
     """(head run, base run) of ``testexec.run_pytest_snapshot`` for the ``tests`` present at head, on the
     head and on the merge base with the head's copies of those tests overlaid; None when none is present."""
     head_tree = _tree_blobs(root, head_commit)
     present = sorted(p for p in set(tests) if p in head_tree)
-    if not present:
+    if not present and command is None:
         return None
     blobs = gitsafe.read_blobs(root, {head_tree[p][1] for p in present}, timeout=_GIT_TIMEOUT_S)
     overlay = {p: blobs[head_tree[p][1]] for p in present if head_tree[p][1] in blobs}
@@ -332,8 +344,13 @@ def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: st
             gitsafe.export_tree(root, commit, scratch / f"{name}_snap", overlay=layer, timeout=_GIT_TIMEOUT_S)
             progress(f"Regression test run {k} of 2: pytest on {label} {commit[:10]} ({len(present)} test file(s))")
             started = time.monotonic()
-            runs.append(testexec.run_pytest_snapshot(scratch / f"{name}_snap", present, workspace, scratch / f"{name}_run",
-                                                     timeout))
+            if command is None:
+                runs.append(testexec.run_pytest_snapshot(scratch / f"{name}_snap", present, workspace, scratch / f"{name}_run",
+                                                         timeout))
+            else:
+                selected = [file for file in present if is_python_test_file(file)]
+                runs.append(run_configured_snapshot(command, scratch / f"{name}_snap", selected, workspace,
+                                                     scratch / f"{name}_run", timeout))
             outcome = "timed out" if runs[-1].timed_out else f"pytest exit {runs[-1].exit_code}"
             progress(f"Regression test run {k} of 2: {outcome} after {time.monotonic() - started:.1f}s")
     finally:
@@ -356,6 +373,9 @@ def _belongs(test_id: str, module: str) -> bool:
 
 def _judge(test_files: Sequence[str], head: Any, base: Any) -> Tuple[str, Tuple[str, ...]]:
     """(reason, fail-to-pass ids) of one commit's Python test files in the head and base runs."""
+    for run in (head, base):
+        if getattr(run, "reason", None):
+            return ("timeout" if head.timed_out or base.timed_out else run.reason), ()
     modules = {p[:-3].replace("/", ".") for p in test_files}
     mine = lambda ids: {i for i in ids if any(_belongs(i, m) for m in modules)}  # noqa: E731
     f2p = tuple(sorted(i for i in mine(head.passed_ids)
@@ -371,29 +391,44 @@ def _judge(test_files: Sequence[str], head: Any, base: Any) -> Tuple[str, Tuple[
 
 
 def _evaluate_fix_commit(root: str, meta: _CommitMeta, head_commit: str, base_commit: str,
-                         runs: Optional[Tuple[Any, Any]]) -> Tuple[CommitRegression, Optional[RegressionFinding]]:
+                         runs: Optional[Tuple[Any, Any]], native: Optional[Dict[str, Any]] = None,
+                         configured: bool = False) -> Tuple[CommitRegression, Optional[RegressionFinding]]:
     source_files = tuple(p for p in meta.changed_files if is_source_file(p))
     test_files = tuple(p for p in meta.present_files if is_python_test_file(p))
-    other_tests = () if test_files else tuple(
-        p for p in meta.present_files if is_test_file(p) and posixpath.splitext(p)[1] in _OTHER_LANGUAGE_TESTS)
-    reason, f2p = (("tests_not_pytest", ()) if other_tests else ("no_test_changes", ()) if not test_files
-                   else ("no_tests_collected", ()) if runs is None else _judge(test_files, *runs))
+    other_tests = tuple(p for p in meta.present_files if test_language(p) is not None)
+    rows = []
+    for language, outcome in (native or {}).items():
+        mine = tuple(p for p in other_tests if test_language(p) == language)
+        if mine:
+            row = language_evidence(outcome, mine)
+            if row["reason"] != "no_test_changes":
+                rows.append(row)
+    reasons, f2p = [], ()
+    if configured and not test_files and runs and getattr(runs[0], "reason", None):
+        reasons.append(runs[0].reason)
+    if test_files:
+        py_reason, f2p = ("no_tests_collected", ()) if runs is None else _judge(test_files, *runs)
+        reasons.append(py_reason)
+    if configured and other_tests:
+        reasons.append("tests_runner_unsupported")
+    reasons.extend(row["reason"] for row in rows)
+    reason = next((value for value in reasons if value != "ok"), "ok" if reasons else "no_test_changes")
     if reason == "ok":
-        return CommitRegression(meta.oid, meta.subject, "passed", "ok", f2p, meta.no_test_reason), None
+        return CommitRegression(meta.oid, meta.subject, "passed", "ok", f2p, meta.no_test_reason, languages=tuple(rows)), None
     # Only a commit that did not pass needs its exemption: each lookup rescans the whole range.
     approval, rejected = _resolve_commit_exemption(root, head_commit, base_commit, meta)
     nt_note = f" (its test exemption was rejected: {rejected})" if rejected else ""
     if meta.no_test_reason:
         nt_note += f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
     named = f"fix commit {meta.oid[:10]} ({meta.subject})"
-    if other_tests:
-        msg = f"{named} changes tests pytest cannot run ({', '.join(other_tests[:5])}): the fail-to-pass check is unverified{nt_note}"
-        return (CommitRegression(meta.oid, meta.subject, "unverifiable", "tests_not_pytest", (), meta.no_test_reason),
-                RegressionFinding("tests_not_pytest", meta.oid, other_tests[0], msg, meta.no_test_reason))
+    if reason in UNVERIFIED_CODES:
+        return (CommitRegression(meta.oid, meta.subject, "unverifiable", reason, f2p, meta.no_test_reason, languages=tuple(rows)),
+                RegressionFinding(reason, meta.oid, (other_tests or test_files or source_files or ("",))[0],
+                                  f"{named}: regression tests unverified ({reason}){nt_note}", meta.no_test_reason))
     if approval is not None and approval.valid:
-        return CommitRegression(meta.oid, meta.subject, "exempted", "exempted", f2p, meta.no_test_reason, approval), None
-    return (CommitRegression(meta.oid, meta.subject, "failed", reason, f2p, meta.no_test_reason, exemption_code=rejected),
-            RegressionFinding(reason, meta.oid, (test_files or source_files or ("",))[0], f"{named}{_DETAILS[reason]}{nt_note}",
+        return CommitRegression(meta.oid, meta.subject, "exempted", "exempted", f2p, meta.no_test_reason, approval, languages=tuple(rows)), None
+    return (CommitRegression(meta.oid, meta.subject, "failed", reason, f2p, meta.no_test_reason, exemption_code=rejected, languages=tuple(rows)),
+            RegressionFinding(reason, meta.oid, (test_files or other_tests or source_files or ("",))[0], f"{named}{_DETAILS[reason]}{nt_note}",
                               meta.no_test_reason))
 
 
@@ -406,8 +441,10 @@ def check_ci_regressions(
     timeout: float = DEFAULT_TIMEOUT_S,
     progress: Optional[Callable[[str], None]] = None,
 ) -> RegressionReport:
-    """``progress`` gets one line before and one after each pytest run (``aegis check --ci`` prints them
-    on stderr)."""
+    """Judge each fix's changed tests through a shared head/base pair per language.
+
+    ``progress`` reports test execution on stderr through ``aegis check --ci``.
+    """
     root = workspace_root(workspace)
     workspace_path = Path(root).resolve()
     base_commit = gitsafe.resolve_commit(root, base)
@@ -429,10 +466,21 @@ def check_ci_regressions(
             src = tuple(p for p in meta.changed_files if is_source_file(p))
             if src and not any(is_test_file(p) for p in meta.changed_files):
                 untested.append(UntestedChange(meta.oid, meta.subject, src))
-    # One PR-level pass judges every fix commit's Python tests at once.
+    # The user-authorized global command takes precedence and runs just once per snapshot.
+    command = testexec.user_test_command(workspace_path)
     judged = [p for m in fix_metas for p in m.present_files if is_python_test_file(p)]
-    runs = (_run_pr_level(root, workspace_path, merge_commit, head_commit, judged, timeout, progress or (lambda _line: None))
-            if judged else None)
-    results = [_evaluate_fix_commit(root, meta, head_commit, base_commit, runs) for meta in fix_metas]
+    groups = {}
+    for meta in fix_metas:
+        for file in meta.present_files:
+            language = test_language(file)
+            if language is not None:
+                groups.setdefault(language, []).append(file)
+    say = progress or (lambda _line: None)
+    selected = judged + [file for files in groups.values() for file in files if is_test_file(file)] if command else judged
+    runs = (_run_pr_level(root, workspace_path, merge_commit, head_commit, selected, timeout, say, command)
+            if selected else None)
+    native = (run_native_regressions(root, workspace_path, merge_commit, head_commit, groups, say,
+                                    timeout=timeout if timeout != DEFAULT_TIMEOUT_S else None) if groups and command is None else {})
+    results = [_evaluate_fix_commit(root, meta, head_commit, base_commit, runs, native, command is not None) for meta in fix_metas]
     return RegressionReport(DEFAULT_TIER, tuple(res for res, _finding in results),
                             tuple(f for _res, f in results if f is not None), tuple(untested))

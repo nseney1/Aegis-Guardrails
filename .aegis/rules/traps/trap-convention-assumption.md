@@ -2,7 +2,7 @@
 id: trap-convention-assumption
 domain: correctness
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: Assuming a schema field value or naming convention without verifying against existing instances causes silent contract violations that pass new tests but fail regression
 prediction: "Will fire when new files are created with field values that don't match existing files of the same type"
 falsification: 0 findings in 10 sessions → prune

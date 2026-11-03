@@ -37,7 +37,7 @@ PACK_SPEC = {
         {"name": "subprocess.call", "where": {"shell": True}},
         {"name": "subprocess.check_output", "where": {"shell": True}},
         {"name": "yaml.load", "where": {"Loader|#1": {"in": ["Loader", "UnsafeLoader", "FullLoader"]}}},
-        {"name": "hashlib.new", "where": {"name|#0": {"in": ["'md5'", "'sha1'"]}}},
+        {"name": "hashlib.new", "where": {"name|#0": {"in": ["md5", "sha1"]}}},
         {"name": "requests.get", "where": {"verify": False}},
         {"name": "requests.post", "where": {"verify": False}},
     ]
@@ -47,7 +47,7 @@ _PACK_RULES = {r["id"]: r["forbid_ast"] for r in PYTHON_SECURITY_RULES}
 YAML_RULE = _PACK_RULES["sec-py-yaml-unsafe-load"]
 HASH_RULE = _PACK_RULES["sec-py-weak-hash-md5-sha1"]
 
-# 36 probe cases covering forbid_probe2.py + predicate operators
+# Probe cases covering forbid_probe2.py and predicate operators.
 PROBE_CASES = [
     ("eval bare TP", "x = eval(s)\n", PACK_SPEC, True),
     ("exec bare TP", "exec(code)\n", PACK_SPEC, True),
@@ -66,6 +66,7 @@ PROBE_CASES = [
     ("json.loads safe", "import json\njson.loads(b)\n", PACK_SPEC, False),
     ("tempfile.mktemp TP", "import tempfile\ntempfile.mktemp()\n", PACK_SPEC, True),
     ("md5 default TP", "import hashlib\nhashlib.md5(b)\n", PACK_SPEC, True),
+    ("literal quote characters are not a weak algorithm name", "import hashlib\nhashlib.new(\"'md5'\")\n", HASH_RULE, False),
     ("md5 usedforsecurity=False safe", "import hashlib\nhashlib.md5(b, usedforsecurity=False)\n", PACK_SPEC, False),
     ("md5 usedforsecurity=True TP", "import hashlib\nhashlib.md5(b, usedforsecurity=True)\n", PACK_SPEC, True),
     ("md5 usedforsecurity=var unknown", "import hashlib\nhashlib.md5(b, usedforsecurity=flag)\n", PACK_SPEC, False),

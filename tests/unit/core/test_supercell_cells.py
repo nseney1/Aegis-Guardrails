@@ -1,7 +1,7 @@
 """The antipattern rules derived from the Supercell (Citadel) Cycle 1 RCA.
 
 Every one exists in this repository's .aegis/rules, loads cleanly through the one
-loader (aegis_core.rules) and carries the fields the RCA gave it.
+loader (aegis_core.rules) and retains its RCA fields with the approved enforcement.
 """
 from pathlib import Path
 
@@ -12,33 +12,33 @@ from aegis_core.rules import load_rules
 REPO_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
 
 
-# ALL antipattern rules derived from Supercell Cycle 1 RCA ("enforcement" where the RCA set one)
+# Supercell Cycle 1 RCA rules; prose-only traps became advisory in the 4.5 catalog review.
 SUPERCELL_CELLS = {
     # Security antipatterns (from S1, S2)
     "trap-format-code-injection": {
         "domain": "security",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
     "trap-path-traversal": {
         "domain": "security",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
     # Correctness antipatterns (from C1, C2, C3)
     "trap-schema-contract-drift": {
         "domain": "correctness",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
     "trap-orphaned-module": {
         "domain": "correctness",
     },
     "trap-threshold-spec-drift": {
         "domain": "correctness",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
     # Quality / process antipatterns (from doc-drift RCA)
     "trap-doc-feature-drift": {
         "domain": "documentation",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
     "trap-ascii-art-render": {
         "domain": "documentation",
@@ -49,11 +49,11 @@ SUPERCELL_CELLS = {
     # Architecture antipatterns (from C5, C6)
     "trap-layer-violation": {
         "domain": "architecture",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
     "trap-shell-true-portability": {
         "domain": "portability",
-        "enforcement": "gate",
+        "enforcement": "advisory",
     },
 }
 

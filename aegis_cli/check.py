@@ -3,7 +3,7 @@
   aegis check [FILES...]              Layer 1: workspace checkpoint plus call_graph,
                                       import_guard and forbid_ast on FILES (default: files
                                       changed against HEAD, staged, or the branch base)
-  aegis check --strict                also fail on checkpoint warnings
+  aegis check --strict                also fail on checkpoint warnings and missing AST drivers
   aegis check --hook                  git pre-commit mode: Layer 1 only, never a model call
   aegis check --full --plan TEXT      add Layer 2: adversarial review by --llm-cmd
   aegis check --lane LANE [--base REF] [--paths GLOB...] [--base-policy]
@@ -476,7 +476,7 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--strict",
             action="store_true",
-            help="Fail on checkpoint warnings too (missing tests, hardcoded paths, stub tests...)",
+            help="Fail on checkpoint warnings and missing AST driver coverage",
         )
         parser.add_argument(
             "--full",

@@ -28,8 +28,6 @@ import os
 import re
 from typing import Any, List, Mapping, Optional, Tuple
 
-from aegis_core import command_safety
-
 __all__ = [
     "HOSTS",
     "HookCall",
@@ -110,6 +108,8 @@ def _parse_codex_patch(
     """
     if "*** Begin Patch" not in command:
         return False, command, ()
+    from aegis_core import command_safety
+
     shell_text, heredoc_scripts = command_safety.split_heredocs(command)
     subshells = command_safety.extract_subshell_commands(shell_text)
     try:

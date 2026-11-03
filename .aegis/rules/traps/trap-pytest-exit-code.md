@@ -18,9 +18,15 @@ tags:
   - testing
 created: 2026-09-28
 ---
+## Do
+Treat zero collected/passing tests as missing test evidence, preserve actual execution errors and timeouts, and never manufacture a passing receipt from exit status alone.
 
-# Trap: Pytest Exit Code 5
+A configured command may be unavailable or collect nothing without proving a code defect. Preserve the public status/reason and deterministic check results; no-test output cannot earn witnessed test credit or be converted into a false-positive rule outcome.
 
-Target: `aegis_core/telemetry.py`
+Verify: Cover pytest exit 5, missing interpreters/frameworks, skipped-only/zero-test runs, malformed/missing JUnit, timeout and genuine failures through public check/test execution.
 
-Description: Pytest exit code 5 penalizes uncollected tests. We need to handle this appropriately so it doesn't cause false negatives in outcome evaluation.
+Owner instructions and existing approval/release boundaries remain authoritative.
+
+## Evidence
+- aegis_core/testexec.py: TestsRun.evidence requires exit zero, no timeout and at least one passed test.
+- tests/unit/core/test_testexec.py and tests/unit/cli/test_check_record_cli.py cover execution/evidence status.

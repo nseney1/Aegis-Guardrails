@@ -256,11 +256,11 @@ def _append_step_summary(document: dict, root: str) -> None:
         print(f"note: the step summary could not be written ({type(exc).__name__})", file=sys.stderr)
 
 
-def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool, root: str) -> None:
+def _emit_report(fmt: str, passed: bool, owned: list, issues: list, strict: bool, root: str, pairing_info: list) -> None:
     """``--format github|sarif`` for Layer 1: one report on stdout, and the step summary."""
     from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, layer1_report_document
 
-    document = layer1_report_document(passed, owned, issues, strict)
+    document = layer1_report_document(passed, owned, issues, strict, checkpoint_info=pairing_info)
     print(format_sarif_report(document, workspace_root=root) if fmt == "sarif" else "\n".join(github_annotation_lines(document)))
     _append_step_summary(document, root)
 
@@ -286,6 +286,16 @@ def _print_checkpoint(issues: list[dict], strict: bool) -> None:
     for issue in issues:
         label = "[FAIL]" if is_blocking(issue, strict) else "[WARN]"
         print(f"{label} {issue['message']}")
+
+
+def _workspace_checkpoint(root: str, strict: bool, machine: bool) -> tuple[list, bool, list]:
+    pairing_info: list[dict] = []
+    issues, blocking = run_checkpoint(Path(root), strict=strict, pairing_info=pairing_info)
+    if not machine:
+        _print_checkpoint(issues, strict)
+        for note in pairing_info:
+            print(f"[INFO] {_shown(note['message'], 1000)}")
+    return issues, blocking, pairing_info
 
 
 _MODE_FLAGS = (
@@ -811,9 +821,7 @@ def run_verify(args: argparse.Namespace) -> int:
         return 0
 
     # ── Layer 1: workspace checkpoint, then the per-file tools ────────────
-    issues, blocking = run_checkpoint(Path(repo_root), strict=strict)
-    if not machine:
-        _print_checkpoint(issues, strict)
+    issues, blocking, pairing_info = _workspace_checkpoint(repo_root, strict, machine)
 
     if not target_files:
         if staged:
@@ -825,10 +833,11 @@ def run_verify(args: argparse.Namespace) -> int:
         # Say so: a Layer 2 run that reviewed nothing must not read like a Layer 1-only pass.
         layer2_summary = "Layer 2: no changed files to review"
         if report_fmt:
-            _emit_report(report_fmt, not blocking, [], issues, strict, repo_root)
+            _emit_report(report_fmt, not blocking, [], issues, strict, repo_root, pairing_info)
         elif use_json:
             payload = format_layer1_json_payload(not blocking, [], [], summary)
             payload["checkpoint_issues"] = issues
+            payload["checkpoint_info"] = pairing_info
             if held.active:
                 payload["baseline"] = {**held.as_dict(), "grandfathered": 0, "new": [], "blocked": []}
             if layer2:
@@ -843,20 +852,8 @@ def run_verify(args: argparse.Namespace) -> int:
         return 1 if blocking else 0
 
     try:
-        if staged:
-            # What `git commit` records is the index, not the working tree.
-            pairs = baseline.run_grouped(
-                lambda group: runner.run_layer1_on_index(group, repo_root), target_files, root=repo_root)
-        else:
-            # Mutation testing is slow; it runs only behind --full (fast_mode otherwise).
-            pairs = baseline.run_grouped(
-                lambda group: runner.run_layer1(
-                    changed_files=group,
-                    repo_root=repo_root,
-                    fast_mode=not layer2,
-                    diff_base=getattr(args, "_diff_base", None),
-                ),
-                target_files, root=repo_root)
+        pairs, sources = baseline.run_checks(repo_root, target_files, staged=staged, fast_mode=not layer2,
+                                             diff_base=getattr(args, "_diff_base", None))
     except Exception as exc:
         print(f"Error: Layer 1 could not run: {exc}", file=sys.stderr)
         return _unjudged(report_fmt, "Layer 1 could not run")
@@ -865,16 +862,16 @@ def run_verify(args: argparse.Namespace) -> int:
     if held.active:
         # The baseline decides which failed checks count. Evidence it does not hold stays failing.
         try:
-            applied = baseline.apply(pairs, baseline.Sources(repo_root, staged=staged), held)
+            applied = baseline.apply(pairs, sources, held)
         except Exception as exc:  # fail closed: a baseline that cannot be applied excuses nothing
             print(f"Error: the baseline could not be applied: {_shown(str(exc), 300)}", file=sys.stderr)
             return _unjudged(report_fmt, "the baseline could not be applied")
         results = list(applied.effective)
 
-    tools_pass = runner.gate_verdict(results)
+    tools_pass = runner.gate_verdict(results, **({"strict": True} if strict else {}))
     layer1_pass = tools_pass and not blocking
     if results:
-        summary = runner.format_summary(results)
+        summary = runner.format_summary(results, **({"strict": True} if strict else {}))
     else:
         n = len(target_files)
         summary = f"Layer 1: no check applies to the {n} target file{'' if n == 1 else 's'} (0 checks run, PASSED)"
@@ -920,6 +917,7 @@ def run_verify(args: argparse.Namespace) -> int:
     def _emit_json(passed: bool, layer2_result: Any = None, vendor: str = "") -> None:
         payload = format_layer1_json_payload(passed, target_files, results, summary)
         payload["checkpoint_issues"] = issues
+        payload["checkpoint_info"] = pairing_info
         if applied is not None:
             payload["baseline"] = {
                 **held.as_dict(),
@@ -936,7 +934,7 @@ def run_verify(args: argparse.Namespace) -> int:
         _record_baseline(layer1_pass)
         if report_fmt:  # baseline.apply keeps one item per pair, in order
             _emit_report(report_fmt, layer1_pass, [(path, e) for (path, _), e in zip(pairs, results)], issues, strict,
-                         repo_root)
+                         repo_root, pairing_info)
         elif use_json:
             _emit_json(layer1_pass)
         return 0 if layer1_pass else 1

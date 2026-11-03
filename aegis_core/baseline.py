@@ -70,6 +70,7 @@ __all__ = [
     "load",
     "parse",
     "render",
+    "run_checks",
     "run_fast",
     "run_grouped",
     "write",
@@ -378,13 +379,15 @@ class Sources:
     index (``staged``) when the pre-commit hook checks what a commit would record.
     ``reviewed`` as in ``runner.run_layer1``: which version of the gate rules was enforced."""
 
-    def __init__(self, root: Any, staged: bool = False, reviewed: bool = True) -> None:
+    def __init__(self, root: Any, staged: bool = False, reviewed: bool = True, *, allow_build: bool = True,
+                 ast_results: Optional[Dict[str, Any]] = None) -> None:
         self.root = Path(os.fspath(root))
         self.staged = staged
         self.reviewed = reviewed
+        self.allow_build = allow_build
         self._texts: Dict[str, Optional[str]] = {}
         self._lines: Dict[str, primitives.LineIndex] = {}
-        self._trees: Dict[str, Any] = {}
+        self._trees: Dict[str, Any] = {p: None if isinstance(t, Exception) else t for p, t in (ast_results or {}).items()}
         self._sites: Dict[Tuple[str, str, str, str], List[int]] = {}
         self._index: Optional[Dict[str, str]] = None
         self._runner: Any = None
@@ -449,7 +452,7 @@ class Sources:
                 if text is not None and path.endswith(".py"):
                     tree = extract_normalized_ast(path, code=text)
                 elif text is not None:
-                    self._runner = self._runner or ASTDriverRunner()
+                    self._runner = self._runner or ASTDriverRunner(allow_build=self.allow_build)
                     with tempfile.TemporaryDirectory(prefix="aegis-baseline-") as scratch:
                         copy = os.path.join(scratch, posixpath.basename(path))
                         with open(copy, "wb") as handle:
@@ -457,7 +460,7 @@ class Sources:
                         tree = extract_normalized_ast(copy, workspace_root=self.root, ast_runner=self._runner,
                                                       confine_root=scratch)
             else:
-                self._runner = self._runner or ASTDriverRunner()
+                self._runner = self._runner or ASTDriverRunner(allow_build=self.allow_build)
                 tree = extract_normalized_ast(str(self.root / path), workspace_root=self.root, ast_runner=self._runner)
         except Exception:  # a tree that cannot be read has no sites: the check stays failing
             tree = None
@@ -670,16 +673,25 @@ def checkable(root: Any, files: Iterable[str]) -> List[str]:
     return out
 
 
-def run_fast(root: Any, files: Sequence[str], *, reviewed: bool = True, git_root: Optional[str] = None,
-             diff_base: Optional[str] = None) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
-    """Layer 1 as ``aegis check`` runs it by default (no model, no mutation testing) on
-    ``files`` of the working tree, each piece of evidence paired with its file. ``reviewed``,
-    ``git_root`` (the history of an exported tree) and ``diff_base`` as in ``runner.run_layer1``."""
+def run_checks(root: Any, files: Sequence[str], *, reviewed: bool = True, git_root: Optional[str] = None,
+               diff_base: Optional[str] = None, allow_build: bool = True, staged: bool = False,
+               fast_mode: bool = True) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
+    """Own one driver session across basename groups; retain its trees for finding enrichment."""
     from aegis_core.verification import runner
+    from aegis_core.ast.runner import ASTDriverRunner
 
     base = os.fspath(root)
-    pairs = run_grouped(
-        lambda group: runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=True, reviewed=reviewed,
-                                        git_root=git_root, diff_base=diff_base),
-        files, root=base)
-    return pairs, Sources(base, reviewed=reviewed)
+    trees: Dict[str, Any] = {}
+    with (ASTDriverRunner() if allow_build else ASTDriverRunner(allow_build=False)) as ast_runner:
+        pairs = run_grouped(
+            lambda group: runner.run_layer1_on_index(group, base, ast_runner=ast_runner, ast_results=trees) if staged else
+                runner.run_layer1(changed_files=list(group), repo_root=base, fast_mode=fast_mode, reviewed=reviewed,
+                                            git_root=git_root, diff_base=diff_base, allow_build=allow_build,
+                                            ast_runner=ast_runner, ast_results=trees), files, root=base)
+    return pairs, Sources(base, staged=staged, reviewed=reviewed, allow_build=allow_build, ast_results=trees)
+
+
+def run_fast(root: Any, files: Sequence[str], *, reviewed: bool = True, git_root: Optional[str] = None,
+             diff_base: Optional[str] = None, allow_build: bool = True) -> Tuple[List[Tuple[Optional[str], ToolEvidence]], Sources]:
+    """Layer 1 without model or mutation testing, with paired evidence and cached source trees."""
+    return run_checks(root, files, reviewed=reviewed, git_root=git_root, diff_base=diff_base, allow_build=allow_build)

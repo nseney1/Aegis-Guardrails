@@ -21,7 +21,7 @@ The [reference](reference.md) lists every public command and MCP schema.
 
 The Python runtime uses only the standard library. Some operations invoke external
 programs: Git for repository operations, the user's `gh` for GitHub evidence,
-configured test commands, optional language drivers and an explicitly requested
+configured test commands, the opt-in Go parser and user drivers, and an explicitly requested
 Layer 2 model command. Zero runtime dependencies does not mean every operation is
 self-contained or offline.
 
@@ -105,11 +105,27 @@ continue. Missing evidence cannot be promoted into confirmed evidence. These
 boundaries are described in [SECURITY](../SECURITY.md),
 [hosts and hooks](hosts-and-hooks.md), and [trust tiers](trust-tiers.md).
 
-Python AST checks run in process. Packaged drivers cover Rust, TypeScript/JavaScript
-and Go; repositories may opt into those packaged drivers. Custom driver commands
-belong in user configuration. Without an opted-in driver, TypeScript/JavaScript
-and Go AST checks are skipped: those files have not been parsed or verified, and
-the skipped checks do not block a pass. A configured driver that is unavailable,
-cannot run safely or fails instead makes verification fail closed. The SDK offers
-a Python integration surface, while host adapters supply workspace and tool-call
-context. Neither gives model output authority over deterministic checks.
+Python, TypeScript/JavaScript and Rust parse in process; native JS/TS and Rust
+need no language runtime or repository dependencies. Opted-in Go uses a packaged
+standard-library parser built into the user cache, then one bounded NDJSON batch
+process per check. A check-local AST session reuses parsed facts across rules,
+security head/base comparisons and structural checks. Custom user-scope drivers
+retain the per-file protocol; repository settings cannot select a command.
+
+Missing driver coverage produces advisory `unverified no_driver` evidence, blocking
+under ordinary `--strict`. Oversized native sources produce advisory `too_large`;
+a configured driver or active parser failure fails closed. Parsing is syntactic,
+without type resolution or Rust macro expansion. [Language checks](languages.md)
+describes extraction coverage, matching and evasion bounds.
+
+Test execution consumes pure user-command plans, prepares installed runtimes outside
+the repository, and retains namespaced outcomes with completeness and mapping errors.
+Recorded checks and commit replay share the same snapshot recipe. A global command
+has precedence; automatic language runs require complete evidence from every selected
+language. Coverage keeps per-language availability and remains report-only. User
+commands execute repository code: offline defaults are not a network sandbox.
+
+The SDK offers a Python integration surface, while host adapters supply workspace
+and tool-call context. Shared operations keep the same core semantics and authority;
+CLI-only setup, checks and release actions do not require duplicate MCP tools.
+Neither adapter gives model output authority over deterministic checks.

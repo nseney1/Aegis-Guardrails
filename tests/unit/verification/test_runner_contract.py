@@ -145,12 +145,24 @@ class TestLayer1OnIndex:
     def test_a_file_whose_driver_lookup_fails_is_still_read_and_fails_closed(self, repo: Path):
         (repo / ".aegis").mkdir()
         (repo / ".aegis" / "config.json").write_text("{not json", encoding="utf-8")
+        _stage(repo, "app.go", b"package main\n\nfunc run() {}\n")
+
+        results = runner.run_layer1_on_index(["app.go"], str(repo))
+
+        assert [(r.tool, r.target, r.verdict) for r in results] == [
+            ("call_graph", "app.go", False), ("security_pack", "app.go", False)]
+        assert results[0].detail.startswith("call_graph: cannot verify app.go: ")
+        assert results[1].detail.startswith("security_pack: cannot verify app.go: ")
+        assert results[1].language == "go"
+
+    def test_native_ts_needs_no_driver_lookup_so_a_malformed_config_does_not_block_it(self, repo: Path):
+        (repo / ".aegis").mkdir()
+        (repo / ".aegis" / "config.json").write_text("{not json", encoding="utf-8")
         _stage(repo, "app.ts", b"export function run() {}\n")
 
         results = runner.run_layer1_on_index(["app.ts"], str(repo))
 
-        assert [(r.tool, r.target, r.verdict) for r in results] == [("call_graph", "app.ts", False)]
-        assert results[0].detail.startswith("call_graph: cannot verify app.ts: ")
+        assert [(r.tool, r.target, r.verdict) for r in results] == [("call_graph", "app.ts", True)]
 
 
 def test_working_tree_and_index_preserve_identical_forbid_ast_evidence(repo: Path):

@@ -156,8 +156,10 @@ _GUARD_GIT_SUBCOMMANDS = frozenset({"push", "reset", "clean", "merge", "add"})
 
 
 def _guard_git(cmd: UnwrappedCommand) -> List[GuardRule]:
-    flags = [f.lstrip("\\") for f in cmd.flags]
     sub = cmd.subcommand
+    if sub not in _GUARD_GIT_SUBCOMMANDS:
+        return []
+    flags = [f.lstrip("\\") for f in cmd.flags]
     letters = "".join(_short_letters(f, _GIT_SHORT_VALUES.get(sub or "", "")) for f in flags)
     found: List[GuardRule] = []
     if sub == "push":
@@ -255,6 +257,7 @@ def _git_aliases(cmd: UnwrappedCommand) -> Dict[str, str]:
 # p'``) would be rescanned for every stage at every nesting level; past this many, a script
 # contributes nothing (fail-open, like MAX_DEPTH).
 _MAX_ALIAS_SCRIPTS = 16
+_SIMPLE_ALIAS_WORDS = re.compile(r"\w+(?: +\w+)*", re.ASCII)
 
 
 @dataclass
@@ -301,7 +304,7 @@ def _guard_git_alias(
                 _guard_scan(" ".join([value[1:]] + arguments), depth + 1, scan, aliases)
             return
         try:
-            words = shlex.split(value)
+            words = value.split() if _SIMPLE_ALIAS_WORDS.fullmatch(value) else shlex.split(value)
         except ValueError:
             return
         rest.extend(reversed(words))

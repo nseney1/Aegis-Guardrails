@@ -19,6 +19,7 @@ from aegis_cli.doctor_base import (
 from aegis_core import human_gate
 from aegis_core.pathlookup import is_bare
 from aegis_core.primitives import real_key
+from aegis_core.verification.ast_checks import driver_availability as _ast_driver_state
 
 
 # ── Host plane: instruction files ───────────────────────────────────────────
@@ -900,27 +901,6 @@ def _best_effort(rows: List[Dict[str, Any]], governed: bool, setup: str) -> Dict
 
 
 # ── The diagnosis ───────────────────────────────────────────────────────────
-
-def _ast_driver_state(ws_root: Path) -> Tuple[Dict[str, str], List[str]]:
-    """(the AST driver configured per extension, 'default' for the catch-all slot; the detected
-    non-Python source extensions that have none): the one definition the driver check and the
-    --fix plan share. A config that cannot be read raises SlotResolutionError."""
-    from aegis_core.ast.detect import detect_project_languages
-    from aegis_core.skills.slots import SlotRegistry
-
-    langs = detect_project_languages(ws_root)
-    drivers: Dict[str, str] = {}
-    for registry in (SlotRegistry.load(ws_root), SlotRegistry.load_user(ws_root)):
-        for slot_name, slot_val in registry.to_dict().items():
-            if slot_name == "ast_driver":
-                drivers["default"] = str(slot_val)
-            elif slot_name.startswith("ast_driver_"):
-                drivers[f".{slot_name[len('ast_driver_'):]}"] = str(slot_val)
-    if "default" in drivers:
-        return drivers, []
-    return drivers, sorted({ext for lang, info in langs.items() if lang != "python"
-                            for ext in info.get("extensions", []) if ext not in drivers})
-
 
 def _missing_ast_extensions(ws_root: Path) -> List[str]:
     """Detected source extensions with no AST driver configured (what --fix provisions).

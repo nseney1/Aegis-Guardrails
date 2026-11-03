@@ -103,7 +103,50 @@ def test_absolute_repository_links_resolve(kind, path):
 def test_the_readme_links_the_docs_by_absolute_url():
     """Without absolute links the PyPI page has no way into the docs."""
     paths = {path for _, path in _all_links()}
-    assert {"docs/how-it-works.md", "docs/reference.md"} <= paths
+    assert {"docs/how-it-works.md", "docs/reference.md", "docs/languages.md"} <= paths
+
+
+def test_language_matrix_counts_the_shipped_security_packs():
+    from aegis_core.verification.security_pack import SECURITY_RULES_BY_LANGUAGE
+
+    readme = README.read_text(encoding="utf-8")
+    included = _section(readme, "What's included")
+    for label, language in (("Python", "python"), ("TS/JS", "typescript"), ("Go", "go"), ("Rust", "rust")):
+        row = next((line for line in included.splitlines() if line.startswith(f"| {label} |")), "")
+        assert row, f"missing language matrix row: {label}"
+        assert row.split("|")[3].strip() == str(len(SECURITY_RULES_BY_LANGUAGE[language]))
+    assert "Go ≥1.21" in included
+    assert len(readme.splitlines()) <= 200
+
+
+def test_language_guide_config_examples_expand_as_documented(tmp_path, monkeypatch):
+    """Every JSON configuration example is accepted by the user-scope command planner."""
+    from aegis_core.testplans import expand_command, language_settings
+
+    guide = ROOT / "docs" / "languages.md"
+    assert guide.is_file(), "the language configuration guide is missing"
+    examples = re.findall(r"```json\n(.*?)\n```", guide.read_text(encoding="utf-8"), re.S)
+    assert examples, "the guide must include a concrete user configuration"
+    home, workspace = tmp_path / "home", tmp_path / "repo"
+    (home / ".aegis").mkdir(parents=True)
+    workspace.mkdir()
+    for key in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(key, str(home))
+    checked = set()
+    for example in examples:
+        config = json.loads(example)
+        (home / ".aegis" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        for section in ("tests", "coverage"):
+            for language in config.get(section, {}).get("languages", {}):
+                settings = language_settings(workspace, language, coverage=section == "coverage")
+                assert settings.command
+                argv = expand_command(settings.command, {"files": ["tests/a test.ts", "tests/b.test.ts"],
+                    "packages": ["./pkg"], "filters": ["^TestX$"], "junit": "/reports/run.xml", "out": "/reports/out"})
+                assert not any(re.search(r"\{(?:files|packages|filters|junit|out)\}", word) for word in argv)
+                if "{files}" in settings.command:
+                    assert "tests/a test.ts" in argv and "tests/b.test.ts" in argv
+                checked.add((section, language))
+    assert {("tests", "ts"), ("coverage", "ts"), ("coverage", "rust")} <= checked
 
 
 def test_the_readme_has_no_mermaid_block():

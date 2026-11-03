@@ -1,8 +1,8 @@
 """R-checks-10: a ``where`` gives a definite answer only for call sites whose arguments were recorded.
 
-Only the Python driver records call arguments. A site from another driver carries an empty
-argument map, which says nothing about the call, so a ``where`` over it is UNKNOWN (advisory)
-instead of a silent pass or a conviction without evidence.
+A driver declares argument extraction with its ``args`` capability. Without that declaration,
+its argument map says nothing definite about the call, so a ``where`` over it is UNKNOWN
+(advisory) instead of a silent pass or a conviction without evidence.
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from aegis_core.ast.policy import evaluate_forbid_ast, evaluate_forbid_ast_struc
 from aegis_core.ast.schema import CallSiteNode, NormalizedAST
 
 
-def _ts(*sites: CallSiteNode) -> NormalizedAST:
-    return NormalizedAST(file_path="app.ts", language="typescript", call_sites=sites)
+def _ts(*sites: CallSiteNode, metadata=None) -> NormalizedAST:
+    return NormalizedAST(file_path="app.ts", language="typescript", call_sites=sites, metadata=metadata or {})
 
 
 def _spec(where=None) -> dict:
@@ -42,7 +42,7 @@ def test_a_site_without_recorded_arguments_is_unknown(where):
     ({"shell": "True"}, {"shell": {"absent": True}}, False),
 ], ids=["literal-hit", "literal-miss", "absent-miss"])
 def test_a_non_python_site_that_records_arguments_is_judged_normally(args, where, hit):
-    norm = _ts(CallSiteNode(target="exec", line=3, args=args))
+    norm = _ts(CallSiteNode(target="exec", line=3, args=args), metadata={"capabilities": ["args"]})
     assert _split(norm, _spec(where)) == (([3], []) if hit else ([], []))
 
 

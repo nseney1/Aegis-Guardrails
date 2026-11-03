@@ -330,7 +330,7 @@ def _count_runs(monkeypatch: pytest.MonkeyPatch) -> list:
 @needs_git
 def test_a_fix_with_only_a_go_test_is_unverified_not_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """R-evidence-26: Given a fix changing pkg/handler.go and pkg/handler_test.go, When regressions are
-    checked, Then it is unverifiable/tests_not_pytest, nothing runs, and the report still passes."""
+    checked, Then absent native definitions are explicit, no pytest runs, and the report still passes."""
     repo = make_repo(tmp_path)
     runs = _count_runs(monkeypatch)
     repo.write("pkg/handler.go", "package pkg\n\nfunc Handle() int { return 2 }\n")
@@ -339,12 +339,12 @@ def test_a_fix_with_only_a_go_test_is_unverified_not_failed(tmp_path: Path, monk
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     (item,) = report.commits
-    assert (item.commit, item.status, item.reason) == (oid, "unverifiable", "tests_not_pytest")
+    assert (item.commit, item.status, item.reason) == (oid, "unverifiable", "no_driver")
     assert item.passed is True
     assert runs == []
     assert report.passed is True and report.blocking is False and report.status == "pass"
-    assert [(f.code, f.path) for f in report.findings] == [("tests_not_pytest", "pkg/handler_test.go")]
-    assert "tests_not_pytest" in regression.UNVERIFIED_CODES
+    assert [(f.code, f.path) for f in report.findings] == [("no_driver", "pkg/handler_test.go")]
+    assert "no_driver" in regression.UNVERIFIED_CODES
 
 
 @needs_git
@@ -366,7 +366,7 @@ def test_a_fix_whose_only_test_change_is_not_a_test_stays_no_test_changes(
 
 
 @needs_git
-def test_a_fix_with_a_go_test_and_a_python_test_takes_the_python_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_python_transition_does_not_hide_an_unavailable_go_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo = make_repo(tmp_path)
     runs = _count_runs(monkeypatch)
     repo.write("src/app.py", "def compute(x: int) -> int:\n    return x + 1\n")
@@ -375,7 +375,7 @@ def test_a_fix_with_a_go_test_and_a_python_test_takes_the_python_path(tmp_path: 
     repo.commit("fix: compute adds one")
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert [(c.status, c.reason) for c in report.commits] == [("passed", "ok")]
+    assert [(c.status, c.reason) for c in report.commits] == [("unverifiable", "no_driver")]
     assert runs and all(files == ("tests/test_app.py",) for files in runs)
 
 
@@ -684,7 +684,7 @@ def test_no_python_test_to_judge_starts_no_run(tmp_path: Path, monkeypatch: pyte
     _fix(repo, "fix: compute adds one", {"src/app.py": APP.format(1)})
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
-    assert [c.reason for c in report.commits] == ["tests_not_pytest", "no_test_changes"]
+    assert [c.reason for c in report.commits] == ["no_driver", "no_test_changes"]
     assert runs == []
 
 

@@ -186,7 +186,6 @@ python3 -c "import aegis_mcp.registry as r; print(len(r.TOOL_DEFINITIONS))"   # 
 
 These are future directions, not capabilities of the current release.
 
-- **4.5.0 — multi-language AST:** deeper TypeScript/JavaScript, Go and Rust analysis through a shared normalized AST, with explicit unsupported and unverified results. The packaged drivers available today do not provide this full analysis.
 - **4.6.0 — lessons from repository history:** `aegis mine` would turn observed failures and corrections into candidates in one proposal queue for human review. It would not create active rules automatically.
 - **4.7.0 — parallel agents in one repository:** improve coordination and review for agents sharing a repository, building on the existing advisory lanes and leases without claiming isolation or autonomous approval.
 - **4.8.0 — code-claim checks:** a proposed `aegis claims check FILE` would read `{id, anchor, probe, expect}` claims and report **holds**, **moved**, **no longer holds** or **contradicts** against the current code. It would be stateless, read-only and independent of any plan format.

@@ -72,8 +72,8 @@ def fail(msg):
     sys.exit(1)
 
 
-def check_module_origins():
-    for name in PACKAGES:
+def check_module_origins(names=PACKAGES):
+    for name in names:
         mod = importlib.import_module(name)
         origin = os.path.realpath(getattr(mod, "__file__", "") or "")
         if not any(origin.startswith(r + os.sep) for r in _SITE_ROOTS):
@@ -89,6 +89,45 @@ def make_workspace():
         f.write("---\nid: trap-smoke\ntype: trap\nhypothesis: smoke\n"
                 "prediction: smoke\ntarget_paths: ['*.py']\n---\n# Smoke\n")
     return ws
+
+
+def check_native_ast(ws):
+    """Parse installed native languages directly with no toolchain or user configuration."""
+    from aegis_core.ast.policy import evaluate_forbid_ast_structured
+    from aegis_core.ast.runner import ASTDriverRunner
+
+    javascript = ("import {exec as run} from 'node:child_process';\n"
+                  "export function native_smoke(){run('smoke');}\n")
+    rust = 'use std::process::Command as Cmd;\npub fn native_smoke(){Cmd::new("smoke");}\n'
+    previous = dict(os.environ)
+    with tempfile.TemporaryDirectory(prefix="aegis-smoke-native-home-") as home:
+        env = _home_env(home, drop=("PYTHONPATH", "AEGIS_WORKSPACE", "CLAUDE_CONFIG_DIR", "CODEX_HOME"))
+        env.update(PATH=home, XDG_CONFIG_HOME=os.path.join(home, ".config"))
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            for extension in (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".rs"):
+                source = rust if extension == ".rs" else javascript
+                path = os.path.join(ws, "native_smoke" + extension)
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(source)
+                tree = ASTDriverRunner().parse_file(path, workspace_root=ws)
+                language = ("rust" if extension == ".rs" else "javascript"
+                            if extension in (".js", ".jsx", ".mjs", ".cjs") else "typescript")
+                target = "Cmd::new" if extension == ".rs" else "run"
+                pattern = "std::process::Command::new" if extension == ".rs" else "child_process.exec"
+                if (tree.language != language or [d.name for d in tree.definitions] != ["native_smoke"] or
+                        [call.target for call in tree.call_sites] != [target]):
+                    fail(f"native {extension} extraction witness failed")
+                findings = evaluate_forbid_ast_structured(
+                    tree, {"calls": [{"name": pattern, "where": {"#0": "smoke"}}]}, source=source)
+                if len(findings) != 1 or findings[0]["unknown"] or findings[0]["pattern"] != pattern:
+                    fail(f"native {extension} qualified-call witness failed: {findings!r}")
+                print(f"ok  native {extension} {language}: definition, call and qualified argument")
+            check_module_origins(("aegis_core.ast.drivers.js", "aegis_core.ast.drivers.rust"))
+        finally:
+            os.environ.clear()
+            os.environ.update(previous)
 
 
 def check_cli(ws):
@@ -313,6 +352,7 @@ def main():
         fail("run with python -I so the current directory cannot shadow site-packages")
     check_module_origins()
     ws = make_workspace()
+    check_native_ast(ws)
     check_cli(ws)
     check_doctor(ws)
     check_mcp(ws)

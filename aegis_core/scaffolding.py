@@ -225,7 +225,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install aegis-guardrails=={version}
+{go_setup}      - run: pip install aegis-guardrails=={version}
       - run: aegis check
       - run: aegis check --ci
         env:
@@ -246,7 +246,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install aegis-guardrails=={version}
+{go_setup}      - run: pip install aegis-guardrails=={version}
       # Exit 1 means findings: the aegis-check job gates on them, so this step never fails the run.
       - run: aegis check --format sarif > aegis.sarif
         continue-on-error: true
@@ -258,10 +258,14 @@ jobs:
 """
 
 
-def ci_workflow() -> str:
+def ci_workflow(*, go_enabled: bool = False) -> str:
     """The GitHub Actions workflow init prints, and writes with ``--ci``: ``aegis check`` on
     every pull request, with the aegis version that wrote it (a newer release may check more)."""
-    return _CI_WORKFLOW.format(version=__version__)
+    go_setup = ("      - uses: actions/setup-go@v7\n"
+                "        with:\n"
+                "          go-version: \"1.21.x\"\n"
+                "          cache: false\n") if go_enabled else ""
+    return _CI_WORKFLOW.format(version=__version__, go_setup=go_setup)
 
 
 def workflow_files(root: Path) -> List[Path]:

@@ -2,7 +2,7 @@
 id: trap-ghost-cli-flags
 domain: correctness
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: CLI flags registered in the argument parser but not consumed by the handler function create a false contract — users believe the flag does something but it is silently ignored
 prediction: "Will fire when argparse registers --flag but the run_* handler never reads args.flag, or reads it but takes no action"
 falsification: 0 findings in 10 sessions → prune

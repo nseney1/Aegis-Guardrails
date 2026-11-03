@@ -134,10 +134,56 @@ def _plan(findings: List[_Finding], ast_missing: List[str], root: Path) -> List[
 
         plan.append(_Change(WorkspaceLayout(root).config_file, "enable_packaged_ast_drivers", None,
                             [f"enable the packaged AST drivers for {', '.join(ast_missing)}"]))
+    cache = _go_cache_change(root, ast_missing)
+    if cache is not None:
+        plan.append(cache)
     return plan
 
 
+def _go_cache_change(root: Path, missing: List[str]) -> Optional[_Change]:
+    from aegis_core.ast.runner import ASTDriverRegistry
+    from aegis_core.skills.slots import SlotResolutionError
+
+    try:
+        plan = ASTDriverRegistry().plan_driver('.go', workspace_root=root)
+    except SlotResolutionError:
+        return None  # the health check reports the configuration error
+    if '.go' not in missing and not (plan is not None and plan.packaged_go):
+        return None
+    from aegis_core.ast.gobuild import GoDriverUnavailableError, inspect_go_driver
+
+    try:
+        status = inspect_go_driver(root)
+    except GoDriverUnavailableError:
+        return None  # diagnostics report states a cache build cannot repair
+    if status.cache_hit:
+        return None
+    return _Change(status.binary, 'prepare_go_cache', None,
+                   [f'prepare the packaged Go driver cache with {status.goversion}'])
+
+
 def _apply(plan: List[_Change], home: Optional[Path], root: Path) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+    """Back up configuration files; generate confirmed cache entries separately."""
+    files = [change for change in plan if change.kind != 'prepare_go_cache']
+    results, backup = _apply_files(files, home, root) if files else ([], None)
+    for change in (change for change in plan if change.kind == 'prepare_go_cache'):
+        from aegis_core.ast.gobuild import GoDriverUnavailableError, inspect_go_driver, prepare_go_driver
+
+        try:
+            if inspect_go_driver(root).binary != change.path:
+                raise _Refused('Go driver cache key changed since the check; re-run aegis doctor')
+            binary = prepare_go_driver(root)
+            if binary != change.path:
+                raise _Refused('Go driver cache key changed during preparation; re-run aegis doctor')
+            status, reason = 'applied', None
+        except (GoDriverUnavailableError, _Refused) as exc:
+            status, reason = 'failed', _clean(str(exc), 1024)
+        results.append({'action': change.kind, 'path': str(change.path), 'status': status,
+                        'changes': list(change.describe), 'reason': reason})
+    return results, backup
+
+
+def _apply_files(plan: List[_Change], home: Optional[Path], root: Path) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
     from aegis_core.storage import atomic_write_bytes
 
     results: List[Dict[str, Any]] = []

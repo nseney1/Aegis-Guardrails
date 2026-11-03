@@ -95,7 +95,7 @@ class TestSlotRegistryBranches:
     def test_get_ast_driver_branch_coverage_and_mutant_kills(self):
         from aegis_core.skills.slots import SlotRegistry
         reg = SlotRegistry({
-            "ast_driver_ts": "node install/drivers/ts_ast.js",
+            "ast_driver_external": "external-parser driver",
             "ast_driver": "default-runner",
         })
         # .py returns None
@@ -104,8 +104,9 @@ class TestSlotRegistryBranches:
         assert reg.get_ast_driver("PY") is None
 
         # specific extension
-        assert reg.get_ast_driver("ts") == "node install/drivers/ts_ast.js"
-        assert reg.get_ast_driver(".ts") == "node install/drivers/ts_ast.js"
+        assert reg.get_ast_driver("external") == "external-parser driver"
+        assert reg.get_ast_driver(".external") == "external-parser driver"
+        assert reg.get_ast_driver(".ts") is None
 
         # fallback to default ast_driver
         assert reg.get_ast_driver("go") == "default-runner"

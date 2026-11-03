@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 import ast
 import json
 import os
@@ -9,6 +10,7 @@ import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
+    "canonical_spelling",
     "DefinitionNode",
     "SymbolDef",
     "CallSiteNode",
@@ -26,6 +28,16 @@ def _normalize_ast_token(token: str) -> str:
     if t.endswith("()"):
         t = t[:-2].strip()
     return t
+
+
+def canonical_spelling(token: str) -> str:
+    """A matching spelling; serialized nodes retain the driver's original text."""
+    t = _normalize_ast_token(token)
+    if t.startswith("node:"):
+        t = t[5:]
+    if t.startswith("::"):  # Rust's absolute root is not a relative import.
+        t = t[2:]
+    return t.replace("::", ".").replace("/", ".")
 
 
 def _dotted_name(node: ast.AST) -> Optional[str]:
@@ -121,36 +133,42 @@ def _driver_alias_pairs(data: Mapping[str, Any]) -> List[Tuple[str, str]]:
     return pairs
 
 
+def _import_alias_pairs(imp: Any) -> Tuple[Tuple[str, str], ...]:
+    """Canonical alias pairs, preserving repeated bindings for occurrence counts."""
+    pairs = _driver_alias_pairs(imp) if isinstance(imp, Mapping) else (getattr(imp, "aliases", None) or ())
+    if isinstance(pairs, Mapping):
+        pairs = pairs.items()
+    return tuple((canonical_spelling(str(a)), canonical_spelling(str(o))) for a, o in pairs if a and o)
+
+
 def _import_aliases(imp: Any) -> Dict[str, Tuple[str, ...]]:
     """Map each name an import binds via ``as`` to every name it aliases.
 
     Multi-valued because one statement may bind a name twice
     (``from m import a as x, b as x``); keeping only one original would hide the other.
     """
-    pairs = _driver_alias_pairs(imp) if isinstance(imp, Mapping) else (getattr(imp, "aliases", None) or ())
-    if isinstance(pairs, Mapping):
-        pairs = pairs.items()
     table: Dict[str, List[str]] = {}
-    for a, o in pairs:
-        if a and o:
-            add_binding(table, _normalize_ast_token(str(a)), _normalize_ast_token(str(o)))
+    for a, o in _import_alias_pairs(imp):
+        add_binding(table, a, o)
     return {name: tuple(originals) for name, originals in table.items()}
 
 
 def _extract_import_tuple(imp: Any) -> Tuple[str, Tuple[str, ...]]:
     """(source, symbols) of an import in its plain form: aliased names map back to originals."""
     if isinstance(imp, tuple) and len(imp) == 2 and isinstance(imp[0], str):
-        return imp[0], tuple(imp[1])
+        return canonical_spelling(imp[0]), tuple(canonical_spelling(s) for s in imp[1])
     if isinstance(imp, str):
-        return _normalize_ast_token(imp), ()
+        return canonical_spelling(imp), ()
     if isinstance(imp, Mapping):
-        src = _normalize_ast_token(str(imp.get("source") or imp.get("module") or ""))
+        src = canonical_spelling(str(imp.get("source") or imp.get("module") or ""))
         raw_syms = imp.get("imported_symbols") or imp.get("imported_names") or ()
     else:
-        src = _normalize_ast_token(str(getattr(imp, "source", "") or getattr(imp, "module", "") or ""))
+        src = canonical_spelling(str(getattr(imp, "source", "") or getattr(imp, "module", "") or ""))
         raw_syms = getattr(imp, "imported_symbols", ()) or getattr(imp, "imported_names", ()) or ()
     aliases = _import_aliases(imp)
-    syms = [_normalize_ast_token(str(s)) for s in raw_syms if s]
+    syms = [canonical_spelling(str(s)) for s in raw_syms if s]
+    occurrences = Counter(syms)
+    aliased = Counter(a for a, _ in _import_alias_pairs(imp))
     out: List[str] = []
     expanded: set = set()
     for sym in syms:
@@ -164,7 +182,7 @@ def _extract_import_tuple(imp: Any) -> Tuple[str, Tuple[str, ...]]:
         out.extend(originals)
         # One bound name per alias pair; a surplus occurrence is a plain binding of the
         # same name in this statement (``from m import a as b, b``) and must be kept.
-        if syms.count(sym) > len(originals):
+        if occurrences[sym] > aliased[sym]:
             out.append(sym)
     return src, tuple(out)
 
@@ -184,10 +202,12 @@ def _split_reference(ref: str) -> tuple[str, str]:
 
 def _dot_suffixes(name: str) -> list[str]:
     """``name`` and each part of it after a dot: exactly the patterns that match ``name``."""
-    return [name, *(name[i + 1:] for i, ch in enumerate(name) if ch == ".")]
+    return [name, *(suffix for i, ch in enumerate(name) if ch == "." for suffix in (name[i:], name[i + 1:]))]
 
 
 def _suffix_match(spelling: str, pattern: str) -> bool:
+    if pattern.startswith("."):
+        return spelling.endswith(pattern)
     return spelling == pattern or spelling.endswith(f".{pattern}")
 
 
@@ -205,10 +225,12 @@ def _spellings(
     aliases: Optional[Mapping[str, Any]],
     *,
     qualify_heads: bool,
+    bound_origins: Optional[Mapping[str, Any]] = None,
 ) -> list[str]:
     """Every spelling of ``ref``: as written and through each alias original, each also
     qualified through the import map (an exact key, else, for calls, its part before the
     first dot). The reference semantics that ``_SpellingIndex`` answers without listing."""
+    ref = canonical_spelling(ref)
     out: list[str] = []
     for spelled in [ref, *_dealias(ref, aliases)]:
         out.append(spelled)
@@ -219,6 +241,9 @@ def _spellings(
                 head, tail = spelled.split(".", 1)
                 if head in imported_qual_map:
                     out.extend(f"{qual}.{tail}" for qual in _as_names(imported_qual_map[head]))
+    # A source-backed import's original is already qualified. Its source namespace is
+    # not another local name to resolve through an unrelated import.
+    out.extend(_dealias(ref, bound_origins))
     return out
 
 
@@ -240,21 +265,34 @@ class _SpellingIndex:
         aliases: Optional[Mapping[str, Any]],
         *,
         qualify_heads: bool,
+        bound_origins: Optional[Mapping[str, Any]] = None,
     ):
-        self._quals = imported_qual_map or {}
-        self._aliases = aliases or {}
+        self._quals = {canonical_spelling(k): tuple(canonical_spelling(v) for v in _as_names(values))
+                       for k, values in (imported_qual_map or {}).items()}
+        self._aliases = {canonical_spelling(k): tuple(canonical_spelling(v) for v in _as_names(values))
+                         for k, values in (aliases or {}).items()}
+        self._origins = {canonical_spelling(k): tuple(canonical_spelling(v) for v in _as_names(values))
+                         for k, values in (bound_origins or {}).items()}
         self._qualify_heads = qualify_heads
         self._enumerate = any("." in key or "::" in key for key in self._quals)
         self._heads: dict[tuple[str, bool], tuple[frozenset[str], dict[str, frozenset[str]]]] = {}
         self._qual_suffixes: dict[str, frozenset[str]] = {}
 
+    def spellings(self, ref: str) -> list[str]:
+        return _spellings(ref, self._quals, self._aliases, qualify_heads=self._qualify_heads,
+                          bound_origins=self._origins)
+
+    def is_bound(self, name: str) -> bool:
+        return name in self._quals or name in self._aliases or name in self._origins
+
     def matches(self, ref: str, pattern: str) -> bool:
         # An empty pattern names nothing. An empty reference needs no guard: it has no
         # spelling a non-empty pattern ends, and evaluate_forbid_ast drops empty ones anyway.
+        ref, pattern = canonical_spelling(ref), canonical_spelling(pattern)
         if not pattern:
             return False
         if self._enumerate:
-            spellings = _spellings(ref, self._quals, self._aliases, qualify_heads=self._qualify_heads)
+            spellings = self.spellings(ref)
             return any(_suffix_match(s, pattern) for s in spellings)
         if _suffix_match(ref, pattern):  # covers the suffixes that lie inside ``rest``
             return True
@@ -289,7 +327,7 @@ class _SpellingIndex:
                 elif mode and origin in self._quals:
                     members.setdefault("", set()).add(origin)
             self._heads[key] = (
-                frozenset(s for origin in origins for s in _dot_suffixes(origin)),
+                frozenset(s for origin in [*origins, *_as_names(self._origins.get(head))] for s in _dot_suffixes(origin)),
                 {w: self._suffixes_of(names) for w, names in members.items()},
             )
         return self._heads[key]
@@ -382,6 +420,7 @@ class CallSiteNode:
     caller_scope: Optional[str] = None
     args: Dict[str, Any] = field(default_factory=dict)
     shadowed: Optional[bool] = None
+    kind: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res: Dict[str, Any] = {"target": self.target, "line": self.line, "caller_scope": self.caller_scope}
@@ -389,6 +428,8 @@ class CallSiteNode:
             res["args"] = dict(self.args)
         if self.shadowed is not None:
             res["shadowed"] = self.shadowed
+        if self.kind is not None:
+            res["kind"] = self.kind
         return res
 
     @classmethod
@@ -401,6 +442,7 @@ class CallSiteNode:
             caller_scope=str(data["caller_scope"]) if data.get("caller_scope") else None,
             args=args,
             shadowed=data["shadowed"] if isinstance(data.get("shadowed"), bool) else None,
+            kind=str(data["kind"]) if data.get("kind") is not None else None,
         )
 
 
@@ -414,8 +456,10 @@ class ImportNode:
     -> ``("p", "path")``. Policy checks use it to judge the aliased form exactly like
     the plain form, so renaming an import cannot hide a forbidden API. ``from_dict``
     also turns the single ``alias`` of the TypeScript, Rust and Go drivers into a pair
-    (``_driver_alias_pairs``); a renamed member of a TypeScript ``{a as b}`` or Rust
-    ``{A as B}`` group is not emitted by those drivers, so it cannot be recovered here.
+    (``_driver_alias_pairs``); grouped member aliases use explicit pairs.
+
+    ``is_namespace`` distinguishes a whole-module Python import from a member
+    import with the same spelling. None preserves legacy driver payloads.
     """
 
     source: str
@@ -423,6 +467,7 @@ class ImportNode:
     line: int = 1
     is_type_only: bool = False
     aliases: Tuple[Tuple[str, str], ...] = ()
+    is_namespace: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res: Dict[str, Any] = {
@@ -434,6 +479,8 @@ class ImportNode:
         # Omitted when empty so plain imports serialize exactly as before aliases existed.
         if self.aliases:
             res["aliases"] = [list(pair) for pair in self.aliases]
+        if self.is_namespace is not None:
+            res["is_namespace"] = self.is_namespace
         return res
 
     @classmethod
@@ -446,6 +493,7 @@ class ImportNode:
             line=int(data.get("line", 1)),
             is_type_only=bool(data.get("is_type_only", False)),
             aliases=tuple(_driver_alias_pairs(data)),
+            is_namespace=data["is_namespace"] if isinstance(data.get("is_namespace"), bool) else None,
         )
 
 
@@ -562,6 +610,10 @@ class NormalizedAST:
                 coerced_mutations.append(m)
 
         meta_dict: Dict[str, Any] = dict(metadata) if metadata else {}
+        if isinstance(meta_dict.get("allow_comments"), Mapping):
+            meta_dict["allow_comments"] = {int(line): entries for line, entries in meta_dict["allow_comments"].items()}
+        if isinstance(meta_dict.get("capabilities"), (list, tuple, set, frozenset)):
+            meta_dict["capabilities"] = sorted(set(meta_dict["capabilities"]))
         if decorators is not None:
             meta_dict["decorators"] = [_normalize_ast_token(d) if isinstance(d, str) else str(d) for d in decorators]
 

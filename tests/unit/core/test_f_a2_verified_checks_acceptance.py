@@ -313,6 +313,10 @@ def test_a_swap_during_the_run_does_not_reach_the_snapshot(tmp_path):
         "sys.path.insert(0, os.getcwd())\n"
         "from src.app import app\n"
         "ok = app() == 2\n"
+        "report = '<testsuite tests=\"1\"><testcase classname=\"snapshot\" name=\"test_app\">'\n"
+        "report += '' if ok else '<failure message=\"wrong snapshot\"/>'\n"
+        "report += '</testcase></testsuite>'\n"
+        "pathlib.Path(sys.argv[1]).write_text(report, encoding='utf-8')\n"
         "print('1 passed in 0s' if ok else '1 failed in 0s')\n"
         "sys.exit(0 if ok else 1)\n"
     )

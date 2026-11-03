@@ -2,7 +2,7 @@
 id: trap-format-code-injection
 domain: security
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: Using str.format() or f-strings to inject variables into executable code templates enables code injection when inputs contain quotes or Python syntax
 prediction: "Will catch .format() calls on strings that are later executed via subprocess, exec(), eval(), or written as .py files"
 falsification: 0 findings in 20 sessions → prune
@@ -22,14 +22,15 @@ tags:
   - injection
   - critical
 ---
+## Do
+Keep untrusted values as structured arguments or serialized data; when generating executable text, escape for the exact destination language and validate the complete executable boundary.
 
-When generating executable code (Python scripts, shell commands) via string
-formatting, all user-controlled or path-derived variables MUST be escaped
-with `repr()` or `shlex.quote()` before interpolation.
+Python repr, JSON encoding and shell quoting solve different problems. Never treat JSON serialization as shell escaping, interpolate untrusted text into an executable template, or allow a quoted prefix to conceal later shell syntax.
 
-Citadel S1 incident: `branch_coverage.py` used `_TRACE_SCRIPT_TEMPLATE.format(
-test_file=test_file)` to inject file paths directly into Python string literals.
-A path containing `"); import os; os.system("id` would execute arbitrary code.
+Verify: Use synthetic quotes, newlines, substitutions, separators and path edge cases at the public subprocess/template boundary; ensure hostile data stays inert.
 
-Detection: grep for `.format(` in files that also contain `subprocess.run`,
-`exec(`, `eval(`, or write to `.py` files.
+Owner instructions and existing approval/release boundaries remain authoritative.
+
+## Evidence
+- The original coverage-template incident interpolated a path into executable Python source.
+- aegis_core/testexec.py, gitsafe.py and AST driver planning preserve structured execution and command authority.

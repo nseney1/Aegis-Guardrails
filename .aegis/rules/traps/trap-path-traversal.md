@@ -2,7 +2,7 @@
 id: trap-path-traversal
 domain: security
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "User-supplied file paths (CLI --files, API params) that are joined with a root directory without containment checks enable reading/writing arbitrary files outside the workspace"
 prediction: "Will flag os.path.join(root, user_input) without is_relative_to() or startswith() guard"
 falsification: 0 findings in 20 sessions → prune
@@ -22,7 +22,15 @@ tags:
   - path-traversal
   - critical
 ---
+## Do
+Resolve and confine paths with the canonical workspace/storage helpers before access; reject traversal, foreign roots and unsafe symlinks without relying on string-prefix containment.
 
-Citadel S2 incident: `aegis_cli/verify.py` accepted `--files ../../etc/passwd`
-without containment, allowing path traversal. Fix: resolve path and check
-`resolved.startswith(root + os.sep)`.
+Preserve drive/case/UNC and native path semantics across platforms. Binding identifies the authorized workspace; confinement then validates the normalized target. Writes additionally preserve the destination API's symlink and regular-file policy.
+
+Verify: Exercise sibling-prefix directories, relative traversal, absolute/foreign paths, symlinks, nonregular sources and Windows spellings through public path/storage APIs.
+
+Owner instructions and existing approval/release boundaries remain authoritative.
+
+## Evidence
+- aegis_core/workspace/confinement.py and storage.py provide canonical confinement and safe file access.
+- tests/unit/core/test_workspace_binding.py and test_storage.py cover root conflicts, path spelling and symlink boundaries.

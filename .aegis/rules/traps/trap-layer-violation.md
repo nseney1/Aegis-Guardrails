@@ -2,7 +2,7 @@
 id: trap-layer-violation
 domain: architecture
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "When module A imports private functions (_prefixed) from module B in a different architectural layer, it creates hidden coupling that breaks when B refactors"
 prediction: "Will catch cross-layer private imports (e.g., aegis_mcp importing _check_* from aegis_cli)"
 falsification: 0 findings in 20 sessions → prune

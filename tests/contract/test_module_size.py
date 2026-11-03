@@ -9,8 +9,6 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 RECORD = Path(__file__).with_name("size_ratchet.json")
 PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
-# Standalone Rust driver template; it is shipped to another interpreter, not imported.
-EXEMPT = {"aegis_core/ast/drivers/templates/rust_ast.py"}
 
 
 def test_size_record_matches_tree():
@@ -59,8 +57,6 @@ def measure_sizes(root):
     for package in PACKAGES:
         for path in sorted((root / package).rglob("*.py")):
             rel = path.relative_to(root).as_posix()
-            if rel in EXEMPT:
-                continue
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=rel)
             result["modules"][rel] = {"lines": len(source.splitlines()),

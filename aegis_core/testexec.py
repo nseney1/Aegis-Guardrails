@@ -17,6 +17,7 @@ test run leaves behind after a normal exit are not swept.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -28,6 +29,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -48,6 +50,7 @@ __all__ = [
     "kill_group",
     "parse_junit_cases",
     "plan_command",
+    "python_module_index",
     "pytest_args",
     "run_pytest_snapshot",
     "run_tests",
@@ -83,16 +86,18 @@ class TestsRun:
     nodeid_digest: Optional[str] = None
     duration_s: float = 0.0
     pytest_missing: bool = False  # not recorded: it only feeds the ``hint`` of ``aegis check --record``
+    complete: bool = True
 
     @property
     def evidence(self) -> bool:
-        """A run is evidence only when it exited 0 in time and at least one test passed."""
-        return self.exit == 0 and not self.timed_out and self.passed > 0
+        """Evidence needs a complete structured report, a clean exit and at least one pass."""
+        return self.complete and self.exit == 0 and not self.timed_out and self.passed > 0 and self.failed == 0
 
     def as_dict(self) -> Dict[str, Any]:
         return {"exit": self.exit, "timed_out": self.timed_out, "collected": self.collected, "passed": self.passed,
                 "failed": self.failed, "skipped": self.skipped, "deselected": self.deselected,
-                "nodeid_digest": self.nodeid_digest, "duration_s": round(self.duration_s, 3)}
+                "nodeid_digest": self.nodeid_digest, "duration_s": round(self.duration_s, 3),
+                "complete": self.complete}
 
 
 # ── The command ──────────────────────────────────────────────────────────────
@@ -113,22 +118,54 @@ def user_test_command(workspace: Path) -> Optional[List[str]]:
     return None
 
 
+def python_module_index(words: Sequence[str]) -> int:
+    """Actual ``-m`` index in interpreter arguments (excluding the executable), or -1.
+
+    Stop at a script, code, stdin, ``--`` or an unknown option; consume values of
+    supported argument-bearing options before looking for the module selector.
+    """
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word == "-m":
+            return index
+        if word in ("-c", "--", "-") or not word.startswith("-"):
+            break
+        if word in ("-W", "-X", "--check-hash-based-pycs"):
+            index += 2
+        elif word.startswith(("-W", "-X", "--check-hash-based-pycs=")) or word in (
+                "-b", "-bb", "-B", "-d", "-E", "-i", "-I", "-O", "-OO", "-P", "-q", "-R", "-s", "-S",
+                "-u", "-v", "-vv", "-x"):
+            index += 1
+        else:
+            break
+    return -1
+
+
 def plan_command(logical: Optional[Sequence[str]], junit: Optional[Path] = None) -> Tuple[List[str], List[str]]:
     """``(argv to execute, logical command)``: the logical command is machine-independent (the
     digest is taken from it), the argv has the absolute interpreter and the fixed flags."""
     words = list(logical) if logical else list(DEFAULT_COMMAND)
+    expanded = [word.replace("{junit}", str(junit)) if junit is not None else word for word in words]
     first = os.path.basename(words[0].replace("\\", "/"))
     if _PYTEST_NAME.fullmatch(first):
         # A pytest launcher (even an absolute venv one) runs under Aegis's interpreter: guessing a
         # sibling python from its path would let the path choose the interpreter.
-        python, rest = sys.executable, ["-m", "pytest", *words[1:]]
+        python, rest = sys.executable, ["-m", "pytest", *expanded[1:]]
     elif _PYTHON_NAME.fullmatch(first):
         # Only the user-scope config reaches here, so an absolute interpreter is the user's choice.
-        python, rest = (words[0] if os.path.isabs(words[0]) else sys.executable), words[1:]
+        python, rest = (expanded[0] if os.path.isabs(expanded[0]) else sys.executable), expanded[1:]
     else:
-        return list(words), words
+        return expanded, words
+    module_at = python_module_index(rest)
+    module_name = rest[module_at + 1:module_at + 2] if module_at >= 0 else []
+    if junit is not None and module_name == ["unittest"]:
+        from aegis_core import unittest_runner
+
+        rest = [*rest[:module_at], "-I", str(Path(unittest_runner.__file__).resolve()), str(junit),
+                *rest[module_at + 2:]]
     argv = [python, *_PYTHON_FLAGS, *rest]
-    if "-m" in rest and rest[rest.index("-m") + 1:rest.index("-m") + 2] == ["pytest"]:
+    if module_name == ["pytest"]:
         argv += list(_PYTEST_FLAGS)
         if junit is not None:
             argv.append(f"--junitxml={junit}")
@@ -142,7 +179,7 @@ def pytest_args(words: Sequence[str]) -> Optional[List[str]]:
     if _PYTEST_NAME.fullmatch(first):
         return list(words[1:])
     rest = list(words[1:])
-    at = rest.index("-m") if "-m" in rest else -1
+    at = python_module_index(rest)
     return rest[at + 2:] if _PYTHON_NAME.fullmatch(first) and at >= 0 and rest[at + 1:at + 2] == ["pytest"] else None
 
 
@@ -230,16 +267,73 @@ class _JunitReport:
     passed_ids: Set[str]
     failed_ids: Set[str]
     collection_errors: List[str]
+    complete: bool
+    structurally_valid: bool
+
+
+def _junit_complete(root: ET.Element, cases: List[ET.Element]) -> bool:
+    """Check declared counts, identities and terminal states before certifying a report."""
+    ids = [f"{case.get('classname', '').strip()}::{case.get('name', '').strip()}"
+           if case.get('classname', '').strip() else case.get('name', '').strip() for case in cases]
+    if root.tag not in ("testsuite", "testsuites") or len(ids) != len(set(ids)):
+        return False
+    parents = {child: parent for parent in root.iter() for child in parent}
+    for case in cases:
+        terminal = [child.tag for child in case if child.tag in ("failure", "error", "skipped")]
+        if (not case.get("name", "").strip() or len(terminal) > 1
+                or case.get("status", "") not in ("", "run") or parents[case].tag != "testsuite"):
+            return False
+    for suite in root.iter():
+        if suite.tag not in ("testsuite", "testsuites"):
+            continue
+        if suite is not root and (suite.tag == "testsuites" or parents[suite].tag not in ("testsuite", "testsuites")):
+            return False
+        if suite.tag == "testsuite" and suite.get("tests") is None:
+            return False
+        children = list(suite.iter("testcase"))
+        suite_errors = {tag: sum(len(s.findall(tag)) for s in suite.iter("testsuite"))
+                        for tag in ("failure", "error")}
+        totals = [len(children), *(sum(case.find(status) is not None for case in children) + suite_errors.get(status, 0)
+                                  for status in ("failure", "error", "skipped"))]
+        for attr, total in zip(("tests", "failures", "errors", "skipped"), totals):
+            value = suite.get(attr)
+            if value is not None and (not value.isascii() or not value.isdecimal()
+                                      or len(value) > 7 or int(value) != total):
+                return False
+    return True
 
 
 def _inspect_junit(path: Path) -> Optional[_JunitReport]:
     try:
-        if not path.is_file() or path.stat().st_size > _MAX_JUNIT_BYTES:
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > _MAX_JUNIT_BYTES
+                or getattr(before, "st_file_attributes", 0) & 0x400):
             return None
-        raw = path.read_bytes()
+        flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_BINARY", 0))
+        with os.fdopen(os.open(path, flags), "rb") as source:
+            opened = os.fstat(source.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                    or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)):
+                return None
+            raw = source.read(_MAX_JUNIT_BYTES + 1)
         if len(raw) > _MAX_JUNIT_BYTES:
             return None
-        root = ET.fromstring(raw)
+        parser = ET.XMLPullParser(events=("start", "end"))
+        root, depth, elements = None, 0, 0
+        for offset in range(0, len(raw), 8192):
+            parser.feed(raw[offset:offset + 8192])
+            for event, element in parser.read_events():
+                if event == "start":
+                    root = element if root is None else root
+                    depth, elements = depth + 1, elements + 1
+                    if depth > 128 or elements > 100_000:
+                        return None
+                else:
+                    depth -= 1
+        parser.close()
+        if root is None:
+            return None
     except (OSError, ET.ParseError):
         return None
     col_errors: List[str] = []
@@ -277,37 +371,40 @@ def _inspect_junit(path: Path) -> Optional[_JunitReport]:
                 passed_ids.add(nodeid)
     digest = hashlib.sha256("\n".join(sorted(ids)).encode("utf-8", "replace")).hexdigest()
     passed_count = len(cases) - failed_count - skipped_count
+    valid = _junit_complete(root, cases)
     return _JunitReport(len(cases), passed_count, failed_count, skipped_count, digest, passed_ids, failed_ids,
-                        col_errors)
+                        col_errors, not col_errors and valid, valid)
 
 
 def parse_junit_cases(path: Path) -> Tuple[Set[str], Set[str], List[str]]:
-    """``(passed_ids, failed_ids, collection_errors)`` from a JUnit file."""
+    """Export identities only from structurally valid reports, including collection failures."""
     report = _inspect_junit(path)
-    if report is None:
+    if report is None or not report.structurally_valid:
         return set(), set(), []
     return report.passed_ids, report.failed_ids, report.collection_errors
 
 
 def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float, junit: Path,
-              output: Path) -> TestsRun:
+              output: Path, *, stderr_output: Optional[Path] = None) -> TestsRun:
     """Run ``argv`` in ``cwd`` with ``env`` and nothing else inherited; kill the process group at
-    the end, whatever happened (on Windows only while the root is alive, see the module docstring)."""
+    the end, whatever happened (on Windows only while the root is alive, see the module docstring).
+    Diagnostics remain merged unless a separate stderr output path is supplied."""
     started = datetime.now(timezone.utc)
     if shutil.which(argv[0], path=env.get("PATH")) is None and not os.path.isabs(argv[0]):
-        return TestsRun(exit=127)
+        return TestsRun(exit=127, complete=False)
     kwargs: Dict[str, Any] = {}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         kwargs["start_new_session"] = True
     timed_out = False
-    with open(output, "wb") as sink:
+    with open(output, "wb") as sink, (
+            open(stderr_output, "wb") if stderr_output is not None else nullcontext(subprocess.STDOUT)) as errors:
         try:
             proc = subprocess.Popen(list(argv), cwd=str(cwd), env=dict(env), stdin=subprocess.DEVNULL, stdout=sink,
-                                    stderr=subprocess.STDOUT, close_fds=True, **kwargs)
+                                    stderr=errors, close_fds=True, **kwargs)
         except OSError:
-            return TestsRun(exit=127)
+            return TestsRun(exit=127, complete=False)
         try:
             code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -329,7 +426,7 @@ def run_tests(argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: f
     seconds = (datetime.now(timezone.utc) - started).total_seconds()
     return TestsRun(exit=code, timed_out=timed_out, collected=collected, passed=passed, failed=failed,
                     skipped=skipped, deselected=counts.get("deselected", 0), nodeid_digest=digest, duration_s=seconds,
-                    pytest_missing=bool(_NO_PYTEST.search(text)))
+                    pytest_missing=bool(_NO_PYTEST.search(text)), complete=report is not None and report.complete)
 
 
 class PytestOutcome(NamedTuple):
@@ -338,6 +435,7 @@ class PytestOutcome(NamedTuple):
     passed_ids: FrozenSet[str]
     failed_ids: FrozenSet[str]
     collection_errors: FrozenSet[str]
+    reason: Optional[str] = None
 
 
 # T5's run (aegis_core.regression): pytest from the interpreter that runs Aegis, isolated (-I -S), on a
@@ -375,4 +473,5 @@ def run_pytest_snapshot(snapshot: Path, test_files: Sequence[str], workspace: Pa
             *_SNAPSHOT_PYTEST_FLAGS, f"--rootdir={snap}", f"--junitxml={junit}", "--", *test_files]
     res = run_tests(argv, snap, hermetic_env(home, tmp), timeout, junit, scratch / "output.txt")
     passed, failed, col_errors = parse_junit_cases(junit)
-    return PytestOutcome(res.exit, res.timed_out, frozenset(passed), frozenset(failed), frozenset(col_errors))
+    reason = "incomplete_test_output" if not res.complete and not col_errors else None
+    return PytestOutcome(res.exit, res.timed_out, frozenset(passed), frozenset(failed), frozenset(col_errors), reason)

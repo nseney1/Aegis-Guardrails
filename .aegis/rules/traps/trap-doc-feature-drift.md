@@ -2,7 +2,7 @@
 id: trap-doc-feature-drift
 domain: documentation
 type: trap
-enforcement: gate
+enforcement: advisory
 hypothesis: "Adding or modifying a feature without updating ALL documentation surfaces (README, CHANGELOG, SKILL.md) in the same commit causes doc-feature desync"
 prediction: "Will fire when a commit touches code files but not documentation, or updates one doc surface but not others"
 falsification: 0 findings in 20 sessions → prune

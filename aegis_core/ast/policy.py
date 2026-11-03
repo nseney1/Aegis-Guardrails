@@ -11,23 +11,16 @@ import tokenize
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from aegis_core.errors import AegisError
+from aegis_core.ast.literals import compare_literal, compare_options
 from aegis_core.ast.schema import (
     NormalizedAST, _SpellingIndex, add_binding, _call_target, _decorator_name,
     _decorator_pattern, _extract_import_tuple, _extract_python_decorators_from_file,
-    _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, _spellings,
+    _extract_python_decorators_from_tree, _import_aliases, _normalize_ast_token, canonical_spelling,
 )
 
 __all__ = ["ASTExtractionError", "_match_ImportNode_against_pattern", "evaluate_forbid_ast", "evaluate_forbid_ast_delta", "evaluate_forbid_ast_structured", "extract_normalized_ast", "parse_allow_comments", "violation_messages"]
 _ALLOW_COMMENT_RE = re.compile(r"#\s*aegis:\s*allow(?:\[([^\]]+)\])?(?:\s*[:\-]?\s*(.*))?$", re.IGNORECASE)
 _ABSENT = object()
-
-
-def _is_literal(val: Any) -> bool:
-    return isinstance(val, str) and val != "<expr>" and (val in ("True", "False", "None") or val[:1] in ("'", '"', "-", *"0123456789") or val[:2] in ("b'", 'b"'))
-
-
-def _unquote(val: str) -> str:
-    return val[2:-1] if val[:2] in ("b'", 'b"') and len(val) >= 3 else (val[1:-1] if val[:1] in ("'", '"') and len(val) >= 2 else val)
 
 
 def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
@@ -37,9 +30,7 @@ def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
     if not isinstance(cond, Mapping):
         if value is _ABSENT:
             return None if has_splat else False
-        if not _is_literal(value):
-            return True if isinstance(cond, str) and isinstance(value, str) and value != "<expr>" and (value == cond or value.endswith(f".{cond}")) else None
-        return value == repr(cond) or value == str(cond) or _unquote(value) == cond
+        return compare_literal(value, cond)
     res: Optional[bool] = True
     for op, target in cond.items():
         if op == "not":
@@ -49,12 +40,7 @@ def _cond(value: Any, cond: Any, has_splat: bool) -> Optional[bool]:
             v = None if (value is _ABSENT and has_splat) else ((value is _ABSENT) == bool(target))
         elif op == "in":
             opts = target if isinstance(target, (list, tuple, set, frozenset)) else ()
-            if value is _ABSENT or not isinstance(value, str) or value == "<expr>":
-                v = (None if has_splat else False) if value is _ABSENT else None
-            elif any(value == str(c) or value == repr(c) or _unquote(value) == str(c) or value.endswith(f".{c}") for c in opts):
-                v = True
-            else:
-                v = False if (_is_literal(value) or value.rpartition(".")[2][:1].isupper()) else None
+            v = (None if has_splat else False) if value is _ABSENT else compare_options(value, opts)
         else:
             v = None
         if v is False:
@@ -70,13 +56,14 @@ def _site_args(site: Any) -> Dict[str, Any]:
 
 
 def _driver_extracts_args(normalized_ast: Any) -> bool:
-    # Only the Python driver records call arguments; elsewhere an empty map means "not extracted".
-    return str(getattr(normalized_ast, "language", "") or "").lower() == "python"
+    meta = getattr(normalized_ast, "metadata", None)
+    capabilities = meta.get("capabilities", ()) if isinstance(meta, Mapping) else ()
+    return isinstance(capabilities, (list, tuple, set, frozenset)) and "args" in capabilities
 
 
 def _match_where(site: Any, where: Mapping[str, Any], args_known: bool = True) -> Optional[bool]:
     args = _site_args(site)
-    if not args and not args_known:
+    if not args_known:
         return None
     has_splat = "*" in args or "**" in args
     res: Optional[bool] = True
@@ -96,7 +83,11 @@ def _add_allow(by_line: Dict[int, List[Dict[str, Any]]], line_no: int, text: str
         by_line.setdefault(int(line_no), []).append({"rules": rules, "reason": (m.group(2) or "").strip()})
 
 
-def parse_allow_comments(source: str) -> Dict[int, List[Dict[str, Any]]]:
+def parse_allow_comments(source: str, language: str = "python") -> Dict[int, List[Dict[str, Any]]]:
+    # Non-Python overrides come only from parser comment tokens in metadata. Their
+    # lexical boundaries (JS regex/templates, Rust raw strings) belong to each driver.
+    if language.lower() != "python":
+        return {}
     if not source or "aegis" not in source.lower():
         return {}
     by_line: Dict[int, List[Dict[str, Any]]] = {}
@@ -117,7 +108,12 @@ def _line_of(item: Any) -> Optional[int]:
 
 def _allow_reason_for_line(allow_map: Mapping[int, List[Dict[str, Any]]], line: Optional[int], rule_id: Optional[str]) -> Optional[str]:
     for entry in (allow_map.get(line) or ()) if line else ():
-        if entry.get("rules") is None or not rule_id or rule_id in entry["rules"]:
+        if not isinstance(entry, Mapping):
+            continue
+        rules = entry.get("rules")
+        if rules is not None and not isinstance(rules, (list, tuple, set, frozenset)):
+            continue
+        if rules is None or not rule_id or rule_id in rules:
             return str(entry.get("reason") or "")
     return None
 
@@ -127,17 +123,70 @@ class ASTExtractionError(AegisError):
         super().__init__(f"cannot verify {path}: {reason}", code="AST_UNVERIFIABLE", path=path, reason=reason)
 
 
+def is_size_limit_error(exc: BaseException) -> bool:
+    """Recognize the typed native size reason through extraction wrappers."""
+    from aegis_core.ast.driver_errors import ASTDriverError
+
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ASTDriverError) and getattr(exc, 'reason', None) == 'too_large':
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def _uncertain_path_matches(target: str, pattern: str, *, prefix: bool = False) -> bool:
+    """Unknown segments may expand; known components still rule out incompatible names."""
+    target, pattern = canonical_spelling(target), canonical_spelling(pattern)
+    if prefix and target.startswith('.') and not pattern.startswith('.'):
+        return False
+    parts = target.strip('.').split('.')
+    wanted = pattern.strip('.').split('.')
+    suffix = not prefix and (pattern.startswith('.') or '.' not in pattern)
+    if suffix:
+        parts.reverse()
+        wanted.reverse()
+    positions = {0}
+    for part in parts:
+        if (prefix or suffix) and len(wanted) in positions:
+            return True
+        if part in ('<expr>', '<computed>'):
+            positions = set(range(min(positions), len(wanted) + 1)) if positions else set()
+        else:
+            positions = {index + 1 for index in positions if index < len(wanted) and wanted[index] == part}
+        if not positions:
+            return False
+    return len(wanted) in positions
+
+
+def _uncertain_token(value: str) -> bool:
+    return '<expr>' in value or '<computed>' in value
+
+
 def _match_ImportNode_against_pattern(imp: Any, pattern: str) -> bool:
-    mod = _normalize_ast_token(pattern)
+    mod = canonical_spelling(pattern)
     if not mod:
         return False
     src, syms = _extract_import_tuple(imp)
+    if src.startswith(".") and not mod.startswith("."):
+        return False
     if src and (src == mod or src.startswith(f"{mod}.")):
         return True
     return any(s == mod or s.startswith(f"{mod}.") or (src and (f"{src}.{s}" == mod or f"{src}.{s}".startswith(f"{mod}."))) for s in syms)
 
 
-def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], defined_names: set[str], args_known: bool = True) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
+def _namespace_alias(imp: Any, source: str, bound: str, original: str, language: str) -> bool:
+    marker = imp.get('is_namespace') if isinstance(imp, Mapping) else getattr(imp, 'is_namespace', None)
+    if isinstance(marker, bool):
+        return marker
+    if language in ('javascript', 'typescript'):
+        symbols = imp.get('imported_symbols', ()) if isinstance(imp, Mapping) else getattr(imp, 'imported_symbols', ())
+        return bound not in {canonical_spelling(str(name)) for name in symbols or ()}
+    return original == source
+
+
+def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIndex, defined_names: set[str], args_known: bool = True) -> Tuple[str, List[Tuple[Any, Optional[bool]]]]:
     if isinstance(raw_call, str):
         call = _normalize_ast_token(raw_call)
         where = None
@@ -150,19 +199,46 @@ def _eval_call_entry(raw_call: Any, raw_call_sites: Any, call_index: _SpellingIn
         return "", []
     if not call:
         return "", []
+    origins_by_head = {}
+    possible_by_head = {}
+    canonical_call = canonical_spelling(call)
+    method_pattern = canonical_call.startswith('.') or '.' not in canonical_call
     hits: List[Tuple[Any, Optional[bool]]] = []
     for site in raw_call_sites:
         target = _call_target(site)
-        if not target or not call_index.matches(target, call):
+        normalized = canonical_spelling(target)
+        head, separator, tail = normalized.partition('.')
+        if head not in origins_by_head:
+            origins = call_index.spellings(head) if call_index.is_bound(head) else [head]
+            origins_by_head[head] = origins, [name for name in origins if _uncertain_token(name)]
+        origins, unknown_origins = origins_by_head[head]
+        raw_unknown = _uncertain_token(normalized)
+        uncertain = raw_unknown or bool(unknown_origins)
+        candidates = []
+        if raw_unknown and method_pattern:
+            candidates = [normalized]
+        elif raw_unknown:
+            if head not in possible_by_head:
+                possible_by_head[head] = [name for name in origins
+                                          if _uncertain_path_matches(name + '.<expr>', call)]
+            candidates = [name + separator + tail for name in possible_by_head[head]]
+        elif unknown_origins:
+            candidates = [name + separator + tail for name in unknown_origins]
+        compatible = call_index.matches(target, call) or any(_uncertain_path_matches(name, call) for name in candidates)
+        if not target or not compatible:
             continue
         if builtin_only:
-            spelled = _spellings(target, imported_qual_map, aliases, qualify_heads=True)
+            spelled = call_index.spellings(target)
             shadowed = site.get("shadowed") if isinstance(site, Mapping) else getattr(site, "shadowed", None)
             if not isinstance(shadowed, bool):  # no driver verdict: the legacy file-wide test
-                shadowed = call in imported_qual_map or call in aliases or call in defined_names
+                shadowed = call_index.is_bound(call) or call in defined_names
             if not (any(s in (f"builtins.{call}", f"__builtins__.{call}") for s in spelled) or (target == call and not shadowed)):
                 continue
         verdict = _match_where(site, where, args_known) if where else True
+        if verdict is not False and uncertain and not (
+            method_pattern and call_index.matches(target, call)
+        ):
+            verdict = None
         if verdict is not False:
             hits.append((site, verdict))
     return call, hits
@@ -190,7 +266,7 @@ def _snippet(text: str) -> str:
     return f"{collapsed[:_SNIPPET_KEEP]}#{hashlib.sha256(collapsed.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}"
 
 
-def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any]) -> List[str]:
+def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, imported_qual_map: Mapping[str, Any], aliases: Mapping[str, Any], bound_origins: Mapping[str, Any]) -> List[str]:
     if not isinstance(forbidden, (list, tuple, set)) or not forbidden:
         return []
     try:
@@ -210,7 +286,7 @@ def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, impo
         except Exception as exc:
             raise ASTExtractionError(fp, f"{type(exc).__name__}: {exc}") from exc
     names = list(dict.fromkeys(n for n in map(_decorator_name, raw_decs) if n))
-    index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=False)
+    index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=False, bound_origins=bound_origins)
     pats = (_decorator_pattern(raw) if isinstance(raw, str) else "" for raw in forbidden)
     return [dec for dec in pats if dec and any(index.matches(name, _decorator_pattern(dec)) for name in names)]
 
@@ -231,39 +307,71 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
     parsed_imports: list[Any] = []
     imported_qual_map: dict[str, Any] = {}
     aliases: dict[str, Any] = {}
+    bound_origins: dict[str, Any] = {}
     for imp in getattr(normalized_ast, "imports", ()) or ():
         src, syms = _extract_import_tuple(imp)
-        for name, originals in _import_aliases(imp).items():
+        bindings = _import_aliases(imp)
+        member_aliases = []
+        namespace_symbols = Counter()
+        marker = imp.get('is_namespace') if isinstance(imp, Mapping) else getattr(imp, 'is_namespace', None)
+        for name, originals in bindings.items():
             for orig in originals:
-                add_binding(aliases, name, orig)
-        parsed_imports.append((imp, (src, syms)))
+                namespace = _namespace_alias(imp, src, name, orig, normalized_ast.language)
+                add_binding(bound_origins if src else aliases, name, f"{src}.{orig}" if src and not namespace else orig)
+                if not namespace:
+                    member_aliases.append(orig)
+                elif normalized_ast.language == 'rust':
+                    namespace_symbols[orig] += 1
+        # A whole-module Rust alias also matches the bare module leaf. This is
+        # an alternate import spelling, never a member to append to the source.
+        module_leaf = src.rsplit('.', 1)[-1] if normalized_ast.language == 'rust' and any(
+            src in originals for originals in bindings.values()) else ''
+        import_syms = []
+        for sym in () if marker is True else syms:
+            if namespace_symbols[sym]:
+                namespace_symbols[sym] -= 1
+            else:
+                import_syms.append(sym)
+        parsed_imports.append((imp, (src, tuple(import_syms)), module_leaf))
+        # Only actual plain bindings may qualify another reference's head. Aliased
+        # originals belong to their own bound name, not a global table of leaf names.
+        aliased_symbols = Counter(member_aliases if normalized_ast.language in ('javascript', 'typescript')
+                                  else (orig for originals in bindings.values() for orig in originals))
         for sym in syms if src else ():
-            if sym and sym != src:
+            if aliased_symbols[sym]:
+                aliased_symbols[sym] -= 1
+                continue
+            if sym and marker is not True and (sym != src or marker is False or normalized_ast.language in ('javascript', 'typescript', 'rust')):
                 add_binding(imported_qual_map, sym, f"{src}.{sym}")
     by_line = lambda hit: _line_of(hit[0]) or 0
     hits: List[Tuple[str, str, Any, Optional[bool]]] = []
     for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
         mod = _normalize_ast_token(raw_mod) if isinstance(raw_mod, str) else ""
         if mod:
-            matched = sorted(((r, True) for r, t in parsed_imports if _match_ImportNode_against_pattern(t, mod)), key=by_line)
+            matched = sorted(((r, None if _uncertain_token(t[0]) else True) for r, t, leaf in parsed_imports
+                              if (_uncertain_path_matches(t[0], mod, prefix=True) if _uncertain_token(t[0])
+                                  else _match_ImportNode_against_pattern(t, mod) or mod == leaf)), key=by_line)
             hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
     raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
-    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True)
+    call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True, bound_origins=bound_origins)
     defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
-        call, matched = _eval_call_entry(raw_call, raw_call_sites, call_index, imported_qual_map, aliases, defined_names, _driver_extracts_args(normalized_ast))
+        call, matched = _eval_call_entry(raw_call, raw_call_sites, call_index, defined_names, _driver_extracts_args(normalized_ast))
         hits.extend(("calls", call, site, verdict) for site, verdict in sorted(matched, key=by_line))
-    hits.extend(("decorators", dec, None, True) for dec in _decorator_hits(normalized_ast, forbid_spec.get("decorators"), fp, imported_qual_map, aliases))
+    hits.extend(("decorators", dec, None, True) for dec in _decorator_hits(normalized_ast, forbid_spec.get("decorators"), fp, imported_qual_map, aliases, bound_origins))
     if not hits:
         return []
     meta = getattr(normalized_ast, "metadata", None)
     text = source if isinstance(source, str) else _read_source(fp)
-    if isinstance(source, str):
-        allows = parse_allow_comments(source)
+    language = str(getattr(normalized_ast, "language", "") or "").lower()
+    if language != "python" and isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
+        allows = meta["allow_comments"]
+    elif isinstance(source, str):
+        allows = parse_allow_comments(source, language)
     elif isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
         allows = meta["allow_comments"]
     else:
-        allows = parse_allow_comments(text or "")
+        allows = parse_allow_comments(text or "", language)
     # Universal newlines, as the parsers count lines; split once per call, never per finding.
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if text else []
     findings: list[dict[str, Any]] = []
@@ -336,12 +444,25 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
     path_str = str(file_path)
     ext = os.path.splitext(path_str)[1].lower()
     try:
-        if code is not None or ext == ".py":
+        if code is not None and ext in ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.rs'):
+            if ext == '.rs':
+                from aegis_core.ast.drivers.rust import parse
+            else:
+                from aegis_core.ast.drivers.js import parse
+
+            return parse(code, path_str)
+        if code is not None and ext != ".py":
+            raise ASTExtractionError(path_str, f"source parsing unsupported for extension '{ext}' until a native source parser is available")
+        if ext == ".py":
             source_text = code if code is not None else read_python_source(path_str)
             tree = ast.parse(source_text, filename=path_str)
             norm_ast = parse_python_ast(source_text, file_path=path_str)
             decs = _extract_python_decorators_from_tree(tree)
-            allows = parse_allow_comments(source_text)
+            allows = {
+                line: [{**entry, "rules": sorted(entry["rules"]) if entry["rules"] is not None else None}
+                       for entry in entries]
+                for line, entries in parse_allow_comments(source_text).items()
+            }
             if decs or allows:
                 meta = {**norm_ast.metadata, **({"decorators": list(decs)} if decs else {}), **({"allow_comments": allows} if allows else {})}
                 object.__setattr__(norm_ast, "metadata", meta)
@@ -349,7 +470,8 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
         if ast_runner is None:
             from aegis_core.ast.runner import ASTDriverRunner
             ast_runner = ASTDriverRunner()
-        if not ast_runner.registry.resolve_driver(ext, workspace_root=workspace_root):
+        resolve = getattr(ast_runner, "resolve_driver", ast_runner.registry.resolve_driver)
+        if not resolve(ext, workspace_root=workspace_root):
             return None
         return ast_runner.parse_file(path_str, workspace_root=workspace_root, **({"confine_root": confine_root} if confine_root is not None else {}))
     except Exception as exc:

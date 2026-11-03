@@ -171,7 +171,11 @@ def _print_plan(plan: List[_Change], home: Optional[Path]) -> None:
     from aegis_core.workspace.layout import UserLayout
 
     where = f"{UserLayout(home).backups_dir}{os.sep}<UTC stamp>" if home else "the Aegis backups directory"
-    print(f"\nPlanned changes (each file is backed up to {_clean(where, 4096)} first):")
+    if any(change.kind == 'prepare_go_cache' for change in plan):
+        print(f"\nPlanned changes (configuration files are backed up to {_clean(where, 4096)} first; "
+              "generated Go cache entries are not backed up):")
+    else:
+        print(f"\nPlanned changes (each file is backed up to {_clean(where, 4096)} first):")
     for index, change in enumerate(plan, 1):
         print(f"  {index}. {_clean(change.path, 4096)}: {_clean('; '.join(change.describe), 4096)}")
 

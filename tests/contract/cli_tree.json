@@ -245,6 +245,25 @@
             "type": "str"
           },
           {
+            "choices": [
+              "python",
+              "typescript",
+              "javascript",
+              "go",
+              "rust"
+            ],
+            "default": null,
+            "dest": "ast_language",
+            "flags": [
+              "--ast-language"
+            ],
+            "help": "Also measure matched AST source fixtures; Python, JS/TS and Rust native parsers are available",
+            "kind": "store",
+            "metavar": null,
+            "nargs": null,
+            "required": false
+          },
+          {
             "default": 20,
             "dest": "runs",
             "flags": [
@@ -346,7 +365,7 @@
             "flags": [
               "--strict"
             ],
-            "help": "Fail on checkpoint warnings too (missing tests, hardcoded paths, stub tests...)",
+            "help": "Fail on checkpoint warnings and missing AST driver coverage",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -714,7 +733,7 @@
             "flags": [
               "--fix"
             ],
-            "help": "Repair what doctor reported, after confirmation; every file is backed up first",
+            "help": "Repair after confirmation; configuration files are backed up and generated Go caches are rebuilt",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -801,7 +820,7 @@
             "required": false
           }
         ],
-        "description": "Read-only health checks, the host matrix (binary, registration, identity, workspace, bootstrap, budget per host) and the enforcement tiers in force here. --fix changes only what doctor reported (stale v3 and misplaced MCP entries, v3 hook entries, legacy rule blocks, unedited v3 rule copies, missing packaged AST drivers), after confirmation, backing each file up to ~/.aegis/backups/<UTC stamp>/ first.",
+        "description": "Read-only health checks, the host matrix (binary, registration, identity, workspace, bootstrap, budget per host) and the enforcement tiers in force here. --fix changes only what doctor reported (stale v3 and misplaced MCP entries, v3 hook entries, legacy rule blocks, unedited v3 rule copies, missing packaged AST drivers and Go cache entries), after confirmation. Configuration files are backed up to ~/.aegis/backups/<UTC stamp>/ first; generated cache entries are rebuilt.",
         "help": "System health and governance audit"
       },
       "hook": {

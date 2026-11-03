@@ -8,7 +8,7 @@ from aegis_core.skills.slots import SlotRegistry
 from aegis_core.workspace.base import Workspace
 
 
-def test_init_provisions_rust_ast_driver(tmp_path: Path, monkeypatch):
+def test_init_uses_native_rust_without_a_driver_opt_in(tmp_path: Path, monkeypatch):
     # Setup simulated Rust project
     (tmp_path / "Cargo.toml").write_text("[package]\nname = 'rust_app'\n", encoding="utf-8")
     src = tmp_path / "src"
@@ -31,16 +31,16 @@ def test_init_provisions_rust_ast_driver(tmp_path: Path, monkeypatch):
     exit_code = run_init(args)
     assert exit_code == 0
 
-    # The repo opts in to the packaged driver in .aegis/config.json
+    # Native Rust needs no packaged-driver opt-in in .aegis/config.json
     config = tmp_path / ".aegis" / "config.json"
-    assert '"rs"' in config.read_text(encoding="utf-8")
+    assert '"rs"' not in config.read_text(encoding="utf-8")
 
     registry = SlotRegistry.load(tmp_path)
     rs_driver = registry.get_ast_driver(".rs")
-    assert rs_driver is not None
-    assert "rust_ast.py" in rs_driver
+    assert rs_driver is None
+    assert ".rs" in registry.get_configured_extensions()
 
-    # Nothing is staged in the repository: the packaged template is what runs
+    # Nothing is staged in the repository: Rust parsing is built in
     assert not (tmp_path / ".aegis" / "drivers").exists()
 
 
@@ -66,6 +66,7 @@ def test_init_provisions_polyglot_ts_go_drivers(tmp_path: Path, monkeypatch):
     assert exit_code == 0
 
     registry = SlotRegistry.load(tmp_path)
-    assert registry.get_ast_driver(".ts") is not None
+    assert registry.get_ast_driver(".ts") is None
+    assert '.ts' in registry.get_configured_extensions()
     assert registry.get_ast_driver(".go") is not None
     assert not (tmp_path / ".aegis" / "drivers").exists()

@@ -11,42 +11,30 @@ expiry_days: 60
 created: "2026-10-15T16:11:59Z"
 impact_weight: 1.0
 tags: ["debrief", "citadel", "subprocess", "trust"]
-target_paths: ["aegis_core/ast/runner.py", "aegis_core/skills/slots.py", "aegis_core/outcomes/engine.py", "aegis_core/outcomes/telemetry.py", "aegis_core/verification/test_runner.py", "aegis_core/verification/mutation_tester.py", "aegis_mcp/server.py", "aegis_cli/hooks/management.py", "aegis_cli/hooks/runtime.py"]
+target_paths:
+  - "aegis_core/ast/runner.py"
+  - "aegis_core/ast/batch.py"
+  - "aegis_core/testexec.py"
+  - "aegis_core/pathlookup.py"
+  - "aegis_core/gitsafe.py"
+  - "aegis_core/skills/slots.py"
+  - "aegis_cli/hooks/runtime.py"
 lineage:
   parent_id: null
   created_by: "manual"
   generation: 0
   siblings: []
 ---
-# Boundary: the governed repository is untrusted input
+## Do
+Treat governed repository content as data, not executable authority; choose commands, interpreters and slot roles from trusted packaged or user-scope sources and confine repository-derived paths.
 
-**Rule**: Treat the repository under governance as untrusted input. Never
-subprocess a command, interpreter, script or test file whose selection comes
-from repository files; resolve executables only from packaged templates or
-user-scope config (D10). Never put the cwd on `sys.path` for hooks. Run every
-child with a scrubbed environment and a process-group kill. Every new
-subprocess sink needs a hostile-clone marker-file test.
+Pass validated repository values as structured argv/data to trusted programs rather than evaluating repository-selected commands. Preserve isolated environment/cwd policies at each subprocess boundary, bounded process ownership and explicit execution opt-in.
 
-## Incident (v4 Citadel review)
+Verify: Use hostile-clone marker fixtures for command selection, relative/inside-repository executables, slot overrides, interpreter choice, symlink escape and process-group timeout behavior.
 
-- `.aegis/slots.yaml` `ast_driver` commands were run by `aegis check`, the
-  pre-commit hook and MCP verify. Session close ran the repository's own test
-  and build commands, and Layer 1 mutation and coverage ran pytest from it.
-- The pre-commit hook exec'd `$PWD/.venv/bin/python`, imported `aegis_cli` from
-  the cwd and failed open. The enforcement generator interpolated rule `type`
-  unescaped, and pre-commit ran `check-*` scripts from the repository.
-- Scan-time slot interpolation injected unsigned `slots.yaml` values into
-  HMAC-signed rule text, and tier promotion trusted repo-set fitness frontmatter.
-- It was missed because the BUG-073 guard covered only API keys and URLs, so
-  nobody inventoried the subprocess sinks; existing tests pinned the unsafe
-  behavior, and no test ran a marker-file probe from a hostile clone.
+Owner instructions and existing approval/release boundaries remain authoritative.
 
-## Check
-
-1. List every `subprocess`, `os.exec*` and `os.system` call in `aegis_*` with the
-   source of its argv. Any argv element read from a repository file fails.
-2. Hook runners never insert the cwd or a repository path on `sys.path`, and
-   fail closed when the installed aegis is missing.
-3. Hostile-clone test: a temp repository whose config, slots, scripts and test
-   files would create a marker file if executed; run the command and assert the
-   marker does not exist.
+## Evidence
+- aegis_core/testexec.py rejects user configuration that resolves inside the workspace and normalizes trusted test execution.
+- aegis_core/ast/runner.py and pathlookup.py resolve executable authority; batch.py isolates owned drivers.
+- tests/unit/core/test_testexec.py and test_repo_slots_untrusted.py cover trust boundaries.

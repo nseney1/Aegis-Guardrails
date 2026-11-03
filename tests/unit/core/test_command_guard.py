@@ -11,6 +11,7 @@ the block and record sets in aegis_core.command_safety.
 from __future__ import annotations
 
 import itertools
+import shlex
 import time
 
 import pytest
@@ -391,6 +392,27 @@ def test_every_link_of_an_alias_chain_is_judged_with_the_words_before_it(command
 ], ids=["reset", "chained", "config-env", "shell-alias", "harmless", "overrides-the-environment"])
 def test_an_alias_an_alias_defines_is_expanded(command, rule):
     assert _id(command) == rule
+
+
+@pytest.mark.parametrize("target", ["push -f", "status"], ids=["destructive", "harmless"])
+@pytest.mark.parametrize("spelling, expands", [
+    ("next_step", True),
+    ("next_step extra words", True),
+    ("next_step  extra  words", True),
+    ("'next_step' extra", True),
+    (r"next\_step extra", True),
+    ("next_step\textra", True),
+    ("next_step\nextra", True),
+    ('"next_step extra"', False),
+    (r"next_step\ extra", False),
+    ("next_step\u00a0extra", False),
+    ("next_step\u2003extra", False),
+    ("next_step;extra", False),
+], ids=["word", "words", "spaces", "quoted-word", "escaped-word", "tab", "newline",
+        "quoted-space", "escaped-space", "nbsp", "em-space", "semicolon"])
+def test_alias_word_spelling_preserves_destructive_and_harmless_decisions(spelling, expands, target):
+    command = "git -c alias.next_step=" + shlex.quote(target) + " -c alias.a=" + shlex.quote(spelling) + " a"
+    assert _id(command) == ((GUARD_BLOCK, "git-push-force") if expands and target == "push -f" else None)
 
 
 @pytest.mark.parametrize("command", [
