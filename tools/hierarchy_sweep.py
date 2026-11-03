@@ -159,7 +159,7 @@ def run(store_path, rounds, chosen, dry_run):
     still_unread, root_queue, root_times = remaining(initiatives)
     rotate = [{key: row[key] for key in ("initiative", "endpoint", "session")}
               for row in rows if row["state"] == "rotate_needed"]
-    quiet = not still_unread and not broken
+    quiet = not still_unread and not root_queue and not broken
     return (0 if quiet else 3), {"rounds": completed, "quiet": quiet, "rows": rows, "still_unread": still_unread,
                                  "root_queue": root_queue, "root_time": root_times, "rotate_needed": rotate}
 

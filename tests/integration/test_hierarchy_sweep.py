@@ -100,6 +100,7 @@ def fleet(tmp_path):
 def test_nothing_unread_means_nothing_is_launched(fleet):
     result = fleet.sweep()
     assert result["quiet"] is True and result["rows"] == []
+    assert result["root_queue"] == [] and result["still_unread"] == []
     assert fleet.launches() == []
 
 
@@ -249,6 +250,7 @@ def test_a_native_thread_with_unread_mail_is_left_for_root_to_message(fleet):
     invoke(fleet.root, "publish", {"message_id": "for-review", "from": "pilot/orchestrator", "to": "pilot/lane/review", "host": "claude-code",
                                    "session": fleet.orchestrator["session"], "binding_generation": 1, "type": "info", "body": "Look."})
     result = fleet.sweep(expect=3)
+    assert result["quiet"] is False and result["root_queue"] == []
     assert result["rows"] == [{"initiative": "pilot", "endpoint": "pilot/lane/review", "state": "message_thread", "session": "native-review",
                                "unread_count": 1, "meter_before": "no_transcript", "active_seconds_before": None}]
     assert fleet.launches() == []
@@ -298,6 +300,7 @@ def test_an_endpoint_with_no_profile_is_reported_not_skipped_silently(fleet):
                                    "host": "claude-code", "session": fleet.orchestrator["session"], "binding_generation": 1,
                                    "type": "info", "body": "Look."})
     result = fleet.sweep(expect=3)
+    assert result["quiet"] is False and result["root_queue"] == []
     assert result["rows"] == [{"initiative": "pilot", "endpoint": "pilot/lane/review", "state": "no_profile", "unread_count": 1}]
 
 
@@ -307,7 +310,7 @@ def test_an_unbound_endpoint_with_no_session_cannot_receive_mail_and_is_not_an_e
 
 
 @posix_only
-def test_root_is_never_woken_and_its_queue_is_reported(fleet):
+def test_root_job_requires_attention_even_when_worker_inboxes_are_quiet(fleet):
     fleet.add_role("pilot/root", "codex-cli", session="root-session")
     brief = fleet.base / "packet.md"
     brief.write_bytes(b"Run it.\n")
@@ -315,10 +318,11 @@ def test_root_is_never_woken_and_its_queue_is_reported(fleet):
                                    "host": "claude-code", "session": fleet.orchestrator["session"], "binding_generation": 1,
                                    "type": "job_request", "body": "Run.",
                                    "brief": {"path": str(brief), "sha256": hashlib.sha256(b"Run it.\n").hexdigest()}})
-    result = fleet.sweep()
+    result = fleet.sweep(expect=3)
     assert fleet.launches() == [] and result["rows"] == []
+    assert result["still_unread"] == []  # Worker quiet does not clear ROOT's obligations.
     assert result["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root", "unread_count": 1, "open_jobs": 1}]
-    assert result["quiet"] is True
+    assert result["quiet"] is False
 
 
 def test_root_reading_its_mail_clears_unread_but_not_its_open_jobs(fleet):
@@ -331,13 +335,79 @@ def test_root_reading_its_mail_clears_unread_but_not_its_open_jobs(fleet):
     invoke(fleet.root, "publish", {**orchestrator, "message_id": "job-1", "type": "job_request", "body": "Run.",
                                    "brief": {"path": str(brief), "sha256": hashlib.sha256(b"Run it.\n").hexdigest()}})
     entry = {"initiative": "pilot", "endpoint": "pilot/root"}
-    assert fleet.sweep()["root_queue"] == [{**entry, "unread_count": 2, "open_jobs": 1}]
+    assert fleet.sweep(expect=3)["root_queue"] == [{**entry, "unread_count": 2, "open_jobs": 1}]
     delivery = str(fleet.base / "delivery")
     page = invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True, limit=1)
     assert [row["message"]["message_id"] for row in page["messages"]] == ["note"]
-    assert fleet.sweep()["root_queue"] == [{**entry, "unread_count": 1, "open_jobs": 1}]
+    assert fleet.sweep(expect=3)["root_queue"] == [{**entry, "unread_count": 1, "open_jobs": 1}]
     invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True)
-    assert fleet.sweep()["root_queue"] == [{**entry, "unread_count": 0, "open_jobs": 1}]
+    result = fleet.sweep(expect=3)
+    assert result["root_queue"] == [{**entry, "unread_count": 0, "open_jobs": 1}]
+    assert result["quiet"] is False and result["still_unread"] == []
+    assert fleet.launches() == []
+
+
+def test_unread_root_information_requires_attention_until_root_reads_it(fleet):
+    fleet.add_role("pilot/root", "codex-cli", session="root-session")
+    fleet.send("pilot/orchestrator", "pilot/root", "root-note")
+    result = fleet.sweep(expect=3)
+    assert result["quiet"] is False and result["still_unread"] == []
+    assert result["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root",
+                                    "unread_count": 1, "open_jobs": 0}]
+    assert fleet.launches() == []
+    invoke(fleet.root, "inbox", endpoint="pilot/root",
+           delivery_dir=str(fleet.base / "delivery"), mark_read=True)
+    result = fleet.sweep()
+    assert result["quiet"] is True and result["root_queue"] == []
+    assert fleet.launches() == []
+
+
+@pytest.mark.parametrize("state, exit_code, open_jobs", [
+    ("completed", 0, 0), ("failed", 7, 0), ("refused", None, 0), ("unknown", None, 1),
+])
+def test_job_receipt_terminality_and_recipient_read_are_separate(fleet, state, exit_code, open_jobs):
+    fleet.add_role("pilot/root", "codex-cli", session="root-session")
+    packet = fleet.base / "packet.md"
+    packet.write_bytes(b"Synthetic request; this test executes no job.\n")
+    evidence = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    invoke(fleet.root, "publish", {
+        "message_id": "job-1", "from": "pilot/orchestrator", "to": "pilot/root",
+        "host": "claude-code", "session": fleet.orchestrator["session"], "binding_generation": 1,
+        "type": "job_request", "body": "Information only.", "brief": evidence,
+    })
+    delivery = str(fleet.base / "delivery")
+    invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True)
+    pending = fleet.sweep(expect=3)
+    assert pending["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root",
+                                     "unread_count": 0, "open_jobs": 1}]
+    assert pending["quiet"] is False and fleet.launches() == []
+
+    invoke(fleet.root, "publish", {
+        "message_id": "job-1-receipt", "from": "pilot/root", "to": "pilot/orchestrator",
+        "host": "codex-cli", "session": "root-session", "binding_generation": 1,
+        "type": "job_receipt", "body": "Synthetic bookkeeping, never execution evidence.",
+        "in_reply_to": "job-1",
+        "receipt": {"state": state, "exit_code": exit_code, "evidence": [evidence],
+                    "reason": "Synthetic fixture outcome."},
+    })
+    published = invoke(fleet.root, "delivery", delivery_dir=delivery, message_id="job-1-receipt")
+    assert published["message"]["state"] == "published"
+    assert published["message"]["read_at"] is None
+    expected_root = ([{"initiative": "pilot", "endpoint": "pilot/root",
+                       "unread_count": 0, "open_jobs": open_jobs}] if open_jobs else [])
+    pending = fleet.sweep("--dry-run", expect=3)
+    assert pending["quiet"] is False and pending["root_queue"] == expected_root
+    assert pending["still_unread"] == [{"initiative": "pilot", "endpoint": "pilot/orchestrator", "unread_count": 1}]
+    assert [row["state"] for row in pending["rows"]] == ["would_wake"]
+    assert fleet.launches() == []
+
+    result = fleet.sweep(expect=3 if open_jobs else 0)
+    assert result["quiet"] is (open_jobs == 0)
+    assert result["root_queue"] == expected_root and result["still_unread"] == []
+    assert result["rows"][0]["read"] == ["job-1-receipt"]
+    read = invoke(fleet.root, "delivery", delivery_dir=delivery, message_id="job-1-receipt")
+    assert read["message"]["state"] == "read"
+    assert read["message"]["read_by"]["session"] == fleet.orchestrator["session"]
 
 
 def test_only_root_marks_mail_read_through_the_cli(fleet):
@@ -405,6 +475,7 @@ def test_a_broken_mailbox_is_reported_and_the_others_still_run(fleet):
     fleet.send("pilot/front-door", "pilot/orchestrator", "for-pilot")
     (other / "manifest.json").write_text("{broken")
     result = fleet.sweep(expect=3)
+    assert result["quiet"] is False and result["root_queue"] == []
     states = {row["initiative"]: row["state"] for row in result["rows"]}
     assert states == {"second": "mailbox_error", "pilot": "read"}
     assert next(row for row in result["rows"] if row["initiative"] == "second")["error"]

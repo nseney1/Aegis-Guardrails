@@ -110,11 +110,14 @@ def test_owner_intent_becomes_a_job_and_its_result_reaches_the_front_door(trial)
     trial.send("pilot/front-door", "pilot/orchestrator", "intent")
     assert trial.delivery_state("intent")["state"] == "published"
 
-    first = trial.sweep("--rounds", "5")
+    first = trial.sweep("--rounds", "5", expect=3)
     assert [(row["endpoint"], row["state"]) for row in first["rows"]] == [("pilot/orchestrator", "read")]
     assert first["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root", "unread_count": 2, "open_jobs": 1}]
-    assert first["quiet"] is True
+    assert first["quiet"] is False and first["still_unread"] == []
     assert trial.delivery_state("intent")["state"] == "read"
+
+    invoke(trial.root, "inbox", endpoint="pilot/root", delivery_dir=str(trial.delivery), mark_read=True)
+    assert trial.delivery_state("job-1")["state"] == "read"
 
     jobs = trial.run_jobs()
     assert [(row["job"], row["state"]) for row in jobs["rows"]] == [("pilot/job-1", "completed")]
@@ -122,7 +125,7 @@ def test_owner_intent_becomes_a_job_and_its_result_reaches_the_front_door(trial)
 
     second = trial.sweep("--rounds", "5")
     assert [(row["endpoint"], row["state"]) for row in second["rows"]] == [("pilot/orchestrator", "read"), ("pilot/front-door", "read")]
-    assert second["quiet"] is True and second["root_queue"][0]["open_jobs"] == 0
+    assert second["quiet"] is True and second["root_queue"] == []
     final = trial.delivery_state("validated")
     assert final["state"] == "read" and final["read_by"]["session"] == trial.roles["front-door"]["session"]
 
@@ -135,7 +138,7 @@ def test_owner_intent_becomes_a_job_and_its_result_reaches_the_front_door(trial)
 def test_every_launch_uses_a_generated_profile_with_a_fixed_prompt(trial):
     trial.plan(job_plan(trial))
     trial.send("pilot/front-door", "pilot/orchestrator", "intent", body="SECRET-INTENT-TEXT")
-    trial.sweep("--rounds", "5")
+    trial.sweep("--rounds", "5", expect=3)
     launch = trial.launches()[0]
     assert launch["program"] == "claude" and launch["cwd"] == str(trial.tmp)
     assert "SECRET-INTENT-TEXT" not in json.dumps(launch)
