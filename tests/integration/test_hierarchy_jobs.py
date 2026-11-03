@@ -1670,8 +1670,11 @@ def test_a_merge_job_commits_exactly_the_predicted_tree_with_both_parents(shop):
     final = shop.receipts("job-1")[-1]
     recorded = json.loads(verified_evidence(final)["result.json"].read_text())
     assert recorded["commit"] == head and head in final["body"]
-    assert recorded["merge"] == {"commit": before, "merge": side, "merge_bases": [git(shop.checkout, "merge-base", before, side)],
-                                 "expected_tree": tree, "tree": tree, "new_commit": head, "config": list(MERGE_CONFIG)}
+    record = recorded["merge"]
+    assert record.pop("git_version").startswith("git version "), "the receipt shows which git merged"
+    assert record == {"commit": before, "merge": side, "merge_bases": [git(shop.checkout, "merge-base", before, side)],
+                      "expected_tree": tree, "tree": tree, "new_commit": head, "config": list(MERGE_CONFIG),
+                      "head_ref": "refs/heads/feature/x"}
 
 
 def test_a_conflicting_merge_halts_with_its_paths_even_when_the_packet_names_the_conflicted_tree(shop):
@@ -1917,6 +1920,8 @@ def test_the_pinned_prediction_matches_the_runner_whatever_the_local_merge_confi
     ("merge-exact", {"expected_tree": None}, "merge recipe needs expected_tree"),
     ("merge-exact", {"message": None}, "merge recipe needs expected_tree"),
     ("merge-exact", {"paths": ["src/app.py"]}, "takes no paths"),
+    ("merge-exact", {"paths": []}, "takes no paths"),
+    ("merge-exact", {"paths": ""}, "takes no paths"),
     ("merge-exact", {"merge": "not-an-id"}, "invalid merge"),
     ("touch", {"merge": "0" * 40}, "only a merge recipe"),
     ("commit", {"merge": "0" * 40}, "only a merge recipe"),

@@ -10,10 +10,18 @@ A job is refused unless the checkout is registered for the initiative and its re
 the bytes of its uncommitted files match the packet exactly. The source is witnessed again afterward,
 so a clean exit over changed source is not reported as success. Files Git ignores are not covered.
 
-A `merge` recipe merges one commit (`merge`) into a clean checkout's HEAD (`commit`). Like a `commit` recipe it
-changes nothing until the result is checked: `git merge-tree --write-tree` must merge cleanly to exactly
-`expected_tree`, then HEAD moves by compare-and-swap, and only then do the index and files follow. A second merge is
-a second job. A change to any `.gitattributes` file on either side is refused; that merge goes to an integrator lane.
+A `merge` recipe merges one commit (`merge`) into a clean checkout's HEAD (`commit`); a second merge is a second job.
+Its packet names `merge`, `expected_tree` and `message`, has no `paths` key, and omits `dirty_content_sha256` or gives
+the empty digest. Admit refuses a dirty worktree (read as the steps read it, without the owner's global excludes), a
+merge equal to or already in `commit`, unrelated histories, submodules on either side, a changed path with a `filter`
+attribute or a `merge` attribute other than the built-in text or binary, any `.gitattributes` change on either side, and
+`merge.default` or any `merge.<name>.driver` in the repository's config. Those merges go to an integrator lane.
+Before any ref moves, `git merge-tree --write-tree` must merge cleanly to exactly `expected_tree` with no submodule, and
+a dry run of `read-tree -m -u` must accept the real index and files; until then git writes new objects only. HEAD then
+moves by compare-and-swap to a commit with parents `commit` and `merge`, and the index and files follow. If read-tree
+fails there, HEAD goes back by compare-and-swap and the reason says whether it did. After a timeout or a failed check
+past the swap, the reason says what HEAD, the index and status show, and the result's `commit` names the new commit
+whenever HEAD does. The result's `merge` record binds the inputs, the branch HEAD points at, and the git version.
 The orchestrator predicts `expected_tree` with the runner's pinned config and no global or system config:
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c merge.renames=true -c merge.directoryRenames=false \
     -c merge.renameLimit=7000 -c merge.renormalize=false merge-tree --write-tree <commit> <merge>
@@ -234,6 +242,8 @@ def checked_paths(packet, recipe, checkout):
     takes_paths = commit or (recipe["kind"] == "command" and any("$paths" in step for step in recipe["steps"]))
     if not takes_paths:
         require(not paths, "this recipe takes no paths")
+        # A merge names no paths at all, so even an empty value is refused, as expected_tree is for a command recipe.
+        require(recipe["kind"] != "merge" or "paths" not in packet, "a merge recipe takes no paths key, not even an empty one")
         return []
     require(isinstance(paths, list) and bool(paths), "this recipe needs paths")
     require(len(paths) <= MAX_PATHS, "too many paths")
@@ -307,6 +317,13 @@ def refuse_attributes(checkout, paths, revisions):
                 flagged.add("%s (%s=%s)" % (os.fsdecode(path), name.decode(), value.decode(errors="replace")))
     require(not flagged, "a merge job refuses changed paths with a filter attribute or a merge attribute other than the "
             "built-in text or binary: " + ", ".join(sorted(flagged))[:1024])
+
+
+def head_ref(checkout):
+    """The branch HEAD points at, or None when HEAD is detached: what a merge's swap would move."""
+    found = pinned_git(checkout, "symbolic-ref", "-q", "HEAD")
+    require(found.returncode in (0, 1), "could not read which branch HEAD points at")
+    return found.stdout.decode().strip() or None
 
 
 def merge_refusals(checkout, commit, merge):
@@ -431,9 +448,12 @@ def admit(ledger, initiative, message, mailbox, recipes):
     witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None)
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
             (packet["commit"], packet["tree"], dirty), "source does not match the packet")
+    admitted = {**packet, "dirty_content_sha256": dirty, "paths": paths}
     if kind == "merge":
         merge_refusals(checkout, packet["commit"], packet["merge"])
-    return {**packet, "dirty_content_sha256": dirty, "paths": paths}, raw
+        # The witness binds the revision and tree, not the branch, so the branch is held here and checked again at run time.
+        admitted["head_ref"] = head_ref(checkout)
+    return admitted, raw
 
 
 def patient(action, wait):
@@ -933,6 +953,8 @@ def merge_steps(packet, recipes, job, details):
     message_file = job.folder / "scratch" / "commit-message"
     message_file.parent.mkdir(mode=0o700, exist_ok=True)
     message_file.write_text(packet["message"], encoding="utf-8")
+    # The git the steps run, found on the recipe's PATH inside the sandbox, so a prediction can name the same one.
+    details["git_version"] = yield Step(["git", "--version"], plain, capture=True)
     details["merge_bases"] = (yield Step(git + ["merge-base", "--all", commit, merge], temporary, capture=True)).split()
     pinned = [part for item in MERGE_CONFIG for part in ("-c", item)]
     code, output = yield Step(git + pinned + ["merge-tree", "--write-tree", commit, merge], temporary, capture=True, verdict=True)
@@ -1079,6 +1101,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     view = MERGE_VIEW_ENV if recipe["kind"] == "merge" else None
     try:
         before = source_state(mailbox, checkout, view)
+        branch = head_ref(checkout) if recipe["kind"] == "merge" else None
     except ERRORS as exc:
         write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048])
         return settle(store, job, wait)
@@ -1086,6 +1109,10 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             packet["commit"], packet["tree"], packet["dirty_content_sha256"]):
         # The job may have waited hours for a slot, so the exact source is checked again here.
         write_result(job, "refused", None, reason="source does not match the packet: it changed while the job waited")
+        return settle(store, job, wait)
+    if recipe["kind"] == "merge" and branch != packet["head_ref"]:
+        write_result(job, "refused", None, reason="HEAD points at %s now, not %s as at admit, so the swap would move another "
+                     "branch" % (branch or "no branch", packet["head_ref"] or "no branch"))
         return settle(store, job, wait)
 
     def announce():
@@ -1130,7 +1157,8 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         # Every input and the pinned config, so the receipt binds them and anyone can predict the tree again.
         extra["merge"] = {"commit": packet["commit"], "merge": packet["merge"], "merge_bases": details.get("merge_bases"),
                           "expected_tree": packet["expected_tree"], "tree": details.get("tree"),
-                          "new_commit": details.get("new_commit"), "config": list(MERGE_CONFIG)}
+                          "new_commit": details.get("new_commit"), "config": list(MERGE_CONFIG),
+                          "head_ref": packet["head_ref"], "git_version": details.get("git_version")}
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
                  steps=rows, before=before, after=after, commit=commit, **extra)
     # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other
