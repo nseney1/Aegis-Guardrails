@@ -1,5 +1,15 @@
 # Dogfooding the agent hierarchy
 
+**2026-11-03 owner-facing ROOT amendment:** the operational ROOT procedures below
+are historical. Current ROOT only reviews evidence, talks with the owner and
+approves/denies canonical requests. It cannot run these commands or delegate them
+through a helper. A distinct qualified operator and independently accepted native
+capability/decision/dispatch interfaces are required before cutover. See the
+[maintenance design](hierarchy-maintenance-design.md) and
+[shutdown/cutover runbook](hierarchy-maintenance-runbook.md). The evidence-only
+lifecycle journal does not enable a native executor. Legacy routes and command
+names are compatibility evidence, not execution authority.
+
 This is how root moves live sessions onto the [agent hierarchy](agent-hierarchies.md) tools, and how it
 runs them afterward. Every tool here has tests, but those tests use a fake host, so **no real Claude or
 Codex session has run this flow yet**. The checks below are what would show that it works.

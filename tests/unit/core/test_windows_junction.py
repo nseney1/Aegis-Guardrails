@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import stat
 import struct
+import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -360,12 +362,36 @@ def test_unsupported_resolved_targets_fail_before_creating_an_entry(tmp_path, mo
 
     target, link = tmp_path / "dependencies", tmp_path / "node_modules"
     target.mkdir()
-    original = Path.resolve
-    monkeypatch.setattr(Path, "resolve", lambda path, *args, **kwargs:
-        Path(resolved) if path == target else original(path, *args, **kwargs))
+    original = os.path.realpath
+    monkeypatch.setattr(os.path, "realpath", lambda path, *args, **kwargs:
+        resolved if os.fspath(path) == str(target) else original(path, *args, **kwargs))
     with pytest.raises(OSError, match=message):
         create_directory_junction(target, link)
     assert not link.exists() and not junction_kernel.calls
+
+
+def test_python39_resolution_denial_still_sends_the_absolute_target(tmp_path, monkeypatch, junction_kernel):
+    """P6 on Python 3.9 (Validate runs 41454378514, 41482747131): its Windows Path.resolve lets
+    the restricted token's WinError 5 escape, where 3.10+ resolution falls back to the path."""
+    from aegis_core.verification.windows_junction import create_directory_junction
+
+    target, link = tmp_path / "dependencies", tmp_path / "node_modules"
+    target.mkdir()
+    expected = str(target.resolve()).replace("/", "\\")
+    original = Path.resolve
+
+    def python39_resolve(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(13, "Access is denied", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", python39_resolve)
+    create_directory_junction(target, link)
+    raw, = junction_kernel.buffers
+    _, _, _, sub_offset, sub_size, print_offset, print_size = struct.unpack("<LHHHHHH", raw[:16])
+    assert raw[16 + sub_offset:16 + sub_offset + sub_size].decode("utf-16-le") == "\\??\\" + expected
+    assert raw[16 + print_offset:16 + print_offset + print_size].decode("utf-16-le") == expected
+    assert link.lstat().st_reparse_tag == 0xA0000003
 
 
 def test_success_status_without_mount_point_tag_is_not_accepted(tmp_path, junction_kernel):
@@ -402,3 +428,62 @@ def test_real_windows_junction_reads_target_without_symlink_privilege_and_remove
         link.rmdir()
     retained = tmp_path / "moved-dependencies" if dangling else target
     assert not link.exists() and (retained / "keep").read_text() == "dependency"
+
+
+_RESTRICTED_TOKEN_PROBE = textwrap.dedent('''
+    import ctypes
+    import importlib.util
+    from pathlib import Path
+    import sys
+
+    class DenyCodecImports:
+        def find_spec(self, name, path=None, target=None):
+            if name.startswith("encodings."):
+                raise ImportError("restricted token cannot read " + name)
+            return None
+
+    def impersonate():
+        sys.meta_path.insert(0, DenyCodecImports())
+        for name in [name for name in sys.modules if name.startswith("encodings.utf_16")]:
+            del sys.modules[name]
+
+    def kernel_boundary(*args, **kwargs):
+        raise RuntimeError("kernel boundary reached")
+
+    module, target, link = sys.argv[1:]
+    try:
+        if module == "-":
+            impersonate()
+            target.encode("utf-16-le")
+        else:
+            # Load by path before impersonation, as .github/scripts/p6_noadmin.py does.
+            spec = importlib.util.spec_from_file_location("p6_product_junction", module)
+            junction = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(junction)
+            ctypes.WinDLL = kernel_boundary
+            impersonate()
+            junction.create_directory_junction(Path(target), Path(link))
+        print("no error")
+    except Exception as error:
+        print(type(error).__name__ + ": " + str(error))
+''')
+
+
+def test_junction_encodes_its_target_after_a_restricted_token_blocks_codec_imports(tmp_path):
+    """P6 regression (Validate run 41454388514): Windows CI creates the junction after
+    impersonating a restricted token that can no longer import stdlib codec modules."""
+    from aegis_core.verification import windows_junction
+
+    target, link = tmp_path / "dependencies", tmp_path / "node_modules"
+    target.mkdir()
+
+    def probe(module):
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _RESTRICTED_TOKEN_PROBE,
+                                 module, str(target), str(link)], capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    # The control proves the probe reproduces CI's failure when nothing resolved the codec first.
+    assert probe("-") == "LookupError: unknown encoding: utf-16-le"
+    assert probe(windows_junction.__file__) == "RuntimeError: kernel boundary reached"
+    assert not link.exists()

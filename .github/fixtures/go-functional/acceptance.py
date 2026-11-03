@@ -18,7 +18,7 @@ import time
 import traceback
 import venv
 
-OWNER_SHA = '692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474'
+OWNER_SHA = 'db2995e528007c2bb17fabada5e708c3107e83607efd4a6acad4ad35d0f9cf7b'
 OFFLINE = {'GOTOOLCHAIN': 'local', 'GOPROXY': 'off', 'GOWORK': 'off',
            'GOFLAGS': '', 'GOENV': 'off', 'CGO_ENABLED': '0'}
 RULE = ('---\nid: blocked\ntype: invariant\nenforcement: gate\n'

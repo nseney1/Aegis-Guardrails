@@ -18,7 +18,7 @@ import sys
 import traceback
 
 
-HELPER_SHA = '692cb44ebcf239a34c01b16648e4b923a464de57e94e85362f49f7cc443af474'
+HELPER_SHA = 'db2995e528007c2bb17fabada5e708c3107e83607efd4a6acad4ad35d0f9cf7b'
 DWORD, BOOL, HANDLE = C.c_uint32, C.c_int32, C.c_void_p
 
 
@@ -177,6 +177,9 @@ class Token:
         label = SID_AND_ATTRIBUTES(C.cast(self.medium, HANDLE), 0x20)
         self.checked('SetTokenInformation', self.restricted, 25, C.byref(label),
                      C.sizeof(label) + self.adv.GetLengthSid(self.medium))
+        allowed = LUID()
+        self.checked('LookupPrivilegeValueW', None, 'SeChangeNotifyPrivilege', C.byref(allowed))
+        self.change_notify_luid = (allowed.LowPart, allowed.HighPart)
 
     def enter(self):
         self.checked('ImpersonateLoggedOnUser', self.restricted)
@@ -208,9 +211,7 @@ class Token:
             self.checked('CheckTokenMembership', None, self.admin, C.byref(member))
             require(not member.value, 'effective Administrators membership is enabled')
             row['privileges'] = self.privileges(token)
-            allowed = LUID()
-            self.checked('LookupPrivilegeValueW', None, 'SeChangeNotifyPrivilege', C.byref(allowed))
-            require(all(not p['attributes'] & 2 or (p['low'], p['high']) == (allowed.LowPart, allowed.HighPart)
+            require(all(not p['attributes'] & 2 or (p['low'], p['high']) == self.change_notify_luid
                         for p in row['privileges']), 'unexpected enabled privilege')
         finally:
             self.checked('CloseHandle', token)
@@ -323,7 +324,8 @@ def worker(config):
                     'attributes': getattr(owned, 'st_file_attributes', None)}
                 require(result['junction']['tag'] == 0xA0000003 and result['junction']['attributes'] & 0x400,
                         'created entry is not a mount-point junction')
-                require(link.resolve() == target.resolve(), 'junction target differs')
+                # Python 3.9's Path.resolve() raises under this token; 3.10+ resolve() is realpath.
+                require(Path(os.path.realpath(link)) == Path(os.path.realpath(target)), 'junction target differs')
                 require((link / 'sentinel.txt').read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'junction traversal failed')
                 current = link.lstat()
                 require((current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino)

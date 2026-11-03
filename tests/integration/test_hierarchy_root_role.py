@@ -1,4 +1,4 @@
-"""Root is a real endpoint with one route, and job requests stay separate from grants."""
+"""Legacy ROOT endpoint data keeps its routes; it grants no owner-facing ROOT authority."""
 import hashlib
 import json
 import os
@@ -272,14 +272,14 @@ def test_a_job_can_be_requested_and_answered_through_the_scoped_adapter(team):
     assert "route is not vertical" in payload(denied[-1])["error"]
 
 
-def test_root_gets_no_mailbox_adapter_because_it_uses_the_controller(team):
+def test_root_gets_no_legacy_mailbox_adapter_or_operational_controller_authority(team):
     root, _ = team
     result = subprocess.run([sys.executable, "-I", str(HELPER), "--root", str(root), "serve", "--endpoint", "a/root",
                              "--host", "host-one", "--session", "a/root", "--generation", "1"],
                             input="", capture_output=True, text=True, timeout=15,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"] == "root uses the controller, not the mailbox adapter"
+    assert json.loads(result.stdout)["error"] == "ROOT has no qualified decision adapter; operational controller access is forbidden"
 
 
 def test_stored_job_messages_survive_a_fresh_read(team):

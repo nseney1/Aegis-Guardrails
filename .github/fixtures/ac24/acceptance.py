@@ -215,6 +215,27 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
 
+def audited_program(executable, args):
+    """Return the program a subprocess.Popen audit event spawns, or None.
+
+    CPython audits `executable` as passed. POSIX sets it to args[0] first; Windows
+    usually leaves it None and audits the list2cmdline string, whose program token
+    is quoted only when it contains a space or tab (a program path never holds '"').
+    """
+    if executable is not None:
+        return str(executable)
+    if isinstance(args, (list, tuple)):
+        return str(args[0]) if args else None
+    if not isinstance(args, (str, bytes, os.PathLike)):
+        return None
+    text = os.fsdecode(args)
+    if text.startswith('"'):
+        program = text[1:].split('"', 1)[0]
+    else:
+        program = text.replace('\t', ' ').split(' ', 1)[0]
+    return program or None
+
+
 def digest(path):
     result = hashlib.sha256()
     with path.open('rb') as stream:
@@ -322,7 +343,7 @@ def worker(config_path):
     def audit(event, args):
         if event == 'subprocess.Popen':
             executable, argv, cwd, _env = args
-            events.append({'phase': phase[0], 'executable': str(executable),
+            events.append({'phase': phase[0], 'executable': str(audited_program(executable, argv)),
                            'argv': list(argv) if isinstance(argv, (list, tuple)) else str(argv),
                            'cwd': str(cwd)})
     sys.addaudithook(audit)

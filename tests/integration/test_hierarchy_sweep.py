@@ -104,6 +104,79 @@ def test_nothing_unread_means_nothing_is_launched(fleet):
     assert fleet.launches() == []
 
 
+def test_mail_quiet_does_not_claim_that_untracked_work_is_complete(fleet):
+    result = fleet.sweep()
+    assert result["quiet"] is True
+    assert result.get("work_complete") is False, "mail quiet must not erase untracked FINAL/HOLD obligations"
+    assert result["lifecycle"]["state"] == "untracked"
+
+
+def test_an_unavailable_lifecycle_is_hold_even_when_mail_is_quiet(fleet):
+    missing = fleet.tmp / "missing-lifecycle"
+    result = fleet.sweep("--lifecycle", str(missing), expect=3)
+    assert result["quiet"] is False and result["mail_quiet"] is True
+    assert result["work_complete"] is False
+    assert result["lifecycle"]["state"] == "hold"
+    assert "No such file" in result["lifecycle"]["error"]
+    assert fleet.launches() == []
+
+
+def test_lifecycle_preflight_holds_unread_work_before_any_host_wake(fleet):
+    fleet.send("pilot/front-door", "pilot/orchestrator", "must-remain-unread")
+    result = fleet.sweep("--lifecycle", str(fleet.tmp / "missing-lifecycle"), expect=3)
+    assert result["lifecycle"]["state"] == "hold"
+    assert fleet.launches() == [], "invalid lifecycle destination must refuse before dispatch"
+
+
+@posix_only
+def test_owned_lifecycle_obligation_keeps_zero_job_sweep_pending(fleet):
+    from tests.integration.test_hierarchy_lifecycle import Ledger, request
+
+    folder = fleet.tmp / "recovery"
+    folder.mkdir()
+    ledger = Ledger(folder)
+    value = request()
+    ledger.publish(value)
+    ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+                 "next_decision": "authorize P1 recovery", "condition": "controls reviewed", "evidence": ledger.evidence},
+                 **ledger.target(value))
+    result = fleet.sweep("--lifecycle", str(ledger.path), expect=3)
+    assert result["mail_quiet"] is True and result["quiet"] is False
+    assert result["root_queue"] == [] and result["work_complete"] is False
+    assert result["lifecycle"]["obligations"][0]["owner"] == "engine/coordinator"
+    assert fleet.launches() == []
+
+
+def test_a_mailbox_error_on_the_final_read_keeps_its_original_diagnostic(fleet):
+    # The filesystem is the real boundary: fail only its later manifest read,
+    # while using the public entry point and real stores/mailbox objects.
+    script = """
+import errno, importlib.util, io, json, os, sys
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location('sweep_entry', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_open, reads = io.open, 0
+def open_boundary(path, *args, **kwargs):
+    global reads
+    if os.fspath(path) == sys.argv[3]:
+        reads += 1
+        if reads > 1:
+            raise PermissionError(errno.EACCES, 'fixture final-read denied', sys.argv[3])
+    return real_open(path, *args, **kwargs)
+with patch('io.open', open_boundary):
+    sys.exit(module.main(['--store', sys.argv[2], '--dry-run']))
+"""
+    proc = subprocess.run([sys.executable, "-c", script, str(SWEEP), str(fleet.workspace.store),
+                           str(fleet.root / "manifest.json")], capture_output=True, text=True, timeout=15, env=fleet.env())
+    assert proc.returncode == 3 and not proc.stderr, proc.stdout + proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["quiet"] is False
+    errors = [row for row in result["rows"] if row["state"] == "mailbox_error"]
+    assert len(errors) == 1 and "fixture final-read denied" in errors[0]["error"]
+    assert fleet.launches() == []
+
+
 @posix_only
 def test_a_session_with_unread_mail_is_woken_and_reads_it(fleet):
     fleet.send("pilot/front-door", "pilot/orchestrator", "hello")

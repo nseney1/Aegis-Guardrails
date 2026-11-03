@@ -14,9 +14,9 @@ PROJECT = '[project]\nname = "aegis-guardrails"\ndynamic = ["version"]\ndependen
 EXTRAS = '[project.optional-dependencies]\ndev = ["pytest"]\n'
 
 
-def _run(root, *args, env=None):
+def _run(root, *args, env=None, timeout=10):
     return subprocess.run([sys.executable, str(GATE), args[0], str(root), *args[1:]],
-                          capture_output=True, text=True, timeout=10, env=env)
+                          capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def _source(tmp_path, text=PROJECT + EXTRAS):
@@ -68,7 +68,8 @@ with open(os.environ["GO_STUB_LOG"], "a", encoding="utf-8") as stream:
         "env": {k: os.environ.get(k) for k in ("GOPROXY", "GOFLAGS", "GOTOOLCHAIN",
             "GOWORK", "GOENV", "GO111MODULE", "CGO_ENABLED")}}) + "\\n")
 mode = os.environ.get("GO_STUB_MODE", "ok")
-if mode == "timeout" or (mode == "build-timeout" and sys.argv[1] == "build"): time.sleep(5)
+if mode == "timeout": time.sleep(5)
+if mode == "build-timeout" and sys.argv[1] == "build": time.sleep(60)
 if mode == "failure" or (mode == "build-failure" and sys.argv[1] == "build"):
     sys.exit("compiler unavailable")
 if sys.argv[1] == "list":
@@ -101,8 +102,13 @@ def test_go_gate_builds_only_copied_first_party_sources_with_offline_env(tmp_pat
 def test_go_gate_fails_closed_at_the_process_boundary(tmp_path, mode, reason):
     stub, env = _go(tmp_path)
     env["GO_STUB_MODE"] = mode
-    args = ["--timeout", "0.2"] if "timeout" in mode else []
-    proc = _run(tmp_path, "go", *args, "--go-command", sys.executable, str(stub), env=env)
+    # The gate gives go list and go build one shared deadline. In build-timeout, go list must
+    # finish however slowly the stub's interpreter starts, so the deadline is generous there and
+    # only the build stub outlasts it.
+    budget = {"timeout": "0.2", "build-timeout": "10"}.get(mode)
+    args = ["--timeout", budget] if budget else []
+    proc = _run(tmp_path, "go", *args, "--go-command", sys.executable, str(stub), env=env,
+                timeout=60 if mode == "build-timeout" else 10)
     assert proc.returncode == 1 and reason in proc.stderr, proc.stderr
 
 

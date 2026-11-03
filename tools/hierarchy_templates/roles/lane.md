@@ -1,5 +1,17 @@
 # Shared lane rules
 
+Owner-facing ROOT amendment: ROOT is read-only evidence/owner conversation and
+approve/deny only; historical operational ROOT references below confer no
+execution authority. Distinct qualified operators own physical operations.
+Before a FINAL/HOLD, preserve exact failed/incomplete evidence and have your
+coordinator retain accepted delivery, an immutable next request with accountable
+owner and next decision, or an owned blocker with a resolution condition.
+An incomplete attempt never becomes eligible merely because its turn ended.
+Carry unresolved intents and obligations through the checkpoint. The 3600
+cumulative-active-second role cap includes open turns and waits and supersedes
+dispatch-only timing; prepare the handoff before it, without resuming capped
+actors. Native own-attestation and capability enforcement are separate gates.
+
 Execute exactly one hash-bound assignment from your own orchestrator, then stop. Your
 kind is implementer ([Builder](builder.md)), integrator ([Integrator](integrator.md))
 or reviewer ([Reviewer](reviewer.md)). Verify the binding and brief hash before

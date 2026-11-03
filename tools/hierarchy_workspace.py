@@ -213,7 +213,9 @@ def apply_request(ledger, data, event):
     require(data["request_id"] not in ledger.requests, "duplicate request id")
     require(not any(r["kind"] == data["kind"] and r["holder"] == data["holder"] and r["state"] in ("queued", "granted")
                     for r in ledger.requests.values()), "holder already has an open request")
-    ledger.requests[data["request_id"]] = {**data, "state": "queued", "seq": event["seq"], "requested_at": event["at"]}
+    ledger.requests[data["request_id"]] = {**data, "state": "queued", "seq": event["seq"], "requested_at": event["at"],
+                                          "reserved_repository": initiative["repository"],
+                                          "reserved_paths": list(initiative["touched_paths"])}
 
 
 def apply_withdraw(ledger, data, event):
@@ -441,9 +443,16 @@ def check_paths(ledger, identifier, paths):
                                       "unreadable": bad.error[:512]})
     declared = [peer["id"] for peer in peers if peer["id"] != identifier
                 and match.sets_overlap(peer["touched_paths"], paths)]
-    conflict = bool(conflicts or unreadable_checkouts)
+    # A lease's expiry or a successor's updated declaration is not terminal evidence for
+    # the original capacity claim. Replay pins scope at request time, including old stores.
+    reserved = [{"request_id": r["request_id"], "initiative": r["initiative"], "holder": r["holder"],
+                 "paths": r["reserved_paths"]} for r in ledger.held("writer")
+                if r["initiative"] != identifier and r["reserved_repository"] == initiative["repository"]
+                and match.sets_overlap(r["reserved_paths"], paths)]
+    conflict = bool(conflicts or unreadable_checkouts or reserved)
     return (3 if conflict else 0), {
         "initiative": identifier, "paths": paths, "conflict": conflict, "conflicts": conflicts[:MAX_VIEW_ROWS],
+        "reserved_conflicts": reserved[:MAX_VIEW_ROWS],
         "unreadable_checkouts": unreadable_checkouts[:MAX_VIEW_ROWS], "own_overlaps": own_overlaps[:MAX_VIEW_ROWS],
         "declared_overlaps": declared, "checked_checkouts": checked,
         "note": "A clear result is advice, not a lock: run the check and the lease claim one after another."}

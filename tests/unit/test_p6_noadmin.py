@@ -39,11 +39,14 @@ class WindowsBoundary:
     """Keep real ctypes buffers and token proofs; replace only native OS calls."""
 
     def __init__(self, problem=None, scalar_length=4, scalar_phase=0, scalar_kind=20,
-                 boolean_length=1, boolean_value=1, boolean_padding=0xA5, boolean_phase=1):
+                 boolean_length=1, boolean_value=1, boolean_padding=0xA5, boolean_phase=1,
+                 privilege_luid=(23, 0), enabled_luid=None, privilege_phase=1):
         self.problem, self.scalar_length, self.scalar_phase = problem, scalar_length, scalar_phase
         self.scalar_kind = scalar_kind
         self.boolean_length, self.boolean_value = boolean_length, boolean_value
         self.boolean_padding, self.boolean_phase = boolean_padding, boolean_phase
+        self.privilege_luid, self.enabled_luid = privilege_luid, enabled_luid
+        self.privilege_phase, self.privilege_lookups = privilege_phase, []
         self.error, self.active, self.impersonations, self.reverts = 0, False, 0, 0
         self.closed, self.scalar_queries, self.modified_tokens = [], [], []
         self.boolean_queries = []
@@ -81,7 +84,10 @@ class WindowsBoundary:
             attributes = (4 if self.problem == "admin_enabled" else 0x10) if kind == 2 else 0
             return bytes(Groups(1, (SidAttributes * 1)(SidAttributes(self.pointer(sid), attributes))))
         if kind == 3:
-            return struct.pack("<IIII", 1, 99 if self.problem == "privilege_enabled" else 23, 0, 2)
+            luid = (99, 0) if self.problem == "privilege_enabled" else self.privilege_luid
+            if self.active and self.impersonations == self.privilege_phase and self.enabled_luid is not None:
+                luid = self.enabled_luid
+            return struct.pack("<IIiI", 1, *luid, 2)
         if kind == 25:
             sid = self.high if self.active and self.problem == "high_integrity" else self.medium
             return bytes(SidAttributes(self.pointer(sid), 0x20))
@@ -167,7 +173,11 @@ class WindowsBoundary:
             C.cast(args[2], C.POINTER(BOOL))[0] = int(self.problem == "admin_membership")
             return 1
         if name == "LookupPrivilegeValueW":
-            C.memmove(args[2], struct.pack("<II", 23, 0), 8)
+            assert args[:2] == (None, "SeChangeNotifyPrivilege")
+            self.privilege_lookups.append(self.active)
+            if self.problem == "lookup_prepare_failure" or self.active and self.problem == "lookup_active_failure":
+                return self.fail(6)
+            C.memmove(args[2], struct.pack("<Ii", *self.privilege_luid), 8)
             return 1
         if name == "CloseHandle":
             self.closed.append(args[0].value)
@@ -201,9 +211,12 @@ def run_worker(tmp_path, monkeypatch):
     modeled_sys.getwindowsversion = lambda: version
     monkeypatch.setattr(probe, "sys", modeled_sys)
 
-    def run(**options):
+    def run(junction=None, **options):
         boundary = WindowsBoundary(**options)
         monkeypatch.setattr(C, "WinDLL", boundary.dll, raising=False)
+        if junction is not None:
+            # Replace only the product helper the worker loads by path; its own checks still run.
+            monkeypatch.setattr(probe, "load", lambda path, name: junction(boundary))
         fatal_calls = []
 
         def fatal_exit(code):
@@ -218,10 +231,53 @@ def run_worker(tmp_path, monkeypatch):
         except SystemExit as error:
             code = error.code
         report = json.loads((root / "worker-result.json").read_text())
+        (root / "controlled-boundary.json").write_text(json.dumps({
+            "active": boundary.active, "impersonations": boundary.impersonations,
+            "reverts": boundary.reverts, "closed": boundary.closed,
+            "privilege_lookups": boundary.privilege_lookups,
+            "junction_opens": boundary.junction_opens, "fatal_calls": fatal_calls,
+        }, indent=2, sort_keys=True) + "\n")
         assert report["status"] == "FAIL" and report["windows_acceptance"] is False
         return boundary, code, report, fatal_calls
 
     return run
+
+
+@pytest.mark.parametrize("luid", [(0x12345678, 7), (0x12345678, -7)])
+def test_privilege_lookup_before_impersonation_preserves_complete_local_luid(run_worker, luid):
+    boundary, code, report, fatal = run_worker(problem="lookup_active_failure", privilege_luid=luid)
+    assert code == 1 and report["error"] == "CreateFileW failed: Windows error 5"
+    assert report["junction_called"] and boundary.junction_opens == 1
+    assert boundary.privilege_lookups == [False]
+    for phase in ("preflight", "operation"):
+        assert report["token"][phase]["privileges"] == [{"low": luid[0], "high": luid[1], "attributes": 2}]
+    assert not boundary.active and boundary.impersonations == boundary.reverts == 2
+    assert boundary.closed.count(101) == boundary.closed.count(102) == 1
+    assert boundary.closed.count(103) == 2 and not fatal
+
+
+def test_privilege_lookup_prepare_failure_stops_before_impersonation_and_closes_owned_handles(run_worker):
+    boundary, code, report, fatal = run_worker(problem="lookup_prepare_failure")
+    assert code == 1 and (report["error_type"], report["error"]) == (
+        "RuntimeError", "LookupPrivilegeValueW failed: Windows error 6")
+    assert not report["junction_called"] and boundary.junction_opens == 0
+    assert boundary.privilege_lookups == [False]
+    assert not boundary.active and boundary.impersonations == boundary.reverts == 0
+    assert "preflight" not in report["token"] and "operation" not in report["token"]
+    assert boundary.closed.count(101) == boundary.closed.count(102) == 1
+    assert 103 not in boundary.closed and not fatal
+
+
+@pytest.mark.parametrize("phase", [1, 2])
+@pytest.mark.parametrize("unexpected", [(0x12345679, -7), (0x12345678, -8)])
+def test_privilege_allowlist_rejects_each_mismatched_luid_part_in_both_proofs(run_worker, phase, unexpected):
+    boundary, code, report, fatal = run_worker(
+        privilege_luid=(0x12345678, -7), enabled_luid=unexpected, privilege_phase=phase)
+    assert code == 1 and report["error"] == "unexpected enabled privilege"
+    assert not report["junction_called"] and boundary.junction_opens == 0
+    assert not boundary.active and boundary.reverts == phase
+    assert boundary.closed.count(101) == boundary.closed.count(102) == 1
+    assert boundary.closed.count(103) == phase and not fatal
 
 
 def test_fixed_width_scalars_avoid_bad_length_sizing_and_reach_the_junction_boundary(run_worker):
@@ -346,3 +402,62 @@ def test_failed_reversion_remains_terminal_without_closing_unrestored_token_hand
     assert code == 3 and fatal == [3] and report["error"] == "RevertToSelf failed: Windows error 5"
     assert not report["junction_called"] and boundary.active
     assert 101 not in boundary.closed and 102 not in boundary.closed
+
+
+def python39_junction(monkeypatch, destination=None):
+    """A followable directory link stands in for the product junction. Under the restricted
+    token, Python 3.9's Windows Path.resolve lets _getfinalpathname's WinError 5 escape
+    (pathlib catches only FileNotFoundError); 3.10+ resolves through os.path.realpath."""
+    resolve, lstat, rmdir = Path.resolve, Path.lstat, Path.rmdir
+    created = []
+
+    def install(boundary):
+        def restricted_resolve(path, *args, **kwargs):
+            if boundary.active:
+                raise PermissionError(13, "Access is denied", str(path))
+            return resolve(path, *args, **kwargs)
+
+        def junction_lstat(path):
+            info = lstat(path)
+            if path not in created:
+                return info
+            fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+            return SimpleNamespace(**(fields | {"st_reparse_tag": 0xA0000003, "st_file_attributes": 0x400}))
+
+        def cleanup_boundary(path):
+            if path in created:
+                # Stop before cleanup so this control keeps FAIL and cannot manufacture acceptance.
+                raise RuntimeError("modeled cleanup boundary")
+            return rmdir(path)
+
+        def create_directory_junction(target, link):
+            os.symlink(destination or target, link, target_is_directory=True)
+            created.append(link)
+
+        monkeypatch.setattr(Path, "resolve", restricted_resolve)
+        monkeypatch.setattr(Path, "lstat", junction_lstat)
+        monkeypatch.setattr(Path, "rmdir", cleanup_boundary)
+        return SimpleNamespace(create_directory_junction=create_directory_junction)
+
+    return install
+
+
+@pytest.mark.parametrize("elsewhere,message", [(False, "modeled cleanup boundary"),
+                                               (True, "junction target differs")])
+def test_junction_target_check_survives_python39_resolution_under_the_token(run_worker, monkeypatch, tmp_path,
+                                                                           elsewhere, message):
+    """P6 on Python 3.9 (Validate runs 41454378514, 41482747131): the worker verifies the junction
+    target without Path.resolve under the token and still rejects a junction that points elsewhere."""
+    from tests.conftest import symlink_or_skip
+
+    symlink_or_skip(tmp_path, tmp_path / "link-probe", target_is_directory=True)
+    destination = None
+    if elsewhere:
+        destination = tmp_path / "elsewhere"
+        destination.mkdir()
+        # A matching sentinel leaves the target comparison as the only check that can reject it.
+        (destination / "sentinel.txt").write_text("P6 owned sentinel\n", encoding="utf-8")
+    boundary, code, report, fatal = run_worker(junction=python39_junction(monkeypatch, destination))
+    assert code == 1 and (report["error_type"], report["error"]) == ("RuntimeError", message)
+    assert report["junction_called"] and report["junction"]["tag"] == 0xA0000003
+    assert not boundary.active and boundary.impersonations == boundary.reverts == 2 and not fatal

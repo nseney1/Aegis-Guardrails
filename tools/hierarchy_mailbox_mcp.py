@@ -84,8 +84,10 @@ def definitions(extra=(), board_specs=None):
 class Connection:
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
                  initiative=None, board=None):
-        # Grants and job runs stay out of anything a model session can call, so root has no adapter.
-        require(endpoint_parts(endpoint)[1] != "root", "root uses the controller, not the mailbox adapter")
+        # Owner-facing ROOT needs a separately qualified decision-only boundary.
+        # Legacy configured-sender transport cannot authenticate or provide it.
+        require(endpoint_parts(endpoint)[1] != "root",
+                "ROOT has no qualified decision adapter; operational controller access is forbidden")
         require(board is None or (delivery_dir is None and workspace_store is None), "a board connection takes no mailbox options")
         require((workspace_store is None) == (initiative is None),
                 "workspace store and initiative must be given together")

@@ -66,12 +66,14 @@ from hierarchy_mailbox import (GIT_ID, SHA256, SLUG, Mailbox, encoded, fields, i
                                publish_file, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
-from hierarchy_workspace import Store, absolute, check_paths, grant_next, verify_evidence  # noqa: E402
+from hierarchy_workspace import (Store, absolute, capacity_view, check_paths, grant_next, initiative_view,  # noqa: E402
+                                 verify_evidence)
 
 
 RECIPES_SCHEMA = "aegis.hierarchy-job-recipes/v1"
 PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
 RESULT_SCHEMA = "aegis.hierarchy-job-result/v1"
+RECOVERY_SCHEMA = "aegis.hierarchy-recovery-status/v1"
 COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout", "$cargo_target"}
 ENV_TOKENS = {"$scratch", "$checkout"}
 SANDBOXES = ("bwrap", "none")
@@ -90,8 +92,6 @@ MAX_PATHS = 256
 MAX_PATHS_BYTES = 65536
 # Each step leaves up to two files, and a receipt can reference 64.
 MAX_STEPS = 20
-# A claim this old with nothing readable in it was left by a runner that died while writing it.
-CLAIM_GRACE_SECONDS = 60
 MAX_RESULT_BYTES = 4194304
 MAX_JOBS_DEFAULT = 20
 MAX_TIMEOUT_SECONDS = 86400
@@ -468,23 +468,56 @@ def patient(action, wait):
             time.sleep(0.05)
 
 
+def process_scope():
+    """An absent PID is meaningful only in the original boot and PID namespace."""
+    try:
+        own = Path("/proc/self/stat").read_text(encoding="ascii").split(" ", 1)[0]
+        require(own == str(os.getpid()), "process table self witness does not match current pid")
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        namespace = os.readlink("/proc/self/ns/pid")
+    except OSError as exc:
+        raise ValueError("cannot establish process scope: " + str(exc)) from exc
+    require(re.fullmatch(r"[0-9a-f-]{36}", boot) is not None and re.fullmatch(r"pid:\[\d+\]", namespace) is not None,
+            "invalid process scope witness")
+    return {"boot_id": boot, "pid_namespace": namespace}
+
+
+def process_entries():
+    """Unlike Path.glob, explicit enumeration does not suppress unreadable-root errors."""
+    process_scope()
+    try:
+        with os.scandir("/proc") as entries:
+            paths = [Path("/proc") / entry.name for entry in entries if entry.name.isdigit()]
+    except OSError as exc:
+        raise ValueError("cannot enumerate process table: " + str(exc)) from exc
+    require(Path("/proc") / str(os.getpid()) in paths, "process table does not include its self witness")
+    return paths
+
+
 def process_start(pid):
     """Process start time, which tells a live process from a reused PID. None when it is gone or a zombie."""
     try:
         after_name = Path("/proc/%d/stat" % pid).read_text(encoding="ascii", errors="replace").rpartition(")")[2].split()
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
+    except OSError as exc:
+        raise ValueError("cannot observe process %s: %s" % (pid, exc)) from exc
+    require(len(after_name) > 19, "malformed process stat: " + str(pid))
     return None if after_name[0] in ("Z", "X") else after_name[19]
 
 
 def group_members(group):
     """Live members of a process group. Zombies cannot act, so they do not count."""
     members = []
-    for item in Path("/proc").glob("[0-9]*/stat"):
+    for process in process_entries():
+        item = process / "stat"
         try:
             after_name = item.read_text(encoding="ascii", errors="replace").rpartition(")")[2].split()
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
+        except OSError as exc:
+            raise ValueError("cannot observe process group %s: %s" % (group, exc)) from exc
+        require(len(after_name) > 2, "malformed process group stat: " + str(item))
         if after_name[2] == str(group) and after_name[0] not in ("Z", "X"):
             members.append(int(item.parent.name))
     return members
@@ -523,14 +556,17 @@ def census_command(words, kind):
 def outside_roots(owners, kind):
     """Topmost processes of this kind that no running job of this ledger started."""
     parents, heavy = {}, set()
-    for item in Path("/proc").glob("[0-9]*/cmdline"):
+    for process in process_entries():
+        item = process / "cmdline"
         pid = int(item.parent.name)
         try:
             words = [word.decode(errors="replace") for word in item.read_bytes().split(b"\0") if word]
             parents[pid] = int((item.parent / "stat").read_text(encoding="ascii", errors="replace")
                                .rpartition(")")[2].split()[1])
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ProcessLookupError):
             continue
+        except (OSError, ValueError, IndexError) as exc:
+            raise ValueError("cannot census process %s: %s" % (pid, exc)) from exc
         if census_command(words, kind):
             heavy.add(pid)
     roots = []
@@ -569,7 +605,17 @@ class Job:
             return None
         info = os.lstat(self.result_path)
         require(stat.S_ISREG(info.st_mode) and info.st_size <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
-        return strict_json(self.result_path.read_bytes().decode("utf-8"))
+        result = strict_json(self.result_path.read_bytes().decode("utf-8"))
+        require(isinstance(result, dict) and result.get("schema") == RESULT_SCHEMA, "invalid job result schema")
+        require(result.get("job") == self.id, "result does not belong to job: " + self.id)
+        require(result.get("state") in ("completed", "failed", "refused"), "invalid terminal job state")
+        require(isinstance(result.get("steps"), list), "invalid job result steps")
+        code = result.get("exit_code")
+        require((result["state"] == "refused" and code is None)
+                or (result["state"] == "completed" and type(code) is int and code == 0)
+                or (result["state"] == "failed" and type(code) is int and code != 0),
+                "job result state and exit code disagree")
+        return result
 
     def claim(self, packet_raw):
         """Exclusive, so two runners or a retry can never start the same job twice."""
@@ -579,17 +625,23 @@ class Job:
         except FileExistsError:
             return False
         ticks = process_start(os.getpid())
-        publish_file(self.claim_path, encoded({"pid": os.getpid(), "start": ticks, "job": self.id, "at": timestamp()}) + b"\n")
+        publish_file(self.claim_path, encoded({"pid": os.getpid(), "start": ticks, "job": self.id, "at": timestamp(),
+                                             "process_scope": process_scope()}) + b"\n")
         if packet_raw is not None:
             publish_file(self.folder / "packet.md", packet_raw)
         return True
 
     def runner_alive(self):
+        """True/False only with a valid original claim and observable process; otherwise unknown."""
         try:
             claim = read_json(self.claim_path)
         except (ValueError, OSError):
-            # Probably a runner that is starting right now, so unsure means alive for a moment.
-            return time.time() - self.folder.stat().st_mtime < CLAIM_GRACE_SECONDS
+            return None
+        require(isinstance(claim, dict) and claim.get("job") == self.id, "claim does not belong to job: " + self.id)
+        require(type(claim.get("pid")) is int and claim["pid"] > 0 and isinstance(claim.get("start"), str)
+                and claim["start"].isdigit(), "invalid runner claim: " + self.id)
+        if claim.get("process_scope") != process_scope():
+            return None
         return process_start(claim["pid"]) == claim["start"]
 
     def process_record(self):
@@ -630,6 +682,13 @@ def receipt_id(job, state):
     return "receipt-" + hashlib.sha256(job.message["message_id"].encode()).hexdigest()[:24] + "-" + state
 
 
+def receipt_matches(job, prior, receipt, body):
+    """A stable ID alone is not delivery of this result. A successor may preserve the original sender generation."""
+    return (prior.get("type") == "job_receipt" and prior.get("from") == job.message["to"]
+            and prior.get("to") == job.message["from"] and prior.get("in_reply_to") == job.message["message_id"]
+            and prior.get("receipt") == receipt and prior.get("body") == body)
+
+
 def publish_receipt(job, state, body, wait, *, exit_code=None, evidence=None, reason=None):
     message = job.message
     root = Path(job.initiative["mailbox_root"])
@@ -645,7 +704,11 @@ def publish_receipt(job, state, body, wait, *, exit_code=None, evidence=None, re
     def attempt():
         with writer_lock(root):
             mailbox = Mailbox(root)
-            if identifier in mailbox.messages():
+            existing = mailbox.messages().get(identifier)
+            if existing is not None:
+                prior = existing["message"]
+                require(receipt_matches(job, prior, receipt, body),
+                        "receipt id already names different evidence: " + identifier)
                 return
             binding = mailbox.current_binding(message["to"])
             mailbox.publish({"message_id": identifier, "from": message["to"], "to": message["from"], "host": binding["host"],
@@ -684,9 +747,27 @@ def result_body(job, result):
     return "\n\n".join(lines)
 
 
+def check_settlement_processes(job, result):
+    """Read-only stop-evidence check shared by settlement and its recovery report."""
+    claim = read_json(job.claim_path)
+    require(isinstance(claim, dict) and claim.get("job") == job.id and claim.get("process_scope") == process_scope(),
+            "job process scope is unknown: " + job.id)
+    record = job.process_record()
+    if result["steps"] and result.get("process_stopped_confirmed") is not True:
+        require(record is not None and type(record.get("step")) is int and record["step"] == len(result["steps"])
+                and type(record.get("group")) is int and record["group"] > 0,
+                "executed steps lack process stop evidence: " + job.id)
+    group = job.process_group()
+    require(not group or (type(group) is int and group > 0), "invalid job process group")
+    require(not (group and group_members(group)), "job process group is still running: " + str(group))
+    require(not job.unrecorded_step() or result.get("process_stopped_confirmed") is True,
+            "job has an unrecorded process effect: " + job.id)
+
+
 def settle(store, job, wait):
     """Finish a job whose result exists. Each step checks first, so this is safe to repeat after a crash."""
     result = job.result()
+    check_settlement_processes(job, result)
     state = result["state"]
     evidence = job.evidence() if state != "refused" else None
     publish_receipt(job, state, result_body(job, result), wait, exit_code=result["exit_code"], evidence=evidence,
@@ -888,10 +969,10 @@ class StillRunning(Exception):
 def stop_for_certain(process):
     try:
         stop_group(process)
-    except (OSError, subprocess.SubprocessError) as exc:
+        if group_members(process.pid):
+            raise StillRunning(process.pid, "members were left after the stop")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise StillRunning(process.pid, str(exc)[:512]) from exc
-    if group_members(process.pid):
-        raise StillRunning(process.pid, "members were left after the stop")
 
 
 def command_steps(recipe, packet, recipes, job):
@@ -1114,6 +1195,15 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         write_result(job, "refused", None, reason="HEAD points at %s now, not %s as at admit, so the swap would move another "
                      "branch" % (branch or "no branch", packet["head_ref"] or "no branch"))
         return settle(store, job, wait)
+    if recipe["kind"] == "commit":
+        # Admission can precede a capacity wait or claim publication. A lease acquired
+        # in between still owns its paths, even though the source bytes did not move.
+        try:
+            code, overlap = check_paths(store.load(), job.initiative["id"], packet["paths"])
+            require(code == 0, json.dumps(overlap, sort_keys=True)[:2048])
+        except ERRORS as exc:
+            write_result(job, "refused", None, reason="path ownership changed before execution: " + str(exc)[:2048])
+            return settle(store, job, wait)
 
     def announce():
         publish_receipt(job, "started", "Job %s started." % job.id, wait)
@@ -1159,8 +1249,11 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
                           "expected_tree": packet["expected_tree"], "tree": details.get("tree"),
                           "new_commit": details.get("new_commit"), "config": list(MERGE_CONFIG),
                           "head_ref": packet["head_ref"], "git_version": details.get("git_version")}
+    # run_step guards every launched process with stop_for_certain, including a failed
+    # process-record write. Unknown stop evidence raises StillRunning above and cannot
+    # reach this result. Preserve that confirmation when the last group record is absent.
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
-                 steps=rows, before=before, after=after, commit=commit, **extra)
+                 steps=rows, before=before, after=after, commit=commit, process_stopped_confirmed=True, **extra)
     # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other
     # failed jobs keep the rest of their work for diagnosis until root runs clean.
     names = WORK_FOLDERS if not reason or recipe.get("heavy_tests", False) else ("cargo-target",)
@@ -1195,7 +1288,11 @@ def visit_existing(store, job, wait):
     if not job.folder.exists():
         return None
     group = job.process_group()
-    if job.runner_alive():
+    runner = job.runner_alive()
+    if runner is None:
+        return {"job": job.id, "state": "abandoned", "process_group": group, "process_alive": None,
+                "reason": "runner visibility is unknown; retain the original claim and reservation"}
+    if runner:
         return {"job": job.id, "state": "running", "process_group": group}
     alive = bool(group and group_members(group))
     unrecorded = job.unrecorded_step()
@@ -1296,7 +1393,13 @@ def census(store_path, ledger, fixture, kind):
         if request["holder"].startswith("job:"):
             claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
             if claim.exists():
-                owners.add(read_json(claim)["pid"])
+                record = read_json(claim)
+                require(isinstance(record, dict) and record.get("job") == request["holder"][4:]
+                        and type(record.get("pid")) is int and record["pid"] > 0
+                        and isinstance(record.get("start"), str) and record["start"].isdigit(),
+                        "invalid runner claim: " + request["holder"][4:])
+                if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
+                    owners.add(record["pid"])
     return {"limit": ledger.limits[kind], "held": len(held), "external_roots": outside_roots(owners, kind), "census": "proc"}
 
 
@@ -1412,14 +1515,17 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     require(record is not None and folder.exists(), "no running job here: " + identifier)
     job = Job(store.path, initiative, record["message"])
     require(not job.result_path.exists(), "job is already finished: " + identifier)
-    require(not job.runner_alive(), "its runner is still running: " + identifier)
+    runner = job.runner_alive()
+    require(runner is not None, "runner visibility is unknown: " + identifier)
+    require(not runner, "its runner is still running: " + identifier)
     group = job.process_group()
     require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
     unrecorded = job.unrecorded_step()
     if unrecorded:
         require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
                 "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
-    write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True)
+    write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
+                 process_stopped_confirmed=process_stopped)
     return 0, settle(store, job, wait)
 
 
@@ -1470,6 +1576,146 @@ def clean_finished(store_path, initiative_id):
                "not_finished": not_finished}
 
 
+def recovery_source(job, mailbox, result):
+    """Observe the original packet and current source without admitting or running it."""
+    if mailbox is None or "brief" not in job.message:
+        return {"state": "unavailable", "reason": "original mailbox request is unavailable"}
+    packet = strict_json(packet_text(mailbox.brief(job.message["brief"])))
+    require(isinstance(packet, dict) and packet.get("schema") == PACKET_SCHEMA, "invalid recovery packet")
+    checkout = absolute(packet["checkout"], "checkout")
+    require(checkout in job.initiative["checkouts"], "checkout is no longer registered for this initiative")
+    view = MERGE_VIEW_ENV if "merge" in packet else None
+    observed = source_state(mailbox, checkout, view)
+    expected = {"source_revision": packet["commit"], "source_tree": packet["tree"],
+                "dirty_content_sha256": packet.get("dirty_content_sha256", EMPTY_STATUS)}
+    # A completed commit/merge changes source intentionally. Its after-witness, not the old packet,
+    # is the reference for later incoming-work revalidation; the original packet remains untouched.
+    if result is not None and isinstance(result.get("after"), dict):
+        expected = {key: result["after"].get(key) for key in expected}
+    return {"state": "match" if all(observed.get(key) == value for key, value in expected.items()) else "changed",
+            "expected": expected, "observed": observed}
+
+
+def recovery_job(store, ledger, initiative, message, records, mailbox):
+    job = Job(store.path, initiative, message)
+    reservations = [dict(r) for r in ledger.requests.values() if r["holder"] == job.holder]
+    held = any(r["state"] in ("queued", "granted") for r in reservations)
+    row = {"job": job.id, "owner": initiative["id"] + "/orchestrator", "reservations": reservations,
+           "claim": None, "runner_alive": None, "process_alive": None, "receipt": "not_published",
+           "source": {"state": "unavailable"}, "next_action": "Revalidate the original source and admission before run-open."}
+    result = None
+    try:
+        if job.folder.exists():
+            if job.claim_path.exists():
+                row["claim"] = read_json(job.claim_path)
+            result = job.result()
+            if result is None:
+                row["runner_alive"] = job.runner_alive()
+                group = job.process_group()
+                row["process_group"] = group
+                row["process_alive"] = bool(group_members(group)) if group else None
+                row["state"] = "running" if row["runner_alive"] is True else "unknown_effect"
+                row["next_action"] = "Retain the original reservation; a qualified operator must reconcile process effects."
+            else:
+                check_settlement_processes(job, result)
+                row["result"] = {"path": str(job.result_path), "sha256": file_sha256(job.result_path),
+                                 "state": result["state"], "exit_code": result["exit_code"]}
+                row["retained_outputs"] = result.get("kept", [])
+                receipt = {"state": result["state"]}
+                if result["exit_code"] is not None:
+                    receipt["exit_code"] = result["exit_code"]
+                if result["state"] != "refused":
+                    receipt["evidence"] = job.evidence()
+                if result.get("reason") is not None:
+                    receipt["reason"] = result["reason"][:4096]
+                prior = records.get(receipt_id(job, result["state"]))
+                if prior is not None:
+                    row["receipt"] = ("match" if "from" in message and receipt_matches(
+                        job, prior["message"], receipt, result_body(job, result)) else "mismatch")
+                row["state"] = "finished" if row["receipt"] == "match" and not held else "settle_pending"
+                row["next_action"] = ("Retain evidence for independent acceptance." if row["state"] == "finished" else
+                                      "Reconcile the exact receipt and result; run-open may settle without rerunning the job.")
+        else:
+            row["state"] = "reserved_not_started" if held else "pending"
+        row["source"] = recovery_source(job, mailbox, result)
+        if row["source"]["state"] == "changed":
+            row["next_action"] = "Revalidate incoming source before dependent work; retain the historical result and claim."
+    except ERRORS as exc:
+        row.update(state="evidence_error", error=str(exc)[:2048],
+                   next_action="Preserve all evidence and capacity; reconcile the unavailable or inconsistent record.")
+    return row
+
+
+def recovery_status(store_path, chosen=()):
+    """Read-only, replayable inventory; observations never grant, release, resolve or transfer ownership."""
+    require(isinstance(chosen, (tuple, list)) and all(isinstance(item, str) for item in chosen), "invalid initiatives")
+    store = Store(store_path)
+    ledger = store.load()
+    for identifier in chosen:
+        ledger.initiative(identifier)
+    initiatives = sorted((i for i in ledger.initiatives.values() if not chosen or i["id"] in chosen),
+                         key=lambda i: (i["priority"], i["id"]))
+    rows, blockers, teams, process_census = [], [], [], {}
+    for kind in HEAVY_KINDS:
+        try:
+            observed = census(store.path, ledger, None, kind)
+            process_census[kind] = {**observed, "state": "observed", "admission_free": max(
+                0, observed["limit"] - observed["held"] - len(observed["external_roots"]))}
+        except ERRORS as exc:
+            process_census[kind] = {"state": "unavailable", "admission_free": None, "error": str(exc)[:512]}
+            blockers.append({"kind": kind, "owner": "qualified operator", "reason": "census_unavailable",
+                             "next_action": "Restore process visibility in the original scope; do not admit or release work."})
+    for initiative in initiatives:
+        owner = initiative["id"] + "/orchestrator"
+        team = initiative_view(ledger, initiative["id"])
+        teams.append(team)
+        if team["blocked_by"] or team["base_moved"] or team["state"] != "active":
+            blockers.append({"initiative": initiative["id"], "owner": owner, "reason": "initiative_pending",
+                             "next_action": "Resolve dependencies/state and revalidate the exact incoming source."})
+        records, mailbox = {}, None
+        if "mailbox_root" in initiative:
+            try:
+                mailbox = Mailbox(initiative["mailbox_root"])
+                records = mailbox.messages()
+            except ERRORS as exc:
+                blockers.append({"initiative": initiative["id"], "owner": owner, "reason": "mailbox_unavailable",
+                                 "error": str(exc)[:512], "next_action": "Restore visibility; retain all reservations."})
+        messages = {identifier: record["message"] for identifier, record in records.items()
+                    if record["message"]["type"] == "job_request"}
+        prefix = "job:" + initiative["id"] + "/"
+        for request in ledger.requests.values():
+            if request["initiative"] != initiative["id"]:
+                continue
+            if request["holder"].startswith(prefix):
+                identifier = request["holder"][len(prefix):]
+                matching(identifier, SLUG, "job message id")
+                messages.setdefault(identifier, {"message_id": identifier})
+            elif request["state"] in ("granted", "queued"):
+                blockers.append({"initiative": initiative["id"], "request_id": request["request_id"],
+                                 "holder": request["holder"], "owner": owner, "reason": "retained_reservation",
+                                 "next_action": "Correlate original actor/source and terminal evidence; TTL is not release evidence."})
+        base = safe_path(store.path / "jobs" / initiative["id"])
+        for folder in sorted(base.iterdir()) if base.is_dir() else []:
+            safe_path(folder)
+            require(folder.is_dir() and SLUG.fullmatch(folder.name) is not None, "unexpected job directory: " + str(folder))
+            messages.setdefault(folder.name, {"message_id": folder.name})
+        for message in messages.values():
+            row = recovery_job(store, ledger, initiative, message, records, mailbox)
+            rows.append(row)
+            if row["state"] != "finished" or row["source"]["state"] == "changed":
+                blockers.append({"job": row["job"], "owner": owner, "reason": row["state"],
+                                 "next_action": row["next_action"]})
+        if initiative["touched_paths"]:
+            _, team["paths"] = check_paths(ledger, initiative["id"], initiative["touched_paths"])
+            if team["paths"]["conflict"]:
+                blockers.append({"initiative": initiative["id"], "owner": owner, "reason": "path_conflict",
+                                 "next_action": "Agree path ownership with the retaining team before admission."})
+    return (3 if blockers else 0), {"schema": RECOVERY_SCHEMA, "read_only": True, "seq": ledger.seq,
+                                   "capacity": capacity_view(ledger), "capacity_scope": "ledger_only",
+                                   "process_census": process_census, "initiatives": teams, "jobs": rows,
+                                   "blockers": blockers, "native_qualification": "not_established"}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--store", help="Absolute path to the workspace store")
@@ -1482,6 +1728,8 @@ def main(argv=None):
     opened = commands.add_parser("run-open", help="Run every job request that can run now")
     opened.add_argument("--initiative", action="append", default=[], help="Only this initiative; can repeat")
     opened.add_argument("--max-jobs", type=int, default=MAX_JOBS_DEFAULT)
+    recovery = commands.add_parser("recovery-status", help="Read retained reservations, source and unknown job effects")
+    recovery.add_argument("--initiative", action="append", default=[])
     commands.add_parser("check-recipes", help="Validate the recipe file and summarize it")
     resolved = commands.add_parser("resolve", help="Close a job whose runner stopped, once nothing of it is running")
     resolved.add_argument("--job", required=True, help="<initiative>/<message-id>")
@@ -1498,6 +1746,8 @@ def main(argv=None):
         require(args.command == "source-digest" or args.store is not None, "--store is required")
         if args.command == "source-digest":
             code, result = source_digest(args.checkout)
+        elif args.command == "recovery-status":
+            code, result = recovery_status(args.store, args.initiative)
         elif args.command == "resolve":
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait, args.process_stopped)
         elif args.command == "clean" and args.job is None:

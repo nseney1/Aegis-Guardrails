@@ -29,7 +29,7 @@ def test_every_role_has_a_template(role):
     assert (TEMPLATES / "roles" / (role + ".md")).read_text(encoding="utf-8").strip()
 
 
-@pytest.mark.parametrize("name, limit", [("roles/root.md", 90), ("roles/front-door.md", 60), ("roles/orchestrator.md", 60),
+@pytest.mark.parametrize("name, limit", [("roles/front-door.md", 60), ("roles/orchestrator.md", 60),
                                          ("roles/lane.md", 60), ("lane-brief.md", 60)])
 def test_templates_state_the_owners_rotation_limit(name, limit):
     words = " ".join((TEMPLATES / name).read_text(encoding="utf-8").split())
@@ -101,23 +101,23 @@ def test_orchestrators_bind_by_kind_and_list_governance_paths_without_a_fixed_wr
     assert "three concurrent writers" not in words("roles/orchestrator.md")
 
 
-def test_root_changes_limits_and_stops_earlier_roots_lanes_only_under_owner_decisions():
-    assert missing("roles/root.md", ["only from an owner decision, with `set-limits`",
+def test_archived_operator_changes_limits_and_stops_earlier_roots_lanes_only_under_owner_decisions():
+    assert missing("roles/operator.md", ["only from an owner decision, with `set-limits`",
                                      "a finished, orchestrator-verified lane that an earlier ROOT launched",
                                      "approve that specific stop", "never work around the refusal"]) == []
 
 
-def test_root_launch_prompts_copy_the_briefs_deadline_and_the_exact_self_stop_line():
-    assert missing("roles/root.md", ["copy the brief's deadline", "the brief wins over a default", SELF_STOP,
+def test_archived_operator_launch_prompts_copy_the_briefs_deadline_and_the_exact_self_stop_line():
+    assert missing("roles/operator.md", ["copy the brief's deadline", "the brief wins over a default", SELF_STOP,
                                      "send one line saying so, and never stop another session"]) == []
 
 
-def test_root_stops_the_outgoing_session_and_checks_its_pid():
-    assert missing("roles/root.md", ["stop the outgoing session", "verify its PID is gone"]) == []
+def test_archived_operator_stops_the_outgoing_session_and_checks_its_pid():
+    assert missing("roles/operator.md", ["stop the outgoing session", "verify its PID is gone"]) == []
 
 
-def test_root_releases_a_live_lanes_grant_only_on_all_four_conditions():
-    assert missing("roles/root.md", ["only when all four hold", "it reported done", "verified the report against git",
+def test_archived_operator_releases_a_live_lanes_grant_only_on_all_four_conditions():
+    assert missing("roles/operator.md", ["only when all four hold", "it reported done", "verified the report against git",
                                      "no `waitingFor`", "no claimed job and no open accepted dispatch",
                                      "with the session id and the verified tip and tree",
                                      "Nobody messages a released lane", "only its verified tip merges"]) == []
@@ -219,7 +219,7 @@ def test_the_corrected_lane_facts_and_attributions_stay_pinned():
     assert missing("lane-brief.md", ["(layout f, T38 and T48)"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/operator.md"])
 def test_managers_follow_the_launch_order_bind_quietly_and_close_dispatches(name):
     assert missing(name, ["worktree → lease → writer → bind → launch → dispatch → accept",
                           "Every writing dispatch names a lease, which ROOT claims before the launch",
@@ -228,7 +228,7 @@ def test_managers_follow_the_launch_order_bind_quietly_and_close_dispatches(name
                           "Close a dispatch before its worktree is removed", "\"git identity check failed\""]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/operator.md"])
 def test_handoffs_carry_the_owner_approved_backlog_table_verbatim(name):
     assert missing(name, ["\"Owner-approved backlog\" table, copied forward verbatim",
                           "done (with evidence) or retired by a cited record",
@@ -250,26 +250,26 @@ def test_orchestrators_relay_cross_team_requests_through_root_and_address_roles_
     assert "Cross-hierarchy findings go orchestrator to orchestrator" not in words("roles/orchestrator.md")
 
 
-@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/operator.md"])
 def test_no_template_names_a_resolve_endpoint_command_or_a_later_listagents_name(name):
     assert "resolve --endpoint" not in words(name)
     assert "any later N that ListAgents shows" not in words(name)
 
 
-def test_root_names_current_holders_keeps_codex_liveness_and_fetches_without_maintenance():
-    assert missing("roles/root.md", ["never a predicted number", "lane liveness, stall checks and retirements",
+def test_archived_operator_names_current_holders_keeps_codex_liveness_and_fetches_without_maintenance():
+    assert missing("roles/operator.md", ["never a predicted number", "lane liveness, stall checks and retirements",
                                      "(F-C12)"] + BY_BINDING + [
                                      "`git ls-remote` or `gh api`",
                                      "`git fetch --no-auto-maintenance --no-write-fetch-head origin <full sha>`",
                                      "(the T14 trap)"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md"])
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/operator.md"])
 def test_managers_never_call_enter_worktree(name):
     assert missing(name, ["Never call `EnterWorktree` and keep the launch cwd"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/root.md", "roles/reviewer.md"])
+@pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/operator.md", "roles/reviewer.md"])
 def test_managers_and_reviewers_keep_the_launch_cwd(name):
     assert missing(name, ["not even inside a compound command or a subshell", "Run `pwd` before the first Write",
                           "run one lone `cd <launch cwd>` and report it"]) == []
@@ -280,14 +280,14 @@ def test_stop_wording_orders_the_routes_and_adds_no_new_authority():
     assert missing("roles/orchestrator.md", ["Your outgoing session stops (root's `stop`, then T99 c) "
                                              "before checkpoint replacement"]) == []
     assert "Stop the outgoing session before checkpoint replacement" not in words("roles/orchestrator.md")
-    assert missing("roles/root.md", ["send `stop` first", "use your own T93 stop only if the session has not stopped",
+    assert missing("roles/operator.md", ["send `stop` first", "use your own T93 stop only if the session has not stopped",
                                      "never send `stop` after your own stop was refused",
                                      "T114 below for a lane an earlier ROOT launched",
                                      "the retiring rule (F5, above) for your own launches"]) == []
 
 
-def test_root_limits_each_test_and_lets_the_briefs_run_timeout_win():
-    assert missing("roles/root.md", ["\"stop any test over N minutes\" limits each test",
+def test_archived_operator_limits_each_test_and_lets_the_briefs_run_timeout_win():
+    assert missing("roles/operator.md", ["\"stop any test over N minutes\" limits each test",
                                      "the brief's own run timeout wins"]) == []
 
 
@@ -307,7 +307,7 @@ def test_reviewers_publish_exactly_an_ack_and_a_review_for_a_mailbox_dispatch():
 
 
 def test_the_corrected_manager_facts_and_attributions_stay_pinned():
-    assert missing("roles/root.md", ["with the T93 checks below",
+    assert missing("roles/operator.md", ["with the T93 checks below",
                                      "`python3 /absolute/prototype/tools/hierarchy_handoff.py --spec "
                                      "/absolute/handoff-spec.json`", "**Launches, T1 and T26.**"]) == []
     assert missing("roles/orchestrator.md", ["(`set-limits`, T59 and T63)", "**Writing lanes, T38 and T48.**"]) == []
@@ -413,5 +413,5 @@ def test_the_job_recipe_template_needs_local_values_then_passes_its_own_check(tm
     assert all(recipe["sandbox"] == "bwrap" for recipe in recipes["recipes"].values())
 
 
-def test_root_has_no_assistant_list():
+def test_archived_operator_has_no_assistant_list():
     assert not (TEMPLATES / "claude-agents" / "assistants-root.json").exists()

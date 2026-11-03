@@ -27,6 +27,7 @@ from hierarchy_mailbox import Mailbox, endpoint_parts, read_json, require, safe_
 from hierarchy_meter import ROOT_LIMIT_SECONDS, measure  # noqa: E402
 from hierarchy_wake import wake  # noqa: E402
 from hierarchy_workspace import Store  # noqa: E402
+from hierarchy_lifecycle import Lifecycle  # noqa: E402
 
 
 MAX_ROUNDS = 100
@@ -123,14 +124,18 @@ def root_time(binding):
     return {**row, "state": meter["state"], "active_seconds": meter["active_seconds"], "limit": meter["limit"]}
 
 
-def remaining(initiatives):
+def remaining(initiatives, broken=None, rows=None):
     """Described from the mailboxes as they are now, because a round's own view goes stale as turns publish."""
     still_unread, root_queue, root_sessions = [], [], {}
     for initiative in initiatives:
         try:
             found, jobs = summaries(initiative)
-        except ERRORS:
-            continue  # Already reported as a mailbox_error row.
+        except ERRORS as exc:
+            if rows is not None and (broken is None or initiative["id"] not in broken):
+                rows.append({"initiative": initiative["id"], "state": "mailbox_error", "error": str(exc)[:512]})
+            if broken is not None:
+                broken.add(initiative["id"])
+            continue
         for name, summary in found.items():
             entry = {"initiative": initiative["id"], "endpoint": name, "unread_count": summary["unread_count"]}
             if is_root(name):
@@ -144,7 +149,7 @@ def remaining(initiatives):
     return still_unread, root_queue, [root_time(binding) for binding in root_sessions.values()]
 
 
-def run(store_path, rounds, chosen, dry_run):
+def run(store_path, rounds, chosen, dry_run, lifecycle_path=None):
     require(type(rounds) is int and 0 < rounds <= MAX_ROUNDS, "invalid rounds")
     ledger = Store(store_path).load()
     for identifier in chosen:
@@ -153,14 +158,32 @@ def run(store_path, rounds, chosen, dry_run):
                           and "delivery_dir" in i and (not chosen or i["id"] in chosen)),
                          key=lambda i: (i["priority"], i["id"]))
     rows, tried, broken = [], set(), set()
+    lifecycle = {"state": "untracked", "work_complete": False, "coverage": "untracked", "execution_enabled": False}
+    if lifecycle_path is not None:
+        try:
+            lifecycle = Lifecycle(lifecycle_path).status()
+        except ERRORS + (TypeError, KeyError) as exc:
+            lifecycle = {"state": "hold", "work_complete": False, "execution_enabled": False, "error": str(exc)}
+            still_unread, root_queue, root_times = remaining(initiatives, broken, rows)
+            return 3, {"rounds": 0, "quiet": False, "mail_quiet": not still_unread and not root_queue and not broken,
+                       "work_complete": False, "lifecycle": lifecycle, "rows": rows, "still_unread": still_unread,
+                       "root_queue": root_queue, "root_time": root_times, "rotate_needed": []}
     completed = 0
     while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run):
         completed += 1
-    still_unread, root_queue, root_times = remaining(initiatives)
+    still_unread, root_queue, root_times = remaining(initiatives, broken, rows)
     rotate = [{key: row[key] for key in ("initiative", "endpoint", "session")}
               for row in rows if row["state"] == "rotate_needed"]
-    quiet = not still_unread and not root_queue and not broken
-    return (0 if quiet else 3), {"rounds": completed, "quiet": quiet, "rows": rows, "still_unread": still_unread,
+    mail_quiet = not still_unread and not root_queue and not broken
+    if lifecycle_path is not None:
+        try:
+            lifecycle = Lifecycle(lifecycle_path).status()
+        except ERRORS + (TypeError, KeyError) as exc:
+            lifecycle = {"state": "hold", "work_complete": False, "execution_enabled": False, "error": str(exc)}
+    quiet = mail_quiet and (lifecycle_path is None or lifecycle["work_complete"])
+    return (0 if quiet else 3), {"rounds": completed, "quiet": quiet, "mail_quiet": mail_quiet,
+                                 "work_complete": lifecycle["work_complete"], "lifecycle": lifecycle,
+                                 "rows": rows, "still_unread": still_unread,
                                  "root_queue": root_queue, "root_time": root_times, "rotate_needed": rotate}
 
 
@@ -170,10 +193,11 @@ def main(argv=None):
     parser.add_argument("--rounds", type=int, default=1, help="Repeat while sessions are still being woken")
     parser.add_argument("--initiative", action="append", default=[], help="Only sweep this initiative; can repeat")
     parser.add_argument("--dry-run", action="store_true", help="Report what would happen; write and launch nothing")
+    parser.add_argument("--lifecycle", help="Read-only evidence ledger; its obligations remain distinct from mail quiet")
     args = parser.parse_args(argv)
     try:
         safe_path(args.store)
-        code, result = run(args.store, args.rounds, args.initiative, args.dry_run)
+        code, result = run(args.store, args.rounds, args.initiative, args.dry_run, args.lifecycle)
     except ERRORS as exc:
         code, result = 2, {"error": str(exc)}
     print(json.dumps(result, sort_keys=True))

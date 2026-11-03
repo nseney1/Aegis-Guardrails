@@ -288,8 +288,8 @@ jobs:
           python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
           python -m pytest tests/ -q -n auto
 
-      # Shared source preparation for Go and P6. The identical pinned AC24 helper
-      # is a proposed common payload; the separate acquisition patch remains held.
+      # Shared clean source for Go, P6 and AC24; the pinned AC24 helper is their common
+      # ownership payload. The AC24 acquisition below is owner-approved (decision A).
       - name: Prepare clean tracked source for language acceptance
         id: language-source
         env:
@@ -399,6 +399,83 @@ jobs:
           name: aegis-go-windows-${{ matrix.python-version }}-${{ github.run_attempt }}
           if-no-files-found: warn
           path: ${{ runner.temp }}/aegis-go-curated-${{ matrix.python-version }}/
+
+      # AC24 (owner decision A, 2026-11-02): the owner approved this pinned, locked network
+      # acquisition of the unchanged M0 fixture as an exception to the no-download and cap rules.
+      # ac24_acquire.py allows only npm ci --ignore-scripts from registry.npmjs.org with SHA512
+      # integrity, a 600 s bound and 0 retries. Both scripts refuse a dirty or mismatched tree,
+      # so they run on the shared clean source rather than the test-suite workspace.
+      - name: Record existing Node for AC24 acceptance
+        env:
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          python -I -S - "$RUNNER_TEMP/aegis-ac24-tools-$AEGIS_PYTHON_LEG.json" <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess, sys
+          result = {"platform": sys.platform, "python": sys.version, "tools": {}}
+          env = dict(os.environ)
+          env.pop("NODE_OPTIONS", None)
+          for name, flag in (("node", "--version"),):
+              found = shutil.which(name)
+              row = {"available": found is not None}
+              if found:
+                  path = pathlib.Path(found).resolve()
+                  done = subprocess.run([str(path), flag], cwd=os.environ["RUNNER_TEMP"], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                  row.update(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                             exit=done.returncode, stdout=done.stdout, stderr=done.stderr)
+              result["tools"][name] = row
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(result, indent=2), encoding="utf-8")
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Acquire the complete locked M0 Windows test fixture
+        env:
+          AEGIS_LANGUAGE_SOURCE: ${{ steps.language-source.outputs.source }}
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          python -I -S -B "$AEGIS_LANGUAGE_SOURCE/.github/scripts/ac24_acquire.py" \
+            --source "$AEGIS_LANGUAGE_SOURCE" --kit "$AEGIS_LANGUAGE_SOURCE/.github/fixtures/ac24" \
+            --root "$RUNNER_TEMP/aegis-ac24-acquisition-$AEGIS_PYTHON_LEG" \
+            --execute-locked-acquisition
+
+      - name: Verify real Vitest Windows snapshot junction
+        env:
+          AEGIS_LANGUAGE_SOURCE: ${{ steps.language-source.outputs.source }}
+          AEGIS_LANGUAGE_AUDIT: ${{ steps.language-source.outputs.audit }}
+          AEGIS_LANGUAGE_TREE: ${{ steps.language-source.outputs.tree }}
+          AEGIS_PYTHON_LEG: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          AC24_KIT="$AEGIS_LANGUAGE_SOURCE/.github/fixtures/ac24"
+          AC24_ROOT="$RUNNER_TEMP/aegis-ac24-acquisition-$AEGIS_PYTHON_LEG"
+          AC24_NODE="$(python -I -S -c 'import json,pathlib,sys; r=json.loads(pathlib.Path(sys.argv[1]).read_text()); assert r["status"]=="PASS", "M0 acquisition failed"; print(r["tools"]["node"])' "$AC24_ROOT/execution.json")"
+          python -I -S -B "$AC24_KIT/acceptance.py" \
+            --source "$AEGIS_LANGUAGE_SOURCE" --expected-audit "$AEGIS_LANGUAGE_AUDIT" \
+            --expected-tree "$AEGIS_LANGUAGE_TREE" \
+            --node "$AC24_NODE" --node-modules "$AC24_ROOT/project/node_modules" \
+            --fixture "$AC24_KIT/fixture" --package-lock "$AC24_KIT/m0-package-lock.json" \
+            --evidence "$RUNNER_TEMP/aegis-ac24-evidence-$AEGIS_PYTHON_LEG" \
+            --require-platform win32 --require-link junction
+
+      - name: Preserve AC24 acquisition and acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: aegis-ac24-windows-${{ matrix.python-version }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/aegis-ac24-tools-${{ matrix.python-version }}.json
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/*.json
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/node-identity/*.json
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/node-identity/*.log
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/npm-identity/*.json
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/npm-identity/*.log
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/npm-ci/*.json
+            ${{ runner.temp }}/aegis-ac24-acquisition-${{ matrix.python-version }}/npm-ci/*.log
+            ${{ runner.temp }}/aegis-ac24-evidence-${{ matrix.python-version }}/*.json
+            ${{ runner.temp }}/aegis-ac24-evidence-${{ matrix.python-version }}/*.log
+            ${{ runner.temp }}/aegis-ac24-evidence-${{ matrix.python-version }}/*.xml
 
   # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
   # once every job passed, only on the events doctor --release consumes (not release, not PRs).
