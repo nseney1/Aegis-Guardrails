@@ -107,6 +107,10 @@ MERGE_CONFIG = ("merge.renames=true", "merge.directoryRenames=false", "merge.ren
 # The built-in merge drivers as check-attr reports them: unspecified or set is text, unset is binary.
 BUILT_IN_MERGE = {b"unspecified", b"set", b"unset", b"text", b"binary"}
 PINNED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+# The merge steps' view of the owner's files: no global or system config, and a HOME and XDG_CONFIG_HOME that hold
+# nothing, so no global excludes or attributes. A merge's clean checks read status this way too, so a file only the owner's
+# global excludes ignore counts as uncommitted there, and read-tree never meets it as a surprise after HEAD has moved.
+MERGE_VIEW_ENV = {**PINNED_GIT_ENV, "HOME": os.devnull, "XDG_CONFIG_HOME": os.devnull}
 HOME_FOLDERS = {"HOME": "", "USERPROFILE": "", "APPDATA": "AppData/Roaming", "LOCALAPPDATA": "AppData/Local",
                 "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude", "XDG_CONFIG_HOME": ".config",
                 "XDG_CACHE_HOME": ".cache", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
@@ -331,10 +335,11 @@ def merge_refusals(checkout, commit, merge):
             "neither side changed are filtered or merged; send this merge to an integrator lane: " + ", ".join(edited)[:1024])
 
 
-def uncommitted_content(checkout):
-    """Git status names the paths that differ, not their bytes, so one status can hide different content."""
+def uncommitted_content(checkout, view=None):
+    """Git status names the paths that differ, not their bytes, so one status can hide different content. `view` overrides
+    part of the environment, as a merge's checks do to read status the way its steps do."""
     status = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                            cwd=checkout, capture_output=True, timeout=120)
+                            cwd=checkout, env={**os.environ, **view} if view else None, capture_output=True, timeout=120)
     require(status.returncode == 0, "could not read the status of " + str(checkout))
     refuse_submodules(checkout)
     tokens = status.stdout.split(b"\0")
@@ -356,8 +361,8 @@ def uncommitted_content(checkout):
     return digest.hexdigest(), count
 
 
-def source_state(mailbox, checkout):
-    return {**mailbox.source_witness(checkout), "dirty_content_sha256": uncommitted_content(checkout)[0]}
+def source_state(mailbox, checkout, view=None):
+    return {**mailbox.source_witness(checkout), "dirty_content_sha256": uncommitted_content(checkout, view)[0]}
 
 
 def source_digest(checkout):
@@ -410,12 +415,13 @@ def admit(ledger, initiative, message, mailbox, recipes):
         matching(packet["merge"], GIT_ID, "merge")
         require(packet["merge"] != packet["commit"], "merge equals commit, so it would make no change")
         # Clean before, so that afterward the checkout can be compared with exactly the merged tree.
-        count = uncommitted_content(checkout)[1]
-        require(count == 0, "a merge needs a clean worktree, and this one has %d uncommitted entries" % count)
+        count = uncommitted_content(checkout, MERGE_VIEW_ENV)[1]
+        require(count == 0, "a merge needs a clean worktree, and this one has %d uncommitted entries, read as the merge steps "
+                "read them: without the owner's global excludes" % count)
         require(dirty == EMPTY_STATUS, "a merge needs a clean worktree, so dirty_content_sha256 must be the empty digest")
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
-    witness = source_state(mailbox, checkout)
+    witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None)
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
             (packet["commit"], packet["tree"], dirty), "source does not match the packet")
     if kind == "merge":
@@ -835,7 +841,8 @@ def job_environment(recipes, job, checkout):
 class Step:
     def __init__(self, argv, env=None, capture=False, verdict=False):
         # A verdict step's exit is the plan's to judge: it receives (exit code, output), so a non-zero exit can halt the
-        # job with a reason of its own, such as the conflicted paths, instead of a bare exit code.
+        # job with a reason of its own, such as the conflicted paths, instead of a bare exit code. Its output is the
+        # captured stdout, or else its log, so that reason can quote git's own error.
         self.argv, self.env, self.capture, self.verdict = argv, env or {}, capture, verdict
 
 
@@ -868,7 +875,20 @@ def command_steps(recipe, packet, recipes, job):
     return None
 
 
-def commit_steps(packet, recipes, job):
+def git_error(output):
+    """Git's own words from a step, on one bounded line, for a reason."""
+    return " ".join((output or "").split())[:1024] or "no output"
+
+
+def put_back(git, env, job, old, new, failed, code, output):
+    """A step past the swap failed, so HEAD goes back by compare-and-swap, and the reason says whether it did."""
+    restored, _ = yield Step(git + ["update-ref", "-m", "hierarchy job %s: put back" % job.id, "HEAD", old, new], env, verdict=True)
+    outcome = ("HEAD was restored to %s by compare-and-swap" % old if restored == 0 else
+               "HEAD was not restored: the compare-and-swap back to %s failed (exit %d)" % (old, restored))
+    raise Halt("%s failed after HEAD moved to %s (exit %d): %s. %s." % (failed, new, code, git_error(output), outcome))
+
+
+def commit_steps(packet, recipes, job, details):
     """Built on a throwaway index, so a wrong tree leaves the checkout's index, HEAD and files as they were."""
     identity = recipes["identity"]
     git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
@@ -883,16 +903,20 @@ def commit_steps(packet, recipes, job):
     tree = yield Step(git + ["write-tree"], temporary, capture=True)
     if tree != packet["expected_tree"]:
         raise Halt("the staged tree %s is not the expected tree %s" % (tree, packet["expected_tree"]))
-    commit = yield Step(git + ["commit-tree", tree, "-p", packet["commit"], "-F", str(message_file)], plain, capture=True)
+    commit = details["new_commit"] = yield Step(git + ["commit-tree", tree, "-p", packet["commit"], "-F", str(message_file)],
+                                                plain, capture=True)
     # The old value makes this a compare-and-swap, so a lane committing in between cannot be overwritten.
     yield Step(git + ["update-ref", "-m", "hierarchy job " + job.id, "HEAD", commit, packet["commit"]], plain)
-    yield Step(git + ["add", "--", *packet["paths"]], plain)
+    code, output = yield Step(git + ["add", "--", *packet["paths"]], plain, verdict=True)
+    if code != 0:
+        yield from put_back(git, plain, job, packet["commit"], commit, "git add on the real index", code, output)
     return commit
 
 
 def merge_steps(packet, recipes, job, details):
     """Like commit_steps: the merged tree is checked before any ref moves, HEAD moves by compare-and-swap, and only then
-    do the index and files follow. merge-tree writes objects only, and every step before the swap has a throwaway index."""
+    do the index and files follow. Before the swap, git writes objects only: merge-tree and commit-tree write new objects,
+    and the dry run reads the real index and files without writing them. If read-tree then fails, HEAD goes back."""
     identity = recipes["identity"]
     git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
            "-c", "user.name=" + identity["name"], "-c", "user.email=" + identity["email"]]
@@ -920,13 +944,21 @@ def merge_steps(packet, recipes, job, details):
         raise Halt("the merged tree has submodules, which are not supported: " + ", ".join(gitlinks)[:1024])
     if tree != packet["expected_tree"]:
         raise Halt("the merged tree %s is not the expected tree %s" % (tree, packet["expected_tree"]))
+    # On the real index and files, so a held index.lock or an untracked file at a path the merge adds is refused while
+    # nothing has moved. One that appears after this is met past the swap, below.
+    code, output = yield Step(git + ["read-tree", "-n", "-m", "-u", commit, tree], plain, verdict=True)
+    if code != 0:
+        raise Halt("a dry run of read-tree refused to bring the index and files to the merge (exit %d), so HEAD, the index "
+                   "and the files were not changed: %s" % (code, git_error(output)))
     created = yield Step(git + ["commit-tree", tree, "-p", commit, "-p", merge, "-F", str(message_file)], plain, capture=True)
     details["new_commit"] = created
     code, _ = yield Step(git + ["update-ref", "-m", "hierarchy job " + job.id, "HEAD", created, commit], plain, verdict=True)
     if code != 0:
         raise Halt("the compare-and-swap of HEAD from %s failed (exit %d): another writer moved HEAD or held its lock, "
                    "and the index and files were not touched" % (commit, code))
-    yield Step(git + ["read-tree", "-m", "-u", commit, created], plain)
+    code, output = yield Step(git + ["read-tree", "-m", "-u", commit, created], plain, verdict=True)
+    if code != 0:
+        yield from put_back(git, plain, job, commit, created, "read-tree", code, output)
     return created
 
 
@@ -967,7 +999,8 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     stop_for_certain(process)
     row["exit_code"] = process.returncode
     row["seconds"] = round(time.monotonic() - began, 3)
-    return row, out_path.read_text(encoding="utf-8", errors="replace").strip() if step.capture else None
+    source = out_path if step.capture else log_path if step.verdict else None
+    return row, source.read_text(encoding="utf-8", errors="replace").strip() if source else None
 
 
 def execute(job, recipe, packet, recipes, on_start, details):
@@ -977,7 +1010,7 @@ def execute(job, recipe, packet, recipes, on_start, details):
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
     if recipe["kind"] == "commit":
-        plan = commit_steps(packet, recipes, job)
+        plan = commit_steps(packet, recipes, job, details)
     elif recipe["kind"] == "merge":
         plan = merge_steps(packet, recipes, job, details)
     else:
@@ -1014,14 +1047,31 @@ def execute(job, recipe, packet, recipes, on_start, details):
     return rows, reason, exit_code, created
 
 
+def checkout_state(checkout, commit, created, view):
+    """Where a commit or merge left the checkout once HEAD may have moved: what HEAD names, which tree the index holds,
+    and how many entries status shows against HEAD."""
+    try:
+        found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "HEAD")
+        head = found.stdout.decode().strip() if found.returncode == 0 else "nothing readable"
+        role = {commit: "the packet's commit", created: "the new commit"}.get(head, "neither the packet's commit nor the new one")
+        index = next((name for revision, name in ((created, "the new commit"), (commit, "the packet's commit"))
+                      if pinned_git(checkout, "diff-index", "--cached", "--quiet", revision, "--").returncode == 0), "neither commit")
+        count = uncommitted_content(checkout, view)[1]
+    except ERRORS as exc:
+        return "The checkout's state could not be read afterward: " + str(exc)[:512]
+    return ("Afterward HEAD names %s (%s), the index holds the tree of %s, and status shows %d uncommitted entries against "
+            "HEAD." % (head, role, index, count))
+
+
 def run_job(store, job, packet, packet_raw, recipes, wait):
     recipe = recipes["recipes"][packet["recipe"]]
     if not job.claim(packet_raw):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
+    view = MERGE_VIEW_ENV if recipe["kind"] == "merge" else None
     try:
-        before = source_state(mailbox, checkout)
+        before = source_state(mailbox, checkout, view)
     except ERRORS as exc:
         write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048])
         return settle(store, job, wait)
@@ -1039,11 +1089,14 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce, details)
     except StillRunning as exc:
         # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
-        return {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
+        row = {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
+        if details.get("new_commit"):
+            row["checkout_state"] = checkout_state(checkout, packet["commit"], details["new_commit"], view)
+        return row
     except ERRORS as exc:
         rows, reason, exit_code, created = [], "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT, None
     try:
-        after = source_state(mailbox, checkout)
+        after = source_state(mailbox, checkout, view)
     except ERRORS as exc:
         # Without this the job would have no result, and so no receipt, and would hold its slot.
         after = None
@@ -1057,6 +1110,14 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
                 reason, exit_code = "the worktree is not clean after the merge", NO_VERDICT_EXIT
         elif after != before:
             reason, exit_code = "source changed during the job, so its exit proves nothing", NO_VERDICT_EXIT
+    moved = details.get("new_commit")
+    if reason and moved:
+        # Once the swap may have run, "failed" no longer means "untouched", so the reason says where everything is.
+        reason += " " + checkout_state(checkout, packet["commit"], moved, view)
+    if not reason:
+        commit = created
+    else:
+        commit = moved if after is not None and moved and after["source_revision"] == moved else None
     extra = {"kept": keep_evidence(job, recipe["keep"])} if recipe.get("keep") else {}
     if recipe["kind"] == "merge":
         # Every input and the pinned config, so the receipt binds them and anyone can predict the tree again.
@@ -1064,7 +1125,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
                           "expected_tree": packet["expected_tree"], "tree": details.get("tree"),
                           "new_commit": details.get("new_commit"), "config": list(MERGE_CONFIG)}
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
-                 steps=rows, before=before, after=after, commit=created if not reason else None, **extra)
+                 steps=rows, before=before, after=after, commit=commit, **extra)
     # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other
     # failed jobs keep the rest of their work for diagnosis until root runs clean.
     names = WORK_FOLDERS if not reason or recipe.get("heavy_tests", False) else ("cargo-target",)

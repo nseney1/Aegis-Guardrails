@@ -1777,6 +1777,91 @@ def test_a_head_moved_during_the_merge_is_never_overwritten(shop):
     assert snapshot(shop)[1:] == before[1:], "the index and files must not move"
 
 
+# Fails the step past the swap that brings the real index forward (and for a merge the files), as a lock taken by an IDE
+# at that moment would.
+FAILS_AFTER_SWAP = ("import os, sys\n"
+                    "argv = sys.argv[1:]\n"
+                    "if %r in argv and '-n' not in argv and 'GIT_INDEX_FILE' not in os.environ:\n"
+                    "    sys.stderr.write('error: simulated failure past the swap\\n')\n"
+                    "    sys.exit(128)\n"
+                    "os.execvp(argv[0], argv)\n")
+
+
+@pytest.mark.parametrize("kind", ["merge", "commit"])
+def test_a_step_failing_after_the_swap_puts_head_back_and_says_so(shop, kind):
+    wrapper = shop.tmp / "fails-after-swap.py"
+    wrapper.write_text(FAILS_AFTER_SWAP % ("read-tree" if kind == "merge" else "add"))
+    shop.recipes["prefix"] = [sys.executable, str(wrapper)]
+    shop.save_recipes()
+    if kind == "merge":
+        merge_request(shop, two_sides(shop)[0])
+    else:
+        commit_request(shop)
+    before = snapshot(shop)
+    shop.run_open()
+    assert_stopped(shop, before, "failed", "HEAD was restored to " + before[0], "simulated failure past the swap")
+    assert json.loads(verified_evidence(shop.receipts("job-1")[-1])["result.json"].read_text())["commit"] is None
+
+
+# Puts an obstacle in the checkout after admit, while the merge is being computed and before anything moves.
+OBSTACLE_AFTER_ADMIT = ("import os, sys\n"
+                        "if 'ls-tree' in sys.argv:\n"
+                        "    open(%r, 'w').close()\n"
+                        "os.execvp(sys.argv[1], sys.argv[1:])\n")
+
+
+@pytest.mark.parametrize("obstacle, error", [
+    ("docs/side.md", "Untracked working tree file 'docs/side.md' would be overwritten"),
+    (".git/index.lock", "index.lock': File exists"),
+])
+def test_an_obstacle_appearing_after_admit_is_refused_before_head_moves(shop, obstacle, error):
+    side, _ = two_sides(shop)
+    wrapper = shop.tmp / "obstacle.py"
+    wrapper.write_text(OBSTACLE_AFTER_ADMIT % str(shop.checkout / obstacle))
+    shop.recipes["prefix"] = [sys.executable, str(wrapper)]
+    merge_request(shop, side)
+    before = snapshot(shop)
+    shop.run_open()
+    (shop.checkout / obstacle).unlink()
+    assert_stopped(shop, before, "failed", "dry run", "HEAD, the index and the files were not changed", error)
+
+
+def test_a_file_only_the_owners_global_excludes_ignore_keeps_a_merge_out(shop):
+    # The steps read no global excludes, so a merge's clean check reads none either: one ignore view for both.
+    side, _ = two_sides(shop)
+    excludes = shop.tmp / "owner-config" / "git" / "ignore"
+    excludes.parent.mkdir(parents=True)
+    excludes.write_text("docs/side.md\n")
+    (shop.checkout / "docs" / "side.md").write_text("the owner's notes\n")
+    merge_request(shop, side)
+    before = snapshot(shop)
+    shop.run_open(env={**shop.env(), "XDG_CONFIG_HOME": str(excludes.parent.parent)})
+    assert_stopped(shop, before, "refused", "clean worktree")
+
+
+SLOW_AFTER_SWAP = ("import os, sys, time\n"
+                   "if 'read-tree' in sys.argv and '-n' not in sys.argv:\n"
+                   "    time.sleep(60)\n"
+                   "os.execvp(sys.argv[1], sys.argv[1:])\n")
+
+
+def test_a_timeout_after_the_swap_names_where_head_and_the_index_are(shop):
+    with_merge_recipe(shop, timeout_seconds=5)
+    side, commit = two_sides(shop)
+    wrapper = shop.tmp / "slow-after-swap.py"
+    wrapper.write_text(SLOW_AFTER_SWAP)
+    shop.recipes["prefix"] = [sys.executable, str(wrapper)]
+    shop.save_recipes()
+    merge_request(shop, side)
+    shop.run_open()
+    head = git(shop.checkout, "rev-parse", "HEAD")
+    final = shop.receipts("job-1")[-1]
+    assert head != commit
+    assert all(part in final["receipt"]["reason"] for part in (
+        "timed out", "HEAD names %s (the new commit)" % head, "the index holds the tree of the packet's commit")), final
+    assert json.loads(verified_evidence(final)["result.json"].read_text())["commit"] == head
+
+
 def test_a_merge_into_a_dirty_worktree_is_refused(shop):
     side, _ = two_sides(shop)
     (shop.checkout / "notes.txt").write_text("uncommitted\n")
