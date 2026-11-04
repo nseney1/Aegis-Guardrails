@@ -404,7 +404,10 @@ The other commands are `update`, `withdraw`, `release`, `status`, `mark-merge`,
 
 - **Same repository:** `check-paths` reads leases from every registered checkout, using
   the real Aegis reader and overlap rule, because leases in independent clones cannot
-  see each other. Each initiative lists its `lanes`, because linked worktrees share
+  see each other. The reader must come from the `aegis_core` beside these tools in
+  the same source checkout. A missing reader or a foreign package already loaded
+  by the host is refused; an installed wheel is not a fallback. This refusal leaves
+  the capacity ledger unchanged. Each initiative lists its `lanes`, because linked worktrees share
   lease refs, so seeing a lease proves nothing about who holds it. A lease is an
   initiative's own only if its lane is assigned there and it is visible through that
   initiative's checkout. Any other overlapping lease, or an unreadable checkout, is a

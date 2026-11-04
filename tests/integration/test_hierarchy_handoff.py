@@ -36,21 +36,20 @@ def mailbox_files(root):
     return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
-@pytest.mark.skipif(os.name == "nt", reason="the deep path fixture exceeds Windows path limits")
 def test_a_dirty_state_over_three_megabytes_binds_through_a_digest(pilot, tmp_path):  # noqa: F811
     root, _, ready = active_writer(pilot, tmp_path)
     worktree = Path(ready["worktree"])
-    deep = worktree.joinpath(*["d" * 200] * 10)
-    deep.mkdir(parents=True)
-    for index in range(1500):
-        (deep / ("%04d.txt" % index)).touch()
+    # Many bounded filenames exercise the same byte limit without a >2KB path.
+    entries = 30000
+    for index in range(entries):
+        (worktree / ("d" * 96 + "%05d.txt" % index)).touch()
     raw = raw_status(worktree)
     assert len(raw) > 3000000
     evidence = tmp_path / "evidence"
     request = invoke(root, "draft-handoff", draft(root, evidence_dir=str(evidence)), process_timeout=60)
     source = request["checkpoint"]["sources"][0]
     assert source["dirty_state_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert source["dirty_entries"] == 1500
+    assert source["dirty_entries"] == entries
     assert "dirty_state" not in source
     assert Path(source["dirty_evidence"]).read_bytes() == raw
     binding = invoke(root, "bind", request, process_timeout=60)

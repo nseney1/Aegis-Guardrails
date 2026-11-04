@@ -389,12 +389,40 @@ def grant_next(store, kind, outside=None):
 def lease_tools():
     """The real Aegis reader and overlap rule, so this check cannot drift from the claim's own."""
     root = str(TOOLS.parent)
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    package = TOOLS.parent / "aegis_core"
+    error = "the Aegis lease reader is unavailable from this checkout"
+    # These helpers are source-checkout tools. An installed wheel or a reader
+    # cached by an embedding host must not supply another revision's lease rules.
+    require(package.resolve() == package, error)
+    for name in ("__init__.py", "match.py", "team.py"):
+        path = package / name
+        require(path.is_file() and path.resolve().is_relative_to(package), error)
+
+    def check_loaded():
+        expected = {"aegis_core": package / "__init__.py",
+                    "aegis_core.match": package / "match.py", "aegis_core.team": package / "team.py"}
+        for name, module in tuple(sys.modules.items()):
+            if name == "aegis_core" or name.startswith("aegis_core."):
+                origin = getattr(module, "__file__", None)
+                require(origin is not None and Path(origin).resolve().is_relative_to(package), error)
+                resolved = Path(origin).resolve()
+                require(name not in expected or resolved == expected[name].resolve(), error)
+                search = getattr(module, "__path__", None)
+                if search is not None:
+                    require(tuple(Path(entry).resolve() for entry in search) == (resolved.parent,), error)
+        loaded = sys.modules.get("aegis_core")
+        for name in ("match", "team"):
+            if loaded is not None and hasattr(loaded, name):
+                cached = sys.modules.get("aegis_core." + name)
+                require(cached is not None and getattr(loaded, name) is cached, error)
+
+    check_loaded()
+    sys.path[:] = [root] + [entry for entry in sys.path if entry != root]
     try:
         from aegis_core import match, team
     except ImportError as exc:
-        raise ValueError("the Aegis lease reader is unavailable from this checkout") from exc
+        raise ValueError(error) from exc
+    check_loaded()
     return match, team
 
 

@@ -387,6 +387,14 @@ python3 -B -I tools/hierarchy_root.py check-hashes /abs/requests/lane-prompt.txt
   expects `outgoing_stop.verified: true`. Only the record `verify-retired` writes counts, and
   `transfer --ack` takes only the ACK `startup-ack` wrote.
 
+The ROOT helper checks disk space with the platform's portable disk-usage API and accepts
+absolute paths in the host's native syntax. Its writes flush the file before atomic publication;
+on POSIX they also flush the containing directory and report directory-flush failures. Windows
+does not provide that directory flush through these standard-library APIs, so successful writes
+there do not establish directory durability across power loss. Process verification uses POSIX
+semantics: `verify-retired` and a `startup-ack` that probes a host PID refuse on Windows before
+signalling a process or writing an acknowledgment/custody update. Planning remains read-only.
+
 ## Measure the trial
 
 Compare with the same counting method against this baseline from 489 mailbox messages:

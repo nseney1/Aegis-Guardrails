@@ -379,7 +379,11 @@ def test_the_handoff_spec_template_passes_spec_validation(tmp_path):
 def test_the_initiative_template_registers(tmp_path):
     workspace = Workspace(tmp_path)
     workspace.run("init", {"writer_limit": 3, "heavy_limit": 1})
-    assert workspace.run("register", template("initiative.json"))["initiative"]["id"] == "aegis-p1"
+    request = template("initiative.json")
+    request.update(checkouts=[str(tmp_path / "checkout")], mailbox_root=str(tmp_path / "mailbox"),
+                   delivery_dir=str(tmp_path / "delivery"))
+    registered = workspace.run("register", request)["initiative"]
+    assert registered["id"] == "aegis-p1" and registered["checkouts"] == request["checkouts"]
 
 
 @pytest.mark.parametrize("role,expected", sorted(ASSISTANTS.items()))

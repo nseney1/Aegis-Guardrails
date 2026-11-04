@@ -316,18 +316,23 @@ def test_a_lease_acquired_after_admission_is_rechecked_before_a_commit(shop, mon
     shop.workspace.register("content", project="aegis", checkouts=[str(peer)], lanes=["content-writer"])
     commit_request(shop)
     before = shop.head()
-    original = os.mkdir
+    original = Path.mkdir
     job_folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    injected = []
 
     def mkdir(path, *args, **kwargs):
-        if Path(path) == job_folder:
+        if Path(path) == job_folder and not injected:
             write_lease(peer, "content-writer", ["src/**"])
+            injected.append(path)
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "mkdir", mkdir)
+    # Python 3.9's pathlib caches os.mkdir in its accessor. Intercept the
+    # filesystem boundary used by every supported pathlib version.
+    monkeypatch.setattr(Path, "mkdir", mkdir)
     code = hierarchy_jobs.main(["--store", str(shop.workspace.store), "--recipes", str(shop.recipes_path), "run-open"])
     answer = json.loads(capsys.readouterr().out)
     assert code == 0, answer
+    assert injected == [job_folder]
     assert answer["rows"][0]["state"] == "refused"
     assert answer["rows"][0]["reason"].startswith("path ownership changed before execution: ")
     assert shop.head() == before

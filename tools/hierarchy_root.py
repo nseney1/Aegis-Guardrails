@@ -70,9 +70,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -125,7 +127,7 @@ def encode_json(obj):
     return (json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
 
 
-def check_free_space(paths, min_free_mb, statvfs=os.statvfs):
+def check_free_space(paths, min_free_mb, disk_usage=shutil.disk_usage):
     """Refuse before any write when a target's filesystem is nearly full.
 
     With / at 0 bytes free, writes and here-doc temp files failed silently and an ACK
@@ -135,14 +137,17 @@ def check_free_space(paths, min_free_mb, statvfs=os.statvfs):
         folder = Path(path).parent
         while not folder.exists() and folder != folder.parent:
             folder = folder.parent
-        stats = statvfs(folder)
-        free = stats.f_bavail * stats.f_frsize
+        free = disk_usage(folder).free
         if free < min_free_mb * 1024 * 1024:
             raise Failure(EXIT_IO, "free space below --min-free-mb at %s: %d MB free, %d MB required"
                           % (folder, free // (1024 * 1024), min_free_mb), free_bytes=free, path=str(path))
 
 
 def _fsync_folder(folder):
+    # Windows has no supported directory-fsync operation through these stdlib APIs.
+    # File fsync and atomic publication still apply; POSIX directory failures propagate.
+    if os.name != "posix":
+        return
     fd = os.open(folder, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -426,7 +431,7 @@ def absolute_path_problem(value):
     A relative path resolves against whatever cwd the reader happens to have, so the same
     prompt could check against one file and be read against another.
     """
-    if not value.startswith("/"):
+    if not Path(value).is_absolute():
         return "relative path: never a candidate (T100)"
     if ".." in Path(value).parts:
         return "path with '..': never a candidate (T100)"
@@ -442,7 +447,7 @@ def absolute_argument(value, argument):
 def line_paths(line):
     for chunk in PATH_SPLIT.split(line):
         chunk = chunk.strip("*_").rstrip(".:")
-        if "/" in chunk and "://" not in chunk:
+        if ("/" in chunk or "\\" in chunk) and "://" not in chunk:
             yield chunk
 
 
@@ -655,7 +660,7 @@ def read_launch_spec(path):
     return spec
 
 
-TMP_ROOT = "/tmp"
+TMP_ROOT = tempfile.gettempdir() if os.name == "nt" else "/tmp"
 
 
 def untrusted_cwd_reason(cwd, tmp_root=None):
@@ -1038,6 +1043,7 @@ def cmd_rebind(args):
 def process_state(pid):
     """(alive, start_ticks). A zombie is gone; start ticks are field 22 of /proc/<pid>/stat,
     read after the last ")" because the command name may itself contain one."""
+    require(os.name == "posix", "process verification requires a supported POSIX host")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1360,7 +1366,7 @@ def cmd_startup_ack(args):
         return EXIT_CRITICAL, {"ok": False, "error": "a critical startup check failed; nothing was written",
                                "critical_checks": checks}
     check_free_space([out], args.min_free_mb)
-    stats = os.statvfs(out.parent)
+    free = shutil.disk_usage(out.parent).free
     sources = [source_observation(path) for path in (read_json(args.sources) if args.sources else [])]
     observations = ["source missing: " + s["path"] for s in sources if not s["present"]]
     if torn:
@@ -1377,7 +1383,7 @@ def cmd_startup_ack(args):
                                     "active_root_session": custody.get("active_root_session"),
                                     "active_native_root": custody.get("active_native_root")},
                         "tools_pin": pin, "sources_readonly": sources,
-                        "disk": {"free_mb": stats.f_bavail * stats.f_frsize // (1024 * 1024)}},
+                        "disk": {"free_mb": free // (1024 * 1024)}},
            "goal_records": goal_records(rows), "torn_tail": torn, "critical_checks": checks,
            "observations": observations}
     written = atomic_write_json(out, ack)

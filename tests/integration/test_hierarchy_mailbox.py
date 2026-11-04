@@ -531,7 +531,7 @@ def test_full_history_refuses_append_and_remains_readable(pilot, kind):
         for number in range(1, 10000):
             header["message_id"] = "capacity-%05d" % number
             raw = "---\n" + json.dumps(header, sort_keys=True) + "\n---\n\n" + seed["message"]["body"]
-            (folder / ("20261101T000000000000Z-orchestrator-to-lane-capacity-%05d.md" % number)).write_text(raw)
+            (folder / ("20261101T000000000000Z-orchestrator-to-lane-capacity-%05d.md" % number)).write_bytes(raw.encode("utf-8"))
         result = invoke(root, "publish", message(identifier="overflow"), ok=False, process_timeout=60)
         assert result["error"] == "mailbox history limit reached"
         assert invoke(root, "status", process_timeout=60)["messages"] == 10000

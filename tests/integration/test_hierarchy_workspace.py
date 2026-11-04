@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import sys
 import time
+import venv
 
 import pytest
 
@@ -139,10 +141,12 @@ def test_commands_refuse_an_uninitialized_store(tmp_path):
 
 
 def test_registered_initiatives_are_listed_and_duplicates_refused(workspace):
-    workspace.register("aegis-47", priority=5, touched_paths=["tools/**"], checkouts=["/absolute/clone"])
+    checkout = str(workspace.tmp / "clone")
+    workspace.register("aegis-47", priority=5, touched_paths=["tools/**"], checkouts=[checkout])
     record = workspace.run("status")["initiatives"]["aegis-47"]
     assert record["priority"] == 5 and record["state"] == "active"
     assert record["touched_paths"] == ["tools/**"] and record["base_moved"] is None
+    assert record["checkouts"] == [checkout]
     refused = workspace.run("register", {"id": "aegis-47", "project": "aegis", "repository": "aegis", "priority": 5,
                                          "target_branch": "develop"}, expect=2)
     assert refused["error"] == "initiative already registered: aegis-47"
@@ -511,6 +515,57 @@ def test_a_missing_lease_reader_is_a_clear_error(workspace, tmp_path):
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2 and not result.stderr
     assert json.loads(result.stdout)["error"] == "the Aegis lease reader is unavailable from this checkout"
+
+
+@pytest.mark.parametrize("checkout_reader,preloaded", [
+    (False, None), (True, None), (True, "package"), (True, "search_path"),
+])
+def test_path_checks_use_only_the_reader_from_the_tools_checkout(workspace, tmp_path, checkout_reader, preloaded):
+    workspace.register("first")
+    environment = tmp_path / "python"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    probe = subprocess.run([str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                           capture_output=True, text=True, timeout=20, check=True)
+    installed = Path(probe.stdout.strip()) / "aegis_core"
+    shutil.copytree(ROOT / "aegis_core", installed, ignore=shutil.ignore_patterns("__pycache__"))
+    marker = tmp_path / "foreign-reader-imported"
+    initializer = installed / "__init__.py"
+    initializer.write_text("from pathlib import Path\nPath(%r).write_text('imported')\n" % str(marker)
+                           + initializer.read_text(encoding="utf-8"), encoding="utf-8")
+    reader = installed / "match.py"
+    reader.write_text(reader.read_text(encoding="utf-8")
+                      + "\nfrom pathlib import Path\nPath(%r).write_text('reader imported')\n" % str(marker),
+                      encoding="utf-8")
+    source = tmp_path / "source"
+    copied_tools = source / "tools"
+    copied_tools.mkdir(parents=True)
+    for name in ("hierarchy_mailbox.py", "hierarchy_workspace.py"):
+        shutil.copyfile(CONTROLLER.parent / name, copied_tools / name)
+    if checkout_reader:
+        shutil.copytree(ROOT / "aegis_core", source / "aegis_core", ignore=shutil.ignore_patterns("__pycache__"))
+    request = tmp_path / "paths.json"
+    request.write_text(json.dumps({"initiative": "first", "paths": ["x.txt"]}), encoding="utf-8")
+    argv = [str(python), "-I"]
+    if preloaded == "package":
+        argv += ["-c", "import aegis_core,runpy,sys; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"]
+    elif preloaded == "search_path":
+        argv += ["-c", ("import runpy,sys; sys.path.insert(0,%r); import aegis_core; "
+                        "aegis_core.__path__=[%r]; sys.argv=sys.argv[1:]; "
+                        "runpy.run_path(sys.argv[0], run_name='__main__')") % (str(source), str(installed))]
+    argv += [str(copied_tools / "hierarchy_workspace.py"), "--store", str(workspace.store),
+             "check-paths", "--request", str(request)]
+    before = {p.name: p.read_bytes() for p in (workspace.store / "events").iterdir()}
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    assert not result.stderr, result.stderr
+    if checkout_reader and not preloaded:
+        assert result.returncode == 0, result.stdout
+        assert json.loads(result.stdout)["conflict"] is False
+    else:
+        assert result.returncode == 2, result.stdout
+        assert json.loads(result.stdout)["error"] == "the Aegis lease reader is unavailable from this checkout"
+    assert marker.exists() is (preloaded == "package")
+    assert before == {p.name: p.read_bytes() for p in (workspace.store / "events").iterdir()}
 
 
 def test_an_initial_priority_can_name_its_source(workspace):

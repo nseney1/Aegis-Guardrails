@@ -110,8 +110,11 @@ def test_a_dirty_source_is_refused_because_every_adapter_runs_from_it(tmp_path):
 
 def test_a_source_that_is_not_a_checkout_is_refused(tmp_path):
     built = Setup(tmp_path)
-    shutil.rmtree(built.source / ".git")
-    assert "source checkout" in provision("init", built.init_request(), expect=2)["error"]
+    source = tmp_path / "never-a-checkout"
+    source.mkdir()
+    request = built.init_request()
+    request["source"] = str(source)
+    assert provision("init", request, expect=2)["error"] == "source checkout is not a git checkout: " + str(source)
     assert not built.base.exists()
 
 

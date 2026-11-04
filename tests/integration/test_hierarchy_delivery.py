@@ -93,13 +93,13 @@ class Pilot:
             argv += ["--delivery-dir", str(self.delivery if delivery is True else delivery)]
         return argv
 
-    def adapter(self, calls, *, delivery=True):
+    def adapter(self, calls, *, delivery=True, timeout=15):
         frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}]
         frames += [{"jsonrpc": "2.0", "id": index + 2, "method": "tools/call",
                     "params": {"name": name, "arguments": arguments}}
                    for index, (name, arguments) in enumerate(calls)]
         return subprocess.run(self.adapter_argv(delivery), input="".join(json.dumps(f) + "\n" for f in frames),
-                              capture_output=True, text=True, timeout=15,
+                              capture_output=True, text=True, timeout=timeout,
                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
     def read_inbox(self, **arguments):
@@ -285,7 +285,8 @@ def test_a_full_read_ledger_refuses_more_receipts_and_stays_readable(pilot):
     pilot.publish("seed-note")
     pilot.publish()
     folder = fill_receipts(pilot, "reads", 10000)
-    result = pilot.adapter([("mailbox_inbox", {})])
+    # Validate the full receipt history within a finite budget on slower filesystems.
+    result = pilot.adapter([("mailbox_inbox", {})], timeout=60)
     assert result.returncode == 0
     delivered = json.loads(json.loads(result.stdout.splitlines()[-1])["result"]["content"][0]["text"])["messages"]
     assert [row["message"]["message_id"] for row in delivered] == ["seed-note", "note-1"]
@@ -467,7 +468,7 @@ def test_a_process_whose_start_cannot_be_recorded_is_stopped_and_not_counted(pil
         code, result = pilot.wake(pilot.profile(mode="sleeper"), timeout=20)
     finally:
         folder.chmod(0o755)
-    assert code == 3 and result["state"] == "failed_to_start"
+    assert code == 3 and result["state"] == "failed_to_start", (code, result)
     assert "could not record the start" in result["error"]
     assert not session_process_exists(pilot.session)
     assert pilot.state()["state"] == "published"
@@ -488,7 +489,7 @@ def process_gone(pid, deadline=2.0):
 def test_a_timeout_stops_the_whole_process_group_before_reporting(pilot):
     pilot.publish()
     code, result = pilot.wake(pilot.profile(mode="sleeper", timeout_seconds=1))
-    assert code == 3 and result["state"] == "timed_out" and result["timed_out"] is True
+    assert code == 3 and result["state"] == "timed_out" and result["timed_out"] is True, (code, result)
     child = int(Path(str(pilot.record) + ".child").read_text())
     assert process_gone(child)
     assert pilot.state()["state"] == "woken"

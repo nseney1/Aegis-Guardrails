@@ -17,7 +17,8 @@ ENDPOINTS = {
     "a/lane/f2": {"kind": "implementer"}, "a/lane/review": {"kind": "reviewer"},
     "b/front-door": {}, "b/orchestrator": {}, "b/root": {},
 }
-EVIDENCE = [{"path": "/absolute/evidence/job-1.json", "sha256": "a" * 64}]
+# A receipt is an unverified claim, but its path must be absolute on this host.
+EVIDENCE = [{"path": str(Path(__file__).resolve().with_name("unverified-job-1.json")), "sha256": "a" * 64}]
 COMPLETED = {"state": "completed", "exit_code": 0, "evidence": EVIDENCE}
 
 

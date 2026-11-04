@@ -24,17 +24,23 @@ LAUNCHER_TEXT = ("import hashlib, json, os, subprocess\n" + "x = 1\n" * 400)[:23
 
 # D-P3-1: pytest's tmp_path is under /tmp, which launch refuses as a cwd. Tests replace
 # TMP_ROOT inside the tool's own process; the command line has no seam that turns it off.
-DRIVER = ("import importlib.util, sys\n"
+DRIVER = ("import importlib.util, os, sys\n"
           "spec = importlib.util.spec_from_file_location('hierarchy_root', sys.argv[1])\n"
           "tool = importlib.util.module_from_spec(spec)\n"
           "spec.loader.exec_module(tool)\n"
-          "tool.TMP_ROOT = sys.argv[2]\n"
+          "if sys.argv[2]: tool.TMP_ROOT = sys.argv[2]\n"
+          "if os.name == 'nt' and os.environ.get('HIERARCHY_STUB_SCRIPT'):\n"
+          " original_run = tool.subprocess.run\n"
+          " def run(argv, *args, **kwargs):\n"
+          "  if argv[0] == 'claude': argv = [sys.executable, '-I', os.environ['HIERARCHY_STUB_SCRIPT'], *argv[1:]]\n"
+          "  return original_run(argv, *args, **kwargs)\n"
+          " tool.subprocess.run = run\n"
           "sys.exit(tool.main(sys.argv[3:]))\n")
 
 
 def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None, tmp_root=None):
-    head = [sys.executable, "-B", "-I", str(TOOL)] if tmp_root is None else \
-        [sys.executable, "-B", "-I", "-c", DRIVER, str(TOOL), str(tmp_root)]
+    head = [sys.executable, "-B", "-I", str(TOOL)] if tmp_root is None and os.name != "nt" else \
+        [sys.executable, "-B", "-I", "-c", DRIVER, str(TOOL), str(tmp_root) if tmp_root is not None else ""]
     proc = subprocess.run([*head, *[str(a) for a in args]], input=stdin,
                           capture_output=True, timeout=timeout, env=env if env is not None else dict(os.environ),
                           cwd=cwd)
@@ -44,6 +50,80 @@ def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None, tmp_root=None):
 
 def sha(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def capability_cli(*args, before="", after="", env=None):
+    """Run the public command with only the indicated OS boundary replaced."""
+    driver = ("import importlib.util, os, shutil, sys, types\n" + before
+              + "spec = importlib.util.spec_from_file_location('hierarchy_root', sys.argv[1])\n"
+              "tool = importlib.util.module_from_spec(spec)\n"
+              "spec.loader.exec_module(tool)\n" + after
+              + "sys.exit(tool.main(sys.argv[2:]))\n")
+    return subprocess.run([sys.executable, "-B", "-I", "-c", driver, str(TOOL), *map(str, args)],
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+def test_hash_cli_imports_without_statvfs(tmp_path):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("No hash tokens.\n", encoding="utf-8")
+    result = capability_cli("check-hashes", prompt,
+                            before="if hasattr(os, 'statvfs'): del os.statvfs\n")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert json.loads(result.stdout)["ok"] is True
+
+
+@pytest.mark.parametrize("host,expected", [("nt", 0), ("posix", 4)])
+def test_render_flushes_the_file_and_preserves_posix_directory_errors(tmp_path, host, expected):
+    template = tmp_path / "template.txt"
+    template.write_text("A plain prompt.", encoding="utf-8")
+    target, flushed = tmp_path / "out.txt", tmp_path / "file-flushed"
+    boundary = ("original_open, original_fsync = os.open, os.fsync\n"
+                "def open_file(path, flags, *args, **kwargs):\n"
+                " if tool.Path(path).is_dir(): raise PermissionError('directory flush unavailable')\n"
+                " return original_open(path, flags, *args, **kwargs)\n"
+                "def fsync(fd):\n"
+                " original_fsync(fd)\n"
+                " tool.Path(%r).write_text('flushed')\n"
+                "tool.os = types.SimpleNamespace(**{**vars(os), 'name': %r, 'open': open_file, 'fsync': fsync})\n"
+                % (str(flushed), host))
+    result = capability_cli("render-prompt", "--template", template, "--out", target, after=boundary)
+    assert result.returncode == expected, (result.stdout, result.stderr)
+    assert target.read_bytes() == template.read_bytes()
+    assert flushed.read_text() == "flushed"
+    if host == "posix":
+        assert "directory flush unavailable" in json.loads(result.stdout)["error"]
+
+
+def test_launch_disk_refusal_uses_portable_free_bytes(tmp_path, stub, prompt_file):
+    spec_path, spec = launch_spec(tmp_path, prompt_file)
+    result = capability_cli("launch", "--spec", spec_path, "--min-free-mb", "1", env=stub.env(),
+                            before="shutil.disk_usage = lambda path: types.SimpleNamespace(free=0)\n",
+                            after="tool.TMP_ROOT = %r\n" % str(stub.tmp_root))
+    assert result.returncode == 4, (result.stdout, result.stderr)
+    answer = json.loads(result.stdout)
+    assert answer["free_bytes"] == 0 and answer["path"] == spec["record_out"]
+    assert answer["error"].startswith("free space below --min-free-mb")
+    assert not stub.launched() and not Path(spec["record_out"]).exists()
+
+
+@pytest.mark.parametrize("command", ["verify-retired", "startup-ack"])
+def test_process_verification_refuses_an_unsupported_host_before_any_probe(tmp_path, stub, startup, command):
+    custody = startup["custody"]
+    before = custody.read_bytes()
+    if command == "verify-retired":
+        args = [command, "--session", OUTGOING, "--pid", "123", "--custody", custody,
+                "--expect-custody-sha256", sha(before)]
+    else:
+        args = [command, "--packet", startup["packet"], "--packet-sha256", sha(startup["packet"].read_bytes()),
+                "--rendezvous", startup["rendezvous"], "--rendezvous-sha256", sha(startup["rendezvous"].read_bytes()),
+                "--custody", custody, "--tools-pin", startup["pin"], "--role", "ROOT", "--out", startup["out"]]
+    result = capability_cli(*args, env={**stub.env(), "CLAUDE_PID": "123"}, after=(
+        "def forbidden(*args, **kwargs): raise AssertionError('OS process probe must not run')\n"
+        "tool.os = types.SimpleNamespace(**{**vars(os), 'name': 'nt', 'kill': forbidden})\n"))
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert json.loads(result.stdout)["error"] == "process verification requires a supported POSIX host"
+    assert custody.read_bytes() == before and not startup["out"].exists()
+    assert not (stub.dir / "calls.jsonl").exists()
 
 
 def write_transcript(path, records, torn_tail=None):
@@ -112,7 +192,7 @@ def tmp_path(tmp_path):
 @pytest.fixture
 def prompt_file(tmp_path):
     path = tmp_path / "prompt.txt"
-    path.write_text("You are a lane.\nDo the brief.\n", encoding="utf-8")
+    path.write_bytes(b"You are a lane.\nDo the brief.\n")
     return path
 
 
@@ -267,7 +347,7 @@ def test_check_hashes_refuses_a_relative_source_or_file_naming_the_argument(tmp_
     prompt.write_text("nothing\n", encoding="utf-8")
     code, out, _ = check_hashes(prompt, "--source", value, cwd=tmp_path)
     assert code == 2, out
-    assert "--source" in out["error"] and value in out["error"]
+    assert "--source" in out["error"] and repr(value) in out["error"]
     code, out, _ = check_hashes("prompt.txt", cwd=tmp_path)
     assert code == 2 and "check-hashes file" in out["error"] and "prompt.txt" in out["error"]
 
@@ -279,8 +359,8 @@ def render(template, *extra, cwd=None):
 @pytest.fixture
 def template(tmp_path):
     path = tmp_path / "prompt.template"
-    path.write_text("You are a lane.\nYour brief is {path:brief} (sha256 {sha256:brief}).\n"
-                    "Template:\n- {path:role}\n- sha256 {sha256:role}\n", encoding="utf-8")
+    path.write_bytes(b"You are a lane.\nYour brief is {path:brief} (sha256 {sha256:brief}).\n"
+                     b"Template:\n- {path:role}\n- sha256 {sha256:role}\n")
     return path
 
 
@@ -465,6 +545,8 @@ def test_check_hashes_and_render_prompt_refuse_a_non_regular_or_oversized_input(
     """P3-3: Path.read_bytes() blocked forever on a FIFO and read /dev/zero without bound."""
     target = tmp_path / "input.txt"
     if kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("this host cannot create a POSIX FIFO")
         os.mkfifo(target)
     elif kind == "directory":
         target.mkdir()
@@ -489,6 +571,8 @@ def test_check_hashes_and_render_prompt_refuse_a_non_regular_or_oversized_input(
 
 STUB = r'''
 import json, os, pathlib, sys
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 d = pathlib.Path(os.environ["HIERARCHY_STUB_DIR"])
 argv = sys.argv[1:]
 with (d / "calls.jsonl").open("a") as calls:
@@ -496,12 +580,12 @@ with (d / "calls.jsonl").open("a") as calls:
 if argv[:2] == ["agents", "--json"]:
     after = d / "agents-after.json"
     source = after if (d / "launched").exists() and after.exists() else d / "agents.json"
-    sys.stdout.write(source.read_text() if source.exists() else "[]")
+    sys.stdout.write(source.read_text(encoding="utf-8") if source.exists() else "[]")
     sys.exit(0)
 if argv[:1] == ["logs"]:
     (d / "logs-args.json").write_text(json.dumps(argv))
     logs = d / "logs.txt"
-    sys.stdout.write(logs.read_text() if logs.exists() else "")
+    sys.stdout.write(logs.read_text(encoding="utf-8") if logs.exists() else "")
     sys.exit(0)
 if argv[:1] == ["--bg"]:
     stdin = sys.stdin.buffer.read()
@@ -517,7 +601,7 @@ if argv[:1] == ["--bg"]:
     if cfg["assistant"]:
         records.append({"type": "assistant", "uuid": "a-1", "timestamp": "2026-11-02T16:00:03.000Z",
                         "sessionId": cfg["session"], "message": {"role": "assistant", "content": []}})
-    folder = pathlib.Path(cfg["projects"]) / os.getcwd().replace("/", "-")
+    folder = pathlib.Path(cfg["projects"]) / os.getcwd().replace("/", "-").replace("\\", "-").replace(":", "-")
     folder.mkdir(parents=True, exist_ok=True)
     (folder / (cfg["session"] + ".jsonl")).write_text("".join(json.dumps(r) + "\n" for r in records))
     if cfg.get("plant"):  # another writer creates the record path while the launch is observed
@@ -551,6 +635,7 @@ class Stub:
 
     def env(self):
         return {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
+                "HIERARCHY_STUB_SCRIPT": str(self.bin / "claude"),
                 "HIERARCHY_STUB_DIR": str(self.dir), "CLAUDE_CODE_SESSION_ID": "parent-session",
                 "CLAUDE_PID": "1"}
 
@@ -711,6 +796,8 @@ def test_launch_refuses_an_unwritable_record_folder_before_launching(tmp_path, s
     """P2-3: the record (with its stop command) was lost after the session had started."""
     folder = tmp_path / "records"
     if problem == "read_only":
+        if not hasattr(os, "geteuid"):
+            pytest.skip("this test requires POSIX directory permission bits")
         if os.geteuid() == 0:
             pytest.skip("root ignores folder permissions")
         folder.mkdir()
@@ -777,14 +864,15 @@ def test_launch_refuses_a_cwd_a_background_session_cannot_trust(tmp_path, stub, 
 
 
 def test_launch_refuses_a_cwd_under_tmp_without_the_test_seam(tmp_path, stub, prompt_file):
-    cwd = Path(tempfile.mkdtemp(prefix="aegis47-hfix-cwd-", dir="/tmp"))
+    root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    cwd = Path(tempfile.mkdtemp(prefix="aegis47-hfix-cwd-", dir=root))
     try:
         spec_path, spec = launch_spec(tmp_path, prompt_file, cwd=str(cwd))
         code, out, _ = run_tool("launch", "--spec", spec_path, "--plan", env=stub.env())
     finally:
         cwd.rmdir()
     assert code == 2, out
-    assert "under /tmp" in out["error"]
+    assert "under %s" % Path(root).resolve() in out["error"]
 
 
 def test_launch_refuses_uses_enter_worktree_under_layout_f(tmp_path, stub, prompt_file):
@@ -1049,11 +1137,11 @@ def test_cas_update_refuses_a_change_between_read_and_replace(tool, tmp_path):
 
 def test_free_space_precheck_refuses_below_the_threshold(tool, tmp_path):
     class Stats:
-        f_bavail, f_frsize = 100, 1024 * 1024
+        free = 100 * 1024 * 1024
 
     target = tmp_path / "missing-folder" / "ack.json"
-    assert failure_code(tool, lambda: tool.check_free_space([target], 512, statvfs=lambda _: Stats)) == 4
-    assert tool.check_free_space([target], 64, statvfs=lambda _: Stats) is None
+    assert failure_code(tool, lambda: tool.check_free_space([target], 512, disk_usage=lambda _: Stats)) == 4
+    assert tool.check_free_space([target], 64, disk_usage=lambda _: Stats) is None
     assert not target.parent.exists()
 
 
@@ -1213,6 +1301,7 @@ def retired(stub, pid, custody=None, expect=None):
     return run_tool(*argv, env=stub.env())
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_verify_retired_refuses_while_the_process_is_alive(tmp_path, stub):
     custody = custody_file(tmp_path)
     before = custody.read_bytes()
@@ -1228,6 +1317,7 @@ def test_verify_retired_refuses_while_the_process_is_alive(tmp_path, stub):
     assert custody.read_bytes() == before
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_verify_retired_records_outgoing_stopped_when_gone(tmp_path, stub):
     custody = custody_file(tmp_path)
     pid = finished_pid()
@@ -1241,6 +1331,7 @@ def test_verify_retired_records_outgoing_stopped_when_gone(tmp_path, stub):
     assert out["custody_update"]["sha256"] == sha(custody.read_bytes())
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_verify_retired_refuses_a_session_still_listed_after_its_pid_is_gone(tmp_path, stub):
     custody = custody_file(tmp_path)
     before = custody.read_bytes()
@@ -1505,6 +1596,7 @@ def startup_ack(stub, files, *extra, packet_sha=None, rendezvous_sha=None, env=N
                     "--projects-dir", stub.projects, "--min-free-mb", "1", *extra, env=environment)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_startup_ack_writes_live_facts_and_observes_missing_sources(stub, startup):
     code, out, err = startup_ack(stub, startup)
     assert code == 0, (out, err)
@@ -1527,6 +1619,7 @@ def test_startup_ack_writes_live_facts_and_observes_missing_sources(stub, startu
 
 
 @pytest.mark.parametrize("break_it", ["packet", "pin", "custody", "identity"])
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_startup_ack_fails_a_critical_check_and_writes_nothing(stub, startup, break_it):
     kwargs = {}
     if break_it == "packet":
@@ -1543,6 +1636,7 @@ def test_startup_ack_fails_a_critical_check_and_writes_nothing(stub, startup, br
 
 
 @pytest.mark.parametrize("field", ["sha256", "path"])
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_startup_ack_refuses_a_packet_the_rendezvous_does_not_name(stub, startup, tmp_path, field):
     """P2-1: --packet-sha256 is operator-supplied; the rendezvous file says which packet is meant."""
     rendezvous = json.loads(startup["rendezvous"].read_text(encoding="utf-8"))
@@ -1560,6 +1654,7 @@ def test_startup_ack_refuses_a_packet_the_rendezvous_does_not_name(stub, startup
     assert not startup["out"].exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_transfer_accepts_the_ack_startup_ack_writes(stub, startup, rotation):
     """D-P3-4: transfer was tested only with a hand-built ACK; a rename on either side passed both suites.
 
@@ -1575,6 +1670,7 @@ def test_transfer_accepts_the_ack_startup_ack_writes(stub, startup, rotation):
     assert record["incoming"]["startup_ack"] == {"path": str(startup["out"]), "sha256": sha(startup["out"].read_bytes())}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_startup_ack_requires_the_rendezvous_sha256_and_refuses_changed_bytes(stub, startup):
     code, out, err = startup_ack(stub, startup, rendezvous_sha=False)
     assert code == 2 and out is None and "--rendezvous-sha256" in err
@@ -1644,6 +1740,7 @@ def test_startup_ack_plan_writes_nothing(stub, startup):
     assert not startup["out"].exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="real process verification requires POSIX signal semantics")
 def test_verify_retired_leaves_a_changed_custody_untouched(tmp_path, stub):
     custody = custody_file(tmp_path)
     before = custody.read_bytes()

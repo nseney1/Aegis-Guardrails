@@ -1733,16 +1733,20 @@ def test_a_merge_touching_a_filtered_or_union_merged_path_is_refused(shop, attri
 
 
 @pytest.mark.parametrize("side, path, attributes", [
-    ("merge", ".gitattributes", "untouched.txt filter=lfs\n"),
-    ("commit", ".gitattributes", "untouched.txt filter=lfs\n"),
-    ("merge", "src/.gitattributes", "app.py filter=lfs\n"),
+    ("merge", ".gitattributes", "untouched.txt filter=aegis-test-absent\n"),
+    ("commit", ".gitattributes", "untouched.txt filter=aegis-test-absent\n"),
+    ("merge", "src/.gitattributes", "app.py filter=aegis-test-absent\n"),
 ])
 def test_a_merge_changing_gitattributes_on_either_side_is_refused(shop, side, path, attributes):
     # The new filter lands on a path neither side changes, which the per-path attribute check never reads.
-    main_commit(shop, {"untouched.txt": "the same on both sides\n"})
+    # An unconfigured filter preserves that premise even when Git LFS is installed.
+    base = main_commit(shop, {"untouched.txt": "the same on both sides\n"})
     change = {path: attributes}
     merge = side_commit(shop, "side", change if side == "merge" else {"docs/side.md": "side\n"})
     main_commit(shop, change if side == "commit" else {"docs/main.md": "main\n"})
+    untouched = "src/app.py" if path.startswith("src/") else "untouched.txt"
+    for revision in (merge, shop.head()["commit"]):
+        assert untouched not in git(shop.checkout, "diff", "--name-only", base, revision).splitlines()
     merge_request(shop, merge)
     before = snapshot(shop)
     shop.run_open()
