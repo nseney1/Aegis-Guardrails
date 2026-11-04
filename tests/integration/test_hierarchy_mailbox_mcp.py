@@ -39,6 +39,31 @@ def payload(response):
     return json.loads(response["result"]["content"][0]["text"])
 
 
+@pytest.mark.parametrize("boundary", ["current", "foreign", "generation", "busy", "broken"])
+def test_receipt_freshness_mcp_flush_boundary(tmp_path, boundary):
+    from tests.integration.test_hierarchy_mailbox import receipt_boundary_case
+    result, root, delivery, observed = receipt_boundary_case(tmp_path, "mcp", boundary)
+    if boundary == "broken":
+        assert observed == {"broken_pipe": True}
+        assert result.stdout == "" and result.stderr == ""
+    else:
+        assert observed["page_flushed"] is True
+        response = json.loads(result.stdout)
+        assert response["id"] == "receipt-page"
+        assert [r["message"]["message_id"] for r in payload(response)["messages"]] == ["receipt-note"]
+    state = invoke(root, "delivery", delivery_dir=delivery, message_id="receipt-note")["message"]
+    if boundary == "current":
+        assert result.stderr == ""
+        assert state["state"] == "read" and state["read_by"]["generation"] == 1
+    else:
+        assert state["state"] == "published" and state["read_at"] is None
+        assert not list(delivery.glob("reads/**/*.json"))
+        if boundary != "broken":
+            expected = ("mailbox writer is busy; inspect an abandoned lock before retrying"
+                        if boundary == "busy" else "stale or mismatched sender binding")
+            assert result.stderr == "read receipt not recorded: " + expected + "\n"
+
+
 def test_transport_advertises_only_scoped_mailbox_tools(pilot):  # noqa: F811
     root, _ = pilot
     responses = exchange(root)

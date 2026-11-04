@@ -63,6 +63,164 @@ def message(sender="a/orchestrator", recipient="a/lane/f2", *, identifier="dispa
             "type": kind, "body": "Information, never an approval.", **extra}
 
 
+RECEIPT_FLUSH_DRIVER = r'''
+import json, os, runpy, subprocess, sys
+from pathlib import Path
+helper, mode, boundary, root, delivery, endpoint, request, marker = sys.argv[1:9]
+real_stdout = sys.stdout
+real_buffer = real_stdout.buffer
+class BoundaryBuffer:
+    def __init__(self):
+        self.wrote = False
+        self.acted = False
+    def write(self, data):
+        self.wrote = True
+        if boundary == "broken" and not self.acted:
+            self.acted = True
+            reader, writer = os.pipe()
+            os.close(reader)
+            os.dup2(writer, real_stdout.fileno())
+            os.close(writer)
+            Path(marker).write_text(json.dumps({"broken_pipe": True}))
+        return real_buffer.write(data)
+    def flush(self):
+        real_buffer.flush()
+        if not self.wrote or self.acted:
+            return
+        self.acted = True
+        result = {"page_flushed": True}
+        if boundary in ("foreign", "generation"):
+            call = subprocess.run([sys.executable, "-I", "-B", helper, "--root", root,
+                                   "bind", "--request", request],
+                                  capture_output=True, text=True, timeout=5)
+            assert call.returncode == 0, call.stdout + call.stderr
+            result["replacement"] = json.loads(call.stdout)
+        elif boundary == "busy":
+            descriptor = os.open(str(Path(root) / ".write.lock"),
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+            result["writer_busy"] = True
+        Path(marker).write_text(json.dumps(result))
+class Output:
+    buffer = BoundaryBuffer()
+    def fileno(self):
+        return real_stdout.fileno()
+    def flush(self):
+        return self.buffer.flush()
+    def write(self, text):
+        return real_stdout.write(text)
+sys.stdout = Output()
+sys.path.insert(0, str(Path(helper).parent))
+if mode == "cli":
+    sys.argv = [helper, "--root", root, "inbox", "--endpoint", endpoint,
+                "--mark-read", "--delivery-dir", delivery]
+else:
+    sys.argv = [helper, "--root", root, "serve", "--endpoint", endpoint,
+                "--host", "host-one", "--session", endpoint, "--generation", "1",
+                "--delivery-dir", delivery]
+runpy.run_path(helper, run_name="__main__")
+'''
+
+
+def receipt_fixture(tmp_path, endpoint="a/lane/review"):
+    """Create every binding/message/checkpoint through the public CLI."""
+    root, delivery = tmp_path / "mailbox", tmp_path / "delivery"
+    endpoints = {"a/root": {}, "a/front-door": {}, "a/orchestrator": {},
+                 "a/lane/review": {"kind": "reviewer"}}
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints,
+                          "counterparts": [], "writer_limit": 3})
+    for name in endpoints:
+        invoke(root, "bind", {"endpoint": name, "host": "host-one", "session": name,
+                              "expected_generation": 0})
+    invoke(root, "publish", message(recipient=endpoint, identifier="receipt-note"))
+    brief = tmp_path / "receipt-checkpoint.md"
+    brief.write_bytes(b"Retain receipt-note for the incoming connection.\n")
+    checkpoint = {"outgoing_stopped": True,
+                  "briefs": [{"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}],
+                  "sources": [], "lease_refs": [], "completed_checks": [],
+                  "pending_message_ids": ["receipt-note"], "last_acknowledgment_ids": []}
+    return root, delivery, checkpoint
+
+
+def receipt_boundary_case(tmp_path, mode, boundary):
+    endpoint = "a/root" if mode == "cli" else "a/lane/review"
+    root, delivery, checkpoint = receipt_fixture(tmp_path, endpoint)
+    driver = tmp_path / "receipt_flush_driver.py"
+    driver.write_text(RECEIPT_FLUSH_DRIVER, encoding="utf-8")
+    request, marker = tmp_path / "replacement.json", tmp_path / "flush-marker.json"
+    request.write_text(json.dumps({"endpoint": endpoint, "host": "host-one",
+                                  "session": "replacement" if boundary == "foreign" else endpoint,
+                                  "expected_generation": 1, "checkpoint": checkpoint}), encoding="utf-8")
+    frame = {"jsonrpc": "2.0", "id": "receipt-page", "method": "tools/call",
+             "params": {"name": "mailbox_inbox", "arguments": {}}}
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", str(driver), str(HELPER), mode,
+                                 boundary, str(root), str(delivery), endpoint, str(request), str(marker)],
+                                input=json.dumps(frame) + "\n" if mode == "mcp" else "",
+                                capture_output=True, text=True, timeout=15,
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    finally:
+        # Explicit owner cleanup of the disposable OS-boundary contention fixture.
+        if boundary == "busy" and (root / ".write.lock").exists():
+            (root / ".write.lock").unlink()
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(marker.read_text())
+    return result, root, delivery, observed
+
+
+@pytest.mark.parametrize("boundary", ["current", "foreign", "generation", "busy"])
+def test_receipt_freshness_cli_flush_boundary(tmp_path, boundary):
+    result, root, delivery, observed = receipt_boundary_case(tmp_path, "cli", boundary)
+    page = json.loads(result.stdout)
+    assert observed["page_flushed"] is True
+    assert [r["message"]["message_id"] for r in page["messages"]] == ["receipt-note"]
+    state = invoke(root, "delivery", delivery_dir=delivery, message_id="receipt-note")["message"]
+    if boundary == "current":
+        assert not result.stderr
+        assert state["state"] == "read" and state["read_by"]["generation"] == 1
+    else:
+        assert state["state"] == "published" and state["read_at"] is None
+        assert not list(delivery.glob("reads/**/*.json"))
+        expected = ("mailbox writer is busy; inspect an abandoned lock before retrying"
+                    if boundary == "busy" else "stale or mismatched sender binding")
+        assert result.stderr == "read receipt not recorded: " + expected + "\n"
+
+
+@pytest.mark.parametrize("session", ["replacement", "a/lane/review"])
+def test_receipt_freshness_public_mailbox_rejects_retired_page(tmp_path, session):
+    from tools.hierarchy_mailbox import Mailbox
+    root, delivery, checkpoint = receipt_fixture(tmp_path)
+    mailbox = Mailbox(root)
+    page = mailbox.inbox("a/lane/review")
+    binding = page["binding"]
+    sender = {"from": "a/lane/review", "host": binding["host"], "session": binding["session"],
+              "binding_generation": binding["generation"]}
+    replacement = invoke(root, "bind", {"endpoint": "a/lane/review", "host": "host-one", "session": session,
+                                        "expected_generation": 1, "checkpoint": checkpoint})
+    assert replacement["generation"] == 2
+    with pytest.raises(ValueError, match="^stale or mismatched sender binding$"):
+        mailbox.record_read(delivery, sender, ["receipt-note"])
+    assert not list(delivery.glob("reads/**/*.json"))
+    assert invoke(root, "delivery", delivery_dir=delivery, message_id="receipt-note")["message"]["state"] == "published"
+
+
+def test_receipt_freshness_preserves_historical_receipts_and_checks_before_dedupe(tmp_path):
+    from tools.hierarchy_mailbox import Mailbox
+    root, delivery, checkpoint = receipt_fixture(tmp_path)
+    mailbox = Mailbox(root)
+    sender = {"from": "a/lane/review", "host": "host-one", "session": "a/lane/review", "binding_generation": 1}
+    mailbox.record_read(delivery, sender, ["receipt-note"])
+    before = {p: p.read_bytes() for p in delivery.glob("reads/**/*.json")}
+    assert len(before) == 1
+    invoke(root, "bind", {"endpoint": "a/lane/review", "host": "host-one", "session": "a/lane/review",
+                          "expected_generation": 1, "checkpoint": checkpoint})
+    with pytest.raises(ValueError, match="^stale or mismatched sender binding$"):
+        mailbox.record_read(delivery, sender, ["receipt-note"])
+    assert {p: p.read_bytes() for p in delivery.glob("reads/**/*.json")} == before
+    state = invoke(root, "delivery", delivery_dir=delivery, message_id="receipt-note")["message"]
+    assert state["state"] == "read" and state["read_by"]["generation"] == 1
+
+
 def published(root):
     return sorted(root.glob("**/*.md"))
 

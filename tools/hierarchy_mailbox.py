@@ -1009,8 +1009,8 @@ class Mailbox:
     def write_delivery_receipt(self, directory, kind, receipt):
         folder = safe_path(self.delivery_directory(directory) / kind / receipt["endpoint"])
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Each ledger has its own lock, so adapter reads never contend with mailbox publishers. Past
-        # the limit the reader would refuse the whole ledger, so a full one refuses here instead.
+        # record_read holds mailbox exclusion before this ledger lock. Past the limit the reader
+        # would refuse the whole ledger, so a full one refuses here instead.
         with writer_lock(folder):
             self.require_receipt_room(directory, kind, receipt["endpoint"])
             name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex + ".json"
@@ -1018,15 +1018,24 @@ class Mailbox:
 
     def record_read(self, directory, sender, message_ids):
         """Record what the adapter returned to this connection, never what the session did with it."""
-        endpoint = sender["from"]
-        records = self.messages()
-        seen = {identifier for receipt in self.delivery_receipts(directory, "reads", endpoint, records)
-                if receipt["generation"] == sender["binding_generation"] for identifier in receipt["message_ids"]}
-        fresh = [identifier for identifier in message_ids if identifier not in seen]
-        if fresh:
-            self.write_delivery_receipt(directory, "reads", {
-                "endpoint": endpoint, "host": sender["host"], "session": sender["session"],
-                "generation": sender["binding_generation"], "message_ids": fresh})
+        # The delivered page's binding can retire during stdout flush. Fence it before even
+        # deduplicating receipts, and retain exclusion through publication; historical receipts
+        # remain valid, but cannot authorize a new receipt for a retired connection.
+        with writer_lock(self.root):
+            endpoint = sender["from"]
+            binding = self.current_binding(endpoint)
+            expected = {"from": binding["endpoint"], "host": binding["host"],
+                        "session": binding["session"], "binding_generation": binding["generation"]}
+            require(all(type(sender.get(key)) is type(value) and sender.get(key) == value
+                        for key, value in expected.items()), "stale or mismatched sender binding")
+            records = self.messages()
+            seen = {identifier for receipt in self.delivery_receipts(directory, "reads", endpoint, records)
+                    if receipt["generation"] == sender["binding_generation"] for identifier in receipt["message_ids"]}
+            fresh = [identifier for identifier in message_ids if identifier not in seen]
+            if fresh:
+                self.write_delivery_receipt(directory, "reads", {
+                    "endpoint": endpoint, "host": sender["host"], "session": sender["session"],
+                    "generation": sender["binding_generation"], "message_ids": fresh})
 
     def endpoint_delivery(self, directory, endpoint, records):
         """Per-message rows and an endpoint summary; published, woken and read stay separate."""
