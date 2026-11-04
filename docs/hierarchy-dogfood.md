@@ -395,6 +395,63 @@ there do not establish directory durability across power loss. Process verificat
 semantics: `verify-retired` and a `startup-ack` that probes a host PID refuse on Windows before
 signalling a process or writing an acknowledgment/custody update. Planning remains read-only.
 
+## Canonical asynchronous fixture transactions
+
+The source-checkout Operator has a separate, explicit evidence-only asynchronous
+fixture seam. Its `submit(request_id, request_sha256, actor, generation, target)`,
+`observe(request_id, request_sha256, actor, generation)` and
+`cancel(request_id, request_sha256, actor, generation, reason)` methods retain the
+existing production native refusal. The legacy synchronous `execute` signature
+and object-provider behavior stay separate. No new CLI or native dispatch is
+enabled by these methods.
+
+The async provider configuration is a closed data-only process descriptor for
+the bounded helper in [the watch bridge](../tools/hierarchy_watch_bridge.py).
+It is not an injected Python inspection/start callback. The caller supplies only
+provider/endpoint/thread/deadline target data. The canonical transaction derives
+the request hash, sole intent, original actor/generation/cap, source, authority,
+decision and admission linkage. Local files, process labels and this fixture
+descriptor never authenticate those claims as native authority.
+
+A single writer fence covers final bounded inspection, admission, the sole
+intent/start, immutable attempted provider association and actual submit
+issuance. The calls share one absolute monotonic budget, at most five seconds
+including stop/reap reserves, reduced by remaining authority, target deadline
+and caller cap. Wall expiry is converted to a remaining duration; it is checked
+again before submit. Polling an existing job happens outside the canonical
+writer lock, with fresh current-actor/hash/association checks before retaining
+the observation. A running job therefore does not keep the writer locked for
+its whole lifetime.
+
+| Canonical result | Meaning |
+|---|---|
+| `refused/none` | This call attempted no new effect; older unresolved work is still retained. |
+| `running/possible` | Observe the existing association, retaining its original authority and reservation. |
+| `unknown/possible` | A reply, handle or observation is ambiguous; never repeat a start. |
+| `completed/confirmed` | Exact passed/failed terminal evidence exists; review, delivery and resource recovery remain separate. |
+
+Start reply loss, association-publication uncertainty, timeout, incomplete or
+contradictory observations never authorize another intent or start. Cancellation
+is a single stop-only attempt by the current operator/current generation against
+the exact bound handle, within its own remaining cap and five-second bound.
+It may stop already-owned work after original start expiry or denial without
+renewing that authority. An interrupt/cancel ACK remains unknown. Only retained
+owned-job quiescence with an actual nonzero exit can represent cancelled work as
+a failed terminal result; it is never a passing result or reservation release.
+Reaping the helper's direct child proves neither remote-job nor escaped-descendant
+quiescence. S3 remains the resource-recovery owner.
+
+New projection fields appear only on a new association event. Legacy journal
+rows/checkpoints/raw request bytes and receipt recovery retain their old shape;
+an old unresolved intent without an association cannot acquire a new start.
+New expired approvals refuse at new-record admission, after identical receipt
+recovery; old expired approval journal replay and later denial remain valid.
+
+These checks demonstrate disposable source/transport behavior only. Authenticated
+host identity, effective tool restrictions, persistent native lifetime,
+escape-resistant containment, integrated validation and owner cutover remain
+separately held.
+
 ## Measure the trial
 
 Compare with the same counting method against this baseline from 489 mailbox messages:

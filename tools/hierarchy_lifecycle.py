@@ -35,8 +35,77 @@ PERMISSIONS = {"publish": {"coordinator", "router"}, "read": ROLES - {"root"}, "
                "decision": {"root"}, "admit": {"operator"}, "wait": {"operator"}, "intent": {"operator"},
                "start": {"operator"}, "terminal": {"operator"}, "meter": {"operator"},
                "review": {"reviewer"}, "delivery": {"coordinator"}, "disposition": {"coordinator"},
-               "resolve": {"coordinator"}, "succeed": ROLES}
+               "resolve": {"coordinator"}, "succeed": ROLES,
+               "associate": {"operator"}, "observe": {"operator"}, "cancel_attempt": {"operator"}}
 GATES = {"source", "capability", "lease", "capacity", "observer", "job"}
+PROVIDER_STATES = {"not_started", "running", "disconnected", "ambiguous", "cancel_requested",
+                   "cancelled", "passed", "failed", "unknown"}
+
+
+def provider_handle(row):
+    for observation in row.get("observations", []):
+        handle = observation["value"]["provider_handle"]
+        if handle is not None:
+            return handle
+    return None
+
+
+def validate_observation(row, value):
+    fields(value, {"association_sha256", "provider_state", "provider_handle", "exit_code", "evidence", "quiescent"})
+    require(value["association_sha256"] == row["association"]["sha256"], "provider association sha256 mismatch")
+    require(isinstance(value["provider_state"], str) and value["provider_state"] in PROVIDER_STATES,
+            "invalid provider state")
+    require(type(value["quiescent"]) is bool, "invalid provider quiescence")
+    handle = value["provider_handle"]
+    if handle is not None:
+        fields(handle, {"thread_id", "turn_id"})
+        for name in handle:
+            text(handle[name], "provider " + name, 256)
+        require(handle["thread_id"] == row["association"]["value"]["thread_id"], "provider thread mismatch")
+        known = provider_handle(row)
+        require(known is None or known == handle, "provider handle changed")
+    state, code = value["provider_state"], value["exit_code"]
+    if state in {"passed", "failed", "cancelled"}:
+        require(handle is not None and value["quiescent"] is True, "terminal provider evidence requires owned quiescence")
+        require(type(code) is int and (code == 0 if state == "passed" else code != 0),
+                "terminal exit code does not match outcome")
+    else:
+        require(code is None and value["quiescent"] is False, "nonterminal provider observation cannot claim quiescence")
+    evidence(value["evidence"])
+    return value
+
+
+def validate_association(policy, state, row, value, cid, at):
+    fields(value, {"schema", "request_id", "request_sha256", "intent_id", "source", "authority", "authority_sha256",
+                   "decision_sha256", "admission_sha256", "original_actor", "original_generation", "original_cap_seconds",
+                   "authority_expires_at", "provider", "endpoint_id", "thread_id", "client_id", "deadline"})
+    require(value["schema"] == "aegis.provider-association/v1", "unsupported provider association schema")
+    request = row["request"]
+    require(row["intent"] is not None and row["start"] is not None, "association requires a started canonical intent")
+    require(row["intent"]["actor"] == cid, "association requires its original current operator")
+    require(row["terminal"] is None and row.get("association") is None, "canonical intent already has an association or result")
+    authority = state["requests"][request["authority"]]
+    decisions = [d for d in state["decisions"] if d["request_id"] == request["authority"]]
+    require(decisions and decisions[-1]["decision"] == "approve", "authority revoked before effect")
+    expected = {"request_id": request["id"], "request_sha256": row["raw"]["sha256"],
+                "intent_id": row["intent"]["id"], "source": request["source"], "authority": request["authority"],
+                "authority_sha256": authority["raw"]["sha256"], "decision_sha256": digest(decisions[-1]),
+                "admission_sha256": digest(row["admission"]), "original_actor": cid,
+                "original_generation": policy["actors"][cid]["generation"],
+                "original_cap_seconds": policy["actors"][cid]["cap_seconds"],
+                "authority_expires_at": authority["request"]["continuation"]["expires_at"],
+                "client_id": "client-" + row["intent"]["id"]}
+    require(all(value[k] == v for k, v in expected.items()), "canonical provider association mismatch")
+    integer(value["original_generation"], "original generation")
+    integer(value["original_cap_seconds"], "original cap", maximum=3600)
+    for name, limit in (("provider", 128), ("endpoint_id", 128), ("thread_id", 256), ("client_id", 256)):
+        text(value[name], "provider " + name, limit)
+    require(parse_time(at) < parse_time(value["deadline"]) <= parse_time(value["authority_expires_at"]),
+            "execution deadline expired or exceeds authority")
+    require((parse_time(value["deadline"]) - parse_time(at)).total_seconds()
+            <= policy["actors"][cid]["cap_seconds"] - active_seconds(state, cid, at),
+            "execution deadline exceeds original actor cap")
+    return value
 
 
 def load_json(path):
@@ -262,7 +331,7 @@ def resolve_row(state, row, resolution, cid):
 def reduce_event(policy, state, envelope, at):
     cid, actor, event = actor_for(policy, state, envelope)
     kind = event["type"]
-    if kind not in {"meter", "succeed", "terminal"}:
+    if kind not in {"meter", "succeed", "terminal", "observe"}:
         require(active_seconds(state, cid, at) < actor["cap_seconds"], "actor cumulative active cap reached")
     mark = {"actor": cid, "generation": actor["generation"], "at": at}
     if kind == "publish":
@@ -294,13 +363,34 @@ def reduce_event(policy, state, envelope, at):
     extra = {"decision": {"decision", "reason"}, "read": set(), "route": {"to"}, "admit": {"source", "gates"},
              "wait": {"reason"}, "intent": {"intent_id"}, "start": {"intent_id"}, "terminal": {"result"},
              "review": {"result_sha256", "source", "verdict", "evidence"}, "delivery": {"evidence"},
-             "disposition": {"status", "resolution"}, "resolve": {"blocker_sha256", "resolution"}}
+             "disposition": {"status", "resolution"}, "resolve": {"blocker_sha256", "resolution"},
+             "associate": {"association"}, "observe": {"intent_id", "association_sha256", "observation"},
+             "cancel_attempt": {"intent_id", "association_sha256", "reason"}}
     fields(event, common | extra[kind])
     row = target(state, event)
     value = row["request"]
     if row["resolution"] and row["resolution"]["kind"] in {"complete", "next"}:
         require(kind in {"read", "route", "decision"}, "closed request requires a new immutable version")
-    if kind == "decision":
+    if kind == "associate":
+        binding = validate_association(policy, state, row, event["association"], cid, at)
+        # Lazy projection is essential: old succession events hash the exact old
+        # state. Do not add these keys when replaying any legacy event.
+        row["association"] = {**mark, "value": binding, "sha256": digest(binding)}
+        row["observations"], row["cancellation"] = [], None
+    elif kind in {"observe", "cancel_attempt"}:
+        require(row.get("association") is not None, "canonical provider association is unavailable")
+        require(event["intent_id"] == row["intent"]["id"]
+                and event["association_sha256"] == row["association"]["sha256"], "canonical association correlation changed")
+        require(row["terminal"] is None or row["terminal"]["value"]["outcome"] == "unknown", "intent already has terminal evidence")
+        if kind == "observe":
+            value = validate_observation(row, event["observation"])
+            row["observations"].append({**mark, "value": value})
+        else:
+            require(row.get("cancellation") is None, "canonical cancellation already attempted; observe its effect")
+            require(provider_handle(row) is not None, "owned provider handle is unavailable")
+            text(event["reason"], "cancellation reason", 1024)
+            row["cancellation"] = {**mark, "reason": event["reason"]}
+    elif kind == "decision":
         require(value["authority"] == value["id"], "only the authority request can receive a decision")
         require(event["decision"] in {"approve", "deny"}, "decision must be approve or deny")
         text(event["reason"], "decision reason", 1024)
@@ -436,22 +526,34 @@ class Lifecycle:
         require(os.name == "posix", "durable lifecycle mutation requires POSIX directory fsync")
         with writer_lock(self.root):
             policy, state = self.load()
-            fields(envelope, {"id", "actor", "generation", "custody", "event"})
-            matching(envelope["id"], SLUG, "event id")
-            previous = state["receipts"].get(envelope["id"])
-            if previous:
-                require(previous["event_sha256"] == digest(envelope), "event id conflicts with different bytes")
-                # A committed receipt is a read, even after a generation changed.
-                # Never reapply it or use it as authority for a new event.
-                return previous
-            actor_for(policy, state, envelope)
-            require(state["sequence"] < MAX_EVENTS, "lifecycle event limit reached")
-            record = {"schema": JOURNAL, "sequence": state["sequence"] + 1, "previous": state["head"],
-                      "policy_sha256": digest(policy), "at": timestamp(), "envelope": envelope, "event_sha256": digest(envelope)}
-            reduce_event(policy, state, envelope, record["at"])
-            publish_file(self.root / "events" / ("%06d.json" % record["sequence"]), encoded(record) + b"\n", limit=MAX_BYTES)
-            sync_directory(self.root / "events")
-            return self.finish(state, record)
+            return self._record_under_lock(envelope, policy, state)
+
+    def _record_under_lock(self, envelope, policy, state):
+        """Append to the caller's loaded state while its writer lock is held.
+
+        Only record() and the evidence-only Operator transaction own this seam.
+        It does not acquire/reenter a lock or establish native authority.
+        """
+        fields(envelope, {"id", "actor", "generation", "custody", "event"})
+        matching(envelope["id"], SLUG, "event id")
+        previous = state["receipts"].get(envelope["id"])
+        if previous:
+            require(previous["event_sha256"] == digest(envelope), "event id conflicts with different bytes")
+            return previous
+        actor_for(policy, state, envelope)
+        require(state["sequence"] < MAX_EVENTS, "lifecycle event limit reached")
+        record = {"schema": JOURNAL, "sequence": state["sequence"] + 1, "previous": state["head"],
+                  "policy_sha256": digest(policy), "at": timestamp(), "envelope": envelope, "event_sha256": digest(envelope)}
+        reduce_event(policy, state, envelope, record["at"])
+        # Admission of NEW approvals only; load() replays historical bytes.
+        event = envelope["event"]
+        if event["type"] == "decision" and event["decision"] == "approve":
+            authority = state["requests"][event["request_id"]]["request"]
+            require(parse_time(record["at"]) < parse_time(authority["continuation"]["expires_at"]),
+                    "bounded authority expired")
+        publish_file(self.root / "events" / ("%06d.json" % record["sequence"]), encoded(record) + b"\n", limit=MAX_BYTES)
+        sync_directory(self.root / "events")
+        return self.finish(state, record)
 
     def status(self):
         policy, state = self.load()

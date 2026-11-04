@@ -13,10 +13,12 @@ import os
 from pathlib import Path
 import stat
 import sys
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import digest, encoded, fields, parse_time, require, safe_path, timestamp, writer_lock  # noqa: E402
+from hierarchy_mailbox import (SHA256, SLUG, digest, encoded, fields, matching, parse_time, require,  # noqa: E402
+                               safe_path, text, timestamp, writer_lock)
 
 
 NATIVE_HOLD = "authenticated native operator execution is unavailable"
@@ -75,6 +77,256 @@ class Operator:
         self.root = Path(lifecycle_root)
         self.provider = provider
         self.evidence_only = evidence_only
+
+    @staticmethod
+    def _async_reply(request_id, request_sha256, row=None, *, state=None, reason="canonical asynchronous state retained"):
+        from hierarchy_lifecycle import provider_handle
+        intent = row["intent"] if row else None
+        association = row.get("association") if row else None
+        terminal = row["terminal"] if row else None
+        observations = row.get("observations", []) if row else []
+        observed = observations[-1]["value"] if observations else None
+        known = terminal is not None and terminal["value"]["outcome"] != "unknown"
+        if state is None:
+            state = "completed" if known else "running" if observed and observed["provider_state"] == "running" else "unknown" if intent else "refused"
+        # An older unknown receipt stays in history; a fresh running observation
+        # must not inherit that receipt's terminal outcome/exit-code fields.
+        value = terminal["value"] if terminal and (known or state == "unknown") else None
+        return {"schema": "aegis.operator-async-result/v1", "state": state,
+                "effect": {"completed": "confirmed", "running": "possible", "unknown": "possible", "refused": "none"}[state],
+                "reason": reason, "request_id": request_id, "request_sha256": request_sha256,
+                "intent_id": intent["id"] if intent else None,
+                "original_actor": association["value"]["original_actor"] if association else intent["actor"] if intent else None,
+                "original_generation": association["value"]["original_generation"] if association else intent["generation"] if intent else None,
+                "association": association["value"] if association else None,
+                "association_sha256": association["sha256"] if association else None,
+                "provider_handle": provider_handle(row) if association else None,
+                "provider_state": observed["provider_state"] if observed else value["outcome"] if value else "unknown" if intent else "not_started",
+                "outcome": value["outcome"] if value else None, "exit_code": value["exit_code"] if value else None,
+                "evidence": value["evidence"] if value else observed["evidence"] if observed else [],
+                "terminal_sha256": terminal["sha256"] if terminal else None, "native_qualified": False}
+
+    @staticmethod
+    def _context(policy, state, request_id, request_sha256, actor, generation):
+        from hierarchy_lifecycle import actor_for
+        matching(request_id, SLUG, "request id")
+        matching(request_sha256, SHA256, "request sha256")
+        require(request_id in state["requests"], "unknown request id")
+        row = state["requests"][request_id]
+        require(row["raw"]["sha256"] == request_sha256, "request sha256 mismatch")
+        root = state["current"]["root"]
+
+        def envelope(kind, **body):
+            event = {"type": kind, "request_id": request_id, "request_sha256": request_sha256, **body}
+            if kind == "associate":
+                identifier = "async-associate-" + digest(body["association"])[:48]
+            elif kind == "observe":
+                identifier = "async-observe-" + digest({"association_sha256": body["association_sha256"],
+                                                       "observation": body["observation"]})[:48]
+            elif kind == "cancel_attempt":
+                identifier = "async-cancel-" + body["association_sha256"][:48]
+            else:
+                identifier = "async-" + digest({"actor": actor, "generation": generation, "event": event})[:48]
+            return {"id": identifier,
+                    "actor": actor, "generation": generation,
+                    "custody": {"cid": root, "generation": policy["actors"][root]["generation"]}, "event": event}
+
+        actor_for(policy, state, envelope("admit"))
+        return row, envelope
+
+    @staticmethod
+    def _deadline(policy, state, actor, *, row=None, target=None):
+        from hierarchy_lifecycle import active_seconds
+        now = timestamp()
+        remaining = policy["actors"][actor]["cap_seconds"] - active_seconds(state, actor, now)
+        require(remaining > 0, "actor cumulative active cap reached")
+        remaining = min(5.0, remaining)
+        if target is not None:
+            authority = state["requests"][row["request"]["authority"]]["request"]
+            target_time = parse_time(target["deadline"])
+            require(parse_time(now) < target_time <= parse_time(authority["continuation"]["expires_at"]),
+                    "execution deadline expired or exceeds authority")
+            require((target_time - parse_time(now)).total_seconds()
+                    <= policy["actors"][actor]["cap_seconds"] - active_seconds(state, actor, now),
+                    "execution deadline exceeds original actor cap")
+            remaining = min(remaining,
+                            (parse_time(authority["continuation"]["expires_at"]) - parse_time(now)).total_seconds(),
+                            (parse_time(target["deadline"]) - parse_time(now)).total_seconds())
+            require(remaining > 0, "execution deadline expired")
+        return time.monotonic() + remaining
+
+    @staticmethod
+    def _process(spec, method, row, actor, generation, deadline, reason=None):
+        # These fixed, source-reviewed helpers accept plain data, never an
+        # arbitrary Python provider callback. Native mode never reaches here.
+        from hierarchy_watch_bridge import process_provider_call
+        from hierarchy_lifecycle import provider_handle
+        association = row.get("association")
+        call = process_provider_call(spec, method, row["request"], row["raw"]["sha256"], actor=actor,
+                                     generation=generation, association=association["value"] if association else None,
+                                     provider_handle=provider_handle(row) if association else None,
+                                     reason=reason, deadline=deadline, evidence_only=True)
+        fields(call, {"schema", "transport", "reason", "result", "process", "evidence_dir", "native_qualified"})
+        require(call["schema"] == "aegis.fixture-process-call-result/v1" and call["native_qualified"] is False,
+                "invalid process provider qualification")
+        require(call["transport"] in {"received", "not_sent", "uncertain"}, "invalid process provider transport")
+        return call
+
+    def _publish_observation(self, lifecycle, call, request_id, request_sha256, actor, generation, association_sha256):
+        from hierarchy_lifecycle import validate_observation
+        with writer_lock(lifecycle.root):
+            policy, state = lifecycle.load()
+            row, envelope = self._context(policy, state, request_id, request_sha256, actor, generation)
+            require(row.get("association") and row["association"]["sha256"] == association_sha256,
+                    "canonical association correlation changed")
+            if row["terminal"] is not None and row["terminal"]["value"]["outcome"] != "unknown":
+                return self._async_reply(request_id, request_sha256, row)
+            if call["transport"] == "received":
+                observed = call["result"]
+            else:
+                from hierarchy_lifecycle import provider_handle
+                observed = {"association_sha256": association_sha256, "provider_state": "unknown",
+                            "provider_handle": provider_handle(row), "exit_code": None,
+                            "evidence": row["admission"]["gates"]["job"], "quiescent": False}
+            validate_observation(row, observed)
+            verify_refs(observed["evidence"])
+            if call["evidence_dir"] is not None:
+                # The immutable call receipt retains the provider's original
+                # evidence list as well as timeout/correlation/cleanup failures.
+                # Referencing it avoids losing the actual uncertain transport
+                # behind a generic pre-existing admission witness.
+                receipt = safe_path(Path(call["evidence_dir"]) / "result.json")
+                require(stat.S_ISREG(receipt.stat().st_mode), "transport receipt must be a regular file")
+                with receipt.open("rb") as stream:
+                    raw_receipt = stream.read(MAX_EVIDENCE_BYTES + 1)
+                require(len(raw_receipt) <= MAX_EVIDENCE_BYTES, "transport receipt exceeds byte limit")
+                observed = {**observed, "evidence": [{"path": str(receipt),
+                                                     "sha256": hashlib.sha256(raw_receipt).hexdigest()}]}
+                verify_refs(observed["evidence"])
+            require(row["request"]["source"] == row["association"]["value"]["source"], "provider source mismatch")
+            lifecycle._record_under_lock(envelope("observe", intent_id=row["intent"]["id"],
+                                                  association_sha256=association_sha256, observation=observed), policy, state)
+            phase = observed["provider_state"]
+            if phase in {"passed", "failed", "cancelled"}:
+                result = {"request_sha256": request_sha256, "intent_id": row["intent"]["id"],
+                          "source": row["request"]["source"], "outcome": "passed" if phase == "passed" else "failed",
+                          "exit_code": observed["exit_code"], "evidence": observed["evidence"]}
+                raw = encoded(result).decode()
+                lifecycle._record_under_lock(envelope("terminal", result={"raw": raw, "sha256": hashlib.sha256(raw.encode()).hexdigest()}),
+                                             policy, state)
+            return self._async_reply(request_id, request_sha256, row, reason=call["reason"])
+
+    def submit(self, request_id, request_sha256, actor, generation, target):
+        if not self.evidence_only:
+            return self._async_reply(request_id, request_sha256, reason=NATIVE_HOLD)
+        from hierarchy_lifecycle import Lifecycle, active_seconds, approved_authority
+        from hierarchy_watch_bridge import validate_process_provider
+        lifecycle, row, descriptor = Lifecycle(self.root), None, None
+        attempted = False
+        try:
+            require(os.name == "posix", "disposable operator requires POSIX execution exclusion")
+            spec = validate_process_provider(self.provider)
+            import fcntl
+            descriptor = os.open(safe_path(self.root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return self._async_reply(request_id, request_sha256, reason="canonical operator execution is already in progress")
+            with writer_lock(lifecycle.root):
+                policy, state = lifecycle.load()
+                row = state["requests"].get(request_id)
+                row, envelope = self._context(policy, state, request_id, request_sha256, actor, generation)
+                if row["intent"] is not None:
+                    return self._async_reply(request_id, request_sha256, row)
+                fields(target, {"provider", "endpoint_id", "thread_id", "deadline"})
+                require(target["provider"] == spec["provider"] and target["endpoint_id"] == spec["endpoint_id"],
+                        "provider target mismatch")
+                text(target["thread_id"], "provider thread_id", 256)
+                now = timestamp()
+                approved_authority(state, row, now)
+                deadline = self._deadline(policy, state, actor, row=row, target=target)
+                inspected = self._process(spec, "inspect", row, actor, generation, deadline)
+                require(inspected["transport"] == "received", inspected["reason"])
+                observation = inspected["result"]
+                from hierarchy_lifecycle import GATES
+                fields(observation, {"qualified", "mode", "source", "gates", "reason"})
+                require(observation["mode"] == "fixture" and observation["qualified"] is True, observation["reason"])
+                require(observation["source"] == row["request"]["source"], "provider source mismatch")
+                fields(observation["gates"], GATES)
+                for refs in observation["gates"].values():
+                    verify_refs(refs)
+                lifecycle._record_under_lock(envelope("admit", source=row["request"]["source"], gates=observation["gates"]), policy, state)
+                intent_id = "intent-" + digest({"request": request_sha256, "actor": actor, "generation": generation})[:32]
+                attempted = True  # Publication may succeed even when its reply is lost.
+                lifecycle._record_under_lock(envelope("intent", intent_id=intent_id), policy, state)
+                lifecycle._record_under_lock(envelope("start", intent_id=intent_id), policy, state)
+                authority = state["requests"][row["request"]["authority"]]
+                decisions = [d for d in state["decisions"] if d["request_id"] == row["request"]["authority"]]
+                binding = {"schema": "aegis.provider-association/v1", "request_id": request_id,
+                           "request_sha256": request_sha256, "intent_id": intent_id, "source": row["request"]["source"],
+                           "authority": row["request"]["authority"], "authority_sha256": authority["raw"]["sha256"],
+                           "decision_sha256": digest(decisions[-1]), "admission_sha256": digest(row["admission"]),
+                           "original_actor": actor, "original_generation": generation,
+                           "original_cap_seconds": policy["actors"][actor]["cap_seconds"],
+                           "authority_expires_at": authority["request"]["continuation"]["expires_at"],
+                           "provider": target["provider"], "endpoint_id": target["endpoint_id"],
+                           "thread_id": target["thread_id"], "client_id": "client-" + intent_id, "deadline": target["deadline"]}
+                lifecycle._record_under_lock(envelope("associate", association=binding), policy, state)
+                fresh = timestamp()
+                require(parse_time(fresh) < parse_time(binding["authority_expires_at"])
+                        and parse_time(fresh) < parse_time(binding["deadline"]), "bounded authority expired")
+                require(active_seconds(state, actor, fresh) < policy["actors"][actor]["cap_seconds"], "actor cumulative active cap reached")
+                require(time.monotonic() < deadline, "process provider deadline reached")
+                call = self._process(spec, "submit", row, actor, generation, deadline)
+                association_sha256 = row["association"]["sha256"]
+            return self._publish_observation(lifecycle, call, request_id, request_sha256, actor, generation, association_sha256)
+        except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
+            return self._async_reply(request_id, request_sha256, row, state="unknown" if attempted else "refused", reason=str(exc))
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def observe(self, request_id, request_sha256, actor, generation):
+        return self._follow("observe", request_id, request_sha256, actor, generation)
+
+    def cancel(self, request_id, request_sha256, actor, generation, reason):
+        return self._follow("cancel", request_id, request_sha256, actor, generation, reason)
+
+    def _follow(self, method, request_id, request_sha256, actor, generation, reason=None):
+        if not self.evidence_only:
+            return self._async_reply(request_id, request_sha256, reason=NATIVE_HOLD)
+        from hierarchy_lifecycle import Lifecycle, provider_handle
+        from hierarchy_watch_bridge import validate_process_provider
+        lifecycle, row, attempted = Lifecycle(self.root), None, False
+        try:
+            spec = validate_process_provider(self.provider)
+            with writer_lock(lifecycle.root):
+                policy, state = lifecycle.load()
+                row = state["requests"].get(request_id)
+                row, envelope = self._context(policy, state, request_id, request_sha256, actor, generation)
+                if row["intent"] is None or row.get("association") is None or (row["terminal"] is not None
+                        and row["terminal"]["value"]["outcome"] != "unknown"):
+                    return self._async_reply(request_id, request_sha256, row)
+                binding = row["association"]["value"]
+                require(binding["provider"] == spec["provider"] and binding["endpoint_id"] == spec["endpoint_id"],
+                        "provider target mismatch")
+                deadline = self._deadline(policy, state, actor)
+                association_sha256 = row["association"]["sha256"]
+                if method == "cancel":
+                    if row.get("cancellation") is not None:
+                        return self._async_reply(request_id, request_sha256, row)
+                    text(reason, "cancellation reason", 1024)
+                    require(provider_handle(row) is not None, "owned provider handle is unavailable")
+                    attempted = True
+                    lifecycle._record_under_lock(envelope("cancel_attempt", intent_id=row["intent"]["id"],
+                                                          association_sha256=association_sha256, reason=reason), policy, state)
+                    call = self._process(spec, "cancel", row, actor, generation, deadline, reason)
+            if method == "observe":
+                attempted = True
+                call = self._process(spec, "observe", row, actor, generation, deadline)
+            return self._publish_observation(lifecycle, call, request_id, request_sha256, actor, generation, association_sha256)
+        except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
+            return self._async_reply(request_id, request_sha256, row, state="unknown" if attempted else "refused", reason=str(exc))
 
     def execute(self, request_id, actor, generation):
         if not self.evidence_only:

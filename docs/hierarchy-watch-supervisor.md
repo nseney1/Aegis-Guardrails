@@ -113,3 +113,26 @@ An independent launcher/process test exercises the local bounded loop after its
 launcher exits. That test does not prove survival across a real model turn or a
 native host/daemon shutdown. Exact integrated source, independent review, full
 suite, hosted CI and native acceptance are separate delivery facts.
+
+## Observing an existing asynchronous association
+
+The optional async operator bridge returns `running/possible` as well as the
+original result pairs. A running watch reference remains unresolved until the
+canonical ledger records exact terminal evidence. Every step first polls existing
+unresolved canonical associations, even after original start expiry or denial.
+The operator still fences the current observer's identity, generation and cap.
+An approved successor observes the same original association and reservations.
+
+A restarted watch may recover a missing local row as an observation reference.
+It never calls submit to reconstruct history. Missing legacy associations and
+bridges without the optional `poll_request` port retain an explicit HOLD.
+Disconnected, ambiguous and malformed replies retain unknown effect and history;
+reconnection observes the same association.
+
+A `refused/none` response from a follow-up applies to that call alone. The watch
+retains its prior running/unknown/dispatching result and adds
+`observation_refused` history. This cannot erase an older effect or make it
+retryable. Original failures remain in history when later observation succeeds.
+Canonical terminal settlement still leaves independent review, delivery and
+final disposition as separate completion requirements. No second queue, resource
+ledger, authority decision, generation reset or native execution path is added.

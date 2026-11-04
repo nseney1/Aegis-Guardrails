@@ -163,7 +163,7 @@ class Supervisor:
                     and terminal["value"]["outcome"] != "unknown"):
                 attempt["canonical_settlement"] = {"intent_id": row["intent"]["id"],
                                                    "terminal_sha256": terminal["sha256"]}
-        unresolved = any(row["state"] in {"dispatching", "unknown"} and row["canonical_settlement"] is None
+        unresolved = any(row["state"] in {"dispatching", "unknown", "running"} and row["canonical_settlement"] is None
                          for row in attempts)
         return {"schema": "aegis.watch-status/v1", "watch_id": self.config["watch_id"],
                 "state": "hold" if observation_error else "observed", "observation_error": observation_error,
@@ -177,6 +177,79 @@ class Supervisor:
         with self.worker():
             return self._step(generation, bridge or NativeBridge())
 
+
+    @staticmethod
+    def result_pair(result):
+        pairs = {"completed": "confirmed", "refused": "none", "unknown": "possible", "running": "possible"}
+        require(isinstance(result, dict) and result.get("state") in pairs, "invalid bridge result state")
+        require(result.get("effect") == pairs[result["state"]], "invalid bridge result effect")
+        require(result.get("native_qualified") is False, "evidence-only watch cannot certify native execution")
+        encoded(result)
+
+    def _poll_associations(self, generation, bridge, lifecycle, holds, may_continue):
+        for request_id, row in sorted(lifecycle["requests"].items()):
+            if not may_continue():
+                break
+            terminal = row["terminal"]
+            if (row["intent"] is None or (terminal and terminal["value"]["outcome"] != "unknown")
+                    or (row["resolution"] and row["resolution"]["kind"] in {"complete", "next"})):
+                continue
+            if row.get("association") is None:
+                holds[request_id] = "canonical provider association is unavailable"
+                continue
+            request_sha256 = row["raw"]["sha256"]
+            operation_id = "watch-" + digest({"request_id": request_id, "request_sha256": request_sha256})
+            with self.database() as db:
+                self.fence(db, generation)
+                prior = db.execute("SELECT * FROM attempts WHERE operation_id=?", (operation_id,)).fetchone()
+                if prior is None:
+                    require(db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] < MAX_ATTEMPTS,
+                            "watch attempt limit reached")
+                    # This reference recovers observation, never dispatch. The
+                    # existing canonical association remains the only intent.
+                    retained = {"state": "unknown", "effect": "possible", "native_qualified": False,
+                                "intent_id": row["intent"]["id"],
+                                "association_sha256": row["association"]["sha256"],
+                                "reason": "canonical association recovered for observation only"}
+                    db.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?)",
+                               (operation_id, request_id, request_sha256, generation, "unknown", encoded(retained).decode()))
+                    self.history(db, operation_id, "recovered_observation", retained)
+                else:
+                    require(prior["request_id"] == request_id and prior["request_sha256"] == request_sha256,
+                            "watch association correlation mismatch")
+            poll = getattr(bridge, "poll_request", None)
+            if not callable(poll):
+                holds[request_id] = "bridge cannot observe an existing canonical association"
+                with self.database() as db:
+                    self.fence(db, generation)
+                    self.history(db, operation_id, "observation_hold", {"reason": holds[request_id]})
+                continue
+            if not may_continue():
+                break
+            try:
+                result = poll(request_id, request_sha256, operation_id)
+                self.result_pair(result)
+                require(result.get("intent_id") == row["intent"]["id"]
+                        and result.get("association_sha256") == row["association"]["sha256"],
+                        "bridge follow-up correlation mismatch")
+            except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
+                result = {"state": "unknown", "effect": "possible", "reason": str(exc)[:4096],
+                          "intent_id": row["intent"]["id"], "association_sha256": row["association"]["sha256"],
+                          "native_qualified": False}
+            with self.database() as db:
+                self.fence(db, generation)
+                if result["state"] == "refused":
+                    # No effect from THIS call is not absence of the older job.
+                    # Never replace its running/unknown reference with a retryable refusal.
+                    holds[request_id] = str(result.get("reason", "observation refused"))[:4096]
+                    self.history(db, operation_id, "observation_refused", result)
+                else:
+                    db.execute("UPDATE attempts SET state=?,result=? WHERE operation_id=?",
+                               (result["state"], encoded(result).decode(), operation_id))
+                    self.history(db, operation_id, result["state"], result)
+                    if result["state"] == "unknown":
+                        holds[request_id] = str(result.get("reason", "provider effect remains unknown"))[:4096]
+
     def _step(self, generation, bridge, *, deadline=None, stop_event=None):
         if (deadline is not None or stop_event is not None) and hasattr(bridge, "with_control"):
             bridge = bridge.with_control(deadline=deadline, stop_event=stop_event)
@@ -189,6 +262,7 @@ class Supervisor:
             self.fence(db, generation)
         lifecycle = lifecycle_status(self.lifecycle_root)
         holds = dict(lifecycle["continuation_holds"])
+        self._poll_associations(generation, bridge, lifecycle, holds, may_continue)
         for request_id in lifecycle["continuation_candidates"]:
             if not may_continue():
                 break
@@ -242,12 +316,7 @@ class Supervisor:
                     # call occurred, so this retained dispatch is a known refusal.
                     result = {"state": "refused", "effect": "none", "native_qualified": False,
                               "reason": "watch stopped or deadline reached before provider dispatch"}
-                require(isinstance(result, dict) and result.get("state") in {"completed", "refused", "unknown"},
-                        "invalid bridge result state")
-                require(result.get("effect") == {"completed": "confirmed", "refused": "none", "unknown": "possible"}[result["state"]],
-                        "invalid bridge result effect")
-                require(result.get("native_qualified") is False, "evidence-only watch cannot certify native execution")
-                encoded(result)
+                self.result_pair(result)
             except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
                 result = {"state": "unknown", "effect": "possible", "reason": str(exc)[:4096], "native_qualified": False}
             with self.database() as db:

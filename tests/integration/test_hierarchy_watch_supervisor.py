@@ -392,3 +392,35 @@ def test_model_free_loop_survives_its_launcher_and_keeps_watching(watch):
     assert result["obligations"][0]["request_id"] == "after-launcher-exit"
     assert result["native_qualified"] is False
     assert result["work_complete"] is False
+
+
+def test_async_consumer_legacy_unassociated_intent_stays_held(watch):
+    supervisor, journal, host, request = watch
+    value = approved(journal, request)
+    journal.admit(value)
+    journal.intent(value)
+    result = supervisor.step(1, host)
+    assert result["attempts"] == []
+    assert result["holds"][value["id"]] == "canonical provider association is unavailable"
+    assert host.effects() == []
+
+
+def test_async_consumer_unsupported_poll_port_preserves_unknown(tmp_path):
+    from tests.integration.test_hierarchy_operator import async_job
+    if not (os.name == "posix" and all(hasattr(os, n) for n in
+            ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT"))):
+        pytest.skip("asynchronous process execution requires POSIX waitid WNOWAIT")
+    from tests.integration.test_hierarchy_lifecycle import Ledger
+    from tools.hierarchy_watch_supervisor import Supervisor, initialize
+    from hierarchy_operator import Operator
+    journal = Ledger(tmp_path)
+    journal, value, candidate, spec, target, state = async_job.__wrapped__(journal)
+    started = Operator(journal.path, spec, evidence_only=True).submit(
+        value["id"], journal.target(value)["request_sha256"], journal.operator, 1, target)
+    root = tmp_path / "watch"
+    initialize(root, journal.path, "async-watch", evidence_only=True)
+    result = Supervisor(root).step(1, Host(tmp_path))
+    assert result["attempts"][0]["state"] == "unknown"
+    assert result["attempts"][0]["result"]["intent_id"] == started["intent_id"]
+    assert result["holds"][value["id"]] == "bridge cannot observe an existing canonical association"
+    assert json.loads(state.read_text())["starts"] == 1

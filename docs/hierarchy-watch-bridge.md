@@ -83,6 +83,100 @@ may leave the canonical writer's lock file behind; retain it and the unresolved
 intent for qualified reconciliation. This bridge never removes abandoned locks
 or releases capacity. Legacy synchronous Python bridges remain uninterruptible.
 
+## Bounded asynchronous fixture provider
+
+`validate_process_provider(spec)` validates and copies a plain data descriptor;
+it creates neither evidence nor a process. The closed descriptor has `schema`
+(`aegis.fixture-process-provider/v1`), `mode` (`fixture`), `provider`, opaque
+`endpoint_id`, `argv`, `cwd`, `evidence_dir`, and `stop_grace`. The executable
+and paths must be absolute, with no symlink or traversal. The argument vector
+has at most 64 strings of at most 4096 characters. Stop grace is positive and
+at most 0.2 seconds; the encoded descriptor is at most 256 KiB.
+
+`process_provider_call(spec, method, request, request_sha256, actor=...,
+generation=..., association=None, provider_handle=None, reason=None,
+deadline=..., evidence_only=True)` provides the fixed process boundary used
+by canonical asynchronous fixture transactions. Methods are `inspect`, `submit`,
+`observe`, and `cancel`. No provider callback, native transport, authority store,
+or dispatch queue is supplied. The canonical operator owns all admission and
+the one attempted association; the helper checks only transport/input correlation.
+
+The caller supplies one absolute monotonic deadline spanning its final inspection,
+canonical publication, and submit, with a total budget of at most five seconds.
+Every helper call reserves two stop-grace periods inside that same deadline for
+owned-child cleanup. An expired or insufficient budget returns `not_sent` before
+launch. The canonical operator converts remaining wall-clock authority, target,
+and actor-cap durations to its monotonic budget and repeats its final checks;
+this helper never renews an authority or resets a caller's budget.
+
+The stdin frame has schema `aegis.fixture-process-call/v1`, a fresh local `call_id`,
+method, request and exact raw request hash, caller actor/generation, canonical
+association and its digest, known provider handle, and cancellation reason.
+The child echoes every field plus `result`. Correlation includes exact JSON
+types: a boolean cannot echo an integer generation. Frames are at most 1 MiB
+and 32 levels deep. Inspect returns the existing five provider-inspection fields;
+other methods return the six closed canonical observation fields
+`association_sha256`, `provider_state`, `provider_handle`, `exit_code`, `evidence`,
+and `quiescent`. The canonical operator independently validates evidence and
+terminal semantics. The disposable fixture envelope is separate from the pinned
+native-protocol codec and does not send shared-daemon RPC.
+
+Provider and endpoint names remain bounded to 128 characters. Canonical
+`thread_id` and `turn_id` values support up to 256 characters at both input and
+response boundaries. An oversized caller-supplied thread or known handle refuses
+before a child is started; an oversized returned handle leaves an uncertain reply.
+
+Results use schema `aegis.fixture-process-call-result/v1` and include `transport`,
+`reason`, `result`, direct-call `process` details, `evidence_dir`, and
+`native_qualified: false`. A valid reply is `received`; refusal before launch is
+`not_sent`; any uncertain reply or cleanup after launch is `uncertain`. Neither
+`received` nor reaping the call process proves that its associated job stopped.
+An interrupt acknowledgment remains nonterminal. Missing, malformed, oversized,
+wrongly correlated or nonzero-exit replies retain evidence and never retry.
+
+The implementation reuses the existing POSIX owned-child runner and regular
+stdout/stderr files, retaining `request.json`, `stdout`, `stderr`, and `result.json`.
+It never waits for inherited-pipe EOF. Legacy watch-process envelopes/results
+remain unchanged. Escaped descendants, remote job containment, uninterruptible
+OS/storage operations and authenticated native lifetime remain unqualified.
+
+
+## Asynchronous bridge/watch consumer
+
+An optional `async_target` keyword on `OperatorBridge` selects the canonical
+asynchronous fixture path. It is copied as plain JSON data. Discovery checks the
+canonical candidate and descriptor; final inspection remains inside the operator's
+one bounded transaction. An unstarted continuation calls public `Operator.submit`.
+An existing intent is observed through `poll_request(request_id, request_sha256,
+operation_id)`, never submitted again. The original synchronous object-provider
+and `execute` path remain the default.
+
+Async results additionally admit `running/possible`. The bridge retains the
+canonical result fields and checks request, intent and immutable association
+correlation on follow-up. Watch operation IDs correlate delivery only. They do not
+mint execution intents, provider handles, authority or resource reservations.
+
+`cancel_request(request_id, request_sha256, operation_id, reason)` is an explicit
+stop-only request to public `Operator.cancel`. The supervisor never cancels
+automatically because a grant expired, was denied, an actor reached its cap, or a
+host went quiet. A cancellation acknowledgment stays unknown. Only canonical
+owned-job quiescence and a nonzero terminal exit settle cancellation as failure;
+neither cancellation nor local child cleanup releases resources.
+
+`with_control(deadline=..., stop_event=...)` supplies a bounded copy for async
+calls. A stop request or less than the complete five-second transaction budget
+remaining prevents a new operator call. This can hold an otherwise eligible
+request near the end of a short watch run. The operator API cannot interrupt a
+call already in progress; its existing five-second process budget, cleanup
+reserve, original authority/target expiry and actor cap still apply.
+Uninterruptible OS/storage behavior and native persistent lifetime remain
+unqualified. This option does not make legacy synchronous callbacks interruptible.
+
+Missing/legacy associations hold without dispatch. Unsupported process primitives
+retain explicit no-effect refusals; only supported execution fixture tests use a
+capability guard. These results remain disposable fixture evidence and do not
+qualify any actual native host or decision service.
+
 ## Supported-host qualification matrix
 
 ```sh

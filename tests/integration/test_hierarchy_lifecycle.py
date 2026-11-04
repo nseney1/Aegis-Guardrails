@@ -328,10 +328,9 @@ def test_a_capped_operator_has_no_continuation_candidate_or_new_intent(ledger):
 
 
 @pytest.mark.parametrize("decision", ["deny", "expired", "exhausted", "outside-scope"])
-def test_bounded_authority_stops_at_denial_expiry_budget_or_exact_scope(ledger, decision):
+def test_bounded_authority_stops_at_denial_expiry_budget_or_exact_scope(ledger, decision, monkeypatch):
     child = request("unapproved-late", authority="engine-partial")
-    scope = {"members": [], "max_starts": 1, "expires_at": "2000-01-01T00:00:00Z" if decision == "expired"
-             else "2099-01-01T00:00:00Z"}
+    scope = {"members": [], "max_starts": 1, "expires_at": "2099-01-01T00:00:00Z"}
     if decision == "exhausted":
         scope["members"] = [{"id": child["id"], "sha256": raw_request(child)["sha256"],
                              "phase": child["phase"], "operation": child["operation"]}]
@@ -354,9 +353,110 @@ def test_bounded_authority_stops_at_denial_expiry_budget_or_exact_scope(ledger, 
     else:
         error = "bounded authority expired"
     before = ledger.files()
-    refused = ledger.admit(value, expect=2)
-    assert refused["error"] == error
+    if decision == "expired":
+        from tools import hierarchy_lifecycle
+        # Approval was valid. Advance only the external clock for fresh admission.
+        monkeypatch.setattr(hierarchy_lifecycle, "timestamp", lambda: "2100-01-01T00:00:00Z")
+        envelope = {"id": "expired-admission", "actor": ledger.operator, "generation": 1,
+                    "custody": {"cid": ledger.root_actor, "generation": 1},
+                    "event": {"type": "admit", "source": SOURCE,
+                              "gates": {name: ledger.evidence for name in
+                                        ("source", "capability", "lease", "capacity", "observer", "job")},
+                              **ledger.target(value)}}
+        with pytest.raises(ValueError, match="^bounded authority expired$"):
+            hierarchy_lifecycle.Lifecycle(ledger.path).record(envelope)
+    else:
+        refused = ledger.admit(value, expect=2)
+        assert refused["error"] == error
     assert ledger.files() == before
+
+
+def test_new_expired_approval_refuses_without_changing_the_journal(ledger):
+    value = request(continuation={"members": [], "max_starts": 1, "expires_at": "2000-01-01T00:00:00Z"})
+    ledger.publish(value)
+    before = ledger.files()
+    refused = ledger.approve(value, expect=2)
+    assert refused["error"] == "bounded authority expired"
+    assert ledger.files() == before
+    assert ledger.status()["requests"][value["id"]]["raw"] == raw_request(value)
+    assert ledger.status()["decisions"] == []
+
+
+@pytest.mark.parametrize("at", ["2099-01-01T00:00:00Z", "2099-01-01T00:00:00.000001Z"])
+def test_new_approval_at_or_after_expiry_is_refused_atomically(ledger, monkeypatch, at):
+    from tools import hierarchy_lifecycle
+    value = request()
+    ledger.publish(value)
+    envelope = {"id": "at-expiry-approval", "actor": ledger.root_actor, "generation": 1,
+                "custody": {"cid": ledger.root_actor, "generation": 1},
+                "event": {"type": "decision", "decision": "approve", "reason": "bounded fixture approval",
+                          **ledger.target(value)}}
+    monkeypatch.setattr(hierarchy_lifecycle, "timestamp", lambda: at)
+    before = ledger.files()
+    with pytest.raises(ValueError, match="^bounded authority expired$"):
+        hierarchy_lifecycle.Lifecycle(ledger.path).record(envelope)
+    assert ledger.files() == before
+
+
+def test_approval_receipt_survives_expiry_and_root_succession_without_new_authority(ledger, monkeypatch):
+    from tools import hierarchy_lifecycle
+    value = request()
+    ledger.publish(value)
+    approval = {"id": "retained-approval", "actor": ledger.root_actor, "generation": 1,
+                "custody": {"cid": ledger.root_actor, "generation": 1},
+                "event": {"type": "decision", "decision": "approve", "reason": "bounded fixture approval",
+                          **ledger.target(value)}}
+    lifecycle = hierarchy_lifecycle.Lifecycle(ledger.path)
+    monkeypatch.setattr(hierarchy_lifecycle, "timestamp", lambda: "2098-01-01T00:00:00Z")
+    receipt = lifecycle.record(approval)
+    monkeypatch.setattr(hierarchy_lifecycle, "timestamp", lambda: "2100-01-01T00:00:00Z")
+    policy, state = lifecycle.load()
+    lifecycle.record({"id": "successor-after-expiry", "actor": "root-2", "generation": 2,
+                      "custody": {"cid": "root-1", "generation": 1},
+                      "event": {"type": "succeed", "predecessor": "root-1",
+                                "checkpoint_sha256": hierarchy_lifecycle.checkpoint(policy, state)["sha256"]}})
+    before = ledger.files()
+    assert lifecycle.record(approval) == receipt
+    assert ledger.files() == before
+    changed = copy.deepcopy(approval)
+    changed["event"]["reason"] = "conflicting receipt bytes"
+    with pytest.raises(ValueError, match="^event id conflicts with different bytes$"):
+        lifecycle.record(changed)
+    assert ledger.files() == before
+    denial = {"id": "deny-after-expiry", "actor": "root-2", "generation": 2,
+              "custody": {"cid": "root-2", "generation": 2},
+              "event": {"type": "decision", "decision": "deny", "reason": "revoke after expiry",
+                        **ledger.target(value)}}
+    lifecycle.record(denial)
+    assert [d["decision"] for d in lifecycle.load()[1]["decisions"]] == ["approve", "deny"]
+
+
+def test_old_expired_approval_journal_replays_unchanged_and_still_allows_denial(ledger):
+    from tools.hierarchy_mailbox import digest, encoded
+    value = request(continuation={"members": [], "max_starts": 1, "expires_at": "2000-01-01T00:00:00Z"})
+    ledger.publish(value)
+    first = json.loads((ledger.path / "events" / "000001.json").read_text())
+    # Historical v1 journal shape accepted at ce812358: an expired approval was
+    # committed. Construct archived bytes without using new-event admission.
+    envelope = {"id": "legacy-expired-approval", "actor": "root-1", "generation": 1,
+                "custody": {"cid": "root-1", "generation": 1},
+                "event": {"type": "decision", "decision": "approve", "reason": "bounded fixture approval",
+                          **ledger.target(value)}}
+    archived = {"schema": "aegis.lifecycle-event/v1", "sequence": 2, "previous": digest(first),
+                "policy_sha256": first["policy_sha256"], "at": "2001-01-01T00:00:00Z",
+                "envelope": envelope, "event_sha256": digest(envelope)}
+    (ledger.path / "events" / "000002.json").write_bytes(encoded(archived) + b"\n")
+    before = ledger.files()
+    status = ledger.status()
+    assert [d["decision"] for d in status["decisions"]] == ["approve"]
+    assert status["requests"][value["id"]]["raw"] == raw_request(value)
+    checkpoint = ledger.cli("checkpoint")
+    assert checkpoint["state"]["head"] == digest(archived)
+    assert ledger.approve(value, identifier="legacy-expired-approval") == status["receipts"]["legacy-expired-approval"]
+    assert ledger.files() == before
+    ledger.event("decision", actor="root-1", decision="deny", reason="historical approval revoked",
+                 **ledger.target(value))
+    assert [d["decision"] for d in ledger.status()["decisions"]] == ["approve", "deny"]
 
 
 def test_blocker_resolution_requires_exact_blocker_hash_and_advances_to_an_owned_request(ledger):
