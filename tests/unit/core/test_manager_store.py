@@ -199,16 +199,31 @@ def test_world_readable_store_is_rejected(tmp_path):
 
 def test_concurrent_processes_preserve_every_event_and_chain(tmp_path):
     root = tmp_path / "audit"
-    worker = ("import sys; sys.path.insert(0, sys.argv[1]); "
-              "from pathlib import Path; from aegis_core.manager_store import ManagerStore; "
-              "s=ManagerStore(Path(sys.argv[2])); "
-              "[s.append({'worker': sys.argv[3], 'item': i}) for i in range(12)]")
+    worker = """
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aegis_core.manager_store import ManagerStore
+phase, item = "construct", None
+try:
+    store = ManagerStore(Path(sys.argv[2]))
+    phase = "append"
+    for item in range(12):
+        store.append({"worker": sys.argv[3], "item": item})
+except BaseException:
+    print(f"worker={sys.argv[3]} pid={os.getpid()} phase={phase} item={item} root={sys.argv[2]}",
+          file=sys.stderr, flush=True)
+    raise
+"""
     processes = [subprocess.Popen([sys.executable, "-I", "-c", worker, str(REPO), str(root), str(n)],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for n in range(4)]
     try:
         for process in processes:
             stdout, stderr = process.communicate(timeout=30)
-            assert process.returncode == 0, (stdout, stderr)
+            if process.returncode != 0:
+                pytest.fail(f"worker exit={process.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                            pytrace=False)
     finally:
         for process in processes:
             if process.poll() is None:
