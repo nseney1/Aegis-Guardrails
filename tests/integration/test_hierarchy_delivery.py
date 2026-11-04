@@ -95,6 +95,44 @@ finally:
     sys.settrace(None)
 '''
 
+# Only the OS process boundary is substituted; the public CLI and store are real.
+WAKE_GROUP_FAULT = r'''
+import errno, json, os, runpy, signal, subprocess, sys
+wake_path, mode, record_path = sys.argv[1:4]
+sys.argv = [wake_path] + sys.argv[4:]
+real_killpg, real_popen = os.killpg, subprocess.Popen
+processes, calls = [], []
+def popen(*args, **kwargs):
+    process = real_popen(*args, **kwargs)
+    if kwargs.get("start_new_session"):
+        processes.append(process)
+    return process
+def killpg(pid, number):
+    calls.append({"pid": pid, "signal": number})
+    if mode == "persistent" and number == signal.SIGKILL:
+        # An accepted signal is not confirmation of group disappearance.
+        return None
+    if number == 0 and (mode == "persistent" or
+                         (mode == "transient" and sum(c["signal"] == 0 for c in calls) == 1)):
+        raise PermissionError(errno.EPERM, "fixture probe denied")
+    if number != 0 and mode == "signal":
+        raise PermissionError(errno.EPERM, "fixture signal denied")
+    return real_killpg(pid, number)
+subprocess.Popen, os.killpg = popen, killpg
+try:
+    runpy.run_path(wake_path, run_name="__main__")
+finally:
+    # Fixture teardown is separate from the CLI's recorded outcome.
+    with open(record_path, "w", encoding="utf-8") as stream:
+        json.dump({"calls": calls, "pids": [p.pid for p in processes]}, stream)
+    for process in processes:
+        try:
+            real_killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+'''
+
 
 class Pilot:
     def __init__(self, tmp_path, host="host-one", root=None, delivery=None):
@@ -159,11 +197,17 @@ class Pilot:
         path.write_text(json.dumps(document), encoding="utf-8")
         return path
 
-    def wake(self, profile, *flags, home=None, timeout=30, extra_env=None, diagnostic=False):
+    def wake(self, profile, *flags, home=None, timeout=30, extra_env=None, diagnostic=False, group_fault=None):
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
         if home is not None:
             env["HOME"] = str(home)
         command = [sys.executable, "-I", str(WAKE)]
+        if group_fault is not None:
+            boundary = self.tmp / "wake_group_fault.py"
+            boundary.write_text(WAKE_GROUP_FAULT, encoding="utf-8")
+            self.group_fault_record = self.tmp / "group-fault.json"
+            command = [sys.executable, "-I", str(boundary), str(WAKE), group_fault,
+                       str(self.group_fault_record)]
         if diagnostic:
             observer = self.tmp / "observe_wake.py"
             observer.write_text(WAKE_DIAGNOSTIC, encoding="utf-8")
@@ -555,6 +599,37 @@ def process_gone(pid, deadline=2.0):
             return True
         time.sleep(0.05)
     return False
+
+
+@posix_only
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the directory permission")
+@pytest.mark.parametrize("fault", ["transient", "persistent", "signal"])
+def test_failed_start_cleanup_distinguishes_probe_and_signal_denial(pilot, fault):
+    import signal
+    pilot.publish()
+    folder = pilot.delivery / "wakes" / TARGET
+    folder.mkdir(parents=True)
+    folder.chmod(0o555)
+    try:
+        code, result = pilot.wake(pilot.profile(mode="sleeper"), group_fault=fault, timeout=25)
+    finally:
+        folder.chmod(0o755)
+    boundary = json.loads(pilot.group_fault_record.read_text())
+    signals = [call["signal"] for call in boundary["calls"]]
+    assert signal.SIGTERM in signals
+    if fault == "transient":
+        assert code == 3 and result["state"] == "failed_to_start", (code, result, boundary)
+        assert "could not record the start" in result["error"]
+        assert signals.count(0) >= 2
+    elif fault == "persistent":
+        assert code == 2 and result == {"error": "[Errno 1] fixture probe denied"}, (code, result)
+        assert signal.SIGKILL in signals, boundary
+    else:
+        assert code == 2 and result == {"error": "[Errno 1] fixture signal denied"}, (code, result)
+        assert signals == [signal.SIGTERM]
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["last_wake"] is None
+    assert all(process_gone(pid) for pid in boundary["pids"])
 
 
 @posix_only

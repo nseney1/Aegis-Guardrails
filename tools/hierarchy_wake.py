@@ -293,20 +293,30 @@ def claim_wake(mailbox, endpoint):
 
 def stop_group(process):
     """Stop every process in the turn's group before reporting, so nothing keeps writing after a verdict."""
+    probe_error = None
     for signal_number in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, signal_number)
         except ProcessLookupError:
+            probe_error = None
             break
         deadline = time.monotonic() + STOP_GRACE_SECONDS
         while time.monotonic() < deadline:
             process.poll()
             try:
                 os.killpg(process.pid, 0)
+                probe_error = None
             except ProcessLookupError:
                 process.wait()
                 return
+            except PermissionError as exc:
+                # A denied existence probe is inconclusive, including during
+                # process exit on macOS. Keep the bounded cleanup/reap loop;
+                # neither this error nor an accepted signal proves absence.
+                probe_error = exc
             time.sleep(0.05)
+    if probe_error is not None:
+        raise probe_error
     process.wait(timeout=STOP_GRACE_SECONDS)
 
 
