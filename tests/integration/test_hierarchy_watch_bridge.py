@@ -191,20 +191,25 @@ root, mode, marker = Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 request = json.load(sys.stdin)
 evidence = root.parent / "retained-failure.json"
 refs = [{"path":str(evidence),"sha256":hashlib.sha256(evidence.read_bytes()).hexdigest()}]
+def publish_effect(value):
+    pending = marker.with_name(marker.name + ".pending")
+    pending.write_text(json.dumps(value))
+    os.replace(pending, marker)
 class Provider:
     def inspect(self, value, actor, generation):
         return {"qualified":True,"mode":"fixture","source":value["source"],
                 "gates":{k:refs for k in ("source","capability","lease","capacity","observer","job")},"reason":"fixture"}
     def execute(self, value, intent):
-        marker.write_text(json.dumps({"pid":os.getpid(),"intent":intent}))
         if mode == "hang":
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        publish_effect({"pid":os.getpid(),"intent":intent})
+        if mode == "hang":
             while True: time.sleep(0.01)
         return {"outcome":"passed","exit_code":0,"evidence":refs}
 bridge = OperatorBridge(root, Provider(), "operator-1", 1, evidence_only=True)
 if request["method"] == "observe":
     if mode == "hang-observe":
-        marker.write_text(json.dumps({"pid":os.getpid()}))
+        publish_effect({"pid":os.getpid()})
         while True: time.sleep(0.01)
     result = bridge.observe(request["request_id"], request["request_sha256"])
 else:
@@ -264,6 +269,87 @@ def test_process_bridge_joins_real_operator_and_retains_output(process_host):
     assert ledger.status()["requests"][value["id"]]["terminal"]["value"]["outcome"] == "passed"
     assert marker.exists() and result["native_qualified"] is False
     assert len(list((marker.parent / "process-evidence").glob("*/stdout"))) == 2
+
+
+@pytest.mark.parametrize("mode", ["hang", "hang-observe"])
+def test_effect_marker_publishes_complete_json_after_file_write_boundary(process_host, monkeypatch, mode):
+    supervisor, ledger, value, marker, build = process_host
+    ready = marker.parent / "write-boundary-ready"
+    release = marker.parent / "release-write"
+    witness = marker.parent / "write-boundary.json"
+    wrapper = marker.parent / "file_boundary.py"
+    # Pause a real child inside the external file write, after a partial byte
+    # reaches the open file. Neither Operator nor bridge behavior is replaced.
+    wrapper.write_text(
+        "import json,os,runpy,signal,sys,time\nfrom pathlib import Path\n"
+        "marker=Path(sys.argv[-1])\noriginal=Path.write_text\n"
+        "def paused_write(path,data,*args,**kwargs):\n"
+        "    if path.name not in ('effect.json','effect.json.pending'):\n"
+        "        return original(path,data,*args,**kwargs)\n"
+        "    with path.open('w') as stream:\n"
+        "        stream.write(data[:1]); stream.flush()\n"
+        "        marker.with_name('write-boundary.json').write_bytes(json.dumps({\n"
+        "            'pid':os.getpid(),'ignores_term':signal.getsignal(signal.SIGTERM)==signal.SIG_IGN\n"
+        "        }).encode())\n"
+        "        marker.with_name('write-boundary-ready').mkdir()\n"
+        "        end=time.monotonic()+5\n"
+        "        while not marker.with_name('release-write').exists():\n"
+        "            if time.monotonic()>=end: raise RuntimeError('file boundary release deadline')\n"
+        "            time.sleep(0.01)\n"
+        "        stream.write(data[1:])\n"
+        "    return len(data)\n"
+        "Path.write_text=paused_write\nsys.argv=sys.argv[1:]\n"
+        "runpy.run_path(sys.argv[0],run_name='__main__')\n"
+    )
+    original_popen = subprocess.Popen
+
+    def launch(argv, *args, **kwargs):
+        return original_popen(argv[:3] + [str(wrapper)] + argv[3:], *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    stop = threading.Event()
+    results, errors = [], []
+
+    def run():
+        try:
+            results.append(supervisor.run(1, seconds=4, interval=0.01,
+                                          bridge=build(mode, timeout=5), stop_event=stop))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not ready.exists() and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), errors
+        assert not marker.exists(), "final effect marker became visible during an incomplete JSON write"
+        observed = json.loads(witness.read_text())
+        if mode == "hang":
+            assert observed["ignores_term"], "SIGTERM behavior was installed after readiness"
+        release.touch()
+        deadline = time.monotonic() + 3
+        while not marker.exists() and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), errors
+        assert json.loads(marker.read_text())["pid"] == observed["pid"]
+        assert not marker.with_name("effect.json.pending").exists()
+    finally:
+        release.touch()
+        stop.set()
+        thread.join(timeout=6)
+        assert not thread.is_alive(), "owned public bridge did not finish cleanup"
+    assert errors == []
+    if mode == "hang":
+        assert results[0]["attempts"][0]["result"]["reason"] == "process bridge stop requested"
+    else:
+        assert results[0]["holds"][value["id"]] == "process bridge stop requested"
+        assert ledger.status()["requests"][value["id"]]["intent"] is None
+    receipts = [json.loads(p.read_text()) for p in (marker.parent / "process-evidence").glob("*/result.json")]
+    assert receipts and all(r["process"]["reaped"] for r in receipts)
+    with pytest.raises(ProcessLookupError):
+        os.kill(observed["pid"], 0)
 
 
 def test_process_timeout_reaps_child_and_restart_never_reexecutes(process_host):

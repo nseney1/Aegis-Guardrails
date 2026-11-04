@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,8 +35,12 @@ def until(predicate, timeout=4):
 @pytest.fixture
 def broker(tmp_path, request):
     candidate = module()
-    if os.name != "posix" or not hasattr(os, "WNOWAIT"):
-        pytest.skip("positive disposable broker exercises require POSIX waitid WNOWAIT")
+    try:
+        candidate.supported()
+    except candidate.BrokerError as exc:
+        if exc.code != "FIXTURE_UNSUPPORTED_HOST":
+            raise
+        pytest.skip(str(exc))
     from tests.integration.test_hierarchy_lifecycle import Ledger, request as canonical_request
     ledger = Ledger(tmp_path)
     value = canonical_request("broker-work")
@@ -285,3 +290,84 @@ def test_unsupported_host_refuses_explicitly_without_endpoint(tmp_path, monkeypa
         candidate.serve(tmp_path / "new", tmp_path / "missing", work_seconds=1, lifetime_seconds=2)
     assert error.value.code == "FIXTURE_UNSUPPORTED_HOST"
     assert list(tmp_path.iterdir()) == []
+
+
+HOST_CAPABILITIES = ("name", "AF_UNIX", "waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+
+
+def missing_host_capability(candidate, missing, monkeypatch):
+    """Substitute only the external OS capability surface, never authorization."""
+    name = "socket" if missing == "AF_UNIX" else "os"
+    values = vars(getattr(candidate, name)).copy()
+    if missing == "name":
+        values["name"] = "unsupported"
+    else:
+        values.pop(missing, None)
+    monkeypatch.setattr(candidate, name, SimpleNamespace(**values))
+
+
+@pytest.mark.parametrize("missing", HOST_CAPABILITIES)
+def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, missing):
+    probe = tmp_path / "test_capability_probe.py"
+    probe.write_text(
+        "import pytest\n"
+        "from tests.integration.test_hierarchy_fixture_broker import broker, module, missing_host_capability\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def unsupported(monkeypatch):\n"
+        "    missing_host_capability(module(), " + repr(missing) + ", monkeypatch)\n"
+        "def test_positive(broker):\n"
+        "    pass\n"
+    )
+    fixtures = tmp_path / "fixtures"
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "--basetemp", str(fixtures), str(probe)], cwd=ROOT,
+        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 skipped" in result.stdout, result.stdout + result.stderr
+    assert not list(fixtures.rglob("policy.json")), "unsupported fixture created a canonical ledger"
+    assert not list(fixtures.rglob("broker-output")), "unsupported fixture launched its broker"
+
+
+@pytest.mark.parametrize("missing", [None, *HOST_CAPABILITIES])
+def test_public_unsupported_serve_and_cli_preserve_inputs(tmp_path, monkeypatch, missing):
+    candidate = module()
+    if missing is None:
+        try:
+            candidate.supported()
+        except candidate.BrokerError as exc:
+            assert exc.code == "FIXTURE_UNSUPPORTED_HOST"
+        else:
+            pytest.skip("actual host supports the disposable broker; negative OS cases run separately")
+    else:
+        missing_host_capability(candidate, missing, monkeypatch)
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    sentinel = inputs / "untouched.json"
+    sentinel.write_bytes(b'{"foreign":"unchanged"}\n')
+    before = sentinel.read_bytes()
+    with pytest.raises(candidate.BrokerError, match="^fixture broker requires POSIX waitid WNOWAIT$") as error:
+        candidate.serve(tmp_path / "endpoint", inputs, work_seconds=1, lifetime_seconds=2)
+    assert error.value.code == "FIXTURE_UNSUPPORTED_HOST"
+    argv = ["serve", "--directory", str(tmp_path / "endpoint"), "--lifecycle-root", str(inputs),
+            "--work-seconds", "1", "--lifetime-seconds", "2"]
+    if missing is None:
+        command = [sys.executable, "-I", "-B", str(TOOL), *argv]
+    else:
+        command = [sys.executable, "-I", "-B", "-c",
+                   "import sys; sys.path.insert(0, sys.argv[1]); from types import SimpleNamespace; "
+                   "from tools import hierarchy_fixture_broker as candidate; "
+                   "missing=sys.argv[2]; name='socket' if missing=='AF_UNIX' else 'os'; "
+                   "values=vars(getattr(candidate,name)).copy(); "
+                   "values.update(name='unsupported') if missing=='name' else values.pop(missing,None); "
+                   "setattr(candidate,name,SimpleNamespace(**values)); "
+                   "sys.exit(candidate.main(sys.argv[3:]))", str(ROOT), missing, *argv]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "fixture broker requires POSIX waitid WNOWAIT\n"
+    assert sentinel.read_bytes() == before
+    assert list(inputs.iterdir()) == [sentinel]
+    assert list(tmp_path.iterdir()) == [inputs]

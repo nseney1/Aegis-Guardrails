@@ -17,6 +17,8 @@ import tempfile
 
 MANIFEST_SHA256 = "f708a079afdb19edbf7ffa236956936e88a43b5114c75ccdbca9da757b7e2595"
 MAILBOX_SHA256 = "5427e46a65f109257cbfb8153dee9e29384fe1908aa516708ede776f33f3add8"
+# Separately reviewed fixture successor; the corpus retains its historical pins.
+WATCH_TEST_SHA256 = "cf5df318f327c2f0b535b4bc9dadbef9d2c730d61aa287f57e95e201071155f9"
 MAX_FILE = 1048576
 MAX_TOTAL = 4194304
 SHA = re.compile(r"[a-f0-9]{64}\Z")
@@ -188,7 +190,8 @@ class _VerifiedSourceLoader(importlib.abc.SourceLoader):
 
 def verify_source(expected):
     root = checked_root(Path(__file__).resolve().parents[1])
-    pins = {**expected, "tools/hierarchy_mailbox.py": MAILBOX_SHA256}
+    pins = {**expected, "tools/hierarchy_mailbox.py": MAILBOX_SHA256,
+            "tests/integration/test_hierarchy_watch_bridge.py": WATCH_TEST_SHA256}
     sources = {}
     try:
         for name, sha in pins.items():
@@ -277,7 +280,8 @@ def inspect_legacy(fixtures_root):
     for case in definition["legacy_cases"]:
         prefix = case["prefix"] + "/"
         with tempfile.TemporaryDirectory(prefix="aegis-legacy-replay-") as temporary:
-            store = Path(temporary)
+            # Only our newly allocated scratch may traverse an OS temp alias.
+            store = checked_root(Path(temporary).resolve(strict=True))
             (store / "events").mkdir()
             (store / "policy.json").write_bytes(payloads[prefix + "policy.json"])
             for sequence in range(1, case["expected_sequence"] + 1):
