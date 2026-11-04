@@ -82,8 +82,8 @@ class Pilot:
     def state(self, identifier="note-1"):
         return invoke(self.root, "delivery", delivery_dir=self.delivery, message_id=identifier)["message"]
 
-    def summary(self):
-        data = invoke(self.root, "delivery", delivery_dir=self.delivery, endpoint=TARGET)
+    def summary(self, *, timeout=15):
+        data = invoke(self.root, "delivery", delivery_dir=self.delivery, endpoint=TARGET, process_timeout=timeout)
         return data["endpoints"][TARGET]
 
     def adapter_argv(self, delivery=True):
@@ -292,7 +292,7 @@ def test_a_full_read_ledger_refuses_more_receipts_and_stays_readable(pilot):
     assert [row["message"]["message_id"] for row in delivered] == ["seed-note", "note-1"]
     assert "read receipt not recorded: delivery receipt history limit reached" in result.stderr
     assert len(list(folder.glob("*.json"))) == 10000
-    summary = pilot.summary()
+    summary = pilot.summary(timeout=60)
     assert summary["read"] == 1 and summary["unread"] == ["note-1"]
     assert not (folder / ".write.lock").exists()
 

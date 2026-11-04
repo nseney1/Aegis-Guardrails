@@ -527,7 +527,13 @@ def test_check_hashes_follows_a_symlinked_candidate_and_refuses_a_directory_or_m
         return
     assert code == 6, (out, err)
     [miss] = out["unmatched"]
-    error = "not a regular file" if kind == "directory" else os.strerror(errno.ENOENT)
+    error = "not a regular file"
+    if kind == "missing":
+        # Windows' native FileNotFoundError text differs from C's errno message.
+        with pytest.raises(FileNotFoundError) as missing:
+            candidate.stat()
+        assert missing.value.errno == errno.ENOENT
+        error = missing.value.strerror
     assert miss["candidates"] == [{"path": str(candidate), "line": 1, "sha256": None, "error": error}]
 
 
@@ -922,12 +928,13 @@ def test_launch_reports_a_leaked_first_prompt_and_prints_the_stop_command(tmp_pa
     spec_path, spec = launch_spec(tmp_path, prompt_file)
     # The stub closes stdin like the real host, so the leaked transcript is planted where the tool looks
     # and the stub writes its own copy elsewhere.
-    transcript = stub.projects / spec["cwd"].replace("/", "-") / (SESSION + ".jsonl")
+    transcript = stub.projects / "leaked-first-prompt" / (SESSION + ".jsonl")
     write_transcript(transcript, [user_record(prompt_file.read_text(encoding="utf-8") + LAUNCHER_TEXT)])
     stub.serve("launch.json", {"session": SESSION, "projects": str(tmp_path / "elsewhere"), "assistant": True})
     code, out, err = launch(stub, spec_path)
     assert code == 2, (out, err)
     record = json.loads(Path(spec["record_out"]).read_text(encoding="utf-8"))
+    assert record["first_prompt_check"] is not None, (out, err, record)
     assert record["first_prompt_check"]["extra_chars"] == 2308
     assert record["stop_command"] == "claude stop " + SESSION[:8]
 
