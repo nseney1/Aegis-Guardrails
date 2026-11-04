@@ -3,6 +3,7 @@
 Host processes here are stubs at the subprocess boundary. They show how the tools report
 delivery, not that a real Claude or Codex session reads its mail.
 """
+import errno
 import hashlib
 import json
 import os
@@ -52,6 +53,46 @@ elif mode in ("bind", "publish"):
 FAKE_PS = '''
 import json, os, subprocess
 subprocess.run(json.loads(os.environ["FAKE_PS_ARGV"]), check=True, capture_output=True)
+'''
+
+# A disposable observer around the public CLI; it must preserve its exit status and JSON.
+WAKE_DIAGNOSTIC = r'''
+from pathlib import Path
+import json, os, runpy, sys
+wake_path, diagnostic_path = sys.argv[1:3]
+sys.argv = [wake_path] + sys.argv[3:]
+Path(diagnostic_path).write_text("", encoding="utf-8")
+watched = {wake_path, str(Path(wake_path).with_name("hierarchy_mailbox.py"))}
+
+def record(row):
+    with open(diagnostic_path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+def observe(frame, event, argument):
+    if frame.f_code.co_filename not in watched:
+        return None
+    frame.f_trace_lines = False
+    location = {"file": frame.f_code.co_filename, "function": frame.f_code.co_name,
+                "line": frame.f_lineno}
+    if event == "exception" and isinstance(argument[1], OSError):
+        error = argument[1]
+        record({**location, "event": "oserror", "errno": error.errno,
+                "filename": error.filename, "error_type": type(error).__name__})
+    elif event == "return" and frame.f_code.co_name == "start_turn" and argument is not None:
+        pid = argument[0].pid
+        row = {**location, "event": "started", "pid": pid}
+        try:
+            row["pgid"] = os.getpgid(pid)
+        except OSError as error:
+            row["pgid_error"] = {"errno": error.errno, "error_type": type(error).__name__}
+        record(row)
+    return observe
+
+sys.settrace(observe)
+try:
+    runpy.run_path(wake_path, run_name="__main__")
+finally:
+    sys.settrace(None)
 '''
 
 
@@ -118,11 +159,17 @@ class Pilot:
         path.write_text(json.dumps(document), encoding="utf-8")
         return path
 
-    def wake(self, profile, *flags, home=None, timeout=30, extra_env=None):
+    def wake(self, profile, *flags, home=None, timeout=30, extra_env=None, diagnostic=False):
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
         if home is not None:
             env["HOME"] = str(home)
-        result = subprocess.run([sys.executable, "-I", str(WAKE), "--root", str(self.root), "--delivery-dir",
+        command = [sys.executable, "-I", str(WAKE)]
+        if diagnostic:
+            observer = self.tmp / "observe_wake.py"
+            observer.write_text(WAKE_DIAGNOSTIC, encoding="utf-8")
+            self.diagnostic = self.tmp / "wake-diagnostic.jsonl"
+            command = [sys.executable, "-I", str(observer), str(WAKE), str(self.diagnostic)]
+        result = subprocess.run([*command, "--root", str(self.root), "--delivery-dir",
                                  str(self.delivery), "--endpoint", TARGET, "--profile", str(profile), *flags],
                                 capture_output=True, text=True, timeout=timeout, env=env)
         assert not result.stderr, result.stderr
@@ -384,9 +431,10 @@ def test_nothing_unread_means_nothing_is_launched(pilot):
 
 @posix_only
 @pytest.mark.parametrize("prompt_via", ["stdin", "argv"])
-def test_a_session_that_reads_its_mail_is_reported_as_read(pilot, prompt_via):
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_a_session_that_reads_its_mail_is_reported_as_read(pilot, prompt_via, diagnostic):
     pilot.publish()
-    code, result = pilot.wake(pilot.profile(prompt_via=prompt_via))
+    code, result = pilot.wake(pilot.profile(prompt_via=prompt_via), diagnostic=diagnostic)
     assert code == 0, result
     assert result["state"] == "read" and result["exit_code"] == 0 and result["timed_out"] is False
     assert result["read"] == ["note-1"] and result["still_unread"] == []
@@ -397,6 +445,11 @@ def test_a_session_that_reads_its_mail_is_reported_as_read(pilot, prompt_via):
     assert "mailbox_inbox" in prompt
     assert BODY_SENTINEL not in json.dumps(observed)
     assert "note-1" not in json.dumps(observed)
+    if diagnostic:
+        events = [json.loads(line) for line in pilot.diagnostic.read_text().splitlines()]
+        started = [row for row in events if row["event"] == "started"]
+        assert len(started) == 1 and started[0]["pgid"] == started[0]["pid"], events
+        assert process_gone(started[0]["pid"])
 
 
 @posix_only
@@ -422,14 +475,19 @@ def test_a_failed_turn_is_explicit(pilot):
 
 
 @posix_only
-def test_a_missing_host_binary_never_counts_as_woken(pilot):
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_a_missing_host_binary_never_counts_as_woken(pilot, diagnostic):
     pilot.publish()
     argv = [str(pilot.tmp / "no-such-host"), pilot.session]
-    code, result = pilot.wake(pilot.profile(argv=argv))
+    code, result = pilot.wake(pilot.profile(argv=argv), diagnostic=diagnostic)
     assert code == 3 and result["state"] == "failed_to_start" and result["exit_code"] is None
     assert "error" in result
     assert pilot.state()["state"] == "published"
     assert pilot.summary()["last_wake"]["state"] == "failed_to_start"
+    if diagnostic:
+        events = [json.loads(line) for line in pilot.diagnostic.read_text().splitlines()]
+        assert any(row.get("errno") == errno.ENOENT and row.get("filename") == argv[0]
+                   for row in events), events
 
 
 @posix_only
@@ -465,12 +523,26 @@ def test_a_process_whose_start_cannot_be_recorded_is_stopped_and_not_counted(pil
     folder.mkdir(parents=True)
     folder.chmod(0o555)
     try:
-        code, result = pilot.wake(pilot.profile(mode="sleeper"), timeout=20)
+        code, result = pilot.wake(pilot.profile(mode="sleeper"), timeout=20, diagnostic=True)
     finally:
         folder.chmod(0o755)
-    assert code == 3 and result["state"] == "failed_to_start", (code, result)
+    events = [json.loads(line) for line in pilot.diagnostic.read_text().splitlines()]
+    session_alive = session_process_exists(pilot.session)
+    started = [row for row in events if row["event"] == "started"]
+    process_state = {row["pid"]: subprocess.run(
+        ["ps", "-o", "pid=,pgid=,stat=", "-p", str(row["pid"])],
+        capture_output=True, text=True, timeout=5).stdout.strip() for row in started}
+    child_file = Path(str(pilot.record) + ".child")
+    child_pid = int(child_file.read_text()) if child_file.exists() else None
+    child_gone = process_gone(child_pid) if child_pid is not None else None
+    evidence = {"code": code, "result": result, "os_events": events, "process_state": process_state,
+                "session_alive": session_alive, "child_pid": child_pid, "child_gone": child_gone}
+    if code != 3 or result.get("state") != "failed_to_start":
+        print(json.dumps({"wake_failure_diagnostic": evidence}, sort_keys=True))
+    assert code == 3 and result["state"] == "failed_to_start", evidence
     assert "could not record the start" in result["error"]
-    assert not session_process_exists(pilot.session)
+    assert not session_alive, evidence
+    assert child_gone is not False, evidence
     assert pilot.state()["state"] == "published"
     assert pilot.summary()["last_wake"] is None
 
