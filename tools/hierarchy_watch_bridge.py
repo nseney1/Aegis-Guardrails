@@ -335,6 +335,12 @@ def process_provider_call(spec, method, request, request_sha256, *, actor, gener
             text(reason, "process provider cancellation reason", 1024)
         else:
             require(reason is None, "unexpected process provider cancellation reason")
+    frame = {"schema": "aegis.fixture-process-call/v1", "call_id": uuid.uuid4().hex, "method": method,
+             "request": request, "request_sha256": request_sha256, "actor": actor, "generation": generation,
+             "association": association, "association_sha256": digest(association) if association is not None else None,
+             "provider_handle": provider_handle, "reason": reason}
+    frame = _plain_json(frame)
+    require(len(encoded(frame)) + 1 <= ProcessBridge.MAX_OUTPUT, "process provider request exceeds byte limit")
     if not (os.name == "posix" and all(hasattr(os, name) for name in
             ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT"))):
         return _provider_answer("not_sent", "process provider requires POSIX waitid WNOWAIT")
@@ -342,12 +348,6 @@ def process_provider_call(spec, method, request, request_sha256, *, actor, gener
     remaining = deadline - time.monotonic() - reserve
     if remaining <= 0:
         return _provider_answer("not_sent", "process provider cleanup reserve exceeds remaining budget")
-    frame = {"schema": "aegis.fixture-process-call/v1", "call_id": uuid.uuid4().hex, "method": method,
-             "request": request, "request_sha256": request_sha256, "actor": actor, "generation": generation,
-             "association": association, "association_sha256": digest(association) if association is not None else None,
-             "provider_handle": provider_handle, "reason": reason}
-    frame = _plain_json(frame)
-    require(len(encoded(frame)) + 1 <= ProcessBridge.MAX_OUTPUT, "process provider request exceeds byte limit")
     try:
         bridge = ProcessBridge(spec["argv"], cwd=spec["cwd"], evidence_dir=spec["evidence_dir"],
                                timeout_seconds=remaining, stop_grace=spec["stop_grace"], evidence_only=True)

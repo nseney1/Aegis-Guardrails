@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -342,12 +343,67 @@ def test_process_bridge_stops_same_group_descendant_after_leader_exit(process_ho
     assert not stat.exists() or stat.read_text().split(") ", 1)[1].split()[0] == "Z"
 
 
-def test_supervisor_run_deadline_bounds_inflight_process(process_host):
+@pytest.mark.parametrize("startup_delay", [0, 0.5])
+def test_supervisor_run_deadline_bounds_inflight_process(process_host, monkeypatch, startup_delay):
     supervisor, ledger, value, marker, build = process_host
+    from tools import hierarchy_watch_bridge, hierarchy_watch_supervisor
+    original_popen = subprocess.Popen
+    original_killpg = os.killpg
+    started = time.monotonic()
+    safety_deadline = started + 5
+    safety_expired = False
+    signals = []
+
+    def controlled_clock():
+        nonlocal safety_expired
+        if time.monotonic() >= safety_deadline:
+            safety_expired = True
+            return started + 10
+        # Exercise the run deadline only after a real child reaches the effect.
+        # One virtual second exceeds the run budget, but not the call's five.
+        return started + (1 if marker.exists() else 0)
+
+    def delayed_launch(*args, **kwargs):
+        time.sleep(startup_delay)
+        return original_popen(*args, **kwargs)
+
+    def record_signal(pid, number):
+        signals.append((pid, controlled_clock() - started))
+        return original_killpg(pid, number)
+
+    clock = SimpleNamespace(monotonic=controlled_clock, sleep=time.sleep)
+    monkeypatch.setattr(hierarchy_watch_bridge, "time", clock)
+    monkeypatch.setattr(hierarchy_watch_supervisor, "time", clock)
+    monkeypatch.setattr(subprocess, "Popen", delayed_launch)
+    monkeypatch.setattr(os, "killpg", record_signal)
     result = supervisor.run(1, seconds=0.4, interval=0.01, bridge=build("hang", timeout=5))
+    assert not safety_expired, "child never reached the controlled run deadline"
     assert marker.exists()
     assert result["attempts"][0]["result"]["reason"] == "process bridge deadline reached"
     assert result["attempts"][0]["result"]["process"]["reaped"] is True
+    pid = json.loads(marker.read_text())["pid"]
+    assert any(signalled_pid == pid and virtual_elapsed == 1 for signalled_pid, virtual_elapsed in signals)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_supervisor_expired_run_deadline_never_dispatches(process_host, monkeypatch):
+    supervisor, ledger, value, marker, build = process_host
+    from tools import hierarchy_watch_supervisor
+    readings = iter([0, 1])
+    monkeypatch.setattr(hierarchy_watch_supervisor, "time",
+                        SimpleNamespace(monotonic=lambda: next(readings), sleep=time.sleep))
+    launches = []
+
+    def unexpected_launch(*args, **kwargs):
+        launches.append(args)
+        raise AssertionError("expired run deadline launched a child")
+
+    monkeypatch.setattr(subprocess, "Popen", unexpected_launch)
+    result = supervisor.run(1, seconds=0.4, interval=0.01, bridge=build("hang", timeout=5))
+    assert result["attempts"] == [] and launches == [] and not marker.exists()
+    from tools.hierarchy_lifecycle import Lifecycle
+    assert Lifecycle(ledger.path).load()[1]["requests"][value["id"]]["intent"] is None
 
 
 def test_process_lost_terminal_reply_preserves_canonical_settlement(process_host):
@@ -595,6 +651,31 @@ def test_process_provider_depth_limit_includes_complete_request_envelope(async_p
     request["extra"] = nested
     with pytest.raises(ValueError, match="^process provider data exceeds nesting limit$"):
         provider_call(async_process, "inspect")
+    assert not marker.exists() and not Path(spec["evidence_dir"]).exists()
+
+
+@pytest.mark.parametrize("unavailable", ["platform", "budget"])
+@pytest.mark.parametrize("malformed", ["depth", "size"])
+def test_process_provider_validates_complete_request_before_environment_refusal(
+        async_process, monkeypatch, unavailable, malformed):
+    from tools import hierarchy_watch_bridge
+    spec, request, _, marker = async_process
+    if malformed == "depth":
+        nested = "leaf"
+        for _ in range(31):
+            nested = {"x": nested}
+        request["extra"] = nested
+        message = "process provider data exceeds nesting limit"
+    else:
+        request["extra"] = "x" * 1048576
+        message = "process provider request exceeds byte limit"
+    deadline = time.monotonic() + 2
+    if unavailable == "platform":
+        monkeypatch.delattr(hierarchy_watch_bridge.os, "waitid", raising=False)
+    else:
+        deadline = time.monotonic() - 1
+    with pytest.raises(ValueError, match="^" + message + "$"):
+        provider_call(async_process, "inspect", deadline=deadline)
     assert not marker.exists() and not Path(spec["evidence_dir"]).exists()
 
 
