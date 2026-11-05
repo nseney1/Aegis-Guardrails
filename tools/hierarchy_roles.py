@@ -202,15 +202,22 @@ def require_independent_session(mailbox, endpoint, host, session):
     """Where independence is the control, the registry asks for a separate session, so one session can never hold
     both sides. Mailbox.bind calls this, so every path that binds is checked: the CLI, provisioning, a move and a
     handoff. Only the current binding of each other endpoint counts, and only the separate_session flag is
-    mechanical; the not-author and not-requester rules are for the roles' own checks."""
-    mine = role(endpoint, mailbox.endpoint(endpoint).get("kind"))
+    mechanical; the not-author and not-requester rules are for the roles' own checks.
+
+    The rule separates different roles. One session may hold the same role on several endpoints, such as one
+    ROOT for hierarchies a and b in a shared root, because no independence boundary lies between them."""
+    name = role_name(endpoint, mailbox.endpoint(endpoint).get("kind"))
+    mine = registry()["roles"][name]
     for other in mailbox.manifest["endpoints"]:
         if other == endpoint:
             continue
         history = mailbox.bindings(other)
         if not history or (history[-1]["host"], history[-1]["session"]) != (host, session):
             continue
-        theirs = role(other, mailbox.endpoint(other).get("kind"))
+        other_name = role_name(other, mailbox.endpoint(other).get("kind"))
+        if other_name == name:
+            continue
+        theirs = registry()["roles"][other_name]
         if mine["independence"]["separate_session"] or theirs["independence"]["separate_session"]:
             raise ValueError("session %s already holds %s; the role registry needs a separate session for %s"
                              % (session, other, endpoint if mine["independence"]["separate_session"] else other))

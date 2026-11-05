@@ -410,10 +410,11 @@ def test_root_reading_its_mail_clears_unread_but_not_its_open_jobs(fleet):
     entry = {"initiative": "pilot", "endpoint": "pilot/root"}
     assert fleet.sweep(expect=3)["root_queue"] == [{**entry, "unread_count": 2, "open_jobs": 1}]
     delivery = str(fleet.base / "delivery")
-    page = invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True, limit=1)
+    page = invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True, limit=1,
+                  host="codex-cli", session="root-session", generation=1)
     assert [row["message"]["message_id"] for row in page["messages"]] == ["note"]
     assert fleet.sweep(expect=3)["root_queue"] == [{**entry, "unread_count": 1, "open_jobs": 1}]
-    invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True)
+    invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True, host="codex-cli", session="root-session", generation=1)
     result = fleet.sweep(expect=3)
     assert result["root_queue"] == [{**entry, "unread_count": 0, "open_jobs": 1}]
     assert result["quiet"] is False and result["still_unread"] == []
@@ -429,7 +430,7 @@ def test_unread_root_information_requires_attention_until_root_reads_it(fleet):
                                     "unread_count": 1, "open_jobs": 0}]
     assert fleet.launches() == []
     invoke(fleet.root, "inbox", endpoint="pilot/root",
-           delivery_dir=str(fleet.base / "delivery"), mark_read=True)
+           delivery_dir=str(fleet.base / "delivery"), mark_read=True, host="codex-cli", session="root-session", generation=1)
     result = fleet.sweep()
     assert result["quiet"] is True and result["root_queue"] == []
     assert fleet.launches() == []
@@ -449,7 +450,7 @@ def test_job_receipt_terminality_and_recipient_read_are_separate(fleet, state, e
         "type": "job_request", "body": "Information only.", "brief": evidence,
     })
     delivery = str(fleet.base / "delivery")
-    invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True)
+    invoke(fleet.root, "inbox", endpoint="pilot/root", delivery_dir=delivery, mark_read=True, host="codex-cli", session="root-session", generation=1)
     pending = fleet.sweep(expect=3)
     assert pending["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root",
                                      "unread_count": 0, "open_jobs": 1}]

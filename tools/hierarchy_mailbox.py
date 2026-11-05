@@ -1151,6 +1151,9 @@ def main(argv=None):
     inbox.add_argument("--after", default=None)
     inbox.add_argument("--delivery-dir", default=None, help="With --mark-read, where root's read receipts go")
     inbox.add_argument("--mark-read", action="store_true", help="Root only: record what this page returned as read")
+    for flag, kind in (("--host", str), ("--session", str), ("--generation", int)):
+        inbox.add_argument(flag, type=kind, default=None,
+                           help="With --mark-read: the reading root's own binding, so a replaced root is refused")
     commands.add_parser("status")
     delivery = commands.add_parser("delivery", help="Report published, woken and read states separately")
     delivery.add_argument("--delivery-dir", required=True)
@@ -1205,10 +1208,14 @@ def main(argv=None):
                         "--binding-only takes no --include-briefs, --limit, --after or --mark-read")
                 result = mailbox.binding_view(args.endpoint)
             else:
+                require(args.mark_read or (args.host, args.session, args.generation) == (None, None, None),
+                        "--host, --session and --generation go only with --mark-read")
                 if args.mark_read:
                     require(args.delivery_dir is not None, "--mark-read needs --delivery-dir")
                     require(endpoint_parts(args.endpoint)[1] == "root",
                             "only root reads through the CLI with a receipt; a session's adapter records its own")
+                    require(None not in (args.host, args.session, args.generation),
+                            "--mark-read needs --host, --session and --generation for the reading root")
                 result = mailbox.inbox(args.endpoint, include_briefs=args.include_briefs,
                                        limit=20 if args.limit is None else args.limit, after=args.after)
                 result = _bounded_inbox(result, _cli_line)
@@ -1227,10 +1234,11 @@ def main(argv=None):
             # Root has no adapter, so this does the adapter's job in the same order: flushed first,
             # and a lost receipt only means root sees the message listed as unread again.
             sys.stdout.buffer.flush()
-            binding = result["binding"]
+            # The reader's configured identity, never the current binding's own: that would let a replaced root
+            # record reads in its successor's name.
             try:
-                mailbox.record_read(args.delivery_dir, {"from": args.endpoint, "host": binding["host"], "session": binding["session"],
-                                                        "binding_generation": binding["generation"]},
+                mailbox.record_read(args.delivery_dir, {"from": args.endpoint, "host": args.host, "session": args.session,
+                                                        "binding_generation": args.generation},
                                     [row["message"]["message_id"] for row in result["messages"]])
             except (ValueError, OSError, UnicodeError) as exc:
                 print("read receipt not recorded: " + str(exc), file=sys.stderr, flush=True)

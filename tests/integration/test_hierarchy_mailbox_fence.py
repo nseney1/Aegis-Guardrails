@@ -79,12 +79,12 @@ def test_an_unacknowledged_successor_cannot_post_or_close_on_the_board(hall):  #
     old.close()
     bound = unacked_successor(hall.root, "a/lane/f2", "successor", hall.root.parent)
     before = hall.snapshot()
-    fresh = hall.client(session="successor", generation=bound["generation"])
-    assert fresh.refused("board_publish", channel="alpha", key="early", kind="note", body="Too soon.") == REFUSED_UNREADY
-    assert fresh.refused("board_disposition", post_id=blocker["post_id"], state="resolved") == REFUSED_UNREADY
+    successor = hall.client(session="successor", generation=bound["generation"])
+    assert successor.refused("board_publish", channel="alpha", key="early", kind="note", body="Too soon.") == REFUSED_UNREADY
+    assert successor.refused("board_disposition", post_id=blocker["post_id"], state="resolved") == REFUSED_UNREADY
     assert hall.snapshot() == before
     acknowledge(hall.root, bound)
-    assert fresh.post("after-ack")["from"] == "a/lane/f2"
+    assert successor.post("after-ack")["from"] == "a/lane/f2"
 
 
 def test_a_board_write_takes_the_mailbox_writer_lock(hall):  # noqa: F811
@@ -325,7 +325,7 @@ def test_show_cuts_long_lines_and_keeps_a_page_within_its_byte_budget(pilot, tmp
     page = payload(source_call(root, repository, [("source_show", {"commit": commit, "path": "wide.txt",
                                                                    "max_lines": 2000})])[-1])
     assert page["lines"][0] == "x" * 4096 and page["cut_lines"] == [1]
-    assert sum(len(line) + 1 for line in page["lines"]) <= 65536
+    assert len(json.dumps(json.dumps(page))) <= 262144
     assert page["next_start_line"] == 1 + len(page["lines"]) < page["total_lines"] == 201
 
 
@@ -464,3 +464,253 @@ def test_a_role_provisioned_without_a_repository_gets_no_source_views(setup):
     assert "--source-repo" not in json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_mailbox"]["args"]
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
     assert not {"mcp__aegis_mailbox__" + name for name in SOURCE_TOOLS} & set(argv[argv.index("--allowedTools") + 1].split(","))
+
+
+# Review follow-ups (independent review of 4d13ef0).
+
+sys.path.insert(0, str(ROOT / "tools"))
+import hierarchy_mailbox_mcp  # noqa: E402
+import hierarchy_source  # noqa: E402
+
+from tests.integration.test_hierarchy_carry import fresh, move_request  # noqa: E402,F401
+from tests.integration.test_hierarchy_provision import codex_config, provision  # noqa: E402
+
+RESPONSE_BUDGET = 262144
+
+
+def rendered(result):
+    return len(hierarchy_mailbox_mcp._response_line({"jsonrpc": "2.0", "id": 1,
+                                                     "result": hierarchy_mailbox_mcp._tool_result(result)}))
+
+
+def committed(repository, files):
+    repository.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        (repository / name).parent.mkdir(parents=True, exist_ok=True)
+        (repository / name).write_bytes(data)
+    git(repository, "init", "-q", "-b", "main")
+    git(repository, "add", ".")
+    git(repository, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "c")
+    return git(repository, "rev-parse", "HEAD")
+
+
+def test_one_session_may_hold_the_same_role_in_several_hierarchies(tmp_path):
+    root = tmp_path / "shared" / "mailbox"
+    root.parent.mkdir()
+    endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/root": {}, "b/front-door": {}, "b/orchestrator": {},
+                 "b/root": {}, "a/lane/r1": {"kind": "reviewer"}, "a/lane/r2": {"kind": "reviewer"}}
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "counterparts": [],
+                          "writer_limit": 3})
+    for endpoint in ("a/root", "b/root"):
+        invoke(root, "bind", {"endpoint": endpoint, "host": "codex", "session": "one-root", "expected_generation": 0})
+    for endpoint in ("a/lane/r1", "a/lane/r2"):
+        invoke(root, "bind", {"endpoint": endpoint, "host": "codex", "session": "one-reviewer", "expected_generation": 0})
+    refused = invoke(root, "bind", {"endpoint": "a/orchestrator", "host": "codex", "session": "one-root",
+                                    "expected_generation": 0}, ok=False)
+    assert refused == {"error": held_by("one-root", "a/root", "a/root")}
+
+
+def test_mark_read_records_only_for_the_configured_current_root(tmp_path):
+    root = tmp_path / "rooted" / "mailbox"
+    root.parent.mkdir()
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "counterparts": [], "writer_limit": 3,
+                          "endpoints": {"a/front-door": {}, "a/orchestrator": {}, "a/root": {}}})
+    for endpoint in ("a/front-door", "a/orchestrator", "a/root"):
+        invoke(root, "bind", {"endpoint": endpoint, "host": "codex", "session": endpoint.replace("/", "-"),
+                              "expected_generation": 0})
+    invoke(root, "publish", {"message_id": "to-root", "from": "a/orchestrator", "to": "a/root", "host": "codex",
+                             "session": "a-orchestrator", "binding_generation": 1, "type": "info", "body": "Status."})
+    delivery = root.parent / "delivery"
+    unconfigured = invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True, ok=False)
+    assert unconfigured == {"error": "--mark-read needs --host, --session and --generation for the reading root"}
+    bound = unacked_successor(root, "a/root", "successor-root", root.parent)
+    acknowledge(root, bound)
+    stale = subprocess.run([sys.executable, str(HELPER), "--root", str(root), "inbox", "--endpoint", "a/root",
+                            "--delivery-dir", str(delivery), "--mark-read", "--host", "codex", "--session", "a-root",
+                            "--generation", "1"], capture_output=True, text=True, timeout=15, check=False)
+    assert stale.stderr == "read receipt not recorded: " + STALE + "\n"
+    assert invoke(root, "delivery", delivery_dir=delivery, message_id="to-root")["message"]["state"] == "published"
+    invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True, host="host-one",
+           session="successor-root", generation=bound["generation"])
+    state = invoke(root, "delivery", delivery_dir=delivery, message_id="to-root")["message"]
+    assert state["read_by"] == {"host": "host-one", "session": "successor-root", "generation": bound["generation"]}
+
+
+def test_a_waiting_board_post_never_holds_the_mailbox_lock(hall):  # noqa: F811
+    """While another writer holds the board lock, mailbox writes go ahead; the post lands once the board frees."""
+    client = hall.client()
+    board_lock = hall.board / ".write.lock"
+    board_lock.write_text("held by a test")
+    client.process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 99, "method": "tools/call", "params": {
+        "name": "board_publish", "arguments": {"channel": "alpha", "key": "waits", "kind": "note", "body": "Waiting."}}})
+                               + "\n")
+    client.process.stdin.flush()
+    try:
+        for attempt in range(5):
+            # invoke asserts exit 0, so each of these is a publish that was not refused as busy.
+            invoke(hall.root, "publish", message("a/orchestrator", "a/lane/f2", identifier="during-%d" % attempt))
+    finally:
+        board_lock.unlink()
+    response = json.loads(client.process.stdout.readline())
+    assert not response["result"].get("isError"), response
+    assert payload(response)["from"] == "a/lane/f2" and payload(response)["replayed"] is False
+
+
+def test_a_retired_session_cannot_move_its_successors_board_position(hall):  # noqa: F811
+    author = hall.client()
+    posted = [author.post("post-%d" % number)["post_id"] for number in range(3)]
+    old = hall.client("a/orchestrator")
+    lock = hall.root / ".write.lock"
+    lock.write_text("held by a test")
+    try:
+        assert [post["post_id"] for post in old.read(limit=2)["posts"]] == posted[:2]
+        # The position write now waits for the lock. Rebind meanwhile, as the lock's holder would.
+        brief = hall.root.parent / "brief-rebind.md"
+        brief.write_bytes(b"Handoff.\n")
+        sys.path.insert(0, str(ROOT / "tools"))
+        import hierarchy_mailbox
+        mailbox = hierarchy_mailbox.Mailbox(hall.root)
+        bound = mailbox.bind(mailbox.draft_handoff({
+            "endpoint": "a/orchestrator", "host": "host-one", "session": "successor", "outgoing_stopped": True,
+            "briefs": [{"path": str(brief), "sha256": hashlib.sha256(b"Handoff.\n").hexdigest()}]}))
+        mailbox.acknowledge_handoff({"endpoint": "a/orchestrator", "session": "successor",
+                                     "generation": bound["generation"], "checkpoint_sha256": bound["checkpoint_sha256"]})
+    finally:
+        lock.unlink()
+    old.close()
+    fresh_client = hall.client("a/orchestrator", session="successor", generation=bound["generation"])
+    assert [post["post_id"] for post in fresh_client.read()["posts"]] == posted
+
+
+def test_an_unacknowledged_successors_board_read_moves_its_position(hall):  # noqa: F811
+    author = hall.client()
+    posted = [author.post("post-%d" % number)["post_id"] for number in range(2)]
+    bound = unacked_successor(hall.root, "a/orchestrator", "successor", hall.root.parent)
+    early = hall.client("a/orchestrator", session="successor", generation=bound["generation"])
+    assert [post["post_id"] for post in early.read()["posts"]] == posted
+    early.send("ping")
+    early.close()
+    acknowledge(hall.root, bound)
+    assert hall.client("a/orchestrator", session="successor", generation=bound["generation"]).read()["posts"] == []
+
+
+def test_re_running_add_role_refuses_a_session_that_already_holds_the_other_side(setup):
+    session = "00000000-0000-0000-0000-00000000000a"
+    setup.add_role("pilot/lane/f2", cwd=str(setup.tmp), session=session)
+    # A binding made before every bind was checked: written directly, as an old mailbox may hold one.
+    legacy = setup.root / "bindings" / "pilot/lane/review" / "000001.json"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({"schema": "aegis.role-binding/v1", "endpoint": "pilot/lane/review",
+                                  "host": "claude-code", "session": session, "generation": 1,
+                                  "created_at": "2026-11-05T00:00:00.000000Z", "checkpoint": None,
+                                  "checkpoint_sha256": None}))
+    refused = setup.add_role("pilot/lane/review", cwd=str(setup.tmp), session=session, expect=2)
+    assert refused["error"] == held_by(session, "pilot/lane/f2", "pilot/lane/review")
+
+
+def test_a_move_refuses_an_old_root_where_one_session_holds_both_sides(fresh):  # noqa: F811
+    legacy = fresh.old / "bindings" / "a/lane/look" / "000001.json"
+    record = json.loads(legacy.read_text())
+    legacy.write_text(json.dumps({**record, "session": "cli-build"}))
+    refused = provision("move", move_request(fresh), expect=2)
+    assert refused["error"] == held_by("cli-build", "a/lane/build", "a/lane/look")
+
+
+def test_a_codex_reviewer_gets_working_source_views(setup, project):
+    repository, commit = project
+    role = setup.add_role("pilot/lane/review", "codex-cli", session="01a19969-41df-7631-8ecd-57add111e96c",
+                          cwd=str(setup.source), source_repo=str(repository), reader_shell=True,
+                          skip_git_repo_check=True)
+    server = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]["aegis_mailbox"]
+    assert server["args"][server["args"].index("--source-repo") + 1] == str(repository)
+    assert {"source_show", "source_grep", "mailbox_self"} <= set(server["enabled_tools"])
+    frame = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "source_show", "arguments": {"commit": commit, "path": "README.md"}}}
+    result = subprocess.run([server["command"], *server["args"]], input=json.dumps(frame) + "\n",
+                            capture_output=True, text=True, timeout=15, check=False)
+    assert payload(json.loads(result.stdout))["lines"] == ["Project.", "needle in the readme"]
+
+
+def test_a_lazy_fetch_can_never_run_repository_configured_commands(tmp_path):
+    repository = tmp_path / "lazy"
+    commit = committed(repository, {"b.txt": b"secret\n"})
+    views = hierarchy_source.SourceViews(repository)
+    marker = tmp_path / "ran"
+    # After startup, a writer turns the repository into a partial clone whose fetch runs a command, and the
+    # blob goes missing, so reading it would make Git fetch lazily.
+    git(repository, "config", "core.repositoryformatversion", "1")
+    git(repository, "config", "extensions.partialClone", "origin")
+    git(repository, "config", "remote.origin.url", "file://" + str(tmp_path / "nowhere"))
+    git(repository, "config", "remote.origin.promisor", "true")
+    git(repository, "config", "remote.origin.uploadpack", "sh -c 'touch %s; exit 1'" % marker)
+    blob = git(repository, "rev-parse", commit + ":b.txt")
+    (repository / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    with pytest.raises(ValueError):
+        views.show({"commit": commit, "path": "b.txt"})
+    with pytest.raises(ValueError, match="git failed in the source repository"):
+        views.grep({"commit": commit, "pattern": "secret"})
+    assert not marker.exists()
+    with pytest.raises(ValueError, match="partial clone"):
+        hierarchy_source.SourceViews(repository)
+
+
+def fake_git(tmp_path, monkeypatch, slow):
+    real = subprocess.run(["sh", "-c", "command -v git"], capture_output=True, text=True, check=True).stdout.strip()
+    folder = tmp_path / "fake-bin"
+    folder.mkdir()
+    (folder / "git").write_text("#!/bin/sh\ncase \"$*\" in *\"%s\"*) sleep 5;; esac\nexec %s \"$@\"\n" % (slow, real))
+    (folder / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", str(folder) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(hierarchy_source, "GIT_TIMEOUT_SECONDS", 1)
+
+
+@pytest.mark.parametrize("slow,call", [
+    ("cat-file blob", lambda views, commit: views.show({"commit": commit, "path": "README.md"})),
+    (" grep ", lambda views, commit: views.grep({"commit": commit, "pattern": "needle"})),
+])
+def test_a_slow_git_is_a_refusal_not_a_crash(project, tmp_path, monkeypatch, slow, call):
+    repository, commit = project
+    views = hierarchy_source.SourceViews(repository)
+    fake_git(tmp_path, monkeypatch, slow)
+    with pytest.raises(ValueError, match="git timed out in the source repository"):
+        call(views, commit)
+
+
+def test_show_bounds_its_rendered_response(tmp_path):
+    repository = tmp_path / "controls"
+    commit = committed(repository, {"c.txt": ("\x01" * 4000 + "\n").encode() * 200})
+    page = hierarchy_source.SourceViews(repository).show({"commit": commit, "path": "c.txt", "max_lines": 2000})
+    assert rendered(page) <= RESPONSE_BUDGET
+    assert page["lines"] and page["next_start_line"] == 1 + len(page["lines"])
+
+
+def test_grep_bounds_its_rendered_response(tmp_path):
+    repository = tmp_path / "paths"
+    long_dir = "/".join(["é" * 60] * 3)
+    commit = committed(repository, {"%s/f%03d.txt" % (long_dir, n): b"needle\n" * 5 for n in range(120)})
+    found = hierarchy_source.SourceViews(repository).grep({"commit": commit, "pattern": "needle", "limit": 500})
+    assert rendered(found) <= RESPONSE_BUDGET
+    assert found["truncated"] is True and found["matches"]
+
+
+def test_grep_ignores_repository_settings_that_reshape_its_output(project):
+    repository, commit = project
+    git(repository, "config", "grep.column", "true")
+    git(repository, "config", "grep.lineNumber", "false")
+    git(repository, "config", "grep.fullName", "false")
+    git(repository, "config", "grep.patternType", "perl")
+    found = hierarchy_source.SourceViews(repository).grep({"commit": commit, "pattern": "needle in the readme"})
+    assert found["matches"] == [{"path": "README.md", "line": 2, "text": "needle in the readme"}]
+
+
+def test_grep_never_reads_a_submodules_objects(tmp_path):
+    inner = tmp_path / "inner"
+    committed(inner, {"s.txt": b"submodule token\n"})
+    outer = tmp_path / "outer"
+    committed(outer, {"top.txt": b"top token\n"})
+    git(outer, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "sm")
+    git(outer, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "sm")
+    commit = git(outer, "rev-parse", "HEAD")
+    git(outer, "config", "submodule.recurse", "true")
+    found = hierarchy_source.SourceViews(outer).grep({"commit": commit, "pattern": "token"})
+    assert [match["path"] for match in found["matches"]] == ["top.txt"]

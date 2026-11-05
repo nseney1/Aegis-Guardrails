@@ -4,7 +4,7 @@ Launch through hierarchy_mailbox.py serve, which supports isolated Python import
 The configured sender is provenance, not an authenticated native host identity.
 ROOT gets only a decision adapter over the lifecycle journal, never the mailbox tools.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 import sys
@@ -274,12 +274,22 @@ class Connection:
             self.checked_mailbox()
             result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
             return result
-        # A post or disposition is authored, so it is fenced like a publish: current and acknowledged, under the
-        # mailbox lock held across the board's own lock, so a rebinding cannot land between the check and the write.
+        # A post or disposition is authored, so it is fenced like a publish: current and acknowledged, checked under
+        # the mailbox lock held across the write, so a rebinding cannot land between the check and the write. The
+        # board lock is taken first, with its own wait, and the mailbox lock only once it is held, so a busy board
+        # never makes other mailbox writers busy. No path takes the mailbox lock and then the board lock.
+        self.board.writer_guard = self.fenced_board_write
+        try:
+            result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
+        finally:
+            self.board.writer_guard = nullcontext
+        return result
+
+    @contextmanager
+    def fenced_board_write(self):
         with waiting_writer_lock(self.root):
             self.checked_mailbox(ready=True)
-            result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
-        return result
+            yield
 
     def record_position(self):
         # Called only after the response is written and flushed, like record_read, so a page that

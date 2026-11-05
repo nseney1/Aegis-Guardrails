@@ -308,28 +308,32 @@ is the endpoint's current binding, so a replaced session is refused. A write the
 (a publish, a board post or a board disposition) also needs the handoff acknowledged; the
 acknowledgment is the one such write an unacknowledged successor may make. Records of what was
 returned (read receipts and the board read position) need only the current binding, so they name
-the successor's own generation. A board write holds the mailbox lock across the board's own lock,
-so a rebinding cannot land between the check and the write, and it waits for a busy mailbox lock
-for up to five seconds, as the board waits for its own.
+the successor's own generation. A board write takes the board lock first, then the mailbox lock
+only for the check and the write itself, so a rebinding cannot land between the two and a busy
+board never makes other mailbox writes busy. Each lock is waited for up to five seconds.
 Service writes that publish under an endpoint's current binding, such as job receipts and a
 move's carried-work brief, are checked against that binding, not against the session that asked.
 
 **Independence on every bind.** Every bind checks the role registry's `separate_session` flag,
 whether it comes from the mailbox CLI, `add-role`, a provisioning move or `hierarchy_handoff.py`.
 A session that currently holds one endpoint in a mailbox root cannot be bound to another endpoint
-in that root when either role needs a separate session (Reviewer, Decider and ROOT today). The
-same session name on another host counts as another session. The registry's `not-author` and
-`not-requester` rules are not checked mechanically.
+in that root when the two roles differ and either needs a separate session (Reviewer, Decider and
+ROOT today). One session may hold the same role on several endpoints, such as one ROOT for
+hierarchies `a` and `b` in a shared root. The same session name on another host counts as another
+session. The registry's `not-author` and `not-requester` rules are not checked mechanically.
 
 **Source views.** With `--source-repo /absolute/git/repository`, a role that reads source and
 writes none (Reviewer, Decider, Orchestrator) also gets `source_show` and `source_grep`. Any other
 role is refused at startup, and so is ROOT. Both take a full 40-character commit id and read Git
 objects only: never the working tree, the index or untracked files. `source_show` returns one file
-a page at a time (`start_line`, `max_lines` up to 2,000, at most 64 KiB of text per page; lines
-over 4,096 characters are cut and listed in `cut_lines`). `source_grep` searches for a fixed string,
-optionally under literal `paths`, and returns up to 500 matches, with `truncated` when there were
-more. The repository is fixed at startup, so no argument can point a view elsewhere, and global
-and system Git configuration is ignored. `add-role` takes `source_repo` and writes the option into
+a page at a time (`start_line`, `max_lines` up to 2,000; lines over 4,096 characters are cut and
+listed in `cut_lines`). `source_grep` searches for a fixed string, optionally under literal
+`paths`, and returns up to 500 matches, with `truncated` when there were more. Each answer stays
+under about 192 KiB as sent, so a page or a match list may stop early. The repository is fixed at
+startup, so no argument can point a view elsewhere. Global and system Git configuration is
+ignored, and settings in the repository's own configuration cannot run a command or reshape the
+output: every Git call refuses all transports, so nothing is ever fetched, and a partial clone is
+refused at startup. Each Git run has a 30-second deadline; a timeout is an error answer. `add-role` takes `source_repo` and writes the option into
 the role's connection and allowlist.
 
 With `--workspace-store /absolute/store --initiative <id>`, the adapter adds read-only
@@ -505,7 +509,9 @@ wakes each endpoint that has unread mail and a current wake profile, one turn at
 past 60 active minutes or one whose time cannot be measured is not woken, and one that ignored
 its mail gets no second turn for it in the same sweep. It never wakes root, and instead reports
 root's unread mail, open jobs and active time against its 90 minutes. Root reads its own mail
-with `inbox --mark-read`, so its unread count means what it means for everyone else.
+with `inbox --mark-read --host <host> --session <session> --generation <n>`, giving its own
+binding, so its unread count means what it means for everyone else. A replaced root's read is
+not recorded.
 
 The [workspace board](workspace-board-contract.md) carries information across initiatives
 through a server of its own, when a connection starts with `--board`. It cannot change bindings,

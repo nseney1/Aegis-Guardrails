@@ -49,7 +49,7 @@
   },
   "schema": "aegis.foundation-corpus/v1",
   "source_files": {
-    "docs/hierarchy-dogfood.md": "e48031d532d14a3fa75f44e46fd99c62e89f6a3e846502a19cd5bcf8a6a69422",
+    "docs/hierarchy-dogfood.md": "66acfbd2cd14534bf8148362c2229d13b0241ea08b0fa29c7a4e3e058e3604ae",
     "docs/hierarchy-native-protocol.md": "f1bb7a7f0e4f669129dc2803df77c65e9e38d7541ea130891074c64f01b527f4",
     "docs/hierarchy-watch-bridge.md": "d2cee2f1d6e699bdef6a5d495b9726a2a00c1557fbde43372e0959cf99d3269a",
     "docs/hierarchy-watch-supervisor.md": "d276052c00e2a0fa954b1e5b2c20124ed9317ae0e1e61807f55514381d64f038",

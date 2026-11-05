@@ -116,7 +116,9 @@ def test_owner_intent_becomes_a_job_and_its_result_reaches_the_front_door(trial)
     assert first["quiet"] is False and first["still_unread"] == []
     assert trial.delivery_state("intent")["state"] == "read"
 
-    invoke(trial.root, "inbox", endpoint="pilot/root", delivery_dir=str(trial.delivery), mark_read=True)
+    own = invoke(trial.root, "status")["bindings"]["pilot/root"]
+    invoke(trial.root, "inbox", endpoint="pilot/root", delivery_dir=str(trial.delivery), mark_read=True,
+           host=own["host"], session=own["session"], generation=own["generation"])
     assert trial.delivery_state("job-1")["state"] == "read"
 
     jobs = trial.run_jobs()

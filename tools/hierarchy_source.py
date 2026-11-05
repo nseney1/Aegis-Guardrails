@@ -5,30 +5,45 @@ offers two views instead: show one file at one commit, a page at a time, and gre
 Both read Git objects only, never the working tree, the index or untracked files. The repository is fixed when
 the adapter starts, so no tool argument can point a view at another one.
 
-Only plumbing that applies no filters runs: cat-file for blobs, and grep without textconv. Global and system Git
-configuration is ignored, so a user's aliases, pagers or hooks cannot change what a view returns.
+A writer may share the repository's own configuration, so nothing in it may run a command or reshape output:
+- Every call refuses all transports (protocol.allow=never), so a promisor remote can never be fetched from, and
+  its configured upload-pack or ssh command never runs. A partial clone is refused at startup anyway, because
+  its views would depend on objects it does not have.
+- Only plumbing that applies no filters runs: cat-file for blobs, and grep without textconv, columns or
+  submodule recursion. Global and system configuration is ignored.
+- Each git run has a deadline and its output a byte bound, and each answer is bounded by its rendered size.
 """
+import json
 import os
 from pathlib import PurePosixPath
+import selectors
 import subprocess
+import tempfile
+import time
 
 from hierarchy_mailbox import GIT_ID, fields, require, text
 
 
 GIT_TIMEOUT_SECONDS = 30
 MAX_BLOB_BYTES = 16777216
-SHOW_PAGE_BYTES = 65536
+# The answer as the adapter sends it, JSON-encoded twice, stays under one MCP frame.
+RESPONSE_BYTES = 196608
 MAX_SHOW_LINES = 2000
 DEFAULT_SHOW_LINES = 400
 MAX_LINE_CHARS = 4096
 MAX_GREP_MATCHES = 500
 DEFAULT_GREP_MATCHES = 100
 MAX_MATCH_CHARS = 256
+MAX_GREP_OUTPUT_BYTES = 4194304
 MAX_GREP_PATHS = 64
 MAX_PATH_CHARS = 1024
 MAX_PATTERN_CHARS = 256
 GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_LITERAL_PATHSPECS": "1",
-           "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1",
+           "GIT_NO_LAZY_FETCH": "1", "GIT_PROTOCOL_FROM_USER": "0"}
+GIT_SETTINGS = ("-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "submodule.recurse=false",
+                "-c", "grep.column=false")
+TIMED_OUT = "git timed out in the source repository"
 COMMIT = {"type": "string", "pattern": "^[0-9a-f]{40}$"}
 PATH = {"type": "string", "maxLength": MAX_PATH_CHARS}
 TOOL_SPECS = {
@@ -56,18 +71,71 @@ def relative_path(value):
     return value
 
 
+def rendered_size(value):
+    """What a value adds to the adapter's answer, which JSON-encodes the result and then that text again."""
+    return len(json.dumps(json.dumps(value)))
+
+
 class SourceViews:
     def __init__(self, repository):
         self.repository = repository
         top = self.git("rev-parse", "--show-toplevel", check=False)
         require(top.returncode == 0, "--source-repo is not a git repository: " + str(repository))
+        promisors = self.git("config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$",
+                             check=False)
+        require(not promisors.stdout.strip(),
+                "--source-repo is a partial clone; source views need every object locally: " + str(repository))
 
-    def git(self, *arguments, check=True, data=None):
-        result = subprocess.run(["git", "-C", str(self.repository), "-c", "core.fsmonitor=false", *arguments],
-                                input=data, capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
-                                env={**os.environ, **GIT_ENV})
+    def argv(self, *arguments):
+        return ["git", "-C", str(self.repository), *GIT_SETTINGS, *arguments]
+
+    def git(self, *arguments, check=True):
+        try:
+            result = subprocess.run(self.argv(*arguments), capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
+                                    env={**os.environ, **GIT_ENV}, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(TIMED_OUT) from exc
         require(not check or result.returncode == 0, "git failed in the source repository")
         return result
+
+    def bounded(self, arguments, data, limit):
+        """Run git with a deadline over the whole run, reading at most limit bytes of output.
+
+        Errors go to a file rather than a pipe, so a chatty git cannot block on a pipe nobody reads. git grep
+        exits 1, as for no match, even when it could not read an object, so any error line is a failure."""
+        errors = tempfile.TemporaryFile()
+        process = subprocess.Popen(self.argv(*arguments), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=errors, env={**os.environ, **GIT_ENV})
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        chunks, size, cut = [], 0, False
+        try:
+            process.stdin.write(data)
+            process.stdin.close()
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    left = deadline - time.monotonic()
+                    require(left > 0, TIMED_OUT)
+                    if not selector.select(left):
+                        continue
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= limit:
+                        cut = True
+                        break
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.stdout.close()
+            code = process.wait()
+            errors.seek(0)
+            failed = any(line.startswith((b"error:", b"fatal:")) for line in errors.read(65536).splitlines())
+            errors.close()
+        require(cut or not failed, "git failed in the source repository")
+        return b"".join(chunks), cut, code
 
     def commit(self, value):
         require(isinstance(value, str) and GIT_ID.fullmatch(value) is not None,
@@ -97,18 +165,18 @@ class SourceViews:
         if lines and lines[-1] == "":
             lines.pop()
         require(start <= max(len(lines), 1), "start line is past the end of the file")
-        page, cut, used = [], [], 0
+        page, cut, used = [], [], rendered_size({"commit": commit, "path": path, "blob": blob})
         for number in range(start, min(len(lines), start + limit - 1) + 1):
             line = lines[number - 1]
-            if len(line) > MAX_LINE_CHARS:
-                line = line[:MAX_LINE_CHARS]
-                cut.append(number)
-            used += len(line.encode("utf-8")) + 1
+            shortened = len(line) > MAX_LINE_CHARS
+            line = line[:MAX_LINE_CHARS]
+            used += rendered_size(line)
             # A page always holds at least one line, so a reader always makes progress.
-            if page and used > SHOW_PAGE_BYTES:
-                cut = [n for n in cut if n < number]
+            if page and used > RESPONSE_BYTES:
                 break
             page.append(line)
+            if shortened:
+                cut.append(number)
         last = start + len(page) - 1
         return {"commit": commit, "path": path, "blob": blob, "start_line": start, "total_lines": len(lines),
                 "lines": page, "cut_lines": cut, "next_start_line": last + 1 if last < len(lines) else None}
@@ -126,32 +194,33 @@ class SourceViews:
         limit = arguments.get("limit", DEFAULT_GREP_MATCHES)
         require(type(limit) is int and 1 <= limit <= MAX_GREP_MATCHES,
                 "limit must be between 1 and %d" % MAX_GREP_MATCHES)
-        # -z separates the name, line number and text with NUL, so no file name can forge a match. -I skips
-        # binary files. The pattern comes from a file on stdin, so it can never be read as an option.
-        argv = ["git", "-C", str(self.repository), "-c", "core.fsmonitor=false", "grep", "-z", "-n", "-I", "-F",
-                "--no-color", "--no-textconv", "--full-name", "-f", "-", commit, "--", *paths]
-        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                   env={**os.environ, **GIT_ENV})
-        matches, truncated = [], False
-        try:
-            process.stdin.write(pattern.encode("utf-8") + b"\n")
-            process.stdin.close()
-            prefix = (commit + ":").encode("ascii")
-            for raw in process.stdout:
-                if len(matches) == limit:
-                    truncated = True
-                    break
-                name, number, line = raw.rstrip(b"\n").split(b"\0", 2)
-                require(name.startswith(prefix), "git grep returned an unexpected name")
-                matches.append({"path": name[len(prefix):].decode("utf-8", errors="replace"), "line": int(number),
-                                "text": line.decode("utf-8", errors="replace")[:MAX_MATCH_CHARS]})
-        finally:
-            if truncated:
-                process.kill()
-            process.stdout.close()
-            code = process.wait(timeout=GIT_TIMEOUT_SECONDS)
+        # -z separates the name, line number and text with NUL, so no file name can forge a match, and the
+        # explicit flags override any output setting in the repository's config. -I skips binary files. The
+        # pattern comes from stdin, so it can never be read as an option.
+        output, truncated, code = self.bounded(
+            ["grep", "-z", "-n", "-I", "-F", "--no-color", "--no-column", "--no-textconv", "--no-recurse-submodules",
+             "--full-name", "-f", "-", commit, "--", *paths], pattern.encode("utf-8") + b"\n", MAX_GREP_OUTPUT_BYTES)
         # Exit 1 means no match. Anything else, unless this side stopped it, is a failure, not an empty answer.
         require(truncated or code in (0, 1), "git grep failed in the source repository")
+        rows = output.split(b"\n")
+        # The last piece is empty after a final newline, or a partial line when output was cut.
+        rows.pop()
+        prefix = (commit + ":").encode("ascii")
+        matches, used = [], rendered_size({"commit": commit, "pattern": pattern, "paths": paths})
+        for raw in rows:
+            if len(matches) == limit:
+                truncated = True
+                break
+            parts = raw.split(b"\0")
+            require(len(parts) == 3 and parts[0].startswith(prefix) and parts[1].isdigit(),
+                    "git grep returned unexpected output")
+            match = {"path": parts[0][len(prefix):].decode("utf-8", errors="replace")[:MAX_PATH_CHARS],
+                     "line": int(parts[1]), "text": parts[2].decode("utf-8", errors="replace")[:MAX_MATCH_CHARS]}
+            used += rendered_size(match)
+            if used > RESPONSE_BYTES:
+                truncated = True
+                break
+            matches.append(match)
         return {"commit": commit, "pattern": pattern, "paths": paths, "matches": matches, "truncated": truncated}
 
     def call(self, name, arguments):
