@@ -315,6 +315,17 @@ def publish_file(path, raw, *, limit=MAX_BYTES):
             pending.unlink()
 
 
+def require_independent_session(mailbox, endpoint, host, session):
+    """Every bind, from any path, keeps the registry's separate-session rule. The registry check lives in
+    hierarchy_roles, imported here only when binding: the native foundation acceptance imports this file with no
+    other files present, and it never binds."""
+    directory = str(Path(__file__).resolve().parent)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    import hierarchy_roles
+    hierarchy_roles.require_independent_session(mailbox, endpoint, host, session)
+
+
 class Mailbox:
     def __init__(self, root):
         self.root = safe_path(root)
@@ -440,6 +451,19 @@ class Mailbox:
         fields(ack, {"endpoint", "generation", "session", "checkpoint_sha256"})
         require(ack == {key: binding[key] for key in ack}, "handoff acknowledgment does not match binding")
         return True
+
+    def fence(self, sender, *, ready=True):
+        """The check every write makes: the configured sender is its endpoint's current binding and, unless the
+        write is the acknowledgment itself, that binding has acknowledged its handoff checkpoint.
+
+        Callers hold writer_lock(root), so a rebinding cannot land between this check and the write. The sender is
+        configuration, so this refuses a stale or unacknowledged session; it does not authenticate one."""
+        binding = self.current_binding(sender["from"])
+        expected = {"host": binding["host"], "session": binding["session"], "binding_generation": binding["generation"]}
+        require(all(type(sender.get(key)) is type(value) and sender.get(key) == value for key, value in expected.items()),
+                "stale or mismatched sender binding")
+        require(not ready or self.ready(binding), "handoff checkpoint has not been acknowledged")
+        return binding
 
     def current_binding(self, endpoint):
         history = self.bindings(endpoint)
@@ -655,6 +679,7 @@ class Mailbox:
             self.checkpoint_assignments(request["endpoint"], checkpoint, records)
         else:
             require(checkpoint is None, "initial binding cannot contain a replacement checkpoint")
+        require_independent_session(self, request["endpoint"], request["host"], request["session"])
         record = {"schema": "aegis.role-binding/v1", "endpoint": request["endpoint"],
                   "host": request["host"], "session": request["session"], "generation": len(history) + 1,
                   "created_at": timestamp(), "checkpoint": checkpoint,
@@ -832,11 +857,7 @@ class Mailbox:
         records = self.messages()
         require(request["message_id"] not in records, "message_id already exists: " + request["message_id"])
         require(len(records) < MAX_RECORDS, "mailbox history limit reached")
-        binding = self.current_binding(request["from"])
-        require(all(request[key] == binding[source] for key, source in (
-            ("binding_generation", "generation"), ("host", "host"), ("session", "session"))),
-                "stale or mismatched sender binding")
-        require(self.ready(binding), "handoff checkpoint has not been acknowledged")
+        self.fence(request)
         recipient = self.current_binding(request["to"])
         if request["type"] == "dispatch":
             require(self.ready(recipient), "recipient has not acknowledged its handoff checkpoint")
@@ -1031,13 +1052,11 @@ class Mailbox:
         # The delivered page's binding can retire during stdout flush. Fence it before even
         # deduplicating receipts, and retain exclusion through publication; historical receipts
         # remain valid, but cannot authorize a new receipt for a retired connection.
+        # Only staleness is fenced here. A receipt records what was returned to the current binding, which an
+        # unacknowledged successor is too; it authors nothing.
         with writer_lock(self.root):
             endpoint = sender["from"]
-            binding = self.current_binding(endpoint)
-            expected = {"from": binding["endpoint"], "host": binding["host"],
-                        "session": binding["session"], "binding_generation": binding["generation"]}
-            require(all(type(sender.get(key)) is type(value) and sender.get(key) == value
-                        for key, value in expected.items()), "stale or mismatched sender binding")
+            self.fence(sender, ready=False)
             records = self.messages()
             seen = {identifier for receipt in self.delivery_receipts(directory, "reads", endpoint, records)
                     if receipt["generation"] == sender["binding_generation"] for identifier in receipt["message_ids"]}
@@ -1146,6 +1165,8 @@ def main(argv=None):
     server.add_argument("--workspace-store", default=None, help="Offer this role's read-only workspace views")
     server.add_argument("--initiative", default=None, help="The initiative these views belong to")
     server.add_argument("--board", default=None, help="Serve only the workspace board tools, from this board folder")
+    server.add_argument("--source-repo", default=None,
+                        help="Offer pinned source_show and source_grep over this git repository; reader roles only")
     server.add_argument("--lifecycle", default=None, help="ROOT only: the lifecycle journal its decisions go to")
     server.add_argument("--actor", default=None, help="ROOT only: its configured lifecycle actor; not authenticated")
     args = parser.parse_args(argv)
@@ -1165,9 +1186,10 @@ def main(argv=None):
             from hierarchy_mailbox_mcp import serve
 
             lifecycle = cli_path(args.lifecycle, "--lifecycle") if args.lifecycle is not None else None
+            source_repo = cli_path(args.source_repo, "--source-repo") if args.source_repo is not None else None
             return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir,
                          workspace_store=args.workspace_store, initiative=args.initiative, board=args.board,
-                         lifecycle=lifecycle, actor=args.actor)
+                         lifecycle=lifecycle, actor=args.actor, source_repo=source_repo)
         if args.command == "init":
             result = initialize(root, read_json(args.request))
         elif args.command == "draft-handoff":

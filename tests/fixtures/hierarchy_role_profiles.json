@@ -36,7 +36,7 @@
      "--disallowedTools",
      "Agent(general-purpose),Agent(Explore),Agent(Plan)",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.wake.json"
    },
@@ -97,7 +97,7 @@
       "--disallowedTools",
       "Agent(general-purpose),Agent(Explore),Agent(Plan)",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/front-door",
@@ -136,7 +136,7 @@
      "00000000-0000-0000-0000-000000000001",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative",
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative",
      "--"
     ],
     "start_prompt_via": "argv",
@@ -189,7 +189,7 @@
       "00000000-0000-0000-0000-000000000001",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative",
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative",
       "--"
      ],
      "control": [
@@ -239,7 +239,7 @@
      "--effort",
      "max",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.wake.json"
    },
@@ -297,7 +297,7 @@
       "--effort",
       "max",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/front-door",
@@ -338,7 +338,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.wake.json"
    },
@@ -392,7 +392,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/front-door",
@@ -433,7 +433,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.wake.json"
    },
@@ -487,7 +487,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/front-door",
@@ -536,7 +536,7 @@
      "--disallowedTools",
      "Agent(general-purpose),Agent(Explore),Agent(Plan)",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.wake.json"
    },
@@ -597,7 +597,7 @@
       "--disallowedTools",
       "Agent(general-purpose),Agent(Explore),Agent(Plan)",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/f2",
@@ -636,7 +636,7 @@
      "00000000-0000-0000-0000-000000000004",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
      "--"
     ],
     "start_prompt_via": "argv",
@@ -689,7 +689,7 @@
       "00000000-0000-0000-0000-000000000004",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
       "--"
      ],
      "control": [
@@ -739,7 +739,7 @@
      "--effort",
      "max",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.wake.json"
    },
@@ -797,7 +797,7 @@
       "--effort",
       "max",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/f2",
@@ -838,7 +838,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.wake.json"
    },
@@ -892,7 +892,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/f2",
@@ -933,7 +933,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.wake.json"
    },
@@ -987,7 +987,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/f2",
@@ -1036,7 +1036,7 @@
      "--disallowedTools",
      "Agent(general-purpose),Agent(Explore),Agent(Plan)",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.wake.json"
    },
@@ -1097,7 +1097,7 @@
       "--disallowedTools",
       "Agent(general-purpose),Agent(Explore),Agent(Plan)",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/integration",
@@ -1136,7 +1136,7 @@
      "00000000-0000-0000-0000-000000000005",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
      "--"
     ],
     "start_prompt_via": "argv",
@@ -1189,7 +1189,7 @@
       "00000000-0000-0000-0000-000000000005",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write",
       "--"
      ],
      "control": [
@@ -1239,7 +1239,7 @@
      "--effort",
      "max",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.wake.json"
    },
@@ -1297,7 +1297,7 @@
       "--effort",
       "max",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/integration",
@@ -1338,7 +1338,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.wake.json"
    },
@@ -1392,7 +1392,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/integration",
@@ -1433,7 +1433,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.wake.json"
    },
@@ -1487,7 +1487,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_path_overlap,Edit,Write"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/integration",
@@ -1536,7 +1536,7 @@
      "--disallowedTools",
      "Agent(general-purpose),Agent(Explore),Agent(Plan)",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.wake.json"
    },
@@ -1597,7 +1597,7 @@
       "--disallowedTools",
       "Agent(general-purpose),Agent(Explore),Agent(Plan)",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/review",
@@ -1636,7 +1636,7 @@
      "00000000-0000-0000-0000-000000000006",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff",
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self",
      "--"
     ],
     "start_prompt_via": "argv",
@@ -1689,7 +1689,7 @@
       "00000000-0000-0000-0000-000000000006",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff",
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self",
       "--"
      ],
      "control": [
@@ -1739,7 +1739,7 @@
      "--effort",
      "max",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.wake.json"
    },
@@ -1797,7 +1797,7 @@
       "--effort",
       "max",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/review",
@@ -1838,7 +1838,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.wake.json"
    },
@@ -1892,7 +1892,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/review",
@@ -1933,7 +1933,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.wake.json"
    },
@@ -1987,7 +1987,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/lane/review",
@@ -2036,7 +2036,7 @@
      "--disallowedTools",
      "Agent(general-purpose),Agent(Explore),Agent(Plan)",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.wake.json"
    },
@@ -2097,7 +2097,7 @@
       "--disallowedTools",
       "Agent(general-purpose),Agent(Explore),Agent(Plan)",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/orchestrator",
@@ -2136,7 +2136,7 @@
      "00000000-0000-0000-0000-000000000002",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative",
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative",
      "--"
     ],
     "start_prompt_via": "argv",
@@ -2189,7 +2189,7 @@
       "00000000-0000-0000-0000-000000000002",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative",
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative",
       "--"
      ],
      "control": [
@@ -2239,7 +2239,7 @@
      "--effort",
      "max",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.wake.json"
    },
@@ -2297,7 +2297,7 @@
       "--effort",
       "max",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/orchestrator",
@@ -2338,7 +2338,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.wake.json"
    },
@@ -2392,7 +2392,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/orchestrator",
@@ -2433,7 +2433,7 @@
      "--verbose",
      "--disable-slash-commands",
      "--allowedTools",
-     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+     "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
     ],
     "wake_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.wake.json"
    },
@@ -2487,7 +2487,7 @@
       "--verbose",
       "--disable-slash-commands",
       "--allowedTools",
-      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
+      "mcp__aegis_mailbox__mailbox_inbox,mcp__aegis_mailbox__mailbox_publish,mcp__aegis_mailbox__mailbox_ack_handoff,mcp__aegis_mailbox__mailbox_self,mcp__aegis_mailbox__workspace_capacity,mcp__aegis_mailbox__workspace_initiative"
      ],
      "cwd": "<tmp>/source",
      "endpoint": "pilot/orchestrator",
@@ -2808,7 +2808,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/front-door\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000001\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/front-door\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000001\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -2908,7 +2908,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/front-door\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000001\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/front-door\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000001\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3008,7 +3008,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/front-door\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000001\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/front-door\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000001\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3105,7 +3105,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3209,7 +3209,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3307,7 +3307,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3408,7 +3408,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3505,7 +3505,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/f2\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000004\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3602,7 +3602,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3706,7 +3706,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3804,7 +3804,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -3905,7 +3905,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4002,7 +4002,7 @@
       "-c",
       "sandbox_workspace_write.network_access=false",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/integration\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000005\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_path_overlap\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4095,7 +4095,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4188,7 +4188,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4281,7 +4281,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4381,7 +4381,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/lane/review\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000006\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4474,7 +4474,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4567,7 +4567,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4660,7 +4660,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",
@@ -4760,7 +4760,7 @@
       "-c",
       "approval_policy=\"never\"",
       "-c",
-      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
+      "mcp_servers={aegis_mailbox={command=\"/usr/bin/python3\",args=[\"-I\", \"-B\", \"<tmp>/source/tools/hierarchy_mailbox.py\", \"--root\", \"<tmp>/initiatives/pilot/mailbox\", \"serve\", \"--endpoint\", \"pilot/orchestrator\", \"--host\", \"codex-cli\", \"--session\", \"00000000-0000-0000-0000-000000000002\", \"--generation\", \"1\", \"--delivery-dir\", \"<tmp>/initiatives/pilot/delivery\", \"--workspace-store\", \"<tmp>/store\", \"--initiative\", \"pilot\"],required=true,enabled_tools=[\"mailbox_inbox\", \"mailbox_publish\", \"mailbox_ack_handoff\", \"mailbox_self\", \"workspace_capacity\", \"workspace_initiative\"],tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"},mailbox_ack_handoff={approval_mode=\"approve\"}}}}",
       "--json",
       "-C",
       "<tmp>/source",

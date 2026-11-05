@@ -69,7 +69,7 @@ def test_transport_advertises_only_scoped_mailbox_tools(pilot):  # noqa: F811
     responses = exchange(root)
     assert responses[0]["result"]["serverInfo"]["name"] == "aegis-hierarchy-mailbox"
     tools = {t["name"]: t for t in responses[1]["result"]["tools"]}
-    assert set(tools) == {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff"}
+    assert set(tools) == {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"}
     assert tools["mailbox_inbox"]["annotations"]["readOnlyHint"] is True
     assert tools["mailbox_publish"]["annotations"]["readOnlyHint"] is False
     assert all(t["inputSchema"]["additionalProperties"] is False for t in tools.values())

@@ -4,12 +4,37 @@ Launch through hierarchy_mailbox.py serve, which supports isolated Python import
 The configured sender is provenance, not an authenticated native host identity.
 ROOT gets only a decision adapter over the lifecycle journal, never the mailbox tools.
 """
+from contextlib import contextmanager
 import json
 import os
 import sys
+import time
 
 from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, endpoint_parts, fields, integer, matching,
                                require, SHA256, SLUG, strict_json, text, writer_lock)
+
+
+BOARD_LOCK_WAIT_SECONDS = 5.0
+
+
+@contextmanager
+def waiting_writer_lock(root, seconds=BOARD_LOCK_WAIT_SECONDS):
+    """The mailbox lock, waited for briefly as the board waits for its own: a busy answer is no use to a model
+    mid-post, and board writers now share the mailbox lock with every mailbox write."""
+    deadline = time.monotonic() + seconds
+    while True:
+        lock = writer_lock(root)
+        try:
+            lock.__enter__()
+            break
+        except ValueError as exc:
+            if not str(exc).startswith("mailbox writer is busy") or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _response_line(response):
@@ -44,7 +69,13 @@ def role_workspace_tools(mailbox, endpoint):
     return hierarchy_roles.workspace_tools(hierarchy_roles.role(endpoint, mailbox.endpoint(endpoint).get("kind")))
 
 
-def definitions(extra=(), board_specs=None):
+SELF_TOOL = "mailbox_self"
+SELF_SPEC = ("Show what this connection is configured as: endpoint, role, host, session and generation, whether "
+             "it is the current binding and has acknowledged its checkpoint, and the tools it offers. The identity "
+             "is configuration, not authentication. Changes nothing.", {}, [])
+
+
+def definitions(extra=(), board_specs=None, source_specs=None):
     """A connection is either a role's mailbox or the board, because they fail and change separately."""
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
@@ -67,7 +98,10 @@ def definitions(extra=(), board_specs=None):
         ("mailbox_ack_handoff", False, "Acknowledge this configured successor's checkpoint; grants no owner approval.",
          {"checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, ["checkpoint_sha256"]),
     ]
+    if not board_specs:
+        specs.append((SELF_TOOL, True, *SELF_SPEC))
     specs += [(name, True, *WORKSPACE_TOOL_SPECS[name]) for name in extra]
+    specs += [(name, True, *spec) for name, spec in (source_specs or {}).items()]
     specs += [(name, readonly, description, props, required)
               for name, (readonly, description, props, required) in (board_specs or {}).items()]
     return [{"name": name, "description": description, "annotations": {"readOnlyHint": readonly},
@@ -184,10 +218,11 @@ class Connection:
     instructions = MAILBOX_INSTRUCTIONS
 
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
-                 initiative=None, board=None):
+                 initiative=None, board=None, source_repo=None):
         # Owner-facing ROOT gets only the decision adapter; configured-sender mail is not a decision boundary.
         require(endpoint_parts(endpoint)[1] != "root", ROOT_ONLY_ADAPTER)
-        require(board is None or (delivery_dir is None and workspace_store is None), "a board connection takes no mailbox options")
+        require(board is None or (delivery_dir is None and workspace_store is None and source_repo is None),
+                "a board connection takes no mailbox options")
         require((workspace_store is None) == (initiative is None),
                 "workspace store and initiative must be given together")
         self.root = root
@@ -214,6 +249,14 @@ class Connection:
             else:
                 ledger.initiative(initiative)
             self.workspace_tools = role_workspace_tools(mailbox, endpoint)
+        self.source = None
+        self.source_specs = {}
+        if source_repo is not None:
+            import hierarchy_roles
+            import hierarchy_source
+            hierarchy_roles.require_source_views(endpoint, mailbox.endpoint(endpoint).get("kind"))
+            self.source = hierarchy_source.SourceViews(source_repo)
+            self.source_specs = {name: hierarchy_source.TOOL_SPECS[name] for name in hierarchy_roles.SOURCE_VIEW_TOOLS}
         self.board = None
         self.board_specs = {}
         self.pending_position = None
@@ -224,11 +267,18 @@ class Connection:
             self.board_specs = hierarchy_board.TOOL_SPECS
 
     def definitions(self):
-        return definitions(self.workspace_tools, self.board_specs)
+        return definitions(self.workspace_tools, self.board_specs, self.source_specs)
 
     def board_call(self, name, arguments, render):
-        self.checked_mailbox()
-        result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
+        if self.board_specs[name][0]:
+            self.checked_mailbox()
+            result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
+            return result
+        # A post or disposition is authored, so it is fenced like a publish: current and acknowledged, under the
+        # mailbox lock held across the board's own lock, so a rebinding cannot land between the check and the write.
+        with waiting_writer_lock(self.root):
+            self.checked_mailbox(ready=True)
+            result, self.pending_position = self.board.call(self.sender["from"], name, arguments, render)
         return result
 
     def record_position(self):
@@ -238,7 +288,11 @@ class Connection:
         if position is None:
             return
         try:
-            self.board.move_position(self.sender["from"], *position)
+            # Like a read receipt: fenced to the current binding, under the lock, so a retired session cannot
+            # move its successor's position.
+            with waiting_writer_lock(self.root):
+                self.checked_mailbox()
+                self.board.move_position(self.sender["from"], *position)
         except (ValueError, OSError, UnicodeError) as exc:
             print("board position not recorded: " + str(exc), file=sys.stderr, flush=True)
 
@@ -272,14 +326,24 @@ class Connection:
         except (ValueError, OSError, UnicodeError) as exc:
             print("read receipt not recorded: " + str(exc), file=sys.stderr, flush=True)
 
-    def checked_mailbox(self):
+    def checked_mailbox(self, *, ready=False):
+        """Every call is refused unless this connection is the current binding. A write also needs the handoff
+        acknowledged; a read does not, so a successor can read the checkpoint it must acknowledge."""
         mailbox = Mailbox(self.root)
         require(digest(mailbox.manifest) == self.manifest_digest, "mailbox manifest changed since server startup")
-        binding = mailbox.current_binding(self.sender["from"])
-        require(all(self.sender[key] == binding[source] for key, source in (
-            ("binding_generation", "generation"), ("host", "host"), ("session", "session"))),
-                "stale or mismatched sender binding")
+        mailbox.fence(self.sender, ready=ready)
         return mailbox
+
+    def self_view(self, arguments):
+        fields(arguments, set())
+        import hierarchy_roles
+        mailbox = self.checked_mailbox()
+        endpoint = self.sender["from"]
+        binding = mailbox.current_binding(endpoint)
+        return {"endpoint": endpoint, "role": hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")),
+                "host": binding["host"], "session": binding["session"], "generation": binding["generation"],
+                "ready": mailbox.ready(binding), "current": True, "identity": "configured", "authenticated": False,
+                "tools": sorted(tool["name"] for tool in self.definitions())}
 
     def call(self, name, arguments, render=None):
         text(name, "tool name", 128)
@@ -310,8 +374,13 @@ class Connection:
                 return self.checked_mailbox().acknowledge_handoff({
                     "endpoint": self.sender["from"], "session": self.sender["session"],
                     "generation": self.sender["binding_generation"], **arguments})
+        if name == SELF_TOOL:
+            return self.self_view(arguments)
         if name in self.workspace_tools:
             return self.workspace_view(name, arguments)
+        if name in self.source_specs:
+            self.checked_mailbox()
+            return self.source.call(name, arguments)
         raise ValueError("unknown mailbox tool: " + name)
 
 
@@ -355,17 +424,19 @@ def handle(connection, request):
 
 
 def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None, board=None,
-          lifecycle=None, actor=None):
+          lifecycle=None, actor=None, source_repo=None):
     integer(generation, "binding generation")
     if endpoint_parts(endpoint)[1] == "root":
         require(lifecycle is not None and actor is not None, ROOT_ONLY_ADAPTER)
         require(delivery_dir is None and workspace_store is None and initiative is None and board is None,
                 "the ROOT decision adapter takes no mailbox, workspace or board options")
+        require(source_repo is None, "the ROOT decision adapter takes no source views")
         connection = DecisionConnection(root, endpoint, host, session, generation, lifecycle, actor)
     else:
         require(lifecycle is None and actor is None, "only ROOT takes --lifecycle and --actor")
         connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
-                                workspace_store=workspace_store, initiative=initiative, board=board)
+                                workspace_store=workspace_store, initiative=initiative, board=board,
+                                source_repo=source_repo)
     while True:
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:

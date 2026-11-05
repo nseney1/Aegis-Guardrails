@@ -25,7 +25,7 @@ PROVISION = ROOT / "tools" / "hierarchy_provision.py"
 WAKE = ROOT / "tools" / "hierarchy_wake.py"
 INITIATIVE = {"id": "pilot", "project": "aegis", "repository": "aegis", "priority": 5, "target_branch": "develop"}
 LANES = {"f2": "implementer", "integration": "integrator", "review": "reviewer"}
-MAILBOX_TOOLS = {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff"}
+MAILBOX_TOOLS = {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"}
 
 
 def provision(command, request, *, expect=0):

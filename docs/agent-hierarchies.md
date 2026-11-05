@@ -265,8 +265,8 @@ interpreter/helper, mailbox root, endpoint, host, session and generation. Each r
 needs its own connection. The reviewer profile embeds its own server definition;
 it must not inherit the orchestrator's sender binding.
 
-By default the adapter advertises exactly `mailbox_inbox`, `mailbox_publish` and
-`mailbox_ack_handoff`. Root gets no mailbox adapter, because grants and job runs stay out of
+By default the adapter advertises exactly `mailbox_inbox`, `mailbox_publish`,
+`mailbox_ack_handoff` and `mailbox_self`. Root gets no mailbox adapter, because grants and job runs stay out of
 anything a model session can call. Its only adapter is `serve --endpoint <h>/root --lifecycle
 <journal> --actor <ROOT CID>`, which offers one tool, `root_decide`: approve or deny an existing
 canonical request by ID and raw SHA-256 in the lifecycle journal. The ROOT actor is configuration
@@ -296,7 +296,41 @@ the same file protocol and cannot claim leases, edit source, run supplied comman
 or invoke manager policy. `mailbox_ack_handoff` accepts only `checkpoint_sha256`
 and is available to a successor before its binding is ready. A restricted reviewer
 can thus receive, accept and report independently with source-read tools plus these
-three narrowly scoped mailbox tools.
+narrowly scoped mailbox tools.
+
+`mailbox_self` takes no arguments and changes nothing. It returns the connection's endpoint,
+registry role, host, session and generation, whether the binding has acknowledged its checkpoint,
+and the tools offered. Like every other call it is refused for a replaced session, so an answer
+always means `current: true`. The identity is configuration (`authenticated: false`).
+
+**The write fence.** Every write checks, under the mailbox writer lock, that the configured sender
+is the endpoint's current binding, so a replaced session is refused. A write the session authors
+(a publish, a board post or a board disposition) also needs the handoff acknowledged; the
+acknowledgment is the one such write an unacknowledged successor may make. Records of what was
+returned (read receipts and the board read position) need only the current binding, so they name
+the successor's own generation. A board write holds the mailbox lock across the board's own lock,
+so a rebinding cannot land between the check and the write, and it waits for a busy mailbox lock
+for up to five seconds, as the board waits for its own.
+Service writes that publish under an endpoint's current binding, such as job receipts and a
+move's carried-work brief, are checked against that binding, not against the session that asked.
+
+**Independence on every bind.** Every bind checks the role registry's `separate_session` flag,
+whether it comes from the mailbox CLI, `add-role`, a provisioning move or `hierarchy_handoff.py`.
+A session that currently holds one endpoint in a mailbox root cannot be bound to another endpoint
+in that root when either role needs a separate session (Reviewer, Decider and ROOT today). The
+same session name on another host counts as another session. The registry's `not-author` and
+`not-requester` rules are not checked mechanically.
+
+**Source views.** With `--source-repo /absolute/git/repository`, a role that reads source and
+writes none (Reviewer, Decider, Orchestrator) also gets `source_show` and `source_grep`. Any other
+role is refused at startup, and so is ROOT. Both take a full 40-character commit id and read Git
+objects only: never the working tree, the index or untracked files. `source_show` returns one file
+a page at a time (`start_line`, `max_lines` up to 2,000, at most 64 KiB of text per page; lines
+over 4,096 characters are cut and listed in `cut_lines`). `source_grep` searches for a fixed string,
+optionally under literal `paths`, and returns up to 500 matches, with `truncated` when there were
+more. The repository is fixed at startup, so no argument can point a view elsewhere, and global
+and system Git configuration is ignored. `add-role` takes `source_repo` and writes the option into
+the role's connection and allowlist.
 
 With `--workspace-store /absolute/store --initiative <id>`, the adapter adds read-only
 views by role. Grants, releases, claims and other changes are never offered.
