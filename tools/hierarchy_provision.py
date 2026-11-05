@@ -40,6 +40,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import role_workspace_tools  # noqa: E402
+import hierarchy_roles  # noqa: E402
 from hierarchy_workspace import Store, validate_initiative  # noqa: E402
 
 
@@ -50,9 +51,11 @@ CODEX = "codex-cli"
 # A thread hosted by Codex's app server. Root creates and messages it, so it has no wake profile.
 NATIVE = "codex"
 RECENT_MESSAGES = 20
-LANE_KINDS = {"implementer", "integrator", "reviewer"}
-READ_TOOLS = ["Read", "Glob", "Grep"]
-WRITE_TOOLS = ["Edit", "Write"]
+LANE_KINDS = set(hierarchy_roles.LANE_KINDS)
+READ_TOOLS = hierarchy_roles.READ_TOOLS
+WRITE_TOOLS = hierarchy_roles.WRITE_TOOLS
+# Endpoints init can add beyond the front door, orchestrator and root every initiative has.
+OPTIONAL_ROLES = ("router", "decider")
 SUPPORTED_TOOLS = set(READ_TOOLS + WRITE_TOOLS)
 MAILBOX_TOOLS = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff"]
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -71,7 +74,7 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
 # Generic levels from ADR-TEAM-CONFIG-20261102. Claude has no "ultra" effort: it runs max with ultracode on.
 TEAM_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
-TEAM_KINDS = LANE_KINDS | {"orchestrator"}
+TEAM_KINDS = hierarchy_roles.team_kinds()
 
 
 def git(cwd, *arguments):
@@ -93,13 +96,16 @@ def pin_source(source):
 
 
 def init(request):
-    fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python", "board"})
+    fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python", "board", "roles"})
     base = safe_path(text(request["base"], "base"))
     lanes = request["lanes"]
     require(isinstance(lanes, dict) and lanes, "invalid lanes")
     for lane, kind in lanes.items():
         matching(lane, SLUG, "lane id")
         require(isinstance(kind, str) and kind in LANE_KINDS, "invalid lane kind")
+    roles = request.get("roles", [])
+    require(isinstance(roles, list) and len(roles) == len(set(roles)) and all(r in OPTIONAL_ROLES for r in roles),
+            "roles may list only " + " and ".join(OPTIONAL_ROLES) + ", once each")
     initiative = request["initiative"]
     fields(initiative, {"id", "project", "repository", "priority", "target_branch"},
            {"touched_paths", "blocked_by", "checkouts", "lanes", "source"})
@@ -114,6 +120,7 @@ def init(request):
     store = Store(text(request["store"], "store"))
     hierarchy = initiative["id"]
     endpoints = {hierarchy + "/front-door": {}, hierarchy + "/orchestrator": {}, hierarchy + "/root": {}}
+    endpoints.update({hierarchy + "/" + role: {} for role in roles})
     endpoints.update({hierarchy + "/lane/" + lane: {"kind": kind} for lane, kind in lanes.items()})
     record_path = base / "provision.json"
     store.load()  # A missing store is reported as such, before the lock would fail on its absent folder.
@@ -169,9 +176,13 @@ def board_args(setup, endpoint, host, session, generation):
             "--board", setup["board"]]
 
 
+def registry_role(mailbox, endpoint):
+    return hierarchy_roles.role(endpoint, mailbox.endpoint(endpoint).get("kind"))
+
+
 def takes_board(setup, mailbox, endpoint):
-    # A reviewer's verdict stays independent, so it reads the source and not the other roles' posts.
-    return "board" in setup and mailbox.endpoint(endpoint).get("kind") != "reviewer"
+    # The registry keeps the board from roles whose verdict must stay independent of the other roles' posts.
+    return "board" in setup and hierarchy_roles.takes_board(registry_role(mailbox, endpoint))
 
 
 def toml_list(values):
@@ -299,23 +310,51 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants, 
     return argv + (["--"] if name is not None else [])
 
 
+def fixed_profile(request, mailbox, endpoint):
+    """A role whose registry profile is fixed always runs at that effort, whatever team.json says.
+
+    The tier has no host flag, so the answer says it is recorded and not applied.
+    """
+    profile = registry_role(mailbox, endpoint)["model_profile"]
+    if profile["source"] != "fixed":
+        return request, None
+    effort = profile["effort"]
+    require(request.get("effort", effort) == effort,
+            "the %s role runs at effort %s from the role registry" % (endpoint_parts(endpoint)[1], effort))
+    return {**request, "effort": effort}, {"source": "registry", "effort": effort, "tier": profile.get("tier"),
+                                           "tier_applied": False}
+
+
+def require_independent_session(mailbox, endpoint, host, session):
+    """Where independence is the control, the registry asks for a separate session, so one session can never
+    hold both sides. Checked when provisioning binds a role; a direct mailbox bind is not checked."""
+    mine = registry_role(mailbox, endpoint)
+    for other in mailbox.manifest["endpoints"]:
+        if other == endpoint:
+            continue
+        history = mailbox.bindings(other)
+        if not history or (history[-1]["host"], history[-1]["session"]) != (host, session):
+            continue
+        theirs = registry_role(mailbox, other)
+        if mine["independence"]["separate_session"] or theirs["independence"]["separate_session"]:
+            raise ValueError("session %s already holds %s; the role registry needs a separate session for %s"
+                             % (session, other, endpoint if mine["independence"]["separate_session"] else other))
+
+
 def role_tools(endpoint, mailbox, requested):
-    parts = endpoint_parts(endpoint)
-    writer = mailbox.endpoint(endpoint).get("kind") in ("implementer", "integrator")
+    entry = registry_role(mailbox, endpoint)
+    writer = hierarchy_roles.writer(entry)
     if requested is not None:
         names = [name for name in text(requested, "tools").split(",") if name]
         for name in names:
             require(name in SUPPORTED_TOOLS, "unsupported tool: " + name)
         return names, writer
-    if parts[1] == "front-door":
-        return [], writer
-    return READ_TOOLS + (WRITE_TOOLS if writer else []), writer
+    return hierarchy_roles.file_tools(entry), writer
 
 
 def assistant_catalog(setup, endpoint, mailbox):
-    parts = endpoint_parts(endpoint)
-    kind = mailbox.endpoint(endpoint).get("kind")
-    name = parts[1] if parts[1] != "lane" else {"implementer": "builder", "integrator": "builder", "reviewer": "reviewer"}[kind]
+    name = registry_role(mailbox, endpoint)["provision"]["assistants"]
+    require(name is not None, "no assistant list for this role")
     catalog = Path(setup["source"]) / "tools" / "hierarchy_templates" / "claude-agents" / ("assistants-" + name + ".json")
     require(catalog.is_file(), "no assistant list for this role")
     return str(catalog)
@@ -323,14 +362,14 @@ def assistant_catalog(setup, endpoint, mailbox):
 
 def check_codex_options(request, mailbox, endpoint, host):
     """Real lanes run with these. Each is for one kind of role, so none can widen another role by mistake."""
-    kind = mailbox.endpoint(endpoint).get("kind")
-    writer = kind in ("implementer", "integrator")
-    reader = kind == "reviewer" or endpoint_parts(endpoint)[1] == "orchestrator"
+    entry = registry_role(mailbox, endpoint)
+    writer = hierarchy_roles.writer(entry)
+    reader = entry["provision"]["reader_shell"]
     if "reader_shell" in request:
         # Codex has no file tools without its shell, so a reader of files needs one. Its sandbox stays
         # read-only with no network, and a writer already has the shell it needs.
         require(type(request["reader_shell"]) is bool and host == CODEX and reader,
-                "reader_shell is only for a Codex reviewer or orchestrator")
+                "reader_shell is only for a Codex reviewer, orchestrator or decider")
     for name in ("writable_roots", "tmpdir"):
         if name in request:
             require(host == CODEX and writer, name + " is only for a Codex writer")
@@ -400,13 +439,16 @@ def add_role(request):
     cwd, timeout, assistants = check_role_request(request, setup)
     host = request["host"]
     team = None
+    fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
+        request, fixed = fixed_profile(request, mailbox, endpoint)
         # Before binding, so a bad team.json leaves the endpoint unbound.
         request, team = team_settings(base, host, request, role_kind(mailbox, endpoint))
     session = request.get("session") or str(uuid.uuid4())
     tools, writer = role_tools(endpoint, mailbox, request.get("tools"))
     root = Path(setup["mailbox_root"])
     with writer_lock(root):
+        require_independent_session(Mailbox(root), endpoint, host, session)
         history = mailbox.bindings(endpoint)
         if history:
             require(history[-1]["session"] == session and history[-1]["host"] == host,
@@ -418,6 +460,8 @@ def add_role(request):
     answer = {"endpoint": endpoint, "host": host, "session": session, "generation": generation}
     if team is not None:
         answer["team"] = team
+    if fixed is not None:
+        answer["model_profile"] = fixed
     if endpoint_parts(endpoint)[1] == "root":
         return answer
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
@@ -478,8 +522,9 @@ def codex_start(request):
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
+    request, fixed = fixed_profile(request, mailbox, request["endpoint"])
     options, team = team_settings(base, CODEX, request, role_kind(mailbox, request["endpoint"]))
-    writer = mailbox.endpoint(request["endpoint"]).get("kind") in ("implementer", "integrator")
+    writer = hierarchy_roles.writer(registry_role(mailbox, request["endpoint"]))
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     if not request.get("skip_git_repo_check"):
         require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
@@ -487,6 +532,8 @@ def codex_start(request):
               "cwd": str(cwd),
               "prompt_via": "argv",
               "next": "Read the session ID from the first JSON event, then run add-role with that session."}
+    if fixed is not None:
+        answer["model_profile"] = fixed
     return {**answer, "team": team} if team is not None else answer
 
 
@@ -679,8 +726,10 @@ def move(request):
     if hierarchy not in Store(text(request["store"], "store")).load().initiatives:
         # Sets it up, or finishes registering a setup that an earlier run left unregistered.
         lanes = {name.split("/")[2]: spec["kind"] for name, spec in endpoints.items() if name.split("/")[1] == "lane"}
+        optional = [role for role in OPTIONAL_ROLES if hierarchy + "/" + role in endpoints]
         init({key: request[key] for key in ("store", "base", "source") } | {
             "lanes": lanes, "initiative": {**initiative, "id": hierarchy},
+            **({"roles": optional} if optional else {}),
             **{key: request[key] for key in ("board", "python") if key in request}})
     setup = read_json(base / "provision.json")
     new = Mailbox(setup["mailbox_root"])
