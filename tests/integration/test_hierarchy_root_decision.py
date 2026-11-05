@@ -12,7 +12,7 @@ import sys
 import pytest
 
 from tests.integration.test_hierarchy_lifecycle import Ledger, raw_request, request
-from tests.integration.test_hierarchy_mailbox import HELPER, invoke, message
+from tests.integration.test_hierarchy_mailbox import HELPER, invoke
 from tests.integration.test_hierarchy_mailbox_mcp import payload
 from tests.integration.test_hierarchy_root_role import ENDPOINTS
 
@@ -120,6 +120,11 @@ def test_a_reused_event_id_with_another_decision_is_refused(loop):
     ({"decision": "admit"}, "decision must be approve or deny"),
     ({"reason": ""}, "invalid decision reason"),
     ({"event_id": "../escape"}, "invalid event id"),
+    ({"request_id": 7}, "invalid request id"),
+    ({"request_sha256": None}, "invalid request sha256"),
+    ({"decision": ["approve"]}, "decision must be approve or deny"),
+    ({"reason": {"text": "x"}}, "invalid decision reason"),
+    ({"reason": "x" * 1025}, "invalid decision reason"),
     ({"actor": "operator-1"}, "unexpected fields"),
     ({"custody": {"cid": "root-1", "generation": 1}}, "unexpected fields"),
 ])
@@ -224,8 +229,72 @@ def test_the_decision_is_what_lets_the_operator_admit_the_request(loop):
     ledger.admit(value)
 
 
-def test_mailbox_traffic_cannot_stand_in_for_a_decision(loop):
+def test_an_acknowledged_root_successor_decides_under_its_own_binding(loop):
     root, ledger, value = loop
-    invoke(root, "publish", message("a/orchestrator", "a/root", identifier="please-approve"))
-    assert decisions(ledger) == []
-    assert "no approved bounded authority" in ledger.status()["continuation_holds"]["feature-1"]
+    replacement = rebind(root, "host-one")
+    invoke(root, "ack-handoff", {"endpoint": "a/root", "session": "root-2", "generation": 2,
+                                 "checkpoint_sha256": replacement["checkpoint_sha256"]})
+    answer = payload(responses(serve(root, ledger, [(TOOL, decision(value))], session="root-2", generation=2))[-1])
+    assert answer["receipt"]["event_id"] == "root-decision-1"
+    assert decisions(ledger) == [("feature-1", "approve", "root-1")]
+
+
+class Live:
+    """A running adapter, so the fence is checked on a call after startup, not only at startup."""
+
+    def __init__(self, root, ledger):
+        self.process = subprocess.Popen(
+            [sys.executable, "-I", str(HELPER), "--root", str(root), "serve", "--endpoint", "a/root", "--host",
+             "host-one", "--session", "a/root", "--generation", "1", "--lifecycle", str(ledger.path), "--actor",
+             "root-1"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        self.next = 0
+
+    def ask(self, method, params=None):
+        self.next += 1
+        frame = {"jsonrpc": "2.0", "id": self.next, "method": method, "params": params or {}}
+        self.process.stdin.write(json.dumps(frame) + chr(10))
+        self.process.stdin.flush()
+        return json.loads(self.process.stdout.readline())
+
+    def close(self):
+        self.process.stdin.close()
+        assert self.process.wait(timeout=10) == 0
+        assert self.process.stderr.read() == ""
+
+
+@pytest.fixture
+def live(loop):
+    root, ledger, value = loop
+    adapter = Live(root, ledger)
+    assert "not authenticated" in adapter.ask("initialize")["result"]["instructions"]
+    yield root, ledger, value, adapter
+    adapter.close()
+
+
+def test_a_root_replaced_while_its_adapter_runs_is_refused_on_its_next_call(live):
+    root, ledger, value, adapter = live
+    rebind(root, "host-two")
+    before = ledger.files()
+    refused = adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)})
+    assert refused["result"]["isError"] is True
+    assert payload(refused)["error"] == "stale or mismatched sender binding"
+    assert ledger.files() == before
+
+
+@pytest.mark.parametrize("held", ["mailbox", "lifecycle"])
+def test_a_held_lock_refuses_the_decision_and_records_nothing(live, held):
+    root, ledger, value, adapter = live
+    lock = (root if held == "mailbox" else ledger.path) / ".write.lock"
+    expected = ("mailbox writer is busy; inspect an abandoned lock before retrying" if held == "mailbox" else
+                "lifecycle journal writer is busy; inspect an abandoned %s before retrying" % lock)
+    before = ledger.files()
+    lock.write_text("{}")
+    try:
+        refused = adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)})
+        assert payload(refused)["error"] == expected
+    finally:
+        lock.unlink()
+    assert ledger.files() == before
+    assert payload(adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)}))["receipt"]
+    assert decisions(ledger) == [("feature-1", "approve", "root-1")]

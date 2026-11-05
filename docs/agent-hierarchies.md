@@ -36,7 +36,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | Front door | Always on | `<hierarchy>/front-door` | Owner intent, acceptance, escalation, plain-language status | Relay resources or technical traffic |
 | Orchestrator | Always on | `<hierarchy>/orchestrator` | Task breakdown, lane briefs, judging evidence, draft PR metadata, reading CI | Edit source, run jobs, launch sessions |
-| Root | Always on | `<hierarchy>/root` (optional) | Launching and binding sessions, capacity ledger, jobs through its fixed controller | Make technical or acceptance calls |
+| Root | Always on | `<hierarchy>/root` (optional) | Talking with the owner and approving or denying canonical requests through its decision adapter; read-only | Write files, send mail, launch sessions, run jobs, or make technical or acceptance calls |
 | Builder | On demand | Lane kind `implementer` | Leased source edits, tests first | Push, use GitHub, start heavy jobs |
 | Integrator | On demand | Lane kind `integrator` | Cross-cutting fixes and preparing the candidate from exact frozen source | Add feature scope, push, use GitHub, start heavy jobs |
 | Reviewer | On demand | Lane kind `reviewer` | Independent verdict on exact source and baseline | Edit anything, or review its own work |
@@ -47,8 +47,21 @@ flowchart LR
 reads, writes, calls and approvals it may use, what it must never be given, its independence
 rule, model profile and who it reports to. Actions come from a closed vocabulary in
 `tools/hierarchy_roles.py`, and a role that both allows and prohibits an action is refused.
-Provisioning and the mailbox adapter read their file tools, workspace views, board access, Codex
-sandbox and assistant lists from it. The endpoint grammar and vertical routes stay constants in
+
+What reads the registry at this tier:
+
+- **Provisioning and the mailbox adapter** take each role's file tools, workspace views, board access,
+  Codex sandbox, reader shell, assistant list and team.json kind from it. A role with a fixed model
+  profile (the Router, medium effort) always runs at that effort; its tier has no host flag, so the
+  answer records it as not applied.
+- **`add-role` refuses one session for both sides of an independence rule**, such as an implementer
+  and the reviewer of its work. A direct `bind` through the mailbox CLI is not checked.
+- **Calls, approvals and prohibitions** are checked for consistency, and a test holds the lifecycle
+  events against the journal's own permissions. The mailbox and the journal enforce them in their own
+  code (dispatch, job requests, decisions), not by reading the registry at run time. Delegated Decider
+  approvals and cross-team routing have entries but no mechanism yet.
+
+The endpoint grammar and vertical routes stay constants in
 `tools/hierarchy_mailbox.py`, which the native foundation acceptance pins byte for byte, and the
 registry refuses to load when the two disagree. Roles without an endpoint, such as the Test
 Author hat, the model-free services and the roles used later, have entries and tests of what

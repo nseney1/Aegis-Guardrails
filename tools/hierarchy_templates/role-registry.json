@@ -49,7 +49,7 @@
       "calls": [],
       "approvals": [],
       "prohibitions": {
-        "reads": [],
+        "reads": ["source", "board"],
         "writes": ["source", "board", "job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "mailbox:job_request", "session:start", "session:resume", "session:stop",
                   "job:run", "merge", "publish_release"],
@@ -134,7 +134,7 @@
       "independence": {"rule": "not-requester", "separate_session": true},
       "model_profile": {"source": "team"},
       "reports_to": "root",
-      "provision": {"adapter": "mailbox", "reader_shell": false, "assistants": null, "team_kind": true}
+      "provision": {"adapter": "mailbox", "reader_shell": true, "assistants": null, "team_kind": true}
     },
     "implementer": {
       "title": "Implementer",

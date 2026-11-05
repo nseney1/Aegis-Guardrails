@@ -11,11 +11,13 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 
 import pytest
 
 from tests.integration.test_hierarchy_mailbox import ROOT, invoke, message
 from tests.integration.test_hierarchy_provision import MAILBOX_TOOLS, Setup, codex_config, provision, start_connection
+from tests.integration.test_hierarchy_carry import UUID_B, Move, move_request
 
 
 sys.path.insert(0, str(ROOT / "tools"))
@@ -120,6 +122,21 @@ def test_only_root_and_the_router_may_never_execute_and_root_alone_decides():
      "role reviewer reports_to names an unknown role"),
     (lambda r: r["roles"]["router"]["model_profile"].update(source="guess"), "role router has an invalid model profile"),
     (lambda r: r.update(schema="aegis.role-registry/v2"), "unsupported role registry schema"),
+    (lambda r: r["roles"]["router"]["independence"].update(rule="sometimes"), "role router has an invalid independence rule"),
+    (lambda r: r["roles"]["router"].update(service="tools/x.py"),
+     "role router: only a service without an endpoint names a service module"),
+    (lambda r: r["roles"]["router"]["endpoint"].update(lane_kind="reviewer"),
+     "role router: only a lane endpoint names a lane kind"),
+    (lambda r: r["roles"]["router"]["provision"].update(adapter="shell"), "role router has an unknown adapter"),
+    (lambda r: r["roles"]["router"]["provision"].update(assistants="everyone"),
+     "role router names an unknown assistant list"),
+    (lambda r: r["roles"]["implementer"]["provision"].update(reader_shell=True),
+     "role implementer: a reader shell is only for a role that reads source and writes none"),
+    (lambda r: r["roles"]["owner"].update(provision=r["roles"]["router"]["provision"]),
+     "role owner has provisioning but no endpoint"),
+    (lambda r: r["roles"]["router"]["reads"].append("mailbox"), "role router reads must be a list without repeats"),
+    (lambda r: r["roles"]["integrator"]["endpoint"].update(lane_kind="builder"),
+     "registry lane kinds differ from the mailbox lane kinds"),
 ])
 def test_a_contradictory_or_drifted_registry_is_refused(change, error):
     assert refusal(changed(change)) == error
@@ -191,10 +208,10 @@ def test_router_and_decider_run_read_only_on_codex_without_a_shell(setup, endpoi
     assert set(codex_config(argv)["mcp_servers"]["aegis_mailbox"]["enabled_tools"]) == MAILBOX_TOOLS
 
 
-@pytest.mark.parametrize("endpoint", ["pilot/router", "pilot/decider"])
-@pytest.mark.parametrize("change,error", [
-    ({"reader_shell": True}, "reader_shell is only for a Codex reviewer or orchestrator"),
-    ({"writable_roots": []}, "writable_roots is only for a Codex writer"),
+@pytest.mark.parametrize("endpoint,change,error", [
+    ("pilot/router", {"reader_shell": True}, "reader_shell is only for a Codex reviewer, orchestrator or decider"),
+    ("pilot/router", {"writable_roots": []}, "writable_roots is only for a Codex writer"),
+    ("pilot/decider", {"writable_roots": []}, "writable_roots is only for a Codex writer"),
 ])
 def test_router_and_decider_cannot_widen_their_codex_sandbox(setup, endpoint, change, error):
     refused = setup.add_role(endpoint, "codex-cli", session="abc", cwd=str(setup.source), expect=2, **change)
@@ -217,11 +234,13 @@ def test_team_reasoning_covers_the_decider_but_not_the_global_router(setup, kind
         assert result["error"] == "unknown role kind in team.json reasoning_by_kind: router"
 
 
+# ROOT itself never sends: its only adapter records decisions. These routes let the Router and the
+# Decider reach it; the mailbox CLI on root's endpoint is an operator tool, not a ROOT session.
 @pytest.mark.parametrize("sender,recipient", [
-    ("pilot/router", "pilot/root"), ("pilot/root", "pilot/router"),
+    ("pilot/router", "pilot/root"),
     ("pilot/router", "pilot/orchestrator"), ("pilot/orchestrator", "pilot/router"),
     ("pilot/decider", "pilot/orchestrator"), ("pilot/orchestrator", "pilot/decider"),
-    ("pilot/decider", "pilot/root"), ("pilot/root", "pilot/decider"),
+    ("pilot/decider", "pilot/root"),
 ])
 def test_router_and_decider_routes(setup, sender, recipient):
     bind_all(setup)
@@ -271,3 +290,73 @@ def test_the_router_cannot_reach_the_decision_adapter(setup):
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2
     assert json.loads(result.stdout)["error"] == "only ROOT takes --lifecycle and --actor"
+
+
+def test_a_codex_decider_may_take_a_read_only_shell_to_read_source(setup):
+    role = setup.add_role("pilot/decider", "codex-cli", session="01a19a29-d635-7411-8529-9efedafc0898",
+                          cwd=str(setup.source), reader_shell=True)
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "shell_tool" not in [argv[index + 1] for index, word in enumerate(argv) if word == "--disable"]
+
+
+def test_the_router_always_runs_at_its_registry_effort(setup):
+    (setup.base / "team.json").write_text(json.dumps({"model": "claude-opus-5-5", "reasoning": "max"}))
+    role = setup.add_role("pilot/router", cwd=str(setup.tmp))
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    assert argv[argv.index("--effort") + 1] == "medium"
+    assert role["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast", "tier_applied": False}
+    refused = setup.add_role("pilot/router", cwd=str(setup.tmp), session=role["session"], effort="max", expect=2)
+    assert refused["error"] == "the router role runs at effort medium from the role registry"
+
+
+def test_codex_start_applies_the_routers_registry_effort(setup):
+    started = provision("codex-start", setup.request(base=str(setup.base), endpoint="pilot/router", cwd=str(setup.source)))
+    assert codex_config(started["start_argv"])["model_reasoning_effort"] == "medium"
+    assert started["model_profile"]["effort"] == "medium"
+
+
+@pytest.mark.parametrize("first,second,independent", [
+    ("pilot/lane/f2", "pilot/lane/review", "pilot/lane/review"),
+    ("pilot/lane/review", "pilot/lane/f2", "pilot/lane/review"),
+    ("pilot/orchestrator", "pilot/decider", "pilot/decider"),
+    ("pilot/decider", "pilot/lane/f2", "pilot/decider"),
+])
+def test_one_session_cannot_hold_both_sides_of_an_independence_rule(setup, first, second, independent):
+    session = str(uuid.uuid4())
+    setup.add_role(first, cwd=str(setup.tmp), session=session)
+    refused = setup.add_role(second, cwd=str(setup.tmp), session=session, expect=2)
+    assert refused["error"] == ("session %s already holds %s; the role registry needs a separate session for %s"
+                                % (session, first, independent))
+    assert invoke(setup.root, "status")["bindings"][second] is None
+
+
+def test_one_session_may_hold_roles_without_an_independence_rule(setup):
+    session = str(uuid.uuid4())
+    setup.add_role("pilot/front-door", cwd=str(setup.tmp), session=session)
+    assert setup.add_role("pilot/orchestrator", cwd=str(setup.tmp), session=session)["generation"] == 1
+
+
+@pytest.mark.parametrize("name", ["router", "decider", "reviewer", "specialist-reviewer"])
+def test_roles_that_must_stay_independent_of_team_posts_never_get_the_board(name):
+    entry = hierarchy_roles.registry()["roles"][name]
+    assert "board" in entry["prohibitions"]["reads"] and not hierarchy_roles.takes_board(entry)
+
+
+def test_moving_a_hierarchy_keeps_its_router_and_decider(tmp_path):
+    built = Move.__new__(Move)
+    Setup.__init__(built, tmp_path)
+    (tmp_path / "old").mkdir()
+    built.old = tmp_path / "old" / "mailbox"
+    endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/router": {}, "a/decider": {},
+                 "a/lane/build": {"kind": "implementer"}}
+    invoke(built.old, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "writer_limit": 3,
+                               "counterparts": []})
+    for endpoint, session in (("a/orchestrator", "native-orchestrator"), ("a/router", "native-router"),
+                              ("a/decider", "native-decider")):
+        invoke(built.old, "bind", {"endpoint": endpoint, "host": "codex", "session": session, "expected_generation": 0})
+    result = provision("move", move_request(built))
+    assert {"a/router", "a/decider"} <= set(result["roles"])
+    assert result["roles"]["a/root"]["session"] == UUID_B
+    manifest = json.loads((Path(result["mailbox_root"]) / "manifest.json").read_text())
+    assert {"a/router", "a/decider"} <= set(manifest["endpoints"])

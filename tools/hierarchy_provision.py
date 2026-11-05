@@ -310,6 +310,37 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants, 
     return argv + (["--"] if name is not None else [])
 
 
+def fixed_profile(request, mailbox, endpoint):
+    """A role whose registry profile is fixed always runs at that effort, whatever team.json says.
+
+    The tier has no host flag, so the answer says it is recorded and not applied.
+    """
+    profile = registry_role(mailbox, endpoint)["model_profile"]
+    if profile["source"] != "fixed":
+        return request, None
+    effort = profile["effort"]
+    require(request.get("effort", effort) == effort,
+            "the %s role runs at effort %s from the role registry" % (endpoint_parts(endpoint)[1], effort))
+    return {**request, "effort": effort}, {"source": "registry", "effort": effort, "tier": profile.get("tier"),
+                                           "tier_applied": False}
+
+
+def require_independent_session(mailbox, endpoint, host, session):
+    """Where independence is the control, the registry asks for a separate session, so one session can never
+    hold both sides. Checked when provisioning binds a role; a direct mailbox bind is not checked."""
+    mine = registry_role(mailbox, endpoint)
+    for other in mailbox.manifest["endpoints"]:
+        if other == endpoint:
+            continue
+        history = mailbox.bindings(other)
+        if not history or (history[-1]["host"], history[-1]["session"]) != (host, session):
+            continue
+        theirs = registry_role(mailbox, other)
+        if mine["independence"]["separate_session"] or theirs["independence"]["separate_session"]:
+            raise ValueError("session %s already holds %s; the role registry needs a separate session for %s"
+                             % (session, other, endpoint if mine["independence"]["separate_session"] else other))
+
+
 def role_tools(endpoint, mailbox, requested):
     entry = registry_role(mailbox, endpoint)
     writer = hierarchy_roles.writer(entry)
@@ -338,7 +369,7 @@ def check_codex_options(request, mailbox, endpoint, host):
         # Codex has no file tools without its shell, so a reader of files needs one. Its sandbox stays
         # read-only with no network, and a writer already has the shell it needs.
         require(type(request["reader_shell"]) is bool and host == CODEX and reader,
-                "reader_shell is only for a Codex reviewer or orchestrator")
+                "reader_shell is only for a Codex reviewer, orchestrator or decider")
     for name in ("writable_roots", "tmpdir"):
         if name in request:
             require(host == CODEX and writer, name + " is only for a Codex writer")
@@ -408,13 +439,16 @@ def add_role(request):
     cwd, timeout, assistants = check_role_request(request, setup)
     host = request["host"]
     team = None
+    fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
+        request, fixed = fixed_profile(request, mailbox, endpoint)
         # Before binding, so a bad team.json leaves the endpoint unbound.
         request, team = team_settings(base, host, request, role_kind(mailbox, endpoint))
     session = request.get("session") or str(uuid.uuid4())
     tools, writer = role_tools(endpoint, mailbox, request.get("tools"))
     root = Path(setup["mailbox_root"])
     with writer_lock(root):
+        require_independent_session(Mailbox(root), endpoint, host, session)
         history = mailbox.bindings(endpoint)
         if history:
             require(history[-1]["session"] == session and history[-1]["host"] == host,
@@ -426,6 +460,8 @@ def add_role(request):
     answer = {"endpoint": endpoint, "host": host, "session": session, "generation": generation}
     if team is not None:
         answer["team"] = team
+    if fixed is not None:
+        answer["model_profile"] = fixed
     if endpoint_parts(endpoint)[1] == "root":
         return answer
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
@@ -486,6 +522,7 @@ def codex_start(request):
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
+    request, fixed = fixed_profile(request, mailbox, request["endpoint"])
     options, team = team_settings(base, CODEX, request, role_kind(mailbox, request["endpoint"]))
     writer = hierarchy_roles.writer(registry_role(mailbox, request["endpoint"]))
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
@@ -495,6 +532,8 @@ def codex_start(request):
               "cwd": str(cwd),
               "prompt_via": "argv",
               "next": "Read the session ID from the first JSON event, then run add-role with that session."}
+    if fixed is not None:
+        answer["model_profile"] = fixed
     return {**answer, "team": team} if team is not None else answer
 
 
@@ -687,8 +726,10 @@ def move(request):
     if hierarchy not in Store(text(request["store"], "store")).load().initiatives:
         # Sets it up, or finishes registering a setup that an earlier run left unregistered.
         lanes = {name.split("/")[2]: spec["kind"] for name, spec in endpoints.items() if name.split("/")[1] == "lane"}
+        optional = [role for role in OPTIONAL_ROLES if hierarchy + "/" + role in endpoints]
         init({key: request[key] for key in ("store", "base", "source") } | {
             "lanes": lanes, "initiative": {**initiative, "id": hierarchy},
+            **({"roles": optional} if optional else {}),
             **{key: request[key] for key in ("board", "python") if key in request}})
     setup = read_json(base / "provision.json")
     new = Mailbox(setup["mailbox_root"])

@@ -2831,7 +2831,7 @@
    }
   },
   "codex-cli pilot/front-door {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-cli pilot/front-door {\"skip_git_repo_check\": true}": {
    "answer": {
@@ -3128,7 +3128,7 @@
    }
   },
   "codex-cli pilot/lane/f2 {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-cli pilot/lane/f2 {\"skip_git_repo_check\": true}": {
    "answer": {
@@ -3625,7 +3625,7 @@
    }
   },
   "codex-cli pilot/lane/integration {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-cli pilot/lane/integration {\"skip_git_repo_check\": true}": {
    "answer": {
@@ -4788,7 +4788,7 @@
    "files": {}
   },
   "codex-cli pilot/root {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-cli pilot/root {\"skip_git_repo_check\": true}": {
    "answer": {
@@ -4865,7 +4865,7 @@
    "files": {}
   },
   "codex-start pilot/front-door {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-start pilot/front-door {\"skip_git_repo_check\": true}": {
    "answer": {
@@ -5021,7 +5021,7 @@
    "files": {}
   },
   "codex-start pilot/lane/f2 {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-start pilot/lane/f2 {\"skip_git_repo_check\": true}": {
    "answer": {
@@ -5283,7 +5283,7 @@
    "files": {}
   },
   "codex-start pilot/lane/integration {\"reader_shell\": true}": {
-   "error": "reader_shell is only for a Codex reviewer or orchestrator"
+   "error": "reader_shell is only for a Codex reviewer, orchestrator or decider"
   },
   "codex-start pilot/lane/integration {\"skip_git_repo_check\": true}": {
    "answer": {

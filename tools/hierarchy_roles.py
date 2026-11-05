@@ -93,6 +93,10 @@ def validate_role(name, role):
                 "role %s has invalid provisioning flags" % name)
         require(provision["assistants"] is None or provision["assistants"] in ASSISTANTS,
                 "role %s names an unknown assistant list" % name)
+        # Codex has no file tools without its shell, so the shell is only for a role that reads source and
+        # writes none; a writer already has one in its sandbox.
+        require(not provision["reader_shell"] or ("source" in allowed["reads"] and "source" not in allowed["writes"]),
+                "role %s: a reader shell is only for a role that reads source and writes none" % name)
         # The decision adapter offers one tool. A role that could also write source or mail through
         # it would turn a decision boundary into an operational one.
         require(provision["adapter"] != "decision" or not ({"source", "mailbox", "board"} & allowed["writes"]),

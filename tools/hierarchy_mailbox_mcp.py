@@ -106,6 +106,7 @@ class DecisionConnection:
 
     def __init__(self, root, endpoint, host, session, generation, lifecycle, actor):
         import hierarchy_lifecycle
+        self.journal = hierarchy_lifecycle
         self.root = root
         self.sender = {"from": endpoint, "host": host, "session": session, "binding_generation": generation}
         self.manifest_digest = digest(Mailbox(root).manifest)
@@ -126,7 +127,9 @@ class DecisionConnection:
         return mailbox
 
     def root_actor(self):
-        policy, _ = self.lifecycle.load()
+        # The policy is written once at init and never changes, so this needs no journal replay and no
+        # lock. Whether the actor still holds custody is the journal's check, made under its own lock.
+        policy = self.journal.validate_policy(self.journal.load_json(self.lifecycle.root / "policy.json"))
         actor = policy["actors"].get(self.actor)
         require(actor is not None and actor["role"] == "root",
                 "actor %s is not a ROOT actor in the lifecycle policy" % self.actor)
@@ -142,10 +145,15 @@ class DecisionConnection:
         text(name, "tool name", 128)
         require(name == DECISION_TOOL, "unknown ROOT tool: %s; ROOT only records decisions" % name)
         fields(arguments, set(DECISION_SPEC[2]))
+        # Typed here, so a malformed value is a refusal and never reaches the journal's own code as a non-string.
         matching(arguments["event_id"], SLUG, "event id")
-        # The journal checks the rest: that the request exists with these bytes, the decision vocabulary,
-        # the reason bound, and that this actor still holds ROOT custody.
-        # Under the mailbox lock, so a rebinding cannot land between the fence check and the record.
+        matching(arguments["request_id"], SLUG, "request id")
+        matching(arguments["request_sha256"], SHA256, "request sha256")
+        require(arguments["decision"] in ("approve", "deny"), "decision must be approve or deny")
+        text(arguments["reason"], "decision reason", 1024)
+        # The journal checks the rest: that the request exists with these bytes and that this actor still
+        # holds ROOT custody. Under the mailbox lock, so a rebinding cannot land between the fence check
+        # and the record.
         with writer_lock(self.root):
             self.checked_mailbox()
             actor = self.root_actor()
@@ -154,7 +162,15 @@ class DecisionConnection:
                         "event": {"type": "decision", "request_id": arguments["request_id"],
                                   "request_sha256": arguments["request_sha256"], "decision": arguments["decision"],
                                   "reason": arguments["reason"]}}
-            receipt = self.lifecycle.record(envelope)
+            try:
+                receipt = self.lifecycle.record(envelope)
+            except ValueError as exc:
+                # The journal shares the mailbox's lock helper, whose busy text names the mailbox. The mailbox
+                # lock is already held here, so a busy lock at this point is the journal's.
+                if str(exc).startswith("mailbox writer is busy"):
+                    raise ValueError("lifecycle journal writer is busy; inspect an abandoned "
+                                     + str(self.lifecycle.root / ".write.lock") + " before retrying") from exc
+                raise
         return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
 
     def record_read(self):
