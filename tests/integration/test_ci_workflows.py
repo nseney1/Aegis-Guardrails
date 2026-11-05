@@ -156,7 +156,10 @@ def test_wave_prs_run_the_fast_linux_leg_with_a_read_only_token_and_no_secrets()
     assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}
     assert isinstance(job.get("timeout-minutes"), int) and job["timeout-minutes"] <= 60
     text = yaml.safe_dump(job)
-    assert "secrets." not in text and "github.token" not in text and "GH_TOKEN" not in text
+    # Any spelling of a secret or the workflow token: secrets.X, secrets['X'], toJSON(secrets),
+    # github.token, github['token'].
+    assert not re.search(r"\bsecrets\b|github\s*(\.|\[)\s*'?token|GH_TOKEN", text), text
+    assert not {"environment", "container", "services"} & set(job)
     assert [s["with"]["python-version"] for s in _step_using(job, "actions/setup-python")] == ["3.11"]
     checkout = _step_using(job, "actions/checkout")
     assert len(checkout) == 1 and checkout[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
@@ -195,7 +198,9 @@ def _bubblewrap_probe():
 @pytest.mark.parametrize("name", [FAST_JOB, "validate"])
 def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite(name):
     job = _load("validate.yml")["jobs"][name]
-    install = _index(job, "apt-get install", "bubblewrap")
+    install = _index(job, "apt-get", "install -y --no-install-recommends bubblewrap")
+    # A transient mirror error must not fail a wave PR's required check.
+    assert _runs(job)[install].count("-o Acquire::Retries=3") == 2
     probe = _index(job, _bubblewrap_probe())
     suite = _index(job, "make test")
     assert install < probe < suite

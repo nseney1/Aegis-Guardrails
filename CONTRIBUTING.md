@@ -64,7 +64,7 @@ The core package and its suite support Linux, macOS and Windows. The hierarchy t
 | Platform | What is supported |
 | --- | --- |
 | Linux | Everything, including the job runner |
-| macOS | Everything except the job runner. The watch bridge's process supervision also needs a newer Python than 3.9 or 3.11 ([watch bridge](docs/hierarchy-watch-bridge.md)) |
+| macOS | Everything except what reads Linux `/proc`: the job runner, host-authority protected control and provider-recovery process checks. The fixture broker and the watch bridge's process supervision need `os.waitid`, which macOS Python 3.9 and 3.11 lack ([watch bridge](docs/hierarchy-watch-bridge.md)) |
 | Windows | The core suite only |
 
 A hierarchy test that cannot run on a platform has a skip marker that names the reason, so those skips are expected. The Windows CI step may not deselect tests.

@@ -20,8 +20,10 @@ permissions:
 # (2026-10-20/21: validate 146 min on macOS 3.9, of which check --ci was about 120; aegis-check
 # 27; test-windows 16; the rest under 1), never below 45 for validate and test-windows, at most
 # GitHub's 360. Lower them only from new measurements: a limit must not turn a slow green run red.
-# test-windows: 90, because the 2026-11-03 green run took 23.5 min and dispatch run 41796679010
-# (2026-11-05) hit the old 45. test-fast: 30, against 5.75 min for the ubuntu-latest 3.11 leg.
+# test-windows: 90, three times the ~29 min green dispatch runs of 2026-11-04 (41768431362).
+# Dispatch run 41796679010 (2026-11-04) was cancelled at the old 45 with the suite still running;
+# its log has expired, so a hang there is not ruled out. test-fast: 45, against 17.6 min for the
+# ubuntu-latest 3.11 leg (41768431362), the slowest of its last 5 green runs.
 jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
@@ -102,7 +104,7 @@ jobs:
   # credentials. Wave PRs build no wheel, so it installs the checkout into its own venv.
   test-fast:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,7 +117,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install bubblewrap
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
 
       # Same probe and reason as the validate job's step of the same name.
       - name: Prove bubblewrap runs
@@ -283,7 +285,7 @@ jobs:
 
       - name: Install bubblewrap
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
 
       # Same probe as tests/integration/test_hierarchy_jobs.py. The job tests skip when it fails,
       # so it runs here as a hard step. Ubuntu 23.10 and later block unprivileged user namespaces
