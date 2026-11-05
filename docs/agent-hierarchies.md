@@ -12,6 +12,7 @@ To move live sessions or run a trial with real sessions, follow the [dogfood gui
 | Tool | Root uses it to |
 | --- | --- |
 | `tools/hierarchy_provision.py` | Set up an initiative, generate each role's connection and wake profile, and move a live hierarchy to a new root |
+| `tools/hierarchy_launcher.py` | Start, resume and stop Codex role sessions, and record each outcome |
 | `tools/hierarchy_sweep.py` | Wake sessions with unread mail across initiatives |
 | `tools/hierarchy_jobs.py` | Run job requests through fixed recipes and answer them |
 | `tools/hierarchy_review.py` | Prepare exact read-only copies for reviewers |
@@ -53,8 +54,12 @@ What reads the registry at this tier:
 
 - **Provisioning and the mailbox adapter** take each role's file tools, workspace views, board access,
   Codex sandbox, reader shell, assistant list and team.json kind from it. A role with a fixed model
-  profile (the Router, medium effort) always runs at that effort; its tier has no host flag, so the
-  answer records it as not applied.
+  profile (the Router, medium effort) always runs at that effort. On Codex its tier is passed as
+  `service_tier` and the answer says `tier_applied: true`; Claude has no tier flag, so there it is
+  recorded as not applied. Whether Codex serves the tier is for the native probe to show.
+- **Lifecycle connections** come from each role's `provision.lifecycle_tools`: `router_status` for the
+  Router and `decider_record` for the Decider. Every other role is refused `--lifecycle` and `--actor`
+  with "the <role> role has no lifecycle connection". ROOT keeps its decision adapter.
 - **Every bind refuses one session for both sides of an independence rule**, such as an implementer
   and the reviewer of its work, whether it comes from `add-role` or a direct `bind`.
 - **Calls, approvals and prohibitions** are checked for consistency, and a test holds the lifecycle
@@ -500,8 +505,9 @@ recorded an earlier delivery. If the closing report fails, the run still returns
 `report_error` in place of `requests`.
 
 Escalation is the Router session's job, not this code's. The session reads `status` and tells ROOT
-about anything held. No Router session connection offers `status` yet, so until one does, whoever
-runs the router reads it and passes it on. `route` refuses the whole run before writing anything if `--actor` is not the
+about anything held. Its connection offers this as the read-only `router_status` tool when `add-role`
+is given the journal (`lifecycle`, and no actor: routing stays this code's). The tool reads under the
+journal's writer lock, waiting up to 2 s, as `status` does. `route` refuses the whole run before writing anything if `--actor` is not the
 journal's current router actor. The journal itself accepts a `route` event from the router actor
 without checking approval, so this code is where that check lives. The router actor and the
 borrowed binding are configuration, not authenticated identities.
@@ -540,11 +546,44 @@ Limits in M1:
 - A journal has one current Decider, as it has one Router. The journal checks the delegation's team
   against the target's, not against the Decider's, so with several teams on one journal that Decider
   serves all of them.
-- No session connection offers this event yet, so a Decider session cannot record it on its own; the
-  per-role connections come with the launcher. The protected host qualifies only the original five
-  roles, so a protected plan with a decider actor is refused.
+- A Decider session records the event with its connection's `decider_record` tool, when `add-role` is
+  given `lifecycle` and `actor` (both or neither). The tool needs the handoff acknowledged, takes the
+  mailbox lock, reads ROOT's custody from the journal and then records; if custody moves in between, the
+  journal refuses and the Decider retries. The protected host qualifies only the original five roles,
+  so a protected plan with a decider actor is refused.
 - Router `status` shows a request the Decider approved as `awaiting_decision`, because no ROOT decision
   exists for it; the delegated approval is in the journal's `delegated_decisions`.
+
+## Start, resume and stop sessions
+
+`tools/hierarchy_launcher.py` is the Provider bridge. Each command prints one JSON object and exits 0
+when the outcome is good, 2 when refused, and 3 when the outcome is not good (a failed start, unread
+mail after a wake, a stop that did not take).
+
+```sh
+python3 tools/hierarchy_launcher.py --base /abs/base start --request /abs/start.json
+python3 tools/hierarchy_launcher.py --base /abs/base resume --endpoint pilot/lane/f1
+python3 tools/hierarchy_launcher.py --base /abs/base stop --endpoint pilot/lane/f1
+python3 tools/hierarchy_launcher.py --base /abs/base status
+```
+
+- `start` takes the `add-role` keys without `host`, `session` or `base`, plus `start_timeout_seconds`
+  (default 300). It runs the role's Codex start argv for one turn with no tools, reads the session ID
+  from the first `thread.started` event, and binds it with `add-role`. An endpoint that is already
+  bound is refused.
+- `resume` runs `tools/hierarchy_wake.py` with the current binding's wake profile, unchanged.
+- `stop` signals the processes whose arguments name the bound session: SIGTERM, then SIGKILL after
+  `--grace-seconds` (default 5). It never removes a wake marker; the answer says whether one remains.
+  A Claude background session is refused, since it stops through `claude stop`.
+- Every outcome, refusals included, is a record under `<base>/launches/<endpoint>/` (schema
+  `aegis.hierarchy-launch/v1`); `status` reads them back. These are not lifecycle events.
+
+For a Codex role, `add-role` also writes `profiles/<endpoint>-g<N>.codex.json`
+(`aegis.hierarchy-codex-profile/v1`): sandbox mode, writable roots, network, approval policy, disabled
+features, MCP servers with their enabled tools, model, effort and service tier. The argv is built from
+that record as inline `-c` settings under `--ignore-user-config`; no file is written to `~/.codex`.
+ROOT given `lifecycle` and `actor` gets a connection file for its decision adapter (`aegis_decision`)
+and, on Codex, the matching `mcp_config` setting, but no wake profile: the supervisor never wakes ROOT.
 
 ## Run several initiatives
 
