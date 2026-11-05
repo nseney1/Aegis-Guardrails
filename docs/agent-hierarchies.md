@@ -60,7 +60,8 @@ What reads the registry at this tier:
 - **Calls, approvals and prohibitions** are checked for consistency, and a test holds the lifecycle
   events against the journal's own permissions. The mailbox and the journal enforce them in their own
   code (dispatch, job requests, decisions), not by reading the registry at run time. Delegated Decider
-  approvals have an entry but no mechanism yet. Routing is [its own tool](#route-approved-requests).
+  approvals are [a journal event](#delegated-decider-approvals). Routing is
+  [its own tool](#route-approved-requests).
 
 The endpoint grammar and vertical routes stay constants in
 `tools/hierarchy_mailbox.py`, which the native foundation acceptance pins byte for byte, and the
@@ -503,6 +504,30 @@ journal's current router actor. The journal itself accepts a `route` event from 
 without checking approval, so this code is where that check lives. The router actor and the
 borrowed binding are configuration, not authenticated identities.
 
+`status` also lists `escalations`: each request the team Decider escalated, with its delegation,
+reason, time and ROOT's last decision on it (`null` until ROOT decides). The Router session voices
+them to ROOT, which decides on a canonical request as usual.
+
+## Delegated Decider approvals
+
+ROOT delegates by approving an ordinary canonical request with `operation: "delegate-merge"`. Its
+`team` and `paths` are the scope, `continuation.max_starts` is how many approvals it allows, and
+`continuation.expires_at` ends it. A deny after the approve revokes it, as for any request.
+
+The team Decider records a `delegated_decision` in the lifecycle journal, with the target request ID
+and hash, the delegation's ID and hash, the reviewed `commit`, `review` (evidence references to the
+reviewer's verdict), `decision` and `reason`. The journal accepts `approve` only when the delegation
+is ROOT-approved and unexpired, names the target's team, covers every target path (the same path or a
+parent directory), still has approvals left, the commit is the target's source commit, and the
+Decider did not publish the target. Anything else can only be `escalate`. A target gets one delegated
+decision, and none after ROOT has decided it.
+
+The event never admits work: it does not count as a ROOT decision, does not use a continuation budget
+and does not make a request admissible. The Decider cannot record `decision`, `admit`, `intent` or
+`publish`. A policy's `current` may omit the decider, so five-role journals load and replay exactly as
+before. Decider identity is configuration-bound, like every journal actor; the separate-session rule
+is enforced when the mailbox binds the endpoint.
+
 ## Run several initiatives
 
 | Level | Who | How many |
@@ -632,7 +657,7 @@ The public subprocess suites are `tests/integration/test_hierarchy_mailbox.py`,
 `test_hierarchy_root_role.py`, `test_hierarchy_workspace.py`, `test_hierarchy_role_tools.py`,
 `test_hierarchy_templates.py`, `test_hierarchy_meter.py`, `test_hierarchy_provision.py`,
 `test_hierarchy_sweep.py`, `test_hierarchy_jobs.py`, `test_hierarchy_review.py`,
-`test_hierarchy_board.py`, `test_hierarchy_router.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
+`test_hierarchy_board.py`, `test_hierarchy_router.py`, `test_hierarchy_decider.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
 subprocess boundary, so they do not show that a real Claude or Codex session wakes, reads its
 mail or honors a tool list. Those are live gates and remain open for this code.
 `tests/integration/test_hierarchy_scenario.py` adds a simulated two-hierarchy run

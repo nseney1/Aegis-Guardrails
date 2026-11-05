@@ -28,6 +28,7 @@ LEGACY_STATE_KEYS = {"sequence", "head", "current", "requests", "decisions", "co
 
 
 def decider_policy(tmp_path):
+    (tmp_path / "probe").mkdir(exist_ok=True)
     policy = Ledger(tmp_path / "probe", initialize=False).policy
     decider = {**copy.deepcopy(policy["actors"]["reviewer-1"]), "role": "decider"}
     policy["actors"]["decider-1"] = decider
@@ -38,14 +39,14 @@ def decider_policy(tmp_path):
 
 
 def delegation(identifier="delegation-1", max_starts=2, expires_at=FUTURE, **changes):
-    value = request(identifier, operation="delegate-merge", phase="integration", paths=["/fixture/engine"],
-                    next_decision="approve in-scope merges", **changes)
-    value["continuation"] = {"members": [], "max_starts": max_starts, "expires_at": expires_at}
-    return value
+    fields = {"operation": "delegate-merge", "phase": "integration", "paths": ["/fixture/engine"],
+              "next_decision": "approve in-scope merges",
+              "continuation": {"members": [], "max_starts": max_starts, "expires_at": expires_at}}
+    return request(identifier, **{**fields, **changes})
 
 
 def merge(identifier="merge-1", **changes):
-    return request(identifier, operation="merge", phase="integration", **changes)
+    return request(identifier, **{"operation": "merge", "phase": "integration", **changes})
 
 
 class Decider(Ledger):
@@ -59,17 +60,17 @@ class Decider(Ledger):
         self.approve(value)
         return value
 
-    def decide(self, target, granted, decision="approve", actor="decider-1", commit=None, expect=0, **changes):
+    def decide(self, target, granted, choice="approve", actor="decider-1", commit=None, expect=0, **changes):
         body = {"request_id": target["id"], "request_sha256": raw_request(target)["sha256"],
                 "delegation_id": granted["id"], "delegation_sha256": raw_request(granted)["sha256"],
                 "commit": commit or target["source"]["commit"], "review": self.evidence,
-                "decision": decision, "reason": "fixture " + decision}
+                "decision": choice, "reason": "fixture " + choice}
         body.update(changes)
         return self.event("delegated_decision", actor=actor, expect=expect, **body)
 
-    def refused(self, target, granted, decision="approve", **kwargs):
+    def refused(self, target, granted, choice="approve", **kwargs):
         before = self.files()
-        result = self.decide(target, granted, decision, expect=2, **kwargs)
+        result = self.decide(target, granted, choice, expect=2, **kwargs)
         assert self.files() == before
         return result["error"]
 
@@ -320,3 +321,24 @@ def test_the_registry_gives_the_decider_its_journal_role():
     assert "lifecycle:decision" in entry["prohibitions"]["approvals"]
     assert hierarchy_lifecycle.PERMISSIONS["delegated_decision"] == {"decider"}
     assert "decider" not in hierarchy_lifecycle.PERMISSIONS["decision"] | hierarchy_lifecycle.PERMISSIONS["admit"]
+
+
+def test_the_router_status_lists_each_escalation_for_root(tmp_path):
+    from tests.integration.test_hierarchy_router import Loop
+    policy = decider_policy(tmp_path)
+    loop = Loop(tmp_path, policy_changes={key: policy[key] for key in ("actors", "current", "successors")})
+    loop.ledger.__class__ = Decider
+    granted = loop.ledger.delegate()
+    inside, outside = merge("merge-1"), merge("merge-2", paths=["/fixture/other"])
+    for value in (inside, outside):
+        loop.ledger.publish(value)
+    loop.ledger.decide(inside, granted)
+    loop.ledger.decide(outside, granted, "escalate", reason="path outside the delegation")
+    [escalation] = loop.run("status")["escalations"]
+    at = escalation.pop("at")
+    assert hierarchy_lifecycle.parse_time(at)
+    assert escalation == {"request_id": "merge-2", "request_sha256": raw_request(outside)["sha256"],
+                          "team": "engine", "delegation_id": "delegation-1", "actor": "decider-1",
+                          "reason": "path outside the delegation", "root_decision": None}
+    loop.ledger.approve(outside)
+    assert loop.run("status")["escalations"][0]["root_decision"] == "approve"

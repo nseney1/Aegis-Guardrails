@@ -31,11 +31,13 @@ ZERO = "0" * 64
 MAX_EVENTS = 10000
 MAX_REQUESTS = 256
 MAX_BYTES = 1048576
-ROLES = {"root", "router", "coordinator", "operator", "reviewer"}
+ROLES = {"root", "router", "coordinator", "operator", "reviewer", "decider"}
+# A policy may omit these, so policies written before the role existed still load.
+OPTIONAL_ROLES = {"decider"}
 INITIAL_ENVELOPE = "aegis.initial-bootstrap-envelope/v1"
 UINT64 = (1 << 64) - 1
-PERMISSIONS = {"publish": {"coordinator", "router"}, "read": ROLES - {"root"}, "route": {"router"},
-               "decision": {"root"}, "admit": {"operator"}, "wait": {"operator"}, "intent": {"operator"},
+PERMISSIONS = {"publish": {"coordinator", "router"}, "read": {"router", "coordinator", "operator", "reviewer"},
+               "route": {"router"}, "decision": {"root"}, "delegated_decision": {"decider"}, "admit": {"operator"}, "wait": {"operator"}, "intent": {"operator"},
                "start": {"operator"}, "terminal": {"operator"}, "meter": {"operator"},
                "review": {"reviewer"}, "delivery": {"coordinator"}, "disposition": {"coordinator"},
                "resolve": {"coordinator"}, "succeed": ROLES,
@@ -193,7 +195,7 @@ def validate_policy(value):
     evidence(value["authority"])
     actors = value["actors"]
     require(isinstance(actors, dict) and 5 <= len(actors) <= 128, "invalid lifecycle actors")
-    fields(value["current"], ROLES)
+    fields(value["current"], ROLES - OPTIONAL_ROLES, OPTIONAL_ROLES)
     for cid, actor in actors.items():
         matching(cid, SLUG, "actor CID")
         fields(actor, {"role", "generation", "profile", "cap_seconds"})
@@ -325,7 +327,7 @@ def _reduce_initial(policy, state, envelope):
     matching(cid, SLUG, "bootstrap actor CID")
     require(cid in policy["current"].values(), "INITIAL creation requires an original current actor")
     actor = policy["actors"][cid]
-    require(state["current"][actor["role"]] == cid, "INITIAL actor generation is fenced")
+    require(state["current"].get(actor["role"]) == cid, "INITIAL actor generation is fenced")
     require(cid not in bootstrap["creations"], "INITIAL creation already recorded")
     integer(event["generation"], "bootstrap generation", maximum=UINT64)
     integer(event["cap_seconds"], "bootstrap cap", maximum=86400 if actor["role"] == "root" else 3600)
@@ -356,7 +358,7 @@ def actor_for(policy, state, envelope):
     require(kind in PERMISSIONS, "unknown lifecycle event")
     require(actor["role"] in PERMISSIONS[kind], "role %s cannot record %s" % (actor["role"], kind))
     if kind != "succeed":
-        require(state["current"][actor["role"]] == cid, "actor generation is fenced")
+        require(state["current"].get(actor["role"]) == cid, "actor generation is fenced")
     return cid, actor, event
 
 
@@ -397,6 +399,43 @@ def approved_authority(state, row, at):
         require(prior is not None and prior["resolution"] is not None and prior["resolution"]["kind"] == "complete",
                 "prerequisite lacks accepted delivery")
     return value["authority"]
+
+
+def covered(scope, path):
+    return any(path == granted or path.startswith(granted.rstrip("/") + "/") for granted in scope)
+
+
+def delegated_decision(state, row, event, mark):
+    """Record the Decider's approve or escalate. It is non-admitting: it never touches decisions,
+    consumed or approved_authority, so nothing it records makes a request admissible."""
+    value, cid, at = row["request"], mark["actor"], mark["at"]
+    require(event["delegation_id"] in state["requests"], "unknown delegation id")
+    parent = state["requests"][event["delegation_id"]]
+    require(event["delegation_sha256"] == parent["raw"]["sha256"], "delegation sha256 mismatch")
+    require(event["decision"] in {"approve", "escalate"}, "delegated decision must be approve or escalate")
+    matching(event["commit"], GIT_ID, "reviewed commit")
+    evidence(event["review"])
+    text(event["reason"], "delegated decision reason", 1024)
+    require(parent is not row, "a delegation cannot be its own target")
+    # Lazy key, like the provider association: legacy replays and checkpoints keep their exact bytes.
+    recorded = state.get("delegated_decisions", [])
+    require(all(d["request_id"] != value["id"] for d in recorded), "target already has a delegated decision")
+    require(all(d["request_id"] != value["id"] for d in state["decisions"]), "ROOT already decided the target")
+    if event["decision"] == "approve":
+        grant = parent["request"]
+        require(grant["operation"] == "delegate-merge" and grant["authority"] == grant["id"],
+                "delegation must be a delegate-merge authority request")
+        decisions = [d for d in state["decisions"] if d["request_id"] == grant["id"]]
+        require(decisions and decisions[-1]["decision"] == "approve", "delegation is not approved by ROOT")
+        require(parse_time(at) < parse_time(grant["continuation"]["expires_at"]), "delegation expired")
+        require(grant["team"] == value["team"], "delegation is for another team")
+        require(all(covered(grant["paths"], path) for path in value["paths"]),
+                "target path is outside the delegation's paths")
+        used = sum(1 for d in recorded if d["delegation_id"] == grant["id"] and d["decision"] == "approve")
+        require(used < grant["continuation"]["max_starts"], "delegation has no approvals left")
+        require(event["commit"] == value["source"]["commit"], "reviewed commit is not the target's source commit")
+        require(cid != row["publisher"], "the decider cannot decide a request it published")
+    state["delegated_decisions"] = recorded + [{**mark, **event}]
 
 
 def unknown_effect(row):
@@ -456,7 +495,7 @@ def reduce_event(policy, state, envelope, at):
     if kind == "succeed":
         fields(event, {"type", "predecessor", "checkpoint_sha256"})
         old = event["predecessor"]
-        require(policy["successors"].get(old) == cid and state["current"][actor["role"]] == old,
+        require(policy["successors"].get(old) == cid and state["current"].get(actor["role"]) == old,
                 "incoming actor must attest its own approved succession")
         require(event["checkpoint_sha256"] == checkpoint(policy, state)["sha256"], "checkpoint sha256 mismatch")
         state["current"][actor["role"]] = cid
@@ -469,7 +508,8 @@ def reduce_event(policy, state, envelope, at):
              "review": {"result_sha256", "source", "verdict", "evidence"}, "delivery": {"evidence"},
              "disposition": {"status", "resolution"}, "resolve": {"blocker_sha256", "resolution"},
              "associate": {"association"}, "observe": {"intent_id", "association_sha256", "observation"},
-             "cancel_attempt": {"intent_id", "association_sha256", "reason"}}
+             "cancel_attempt": {"intent_id", "association_sha256", "reason"},
+             "delegated_decision": {"delegation_id", "delegation_sha256", "commit", "review", "decision", "reason"}}
     fields(event, common | extra[kind])
     row = target(state, event)
     value = row["request"]
@@ -502,6 +542,8 @@ def reduce_event(policy, state, envelope, at):
         require(not prior or (prior[-1]["decision"] == "approve" and event["decision"] == "deny"),
                 "decision already recorded; use a new immutable request version")
         state["decisions"].append({**mark, **event})
+    elif kind == "delegated_decision":
+        delegated_decision(state, row, event, mark)
     elif kind == "read":
         row["read"] = mark
     elif kind == "route":
@@ -922,7 +964,7 @@ class ProtectedCanonicalBootstrapWriter:
                         return refused("INITIAL_CORRELATION_MISMATCH")
                     bootstrap_guard.require_initial_creation_current(reserved_enrollment, policy, state, row)
                     if (cid not in policy["current"].values()
-                            or state["current"][policy["actors"][cid]["role"]] != cid):
+                            or state["current"].get(policy["actors"][cid]["role"]) != cid):
                         return refused("INITIAL_CREATION_FORBIDDEN")
                     if row != reserved_enrollment.witness:
                         return refused("INITIAL_CORRELATION_MISMATCH")

@@ -28,13 +28,13 @@ VOCABULARY = {
               | {"lifecycle:" + event for event in LIFECYCLE_EVENTS},
     "calls": {"mailbox:dispatch", "mailbox:job_request", "mailbox:job_receipt", "session:start", "session:resume",
               "session:stop", "session:wake", "job:run", "merge", "publish_release"},
-    "approvals": {"lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+    "approvals": {"lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                   "release_signature"},
 }
 KINDS = {"global", "per-team", "on-demand", "service", "legacy"}
 M1_USE = {"loop", "hat", "later", "m6", "legacy"}
 INDEPENDENCE = {"none", "not-author", "not-requester"}
-LIFECYCLE_ROLES = {"root", "router", "coordinator", "operator", "reviewer"}
+LIFECYCLE_ROLES = {"root", "router", "coordinator", "operator", "reviewer", "decider"}
 ASSISTANTS = {"builder", "front-door", "orchestrator", "reviewer"}
 # In the order the adapter offers them, which the generated profiles keep.
 WORKSPACE_TOOLS = ("workspace_capacity", "workspace_initiative", "workspace_path_overlap")
