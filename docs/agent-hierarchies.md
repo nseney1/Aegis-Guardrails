@@ -3,9 +3,10 @@
 This source-checkout prototype supplies six role contracts, plain-file mailboxes,
 stable endpoint bindings, checkpoint handoffs and a workspace controller. The stdlib-only
 helper is `tools/hierarchy_mailbox.py`; it is outside Aegis core and is not installed
-in the wheel. No process watches folders or tracks repository work for Aegis. Only
-`tools/hierarchy_wake.py` (with a reviewed profile) and `tools/hierarchy_launcher.py` (`start` and
-`stop`) start or stop a host, and only when root runs them.
+in the wheel. Nothing watches folders or tracks repository work for Aegis unless root starts
+[the loop](#run-the-loop), which polls the journal and mailboxes and wakes sessions through
+`tools/hierarchy_sweep.py`. Otherwise only `tools/hierarchy_wake.py` (with a reviewed profile) and
+`tools/hierarchy_launcher.py` (`start` and `stop`) start or stop a host, and only when root runs them.
 Host configuration, manager policy/membership and release gates are unchanged.
 
 To move live sessions or run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
@@ -21,6 +22,7 @@ To move live sessions or run a trial with real sessions, follow the [dogfood gui
 | `tools/hierarchy_handoff.py` | Hand a session's endpoints to its successor |
 | `tools/hierarchy_workspace.py` | Keep the initiative registry, capacity ledger and lease checks |
 | `tools/hierarchy_router.py` | Route ROOT-approved canonical requests to each team's orchestrator, and report what is held |
+| `tools/hierarchy_loop.py` | Keep routing, waking and running open jobs without a nudge, and report what waits on whom |
 | `tools/hierarchy_board.py` | Keep [board](workspace-board-contract.md) channels and grants, and read digests |
 
 ## Role contracts
@@ -69,7 +71,9 @@ What reads the registry at this tier:
   events against the journal's own permissions. The mailbox and the journal enforce them in their own
   code (dispatch, job requests, decisions), not by reading the registry at run time. Delegated Decider
   approvals are [a journal event](#delegated-decider-approvals). Routing is
-  [its own tool](#route-approved-requests).
+  [its own tool](#route-approved-requests). The watch-supervisor's calls `router:route` and
+  `jobs:run-open` name the tools [the loop](#run-the-loop) starts; those tools keep their own checks,
+  and no code reads the registry to enforce the calls.
 
 The endpoint grammar and vertical routes stay constants in
 `tools/hierarchy_mailbox.py`, which the native foundation acceptance pins byte for byte, and the
@@ -217,8 +221,8 @@ Readiness and active checkpoints execute only bounded, fixed Git inspections.
 
 ## Know whether a message was read
 
-Publishing only writes a file, and nothing watches the folders. A stopped session
-receives nothing until something starts a turn for it, so report three states:
+Publishing only writes a file. A stopped session receives nothing until something starts a turn
+for it: a sweep, a wake, or [the loop](#run-the-loop) if root runs one. Report three states:
 
 | State | Meaning | Evidence |
 | --- | --- | --- |
@@ -486,7 +490,9 @@ python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store 
   route --actor router-1 --evidence-only [--request <id>]
 ```
 
-`status` changes nothing. It lists each authority request as one of these states:
+`status` changes nothing. It names the journal's current router actor (`router`), which a caller such
+as [the loop](#run-the-loop) passes to `route`, so routing follows a router succession without new
+configuration. It lists each authority request as one of these states:
 
 - `awaiting_decision`, `denied`, `closed` or `ready`.
 - `delegation`: an approved `delegate-merge` request. It is the team Decider's scope, never work,
@@ -518,6 +524,56 @@ borrowed binding are configuration, not authenticated identities.
 `status` also lists `escalations`: each request the team Decider escalated, with its delegation,
 reason, time and ROOT's last decision on it (`null` until ROOT decides). The Router session voices
 them to ROOT, which approves or denies the escalated request itself.
+
+When `status` refuses (exit 2), its answer has a `source`: `journal` (the journal could not be read
+under its lock), `store` (the workspace store could not be read) or `arguments`.
+
+## Run the loop
+
+`tools/hierarchy_loop.py` is the watch-supervisor's service. It is model-free and has no endpoint.
+Root starts it once per lifecycle journal, outside any model session, and it keeps working after
+sessions end:
+
+```sh
+python3 -I -B tools/hierarchy_loop.py --lifecycle /abs/lifecycle --store /abs/store \
+  --recipes /abs/recipes.json --state-dir /abs/loop run [--interval 30] [--passes N]
+python3 -I -B tools/hierarchy_loop.py ... once        # one pass
+python3 -I -B tools/hierarchy_loop.py ... status [--text]
+```
+
+Each pass runs these tools as child processes, in order, and acts on nothing else:
+
+1. `hierarchy_router.py status`, to read the journal under its lock and learn the current router.
+2. `hierarchy_router.py route --actor <current router> --evidence-only`, only when a request is
+   `ready` or `delivered_unrecorded`.
+3. `hierarchy_sweep.py --rounds 1 --durable`, to wake sessions with unread mail.
+4. `hierarchy_jobs.py run-open`, last, so a long job does not hold up the pass's wakes. Its answers
+   are mail, which the next pass wakes the requester for.
+
+The loop writes no mail, journal event or approval itself, and it never wakes root. Children run in
+their own session with no timeout: killing one could leave a mailbox or journal `.write.lock` behind.
+A hung child therefore stalls the loop, and `status` shows which step and for how long. A SIGTERM or
+SIGINT stops the loop between steps. Only one loop runs per journal and per store: it holds a lock on
+`<lifecycle>.loop.lock` and `<store>.loop.lock`, and a second one is refused with "loop already active
+for <path>".
+
+`<state-dir>/status.json` (`aegis.loop-status/v1`) records the last pass, each step, and every
+**hold**: something only a person or a role can settle, with the step, kind, who must act (`root`,
+`owner` or `router`), first and last seen and a count. `status` reads `running` (with the current
+step and its age), `stale` (no pass or heartbeat within 3 intervals) or `not_running` (no loop holds
+the lock); it never reads a stale file as quiet. `status --text` groups the holds by who must act.
+Among them:
+
+- `journal_unavailable` for root; after 3 such passes in a row, `journal_lock` for the owner, naming
+  `<lifecycle>/.write.lock`. The loop never removes a lock. `store_unavailable` and
+  `router_status_error` are for root and do not count toward `journal_lock`.
+- Requests the router holds, `delivered_unrecorded`, `revoked_after_route` and unanswered
+  escalations, for the Router session or root.
+- Sweep rows such as `ignored_mail`, `wake_marker_held`, `start_failed`, `start_backoff`, root's queue
+  and rotation; and jobs that need root (`job_<state>`).
+- `start_failing` for the owner, once an endpoint failed to start in 3 passes in a row. The loop then
+  skips that endpoint (`sweep --skip`) until the owner deletes `status.json`, which also clears the
+  other counts. A malformed `status.json` restarts the counts with a one-pass `status_reset` hold.
 
 ## Delegated Decider approvals
 
@@ -663,7 +719,13 @@ before it fills.
 wakes each endpoint that has unread mail and a current wake profile, one turn at a time. With
 `--rounds` it repeats, so a conversation continues without anyone starting each turn. A session
 past 60 active minutes or one whose time cannot be measured is not woken, and one that ignored
-its mail gets no second turn for it in the same sweep. It never wakes root, and instead reports
+its mail gets no second turn for it in the same sweep. With `--durable`, as the loop runs it, that holds
+across sweeps: the wake receipts of the current binding generation show which unread mail a turn was
+already given for (`ignored_mail`), and only new mail or a successor generation earns another turn.
+Durable mode also reports a held wake marker (`wake_marker_held`, never removed), stops after 3 failed
+starts for the same unread mail (`start_failed`), waits 300 s after a failed start (`start_backoff`),
+and re-reads each endpoint just before waking it (`binding_changed` if its binding moved meanwhile).
+`--skip ENDPOINT` reports that endpoint as `skipped` and never wakes it. It never wakes root, and instead reports
 root's unread mail, open jobs and active time against its 90 minutes. Root reads its own mail
 with `inbox --mark-read --host <host> --session <session> --generation <n>`, giving its own
 binding, so its unread count means what it means for everyone else. A replaced root's read is
@@ -725,12 +787,19 @@ the existing separate owner review/activation. See [manager mode](manager-worksp
 
 ## Acceptance and limitations
 
+The native foundation corpus pins some guides byte for byte, so they predate [the loop](#run-the-loop)
+and durable sweeps: `docs/hierarchy-dogfood.md` still says nothing runs on a timer and that ignored
+mail gets no second turn only within one sweep, and `docs/hierarchy-watch-supervisor.md` describes the
+pinned evidence-only supervisor, not the loop the watch-supervisor role now runs. Where they differ,
+this guide is current. If the loop runs, do not also run sweep or `run-open` by hand for the same
+store.
+
 The public subprocess suites are `tests/integration/test_hierarchy_mailbox.py`,
 `test_hierarchy_mailbox_mcp.py`, `test_hierarchy_delivery.py`, `test_hierarchy_handoff.py`,
 `test_hierarchy_root_role.py`, `test_hierarchy_workspace.py`, `test_hierarchy_role_tools.py`,
 `test_hierarchy_templates.py`, `test_hierarchy_meter.py`, `test_hierarchy_provision.py`,
 `test_hierarchy_sweep.py`, `test_hierarchy_jobs.py`, `test_hierarchy_review.py`,
-`test_hierarchy_board.py`, `test_hierarchy_router.py`, `test_hierarchy_decider.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
+`test_hierarchy_board.py`, `test_hierarchy_router.py`, `test_hierarchy_decider.py`, `test_hierarchy_loop.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
 subprocess boundary, so they do not show that a real Claude or Codex session wakes, reads its
 mail or honors a tool list. Those are live gates and remain open for this code.
 `tests/integration/test_hierarchy_scenario.py` adds a simulated two-hierarchy run

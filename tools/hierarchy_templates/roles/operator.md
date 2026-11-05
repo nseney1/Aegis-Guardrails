@@ -38,9 +38,10 @@ says. If a runner dies, the job stays open and keeps its slot until you check th
 of it is running and run `resolve`. Prepare review copies with `tools/hierarchy_review.py`.
 Keep channels and grants on the board yourself, through its CLI.
 
-Report delivery honestly. A published message is only a file, and nothing watches the
-folders. Run `tools/hierarchy_sweep.py` at task boundaries to wake sessions with unread
-mail, and read what it reports back, including your own queue and active time. Report
+Report delivery honestly. A published message is only a file. If no loop runs
+(`tools/hierarchy_loop.py status`), run `tools/hierarchy_sweep.py` at task boundaries to wake
+sessions with unread mail; if one runs, read its holds instead. Either way, read what it reports
+back, including your own queue and active time. Report
 published, woken and read separately, and say read only when `delivery` shows it. A clean exit from a turn proves nothing about reading. A wake and
 a replacement cannot overlap; if a crashed wake leaves its lock file in the mailbox
 root, check that its process has stopped before removing the file.
