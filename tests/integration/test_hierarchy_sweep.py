@@ -3,10 +3,12 @@
 Hosts are the fake host on PATH, which reads and replies through the real adapter. These tests show
 the tools work together, not that real sessions behave this way.
 """
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -576,3 +578,398 @@ def test_a_dry_run_launches_nothing(fleet):
 def test_bad_round_counts_are_refused(fleet):
     assert fleet.sweep("--rounds", "0", expect=2)["error"] == "invalid rounds"
     assert fleet.sweep("--rounds", "1000", expect=2)["error"] == "invalid rounds"
+
+
+class SealedFleet(Fleet):
+    """PATH is only the fake binaries plus links to the tools the wake needs, so no real model binary is reachable."""
+
+    def __init__(self, tmp_path):
+        super().__init__(tmp_path)
+        for tool in ("ps",):
+            found = shutil.which(tool)
+            assert found, "the wake's process census needs " + tool
+            (self.bin / tool).symlink_to(found)
+
+    def env(self):
+        return {**super().env(), "PATH": str(self.bin)}
+
+
+@pytest.fixture
+def sealed(tmp_path):
+    built = SealedFleet(tmp_path)
+    built.init()
+    built.front_door = built.add_role("pilot/front-door", cwd=str(tmp_path))
+    built.orchestrator = built.add_role("pilot/orchestrator", cwd=str(tmp_path))
+    return built
+
+
+def held_row(fleet, state, generation=1, **extra):
+    session = invoke(fleet.root, "status")["bindings"]["pilot/orchestrator"]["session"]
+    return {"initiative": "pilot", "endpoint": "pilot/orchestrator", "state": state, "session": session,
+            "generation": generation, "unread_count": extra.pop("unread_count", 1), **extra}
+
+
+def failed_start(fleet, message_ids, at=None, generation=1, state="failed_to_start"):
+    """Written through the mailbox's own receipt API, the way a wake that could not start records it."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from hierarchy_mailbox import Mailbox
+
+    binding = invoke(fleet.root, "status")["bindings"]["pilot/orchestrator"]
+    receipt = {"endpoint": "pilot/orchestrator", "host": binding["host"], "session": binding["session"],
+               "generation": generation, "message_ids": message_ids, "wake_id": "wake-" + uuid.uuid4().hex,
+               "state": state, "exit_code": None, "timed_out": False}
+    if at is not None:
+        receipt["at"] = at
+    Mailbox(fleet.root).write_delivery_receipt(str(fleet.base / "delivery"), "wakes", receipt)
+
+
+def ago(seconds):
+    moment = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return moment.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def hand_off(fleet, endpoint="pilot/orchestrator"):
+    """A successor binding with its own wake profile and a first-turn transcript, as provisioning leaves one."""
+    session = str(uuid.uuid4())
+    brief = fleet.base / "brief.md"
+    brief.write_bytes(b"Handoff.\n")
+    invoke(fleet.root, "bind", invoke(fleet.root, "draft-handoff", {
+        "endpoint": endpoint, "host": "claude-code", "session": session, "outgoing_stopped": True,
+        "briefs": [{"path": str(brief), "sha256": hashlib.sha256(b"Handoff.\n").hexdigest()}]}))
+    stem = endpoint.replace("/", "%2F")
+    old = json.loads((fleet.base / "profiles" / (stem + "-g1.wake.json")).read_text())
+    profile = json.loads(json.dumps(old).replace(old["session"], session))
+    profile["generation"] = 2
+    (fleet.base / "profiles" / (stem + "-g2.wake.json")).write_text(json.dumps(profile))
+    started(fleet, "claude-code", session)
+    return session
+
+
+@posix_only
+def test_durable_ignored_mail_gets_no_second_turn_from_a_later_sweep_process(sealed):
+    sealed.plan({"pilot/orchestrator": {"ignore": True}})
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    assert [row["state"] for row in sealed.sweep("--durable", expect=3)["rows"]] == ["woken_unread"]
+
+    second = sealed.sweep("--durable", expect=3)
+    third = sealed.sweep("--durable", expect=3)
+
+    assert second["rows"] == third["rows"] == [held_row(sealed, "ignored_mail")]
+    assert second["still_unread"] == [{"initiative": "pilot", "endpoint": "pilot/orchestrator", "unread_count": 1}]
+    assert len(sealed.launches()) == 1
+
+
+@posix_only
+def test_durable_new_mail_after_ignored_mail_wakes_once(sealed):
+    sealed.plan({"pilot/orchestrator": {"ignore": True}})
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    sealed.sweep("--durable", expect=3)
+    sealed.send("pilot/front-door", "pilot/orchestrator", "again")
+
+    woken = sealed.sweep("--durable", expect=3)
+    after = sealed.sweep("--durable", expect=3)
+
+    assert [row["state"] for row in woken["rows"]] == ["woken_unread"]
+    assert woken["rows"][0]["still_unread"] == ["hello", "again"]
+    assert after["rows"] == [held_row(sealed, "ignored_mail", unread_count=2)]
+    assert len(sealed.launches()) == 2
+
+
+@posix_only
+def test_durable_successor_generation_gets_one_turn_for_inherited_mail(sealed):
+    sealed.plan({"pilot/orchestrator": {"ignore": True}})
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    sealed.sweep("--durable", expect=3)
+    successor = hand_off(sealed)
+
+    woken = sealed.sweep("--durable", expect=3)
+    after = sealed.sweep("--durable", expect=3)
+
+    assert [row["state"] for row in woken["rows"]] == ["woken_unread"]
+    assert successor in sealed.launches()[-1]["argv"]
+    assert after["rows"] == [held_row(sealed, "ignored_mail", generation=2)]
+    assert len(sealed.launches()) == 2
+
+
+@posix_only
+def test_durable_held_wake_marker_is_reported_and_kept(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    marker = sealed.root / ".wake-pilot%2Forchestrator.lock"
+    marker.write_text("fixture turn in progress")
+
+    first = sealed.sweep("--durable", expect=3)
+    second = sealed.sweep("--durable", expect=3)
+
+    assert first["rows"] == second["rows"] == [held_row(sealed, "wake_marker_held", marker=str(marker))]
+    assert marker.read_text() == "fixture turn in progress"
+    assert sealed.launches() == []
+    assert not (sealed.base / "delivery" / "wakes").exists()
+
+
+@posix_only
+def test_durable_three_failed_starts_for_unread_mail_stop_retries(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    times = [ago(3000), ago(2000), ago(1000)]
+    for at in times:
+        failed_start(sealed, ["hello"], at=at)
+
+    result = sealed.sweep("--durable", expect=3)
+
+    assert result["rows"] == [held_row(sealed, "start_failed", failed_starts=3, last_failed_at=times[-1])]
+    assert sealed.launches() == []
+
+
+@posix_only
+def test_durable_failed_starts_from_an_earlier_generation_do_not_count(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    for at in (ago(3000), ago(2000), ago(1000)):
+        failed_start(sealed, ["hello"], at=at)
+    successor = hand_off(sealed)
+
+    result = sealed.sweep("--durable", expect=3)
+
+    # The turn starts; the fake host cannot read for a successor that has not acknowledged its handoff.
+    assert [(row["state"], row["wake_exit"]) for row in result["rows"]] == [("woken_unread", 3)]
+    assert [successor in row["argv"] for row in sealed.launches()] == [True]
+
+
+@posix_only
+def test_durable_a_failed_start_within_300_seconds_backs_off(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    recent = ago(10)
+    failed_start(sealed, ["hello"], at=ago(1000))
+    failed_start(sealed, ["hello"], at=recent)
+
+    result = sealed.sweep("--durable", expect=3)
+
+    assert result["rows"] == [held_row(sealed, "start_backoff", failed_starts=2, last_failed_at=recent)]
+    assert sealed.launches() == []
+
+
+@posix_only
+def test_durable_a_failed_start_older_than_300_seconds_is_retried(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    failed_start(sealed, ["hello"], at=ago(1000))
+    failed_start(sealed, ["hello"], at=ago(301))
+
+    result = sealed.sweep("--durable")
+
+    assert [row["state"] for row in result["rows"]] == ["read"]
+    assert len(sealed.launches()) == 1
+
+
+@posix_only
+def test_without_durable_the_sweep_behaves_as_before(sealed):
+    sealed.plan({"pilot/orchestrator": {"ignore": True}})
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    for at in (ago(30), ago(20), ago(10)):
+        failed_start(sealed, ["hello"], at=at)
+    sealed.sweep(expect=3)
+    sealed.sweep(expect=3)
+    assert len(sealed.launches()) == 2, "without --durable, ignored mail and recent failures do not hold a wake"
+
+    marker = sealed.root / ".wake-pilot%2Forchestrator.lock"
+    marker.write_text("fixture turn in progress")
+    row = sealed.sweep(expect=3)["rows"][0]
+    assert (row["state"], row["error"]) == (
+        "refused", "a wake is already in progress for this endpoint; inspect the lock before retrying")
+    assert marker.exists()
+
+
+@posix_only
+def test_durable_never_wakes_root_messages_native_threads_and_wakes_codex_cli(sealed):
+    sealed.add_role("pilot/root", "codex-cli", session="root-session")
+    sealed.add_role("pilot/lane/review", "codex", session="native-review")
+    worker = sealed.add_role("pilot/lane/f2", "codex-cli", session=str(uuid.uuid4()), cwd=str(sealed.source))
+    sender = {"from": "pilot/orchestrator", "host": "claude-code", "session": sealed.orchestrator["session"],
+              "binding_generation": 1, "type": "info", "body": "Look."}
+    for identifier, to in (("for-root", "pilot/root"), ("for-review", "pilot/lane/review"), ("for-f2", "pilot/lane/f2")):
+        invoke(sealed.root, "publish", {**sender, "message_id": identifier, "to": to})
+
+    result = sealed.sweep("--durable", expect=3)
+
+    states = {row["endpoint"]: row["state"] for row in result["rows"]}
+    assert states == {"pilot/lane/review": "message_thread", "pilot/lane/f2": "read"}
+    assert result["root_queue"] == [{"initiative": "pilot", "endpoint": "pilot/root", "unread_count": 1, "open_jobs": 0}]
+    launched = sealed.launches()
+    assert [(row["endpoint"], row["program"]) for row in launched] == [("pilot/lane/f2", "codex")]
+    assert worker["session"] in launched[0]["argv"]
+
+
+def mailbox_api(fleet):
+    sys.path.insert(0, str(ROOT / "tools"))
+    from hierarchy_mailbox import Mailbox
+
+    return Mailbox(fleet.root)
+
+
+def publish_many(fleet, identifiers):
+    """In-process publishes, because one CLI process per message makes a 101-message fixture slow."""
+    mailbox = mailbox_api(fleet)
+    binding = invoke(fleet.root, "status")["bindings"]["pilot/front-door"]
+    for identifier in identifiers:
+        mailbox.publish({"message_id": identifier, "from": "pilot/front-door", "to": "pilot/orchestrator",
+                         "host": binding["host"], "session": binding["session"],
+                         "binding_generation": binding["generation"], "type": "info", "body": "UNTRUSTED-BODY"})
+
+
+def mark_read(fleet, message_ids):
+    binding = invoke(fleet.root, "status")["bindings"]["pilot/orchestrator"]
+    mailbox_api(fleet).record_read(str(fleet.base / "delivery"), {
+        "from": "pilot/orchestrator", "host": binding["host"], "session": binding["session"],
+        "binding_generation": binding["generation"]}, message_ids)
+
+
+@posix_only
+def test_durable_new_mail_behind_more_than_100_ignored_messages_wakes_once(sealed):
+    sealed.plan({"pilot/orchestrator": {"ignore": True}})
+    publish_many(sealed, ["old-%03d" % index for index in range(101)])
+    assert [row["state"] for row in sealed.sweep("--durable", expect=3)["rows"]] == ["woken_unread"]
+    # The wake receipt names only the oldest 100; the 101st was in that turn's inbox all the same.
+    assert sealed.sweep("--durable", expect=3)["rows"] == [held_row(sealed, "ignored_mail", unread_count=101)]
+
+    sealed.send("pilot/front-door", "pilot/orchestrator", "fresh")
+    woken = sealed.sweep("--durable", expect=3)
+    after = sealed.sweep("--durable", expect=3)
+
+    assert [row["state"] for row in woken["rows"]] == ["woken_unread"]
+    assert after["rows"] == [held_row(sealed, "ignored_mail", unread_count=102)]
+    assert len(sealed.launches()) == 2
+
+
+@posix_only
+def test_durable_new_mail_after_three_failed_starts_wakes(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    for at in (ago(3000), ago(2000), ago(1000)):
+        failed_start(sealed, ["hello"], at=at)
+    sealed.send("pilot/front-door", "pilot/orchestrator", "again")
+
+    result = sealed.sweep("--durable")
+
+    assert [(row["state"], row["read"]) for row in result["rows"]] == [("read", ["hello", "again"])]
+    assert len(sealed.launches()) == 1
+
+
+@posix_only
+def test_durable_failed_starts_for_mail_since_read_do_not_count(sealed):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    for at in (ago(3000), ago(2000), ago(1000)):
+        failed_start(sealed, ["hello"], at=at)
+    mark_read(sealed, ["hello"])
+    sealed.send("pilot/front-door", "pilot/orchestrator", "again")
+
+    result = sealed.sweep("--durable")
+
+    assert [(row["state"], row["read"]) for row in result["rows"]] == [("read", ["again"])]
+    assert len(sealed.launches()) == 1
+
+
+@posix_only
+def test_durable_rereads_receipts_so_a_turn_given_after_the_snapshot_is_not_repeated(sealed, monkeypatch, capsys):
+    sealed.plan({"pilot/orchestrator": {"ignore": True}})
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    for key, value in sealed.env().items():
+        monkeypatch.setenv(key, value)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_sweep
+
+    measure = hierarchy_sweep.measure
+
+    def turn_given_meanwhile(*args, **kwargs):
+        # Runs after the round's snapshot and before the wake: another sweep gives this endpoint its turn here.
+        failed_start(sealed, ["hello"], state="started")
+        return measure(*args, **kwargs)
+
+    monkeypatch.setattr(hierarchy_sweep, "measure", turn_given_meanwhile)
+    code = hierarchy_sweep.main(["--store", str(sealed.workspace.store), "--durable"])
+    result = json.loads(capsys.readouterr().out)
+
+    assert code == 3
+    assert result["rows"] == [held_row(sealed, "ignored_mail")]
+    assert sealed.launches() == []
+
+
+def durable_in_process(sealed, monkeypatch, capsys, meanwhile):
+    """One durable sweep in this process; `meanwhile` runs once after the round's snapshot, before the wake."""
+    for key, value in sealed.env().items():
+        monkeypatch.setenv(key, value)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_sweep
+
+    measure, done = hierarchy_sweep.measure, []
+
+    def changed_meanwhile(*args, **kwargs):
+        if not done:
+            done.append(meanwhile())
+        return measure(*args, **kwargs)
+
+    monkeypatch.setattr(hierarchy_sweep, "measure", changed_meanwhile)
+    code = hierarchy_sweep.main(["--store", str(sealed.workspace.store), "--durable"])
+    return code, json.loads(capsys.readouterr().out)
+
+
+@posix_only
+def test_durable_a_handoff_after_the_snapshot_is_reported_and_not_woken_on_the_old_binding(sealed, monkeypatch, capsys):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+
+    code, result = durable_in_process(sealed, monkeypatch, capsys, lambda: hand_off(sealed))
+
+    assert code == 3
+    assert result["rows"] == [{"initiative": "pilot", "endpoint": "pilot/orchestrator", "state": "binding_changed",
+                               "unread_count": 1}]
+    assert sealed.launches() == []
+    assert not (sealed.base / "delivery" / "wakes").exists()
+    # The next pass judges the successor binding on its own; the fake host cannot read for a successor that
+    # has not acknowledged its handoff, so the turn starts and leaves the mail unread.
+    successor = invoke(sealed.root, "status")["bindings"]["pilot/orchestrator"]["session"]
+    after = sealed.sweep("--durable", expect=3)
+    assert [(row["state"], row["wake_exit"]) for row in after["rows"]] == [("woken_unread", 3)]
+    assert [successor in row["argv"] for row in sealed.launches()] == [True]
+
+
+@posix_only
+def test_durable_mail_read_after_the_snapshot_is_not_held_by_old_failed_starts(sealed, monkeypatch, capsys):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+    for at in (ago(3000), ago(2000), ago(1000)):
+        failed_start(sealed, ["hello"], at=at)
+
+    code, result = durable_in_process(sealed, monkeypatch, capsys, lambda: mark_read(sealed, ["hello"]))
+
+    assert code == 0
+    assert [row["state"] for row in result["rows"]] == ["nothing_unread"]
+    assert sealed.launches() == []
+
+
+@posix_only
+def test_durable_a_binding_gone_after_the_snapshot_is_no_profile(sealed, monkeypatch, capsys):
+    sealed.send("pilot/front-door", "pilot/orchestrator", "hello")
+
+    code, result = durable_in_process(sealed, monkeypatch, capsys,
+                                      lambda: shutil.rmtree(sealed.root / "bindings" / "pilot" / "orchestrator"))
+
+    assert result["rows"] == [{"initiative": "pilot", "endpoint": "pilot/orchestrator", "state": "no_profile",
+                               "unread_count": 1}]
+    assert code == 3
+    assert sealed.launches() == []
+
+
+@posix_only
+@pytest.mark.parametrize("flags", [(), ("--durable",), ("--dry-run",)])
+def test_a_skipped_endpoint_is_reported_with_its_mail_and_never_woken(fleet, flags):
+    fleet.send("pilot/orchestrator", "pilot/front-door", "for-front-door")
+    fleet.send("pilot/front-door", "pilot/orchestrator", "for-orchestrator")
+
+    result = fleet.sweep("--skip", "pilot/orchestrator", "--skip", "pilot/lane/absent", *flags, expect=3)
+
+    rows = {row["endpoint"]: row for row in result["rows"]}
+    assert rows["pilot/orchestrator"] == {"initiative": "pilot", "endpoint": "pilot/orchestrator", "state": "skipped",
+                                          "unread_count": 1}
+    assert rows["pilot/front-door"]["state"] == ("would_wake" if flags == ("--dry-run",) else "read")
+    assert {"initiative": "pilot", "endpoint": "pilot/orchestrator", "unread_count": 1} in result["still_unread"]
+    assert [row["endpoint"] for row in fleet.launches()] == ([] if flags == ("--dry-run",) else ["pilot/front-door"])
+
+
+def test_a_malformed_skip_endpoint_is_refused_before_anything_runs(fleet):
+    fleet.send("pilot/front-door", "pilot/orchestrator", "hello")
+    assert fleet.sweep("--skip", "orchestrator", expect=2) == {"error": "invalid endpoint"}
+    assert fleet.launches() == []

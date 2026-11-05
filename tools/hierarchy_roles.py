@@ -27,8 +27,10 @@ VOCABULARY = {
     # mailbox:bind is the binding record alone, which the launcher publishes through add-role; it is not mail.
     "writes": {"source", "mailbox", "mailbox:bind", "board", "job_evidence", "worktree_lease", "governance"}
               | {"lifecycle:" + event for event in LIFECYCLE_EVENTS},
+    # router:route and jobs:run-open only start those tools as children, which keep their own checks; neither
+    # lets the caller write mail or the journal, or run a job itself.
     "calls": {"mailbox:dispatch", "mailbox:job_request", "mailbox:job_receipt", "session:start", "session:resume",
-              "session:stop", "session:wake", "job:run", "merge", "publish_release"},
+              "session:stop", "session:wake", "router:route", "jobs:run-open", "job:run", "merge", "publish_release"},
     "approvals": {"lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                   "release_signature"},
 }

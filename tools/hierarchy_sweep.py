@@ -7,14 +7,15 @@ priority order, wakes each endpoint that has unread mail and a current profile, 
 conversation continues without anyone starting each turn.
 
 It stops rather than guesses. A session past 60 active minutes, or one with no transcript to measure, is not woken. A
-session that ignored its mail is not retried in the same sweep. Root's own queue and its time against
+session that ignored its mail is not retried in the same sweep, nor, with --durable, by a later one. Root's own queue and its time against
 its 90 minutes are only reported, because jobs go through `tools/hierarchy_jobs.py` and only root can
-rotate itself. This runs nothing on its own schedule, and a read here means what `delivery` says it
+rotate itself. An endpoint named with --skip is reported with its unread count and never woken. This runs nothing on its own schedule, and a read here means what `delivery` says it
 means: the adapter returned the message.
 """
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -23,7 +24,8 @@ import sys
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import Mailbox, endpoint_parts, read_json, require, safe_path  # noqa: E402
+from hierarchy_mailbox import (MAX_DELIVERY_IDS, Mailbox, endpoint_parts, parse_time, read_json, require,  # noqa: E402
+                               safe_path)
 from hierarchy_meter import ROOT_LIMIT_SECONDS, measure  # noqa: E402
 from hierarchy_wake import wake  # noqa: E402
 from hierarchy_workspace import Store  # noqa: E402
@@ -33,6 +35,10 @@ from hierarchy_lifecycle import Lifecycle  # noqa: E402
 MAX_ROUNDS = 100
 NATIVE_HOST = "codex"
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError)
+# Durable mode caps failed starts per generation, which also keeps a broken profile from filling the
+# wake receipt ledger (MAX_RECORDS) with one failure per pass.
+FAILED_START_LIMIT = 3
+START_BACKOFF = timedelta(seconds=300)
 
 
 def profile_for(mailbox_root, endpoint, binding):
@@ -44,7 +50,56 @@ def profile_for(mailbox_root, endpoint, binding):
     return path if profile.get("session") == binding["session"] and profile.get("host") == binding["host"] else None
 
 
-def wake_endpoint(initiative, name, summary, dry_run):
+def covered(wake, pending):
+    """The unread IDs a wake receipt stands for.
+
+    wake() records only the oldest MAX_DELIVERY_IDS unread IDs. A capped receipt therefore also stands for every
+    message still unread now that was published before the receipt: it was unread then too, because reads are
+    never withdrawn, so that turn had it in its inbox. Without this, mail past the cap is never "given" and
+    new mail behind 100 ignored messages could not be told apart from the old."""
+    named = set(wake["message_ids"])
+    if len(named) < MAX_DELIVERY_IDS:
+        return named
+    at = parse_time(wake["at"])
+    return named | {identifier for identifier, published in pending.items() if parse_time(published) <= at}
+
+
+def durable_hold(summary, now):
+    """Why a durable sweep must not start a turn now, judged only from the mailbox's own wake receipts and marker."""
+    generation = summary["binding"]["generation"]
+    held = {"session": summary["binding"]["session"], "generation": generation, "unread_count": summary["unread_count"]}
+    if summary["marker"].exists():
+        # A turn may still be running, or one died holding it; only the owner or ROOT may clear it.
+        return {"state": "wake_marker_held", "marker": str(summary["marker"]), **held}
+    # The full unread set, not the capped summary list, so mail past the first 100 IDs is judged too.
+    pending = summary["pending"]
+    unread = set(pending)
+    if not unread:
+        # Read since the snapshot; wake() itself reports nothing_unread, and an empty set must not match old failures.
+        return None
+    current = [wake for wake in summary["wakes"] if wake["generation"] == generation]
+    # A failure counts only for the exact mail now unread: new mail resets the cap and the backoff, and a failure
+    # whose mail has since been read no longer holds anything.
+    failures = [wake for wake in current if wake["state"] == "failed_to_start" and unread <= covered(wake, pending)]
+    if failures:
+        last = max(failures, key=lambda wake: parse_time(wake["at"]))["at"]
+        counts = {"failed_starts": len(failures), "last_failed_at": last}
+        if len(failures) >= FAILED_START_LIMIT:
+            return {"state": "start_failed", **held, **counts}
+        if now - parse_time(last) < START_BACKOFF:
+            return {"state": "start_backoff", **held, **counts}
+    # Only turns this binding was given count, so a successor gets one turn for the mail it inherited.
+    failed = {wake["wake_id"] for wake in current if wake["state"] == "failed_to_start"}
+    given = set()
+    for wake in current:
+        if wake["state"] == "started" and wake["wake_id"] not in failed:
+            given |= covered(wake, pending)
+    if unread <= given:
+        return {"state": "ignored_mail", **held}
+    return None
+
+
+def wake_endpoint(initiative, name, summary, dry_run, durable=False):
     binding = summary["binding"]
     row = {"initiative": initiative["id"], "endpoint": name}
     if binding is None:
@@ -66,6 +121,25 @@ def wake_endpoint(initiative, name, summary, dry_run):
     if meter["state"] == "no_transcript":
         # Without a transcript its active time is unknown, so a wake could carry it past its limit.
         return {**row, "state": "time_unknown", "session": binding["session"], "unread_count": summary["unread_count"]}
+    if durable:
+        # Judged on receipts read now, not on the round's opening snapshot: an earlier endpoint's turn can run for
+        # minutes, and another sweep may give this endpoint its turn meanwhile. A window remains between this
+        # read and wake() claiming its marker, because wake() is pinned and does not apply the ignored-mail rule
+        # under its own lock; this narrows the window to milliseconds instead of a whole round.
+        try:
+            summary = fresh_summary(initiative, name)
+        except ERRORS as exc:
+            return {**row, "state": "mailbox_error", "error": str(exc)[:512]}
+        if summary["binding"] is None:
+            return {**row, "state": "no_profile", "unread_count": summary["unread_count"]}
+        fresh = summary["binding"]
+        if (fresh["session"], fresh["generation"]) != (binding["session"], binding["generation"]):
+            # A handoff landed after the snapshot: the meter, host and profile above were judged for the old
+            # binding, so waking now would resume the wrong session. The next pass judges the new one.
+            return {**row, "state": "binding_changed", "unread_count": summary["unread_count"]}
+        held = durable_hold(summary, datetime.now(timezone.utc))
+        if held is not None:
+            return {**row, **held}
     if dry_run:
         return {**row, "state": "would_wake", "unread": summary["unread"]}
     try:
@@ -80,23 +154,44 @@ def wake_endpoint(initiative, name, summary, dry_run):
                if key in result}}
 
 
-def summaries(initiative):
+def endpoint_summary(mailbox, initiative, name, records, durable):
+    summary = mailbox.endpoint_delivery(initiative["delivery_dir"], name, records)[1]
+    if not durable:
+        return summary
+    # The summary has no generation on woken_unread and caps its IDs, so durable mode reads the receipts it came
+    # from and the full unread set, each unread ID with when it was published.
+    directory = initiative["delivery_dir"]
+    read = {identifier for receipt in mailbox.delivery_receipts(directory, "reads", name, records)
+            for identifier in receipt["message_ids"]}
+    pending = {record["message"]["message_id"]: record["message"]["created_at"] for record in records.values()
+               if record["message"]["to"] == name and record["message"]["message_id"] not in read}
+    return {**summary, "marker": mailbox.wake_marker(name), "pending": pending,
+            "wakes": mailbox.delivery_receipts(directory, "wakes", name, records)}
+
+
+def summaries(initiative, durable=False):
     mailbox = Mailbox(initiative["mailbox_root"])
     records = mailbox.messages()
-    return ({name: mailbox.endpoint_delivery(initiative["delivery_dir"], name, records)[1]
-             for name in sorted(mailbox.manifest["endpoints"])}, mailbox.open_job_requests(records))
+    found = {name: endpoint_summary(mailbox, initiative, name, records, durable)
+             for name in sorted(mailbox.manifest["endpoints"])}
+    return found, mailbox.open_job_requests(records)
+
+
+def fresh_summary(initiative, name):
+    mailbox = Mailbox(initiative["mailbox_root"])
+    return endpoint_summary(mailbox, initiative, name, mailbox.messages(), True)
 
 
 def is_root(endpoint):
     return endpoint_parts(endpoint)[1] == "root"
 
 
-def sweep_round(initiatives, rows, tried, broken, dry_run):
+def sweep_round(initiatives, rows, tried, broken, dry_run, durable=False, skip=frozenset()):
     """One pass in priority order. Returns how many turns it started."""
     woken = 0
     for initiative in initiatives:
         try:
-            found, _ = summaries(initiative)
+            found, _ = summaries(initiative, durable)
         except ERRORS as exc:
             if initiative["id"] not in broken:
                 broken.add(initiative["id"])
@@ -109,7 +204,13 @@ def sweep_round(initiatives, rows, tried, broken, dry_run):
             if not summary["unread_count"] or is_root(name) or attempt in tried:
                 continue
             tried.add(attempt)
-            row = wake_endpoint(initiative, name, summary, dry_run)
+            if name in skip:
+                # The caller holds this endpoint (the loop does after repeated unrecorded start failures), so it
+                # is reported with its mail and never woken, in any mode.
+                rows.append({"initiative": initiative["id"], "endpoint": name, "state": "skipped",
+                             "unread_count": summary["unread_count"]})
+                continue
+            row = wake_endpoint(initiative, name, summary, dry_run, durable)
             rows.append(row)
             woken += "wake_exit" in row
     return woken
@@ -149,8 +250,11 @@ def remaining(initiatives, broken=None, rows=None):
     return still_unread, root_queue, [root_time(binding) for binding in root_sessions.values()]
 
 
-def run(store_path, rounds, chosen, dry_run, lifecycle_path=None):
+def run(store_path, rounds, chosen, dry_run, lifecycle_path=None, *, durable=False, skip=()):
     require(type(rounds) is int and 0 < rounds <= MAX_ROUNDS, "invalid rounds")
+    for endpoint in skip:
+        endpoint_parts(endpoint)
+    skip = frozenset(skip)
     ledger = Store(store_path).load()
     for identifier in chosen:
         ledger.initiative(identifier)
@@ -169,7 +273,7 @@ def run(store_path, rounds, chosen, dry_run, lifecycle_path=None):
                        "work_complete": False, "lifecycle": lifecycle, "rows": rows, "still_unread": still_unread,
                        "root_queue": root_queue, "root_time": root_times, "rotate_needed": []}
     completed = 0
-    while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run):
+    while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run, durable, skip):
         completed += 1
     still_unread, root_queue, root_times = remaining(initiatives, broken, rows)
     rotate = [{key: row[key] for key in ("initiative", "endpoint", "session")}
@@ -194,10 +298,17 @@ def main(argv=None):
     parser.add_argument("--initiative", action="append", default=[], help="Only sweep this initiative; can repeat")
     parser.add_argument("--dry-run", action="store_true", help="Report what would happen; write and launch nothing")
     parser.add_argument("--lifecycle", help="Read-only evidence ledger; its obligations remain distinct from mail quiet")
+    parser.add_argument("--durable", action="store_true",
+                        help="Across sweeps: no second turn for mail this generation ignored, never past a held wake "
+                             "marker, and stop after 3 failed starts for the same unread mail with 300 s between "
+                             "them")
+    parser.add_argument("--skip", action="append", default=[], metavar="ENDPOINT",
+                        help="Report this endpoint as skipped with its unread count and never wake it; can repeat")
     args = parser.parse_args(argv)
     try:
         safe_path(args.store)
-        code, result = run(args.store, args.rounds, args.initiative, args.dry_run, args.lifecycle)
+        code, result = run(args.store, args.rounds, args.initiative, args.dry_run, args.lifecycle, durable=args.durable,
+                           skip=args.skip)
     except ERRORS as exc:
         code, result = 2, {"error": str(exc)}
     print(json.dumps(result, sort_keys=True))
