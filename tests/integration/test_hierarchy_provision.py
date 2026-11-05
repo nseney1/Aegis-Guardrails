@@ -574,3 +574,304 @@ def test_a_bad_role_kind_map_is_refused(setup, by_kind, error):
     write_team(setup, model="claude-opus-5-5", reasoning="max", reasoning_by_kind=by_kind)
     result = setup.add_role("pilot/orchestrator", cwd=str(setup.tmp), expect=2)
     assert error in result["error"], result
+
+
+# Lifecycle connections, the Router's tier and the Codex profile record (M1 item 4)
+
+
+ROOT_SESSION = "root-session-1"
+REVIEW_SESSION = "01a19a29-d635-7411-8529-9efedafc0885"
+NO_LIFECYCLE = "the %s role has no lifecycle connection"
+PAIR = "lifecycle and actor must be given together"
+ROUTER_ACTOR = "the router session takes no lifecycle actor; routing is the router tool's"
+
+
+@pytest.fixture
+def team(tmp_path):
+    """A provisioned initiative with a Router and a Decider, and a lifecycle journal whose policy has both."""
+    from tests.integration.test_hierarchy_decider import Decider
+    built = Setup(tmp_path)
+    provision("init", built.init_request(roles=["router", "decider"]))
+    (tmp_path / "journal").mkdir()
+    built.ledger = Decider(tmp_path / "journal")
+    built.lifecycle = str(built.ledger.path)
+    return built
+
+
+def unbound(setup, endpoint):
+    return invoke(setup.root, "status")["bindings"][endpoint] is None
+
+
+def root_args(setup, host, session=ROOT_SESSION, actor="root-1"):
+    return ["-I", "-B", str(setup.source / "tools" / "hierarchy_mailbox.py"), "--root", str(setup.root), "serve",
+            "--endpoint", "pilot/root", "--host", host, "--session", session, "--generation", "1",
+            "--lifecycle", setup.lifecycle, "--actor", actor]
+
+
+def call_server(definition, calls):
+    frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}]
+    frames += [{"jsonrpc": "2.0", "id": index + 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+               for index, (name, arguments) in enumerate(calls)]
+    result = subprocess.run([definition["command"], *definition["args"]], input="".join(json.dumps(f) + "\n" for f in frames),
+                            capture_output=True, text=True, timeout=20, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    return [json.loads(line) for line in result.stdout.splitlines()][1:]
+
+
+def test_root_with_a_journal_gets_a_decision_connection_that_records_root_decide(team):
+    from tests.integration.test_hierarchy_lifecycle import raw_request, request as lifecycle_request
+    role = team.add_role("pilot/root", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
+    assert "wake_profile" not in role and "start_argv" not in role and "mcp_config" not in role
+    assert not (team.base / "profiles").exists() or not list((team.base / "profiles").glob("*root*"))
+    definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]
+    assert definition == {"command": "/usr/bin/python3", "args": root_args(team, "claude-code")}
+    assert Path(role["connection"]).name == "pilot%2Froot-g1.json"
+    assert start_connection(role["connection"], "aegis_decision") == {"root_decide"}
+    value = lifecycle_request("feature-1")
+    team.ledger.publish(value)
+    [answer] = call_server(definition, [("root_decide", {
+        "event_id": "root-decision-1", "request_id": "feature-1", "request_sha256": raw_request(value)["sha256"],
+        "decision": "approve", "reason": "the owner agreed this feature"})])
+    assert answer["result"].get("isError") is not True, answer
+    assert [(d["request_id"], d["decision"], d["actor"]) for d in team.ledger.status()["decisions"]] == [
+        ("feature-1", "approve", "root-1")]
+
+
+def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_file(team, tmp_path):
+    tomllib = pytest.importorskip("tomllib", reason="Codex settings are read with tomllib, Python 3.11+")
+    role = team.add_role("pilot/root", "codex-cli", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
+    assert tomllib.loads(role["mcp_config"]) == {"mcp_servers": {"aegis_decision": {
+        "command": "/usr/bin/python3", "args": root_args(team, "codex-cli"), "required": True,
+        "enabled_tools": ["root_decide"], "tools": {"root_decide": {"approval_mode": "approve"}}}}}
+    assert json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]["args"] == root_args(team, "codex-cli")
+    (tmp_path / "native").mkdir()
+    native = Setup(tmp_path / "native")
+    native.init()
+    native.lifecycle = team.lifecycle
+    flat = native.add_role("pilot/root", "codex", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
+    assert json.loads(Path(flat["connection"]).read_text()) == {"command": "/usr/bin/python3", "args": root_args(native, "codex")}
+    assert "mcp_config" not in flat
+
+
+def test_root_without_a_journal_keeps_its_binding_only_answer(team):
+    role = team.add_role("pilot/root", session=ROOT_SESSION)
+    assert role == {"endpoint": "pilot/root", "host": "claude-code", "session": ROOT_SESSION, "generation": 1}
+
+
+@pytest.mark.parametrize("changes,error", [
+    ({"lifecycle": "<journal>"}, PAIR),
+    ({"actor": "root-1"}, PAIR),
+    ({"lifecycle": "<journal>", "actor": "router-1"}, "actor router-1 is not a root actor in the lifecycle policy"),
+    ({"lifecycle": "<journal>", "actor": "absent-1"}, "actor absent-1 is not a root actor in the lifecycle policy"),
+    ({"lifecycle": "<journal>", "actor": "../root"}, "invalid actor"),
+    ({"lifecycle": "relative/journal", "actor": "root-1"}, "path must be absolute without traversal"),
+])
+def test_root_lifecycle_keys_are_checked_before_binding(team, changes, error):
+    changes = {key: team.lifecycle if value == "<journal>" else value for key, value in changes.items()}
+    refused = team.add_role("pilot/root", session=ROOT_SESSION, expect=2, **changes)
+    assert refused["error"] == error
+    assert unbound(team, "pilot/root") and not (team.base / "connections").exists()
+
+
+def test_a_router_with_the_journal_gets_router_status(team):
+    role = team.add_role("pilot/router", cwd=str(team.tmp), lifecycle=team.lifecycle)
+    arguments = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_mailbox"]["args"]
+    assert arguments[-2:] == ["--lifecycle", team.lifecycle] and "--actor" not in arguments
+    assert "router_status" in start_connection(role["connection"])
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    assert "mcp__aegis_mailbox__router_status" in flag(argv, "--allowedTools").split(",")
+
+
+def test_a_codex_router_enables_router_status_and_without_the_journal_does_not(team, tmp_path):
+    role = team.add_role("pilot/router", "codex-cli", session=REVIEW_SESSION, cwd=str(team.source), lifecycle=team.lifecycle)
+    server = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]["aegis_mailbox"]
+    assert server["enabled_tools"][-1] == "router_status" and "router_status" not in server["tools"]
+    (tmp_path / "plain").mkdir()
+    plain = Setup(tmp_path / "plain")
+    provision("init", plain.init_request(roles=["router"]))
+    without = plain.add_role("pilot/router", cwd=str(plain.tmp))
+    assert "router_status" not in start_connection(without["connection"])
+
+
+def test_the_router_session_is_refused_an_actor(team):
+    refused = team.add_role("pilot/router", cwd=str(team.tmp), lifecycle=team.lifecycle, actor="router-1", expect=2)
+    assert refused["error"] == ROUTER_ACTOR
+    refused = team.add_role("pilot/router", cwd=str(team.tmp), actor="router-1", expect=2)
+    assert refused["error"] == ROUTER_ACTOR
+    assert unbound(team, "pilot/router")
+
+
+def test_a_decider_with_the_journal_and_its_actor_gets_decider_record(team):
+    role = team.add_role("pilot/decider", "codex-cli", session=REVIEW_SESSION, cwd=str(team.source), reader_shell=True,
+                         lifecycle=team.lifecycle, actor="decider-1")
+    server = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]["aegis_mailbox"]
+    assert server["args"][-4:] == ["--lifecycle", team.lifecycle, "--actor", "decider-1"]
+    assert server["enabled_tools"][-1] == "decider_record"
+    assert server["tools"]["decider_record"] == {"approval_mode": "approve"}
+    (team.tmp / "claude").mkdir()
+    claude = Setup(team.tmp / "claude")
+    provision("init", claude.init_request(roles=["decider"]))
+    plain = claude.add_role("pilot/decider", cwd=str(claude.tmp), lifecycle=team.lifecycle, actor="decider-1")
+    assert "decider_record" in start_connection(plain["connection"])
+    argv = json.loads(Path(plain["wake_profile"]).read_text())["argv"]
+    assert "mcp__aegis_mailbox__decider_record" in flag(argv, "--allowedTools").split(",")
+
+
+@pytest.mark.parametrize("changes,error", [
+    ({"lifecycle": "<journal>"}, PAIR),
+    ({"actor": "decider-1"}, PAIR),
+    ({"lifecycle": "<journal>", "actor": "root-1"}, "actor root-1 is not a decider actor in the lifecycle policy"),
+])
+def test_decider_lifecycle_keys_are_checked_before_binding(team, changes, error):
+    changes = {key: team.lifecycle if value == "<journal>" else value for key, value in changes.items()}
+    refused = team.add_role("pilot/decider", cwd=str(team.tmp), expect=2, **changes)
+    assert refused["error"] == error
+    assert unbound(team, "pilot/decider")
+
+
+@pytest.mark.parametrize("endpoint,role,key", [
+    ("pilot/orchestrator", "orchestrator", "lifecycle"), ("pilot/lane/f2", "implementer", "actor"),
+    ("pilot/lane/review", "reviewer", "lifecycle"), ("pilot/front-door", "front-door", "actor"),
+])
+def test_other_roles_have_no_lifecycle_connection(team, endpoint, role, key):
+    refused = team.add_role(endpoint, cwd=str(team.tmp), expect=2, **{key: team.lifecycle if key == "lifecycle" else "root-1"})
+    assert refused["error"] == NO_LIFECYCLE % role
+    assert unbound(team, endpoint)
+
+
+@pytest.mark.parametrize("journal,error", [
+    ("<missing>", "lifecycle is not a journal directory: <missing>"),
+    ("<file>", "lifecycle is not a journal directory: <file>"),
+    (None, "invalid lifecycle"),
+    (7, "invalid lifecycle"),
+])
+def test_a_router_journal_that_is_not_a_journal_is_refused_before_binding(team, journal, error):
+    paths = {"<missing>": str(team.tmp / "no-journal"), "<file>": str(team.tmp / "journal-file")}
+    (team.tmp / "journal-file").write_text("{}")
+    journal = paths.get(journal, journal)
+    for name, path in paths.items():
+        error = error.replace(name, path)
+    refused = team.add_role("pilot/router", cwd=str(team.tmp), lifecycle=journal, expect=2)
+    assert refused["error"] == error
+    assert unbound(team, "pilot/router") and not (team.base / "connections").exists()
+
+
+@pytest.mark.parametrize("endpoint,changes,error", [
+    ("pilot/orchestrator", {"lifecycle": None}, NO_LIFECYCLE % "orchestrator"),
+    ("pilot/orchestrator", {"actor": None}, NO_LIFECYCLE % "orchestrator"),
+    ("pilot/router", {"actor": None}, ROUTER_ACTOR),
+    ("pilot/router", {"lifecycle": "<journal>", "actor": None}, ROUTER_ACTOR),
+    ("pilot/root", {"lifecycle": None, "actor": None}, "invalid actor"),
+    ("pilot/root", {"lifecycle": None, "actor": "root-1"}, "invalid lifecycle"),
+    ("pilot/root", {"lifecycle": "<journal>", "actor": None}, "invalid actor"),
+    ("pilot/root", {"lifecycle": "<journal>"}, PAIR),
+    ("pilot/decider", {"lifecycle": "<journal>", "actor": None}, "invalid actor"),
+    ("pilot/decider", {"lifecycle": ["<journal>"], "actor": "decider-1"}, "invalid lifecycle"),
+    ("pilot/decider", {"actor": None}, PAIR),
+])
+def test_a_null_or_non_string_lifecycle_key_is_refused_before_binding(team, endpoint, changes, error):
+    changes = {key: team.lifecycle if value == "<journal>" else value for key, value in changes.items()}
+    extra = {"session": ROOT_SESSION} if endpoint == "pilot/root" else {"cwd": str(team.tmp)}
+    refused = team.add_role(endpoint, expect=2, **extra, **changes)
+    assert refused["error"] == error
+    assert unbound(team, endpoint) and not (team.base / "connections").exists()
+
+
+def test_a_codex_router_applies_its_registry_tier(team):
+    role = team.add_role("pilot/router", "codex-cli", session=REVIEW_SESSION, cwd=str(team.source))
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    settings = [argv[index + 1] for index, word in enumerate(argv) if word == "-c"]
+    effort = settings.index('model_reasoning_effort="medium"')
+    assert settings[effort + 1] == 'service_tier="ultrafast"'
+    assert role["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast", "tier_applied": True}
+    profile = json.loads(Path(role["codex_profile"]).read_text())
+    assert profile["service_tier"] == "ultrafast" and profile["effort"] == "medium"
+
+
+def test_a_claude_router_records_its_tier_without_a_flag(team):
+    role = team.add_role("pilot/router", cwd=str(team.tmp))
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    assert not any("ultrafast" in word for word in argv) and "codex_profile" not in role
+    assert role["model_profile"]["tier_applied"] is False
+
+
+def disabled(argv):
+    return [argv[index + 1] for index, word in enumerate(argv) if word == "--disable"]
+
+
+def assert_argv_follows_profile(argv, profile):
+    config = codex_config(argv)
+    assert disabled(argv) == profile["disabled_features"]
+    assert flag(argv, "--sandbox") == profile["sandbox"] and flag(argv, "-C") == profile["cwd"]
+    assert ("--ignore-user-config" in argv) is profile["ignore_user_config"]
+    assert config["approval_policy"] == profile["approval_policy"]
+    assert config["mcp_servers"] == profile["mcp_servers"]
+    for setting, key in (("model", "model"), ("model_reasoning_effort", "effort"), ("service_tier", "service_tier")):
+        assert config.get(setting) == profile[key], setting
+    if profile["sandbox"] == "workspace-write":
+        assert config["sandbox_workspace_write"]["writable_roots"] == profile["writable_roots"]
+        assert config["sandbox_workspace_write"]["network_access"] is profile["network_access"]
+    else:
+        assert "sandbox_workspace_write" not in config
+    assert [argv[index + 1] for index, word in enumerate(argv) if word == "--add-dir"] == profile["add_dirs"]
+    assert ("--skip-git-repo-check" in argv) is profile["skip_git_repo_check"]
+    tmpdir = (config.get("shell_environment_policy") or {}).get("set", {}).get("TMPDIR")
+    assert tmpdir == profile["tmpdir"]
+
+
+def test_a_codex_reviewer_profile_is_recorded_and_its_argv_is_built_from_it(setup):
+    role = setup.add_role("pilot/lane/review", "codex-cli", session=REVIEW_SESSION, cwd=str(setup.source))
+    assert Path(role["codex_profile"]) == setup.base / "profiles" / "pilot%2Flane%2Freview-g1.codex.json"
+    profile = json.loads(Path(role["codex_profile"]).read_text())
+    assert {key: profile[key] for key in ("schema", "endpoint", "role", "host", "session", "generation", "sandbox",
+                                          "writable_roots", "network_access", "approval_policy", "ignore_user_config",
+                                          "cwd", "skip_git_repo_check", "model", "effort", "service_tier", "tmpdir",
+                                          "add_dirs")} == {
+        "schema": "aegis.hierarchy-codex-profile/v1", "endpoint": "pilot/lane/review", "role": "reviewer",
+        "host": "codex-cli", "session": REVIEW_SESSION, "generation": 1, "sandbox": "read-only", "writable_roots": [],
+        "network_access": False, "approval_policy": "never", "ignore_user_config": True, "cwd": str(setup.source),
+        "skip_git_repo_check": False, "model": None, "effort": None, "service_tier": None, "tmpdir": None, "add_dirs": []}
+    assert "shell_tool" in profile["disabled_features"]
+    server = profile["mcp_servers"]["aegis_mailbox"]
+    # The reviewer's registry entry reads no workspace view, so it has the mailbox tools alone.
+    assert server["enabled_tools"] == ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"]
+    assert server["required"] is True and server["command"] == "/usr/bin/python3"
+    argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    assert argv[-2:] == ["resume", REVIEW_SESSION]
+    assert_argv_follows_profile(argv, profile)
+
+
+def test_a_codex_implementer_profile_writes_only_its_roots(setup, tmp_path):
+    writable, private = tmp_path / "worktree", tmp_path / "private-tmp"
+    writable.mkdir()
+    private.mkdir()
+    role = setup.add_role("pilot/lane/f2", "codex-cli", session=CODEX_SESSION, cwd=str(setup.source),
+                          writable_roots=[str(writable)], tmpdir=str(private), add_dirs=[str(writable)],
+                          model="gpt-5.5-codex", effort="high", skip_git_repo_check=True)
+    profile = json.loads(Path(role["codex_profile"]).read_text())
+    assert profile["role"] == "implementer" and profile["sandbox"] == "workspace-write"
+    assert profile["writable_roots"] == [str(writable)] and profile["network_access"] is False
+    assert profile["approval_policy"] == "never" and "shell_tool" not in profile["disabled_features"]
+    assert (profile["model"], profile["effort"], profile["tmpdir"]) == ("gpt-5.5-codex", "high", str(private))
+    assert_argv_follows_profile(json.loads(Path(role["wake_profile"]).read_text())["argv"], profile)
+
+
+def test_codex_start_returns_the_profile_without_writing_it(team):
+    started = provision("codex-start", team.request(base=str(team.base), endpoint="pilot/router", cwd=str(team.source)))
+    profile = started["codex_profile"]
+    assert (profile["session"], profile["generation"], profile["mcp_servers"]) == (None, None, {})
+    assert profile["role"] == "router" and profile["service_tier"] == "ultrafast"
+    assert_argv_follows_profile(started["start_argv"], profile)
+    assert not (team.base / "profiles").exists()
+
+
+def test_a_launched_codex_role_records_its_codex_profile(tmp_path):
+    from tests.integration.test_hierarchy_launcher import Launch
+    launch = Launch(tmp_path)
+    launch.init()
+    thread = "019a6c3e-1111-7222-8333-444455556677"
+    answer = launch.start(thread=thread, cwd=str(launch.source))
+    assert answer["state"] == "bound"
+    profile = json.loads(Path(answer["codex_profile"]).read_text())
+    assert profile["session"] == thread and profile["role"] == "reviewer"
+    assert_argv_follows_profile(json.loads(Path(answer["wake_profile"]).read_text())["argv"], profile)

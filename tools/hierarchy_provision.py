@@ -39,12 +39,13 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
                                matching, publish_file, read_json, require, safe_path, strict_json, strings, text,
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
-from hierarchy_mailbox_mcp import role_workspace_tools  # noqa: E402
+from hierarchy_mailbox_mcp import ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
 import hierarchy_roles  # noqa: E402
 from hierarchy_workspace import Store, validate_initiative  # noqa: E402
 
 
 SCHEMA = "aegis.hierarchy-provision/v1"
+CODEX_PROFILE_SCHEMA = "aegis.hierarchy-codex-profile/v1"
 CARRY_SCHEMA = "aegis.hierarchy-carry/v1"
 CLAUDE = "claude-code"
 CODEX = "codex-cli"
@@ -64,6 +65,12 @@ SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 CODEX_DISABLED = ["apps", "plugins", "remote_plugin", "multi_agent", "memories", "computer_use", "browser_use",
                   "browser_use_external", "browser_use_full_cdp_access", "goals"]
 CODEX_SHELL = ["shell_tool", "unified_exec"]
+APPROVE = {"approval_mode": "approve"}
+MAILBOX_TOOL_CONFIG = {"mailbox_inbox": {"output_token_limit": 30000}, "mailbox_publish": APPROVE,
+                       "mailbox_ack_handoff": APPROVE}
+# A tool that writes the journal waits for the session's approval, as a mailbox write does.
+LIFECYCLE_TOOL_CONFIG = {"decider_record": APPROVE}
+LIFECYCLE_PAIR = "lifecycle and actor must be given together"
 ASSISTANT_ENV = ["env", "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2"]
 ASSISTANT_BLOCKED = "Agent(general-purpose),Agent(Explore),Agent(Plan)"
 ASSISTANT_NOTE = "enabled; using them needs the owner's go-ahead and a live probe"
@@ -162,11 +169,23 @@ def build_base(base, endpoints, writer_limit, record):
         raise
 
 
-def adapter_args(setup, endpoint, host, session, generation, source_repo=None):
+def adapter_args(setup, endpoint, host, session, generation, source_repo=None, lifecycle=()):
     return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
             "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
             "--delivery-dir", setup["delivery_dir"], "--workspace-store", setup["store"],
-            "--initiative", setup["initiative"]] + (["--source-repo", source_repo] if source_repo else [])
+            "--initiative", setup["initiative"]] + (["--source-repo", source_repo] if source_repo else []) + list(lifecycle)
+
+
+def lifecycle_args(request):
+    return ((["--lifecycle", request["lifecycle"]] if "lifecycle" in request else []) +
+            (["--actor", request["actor"]] if "actor" in request else []))
+
+
+def decision_args(setup, endpoint, host, session, generation, request):
+    """ROOT's decision adapter takes the journal and its actor, and nothing else."""
+    return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
+            "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
+            *lifecycle_args(request)]
 
 
 def board_args(setup, endpoint, host, session, generation):
@@ -189,47 +208,68 @@ def toml_list(values):
     return "[" + ", ".join(json.dumps(value) for value in values) + "]"
 
 
-def codex_argv(cwd, *, writer, settings, tail, options):
-    disabled = CODEX_DISABLED + ([] if writer or options.get("reader_shell") else CODEX_SHELL)
+def toml_value(value):
+    """Values are quoted as JSON strings, which TOML accepts unchanged, so a path cannot change the table."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return toml_list(value)
+    return "{" + ",".join(key + "=" + toml_value(item) for key, item in value.items()) + "}"
+
+
+def codex_profile(cwd, *, writer, servers, options, endpoint, role, session=None, generation=None, tier=None):
+    """Everything a Codex role runs with, as an Aegis record. The argv is built from this alone."""
+    return {"schema": CODEX_PROFILE_SCHEMA, "endpoint": endpoint, "role": role, "host": CODEX, "session": session,
+            "generation": generation, "sandbox": "workspace-write" if writer else "read-only",
+            "writable_roots": list(options.get("writable_roots", [])), "network_access": False,
+            "approval_policy": "never", "ignore_user_config": True,
+            "disabled_features": CODEX_DISABLED + ([] if writer or options.get("reader_shell") else CODEX_SHELL),
+            "mcp_servers": servers, "model": options.get("model"), "effort": options.get("effort"),
+            "service_tier": tier, "tmpdir": options.get("tmpdir"), "add_dirs": list(options.get("add_dirs", [])),
+            "cwd": cwd, "skip_git_repo_check": bool(options.get("skip_git_repo_check"))}
+
+
+def codex_argv(profile, tail=()):
     argv = ["codex"]
-    for feature in disabled:
+    for feature in profile["disabled_features"]:
         argv += ["--disable", feature]
-    argv += ["exec", "--ignore-user-config", "--sandbox", "workspace-write" if writer else "read-only",
-             "-c", 'approval_policy="never"']
-    if writer:
-        argv += ["-c", "sandbox_workspace_write.writable_roots=" + toml_list(options.get("writable_roots", [])),
+    argv += ["exec"] + (["--ignore-user-config"] if profile["ignore_user_config"] else [])
+    argv += ["--sandbox", profile["sandbox"], "-c", "approval_policy=" + json.dumps(profile["approval_policy"])]
+    if profile["sandbox"] == "workspace-write":
+        argv += ["-c", "sandbox_workspace_write.writable_roots=" + toml_list(profile["writable_roots"]),
                  "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
                  "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                 "-c", "sandbox_workspace_write.network_access=false"]
-    argv += ["-c", settings, "--json", "-C", cwd]
-    for setting, name in (("model", "model"), ("model_reasoning_effort", "effort")):
-        if name in options:
-            argv += ["-c", setting + "=" + json.dumps(options[name])]
-    if "tmpdir" in options:
+                 "-c", "sandbox_workspace_write.network_access=" + toml_value(profile["network_access"])]
+    argv += ["-c", "mcp_servers=" + toml_value(profile["mcp_servers"]), "--json", "-C", profile["cwd"]]
+    for setting, name in (("model", "model"), ("model_reasoning_effort", "effort"), ("service_tier", "service_tier")):
+        if profile[name] is not None:
+            argv += ["-c", setting + "=" + json.dumps(profile[name])]
+    if profile["tmpdir"] is not None:
         # zsh makes its here-document files from TMPPREFIX, so a writer's sandbox has to allow that path too.
-        argv += ["-c", "shell_environment_policy.set.TMPDIR=" + json.dumps(options["tmpdir"]),
-                 "-c", "shell_environment_policy.set.TMPPREFIX=" + json.dumps(options["tmpdir"] + "/zsh")]
-    for directory in options.get("add_dirs", []):
+        argv += ["-c", "shell_environment_policy.set.TMPDIR=" + json.dumps(profile["tmpdir"]),
+                 "-c", "shell_environment_policy.set.TMPPREFIX=" + json.dumps(profile["tmpdir"] + "/zsh")]
+    for directory in profile["add_dirs"]:
         argv += ["--add-dir", directory]
-    if options.get("skip_git_repo_check"):
+    if profile["skip_git_repo_check"]:
         argv.append("--skip-git-repo-check")
     return argv + list(tail)
 
 
-def codex_servers(setup, endpoint, session, generation, tools, board, source_repo=None):
-    # Values are quoted as JSON strings, which TOML accepts unchanged, so a path cannot change the table.
-    arguments = adapter_args(setup, endpoint, CODEX, session, generation, source_repo)
-    limits = "mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"}," \
-             "mailbox_ack_handoff={approval_mode=\"approve\"}"
-    servers = ("aegis_mailbox={command=" + json.dumps(setup["python"]) + ",args=" + toml_list(arguments) +
-               ",required=true,enabled_tools=" + toml_list(tools) + ",tools={" + limits + "}}")
-    if board:
+def codex_servers(setup, arguments, tools, board_arguments=None):
+    tools = list(tools)
+    config = {**MAILBOX_TOOL_CONFIG, **{name: LIFECYCLE_TOOL_CONFIG[name] for name in tools if name in LIFECYCLE_TOOL_CONFIG}}
+    servers = {"aegis_mailbox": {"command": setup["python"], "args": arguments, "required": True, "enabled_tools": tools,
+                                 "tools": config}}
+    if board_arguments is not None:
         # Not required, because a session must keep its mailbox even when the board is damaged.
-        servers += (",aegis_board={command=" + json.dumps(setup["python"]) + ",args=" +
-                    toml_list(board_args(setup, endpoint, CODEX, session, generation)) +
-                    ",required=false,enabled_tools=" + toml_list(list(BOARD_TOOL_SPECS)) +
-                    ",tools={board_publish={approval_mode=\"approve\"},board_disposition={approval_mode=\"approve\"}}}")
-    return "mcp_servers={" + servers + "}"
+        servers["aegis_board"] = {"command": setup["python"], "args": board_arguments, "required": False,
+                                  "enabled_tools": list(BOARD_TOOL_SPECS),
+                                  "tools": {"board_publish": APPROVE, "board_disposition": APPROVE}}
+    return servers
 
 
 def role_kind(mailbox, endpoint):
@@ -310,10 +350,11 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants, 
     return argv + (["--"] if name is not None else [])
 
 
-def fixed_profile(request, mailbox, endpoint):
+def fixed_profile(request, mailbox, endpoint, host):
     """A role whose registry profile is fixed always runs at that effort, whatever team.json says.
 
-    The tier has no host flag, so the answer says it is recorded and not applied.
+    Codex takes the tier as service_tier. Claude has no tier flag, so there the answer says it is recorded and not
+    applied. Whether a host serves the tier is a separate probe.
     """
     profile = registry_role(mailbox, endpoint)["model_profile"]
     if profile["source"] != "fixed":
@@ -321,8 +362,13 @@ def fixed_profile(request, mailbox, endpoint):
     effort = profile["effort"]
     require(request.get("effort", effort) == effort,
             "the %s role runs at effort %s from the role registry" % (endpoint_parts(endpoint)[1], effort))
-    return {**request, "effort": effort}, {"source": "registry", "effort": effort, "tier": profile.get("tier"),
-                                           "tier_applied": False}
+    tier = profile.get("tier")
+    return {**request, "effort": effort}, {"source": "registry", "effort": effort, "tier": tier,
+                                           "tier_applied": host == CODEX and tier is not None}
+
+
+def applied_tier(fixed):
+    return fixed["tier"] if fixed is not None and fixed["tier_applied"] else None
 
 
 def role_tools(endpoint, mailbox, requested):
@@ -367,10 +413,40 @@ def check_codex_options(request, mailbox, endpoint, host):
         require(type(request["skip_git_repo_check"]) is bool and host == CODEX, "skip_git_repo_check is only for Codex")
 
 
+def journal_policy(lifecycle):
+    import hierarchy_lifecycle
+    path = safe_path(text(lifecycle, "lifecycle"))
+    require(path.is_dir(), "lifecycle is not a journal directory: " + str(path))
+    return hierarchy_lifecycle.validate_policy(hierarchy_lifecycle.load_json(path / "policy.json"))
+
+
+def check_lifecycle(request, mailbox, endpoint):
+    """A role's journal connection follows its registry entry. ROOT's decision adapter and the Decider act as one
+    policy actor; the Router reads status and acts as none. Every other role is refused the journal."""
+    # By key presence, as add_role and lifecycle_args decide, so a null is checked and refused, never passed on.
+    if "lifecycle" not in request and "actor" not in request:
+        return
+    lifecycle, actor = request.get("lifecycle"), request.get("actor")
+    kind = mailbox.endpoint(endpoint).get("kind")
+    entry = hierarchy_roles.role(endpoint, kind)
+    tools = hierarchy_roles.lifecycle_tools(entry)
+    if "router_status" in tools:
+        require("actor" not in request, ROUTER_TAKES_NO_ACTOR)
+        journal_policy(lifecycle)
+        return
+    acting = "root" if entry["provision"]["adapter"] == "decision" else "decider" if "decider_record" in tools else None
+    require(acting is not None, "the %s role has no lifecycle connection" % hierarchy_roles.role_name(endpoint, kind))
+    require("lifecycle" in request and "actor" in request, LIFECYCLE_PAIR)
+    matching(actor, SLUG, "actor")
+    found = journal_policy(lifecycle)["actors"].get(actor)
+    require(found is not None and found["role"] == acting,
+            "actor %s is not a %s actor in the lifecycle policy" % (actor, acting))
+
+
 def check_role_request(request, setup):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort", "timeout_seconds", "assistants",
                                                    "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background",
-                                                   "kind", "source_repo"})
+                                                   "kind", "source_repo", "lifecycle", "actor"})
     host = request["host"]
     require(host in (CLAUDE, CODEX, NATIVE), "unsupported host: " + str(host))
     require(type(request.get("background", False)) is bool, "invalid background")
@@ -382,6 +458,7 @@ def check_role_request(request, setup):
     if "kind" in request:
         mailbox.require_kind(request["endpoint"], request["kind"])
     check_codex_options(request, mailbox, request["endpoint"], host)
+    check_lifecycle(request, mailbox, request["endpoint"])
     if "source_repo" in request:
         # Before binding, so a refused option leaves the endpoint unbound.
         require(endpoint_parts(request["endpoint"])[1] != "root", "the ROOT decision adapter takes no source views")
@@ -432,7 +509,7 @@ def add_role(request):
     team = None
     fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
-        request, fixed = fixed_profile(request, mailbox, endpoint)
+        request, fixed = fixed_profile(request, mailbox, endpoint, host)
         # Before binding, so a bad team.json leaves the endpoint unbound.
         request, team = team_settings(base, host, request, role_kind(mailbox, endpoint))
     session = request.get("session") or str(uuid.uuid4())
@@ -454,15 +531,18 @@ def add_role(request):
         answer["team"] = team
     if fixed is not None:
         answer["model_profile"] = fixed
-    if endpoint_parts(endpoint)[1] == "root":
-        return answer
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
+    connection = base / "connections" / (stem + ".json")
+    if endpoint_parts(endpoint)[1] == "root":
+        return root_connection(setup, connection, answer, request) if "lifecycle" in request else answer
     role_extra = role_workspace_tools(mailbox, endpoint)
     source_repo = request.get("source_repo")
-    enabled = MAILBOX_TOOLS + list(role_extra) + (list(hierarchy_roles.SOURCE_VIEW_TOOLS) if source_repo else [])
-    arguments = adapter_args(setup, endpoint, host, session, generation, source_repo)
+    entry = registry_role(mailbox, endpoint)
+    enabled = (MAILBOX_TOOLS + list(role_extra) + (list(hierarchy_roles.SOURCE_VIEW_TOOLS) if source_repo else []) +
+               (list(hierarchy_roles.lifecycle_tools(entry)) if "lifecycle" in request else []))
+    journal = lifecycle_args(request)
+    arguments = adapter_args(setup, endpoint, host, session, generation, source_repo, journal)
     board = takes_board(setup, mailbox, endpoint)
-    connection = base / "connections" / (stem + ".json")
     connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if host == NATIVE:
         # The flat form a native thread's own script reads, as in the live connection files.
@@ -493,8 +573,16 @@ def add_role(request):
         if assistants:
             answer["assistants"] = ASSISTANT_NOTE
     else:
-        settings = codex_servers(setup, endpoint, session, generation, enabled, board, source_repo)
-        wake_argv = codex_argv(str(cwd), writer=writer, settings=settings, tail=["resume", session], options=request)
+        servers = codex_servers(setup, arguments, enabled,
+                                board_args(setup, endpoint, CODEX, session, generation) if board else None)
+        profile = codex_profile(str(cwd), writer=writer, servers=servers, options=request, endpoint=endpoint,
+                                role=hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")),
+                                session=session, generation=generation, tier=applied_tier(fixed))
+        codex_record = base / "profiles" / (stem + ".codex.json")
+        codex_record.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        codex_record.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        answer["codex_profile"] = str(codex_record)
+        wake_argv = codex_argv(profile, ["resume", session])
         prompt_via = "argv"
     wake_profile = base / "profiles" / (stem + ".wake.json")
     wake_profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -508,6 +596,22 @@ def add_role(request):
             "prompt_via": prompt_via}
 
 
+def root_connection(setup, connection, answer, request):
+    """The supervisor never wakes ROOT, so it gets a connection and no wake profile."""
+    host = answer["host"]
+    arguments = decision_args(setup, answer["endpoint"], host, answer["session"], answer["generation"], request)
+    connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    server = {"command": setup["python"], "args": arguments}
+    # A native thread's own script reads the flat form, as for every other role.
+    written = server if host == NATIVE else {"mcpServers": {"aegis_decision": server}}
+    connection.write_text(json.dumps(written, indent=2) + "\n", encoding="utf-8")
+    answer = {**answer, "connection": str(connection)}
+    if host == CODEX:
+        answer["mcp_config"] = "mcp_servers=" + toml_value({"aegis_decision": {
+            **server, "required": True, "enabled_tools": ["root_decide"], "tools": {"root_decide": APPROVE}}})
+    return answer
+
+
 def codex_start(request):
     fields(request, {"base", "endpoint"}, {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"})
     base = safe_path(text(request["base"], "base"))
@@ -515,13 +619,18 @@ def codex_start(request):
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
-    request, fixed = fixed_profile(request, mailbox, request["endpoint"])
+    request, fixed = fixed_profile(request, mailbox, request["endpoint"], CODEX)
     options, team = team_settings(base, CODEX, request, role_kind(mailbox, request["endpoint"]))
     writer = hierarchy_roles.writer(registry_role(mailbox, request["endpoint"]))
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     if not request.get("skip_git_repo_check"):
         require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
-    answer = {"start_argv": codex_argv(str(cwd), writer=writer, settings="mcp_servers={}", tail=[], options=options),
+    # Returned, not written: the session and its generation exist only once add-role binds it.
+    profile = codex_profile(str(cwd), writer=writer, servers={}, options=options, endpoint=request["endpoint"],
+                            role=hierarchy_roles.role_name(request["endpoint"], mailbox.endpoint(request["endpoint"]).get("kind")),
+                            tier=applied_tier(fixed))
+    answer = {"start_argv": codex_argv(profile),
+              "codex_profile": profile,
               "cwd": str(cwd),
               "prompt_via": "argv",
               "next": "Read the session ID from the first JSON event, then run add-role with that session."}

@@ -109,7 +109,7 @@ def test_only_root_and_the_router_may_never_execute_and_root_alone_decides():
     (lambda r: r["roles"]["implementer"]["writes"].append("lifecycle:route"),
      "role implementer records lifecycle events without a lifecycle role"),
     (lambda r: r["roles"]["architect"].update(endpoint={"role": "router"},
-                                              provision=r["roles"]["router"]["provision"]),
+                                              provision={**r["roles"]["router"]["provision"], "lifecycle_tools": []}),
      "two roles claim endpoint router"),
     (lambda r: r["roles"]["test-author"].update(hat_of="owner"),
      "role test-author is a hat, so it uses the endpoint of the role it is worn on"),
@@ -142,6 +142,19 @@ def test_only_root_and_the_router_may_never_execute_and_root_alone_decides():
 ])
 def test_a_contradictory_or_drifted_registry_is_refused(change, error):
     assert refusal(changed(change)) == error
+
+
+def test_the_provider_bridge_may_bind_an_endpoint_but_never_write_mail():
+    # The launcher's start publishes the binding record through add-role, and nothing else in the mailbox.
+    roles = hierarchy_roles.registry()["roles"]
+    bridge = roles["provider-bridge"]
+    assert bridge["writes"] == ["mailbox:bind"]
+    assert "mailbox" in bridge["prohibitions"]["writes"]
+    assert {name for name, entry in roles.items() if "mailbox:bind" in entry["writes"]} == {"provider-bridge"}
+    assert refusal(changed(lambda r: r["roles"]["provider-bridge"]["writes"].append("mailbox"))) == (
+        "role provider-bridge both allows and prohibits writes: mailbox")
+    assert refusal(changed(lambda r: r["roles"]["provider-bridge"]["writes"].append("mailbox:post"))) == (
+        "role provider-bridge lists an unknown writes action: mailbox:post")
 
 
 def test_the_registry_path_is_fixed_beside_the_loader():
@@ -302,7 +315,20 @@ def test_the_router_cannot_reach_the_decision_adapter(setup):
                             input="", capture_output=True, text=True, timeout=20,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"] == "only ROOT takes --lifecycle and --actor"
+    assert json.loads(result.stdout)["error"] == "the router session takes no lifecycle actor; routing is the router tool's"
+
+
+@posix_only
+@pytest.mark.parametrize("endpoint,role", [("pilot/orchestrator", "orchestrator"), ("pilot/lane/f2", "implementer")])
+def test_a_role_without_lifecycle_tools_is_refused_the_journal(setup, endpoint, role):
+    bind_all(setup)
+    result = subprocess.run([sys.executable, "-I", str(setup.source / "tools" / "hierarchy_mailbox.py"), "--root",
+                             str(setup.root), "serve", "--endpoint", endpoint, "--host", "h", "--session",
+                             endpoint.replace("/", "-"), "--generation", "1", "--lifecycle", str(setup.tmp)],
+                            input="", capture_output=True, text=True, timeout=20,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["error"] == "the %s role has no lifecycle connection" % role
 
 
 @posix_only
@@ -321,6 +347,7 @@ def test_the_router_always_runs_at_its_registry_effort(setup):
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
     assert argv[argv.index("--effort") + 1] == "medium"
     assert role["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast", "tier_applied": False}
+    assert "codex_profile" not in role and not any("service_tier" in word for word in argv), "Claude has no tier flag"
     refused = setup.add_role("pilot/router", cwd=str(setup.tmp), session=role["session"], effort="max", expect=2)
     assert refused["error"] == "the router role runs at effort medium from the role registry"
 
@@ -328,8 +355,9 @@ def test_the_router_always_runs_at_its_registry_effort(setup):
 @posix_only
 def test_codex_start_applies_the_routers_registry_effort(setup):
     started = provision("codex-start", setup.request(base=str(setup.base), endpoint="pilot/router", cwd=str(setup.source)))
-    assert codex_config(started["start_argv"])["model_reasoning_effort"] == "medium"
-    assert started["model_profile"]["effort"] == "medium"
+    config = codex_config(started["start_argv"])
+    assert config["model_reasoning_effort"] == "medium" and config["service_tier"] == "ultrafast"
+    assert started["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast", "tier_applied": True}
 
 
 @posix_only

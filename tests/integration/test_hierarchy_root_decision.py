@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -212,12 +213,13 @@ def test_root_takes_no_mailbox_workspace_or_board_options(loop, tmp_path, flag):
     assert json.loads(result.stdout)["error"] == "the ROOT decision adapter takes no mailbox, workspace or board options"
 
 
-@pytest.mark.parametrize("endpoint", ["a/orchestrator", "a/front-door", "a/lane/f2", "a/lane/review"])
-def test_no_other_role_gets_the_decision_adapter(loop, endpoint):
+@pytest.mark.parametrize("endpoint, role", [("a/orchestrator", "orchestrator"), ("a/front-door", "front-door"),
+                                            ("a/lane/f2", "implementer"), ("a/lane/review", "reviewer")])
+def test_no_other_role_gets_the_decision_adapter(loop, endpoint, role):
     root, ledger, value = loop
     result = serve(root, ledger, endpoint=endpoint)
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"] == "only ROOT takes --lifecycle and --actor"
+    assert json.loads(result.stdout)["error"] == "the %s role has no lifecycle connection" % role
     assert decisions(ledger) == []
 
 
@@ -297,4 +299,18 @@ def test_a_held_lock_refuses_the_decision_and_records_nothing(live, held):
         lock.unlink()
     assert ledger.files() == before
     assert payload(adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)}))["receipt"]
+    assert decisions(ledger) == [("feature-1", "approve", "root-1")]
+
+
+def test_a_moment_of_journal_contention_is_waited_out(live):
+    root, ledger, value, adapter = live
+    lock = ledger.path / ".write.lock"
+    lock.write_text("{}")
+    release = threading.Timer(0.3, lock.unlink)
+    release.start()
+    try:
+        answer = adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)})
+    finally:
+        release.join(timeout=5)
+    assert payload(answer)["receipt"]["event_id"] == "root-decision-1"
     assert decisions(ledger) == [("feature-1", "approve", "root-1")]

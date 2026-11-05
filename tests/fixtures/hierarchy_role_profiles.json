@@ -2735,6 +2735,7 @@
   },
   "codex-cli pilot/front-door {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Ffront-door-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/front-door",
@@ -2835,6 +2836,7 @@
   },
   "codex-cli pilot/front-door {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Ffront-door-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/front-door",
@@ -2935,6 +2937,7 @@
   },
   "codex-cli pilot/front-door {}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Ffront-door-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Ffront-door-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/front-door",
@@ -3028,6 +3031,7 @@
   },
   "codex-cli pilot/lane/f2 {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Ff2-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/f2",
@@ -3132,6 +3136,7 @@
   },
   "codex-cli pilot/lane/f2 {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Ff2-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/f2",
@@ -3230,6 +3235,7 @@
   },
   "codex-cli pilot/lane/f2 {\"tmpdir\": \"<writable>\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Ff2-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/f2",
@@ -3331,6 +3337,7 @@
   },
   "codex-cli pilot/lane/f2 {\"writable_roots\": [\"<writable>\"]}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Ff2-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/f2",
@@ -3428,6 +3435,7 @@
   },
   "codex-cli pilot/lane/f2 {}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Ff2-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Ff2-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/f2",
@@ -3525,6 +3533,7 @@
   },
   "codex-cli pilot/lane/integration {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Fintegration-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/integration",
@@ -3629,6 +3638,7 @@
   },
   "codex-cli pilot/lane/integration {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Fintegration-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/integration",
@@ -3727,6 +3737,7 @@
   },
   "codex-cli pilot/lane/integration {\"tmpdir\": \"<writable>\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Fintegration-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/integration",
@@ -3828,6 +3839,7 @@
   },
   "codex-cli pilot/lane/integration {\"writable_roots\": [\"<writable>\"]}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Fintegration-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/integration",
@@ -3925,6 +3937,7 @@
   },
   "codex-cli pilot/lane/integration {}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Fintegration-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Fintegration-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/integration",
@@ -4022,6 +4035,7 @@
   },
   "codex-cli pilot/lane/review {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Freview-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/review",
@@ -4119,6 +4133,7 @@
   },
   "codex-cli pilot/lane/review {\"reader_shell\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Freview-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/review",
@@ -4208,6 +4223,7 @@
   },
   "codex-cli pilot/lane/review {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Freview-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/review",
@@ -4308,6 +4324,7 @@
   },
   "codex-cli pilot/lane/review {}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Flane%2Freview-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Flane%2Freview-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/lane/review",
@@ -4401,6 +4418,7 @@
   },
   "codex-cli pilot/orchestrator {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Forchestrator-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/orchestrator",
@@ -4498,6 +4516,7 @@
   },
   "codex-cli pilot/orchestrator {\"reader_shell\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Forchestrator-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/orchestrator",
@@ -4587,6 +4606,7 @@
   },
   "codex-cli pilot/orchestrator {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Forchestrator-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/orchestrator",
@@ -4687,6 +4707,7 @@
   },
   "codex-cli pilot/orchestrator {}": {
    "answer": {
+    "codex_profile": "<tmp>/initiatives/pilot/profiles/pilot%2Forchestrator-g1.codex.json",
     "connection": "<tmp>/initiatives/pilot/connections/pilot%2Forchestrator-g1.json",
     "cwd": "<tmp>/source",
     "endpoint": "pilot/orchestrator",
@@ -4816,6 +4837,41 @@
   },
   "codex-start pilot/front-door {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": "high",
+     "endpoint": "pilot/front-door",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": "gpt-5.5-codex",
+     "network_access": false,
+     "role": "front-door",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -4869,6 +4925,41 @@
   },
   "codex-start pilot/front-door {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": null,
+     "endpoint": "pilot/front-door",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "front-door",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": true,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -4922,6 +5013,41 @@
   },
   "codex-start pilot/front-door {}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": null,
+     "endpoint": "pilot/front-door",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "front-door",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -4968,6 +5094,39 @@
   },
   "codex-start pilot/lane/f2 {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": "high",
+     "endpoint": "pilot/lane/f2",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": "gpt-5.5-codex",
+     "network_access": false,
+     "role": "implementer",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5025,6 +5184,39 @@
   },
   "codex-start pilot/lane/f2 {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/f2",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "implementer",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": true,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5076,6 +5268,39 @@
   },
   "codex-start pilot/lane/f2 {\"tmpdir\": \"<writable>\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/f2",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "implementer",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": "<tmp>/writable",
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5130,6 +5355,41 @@
   },
   "codex-start pilot/lane/f2 {\"writable_roots\": [\"<writable>\"]}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/f2",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "implementer",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": [
+      "<tmp>/writable"
+     ]
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5180,6 +5440,39 @@
   },
   "codex-start pilot/lane/f2 {}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/f2",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "implementer",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5230,6 +5523,39 @@
   },
   "codex-start pilot/lane/integration {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": "high",
+     "endpoint": "pilot/lane/integration",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": "gpt-5.5-codex",
+     "network_access": false,
+     "role": "integrator",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5287,6 +5613,39 @@
   },
   "codex-start pilot/lane/integration {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/integration",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "integrator",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": true,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5338,6 +5697,39 @@
   },
   "codex-start pilot/lane/integration {\"tmpdir\": \"<writable>\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/integration",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "integrator",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": "<tmp>/writable",
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5392,6 +5784,41 @@
   },
   "codex-start pilot/lane/integration {\"writable_roots\": [\"<writable>\"]}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/integration",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "integrator",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": [
+      "<tmp>/writable"
+     ]
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5442,6 +5869,39 @@
   },
   "codex-start pilot/lane/integration {}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/integration",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "integrator",
+     "sandbox": "workspace-write",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5492,6 +5952,41 @@
   },
   "codex-start pilot/lane/review {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": "high",
+     "endpoint": "pilot/lane/review",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": "gpt-5.5-codex",
+     "network_access": false,
+     "role": "reviewer",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5542,6 +6037,39 @@
   },
   "codex-start pilot/lane/review {\"reader_shell\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/review",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "reviewer",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5584,6 +6112,41 @@
   },
   "codex-start pilot/lane/review {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/review",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "reviewer",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": true,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5637,6 +6200,41 @@
   },
   "codex-start pilot/lane/review {}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": null,
+     "endpoint": "pilot/lane/review",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "reviewer",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5683,6 +6281,41 @@
   },
   "codex-start pilot/orchestrator {\"effort\": \"high\", \"model\": \"gpt-5.5-codex\"}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": "high",
+     "endpoint": "pilot/orchestrator",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": "gpt-5.5-codex",
+     "network_access": false,
+     "role": "orchestrator",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5733,6 +6366,39 @@
   },
   "codex-start pilot/orchestrator {\"reader_shell\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals"
+     ],
+     "effort": null,
+     "endpoint": "pilot/orchestrator",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "orchestrator",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5775,6 +6441,41 @@
   },
   "codex-start pilot/orchestrator {\"skip_git_repo_check\": true}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": null,
+     "endpoint": "pilot/orchestrator",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "orchestrator",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": true,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
@@ -5828,6 +6529,41 @@
   },
   "codex-start pilot/orchestrator {}": {
    "answer": {
+    "codex_profile": {
+     "add_dirs": [],
+     "approval_policy": "never",
+     "cwd": "<tmp>/source",
+     "disabled_features": [
+      "apps",
+      "plugins",
+      "remote_plugin",
+      "multi_agent",
+      "memories",
+      "computer_use",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "goals",
+      "shell_tool",
+      "unified_exec"
+     ],
+     "effort": null,
+     "endpoint": "pilot/orchestrator",
+     "generation": null,
+     "host": "codex-cli",
+     "ignore_user_config": true,
+     "mcp_servers": {},
+     "model": null,
+     "network_access": false,
+     "role": "orchestrator",
+     "sandbox": "read-only",
+     "schema": "aegis.hierarchy-codex-profile/v1",
+     "service_tier": null,
+     "session": null,
+     "skip_git_repo_check": false,
+     "tmpdir": null,
+     "writable_roots": []
+    },
     "cwd": "<tmp>/source",
     "next": "Read the session ID from the first JSON event, then run add-role with that session.",
     "prompt_via": "argv",
