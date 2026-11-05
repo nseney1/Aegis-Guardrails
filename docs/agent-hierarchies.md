@@ -3,8 +3,9 @@
 This source-checkout prototype supplies six role contracts, plain-file mailboxes,
 stable endpoint bindings, checkpoint handoffs and a workspace controller. The stdlib-only
 helper is `tools/hierarchy_mailbox.py`; it is outside Aegis core and is not installed
-in the wheel. No process watches folders or tracks repository work for Aegis, and only
-`tools/hierarchy_wake.py` starts a host, when root runs it with a reviewed profile.
+in the wheel. No process watches folders or tracks repository work for Aegis. Only
+`tools/hierarchy_wake.py` (with a reviewed profile) and `tools/hierarchy_launcher.py` (`start` and
+`stop`) start or stop a host, and only when root runs them.
 Host configuration, manager policy/membership and release gates are unchanged.
 
 To move live sessions or run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
@@ -59,7 +60,9 @@ What reads the registry at this tier:
   recorded as not applied. Whether Codex serves the tier is for the native probe to show.
 - **Lifecycle connections** come from each role's `provision.lifecycle_tools`: `router_status` for the
   Router and `decider_record` for the Decider. Every other role is refused `--lifecycle` and `--actor`
-  with "the <role> role has no lifecycle connection". ROOT keeps its decision adapter.
+  with "the <role> role has no lifecycle connection". ROOT keeps its decision adapter. The `serve`
+  help text in `tools/hierarchy_mailbox.py` still calls `--lifecycle` and `--actor` ROOT only; it
+  predates these connections and is pinned by the native foundation corpus.
 - **Every bind refuses one session for both sides of an independence rule**, such as an implementer
   and the reviewer of its work, whether it comes from `add-role` or a direct `bind`.
 - **Calls, approvals and prohibitions** are checked for consistency, and a test holds the lifecycle
@@ -567,20 +570,33 @@ python3 tools/hierarchy_launcher.py --base /abs/base stop --endpoint pilot/lane/
 python3 tools/hierarchy_launcher.py --base /abs/base status
 ```
 
-- `start` takes the `add-role` keys without `host`, `session` or `base`, plus `start_timeout_seconds`
-  (default 300). It runs the role's Codex start argv for one turn with no tools, reads the session ID
-  from the first `thread.started` event, and binds it with `add-role`. An endpoint that is already
-  bound is refused.
-- `resume` runs `tools/hierarchy_wake.py` with the current binding's wake profile, unchanged.
+- `start` takes `endpoint`, the `codex-start` options (`cwd`, `reader_shell`, `writable_roots`,
+  `tmpdir`, `add_dirs`, `model`, `effort`, `skip_git_repo_check`), the `add-role` keys `timeout_seconds`,
+  `source_repo`, `kind`, `lifecycle` and `actor`, and `start_timeout_seconds` (default 300). It runs
+  the role's Codex start argv for one turn with no MCP servers, reads the session ID from the first
+  `thread.started` event, and binds it with `add-role`. The start turn keeps the role's sandbox, and a
+  writer or reader-shell role keeps its shell, so only the start prompt keeps that turn inert. An
+  endpoint that is already bound, a second start while one runs, and ROOT (the owner's own session)
+  are refused. If the mailbox stays busy for 10 s after the turn, the record is `bind_busy` with the
+  session, and `add-role` with that session finishes the bind. A SIGTERM, SIGINT or SIGHUP to the
+  launcher stops the start's process group and is recorded (`start_incomplete` once a session is known,
+  else `failed_to_start`, error "the launcher was interrupted"); during the bind wait it ends the wait
+  instead, and the session can still be bound with `add-role`. The start lock is released either way.
+- `resume` runs `tools/hierarchy_wake.py` with the current binding's wake profile, unchanged, and
+  leaves every timeout to it.
 - `stop` signals the processes whose arguments name the bound session: SIGTERM, then SIGKILL after
   `--grace-seconds` (default 5). It never removes a wake marker; the answer says whether one remains.
-  A Claude background session is refused, since it stops through `claude stop`.
-- Every outcome, refusals included, is a record under `<base>/launches/<endpoint>/` (schema
+  A Claude background session is refused, since it stops through `claude stop`, and so are a native
+  thread (its own app stops it) and ROOT. A process census that fails after signals were sent is
+  `stop_failed` with the signalled pids, not `refused`.
+- Once the endpoint is known to the mailbox manifest, every outcome, refusals included, is a record
+  under `<base>/launches/<endpoint>/` (schema
   `aegis.hierarchy-launch/v1`); `status` reads them back. These are not lifecycle events.
 
-For a Codex role, `add-role` also writes `profiles/<endpoint>-g<N>.codex.json`
-(`aegis.hierarchy-codex-profile/v1`): sandbox mode, writable roots, network, approval policy, disabled
-features, MCP servers with their enabled tools, model, effort and service tier. The argv is built from
+For a Codex role other than ROOT, `add-role` also writes `profiles/<endpoint>-g<N>.codex.json`
+(`aegis.hierarchy-codex-profile/v1`; `codex-start` returns the same record without writing it):
+sandbox mode, writable roots, network, approval policy, disabled features, MCP servers with their
+enabled tools, model, effort and service tier. The argv is built from
 that record as inline `-c` settings under `--ignore-user-config`; no file is written to `~/.codex`.
 ROOT given `lifecycle` and `actor` gets a connection file for its decision adapter (`aegis_decision`)
 and, on Codex, the matching `mcp_config` setting, but no wake profile: the supervisor never wakes ROOT.

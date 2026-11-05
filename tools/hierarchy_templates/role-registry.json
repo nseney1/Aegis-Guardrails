@@ -246,7 +246,7 @@
       "service": "tools/hierarchy_launcher.py",
       "lifecycle_role": null,
       "reads": ["mailbox"],
-      "writes": [],
+      "writes": ["mailbox:bind"],
       "calls": ["session:start", "session:resume", "session:stop"],
       "approvals": [],
       "prohibitions": {

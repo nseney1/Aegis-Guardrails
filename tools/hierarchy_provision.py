@@ -423,19 +423,20 @@ def journal_policy(lifecycle):
 def check_lifecycle(request, mailbox, endpoint):
     """A role's journal connection follows its registry entry. ROOT's decision adapter and the Decider act as one
     policy actor; the Router reads status and acts as none. Every other role is refused the journal."""
-    lifecycle, actor = request.get("lifecycle"), request.get("actor")
-    if lifecycle is None and actor is None:
+    # By key presence, as add_role and lifecycle_args decide, so a null is checked and refused, never passed on.
+    if "lifecycle" not in request and "actor" not in request:
         return
+    lifecycle, actor = request.get("lifecycle"), request.get("actor")
     kind = mailbox.endpoint(endpoint).get("kind")
     entry = hierarchy_roles.role(endpoint, kind)
     tools = hierarchy_roles.lifecycle_tools(entry)
     if "router_status" in tools:
-        require(actor is None, ROUTER_TAKES_NO_ACTOR)
+        require("actor" not in request, ROUTER_TAKES_NO_ACTOR)
         journal_policy(lifecycle)
         return
     acting = "root" if entry["provision"]["adapter"] == "decision" else "decider" if "decider_record" in tools else None
     require(acting is not None, "the %s role has no lifecycle connection" % hierarchy_roles.role_name(endpoint, kind))
-    require(lifecycle is not None and actor is not None, LIFECYCLE_PAIR)
+    require("lifecycle" in request and "actor" in request, LIFECYCLE_PAIR)
     matching(actor, SLUG, "actor")
     found = journal_policy(lifecycle)["actors"].get(actor)
     require(found is not None and found["role"] == acting,

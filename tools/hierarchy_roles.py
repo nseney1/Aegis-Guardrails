@@ -24,7 +24,8 @@ LIFECYCLE_EVENTS = ("publish", "read", "route", "admit", "wait", "intent", "star
 VOCABULARY = {
     "reads": {"source", "mailbox", "board", "lifecycle", "job_evidence", "owner_records", "workspace_capacity",
               "workspace_initiative", "workspace_path_overlap"},
-    "writes": {"source", "mailbox", "board", "job_evidence", "worktree_lease", "governance"}
+    # mailbox:bind is the binding record alone, which the launcher publishes through add-role; it is not mail.
+    "writes": {"source", "mailbox", "mailbox:bind", "board", "job_evidence", "worktree_lease", "governance"}
               | {"lifecycle:" + event for event in LIFECYCLE_EVENTS},
     "calls": {"mailbox:dispatch", "mailbox:job_request", "mailbox:job_receipt", "session:start", "session:resume",
               "session:stop", "session:wake", "job:run", "merge", "publish_release"},

@@ -138,7 +138,8 @@ LIFECYCLE_TOOL_SPECS = {
         False, "Record the team Decider's approve or escalate on a canonical request, within a ROOT-approved "
                "delegation, under this connection's configured decider actor. The actor is configuration, not an "
                "authenticated identity. An approval admits nothing; the journal checks the scope, budget and expiry. "
-               "Retrying the same event_id with the same values returns the original receipt.",
+               "Retrying the same event_id with the same values returns the original receipt while ROOT custody is "
+               "unchanged; after a ROOT succession, record with a new event_id.",
         {"event_id": {"type": "string", "maxLength": 80}, "request_id": {"type": "string", "maxLength": 80},
          "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
          "delegation_id": {"type": "string", "maxLength": 80},
@@ -157,8 +158,8 @@ LIFECYCLE_TOOL_SPECS = {
 
 
 def journal_busy(lifecycle, exc):
-    # The journal shares the mailbox's lock helper, whose busy text names the mailbox. Callers hold the mailbox
-    # lock already, so a busy lock at this point is the journal's.
+    # The journal shares the mailbox's lock helper, whose busy text names the mailbox. Callers either hold the
+    # mailbox lock already or never take it (router_status), so a busy lock at this point is the journal's.
     if str(exc).startswith("mailbox writer is busy"):
         return ValueError("lifecycle journal writer is busy; inspect an abandoned "
                           + str(lifecycle.root / ".write.lock") + " before retrying")
@@ -230,6 +231,7 @@ class DecisionConnection:
                                  "additionalProperties": False}}]
 
     def call(self, name, arguments, render=None):
+        import hierarchy_router
         text(name, "tool name", 128)
         require(name == DECISION_TOOL, "unknown ROOT tool: %s; ROOT only records decisions" % name)
         fields(arguments, set(DECISION_SPEC[2]))
@@ -251,7 +253,8 @@ class DecisionConnection:
                                   "request_sha256": arguments["request_sha256"], "decision": arguments["decision"],
                                   "reason": arguments["reason"]}}
             try:
-                receipt = self.lifecycle.record(envelope)
+                # Waited out like the router's record; a retry is safe because the event id is idempotent.
+                receipt = hierarchy_router.patient(lambda: self.lifecycle.record(envelope), LIFECYCLE_WAIT_SECONDS)
             except ValueError as exc:
                 raise journal_busy(self.lifecycle, exc) from exc
         return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
@@ -345,7 +348,10 @@ class Connection:
         if name == "router_status":
             fields(arguments, set())
             self.checked_mailbox()
-            return hierarchy_router.status(self.lifecycle, self.store, LIFECYCLE_WAIT_SECONDS)
+            try:
+                return hierarchy_router.status(self.lifecycle, self.store, LIFECYCLE_WAIT_SECONDS)
+            except ValueError as exc:
+                raise journal_busy(self.lifecycle, exc) from exc
         fields(arguments, set(LIFECYCLE_TOOL_SPECS[name][3]))
         # Typed here, so a malformed value is a refusal and never reaches the journal's own code as a non-string.
         for key, label in (("event_id", "event id"), ("request_id", "request id"), ("delegation_id", "delegation id")):
@@ -369,7 +375,8 @@ class Connection:
                 envelope = {"id": arguments["event_id"], "actor": self.actor, "generation": actor["generation"],
                             "custody": {"cid": root, "generation": policy["actors"][root]["generation"]},
                             "event": {"type": "delegated_decision", **event}}
-                receipt = self.lifecycle.record(envelope)
+                # The journal lock is taken again here, fail-fast; the event id is idempotent, so waiting is safe.
+                receipt = hierarchy_router.patient(lambda: self.lifecycle.record(envelope), LIFECYCLE_WAIT_SECONDS)
             except ValueError as exc:
                 raise journal_busy(self.lifecycle, exc) from exc
         return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
