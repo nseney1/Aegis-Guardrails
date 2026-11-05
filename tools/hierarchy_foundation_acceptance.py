@@ -15,7 +15,7 @@ import sys
 import tempfile
 
 
-MANIFEST_SHA256 = "b2c7e6fc511073ce07dcfe2405cc0120048e67550a2d89cdd239d53ad40d5301"
+MANIFEST_SHA256 = "8792b55905da4555c63234a5fbf7615a6cdf4dec887ab18ea6b2585d96b1e708"
 MAILBOX_SHA256 = "4b00ecadf94be3001ed745329b2e6c874a34e99c32c0b088c959458bfbe30cd3"
 # Separately reviewed fixture successor; the corpus retains its historical pins.
 WATCH_TEST_SHA256 = "cf5df318f327c2f0b535b4bc9dadbef9d2c730d61aa287f57e95e201071155f9"

@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools" / "hierarchy_foundation_acceptance.py"
 CORPUS = ROOT / "tests" / "fixtures" / "hierarchy_native_foundation"
-MANIFEST_SHA256 = "b2c7e6fc511073ce07dcfe2405cc0120048e67550a2d89cdd239d53ad40d5301"
+MANIFEST_SHA256 = "8792b55905da4555c63234a5fbf7615a6cdf4dec887ab18ea6b2585d96b1e708"
 
 
 def snapshot(root):
@@ -264,6 +264,7 @@ else:
     assert json.loads(result.stdout) == {"code": "FOUNDATION_SOURCE_MISMATCH"}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="foundation replay requires a POSIX host")
 def test_public_api_repeated_replay_reuses_its_verified_source_without_changing_fixtures(tmp_path):
     script = r'''
 import importlib.util,json,sys

@@ -4,7 +4,8 @@
 The Router routes and reports; it never approves or executes. This code is the model-free half: it reads
 the journal, finds authority requests whose last ROOT decision is an unexpired approve and that have not
 been routed, and delivers each to `<team>/orchestrator` in that team's mailbox. The Router role session is
-the voice: it reads `status` and tells ROOT about anything held.
+the voice: it reads `status` and tells ROOT about anything held, and about each request the team
+Decider escalated (option A: the Decider's `delegated_decision` approves only inside a delegation).
 
 The team registry is the workspace initiative ledger. A request's `team` names an active initiative, and
 that initiative's `mailbox_root` holds the team's endpoints. The message goes out under the current
@@ -93,6 +94,9 @@ def decision_state(state, row, at):
         return "awaiting_decision", None
     if decision == "deny":
         return "denied", None
+    if value["operation"] == "delegate-merge":
+        # An approved delegation is the team Decider's scope, not work for the orchestrator.
+        return "delegation", None
     if parse_time(at) >= parse_time(value["continuation"]["expires_at"]):
         return "held", "approval_expired"
     return None, None
@@ -194,6 +198,10 @@ def row_view(state, key, row, ledger, at):
 
 def report(lifecycle, store, wait, held=None):
     _policy, state = locked_load(lifecycle, wait)
+    return request_rows(state, store, held)
+
+
+def request_rows(state, store, held=None):
     ledger = store.load()
     at = timestamp()
     rows = []
@@ -209,9 +217,23 @@ def report(lifecycle, store, wait, held=None):
     return rows
 
 
+def escalations(state):
+    """What the Decider handed to ROOT. ROOT decides on a canonical request; until then the Router voices it."""
+    rows = []
+    for entry in state.get("delegated_decisions", []):
+        if entry["decision"] != "escalate":
+            continue
+        rows.append({"request_id": entry["request_id"], "request_sha256": entry["request_sha256"],
+                     "team": state["requests"][entry["request_id"]]["request"]["team"],
+                     "delegation_id": entry["delegation_id"], "actor": entry["actor"], "at": entry["at"],
+                     "reason": entry["reason"], "root_decision": last_decision(state, entry["request_id"])})
+    return rows
+
+
 def status(lifecycle, store, wait):
+    _policy, state = locked_load(lifecycle, wait)
     return {"schema": STATUS, "execution_enabled": False, "identity": "configured", "authenticated": False,
-            "requests": report(lifecycle, store, wait)}
+            "requests": request_rows(state, store), "escalations": escalations(state)}
 
 
 def router_actor(policy, state, actor):

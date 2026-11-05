@@ -28,12 +28,16 @@ PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
 EMPTY = hashlib.sha256(b"").hexdigest()
 
 
+# The CI Linux legs run this same probe as a hard step (test_ci_workflows), so a sandbox that
+# cannot start fails the run there instead of silently skipping the tests below.
+BUBBLEWRAP_PROBE = ("bwrap", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+                    "true")
+
+
 def bubblewrap_works():
     if shutil.which("bwrap") is None:
         return False
-    probe = subprocess.run(["bwrap", "--unshare-net", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-                            "true"],
-                           capture_output=True, timeout=10)
+    probe = subprocess.run(list(BUBBLEWRAP_PROBE), capture_output=True, timeout=10)
     return probe.returncode == 0
 
 

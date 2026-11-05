@@ -57,6 +57,23 @@ python -m build  # when packaging changes; wheel and sdist go into dist/
 
 `make install`, `make lint` and `make build` are shortcuts for the corresponding Python commands.
 
+### Platforms and CI
+
+The core package and its suite support Linux, macOS and Windows. The hierarchy tools (`tools/hierarchy_*.py`, a source-checkout prototype outside the wheel) are POSIX-only: the lifecycle journal needs directory fsync, and the job runner needs `/proc` and bubblewrap (`bwrap`).
+
+| Platform | What is supported |
+| --- | --- |
+| Linux | Everything, including the job runner |
+| macOS | Everything except what reads Linux `/proc`: the job runner, host-authority protected control and provider-recovery process checks. The fixture broker and the watch bridge's process supervision need `os.waitid`, which macOS Python 3.9 and 3.11 lack ([watch bridge](docs/hierarchy-watch-bridge.md)) |
+| Windows | The core suite only |
+
+A hierarchy test that cannot run on a platform has a skip marker that names the reason, so those skips are expected. The Windows CI step may not deselect tests.
+
+CI runs `.github/workflows/validate.yml`:
+
+- Every pull request into `develop` runs `test-fast`: the whole suite on Linux, Python 3.11, with `pytest-xdist`, from a fresh venv, with bubblewrap installed and probed. It runs the pull request's own code, so it gets a read-only token, no secrets and a checkout that keeps no credentials. The required `aegis-check` fails unless it succeeds.
+- The full matrix (Linux 3.11 and 3.9, macOS 3.9 and 3.11, Windows 3.9 and 3.12) runs on pushes to `main`, `develop` and `release/**`, on pull requests into `main` and `release/**`, on manual dispatch, and nightly against `main`. A release candidate gets it from its pull request into `main`.
+
 ## Branches and reviews
 
 - Branch from `develop` as `feature/<name>`, `fix/<name>`, `docs/<name>` or `chore/<name>`, and open the pull request against `develop`.

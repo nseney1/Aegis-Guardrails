@@ -60,7 +60,8 @@ What reads the registry at this tier:
 - **Calls, approvals and prohibitions** are checked for consistency, and a test holds the lifecycle
   events against the journal's own permissions. The mailbox and the journal enforce them in their own
   code (dispatch, job requests, decisions), not by reading the registry at run time. Delegated Decider
-  approvals have an entry but no mechanism yet. Routing is [its own tool](#route-approved-requests).
+  approvals are [a journal event](#delegated-decider-approvals). Routing is
+  [its own tool](#route-approved-requests).
 
 The endpoint grammar and vertical routes stay constants in
 `tools/hierarchy_mailbox.py`, which the native foundation acceptance pins byte for byte, and the
@@ -241,11 +242,11 @@ or the Claude session table lists it as live, stops the turn's whole process gro
 before reporting, and exits 0 only if the messages were read, 3 if they were not, and
 2 if it refused. Use `--dry-run` to see what would happen. It supports POSIX only.
 
-A wake and a replacement cannot overlap. The wake rechecks the binding under the mailbox
-writer lock immediately before launching, so it never starts a session that was just
-replaced. It then holds a `.wake-<endpoint>.lock` file in the mailbox root until the turn
-ends, and `bind` refuses while that file exists. Other mailbox writes keep working during
-the turn. A crashed wake leaves the file behind, which blocks wakes and replacements for
+A wake and a replacement cannot overlap. Under the mailbox writer lock, the wake rechecks the
+binding and creates a `.wake-<endpoint>.lock` file in the mailbox root, so it never starts a
+session that was just replaced. It releases the writer lock before launching, so the session
+can read its mail at once, and holds the wake file until the turn ends; `bind` refuses while
+that file exists. Other mailbox writes keep working during the turn. A crashed wake leaves the file behind, which blocks wakes and replacements for
 that endpoint. Check that its process has stopped before removing the file.
 
 Each endpoint keeps at most 10,000 read receipts and 10,000 wake receipts. A full ledger
@@ -480,6 +481,8 @@ python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store 
 `status` changes nothing. It lists each authority request as one of these states:
 
 - `awaiting_decision`, `denied`, `closed` or `ready`.
+- `delegation`: an approved `delegate-merge` request. It is the team Decider's scope, never work,
+  so it is not routed.
 - `held`, with a `reason`: `approval_expired`, `team_unregistered`, `team_inactive`,
   `team_has_no_mailbox`, `router_endpoint_missing`, `router_unbound`, `orchestrator_unbound`,
   `router_handoff_unacknowledged`, `route_message_conflict`, `request_too_large` (the routed body
@@ -502,6 +505,46 @@ runs the router reads it and passes it on. `route` refuses the whole run before 
 journal's current router actor. The journal itself accepts a `route` event from the router actor
 without checking approval, so this code is where that check lives. The router actor and the
 borrowed binding are configuration, not authenticated identities.
+
+`status` also lists `escalations`: each request the team Decider escalated, with its delegation,
+reason, time and ROOT's last decision on it (`null` until ROOT decides). The Router session voices
+them to ROOT, which approves or denies the escalated request itself.
+
+## Delegated Decider approvals
+
+ROOT delegates by approving an ordinary canonical request with `operation: "delegate-merge"` and no
+continuation members. Its `team` and `paths` are the scope, `continuation.max_starts` is how many
+approvals it allows, and `continuation.expires_at` ends it. A deny after the approve revokes it, as
+for any request. The approval makes the delegation the Decider's scope and nothing else: the journal
+never admits a delegation as work, and the Router never routes it.
+
+The team Decider records a `delegated_decision` in the lifecycle journal, with the target request ID
+and hash, the delegation's ID and hash, the reviewed `commit`, `review` (evidence references to the
+reviewer's verdict), `decision` and `reason`. Either choice needs a real delegation and a target
+that is an authority request, which ROOT could decide itself. The journal accepts `approve` only
+when the delegation is ROOT-approved and unexpired, names the target's team, covers every target
+path component by component (the same path or a parent directory, never `/`), still has approvals
+left, the commit is the target's source commit, and the Decider did not publish the target. Anything
+else can only be `escalate`. A target gets one delegated decision, and none after ROOT has decided
+it. Only the coordinator and router can publish, so the publisher rule holds by role separation;
+the journal checks it anyway.
+
+The event never admits work: it does not count as a ROOT decision, does not use a continuation budget
+and does not make a request admissible. The Decider cannot record `decision`, `admit`, `intent` or
+`publish`. A policy's `current` may omit the decider, so five-role journals load and replay exactly as
+before. Decider identity is configuration-bound, like every journal actor; the separate-session rule
+is enforced when the mailbox binds the endpoint.
+
+Limits in M1:
+
+- A journal has one current Decider, as it has one Router. The journal checks the delegation's team
+  against the target's, not against the Decider's, so with several teams on one journal that Decider
+  serves all of them.
+- No session connection offers this event yet, so a Decider session cannot record it on its own; the
+  per-role connections come with the launcher. The protected host qualifies only the original five
+  roles, so a protected plan with a decider actor is refused.
+- Router `status` shows a request the Decider approved as `awaiting_decision`, because no ROOT decision
+  exists for it; the delegated approval is in the journal's `delegated_decisions`.
 
 ## Run several initiatives
 
@@ -632,7 +675,7 @@ The public subprocess suites are `tests/integration/test_hierarchy_mailbox.py`,
 `test_hierarchy_root_role.py`, `test_hierarchy_workspace.py`, `test_hierarchy_role_tools.py`,
 `test_hierarchy_templates.py`, `test_hierarchy_meter.py`, `test_hierarchy_provision.py`,
 `test_hierarchy_sweep.py`, `test_hierarchy_jobs.py`, `test_hierarchy_review.py`,
-`test_hierarchy_board.py`, `test_hierarchy_router.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
+`test_hierarchy_board.py`, `test_hierarchy_router.py`, `test_hierarchy_decider.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
 subprocess boundary, so they do not show that a real Claude or Codex session wakes, reads its
 mail or honors a tool list. Those are live gates and remain open for this code.
 `tests/integration/test_hierarchy_scenario.py` adds a simulated two-hierarchy run
@@ -664,3 +707,11 @@ Symlinks and nonregular inputs are refused. Storage runs under the same local us
 does not authenticate a host/session, and is not a hostile-process security boundary.
 Atomic visibility is not a claim of filesystem crash recovery. Local Linux checks
 establish no Windows filesystem or physical-host acceptance.
+
+The hierarchy tools are POSIX-only. Linux supports all of them. macOS supports everything
+except what reads Linux `/proc`: the job runner (`tools/hierarchy_jobs.py`, which also runs
+recipes under bubblewrap), host-authority protected control and provider-recovery process
+checks. The fixture broker and the watch bridge's process supervision need `os.waitid`, which
+macOS Python 3.9 and 3.11 lack. Windows supports only the core Aegis suite. Each hierarchy test that cannot run on a
+platform carries a skip marker with its reason, and CI runs the Linux legs with bubblewrap
+installed and probed. See [Platforms and CI](../CONTRIBUTING.md#platforms-and-ci).

@@ -53,7 +53,7 @@
         "writes": ["source", "board", "job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "mailbox:job_request", "session:start", "session:resume", "session:stop",
                   "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -104,7 +104,7 @@
         "reads": ["board"],
         "writes": ["source", "board", "job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "delegated_decision", "owner_reserved", "release_signature"]
+        "approvals": ["lifecycle:decision", "lifecycle:delegated_decision", "owner_reserved", "release_signature"]
       },
       "independence": {"rule": "not-author", "separate_session": true},
       "model_profile": {"source": "team"},
@@ -119,11 +119,11 @@
       "endpoint": {"role": "decider"},
       "hat_of": null,
       "service": null,
-      "lifecycle_role": null,
+      "lifecycle_role": "decider",
       "reads": ["source", "mailbox", "lifecycle", "job_evidence"],
-      "writes": ["mailbox"],
+      "writes": ["mailbox", "lifecycle:succeed"],
       "calls": [],
-      "approvals": ["delegated_decision"],
+      "approvals": ["lifecycle:delegated_decision"],
       "prohibitions": {
         "reads": ["board"],
         "writes": ["source", "board", "job_evidence", "worktree_lease", "governance"],
@@ -153,7 +153,7 @@
         "reads": [],
         "writes": ["job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -178,7 +178,7 @@
         "reads": [],
         "writes": ["job_evidence", "worktree_lease", "governance"],
         "calls": ["job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -222,7 +222,7 @@
         "reads": [],
         "writes": ["source", "mailbox", "board", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -247,7 +247,7 @@
         "reads": [],
         "writes": ["source", "mailbox", "board", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -274,7 +274,7 @@
         "reads": [],
         "writes": ["source", "board", "governance"],
         "calls": ["mailbox:dispatch", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -299,7 +299,7 @@
         "reads": [],
         "writes": ["source", "job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -324,7 +324,7 @@
         "reads": [],
         "writes": ["source", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "not-author", "separate_session": true},
@@ -349,7 +349,7 @@
         "reads": [],
         "writes": ["job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},
@@ -374,7 +374,7 @@
         "reads": ["board"],
         "writes": ["source", "board", "job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "delegated_decision", "owner_reserved", "release_signature"]
+        "approvals": ["lifecycle:decision", "lifecycle:delegated_decision", "owner_reserved", "release_signature"]
       },
       "independence": {"rule": "not-author", "separate_session": true},
       "model_profile": {"source": "team"},
@@ -398,7 +398,7 @@
         "reads": [],
         "writes": ["source", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "not-author", "separate_session": true},
@@ -423,7 +423,7 @@
         "reads": ["source"],
         "writes": ["source", "job_evidence", "worktree_lease", "governance"],
         "calls": ["mailbox:dispatch", "job:run", "merge", "publish_release"],
-        "approvals": ["lifecycle:decision", "lifecycle:review", "delegated_decision", "owner_reserved",
+        "approvals": ["lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
                       "release_signature"]
       },
       "independence": {"rule": "none", "separate_session": false},

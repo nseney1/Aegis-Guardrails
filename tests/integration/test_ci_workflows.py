@@ -114,13 +114,129 @@ def test_wave_tests_run_pull_requests_into_develop_without_secrets():
     ("success", "failure", False), ("skipped", "cancelled", False),
 ])
 def test_required_check_rejects_unexpected_upstream_results(expected, actual, passed):
-    step = _load("validate.yml")["jobs"]["aegis-check"]["steps"][0]
-    argv = shlex.split(step["run"])
-    env = dict(os.environ, EXPECTED_RESULT=expected, NEEDS_JSON=json.dumps({"build-wheel": {"result": actual}}))
-    proc = subprocess.run([sys.executable, *argv[1:]], env=env, capture_output=True, text=True, timeout=10)
+    proc = _run_upstream_gate(expected, {"build-wheel": {"result": actual}, FAST_JOB: {"result": "success"}})
     assert (proc.returncode == 0) is passed, proc.stderr
     if not passed:
         assert "build-wheel" in proc.stderr and "Unexpected upstream job results" in proc.stderr
+
+
+FAST_JOB = "test-fast"
+
+
+def _run_upstream_gate(expected, needs):
+    step = _load("validate.yml")["jobs"]["aegis-check"]["steps"][0]
+    argv = shlex.split(step["run"])
+    fixed = {k: v for k, v in step.get("env", {}).items() if "${{" not in str(v)}
+    env = dict(os.environ, **fixed, EXPECTED_RESULT=expected, NEEDS_JSON=json.dumps(needs))
+    return subprocess.run([sys.executable, *argv[1:]], env=env, capture_output=True, text=True, timeout=10)
+
+
+# A wave PR skips the full matrix but must still pass the fast leg; every other run needs both.
+@pytest.mark.parametrize("expected,fast,passed", [
+    ("skipped", "success", True), ("success", "success", True),
+    ("skipped", "skipped", False), ("skipped", "failure", False), ("skipped", "cancelled", False),
+    ("success", "failure", False), ("skipped", None, False),
+])
+def test_required_check_needs_the_fast_leg_to_succeed_on_every_run(expected, fast, passed):
+    needs = {"build-wheel": {"result": expected}}
+    if fast is not None:
+        needs[FAST_JOB] = {"result": fast}
+    proc = _run_upstream_gate(expected, needs)
+    assert (proc.returncode == 0) is passed, proc.stderr
+    if not passed:
+        assert FAST_JOB in proc.stderr and "Unexpected upstream job results" in proc.stderr
+
+
+def _fast_job():
+    return _load("validate.yml")["jobs"][FAST_JOB]
+
+
+def _runs(job):
+    return [s.get("run", "") for s in job.get("steps", [])]
+
+
+def _index(job, *needles):
+    found = [i for i, run in enumerate(_runs(job)) if all(n in run for n in needles)]
+    assert len(found) == 1, (needles, found)
+    return found[0]
+
+
+def _packages(run):
+    return sorted(word for word in run.split() if "==" in word)
+
+
+def test_wave_prs_run_the_fast_linux_leg_with_a_read_only_token_and_no_secrets():
+    workflow = _load("validate.yml")
+    assert "pull_request_target" not in _triggers(workflow)
+    job = workflow["jobs"][FAST_JOB]
+    # No `if` and no `needs`: build-wheel and dependency-audit skip on wave PRs, and the verdict
+    # needs this job to succeed on push and dispatch too.
+    assert "if" not in job and "needs" not in job
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}
+    assert isinstance(job.get("timeout-minutes"), int) and job["timeout-minutes"] <= 60
+    text = yaml.safe_dump(job)
+    # Any spelling of a secret or the workflow token: secrets.X, secrets['X'], toJSON(secrets),
+    # github.token, github['token'].
+    assert not re.search(r"\bsecrets\b|github\s*(\.|\[)\s*'?token|GH_TOKEN", text), text
+    assert not {"environment", "container", "services"} & set(job)
+    assert [s["with"]["python-version"] for s in _step_using(job, "actions/setup-python")] == ["3.11"]
+    checkout = _step_using(job, "actions/checkout")
+    assert len(checkout) == 1 and checkout[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    for step in job["steps"]:
+        assert not step.get("continue-on-error") and "if" not in step, step
+        assert "|| true" not in step.get("run", ""), step
+    assert FAST_JOB in workflow["jobs"]["aegis-check"]["needs"]
+
+
+def test_the_fast_leg_runs_the_whole_suite_with_xdist_from_its_own_venv():
+    job = _fast_job()
+    # The runner context is not available to job-level env, so a step exports the venv path.
+    export = _index(job, 'echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"')
+    venv = _index(job, 'python -m venv "$VENV"')
+    assert export < venv
+    install = _index(job, '"$VENV/bin/pip" install pytest==')
+    package = _index(job, '"$VENV/bin/pip" install .')
+    lint = _index(job, 'make lint PYTHON="$VENV/bin/python"')
+    suite = _index(job, 'make test PYTHON="$VENV/bin/python"')
+    assert venv < install < package < lint < suite
+    validate_install = next(s["run"] for s in _load("validate.yml")["jobs"]["validate"]["steps"]
+                            if s.get("name") == INSTALL_STEP)
+    packages = _packages(_runs(job)[install])
+    assert packages == _packages(validate_install.splitlines()[0]) and "pytest-xdist==3.6.1" in packages
+    assert _runs(job)[suite].strip() == 'make test PYTHON="$VENV/bin/python"'
+    for flag in ("--deselect", " -k ", " -m ", "--ignore"):
+        assert flag not in _runs(job)[suite]
+    assert _index(job, "grep -rnI '/home/'") > package
+
+
+def _bubblewrap_probe():
+    from tests.integration.test_hierarchy_jobs import BUBBLEWRAP_PROBE
+    return shlex.join(BUBBLEWRAP_PROBE)
+
+
+@pytest.mark.parametrize("name", [FAST_JOB, "validate"])
+def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite(name):
+    job = _load("validate.yml")["jobs"][name]
+    install = _index(job, "apt-get", "install -y --no-install-recommends bubblewrap")
+    # A transient mirror error must not fail a wave PR's required check.
+    assert _runs(job)[install].count("-o Acquire::Retries=3") == 2
+    probe = _index(job, _bubblewrap_probe())
+    suite = _index(job, "make test")
+    assert install < probe < suite
+    steps = job["steps"]
+    # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; without
+    # lifting that, the probe fails and the eight bubblewrap job tests would skip silently.
+    assert "kernel.apparmor_restrict_unprivileged_userns=0" in steps[probe]["run"]
+    if name == "validate":
+        assert steps[install].get("if") == steps[probe].get("if") == "runner.os == 'Linux'"
+    assert not steps[probe].get("continue-on-error") and "|| true" not in steps[probe]["run"]
+
+
+def test_the_full_matrix_also_runs_nightly_and_on_dispatch():
+    triggers = _triggers(_load("validate.yml"))
+    assert "workflow_dispatch" in triggers
+    assert len(triggers["schedule"]) == 1 and len(triggers["schedule"][0]["cron"].split()) == 5
 
 
 def test_wave_governance_cannot_be_skipped_while_keeping_the_required_check():
