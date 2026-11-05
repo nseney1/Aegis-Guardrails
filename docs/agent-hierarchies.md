@@ -18,6 +18,7 @@ To move live sessions or run a trial with real sessions, follow the [dogfood gui
 | `tools/hierarchy_meter.py` | Measure active time against the rotation limits |
 | `tools/hierarchy_handoff.py` | Hand a session's endpoints to its successor |
 | `tools/hierarchy_workspace.py` | Keep the initiative registry, capacity ledger and lease checks |
+| `tools/hierarchy_router.py` | Route ROOT-approved canonical requests to each team's orchestrator, and report what is held |
 | `tools/hierarchy_board.py` | Keep [board](workspace-board-contract.md) channels and grants, and read digests |
 
 ## Role contracts
@@ -54,12 +55,12 @@ What reads the registry at this tier:
   Codex sandbox, reader shell, assistant list and team.json kind from it. A role with a fixed model
   profile (the Router, medium effort) always runs at that effort; its tier has no host flag, so the
   answer records it as not applied.
-- **`add-role` refuses one session for both sides of an independence rule**, such as an implementer
-  and the reviewer of its work. A direct `bind` through the mailbox CLI is not checked.
+- **Every bind refuses one session for both sides of an independence rule**, such as an implementer
+  and the reviewer of its work, whether it comes from `add-role` or a direct `bind`.
 - **Calls, approvals and prohibitions** are checked for consistency, and a test holds the lifecycle
   events against the journal's own permissions. The mailbox and the journal enforce them in their own
   code (dispatch, job requests, decisions), not by reading the registry at run time. Delegated Decider
-  approvals and cross-team routing have entries but no mechanism yet.
+  approvals have an entry but no mechanism yet. Routing is [its own tool](#route-approved-requests).
 
 The endpoint grammar and vertical routes stay constants in
 `tools/hierarchy_mailbox.py`, which the native foundation acceptance pins byte for byte, and the
@@ -445,6 +446,51 @@ so a busy mailbox or store only delays a receipt or a release until the next run
 leaves `unknown` and keeps the slot until root runs `resolve`. See the
 [dogfood guide](hierarchy-dogfood.md) for packets and recipes.
 
+## Route approved requests
+
+`tools/hierarchy_router.py` is the Router's model-free code. It never approves or executes. It reads
+the lifecycle journal and routes each authority request whose last ROOT decision is an unexpired
+`approve` and that has not been routed. Continuation members travel inside their authority request.
+
+The team registry is the workspace initiative registry. A request's `team` must be an active
+initiative with a `mailbox_root`. That mailbox needs a bound `<team>/router` that has acknowledged
+its handoff, and a bound `<team>/orchestrator`. The request goes out as an `info` message from
+`<team>/router`, under that endpoint's current binding, and its body is strict JSON:
+
+```json
+{"schema": "aegis.routed-request/v1", "request_id": "...", "request_sha256": "...",
+ "request": {"raw": "<exact canonical bytes>", "sha256": "..."}}
+```
+
+The router then records a `route` event, with `to` set to `<team>/orchestrator`. The message ID and
+the event ID are both `route-<request sha256>`, so routing again changes nothing. A run that
+delivered but lost its journal write is finished by the next run without a second message. An
+existing message under that ID with different content is held as `route_message_conflict`.
+
+```sh
+python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store status
+python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store \
+  route --actor router-1 --evidence-only [--request <id>]
+```
+
+`status` changes nothing. It lists each authority request as one of these states:
+
+- `awaiting_decision`, `denied`, `closed` or `ready`.
+- `held`, with a `reason`: `approval_expired`, `team_unregistered`, `team_inactive`,
+  `team_has_no_mailbox`, `router_endpoint_missing`, `orchestrator_endpoint_missing`,
+  `router_unbound`, `orchestrator_unbound`, `router_handoff_unacknowledged`,
+  `route_message_conflict`, `team_mailbox_unreadable` or `request_too_large`. A route run can also
+  hold a request with `delivery_error` and a `detail`, for example when the team mailbox is busy.
+- `routed`, with `to` and the route mark. A routed request is never routed again. If ROOT denies it
+  afterward, it shows `revoked_after_route: true`.
+
+Escalation is the Router session's job, not this code's. The session reads `status` and tells ROOT
+about anything held. No Router session connection offers `status` yet, so until one does, whoever
+runs the router reads it and passes it on. `route` refuses the whole run before writing anything if `--actor` is not the
+journal's current router actor. The journal itself accepts a `route` event from the router actor
+without checking approval, so this code is where that check lives. The router actor and the
+borrowed binding are configuration, not authenticated identities.
+
 ## Run several initiatives
 
 | Level | Who | How many |
@@ -574,7 +620,7 @@ The public subprocess suites are `tests/integration/test_hierarchy_mailbox.py`,
 `test_hierarchy_root_role.py`, `test_hierarchy_workspace.py`, `test_hierarchy_role_tools.py`,
 `test_hierarchy_templates.py`, `test_hierarchy_meter.py`, `test_hierarchy_provision.py`,
 `test_hierarchy_sweep.py`, `test_hierarchy_jobs.py`, `test_hierarchy_review.py`,
-`test_hierarchy_board.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
+`test_hierarchy_board.py`, `test_hierarchy_router.py` and `test_hierarchy_dogfood.py`. They stub host processes at the
 subprocess boundary, so they do not show that a real Claude or Codex session wakes, reads its
 mail or honors a tool list. Those are live gates and remain open for this code.
 `tests/integration/test_hierarchy_scenario.py` adds a simulated two-hierarchy run
