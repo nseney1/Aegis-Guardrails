@@ -212,12 +212,13 @@ def test_root_takes_no_mailbox_workspace_or_board_options(loop, tmp_path, flag):
     assert json.loads(result.stdout)["error"] == "the ROOT decision adapter takes no mailbox, workspace or board options"
 
 
-@pytest.mark.parametrize("endpoint", ["a/orchestrator", "a/front-door", "a/lane/f2", "a/lane/review"])
-def test_no_other_role_gets_the_decision_adapter(loop, endpoint):
+@pytest.mark.parametrize("endpoint, role", [("a/orchestrator", "orchestrator"), ("a/front-door", "front-door"),
+                                            ("a/lane/f2", "implementer"), ("a/lane/review", "reviewer")])
+def test_no_other_role_gets_the_decision_adapter(loop, endpoint, role):
     root, ledger, value = loop
     result = serve(root, ledger, endpoint=endpoint)
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"] == "only ROOT takes --lifecycle and --actor"
+    assert json.loads(result.stdout)["error"] == "the %s role has no lifecycle connection" % role
     assert decisions(ledger) == []
 
 

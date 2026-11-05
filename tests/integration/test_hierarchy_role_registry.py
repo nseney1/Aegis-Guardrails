@@ -109,7 +109,7 @@ def test_only_root_and_the_router_may_never_execute_and_root_alone_decides():
     (lambda r: r["roles"]["implementer"]["writes"].append("lifecycle:route"),
      "role implementer records lifecycle events without a lifecycle role"),
     (lambda r: r["roles"]["architect"].update(endpoint={"role": "router"},
-                                              provision=r["roles"]["router"]["provision"]),
+                                              provision={**r["roles"]["router"]["provision"], "lifecycle_tools": []}),
      "two roles claim endpoint router"),
     (lambda r: r["roles"]["test-author"].update(hat_of="owner"),
      "role test-author is a hat, so it uses the endpoint of the role it is worn on"),
@@ -302,7 +302,20 @@ def test_the_router_cannot_reach_the_decision_adapter(setup):
                             input="", capture_output=True, text=True, timeout=20,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"] == "only ROOT takes --lifecycle and --actor"
+    assert json.loads(result.stdout)["error"] == "the router session takes no lifecycle actor; routing is the router tool's"
+
+
+@posix_only
+@pytest.mark.parametrize("endpoint,role", [("pilot/orchestrator", "orchestrator"), ("pilot/lane/f2", "implementer")])
+def test_a_role_without_lifecycle_tools_is_refused_the_journal(setup, endpoint, role):
+    bind_all(setup)
+    result = subprocess.run([sys.executable, "-I", str(setup.source / "tools" / "hierarchy_mailbox.py"), "--root",
+                             str(setup.root), "serve", "--endpoint", endpoint, "--host", "h", "--session",
+                             endpoint.replace("/", "-"), "--generation", "1", "--lifecycle", str(setup.tmp)],
+                            input="", capture_output=True, text=True, timeout=20,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["error"] == "the %s role has no lifecycle connection" % role
 
 
 @posix_only
