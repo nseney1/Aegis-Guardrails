@@ -452,6 +452,68 @@ host identity, effective tool restrictions, persistent native lifetime,
 escape-resistant containment, integrated validation and owner cutover remain
 separately held.
 
+## Protected canonical ROOT decisions
+
+### Initial bootstrap source foundation
+
+The inactive protected bootstrap source introduces
+`ProtectedCanonicalEnrollmentWriter.initialize_reserved_genesis` and
+`ProtectedCanonicalBootstrapWriter.commit_initial_creation`. Their fixed
+canonical root must match the actual H-owned runtime. The genesis marker records
+the complete approved reservation set, including planned successors, in the
+existing journal. Only the original five current actors can receive an INITIAL
+creation intent. Ordinary operator permissions and legacy journal bytes retain
+their existing behavior.
+
+`Lifecycle.initial_bootstrap()` replays and validates that journal and returns
+the original genesis checkpoint and receipt, all reserved witnesses, and original
+INITIAL creation envelopes and receipts. It refuses legacy histories without a
+marker with `initial bootstrap genesis missing`. The genesis checkpoint's
+`sha256` is its original body commitment; later INITIAL events advance current
+state without replacing that original prefix. These values are evidence, not
+transferable authority.
+
+Actual H lexical guards perform identity checks before canonical reads, then
+guard the original creation row before receipt recovery. NEW creation checks
+apply only after exact recovery is ruled out. A recovered receipt never starts
+another runtime. Root-claim or publication ambiguity retains UNKNOWN with the
+same root, actor and event identity; it permits no retry or abandoned-lock
+cleanup. Bootstrap authority cannot substitute for a live ROOT invocation.
+
+The current read-port checks cover legacy compatibility and missing-marker
+refusal. Positive protected bootstrap, real H guards, live ROOT decision writing,
+native enforcement and owner cutover require their separate public tests and
+qualification. None of these source interfaces enables a deployment or restart.
+
+### LIVE decision transaction source
+
+`ProtectedCanonicalDecisionWriter(root, authority).commit_decision(invocation, command)`
+is the decision-only protected source transaction. The fixed H composition supplies
+the canonical root and actual `HostAuthority`; tool arguments supply only the
+closed five-field event/request/hash/decision/reason data. Construction alone is
+not authority. Malformed data refuses before H or canonical access.
+
+The transaction enters the real H decision fence, then canonical writer exclusion,
+loads fresh state and checks current ROOT identity before target or receipt
+disclosure. The H-owned `require_decision_command` check then binds all five
+command fields to the actual received frame before any event/recovery key,
+target or receipt lookup, including direct public writer entry. Replay guards
+the original target before comparing all five fields
+and returns the original receipt across succession without rebuilding its actor
+envelope. A source-owned original-only call never enters the NEW branch. NEW
+approve and deny check the current canonical cap; only NEW approve checks expiry.
+Current runtime and call budgets still apply to receipt recovery.
+
+Publication, canonical unlock, final current checks and H exit share one
+uncertainty scope. Possible publication returns the original event key with
+`unknown/possible` and no receipt. Corrupt/missing canonical data also remains
+unresolved; no repair, lock stealing, retry, new key or second journal is used.
+The protected host may inspect the retained exception for diagnostics. Exact
+ten-field results always have `native_qualified: false`; direct writer calls
+cannot mint H completion, release runtime UNKNOWN or authorize job execution.
+Public source tests and independent review are separate from deployed runtime,
+hosted validation, native confinement and workflow restart qualification.
+
 ## Measure the trial
 
 Compare with the same counting method against this baseline from 489 mailbox messages:

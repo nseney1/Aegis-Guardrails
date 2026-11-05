@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -31,6 +32,8 @@ MAX_EVENTS = 10000
 MAX_REQUESTS = 256
 MAX_BYTES = 1048576
 ROLES = {"root", "router", "coordinator", "operator", "reviewer"}
+INITIAL_ENVELOPE = "aegis.initial-bootstrap-envelope/v1"
+UINT64 = (1 << 64) - 1
 PERMISSIONS = {"publish": {"coordinator", "router"}, "read": ROLES - {"root"}, "route": {"router"},
                "decision": {"root"}, "admit": {"operator"}, "wait": {"operator"}, "intent": {"operator"},
                "start": {"operator"}, "terminal": {"operator"}, "meter": {"operator"},
@@ -238,6 +241,105 @@ def checkpoint(policy, state):
     return {**body, "sha256": digest(body)}
 
 
+def _initial_process(value):
+    fields(value, {"boot_id", "pid_namespace", "pid", "start_ticks"})
+    boot = value["boot_id"]
+    require(isinstance(boot, str) and str(uuid.UUID(boot)) == boot, "invalid bootstrap boot id")
+    integer(value["pid"], "bootstrap process id", maximum=2147483647)
+    for name in ("pid_namespace", "start_ticks"):
+        integer(value[name], "bootstrap " + name, maximum=UINT64)
+
+
+def _initial_channel(value):
+    fields(value, {"schema", "runtime_instance", "appserver_instance", "control_peer_instance",
+                   "read_pipe_inode", "write_pipe_inode", "epoch", "deployment_sha256",
+                   "runtime_executable_sha256", "host_source_closure_sha256", "role_ceiling_sha256"})
+    require(value["schema"] == "aegis.host-channel-witness/v1", "unsupported bootstrap channel schema")
+    for name in ("runtime_instance", "appserver_instance", "control_peer_instance"):
+        _initial_process(value[name])
+    for name in ("read_pipe_inode", "write_pipe_inode", "epoch"):
+        integer(value[name], "bootstrap " + name, maximum=UINT64)
+    require(value["read_pipe_inode"] != value["write_pipe_inode"], "bootstrap pipe directions alias")
+    for name in ("deployment_sha256", "runtime_executable_sha256", "host_source_closure_sha256",
+                 "role_ceiling_sha256"):
+        matching(value[name], SHA256, "bootstrap " + name)
+
+
+def _initial_key(policy, cid):
+    return "initial-" + digest({"schema": "aegis.initial-creation-key/v1",
+                                "policy_sha256": digest(policy), "actor_cid": cid})[:40]
+
+
+def _reduce_initial(policy, state, envelope):
+    """Validate inert bootstrap journal evidence, without authenticating a host."""
+    fields(envelope, {"schema", "id", "event"})
+    require(envelope["schema"] == INITIAL_ENVELOPE, "unsupported bootstrap envelope schema")
+    matching(envelope["id"], SLUG, "event id")
+    event = envelope["event"]
+    require(isinstance(event, dict), "expected a JSON object")
+    if event.get("type") == "initial_reservations":
+        fields(event, {"type", "approved_plan", "channel_witness", "reservations"})
+        require(envelope["id"] == "initial-genesis" and state["sequence"] == 0
+                and "initial_bootstrap" not in state, "initial genesis must be the first journal event")
+        evidence([event["approved_plan"]])
+        require(policy["authority"] == [event["approved_plan"]], "bootstrap approved plan mismatch")
+        _initial_channel(event["channel_witness"])
+        channel_sha256 = digest(event["channel_witness"])
+        rows = event["reservations"]
+        require(isinstance(rows, list) and 5 <= len(rows) <= 128, "invalid bootstrap reservation set")
+        cids, sequences = [], set()
+        for row in rows:
+            fields(row, {"schema", "channel_instance_sha256", "approved_plan_sha256", "actor_cid",
+                         "role", "generation", "profile_sha256", "cap_seconds", "reservation_sequence",
+                         "expires_monotonic_ns"})
+            require(row["schema"] == "aegis.host-reservation-witness/v1",
+                    "unsupported bootstrap reservation schema")
+            cid = row["actor_cid"]
+            matching(cid, SLUG, "bootstrap actor CID")
+            require(cid in policy["actors"], "unknown bootstrap actor CID")
+            actor = policy["actors"][cid]
+            integer(row["generation"], "bootstrap generation", maximum=UINT64)
+            integer(row["cap_seconds"], "bootstrap cap", maximum=86400 if actor["role"] == "root" else 3600)
+            integer(row["reservation_sequence"], "bootstrap reservation sequence", maximum=UINT64)
+            integer(row["expires_monotonic_ns"], "bootstrap reservation expiry", maximum=UINT64)
+            require(row["role"] == actor["role"] and row["generation"] == actor["generation"]
+                    and row["profile_sha256"] == digest(actor["profile"])
+                    and row["cap_seconds"] == actor["cap_seconds"]
+                    and row["approved_plan_sha256"] == event["approved_plan"]["sha256"]
+                    and row["channel_instance_sha256"] == channel_sha256,
+                    "bootstrap reservation correlation mismatch")
+            require(row["reservation_sequence"] not in sequences, "duplicate bootstrap reservation sequence")
+            sequences.add(row["reservation_sequence"])
+            cids.append(cid)
+        require(cids == sorted(policy["actors"]), "bootstrap reservations must match all planned actors")
+        state["initial_bootstrap"] = {"genesis": {"envelope": copy.deepcopy(envelope)},
+                                      "reservations": copy.deepcopy(rows), "creations": {}}
+        return
+    require(event.get("type") == "initial_creation", "unknown bootstrap event")
+    fields(event, {"type", "genesis_event_sha256", "approved_plan_sha256", "reservation_set_sha256",
+                   "actor_cid", "role", "generation", "profile_sha256", "cap_seconds",
+                   "channel_instance_sha256", "reservation_witness_sha256"})
+    require("initial_bootstrap" in state, "initial bootstrap genesis missing")
+    bootstrap = state["initial_bootstrap"]
+    cid = event["actor_cid"]
+    matching(cid, SLUG, "bootstrap actor CID")
+    require(cid in policy["current"].values(), "INITIAL creation requires an original current actor")
+    actor = policy["actors"][cid]
+    require(state["current"][actor["role"]] == cid, "INITIAL actor generation is fenced")
+    require(cid not in bootstrap["creations"], "INITIAL creation already recorded")
+    integer(event["generation"], "bootstrap generation", maximum=UINT64)
+    integer(event["cap_seconds"], "bootstrap cap", maximum=86400 if actor["role"] == "root" else 3600)
+    row = next(row for row in bootstrap["reservations"] if row["actor_cid"] == cid)
+    expected = {name: row[name] for name in ("actor_cid", "role", "generation", "profile_sha256",
+                                            "cap_seconds", "channel_instance_sha256", "approved_plan_sha256")}
+    expected.update(type="initial_creation", genesis_event_sha256=digest(bootstrap["genesis"]["envelope"]),
+                    reservation_set_sha256=digest(bootstrap["reservations"]),
+                    reservation_witness_sha256=digest(row))
+    require(event == expected and envelope["id"] == _initial_key(policy, cid),
+            "INITIAL creation correlation mismatch")
+    bootstrap["creations"][cid] = {"actor_cid": cid, "envelope": copy.deepcopy(envelope)}
+
+
 def actor_for(policy, state, envelope):
     fields(envelope, {"id", "actor", "generation", "custody", "event"})
     matching(envelope["id"], SLUG, "event id")
@@ -329,6 +431,8 @@ def resolve_row(state, row, resolution, cid):
 
 
 def reduce_event(policy, state, envelope, at):
+    if isinstance(envelope, dict) and envelope.get("schema") == INITIAL_ENVELOPE:
+        return _reduce_initial(policy, state, envelope)
     cid, actor, event = actor_for(policy, state, envelope)
     kind = event["type"]
     if kind not in {"meter", "succeed", "terminal", "observe"}:
@@ -488,13 +592,22 @@ def sync_directory(path):
         os.close(fd)
 
 
+class _InitialBootstrapMissing(ValueError):
+    pass
+
+
 class Lifecycle:
     def __init__(self, root):
         self.root = safe_path(root)
 
     def load(self):
+        policy, state, _ = self._replay()
+        return policy, state
+
+    def _replay(self):
         policy = validate_policy(load_json(self.root / "policy.json"))
         state = initial_state(policy)
+        genesis_checkpoint = None
         paths = sorted((self.root / "events").iterdir())
         require(len(paths) <= MAX_EVENTS, "lifecycle event limit reached")
         for index, path in enumerate(paths, 1):
@@ -511,7 +624,22 @@ class Lifecycle:
             require(identifier not in state["receipts"], "duplicate journal event id")
             reduce_event(policy, state, record["envelope"], record["at"])
             self.finish(state, record)
-        return policy, state
+            if record["envelope"].get("schema") == INITIAL_ENVELOPE and index == 1:
+                genesis_checkpoint = copy.deepcopy(checkpoint(policy, state))
+        return policy, state, genesis_checkpoint
+
+    def initial_bootstrap(self):
+        """Return validated original INITIAL evidence, never a native grant."""
+        policy, state, genesis_checkpoint = self._replay()
+        if genesis_checkpoint is None:
+            raise _InitialBootstrapMissing("initial bootstrap genesis missing")
+        bootstrap = state["initial_bootstrap"]
+        return {"schema": "aegis.initial-bootstrap-snapshot/v1", "policy_sha256": digest(policy),
+                "genesis_checkpoint": genesis_checkpoint,
+                "genesis_receipt": copy.deepcopy(bootstrap["genesis"]["receipt"]),
+                "reservations": copy.deepcopy(bootstrap["reservations"]),
+                "creations": [copy.deepcopy(bootstrap["creations"][cid])
+                              for cid in sorted(bootstrap["creations"])]}
 
     @staticmethod
     def finish(state, record):
@@ -520,6 +648,13 @@ class Lifecycle:
         receipt = {"event_id": record["envelope"]["id"], "sequence": record["sequence"],
                    "event_sha256": record["event_sha256"], "execution_enabled": False}
         state["receipts"][receipt["event_id"]] = receipt
+        envelope = record["envelope"]
+        if envelope.get("schema") == INITIAL_ENVELOPE:
+            bootstrap = state["initial_bootstrap"]
+            if envelope["event"]["type"] == "initial_reservations":
+                bootstrap["genesis"]["receipt"] = copy.deepcopy(receipt)
+            else:
+                bootstrap["creations"][envelope["event"]["actor_cid"]]["receipt"] = copy.deepcopy(receipt)
         return receipt
 
     def record(self, envelope):
@@ -582,6 +717,420 @@ class Lifecycle:
                 "work_complete": bool(state["requests"]) and not obligations, "coverage": "registered_requests_only",
                 "execution_enabled": False, "native_enforcement": "unqualified", "policy_sha256": digest(policy),
                 "obligations": obligations, "continuation_candidates": candidates, "continuation_holds": holds, **state}
+
+
+def _prepare_initial(policy, state, envelope):
+    require(state["sequence"] < MAX_EVENTS, "lifecycle event limit reached")
+    record = {"schema": JOURNAL, "sequence": state["sequence"] + 1, "previous": state["head"],
+              "policy_sha256": digest(policy), "at": timestamp(), "envelope": envelope,
+              "event_sha256": digest(envelope)}
+    candidate = copy.deepcopy(state)
+    reduce_event(policy, candidate, envelope, record["at"])
+    require(len(encoded(record)) + 1 <= MAX_BYTES, "bootstrap event exceeds lifecycle byte limit")
+    return record, Lifecycle.finish(candidate, record)
+
+
+def _publish_initial(root, record):
+    publish_file(root / "events" / ("%06d.json" % record["sequence"]),
+                 encoded(record) + b"\n", limit=MAX_BYTES)
+    sync_directory(root / "events")
+
+
+_GENESIS_REASONS = {
+    "HOST_AUTHORITY_REFUSED": "current protected host authority is required",
+    "PLAN_MISMATCH": "protected bootstrap plan does not match",
+    "POLICY_INVALID": "protected bootstrap evidence is invalid",
+    "ROOT_ALREADY_EXISTS": "protected canonical root already exists",
+    "GENESIS_PUBLICATION_UNKNOWN": "canonical genesis may have been published; retain the original root and reservations",
+}
+
+
+class CanonicalGenesisError(PermissionError):
+    """Closed genesis refusal/ambiguity; no implicit retry or cleanup grant."""
+
+    __slots__ = ("_code", "_possible")
+
+    def __init__(self, code, *, possible=False):
+        self._code, self._possible = code, possible
+        super().__init__(_GENESIS_REASONS[code])
+
+    @property
+    def code(self):
+        return self._code
+
+    @property
+    def reason(self):
+        return _GENESIS_REASONS[self._code]
+
+    @property
+    def state(self):
+        return "unknown" if self._possible else "refused"
+
+    @property
+    def effect(self):
+        return "possible" if self._possible else "none"
+
+
+class ProtectedCanonicalEnrollmentWriter:
+    """Fixed-root protected genesis; only actual H source constructs its guard."""
+
+    def __init__(self, root, authority):
+        self.root, self.authority = safe_path(root), authority
+
+    def initialize_reserved_genesis(self, owned_runtime, reserved_enrollments, approved_plan_ref):
+        from tools import hierarchy_host_authority as host
+
+        claimed = False
+        try:
+            if (type(self.authority) is not host.HostAuthority
+                    or self.authority.owned_runtime is not owned_runtime):
+                raise CanonicalGenesisError("HOST_AUTHORITY_REFUSED")
+            # These are inert copies of already authenticated protected inputs.
+            # No caller-selected plan file is opened, or read back under a fence.
+            if (self.root != owned_runtime.canonical_root
+                    or approved_plan_ref != owned_runtime.approved_plan_ref):
+                raise CanonicalGenesisError("PLAN_MISMATCH")
+            plan = owned_runtime.accepted_plan
+            fields(plan, {"source", "actors", "current", "successors"})
+            evidence([approved_plan_ref])
+            policy = validate_policy({"schema": POLICY, "authority": [copy.deepcopy(approved_plan_ref)], **plan})
+            require(len(encoded(policy)) + 1 <= MAX_BYTES, "bootstrap policy exceeds lifecycle byte limit")
+            require(isinstance(reserved_enrollments, tuple), "bootstrap requires owned reservation tuple")
+            rows = []
+            for reservation in reserved_enrollments:
+                if type(reservation) is not host.ReservedEnrollment:
+                    raise CanonicalGenesisError("HOST_AUTHORITY_REFUSED")
+                rows.append(reservation.witness)
+            envelope = {"schema": INITIAL_ENVELOPE, "id": "initial-genesis",
+                        "event": {"type": "initial_reservations", "approved_plan": copy.deepcopy(approved_plan_ref),
+                                  "channel_witness": owned_runtime.channel_witness, "reservations": rows}}
+            record, _ = _prepare_initial(policy, initial_state(policy), envelope)
+            with self.authority.bootstrap_fence(owned_runtime, approved_plan_ref, reserved_enrollments) as guard:
+                guard.require_reserved_genesis_current()
+                # Existing-root refusal is known not to claim it. Other errors
+                # during this exclusive claim conservatively retain UNKNOWN.
+                claimed = True
+                try:
+                    self.root.mkdir(mode=0o700)
+                except FileExistsError:
+                    claimed = False
+                    raise CanonicalGenesisError("ROOT_ALREADY_EXISTS")
+                with writer_lock(self.root):
+                    guard.require_reserved_genesis_current()
+                    (self.root / "events").mkdir(mode=0o700)
+                    guard.require_reserved_genesis_current()
+                    publish_file(self.root / "policy.json", encoded(policy) + b"\n", limit=MAX_BYTES)
+                    guard.require_reserved_genesis_current()
+                    _publish_initial(self.root, record)
+                    sync_directory(self.root)
+                    sync_directory(self.root.parent)
+                    snapshot = Lifecycle(self.root).initial_bootstrap()
+                    enrollments = []
+                    for row in snapshot["reservations"]:
+                        item = {name: row[name] for name in ("actor_cid", "role", "generation", "profile_sha256",
+                                                            "cap_seconds", "channel_instance_sha256")}
+                        item["reservation_witness_sha256"] = digest(row)
+                        enrollments.append(item)
+                    answer = {"schema": "aegis.protected-reserved-enrollment-receipt/v1",
+                              "policy_sha256": snapshot["policy_sha256"],
+                              "checkpoint_sha256": snapshot["genesis_checkpoint"]["sha256"],
+                              "enrollments": enrollments}
+                    guard.require_reserved_genesis_current()
+                    return answer
+        except CanonicalGenesisError as exc:
+            if claimed:
+                raise CanonicalGenesisError("GENESIS_PUBLICATION_UNKNOWN", possible=True) from exc
+            raise
+        except host.HostAuthorityError as exc:
+            code = "GENESIS_PUBLICATION_UNKNOWN" if claimed else "HOST_AUTHORITY_REFUSED"
+            raise CanonicalGenesisError(code, possible=claimed) from exc
+        except (ValueError, OSError) as exc:
+            code = "GENESIS_PUBLICATION_UNKNOWN" if claimed else "POLICY_INVALID"
+            raise CanonicalGenesisError(code, possible=claimed) from exc
+
+
+_INITIAL_REASONS = {
+    "HOST_AUTHORITY_REFUSED": "current protected INITIAL authority is required",
+    "INITIAL_GENESIS_REQUIRED": "protected INITIAL genesis is required",
+    "INITIAL_CREATION_FORBIDDEN": "INITIAL creation requires its original current actor",
+    "INITIAL_CORRELATION_MISMATCH": "protected INITIAL correlation does not match",
+    "INITIAL_EVENT_CONFLICT": "INITIAL event identity conflicts with original evidence",
+    "CANONICAL_INVALID": "canonical INITIAL history is invalid",
+    "CANONICAL_BUSY": "canonical writer exclusion is busy",
+    "INITIAL_CREATION_PUBLICATION_UNKNOWN": "INITIAL intent may have been published; retain its original identity",
+}
+
+
+def _initial_result(state, *, code=None, cid=None, event_id=None, receipt=None):
+    return {"schema": "aegis.initial-creation-result/v1", "state": state,
+            "effect": {"recorded": "canonical_initial_creation", "recovered": "none",
+                       "refused": "none", "unknown": "possible"}[state],
+            "code": code, "reason": _INITIAL_REASONS[code] if code else None,
+            "actor_cid": cid, "event_id": event_id, "receipt": copy.deepcopy(receipt),
+            "native_qualified": False}
+
+
+def _initial_creation_envelope(policy, snapshot, witness):
+    event = {name: witness[name] for name in ("actor_cid", "role", "generation", "profile_sha256",
+                                             "cap_seconds", "channel_instance_sha256", "approved_plan_sha256")}
+    event.update(type="initial_creation", genesis_event_sha256=snapshot["genesis_receipt"]["event_sha256"],
+                 reservation_set_sha256=digest(snapshot["reservations"]), reservation_witness_sha256=digest(witness))
+    return {"schema": INITIAL_ENVELOPE, "id": _initial_key(policy, witness["actor_cid"]), "event": event}
+
+
+class ProtectedCanonicalBootstrapWriter:
+    """Commit one INITIAL intent; never bind or start a runtime from a receipt."""
+
+    def __init__(self, root):
+        self.root = safe_path(root)
+
+    def commit_initial_creation(self, bootstrap_guard, reserved_enrollment):
+        from tools import hierarchy_host_authority as host
+
+        possible, cid, identifier = False, None, None
+
+        def refused(code):
+            return _initial_result("refused", code=code, cid=cid, event_id=identifier)
+
+        try:
+            if (type(bootstrap_guard) is not host.InitialCreationGuard
+                    or type(reserved_enrollment) is not host.ReservedEnrollment):
+                return refused("HOST_AUTHORITY_REFUSED")
+            bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+            if self.root != reserved_enrollment.owned_runtime.canonical_root:
+                return refused("INITIAL_CORRELATION_MISMATCH")
+            with writer_lock(self.root):
+                bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+                reader = Lifecycle(self.root)
+                policy, state = reader.load()
+                snapshot = reader.initial_bootstrap()
+                bootstrap_guard.require_initial_creation_current(reserved_enrollment, policy, state, None)
+                cid = reserved_enrollment.actor_cid
+                identifier = _initial_key(policy, cid)
+                original = next((row for row in snapshot["creations"] if row["actor_cid"] == cid), None)
+                if original is not None:
+                    bootstrap_guard.require_initial_creation_current(reserved_enrollment, policy, state, original)
+                    expected = _initial_creation_envelope(policy, snapshot, reserved_enrollment.witness)
+                    if (original["envelope"] != expected
+                            or original["receipt"]["event_sha256"] != digest(expected)):
+                        return refused("INITIAL_EVENT_CONFLICT")
+                    bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+                    answer = _initial_result("recovered", cid=cid, event_id=identifier, receipt=original["receipt"])
+                else:
+                    row = next((row for row in snapshot["reservations"] if row["actor_cid"] == cid), None)
+                    if row is None:
+                        return refused("INITIAL_CORRELATION_MISMATCH")
+                    bootstrap_guard.require_initial_creation_current(reserved_enrollment, policy, state, row)
+                    if (cid not in policy["current"].values()
+                            or state["current"][policy["actors"][cid]["role"]] != cid):
+                        return refused("INITIAL_CREATION_FORBIDDEN")
+                    if row != reserved_enrollment.witness:
+                        return refused("INITIAL_CORRELATION_MISMATCH")
+                    bootstrap_guard.require_initial_creation_new(reserved_enrollment, policy, state, row)
+                    envelope = _initial_creation_envelope(policy, snapshot, row)
+                    if identifier in state["receipts"]:
+                        return refused("INITIAL_EVENT_CONFLICT")
+                    record, receipt = _prepare_initial(policy, state, envelope)
+                    bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+                    possible = True
+                    _publish_initial(self.root, record)
+                    bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+                    answer = _initial_result("recorded", cid=cid, event_id=identifier, receipt=receipt)
+            bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+            return answer
+        except host.HostAuthorityError:
+            if not possible:
+                return refused("HOST_AUTHORITY_REFUSED")
+        except _InitialBootstrapMissing:
+            if not possible:
+                return refused("INITIAL_GENESIS_REQUIRED")
+        except (ValueError, OSError) as exc:
+            if not possible:
+                if isinstance(exc, FileNotFoundError):
+                    return refused("INITIAL_GENESIS_REQUIRED")
+                if isinstance(exc.__cause__, FileExistsError):
+                    return refused("CANONICAL_BUSY")
+                return refused("CANONICAL_INVALID")
+        return _initial_result("unknown", code="INITIAL_CREATION_PUBLICATION_UNKNOWN", cid=cid, event_id=identifier)
+
+
+_DECISION_ERRORS = {
+    "INVALID_DECISION_INPUT": "invalid decision command",
+    "HOST_AUTHORITY_UNAVAILABLE": "protected host authority is unavailable",
+    "UNAUTHORIZED_ROLE": "decision requires a current ROOT HostInvocation",
+    "STALE_INVOCATION": "decision invocation is stale",
+    "SOURCE_MISMATCH": "protected canonical source binding mismatch",
+    "REQUEST_HASH_MISMATCH": "request sha256 mismatch",
+    "UNKNOWN_REQUEST": "unknown request id",
+    "BOUNDED_AUTHORITY_EXPIRED": "bounded authority expired",
+    "REPLAY_CONFLICT": "event id conflicts with different decision payload",
+    "DECISION_CONFLICT": "decision requires an authority request and a valid first approve/deny or approve-to-deny transition",
+    "CAP_REACHED": "actor cumulative active cap reached",
+    "CANONICAL_WRITER_BUSY": "mailbox writer is busy; inspect an abandoned lock before retrying",
+    "PUBLICATION_UNKNOWN": "canonical decision publication is unresolved",
+}
+
+
+def _decision_correlations(command):
+    if type(command) is not dict or not all(type(key) is str for key in command):
+        return {name: None for name in ("event_id", "request_id", "request_sha256")}
+    result = {}
+    for name, pattern in (("event_id", SLUG), ("request_id", SLUG), ("request_sha256", SHA256)):
+        value = command.get(name)
+        result[name] = value if type(value) is str and pattern.fullmatch(value) is not None else None
+    return result
+
+
+def _decision_command(command):
+    if (type(command) is not dict or not all(type(key) is str for key in command)
+            or set(command) != {"event_id", "request_id", "request_sha256", "decision", "reason"}
+            or any(value is None for value in _decision_correlations(command).values())):
+        return None
+    decision, reason = command["decision"], command["reason"]
+    if (type(decision) is not str or decision not in {"approve", "deny"}
+            or type(reason) is not str or not 0 < len(reason) <= 1024 or "\x00" in reason):
+        return None
+    return dict(command)
+
+
+def _decision_result(command, state, code=None, receipt=None):
+    reasons = {"recorded": "canonical decision recorded", "recovered": "original canonical receipt recovered"}
+    return {"schema": "aegis.protected-decision-commit/v1", "state": state,
+            "effect": {"recorded": "canonical_decision", "recovered": "none",
+                       "refused": "none", "unknown": "possible"}[state],
+            "code": code, "reason": _DECISION_ERRORS[code] if code else reasons[state],
+            **_decision_correlations(command), "receipt": copy.deepcopy(receipt), "native_qualified": False}
+
+
+class ProtectedCanonicalDecisionWriter:
+    """One protected decision transaction; results are data, never runtime grants."""
+
+    def __init__(self, root, authority):
+        self.root, self._authority = safe_path(root), authority
+        # Retain the actual exception for the protected host's diagnostics only.
+        # This is neither a second journal nor evidence authorizing another call.
+        self._last_failure = None
+
+    def commit_decision(self, invocation, command):
+        from tools import hierarchy_host_authority as host
+
+        supplied = command
+        command = _decision_command(supplied)
+        if command is None:
+            return _decision_result(supplied, "refused", "INVALID_DECISION_INPUT")
+        if type(self._authority) is not host.HostAuthority:
+            return _decision_result(command, "refused", "HOST_AUTHORITY_UNAVAILABLE")
+        if type(invocation) is not host.HostInvocation:
+            return _decision_result(command, "refused", "UNAUTHORIZED_ROLE")
+        possible = False
+        self._last_failure = None
+
+        def refused(code):
+            return _decision_result(command, "refused", code)
+
+        try:
+            with self._authority.effect_fence(invocation, "decision"):
+                if self.root != self._authority.canonical_root:
+                    return refused("SOURCE_MISMATCH")
+                with writer_lock(self.root):
+                    reader = Lifecycle(self.root)
+                    policy, state = reader.load()
+                    # Neither an unknown target nor an original receipt may be
+                    # disclosed until current identity is proven under BOTH.
+                    self._authority.require_current(invocation, policy, state, None)
+                    self._authority.require_decision_command(invocation, command)
+                    if invocation.event_id != command["event_id"]:
+                        return refused("STALE_INVOCATION")
+                    recovery = invocation.decision_recovery_event_id
+                    if recovery is not None and (type(recovery) is not str
+                            or SLUG.fullmatch(recovery) is None or recovery != command["event_id"]):
+                        return refused("STALE_INVOCATION")
+                    previous = state["receipts"].get(command["event_id"])
+                    if previous is not None:
+                        record = load_json(self.root / "events" / ("%06d.json" % previous["sequence"]))
+                        original = record["envelope"]
+                        require(record["sequence"] == previous["sequence"]
+                                and record["event_sha256"] == previous["event_sha256"]
+                                and digest(original) == previous["event_sha256"]
+                                and original["id"] == command["event_id"], "original decision receipt differs")
+                        event = original["event"]
+                        if event["type"] != "decision":
+                            return refused("REPLAY_CONFLICT")
+                        row = state["requests"].get(event["request_id"])
+                        require(row is not None, "original decision request is unavailable")
+                        # Guard the ORIGINAL target before comparing any changed
+                        # incoming request/hash/reason or rebuilding an envelope.
+                        self._authority.require_current(invocation, policy, state, row)
+                        original_command = {"event_id": original["id"], **{
+                            key: event[key] for key in ("request_id", "request_sha256", "decision", "reason")}}
+                        if original_command != command:
+                            return refused("REPLAY_CONFLICT")
+                        answer = _decision_result(command, "recovered", receipt=previous)
+                    elif recovery is not None:
+                        # The actual source-owned original-only mode never
+                        # falls through to NEW, including a missing original.
+                        return _decision_result(command, "unknown", "PUBLICATION_UNKNOWN")
+                    else:
+                        row = state["requests"].get(command["request_id"])
+                        if row is None:
+                            return refused("UNKNOWN_REQUEST")
+                        self._authority.require_current(invocation, policy, state, row)
+                        if row["raw"]["sha256"] != command["request_sha256"]:
+                            return refused("REQUEST_HASH_MISMATCH")
+                        value = row["request"]
+                        prior = [item for item in state["decisions"] if item["request_id"] == value["id"]]
+                        if (value["authority"] != value["id"] or prior and not (
+                                prior[-1]["decision"] == "approve" and command["decision"] == "deny")):
+                            return refused("DECISION_CONFLICT")
+                        at, cid = timestamp(), invocation.actor_cid
+                        actor = policy["actors"][cid]
+                        if active_seconds(state, cid, at) >= actor["cap_seconds"]:
+                            return refused("CAP_REACHED")
+                        if (command["decision"] == "approve"
+                                and parse_time(at) >= parse_time(value["continuation"]["expires_at"])):
+                            return refused("BOUNDED_AUTHORITY_EXPIRED")
+                        require(state["sequence"] < MAX_EVENTS, "lifecycle event limit reached")
+                        root = state["current"]["root"]
+                        envelope = {"id": command["event_id"], "actor": cid, "generation": actor["generation"],
+                                    "custody": {"cid": root, "generation": policy["actors"][root]["generation"]},
+                                    "event": {"type": "decision", **{key: command[key] for key in (
+                                        "request_id", "request_sha256", "decision", "reason")}}}
+                        record = {"schema": JOURNAL, "sequence": state["sequence"] + 1,
+                                  "previous": state["head"], "policy_sha256": digest(policy), "at": at,
+                                  "envelope": envelope, "event_sha256": digest(envelope)}
+                        reduce_event(policy, state, envelope, at)
+                        self._authority.require_current(invocation, policy, state, row)
+                        possible = True  # Before the first possible publication.
+                        publish_file(self.root / "events" / ("%06d.json" % record["sequence"]),
+                                     encoded(record) + b"\n", limit=MAX_BYTES)
+                        sync_directory(self.root / "events")
+                        receipt = reader.finish(state, record)
+                        self._authority.require_current(invocation, policy, state, row)
+                        answer = _decision_result(command, "recorded", receipt=receipt)
+                # Publication, canonical unlock and this final original-budget
+                # check are inside the same uncertainty handling scope.
+                self._authority.require_current(invocation, policy, state, None)
+            # The H guard exit is also complete before returning known data.
+            return answer
+        except host.HostAuthorityError as exc:
+            self._last_failure = exc
+            if not possible:
+                mappings = {
+                    "UNSUPPORTED_HOST": "HOST_AUTHORITY_UNAVAILABLE",
+                    "UNPROTECTED_DEPLOYMENT": "HOST_AUTHORITY_UNAVAILABLE",
+                    "HOST_PROFILE_UNQUALIFIED": "HOST_AUTHORITY_UNAVAILABLE",
+                    "CANONICAL_API_UNAVAILABLE": "HOST_AUTHORITY_UNAVAILABLE",
+                    "HOST_PROTOCOL_ERROR": "STALE_INVOCATION", "HOST_PROTOCOL_TIMEOUT": "STALE_INVOCATION",
+                    "HOST_CALL_CONFLICT": "STALE_INVOCATION", "STALE_INVOCATION": "STALE_INVOCATION",
+                    "ROLE_OPERATION_FORBIDDEN": "UNAUTHORIZED_ROLE", "CANONICAL_CORRELATION_MISMATCH": "SOURCE_MISMATCH",
+                    "PROVIDER_OUTCOME_UNKNOWN": "UNAUTHORIZED_ROLE", "PROVIDER_HANDLE_INVALID": "UNAUTHORIZED_ROLE",
+                    "HISTORY_CURSOR_INVALID": "UNAUTHORIZED_ROLE"}
+                return refused(mappings[exc.code])
+        except Exception as exc:
+            self._last_failure = exc
+            if not possible and isinstance(exc, ValueError) and isinstance(exc.__cause__, FileExistsError):
+                return refused("CANONICAL_WRITER_BUSY")
+        return _decision_result(command, "unknown", "PUBLICATION_UNKNOWN")
 
 
 def initialize(root, policy):
