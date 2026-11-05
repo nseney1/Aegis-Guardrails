@@ -19,7 +19,7 @@ yaml = pytest.importorskip("yaml")
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 GITHUB = os.path.join(REPO_ROOT, ".github")
 WORKFLOWS = os.path.join(GITHUB, "workflows")
-WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml")
+WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml", "wave-tests.yml")
 SHA_REF = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 PINNED_LINE = re.compile(r"uses:\s*[^@\s]+@[0-9a-f]{40}\s+#\s*v\d+\.\d+\.\d+\s*$")
 
@@ -86,6 +86,26 @@ def test_wave_prs_keep_governance_while_full_validation_runs_on_develop_and_down
             assert step.get("if") == FULL_VALIDATION, step
     governance = _triggers(_load("aegis-governance.yml"))
     assert governance == {"pull_request_target": {"branches": ["main", "develop", "release/**"]}}
+
+
+def test_wave_tests_run_pull_requests_into_develop_without_secrets():
+    """Owner decision 2026-11-05: execute tests on wave PRs, with nothing to leak."""
+    workflow = _load("wave-tests.yml")
+    assert _triggers(workflow) == {"pull_request": {"branches": ["develop"]}}
+    assert workflow["permissions"] == {"contents": "read"}
+    text = _read("wave-tests.yml")
+    for forbidden in ("${{ secrets", "github.token", "GH_TOKEN", "pull_request_target", "id-token",
+                      "actions/cache", "upload-artifact"):
+        assert forbidden not in text, forbidden
+    for job in workflow["jobs"].values():
+        assert "permissions" not in job, "jobs inherit the read-only token"
+        for checkout in _step_using(job, "actions/checkout"):
+            assert checkout["with"]["persist-credentials"] is False
+        for setup in _step_using(job, "actions/setup-python"):
+            assert "cache" not in setup.get("with", {}), "no cache a pull request could poison"
+    # PRs into main and release/** keep the full Validate run; wave PRs keep its
+    # base-sourced required check (see the test above).
+    assert "main" not in _triggers(workflow)["pull_request"]["branches"]
 
 
 @pytest.mark.parametrize("expected,actual,passed", [
