@@ -196,13 +196,24 @@ def read_stdin_json():
     return strict_json(raw.decode("utf-8"))
 
 
+# The endpoint grammar and vertical routes. tools/hierarchy_templates/role-registry.json records the same
+# values per role, and hierarchy_roles.py refuses to load when the two disagree. They stay constants here
+# because the native foundation acceptance pins this file and imports it with no other files present.
+ENDPOINT_ROLES = ("front-door", "orchestrator", "root", "lane", "router", "decider")
+LANE_KINDS = ("implementer", "integrator", "reviewer")
+VERTICAL_ROUTES = (("front-door", "orchestrator"), ("orchestrator", "lane"), ("orchestrator", "root"),
+                   ("router", "root"), ("router", "orchestrator"), ("decider", "orchestrator"), ("decider", "root"))
+# Only these roles have counterparts in other hierarchies, each with its own shared folder.
+ACROSS_ROLES = ("front-door", "orchestrator", "lane")
+
+
 def endpoint_parts(endpoint):
     require(isinstance(endpoint, str), "invalid endpoint")
     parts = endpoint.split("/")
     require(len(parts) in (2, 3), "invalid endpoint")
     matching(parts[0], SLUG, "hierarchy")
     require(parts[0] not in {"across", "bindings"}, "reserved hierarchy name")
-    require(parts[1] in {"front-door", "orchestrator", "root", "lane"}, "invalid endpoint role")
+    require(parts[1] in ENDPOINT_ROLES, "invalid endpoint role")
     require((parts[1] == "lane") == (len(parts) == 3), "invalid endpoint")
     if len(parts) == 3:
         matching(parts[2], SLUG, "lane id")
@@ -221,8 +232,7 @@ def validate_manifest(manifest):
         hierarchies.add(parts[0])
         if parts[1] == "lane":
             fields(definition, {"kind"})
-            require(isinstance(definition["kind"], str) and definition["kind"] in {"implementer", "integrator", "reviewer"},
-                    "invalid lane kind")
+            require(isinstance(definition["kind"], str) and definition["kind"] in LANE_KINDS, "invalid lane kind")
         else:
             fields(definition, set())
     for hierarchy in hierarchies:
@@ -237,6 +247,7 @@ def validate_manifest(manifest):
         left, right = (endpoint_parts(p) for p in pair)
         require("root" not in (left[1], right[1]), "root endpoints cannot be counterparts")
         require(left[0] != right[0] and left[1] == right[1], "counterparts must have the same role across hierarchies")
+        require(left[1] in ACROSS_ROLES, "only front doors, orchestrators and lanes can be counterparts")
         require(not any(p in paired for p in pair), "endpoint has more than one counterpart")
         paired.update(pair)
     return manifest
@@ -328,8 +339,7 @@ class Mailbox:
         self.endpoint(sender)
         self.endpoint(recipient)
         left, right = endpoint_parts(sender), endpoint_parts(recipient)
-        vertical = left[0] == right[0] and {left[1], right[1]} in (
-            {"front-door", "orchestrator"}, {"orchestrator", "lane"}, {"orchestrator", "root"})
+        vertical = left[0] == right[0] and any({left[1], right[1]} == set(pair) for pair in VERTICAL_ROUTES)
         across = any({sender, recipient} == set(pair) for pair in self.manifest["counterparts"])
         require(vertical or across, "route is not vertical or an explicit counterpart")
         return self.root / ("across" if across else right[0]) / right[1]
@@ -496,7 +506,7 @@ class Mailbox:
         records = {}
         folders = {self.root / endpoint.split("/")[0] / endpoint.split("/")[1]
                    for endpoint in self.manifest["endpoints"]}
-        folders |= {self.root / "across" / role for role in ("front-door", "orchestrator", "lane")}
+        folders |= {self.root / "across" / role for role in ACROSS_ROLES}
         for folder in sorted(folders):
             safe_path(folder)
             for path in sorted(folder.iterdir()):
@@ -1099,7 +1109,7 @@ def initialize(root, request):
     with writer_lock(root):
         for endpoint in request["endpoints"]:
             (root / endpoint.split("/")[0] / endpoint.split("/")[1]).mkdir(parents=True, exist_ok=True, mode=0o700)
-        for role in ("front-door", "orchestrator", "lane"):
+        for role in ACROSS_ROLES:
             (root / "across" / role).mkdir(parents=True, mode=0o700)
         publish_file(root / "manifest.json", encoded(request) + b"\n")
     return {"root": str(root), "manifest_sha256": digest(request), "authority": "information_only"}

@@ -39,15 +39,9 @@ WORKSPACE_TOOL_SPECS = {
 
 
 def role_workspace_tools(mailbox, endpoint):
-    """Read-only views by role. Reviewers get none, and grants are never offered to any role."""
-    role = endpoint_parts(endpoint)[1]
-    if role == "orchestrator":
-        return ("workspace_capacity", "workspace_initiative")
-    if role == "front-door":
-        return ("workspace_initiative",)
-    if mailbox.endpoint(endpoint).get("kind") in ("implementer", "integrator"):
-        return ("workspace_path_overlap",)
-    return ()
+    """Read-only views the registry gives this role. Grants are never offered to any role."""
+    import hierarchy_roles
+    return hierarchy_roles.workspace_tools(hierarchy_roles.role(endpoint, mailbox.endpoint(endpoint).get("kind")))
 
 
 def definitions(extra=(), board_specs=None):
@@ -190,7 +184,7 @@ class Connection:
         self.initiative = initiative
         self.workspace_tools = ()
         if workspace_store is not None:
-            # Imported only when configured, so the default adapter needs just the two mailbox files.
+            # Imported only when configured, so a mailbox-only adapter does not load the workspace store.
             import hierarchy_workspace
             self.workspace = hierarchy_workspace
             self.store = hierarchy_workspace.Store(workspace_store)

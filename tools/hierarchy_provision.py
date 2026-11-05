@@ -40,6 +40,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import role_workspace_tools  # noqa: E402
+import hierarchy_roles  # noqa: E402
 from hierarchy_workspace import Store, validate_initiative  # noqa: E402
 
 
@@ -50,9 +51,11 @@ CODEX = "codex-cli"
 # A thread hosted by Codex's app server. Root creates and messages it, so it has no wake profile.
 NATIVE = "codex"
 RECENT_MESSAGES = 20
-LANE_KINDS = {"implementer", "integrator", "reviewer"}
-READ_TOOLS = ["Read", "Glob", "Grep"]
-WRITE_TOOLS = ["Edit", "Write"]
+LANE_KINDS = set(hierarchy_roles.LANE_KINDS)
+READ_TOOLS = hierarchy_roles.READ_TOOLS
+WRITE_TOOLS = hierarchy_roles.WRITE_TOOLS
+# Endpoints init can add beyond the front door, orchestrator and root every initiative has.
+OPTIONAL_ROLES = ("router", "decider")
 SUPPORTED_TOOLS = set(READ_TOOLS + WRITE_TOOLS)
 MAILBOX_TOOLS = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff"]
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -71,7 +74,7 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
 # Generic levels from ADR-TEAM-CONFIG-20261102. Claude has no "ultra" effort: it runs max with ultracode on.
 TEAM_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
-TEAM_KINDS = LANE_KINDS | {"orchestrator"}
+TEAM_KINDS = hierarchy_roles.team_kinds()
 
 
 def git(cwd, *arguments):
@@ -93,13 +96,16 @@ def pin_source(source):
 
 
 def init(request):
-    fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python", "board"})
+    fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python", "board", "roles"})
     base = safe_path(text(request["base"], "base"))
     lanes = request["lanes"]
     require(isinstance(lanes, dict) and lanes, "invalid lanes")
     for lane, kind in lanes.items():
         matching(lane, SLUG, "lane id")
         require(isinstance(kind, str) and kind in LANE_KINDS, "invalid lane kind")
+    roles = request.get("roles", [])
+    require(isinstance(roles, list) and len(roles) == len(set(roles)) and all(r in OPTIONAL_ROLES for r in roles),
+            "roles may list only " + " and ".join(OPTIONAL_ROLES) + ", once each")
     initiative = request["initiative"]
     fields(initiative, {"id", "project", "repository", "priority", "target_branch"},
            {"touched_paths", "blocked_by", "checkouts", "lanes", "source"})
@@ -114,6 +120,7 @@ def init(request):
     store = Store(text(request["store"], "store"))
     hierarchy = initiative["id"]
     endpoints = {hierarchy + "/front-door": {}, hierarchy + "/orchestrator": {}, hierarchy + "/root": {}}
+    endpoints.update({hierarchy + "/" + role: {} for role in roles})
     endpoints.update({hierarchy + "/lane/" + lane: {"kind": kind} for lane, kind in lanes.items()})
     record_path = base / "provision.json"
     store.load()  # A missing store is reported as such, before the lock would fail on its absent folder.
@@ -169,9 +176,13 @@ def board_args(setup, endpoint, host, session, generation):
             "--board", setup["board"]]
 
 
+def registry_role(mailbox, endpoint):
+    return hierarchy_roles.role(endpoint, mailbox.endpoint(endpoint).get("kind"))
+
+
 def takes_board(setup, mailbox, endpoint):
-    # A reviewer's verdict stays independent, so it reads the source and not the other roles' posts.
-    return "board" in setup and mailbox.endpoint(endpoint).get("kind") != "reviewer"
+    # The registry keeps the board from roles whose verdict must stay independent of the other roles' posts.
+    return "board" in setup and hierarchy_roles.takes_board(registry_role(mailbox, endpoint))
 
 
 def toml_list(values):
@@ -300,22 +311,19 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants, 
 
 
 def role_tools(endpoint, mailbox, requested):
-    parts = endpoint_parts(endpoint)
-    writer = mailbox.endpoint(endpoint).get("kind") in ("implementer", "integrator")
+    entry = registry_role(mailbox, endpoint)
+    writer = hierarchy_roles.writer(entry)
     if requested is not None:
         names = [name for name in text(requested, "tools").split(",") if name]
         for name in names:
             require(name in SUPPORTED_TOOLS, "unsupported tool: " + name)
         return names, writer
-    if parts[1] == "front-door":
-        return [], writer
-    return READ_TOOLS + (WRITE_TOOLS if writer else []), writer
+    return hierarchy_roles.file_tools(entry), writer
 
 
 def assistant_catalog(setup, endpoint, mailbox):
-    parts = endpoint_parts(endpoint)
-    kind = mailbox.endpoint(endpoint).get("kind")
-    name = parts[1] if parts[1] != "lane" else {"implementer": "builder", "integrator": "builder", "reviewer": "reviewer"}[kind]
+    name = registry_role(mailbox, endpoint)["provision"]["assistants"]
+    require(name is not None, "no assistant list for this role")
     catalog = Path(setup["source"]) / "tools" / "hierarchy_templates" / "claude-agents" / ("assistants-" + name + ".json")
     require(catalog.is_file(), "no assistant list for this role")
     return str(catalog)
@@ -323,9 +331,9 @@ def assistant_catalog(setup, endpoint, mailbox):
 
 def check_codex_options(request, mailbox, endpoint, host):
     """Real lanes run with these. Each is for one kind of role, so none can widen another role by mistake."""
-    kind = mailbox.endpoint(endpoint).get("kind")
-    writer = kind in ("implementer", "integrator")
-    reader = kind == "reviewer" or endpoint_parts(endpoint)[1] == "orchestrator"
+    entry = registry_role(mailbox, endpoint)
+    writer = hierarchy_roles.writer(entry)
+    reader = entry["provision"]["reader_shell"]
     if "reader_shell" in request:
         # Codex has no file tools without its shell, so a reader of files needs one. Its sandbox stays
         # read-only with no network, and a writer already has the shell it needs.
@@ -479,7 +487,7 @@ def codex_start(request):
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
     options, team = team_settings(base, CODEX, request, role_kind(mailbox, request["endpoint"]))
-    writer = mailbox.endpoint(request["endpoint"]).get("kind") in ("implementer", "integrator")
+    writer = hierarchy_roles.writer(registry_role(mailbox, request["endpoint"]))
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     if not request.get("skip_git_repo_check"):
         require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
