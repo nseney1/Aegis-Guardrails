@@ -62,7 +62,7 @@
     "tools/hierarchy_lifecycle.py": "d8bfdb5b54c99581aabd897c6276b593f790160b86a5da28512a28c16d3b81a9",
     "tools/hierarchy_native_protocol.py": "7703696341a2861b08bb22c82127b84e3e79c0ebef92e575df716d2bdc953a02",
     "tools/hierarchy_operator.py": "d95c797a55138f6563843ab3ab727d3d11cdbf432e39d881300c68f34a34df03",
-    "tools/hierarchy_wake.py": "f42a4433a05ac7bd8566cbd99711d0bcdfe38f8af0c0a76a9057a0d0ae2a941c",
+    "tools/hierarchy_wake.py": "0bcf061f1b3b4b1159efba7e1233c5d2fc53b06dbb08528f8c72c497d443d3b5",
     "tools/hierarchy_watch_bridge.py": "b6dc3a9b2d9abbab2e5b36aff197934e043f6fd25a31625851afd314d0976b2f",
     "tools/hierarchy_watch_supervisor.py": "d1a569fea5e359590a0159fa779a20979191a71b1df6d29e7b7c531c38a35903"
   }

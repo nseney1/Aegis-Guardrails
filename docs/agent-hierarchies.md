@@ -242,11 +242,11 @@ or the Claude session table lists it as live, stops the turn's whole process gro
 before reporting, and exits 0 only if the messages were read, 3 if they were not, and
 2 if it refused. Use `--dry-run` to see what would happen. It supports POSIX only.
 
-A wake and a replacement cannot overlap. The wake rechecks the binding under the mailbox
-writer lock immediately before launching, so it never starts a session that was just
-replaced. It then holds a `.wake-<endpoint>.lock` file in the mailbox root until the turn
-ends, and `bind` refuses while that file exists. Other mailbox writes keep working during
-the turn. A crashed wake leaves the file behind, which blocks wakes and replacements for
+A wake and a replacement cannot overlap. Under the mailbox writer lock, the wake rechecks the
+binding and creates a `.wake-<endpoint>.lock` file in the mailbox root, so it never starts a
+session that was just replaced. It releases the writer lock before launching, so the session
+can read its mail at once, and holds the wake file until the turn ends; `bind` refuses while
+that file exists. Other mailbox writes keep working during the turn. A crashed wake leaves the file behind, which blocks wakes and replacements for
 that endpoint. Check that its process has stopped before removing the file.
 
 Each endpoint keeps at most 10,000 read receipts and 10,000 wake receipts. A full ledger

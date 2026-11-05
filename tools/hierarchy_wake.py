@@ -488,26 +488,27 @@ def wake(root, directory, endpoint, profile_path, dry_run=False):
         return 3, {**answer, "state": "failed_to_start", "error": reason, "exit_code": None, "timed_out": False,
                    "read": [], "still_unread": identifiers}
 
-    # bind takes this same lock, so a replacement cannot slip between this check and the launch. The
-    # marker then blocks bind until the turn ends, and the lock is released so writers keep working.
+    # bind takes this same lock, so a replacement cannot slip between this check and the marker. The
+    # marker then blocks bind until the turn ends. The host starts only after the lock is released: the
+    # lock refuses at once when held, so a host that read its mail before the release was refused.
     with writer_lock(root):
         current = Mailbox(root).current_binding(endpoint)
         require(all(profile[key] == current[key] for key in ("host", "session", "generation")),
                 "binding changed before launch; the outgoing session was not started")
         marker = claim_wake(mailbox, endpoint)
+    if not background:
         failure = None
-        if not background:
+        try:
+            process, log = start_turn(profile, delivery_root / "wake-logs" / endpoint, wake_id)
+        except OSError as exc:
+            failure = failed_start(str(exc))
+        else:
             try:
-                process, log = start_turn(profile, delivery_root / "wake-logs" / endpoint, wake_id)
-            except OSError as exc:
-                failure = failed_start(str(exc))
-            else:
-                try:
-                    # Recorded only once a process exists, because launch intent is not launch evidence.
-                    mailbox.write_delivery_receipt(directory, "wakes", {**base, "wake_id": wake_id, "state": "started"})
-                except (ValueError, OSError) as exc:
-                    abandon_turn(process)
-                    failure = failed_start("could not record the start: " + str(exc), record=False)
+                # Recorded only once a process exists, because launch intent is not launch evidence.
+                mailbox.write_delivery_receipt(directory, "wakes", {**base, "wake_id": wake_id, "state": "started"})
+            except (ValueError, OSError) as exc:
+                abandon_turn(process)
+                failure = failed_start("could not record the start: " + str(exc), record=False)
         if failure is not None:
             marker.unlink()
             return failure
