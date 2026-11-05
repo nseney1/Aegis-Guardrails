@@ -1136,6 +1136,8 @@ def main(argv=None):
     server.add_argument("--workspace-store", default=None, help="Offer this role's read-only workspace views")
     server.add_argument("--initiative", default=None, help="The initiative these views belong to")
     server.add_argument("--board", default=None, help="Serve only the workspace board tools, from this board folder")
+    server.add_argument("--lifecycle", default=None, help="ROOT only: the lifecycle journal its decisions go to")
+    server.add_argument("--actor", default=None, help="ROOT only: its configured lifecycle actor; not authenticated")
     args = parser.parse_args(argv)
     try:
         root = cli_path(args.root, "--root")
@@ -1152,8 +1154,10 @@ def main(argv=None):
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from hierarchy_mailbox_mcp import serve
 
+            lifecycle = cli_path(args.lifecycle, "--lifecycle") if args.lifecycle is not None else None
             return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir,
-                         workspace_store=args.workspace_store, initiative=args.initiative, board=args.board)
+                         workspace_store=args.workspace_store, initiative=args.initiative, board=args.board,
+                         lifecycle=lifecycle, actor=args.actor)
         if args.command == "init":
             result = initialize(root, read_json(args.request))
         elif args.command == "draft-handoff":

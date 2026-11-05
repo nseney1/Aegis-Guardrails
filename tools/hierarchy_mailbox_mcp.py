@@ -2,13 +2,14 @@
 
 Launch through hierarchy_mailbox.py serve, which supports isolated Python imports.
 The configured sender is provenance, not an authenticated native host identity.
+ROOT gets only a decision adapter over the lifecycle journal, never the mailbox tools.
 """
 import json
 import os
 import sys
 
 from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, endpoint_parts, fields, integer, matching,
-                               require, SHA256, strict_json, text, writer_lock)
+                               require, SHA256, SLUG, strict_json, text, writer_lock)
 
 
 def _response_line(response):
@@ -81,13 +82,101 @@ def definitions(extra=(), board_specs=None):
             for name, readonly, description, props, required in specs]
 
 
+MAILBOX_INSTRUCTIONS = ("File-mailbox convention only. Configured sender provenance is not authenticated identity. "
+                        "Acknowledgments confer no approval, membership, execution proof or fitness credit.")
+ROOT_ONLY_ADAPTER = ("ROOT takes only the decision adapter: give --lifecycle and --actor; "
+                     "operational controller access is forbidden")
+DECISION_TOOL = "root_decide"
+DECISION_SPEC = (
+    "Record ROOT's approve or deny on an existing canonical request in the lifecycle journal, under this "
+    "connection's configured ROOT actor. The actor is configuration, not an authenticated identity. Approval is "
+    "not admission, start, acceptance or delivery. Retrying the same event_id with the same values returns the "
+    "original receipt.",
+    {"event_id": {"type": "string", "maxLength": 80}, "request_id": {"type": "string", "maxLength": 80},
+     "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+     "decision": {"type": "string", "enum": ["approve", "deny"]}, "reason": {"type": "string", "maxLength": 1024}},
+    ["event_id", "request_id", "request_sha256", "decision", "reason"])
+
+
+class DecisionConnection:
+    """ROOT's only adapter: one tool that approves or denies a canonical request, and nothing else.
+
+    This is the configuration-bound tier of owner decision 5. The ROOT actor is whatever the connection was
+    configured with, so every answer says it is not authenticated. The strict H decision path is M4 work.
+    """
+    workspace_tools = ()
+    board_specs = {}
+    instructions = ("Decision-only ROOT adapter. The ROOT actor is configuration and is not authenticated. "
+                    "It records approve or deny in the lifecycle journal and never publishes, reads mail, "
+                    "executes, starts or stops anything.")
+
+    def __init__(self, root, endpoint, host, session, generation, lifecycle, actor):
+        import hierarchy_lifecycle
+        self.root = root
+        self.sender = {"from": endpoint, "host": host, "session": session, "binding_generation": generation}
+        self.manifest_digest = digest(Mailbox(root).manifest)
+        matching(actor, SLUG, "actor")
+        self.actor = actor
+        self.lifecycle = hierarchy_lifecycle.Lifecycle(lifecycle)
+        self.checked_mailbox()
+        self.root_actor()
+
+    def checked_mailbox(self):
+        mailbox = Mailbox(self.root)
+        require(digest(mailbox.manifest) == self.manifest_digest, "mailbox manifest changed since server startup")
+        binding = mailbox.current_binding(self.sender["from"])
+        require(all(self.sender[key] == binding[source] for key, source in (
+            ("binding_generation", "generation"), ("host", "host"), ("session", "session"))),
+                "stale or mismatched sender binding")
+        require(mailbox.ready(binding), "handoff checkpoint has not been acknowledged")
+        return mailbox
+
+    def root_actor(self):
+        policy, _ = self.lifecycle.load()
+        actor = policy["actors"].get(self.actor)
+        require(actor is not None and actor["role"] == "root",
+                "actor %s is not a ROOT actor in the lifecycle policy" % self.actor)
+        return actor
+
+    def definitions(self):
+        description, properties, required = DECISION_SPEC
+        return [{"name": DECISION_TOOL, "description": description, "annotations": {"readOnlyHint": False},
+                 "inputSchema": {"type": "object", "properties": properties, "required": required,
+                                 "additionalProperties": False}}]
+
+    def call(self, name, arguments, render=None):
+        text(name, "tool name", 128)
+        require(name == DECISION_TOOL, "unknown ROOT tool: %s; ROOT only records decisions" % name)
+        fields(arguments, set(DECISION_SPEC[2]))
+        matching(arguments["event_id"], SLUG, "event id")
+        # The journal checks the rest: that the request exists with these bytes, the decision vocabulary,
+        # the reason bound, and that this actor still holds ROOT custody.
+        # Under the mailbox lock, so a rebinding cannot land between the fence check and the record.
+        with writer_lock(self.root):
+            self.checked_mailbox()
+            actor = self.root_actor()
+            envelope = {"id": arguments["event_id"], "actor": self.actor, "generation": actor["generation"],
+                        "custody": {"cid": self.actor, "generation": actor["generation"]},
+                        "event": {"type": "decision", "request_id": arguments["request_id"],
+                                  "request_sha256": arguments["request_sha256"], "decision": arguments["decision"],
+                                  "reason": arguments["reason"]}}
+            receipt = self.lifecycle.record(envelope)
+        return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
+
+    def record_read(self):
+        pass
+
+    def record_position(self):
+        pass
+
+
 class Connection:
+    instructions = MAILBOX_INSTRUCTIONS
+
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
                  initiative=None, board=None):
-        # Owner-facing ROOT needs a separately qualified decision-only boundary.
-        # Legacy configured-sender transport cannot authenticate or provide it.
-        require(endpoint_parts(endpoint)[1] != "root",
-                "ROOT has no qualified decision adapter; operational controller access is forbidden")
+        # Owner-facing ROOT gets only the decision adapter; configured-sender mail is not a decision boundary.
+        require(endpoint_parts(endpoint)[1] != "root", ROOT_ONLY_ADAPTER)
         require(board is None or (delivery_dir is None and workspace_store is None), "a board connection takes no mailbox options")
         require((workspace_store is None) == (initiative is None),
                 "workspace store and initiative must be given together")
@@ -123,6 +212,9 @@ class Connection:
             self.board = hierarchy_board.Board(board)
             self.board.load()
             self.board_specs = hierarchy_board.TOOL_SPECS
+
+    def definitions(self):
+        return definitions(self.workspace_tools, self.board_specs)
 
     def board_call(self, name, arguments, render):
         self.checked_mailbox()
@@ -228,14 +320,13 @@ def handle(connection, request):
         connection.checked_mailbox()
         return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "aegis-hierarchy-mailbox", "version": "1"},
-                "instructions": "File-mailbox convention only. Configured sender provenance is not authenticated identity. "
-                                "Acknowledgments confer no approval, membership, execution proof or fitness credit."}
+                "instructions": connection.instructions}
     if method == "ping":
         connection.checked_mailbox()
         return {}
     if method == "tools/list":
         connection.checked_mailbox()
-        return {"tools": definitions(connection.workspace_tools, connection.board_specs)}
+        return {"tools": connection.definitions()}
     if method == "tools/call":
         fields(params, {"name"}, {"arguments", "_meta"})
         def render(page):
@@ -253,10 +344,18 @@ def handle(connection, request):
     raise ValueError("unsupported mailbox method: " + method)
 
 
-def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None, board=None):
+def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None, board=None,
+          lifecycle=None, actor=None):
     integer(generation, "binding generation")
-    connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
-                            workspace_store=workspace_store, initiative=initiative, board=board)
+    if endpoint_parts(endpoint)[1] == "root":
+        require(lifecycle is not None and actor is not None, ROOT_ONLY_ADAPTER)
+        require(delivery_dir is None and workspace_store is None and initiative is None and board is None,
+                "the ROOT decision adapter takes no mailbox, workspace or board options")
+        connection = DecisionConnection(root, endpoint, host, session, generation, lifecycle, actor)
+    else:
+        require(lifecycle is None and actor is None, "only ROOT takes --lifecycle and --actor")
+        connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
+                                workspace_store=workspace_store, initiative=initiative, board=board)
     while True:
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:

@@ -16,7 +16,7 @@ import tempfile
 
 
 MANIFEST_SHA256 = "f3f24e619b7e4d79a25522d3ec703719cc524a2866b9bf4e5ae596f628af58be"
-MAILBOX_SHA256 = "5427e46a65f109257cbfb8153dee9e29384fe1908aa516708ede776f33f3add8"
+MAILBOX_SHA256 = "1a44e1f2fe6d9ef6fbbc9f61ecfb3962a4bf08715a469ac2365603221fc46690"
 # Separately reviewed fixture successor; the corpus retains its historical pins.
 WATCH_TEST_SHA256 = "cf5df318f327c2f0b535b4bc9dadbef9d2c730d61aa287f57e95e201071155f9"
 MAX_FILE = 1048576

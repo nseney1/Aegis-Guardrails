@@ -280,7 +280,8 @@ def test_root_gets_no_legacy_mailbox_adapter_or_operational_controller_authority
                             input="", capture_output=True, text=True, timeout=15,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2
-    assert json.loads(result.stdout)["error"] == "ROOT has no qualified decision adapter; operational controller access is forbidden"
+    assert json.loads(result.stdout)["error"] == ("ROOT takes only the decision adapter: give --lifecycle and --actor; "
+                                                  "operational controller access is forbidden")
 
 
 def test_stored_job_messages_survive_a_fresh_read(team):
