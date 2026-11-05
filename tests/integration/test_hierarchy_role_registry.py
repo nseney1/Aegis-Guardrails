@@ -334,6 +334,7 @@ def test_the_router_always_runs_at_its_registry_effort(setup):
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
     assert argv[argv.index("--effort") + 1] == "medium"
     assert role["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast", "tier_applied": False}
+    assert "codex_profile" not in role and not any("service_tier" in word for word in argv), "Claude has no tier flag"
     refused = setup.add_role("pilot/router", cwd=str(setup.tmp), session=role["session"], effort="max", expect=2)
     assert refused["error"] == "the router role runs at effort medium from the role registry"
 
@@ -341,8 +342,9 @@ def test_the_router_always_runs_at_its_registry_effort(setup):
 @posix_only
 def test_codex_start_applies_the_routers_registry_effort(setup):
     started = provision("codex-start", setup.request(base=str(setup.base), endpoint="pilot/router", cwd=str(setup.source)))
-    assert codex_config(started["start_argv"])["model_reasoning_effort"] == "medium"
-    assert started["model_profile"]["effort"] == "medium"
+    config = codex_config(started["start_argv"])
+    assert config["model_reasoning_effort"] == "medium" and config["service_tier"] == "ultrafast"
+    assert started["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast", "tier_applied": True}
 
 
 @posix_only
