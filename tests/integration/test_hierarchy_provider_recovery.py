@@ -255,6 +255,7 @@ def test_unreadable_original_process_is_reported_without_capacity_release(worksp
     assert snapshot(workspace.store) == before
 
 
+@pytest.mark.skipif(os.name == "nt", reason="generated profiles and wakes are POSIX only")
 def test_real_original_mailbox_job_remains_unbound_to_provider_identity(tmp_path):
     from tests.integration.test_hierarchy_mailbox import git, invoke
     from tests.integration.test_hierarchy_provision import Setup

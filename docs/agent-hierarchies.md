@@ -664,3 +664,9 @@ Symlinks and nonregular inputs are refused. Storage runs under the same local us
 does not authenticate a host/session, and is not a hostile-process security boundary.
 Atomic visibility is not a claim of filesystem crash recovery. Local Linux checks
 establish no Windows filesystem or physical-host acceptance.
+
+The hierarchy tools are POSIX-only. Linux supports all of them. macOS supports everything
+except the job runner (`tools/hierarchy_jobs.py`), which reads `/proc` and runs recipes under
+bubblewrap. Windows supports only the core Aegis suite. Each hierarchy test that cannot run on a
+platform carries a skip marker with its reason, and CI runs the Linux legs with bubblewrap
+installed and probed. See [Platforms and CI](../CONTRIBUTING.md#platforms-and-ci).

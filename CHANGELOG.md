@@ -37,7 +37,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 - Native Rust replaces the shipped `rust_ast.py` template. Exact legacy Rust selectors and unedited staged copies are retired during migration; custom commands and the Go opt-in are preserved.
 - Project governance rules now pair focused source contracts with default-budget delivery regressions and advisory baseline coverage. Fourteen prose-only trap gates become advisory; narrowed process scopes and updated ledger/command/parity guidance require maintainer approval.
-- Wave pull requests retain base-sourced governance checks while full audit, build, test and regression validation runs on develop pushes and downstream stages.
+- Wave pull requests into develop run the whole suite on Linux 3.11 (`test-fast`, read-only token, no secrets), and the required `aegis-check` needs it to pass; their governance checks stay base-sourced. Full audit, build, matrix test and regression validation run on develop pushes, downstream stages, manual dispatch and nightly. The Linux legs install bubblewrap and fail if it cannot start, and Windows hierarchy tests that need POSIX skip with their reasons.
 
 ### Fixed
 

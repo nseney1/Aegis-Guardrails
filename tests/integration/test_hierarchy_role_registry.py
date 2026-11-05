@@ -25,6 +25,8 @@ import hierarchy_lifecycle  # noqa: E402
 import hierarchy_roles  # noqa: E402
 
 
+# Provision writes generated profiles and wakes, which are POSIX only (as in test_hierarchy_provision).
+posix_only = pytest.mark.skipif(os.name == "nt", reason="generated profiles and wakes are POSIX only")
 REGISTRY = json.loads((ROOT / "tools" / "hierarchy_templates" / "role-registry.json").read_text())
 # The roles table of the approved M1 definition (aegis-guides/v5.0-m1-definition-20261105.md).
 DEFINITION = {
@@ -166,6 +168,7 @@ def mail(sender, recipient, **extra):
     return {**message(sender, recipient, **extra), "host": "h", "session": sender.replace("/", "-")}
 
 
+@posix_only
 def test_init_adds_router_and_decider_only_when_asked(tmp_path, setup):
     manifest = json.loads((setup.root / "manifest.json").read_text())
     assert {"pilot/router", "pilot/decider"} <= set(manifest["endpoints"])
@@ -175,6 +178,7 @@ def test_init_adds_router_and_decider_only_when_asked(tmp_path, setup):
     assert not {"pilot/router", "pilot/decider"} & set(json.loads((plain.root / "manifest.json").read_text())["endpoints"])
 
 
+@posix_only
 @pytest.mark.parametrize("roles,error", [
     (["router", "router"], "roles may list only router and decider, once each"),
     (["reviewer"], "roles may list only router and decider, once each"),
@@ -186,6 +190,7 @@ def test_init_refuses_other_optional_roles(tmp_path, roles, error):
     assert not built.base.exists()
 
 
+@posix_only
 @pytest.mark.parametrize("endpoint,tools,extra", [
     ("pilot/router", "--tools=", set()),
     ("pilot/decider", "--tools=Read,Glob,Grep", set()),
@@ -199,6 +204,7 @@ def test_router_and_decider_get_only_mail_and_their_file_tools(setup, endpoint, 
     assert start_connection(role["connection"]) == MAILBOX_TOOLS | extra
 
 
+@posix_only
 @pytest.mark.parametrize("endpoint", ["pilot/router", "pilot/decider"])
 def test_router_and_decider_run_read_only_on_codex_without_a_shell(setup, endpoint):
     role = setup.add_role(endpoint, "codex-cli", session="01a19a29-d635-7411-8529-9efedafc0899", cwd=str(setup.source))
@@ -208,6 +214,7 @@ def test_router_and_decider_run_read_only_on_codex_without_a_shell(setup, endpoi
     assert set(codex_config(argv)["mcp_servers"]["aegis_mailbox"]["enabled_tools"]) == MAILBOX_TOOLS
 
 
+@posix_only
 @pytest.mark.parametrize("endpoint,change,error", [
     ("pilot/router", {"reader_shell": True}, "reader_shell is only for a Codex reviewer, orchestrator or decider"),
     ("pilot/router", {"writable_roots": []}, "writable_roots is only for a Codex writer"),
@@ -218,11 +225,13 @@ def test_router_and_decider_cannot_widen_their_codex_sandbox(setup, endpoint, ch
     assert refused["error"] == error
 
 
+@posix_only
 @pytest.mark.parametrize("endpoint", ["pilot/router", "pilot/decider"])
 def test_router_and_decider_have_no_assistants(setup, endpoint):
     assert setup.add_role(endpoint, cwd=str(setup.tmp), assistants=True, expect=2)["error"] == "no assistant list for this role"
 
 
+@posix_only
 @pytest.mark.parametrize("kind,accepted", [("decider", True), ("router", False)])
 def test_team_reasoning_covers_the_decider_but_not_the_global_router(setup, kind, accepted):
     (setup.base / "team.json").write_text(json.dumps({"model": "claude-opus-5-5", "reasoning": "high",
@@ -236,6 +245,7 @@ def test_team_reasoning_covers_the_decider_but_not_the_global_router(setup, kind
 
 # ROOT itself never sends: its only adapter records decisions. These routes let the Router and the
 # Decider reach it; the mailbox CLI on root's endpoint is an operator tool, not a ROOT session.
+@posix_only
 @pytest.mark.parametrize("sender,recipient", [
     ("pilot/router", "pilot/root"),
     ("pilot/router", "pilot/orchestrator"), ("pilot/orchestrator", "pilot/router"),
@@ -248,6 +258,7 @@ def test_router_and_decider_routes(setup, sender, recipient):
     assert [row["message"]["message_id"] for row in invoke(setup.root, "inbox", endpoint=recipient)["messages"]] == ["dispatch-1"]
 
 
+@posix_only
 @pytest.mark.parametrize("sender,recipient", [
     ("pilot/router", "pilot/lane/f2"), ("pilot/lane/f2", "pilot/router"), ("pilot/decider", "pilot/lane/review"),
     ("pilot/router", "pilot/decider"), ("pilot/front-door", "pilot/router"), ("pilot/decider", "pilot/front-door"),
@@ -258,6 +269,7 @@ def test_router_and_decider_cannot_reach_lanes_or_each_other(setup, sender, reci
     assert refused["error"] == "route is not vertical or an explicit counterpart"
 
 
+@posix_only
 @pytest.mark.parametrize("sender,kind,error", [
     ("pilot/router", "job_request", "only an orchestrator can request a job from its own root"),
     ("pilot/decider", "job_request", "only an orchestrator can request a job from its own root"),
@@ -281,6 +293,7 @@ def test_router_decider_and_root_cannot_be_counterparts(tmp_path, role):
                        else "only front doors, orchestrators and lanes can be counterparts")
 
 
+@posix_only
 def test_the_router_cannot_reach_the_decision_adapter(setup):
     bind_all(setup)
     result = subprocess.run([sys.executable, "-I", str(setup.source / "tools" / "hierarchy_mailbox.py"), "--root",
@@ -292,6 +305,7 @@ def test_the_router_cannot_reach_the_decision_adapter(setup):
     assert json.loads(result.stdout)["error"] == "only ROOT takes --lifecycle and --actor"
 
 
+@posix_only
 def test_a_codex_decider_may_take_a_read_only_shell_to_read_source(setup):
     role = setup.add_role("pilot/decider", "codex-cli", session="01a19a29-d635-7411-8529-9efedafc0898",
                           cwd=str(setup.source), reader_shell=True)
@@ -300,6 +314,7 @@ def test_a_codex_decider_may_take_a_read_only_shell_to_read_source(setup):
     assert "shell_tool" not in [argv[index + 1] for index, word in enumerate(argv) if word == "--disable"]
 
 
+@posix_only
 def test_the_router_always_runs_at_its_registry_effort(setup):
     (setup.base / "team.json").write_text(json.dumps({"model": "claude-opus-5-5", "reasoning": "max"}))
     role = setup.add_role("pilot/router", cwd=str(setup.tmp))
@@ -310,12 +325,14 @@ def test_the_router_always_runs_at_its_registry_effort(setup):
     assert refused["error"] == "the router role runs at effort medium from the role registry"
 
 
+@posix_only
 def test_codex_start_applies_the_routers_registry_effort(setup):
     started = provision("codex-start", setup.request(base=str(setup.base), endpoint="pilot/router", cwd=str(setup.source)))
     assert codex_config(started["start_argv"])["model_reasoning_effort"] == "medium"
     assert started["model_profile"]["effort"] == "medium"
 
 
+@posix_only
 @pytest.mark.parametrize("first,second,independent", [
     ("pilot/lane/f2", "pilot/lane/review", "pilot/lane/review"),
     ("pilot/lane/review", "pilot/lane/f2", "pilot/lane/review"),
@@ -331,6 +348,7 @@ def test_one_session_cannot_hold_both_sides_of_an_independence_rule(setup, first
     assert invoke(setup.root, "status")["bindings"][second] is None
 
 
+@posix_only
 def test_one_session_may_hold_roles_without_an_independence_rule(setup):
     session = str(uuid.uuid4())
     setup.add_role("pilot/front-door", cwd=str(setup.tmp), session=session)
@@ -343,6 +361,7 @@ def test_roles_that_must_stay_independent_of_team_posts_never_get_the_board(name
     assert "board" in entry["prohibitions"]["reads"] and not hierarchy_roles.takes_board(entry)
 
 
+@posix_only
 def test_moving_a_hierarchy_keeps_its_router_and_decider(tmp_path):
     built = Move.__new__(Move)
     Setup.__init__(built, tmp_path)

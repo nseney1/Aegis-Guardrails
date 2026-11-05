@@ -264,6 +264,7 @@ else:
     assert json.loads(result.stdout) == {"code": "FOUNDATION_SOURCE_MISMATCH"}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="foundation replay requires a POSIX host")
 def test_public_api_repeated_replay_reuses_its_verified_source_without_changing_fixtures(tmp_path):
     script = r'''
 import importlib.util,json,sys
