@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools" / "hierarchy_foundation_acceptance.py"
 CORPUS = ROOT / "tests" / "fixtures" / "hierarchy_native_foundation"
-MANIFEST_SHA256 = "f708a079afdb19edbf7ffa236956936e88a43b5114c75ccdbca9da757b7e2595"
+MANIFEST_SHA256 = "f3f24e619b7e4d79a25522d3ec703719cc524a2866b9bf4e5ae596f628af58be"
 
 
 def snapshot(root):
