@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -205,6 +206,38 @@ def test_the_router_takes_the_journal_without_an_actor_and_with_the_store(team, 
 
 
 @posix_only
+def test_a_replaced_router_session_is_refused_router_status_at_call_time(team):
+    process = subprocess.Popen(argv(team, "router", None, 1, options(team, lifecycle=True, store=True)),
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    try:
+        def status(identifier):
+            process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+                                            "params": {"name": "router_status", "arguments": {}}}) + "\n")
+            process.stdin.flush()
+            return json.loads(process.stdout.readline())
+        assert payload(status(1))["schema"] == "aegis.router-status/v1"
+        rebind(team, "router", "engine-router-2")
+        assert tool_error(status(2)) == "stale or mismatched sender binding"
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
+
+
+@posix_only
+def test_a_busy_journal_is_named_as_the_journal_in_router_status(team):
+    lock = team.ledger.path / ".write.lock"
+    lock.write_text("{}")
+    try:
+        refused = responses(serve(team, "router", [("router_status", {})], lifecycle=True, store=True))[-1]
+    finally:
+        lock.unlink()
+    assert tool_error(refused) == "lifecycle journal writer is busy; inspect an abandoned %s before retrying" % lock
+
+
+@posix_only
 def test_router_status_takes_no_arguments(team):
     refused = responses(serve(team, "router", [("router_status", {"team": "engine"})], lifecycle=True, store=True))[-1]
     assert tool_error(refused) == "unexpected fields: team"
@@ -331,6 +364,42 @@ def test_a_busy_journal_is_named_as_the_journal(team):
     finally:
         lock.unlink()
     assert tool_error(refused).startswith("lifecycle journal writer is busy; inspect an abandoned " + str(lock))
+
+
+@posix_only
+def test_a_moment_of_journal_contention_at_the_record_is_waited_out(team, monkeypatch):
+    # In process, because the contention must land between the replay and the record, which only the record sees.
+    import hierarchy_lifecycle
+    import hierarchy_mailbox_mcp
+    granted, target = delegated(team)
+    lock = team.ledger.path / ".write.lock"
+    original = hierarchy_lifecycle.Lifecycle.record
+    held = []
+
+    def contended(self, envelope):
+        if not held:
+            lock.write_text("{}")
+            held.append(threading.Timer(0.3, lock.unlink))
+            held[0].start()
+        return original(self, envelope)
+
+    monkeypatch.setattr(hierarchy_lifecycle.Lifecycle, "record", contended)
+    connection = hierarchy_mailbox_mcp.Connection(team.mailboxes["engine"], "engine/decider", "host-one",
+                                                  "engine-decider", 1, lifecycle=team.ledger.path, actor="decider-1")
+    try:
+        result = connection.call(*record(team, target, granted))
+    finally:
+        held[0].join(timeout=5)
+    assert result["receipt"]["event_id"] == "decider-event-1"
+    assert [d["decision"] for d in team.ledger.status()["delegated_decisions"]] == ["approve"]
+
+
+@posix_only
+def test_the_decider_is_told_a_retry_returns_its_receipt_only_while_root_custody_is_unchanged(team):
+    _, listed = responses(decider(team))
+    [description] = [tool["description"] for tool in listed["result"]["tools"] if tool["name"] == "decider_record"]
+    assert ("returns the original receipt while ROOT custody is unchanged; after a ROOT succession, record with a new "
+            "event_id.") in description
 
 
 @posix_only

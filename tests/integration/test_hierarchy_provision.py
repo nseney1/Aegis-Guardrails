@@ -739,6 +739,44 @@ def test_other_roles_have_no_lifecycle_connection(team, endpoint, role, key):
     assert unbound(team, endpoint)
 
 
+@pytest.mark.parametrize("journal,error", [
+    ("<missing>", "lifecycle is not a journal directory: <missing>"),
+    ("<file>", "lifecycle is not a journal directory: <file>"),
+    (None, "invalid lifecycle"),
+    (7, "invalid lifecycle"),
+])
+def test_a_router_journal_that_is_not_a_journal_is_refused_before_binding(team, journal, error):
+    paths = {"<missing>": str(team.tmp / "no-journal"), "<file>": str(team.tmp / "journal-file")}
+    (team.tmp / "journal-file").write_text("{}")
+    journal = paths.get(journal, journal)
+    for name, path in paths.items():
+        error = error.replace(name, path)
+    refused = team.add_role("pilot/router", cwd=str(team.tmp), lifecycle=journal, expect=2)
+    assert refused["error"] == error
+    assert unbound(team, "pilot/router") and not (team.base / "connections").exists()
+
+
+@pytest.mark.parametrize("endpoint,changes,error", [
+    ("pilot/orchestrator", {"lifecycle": None}, NO_LIFECYCLE % "orchestrator"),
+    ("pilot/orchestrator", {"actor": None}, NO_LIFECYCLE % "orchestrator"),
+    ("pilot/router", {"actor": None}, ROUTER_ACTOR),
+    ("pilot/router", {"lifecycle": "<journal>", "actor": None}, ROUTER_ACTOR),
+    ("pilot/root", {"lifecycle": None, "actor": None}, "invalid actor"),
+    ("pilot/root", {"lifecycle": None, "actor": "root-1"}, "invalid lifecycle"),
+    ("pilot/root", {"lifecycle": "<journal>", "actor": None}, "invalid actor"),
+    ("pilot/root", {"lifecycle": "<journal>"}, PAIR),
+    ("pilot/decider", {"lifecycle": "<journal>", "actor": None}, "invalid actor"),
+    ("pilot/decider", {"lifecycle": ["<journal>"], "actor": "decider-1"}, "invalid lifecycle"),
+    ("pilot/decider", {"actor": None}, PAIR),
+])
+def test_a_null_or_non_string_lifecycle_key_is_refused_before_binding(team, endpoint, changes, error):
+    changes = {key: team.lifecycle if value == "<journal>" else value for key, value in changes.items()}
+    extra = {"session": ROOT_SESSION} if endpoint == "pilot/root" else {"cwd": str(team.tmp)}
+    refused = team.add_role(endpoint, expect=2, **extra, **changes)
+    assert refused["error"] == error
+    assert unbound(team, endpoint) and not (team.base / "connections").exists()
+
+
 def test_a_codex_router_applies_its_registry_tier(team):
     role = team.add_role("pilot/router", "codex-cli", session=REVIEW_SESSION, cwd=str(team.source))
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]

@@ -144,6 +144,19 @@ def test_a_contradictory_or_drifted_registry_is_refused(change, error):
     assert refusal(changed(change)) == error
 
 
+def test_the_provider_bridge_may_bind_an_endpoint_but_never_write_mail():
+    # The launcher's start publishes the binding record through add-role, and nothing else in the mailbox.
+    roles = hierarchy_roles.registry()["roles"]
+    bridge = roles["provider-bridge"]
+    assert bridge["writes"] == ["mailbox:bind"]
+    assert "mailbox" in bridge["prohibitions"]["writes"]
+    assert {name for name, entry in roles.items() if "mailbox:bind" in entry["writes"]} == {"provider-bridge"}
+    assert refusal(changed(lambda r: r["roles"]["provider-bridge"]["writes"].append("mailbox"))) == (
+        "role provider-bridge both allows and prohibits writes: mailbox")
+    assert refusal(changed(lambda r: r["roles"]["provider-bridge"]["writes"].append("mailbox:post"))) == (
+        "role provider-bridge lists an unknown writes action: mailbox:post")
+
+
 def test_the_registry_path_is_fixed_beside_the_loader():
     assert hierarchy_roles.PATH == ROOT / "tools" / "hierarchy_templates" / "role-registry.json"
 

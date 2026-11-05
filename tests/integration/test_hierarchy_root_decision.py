@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -298,4 +299,18 @@ def test_a_held_lock_refuses_the_decision_and_records_nothing(live, held):
         lock.unlink()
     assert ledger.files() == before
     assert payload(adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)}))["receipt"]
+    assert decisions(ledger) == [("feature-1", "approve", "root-1")]
+
+
+def test_a_moment_of_journal_contention_is_waited_out(live):
+    root, ledger, value, adapter = live
+    lock = ledger.path / ".write.lock"
+    lock.write_text("{}")
+    release = threading.Timer(0.3, lock.unlink)
+    release.start()
+    try:
+        answer = adapter.ask("tools/call", {"name": TOOL, "arguments": decision(value)})
+    finally:
+        release.join(timeout=5)
+    assert payload(answer)["receipt"]["event_id"] == "root-decision-1"
     assert decisions(ledger) == [("feature-1", "approve", "root-1")]
