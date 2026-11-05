@@ -157,6 +157,46 @@ def test_the_provider_bridge_may_bind_an_endpoint_but_never_write_mail():
         "role provider-bridge lists an unknown writes action: mailbox:post")
 
 
+TRIGGERS = {"router:route", "jobs:run-open"}
+
+
+def test_the_watch_supervisor_may_trigger_routing_and_open_jobs_but_writes_nothing():
+    # The loop service only starts the router and jobs tools as children, which keep their own checks, so the
+    # role gains two trigger calls and no write, job run or mail of its own.
+    supervisor = hierarchy_roles.registry()["roles"]["watch-supervisor"]
+    assert supervisor["service"] == "tools/hierarchy_loop.py"
+    assert supervisor["calls"] == ["session:wake", "router:route", "jobs:run-open"]
+    assert supervisor["writes"] == []
+    assert {"lifecycle", "mailbox", "workspace_initiative"} <= set(supervisor["reads"])
+    refused = supervisor["prohibitions"]
+    assert {"mailbox:dispatch", "job:run", "merge", "publish_release"} <= set(refused["calls"])
+    assert {"source", "mailbox", "board", "governance"} <= set(refused["writes"])
+    assert set(refused["approvals"]) == hierarchy_roles.VOCABULARY["approvals"]
+    assert supervisor["lifecycle_role"] is None
+
+
+def test_no_other_role_may_trigger_routing_or_open_jobs():
+    roles = hierarchy_roles.registry()["roles"]
+    assert TRIGGERS <= hierarchy_roles.VOCABULARY["calls"]
+    assert {name for name, entry in roles.items() if TRIGGERS & set(entry["calls"])} == {"watch-supervisor"}
+
+
+@pytest.mark.parametrize("change,error", [
+    (lambda r: r["roles"]["watch-supervisor"]["calls"].append("job:run"),
+     "role watch-supervisor both allows and prohibits calls: job:run"),
+    (lambda r: r["roles"]["watch-supervisor"]["writes"].append("mailbox"),
+     "role watch-supervisor both allows and prohibits writes: mailbox"),
+    (lambda r: r["roles"]["watch-supervisor"]["calls"].append("jobs:run"),
+     "role watch-supervisor lists an unknown calls action: jobs:run"),
+    (lambda r: r["roles"]["watch-supervisor"]["calls"].append("router:succeed"),
+     "role watch-supervisor lists an unknown calls action: router:succeed"),
+    (lambda r: r["roles"]["watch-supervisor"]["writes"].append("router:route"),
+     "role watch-supervisor lists an unknown writes action: router:route"),
+])
+def test_the_watch_supervisor_cannot_widen_past_its_triggers(change, error):
+    assert refusal(changed(change)) == error
+
+
 def test_the_registry_path_is_fixed_beside_the_loader():
     assert hierarchy_roles.PATH == ROOT / "tools" / "hierarchy_templates" / "role-registry.json"
 

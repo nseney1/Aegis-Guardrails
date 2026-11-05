@@ -348,6 +348,23 @@ def test_a_superseded_router_actor_is_refused(tmp_path):
     assert [r["request_id"] for r in loop.route(actor="router-2")["routed"]] == ["feature-1"]
 
 
+def test_status_names_the_current_router_so_a_caller_follows_succession(tmp_path):
+    (tmp_path / "probe").mkdir()
+    policy = Ledger(tmp_path / "probe", initialize=False).policy
+    actors = {**policy["actors"], "router-2": {**policy["actors"]["router-1"], "generation": 2}}
+    loop = Loop(tmp_path, {"actors": actors, "successors": {**policy["successors"], "router-1": "router-2"}})
+    loop.team("engine")
+    assert loop.run("status")["router"] == "router-1"
+    checkpoint = loop.ledger.cli("checkpoint")["sha256"]
+    loop.ledger.event("succeed", actor="router-2", predecessor="router-1", checkpoint_sha256=checkpoint)
+
+    result = loop.run("status")
+
+    assert result["router"] == "router-2"
+    assert sorted(result) == ["authenticated", "escalations", "execution_enabled", "identity", "requests", "router",
+                              "schema"]
+
+
 def test_route_requires_evidence_only(loop):
     loop.approved(request("feature-1"))
 
@@ -398,6 +415,7 @@ def test_status_changes_nothing(loop):
 
     assert result["schema"] == "aegis.router-status/v1"
     assert result["execution_enabled"] is False
+    assert result["router"] == "router-1"
     assert loop.ledger.files() == journal
     assert mailbox_snapshot(loop.mailboxes["engine"]) == mailbox
     assert {p: p.read_bytes() for p in Path(loop.workspace.store).rglob("*") if p.is_file()} == store
@@ -541,3 +559,63 @@ def test_bad_route_arguments_are_refused_before_anything_is_written(loop, args, 
     assert result["error"] == error
     assert loop.ledger.files() == journal
     assert mailbox_snapshot(loop.mailboxes["engine"]) == mailbox
+
+
+def test_status_names_a_busy_journal_as_the_source_of_its_refusal(loop):
+    (loop.ledger.path / ".write.lock").write_text("{}")
+
+    result = loop.run("status", expect=2)
+
+    assert result["source"] == "journal" and "busy" in result["error"]
+    assert (result["state"], result["execution_enabled"]) == ("hold", False)
+
+
+def test_status_names_a_broken_workspace_store_as_the_source_of_its_refusal(loop):
+    (Path(loop.workspace.store) / "events" / "junk").write_text("x")
+
+    result = loop.run("status", expect=2)
+
+    assert result == {"state": "hold", "execution_enabled": False, "source": "store",
+                      "error": "unexpected workspace store entry: junk"}
+
+
+def test_status_names_a_store_path_that_is_not_a_store_directory_as_the_source(loop, tmp_path):
+    not_a_store = tmp_path / "store-file"
+    not_a_store.write_text("x")
+    proc = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--lifecycle", str(loop.ledger.path), "--store",
+                           str(not_a_store), "status"], capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 2 and not proc.stderr
+    assert json.loads(proc.stdout) == {"state": "hold", "execution_enabled": False, "source": "store",
+                                       "error": "workspace store is not initialized"}
+
+
+def test_status_names_a_refusal_constructing_the_store_as_the_source(loop, monkeypatch, capsysbinary):
+    # Store() repeats cli_path's checks today, so only a race could make it refuse; the tag must not depend on that.
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_router
+
+    def refusing(_path):
+        raise ValueError("symlink paths are not supported: planted")
+
+    monkeypatch.setattr(hierarchy_router, "Store", refusing)
+    code = hierarchy_router.main(["--lifecycle", str(loop.ledger.path), "--store", str(loop.workspace.store), "status"])
+
+    assert code == 2
+    assert json.loads(capsysbinary.readouterr().out) == {"state": "hold", "execution_enabled": False, "source": "store",
+                                                         "error": "symlink paths are not supported: planted"}
+
+
+def test_status_names_a_bad_argument_as_the_source_of_its_refusal(loop):
+    proc = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--lifecycle", "lifecycle", "--store",
+                           str(loop.workspace.store), "status"], capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 2 and not proc.stderr
+    assert json.loads(proc.stdout) == {"state": "hold", "execution_enabled": False, "source": "arguments",
+                                       "error": "--lifecycle must be absolute without traversal: got 'lifecycle'"}
+
+
+def test_a_route_refusal_carries_no_source(loop):
+    (Path(loop.workspace.store) / "events" / "junk").write_text("x")
+
+    assert "source" not in loop.route(expect=2)
