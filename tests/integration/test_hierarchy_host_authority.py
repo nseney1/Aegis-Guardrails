@@ -477,6 +477,8 @@ def test_close_during_blocked_read_never_reads_a_reused_descriptor(api, monkeypa
         forged_read, forged_write = os.pipe()
         owned.update({forged_read, forged_write})
         os.write(forged_write, forged)
+        # Keep the old pipe readable after close, so the wake-up write cannot EPIPE.
+        owned.add(os.dup(client_read))
         try:
             assert entered.wait(5)  # The request is written; the reply is awaited.
             client.close()
@@ -511,6 +513,9 @@ def test_close_interrupts_a_blocked_read_long_before_its_deadline(api, monkeypat
         worker.start()
         try:
             assert entered.wait(5)
+            # entered fires just before the syscall; without this, a close that
+            # wins the race fails fast even in the unfixed client.
+            time.sleep(0.2)
             closed_at = time.monotonic()
             client.close()
         finally:
@@ -1495,6 +1500,7 @@ def test_close_interrupts_a_live_session_waiting_for_its_next_call(api, tmp_path
         worker.start()
         try:
             assert entered.wait(5)
+            time.sleep(0.2)  # Let the worker reach the kernel wait (see the leaf test).
             started = time.monotonic()
             binding.close()
         finally:
@@ -1503,6 +1509,36 @@ def test_close_interrupts_a_live_session_waiting_for_its_next_call(api, tmp_path
         assert [code for code, _ in outcome] == ["HOST_PROTOCOL_ERROR"]
         assert outcome[0][1] - started < 1.0  # Not the 5 s call-wait deadline.
         assert [row["method"] for row in requests] == methods
+
+
+def test_close_during_post_reply_readback_refuses_with_a_typed_error(api, tmp_path, monkeypatch):
+    with live_control_runtime(api, tmp_path, monkeypatch) as (_, binding, requests):
+        session = binding.open_live_session("fixture-root")
+        actual_identity, closers = api._process_identity, []
+
+        def identity(pid):
+            # The provenance readback that runs under the binding lock right
+            # after pending_call's reply: revoke from another thread there.
+            if (not closers and requests[-1]["method"] == "pending_call"
+                    and binding._lock._is_owned()):
+                closer = threading.Thread(target=binding.close)
+                closers.append(closer)
+                closer.start()
+                limit = time.monotonic() + 5
+                while not binding._fenced:  # close() fences, then waits for our lock.
+                    assert time.monotonic() < limit, "close() never fenced"
+                    time.sleep(0.001)
+            return actual_identity(pid)
+
+        monkeypatch.setattr(api, "_process_identity", identity)
+        try:
+            with pytest.raises(api.HostAuthorityError) as stale:
+                session.receive_invocation()  # Never a raw OSError from a released descriptor.
+        finally:
+            for closer in closers:
+                closer.join(5)
+        assert stale.value.code == "STALE_INVOCATION"
+        assert len(closers) == 1 and not closers[0].is_alive()
 
 
 def test_real_initial_live_wire_creates_owned_invocation_and_both_fence_guard(

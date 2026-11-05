@@ -1694,3 +1694,32 @@ def test_public_direct_writer_after_successful_guard_history_keeps_unknown(
         assert direct_methods == methods
         assert methods[-1] == "pending_call"
         assert not any(row["method"] == "retire_call" for row in requests)
+
+
+def test_public_direct_writer_history_stays_unknown_once_stale_or_closed(tmp_path, monkeypatch):
+    with canonical_live_decision(tmp_path, monkeypatch) as values:
+        lifecycle, binding, _, invocation, submitted, _, _, writer = values
+        ledger = lifecycle.Lifecycle(binding.canonical_root)
+        first = writer.commit_decision(invocation, dict(submitted))
+        assert first["state"] == "recorded"  # This scope really published.
+        after_first = ledger.load()
+        files = canonical_files(binding.canonical_root)
+
+        # Past the call budget the invocation is stale, but its history still wins.
+        actual_ns, actual_s = time.monotonic_ns, time.monotonic
+        monkeypatch.setattr(time, "monotonic_ns", lambda: actual_ns() + 6 * 10**9)
+        monkeypatch.setattr(time, "monotonic", lambda: actual_s() + 6)
+        try:
+            late = writer.commit_decision(invocation, dict(submitted))
+        finally:
+            monkeypatch.setattr(time, "monotonic_ns", actual_ns)
+            monkeypatch.setattr(time, "monotonic", actual_s)
+        # That entry closed the owner; a further entry is still unknown, not a refusal.
+        after_close = writer.commit_decision(invocation, dict(submitted))
+
+        for answer in (late, after_close):
+            assert_decision_result(answer, submitted, "unknown", "possible",
+                                   "PUBLICATION_UNKNOWN",
+                                   "canonical decision publication is unresolved")
+        assert ledger.load() == after_first
+        assert canonical_files(binding.canonical_root) == files

@@ -39,12 +39,15 @@ qualify a deployed host, effective tool restrictions or native behavior.
   owned object. `close()` retires the binding and closes all three resources.
   It is a revocation fence, not a drain: it first fences all three descriptors
   (see below) without waiting for any reply, so an in-flight control exchange
-  or app-server wait fails promptly with `HOST_PROTOCOL_ERROR`. It then waits
-  only for a section that is already exiting, such as a guarded canonical
-  publication, before invalidating sessions. After `close()` returns, no
-  owned-descriptor I/O and no guarded publication can start. A request that
-  was already written keeps its unknown outcome under the caller's existing
-  possible-send handling.
+  or app-server wait fails promptly with a typed `HostAuthorityError`
+  (`HOST_PROTOCOL_ERROR`, or `STALE_INVOCATION` when the operation sees the
+  closed binding first). Provenance readback of the descriptors runs under the
+  same fence, so a concurrent `close()` yields `STALE_INVOCATION`, never a raw
+  `OSError` from a released descriptor. `close()` then waits only for a section
+  that is already exiting, such as a guarded canonical publication, before
+  invalidating sessions. After `close()` returns, no owned-descriptor I/O and
+  no guarded publication can start. A request that was already written keeps
+  its unknown outcome under the caller's existing possible-send handling.
 
 - `ProtocolClient(reader, writer, timeout_seconds=5, max_frame_bytes=1048576)`
   takes ownership of two already-created binary pipe streams. It launches no
@@ -265,10 +268,13 @@ reply, retirement, append or replacement deadline is created.
 The decision guard applies the same rule to every entry, including direct
 public N1 calls that bypass dispatch: entering `effect_fence(invocation,
 "decision")` for an invocation whose guard already entered once marks it
-unknown, closes the owner and raises `PROVIDER_OUTCOME_UNKNOWN`. N1 reports
-that as `unknown`/`possible`/`PUBLICATION_UNKNOWN`, never as a no-effect
-refusal, so a second entry can neither publish a fresh decision nor claim
-that nothing happened.
+unknown, closes the owner and raises `PROVIDER_OUTCOME_UNKNOWN`. History is
+checked before currentness, so the result is the same when the invocation is
+already stale or its owner is already closed. N1 reports it as
+`unknown`/`possible`/`PUBLICATION_UNKNOWN`, so a repeat entry can neither
+publish a fresh decision nor claim that nothing happened. This includes a
+retry after a no-effect refusal such as `CANONICAL_WRITER_BUSY`: once a guard
+has entered, a retry needs a new invocation, as dispatch already requires.
 
 Without prior guard entry, all five command fields must match the actual owned
 frame before the fixed co-located `ProtectedCanonicalDecisionWriter` is called.

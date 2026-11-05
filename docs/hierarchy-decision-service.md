@@ -130,10 +130,11 @@ reached the intended public semantic RED: `STALE_INVOCATION` where
 `PROVIDER_OUTCOME_UNKNOWN` was required after successful guard entry and exit.
 Those observations do not establish post-change behavior.
 
-This isolated candidate adds H guard-entry history while retaining N1v5, fixed D
-production code and all tests. No post-change tests have run. Independent exact
-candidate review, all four H/D history branches, fresh approve/deny, all-five
-frame binding and direct N1 controls, affected and full checks remain required.
-Positive stdio reply/recovery fixtures, valid succession, native execution,
-hosted checks, performance, owner acceptance and protected workflow restart
-retain their separate gates.
+The integrated source adds H guard-entry history and applies it to direct N1
+entry. N1 changes only how it maps H's `PROVIDER_OUTCOME_UNKNOWN`, and D
+production code is unchanged. Post-change runs of the H, N1 and D test files
+pass, including the history branches and the direct-N1 controls, and an
+independent review found no deadlock or regression in this path. Positive stdio
+reply/recovery fixtures, valid succession, native execution, hosted checks,
+performance, owner acceptance and protected workflow restart keep their
+separate gates.

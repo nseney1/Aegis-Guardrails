@@ -646,6 +646,14 @@ class HostAuthority:
                                     reserved_enrollment)
 
     def effect_fence(self, invocation, operation):
+        owner = self._owner()
+        if (type(invocation) is HostInvocation and owner is not None
+                and invocation._session._owner is owner and invocation._scope_entered):
+            # History wins over currentness: a call whose decision scope ever
+            # entered stays unknown, even once it is stale or its owner closed.
+            # History never resets, so this unlocked read cannot wrongly refuse;
+            # DecisionGuard.__enter__ repeats the check under the lock.
+            owner._decision_history_unknown()
         owner = self.owned_runtime
         _require(type(self) is HostAuthority and self is owner._authority
                  and operation == "decision" and type(operation) is str,
@@ -1050,19 +1058,24 @@ class OwnedHostBinding:
         _require(_process_identity(self._host_pid) == self._host_process,
                  "STALE_INVOCATION", "host process incarnation changed")
         _require(_process_identity(self._peer_pid) == self._process)
-        pid, uid, _gid = struct.unpack("3i", self._control.getsockopt(
-            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-        _require(pid == self._peer_pid and uid == self._peer_uid)
-        root = Path("/proc") / str(pid)
-        status = (root / "status").read_text()
-        uids = [line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")]
-        _require(len(uids) == 1 and all(int(value) == uid for value in uids[0]))
-        _require(os.stat(root / "ns/time").st_ino == os.stat("/proc/self/ns/time").st_ino)
-        _require(os.readlink(root / "exe") == self._deployment["runtime_executable"]["path"])
-        for number, fd in ((0, self._fds[2]), (1, self._fds[1])):
-            info = os.fstat(fd)
-            _require(stat.S_ISFIFO(info.st_mode)
-                     and os.readlink(root / ("fd/%s" % number)) == "pipe:[%s]" % info.st_ino)
+        # Descriptor readback runs under the fence gate, so close() cannot
+        # release these numbers mid-check. A fenced binding refuses with a typed
+        # error instead of reading a released, possibly reused, descriptor.
+        with self._io_gate:
+            _require(not self._fenced, "STALE_INVOCATION", "runtime binding is closed")
+            pid, uid, _gid = struct.unpack("3i", self._control.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            _require(pid == self._peer_pid and uid == self._peer_uid)
+            root = Path("/proc") / str(pid)
+            status = (root / "status").read_text()
+            uids = [line.split()[1:] for line in status.splitlines() if line.startswith("Uid:")]
+            _require(len(uids) == 1 and all(int(value) == uid for value in uids[0]))
+            _require(os.stat(root / "ns/time").st_ino == os.stat("/proc/self/ns/time").st_ino)
+            _require(os.readlink(root / "exe") == self._deployment["runtime_executable"]["path"])
+            for number, fd in ((0, self._fds[2]), (1, self._fds[1])):
+                info = os.fstat(fd)
+                _require(stat.S_ISFIFO(info.st_mode)
+                         and os.readlink(root / ("fd/%s" % number)) == "pipe:[%s]" % info.st_ino)
         for path, expected in self._files.items():
             raw = _protected_bytes(path, self._owners, self._model_uid, 64 * MAX_FRAME_BYTES)
             _require(hashlib.sha256(raw).hexdigest() == expected)
@@ -1523,6 +1536,22 @@ class OwnedHostBinding:
                         session._invalidate()
                     _OWNED_BINDINGS.discard(self)
 
+    def _decision_history_unknown(self):
+        """Refuse a repeat decision entry, because an earlier scope may have published.
+
+        Same rule as dispatch_decision's history check: the outcome stays
+        unknown, never a fresh write and never a no-effect refusal. Closing the
+        owner retires the session, which marks the call unknown.
+        """
+        cause = None
+        if os.getpid() == self._host_pid:
+            try:
+                self.close()
+            except OSError as exc:
+                cause = exc
+        raise HostAuthorityError("PROVIDER_OUTCOME_UNKNOWN",
+                                 "canonical decision outcome is unresolved") from cause
+
     def _fence(self):
         with self._io_gate:
             self._fenced = True
@@ -1933,16 +1962,13 @@ class DecisionGuard(_OwnedGuard):
         super().__enter__()
         invocation = self._invocation
         if invocation._scope_entered:
-            # An earlier decision scope for this call may already have published.
-            # Its outcome stays unknown: never a fresh write and never a
-            # no-effect refusal. Same rule as dispatch_decision's history check.
+            # Authoritative repeat of effect_fence's history check, for a call
+            # that entered from another thread after this guard was built.
             invocation._stage = "unknown"
             self._active = False
             self._owner._active_guard = None
             self._owner._lock.release()
-            self._owner.close()
-            raise HostAuthorityError("PROVIDER_OUTCOME_UNKNOWN",
-                                     "canonical decision outcome is unresolved")
+            self._owner._decision_history_unknown()
         invocation._scope_entered = True
         invocation._scope_depth += 1
         return self
