@@ -383,6 +383,143 @@ def test_host_fixture_reaps_actual_child_when_pipe_close_fails(api, tmp_path, mo
             _reap_regression_child(child)
 
 
+@contextmanager
+def raw_pipe_client(api, timeout=3):
+    """A client on real anonymous pipes whose peer ends the test owns directly."""
+    if os.name != "posix":
+        pytest.skip("bounded anonymous pipe transport is explicitly POSIX-only")
+    to_client_r, to_client_w = os.pipe()
+    to_peer_r, to_peer_w = os.pipe()
+    owned = {to_client_w, to_peer_r}
+    client = api.ProtocolClient(os.fdopen(to_client_r, "rb", 0), os.fdopen(to_peer_w, "wb", 0),
+                                timeout_seconds=timeout)
+    try:
+        yield client, to_client_r, to_peer_w, to_client_w, to_peer_r, owned
+    finally:
+        try:
+            client.close()
+        finally:
+            for fd in owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def waiting_on(api, monkeypatch, fd, *, writing):
+    """Signal once the client is actually waiting on fd; the wait itself stays real."""
+    entered, actual = threading.Event(), select.select
+
+    def observed(readable, writable, exceptional, timeout=None):
+        if fd in (writable if writing else readable):
+            entered.set()
+        return actual(readable, writable, exceptional, timeout)
+
+    monkeypatch.setattr(api.select, "select", observed)
+    return entered
+
+
+def test_close_during_blocked_write_never_writes_a_reused_descriptor(api, tmp_path, monkeypatch):
+    with raw_pipe_client(api) as (client, _, client_write, _, peer_read, owned):
+        queued = 0
+        while True:  # Fill the outgoing pipe so the next frame must wait to be written.
+            try:
+                queued += os.write(client_write, b"x" * 65536)
+            except BlockingIOError:
+                break
+        entered = waiting_on(api, monkeypatch, client_write, writing=True)
+        errors = []
+
+        def initialize():
+            try:
+                client.initialize()
+            except api.HostAuthorityError as exc:
+                errors.append(exc.code)
+
+        worker = threading.Thread(target=initialize)
+        worker.start()
+        victim_path = tmp_path / "unrelated-file"
+        # Opened before close so it cannot itself land on a released number.
+        victim = os.open(victim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        owned.add(victim)
+        try:
+            assert entered.wait(5)
+            client.close()  # Revocation while the write is still pending.
+            os.dup2(victim, client_write)  # The released number now names another file.
+            owned.add(client_write)
+            while queued:  # The old pipe drains, so a stale wait on it can wake.
+                queued -= len(os.read(peer_read, queued))
+        finally:
+            worker.join(10)
+        assert not worker.is_alive()
+        assert victim_path.read_bytes() == b""
+        assert errors == ["HOST_PROTOCOL_ERROR"]
+
+
+def test_close_during_blocked_read_never_reads_a_reused_descriptor(api, monkeypatch):
+    with raw_pipe_client(api) as (client, client_read, _, peer_write, _, owned):
+        entered = waiting_on(api, monkeypatch, client_read, writing=False)
+        outcome = []
+
+        def initialize():
+            try:
+                client.initialize()
+                outcome.append("initialized")
+            except api.HostAuthorityError as exc:
+                outcome.append(exc.code)
+
+        worker = threading.Thread(target=initialize)
+        worker.start()
+        forged = frame({"id": "aegis-initialize-1", "result": {
+            "codexHome": "/forged", "platformFamily": "unix", "platformOs": "linux",
+            "userAgent": "forged"}})
+        # Created before close so neither end can itself land on a released number.
+        forged_read, forged_write = os.pipe()
+        owned.update({forged_read, forged_write})
+        os.write(forged_write, forged)
+        try:
+            assert entered.wait(5)  # The request is written; the reply is awaited.
+            client.close()
+            os.dup2(forged_read, client_read)  # The released number now names another pipe.
+            owned.add(client_read)
+            os.write(peer_write, b"\n")  # The old pipe becomes readable, so a stale wait can wake.
+        finally:
+            worker.join(10)
+        assert not worker.is_alive()
+        assert outcome == ["HOST_PROTOCOL_ERROR"]
+        os.set_blocking(client_read, False)
+        try:
+            unread = os.read(client_read, 65536)
+        except BlockingIOError:
+            unread = b""  # The closed client consumed the other pipe's data.
+        assert unread == forged
+
+
+@pytest.mark.timing
+def test_close_interrupts_a_blocked_read_long_before_its_deadline(api, monkeypatch):
+    with raw_pipe_client(api, timeout=3) as (client, client_read, _, _, _, _):
+        entered = waiting_on(api, monkeypatch, client_read, writing=False)
+        finished = []
+
+        def initialize():
+            try:
+                client.initialize()
+            except api.HostAuthorityError as exc:
+                finished.append((exc.code, time.monotonic()))
+
+        worker = threading.Thread(target=initialize)
+        worker.start()
+        try:
+            assert entered.wait(5)
+            closed_at = time.monotonic()
+            client.close()
+        finally:
+            worker.join(10)
+        assert not worker.is_alive()
+        assert [code for code, _ in finished] == ["HOST_PROTOCOL_ERROR"]
+        assert finished[0][1] - closed_at < 1.0  # The 3 s read deadline is not waited out.
+
+
 def _control_digest(value):
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"),
                      ensure_ascii=True, allow_nan=False).encode()
@@ -459,6 +596,7 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
     streams, thread, requests, errors = [], None, [], []
     app_thread = None
     enrolled, pending = threading.Event(), {}
+    held = threading.Event()  # Releases a runtime reply held by a "held-*" control fault.
     peer_read, peer_write = None, None
     try:
         # sockaddr_un has a short byte limit; pytest's descriptive case path may
@@ -706,6 +844,9 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
                                 break
                             if control_fault == "wrong-bind-cid" and request["method"] == "bind_initial":
                                 result["actor_cid"] = "foreign-cid"
+                        if control_fault == "held-" + request["method"] + "-reply":
+                            held.wait(10)  # The runtime keeps the request; teardown releases it.
+                            break
                         nonce = "0" * 64 if fault == "wrong-nonce" else request["nonce"]
                         wire.write(frame({"schema": request["schema"], "id": request["id"],
                                           "epoch": 17, "nonce": nonce, "result": result}))
@@ -768,6 +909,7 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
                 cleanup.callback(wire.close)
             if thread is not None:
                 cleanup.callback(thread.join, timeout=3)
+                cleanup.callback(held.set)  # LIFO: release a held reply before the join.
             if app_thread is not None:
                 cleanup.callback(app_thread.join, timeout=3)
             if peer is not None:
@@ -799,6 +941,45 @@ def test_owned_constructor_and_reserve_use_authenticated_control(api, tmp_path, 
         finally:
             binding.close()
         assert control.fileno() == -1 and reader.closed and writer.closed
+
+
+@pytest.mark.timing
+def test_close_revokes_an_in_flight_control_exchange_without_awaiting_its_reply(
+        api, tmp_path, monkeypatch):
+    with owned_runtime_boundary(api, tmp_path, monkeypatch,
+                                control_fault="held-reserve_initial-reply") as inputs:
+        control, reader, writer, deployment, plan_ref, requests = inputs
+        binding = api.OwnedHostBinding.from_owned_channels(control, reader, writer, deployment)
+        outcome = []
+
+        def reserve():
+            try:
+                binding.reserve_initial(plan_ref)
+                outcome.append(("reserved", time.monotonic()))
+            except api.HostAuthorityError as exc:
+                outcome.append((exc.code, time.monotonic()))
+
+        worker = threading.Thread(target=reserve)
+        worker.start()
+        try:
+            limit = time.monotonic() + 5
+            while [row["method"] for row in requests] != ["describe", "reserve_initial"]:
+                assert time.monotonic() < limit, "the runtime never received the request"
+                time.sleep(0.01)
+            started = time.monotonic()
+            binding.close()  # The runtime still holds the request and has not replied.
+            closed = time.monotonic()
+        finally:
+            worker.join(10)
+        assert not worker.is_alive()
+        assert closed - started < 1.0  # Revocation does not wait out the 5 s exchange.
+        assert [code for code, _ in outcome] == ["HOST_PROTOCOL_ERROR"]
+        assert outcome[0][1] - started < 1.0
+        assert control.fileno() == -1 and reader.closed and writer.closed
+        with pytest.raises(api.HostAuthorityError) as stale:
+            binding.reserve_initial(plan_ref)
+        assert stale.value.code == "HOST_CALL_CONFLICT"
+        assert [row["method"] for row in requests] == ["describe", "reserve_initial"]
 
 
 @pytest.mark.parametrize("fault,code", [
@@ -1285,6 +1466,43 @@ def live_control_runtime(api, tmp_path, monkeypatch, fault=None):
             yield lifecycle, binding, requests
         finally:
             binding.close()
+
+
+@pytest.mark.timing
+def test_close_interrupts_a_live_session_waiting_for_its_next_call(api, tmp_path, monkeypatch):
+    with live_control_runtime(api, tmp_path, monkeypatch) as (_, binding, requests):
+        session = binding.open_live_session("fixture-root")
+        session.receive_invocation()  # The app-server stand-in sends exactly one call.
+        methods = [row["method"] for row in requests]
+        entered, actual = threading.Event(), select.select
+
+        def observed(readable, writable, exceptional, timeout=None):
+            if threading.current_thread().name == "next-call" and readable:
+                entered.set()  # The worker is really waiting on the app-server pipe.
+            return actual(readable, writable, exceptional, timeout)
+
+        monkeypatch.setattr(api.select, "select", observed)
+        outcome = []
+
+        def receive():
+            try:
+                session.receive_invocation()
+                outcome.append(("received", time.monotonic()))
+            except api.HostAuthorityError as exc:
+                outcome.append((exc.code, time.monotonic()))
+
+        worker = threading.Thread(target=receive, name="next-call")
+        worker.start()
+        try:
+            assert entered.wait(5)
+            started = time.monotonic()
+            binding.close()
+        finally:
+            worker.join(10)
+        assert not worker.is_alive()
+        assert [code for code, _ in outcome] == ["HOST_PROTOCOL_ERROR"]
+        assert outcome[0][1] - started < 1.0  # Not the 5 s call-wait deadline.
+        assert [row["method"] for row in requests] == methods
 
 
 def test_real_initial_live_wire_creates_owned_invocation_and_both_fence_guard(

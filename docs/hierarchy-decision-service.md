@@ -115,7 +115,10 @@ projection error instead of being relabeled as a host refusal. An adapted error
 is inert data, not proof that an earlier invocation or publication had no effect.
 Malformed command validation still runs before H access; its inert refusal
 cannot clear any original UNKNOWN. D production code and its fixed mapping are
-unchanged by this H-history candidate.
+unchanged by this H-history candidate. N1's direct writer now applies the same
+rule: an H `PROVIDER_OUTCOME_UNKNOWN` raised before N1 reaches publication
+returns `unknown`/`possible`/`PUBLICATION_UNKNOWN`, not the earlier
+`refused`/`none`/`UNAUTHORIZED_ROLE`.
 
 ## Qualification boundary
 

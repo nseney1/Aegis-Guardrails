@@ -28,6 +28,10 @@ MAX_FRAME_BYTES = 1024 * 1024
 MAX_DEPTH = 32
 MAX_CALLS = 32
 MAX_WAIT_SECONDS = 5
+# Longest a blocked wait goes without noticing revocation. Revocation never
+# waits for a reply; this only bounds how soon a waiting operation sees it.
+REVOCATION_POLL_SECONDS = 0.05
+_REVOKED = object()
 CODES = frozenset({
     "UNSUPPORTED_HOST", "UNPROTECTED_DEPLOYMENT", "HOST_PROFILE_UNQUALIFIED",
     "HOST_PROTOCOL_ERROR", "HOST_PROTOCOL_TIMEOUT", "HOST_CALL_CONFLICT",
@@ -155,6 +159,10 @@ class ProtocolClient:
     The process owner must separately reap/stop its actual owned child. The
     bounded connection retains at most MAX_CALLS distinct call identities; it
     refuses rather than evicting replay history or treating an old call as new.
+
+    Revocation (close) is a fence, not a drain: it takes the same gate as every
+    read/write syscall, so no I/O can follow it on a descriptor number that
+    another file may reuse. Bytes already written keep an unknown outcome.
     """
 
     def __init__(self, reader, writer, *, timeout_seconds=MAX_WAIT_SECONDS,
@@ -165,6 +173,7 @@ class ProtocolClient:
                 or not 0 < timeout_seconds <= MAX_WAIT_SECONDS
                 or type(max_frame_bytes) is not int or not 0 < max_frame_bytes <= MAX_FRAME_BYTES):
             raise ValueError("invalid host transport limits")
+        self._gate = self._transport_gate()
         self._reader, self._writer = reader, writer
         self._closed = False
         self._initialized = False
@@ -187,17 +196,31 @@ class ProtocolClient:
     def closed(self):
         return self._closed
 
+    def _transport_gate(self):
+        return threading.RLock()
+
+    def _revoked(self):
+        return self._closed
+
+    def _guarded(self, operation, *args):
+        """Run one non-blocking syscall on an owned descriptor, never after revocation."""
+        with self._gate:
+            if self._revoked():
+                return _REVOKED
+            return operation(*args)
+
     def close(self):
         """Close both owned streams; never signal a PID or infer quiescence."""
-        if self._closed:
-            return
-        self._closed = True
         error = None
-        for stream in (self._writer, self._reader):
-            try:
-                stream.close()
-            except OSError as exc:
-                error = exc if error is None else error
+        with self._gate:  # Waits at most for one in-progress non-blocking syscall.
+            if self._closed:
+                return
+            self._closed = True
+            for stream in (self._writer, self._reader):
+                try:
+                    stream.close()
+                except OSError as exc:
+                    error = exc if error is None else error
         if error is not None:
             raise error
 
@@ -214,12 +237,17 @@ class ProtocolClient:
 
     def _wait(self, fd, deadline, *, writing=False):
         while True:
+            if self._revoked():
+                self._fail()
             left = deadline - time.monotonic()
             if left <= 0:
                 self._fail("HOST_PROTOCOL_TIMEOUT", "host protocol deadline expired")
             try:
+                # Sliced so revocation is seen promptly: closing a descriptor
+                # does not wake a select already sleeping on it.
                 readable, writable, _ = select.select(
-                    [] if writing else [fd], [fd] if writing else [], [], left)
+                    [] if writing else [fd], [fd] if writing else [], [],
+                    min(left, REVOCATION_POLL_SECONDS))
             except InterruptedError:
                 continue  # OS interruption, not a retransmitted protocol request.
             except (OSError, ValueError) as exc:
@@ -243,7 +271,8 @@ class ProtocolClient:
                 self._fail()
             self._wait(self._read_fd, deadline)
             try:
-                chunk = os.read(self._read_fd, min(65536, self._maximum - len(self._buffer)))
+                chunk = self._guarded(os.read, self._read_fd,
+                                      min(65536, self._maximum - len(self._buffer)))
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError as exc:
@@ -251,7 +280,7 @@ class ProtocolClient:
                     self._fail()
                 except HostAuthorityError as error:
                     raise error from exc
-            if not chunk:
+            if chunk is _REVOKED or not chunk:
                 self._fail()
             self._buffer += chunk
 
@@ -268,7 +297,7 @@ class ProtocolClient:
         while offset < len(raw):
             self._wait(self._write_fd, deadline, writing=True)
             try:
-                written = os.write(self._write_fd, raw[offset:])
+                written = self._guarded(os.write, self._write_fd, raw[offset:])
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError as exc:
@@ -276,7 +305,7 @@ class ProtocolClient:
                     self._fail()
                 except HostAuthorityError as error:
                     raise error from exc
-            if written <= 0:
+            if written is _REVOKED or written <= 0:
                 self._fail()
             offset += written
 
@@ -500,10 +529,14 @@ class _ControlIO(ProtocolClient):
 
     def __init__(self, owner):
         self._owner = owner
+        self._gate = owner._io_gate  # The binding's fence takes this same gate.
         self._read_fd = self._write_fd = owner._control.fileno()
         self._maximum, self._buffer = MAX_FRAME_BYTES, b""
         self._closed = False
         os.set_blocking(self._read_fd, False)
+
+    def _revoked(self):
+        return self._closed or self._owner._fenced
 
     def close(self):
         self._owner.close()
@@ -896,6 +929,11 @@ class OwnedHostBinding:
             runtime_control_socket, appserver_reader, appserver_writer)
         self._closed, self._reserved = False, False
         self._lock = threading.RLock()
+        # Descriptor fence: every owned-descriptor syscall and close() take it.
+        # It is held only for one non-blocking syscall, never while waiting on
+        # _lock, so revocation cannot wait on an exchange holding _lock.
+        self._io_gate = threading.RLock()
+        self._fenced, self._retired = False, False
         self._active_guard = None
         self._files, self._reservations, self._policy, self._plan = {}, (), None, None
         self._canonical_api, self._bound_initials = None, set()
@@ -1465,18 +1503,32 @@ class OwnedHostBinding:
         return self._reservations
 
     def close(self):
+        """Revoke now: fence every owned descriptor, then retire local state.
+
+        The fence never waits for a reply, only for one in-progress
+        non-blocking syscall, so an in-flight exchange fails promptly and no
+        I/O follows on a released descriptor number. Retiring state then waits
+        only for a section that is already exiting, such as a guarded
+        publication, so no guarded write completes after close returns.
+        """
         self._require_owner_process()
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            for session in self._live_sessions.values():
-                session._invalidate()
-            if self._appserver is not None:
-                self._appserver._closed = True
-            _OWNED_BINDINGS.discard(self)
-            if hasattr(self, "_wire"):
-                self._wire._closed = True
+        self._closed = True  # Every currentness check refuses from here on.
+        try:
+            self._fence()
+        finally:
+            with self._lock:
+                if not self._retired:
+                    self._retired = True
+                    for session in self._live_sessions.values():
+                        session._invalidate()
+                    _OWNED_BINDINGS.discard(self)
+
+    def _fence(self):
+        with self._io_gate:
+            self._fenced = True
+            for io in (getattr(self, "_wire", None), self._appserver):
+                if io is not None:
+                    io._closed = True
             with ExitStack() as cleanup:
                 for stream in (self._control, self._reader, self._writer):
                     if hasattr(stream, "close"):
@@ -1571,13 +1623,30 @@ def _check_live_description(owner, cid, result, row, lower, upper):
 class _AppserverIO(ProtocolClient):
     def __init__(self, owner):
         self._owner, self._bound_deadline = owner, 0
-        super().__init__(owner._reader, owner._writer)
+        self._opening = True
+        try:
+            # A fence cannot interleave with descriptor setup on these pipes.
+            with owner._io_gate:
+                _require(not owner._fenced, "STALE_INVOCATION", "runtime binding is closed")
+                super().__init__(owner._reader, owner._writer)
+        finally:
+            self._opening = False
+
+    def _transport_gate(self):
+        return self._owner._io_gate
+
+    def _revoked(self):
+        return self._closed or self._owner._fenced
 
     def _operation_deadline(self):
         return min(super()._operation_deadline(), self._bound_deadline)
 
     def close(self):
-        self._closed = True
+        if self._opening:
+            # Never wait on the binding lock while holding its gate. The
+            # constructor's caller closes the binding after this unwinds.
+            self._closed = True
+            return
         self._owner.close()
 
 
@@ -1862,8 +1931,20 @@ class DecisionGuard(_OwnedGuard):
 
     def __enter__(self):
         super().__enter__()
-        self._invocation._scope_entered = True
-        self._invocation._scope_depth += 1
+        invocation = self._invocation
+        if invocation._scope_entered:
+            # An earlier decision scope for this call may already have published.
+            # Its outcome stays unknown: never a fresh write and never a
+            # no-effect refusal. Same rule as dispatch_decision's history check.
+            invocation._stage = "unknown"
+            self._active = False
+            self._owner._active_guard = None
+            self._owner._lock.release()
+            self._owner.close()
+            raise HostAuthorityError("PROVIDER_OUTCOME_UNKNOWN",
+                                     "canonical decision outcome is unresolved")
+        invocation._scope_entered = True
+        invocation._scope_depth += 1
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):

@@ -1114,7 +1114,9 @@ class ProtectedCanonicalDecisionWriter:
             return answer
         except host.HostAuthorityError as exc:
             self._last_failure = exc
-            if not possible:
+            # The host's own UNKNOWN covers effects outside this call (for example an
+            # earlier scope of the same invocation), so it is never a no-effect refusal.
+            if not possible and exc.code != "PROVIDER_OUTCOME_UNKNOWN":
                 mappings = {
                     "UNSUPPORTED_HOST": "HOST_AUTHORITY_UNAVAILABLE",
                     "UNPROTECTED_DEPLOYMENT": "HOST_AUTHORITY_UNAVAILABLE",
@@ -1123,7 +1125,7 @@ class ProtectedCanonicalDecisionWriter:
                     "HOST_PROTOCOL_ERROR": "STALE_INVOCATION", "HOST_PROTOCOL_TIMEOUT": "STALE_INVOCATION",
                     "HOST_CALL_CONFLICT": "STALE_INVOCATION", "STALE_INVOCATION": "STALE_INVOCATION",
                     "ROLE_OPERATION_FORBIDDEN": "UNAUTHORIZED_ROLE", "CANONICAL_CORRELATION_MISMATCH": "SOURCE_MISMATCH",
-                    "PROVIDER_OUTCOME_UNKNOWN": "UNAUTHORIZED_ROLE", "PROVIDER_HANDLE_INVALID": "UNAUTHORIZED_ROLE",
+                    "PROVIDER_HANDLE_INVALID": "UNAUTHORIZED_ROLE",
                     "HISTORY_CURSOR_INVALID": "UNAUTHORIZED_ROLE"}
                 return refused(mappings[exc.code])
         except Exception as exc:

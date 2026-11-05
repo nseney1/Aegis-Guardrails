@@ -37,14 +37,27 @@ qualify a deployed host, effective tool restrictions or native behavior.
   adds the existing schema and `authority: [plan_ref]` without a self-hash cycle.
   Direct reservation construction, copying and serialization do not create an
   owned object. `close()` retires the binding and closes all three resources.
+  It is a revocation fence, not a drain: it first fences all three descriptors
+  (see below) without waiting for any reply, so an in-flight control exchange
+  or app-server wait fails promptly with `HOST_PROTOCOL_ERROR`. It then waits
+  only for a section that is already exiting, such as a guarded canonical
+  publication, before invalidating sessions. After `close()` returns, no
+  owned-descriptor I/O and no guarded publication can start. A request that
+  was already written keeps its unknown outcome under the caller's existing
+  possible-send handling.
 
 - `ProtocolClient(reader, writer, timeout_seconds=5, max_frame_bytes=1048576)`
   takes ownership of two already-created binary pipe streams. It launches no
   process. `initialize()` performs the experimental-capability handshake;
   `receive_call()` yields a new untrusted `item/tool/call` envelope;
   `reply(rpc_id, result)` writes the matching bounded text result. `close()` is
-  idempotent and closes both streams. The process owner separately reaps its
-  actual owned child and proves any required quiescence.
+  idempotent and closes both streams. Every read and write syscall runs under
+  the same gate that `close()` takes before releasing a descriptor, so after
+  `close()` the client never reads or writes a descriptor number that another
+  file may have reused. A blocked wait notices `close()` within
+  `REVOCATION_POLL_SECONDS` (0.05 s) instead of running to its deadline. The
+  process owner separately reaps its actual owned child and proves any
+  required quiescence.
 - `decode_call_frame(raw)` validates one bounded UTF-8 JSONL call. Caller/model
   arguments remain inert data and cannot replace envelope thread/turn/call/RPC
   identifiers. It is not an identity or role-attestation interface.
@@ -248,6 +261,14 @@ lock, closes the owner and raises `PROVIDER_OUTCOME_UNKNOWN` with reason
 `canonical decision outcome is unresolved`. This happens before command
 mismatch, producer availability or writer entry. No refusal proof, completion,
 reply, retirement, append or replacement deadline is created.
+
+The decision guard applies the same rule to every entry, including direct
+public N1 calls that bypass dispatch: entering `effect_fence(invocation,
+"decision")` for an invocation whose guard already entered once marks it
+unknown, closes the owner and raises `PROVIDER_OUTCOME_UNKNOWN`. N1 reports
+that as `unknown`/`possible`/`PUBLICATION_UNKNOWN`, never as a no-effect
+refusal, so a second entry can neither publish a fresh decision nor claim
+that nothing happened.
 
 Without prior guard entry, all five command fields must match the actual owned
 frame before the fixed co-located `ProtectedCanonicalDecisionWriter` is called.
