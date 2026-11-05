@@ -481,6 +481,8 @@ python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store 
 `status` changes nothing. It lists each authority request as one of these states:
 
 - `awaiting_decision`, `denied`, `closed` or `ready`.
+- `delegation`: an approved `delegate-merge` request. It is the team Decider's scope, never work,
+  so it is not routed.
 - `held`, with a `reason`: `approval_expired`, `team_unregistered`, `team_inactive`,
   `team_has_no_mailbox`, `router_endpoint_missing`, `router_unbound`, `orchestrator_unbound`,
   `router_handoff_unacknowledged`, `route_message_conflict`, `request_too_large` (the routed body
@@ -506,27 +508,43 @@ borrowed binding are configuration, not authenticated identities.
 
 `status` also lists `escalations`: each request the team Decider escalated, with its delegation,
 reason, time and ROOT's last decision on it (`null` until ROOT decides). The Router session voices
-them to ROOT, which decides on a canonical request as usual.
+them to ROOT, which approves or denies the escalated request itself.
 
 ## Delegated Decider approvals
 
-ROOT delegates by approving an ordinary canonical request with `operation: "delegate-merge"`. Its
-`team` and `paths` are the scope, `continuation.max_starts` is how many approvals it allows, and
-`continuation.expires_at` ends it. A deny after the approve revokes it, as for any request.
+ROOT delegates by approving an ordinary canonical request with `operation: "delegate-merge"` and no
+continuation members. Its `team` and `paths` are the scope, `continuation.max_starts` is how many
+approvals it allows, and `continuation.expires_at` ends it. A deny after the approve revokes it, as
+for any request. The approval makes the delegation the Decider's scope and nothing else: the journal
+never admits a delegation as work, and the Router never routes it.
 
 The team Decider records a `delegated_decision` in the lifecycle journal, with the target request ID
 and hash, the delegation's ID and hash, the reviewed `commit`, `review` (evidence references to the
-reviewer's verdict), `decision` and `reason`. The journal accepts `approve` only when the delegation
-is ROOT-approved and unexpired, names the target's team, covers every target path (the same path or a
-parent directory), still has approvals left, the commit is the target's source commit, and the
-Decider did not publish the target. Anything else can only be `escalate`. A target gets one delegated
-decision, and none after ROOT has decided it.
+reviewer's verdict), `decision` and `reason`. Either choice needs a real delegation and a target
+that is an authority request, which ROOT could decide itself. The journal accepts `approve` only
+when the delegation is ROOT-approved and unexpired, names the target's team, covers every target
+path component by component (the same path or a parent directory, never `/`), still has approvals
+left, the commit is the target's source commit, and the Decider did not publish the target. Anything
+else can only be `escalate`. A target gets one delegated decision, and none after ROOT has decided
+it. Only the coordinator and router can publish, so the publisher rule holds by role separation;
+the journal checks it anyway.
 
 The event never admits work: it does not count as a ROOT decision, does not use a continuation budget
 and does not make a request admissible. The Decider cannot record `decision`, `admit`, `intent` or
 `publish`. A policy's `current` may omit the decider, so five-role journals load and replay exactly as
 before. Decider identity is configuration-bound, like every journal actor; the separate-session rule
 is enforced when the mailbox binds the endpoint.
+
+Limits in M1:
+
+- A journal has one current Decider, as it has one Router. The journal checks the delegation's team
+  against the target's, not against the Decider's, so with several teams on one journal that Decider
+  serves all of them.
+- No session connection offers this event yet, so a Decider session cannot record it on its own; the
+  per-role connections come with the launcher. The protected host qualifies only the original five
+  roles, so a protected plan with a decider actor is refused.
+- Router `status` shows a request the Decider approved as `awaiting_decision`, because no ROOT decision
+  exists for it; the delegated approval is in the journal's `delegated_decisions`.
 
 ## Run several initiatives
 

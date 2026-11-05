@@ -8,7 +8,6 @@ journal actor; these tests show what the journal accepts and refuses, not what a
 import copy
 import os
 import sys
-import time
 
 import pytest
 
@@ -122,14 +121,29 @@ def test_an_out_of_scope_target_can_only_be_escalated(decider, change, error):
     assert [d["decision"] for d in decider.status()["delegated_decisions"]] == ["escalate"]
 
 
-def test_an_expired_delegation_is_refused_and_can_only_escalate(decider):
-    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3))
-    granted = decider.delegate(delegation(expires_at=expires))
+def reduce_at(decider, target, granted, at, choice="approve"):
+    """Apply one delegated decision to the loaded state at a chosen time, without writing the journal."""
+    policy, state = hierarchy_lifecycle.Lifecycle(decider.path).load()
+    envelope = {"id": "at-fixed-time", "actor": "decider-1", "generation": 1, "custody": {"cid": "root-1", "generation": 1},
+                "event": {"type": "delegated_decision", "request_id": target["id"],
+                          "request_sha256": raw_request(target)["sha256"], "delegation_id": granted["id"],
+                          "delegation_sha256": raw_request(granted)["sha256"], "commit": SOURCE["commit"],
+                          "review": decider.evidence, "decision": choice, "reason": "fixture " + choice}}
+    hierarchy_lifecycle.reduce_event(policy, state, envelope, at)
+    return state
+
+
+@pytest.mark.parametrize("at,expired", [("2098-12-31T23:59:59Z", False), (FUTURE, True), ("2099-01-01T00:00:01Z", True)])
+def test_a_delegation_is_live_strictly_before_it_expires_and_can_only_escalate_after(decider, at, expired):
+    granted = decider.delegate()
     target = merge()
     decider.publish(target)
-    time.sleep(3.5)
-    assert decider.refused(target, granted) == "delegation expired"
-    decider.decide(target, granted, "escalate")
+    if expired:
+        with pytest.raises(ValueError, match="delegation expired"):
+            reduce_at(decider, target, granted, at)
+        reduce_at(decider, target, granted, at, "escalate")
+    else:
+        assert reduce_at(decider, target, granted, at)["delegated_decisions"][0]["decision"] == "approve"
 
 
 def test_an_exhausted_delegation_is_refused_and_escalations_do_not_count(decider):
@@ -155,18 +169,67 @@ def test_a_revoked_or_undecided_delegation_is_refused(decider):
     decider.decide(target, granted, "escalate")
 
 
-@pytest.mark.parametrize("change,error", [
-    ({"operation": "merge"}, "delegation must be a delegate-merge authority request"),
-    ({"authority": "other-authority"}, "delegation must be a delegate-merge authority request"),
+NOT_A_DELEGATION = "delegation must be a delegate-merge authority request with no continuation members"
+MEMBER = {"id": "member-1", "sha256": "e" * 64, "phase": "integration", "operation": "merge"}
+
+
+@pytest.mark.parametrize("choice", ["approve", "escalate"])
+@pytest.mark.parametrize("change", [
+    {"operation": "merge"}, {"authority": "other-authority"},
+    {"continuation": {"members": [MEMBER], "max_starts": 2, "expires_at": FUTURE}},
 ])
-def test_only_a_delegate_merge_authority_request_delegates(decider, change, error):
+def test_only_a_delegate_merge_authority_request_without_members_delegates(decider, change, choice):
     granted = delegation(**change)
     decider.publish(granted)
     if granted["authority"] == granted["id"]:
         decider.approve(granted)
     target = merge()
     decider.publish(target)
-    assert decider.refused(target, granted) == error
+    assert decider.refused(target, granted, choice) == NOT_A_DELEGATION
+
+
+@pytest.mark.parametrize("choice", ["approve", "escalate"])
+def test_the_target_must_be_an_authority_request_root_could_decide(decider, choice):
+    granted = decider.delegate()
+    member = merge("merge-member", authority="merge-parent")
+    decider.publish(member)
+    assert decider.refused(member, granted, choice) == "the target must be an authority request"
+
+
+def test_an_approved_delegation_is_scope_for_the_decider_not_work(decider):
+    granted = decider.delegate()
+    status = decider.status()
+    assert "delegation-1" not in status["continuation_candidates"]
+    assert status["continuation_holds"]["delegation-1"] == "a delegation authorizes the Decider, not work"
+    assert decider.admit(granted, expect=2)["error"] == "a delegation authorizes the Decider, not work"
+    assert decider.status()["consumed"] == {}
+
+
+def test_the_router_never_routes_a_delegation(tmp_path):
+    from tests.integration.test_hierarchy_router import Loop
+    policy = decider_policy(tmp_path)
+    loop = Loop(tmp_path, policy_changes={key: policy[key] for key in ("actors", "current", "successors")})
+    loop.team("engine")
+    loop.ledger.__class__ = Decider
+    loop.ledger.delegate()
+    assert loop.status()["delegation-1"]["state"] == "delegation"
+    assert loop.route()["routed"] == [] and loop.inbox("engine") == []
+
+
+@pytest.mark.parametrize("grant,paths,error", [
+    (["/fixture/engine/"], ["/fixture/engine", "/fixture/engine/tests"], None),
+    (["/fixture/engine"], ["/fixture/engine/"], None),
+    (["/"], ["/fixture/engine/tests"], "a delegation cannot cover the whole filesystem"),
+    (["/fixture/engine/"], ["/fixture/engine-two"], "target path is outside the delegation's paths"),
+])
+def test_paths_are_compared_by_component(decider, grant, paths, error):
+    granted = decider.delegate(delegation(paths=grant))
+    target = merge(paths=paths)
+    decider.publish(target)
+    if error is None:
+        decider.decide(target, granted)
+    else:
+        assert decider.refused(target, granted) == error
 
 
 def test_the_approval_must_name_the_targets_exact_source_commit(decider):

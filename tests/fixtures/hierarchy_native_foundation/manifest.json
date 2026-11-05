@@ -59,7 +59,7 @@
     "tests/integration/test_hierarchy_operator.py": "a2a58673aa5e3c30f0f3138ba71137f3bebc0a5a621305f214e76ee8b0624f22",
     "tests/integration/test_hierarchy_watch_bridge.py": "1412ab09d1935b297eda48fc0560d42c72f175a5cd47451e096d7f28205008e1",
     "tests/integration/test_hierarchy_watch_supervisor.py": "3dc61f509c916ecba1c889159589479d16494a7d5decfa95f9a72f9e84d36ea4",
-    "tools/hierarchy_lifecycle.py": "d8bfdb5b54c99581aabd897c6276b593f790160b86a5da28512a28c16d3b81a9",
+    "tools/hierarchy_lifecycle.py": "ba7e15107cc0fbc86dd5c81fde134a5b05c7c8b8c8a2b75ee548d8559808a219",
     "tools/hierarchy_native_protocol.py": "7703696341a2861b08bb22c82127b84e3e79c0ebef92e575df716d2bdc953a02",
     "tools/hierarchy_operator.py": "d95c797a55138f6563843ab3ab727d3d11cdbf432e39d881300c68f34a34df03",
     "tools/hierarchy_wake.py": "0bcf061f1b3b4b1159efba7e1233c5d2fc53b06dbb08528f8c72c497d443d3b5",

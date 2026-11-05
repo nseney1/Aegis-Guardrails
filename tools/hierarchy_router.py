@@ -94,6 +94,9 @@ def decision_state(state, row, at):
         return "awaiting_decision", None
     if decision == "deny":
         return "denied", None
+    if value["operation"] == "delegate-merge":
+        # An approved delegation is the team Decider's scope, not work for the orchestrator.
+        return "delegation", None
     if parse_time(at) >= parse_time(value["continuation"]["expires_at"]):
         return "held", "approval_expired"
     return None, None

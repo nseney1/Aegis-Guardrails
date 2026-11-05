@@ -33,15 +33,15 @@ runpy.run_path(wake_path, run_name="__main__")
 '''
 
 
-@pytest.mark.parametrize("prompt_via", ["stdin", "argv"])
-def test_a_host_that_reads_at_once_is_not_refused_by_the_wakes_own_lock(tmp_path, prompt_via):
+# argv only: a stdin host blocks until the prompt is written, which already came after the release.
+def test_a_host_that_reads_at_once_is_not_refused_by_the_wakes_own_lock(tmp_path):
     pilot = Pilot(tmp_path)
     pilot.publish()
     wrapper = tmp_path / "slow_parent.py"
     wrapper.write_text(SLOW_PARENT, encoding="utf-8")
     result = subprocess.run([sys.executable, "-I", str(wrapper), str(WAKE), "--root", str(pilot.root),
                              "--delivery-dir", str(pilot.delivery), "--endpoint", TARGET,
-                             "--profile", str(pilot.profile(prompt_via=prompt_via))],
+                             "--profile", str(pilot.profile(prompt_via="argv"))],
                             capture_output=True, text=True, timeout=60,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert not result.stderr, result.stderr

@@ -12,7 +12,7 @@ import copy
 import hashlib
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import sys
 import uuid
@@ -388,6 +388,8 @@ def approved_authority(state, row, at):
     parent = state["requests"].get(value["authority"])
     decisions = [d for d in state["decisions"] if d["request_id"] == value["authority"]]
     require(parent is not None and decisions and decisions[-1]["decision"] == "approve", "no approved bounded authority")
+    # ROOT's approval of a delegation is the Decider's scope; it must never also start work or spend that budget.
+    require(parent["request"]["operation"] != "delegate-merge", "a delegation authorizes the Decider, not work")
     scope = parent["request"]["continuation"]
     require(parse_time(at) < parse_time(scope["expires_at"]), "bounded authority expired")
     if parent is not row:
@@ -402,7 +404,9 @@ def approved_authority(state, row, at):
 
 
 def covered(scope, path):
-    return any(path == granted or path.startswith(granted.rstrip("/") + "/") for granted in scope)
+    """Component-wise, so /a/b covers /a/b/c and /a/b/ but never /a/b-two."""
+    parts = PurePosixPath(path).parts
+    return any(parts[:len(PurePosixPath(granted).parts)] == PurePosixPath(granted).parts for granted in scope)
 
 
 def delegated_decision(state, row, event, mark):
@@ -417,18 +421,23 @@ def delegated_decision(state, row, event, mark):
     evidence(event["review"])
     text(event["reason"], "delegated decision reason", 1024)
     require(parent is not row, "a delegation cannot be its own target")
+    grant = parent["request"]
+    require(grant["operation"] == "delegate-merge" and grant["authority"] == grant["id"]
+            and not grant["continuation"]["members"],
+            "delegation must be a delegate-merge authority request with no continuation members")
+    # Only an authority request can take a ROOT decision, so only one can be escalated to ROOT.
+    require(value["authority"] == value["id"], "the target must be an authority request")
     # Lazy key, like the provider association: legacy replays and checkpoints keep their exact bytes.
     recorded = state.get("delegated_decisions", [])
     require(all(d["request_id"] != value["id"] for d in recorded), "target already has a delegated decision")
     require(all(d["request_id"] != value["id"] for d in state["decisions"]), "ROOT already decided the target")
     if event["decision"] == "approve":
-        grant = parent["request"]
-        require(grant["operation"] == "delegate-merge" and grant["authority"] == grant["id"],
-                "delegation must be a delegate-merge authority request")
         decisions = [d for d in state["decisions"] if d["request_id"] == grant["id"]]
         require(decisions and decisions[-1]["decision"] == "approve", "delegation is not approved by ROOT")
         require(parse_time(at) < parse_time(grant["continuation"]["expires_at"]), "delegation expired")
         require(grant["team"] == value["team"], "delegation is for another team")
+        require(all(PurePosixPath(granted).parts != ("/",) for granted in grant["paths"]),
+                "a delegation cannot cover the whole filesystem")
         require(all(covered(grant["paths"], path) for path in value["paths"]),
                 "target path is outside the delegation's paths")
         used = sum(1 for d in recorded if d["delegation_id"] == grant["id"] and d["decision"] == "approve")
