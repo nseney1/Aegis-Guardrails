@@ -75,7 +75,7 @@ SELF_SPEC = ("Show what this connection is configured as: endpoint, role, host, 
              "is configuration, not authentication. Changes nothing.", {}, [])
 
 
-def definitions(extra=(), board_specs=None, source_specs=None):
+def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=None):
     """A connection is either a role's mailbox or the board, because they fail and change separately."""
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
@@ -103,6 +103,8 @@ def definitions(extra=(), board_specs=None, source_specs=None):
     specs += [(name, True, *WORKSPACE_TOOL_SPECS[name]) for name in extra]
     specs += [(name, True, *spec) for name, spec in (source_specs or {}).items()]
     specs += [(name, readonly, description, props, required)
+              for name, (readonly, description, props, required) in (lifecycle_specs or {}).items()]
+    specs += [(name, readonly, description, props, required)
               for name, (readonly, description, props, required) in (board_specs or {}).items()]
     return [{"name": name, "description": description, "annotations": {"readOnlyHint": readonly},
              "inputSchema": {"type": "object", "properties": props, "required": required,
@@ -124,6 +126,58 @@ DECISION_SPEC = (
      "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
      "decision": {"type": "string", "enum": ["approve", "deny"]}, "reason": {"type": "string", "maxLength": 1024}},
     ["event_id", "request_id", "request_sha256", "decision", "reason"])
+
+
+ROUTER_TAKES_NO_ACTOR = "the router session takes no lifecycle actor; routing is the router tool's"
+LIFECYCLE_WAIT_SECONDS = 2.0
+LIFECYCLE_TOOL_SPECS = {
+    "router_status": (
+        True, "Read the Router's status from the lifecycle journal: where each authority request stands and what "
+              "the team Decider escalated to ROOT. Changes nothing; routing is the router tool's.", {}, []),
+    "decider_record": (
+        False, "Record the team Decider's approve or escalate on a canonical request, within a ROOT-approved "
+               "delegation, under this connection's configured decider actor. The actor is configuration, not an "
+               "authenticated identity. An approval admits nothing; the journal checks the scope, budget and expiry. "
+               "Retrying the same event_id with the same values returns the original receipt.",
+        {"event_id": {"type": "string", "maxLength": 80}, "request_id": {"type": "string", "maxLength": 80},
+         "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+         "delegation_id": {"type": "string", "maxLength": 80},
+         "delegation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+         "commit": {"type": "string", "maxLength": 64},
+         "review": {"type": "array", "minItems": 1, "maxItems": 64,
+                    "items": {"type": "object", "properties": {"path": {"type": "string", "maxLength": 4096},
+                                                               "sha256": {"type": "string",
+                                                                          "pattern": "^[0-9a-f]{64}$"}},
+                              "required": ["path", "sha256"], "additionalProperties": False}},
+         "decision": {"type": "string", "enum": ["approve", "escalate"]},
+         "reason": {"type": "string", "maxLength": 1024}},
+        ["event_id", "request_id", "request_sha256", "delegation_id", "delegation_sha256", "commit", "review",
+         "decision", "reason"]),
+}
+
+
+def journal_busy(lifecycle, exc):
+    # The journal shares the mailbox's lock helper, whose busy text names the mailbox. Callers hold the mailbox
+    # lock already, so a busy lock at this point is the journal's.
+    if str(exc).startswith("mailbox writer is busy"):
+        return ValueError("lifecycle journal writer is busy; inspect an abandoned "
+                          + str(lifecycle.root / ".write.lock") + " before retrying")
+    return exc
+
+
+def lifecycle_options(root, endpoint, workspace_store, lifecycle, actor):
+    """A role's lifecycle connection comes from its registry entry; every other role is refused the journal."""
+    if lifecycle is None and actor is None:
+        return
+    import hierarchy_roles
+    name = hierarchy_roles.role_name(endpoint, Mailbox(root).endpoint(endpoint).get("kind"))
+    tools = hierarchy_roles.lifecycle_tools(hierarchy_roles.registry()["roles"][name])
+    require(bool(tools), "the %s role has no lifecycle connection" % name)
+    if "router_status" in tools:
+        require(actor is None, ROUTER_TAKES_NO_ACTOR)
+        require(workspace_store is not None, "router_status needs --lifecycle and --workspace-store together")
+    if "decider_record" in tools:
+        require(lifecycle is not None and actor is not None, "the decider takes --lifecycle and --actor together")
 
 
 class DecisionConnection:
@@ -199,12 +253,7 @@ class DecisionConnection:
             try:
                 receipt = self.lifecycle.record(envelope)
             except ValueError as exc:
-                # The journal shares the mailbox's lock helper, whose busy text names the mailbox. The mailbox
-                # lock is already held here, so a busy lock at this point is the journal's.
-                if str(exc).startswith("mailbox writer is busy"):
-                    raise ValueError("lifecycle journal writer is busy; inspect an abandoned "
-                                     + str(self.lifecycle.root / ".write.lock") + " before retrying") from exc
-                raise
+                raise journal_busy(self.lifecycle, exc) from exc
         return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
 
     def record_read(self):
@@ -218,10 +267,11 @@ class Connection:
     instructions = MAILBOX_INSTRUCTIONS
 
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
-                 initiative=None, board=None, source_repo=None):
+                 initiative=None, board=None, source_repo=None, lifecycle=None, actor=None):
         # Owner-facing ROOT gets only the decision adapter; configured-sender mail is not a decision boundary.
         require(endpoint_parts(endpoint)[1] != "root", ROOT_ONLY_ADAPTER)
-        require(board is None or (delivery_dir is None and workspace_store is None and source_repo is None),
+        require(board is None or (delivery_dir is None and workspace_store is None and source_repo is None
+                                  and lifecycle is None and actor is None),
                 "a board connection takes no mailbox options")
         require((workspace_store is None) == (initiative is None),
                 "workspace store and initiative must be given together")
@@ -257,6 +307,10 @@ class Connection:
             hierarchy_roles.require_source_views(endpoint, mailbox.endpoint(endpoint).get("kind"))
             self.source = hierarchy_source.SourceViews(source_repo)
             self.source_specs = {name: hierarchy_source.TOOL_SPECS[name] for name in hierarchy_roles.SOURCE_VIEW_TOOLS}
+        self.lifecycle = None
+        self.lifecycle_specs = {}
+        if lifecycle is not None:
+            self.connect_lifecycle(mailbox, endpoint, lifecycle, actor)
         self.board = None
         self.board_specs = {}
         self.pending_position = None
@@ -266,8 +320,62 @@ class Connection:
             self.board.load()
             self.board_specs = hierarchy_board.TOOL_SPECS
 
+    def connect_lifecycle(self, mailbox, endpoint, lifecycle, actor):
+        import hierarchy_lifecycle
+        import hierarchy_roles
+        self.journal = hierarchy_lifecycle
+        self.lifecycle = hierarchy_lifecycle.Lifecycle(lifecycle)
+        tools = hierarchy_roles.lifecycle_tools(hierarchy_roles.role(endpoint, mailbox.endpoint(endpoint).get("kind")))
+        if "decider_record" in tools:
+            matching(actor, SLUG, "actor")
+            self.actor = actor
+            self.decider_actor()
+        self.lifecycle_specs = {name: LIFECYCLE_TOOL_SPECS[name] for name in tools}
+
+    def decider_actor(self):
+        # As for ROOT's adapter: the policy never changes after init, and custody is the journal's check.
+        policy = self.journal.validate_policy(self.journal.load_json(self.lifecycle.root / "policy.json"))
+        actor = policy["actors"].get(self.actor)
+        require(actor is not None and actor["role"] == "decider",
+                "actor %s is not a decider actor in the lifecycle policy" % self.actor)
+        return actor
+
+    def lifecycle_call(self, name, arguments):
+        import hierarchy_router
+        if name == "router_status":
+            fields(arguments, set())
+            self.checked_mailbox()
+            return hierarchy_router.status(self.lifecycle, self.store, LIFECYCLE_WAIT_SECONDS)
+        fields(arguments, set(LIFECYCLE_TOOL_SPECS[name][3]))
+        # Typed here, so a malformed value is a refusal and never reaches the journal's own code as a non-string.
+        for key, label in (("event_id", "event id"), ("request_id", "request id"), ("delegation_id", "delegation id")):
+            matching(arguments[key], SLUG, label)
+        for key, label in (("request_sha256", "request sha256"), ("delegation_sha256", "delegation sha256")):
+            matching(arguments[key], SHA256, label)
+        text(arguments["commit"], "reviewed commit", 64)
+        self.journal.evidence(arguments["review"])
+        require(arguments["decision"] in ("approve", "escalate"), "decision must be approve or escalate")
+        text(arguments["reason"], "delegated decision reason", 1024)
+        # Mailbox lock first, as ROOT's adapter and the router take them, so a rebinding cannot land between the
+        # fence and the record. ROOT's custody is read from the journal; if it moves before the record, the
+        # journal refuses and the Decider retries.
+        with writer_lock(self.root):
+            self.checked_mailbox(ready=True)
+            actor = self.decider_actor()
+            try:
+                policy, state = hierarchy_router.locked_load(self.lifecycle, LIFECYCLE_WAIT_SECONDS)
+                root = state["current"]["root"]
+                event = {key: arguments[key] for key in LIFECYCLE_TOOL_SPECS[name][3] if key != "event_id"}
+                envelope = {"id": arguments["event_id"], "actor": self.actor, "generation": actor["generation"],
+                            "custody": {"cid": root, "generation": policy["actors"][root]["generation"]},
+                            "event": {"type": "delegated_decision", **event}}
+                receipt = self.lifecycle.record(envelope)
+            except ValueError as exc:
+                raise journal_busy(self.lifecycle, exc) from exc
+        return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
+
     def definitions(self):
-        return definitions(self.workspace_tools, self.board_specs, self.source_specs)
+        return definitions(self.workspace_tools, self.board_specs, self.source_specs, self.lifecycle_specs)
 
     def board_call(self, name, arguments, render):
         if self.board_specs[name][0]:
@@ -391,6 +499,8 @@ class Connection:
         if name in self.source_specs:
             self.checked_mailbox()
             return self.source.call(name, arguments)
+        if name in self.lifecycle_specs:
+            return self.lifecycle_call(name, arguments)
         raise ValueError("unknown mailbox tool: " + name)
 
 
@@ -443,10 +553,10 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
         require(source_repo is None, "the ROOT decision adapter takes no source views")
         connection = DecisionConnection(root, endpoint, host, session, generation, lifecycle, actor)
     else:
-        require(lifecycle is None and actor is None, "only ROOT takes --lifecycle and --actor")
+        lifecycle_options(root, endpoint, workspace_store, lifecycle, actor)
         connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
                                 workspace_store=workspace_store, initiative=initiative, board=board,
-                                source_repo=source_repo)
+                                source_repo=source_repo, lifecycle=lifecycle, actor=actor)
     while True:
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:

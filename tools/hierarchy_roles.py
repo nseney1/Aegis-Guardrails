@@ -40,6 +40,8 @@ ASSISTANTS = {"builder", "front-door", "orchestrator", "reviewer"}
 WORKSPACE_TOOLS = ("workspace_capacity", "workspace_initiative", "workspace_path_overlap")
 READ_TOOLS = ["Read", "Glob", "Grep"]
 WRITE_TOOLS = ["Edit", "Write"]
+# The lifecycle tools a session's mailbox connection may carry.
+LIFECYCLE_TOOLS = ("router_status", "decider_record")
 ROLE_FIELDS = {"title", "kind", "m1", "responsibility", "endpoint", "hat_of", "service", "lifecycle_role", "reads",
                "writes", "calls", "approvals", "prohibitions", "independence", "model_profile", "reports_to",
                "provision"}
@@ -53,6 +55,24 @@ def actions(role, name, group):
         require(isinstance(value, str) and value in VOCABULARY[group],
                 "role %s lists an unknown %s action: %s" % (name, group, str(value)[:64]))
     return set(values)
+
+
+def lifecycle_connection(name, role, allowed):
+    """Only the journal role a tool is written for may carry it: the Router reads status, the Decider records
+    within a delegation. ROOT's adapter is the decision tool alone."""
+    tools = role["provision"]["lifecycle_tools"]
+    require(isinstance(tools, list) and len(tools) == len(set(tools)),
+            "role %s lifecycle_tools must be a list without repeats" % name)
+    for tool in tools:
+        require(isinstance(tool, str) and tool in LIFECYCLE_TOOLS,
+                "role %s names an unknown lifecycle tool: %s" % (name, str(tool)[:64]))
+    require(role["provision"]["adapter"] != "decision" or not tools,
+            "role %s: the decision adapter offers only root_decide" % name)
+    require("router_status" not in tools or ("lifecycle" in allowed["reads"] and role["lifecycle_role"] == "router"),
+            "role %s: router_status is for the router, which reads the lifecycle journal" % name)
+    require("decider_record" not in tools
+            or ("lifecycle:delegated_decision" in allowed["approvals"] and role["lifecycle_role"] == "decider"),
+            "role %s: decider_record is for the decider, which approves within a delegation" % name)
 
 
 def validate_role(name, role):
@@ -87,7 +107,7 @@ def validate_role(name, role):
         require(endpoint["role"] in ENDPOINT_ROLES, "role %s names an unknown endpoint role" % name)
         require(("lane_kind" in endpoint) == (endpoint["role"] == "lane"),
                 "role %s: only a lane endpoint names a lane kind" % name)
-        fields(provision, {"adapter", "reader_shell", "assistants", "team_kind"})
+        fields(provision, {"adapter", "reader_shell", "assistants", "team_kind", "lifecycle_tools"})
         require(provision["adapter"] in {"mailbox", "decision"}, "role %s has an unknown adapter" % name)
         require(type(provision["reader_shell"]) is bool and type(provision["team_kind"]) is bool,
                 "role %s has invalid provisioning flags" % name)
@@ -101,6 +121,7 @@ def validate_role(name, role):
         # it would turn a decision boundary into an operational one.
         require(provision["adapter"] != "decision" or not ({"source", "mailbox", "board"} & allowed["writes"]),
                 "role %s: the decision adapter cannot carry write access" % name)
+        lifecycle_connection(name, role, allowed)
     require(role["service"] is None or (endpoint is None and role["kind"] == "service"),
             "role %s: only a service without an endpoint names a service module" % name)
     if role["service"] is not None:
@@ -176,6 +197,10 @@ def file_tools(entry):
 
 def workspace_tools(entry):
     return tuple(name for name in WORKSPACE_TOOLS if name in entry["reads"])
+
+
+def lifecycle_tools(entry):
+    return tuple(entry["provision"]["lifecycle_tools"])
 
 
 def takes_board(entry):
