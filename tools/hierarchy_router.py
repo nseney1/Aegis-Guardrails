@@ -198,11 +198,10 @@ def row_view(state, key, row, ledger, at):
 
 def report(lifecycle, store, wait, held=None):
     _policy, state = locked_load(lifecycle, wait)
-    return request_rows(state, store, held)
+    return request_rows(state, store.load(), held)
 
 
-def request_rows(state, store, held=None):
-    ledger = store.load()
+def request_rows(state, ledger, held=None):
     at = timestamp()
     rows = []
     for key, row in authority_rows(state):
@@ -230,10 +229,30 @@ def escalations(state):
     return rows
 
 
+ERRORS = (ValueError, OSError, UnicodeError, RecursionError)
+
+
+def blamed(source, action):
+    """Run action and tag a refusal with the component that failed.
+
+    A status caller (the loop) escalates only a journal it cannot read to the owner's journal lock; a broken
+    workspace store or a bad argument is a different fix, and an untagged exit 2 cannot say which."""
+    try:
+        return action()
+    except ERRORS as exc:
+        if not hasattr(exc, "source"):
+            exc.source = source
+        raise
+
+
 def status(lifecycle, store, wait):
-    _policy, state = locked_load(lifecycle, wait)
+    _policy, state = blamed("journal", lambda: locked_load(lifecycle, wait))
+    ledger = blamed("store", store.load)
+    # The current router comes from journal custody, so a caller that routes as it follows a succession without
+    # its own record of who the router is.
     return {"schema": STATUS, "execution_enabled": False, "identity": "configured", "authenticated": False,
-            "requests": request_rows(state, store), "escalations": escalations(state)}
+            "router": state["current"]["router"], "requests": request_rows(state, ledger),
+            "escalations": escalations(state)}
 
 
 def router_actor(policy, state, actor):
@@ -354,16 +373,21 @@ def main(argv=None):
     runner.add_argument("--wait", type=float, default=5.0, help="Seconds to wait out a busy writer lock")
     args = parser.parse_args(argv)
     try:
-        lifecycle = Lifecycle(cli_path(args.lifecycle, "--lifecycle"))
-        store = Store(cli_path(args.store, "--store"))
+        lifecycle_path, store_path = cli_path(args.lifecycle, "--lifecycle"), cli_path(args.store, "--store")
+        lifecycle = blamed("journal", lambda: Lifecycle(lifecycle_path))
+        store = blamed("store", lambda: Store(store_path))
         if args.command == "status":
             result = status(lifecycle, store, 5.0)
         else:
             require(args.evidence_only, EVIDENCE_ONLY)
             require(0 <= args.wait <= 60, "--wait must be between 0 and 60 seconds")
             result = route(lifecycle, store, args.actor, args.wait, args.request)
-    except (ValueError, OSError, UnicodeError, RecursionError) as exc:
-        sys.stdout.buffer.write(encoded({"state": "hold", "execution_enabled": False, "error": str(exc)[:1024]}) + b"\n")
+    except ERRORS as exc:
+        refused = {"state": "hold", "execution_enabled": False, "error": str(exc)[:1024]}
+        if args.command == "status":
+            # journal: the lifecycle read failed; store: the workspace store did; arguments: anything else.
+            refused["source"] = getattr(exc, "source", "arguments")
+        sys.stdout.buffer.write(encoded(refused) + b"\n")
         return 2
     sys.stdout.buffer.write(encoded(result) + b"\n")
     return 0
