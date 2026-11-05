@@ -450,7 +450,8 @@ leaves `unknown` and keeps the slot until root runs `resolve`. See the
 
 `tools/hierarchy_router.py` is the Router's model-free code. It never approves or executes. It reads
 the lifecycle journal and routes each authority request whose last ROOT decision is an unexpired
-`approve` and that has not been routed. Continuation members travel inside their authority request.
+`approve` and that has not been routed. Continuation members are not routed on their own: the authority
+request's bytes name each one by ID and hash, and `--request` takes only an authority ID.
 
 The team registry is the workspace initiative registry. A request's `team` must be an active
 initiative with a `mailbox_root`. That mailbox needs a bound `<team>/router` that has acknowledged
@@ -462,10 +463,13 @@ its handoff, and a bound `<team>/orchestrator`. The request goes out as an `info
  "request": {"raw": "<exact canonical bytes>", "sha256": "..."}}
 ```
 
-The router then records a `route` event, with `to` set to `<team>/orchestrator`. The message ID and
-the event ID are both `route-<request sha256>`, so routing again changes nothing. A run that
-delivered but lost its journal write is finished by the next run without a second message. An
-existing message under that ID with different content is held as `route_message_conflict`.
+The router then records a `route` event, with `to` set to `<team>/orchestrator`. Before it sends,
+it replays that event on a copy of the journal state, so a router at its active-time cap or a full
+journal sends nothing. The message ID and the event ID are both `route-<request sha256>`, so routing
+again changes nothing. A run that delivered but lost its journal write is finished by the next run
+without a second message, even if ROOT has denied the request or its approval has expired since. An
+existing message under that ID with a different sender, recipient, type or body is held as
+`route_message_conflict`.
 
 ```sh
 python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store status
@@ -477,12 +481,20 @@ python3 tools/hierarchy_router.py --lifecycle /abs/lifecycle --store /abs/store 
 
 - `awaiting_decision`, `denied`, `closed` or `ready`.
 - `held`, with a `reason`: `approval_expired`, `team_unregistered`, `team_inactive`,
-  `team_has_no_mailbox`, `router_endpoint_missing`, `orchestrator_endpoint_missing`,
-  `router_unbound`, `orchestrator_unbound`, `router_handoff_unacknowledged`,
-  `route_message_conflict`, `team_mailbox_unreadable` or `request_too_large`. A route run can also
-  hold a request with `delivery_error` and a `detail`, for example when the team mailbox is busy.
+  `team_has_no_mailbox`, `router_endpoint_missing`, `router_unbound`, `orchestrator_unbound`,
+  `router_handoff_unacknowledged`, `route_message_conflict`, `request_too_large` (the routed body
+  would exceed the 64 KiB message limit) or `team_mailbox_unreadable` (with a `detail`). One team's
+  unreadable mailbox holds only that team's requests. A route run can also hold a request with
+  `delivery_error` and a `detail`, for example when the team mailbox is busy or the router is at its
+  active-time cap.
+- `delivered_unrecorded`: the message is in the team mailbox but the journal has no route yet. The
+  next route run records it.
 - `routed`, with `to` and the route mark. A routed request is never routed again. If ROOT denies it
-  afterward, it shows `revoked_after_route: true`.
+  after delivery, it shows `revoked_after_route: true`, as does `delivered_unrecorded`.
+
+Each entry in a route run's `routed` list says whether this run sent the message (`delivered`) or only
+recorded an earlier delivery. If the closing report fails, the run still returns `routed`, with
+`report_error` in place of `requests`.
 
 Escalation is the Router session's job, not this code's. The session reads `status` and tells ROOT
 about anything held. No Router session connection offers `status` yet, so until one does, whoever

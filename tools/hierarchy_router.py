@@ -12,8 +12,10 @@ binding of `<team>/router`, borrowed the way the job runner borrows ROOT's, so t
 
 Deduplication is by request hash. The message ID and the journal event ID are both `route-<sha256>`, so a
 second run finds the earlier message and records nothing new, and a run that delivered but lost its journal
-write is finished by the next run without a second message. A routed request is never routed again, even
-if ROOT later denies it; status reports that as `revoked_after_route` for the Router to raise.
+write is finished by the next run without a second message, even after a deny or an expiry. Before sending,
+the route event is replayed on a copy of the journal state, so a delivery the journal would refuse to record
+is never sent. A routed request is never routed again, even if ROOT later denies it; status reports that as
+`revoked_after_route` for the Router to raise.
 
 The journal accepts a `route` event from the router actor without checking approval. This code is where
 that check lives at this tier. The router actor and the borrowed binding are configuration, not
@@ -22,6 +24,7 @@ authenticated identities, so mutation needs --evidence-only, as the journal's ow
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 import time
 from pathlib import Path
@@ -29,7 +32,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_lifecycle import Lifecycle  # noqa: E402
+from hierarchy_lifecycle import MAX_EVENTS, Lifecycle, reduce_event  # noqa: E402
 from hierarchy_mailbox import (Mailbox, cli_path, encoded, matching, parse_time, require, SLUG,  # noqa: E402
                                timestamp, writer_lock)
 from hierarchy_workspace import Store  # noqa: E402
@@ -110,11 +113,10 @@ def team_mailbox(ledger, team):
 def endpoint_reason(mailbox, team):
     """Why the team mailbox cannot take a routed request now, or None. Every write re-checks under the lock."""
     endpoints = mailbox.manifest["endpoints"]
+    # Every manifest has <team>/orchestrator (validate_manifest), but a router endpoint is optional.
     sender, recipient = team + "/router", team + "/orchestrator"
     if sender not in endpoints:
         return "router_endpoint_missing"
-    if recipient not in endpoints:
-        return "orchestrator_endpoint_missing"
     if not mailbox.bindings(sender):
         return "router_unbound"
     if not mailbox.bindings(recipient):
@@ -128,39 +130,59 @@ def expected_message(team, key, raw):
     return {"from": team + "/router", "to": team + "/orchestrator", "type": "info", "body": route_body(key, raw)}
 
 
-def same_delivery(prior, expected):
-    """A stable ID alone is not this delivery. A successor router binding may have sent the original."""
-    return all(prior.get(key) == value for key, value in expected.items())
+def prior_delivery(mailbox, team, key, raw):
+    """'same' if this request's route ID already names this exact delivery, 'conflict' if it names anything else.
 
-
-def message_reason(mailbox, team, key, raw):
-    """A message already under this request's route ID must be this exact delivery."""
+    A stable ID alone is not this delivery. A successor router binding may have sent the original, so the
+    sender's binding fields are not compared."""
     prior = mailbox.messages().get(route_id(raw["sha256"]))
-    if prior is not None and not same_delivery(prior["message"], expected_message(team, key, raw)):
-        return "route_message_conflict"
-    return None
+    if prior is None:
+        return None
+    expected = expected_message(team, key, raw)
+    return "same" if all(prior["message"].get(k) == v for k, v in expected.items()) else "conflict"
 
 
 def authority_rows(state):
-    # Continuation members travel inside their authority request; only the authority gets a ROOT decision.
+    # Continuation members are named, by ID and hash, inside their authority request's bytes; only the
+    # authority gets a ROOT decision, so only the authority is routed.
     return sorted((key, row) for key, row in state["requests"].items() if row["request"]["authority"] == key)
+
+
+def oversized(key, raw):
+    return len(route_body(key, raw).encode("utf-8")) > MAX_BODY
 
 
 def row_view(state, key, row, ledger, at):
     value = row["request"]
-    view = {"request_id": key, "request_sha256": row["raw"]["sha256"], "team": value["team"],
-            "orchestrator": value["team"] + "/orchestrator"}
+    team = value["team"]
+    view = {"request_id": key, "request_sha256": row["raw"]["sha256"], "team": team,
+            "orchestrator": team + "/orchestrator"}
+    revoked = last_decision(state, key) == "deny"
     stage, reason = decision_state(state, row, at)
     if stage == "routed":
-        view.update(state="routed", to=row["routed"]["to"], routed=row["routed"],
-                    revoked_after_route=last_decision(state, key) == "deny")
+        view.update(state="routed", to=row["routed"]["to"], routed=row["routed"], revoked_after_route=revoked)
         return view
+    # A delivery whose journal write was lost is still a delivery, whatever ROOT decided since.
+    initiative = ledger.initiatives.get(team)
+    if initiative is not None and "mailbox_root" in initiative:
+        try:
+            prior = prior_delivery(Mailbox(initiative["mailbox_root"]), team, key, row["raw"])
+        except (ValueError, OSError, UnicodeError) as exc:
+            prior = None
+            if stage is None:
+                stage, reason, view["detail"] = "held", "team_mailbox_unreadable", str(exc)[:1024]
+        if prior == "same":
+            view.update(state="delivered_unrecorded", to=team + "/orchestrator", revoked_after_route=revoked)
+            return view
+        if prior == "conflict" and stage is None:
+            stage, reason = "held", "route_message_conflict"
     if stage is None:
-        root, reason = team_mailbox(ledger, value["team"])
+        root, reason = team_mailbox(ledger, team)
+        if reason is None and oversized(key, row["raw"]):
+            reason = "request_too_large"
         if reason is None:
             try:
-                mailbox = Mailbox(root)
-                reason = endpoint_reason(mailbox, value["team"]) or message_reason(mailbox, value["team"], key, row["raw"])
+                reason = endpoint_reason(Mailbox(root), team)
             except (ValueError, OSError, UnicodeError) as exc:
                 reason, view["detail"] = "team_mailbox_unreadable", str(exc)[:1024]
         stage = "ready" if reason is None else "held"
@@ -177,9 +199,12 @@ def report(lifecycle, store, wait, held=None):
     rows = []
     for key, row in authority_rows(state):
         view = row_view(state, key, row, ledger, at)
-        if held and key in held and view["state"] == "ready":
-            # A delivery attempt this run failed after the checks passed; say so instead of "ready".
-            view.update(state="held", **held[key])
+        if held and key in held:
+            # A delivery attempt this run failed after the checks passed; say why instead of "ready".
+            if view["state"] == "ready":
+                view["state"] = "held"
+            if view["state"] in {"held", "delivered_unrecorded"}:
+                view.update(held[key])
         rows.append(view)
     return rows
 
@@ -198,48 +223,66 @@ def router_actor(policy, state, actor):
     return policy["actors"][actor]
 
 
+def route_envelope(policy, state, actor, key, raw, to):
+    root_actor = state["current"]["root"]
+    return {"id": route_id(raw["sha256"]), "actor": actor, "generation": policy["actors"][actor]["generation"],
+            "custody": {"cid": root_actor, "generation": policy["actors"][root_actor]["generation"]},
+            "event": {"type": "route", "request_id": key, "request_sha256": raw["sha256"], "to": to}}
+
+
+def journal_accepts(policy, state, envelope):
+    """Replay the route event on a copy, so a message goes out only when the journal will record it.
+
+    Without this, a capped or full journal would leave a delivery the journal never records."""
+    trial = copy.deepcopy(state)
+    require(trial["sequence"] < MAX_EVENTS, "lifecycle event limit reached")
+    reduce_event(policy, trial, envelope, timestamp())
+
+
 def deliver(lifecycle, ledger, actor, key, wait):
-    """Deliver one request and record the route. Lock order is mailbox, then journal, as ROOT's adapter takes them."""
-    _policy, state = locked_load(lifecycle, wait)
-    row = state["requests"][key]
-    team = row["request"]["team"]
-    root, reason = team_mailbox(ledger, team)
-    if reason is not None:
-        return None, {"reason": reason}
-    raw = row["raw"]
-    identifier = route_id(raw["sha256"])
-    expected = expected_message(team, key, raw)
-    if len(expected["body"].encode("utf-8")) > MAX_BODY:
-        return None, {"reason": "request_too_large"}
+    """Deliver one request, or finish one whose journal write was lost, and record the route.
 
-    def attempt():
-        with writer_lock(Path(root)):
-            mailbox = Mailbox(root)
-            policy, state = locked_load(lifecycle, wait)
-            entry = router_actor(policy, state, actor)
-            row = state["requests"][key]
-            stage, why = decision_state(state, row, timestamp())
-            if stage is not None:
-                return None, {"reason": why or stage}
-            why = endpoint_reason(mailbox, team)
-            if why is not None:
-                return None, {"reason": why}
-            prior = mailbox.messages().get(identifier)
-            if prior is None:
-                binding = mailbox.current_binding(expected["from"])
-                mailbox.publish({"message_id": identifier, "host": binding["host"], "session": binding["session"],
-                                 "binding_generation": binding["generation"], **expected})
-            elif not same_delivery(prior["message"], expected):
-                return None, {"reason": "route_message_conflict"}
-            root_actor = state["current"]["root"]
-            envelope = {"id": identifier, "actor": actor, "generation": entry["generation"],
-                        "custody": {"cid": root_actor, "generation": policy["actors"][root_actor]["generation"]},
-                        "event": {"type": "route", "request_id": key, "request_sha256": raw["sha256"], "to": expected["to"]}}
-            receipt = patient(lambda: lifecycle.record(envelope), wait)
-            return {"request_id": key, "request_sha256": raw["sha256"], "to": expected["to"], "message_id": identifier,
-                    "receipt": receipt}, None
-
+    Lock order is mailbox, then journal, as ROOT's adapter takes them. The journal lock is not held from
+    the check to the record, so a ROOT deny can land between them; the route is then recorded and status
+    shows it as revoked_after_route, the same as a deny that comes later."""
     try:
+        _policy, state = locked_load(lifecycle, wait)
+        team = state["requests"][key]["request"]["team"]
+        initiative = ledger.initiatives.get(team)
+        if initiative is None or "mailbox_root" not in initiative:
+            return None, {"reason": team_mailbox(ledger, team)[1]}
+        root = initiative["mailbox_root"]
+
+        def attempt():
+            with writer_lock(Path(root)):
+                mailbox = Mailbox(root)
+                policy, state = locked_load(lifecycle, wait)
+                router_actor(policy, state, actor)
+                row = state["requests"][key]
+                raw = row["raw"]
+                if row["routed"] is not None:
+                    return None, {"reason": "already_routed"}
+                expected = expected_message(team, key, raw)
+                envelope = route_envelope(policy, state, actor, key, raw, expected["to"])
+                prior = prior_delivery(mailbox, team, key, raw)
+                if prior == "conflict":
+                    return None, {"reason": "route_message_conflict"}
+                if prior is None:
+                    stage, why = decision_state(state, row, timestamp())
+                    if stage is not None:
+                        return None, {"reason": why or stage}
+                    why = team_mailbox(ledger, team)[1] or ("request_too_large" if oversized(key, raw) else None)
+                    why = why or endpoint_reason(mailbox, team)
+                    if why is not None:
+                        return None, {"reason": why}
+                    journal_accepts(policy, state, envelope)
+                    binding = mailbox.current_binding(expected["from"])
+                    mailbox.publish({"message_id": envelope["id"], "host": binding["host"], "session": binding["session"],
+                                     "binding_generation": binding["generation"], **expected})
+                receipt = patient(lambda: lifecycle.record(envelope), wait)
+                return {"request_id": key, "request_sha256": raw["sha256"], "to": expected["to"],
+                        "message_id": envelope["id"], "delivered": prior is None, "receipt": receipt}, None
+
         return patient(attempt, wait)
     except (ValueError, OSError, UnicodeError) as exc:
         return None, {"reason": "delivery_error", "detail": str(exc)[:1024]}
@@ -251,21 +294,29 @@ def route(lifecycle, store, actor, wait, only=None):
     router_actor(policy, state, actor)
     if only is not None:
         require(only in state["requests"], "unknown request id: " + only)
+        authority = state["requests"][only]["request"]["authority"]
+        require(authority == only, "only an authority request is routed; %s travels inside %s" % (only, authority))
     ledger = store.load()
     at = timestamp()
     routed, held = [], {}
     for key, row in authority_rows(state):
         if only is not None and key != only:
             continue
-        if row_view(state, key, row, ledger, at)["state"] != "ready":
+        if row_view(state, key, row, ledger, at)["state"] not in {"ready", "delivered_unrecorded"}:
             continue
         result, failure = deliver(lifecycle, ledger, actor, key, wait)
         if result is not None:
             routed.append(result)
         else:
             held[key] = failure
-    return {"schema": RUN, "actor": actor, "execution_enabled": False, "identity": "configured",
-            "authenticated": False, "routed": routed, "requests": report(lifecycle, store, wait, held)}
+    result = {"schema": RUN, "actor": actor, "execution_enabled": False, "identity": "configured",
+              "authenticated": False, "routed": routed}
+    try:
+        result["requests"] = report(lifecycle, store, wait, held)
+    except (ValueError, OSError, UnicodeError) as exc:
+        # The routes above are recorded; losing the closing report must not hide them.
+        result.update(requests=None, held=held, report_error=str(exc)[:1024])
+    return result
 
 
 def main(argv=None):

@@ -401,3 +401,143 @@ def test_status_changes_nothing(loop):
     assert loop.ledger.files() == journal
     assert mailbox_snapshot(loop.mailboxes["engine"]) == mailbox
     assert {p: p.read_bytes() for p in Path(loop.workspace.store).rglob("*") if p.is_file()} == store
+
+
+def test_a_lost_journal_write_then_a_deny_still_shows_the_delivery_and_records_it(loop):
+    value = loop.approved(request("feature-1"))
+    deliver_without_recording(loop, value)
+    loop.ledger.event("decision", actor="root-1", decision="deny", reason="withdrawn", **loop.ledger.target(value))
+
+    before = loop.status()["feature-1"]
+    assert (before["state"], before["revoked_after_route"]) == ("delivered_unrecorded", True)
+    result = loop.route()
+
+    assert [(r["request_id"], r["delivered"]) for r in result["routed"]] == [("feature-1", False)]
+    row = loop.status()["feature-1"]
+    assert (row["state"], row["revoked_after_route"]) == ("routed", True)
+    assert len(loop.inbox("engine")) == 1
+
+
+def test_a_lost_journal_write_on_an_expired_approval_is_still_recorded(loop):
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+    value = loop.approved(request("feature-1", continuation={"members": [], "max_starts": 1, "expires_at": expires}))
+    deliver_without_recording(loop, value)
+    time.sleep(2.2)
+
+    assert loop.status()["feature-1"]["state"] == "delivered_unrecorded"
+    assert [r["request_id"] for r in loop.route()["routed"]] == ["feature-1"]
+    assert loop.row(value)["routed"]["to"] == "engine/orchestrator"
+
+
+def test_a_router_at_its_active_cap_delivers_nothing(loop):
+    value = loop.approved(request("feature-1"))
+    loop.ledger.event("meter", actor="operator-1", subject="router-1", active_seconds=3600, open_since=None)
+    journal = loop.ledger.files()
+
+    result = loop.route()
+
+    assert result["routed"] == []
+    row = {r["request_id"]: r for r in result["requests"]}["feature-1"]
+    assert (row["state"], row["reason"]) == ("held", "delivery_error")
+    assert row["detail"] == "actor cumulative active cap reached"
+    assert loop.inbox("engine") == []
+    assert loop.ledger.files() == journal
+    assert loop.row(value)["routed"] is None
+
+
+def test_a_closed_request_is_not_routed(loop):
+    value = loop.approved(request("feature-1"))
+    successor = request("feature-1b")
+    loop.ledger.event("disposition", status="FINAL", resolution={"kind": "next", "request": raw_request(successor),
+                      "evidence": loop.ledger.evidence}, **loop.ledger.target(value))
+    journal = loop.ledger.files()
+
+    result = loop.route()
+
+    assert result["routed"] == []
+    assert {k: r["state"] for k, r in loop.status().items()} == {"feature-1": "closed", "feature-1b": "awaiting_decision"}
+    assert loop.inbox("engine") == []
+    assert loop.ledger.files() == journal
+
+
+@pytest.mark.parametrize("change", [{"to": "engine/root"}, {"from": "engine/front-door", "session": "engine-front-door"},
+                                    {"type": "escalation"}])
+def test_a_same_body_message_with_another_sender_recipient_or_type_is_a_conflict(loop, change):
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_router  # noqa: E402
+    invoke(loop.mailboxes["engine"], "publish", {
+        "message_id": "route-" + target["sha256"], "from": "engine/router", "to": "engine/orchestrator",
+        "host": "host-one", "session": "engine-router", "binding_generation": 1, "type": "info",
+        "body": hierarchy_router.route_body("feature-1", target), **change})
+
+    result = loop.route()
+
+    assert result["routed"] == []
+    row = loop.status()["feature-1"]
+    assert (row["state"], row["reason"]) == ("held", "route_message_conflict")
+    assert loop.row(value)["routed"] is None
+
+
+def test_an_unreadable_team_mailbox_holds_only_that_team(loop):
+    loop.workspace.register("docs", mailbox_root=str(loop.tmp / "docs" / "missing-mailbox"))
+    loop.approved(request("feature-1"))
+    loop.approved(request("feature-2", team="docs"))
+
+    result = loop.route()
+
+    assert [r["request_id"] for r in result["routed"]] == ["feature-1"]
+    row = loop.status()["feature-2"]
+    assert (row["state"], row["reason"]) == ("held", "team_mailbox_unreadable")
+    assert row["detail"]
+
+
+def test_a_request_too_large_for_one_message_is_held_in_status(loop):
+    stem = "/fixture/" + "/".join(["d" * 50] * 5)
+    value = loop.approved(request("feature-1", paths=["%s/%03d" % (stem, i) for i in range(256)]))
+
+    assert loop.status()["feature-1"]["reason"] == "request_too_large"
+    assert loop.route()["routed"] == []
+    assert loop.inbox("engine") == []
+    assert loop.row(value)["routed"] is None
+
+
+def test_delivery_rechecks_the_decision_under_the_lock(loop):
+    """A scan that saw the request approved must not deliver it if ROOT denied it before the lock was taken."""
+    value = loop.approved(request("feature-1"))
+    loop.ledger.event("decision", actor="root-1", decision="deny", reason="withdrawn", **loop.ledger.target(value))
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_router  # noqa: E402
+    from hierarchy_lifecycle import Lifecycle  # noqa: E402
+    from hierarchy_workspace import Store  # noqa: E402
+    journal = loop.ledger.files()
+
+    result = hierarchy_router.deliver(Lifecycle(loop.ledger.path), Store(loop.workspace.store).load(),
+                                      "router-1", "feature-1", 0.2)
+
+    assert result == (None, {"reason": "denied"})
+    assert loop.inbox("engine") == []
+    assert loop.ledger.files() == journal
+
+
+@pytest.mark.parametrize("args,error", [
+    (("--request", "nope"), "unknown request id: nope"),
+    (("--request", "member-1"), "only an authority request is routed; member-1 travels inside feature-1"),
+    (("--wait", "61"), "--wait must be between 0 and 60 seconds"),
+    (("--wait", "-1"), "--wait must be between 0 and 60 seconds"),
+])
+def test_bad_route_arguments_are_refused_before_anything_is_written(loop, args, error):
+    member = request("member-1", authority="feature-1")
+    member_raw = raw_request(member)
+    loop.approved(request("feature-1", continuation={"members": [{"id": "member-1", "sha256": member_raw["sha256"],
+                                                                  "phase": member["phase"], "operation": member["operation"]}],
+                                                     "max_starts": 2, "expires_at": "2099-01-01T00:00:00Z"}))
+    loop.ledger.publish(member)
+    journal, mailbox = loop.ledger.files(), mailbox_snapshot(loop.mailboxes["engine"])
+
+    result = loop.run("route", "--actor", "router-1", "--evidence-only", *args, expect=2)
+
+    assert result["error"] == error
+    assert loop.ledger.files() == journal
+    assert mailbox_snapshot(loop.mailboxes["engine"]) == mailbox
