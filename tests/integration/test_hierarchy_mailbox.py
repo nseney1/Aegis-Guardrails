@@ -113,7 +113,8 @@ sys.stdout = Output()
 sys.path.insert(0, str(Path(helper).parent))
 if mode == "cli":
     sys.argv = [helper, "--root", root, "inbox", "--endpoint", endpoint,
-                "--mark-read", "--delivery-dir", delivery]
+                "--mark-read", "--delivery-dir", delivery,
+                "--host", "host-one", "--session", endpoint, "--generation", "1"]
 else:
     sys.argv = [helper, "--root", root, "serve", "--endpoint", endpoint,
                 "--host", "host-one", "--session", endpoint, "--generation", "1",

@@ -15,6 +15,7 @@ an assistant can only point you somewhere. Your verdict is a recommendation, nev
 owner approval.
 
 - **No prepared copy, T70a and T142.** Without a prepared copy (e.g. a live-worktree review in layout f), use the pinned commit-id reads above: read only exact commit ids (`git show "${rev}:path"`, `git diff <base> <candidate>`), cite the commit and tree ids, and never read the working tree.
+- **Source views.** When your mailbox connection offers `source_show` and `source_grep`, use them for the pinned commit-id reads: they read exact commits only, a page at a time. Cite the commit id you passed.
 - **No `EnterWorktree`, T38, T48 and T139.** No lane calls `EnterWorktree`, whatever its kind: its dialog cannot be answered remotely.
 - **Cwd, T97, T104, T135 and T139.** Keep the launch cwd. Never `cd`, not even inside a compound command or a subshell; use `git -C` and absolute paths. Run `pwd` before the first Write; if it is not the launch cwd, run one lone `cd <launch cwd>` and report it.
 - **Your report, T104.** It lies outside every repository, so the scan answers `not_governed`: record that and continue.

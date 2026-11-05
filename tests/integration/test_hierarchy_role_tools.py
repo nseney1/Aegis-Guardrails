@@ -11,7 +11,7 @@ from tests.integration.test_hierarchy_mailbox import HELPER, git, invoke
 from tests.integration.test_hierarchy_workspace import Workspace, clone_pair, write_lease
 
 
-MAILBOX_TOOLS = {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff"}
+MAILBOX_TOOLS = {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"}
 ENDPOINTS = {"a/front-door": {}, "a/orchestrator": {}, "a/root": {}, "a/lane/f2": {"kind": "implementer"},
              "a/lane/integration": {"kind": "integrator"}, "a/lane/review": {"kind": "reviewer"}}
 ROLE_TOOLS = {

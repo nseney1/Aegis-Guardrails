@@ -22,7 +22,7 @@ patterns only catch key-shaped text, so a post can still leak a secret in anothe
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -265,6 +265,10 @@ def event_digest(event):
 
 
 class Board:
+    # Entered inside the board lock, after it is held, around every write. The mailbox adapter uses it to take
+    # the mailbox lock and check the session's binding only for the write itself, never while waiting.
+    writer_guard = staticmethod(nullcontext)
+
     def __init__(self, path):
         self.path = safe_path(path)
         self.events = self.path / "events"
@@ -287,7 +291,8 @@ class Board:
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
-            yield
+            with self.writer_guard():
+                yield
         finally:
             lock.unlink()
 

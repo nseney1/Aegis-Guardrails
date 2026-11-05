@@ -57,7 +57,7 @@ WRITE_TOOLS = hierarchy_roles.WRITE_TOOLS
 # Endpoints init can add beyond the front door, orchestrator and root every initiative has.
 OPTIONAL_ROLES = ("router", "decider")
 SUPPORTED_TOOLS = set(READ_TOOLS + WRITE_TOOLS)
-MAILBOX_TOOLS = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff"]
+MAILBOX_TOOLS = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"]
 DEFAULT_TIMEOUT_SECONDS = 900
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -162,11 +162,11 @@ def build_base(base, endpoints, writer_limit, record):
         raise
 
 
-def adapter_args(setup, endpoint, host, session, generation):
+def adapter_args(setup, endpoint, host, session, generation, source_repo=None):
     return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
             "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
             "--delivery-dir", setup["delivery_dir"], "--workspace-store", setup["store"],
-            "--initiative", setup["initiative"]]
+            "--initiative", setup["initiative"]] + (["--source-repo", source_repo] if source_repo else [])
 
 
 def board_args(setup, endpoint, host, session, generation):
@@ -216,9 +216,9 @@ def codex_argv(cwd, *, writer, settings, tail, options):
     return argv + list(tail)
 
 
-def codex_servers(setup, endpoint, session, generation, tools, board):
+def codex_servers(setup, endpoint, session, generation, tools, board, source_repo=None):
     # Values are quoted as JSON strings, which TOML accepts unchanged, so a path cannot change the table.
-    arguments = adapter_args(setup, endpoint, CODEX, session, generation)
+    arguments = adapter_args(setup, endpoint, CODEX, session, generation, source_repo)
     limits = "mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode=\"approve\"}," \
              "mailbox_ack_handoff={approval_mode=\"approve\"}"
     servers = ("aegis_mailbox={command=" + json.dumps(setup["python"]) + ",args=" + toml_list(arguments) +
@@ -325,22 +325,6 @@ def fixed_profile(request, mailbox, endpoint):
                                            "tier_applied": False}
 
 
-def require_independent_session(mailbox, endpoint, host, session):
-    """Where independence is the control, the registry asks for a separate session, so one session can never
-    hold both sides. Checked when provisioning binds a role; a direct mailbox bind is not checked."""
-    mine = registry_role(mailbox, endpoint)
-    for other in mailbox.manifest["endpoints"]:
-        if other == endpoint:
-            continue
-        history = mailbox.bindings(other)
-        if not history or (history[-1]["host"], history[-1]["session"]) != (host, session):
-            continue
-        theirs = registry_role(mailbox, other)
-        if mine["independence"]["separate_session"] or theirs["independence"]["separate_session"]:
-            raise ValueError("session %s already holds %s; the role registry needs a separate session for %s"
-                             % (session, other, endpoint if mine["independence"]["separate_session"] else other))
-
-
 def role_tools(endpoint, mailbox, requested):
     entry = registry_role(mailbox, endpoint)
     writer = hierarchy_roles.writer(entry)
@@ -386,7 +370,7 @@ def check_codex_options(request, mailbox, endpoint, host):
 def check_role_request(request, setup):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort", "timeout_seconds", "assistants",
                                                    "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background",
-                                                   "kind"})
+                                                   "kind", "source_repo"})
     host = request["host"]
     require(host in (CLAUDE, CODEX, NATIVE), "unsupported host: " + str(host))
     require(type(request.get("background", False)) is bool, "invalid background")
@@ -398,6 +382,13 @@ def check_role_request(request, setup):
     if "kind" in request:
         mailbox.require_kind(request["endpoint"], request["kind"])
     check_codex_options(request, mailbox, request["endpoint"], host)
+    if "source_repo" in request:
+        # Before binding, so a refused option leaves the endpoint unbound.
+        require(endpoint_parts(request["endpoint"])[1] != "root", "the ROOT decision adapter takes no source views")
+        hierarchy_roles.require_source_views(request["endpoint"], mailbox.endpoint(request["endpoint"]).get("kind"))
+        repository = safe_path(text(request["source_repo"], "source_repo"))
+        require(repository.is_absolute() and git(repository, "rev-parse", "--show-toplevel").returncode == 0,
+                "source_repo must be an absolute path to a git repository")
     for name in ("model", "effort"):
         if name in request:
             text(request[name], name, 128)
@@ -448,7 +439,8 @@ def add_role(request):
     tools, writer = role_tools(endpoint, mailbox, request.get("tools"))
     root = Path(setup["mailbox_root"])
     with writer_lock(root):
-        require_independent_session(Mailbox(root), endpoint, host, session)
+        # Also checked inside bind; here as well, so re-running add-role on an existing binding is checked too.
+        hierarchy_roles.require_independent_session(Mailbox(root), endpoint, host, session)
         history = mailbox.bindings(endpoint)
         if history:
             require(history[-1]["session"] == session and history[-1]["host"] == host,
@@ -466,8 +458,9 @@ def add_role(request):
         return answer
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
     role_extra = role_workspace_tools(mailbox, endpoint)
-    enabled = MAILBOX_TOOLS + list(role_extra)
-    arguments = adapter_args(setup, endpoint, host, session, generation)
+    source_repo = request.get("source_repo")
+    enabled = MAILBOX_TOOLS + list(role_extra) + (list(hierarchy_roles.SOURCE_VIEW_TOOLS) if source_repo else [])
+    arguments = adapter_args(setup, endpoint, host, session, generation, source_repo)
     board = takes_board(setup, mailbox, endpoint)
     connection = base / "connections" / (stem + ".json")
     connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -500,7 +493,7 @@ def add_role(request):
         if assistants:
             answer["assistants"] = ASSISTANT_NOTE
     else:
-        settings = codex_servers(setup, endpoint, session, generation, enabled, board)
+        settings = codex_servers(setup, endpoint, session, generation, enabled, board, source_repo)
         wake_argv = codex_argv(str(cwd), writer=writer, settings=settings, tail=["resume", session], options=request)
         prompt_via = "argv"
     wake_profile = base / "profiles" / (stem + ".wake.json")
