@@ -2822,8 +2822,7 @@ def hand_made_commit(tmp_path, rows):
         repo.mkdir()
         git(repo, "init", "-q")
     tree = hand_made_tree(repo, rows(repo))
-    commit = subprocess.run(["git", "commit-tree", tree, "-m", "hand-made"], cwd=repo, capture_output=True, check=True,
-                            text=True).stdout.strip()
+    commit = git(repo, "commit-tree", tree, "-m", "hand-made")
     return repo, commit, tree
 
 
