@@ -362,7 +362,7 @@ def demanded(error):
     return error[len("missing fields: "):].split(", ")
 
 
-def test_the_writer_checklist_names_what_the_mailbox_demands_in_the_order_it_demands_it(pilot, tmp_path):
+def test_the_writer_checklist_names_what_the_mailbox_demands_in_the_order_it_demands_it(pilot, tmp_path):  # noqa: F811
     root, brief = pilot
     invoke(root, "publish", message(kind="dispatch", brief=brief))
     accept = message("a/lane/f2", "a/orchestrator", identifier="accepted", kind="ack", in_reply_to="dispatch-1",
@@ -385,7 +385,7 @@ def test_the_writer_checklist_names_what_the_mailbox_demands_in_the_order_it_dem
     assert invoke(root, "publish", {**complete, "result": evidence})["message"]["result"]["checks"][3]["outcome"] == "partial"
 
 
-def test_the_reviewer_checklist_matches_the_mailboxs_bare_ack_and_optional_lane_check(pilot, tmp_path):
+def test_the_reviewer_checklist_matches_the_mailboxs_bare_ack_and_optional_lane_check(pilot, tmp_path):  # noqa: F811
     root, brief = pilot
     invoke(root, "publish", message(recipient="a/lane/review", kind="dispatch", brief=brief))
     accept = message("a/lane/review", "a/orchestrator", identifier="accepted", kind="ack", in_reply_to="dispatch-1",
@@ -401,7 +401,7 @@ def test_the_reviewer_checklist_matches_the_mailboxs_bare_ack_and_optional_lane_
     assert missing("roles/reviewer.md", ["`%s`" % field for field in verdict] + ["`{check, outcome, reference}`"]) == []
 
 
-def test_the_orchestrator_checklist_names_the_brief_reference_the_mailbox_demands(pilot):
+def test_the_orchestrator_checklist_names_the_brief_reference_the_mailbox_demands(pilot):  # noqa: F811
     root, _ = pilot
     no_brief = invoke(root, "publish", message(kind="dispatch"), ok=False)["error"]
     assert no_brief == "brief or dispatch message requires a brief hash"
