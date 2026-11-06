@@ -17,9 +17,72 @@ teams' backlog, source ownership, independent review and integration obligations
 `tools/hierarchy_native.py` reads the latest native Codex turn record. It reports
 identity, model, reasoning effort, working directory, approvals and the recorded
 permission profile with exact record hashes. Prompt text cannot override those
-fields. Requested service tier and observed served tier remain separate. Missing
-served-tier telemetry is unknown and does not stop explicitly authorized
-standalone maintenance that requests the default tier.
+fields. Requested service tier and observed served tier remain separate. The
+served tier comes from the current turn's `thread_settings_applied` event
+(`settings_record` names it); settings from an earlier turn are never reused. A
+turn ends at `task_complete` or `turn_aborted`; a turn that was stopped may leave
+neither, so a second unnamed settings record inside a turn that already has its
+own belongs to the next `task_started` (a resumed process may write it first).
+Missing served-tier telemetry is unknown and does not stop explicitly authorized
+standalone maintenance that requests the default tier; when another tier was
+requested, `check` holds with `served tier unavailable`.
+
+`observed_permissions` lists each recorded filesystem entry as `kind`,
+`path_or_special`, `access` and `missing_path_behavior`, including specials such
+as `slash_tmp` and `tmpdir`. `check` refuses every write it was not told to
+expect: path writes outside `--write-root`, and special writes not named by
+`--allow-special-write NAME` (`--allow-tmpdir` names `tmpdir`; `root` is never
+allowed). A provisioned profile on a real host is checked with
+`--approval-policy never --approvals-reviewer user` (or `auto_review`, whichever
+the host records): real rollouts record a reviewer even under `never`.
+`--approvals-reviewer none` expects no reviewer at all and is only for a host
+that records none, such as the test fake. `check` also holds when the served
+tier is known and differs from `--requested-tier`, and reports a model or effort
+it was given no value for as `unchecked`, which holds. `events` lists the
+recorded shell attempts (command, exit code, aggregated output, turn) and patch
+applications for the current turn, or every turn with `--turn all`:
+`exec_command_end` and `patch_apply_end` events, `item_completed` events carrying
+a `CommandExecution` or `FileChange` item, `item.*` stream records, and
+`response_item` `custom_tool_call` / `function_call` records named `apply_patch`
+paired with their output by `call_id` (targets from the `*** Add File:` and
+`*** Update File:` headers). That last shape is unconfirmed against a real host,
+and its entries and the probe report say so. A declined patch is marked
+`declined`. It reports what the host recorded, never model text.
+
+`tools/hierarchy_native_probe.py` drives provisioned roles through a disposable
+probe. A shell attempt is `REFUSED` only when the nonce file is absent and the
+rollout records the exact planned command with the probe helper's own JSON for
+that nonce and path naming errno 1, 13 or 30. The command counts as its own argv,
+the whole string, or `[SHELL, -c|-lc, CMD]` where SHELL's real path is one of
+the shells (sh, bash, zsh, dash) the plan resolved on the host PATH; any other
+wrapper is `INCONCLUSIVE`. A patch is `REFUSED` only when it failed and a whole
+line of its text, with every path it names and the probe root cut out, is
+`patch rejected`, a permission or read-only error, or `[Errno N]` for N in 1, 13
+or 30, before any context-failure header (text after such a header is the
+model's own and never counts). A patch over several paths is never a refusal. A matching record without that evidence is `INCONCLUSIVE`,
+no record (or only a declined one) is `NOT_ATTEMPTED`, and both fail the run. A
+record that contradicts the target file is `UNEXPECTED`, including a success
+record with the nonce absent even when a refusal was also recorded. A target the
+probe user could not write before the turn is `INCONCLUSIVE`. The helper sits
+outside every role's writable roots; it is re-hashed and its lstat compared
+after the probe turn, and every folder from the helper and each target up to `/`
+is recorded before the turn. A replaced folder, or one renamed away and back
+(its change time moves past its modification time), makes every verdict of that
+role `INCONCLUSIVE` and fails the run. After the launcher start,
+each role's expected values are recomputed from the run-time profile record; a
+difference from the plan refuses that role. Each plan request names the
+expected approvals reviewer (`user` or `auto_review` for a real host); there is
+no default and no fallback. The run guards both `$HOME/.codex` and the passwd
+home's `.codex`; an entry it cannot read makes that folder `unknown`, which fails
+the run, but the report is still written and the lock released. It judges only
+turns that started after their launch. Live rollout reads leave out an
+unterminated final line; a record the reader still cannot take fails only that
+role (with its line), the role's session is stopped, and the run goes on to the
+next role. The source may itself be a linked worktree. SIGTERM, SIGHUP or SIGINT
+stops the role's session through the launcher, removes the login and the probe
+worktree (`git worktree remove` only), and writes a report with state
+`interrupted`; after a SIGKILL, `cleanup --probe-root` does the same from the
+launch records and may be repeated.
 
 When a native `task_started` event is present, the context must follow it and
 name that same turn. A missing or mismatched context refuses observation; an old
@@ -29,10 +92,13 @@ turn-start events remain diagnostic observations, never admission grants.
 ```
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID inspect
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID check --model gpt-6-astra --effort ultra --cwd /absolute/workspace
+python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID check --model gpt-6-astra --effort ultra --cwd /absolute/workspace --approval-policy never --approvals-reviewer user --allow-special-write tmpdir
+python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID events --turn all
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID admit --role operator
 ```
 
-The last command currently refuses native admission. Local files and environment
+The `admit` command currently refuses native admission for every Codex role in
+the role registry. Local files and environment
 variables are provenance, not authenticated caller identity. The inspected native
 interface supplies no verified tool allowlist or narrow authenticated decision
 service. ROOT additionally requires an effective read-only filesystem, and the
