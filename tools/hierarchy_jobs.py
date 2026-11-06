@@ -1364,6 +1364,9 @@ def job_environment(recipes, job, checkout, export=None):
         # The export has no .git, or only export_git's stub, so git must not walk up from it into whatever repository
         # holds the store. Discovery stops below the job folder, so it finds the stub or nothing.
         env["GIT_CEILING_DIRECTORIES"] = str(job.folder)
+        # A committed folder holding HEAD, objects/ and refs/ is a bare repository to discovery, found before the stub,
+        # with its own HEAD, config and alternates. Only protected config can refuse that, so it goes in as -c would.
+        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.bareRepository", GIT_CONFIG_VALUE_0="explicit")
     tokens = {"$checkout": export or checkout, "$scratch": scratch_argument(job)}
     for key, value in recipes.get("env", {}).items():
         env[key] = tokens.get(value, value)
