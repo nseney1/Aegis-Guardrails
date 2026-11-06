@@ -10,6 +10,8 @@ in the wheel. Nothing watches folders or tracks repository work for Aegis unless
 Host configuration, manager policy/membership and release gates are unchanged.
 
 To move live sessions or run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
+To take one feature through the M1 loop with real sessions, and induce its failure cases, follow the
+[M1 loop runbook](hierarchy-m1-loop-runbook.md).
 
 | Tool | Root uses it to |
 | --- | --- |
