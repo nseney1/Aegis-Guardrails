@@ -98,7 +98,10 @@ class ScriptError(Exception):
 
 def parse_argv(argv):
     """Read the options codex_argv writes; the last word is the prompt, as the launcher and wake pass it."""
-    import tomllib  # Python 3.11+, and only rollout mode needs it.
+    try:  # Only rollout mode needs TOML.
+        import tomllib
+    except ModuleNotFoundError:  # Python < 3.11, where pytest itself depends on tomli
+        import tomli as tomllib
     options = {"sandbox": "read-only", "cwd": os.getcwd(), "config": {}, "add_dirs": [], "resume": None}
     index = 0
     while index < len(argv):

@@ -19,7 +19,10 @@ def server_definitions(argv):
         return json.load(open(argv[argv.index("--mcp-config") + 1], encoding="utf-8"))["mcpServers"]
     for index, word in enumerate(argv):
         if word == "-c" and argv[index + 1].startswith("mcp_servers="):
-            import tomllib  # Python 3.11+, and only Codex connections need it.
+            try:  # Only Codex connections need TOML.
+                import tomllib
+            except ModuleNotFoundError:  # Python < 3.11, where pytest itself depends on tomli
+                import tomli as tomllib
             return tomllib.loads(argv[index + 1])["mcp_servers"]
     raise SystemExit("no mailbox connection on the command line")
 
