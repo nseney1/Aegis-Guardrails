@@ -451,13 +451,48 @@ a root endpoint keep working, but cannot receive job requests.
 and an exact source, either as a whole `.md` file or as the body of an earlier message, which is
 how a role with no file writer sends one. A job is refused unless its checkout is registered
 for the initiative and its revision, tree and status digest match the packet. The argv comes
-only from root's recipe file, by exact-word substitution with no shell. The source is witnessed
+only from root's recipe file, by exact-word substitution with no shell; a recipe word may also be
+`$scratch/<plain relative path>`, which joins only the job's scratch folder (`scratch/run`) with a
+suffix fixed in the recipe file, never a packet value. The source is witnessed
 again afterward, so a clean exit over changed source is reported as `failed`, with an `exit_code`
 of -1 meaning that no command's own exit decided the result. A heavy job holds a ledger slot, and
 outside heavy processes count against the same limit. The result is written before its receipt,
 so a busy mailbox or store only delays a receipt or a release until the next run. A lost runner
 leaves `unknown` and keeps the slot until root runs `resolve`. See the
 [dogfood guide](hierarchy-dogfood.md) for packets and recipes.
+
+A recipe with `require_clean` refuses a checkout with local changes and a path that is not in the
+packet's commit. It then runs on an export of that commit, not on the checkout:
+- Every blob is written from `git cat-file`, with no filters, attributes or LFS smudging, so LFS
+  files arrive as their pointer files.
+- A symlink that leads outside the export is refused, and so are submodules, any `.git` entry, and a
+  partial clone (fetching its missing objects could run a command from the repository's config).
+- `$checkout`, the working folder and `PYTHONPATH` name the export, and the export is removed after
+  the run.
+- In bubblewrap the live checkout is hidden, so ignored and untracked files there cannot run. With
+  `sandbox: none` they are still readable by absolute path.
+The result's `source_export` names the commit, tree, entry count and size. Use a recipe without the
+flag, such as `lint`, for uncommitted work. One with `expects_tests` keeps pytest's `junit.xml`, and `result.json` gains `tests` (total,
+passed, failed, errors, skipped). A run that reports no tests, passes none (all skipped, for
+example), or leaves no readable junit file, is `failed` even with exit 0. Every result `run-open`
+writes, refusals included, records `recipes_sha256`, the hash of the exact recipe file, and a command
+job's result records `python`, the interpreter's version. A root `resolve` copies the hash recorded
+when the job was admitted, or `null` if none was. Each time root pins or changes the recipe file, it
+publishes the hash `check-recipes` prints, so a Reviewer has a value to compare. The template's `targeted-tests` and `full-suite` set
+both flags. Its `lint` runs the same command as `make lint`, takes no paths, and so cannot be narrowed.
+
+**Reviewing with job evidence.** The orchestrator files `targeted-tests` on the exact commit under
+review and forwards the receipt's evidence references (paths and sha256) in the review dispatch. The
+Reviewer then checks:
+1. Every evidence file still has its sha256.
+2. `result.json` says `completed` and `exit_code` 0, with `tests.passed` above 0 and
+   `tests.failed` and `tests.errors` both 0. Weigh `tests.skipped` against the selection.
+3. The `before` and `after` source revisions are the reviewed commit, with the empty dirty digest.
+4. `recipes_sha256` is the recipe file root published.
+5. The test selection fits the change.
+
+pytest runs the change's own `conftest.py` and configuration, so a hostile change could fake its
+counts. Read those files in the diff. Hosted CI on the PR head stays the merge gate.
 
 ## Route approved requests
 
@@ -789,7 +824,8 @@ the existing separate owner review/activation. See [manager mode](manager-worksp
 
 The native foundation corpus pins some guides byte for byte, so they predate [the loop](#run-the-loop)
 and durable sweeps: `docs/hierarchy-dogfood.md` still says nothing runs on a timer and that ignored
-mail gets no second turn only within one sweep, and `docs/hierarchy-watch-supervisor.md` describes the
+mail gets no second turn only within one sweep, and its packet example adds `dirty_content_sha256` to
+run `targeted-tests` on uncommitted changes, which that recipe now refuses (`require_clean`), and `docs/hierarchy-watch-supervisor.md` describes the
 pinned evidence-only supervisor, not the loop the watch-supervisor role now runs. Where they differ,
 this guide is current. If the loop runs, do not also run sweep or `run-open` by hand for the same
 store.

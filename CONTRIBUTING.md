@@ -51,7 +51,7 @@ Before opening a pull request, run the full suite, the deterministic checks and 
 
 ```bash
 python -m aegis_cli check
-python -m ruff check --isolated --select E9,F63,F7,F82 aegis_cli aegis_core aegis_mcp aegis_sdk tests .github/scripts
+python -m ruff check --isolated --select E9,F63,F7,F82 aegis_cli aegis_core aegis_mcp aegis_sdk tests .github/scripts tools
 python -m build  # when packaging changes; wheel and sdist go into dist/
 ```
 
