@@ -247,7 +247,7 @@ def test_after_router_rotation_the_new_current_router_routes(tmp_path):
     world.ledger.event("succeed", actor="router-2", predecessor="router-1", checkpoint_sha256=checkpoint)
     world.approved(request("feature-1", team="pilot"))
 
-    result = world.once()
+    result = world.once(expect=3)   # the fake Orchestrator leaves the route unanswered: a silent_role hold
 
     route = next(row for row in result["steps"] if row["step"] == "route")
     assert (route["actor"], route["routed"]) == ("router-2", ["feature-1"])
@@ -733,6 +733,11 @@ def test_a_lane_that_accepts_its_dispatch_and_stops_is_a_stalled_dispatch_hold_f
 
     world.send("pilot/lane/review", "pilot/orchestrator", "review-1-verdict", type="review", in_reply_to="review-1",
                result=EVIDENCE)
+    # The Orchestrator answers the verdict, so whether its dispatch falls inside a turn's 5 s slack cannot decide
+    # a silent_role hold; ROOT's unread copy keeps this pass on hold.
+    world.plan({"pilot/orchestrator": {"send": [{"message_id": "reviewed", "to": "pilot/root", "type": "info",
+                                                 "body": "Reviewed."}]}})
     answered = world.once(expect=3)
 
     assert key not in holds(answered)
+    assert set(holds(answered)) == {("sweep", "root_queue", "pilot/root")}
