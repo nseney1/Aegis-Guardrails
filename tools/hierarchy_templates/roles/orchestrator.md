@@ -51,8 +51,10 @@ that hierarchy's accepted writer dispatches.
 Read every inbox page before an ack, a dispatch or opening a PR, using
 `--after <next_after>` until `remaining` is 0 (T15, T28). Use the same mailbox for
 every vertical hop. Requests that change another team's work (paths, merges, queue
-moves) go by ROOT relay (owner decision `c12-cross-orchestrator-traffic-a`); notices
-without authority may go by SendMessage, and the receiver records them in its STATUS.
+moves) go by ROOT relay (owner decision `c12-cross-orchestrator-traffic-a`).
+<!-- host:claude -->
+On a Claude host, notices without authority may go by SendMessage, and the receiver records them in its STATUS.
+<!-- /host -->
 Each orchestrator routes work to its own lanes. A peer still cannot dispatch your lanes.
 Collect and spot-check exact-source reports; preserve failed/incomplete evidence.
 Arrange independent review from a read-only checkout of base and candidate, plus one
@@ -102,7 +104,9 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters.
 ## Working rules
 
 - **Stalls, T3.** A lane whose request has been open longer than 20 minutes (xhigh) or 25 minutes (max), or that has been silent for 15 minutes, cannot read messages: ask root to stop and relaunch it.
+<!-- host:claude -->
 - **Dialogs, T10, T26 and T62.** A present `waitingFor` (e.g. `"permission prompt"`) is a dialog whatever `status` says. Otherwise decide on `status`: `idle` is idle and `busy` is busy, whatever `state` says (an idle session also shows `state: blocked`), and a non-idle status with an unanswered request is a dialog. Then read `claude logs` and tell root, which tells the owner.
+<!-- /host -->
 - **Refusals, T13.** No brief or prompt may tell a lane to work around a refused tool, guard, classifier decision or write.
 - **Writing lanes, T38 and T48.** Writing lanes use layout (f): launched in the trusted workspace, working in a ROOT-registered worktree, never calling `EnterWorktree`.
 - **Endpoints, T61 and T87.** Name only endpoints the manifest declares. For a new lane, ask root to rebind a finished endpoint of the lane's kind whose holder is stopped, and expect the launch prompt to state the binding.
@@ -114,5 +118,11 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters.
 - **Launch order, T117 and T137 (b).** worktree → lease → writer → bind → launch → dispatch → accept. Every writing dispatch names a lease, which ROOT claims before the launch.
 - **Quiet binds and closed dispatches, T118.** Until `ack-lineage` (T69's fix) is live, bind a successor orchestrator at a quiet moment. Every writer dispatch ends with "close this dispatch with a mailbox `result` before the self-stop". Close a dispatch before its worktree is removed; otherwise every later bind and ack fails with "git identity check failed".
 - **Owner-approved backlog, T130.** Every handoff carries the "Owner-approved backlog" table, copied forward verbatim. An item leaves only as done (with evidence) or retired by a cited record, and the successor re-checks the table against the owner records during its read.
+<!-- host:claude -->
 - **Addressing, T132 (2), T136 and T145.** ListAgents can show a successor before its bind, so send to the session the binding names (`hierarchy_mailbox.py --root <mailbox> status </dev/null`, field `bindings["<endpoint>"]`), whose name ListAgents shows; until a successor is bound, its predecessor is still the manager. Codex-hosted roles are not in ListAgents: reach them through the mailbox only, and read their binding the same way. Their Claude lanes poll their inbox (`lane.md`, mixed hosts).
 - **Rotation stop, T99 c.** When root says `stop` after your successor reports read complete, send root one final line, then run `claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null` as your last action; if it is refused, tell root; never stop another session.
+<!-- /host -->
+<!-- host:codex -->
+- **Addressing, T136.** Reach every role through the mailbox only, by its endpoint: the mailbox delivers to whichever session the endpoint's binding names.
+- **Rotation stop, T99 c.** When root says `stop` after your successor reports read complete, send root one final `info` and end your turn; the launcher stops a Codex session. Never run a command to stop a session, yours or another's.
+<!-- /host -->

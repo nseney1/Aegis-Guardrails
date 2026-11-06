@@ -2,9 +2,11 @@
 """The provider bridge: start, resume and stop a provisioned Codex role, and record every outcome.
 
 `start` runs a role's start argv once with its role contract as the prompt, reads the session ID from the
-first `thread.started` event and binds it through add-role. `resume` runs the pinned wake tool with the
-bound wake profile, unchanged. `stop` signals the process groups of the processes that name the
-bound session, so it cannot stop a session on another host. `status` reads the records back.
+first `thread.started` event and binds it through add-role. Every role it starts is a Codex role, so the contract
+leaves out passages marked for another host; a reviewer or an integrator also gets lane.md's shared rules.
+`resume` runs the pinned wake tool with the bound wake profile, unchanged. `stop` signals the process groups of
+the processes that name the bound session, so it cannot stop a session on another host. `status` reads the
+records back.
 ROOT is the owner's session and a native thread belongs to its app: the launcher starts and stops neither.
 
 A launch record is not a lifecycle event and grants nothing: the journal has no provider-bridge
@@ -19,6 +21,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -57,6 +60,18 @@ START_FOOTER = "Reply READY. Act only when woken."
 CONTRACTS = {"orchestrator": "orchestrator.md", "router": "router.md", "decider": "decider.md",
              "front-door": "front-door.md", "implementer": "lane.md", "reviewer": "reviewer.md",
              "integrator": "integrator.md"}
+# reviewer.md and integrator.md open with "Follow the shared lane rules (lane.md)", so lane.md comes first. Its
+# Assignments and Protocol checklist are the implementer's (11-field readiness, a required lane_check); each kind file
+# restates both for its kind, so they are left out of lane.md rather than sent twice and contradicting each other.
+SHARED_LANE_RULES = "lane.md"
+SHARED_FOR = ("reviewer", "integrator")
+KIND_SECTIONS = ("## Assignments", "## Protocol checklist")
+# A contract marks a passage for one host with a line `<!-- host:claude -->` or `<!-- host:codex -->` and ends it with
+# `<!-- /host -->`. The launcher starts Codex roles only.
+CONTRACT_HOSTS = ("claude", "codex")
+START_HOST = "codex"
+HOST_OPEN = re.compile(r"<!-- host:([a-z]+) -->")
+HOST_CLOSE = "<!-- /host -->"
 
 
 class Interrupted(Exception):
@@ -239,19 +254,78 @@ def start_lock(launches, endpoint, identifier):
         lock.unlink()
 
 
+def host_view(text, host, origin):
+    """The contract as a role on `host` reads it: blocks marked for another host and every marker line left out.
+
+    A marker stands alone on its line and blocks do not nest. Anything else that looks like a marker refuses the
+    contract, so a typo can never hand one host's instructions to another."""
+    kept, opened = [], None
+    for number, line in enumerate(text.splitlines(), 1):
+        marker = HOST_OPEN.fullmatch(line.strip())
+        if marker:
+            if opened is not None:
+                raise ValueError("unbalanced host markers in %s: line %d opens a block inside the one opened at line %d"
+                                 % (origin, number, opened[0]))
+            require(marker.group(1) in CONTRACT_HOSTS,
+                    "invalid host marker in %s: line %d names an unknown host: %s" % (origin, number, marker.group(1)))
+            opened = (number, marker.group(1))
+        elif line.strip() == HOST_CLOSE:
+            require(opened is not None,
+                    "unbalanced host markers in %s: line %d closes a block that is not open" % (origin, number))
+            opened = None
+        else:
+            require("<!-- host:" not in line and "<!-- /host" not in line,
+                    "invalid host marker in %s: line %d: a host marker must stand alone on its line" % (origin, number))
+            if opened is None or opened[1] == host:
+                kept.append(line)
+    if opened is not None:
+        raise ValueError("unbalanced host markers in %s: the block opened at line %d is not closed"
+                         % (origin, opened[0]))
+    return tidy(kept)
+
+
+def tidy(lines):
+    # A dropped block or section leaves its blank lines behind; Markdown reads a run of them as one.
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def without_sections(text, headings):
+    """text without each section headed by one of `headings`, up to the next level-1 or level-2 heading."""
+    kept, skipping = [], False
+    for line in text.splitlines():
+        if line.startswith(("# ", "## ")):
+            skipping = line.strip() in headings
+        if not skipping:
+            kept.append(line)
+    return tidy(kept)
+
+
 def start_prompt(launches, endpoint):
-    """(prompt, contract reference) for the start turn.
+    """(prompt, contracts) for the start turn. contracts lists {path, sha256} for each file the prompt carries, in
+    order; the last is the role's own.
 
     The contract goes inline: the start turn has no MCP servers and may run in a cwd that cannot see the
     source. It is read from the pinned source, beside the mailbox code the role's adapter runs, so the
     fields it teaches are the ones that adapter checks.
     """
     role = role_name(endpoint, launches.mailbox.endpoint(endpoint).get("kind"))
-    path = Path(launches.setup["source"]) / "tools" / "hierarchy_templates" / "roles" / CONTRACTS.get(role, "")
+    folder = Path(launches.setup["source"]) / "tools" / "hierarchy_templates" / "roles"
+    path = folder / CONTRACTS.get(role, "")
     require(role in CONTRACTS and path.is_file(), "no role contract for %s: %s" % (role, path))
-    raw = path.read_bytes()
-    prompt = "\n\n".join((START_HEADER % (endpoint, role), raw.decode("utf-8").strip(), START_FOOTER))
-    return prompt, {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
+    files = ([folder / SHARED_LANE_RULES] if role in SHARED_FOR else []) + [path]
+    parts, contracts = [], []
+    for each in files:
+        require(each.is_file(), "no role contract for %s: %s" % (role, each))
+        raw = each.read_bytes()
+        parts.append(host_view(raw.decode("utf-8"), START_HOST, each))
+        contracts.append({"path": str(each), "sha256": hashlib.sha256(raw).hexdigest()})
+    if len(files) > 1:
+        lines = parts[-1].splitlines()
+        require(all(heading in lines for heading in KIND_SECTIONS),
+                "%s must restate lane.md's %s for its kind" % (path, " and ".join(KIND_SECTIONS)))
+        parts[0] = without_sections(parts[0], KIND_SECTIONS)
+    prompt = "\n\n".join((START_HEADER % (endpoint, role), *parts, START_FOOTER))
+    return prompt, contracts
 
 
 def start(launches, request_path):
@@ -280,7 +354,7 @@ def locked_start(launches, request, endpoint, identifier):
                           maximum=3600)
         require(endpoint_parts(endpoint)[1] != "root", ROOT_START)
         require(launches.binding(endpoint) is None, "endpoint is already bound; resume it or hand it off")
-        prompt, contract = start_prompt(launches, endpoint)
+        prompt, contracts = start_prompt(launches, endpoint)
         started = codex_start({"base": str(launches.base), "endpoint": endpoint,
                                **{key: request[key] for key in CODEX_START_KEYS if key in request}})
         argv = started["start_argv"] + [prompt]
@@ -292,8 +366,9 @@ def locked_start(launches, request, endpoint, identifier):
     logs = {name: str(folder / (identifier + "." + name)) for name in ("stdout", "stderr")}
     deferred = Deferred()
     session, exit_code, timed_out, error = run_start(argv, started["cwd"], logs, timeout, deferred)
-    details = {"argv": argv, "cwd": started["cwd"], "contract": contract, "start_timeout_seconds": timeout,
-               "exit_code": exit_code, "timed_out": timed_out}
+    # contract keeps its meaning (the role's own file); contracts lists every file the prompt carries.
+    details = {"argv": argv, "cwd": started["cwd"], "contract": contracts[-1], "contracts": contracts,
+               "start_timeout_seconds": timeout, "exit_code": exit_code, "timed_out": timed_out}
     if not (isinstance(session, str) and SESSION.fullmatch(session)):
         error = error or (None if session is None else "the start reported an invalid session")
         record = launches.record(endpoint, identifier, "start", "failed_to_start", **known, **details,
