@@ -309,7 +309,12 @@ def missing_host_capability(candidate, missing, monkeypatch):
 
 @pytest.mark.parametrize("missing", HOST_CAPABILITIES)
 def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, missing):
-    probe = tmp_path / "test_capability_probe.py"
+    # The child collector must stay inside its owned probe directory, even
+    # when an ancestor has pytest configuration or a Windows junction alias.
+    (tmp_path / "conftest.py").write_text("raise RuntimeError('child pytest loaded an ancestor conftest')\n")
+    directory = tmp_path / "probe"
+    directory.mkdir()
+    probe = directory / "test_capability_probe.py"
     probe.write_text(
         "import pytest\n"
         "from tests.integration.test_hierarchy_fixture_broker import module, missing_host_capability\n"
@@ -324,14 +329,14 @@ def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, 
     report = tmp_path / "capability-report.xml"
     result = subprocess.run(
         [sys.executable, "-B", "-m", "pytest", "-q", "-ra", "-p", "no:cacheprovider",
-         "--basetemp", str(fixtures), "--junitxml", str(report),
+         "--confcutdir", str(directory), "--basetemp", str(fixtures), "--junitxml", str(report),
          str(probe) + "::test_positive"], cwd=ROOT,
         env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    # Validate the selected fixture's outcome, not pytest's aggregate summary
-    # (which can also include collection skips on unsupported hosts).
+    # Prove that exactly one target was collected and skipped for the required
+    # host capability, without accepting duplicate alias or teardown reports.
     cases = ET.parse(report).getroot().findall(".//testcase")
     evidence = report.read_text(encoding="utf-8") + result.stdout + result.stderr
     assert len(cases) == 1 and cases[0].get("name") == "test_positive", evidence
