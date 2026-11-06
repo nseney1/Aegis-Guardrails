@@ -34,7 +34,7 @@ def rollout(tmp_path, rows=None):
     return path
 
 
-def run_tool(path, *args):
+def run_tool(path, *args, cid=CID):
     # The reader runs no tool, so its PATH is an empty fake-bin dir and HOME a disposable folder: a stray
     # lookup of codex or ~/.codex would find nothing real.
     base = Path(path).parent
@@ -43,11 +43,11 @@ def run_tool(path, *args):
     env = {"PATH": str(base / "fake-bin"), "HOME": str(base / "home"), "CODEX_THREAD_ID": CID,
            "CODEX_SESSION_ID": CID, "LANG": os.environ.get("LANG", "C.UTF-8")}
     return subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--rollout", str(path),
-                           "--cid", CID, *args], text=True, capture_output=True, timeout=5, env=env)
+                           "--cid", cid, *args], text=True, capture_output=True, timeout=5, env=env)
 
 
-def invoke(path, *args, code=0):
-    proc = run_tool(path, *args)
+def invoke(path, *args, code=0, cid=CID):
+    proc = run_tool(path, *args, cid=cid)
     assert proc.returncode == code, proc.stdout + proc.stderr
     assert not proc.stderr, proc.stderr
     return json.loads(proc.stdout)
@@ -839,3 +839,89 @@ def test_a_still_running_command_has_no_exit_code_and_code_mode_keeps_turn_attri
     every = invoke(rollout(tmp_path, rows), "events", "--turn", "all")["command_executions"]
     assert [(e["turn_id"], e["command"], e["exit_code"], e["status"], e["options"]) for e in every] == [
         ("t1", "sleep 600", None, "running", ["max_output_tokens", "yield_time_ms"])]
+
+
+# -- Codex multi-agent: whether a session was offered sub-agent tools ---------------------------------------------
+
+MULTI_AGENT = Path(__file__).resolve().parents[1] / "fixtures" / "hierarchy_native_multi_agent" / "v2.jsonl"
+V2_AGENT_TOOLS = ["collaboration." + name for name in ("followup_task", "interrupt_agent", "list_agents", "send_message",
+                                                      "spawn_agent", "wait_agent")]
+
+
+def live_records():
+    """The sanitized records of a live role session started with --disable multi_agent (see the fixture README)."""
+    return [json.loads(line) for line in MULTI_AGENT.read_text(encoding="utf-8").splitlines()]
+
+
+LIVE_CID = live_records()[0]["payload"]["id"]
+
+
+def offered_tools(records):
+    return next(record["payload"] for record in records if record["payload"].get("type") == "additional_tools")
+
+
+def without_collaboration(records):
+    tools = offered_tools(records)
+    tools["tools"] = [entry for entry in tools["tools"] if entry["name"] != "collaboration"]
+    return records
+
+
+def multi_agent_state(path, cid=LIVE_CID):
+    sys.path.insert(0, str(TOOL.parent))
+    import hierarchy_native
+
+    return hierarchy_native.multi_agent_state(str(path), cid)
+
+
+def test_a_live_session_offered_the_v2_agent_tools_reports_each_and_its_version():
+    assert multi_agent_state(MULTI_AGENT) == {"schema": "aegis.native-multi-agent/v1", "cid": LIVE_CID, "version": "v2",
+                                              "agent_tools": V2_AGENT_TOOLS, "turns": 1, "tool_records": 1}
+
+
+@pytest.mark.parametrize("version", [True, False])
+def test_without_the_collaboration_namespace_no_agent_tool_is_offered_and_a_version_is_only_reported(tmp_path, version):
+    records = without_collaboration(live_records())
+    if not version:
+        for record in records:
+            record["payload"].pop("multi_agent_version", None)
+    state = multi_agent_state(rollout(tmp_path, records))
+    assert (state["agent_tools"], state["version"], state["tool_records"]) == ([], "v2" if version else None, 1)
+
+
+def test_an_agent_tool_offered_outside_the_namespace_still_counts(tmp_path):
+    records = without_collaboration(live_records())
+    offered_tools(records)["tools"].append({"type": "function", "name": "spawn_agent"})
+    assert multi_agent_state(rollout(tmp_path, records))["agent_tools"] == ["spawn_agent"]
+
+
+def test_a_rollout_with_no_tools_record_offers_nothing_and_says_so(tmp_path):
+    records = [record for record in live_records() if record["payload"].get("type") != "additional_tools"]
+    state = multi_agent_state(rollout(tmp_path, records))
+    assert (state["agent_tools"], state["tool_records"], state["turns"]) == ([], 0, 1)
+
+
+@pytest.mark.parametrize("change,error", [
+    (lambda tools: tools.update(tools="collaboration"), "malformed additional_tools record at line 3"),
+    (lambda tools: tools["tools"].append({"type": "namespace", "name": "collaboration", "tools": None}),
+     "malformed additional_tools record at line 3"),
+    (lambda tools: tools["tools"].append({"type": "function"}), "malformed additional_tools record at line 3"),
+])
+def test_a_malformed_tools_record_fails_closed(tmp_path, change, error):
+    records = live_records()
+    change(offered_tools(records))
+    with pytest.raises(ValueError) as caught:
+        multi_agent_state(rollout(tmp_path, records))
+    assert str(caught.value) == error
+
+
+def test_multi_agent_state_needs_the_matching_session_identity():
+    with pytest.raises(ValueError) as caught:
+        multi_agent_state(MULTI_AGENT, CID)
+    assert str(caught.value) == "rollout identity does not match requested CID"
+
+
+@pytest.mark.parametrize("offered,code", [(True, 2), (False, 0)])
+def test_the_multi_agent_command_fails_only_when_agent_tools_were_offered(tmp_path, offered, code):
+    records = live_records() if offered else without_collaboration(live_records())
+    result = invoke(rollout(tmp_path, records), "multi-agent", code=code, cid=LIVE_CID)
+    assert result["agent_tools"] == (V2_AGENT_TOOLS if offered else []) and result["version"] == "v2"

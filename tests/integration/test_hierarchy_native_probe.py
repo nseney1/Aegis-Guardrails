@@ -7,6 +7,7 @@ verdict rules; the fake's sandbox is a simulation, so they support no claim abou
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
@@ -24,6 +25,10 @@ GIT = shutil.which("git")
 PS = shutil.which("ps")
 SH = shutil.which("sh")
 KEY = "sk-probe-test-" + uuid.uuid4().hex
+# A live role session's additional_tools record: Codex offered it the multi-agent v2 tools (fixture README).
+MULTI_AGENT = ROOT / "tests" / "fixtures" / "hierarchy_native_multi_agent" / "v2.jsonl"
+V2_AGENT_TOOLS = ["collaboration." + name for name in ("followup_task", "interrupt_agent", "list_agents", "send_message",
+                                                      "spawn_agent", "wait_agent")]
 IDENTITY = {"GIT_AUTHOR_NAME": "probe", "GIT_AUTHOR_EMAIL": "probe@example.invalid",
             "GIT_COMMITTER_NAME": "probe", "GIT_COMMITTER_EMAIL": "probe@example.invalid"}
 WRAPPER = """#!/bin/sh
@@ -276,6 +281,8 @@ def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery
         assert row["settings"]["probe"]["state"] == "PROFILE_MATCH", row["settings"]
         assert row["settings"]["wake"]["state"] == "PROFILE_MATCH"
         assert row["recovery"]["recovered"] is True
+        assert row["multi_agent"] == {"state": "MULTI_AGENT_OFF", "version": None, "agent_tools": [], "turns": 4,
+                                      "tool_records": 0, "reasons": []}
         assert census(row["session"]) == []
     router = role_report(report, "router")
     assert router["settings"]["probe"]["requested_tier"] == "ultrafast"
@@ -296,6 +303,7 @@ def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery
     assert text.startswith("Aegis native probe %s: PASSED" % probe.root)
     assert "implementer shell worktree ALLOWED (expected ALLOWED) as_expected" in text
     assert "Fake codex results support no enforcement claim." in text
+    assert "  multi-agent: MULTI_AGENT_OFF, version not recorded, agent tools none" in text
 
 
 def test_a_stop_mid_turn_then_a_wake_shows_recovery(probe):
@@ -487,6 +495,37 @@ def test_cleanup_removes_the_worktree_and_leaves_no_session_running(probe):
     assert (probe.root / "report.json").is_file() and not Path(plan["gitdir"]).exists()
 
 
+def offered_tools_line():
+    return next(line for line in MULTI_AGENT.read_text(encoding="utf-8").splitlines() if '"additional_tools"' in line)
+
+
+OFFERED_FAILURE = ("the session was offered sub-agent tools: %s (multi_agent_version not recorded)"
+                   % ", ".join(V2_AGENT_TOOLS))
+
+
+def test_a_role_offered_codex_sub_agent_tools_fails_the_run_and_names_them(probe):
+    probe.plan([{"role": "implementer"}])
+    record = probe.tmp / "additional-tools.jsonl"
+    record.write_text(offered_tools_line() + "\n", encoding="utf-8")
+    # The fake writes no additional_tools record, so the probe turn appends the live one to the only rollout.
+    append = 'for f in %s/sessions/*/*/*/rollout-*.jsonl; do /bin/cat %s >> "$f"; done' % (
+        shlex.quote(str(probe.codex_home)), shlex.quote(str(record)))
+    probe.script_turns(first={"implementer": [{"command": append, "target": None}]})
+    report = probe.run(expect=3, cap=4)
+    row = role_report(report, "implementer")
+    assert row["multi_agent"] == {"state": "MULTI_AGENT_OFFERED", "version": None, "agent_tools": V2_AGENT_TOOLS,
+                                  "turns": 4, "tool_records": 1, "reasons": [OFFERED_FAILURE]}
+    assert report["summary"]["failures"] == ["implementer multi-agent: " + OFFERED_FAILURE]
+    assert row["recovery"]["recovered"] is True and row["settings"]["probe"]["state"] == "PROFILE_MATCH"
+    text = probe.invoke("report", "--probe-root", str(probe.root), "--text", expect=3)
+    assert "  multi-agent: MULTI_AGENT_OFFERED, version not recorded, agent tools %s" % ", ".join(V2_AGENT_TOOLS) in text
+
+
+def test_a_multi_agent_read_that_fails_is_unavailable_never_off():
+    checked = native_probe.multi_agent_check(str(MULTI_AGENT), "01a19c00-0000-7000-8000-000000000000")
+    assert checked == {"state": "UNAVAILABLE", "reasons": ["rollout identity does not match requested CID"]}
+
+
 def root_rollout(path, cid, entries):
     records = [
         {"timestamp": "t", "type": "session_meta", "payload": {"id": cid, "source": "vscode"}},
@@ -517,6 +556,20 @@ def test_root_is_read_for_settings_only_and_never_started(probe, writes, expect)
     assert report["roles"] == [] and report["turns_used"] == 0
     assert not probe.calls() and not probe.login_log.exists() and not probe.host_log.exists()
     assert report["login"] is None
+    assert root["multi_agent"]["state"] == "MULTI_AGENT_OFF"
+
+
+def test_root_offered_codex_sub_agent_tools_fails_the_run(probe):
+    cid = "01a19c00-0000-7000-8000-00000000r00t"
+    rollout = probe.tmp / "root-rollout.jsonl"
+    root_rollout(rollout, cid, [{"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"}])
+    with rollout.open("a", encoding="utf-8") as stream:
+        stream.write(offered_tools_line() + "\n")
+    probe.plan([], root={"rollout": str(rollout), "cid": cid})
+    report = probe.run(expect=3, cap=1)
+    assert report["root"]["read_only"] is True
+    assert report["root"]["multi_agent"]["agent_tools"] == V2_AGENT_TOOLS
+    assert report["summary"]["failures"] == ["ROOT multi-agent: " + OFFERED_FAILURE]
 
 
 # ---------------------------------------------------------------- verdict evidence (judge, in process)
