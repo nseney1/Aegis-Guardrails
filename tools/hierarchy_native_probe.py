@@ -10,15 +10,16 @@ role, provisioned with the existing tools. It prints every role's start argv, ta
 the linked one the plan made, a turn cap is given, and, under pytest, the codex on PATH is the test fake. With
 `--auth api-key` (the default) the folder must be empty, the API key variable set, and the probe logs the disposable
 home in with the key on stdin. With `--auth existing` the owner has already logged that folder in
-(`CODEX_HOME=<codex-home> codex login`, e.g. ChatGPT SSO): it may then hold only the owner mark and a private,
-single-link auth.json, and the probe never calls codex login. Never run codex login without CODEX_HOME: it replaces
-~/.codex/auth.json. Either way the disposable auth.json is deleted at cleanup, so a new run needs a new login. For each role it uses the
-launcher to start the session, runs one probe turn with the role's own bound argv, stops a long turn with the
-launcher mid-turn, then publishes a mailbox message and wakes the role with the launcher. ROOT is read for its
-settings only, from a rollout the owner names; the probe never starts or stops it. ~/.codex is hashed before and
-after, the worktree is removed with `git worktree remove` (never prune or repair), and the disposable login is
-deleted. SIGTERM, SIGHUP or SIGINT runs that cleanup too and leaves a report with state "interrupted"; after a
-SIGKILL, `cleanup --probe-root` does it from the launch records.
+(`CODEX_HOME=<codex-home> codex login`, e.g. ChatGPT SSO): it may then hold only the owner mark, a private,
+single-link auth.json, and the auth.lock, log/ and tmp/ a real codex login leaves (each checked without following a
+link), and the probe never calls codex login. Never run codex login without CODEX_HOME: it replaces
+~/.codex/auth.json. Either way the disposable auth.json (and auth.lock, log/, tmp/) is deleted at cleanup, so a
+new run needs a new login. For each role it uses the launcher to start the session, runs one probe turn with the
+role's own bound argv, stops a long turn with the launcher mid-turn, then publishes a mailbox message and wakes
+the role with the launcher. ROOT is read for its settings only, from a rollout the owner names; the probe never
+starts or stops it. ~/.codex is hashed before and after, the worktree is removed with `git worktree remove`
+(never prune or repair), and the disposable login is deleted. SIGTERM, SIGHUP or SIGINT runs that cleanup too and
+leaves a report with state "interrupted"; after a SIGKILL, `cleanup --probe-root` does it from the launch records.
 
 Verdicts come from evidence, never model text: ALLOWED means the nonce is in the target file; REFUSED means the
 nonce is absent and the rollout records the exact planned command (the whole command string, its argv, or a host
@@ -110,10 +111,17 @@ REAL_CLAIM = "this host and Codex version only; a model that declines shows NOT_
 CAP_REASON = "turn cap reached"
 AUTH_MODES = ("api-key", "existing")
 AUTH_FILE = "auth.json"
-# What an existing login's CODEX_HOME may hold: the plan's owner mark and the auth.json `codex login` writes. Nothing
-# else is taken on trust: sessions/ would put a prior session's rollouts beside the probe's, config.toml is the
-# codex_home write target and would change the run's settings, and any other entry is unexplained.
-EXISTING_LOGIN_ENTRIES = (OWNER_MARK, AUTH_FILE)
+LOCK_FILE, LOG_DIR, TMP_DIR = "auth.lock", "log", "tmp"
+LOCK_MAX_BYTES = 4096
+# A real login's tmp/ is tmp/arg0-linux/<one folder>/{.lock, apply_patch, applypatch, codex-linux-sandbox}: 4 levels
+# and a handful of entries. These bounds keep the preflight walk and the cleanup short whatever was planted there.
+TMP_MAX_DEPTH, TMP_MAX_ENTRIES = 8, 512
+ARG0_DIR = "arg0-linux"
+# What an existing login's CODEX_HOME may hold: the plan's owner mark and what a real `codex login` (codex-cli) writes:
+# auth.json, an empty auth.lock, log/codex-login.log and tmp/arg0-linux/<one folder>. Nothing else is taken on trust:
+# sessions/ would put a prior session's rollouts beside the probe's, config.toml is the codex_home write target and
+# would change the run's settings, and any other entry is unexplained.
+EXISTING_LOGIN_ENTRIES = (OWNER_MARK, AUTH_FILE, LOCK_FILE, LOG_DIR, TMP_DIR)
 API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY")
 AUTH_CLEANUP_NOTE = "auth.json is deleted at cleanup; log in again for a new run"
 
@@ -494,8 +502,9 @@ def linked_worktree(state):
                                           for line in listed.stdout.splitlines() if line.startswith("worktree "))
 
 
-def existing_login(codex_home, state):
-    """The owner's own login in the probe's CODEX_HOME. Returns auth.json's sha256; raises Refusal otherwise."""
+def existing_login(codex_home, state, codex=None):
+    """The owner's own login in the probe's CODEX_HOME. Returns auth.json's sha256; raises Refusal otherwise.
+    codex is the codex found on PATH: tmp/arg0-linux/<folder>/ may hold symlinks to it (see login_extras)."""
     folder = Path(codex_home)
     mark = folder / OWNER_MARK
     entries = sorted(os.listdir(folder))
@@ -511,7 +520,87 @@ def existing_login(codex_home, state):
     auth = folder / AUTH_FILE
     if AUTH_FILE not in entries:
         raise Refusal("CODEX_HOME has no auth.json; log in first with: CODEX_HOME=%s codex login" % codex_home)
-    return auth_digest(auth)
+    digest = auth_digest(auth)
+    login_extras(folder, codex)
+    return digest
+
+
+def login_extras(folder, codex=None):
+    """The auth.lock, log/ and tmp/ a real codex login leaves beside auth.json; raises Refusal unless each is what
+    that login writes. None of them is read for its content, and the cleanup removes all three.
+
+    codex-cli's arg0 dispatch puts symlinks named apply_patch, applypatch and codex-linux-sandbox, pointing at the
+    codex binary, in tmp/arg0-linux/<random folder>/. Only there, one level down, is a symlink leaving tmp/ accepted,
+    and only when it resolves to codex (the codex on PATH, resolved once here); the cleanup only unlinks it."""
+    folder = Path(folder)
+    codex_real = os.path.realpath(codex) if codex else None
+    lock = folder / LOCK_FILE
+    if os.path.lexists(lock):
+        info = os.lstat(lock)
+        if stat.S_ISLNK(info.st_mode):
+            raise Refusal("auth.lock in CODEX_HOME is a symlink: " + str(lock))
+        if not stat.S_ISREG(info.st_mode):
+            raise Refusal("auth.lock in CODEX_HOME is not a regular file: " + str(lock))
+        if info.st_nlink != 1:
+            raise Refusal("auth.lock in CODEX_HOME has %d hard links: %s" % (info.st_nlink, lock))
+        if info.st_uid != os.getuid():
+            raise Refusal("auth.lock in CODEX_HOME is not owned by this user: " + str(lock))
+        if info.st_size > LOCK_MAX_BYTES:
+            raise Refusal("auth.lock in CODEX_HOME is larger than %d bytes (%d): %s" % (LOCK_MAX_BYTES, info.st_size,
+                                                                                      lock))
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o002:
+            raise Refusal("auth.lock in CODEX_HOME is writable by others (mode %04o): %s" % (mode, lock))
+        # codex-cli creates it 0664 under the usual umask 002, where the group is the user's own private group.
+        if mode & 0o020 and info.st_gid != os.getgid():
+            raise Refusal("auth.lock in CODEX_HOME is writable by group %d, not this user's own group (mode %04o): %s"
+                          % (info.st_gid, mode, lock))
+    log = folder / LOG_DIR
+    if os.path.lexists(log):
+        if not stat.S_ISDIR(os.lstat(log).st_mode):
+            raise Refusal("log/ in CODEX_HOME is not a real directory (a symlink or another type): " + str(log))
+        try:
+            names = sorted(os.listdir(log))
+        except OSError:
+            raise Refusal("log/ in CODEX_HOME holds an entry that cannot be read: " + str(log))
+        for name in names:
+            info = os.lstat(log / name)
+            if not stat.S_ISREG(info.st_mode):
+                raise Refusal("log/ in CODEX_HOME holds an entry that is not a regular file: " + str(log / name))
+            if info.st_uid != os.getuid():
+                raise Refusal("log/ in CODEX_HOME holds a file not owned by this user: " + str(log / name))
+            # A second link could be ~/.codex/auth.json: a codex appending to its log would write into the owner's.
+            if info.st_nlink != 1:
+                raise Refusal("log/ in CODEX_HOME holds a file with %d hard links: %s" % (info.st_nlink, log / name))
+    tmp = folder / TMP_DIR
+    if os.path.lexists(tmp):
+        if not stat.S_ISDIR(os.lstat(tmp).st_mode):
+            raise Refusal("tmp/ in CODEX_HOME is not a real directory (a symlink or another type): " + str(tmp))
+        def unreadable(exc):
+            # os.walk skips a folder it cannot list unless told otherwise; what it holds would go unchecked.
+            raise Refusal("tmp/ in CODEX_HOME holds an entry that cannot be read: " + str(exc.filename))
+
+        count = 0
+        # os.walk never descends through a symlinked folder; a symlink lands in dirs or files and is checked here.
+        for top, dirs, files in os.walk(tmp, onerror=unreadable, followlinks=False):
+            for name in sorted(dirs + files):
+                path = os.path.join(top, name)
+                parts = os.path.relpath(path, tmp).split(os.sep)
+                if len(parts) > TMP_MAX_DEPTH:
+                    raise Refusal("tmp/ in CODEX_HOME is deeper than %d levels: %s" % (TMP_MAX_DEPTH, path))
+                count += 1
+                if count > TMP_MAX_ENTRIES:
+                    raise Refusal("tmp/ in CODEX_HOME holds more than %d entries: %s" % (TMP_MAX_ENTRIES, tmp))
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode):
+                    arg0 = len(parts) == 3 and parts[0] == ARG0_DIR
+                    if not inside(path, tmp) and not (arg0 and codex_real and os.path.realpath(path) == codex_real):
+                        raise Refusal("tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: " + path)
+                elif stat.S_ISREG(info.st_mode):
+                    if info.st_nlink != 1:
+                        raise Refusal("tmp/ in CODEX_HOME holds a file with %d hard links: %s" % (info.st_nlink, path))
+                elif not stat.S_ISDIR(info.st_mode):
+                    raise Refusal("tmp/ in CODEX_HOME holds a device, FIFO or socket: " + path)
 
 
 def auth_digest(auth):
@@ -570,7 +659,7 @@ def preflight(args):
         if keys:
             raise Refusal("unset OPENAI_API_KEY and CODEX_API_KEY for --auth existing: codex could bill turns to "
                           "the key instead of the SSO login (set: %s)" % ", ".join(keys))
-        auth_sha = existing_login(value, state)
+        auth_sha = existing_login(value, state, codex)
     else:
         mark = Path(value) / OWNER_MARK
         entries = sorted(os.listdir(value))
@@ -1019,7 +1108,7 @@ class Runner:
             answer = {"mode": "existing", "auth_file": str(auth), "codex_login_called": False,
                       "auth_file_sha256_before": self.auth_sha, "cleanup": AUTH_CLEANUP_NOTE}
             try:
-                if existing_login(self.state["codex_home"], self.state) != self.auth_sha:
+                if existing_login(self.state["codex_home"], self.state, self.codex) != self.auth_sha:
                     answer["error"] = "auth.json changed after the preflight"
             except (Refusal, OSError) as exc:
                 answer["error"] = str(exc)
@@ -1319,7 +1408,8 @@ class Runner:
         removed = None
         if registered or os.path.lexists(self.state["worktree"]):
             removed = subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-        auth_removed, auth_error = remove_login(self.state["codex_home"], guarded_homes(self.fake))
+        login_left = []
+        auth_removed, auth_error = remove_login(self.state["codex_home"], guarded_homes(self.fake), login_left)
         answer = {"worktree_removed": (removed is None or removed.returncode == 0)
                   and not os.path.lexists(self.state["worktree"]),
                   "auth_removed": auth_removed, "leftover_processes": sorted(leftover, key=str),
@@ -1328,6 +1418,9 @@ class Runner:
             answer["error"] = removed.stderr.strip()[:500]
         if auth_error:
             answer["auth_error"] = auth_error
+        if login_left:
+            answer["login_left"] = login_left
+            self.failures.append("cleanup: entries left in codex-home: " + ", ".join(login_left))
         if not answer["worktree_removed"]:
             self.failures.append("cleanup: the worktree was not removed")
         if leftover:
@@ -1338,12 +1431,15 @@ class Runner:
         return answer
 
 
-def remove_login(codex_home, guarded):
-    """Deletes auth.json from the plan's codex-home, never through a symlink. Returns (removed, error).
+def remove_login(codex_home, guarded, left=None):
+    """Deletes auth.json, auth.lock, log/ and tmp/ from the plan's codex-home, never through a symlink. Returns
+    (removed, error) for auth.json; what the cleanup did not expect is left in place and its path, relative to
+    codex-home, appended to left.
 
     The folder could have been swapped for a symlink to ~/.codex after the preflight; a path unlink would then
     delete the owner's own login. So the folder must be a real directory at the plan path outside every guarded
-    home, and the unlink goes through a handle opened with O_NOFOLLOW."""
+    home, and every unlink goes through a handle opened with O_NOFOLLOW."""
+    left = [] if left is None else left
     try:
         info = os.lstat(codex_home)
     except FileNotFoundError:
@@ -1366,6 +1462,7 @@ def remove_login(codex_home, guarded):
             pass
         except OSError as exc:
             return False, "auth.json could not be deleted (%s): %s" % (exc.strerror, codex_home)
+        remove_login_extras(fd, left)
         try:
             os.stat(AUTH_FILE, dir_fd=fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -1373,6 +1470,107 @@ def remove_login(codex_home, guarded):
         return False, "auth.json is still in codex-home: " + codex_home
     finally:
         os.close(fd)
+
+
+def remove_login_extras(fd, left):
+    """auth.lock (a regular file), log/ (regular files only) and tmp/ (folders, regular files and symlinks, the links
+    themselves) under the codex-home handle fd. Each step is relative to a handle opened with O_NOFOLLOW, so no
+    symlink is ever followed; anything else stays and is recorded in left."""
+    try:
+        info = os.stat(LOCK_FILE, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if stat.S_ISREG(info.st_mode):
+            unlink_at(fd, LOCK_FILE, LOCK_FILE, left)
+        else:
+            left.append(LOCK_FILE)
+    clear_folder(fd, LOG_DIR, LOG_DIR, False, left)
+    clear_folder(fd, TMP_DIR, TMP_DIR, True, left)
+
+
+def unlink_at(fd, name, relative, left):
+    try:
+        os.unlink(name, dir_fd=fd)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        left.append(relative)
+
+
+def clear_folder(parent, name, relative, nested, left):
+    """Removes the folder name under the handle parent and what it holds: regular files, and with nested also
+    subfolders and symlinks (unlinked, never followed). A symlink or non-folder in name's place is left.
+
+    It walks with a stack, not recursion: a tree planted deeper than Python's recursion limit would otherwise end
+    the cleanup with a RecursionError and a report that misstates what was removed."""
+    fd = open_folder(parent, name, relative, left)
+    if fd is None:
+        return
+    try:
+        listed = iter(sorted(os.listdir(fd)))
+    except OSError:
+        os.close(fd)
+        left.append(relative)
+        return
+    # Each frame: the folder's handle, its parent's handle, its name and relative path, its entries, len(left).
+    stack = [(fd, parent, name, relative, listed, len(left))]
+    try:
+        while stack:
+            fd, parent_fd, folder, path, entries, before = stack[-1]
+            entry = next(entries, None)
+            if entry is None:
+                stack.pop()
+                os.close(fd)
+                try:
+                    os.rmdir(folder, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    if len(left) == before:
+                        left.append(path)
+                continue
+            child = path + "/" + entry
+            try:
+                mode = os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode
+            except FileNotFoundError:
+                continue
+            if nested and stat.S_ISDIR(mode):
+                opened = open_folder(fd, entry, child, left)
+                if opened is not None:
+                    try:
+                        listed = iter(sorted(os.listdir(opened)))
+                    except OSError:
+                        os.close(opened)
+                        left.append(child)
+                        continue
+                    stack.append((opened, fd, entry, child, listed, len(left)))
+            elif stat.S_ISREG(mode) or (nested and stat.S_ISLNK(mode)):
+                unlink_at(fd, entry, child, left)
+            else:
+                left.append(child)
+    finally:
+        for frame in stack:
+            os.close(frame[0])
+
+
+def open_folder(parent, name, relative, left):
+    """A handle on the folder name under parent, opened with O_NOFOLLOW; None (and relative in left) when name is
+    not a real folder now. The O_NOFOLLOW matters: name may be swapped for a symlink after the stat."""
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        left.append(relative)
+        return None
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        left.append(relative)
+        return None
 
 
 def login_failed(login):
