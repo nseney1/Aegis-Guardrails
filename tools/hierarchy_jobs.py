@@ -1416,6 +1416,22 @@ class StillRunning(Exception):
         self.group = group
 
 
+class _LaunchFailure(Exception):
+    """A particular step could not start; earlier steps may already have completed effects."""
+
+    def __init__(self, number, argv, cause):
+        super().__init__(str(cause))
+        self.record = {"step": number, "argv": list(argv), "error": str(cause)[:2048]}
+
+
+class _ExecutionResult:
+    """Completed steps and a failed launch travel together through result publication."""
+
+    def __init__(self, steps=(), reason=None, exit_code=0, created=None, failed_launch=None):
+        self.steps, self.reason, self.exit_code = list(steps), reason, exit_code
+        self.created, self.failed_launch = created, failed_launch
+
+
 def stop_for_certain(process):
     try:
         stop_group(process)
@@ -1539,10 +1555,21 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     # On record before anything starts, so a runner lost at any later moment leaves a record naming this step rather
     # than the previous step's stopped group. If this cannot be written, the step does not start.
     launch = {"step": number, "group": None, "at": timestamp()}
-    record_process(job, launch, ".intent")
-    with open(log_path, "xb") as log, open(out_path, "xb") if step.capture else open(os.devnull, "wb") as out:
-        process = subprocess.Popen(argv, cwd=checkout, env={**env, **step.env}, stdin=subprocess.DEVNULL,
-                                   stdout=out if step.capture else log, stderr=log, start_new_session=True)
+    process = None
+    try:
+        record_process(job, launch, ".intent")
+        with open(log_path, "xb") as log, open(out_path, "xb") if step.capture else open(os.devnull, "wb") as out:
+            process = subprocess.Popen(argv, cwd=checkout, env={**env, **step.env}, stdin=subprocess.DEVNULL,
+                                       stdout=out if step.capture else log, stderr=log, start_new_session=True)
+    except BaseException as exc:
+        # Even closing a parent log handle can fail after Popen succeeded. Such a failure must not be
+        # mistaken for an unstarted child, and uncertainty about its stop still holds the job's resources.
+        if process is not None:
+            stop_for_certain(process)
+            raise
+        if isinstance(exc, ERRORS):
+            raise _LaunchFailure(number, step.argv, exc) from exc
+        raise
     try:
         # Everything after the launch is guarded: a process must never outlive a job that is reported over.
         record_process(job, {**launch, "group": process.pid, "start": process_start(process.pid), "at": timestamp()},
@@ -1578,6 +1605,7 @@ def execute(job, recipe, packet, recipes, on_start, details, export=None):
     else:
         plan = command_steps(recipe, packet, recipes, job, checkout)
     rows, reason, exit_code, created, output = [], None, 0, None, None
+    failed_launch = None
     started = False
 
     def started_once():
@@ -1606,7 +1634,14 @@ def execute(job, recipe, packet, recipes, on_start, details, export=None):
         created = stop.value
     except Halt as halt:
         reason, exit_code = str(halt), NO_VERDICT_EXIT
-    return rows, reason, exit_code, created
+    except _LaunchFailure as exc:
+        reason, exit_code = "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT
+        failed_launch = exc.record
+    except ERRORS as exc:
+        # run_step confirms a started process stopped before propagating an error. StillRunning deliberately
+        # escapes this handler, so no terminal result or resource release follows an uncertain stop.
+        reason, exit_code = "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT
+    return _ExecutionResult(rows, reason, exit_code, created, failed_launch)
 
 
 def checkout_state(checkout, commit, created, view):
@@ -1693,7 +1728,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             return settle(store, job, wait)
     details = {}
     try:
-        rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce, details, export)
+        execution = execute(job, recipe, packet, recipes, announce, details, export)
     except StillRunning as exc:
         # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
         row = {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
@@ -1701,7 +1736,10 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             row["checkout_state"] = checkout_state(checkout, packet["commit"], details["new_commit"], view)
         return row
     except ERRORS as exc:
-        rows, reason, exit_code, created = [], "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT, None
+        execution = _ExecutionResult(reason="the job could not run: " + str(exc)[:2048], exit_code=NO_VERDICT_EXIT)
+    rows, reason, exit_code, created = execution.steps, execution.reason, execution.exit_code, execution.created
+    if execution.failed_launch is not None:
+        extra["failed_launch"] = execution.failed_launch
     cleanup_error = None
     if export is not None:
         # Removed whatever the outcome: the logs and kept files are the evidence, and a full tree per job would fill the
