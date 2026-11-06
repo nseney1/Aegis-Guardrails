@@ -68,6 +68,6 @@ def test_autocrlf_checkout_preserves_foundation_payload_and_pinned_source_bytes(
     git("init", "-q")
     git("-c", "core.autocrlf=false", "add", ".")
     exported = tmp_path / "exported"
-    git("-c", "core.autocrlf=true", "checkout-index", "--all", "--force", "--prefix", str(exported) + os.sep)
+    git("-c", "core.autocrlf=true", "checkout-index", "--all", "--force", "--prefix", exported.as_posix() + "/")
     changed = [name for name in names if (exported / name).read_bytes() != (ROOT / name).read_bytes()]
     assert changed == [], "checkout changed pinned bytes: " + repr(changed)

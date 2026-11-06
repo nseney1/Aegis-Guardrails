@@ -484,12 +484,43 @@ def test_a_job_sees_only_the_fixed_environment(shop):
 
 def spawn_fake_heavy(tmp_path, name):
     """A process called pytest whose parent is gone, so the census sees it as an outside job."""
-    fake = tmp_path / name
-    fake.write_text("#!%s\nimport time\ntime.sleep(60)\n" % sys.executable)
-    fake.chmod(0o700)
-    launcher = subprocess.run(["sh", "-c", "%s >/dev/null 2>&1 </dev/null & echo $!" % fake],
-                              capture_output=True, text=True, timeout=5)
-    return int(launcher.stdout.strip())
+    folder = Path(tempfile.mkdtemp(prefix="census-child-", dir=tmp_path))
+    fake, ready, errors = folder / name, folder / "ready", folder / "stderr.log"
+    # A later launch must never truncate a script an earlier child is still opening.
+    fake.write_text("import os, time\nwith open(%r, 'x') as stream:\n    stream.write(str(os.getpid()))\ntime.sleep(60)\n"
+                    % str(ready))
+    fake.chmod(0o500)
+    with errors.open("wb") as stream:
+        launcher = subprocess.run(["sh", "-c", '"$@" >/dev/null & echo $!', "sh", sys.executable, str(fake)],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stream, text=True, timeout=5)
+    details = {"folder": str(folder), "launcher_returncode": launcher.returncode, "launcher_stdout": launcher.stdout}
+
+    def diagnostic():
+        return json.dumps({**details, "stderr": errors.read_text(errors="replace")[-4096:]}, sort_keys=True)
+
+    assert launcher.returncode == 0 and launcher.stdout.strip().isdigit(), "census fixture launch failed: " + diagnostic()
+    pid = int(launcher.stdout.strip())
+    details["pid"] = pid
+    (folder / "launch.json").write_text(json.dumps(details, sort_keys=True) + "\n")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                state = Path("/proc/%d/stat" % pid).read_text().rpartition(")")[2].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                state = "absent"
+            assert state not in ("absent", "Z", "X"), "census fixture exited before readiness: " + diagnostic()
+            if ready.exists() and ready.read_text() == str(pid):
+                return pid, folder
+            time.sleep(0.01)
+        raise AssertionError("census fixture did not become ready within 5 seconds: " + diagnostic())
+    except BaseException:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # Preserve the readiness failure when its child has already exited.
+        assert finished(pid), "census fixture could not be stopped: " + diagnostic()
+        raise
 
 
 def finished(pid, seconds=5):
@@ -597,16 +628,27 @@ def test_a_census_fixture_names_only_known_kinds(shop):
 
 
 def test_the_real_census_finds_outside_heavy_processes(shop, tmp_path):
-    pids = [spawn_fake_heavy(tmp_path, "pytest") for _ in range(3)]
+    children = []
     try:
+        for _ in range(3):
+            children.append(spawn_fake_heavy(tmp_path, "pytest"))
+        pids = [pid for pid, _ in children]
         shop.request_job("job-1", "heavy")
         row = shop.run_open(census=None, expect=3)["rows"][0]
         assert row["state"] == "waiting"
         assert set(pids) <= set(row["capacity"]["external_roots"])
         assert row["capacity"]["census"] == "proc"
     finally:
-        for pid in pids:
-            os.kill(pid, signal.SIGKILL)
+        failures = []
+        for pid, folder in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                failures.append("census fixture %d exited before cleanup: %s; stderr=%r" % (
+                    pid, folder, (folder / "stderr.log").read_text(errors="replace")[-4096:]))
+            if not finished(pid):
+                failures.append("census fixture %d did not stop: %s" % (pid, folder))
+        assert not failures, "\n".join(failures)
 
 
 SPAN = ("import os, time\nname = str(os.getpid())\nopen(%r, 'a').write('start ' + name + '\\n')\ntime.sleep(0.6)\n"

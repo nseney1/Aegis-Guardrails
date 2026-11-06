@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -320,14 +321,25 @@ def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, 
         "    pass\n"
     )
     fixtures = tmp_path / "fixtures"
+    report = tmp_path / "capability-report.xml"
     result = subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "--basetemp", str(fixtures), str(probe)], cwd=ROOT,
+        [sys.executable, "-B", "-m", "pytest", "-q", "-ra", "-p", "no:cacheprovider",
+         "--basetemp", str(fixtures), "--junitxml", str(report),
+         str(probe) + "::test_positive"], cwd=ROOT,
         env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "1 skipped" in result.stdout, result.stdout + result.stderr
+    # Validate the selected fixture's outcome, not pytest's aggregate summary
+    # (which can also include collection skips on unsupported hosts).
+    cases = ET.parse(report).getroot().findall(".//testcase")
+    evidence = report.read_text(encoding="utf-8") + result.stdout + result.stderr
+    assert len(cases) == 1 and cases[0].get("name") == "test_positive", evidence
+    skipped = cases[0].findall("skipped")
+    assert len(skipped) == 1, evidence
+    assert skipped[0].get("type") == "pytest.skip", evidence
+    assert skipped[0].get("message") == "fixture broker requires POSIX waitid WNOWAIT", evidence
+    assert cases[0].find("failure") is None and cases[0].find("error") is None, evidence
     assert not list(fixtures.rglob("policy.json")), "unsupported fixture created a canonical ledger"
     assert not list(fixtures.rglob("broker-output")), "unsupported fixture launched its broker"
 

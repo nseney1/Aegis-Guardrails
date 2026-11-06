@@ -42,6 +42,9 @@ def run_tool(path, *args, cid=CID):
     (base / "home").mkdir(exist_ok=True)
     env = {"PATH": str(base / "fake-bin"), "HOME": str(base / "home"), "CODEX_THREAD_ID": CID,
            "CODEX_SESSION_ID": CID, "LANG": os.environ.get("LANG", "C.UTF-8")}
+    # Python 3.9 on Windows needs SYSTEMROOT to initialize its random seed.
+    if os.name == "nt" and "SYSTEMROOT" in os.environ:
+        env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
     return subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--rollout", str(path),
                            "--cid", cid, *args], text=True, capture_output=True, timeout=5, env=env)
 
