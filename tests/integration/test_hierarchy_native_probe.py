@@ -773,7 +773,7 @@ def test_a_probe_turn_that_never_starts_is_not_judged_against_the_start_turn(pro
 
 def test_a_hold_turn_that_finishes_on_its_own_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
-    probe.script_turns(hold={"mode": ""})
+    probe.script_turns(hold={"mode": "", "finish_before_stop": True})
     report = probe.run(expect=3, cap=4)
     recovery = role_report(report, "implementer")["recovery"]
     assert recovery["stopped_turn_completed"] is True and recovery["resumed_turn_completed"] is True

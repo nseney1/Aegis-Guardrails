@@ -288,6 +288,11 @@ def run_turn(rollout, options, turn):
         time.sleep(float(turn["context_delay"]))
     if not turn.get("settings_first"):
         rollout.event(applied)
+    # The probe stops a hold turn as soon as its turn_context is visible; a turn that
+    # "finishes on its own" must not be cut between turn_context and task_complete.
+    deferred_stop = turn.get("finish_before_stop") and hasattr(signal, "pthread_sigmask")
+    if deferred_stop:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     rollout.write("turn_context", {"turn_id": turn_id, "root_turn_id": turn_id, "cwd": options["cwd"], "model": model,
                                    "effort": effort, "approval_policy": approval, "approvals_reviewer": reviewer,
                                    "sandbox_policy": recorded.policy(), "permission_profile": profile, "summary": "auto"})
@@ -322,6 +327,8 @@ def run_turn(rollout, options, turn):
     if not turn.get("incomplete"):
         rollout.event({"type": "task_complete", "turn_id": turn_id, "root_turn_id": turn_id,
                        "last_agent_message": message})
+    if deferred_stop:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     emit({"type": "item.completed", "item": {"id": "item_msg", "type": "agent_message", "text": message}})
     emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
     if not options["resume"]:
