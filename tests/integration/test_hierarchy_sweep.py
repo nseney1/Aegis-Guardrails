@@ -1047,9 +1047,9 @@ def answer(fleet, lane, identifier):
                 result={**EVIDENCE, "lane_check": "not_run: fixture"})
 
 
-def turn_starts(fleet, endpoint, read=()):
-    """A wake's start receipt for the endpoint's unread mail, as hierarchy_wake writes it, then the reads the adapter
-    records during the turn. Returns the start receipt; turn_ends writes its finish."""
+def turn_starts(fleet, endpoint, read=(), carried=None):
+    """A wake's start receipt for the endpoint's unread mail (or the `carried` IDs), as hierarchy_wake writes it, then
+    the reads the adapter records during the turn. Returns the start receipt; turn_ends writes its finish."""
     import hierarchy_mailbox
 
     mailbox = mailbox_api(fleet)
@@ -1057,13 +1057,21 @@ def turn_starts(fleet, endpoint, read=()):
     delivery = str(fleet.base / "delivery")
     unread = mailbox.endpoint_delivery(delivery, endpoint, mailbox.messages())[1]["unread"]
     started = {"endpoint": endpoint, "host": binding["host"], "session": binding["session"],
-               "generation": binding["generation"], "message_ids": unread, "wake_id": "wake-" + uuid.uuid4().hex,
-               "state": "started", "at": hierarchy_mailbox.timestamp()}
+               "generation": binding["generation"], "message_ids": unread if carried is None else list(carried),
+               "wake_id": "wake-" + uuid.uuid4().hex, "state": "started", "at": hierarchy_mailbox.timestamp()}
     mailbox.write_delivery_receipt(delivery, "wakes", started)
     if read:
-        mailbox.record_read(delivery, {"from": endpoint, "host": binding["host"], "session": binding["session"],
-                                       "binding_generation": binding["generation"]}, list(read))
+        reads(fleet, endpoint, read)
     return started
+
+
+def reads(fleet, endpoint, identifiers):
+    """The adapter's read receipt for the endpoint's current binding, stamped now."""
+    mailbox = mailbox_api(fleet)
+    binding = mailbox.current_binding(endpoint)
+    mailbox.record_read(str(fleet.base / "delivery"), {"from": endpoint, "host": binding["host"],
+                                                       "session": binding["session"],
+                                                       "binding_generation": binding["generation"]}, list(identifiers))
 
 
 def turn_ends(fleet, started, state="exited"):
@@ -1188,6 +1196,62 @@ def test_a_later_publish_or_a_later_wake_clears_a_silent_role(team, clear):
         assert [(row["endpoint"], row["read"]) for row in result["rows"]] == [("pilot/orchestrator", ["root-note"])]
 
     assert result["silent_roles"] == []
+
+
+@posix_only
+def test_a_background_turn_that_read_its_work_before_its_start_receipt_is_still_a_silent_role(team, clock):
+    """A background wake records `started` only once its launcher returns, so its turn can read before that receipt."""
+    lane = "pilot/lane/f2"
+    clock(600)
+    dispatch(team, lane, "work-1")
+    clock(590)
+    reads(team, lane, ["work-1"])
+    clock(580)
+    started = turn_starts(team, lane, carried=["work-1"])
+    clock(570)
+    turn_ends(team, started)
+    clock(0)
+
+    result = team.sweep()
+
+    assert [(row["endpoint"], row["wake_id"], row["read"]) for row in result["silent_roles"]] == [
+        (lane, started["wake_id"], [{"message_id": "work-1", "type": "dispatch", "from": "pilot/orchestrator"}])]
+
+
+@posix_only
+def test_a_background_turn_that_published_after_its_early_read_is_not_silent(team, clock):
+    """The publish slack is 5 s, but a publish after a read the wake is charged with also belongs to that turn."""
+    lane = "pilot/lane/f2"
+    clock(600)
+    dispatch(team, lane, "work-1")
+    clock(590)
+    reads(team, lane, ["work-1"])
+    clock(588)
+    accept(team, lane, "work-1")
+    clock(580)
+    turn_ends(team, turn_starts(team, lane, carried=["work-1"]))
+    clock(0)
+
+    assert team.sweep("--dry-run", expect=3)["silent_roles"] == []
+
+
+@posix_only
+def test_a_read_from_the_previous_wake_is_not_charged_to_the_next_one(team, clock):
+    lane = "pilot/lane/f2"
+    clock(600)
+    dispatch(team, lane, "work-1")
+    clock(590)
+    turn_ends(team, turn_starts(team, lane, read=["work-1"]))
+    clock(580)
+    # Not work a lane owes an answer to, so the next turn that reads only this is not silent.
+    post(team, "pilot/orchestrator", lane, "note-1")
+    clock(570)
+    later = turn_starts(team, lane, read=["note-1"])
+    clock(560)
+    turn_ends(team, later)
+    clock(0)
+
+    assert team.sweep()["silent_roles"] == []
 
 
 @posix_only
