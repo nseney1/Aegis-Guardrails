@@ -3011,3 +3011,51 @@ def test_git_in_a_clean_job_without_export_git_finds_no_repository(shop, sandbox
     result, rows = git_probe_job(shop, sandbox)
     assert "git_stub" not in result["source_export"]
     assert len(rows) == 8 and all(code != 0 and not out for code, out, _ in rows.values()), rows
+
+
+# Git in a folder of the export, as a build script that runs git from its own crate folder does.
+BARE_PROBE = ("import json, os, subprocess, sys\nrows = {}\n"
+              "for where in ('fake', 'fake/sub'):\n"
+              "    for args in (['rev-parse', 'HEAD'], ['cat-file', '-t', sys.argv[2]], ['config', '--get', 'core.pager']):\n"
+              "        done = subprocess.run(['git'] + args, cwd=where, capture_output=True, text=True)\n"
+              "        rows[' '.join([where] + args)] = [done.returncode, done.stdout.strip()]\n"
+              "os.makedirs(sys.argv[1], exist_ok=True)\n"
+              "open(os.path.join(sys.argv[1], 'git.json'), 'w').write(json.dumps(rows))\n")
+
+
+@pytest.mark.parametrize("export_git", [True, False])
+@pytest.mark.parametrize("sandbox", SANDBOXES)
+def test_a_committed_folder_shaped_like_a_bare_repository_is_never_git_in_the_export(shop, sandbox, export_git):
+    """A folder holding HEAD, objects/ and refs/ is a bare repository to Git's discovery, which would take its HEAD, its
+    config and its alternates, here the live checkout's objects, in place of the stub or nothing."""
+    c = shop.checkout
+    fake = c / "fake"
+    for folder in ("objects/info", "refs", "sub"):
+        (fake / folder).mkdir(parents=True)
+    (fake / "refs" / "keep").write_text("")
+    (fake / "sub" / "keep").write_text("")
+    (fake / "HEAD").write_text("1" * 40 + "\n")
+    (fake / "objects" / "info" / "alternates").write_text(str(c / ".git" / "objects") + "\n")
+    (fake / "config").write_text("[core]\n\trepositoryformatversion = 0\n\tbare = true\n\tpager = planted\n")
+    commit_all(shop)
+    commit = shop.head()["commit"]
+    shop.recipes["recipes"]["build"] = shop.command(["$python", "-I", "-c", BARE_PROBE, "$scratch", commit], sandbox=sandbox,
+                                                    require_clean=True, keep=["run/git.json"], export_git=export_git)
+    shop.save_recipes()
+    shop.request_job("job-1", "build")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "completed", row
+    kept = next(row for row in final_result(shop)[1]["kept"] if row["path"] == "run/git.json")
+    rows = json.loads(Path(kept["copy"]).read_text())
+    assert len(rows) == 6 and all(code != 0 and not out for code, out in rows.values()), rows
+
+
+def test_an_export_that_fails_its_checks_never_gets_a_git_stub(tmp_path):
+    """The stub is the last thing written, so a partial export left by a refusal is never a repository."""
+    jobs = load_jobs_module()
+    repo, commit, tree = hand_made_commit(tmp_path, lambda repo: [("100644", b"f", stored(repo, b"x\n")),
+                                                                  ("120000", b"out", stored(repo, b"../../x"))])
+    outcome = export_or_refusal(jobs, repo, commit, tree, tmp_path / "out", git_stub=True)
+    assert outcome == "the commit has a symlink that leaves it: out -> ../../x", outcome
+    assert (tmp_path / "out" / "f").exists() and not os.path.lexists(tmp_path / "out" / ".git")
+    remove_tree(tmp_path / "out")
