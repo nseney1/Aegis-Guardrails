@@ -10,7 +10,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 
 sys.dont_write_bytecode = True
@@ -25,7 +25,9 @@ STATUS = "aegis.team-status/v1"
 DRAFT = "aegis.team-request/v1"
 WAIT_SECONDS = 2.0
 ACTS = ("root", "owner", "router")
-OWED = ("awaiting_decision", "escalated")
+# within_delegation is listed for ROOT to see but is the team Decider's to decide while its delegation can take it.
+OWED = ("awaiting_decision", "within_delegation", "escalated")
+MERGE, DELEGATION = "merge", "delegate-merge"
 # The loop's own rule for a stale status file: no pass finished and no step began within three intervals.
 STALE_FACTOR = 3
 
@@ -42,7 +44,8 @@ def standing(state, key, row, at):
 
     A Decider's escalation leaves the request without a ROOT decision, which the Router reads as awaiting_decision,
     so the delegated decision is read before that. The journal refuses a delegated decision once ROOT has decided,
-    so a ROOT decision on an escalated request always came after the escalation."""
+    so a ROOT decision on an escalated request always came after the escalation. An undecided merge that a live
+    delegation covers is within_delegation until the Decider escalates it or the delegation can no longer take it."""
     value = row["request"]
     if value["authority"] != key:
         # A continuation member is named in its authority's bytes and never takes a decision of its own.
@@ -56,7 +59,7 @@ def standing(state, key, row, at):
         delegated = [entry["decision"] for entry in state.get("delegated_decisions", []) if entry["request_id"] == key]
         if delegated:
             return "escalated" if delegated[-1] == "escalate" else "delegated_approved"
-        return "awaiting_decision"
+        return "within_delegation" if covering_delegation(state, key, row, at) else "awaiting_decision"
     if decision == "deny":
         return "denied"
     if value["operation"] == "delegate-merge":
@@ -66,16 +69,46 @@ def standing(state, key, row, at):
     return "approved"
 
 
-def owed_row(key, row, escalation):
+def covering_delegation(state, key, row, at):
+    """The id of the delegation under which the team Decider can still approve this merge, or None.
+
+    These are the journal's own checks for a Decider's approve (hierarchy_lifecycle.delegated_decision), with its
+    path rule (hierarchy_lifecycle.covered): a current Decider; a delegate-merge authority request without members
+    whose last ROOT decision is approve, unexpired at `at`, for the request's team, not over the whole filesystem,
+    covering every request path, with approvals left. The reviewed commit is left out because only the review names
+    it, and so is the publisher rule because only a coordinator or the Router publishes. The journal does not check the
+    target's operation; a delegate-merge delegation is read here as covering merges only."""
+    value = row["request"]
+    if value["operation"] != MERGE or state["current"].get("decider") is None:
+        return None
+    recorded = state.get("delegated_decisions", [])
+    for identifier, parent in sorted(state["requests"].items()):
+        grant = parent["request"]
+        if (identifier == key or grant["operation"] != DELEGATION or grant["authority"] != identifier
+                or grant["continuation"]["members"] or grant["team"] != value["team"]
+                or hierarchy_router.last_decision(state, identifier) != "approve"
+                or parse_time(at) >= parse_time(grant["continuation"]["expires_at"])
+                or any(PurePosixPath(path).parts == ("/",) for path in grant["paths"])
+                or not all(hierarchy_lifecycle.covered(grant["paths"], path) for path in value["paths"])):
+            continue
+        used = sum(1 for entry in recorded if entry["delegation_id"] == identifier and entry["decision"] == "approve")
+        if used < grant["continuation"]["max_starts"]:
+            return identifier
+    return None
+
+
+def owed_row(key, row, escalation, delegation=None):
     value, sha256 = row["request"], row["raw"]["sha256"]
     entry = {"request_id": key, "request_sha256": sha256, "team": value["team"], "operation": value["operation"],
              "phase": value["phase"], "owner": value["owner"], "paths": value["paths"], "source": value["source"],
-             "why": "escalated" if escalation else "awaiting_decision",
+             "why": "escalated" if escalation else "within_delegation" if delegation else "awaiting_decision",
              "root_decide": {"request_id": key, "request_sha256": sha256,
                              "event_id_approve": event_id("root", key, sha256, "approve"),
                              "event_id_deny": event_id("root", key, sha256, "deny")}}
     if escalation:
         entry.update(delegation_id=escalation["delegation_id"], escalation_reason=escalation["reason"])
+    elif delegation:
+        entry["delegation_id"] = delegation
     return entry
 
 
@@ -85,13 +118,15 @@ def owed(state, at):
     for key, row in sorted(state["requests"].items()):
         stage = standing(state, key, row, at)
         if stage in OWED:
-            rows.append(owed_row(key, row, escalations[key] if stage == "escalated" else None))
+            rows.append(owed_row(key, row, escalations[key] if stage == "escalated" else None,
+                                 covering_delegation(state, key, row, at) if stage == "within_delegation" else None))
     return rows
 
 
 def pending(lifecycle, wait=WAIT_SECONDS):
-    """aegis.team-pending/v1: one row per request ROOT owes a decision on, with the root_decide arguments for it.
-    lifecycle is a hierarchy_lifecycle.Lifecycle."""
+    """aegis.team-pending/v1: one row per request awaiting a ROOT decision, with the root_decide arguments for it.
+    why is awaiting_decision, escalated (by the Decider) or within_delegation (the Decider's to decide first; deciding
+    it would pre-empt the Decider). lifecycle is a hierarchy_lifecycle.Lifecycle."""
     _policy, state = hierarchy_router.locked_load(lifecycle, wait)
     return {"schema": PENDING, "pending": owed(state, timestamp()), "execution_enabled": False}
 
