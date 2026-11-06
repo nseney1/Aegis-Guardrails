@@ -2380,6 +2380,37 @@ def rejudged(plan, role):
         plan["probe_root"]) for attempt in role["attempts"]}
 
 
+def test_run_1_observations_replay_without_filesystem_or_process_access(tmp_path, monkeypatch):
+    """Once host facts are captured, verdicts and evidence survive an offline replay unchanged."""
+    import builtins
+    import copy
+
+    plan = run1(tmp_path)
+    analyze = native_probe.evidence_analysis.analyze_attempt
+    captured = []
+
+    def capture(*args, **kwargs):
+        captured.append(copy.deepcopy((args, kwargs)))
+        return analyze(*args, **kwargs)
+
+    monkeypatch.setattr(native_probe.evidence_analysis, "analyze_attempt", capture)
+    expected = [row for role in plan["roles"] for row in rejudged(plan, role).values()]
+    before = copy.deepcopy(captured)
+
+    def inaccessible(*args, **kwargs):
+        raise AssertionError("evidence analysis accessed the host")
+
+    with monkeypatch.context() as sealed:
+        sealed.setattr(builtins, "open", inaccessible)
+        for name in ("stat", "lstat", "readlink", "access"):
+            sealed.setattr(os, name, inaccessible)
+        for name in ("run", "Popen"):
+            sealed.setattr(subprocess, name, inaccessible)
+        observed = [analyze(*args, **kwargs) for args, kwargs in captured]
+    assert observed == expected
+    assert captured == before
+
+
 def test_run_1_rejudged_from_its_code_mode_records_matches_the_hand_verification(tmp_path):
     plan = run1(tmp_path)
     table = {}
