@@ -104,6 +104,17 @@ def test_a_tool_outside_the_role_is_refused(team, endpoint, name):
     assert failed is True and data["error"] == "unknown mailbox tool: " + name
 
 
+ROOT_TOOLS = ["root_decide", "team_status", "team_pending", "team_request"]
+
+
+@pytest.mark.parametrize("endpoint", sorted(ROLE_TOOLS))
+def test_roots_decision_and_read_tools_are_never_a_mailbox_roles(team, endpoint):
+    responses = team.responses(endpoint, [(name, {}) for name in ROOT_TOOLS])
+    assert not set(ROOT_TOOLS) & {tool["name"] for tool in responses[1]["result"]["tools"]}
+    assert [json.loads(response["result"]["content"][0]["text"])["error"] for response in responses[2:]] == [
+        "unknown mailbox tool: " + name for name in ROOT_TOOLS]
+
+
 def test_a_store_is_not_reachable_without_configuration(team):
     response = team.responses("a/orchestrator", [("workspace_capacity", {})], store=False)[-1]["result"]
     assert response["isError"] is True
