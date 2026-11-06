@@ -46,8 +46,10 @@ base; a verdict on an unchanged HEAD does not check uncommitted edits.
 
 Check the inbox before reporting. Accept by publishing a mailbox `ack` in reply to the
 dispatch, with readiness for a writing lane; a SendMessage is a notice, not the
-acceptance (T134, T126 (2)). A separate received message is optional. Send source/check evidence
-with completion, plus out-of-lane findings and proposed changelog text. Do not push
+acceptance (T134, T126 (2)). A separate received message is optional. Publish the
+`ack` and the `result` with the fields and in the order of the protocol checklist in
+your role contract (your start turn). Send source/check evidence with completion,
+plus out-of-lane findings and proposed changelog text. Do not push
 unless the push-exception field names an owner decision, and do not use GitHub, sign,
 merge a PR or activate policy. Rotate after 60 minutes of active work through a
 stopped-session checkpoint; do not silently reuse a stale binding. If your result lists
