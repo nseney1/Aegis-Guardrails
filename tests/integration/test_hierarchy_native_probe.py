@@ -156,8 +156,9 @@ class Probe:
             turns.append({"match": "You have unread messages", **wake})
         self.script.write_text(json.dumps({"turns": turns}), encoding="utf-8")
 
-    def run(self, expect=0, cap=None, **changes):
+    def run(self, expect=0, cap=None, extra_words=(), **changes):
         words = ["run", "--probe-root", str(self.root)] + ([] if cap is None else ["--turn-cap", str(cap)])
+        words += list(extra_words)
         return json.loads(self.invoke(*words, expect=expect, **changes))
 
     def calls(self):
@@ -370,6 +371,10 @@ def preflight_cases():
         ("codex-home-in-passwd-home", "CODEX_HOME is inside ~/.codex: {tmp}/passwd-home/.codex/probe"),
         ("no-passwd-stand-in", "under pytest AEGIS_PROBE_FAKE_PASSWD_HOME must name a stand-in passwd home"),
         ("unlisted-worktree", "the probe cwd is not a linked worktree the probe created: {root}/worktree"),
+        ("empty-key-name", "invalid API key variable name"),
+        ("codex-home-dotdot", "CODEX_HOME must be spelled exactly as the plan's path {root}/codex-home: "
+                              "{root}/worktree/../codex-home"),
+        ("codex-home-alias", "CODEX_HOME must be spelled exactly as the plan's path {root}/codex-home: {tmp}/alias"),
     ]
 
 
@@ -416,6 +421,13 @@ def test_every_preflight_refusal_is_exact_and_runs_nothing(probe, case, error):
         # The worktree and its admin folder still agree, but git no longer lists the worktree at this path.
         admin = Path(probe.plan_answer["gitdir"]) / "gitdir"
         admin.write_text(str(probe.tmp / "moved" / ".git") + "\n", encoding="utf-8")
+    elif case == "empty-key-name":
+        words += ["--api-key-env", ""]
+    elif case == "codex-home-dotdot":
+        changes["CODEX_HOME"] = str(probe.root / "worktree") + "/../codex-home"
+    elif case == "codex-home-alias":
+        (probe.tmp / "alias").symlink_to(probe.codex_home)
+        changes["CODEX_HOME"] = str(probe.tmp / "alias")
     answer = json.loads(probe.invoke(*words, expect=2, **changes))
     expected = error.format(home=probe.home, tmp=probe.tmp, root=probe.root)
     assert answer == {"schema": "aegis.native-probe-report/v1", "state": "refused", "error": expected}
@@ -1595,3 +1607,358 @@ def test_under_the_fake_with_a_stand_in_the_real_passwd_home_is_never_resolved(m
     homes = native_probe.guarded_homes(True)
     assert homes == [tmp_path / "home" / ".codex", tmp_path / ".codex"]
     assert not any(path.startswith(real) for path in seen)
+
+
+# ---------------------------------------------------------------- --auth existing (an owner's ChatGPT SSO login)
+
+SSO_AUTH = '{"auth_mode": "chatgpt", "tokens": {"id_token": "fake-sso-%s"}}\n' % uuid.uuid4().hex
+
+
+def sso_login(probe, content=SSO_AUTH, mode=0o600):
+    """What `CODEX_HOME=<codex-home> codex login` leaves behind, written by the test; the probe never logs in."""
+    auth = probe.codex_home / "auth.json"
+    auth.write_text(content, encoding="utf-8")
+    auth.chmod(mode)
+    return auth
+
+
+def owner_auth(probe):
+    """A stand-in for the owner's ~/.codex/auth.json, inside the temporary HOME."""
+    folder = probe.home / ".codex"
+    folder.mkdir(exist_ok=True)
+    real = folder / "auth.json"
+    real.write_text('{"auth_mode": "chatgpt", "owner": true}\n', encoding="utf-8")
+    real.chmod(0o600)
+    return real
+
+
+def test_an_existing_sso_login_runs_without_a_key_or_codex_login_and_is_deleted_at_cleanup(probe):
+    import hashlib
+    real = owner_auth(probe)
+    plan = probe.plan([{"role": "implementer"}])
+    auth = sso_login(probe)
+    probe.script_turns()
+    report = probe.run(cap=4, OPENAI_API_KEY=None, extra_words=["--auth", "existing"])
+    assert report["state"] == "completed", report["summary"]
+    assert report["summary"]["passed"] is True
+    assert report["login"] == {
+        "mode": "existing", "auth_file": str(auth), "codex_login_called": False,
+        "auth_file_sha256_before": hashlib.sha256(SSO_AUTH.encode()).hexdigest(),
+        "cleanup": "auth.json is deleted at cleanup; log in again for a new run"}
+    # The probe never ran codex login, and the owner's own login is untouched.
+    assert not probe.login_log.exists()
+    assert not any(call["argv"][1:2] == ["login"] for call in probe.calls())
+    assert report["home_codex"]["state"] == "unchanged"
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+    assert report["cleanup"]["auth_removed"] is True and not os.path.lexists(auth)
+    assert probe.worktrees() == [str(probe.source)] and not Path(plan["worktree"]).exists()
+    text = probe.invoke("report", "--probe-root", str(probe.root), "--text")
+    assert "login: existing auth.json (codex login not called); deleted at cleanup" in text
+
+
+def test_an_explicit_api_key_auth_keeps_the_key_login(probe):
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns()
+    report = probe.run(cap=4, extra_words=["--auth", "api-key"])
+    assert report["summary"]["passed"] is True
+    assert probe.login_log.read_text().splitlines() == ["login --with-api-key"]
+    assert report["login"] == {"argv": ["codex", "login", "--with-api-key"], "api_key_env": "OPENAI_API_KEY",
+                               "exit_code": 0}
+
+
+KEYS_SET = ("unset OPENAI_API_KEY and CODEX_API_KEY for --auth existing: codex could bill turns to the key instead "
+            "of the SSO login (set: %s)")
+
+
+def existing_cases():
+    return [
+        ("no-auth", "CODEX_HOME has no auth.json; log in first with: CODEX_HOME={root}/codex-home codex login"),
+        ("symlink", "auth.json in CODEX_HOME is a symlink: {root}/codex-home/auth.json"),
+        ("hard-link", "auth.json in CODEX_HOME has 2 hard links: {root}/codex-home/auth.json"),
+        ("group-readable", "auth.json in CODEX_HOME is readable by group or others (mode 0640): "
+                           "{root}/codex-home/auth.json"),
+        ("world-readable", "auth.json in CODEX_HOME is readable by group or others (mode 0604): "
+                           "{root}/codex-home/auth.json"),
+        ("not-a-file", "auth.json in CODEX_HOME is not a regular file: {root}/codex-home/auth.json"),
+        ("extra-entry", "CODEX_HOME holds entries a codex login does not create: notes.txt"),
+        ("config-toml", "CODEX_HOME holds entries a codex login does not create: config.toml"),
+        ("sessions", "CODEX_HOME already holds sessions/; a prior session would pollute the probe's rollout "
+                     "reads: {root}/codex-home"),
+        ("no-mark", "CODEX_HOME does not carry this probe's owner mark: {root}/codex-home"),
+        ("other-mark", "CODEX_HOME does not carry this probe's owner mark: {root}/codex-home"),
+        ("codex-home-other", "CODEX_HOME is not the probe's own folder: {tmp}/other-home"),
+        ("codex-home-in-home", "CODEX_HOME is inside ~/.codex: {home}/.codex"),
+        ("codex-home-in-passwd-home", "CODEX_HOME is inside ~/.codex: {tmp}/passwd-home/.codex"),
+        ("key-env", "--api-key-env applies only to --auth api-key"),
+        ("openai-key", KEYS_SET % "OPENAI_API_KEY"),
+        ("codex-key", KEYS_SET % "CODEX_API_KEY"),
+        ("both-keys", KEYS_SET % "OPENAI_API_KEY, CODEX_API_KEY"),
+        ("mark-symlink", "CODEX_HOME does not carry this probe's owner mark: {root}/codex-home"),
+    ]
+
+
+@pytest.mark.parametrize("case,error", existing_cases())
+def test_every_existing_login_refusal_is_exact_and_runs_nothing(probe, case, error):
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    auth = probe.codex_home / "auth.json"
+    if case != "no-auth":
+        sso_login(probe)
+    words, changes = ["--auth", "existing"], {"OPENAI_API_KEY": None}
+    if case == "symlink":
+        auth.unlink()
+        auth.symlink_to(real)
+    elif case == "hard-link":
+        auth.unlink()
+        os.link(real, auth)
+    elif case == "group-readable":
+        auth.chmod(0o640)
+    elif case == "world-readable":
+        auth.chmod(0o604)
+    elif case == "not-a-file":
+        auth.unlink()
+        auth.mkdir()
+    elif case == "extra-entry":
+        (probe.codex_home / "notes.txt").write_text("x")
+    elif case == "config-toml":
+        (probe.codex_home / "config.toml").write_text('model = "owner"\n')
+    elif case == "sessions":
+        (probe.codex_home / "sessions" / "2026" / "11" / "06").mkdir(parents=True)
+        (probe.codex_home / "sessions" / "2026" / "11" / "06" / "rollout-old.jsonl").write_text("{}\n")
+    elif case == "no-mark":
+        (probe.codex_home / ".aegis-native-probe").unlink()
+    elif case == "other-mark":
+        (probe.codex_home / ".aegis-native-probe").write_text("probe-000000000000\n")
+    elif case == "codex-home-other":
+        (probe.tmp / "other-home").mkdir()
+        changes["CODEX_HOME"] = str(probe.tmp / "other-home")
+    elif case == "codex-home-in-home":
+        changes["CODEX_HOME"] = str(probe.home / ".codex")
+    elif case == "codex-home-in-passwd-home":
+        (probe.passwd_home / ".codex").mkdir()
+        changes["CODEX_HOME"] = str(probe.passwd_home / ".codex")
+    elif case == "key-env":
+        words += ["--api-key-env", "OPENAI_API_KEY"]
+    elif case in ("openai-key", "both-keys"):
+        changes["OPENAI_API_KEY"] = KEY
+        if case == "both-keys":
+            changes["CODEX_API_KEY"] = KEY
+    elif case == "codex-key":
+        changes["CODEX_API_KEY"] = KEY
+    elif case == "mark-symlink":
+        # The right probe id, but read through a symlink the probe did not write.
+        mark = probe.codex_home / ".aegis-native-probe"
+        (probe.tmp / "mark").write_text(mark.read_text())
+        mark.unlink()
+        mark.symlink_to(probe.tmp / "mark")
+    answer = probe.run(cap=4, expect=2, extra_words=words, **changes)
+    expected = error.format(home=probe.home, tmp=probe.tmp, root=probe.root)
+    assert answer == {"schema": "aegis.native-probe-report/v1", "state": "refused", "error": expected}
+    assert not probe.calls() and not probe.login_log.exists()
+    assert not (probe.root / "report.json").exists() and not (probe.root / ".run.lock").exists()
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+def test_an_auth_file_changed_after_the_preflight_fails_the_login_step(probe):
+    probe.plan([{"role": "implementer"}])
+    sso_login(probe)
+    # No process can be paused between the preflight and the login step, so the runner is given a preflight hash
+    # that no longer matches the file, as after a swap in that window.
+    state = json.loads((probe.root / "probe.json").read_text())
+    runner = native_probe.Runner(state, 4, None, str(probe.codex), True, auth="existing", auth_sha="0" * 64)
+    login = runner.login()
+    assert login["mode"] == "existing" and login["codex_login_called"] is False
+    assert login["error"] == "auth.json changed after the preflight"
+    assert native_probe.login_failed(login) == "existing login: auth.json changed after the preflight"
+
+
+def test_the_plan_and_help_name_both_login_routes_and_warn_about_codex_login_without_codex_home(probe):
+    plan = probe.plan([{"role": "implementer"}])
+    assert "--auth existing" in plan["next"] and "CODEX_HOME=%s codex login" % probe.codex_home in plan["next"]
+    assert "never run codex login without CODEX_HOME" in plan["next"]
+    assert "API key" in plan["next"]
+    helped = probe.invoke("run", "--help")
+    assert "--auth {api-key,existing}" in helped
+    assert "auth.json is deleted at cleanup" in " ".join(helped.split())
+
+
+def test_a_codex_home_spelled_with_a_trailing_slash_still_runs(probe):
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns()
+    report = probe.run(cap=4, CODEX_HOME=str(probe.codex_home) + "/")
+    assert report["summary"]["passed"] is True, report["summary"]
+
+
+def swap_codex_home_for_link(probe, target):
+    """codex-home replaced, after the plan, by a symlink to the stand-in ~/.codex (the swap a cleanup must survive)."""
+    shutil.rmtree(probe.codex_home)
+    probe.codex_home.symlink_to(target)
+
+
+def test_the_cleanup_command_never_follows_a_codex_home_symlink_to_the_owners_login(probe):
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    swap_codex_home_for_link(probe, real.parent)
+    answer = json.loads(probe.invoke("cleanup", "--probe-root", str(probe.root), expect=3))
+    error = "codex-home is not a real directory (a symlink or another type); auth.json left: %s" % probe.codex_home
+    assert answer["cleanup"]["auth_removed"] is False and answer["cleanup"]["auth_error"] == error
+    assert "cleanup: the disposable login was not removed: " + error in answer["failures"]
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+def test_the_runs_own_cleanup_never_follows_a_codex_home_symlink_to_the_owners_login(probe, monkeypatch):
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    auth = sso_login(probe)
+    state = json.loads((probe.root / "probe.json").read_text())
+    sha = native_probe.auth_digest(auth)
+    # In process with no roles, so no turn and no codex runs: only the run's cleanup and its ~/.codex digests.
+    state.update(roles=[], root=None)
+    monkeypatch.setenv("HOME", str(probe.home))
+    monkeypatch.setenv("AEGIS_PROBE_FAKE_PASSWD_HOME", str(probe.passwd_home))
+    swap_codex_home_for_link(probe, real.parent)
+    code, report = native_probe.run_locked(state, 4, None, str(probe.codex), True, probe.root, "existing", sha)
+    error = "codex-home is not a real directory (a symlink or another type); auth.json left: %s" % probe.codex_home
+    assert code == 3 and report["cleanup"]["auth_removed"] is False and report["cleanup"]["auth_error"] == error
+    assert "cleanup: the disposable login was not removed: " + error in report["summary"]["failures"]
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+    assert report["home_codex"]["state"] == "unchanged"
+
+
+def test_the_login_removal_refuses_a_folder_off_the_plan_path_or_inside_a_guarded_home(tmp_path):
+    def folder(path):
+        path.mkdir(parents=True)
+        (path / "auth.json").write_text("{}")
+        return path
+    plain = folder(tmp_path / "plain")
+    assert native_probe.remove_login(str(plain), []) == (True, None) and not (plain / "auth.json").exists()
+    # A real folder at the end, but a parent swapped for a symlink: the path leads somewhere else.
+    folder(tmp_path / "b" / "codex-home")
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    spelled = str(tmp_path / "a" / "codex-home")
+    assert native_probe.remove_login(spelled, []) == (
+        False, "codex-home does not resolve to the plan path; auth.json left: " + spelled)
+    guarded = folder(tmp_path / "home" / ".codex" / "probe")
+    assert native_probe.remove_login(str(guarded), [tmp_path / "home" / ".codex"]) == (
+        False, "codex-home is inside ~/.codex; auth.json left: %s" % guarded)
+    assert (tmp_path / "b" / "codex-home" / "auth.json").exists() and (guarded / "auth.json").exists()
+    assert native_probe.remove_login(str(tmp_path / "absent"), []) == (True, None)
+
+
+def test_the_login_removal_never_follows_a_symlink_swapped_in_after_its_checks(tmp_path, monkeypatch):
+    owner = tmp_path / "home" / ".codex"
+    owner.mkdir(parents=True)
+    (owner / "auth.json").write_text("{}")
+    link = tmp_path / "codex-home"
+    link.symlink_to(owner)
+    # The lstat and realpath saw the plan's real folder; the open then meets the symlink, as after a swap.
+    seen_by_lstat(monkeypatch, link, st_mode=stat.S_IFDIR | 0o700)
+    original = os.path.realpath
+    monkeypatch.setattr(native_probe.os.path, "realpath",
+                        lambda name, *words, **options: str(link) if str(name) == str(link) else original(name, *words,
+                                                                                                      **options))
+    removed, error = native_probe.remove_login(str(link), [])
+    assert removed is False and error.startswith("codex-home could not be opened without following a link")
+    assert (owner / "auth.json").exists()
+
+
+def seen_by_lstat(monkeypatch, path, **fields):
+    """The lstat the check makes sees these fields for path; the open after it meets the real file."""
+    original = os.lstat
+    real = original(path)
+    values = {"st_mode": real.st_mode, "st_ino": real.st_ino, "st_dev": real.st_dev, "st_nlink": real.st_nlink,
+              "st_uid": real.st_uid, "st_gid": real.st_gid, "st_size": real.st_size}
+    values.update(fields)
+    seen = os.stat_result([values[key] for key in ("st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid",
+                                                   "st_size")] + [0, 0, 0])
+    monkeypatch.setattr(native_probe.os, "lstat",
+                        lambda name, *words, **options: seen if str(name) == str(path) else original(name, *words,
+                                                                                                       **options))
+
+
+def test_a_fifo_swapped_in_after_the_lstat_is_refused_without_blocking(tmp_path, monkeypatch):
+    import threading
+    fifo = tmp_path / "auth.json"
+    os.mkfifo(fifo, 0o600)
+    seen_by_lstat(monkeypatch, fifo, st_mode=stat.S_IFREG | 0o600, st_nlink=1)
+    result = {}
+
+    def check():
+        try:
+            result["digest"] = native_probe.auth_digest(fifo)
+        except native_probe.Refusal as exc:
+            result["refusal"] = str(exc)
+        except OSError as exc:
+            result["error"] = repr(exc)
+
+    thread = threading.Thread(target=check, daemon=True)
+    thread.start()
+    thread.join(2)
+    blocked = thread.is_alive()
+    if blocked:
+        # Release an open that blocked on the FIFO, so no stuck thread outlives the test.
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        thread.join(2)
+    assert not blocked, "opening auth.json blocked on a FIFO"
+    assert result == {"refusal": "auth.json in CODEX_HOME is not a regular file: %s" % fifo}
+
+
+def test_an_auth_file_replaced_between_the_lstat_and_the_open_is_refused(tmp_path, monkeypatch):
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}")
+    auth.chmod(0o600)
+    seen_by_lstat(monkeypatch, auth, st_ino=os.lstat(auth).st_ino + 1)
+    with pytest.raises(native_probe.Refusal) as refused:
+        native_probe.auth_digest(auth)
+    assert str(refused.value) == "auth.json in CODEX_HOME changed while it was checked: %s" % auth
+
+
+def test_an_auth_file_owned_by_another_user_is_refused(tmp_path, monkeypatch):
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}")
+    auth.chmod(0o600)
+    uid = os.getuid()
+    monkeypatch.setattr(native_probe.os, "getuid", lambda: uid + 1)
+    with pytest.raises(native_probe.Refusal) as refused:
+        native_probe.auth_digest(auth)
+    assert str(refused.value) == "auth.json in CODEX_HOME is not owned by this user: %s" % auth
+
+
+def existing_runner(probe):
+    probe.plan([{"role": "implementer"}])
+    auth = sso_login(probe)
+    state = json.loads((probe.root / "probe.json").read_text())
+    runner = native_probe.Runner(state, 4, None, str(probe.codex), True, auth="existing",
+                                 auth_sha=native_probe.auth_digest(auth))
+    return runner, auth
+
+
+def test_an_auth_file_swapped_for_a_symlink_after_the_preflight_fails_the_login_step(probe):
+    real = owner_auth(probe)
+    runner, auth = existing_runner(probe)
+    auth.unlink()
+    auth.symlink_to(real)
+    login = runner.login()
+    assert login["error"] == "auth.json in CODEX_HOME is a symlink: %s" % auth
+    assert native_probe.login_failed(login) == "existing login: auth.json in CODEX_HOME is a symlink: %s" % auth
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+@pytest.mark.parametrize("entry,error", [
+    ("sessions", "CODEX_HOME already holds sessions/; a prior session would pollute the probe's rollout reads: "
+                 "{home}"),
+    ("notes.txt", "CODEX_HOME holds entries a codex login does not create: notes.txt"),
+])
+def test_an_entry_that_appears_after_the_preflight_fails_the_login_step(probe, entry, error):
+    runner, _ = existing_runner(probe)
+    assert "error" not in runner.login()
+    if entry == "sessions":
+        (probe.codex_home / "sessions").mkdir()
+    else:
+        (probe.codex_home / entry).write_text("x")
+    login = runner.login()
+    assert login["error"] == error.format(home=probe.codex_home)
+    assert native_probe.login_failed(login) == "existing login: " + error.format(home=probe.codex_home)
