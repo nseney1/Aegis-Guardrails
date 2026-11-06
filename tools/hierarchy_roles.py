@@ -22,8 +22,9 @@ PATH = Path(__file__).resolve().parent / "hierarchy_templates" / "role-registry.
 LIFECYCLE_EVENTS = ("publish", "read", "route", "admit", "wait", "intent", "start", "terminal", "meter", "delivery",
                     "disposition", "resolve", "succeed", "associate", "observe", "cancel_attempt")
 VOCABULARY = {
+    # loop_status is the loop's status.json; team_evidence is the run's evidence folder and its SHA256SUMS.
     "reads": {"source", "mailbox", "board", "lifecycle", "job_evidence", "owner_records", "workspace_capacity",
-              "workspace_initiative", "workspace_path_overlap"},
+              "workspace_initiative", "workspace_path_overlap", "loop_status", "team_evidence"},
     # mailbox:bind is the binding record alone, which the launcher publishes through add-role; it is not mail.
     "writes": {"source", "mailbox", "mailbox:bind", "board", "job_evidence", "worktree_lease", "governance"}
               | {"lifecycle:" + event for event in LIFECYCLE_EVENTS},
@@ -45,6 +46,11 @@ READ_TOOLS = ["Read", "Glob", "Grep"]
 WRITE_TOOLS = ["Edit", "Write"]
 # The lifecycle tools a session's mailbox connection may carry.
 LIFECYCLE_TOOLS = ("router_status", "decider_record")
+# The read tools ROOT's decision adapter may offer beside root_decide, and what each reads. team_request reads the
+# journal's policy and custody to draft a publish event; none of them writes.
+DECISION_READ_TOOLS = ("team_status", "team_pending", "team_request")
+DECISION_TOOL_READS = {"team_status": {"lifecycle", "loop_status", "team_evidence"}, "team_pending": {"lifecycle"},
+                       "team_request": {"lifecycle"}}
 ROLE_FIELDS = {"title", "kind", "m1", "responsibility", "endpoint", "hat_of", "service", "lifecycle_role", "reads",
                "writes", "calls", "approvals", "prohibitions", "independence", "model_profile", "reports_to",
                "provision"}
@@ -76,6 +82,21 @@ def lifecycle_connection(name, role, allowed):
     require("decider_record" not in tools
             or ("lifecycle:delegated_decision" in allowed["approvals"] and role["lifecycle_role"] == "decider"),
             "role %s: decider_record is for the decider, which approves within a delegation" % name)
+
+
+def decision_connection(name, role, allowed):
+    """ROOT's read tools ride only on the decision adapter, and each needs the reads it shows ROOT."""
+    tools = role["provision"].get("decision_tools", [])
+    require(isinstance(tools, list) and len(tools) == len(set(tools)),
+            "role %s decision_tools must be a list without repeats" % name)
+    for tool in tools:
+        require(isinstance(tool, str) and tool in DECISION_READ_TOOLS,
+                "role %s names an unknown decision tool: %s" % (name, str(tool)[:64]))
+    require(not tools or role["provision"]["adapter"] == "decision",
+            "role %s: ROOT's read tools are for the decision adapter" % name)
+    for tool in tools:
+        missing = DECISION_TOOL_READS[tool] - allowed["reads"]
+        require(not missing, "role %s: %s reads %s, which the role does not list" % (name, tool, ", ".join(sorted(missing))))
 
 
 def validate_role(name, role):
@@ -110,7 +131,7 @@ def validate_role(name, role):
         require(endpoint["role"] in ENDPOINT_ROLES, "role %s names an unknown endpoint role" % name)
         require(("lane_kind" in endpoint) == (endpoint["role"] == "lane"),
                 "role %s: only a lane endpoint names a lane kind" % name)
-        fields(provision, {"adapter", "reader_shell", "assistants", "team_kind", "lifecycle_tools"})
+        fields(provision, {"adapter", "reader_shell", "assistants", "team_kind", "lifecycle_tools"}, {"decision_tools"})
         require(provision["adapter"] in {"mailbox", "decision"}, "role %s has an unknown adapter" % name)
         require(type(provision["reader_shell"]) is bool and type(provision["team_kind"]) is bool,
                 "role %s has invalid provisioning flags" % name)
@@ -120,11 +141,12 @@ def validate_role(name, role):
         # writes none; a writer already has one in its sandbox.
         require(not provision["reader_shell"] or ("source" in allowed["reads"] and "source" not in allowed["writes"]),
                 "role %s: a reader shell is only for a role that reads source and writes none" % name)
-        # The decision adapter offers one tool. A role that could also write source or mail through
+        # The decision adapter writes only the decision. A role that could also write source or mail through
         # it would turn a decision boundary into an operational one.
         require(provision["adapter"] != "decision" or not ({"source", "mailbox", "board"} & allowed["writes"]),
                 "role %s: the decision adapter cannot carry write access" % name)
         lifecycle_connection(name, role, allowed)
+        decision_connection(name, role, allowed)
     require(role["service"] is None or (endpoint is None and role["kind"] == "service"),
             "role %s: only a service without an endpoint names a service module" % name)
     if role["service"] is not None:
@@ -204,6 +226,11 @@ def workspace_tools(entry):
 
 def lifecycle_tools(entry):
     return tuple(entry["provision"]["lifecycle_tools"])
+
+
+def decision_tools(entry):
+    """ROOT's read tools, in the order its adapter offers them after root_decide."""
+    return tuple(entry["provision"].get("decision_tools", ()))
 
 
 def takes_board(entry):
