@@ -21,7 +21,7 @@ test: ## Run the full suite with an isolated HOME
 	  $(PYTHON) -m pytest tests -q $$xdist
 
 lint: ## Syntax errors and undefined names (ruff, ignoring user-level config)
-	$(PYTHON) -m ruff check --isolated --select E9,F63,F7,F82 aegis_cli aegis_core aegis_mcp aegis_sdk tests .github/scripts
+	$(PYTHON) -m ruff check --isolated --select E9,F63,F7,F82 aegis_cli aegis_core aegis_mcp aegis_sdk tests .github/scripts tools
 
 build: ## Build the wheel and sdist into dist/
 	$(PYTHON) -m build

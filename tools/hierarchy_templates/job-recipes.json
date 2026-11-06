@@ -36,6 +36,11 @@
       "heavy": true,
       "sandbox": "bwrap",
       "timeout_seconds": 1200,
+      "require_clean": true,
+      "expects_tests": true,
+      "keep": [
+        "run/junit.xml"
+      ],
       "steps": [
         [
           "$python",
@@ -47,6 +52,8 @@
           "no:cacheprovider",
           "--basetemp",
           "$scratch",
+          "--junitxml",
+          "$scratch/junit.xml",
           "$paths"
         ]
       ]
@@ -56,6 +63,11 @@
       "heavy": true,
       "sandbox": "bwrap",
       "timeout_seconds": 1800,
+      "require_clean": true,
+      "expects_tests": true,
+      "keep": [
+        "run/junit.xml"
+      ],
       "steps": [
         [
           "$python",
@@ -69,7 +81,9 @@
           "-p",
           "no:cacheprovider",
           "--basetemp",
-          "$scratch"
+          "$scratch",
+          "--junitxml",
+          "$scratch/junit.xml"
         ]
       ]
     },
@@ -84,8 +98,17 @@
           "-m",
           "ruff",
           "check",
+          "--isolated",
           "--no-cache",
-          "$paths"
+          "--select",
+          "E9,F63,F7,F82",
+          "aegis_cli",
+          "aegis_core",
+          "aegis_mcp",
+          "aegis_sdk",
+          "tests",
+          ".github/scripts",
+          "tools"
         ]
       ]
     },
