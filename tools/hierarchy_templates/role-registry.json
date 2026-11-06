@@ -19,7 +19,7 @@
       "hat_of": null,
       "service": null,
       "lifecycle_role": "root",
-      "reads": ["source", "mailbox", "lifecycle", "job_evidence", "owner_records"],
+      "reads": ["source", "mailbox", "lifecycle", "job_evidence", "owner_records", "loop_status", "team_evidence"],
       "writes": ["lifecycle:succeed"],
       "calls": [],
       "approvals": ["lifecycle:decision"],
@@ -34,7 +34,7 @@
       "model_profile": {"source": "team"},
       "reports_to": "owner",
       "provision": {"adapter": "decision", "reader_shell": false, "assistants": null, "team_kind": false,
-                    "lifecycle_tools": []}
+                    "lifecycle_tools": [], "decision_tools": ["team_status", "team_pending", "team_request"]}
     },
     "router": {
       "title": "Router",

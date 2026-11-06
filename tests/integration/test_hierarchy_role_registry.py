@@ -197,6 +197,52 @@ def test_the_watch_supervisor_cannot_widen_past_its_triggers(change, error):
     assert refusal(changed(change)) == error
 
 
+ROOT_READ_TOOLS = ("team_status", "team_pending", "team_request")
+
+
+def test_root_reads_the_loop_and_the_team_evidence_through_three_read_tools_on_its_decision_adapter():
+    roles = hierarchy_roles.registry()["roles"]
+    root = roles["root"]
+    assert {"loop_status", "team_evidence"} <= hierarchy_roles.VOCABULARY["reads"]
+    assert {"lifecycle", "loop_status", "team_evidence"} <= set(root["reads"])
+    assert hierarchy_roles.DECISION_READ_TOOLS == ROOT_READ_TOOLS
+    assert hierarchy_roles.decision_tools(root) == ROOT_READ_TOOLS
+    assert hierarchy_roles.lifecycle_tools(root) == ()
+    assert {name for name, entry in roles.items() if entry["provision"] and hierarchy_roles.decision_tools(entry)} == {
+        "root"}
+    # The read tools add no write, call or approval: ROOT still only decides.
+    assert root["writes"] == ["lifecycle:succeed"] and root["calls"] == []
+    assert root["approvals"] == ["lifecycle:decision"]
+
+
+def test_a_decision_adapter_without_read_tools_is_still_valid():
+    registry = changed(lambda r: r["roles"]["root"]["provision"].pop("decision_tools"))
+    assert hierarchy_roles.decision_tools(hierarchy_roles.validate(registry)["roles"]["root"]) == ()
+
+
+@pytest.mark.parametrize("change,error", [
+    (lambda r: r["roles"]["root"]["provision"].update(decision_tools=["team_status", "team_publish"]),
+     "role root names an unknown decision tool: team_publish"),
+    (lambda r: r["roles"]["root"]["provision"].update(decision_tools=["root_decide"]),
+     "role root names an unknown decision tool: root_decide"),
+    (lambda r: r["roles"]["root"]["provision"].update(decision_tools=["team_status", "team_status"]),
+     "role root decision_tools must be a list without repeats"),
+    (lambda r: r["roles"]["root"]["provision"].update(decision_tools="team_status"),
+     "role root decision_tools must be a list without repeats"),
+    (lambda r: r["roles"]["router"]["provision"].update(decision_tools=["team_pending"]),
+     "role router: ROOT's read tools are for the decision adapter"),
+    (lambda r: r["roles"]["root"]["reads"].remove("loop_status"),
+     "role root: team_status reads loop_status, which the role does not list"),
+    (lambda r: r["roles"]["root"]["reads"].remove("lifecycle"),
+     "role root: team_status reads lifecycle, which the role does not list"),
+    (lambda r: r["roles"]["root"]["reads"].append("loop_state"), "role root lists an unknown reads action: loop_state"),
+    (lambda r: r["roles"]["root"]["provision"].update(lifecycle_tools=["router_status"]),
+     "role root: the decision adapter offers only root_decide"),
+])
+def test_roots_read_tools_are_a_closed_list_and_need_their_reads(change, error):
+    assert refusal(changed(change)) == error
+
+
 def test_the_registry_path_is_fixed_beside_the_loader():
     assert hierarchy_roles.PATH == ROOT / "tools" / "hierarchy_templates" / "role-registry.json"
 

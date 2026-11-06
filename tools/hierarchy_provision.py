@@ -39,7 +39,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
                                matching, publish_file, read_json, require, safe_path, strict_json, strings, text,
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
-from hierarchy_mailbox_mcp import ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
+from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
 import hierarchy_roles  # noqa: E402
 from hierarchy_workspace import Store, validate_initiative  # noqa: E402
 
@@ -71,6 +71,7 @@ MAILBOX_TOOL_CONFIG = {"mailbox_inbox": {"output_token_limit": 30000}, "mailbox_
 # A tool that writes the journal waits for the session's approval, as a mailbox write does.
 LIFECYCLE_TOOL_CONFIG = {"decider_record": APPROVE}
 LIFECYCLE_PAIR = "lifecycle and actor must be given together"
+ROOT_READS = "loop_state and evidence are only for ROOT's decision adapter, with its lifecycle and actor"
 ASSISTANT_ENV = ["env", "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=2"]
 ASSISTANT_BLOCKED = "Agent(general-purpose),Agent(Explore),Agent(Plan)"
 ASSISTANT_NOTE = "enabled; using them needs the owner's go-ahead and a live probe"
@@ -182,10 +183,13 @@ def lifecycle_args(request):
 
 
 def decision_args(setup, endpoint, host, session, generation, request):
-    """ROOT's decision adapter takes the journal and its actor, and nothing else."""
-    return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
-            "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
-            *lifecycle_args(request)]
+    """ROOT's decision adapter takes the journal and its actor, and only read-only folders beside them. It runs from
+    its own entry, because the pinned mailbox CLI cannot carry --loop-state and --evidence."""
+    return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox_mcp.py"), "--root",
+            setup["mailbox_root"], "serve", "--endpoint", endpoint, "--host", host, "--session", session,
+            "--generation", str(generation), *lifecycle_args(request),
+            *(["--loop-state", request["loop_state"]] if "loop_state" in request else []),
+            *(["--evidence", request["evidence"]] if "evidence" in request else [])]
 
 
 def board_args(setup, endpoint, host, session, generation):
@@ -443,10 +447,20 @@ def check_lifecycle(request, mailbox, endpoint):
             "actor %s is not a %s actor in the lifecycle policy" % (actor, acting))
 
 
+def check_root_reads(request, endpoint):
+    """The folders ROOT's team_status reads. They need not exist yet: the loop and the evidence come after ROOT."""
+    names = [name for name in ("loop_state", "evidence") if name in request]
+    if not names:
+        return
+    require(endpoint_parts(endpoint)[1] == "root" and "lifecycle" in request and "actor" in request, ROOT_READS)
+    for name in names:
+        safe_path(text(request[name], name))
+
+
 def check_role_request(request, setup):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort", "timeout_seconds", "assistants",
                                                    "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background",
-                                                   "kind", "source_repo", "lifecycle", "actor"})
+                                                   "kind", "source_repo", "lifecycle", "actor", "loop_state", "evidence"})
     host = request["host"]
     require(host in (CLAUDE, CODEX, NATIVE), "unsupported host: " + str(host))
     require(type(request.get("background", False)) is bool, "invalid background")
@@ -459,6 +473,7 @@ def check_role_request(request, setup):
         mailbox.require_kind(request["endpoint"], request["kind"])
     check_codex_options(request, mailbox, request["endpoint"], host)
     check_lifecycle(request, mailbox, request["endpoint"])
+    check_root_reads(request, request["endpoint"])
     if "source_repo" in request:
         # Before binding, so a refused option leaves the endpoint unbound.
         require(endpoint_parts(request["endpoint"])[1] != "root", "the ROOT decision adapter takes no source views")
@@ -607,8 +622,12 @@ def root_connection(setup, connection, answer, request):
     connection.write_text(json.dumps(written, indent=2) + "\n", encoding="utf-8")
     answer = {**answer, "connection": str(connection)}
     if host == CODEX:
+        enabled = [DECISION_TOOL, *hierarchy_roles.decision_tools(registry_role(Mailbox(setup["mailbox_root"]),
+                                                                                answer["endpoint"]))]
+        # ROOT runs with approval_policy "never", where a tool without an approve entry may be refused rather than
+        # asked; the read tools get the entry too, so none depends on how the host treats readOnlyHint.
         answer["mcp_config"] = "mcp_servers=" + toml_value({"aegis_decision": {
-            **server, "required": True, "enabled_tools": ["root_decide"], "tools": {"root_decide": APPROVE}}})
+            **server, "required": True, "enabled_tools": enabled, "tools": {name: APPROVE for name in enabled}}})
     return answer
 
 

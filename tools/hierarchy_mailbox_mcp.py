@@ -2,16 +2,24 @@
 
 Launch through hierarchy_mailbox.py serve, which supports isolated Python imports.
 The configured sender is provenance, not an authenticated native host identity.
-ROOT gets only a decision adapter over the lifecycle journal, never the mailbox tools.
+ROOT gets only a decision adapter over the lifecycle journal, never the mailbox tools. It may also be launched
+through this file's own serve, which adds ROOT's read-only --loop-state and --evidence; the pinned mailbox CLI
+cannot carry them.
 """
+import argparse
 from contextlib import contextmanager, nullcontext
 import json
 import os
+from pathlib import Path
 import sys
 import time
 
-from hierarchy_mailbox import (MAX_BYTES, Mailbox, _bounded_inbox, digest, endpoint_parts, fields, integer, matching,
-                               require, SHA256, SLUG, strict_json, text, writer_lock)
+sys.dont_write_bytecode = True
+# With -I the script directory is absent from sys.path. Add only this reviewed directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_mailbox import (GIT_ID, MAX_BYTES, MESSAGE_TYPES, STAGES, Mailbox, _bounded_inbox, _cli_line,  # noqa: E402
+                               cli_path, digest, endpoint_parts, fields, integer, matching, require, SHA256, SLUG,
+                               strict_json, text, writer_lock)
 
 
 BOARD_LOCK_WAIT_SECONDS = 5.0
@@ -75,17 +83,60 @@ SELF_SPEC = ("Show what this connection is configured as: endpoint, role, host, 
              "is configuration, not authentication. Changes nothing.", {}, [])
 
 
+# The readiness and result shapes the pinned validator in hierarchy_mailbox.py checks (Mailbox.readiness and
+# Mailbox.completion). That file cannot change here, so a test parses its source and compares; this only teaches the
+# shape at the moment of the call, and the validator stays the check.
+GIT_PATTERN = "^%s$" % GIT_ID.pattern
+TEXT = {"type": "string", "maxLength": 4096}
+READINESS_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "description": "A writing lane's acceptance of its dispatch; a reviewer sends none.",
+    "required": ["worktree", "branch", "base_revision", "lease_ref", "lease_oid", "lease_expires_at", "owned_paths",
+                 "scan_workspace", "scan_evidence", "enforcement_tier", "hook_evidence"],
+    "properties": {
+        "worktree": {**TEXT, "description": "absolute path of the lane worktree's root"},
+        "branch": {"type": "string", "maxLength": 256, "description": "the worktree's current branch"},
+        "base_revision": {"type": "string", "pattern": GIT_PATTERN, "description": "an ancestor of the worktree HEAD"},
+        "lease_ref": {"type": "string", "pattern": "^refs/aegis/lanes/[a-z0-9][a-z0-9_-]{0,79}$"},
+        "lease_oid": {"type": "string", "pattern": GIT_PATTERN},
+        "lease_expires_at": {"type": "string", "maxLength": 64, "description": "UTC, as 2026-11-06T12:00:00Z; later than now"},
+        "owned_paths": {"type": "array", "minItems": 1, "maxItems": 256, "items": TEXT,
+                        "description": "repository-relative paths or patterns"},
+        "scan_workspace": {**TEXT, "description": "the same path as worktree"},
+        "scan_evidence": TEXT,
+        "enforcement_tier": {"type": "string", "enum": ["advisory", "best-effort"]},
+        "hook_evidence": TEXT}}
+RESULT_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "description": "Completion evidence on a result or review that replies to the accepted dispatch. Nothing else "
+                   "goes in result; put paths, digests and test detail in body.",
+    "required": ["source_revision", "source_tree", "checks"],
+    "properties": {
+        "source_revision": {"type": "string", "pattern": GIT_PATTERN},
+        "source_tree": {"type": "string", "pattern": GIT_PATTERN},
+        "lane_check": {**TEXT, "description": "a reference to the lane's own check; required for every lane except "
+                                              "the reviewer"},
+        "checks": {"type": "array", "minItems": 1, "maxItems": 256, "items": {
+            "type": "object", "additionalProperties": False, "required": ["check", "outcome", "reference"],
+            "properties": {"check": TEXT, "outcome": {"type": "string", "enum": ["pass", "fail", "not_run", "partial"]},
+                           "reference": TEXT}}}}}
+PUBLISH_DESCRIPTION = (
+    "Publish information under the configured sender; grants no approval or verified completion. Answering a "
+    "dispatch takes this order: 1. type ack, acknowledgment accepted, in reply to the dispatch (a writing lane adds "
+    "readiness; a reviewer adds none); 2. then type result or review in reply to the same dispatch, with result; "
+    "3. on a refusal, read its text and fix exactly the field it names; never re-send unchanged.")
+
+
 def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=None):
     """A connection is either a role's mailbox or the board, because they fail and change separately."""
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
         "to": {"type": "string", "maxLength": 256},
-        "type": {"type": "string", "enum": ["info", "brief", "dispatch", "result", "review", "escalation", "ack",
-                                            "job_request", "job_receipt"]},
+        "type": {"type": "string", "enum": sorted(MESSAGE_TYPES)},
         "body": {"type": "string", "maxLength": 65536},
         "brief": {"type": "object"}, "in_reply_to": {"type": "string", "maxLength": 80},
-        "acknowledgment": {"type": "string", "enum": ["received", "accepted", "completed"]},
-        "readiness": {"type": "object"}, "result": {"type": "object"}, "receipt": {"type": "object"},
+        "acknowledgment": {"type": "string", "enum": sorted(STAGES)},
+        "readiness": READINESS_SCHEMA, "result": RESULT_SCHEMA, "receipt": {"type": "object"},
     }
     specs = [] if board_specs else [
         ("mailbox_inbox", True, "Read only this endpoint's mailbox; optionally include its hash-verified briefs. "
@@ -93,8 +144,7 @@ def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=N
                                 "message count.",
          {"include_briefs": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
           "after_message_id": {"type": "string", "maxLength": 80}, "binding_only": {"type": "boolean"}}, []),
-        ("mailbox_publish", False, "Publish information under the configured sender; grants no approval or verified completion.",
-         properties, ["message_id", "to", "type", "body"]),
+        ("mailbox_publish", False, PUBLISH_DESCRIPTION, properties, ["message_id", "to", "type", "body"]),
         ("mailbox_ack_handoff", False, "Acknowledge this configured successor's checkpoint; grants no owner approval.",
          {"checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, ["checkpoint_sha256"]),
     ]
@@ -126,6 +176,49 @@ DECISION_SPEC = (
      "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
      "decision": {"type": "string", "enum": ["approve", "deny"]}, "reason": {"type": "string", "maxLength": 1024}},
     ["event_id", "request_id", "request_sha256", "decision", "reason"])
+NAME = {"type": "string", "maxLength": 80}
+SHA256_TEXT = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+# The fields hierarchy_lifecycle.validate_request takes, less the schema, which the draft adds.
+REQUEST_PROPERTIES = {
+    "id": NAME, "version": {"type": "integer", "minimum": 1}, "team": NAME, "owner": TEXT, "next_decision": TEXT,
+    "phase": NAME, "operation": NAME,
+    "source": {"type": "object", "additionalProperties": False, "required": ["commit", "tree", "dirty_sha256"],
+               "properties": {"commit": {"type": "string", "pattern": GIT_PATTERN},
+                              "tree": {"type": "string", "pattern": GIT_PATTERN}, "dirty_sha256": SHA256_TEXT}},
+    "paths": {"type": "array", "minItems": 1, "maxItems": 256, "items": TEXT,
+              "description": "absolute paths the request covers"},
+    "prerequisites": {"type": "array", "maxItems": 256, "items": NAME},
+    "authority": {**NAME, "description": "the request's own id, unless it is a member of another request's continuation"},
+    "continuation": {"type": "object", "additionalProperties": False, "required": ["members", "max_starts", "expires_at"],
+                     "properties": {
+                         "members": {"type": "array", "maxItems": 255, "items": {
+                             "type": "object", "additionalProperties": False,
+                             "required": ["id", "sha256", "phase", "operation"],
+                             "properties": {"id": NAME, "sha256": SHA256_TEXT, "phase": NAME, "operation": NAME}}},
+                         "max_starts": {"type": "integer", "minimum": 1, "maximum": 256},
+                         "expires_at": {"type": "string", "maxLength": 64, "description": "UTC, as 2026-11-30T00:00:00Z"}}},
+}
+# ROOT's tools, in the order the adapter offers them. The registry's decision_tools picks which read tools a
+# connection offers; root_decide is always offered.
+ROOT_TOOL_SPECS = {
+    DECISION_TOOL: (False, *DECISION_SPEC),
+    "team_status": (
+        True, "Read where the team stands: the loop's last report and its holds grouped by who must act (root, owner, "
+              "router), the requests ROOT owes a decision on, every request's state, the Decider's decisions and the "
+              "evidence index. loop and evidence are null when this connection was given no folder for them. Changes "
+              "nothing.", {}, []),
+    "team_pending": (
+        True, "List the requests ROOT owes a decision on: awaiting_decision, or escalated by the Decider. Each row "
+              "carries the exact request_id, request_sha256 and event ids for root_decide; add only the decision and "
+              "a reason. Changes nothing.", {}, []),
+    "team_request": (
+        True, "Draft a new canonical lifecycle request: returns its raw text, sha256 and the exact publish event for "
+              "the coordinator to record. The draft passes the journal's own checks but writes nothing; ROOT cannot "
+              "publish. Changes nothing.", REQUEST_PROPERTIES, sorted(REQUEST_PROPERTIES)),
+}
+LOOP_STATE_ROOT_ONLY = "--loop-state and --evidence are only for ROOT's decision adapter"
+ROOT_ENTRY_ONLY = ("hierarchy_mailbox_mcp.py serves only ROOT's decision adapter; "
+                   "other roles launch through hierarchy_mailbox.py serve")
 
 
 ROUTER_TAKES_NO_ACTOR = "the router session takes no lifecycle actor; routing is the router tool's"
@@ -182,26 +275,38 @@ def lifecycle_options(root, endpoint, workspace_store, lifecycle, actor):
 
 
 class DecisionConnection:
-    """ROOT's only adapter: one tool that approves or denies a canonical request, and nothing else.
+    """ROOT's only adapter: one tool that approves or denies a canonical request, and the read tools its registry
+    entry lists, which change nothing.
 
     This is the configuration-bound tier of owner decision 5. The ROOT actor is whatever the connection was
     configured with, so every answer says it is not authenticated. The strict H decision path is M4 work.
     """
     workspace_tools = ()
     board_specs = {}
-    instructions = ("Decision-only ROOT adapter. The ROOT actor is configuration and is not authenticated. "
-                    "It records approve or deny in the lifecycle journal and never publishes, reads mail, "
-                    "executes, starts or stops anything.")
+    instructions = ("ROOT's decision adapter. The ROOT actor is configuration and is not authenticated. "
+                    "It records approve or deny in the lifecycle journal, reads the journal, the loop's status and "
+                    "the evidence index, and drafts requests for the coordinator to publish. It never publishes, "
+                    "reads mail, executes, starts or stops anything.")
 
-    def __init__(self, root, endpoint, host, session, generation, lifecycle, actor):
+    def __init__(self, root, endpoint, host, session, generation, lifecycle, actor, loop_state=None, evidence=None):
         import hierarchy_lifecycle
+        import hierarchy_roles
+        import hierarchy_team_view
         self.journal = hierarchy_lifecycle
+        self.team_view = hierarchy_team_view
         self.root = root
         self.sender = {"from": endpoint, "host": host, "session": session, "binding_generation": generation}
         self.manifest_digest = digest(Mailbox(root).manifest)
         matching(actor, SLUG, "actor")
         self.actor = actor
         self.lifecycle = hierarchy_lifecycle.Lifecycle(lifecycle)
+        self.loop_state = None if loop_state is None else Path(loop_state)
+        self.evidence = None if evidence is None else Path(evidence)
+        # An explicit table, so a tool name can only ever reach these methods.
+        handlers = {DECISION_TOOL: self.root_decide, "team_status": self.team_status,
+                    "team_pending": self.team_pending, "team_request": self.team_request}
+        offered = (DECISION_TOOL, *hierarchy_roles.decision_tools(hierarchy_roles.role(endpoint)))
+        self.tools = {name: handlers[name] for name in offered}
         self.checked_mailbox()
         self.root_actor()
 
@@ -225,15 +330,42 @@ class DecisionConnection:
         return actor
 
     def definitions(self):
-        description, properties, required = DECISION_SPEC
-        return [{"name": DECISION_TOOL, "description": description, "annotations": {"readOnlyHint": False},
-                 "inputSchema": {"type": "object", "properties": properties, "required": required,
-                                 "additionalProperties": False}}]
+        tools = []
+        for name in self.tools:
+            readonly, description, properties, required = ROOT_TOOL_SPECS[name]
+            tools.append({"name": name, "description": description, "annotations": {"readOnlyHint": readonly},
+                          "inputSchema": {"type": "object", "properties": properties, "required": required,
+                                          "additionalProperties": False}})
+        return tools
 
     def call(self, name, arguments, render=None):
-        import hierarchy_router
         text(name, "tool name", 128)
-        require(name == DECISION_TOOL, "unknown ROOT tool: %s; ROOT only records decisions" % name)
+        require(name in self.tools, "unknown ROOT tool: %s; ROOT only records decisions" % name)
+        return self.tools[name](arguments)
+
+    def read(self, action):
+        """A read takes no mailbox lock, so a busy lock here can only be the journal's."""
+        self.checked_mailbox()
+        try:
+            return action()
+        except ValueError as exc:
+            raise journal_busy(self.lifecycle, exc) from exc
+
+    def team_status(self, arguments):
+        fields(arguments, set())
+        return self.read(lambda: self.team_view.status(self.lifecycle, self.loop_state, self.evidence,
+                                                       LIFECYCLE_WAIT_SECONDS))
+
+    def team_pending(self, arguments):
+        fields(arguments, set())
+        return self.read(lambda: self.team_view.pending(self.lifecycle, LIFECYCLE_WAIT_SECONDS))
+
+    def team_request(self, arguments):
+        # The lifecycle's own request checks name any missing, extra or malformed field.
+        return self.read(lambda: self.team_view.draft_request(self.lifecycle, arguments, wait=LIFECYCLE_WAIT_SECONDS))
+
+    def root_decide(self, arguments):
+        import hierarchy_router
         fields(arguments, set(DECISION_SPEC[2]))
         # Typed here, so a malformed value is a refusal and never reaches the journal's own code as a non-string.
         matching(arguments["event_id"], SLUG, "event id")
@@ -551,15 +683,17 @@ def handle(connection, request):
 
 
 def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None, board=None,
-          lifecycle=None, actor=None, source_repo=None):
+          lifecycle=None, actor=None, source_repo=None, loop_state=None, evidence=None):
     integer(generation, "binding generation")
     if endpoint_parts(endpoint)[1] == "root":
         require(lifecycle is not None and actor is not None, ROOT_ONLY_ADAPTER)
         require(delivery_dir is None and workspace_store is None and initiative is None and board is None,
                 "the ROOT decision adapter takes no mailbox, workspace or board options")
         require(source_repo is None, "the ROOT decision adapter takes no source views")
-        connection = DecisionConnection(root, endpoint, host, session, generation, lifecycle, actor)
+        connection = DecisionConnection(root, endpoint, host, session, generation, lifecycle, actor,
+                                        loop_state=loop_state, evidence=evidence)
     else:
+        require(loop_state is None and evidence is None, LOOP_STATE_ROOT_ONLY)
         lifecycle_options(root, endpoint, workspace_store, lifecycle, actor)
         connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
                                 workspace_store=workspace_store, initiative=initiative, board=board,
@@ -598,3 +732,38 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
         connection.record_position()
         if oversized:
             return 0  # close the channel rather than interpret frame fragments as requests
+
+
+def main(argv=None):
+    """ROOT's decision adapter, with the read-only folders its team_status reads. Every other role keeps one entry,
+    hierarchy_mailbox.py serve."""
+    parser = argparse.ArgumentParser(description="ROOT's decision adapter over stdio: " + ROOT_ONLY_ADAPTER)
+    parser.add_argument("--root", required=True, help="Absolute path to the external pilot mailbox")
+    commands = parser.add_subparsers(dest="command", required=True)
+    server = commands.add_parser("serve", help="ROOT's decision adapter and its read tools")
+    for flag in ("--endpoint", "--host", "--session"):
+        server.add_argument(flag, required=True)
+    server.add_argument("--generation", required=True, type=int)
+    server.add_argument("--lifecycle", default=None, help="The lifecycle journal its decisions go to")
+    server.add_argument("--actor", default=None, help="Its configured lifecycle actor; not authenticated")
+    server.add_argument("--loop-state", default=None, help="The loop's --state-dir; team_status reads its status.json")
+    server.add_argument("--evidence", default=None, help="The run's evidence folder; team_status counts its files")
+    # Taken only so each is refused by name, as hierarchy_mailbox.py serve refuses them for ROOT.
+    for flag in ("--delivery-dir", "--workspace-store", "--initiative", "--board", "--source-repo"):
+        server.add_argument(flag, default=None)
+    args = parser.parse_args(argv)
+    try:
+        root = cli_path(args.root, "--root")
+        require(endpoint_parts(args.endpoint)[1] == "root", ROOT_ENTRY_ONLY)
+        paths = {name: None if getattr(args, name) is None else cli_path(getattr(args, name), "--" + name.replace("_", "-"))
+                 for name in ("lifecycle", "loop_state", "evidence", "source_repo")}
+        return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir,
+                     workspace_store=args.workspace_store, initiative=args.initiative, board=args.board,
+                     actor=args.actor, **paths)
+    except (ValueError, OSError, UnicodeError, RecursionError) as exc:
+        sys.stdout.buffer.write(_cli_line({"error": str(exc)}))
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
