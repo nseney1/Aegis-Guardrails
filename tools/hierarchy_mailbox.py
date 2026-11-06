@@ -265,7 +265,9 @@ def writer_lock(root):
             stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
         yield
     finally:
-        lock.unlink()
+        # Same call Path.unlink makes on 3.11+; before 3.11 it goes through an import-time alias of
+        # os.unlink (pathlib._NormalAccessor), which faults injected at os.unlink never reach.
+        os.unlink(lock)
 
 
 def status_entries(raw):
