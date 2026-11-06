@@ -2231,6 +2231,10 @@ def test_a_python_whose_version_cannot_be_read_is_recorded_without_failing_the_j
      "unsupported token in recipe ok: $scratch/$paths"),
     (lambda r: r["recipes"]["ok"].update(steps=[["$python", "$checkout/x"]]), "unsupported token in recipe ok: $checkout/x"),
     (lambda r: r.update(env={"X": "$scratch/junit.xml"}), "unsupported token in env: $scratch/junit.xml"),
+    (lambda r: r["recipes"]["ok"].update(require_clean=True, export_git="yes"), "invalid export_git flag for recipe ok"),
+    (lambda r: r["recipes"]["ok"].update(export_git=True), "export_git needs require_clean for recipe ok"),
+    (lambda r: r["recipes"]["ok"].update(require_clean=False, export_git=True), "export_git needs require_clean for recipe ok"),
+    (lambda r: r["recipes"]["commit"].update(export_git=True), "unexpected fields: export_git"),
 ])
 def test_bad_evidence_flags_are_refused_with_an_exact_error(shop, change, error):
     change(shop.recipes)
@@ -2246,12 +2250,13 @@ def test_check_recipes_summarizes_the_evidence_flags(shop):
     summary = shop.jobs("check-recipes")
     assert summary["recipes"]["tests"]["require_clean"] is True and summary["recipes"]["tests"]["expects_tests"] is True
     assert summary["recipes"]["ok"]["require_clean"] is False and summary["recipes"]["ok"]["expects_tests"] is False
+    assert summary["recipes"]["tests"]["export_git"] is False
 
 
 def template_for_this_machine(shop):
     """The template with its placeholders filled the way an owner fills them: a real python, and nothing to hide."""
     recipes = json.loads(TEMPLATE.read_text())
-    recipes.update(python=sys.executable, hide=[])
+    recipes.update(python=sys.executable, hide=[], ro_binds=[])
     shop.recipes_path.write_text(json.dumps(recipes))
     return recipes
 
@@ -2278,8 +2283,26 @@ def test_the_template_loads_once_its_placeholders_are_filled(shop):
     summary = shop.jobs("check-recipes")
     assert summary["recipes_sha256"] == hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
     assert summary["recipes"]["full-suite"] == {"kind": "command", "heavy": True, "heavy_tests": False, "sandbox": "bwrap",
-                                                "require_clean": True, "expects_tests": True}
+                                                "require_clean": True, "expects_tests": True, "export_git": False}
     assert summary["recipes"]["lint"]["require_clean"] is False
+    rust = {"kind": "command", "heavy": True, "heavy_tests": True, "sandbox": "bwrap", "require_clean": True,
+            "export_git": True}
+    assert summary["recipes"]["rust-targeted-tests"] == {**rust, "expects_tests": True}
+    assert summary["recipes"]["rust-lint"] == {**rust, "expects_tests": False}
+
+
+def test_the_template_rust_recipes_run_offline_on_a_commit_export_with_a_git_stub(shop):
+    template = json.loads(TEMPLATE.read_text())
+    assert template["env"]["CARGO_NET_OFFLINE"] == "true"
+    assert template["env"]["CARGO_HOME"] in template["ro_binds"], "cargo's registry and git cache are read-only in the job"
+    tests, lint = template["recipes"]["rust-targeted-tests"], template["recipes"]["rust-lint"]
+    for recipe in (tests, lint):
+        assert recipe["require_clean"] and recipe["export_git"] and recipe["heavy_tests"] and recipe["sandbox"] == "bwrap"
+        assert all("--frozen" in step for step in recipe["steps"] if step[:2] in (["cargo", "nextest"], ["cargo", "clippy"]))
+    assert tests["expects_tests"] is True and tests["keep"] == ["run/junit.xml"]
+    config, run = tests["steps"]
+    assert config[0] == "$python" and config[-2:] == ["$scratch", "$scratch/junit.xml"]
+    assert run[:4] == ["cargo", "nextest", "--config-file", "$scratch/nextest-aegis.toml"]
 
 
 def pytest_env(shop):
@@ -2804,9 +2827,9 @@ def hand_made_commit(tmp_path, rows):
     return repo, commit, tree
 
 
-def export_or_refusal(jobs, repo, commit, tree, target):
+def export_or_refusal(jobs, repo, commit, tree, target, **options):
     try:
-        return jobs.export_commit(str(repo), commit, tree, str(target))
+        return jobs.export_commit(str(repo), commit, tree, str(target), **options)
     except jobs.ERRORS as exc:
         return str(exc)
 
@@ -2854,9 +2877,10 @@ def test_an_export_refuses_a_commit_that_holds_a_git_entry(tmp_path, rows, name)
     """A .git in the export would make it, or a folder of it, a repository whose config Git runs."""
     jobs = load_jobs_module()
     repo, commit, tree = hand_made_commit(tmp_path, lambda repo: rows(repo) + [("100644", b"f", stored(repo, b"x\n"))])
-    outcome = export_or_refusal(jobs, repo, commit, tree, tmp_path / "out")
-    assert outcome == "the commit holds a .git entry: " + name, outcome
-    assert not (tmp_path / "out").exists(), "refused before a byte was written"
+    for git_stub in (False, True):
+        outcome = export_or_refusal(jobs, repo, commit, tree, tmp_path / "out", git_stub=git_stub)
+        assert outcome == "the commit holds a .git entry: " + name, outcome
+        assert not (tmp_path / "out").exists(), "refused before a byte was written"
 
 
 def test_a_partial_clone_is_refused_before_a_missing_object_is_fetched(shop):
@@ -2901,3 +2925,89 @@ def test_a_replaced_tree_cannot_make_a_path_look_present_in_the_commit(tmp_path)
     with pytest.raises(ValueError) as refused:
         jobs.refuse_paths_outside_commit(str(repo), commit, ["only_in_fake"])
     assert str(refused.value) == "path only_in_fake is not in commit " + commit[:12]
+
+
+def stub_listing(stub):
+    rows = {}
+    for current, folders, files in os.walk(stub):
+        for name in folders + files:
+            path = Path(current) / name
+            rows[str(path.relative_to(stub))] = (oct(path.lstat().st_mode & 0o7777), path.is_dir())
+    return rows
+
+
+def test_an_export_with_a_git_stub_holds_only_head_config_and_empty_objects_and_refs(tmp_path):
+    jobs = load_jobs_module()
+    repo, commit, tree = hand_made_commit(tmp_path, lambda repo: [("100644", b"f", stored(repo, b"x\n")),
+                                                                  ("120000", b"l", stored(repo, b"f"))])
+    plain = jobs.export_commit(str(repo), commit, tree, str(tmp_path / "plain"))
+    stubbed = jobs.export_commit(str(repo), commit, tree, str(tmp_path / "out"), git_stub=True)
+    assert stubbed == {**plain, "git_stub": True}, "the stub changes neither the entries nor the bytes recorded"
+    assert "git_stub" not in plain and not (tmp_path / "plain" / ".git").exists()
+    stub = tmp_path / "out" / ".git"
+    assert stub_listing(stub) == {"HEAD": ("0o444", False), "config": ("0o444", False), "objects": ("0o555", True),
+                                  "refs": ("0o555", True)}
+    assert oct(stub.stat().st_mode & 0o7777) == "0o555" and oct((tmp_path / "out").stat().st_mode & 0o7777) == "0o555"
+    assert (stub / "HEAD").read_text() == commit + "\n" and len(commit) == 40
+    assert (stub / "config").read_text() == "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+    for target in ("plain", "out"):
+        os.chmod(tmp_path / target, 0o700)
+        remove_tree(tmp_path / target)
+
+
+# A build step, like a build.rs that stamps its provenance, that asks git about HEAD from the export's root and from a
+# folder below it, and keeps the answers as evidence.
+GIT_PROBE = ("import json, os, subprocess, sys\nrows = {}\n"
+             "for where in ('.', 'src'):\n"
+             "    for args in (['HEAD'], ['--git-path', 'HEAD'], ['--symbolic-full-name', 'HEAD'], ['--show-toplevel']):\n"
+             "        done = subprocess.run(['git', 'rev-parse'] + args, cwd=where, capture_output=True, text=True)\n"
+             "        rows[' '.join([where] + args)] = [done.returncode, done.stdout.strip(), os.path.abspath(where)]\n"
+             "os.makedirs(sys.argv[1], exist_ok=True)\n"
+             "open(os.path.join(sys.argv[1], 'git.json'), 'w').write(json.dumps(rows))\n")
+
+
+def git_probe_job(shop, sandbox, **flags):
+    shop.recipes["recipes"]["build"] = shop.command(["$python", "-I", "-c", GIT_PROBE, "$scratch"], sandbox=sandbox,
+                                                    require_clean=True, keep=["run/git.json"], **flags)
+    shop.save_recipes()
+    shop.request_job("job-1", "build")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "completed", row
+    result = final_result(shop)[1]
+    kept = next(row for row in result["kept"] if row["path"] == "run/git.json")
+    data = Path(kept["copy"]).read_bytes()
+    assert hashlib.sha256(data).hexdigest() == kept["sha256"], "the kept answers are the evidence the result names"
+    return result, json.loads(data)
+
+
+def outer_repository(shop):
+    """A repository around the whole store with a HEAD of its own, which the job must never resolve."""
+    git(shop.tmp, "init", "-q")
+    git(shop.tmp, "commit", "-q", "--allow-empty", "-m", "outer")
+    outer = git(shop.tmp, "rev-parse", "HEAD")
+    assert outer != shop.head()["commit"]
+    return outer
+
+
+@pytest.mark.parametrize("sandbox", SANDBOXES)
+def test_git_in_an_export_git_job_resolves_the_stub_and_the_packet_commit(shop, sandbox):
+    outer = outer_repository(shop)
+    commit = shop.head()["commit"]
+    result, rows = git_probe_job(shop, sandbox, export_git=True)
+    assert result["source_export"]["git_stub"] is True and result["source_export"]["removed"] is True
+    export = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "source")
+    assert outer not in json.dumps(rows)
+    for where in (".", "src"):
+        assert rows[where + " HEAD"][:2] == [0, commit], rows
+        assert rows[where + " --symbolic-full-name HEAD"][:2] == [0, "HEAD"], "a detached HEAD at the commit"
+        code, path, cwd = rows[where + " --git-path HEAD"]
+        assert code == 0 and os.path.normpath(os.path.join(cwd, path)) == os.path.join(export, ".git", "HEAD"), rows
+        assert rows[where + " --show-toplevel"][:2] == [0, export], "the stub, never the live checkout or the outer repo"
+
+
+@pytest.mark.parametrize("sandbox", SANDBOXES)
+def test_git_in_a_clean_job_without_export_git_finds_no_repository(shop, sandbox):
+    outer_repository(shop)
+    result, rows = git_probe_job(shop, sandbox)
+    assert "git_stub" not in result["source_export"]
+    assert len(rows) == 8 and all(code != 0 and not out for code, out, _ in rows.values()), rows
