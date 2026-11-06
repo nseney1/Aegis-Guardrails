@@ -62,6 +62,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import fields, integer, read_json, require, safe_path, text  # noqa: E402
 import hierarchy_native as native  # noqa: E402
+import hierarchy_roles  # noqa: E402
 import hierarchy_probe_evidence as evidence_analysis  # noqa: E402
 # Preserve the probe's analysis helpers for copied-source callers.
 from hierarchy_probe_evidence import (CODE_MODE_UNTIED, PATCH_CONTEXT_HEADERS, PATCH_REFUSAL_LINES,  # noqa: E402
@@ -76,13 +77,12 @@ PLAN_SCHEMA = "aegis.native-probe-plan/v1"
 REPORT_SCHEMA = "aegis.native-probe-report/v1"
 TOOLS = Path(__file__).resolve().parent
 HELPER_TEMPLATE = TOOLS / "hierarchy_templates" / "native-probe-attempt.py"
-REGISTRY = TOOLS / "hierarchy_templates" / "role-registry.json"
 # role -> (endpoint role, lane kind, sender endpoint role). The sender is the role the mailbox routes from.
 ROLES = {"implementer": ("lane", "implementer", "orchestrator"), "integrator": ("lane", "integrator", "orchestrator"),
          "reviewer": ("lane", "reviewer", "orchestrator"), "front-door": ("front-door", None, "orchestrator"),
          "orchestrator": ("orchestrator", None, "root"), "router": ("router", None, "root"),
          "decider": ("decider", None, "root")}
-READER_SHELL = ("reviewer", "orchestrator", "decider")
+READER_SHELL = hierarchy_roles.reader_shell_roles()
 TARGETS = ("worktree", "outside", "gitdir", "codex_home")
 CHANNELS = ("shell", "apply_patch")
 TURNS_PER_ROLE = 4
@@ -205,8 +205,7 @@ def tool(name, *words, timeout=None):
 
 
 def fixed_effort(role):
-    profile = read_json(REGISTRY)["roles"][role].get("model_profile") or {}
-    return profile.get("source") == "fixed"
+    return hierarchy_roles.fixed_model_profile(hierarchy_roles.registry()["roles"][role]) is not None
 
 
 # ---------------------------------------------------------------- plan

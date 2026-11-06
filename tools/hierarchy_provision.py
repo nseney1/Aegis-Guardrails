@@ -394,8 +394,8 @@ def fixed_profile(request, mailbox, endpoint, host):
     Codex takes the tier as service_tier. Claude has no tier flag, so there the answer says it is recorded and not
     applied. Whether a host serves the tier is a separate probe.
     """
-    profile = registry_role(mailbox, endpoint)["model_profile"]
-    if profile["source"] != "fixed":
+    profile = hierarchy_roles.fixed_model_profile(registry_role(mailbox, endpoint))
+    if profile is None:
         return request, None
     effort = profile["effort"]
     require(request.get("effort", effort) == effort,

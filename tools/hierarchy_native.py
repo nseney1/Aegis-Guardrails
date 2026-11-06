@@ -21,21 +21,18 @@ import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import encoded, read_json, require, safe_path, strict_json  # noqa: E402
+from hierarchy_mailbox import encoded, require, safe_path, strict_json  # noqa: E402
+import hierarchy_roles  # noqa: E402
 
 
 MAX_ROLLOUT_BYTES = 128 * 1024 * 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
-REGISTRY = Path(__file__).resolve().parent / "hierarchy_templates" / "role-registry.json"
 
 
 def codex_roles():
     """Every registry role with a session endpoint can run on Codex. operator stays for older callers: it names
     the journal role the job executor holds, and admission refuses it like every other role."""
-    roles = read_json(REGISTRY).get("roles")
-    require(isinstance(roles, dict), "role registry has no roles")
-    return tuple(sorted({name for name, entry in roles.items()
-                         if isinstance(entry, dict) and entry.get("endpoint") is not None} | {"operator"}))
+    return tuple(sorted(set(hierarchy_roles.session_roles()) | {"operator"}))
 
 
 ROLES = codex_roles()
@@ -307,8 +304,10 @@ def assess_role(observation, role):
     reasons = []
     if role == "root" and (entries is None or any(entry["access"] == "write" for entry in entries)):
         reasons.append("ROOT requires an effective read-only filesystem")
-    if role == "router" and (profile.get("effort") != "medium" or observation["requested_tier"] != "ultrafast"):
-        reasons.append("router requires medium effort and ultrafast configured tier")
+    entry = hierarchy_roles.registry()["roles"].get(role)
+    fixed = hierarchy_roles.fixed_model_profile(entry) if entry is not None else None
+    if fixed is not None and (profile.get("effort") != fixed["effort"] or observation["requested_tier"] != fixed.get("tier")):
+        reasons.append("%s requires %s effort and %s configured tier" % (role, fixed["effort"], fixed.get("tier")))
     reasons.append(NATIVE_GAP)
     return {"state": "NATIVE_HOLD", "role": role, "reasons": reasons,
             "native_execution_qualified": False, "observation": observation}

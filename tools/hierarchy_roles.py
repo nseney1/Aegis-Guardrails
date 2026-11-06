@@ -211,6 +211,21 @@ def role(endpoint, kind=None):
     return registry()["roles"][role_name(endpoint, kind)]
 
 
+def session_roles():
+    """Registry roles that have a session endpoint, in a stable order."""
+    return tuple(sorted(name for name, entry in registry()["roles"].items() if entry["endpoint"] is not None))
+
+
+def fixed_model_profile(entry):
+    """A fixed effort/tier expectation shared by provisioning and native observation."""
+    profile = entry["model_profile"]
+    return dict(profile) if profile["source"] == "fixed" else None
+
+
+def reader_shell_roles():
+    return tuple(name for name in session_roles() if registry()["roles"][name]["provision"]["reader_shell"])
+
+
 def writer(entry):
     return "source" in entry["writes"]
 
