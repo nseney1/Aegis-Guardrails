@@ -94,8 +94,19 @@ empty but for the plan's owner mark, and the probe runs
 variable, refuses while `OPENAI_API_KEY` or `CODEX_API_KEY` is set (codex could
 bill the turns to the key instead of the SSO login), and refuses unless the folder holds only the owner mark with this
 plan's probe id and an `auth.json` that is a regular file (not a symlink), has
-one link, is owned by the user and is not readable by group or others. It
-refuses `sessions/` (a prior session's rollouts would mix with the probe's),
+one link, is owned by the user and is not readable by group or others. It also
+accepts what a real `codex login` leaves beside it, so leave these in place: an
+`auth.lock` regular file (one link, owned by the user, at most 4096 bytes, not
+writable by others, nor by a group other than the user's own), a `log/` folder
+holding only the user's single-link regular files, and a `tmp/` folder (walked
+without following links, at most 8 levels deep and 512 entries) holding only
+folders, single-link regular files and symlinks that stay inside `tmp/`; a
+folder in `log/` or `tmp/` that cannot be listed is refused. The one exception
+is what codex-cli's arg0 dispatch writes in `tmp/arg0-linux/<folder>/`: the
+symlinks there (`apply_patch`, `applypatch`, `codex-linux-sandbox`) may point
+at the codex binary, accepted only when they resolve to the `codex` on `PATH`;
+any other symlink leaving `tmp/` is refused.
+It refuses `sessions/` (a prior session's rollouts would mix with the probe's),
 `config.toml` (the probe's `codex_home` write target, and it would change the
 run's settings) and any other entry. The report's `login` records
 `mode: existing`, the file's `auth_file_sha256_before`, and that `codex login`
@@ -103,7 +114,12 @@ was not called; the folder and the hash are checked again before the first
 turn. Never run `codex login` without `CODEX_HOME`: it replaces
 `~/.codex/auth.json`. In both modes `CODEX_HOME` must be spelled exactly as the
 plan's path (one trailing slash allowed; no `..` or symlink alias), and the
-cleanup deletes the disposable `auth.json`, so a new plan needs a new login.
+cleanup deletes the disposable `auth.json`, `auth.lock`, `log/` and `tmp/`, so a
+new plan needs a new login. It removes `tmp/` link by link, never following one
+(each folder is opened without following a link, so one swapped for a symlink
+after its check is left), walking with a stack rather than recursion, and leaves
+anything it does not expect (recorded as `login_left` and a cleanup
+failure).
 The cleanup deletes it only through a handle on `codex-home` opened without
 following a link, and only while `codex-home` is a real directory at the plan
 path outside `~/.codex`; otherwise it leaves the file and records a cleanup

@@ -1962,3 +1962,320 @@ def test_an_entry_that_appears_after_the_preflight_fails_the_login_step(probe, e
     login = runner.login()
     assert login["error"] == error.format(home=probe.codex_home)
     assert native_probe.login_failed(login) == "existing login: " + error.format(home=probe.codex_home)
+
+
+# ---------------------------------------------------------------- what a real `codex login` leaves in CODEX_HOME
+
+def real_login(probe):
+    """The layout a real `CODEX_HOME=<codex-home> codex login` (codex-cli, ChatGPT SSO) left in the owner's
+    disposable folder: auth.json 0600, an empty auth.lock 0664, log/ 0775 holding codex-login.log 0600 (544 bytes),
+    and tmp/ 0775 holding arg0-linux/ 0700 with one subfolder. That subfolder holds what codex-cli's arg0 dispatch
+    writes there (seen by name and size only): an empty .lock and the symlinks apply_patch, applypatch and
+    codex-linux-sandbox to the codex binary outside tmp/; here the fake codex on PATH."""
+    auth = sso_login(probe)
+    home = probe.codex_home
+    (home / "auth.lock").write_bytes(b"")
+    (home / "auth.lock").chmod(0o664)
+    (home / "log").mkdir()
+    (home / "log").chmod(0o775)
+    (home / "log" / "codex-login.log").write_bytes(b"l" * 543 + b"\n")
+    (home / "log" / "codex-login.log").chmod(0o600)
+    (home / "tmp").mkdir()
+    (home / "tmp").chmod(0o775)
+    (home / "tmp" / "arg0-linux").mkdir()
+    (home / "tmp" / "arg0-linux").chmod(0o700)
+    sub = home / "tmp" / "arg0-linux" / ".tmpQx7Lm2"
+    sub.mkdir()
+    (sub / ".lock").write_bytes(b"")
+    for name in ARG0_LINKS:
+        (sub / name).symlink_to(probe.codex)
+    return auth
+
+
+ARG0_LINKS = ("apply_patch", "applypatch", "codex-linux-sandbox")
+
+
+def test_a_real_codex_login_layout_runs_and_its_cleanup_removes_the_lock_log_and_tmp(probe):
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    real_login(probe)
+    assert os.path.getsize(probe.codex_home / "log" / "codex-login.log") == 544
+    sub = probe.codex_home / "tmp" / "arg0-linux" / ".tmpQx7Lm2"
+    assert sorted(os.listdir(sub)) == [".lock", *ARG0_LINKS]
+    assert all(os.path.realpath(sub / name) == os.path.realpath(probe.codex) for name in ARG0_LINKS)
+    probe.script_turns()
+    report = probe.run(cap=4, OPENAI_API_KEY=None, extra_words=["--auth", "existing"])
+    assert report["state"] == "completed" and report["summary"]["passed"] is True, report["summary"]
+    assert report["cleanup"]["auth_removed"] is True and "login_left" not in report["cleanup"]
+    for name in ("auth.json", "auth.lock", "log", "tmp"):
+        assert not os.path.lexists(probe.codex_home / name), name
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+def test_the_cleanup_command_leaves_only_the_owner_mark_after_a_real_codex_login(probe):
+    probe.plan([{"role": "implementer"}])
+    real_login(probe)
+    answer = json.loads(probe.invoke("cleanup", "--probe-root", str(probe.root)))
+    assert answer["cleanup"]["auth_removed"] is True and answer["failures"] == []
+    assert "login_left" not in answer["cleanup"]
+    assert sorted(os.listdir(probe.codex_home)) == [".aegis-native-probe"]
+
+
+def real_login_cases():
+    lock, log, tmp = "{root}/codex-home/auth.lock", "{root}/codex-home/log", "{root}/codex-home/tmp"
+    return [
+        ("lock-symlink", "auth.lock in CODEX_HOME is a symlink: " + lock),
+        ("lock-not-a-file", "auth.lock in CODEX_HOME is not a regular file: " + lock),
+        ("lock-hard-link", "auth.lock in CODEX_HOME has 2 hard links: " + lock),
+        ("lock-too-large", "auth.lock in CODEX_HOME is larger than 4096 bytes (4097): " + lock),
+        ("lock-world-writable", "auth.lock in CODEX_HOME is writable by others (mode 0666): " + lock),
+        ("log-symlink", "log/ in CODEX_HOME is not a real directory (a symlink or another type): " + log),
+        ("log-file", "log/ in CODEX_HOME is not a real directory (a symlink or another type): " + log),
+        ("log-subfolder", "log/ in CODEX_HOME holds an entry that is not a regular file: " + log + "/old"),
+        ("log-entry-symlink", "log/ in CODEX_HOME holds an entry that is not a regular file: " + log + "/link"),
+        ("tmp-symlink", "tmp/ in CODEX_HOME is not a real directory (a symlink or another type): " + tmp),
+        ("tmp-link-outside", "tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: "
+                             + tmp + "/arg0-linux/.tmpQx7Lm2/codex"),
+        ("tmp-link-up", "tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: " + tmp + "/arg0-linux/up"),
+        ("tmp-fifo", "tmp/ in CODEX_HOME holds a device, FIFO or socket: " + tmp + "/arg0-linux/.tmpQx7Lm2/pipe"),
+        ("tmp-socket", "tmp/ in CODEX_HOME holds a device, FIFO or socket: " + tmp + "/s"),
+        ("arg0-link-to-auth", "tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: "
+                              + tmp + "/arg0-linux/.tmpQx7Lm2/apply_patch"),
+        ("arg0-link-too-deep", "tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: "
+                               + tmp + "/arg0-linux/.tmpQx7Lm2/inner/apply_patch"),
+        ("arg0-link-too-shallow", "tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: "
+                                  + tmp + "/arg0-linux/apply_patch"),
+        ("codex-link-elsewhere", "tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: "
+                                 + tmp + "/other/.tmpQx7Lm2/apply_patch"),
+        ("tmp-too-deep", "tmp/ in CODEX_HOME is deeper than 8 levels: " + tmp + "/d" * 9),
+        ("tmp-too-many", "tmp/ in CODEX_HOME holds more than 512 entries: " + tmp),
+        ("tmp-unreadable", "tmp/ in CODEX_HOME holds an entry that cannot be read: " + tmp + "/hidden"),
+        ("log-unreadable", "log/ in CODEX_HOME holds an entry that cannot be read: " + log),
+        ("log-hard-link", "log/ in CODEX_HOME holds a file with 2 hard links: " + log + "/codex-tui.log"),
+        ("tmp-hard-link", "tmp/ in CODEX_HOME holds a file with 2 hard links: "
+                          + tmp + "/arg0-linux/.tmpQx7Lm2/state"),
+        ("sessions", "CODEX_HOME already holds sessions/; a prior session would pollute the probe's rollout "
+                     "reads: {root}/codex-home"),
+        ("config-toml", "CODEX_HOME holds entries a codex login does not create: config.toml"),
+        ("other", "CODEX_HOME holds entries a codex login does not create: cache"),
+    ]
+
+
+@pytest.mark.parametrize("case,error", real_login_cases())
+def test_every_real_login_layout_refusal_is_exact_and_runs_nothing(probe, case, error):
+    import socket
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    real_login(probe)
+    home = probe.codex_home
+    lock, sub = home / "auth.lock", home / "tmp" / "arg0-linux" / ".tmpQx7Lm2"
+    if case == "lock-symlink":
+        lock.unlink()
+        lock.symlink_to(real)
+    elif case == "lock-not-a-file":
+        lock.unlink()
+        lock.mkdir()
+    elif case == "lock-hard-link":
+        os.link(lock, probe.tmp / "lock-twin")
+    elif case == "lock-too-large":
+        lock.write_bytes(b"x" * 4097)
+    elif case == "lock-world-writable":
+        lock.chmod(0o666)
+    elif case == "log-symlink":
+        shutil.rmtree(home / "log")
+        (home / "log").symlink_to(real.parent)
+    elif case == "log-file":
+        shutil.rmtree(home / "log")
+        (home / "log").write_text("x")
+    elif case == "log-subfolder":
+        (home / "log" / "old").mkdir()
+    elif case == "log-entry-symlink":
+        (home / "log" / "link").symlink_to(real)
+    elif case == "tmp-symlink":
+        shutil.rmtree(home / "tmp")
+        (home / "tmp").symlink_to(real.parent)
+    elif case == "tmp-link-outside":
+        (sub / "codex").symlink_to(real.parent)
+    elif case == "tmp-link-up":
+        (home / "tmp" / "arg0-linux" / "up").symlink_to("../../auth.json")
+    elif case == "tmp-fifo":
+        os.mkfifo(sub / "pipe", 0o600)
+    elif case == "tmp-socket":
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(home / "tmp" / "s"))
+    elif case == "arg0-link-to-auth":
+        (sub / "apply_patch").unlink()
+        (sub / "apply_patch").symlink_to(real)
+    elif case == "arg0-link-too-deep":
+        (sub / "inner").mkdir()
+        (sub / "inner" / "apply_patch").symlink_to(probe.codex)
+    elif case == "arg0-link-too-shallow":
+        (sub.parent / "apply_patch").symlink_to(probe.codex)
+    elif case == "codex-link-elsewhere":
+        (home / "tmp" / "other" / ".tmpQx7Lm2").mkdir(parents=True)
+        (home / "tmp" / "other" / ".tmpQx7Lm2" / "apply_patch").symlink_to(probe.codex)
+    elif case == "tmp-too-deep":
+        (home / "tmp" / Path(*["d"] * 9)).mkdir(parents=True)
+    elif case == "tmp-too-many":
+        (home / "tmp" / "many").mkdir()
+        for number in range(520):
+            (home / "tmp" / "many" / str(number)).write_bytes(b"")
+    elif case == "tmp-unreadable":
+        # Unlisted, it would hide a FIFO and a symlink to the owner's login from the walk.
+        (home / "tmp" / "hidden").mkdir()
+        os.mkfifo(home / "tmp" / "hidden" / "pipe", 0o600)
+        (home / "tmp" / "hidden" / "auth").symlink_to(real)
+        (home / "tmp" / "hidden").chmod(0)
+    elif case == "log-unreadable":
+        (home / "log").chmod(0)
+    elif case == "log-hard-link":
+        os.link(real, home / "log" / "codex-tui.log")
+    elif case == "tmp-hard-link":
+        os.link(real, sub / "state")
+    elif case == "sessions":
+        (home / "sessions").mkdir()
+    elif case == "config-toml":
+        (home / "config.toml").write_text('model = "owner"\n')
+    elif case == "other":
+        (home / "cache").mkdir()
+    try:
+        answer = probe.run(cap=4, expect=2, extra_words=["--auth", "existing"], OPENAI_API_KEY=None)
+    finally:
+        for unreadable in (home / "tmp" / "hidden", home / "log"):
+            if unreadable.is_dir():
+                unreadable.chmod(0o700)
+    assert answer == {"schema": "aegis.native-probe-report/v1", "state": "refused",
+                      "error": error.format(root=probe.root)}
+    assert not probe.calls() and not (probe.root / "report.json").exists()
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+def test_a_lock_or_log_file_owned_by_another_user_is_refused(tmp_path, monkeypatch):
+    folder = tmp_path / "codex-home"
+    (folder / "log").mkdir(parents=True)
+    (folder / "log" / "codex-login.log").write_text("x")
+    uid = os.getuid()
+    monkeypatch.setattr(native_probe.os, "getuid", lambda: uid + 1)
+    with pytest.raises(native_probe.Refusal) as refused:
+        native_probe.login_extras(folder)
+    assert str(refused.value) == "log/ in CODEX_HOME holds a file not owned by this user: %s" % (
+        folder / "log" / "codex-login.log")
+    (folder / "auth.lock").write_text("")
+    with pytest.raises(native_probe.Refusal) as refused:
+        native_probe.login_extras(folder)
+    assert str(refused.value) == "auth.lock in CODEX_HOME is not owned by this user: %s" % (folder / "auth.lock")
+
+
+def test_a_group_writable_lock_is_allowed_only_in_the_users_own_group(tmp_path, monkeypatch):
+    # codex-cli writes auth.lock 0664 under the usual umask 002, where the group is the user's private group.
+    folder = tmp_path / "codex-home"
+    folder.mkdir()
+    lock = folder / "auth.lock"
+    lock.write_text("")
+    lock.chmod(0o664)
+    gid = os.lstat(lock).st_gid
+    monkeypatch.setattr(native_probe.os, "getgid", lambda: gid)
+    native_probe.login_extras(folder)
+    monkeypatch.setattr(native_probe.os, "getgid", lambda: gid + 1)
+    with pytest.raises(native_probe.Refusal) as refused:
+        native_probe.login_extras(folder)
+    assert str(refused.value) == ("auth.lock in CODEX_HOME is writable by group %d, not this user's own group "
+                                  "(mode 0664): %s" % (gid, lock))
+
+
+def test_a_tmp_symlink_to_the_owners_login_is_refused_and_never_followed_by_the_cleanup(probe):
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    real_login(probe)
+    sub = probe.codex_home / "tmp" / "arg0-linux" / ".tmpQx7Lm2"
+    (sub / "codex").symlink_to(real.parent)
+    (sub / "auth").symlink_to(real)
+    answer = probe.run(cap=4, expect=2, extra_words=["--auth", "existing"], OPENAI_API_KEY=None)
+    assert answer["error"].startswith("tmp/ in CODEX_HOME holds a symlink that leads outside tmp/: ")
+    cleaned = json.loads(probe.invoke("cleanup", "--probe-root", str(probe.root)))
+    assert cleaned["cleanup"]["auth_removed"] is True and cleaned["failures"] == []
+    assert sorted(os.listdir(probe.codex_home)) == [".aegis-native-probe"]
+    assert sorted(os.listdir(real.parent)) == ["auth.json"]
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+def test_the_cleanup_leaves_and_records_what_it_does_not_expect(probe):
+    real = owner_auth(probe)
+    probe.plan([{"role": "implementer"}])
+    real_login(probe)
+    home = probe.codex_home
+    (home / "log" / "old").mkdir()
+    (home / "log" / "link").symlink_to(real)
+    os.mkfifo(home / "tmp" / "arg0-linux" / ".tmpQx7Lm2" / "pipe", 0o600)
+    (home / "sessions").mkdir()
+    answer = json.loads(probe.invoke("cleanup", "--probe-root", str(probe.root), expect=3))
+    left = ["log/link", "log/old", "tmp/arg0-linux/.tmpQx7Lm2/pipe"]
+    assert answer["cleanup"]["auth_removed"] is True and answer["cleanup"]["login_left"] == left
+    assert answer["failures"] == ["cleanup: entries left in codex-home: " + ", ".join(left)]
+    assert sorted(os.listdir(home)) == [".aegis-native-probe", "log", "sessions", "tmp"]
+    assert sorted(os.listdir(home / "log")) == ["link", "old"] and not (home / "auth.lock").exists()
+    assert sorted(os.listdir(home / "tmp" / "arg0-linux" / ".tmpQx7Lm2")) == ["pipe"]
+    assert real.read_text() == '{"auth_mode": "chatgpt", "owner": true}\n'
+
+
+def test_the_login_removal_never_follows_a_lock_log_or_tmp_symlink(tmp_path):
+    owner = tmp_path / "home" / ".codex"
+    owner.mkdir(parents=True)
+    (owner / "auth.json").write_text("{}")
+    folder = tmp_path / "codex-home"
+    folder.mkdir()
+    (folder / "auth.lock").symlink_to(owner / "auth.json")
+    (folder / "log").symlink_to(owner)
+    (folder / "tmp").symlink_to(owner)
+    left = []
+    assert native_probe.remove_login(str(folder), [], left) == (True, None)
+    assert left == ["auth.lock", "log", "tmp"]
+    assert sorted(os.listdir(owner)) == ["auth.json"]
+
+
+@pytest.mark.parametrize("folder", ["log", "tmp/arg0-linux"])
+def test_the_login_removal_never_follows_a_folder_swapped_for_a_symlink_just_before_its_open(tmp_path, monkeypatch,
+                                                                                          folder):
+    owner = tmp_path / "home" / ".codex"
+    owner.mkdir(parents=True)
+    (owner / "auth.json").write_text("{}")
+    home = tmp_path / "codex-home"
+    (home / "log").mkdir(parents=True)
+    (home / "log" / "codex-login.log").write_text("x")
+    (home / "tmp" / "arg0-linux" / ".tmpQx7Lm2").mkdir(parents=True)
+    (home / "tmp" / "arg0-linux" / ".tmpQx7Lm2" / ".lock").write_bytes(b"")
+    target, original, swapped = home / folder, os.open, []
+
+    # The cleanup's stat saw a real folder; the open right after it meets a symlink to the owner's ~/.codex.
+    def racing_open(name, flags, *words, **options):
+        if name == target.name and options.get("dir_fd") is not None and not swapped:
+            os.rename(target, tmp_path / "moved")
+            target.symlink_to(owner)
+            swapped.append(name)
+        return original(name, flags, *words, **options)
+
+    monkeypatch.setattr(native_probe.os, "open", racing_open)
+    left = []
+    assert native_probe.remove_login(str(home), [], left) == (True, None)
+    assert swapped == [target.name] and left == [folder]
+    assert sorted(os.listdir(owner)) == ["auth.json"] and (owner / "auth.json").read_text() == "{}"
+
+
+def test_the_login_removal_clears_a_tmp_tree_deeper_than_the_recursion_limit(tmp_path):
+    home = tmp_path / "codex-home"
+    (home / "tmp").mkdir(parents=True)
+    # Built level by level: Path.mkdir(parents=True) and os.makedirs recurse and would fail at this depth themselves.
+    fd = os.open(home / "tmp", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(sys.getrecursionlimit() + 200):
+            os.mkdir("d", dir_fd=fd)
+            inner = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = inner
+        with open(os.open("f", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd), "w") as stream:
+            stream.write("x")
+    finally:
+        os.close(fd)
+    left = []
+    assert native_probe.remove_login(str(home), [], left) == (True, None)
+    assert left == [] and os.listdir(home) == []
