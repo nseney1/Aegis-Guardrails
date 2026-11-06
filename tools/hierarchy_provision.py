@@ -62,8 +62,10 @@ MAILBOX_TOOLS = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mai
 DEFAULT_TIMEOUT_SECONDS = 900
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-CODEX_DISABLED = ["apps", "plugins", "remote_plugin", "multi_agent", "memories", "computer_use", "browser_use",
-                  "browser_use_external", "browser_use_full_cdp_access", "goals"]
+# multi_agent_v2 as well: the live M1 sessions ran with multi_agent disabled and were still offered the v2 sub-agent
+# tools. Whether codex honours either flag under an account's managed settings is unverified; the native probe checks.
+CODEX_DISABLED = ["apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2", "memories", "computer_use",
+                  "browser_use", "browser_use_external", "browser_use_full_cdp_access", "goals"]
 CODEX_SHELL = ["shell_tool", "unified_exec"]
 APPROVE = {"approval_mode": "approve"}
 MAILBOX_TOOL_CONFIG = {"mailbox_inbox": {"output_token_limit": 30000}, "mailbox_publish": APPROVE,
