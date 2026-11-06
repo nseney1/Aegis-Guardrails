@@ -46,7 +46,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import pwd
 import re
 import secrets
 import shlex
@@ -106,7 +105,7 @@ PATCH_CONTEXT_HEADERS = ("failed to find expected lines", "failed to find contex
 # A shell wrapper [SHELL, -c|-lc, CMD] counts only when SHELL resolves to the binary the plan found for one of these
 # names on PATH; a model-written ./bash, even a read-only one, could print a forged refusal without the helper.
 KNOWN_SHELLS = ("sh", "bash", "zsh", "dash")
-INTERRUPTS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+INTERRUPTS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, name))
 CLEANUP_SCHEMA = "aegis.native-probe-cleanup/v1"
 READ_RETRIES = 3
 # Only a run against the fake codex may name another passwd home, so tests never read the owner's ~/.codex.
@@ -500,6 +499,8 @@ def load_state(probe_root):
 
 def home_codexes(fake=False):
     """$HOME/.codex and the passwd home's .codex: an overridden HOME must not hide the account's real folder."""
+    import pwd  # POSIX execution only; report reading and test collection do not need it.
+
     passwd = pwd.getpwuid(os.getuid()).pw_dir
     if fake and os.environ.get(FAKE_PASSWD_HOME):
         passwd = os.environ[FAKE_PASSWD_HOME]
@@ -1922,6 +1923,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     text_wanted = False
     try:
+        if args.command != "report" and os.name != "posix":
+            raise Refusal("native probe execution requires POSIX")
         if args.command == "plan":
             code, result = 0, plan(read_json(safe_path(text(args.request, "request"))))
         elif args.command == "run":

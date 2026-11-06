@@ -153,7 +153,8 @@ def test_symlinked_root_or_fixture_is_refused(tmp_path, root_link):
                                       (b'{"schema":1,"schema":2}', "FOUNDATION_CORPUS_INVALID"),
                                       (b'{"schema":NaN}', "FOUNDATION_CORPUS_INVALID"),
                                       (b"\xff", "FOUNDATION_CORPUS_INVALID"),
-                                      (b"[" * 17 + b"0" + b"]" * 17, "FOUNDATION_CORPUS_INVALID")])
+                                      (b"[" * 17 + b"0" + b"]" * 17, "FOUNDATION_CORPUS_INVALID")],
+                         ids=["oversized", "duplicate-key", "nan", "invalid-utf8", "too-deep"])
 def test_manifest_sad_paths_have_exact_public_errors(tmp_path, raw, code):
     corpus = copied_corpus(tmp_path)
     (corpus / "manifest.json").write_bytes(raw)

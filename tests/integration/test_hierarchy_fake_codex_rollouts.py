@@ -16,6 +16,8 @@ import time
 
 import pytest
 
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="the fake Codex uses POSIX shell scripts and process signals")
+
 ROOT = Path(__file__).resolve().parents[2]
 FAKE_CODEX = Path(__file__).resolve().with_name("hierarchy_fake_codex.py")
 NATIVE = ROOT / "tools" / "hierarchy_native.py"

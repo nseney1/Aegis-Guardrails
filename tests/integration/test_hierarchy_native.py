@@ -330,7 +330,7 @@ def test_check_still_refuses_an_unexpected_path_write_in_a_real_profile(tmp_path
     extra = {"path": {"type": "path", "path": WORK + "/.git"}, "access": "write", "missing_path_behavior": "skip"}
     rows = [META, started("t1"), turn("t1", permission_profile=real_profile(extra))]
     result = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra",
-                    "--cwd", "/other-workspace", "--allow-special-write", "tmpdir",
+                    "--cwd", str(Path("/other-workspace").absolute()), "--allow-special-write", "tmpdir",
                     "--allow-special-write", "slash_tmp", code=2)
     assert "write root is outside requested scope: " + WORK in result["reasons"]
     assert "write root is outside requested scope: " + WORK + "/.git" in result["reasons"]

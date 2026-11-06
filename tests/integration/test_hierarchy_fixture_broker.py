@@ -246,7 +246,7 @@ def test_broker_loss_never_rebinds_or_resubmits_original_association(broker):
     (b'\xff\n', "FIXTURE_FRAME_INVALID"),
     (b'{}\n{}\n', "FIXTURE_FRAME_INVALID"),
     (b'x' * (768 * 1024 + 1), "FIXTURE_FRAME_TOO_LARGE"),
-])
+], ids=["empty-object", "duplicate-key", "nan", "invalid-utf8", "multiple-frames", "oversized"])
 def test_invalid_public_client_frame_refuses_before_endpoint_access(tmp_path, raw, code):
     candidate = module()
     with pytest.raises(candidate.BrokerError, match="^" + code + "$"):
@@ -311,7 +311,8 @@ def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, 
     probe = tmp_path / "test_capability_probe.py"
     probe.write_text(
         "import pytest\n"
-        "from tests.integration.test_hierarchy_fixture_broker import broker, module, missing_host_capability\n"
+        "from tests.integration.test_hierarchy_fixture_broker import module, missing_host_capability\n"
+        "pytest_plugins = ['tests.integration.test_hierarchy_fixture_broker']\n"
         "@pytest.fixture(autouse=True)\n"
         "def unsupported(monkeypatch):\n"
         "    missing_host_capability(module(), " + repr(missing) + ", monkeypatch)\n"

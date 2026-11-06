@@ -74,7 +74,7 @@ KILL_WAIT_SECONDS = 5.0
 POLL_SECONDS = 0.05
 # The mailbox writer lock is held only for a moment; a start already paid for should outlast that.
 BIND_WAIT_SECONDS = 10.0
-INTERRUPTS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+INTERRUPTS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, name))
 INTERRUPTED = "the launcher was interrupted"
 ROOT_START = "ROOT is the owner's session; bind it with add-role"
 ROOT_STOP = "ROOT is the owner's session; the launcher does not stop it"

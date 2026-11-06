@@ -591,10 +591,11 @@ def test_an_invalid_reported_session_is_a_failed_start_without_a_session(launch,
     assert launch.binding() is None
 
 
-@pytest.mark.parametrize("mode,number,state", [("hang", signal.SIGTERM, "start_incomplete"),
-                                               ("hang", signal.SIGHUP, "start_incomplete"),
-                                               ("silent-hang", signal.SIGINT, "failed_to_start")])
+@pytest.mark.parametrize("mode,number,state", [("hang", "SIGTERM", "start_incomplete"),
+                                               ("hang", "SIGHUP", "start_incomplete"),
+                                               ("silent-hang", "SIGINT", "failed_to_start")])
 def test_an_interrupted_launcher_stops_its_start_and_records_it(launch, mode, number, state):
+    number = getattr(signal, number)
     thread = "interrupted-" + uuid.uuid4().hex
     logs = launch.base / "launches" / "pilot%2Flane%2Freview" / "logs"
     running = launch.started(mode=mode, thread=thread)

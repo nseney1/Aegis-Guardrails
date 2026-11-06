@@ -4,7 +4,6 @@ Every step is the real tool as a child process. The hosts are the fake host, and
 binaries plus links to the tools the steps need, so no real model binary can start. These tests show the
 tools work together on fixtures, not that real sessions behave this way.
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -198,6 +197,8 @@ def test_mail_the_orchestrator_ignored_gets_no_second_turn_from_a_later_pass(wor
 
 
 def test_a_second_instance_is_refused_while_the_first_holds_either_lock(world):
+    import fcntl
+
     for which, guarded in (("lifecycle", world.ledger.path), ("store", world.workspace.store)):
         path = world.lock_path(which)
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -280,6 +281,8 @@ def test_a_run_open_receipt_wakes_the_requester_on_the_next_pass(world):
 
 
 def test_status_reads_not_running_stale_and_running(world):
+    import fcntl
+
     assert world.status(expect=3) == {"schema": "aegis.loop-status/v1", "state": "not_running", "last": None}
     world.once()
     assert world.status(expect=3)["state"] == "not_running"
