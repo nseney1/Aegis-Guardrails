@@ -5,7 +5,8 @@ mailbox adapter read tools/hierarchy_templates/role-registry.json. A difference 
 role gained or lost a tool, a sandbox setting or an option, which the registry move must never do.
 
 M1 item 2 regenerated it once, after checking that the only difference was the new read-only mailbox_self
-tool in every mailbox role's allowlist and Codex enabled_tools.
+tool in every mailbox role's allowlist and Codex enabled_tools. M1 item 9 inserted multi_agent_v2 after multi_agent
+in every Codex disabled_features list and --disable pair, and changed nothing else.
 """
 import json
 import os

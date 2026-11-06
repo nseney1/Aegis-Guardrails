@@ -1,4 +1,5 @@
 """Restricted roles can use the file protocol without general write/shell tools."""
+import ast
 import json
 import hashlib
 import os
@@ -15,6 +16,9 @@ from tests.integration.test_hierarchy_mailbox import (
     INBOX_WIRE_BUDGET, WIRE_PAYLOADS, checkpoint_wire_binding, corrupt_wire_fixture,
     mailbox_snapshot, record_wire_process, seed_wire_inbox, wire_peer_mailbox,
 )
+
+sys.path.insert(0, str(HELPER.parent))
+from hierarchy_mailbox import GIT_ID, MESSAGE_TYPES, STAGES  # noqa: E402
 
 
 def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None,
@@ -75,6 +79,139 @@ def test_transport_advertises_only_scoped_mailbox_tools(pilot):  # noqa: F811
     assert all(t["inputSchema"]["additionalProperties"] is False for t in tools.values())
     assert not {"from", "host", "session", "binding_generation", "root"} & set(
         tools["mailbox_publish"]["inputSchema"]["properties"])
+
+
+# The publish schema teaches what the pinned validator in hierarchy_mailbox.py checks. That file is pinned, so the
+# expectations below are parsed from its own source and constants; a validator change fails here, not in a live run.
+
+
+def validator(name):
+    tree = ast.parse(HELPER.read_text(encoding="utf-8"))
+    [mailbox] = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Mailbox"]
+    [function] = [node for node in mailbox.body if isinstance(node, ast.FunctionDef) and node.name == name]
+    return function
+
+
+def strings(node):
+    return {element.value for element in node.elts}
+
+
+def field_sets(function, subject):
+    """The key sets the validator passes to fields(<subject>, required[, optional])."""
+    for node in ast.walk(function):
+        if (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "fields"
+                and getattr(node.args[0], "id", None) == subject):
+            return [strings(argument) for argument in node.args[1:]]
+    raise AssertionError("no fields(%s, ...) in %s" % (subject, function.name))
+
+
+def keyed(node, key):
+    return isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == key
+
+
+def allowed(function, key):
+    """The set literal that <value>[key] is checked to be in."""
+    for node in ast.walk(function):
+        if (isinstance(node, ast.Compare) and keyed(node.left, key) and isinstance(node.ops[0], ast.In)
+                and isinstance(node.comparators[0], ast.Set)):
+            return strings(node.comparators[0])
+    raise AssertionError("no %s membership check in %s" % (key, function.name))
+
+
+def git_id_keys(function):
+    return {node.args[0].slice.value for node in ast.walk(function)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "matching"
+            and isinstance(node.args[0], ast.Subscript) and getattr(node.args[1], "id", None) == "GIT_ID"}
+
+
+def fullmatch_pattern(function, key):
+    for node in ast.walk(function):
+        if (isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "fullmatch" and len(node.args) > 1
+                and keyed(node.args[1], key)):
+            return node.args[0].value
+    raise AssertionError("no fullmatch on %s in %s" % (key, function.name))
+
+
+def length_bounds(function, key):
+    """(minimum, maximum) from a `lower < len(<value>[key]) <= upper` check."""
+    for node in ast.walk(function):
+        if (isinstance(node, ast.Compare) and len(node.comparators) == 2 and isinstance(node.comparators[0], ast.Call)
+                and getattr(node.comparators[0].func, "id", None) == "len" and keyed(node.comparators[0].args[0], key)):
+            assert isinstance(node.ops[0], ast.Lt) and isinstance(node.ops[1], ast.LtE)
+            return node.left.value + 1, node.comparators[1].value
+    raise AssertionError("no length check on %s in %s" % (key, function.name))
+
+
+def publish_tool(root):
+    return {tool["name"]: tool for tool in exchange(root)[1]["result"]["tools"]}["mailbox_publish"]
+
+
+def test_publish_types_readiness_exactly_as_the_pinned_validator_checks_it(pilot):  # noqa: F811
+    root, _ = pilot
+    schema = publish_tool(root)["inputSchema"]["properties"]["readiness"]
+    function = validator("readiness")
+    [required] = field_sets(function, "readiness")
+    assert schema["type"] == "object" and schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"]) == required
+    assert set(schema["properties"]["enforcement_tier"]["enum"]) == allowed(function, "enforcement_tier")
+    assert git_id_keys(function) == {"base_revision", "lease_oid"}
+    for key in git_id_keys(function):
+        assert schema["properties"][key]["pattern"] == "^%s$" % GIT_ID.pattern, key
+    assert schema["properties"]["lease_ref"]["pattern"] == "^%s$" % fullmatch_pattern(function, "lease_ref")
+    assert schema["properties"]["owned_paths"]["type"] == "array" and schema["properties"]["owned_paths"]["minItems"] == 1
+
+
+def test_publish_types_the_result_exactly_as_the_pinned_validator_checks_it(pilot):  # noqa: F811
+    root, _ = pilot
+    schema = publish_tool(root)["inputSchema"]["properties"]["result"]
+    function = validator("completion")
+    required, optional = field_sets(function, "result")
+    assert schema["type"] == "object" and schema["additionalProperties"] is False
+    assert set(schema["required"]) == required and set(schema["properties"]) == required | optional
+    for key in git_id_keys(function):
+        assert schema["properties"][key]["pattern"] == "^%s$" % GIT_ID.pattern, key
+    checks = schema["properties"]["checks"]
+    assert (checks["minItems"], checks["maxItems"]) == length_bounds(function, "checks")
+    [check_keys] = field_sets(function, "check")
+    items = checks["items"]
+    assert set(items["required"]) == set(items["properties"]) == check_keys and items["additionalProperties"] is False
+    assert set(items["properties"]["outcome"]["enum"]) == allowed(function, "outcome")
+    assert "reviewer" in schema["properties"]["lane_check"]["description"]
+
+
+def test_publish_type_and_stage_enums_are_the_mailbox_constants(pilot):  # noqa: F811
+    root, _ = pilot
+    properties = publish_tool(root)["inputSchema"]["properties"]
+    assert set(properties["type"]["enum"]) == MESSAGE_TYPES
+    assert set(properties["acknowledgment"]["enum"]) == STAGES
+
+
+def test_publish_teaches_the_order_accept_then_report_and_fix_only_the_named_field(pilot):  # noqa: F811
+    root, _ = pilot
+    description = publish_tool(root)["description"]
+    assert description.startswith("Publish information under the configured sender; grants no approval or verified "
+                                  "completion.")
+    first, second, third = (description.index(step) for step in ("1. ", "2. ", "3. "))
+    assert first < second < third
+    accept, report, refusal = description[first:second], description[second:third], description[third:]
+    assert "ack" in accept and "accepted" in accept and "in reply to the dispatch" in accept and "readiness" in accept
+    assert "result" in report and "review" in report
+    assert "refusal" in refusal and "never re-send unchanged" in refusal
+
+
+def test_a_typed_publish_still_accepts_the_reviewers_two_messages(pilot):  # noqa: F811
+    """The schema is advice for the model; the pinned validator stays the check, so a reviewer's bare ack and a
+    result without lane_check publish as before."""
+    root, brief = pilot
+    invoke(root, "publish", message(recipient="a/lane/review", kind="dispatch", brief=brief))
+    evidence = {"source_revision": "a" * 40, "source_tree": "b" * 40,
+                "checks": [{"check": "independent-review", "outcome": "not_run", "reference": "review/findings.md"}]}
+    responses = exchange(root, [
+        ("mailbox_publish", {"message_id": "review-accepted", "to": "a/orchestrator", "type": "ack", "body": "Accepted",
+                             "in_reply_to": "dispatch-1", "acknowledgment": "accepted"}),
+        ("mailbox_publish", {"message_id": "review-result", "to": "a/orchestrator", "type": "result",
+                             "body": "verdict in body", "in_reply_to": "dispatch-1", "result": evidence})])
+    assert [response["result"].get("isError", False) for response in responses[2:]] == [False, False]
 
 
 def test_reviewer_reads_its_brief_and_reports_without_source_write_tools(pilot):  # noqa: F811
@@ -507,3 +644,52 @@ def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):  # noqa: F8
         "checkpoint_sha256": binding["checkpoint_sha256"]}
     assert invoke(root, "inbox", endpoint="a/orchestrator")["messages"] == [
         {"path": receipt["path"], "message": receipt["message"]}]
+
+
+def test_publish_schema_has_nonempty_text_bounds_and_utc_time(pilot):  # noqa: F811
+    import re
+    root, _ = pilot
+    fields = publish_tool(root)["inputSchema"]["properties"]
+    readiness, result = fields["readiness"]["properties"], fields["result"]["properties"]
+    for key in ("worktree", "branch", "scan_workspace", "scan_evidence", "hook_evidence"):
+        assert readiness[key]["minLength"] == 1
+        assert readiness[key]["maxLength"] == (256 if key == "branch" else 4096)
+    assert result["lane_check"]["minLength"] == 1
+    assert readiness["owned_paths"]["items"]["minLength"] == 1
+    pattern = readiness["lease_expires_at"]["pattern"]
+    assert re.fullmatch(pattern, "2099-01-01T00:00:00.000001Z")
+    assert not re.fullmatch(pattern, "2099-01-01T00:00:00+00:00")
+
+
+@pytest.mark.parametrize("field,label", [
+    ("worktree", "worktree"), ("branch", "branch"), ("scan_workspace", "scan workspace"),
+    ("scan_evidence", "scan_evidence"), ("hook_evidence", "hook_evidence"),
+])
+def test_publish_refuses_text_beyond_its_advertised_readiness_limit(pilot, tmp_path, field, label):  # noqa: F811
+    from tests.integration.test_hierarchy_mailbox import readiness
+    root, brief = pilot
+    invoke(root, "publish", message(kind="dispatch", brief=brief))
+    ready = readiness(tmp_path)
+    schema = publish_tool(root)["inputSchema"]["properties"]["readiness"]["properties"][field]
+    ready[field] = "x" * (schema["maxLength"] + 1)
+    answer = exchange(root, [("mailbox_publish", {"message_id": "accepted", "to": "a/orchestrator",
+                         "type": "ack", "body": "Accepted", "in_reply_to": "dispatch-1",
+                         "acknowledgment": "accepted", "readiness": ready})], endpoint="a/lane/f2")[-1]
+    assert answer["result"]["isError"] is True
+    assert payload(answer)["error"] == "invalid " + label
+
+
+def test_publish_requires_the_writers_advertised_lane_check(pilot, tmp_path):  # noqa: F811
+    from tests.integration.test_hierarchy_mailbox import readiness
+    root, brief = pilot
+    invoke(root, "publish", message(kind="dispatch", brief=brief))
+    evidence = {"source_revision": "a" * 40, "source_tree": "b" * 40,
+                "checks": [{"check": "affected-tests", "outcome": "pass", "reference": "tests.log"}]}
+    answers = exchange(root, [
+        ("mailbox_publish", {"message_id": "accepted", "to": "a/orchestrator", "type": "ack", "body": "Accepted",
+                             "in_reply_to": "dispatch-1", "acknowledgment": "accepted", "readiness": readiness(tmp_path)}),
+        ("mailbox_publish", {"message_id": "result", "to": "a/orchestrator", "type": "result", "body": "Done",
+                             "in_reply_to": "dispatch-1", "result": evidence})], endpoint="a/lane/f2")
+    assert not answers[2]["result"].get("isError", False)
+    assert answers[3]["result"]["isError"] is True
+    assert payload(answers[3])["error"] == "invalid lane check reference"

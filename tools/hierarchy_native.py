@@ -5,6 +5,7 @@ The current supported record format exposes identity/profile provenance, but not
 an authenticated caller, effective tool allowlist or decision-only service.
 `check` verifies a standalone maintenance profile; `admit` deliberately refuses
 workflow admission until those independent native boundaries are implemented.
+`multi-agent` reports whether the session was offered Codex sub-agent tools.
 No command writes configuration, binds a session or launches an actor.
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shlex
 from pathlib import Path
 import stat
@@ -39,6 +41,10 @@ def codex_roles():
 ROLES = codex_roles()
 NATIVE_GAP = "authenticated native identity and tool capabilities are unavailable"
 EXEC_SCHEMA = "aegis.native-exec-events/v1"
+MULTI_AGENT_SCHEMA = "aegis.native-multi-agent/v1"
+# What Codex multi-agent v2 offered in additional_tools (codex-cli 0.166.0, every role of the M1 run of 2026-11-06).
+AGENT_NAMESPACE = "collaboration"
+AGENT_TOOL_NAMES = ("followup_task", "interrupt_agent", "list_agents", "send_message", "spawn_agent", "wait_agent")
 
 
 def rollout_records(rollout, tolerant=False):
@@ -423,13 +429,445 @@ def response_patch(call, output, turn, witness):
             "source": call.get("type"), "declined": declined, "shape": UNCONFIRMED_SHAPE, **witness}
 
 
+# Codex code mode, confirmed by native probe run 1: the model sends a custom_tool_call named "exec" whose input is
+# a JavaScript cell. The cell calls tools.exec_command({cmd}) and tools.apply_patch("…") and prints each result
+# with text(). The custom_tool_call_output with the same call_id is a list of input_text parts: a "Script
+# completed" or "Script failed" header, one part per text() call, and after a failure a last "Script error:\n…"
+# part. The host adds an item_completed CommandExecution or FileChange for only some of those calls.
+CODE_MODE = "code_mode"
+CODE_MODE_SHAPE = "confirmed by native probe run 1 (codex-cli 0.166.0)"
+CODE_MODE_TOOLS = ("exec_command", "apply_patch")
+# exec_command options that change neither the shell nor the sandbox. Any other (shell, workdir, login, an
+# escalation request) leaves the record untrusted: the model then chose what ran the command.
+CODE_MODE_SAFE_OPTIONS = ("yield_time_ms", "max_output_tokens")
+CODE_MODE_MAX_CALLS = 1000
+# Bindings in the recognized subset must not be JavaScript reserved words or shadow the called helpers.
+JS_RESERVED_BINDINGS = frozenset((
+    "await break case catch class const continue debugger default delete do else enum export extends false finally "
+    "for function if implements import in instanceof interface let new null package private protected public return "
+    "static super switch this throw true try typeof var void while with yield eval arguments tools text String"
+).split())
+CODE_MODE_ERROR = "Script error:\n"
+CODE_MODE_HEADERS = {"Script completed\n": "completed", "Script failed\n": "failed"}
+# Every alternative consumes what it starts, an unterminated literal or comment up to its line or the cell's end, so
+# a cell full of stray quotes is read in linear time; an unterminated literal never decodes.
+JS_TOKEN = re.compile(r'\s+|//[^\n]*|/\*.*?(?:\*/|\Z)|("(?:[^"\\\n]|\\.)*"?)'
+                      r'|(\'(?:[^\'\\\n]|\\.)*\'?|`(?:[^`\\]|\\.)*`?)|([A-Za-z_$][\w$]*)|(\d+)|(.)', re.S)
+
+
+class Unrecognized(Exception):
+    """A code-mode cell, or one call in it, that is not one of the shapes whose printed output is known."""
+
+
+class CellLimit(Unrecognized):
+    """Expansion must stop before allocating an unbounded call list."""
+
+
+def js_tokens(source):
+    """(kind, text) tokens of a cell; whitespace and comments are dropped. A single-quoted or template literal is
+    kind "other": only a double-quoted literal is ever decoded."""
+    tokens = []
+    for match in JS_TOKEN.finditer(source):
+        if match.group().startswith("/*") and not match.group().endswith("*/"):
+            tokens.append(("invalid", match.group()))
+        for kind, value in zip(("string", "other", "name", "number", "punct"), match.groups()):
+            if value is not None:
+                tokens.append((kind, value))
+    return tokens
+
+
+def js_string(token):
+    """A double-quoted literal decoded as JSON, so an escape JSON does not share (\\x41, \\') leaves it unparsed."""
+    if token[0] != "string":
+        raise Unrecognized("not a double-quoted string literal")
+    try:
+        value = strict_json(token[1])
+    except (ValueError, RecursionError) as exc:
+        raise Unrecognized("a string literal JSON cannot decode") from exc
+    return value
+
+
+class JsCursor:
+    def __init__(self, tokens, at=0):
+        self.tokens, self.at = tokens, at
+
+    def done(self):
+        return self.at >= len(self.tokens)
+
+    def accept(self, *texts):
+        """Consume these exact name or punctuation tokens if they come next; a literal never matches."""
+        found = self.tokens[self.at:self.at + len(texts)]
+        if len(found) == len(texts) and all(kind in ("name", "punct") and value == text
+                                            for (kind, value), text in zip(found, texts)):
+            self.at += len(texts)
+            return True
+        return False
+
+    def need(self, *texts):
+        if not self.accept(*texts):
+            raise Unrecognized("expected " + " ".join(texts))
+
+    def ahead(self, *texts):
+        return not self.done() and self.tokens[self.at][0] == "punct" and self.tokens[self.at][1] in texts
+
+    def take(self, *kinds):
+        if self.done() or self.tokens[self.at][0] not in kinds:
+            raise Unrecognized("expected a " + " or ".join(kinds))
+        self.at += 1
+        return self.tokens[self.at - 1]
+
+
+def js_call(cursor, bound):
+    """tools.exec_command({cmd: "…"}) or tools.apply_patch("…") at the cursor, as one call. A cmd naming a loop
+    variable in bound gives a list of commands, one per element of its array."""
+    cursor.need("tools", ".")
+    tool = cursor.take("name")[1]
+    if tool not in CODE_MODE_TOOLS:
+        raise Unrecognized("not exec_command or apply_patch")
+    cursor.need("(")
+    if tool == "apply_patch":
+        patch = js_string(cursor.take("string"))
+        cursor.need(")")
+        return {"tool": tool, "patch": patch, "paths": patch_paths(patch)}
+    cursor.need("{")
+    command, options = None, []
+    while not cursor.accept("}"):
+        kind, key = cursor.take("name", "string")
+        if kind == "string":
+            key = js_string((kind, key))
+        if kind == "name" and cursor.ahead(",", "}"):
+            value = ("name", key)  # the shorthand {cmd}: the variable cmd
+        else:
+            cursor.need(":")
+            value = cursor.take("string", "number", "name")
+        if key == "cmd":
+            command = js_string(value) if value[0] == "string" else bound.get(value[1])
+            if not isinstance(command, (str, list)) or not command:
+                raise Unrecognized("cmd is not a string literal")
+        elif value[0] == "name" and value[1] not in ("true", "false"):
+            raise Unrecognized("an option is not a literal")
+        else:
+            options.append(key)
+        if not cursor.accept(","):
+            cursor.need("}")
+            break
+    cursor.need(")")
+    if command is None:
+        raise Unrecognized("exec_command has no cmd")
+    return {"tool": tool, "command": command, "options": sorted(options)}
+
+
+def js_print(cursor, bound):
+    cursor.need("text", "(", "await")
+    call = js_call(cursor, bound)
+    cursor.need(")")
+    if not cursor.done() and not cursor.ahead("}"):
+        cursor.need(";")
+    return call
+
+
+def js_statement(cursor, bound):
+    """text(await CALL); or try { text(await CALL); } catch (E) { text(String(E)); }; inside a loop over cmd the
+    catch may print {cmd, error: String(E)}. Each prints exactly one part, whether the call returns or throws."""
+    if not cursor.accept("try", "{"):
+        return {**js_print(cursor, bound), "caught": None}
+    call = js_print(cursor, bound)
+    cursor.need("}", "catch", "(")
+    error = cursor.take("name")[1]
+    if error in JS_RESERVED_BINDINGS:
+        raise Unrecognized("unsupported catch binding")
+    cursor.need(")", "{", "text", "(")
+    if cursor.accept("String", "(", error, ")"):
+        caught = "string"
+    elif "cmd" in bound and cursor.accept("{", "cmd", ",", "error", ":", "String", "(", error, ")"):
+        cursor.accept(",")
+        cursor.need("}")
+        caught = "object"
+    else:
+        raise Unrecognized("a catch that prints something else")
+    cursor.need(")")
+    cursor.accept(";")
+    cursor.need("}")
+    return {**call, "caught": caught}
+
+
+def js_array(cursor):
+    """NAME = ["…", …] after const or let: (NAME, its strings)."""
+    name = cursor.take("name")[1]
+    if name in JS_RESERVED_BINDINGS:
+        raise Unrecognized("unsupported array binding")
+    cursor.need("=", "[")
+    values = []
+    while not cursor.accept("]"):
+        values.append(js_string(cursor.take("string")))
+        if not cursor.accept(","):
+            cursor.need("]")
+            break
+    if not values or not all(isinstance(value, str) for value in values):
+        raise Unrecognized("an array that is not strings")
+    return name, values
+
+
+def js_loop(cursor):
+    """const VARIABLE of NAME) after for (: (VARIABLE, NAME)."""
+    if not (cursor.accept("const") or cursor.accept("let")):
+        raise Unrecognized("a loop without const or let")
+    variable = cursor.take("name")[1]
+    cursor.need("of")
+    name = cursor.take("name")[1]
+    cursor.need(")")
+    if variable in JS_RESERVED_BINDINGS or variable == name:
+        raise Unrecognized("unsupported loop binding")
+    return variable, name
+
+
+def expanded(call, available):
+    count = len(call["command"]) if isinstance(call.get("command"), list) else 1
+    if count > available:
+        raise CellLimit("code-mode cell exceeds %d calls" % CODE_MODE_MAX_CALLS)
+    if call["tool"] == "exec_command" and isinstance(call["command"], list):
+        return [{**call, "command": command} for command in call["command"]]
+    return [call]
+
+
+def js_cell(tokens):
+    """The cell's calls in run order, if the whole cell is the statements js_statement reads, string arrays
+    (const NAME = ["…", …];) and loops over them (for (const cmd of NAME) STATEMENT)."""
+    cursor, arrays, calls = JsCursor(tokens), {}, []
+    while not cursor.done():
+        if cursor.accept("const") or cursor.accept("let"):
+            name, values = js_array(cursor)
+            if name in arrays:
+                raise Unrecognized("duplicate array binding")
+            arrays[name] = values
+            cursor.need(";")
+        elif cursor.accept("for", "("):
+            variable, name = js_loop(cursor)
+            if name not in arrays:
+                raise Unrecognized("a loop over an unknown array")
+            braced = cursor.accept("{")
+            call = js_statement(cursor, {variable: arrays[name]})
+            if braced:
+                cursor.need("}")
+            if not isinstance(call.get("command"), list):
+                raise Unrecognized("a loop whose call does not use its variable")
+            calls += expanded(call, CODE_MODE_MAX_CALLS - len(calls))
+        else:
+            calls += expanded(js_statement(cursor, {}), CODE_MODE_MAX_CALLS - len(calls))
+    return calls
+
+
+def js_scan(tokens):
+    """Every exec_command and apply_patch call of a cell js_cell cannot read: (calls, unparsed). Their output cannot
+    be tied to them; a call whose argument is not a strict literal is listed in unparsed with the reason."""
+    arrays, loops = {}, {}
+    for at in range(len(tokens)):
+        cursor = JsCursor(tokens, at)
+        try:
+            if cursor.accept("const") or cursor.accept("let"):
+                name, values = js_array(cursor)
+                arrays[name] = values
+            elif cursor.accept("for", "("):
+                variable, name = js_loop(cursor)
+                loops[variable] = name
+        except Unrecognized:
+            continue
+    bound = {variable: arrays[name] for variable, name in loops.items() if name in arrays}
+    calls, unparsed = [], []
+    for at in range(len(tokens) - 3):
+        tool = tokens[at + 2][1]
+        if tokens[at] != ("name", "tools") or tokens[at + 1] != ("punct", ".") or tool not in CODE_MODE_TOOLS \
+                or tokens[at + 3] != ("punct", "("):
+            continue
+        try:
+            calls += expanded({**js_call(JsCursor(tokens, at), bound), "caught": None},
+                              CODE_MODE_MAX_CALLS - len(calls))
+        except CellLimit:
+            raise
+        except Unrecognized as exc:
+            unparsed.append({"tool": tool, "reason": str(exc)})
+    return calls, unparsed
+
+
+def code_mode_calls(source):
+    """(calls, paired, unparsed) of one cell: paired says each call prints exactly one output part in order."""
+    tokens = js_tokens(source)
+    try:
+        return js_cell(tokens), True, []
+    except Unrecognized:
+        try:
+            calls, unparsed = js_scan(tokens)
+            return calls, False, unparsed
+        except CellLimit as exc:
+            return [], False, [{"tool": "exec", "reason": str(exc)}]
+
+
+def code_mode_parts(payload):
+    """(header, printed parts, script error or None) of an exec output, or None when it is not that shape (a
+    "Script running" cell, a header that disagrees with the error part)."""
+    value = payload.get("output")
+    if isinstance(value, str):
+        texts = [value]
+    elif isinstance(value, list) and value and all(
+            isinstance(part, dict) and part.get("type") == "input_text" and isinstance(part.get("text"), str)
+            for part in value):
+        texts = [part["text"] for part in value]
+    else:
+        return None
+    header = next((state for prefix, state in CODE_MODE_HEADERS.items() if texts[0].startswith(prefix)), None)
+    body, error = texts[1:], None
+    if body and body[-1].startswith(CODE_MODE_ERROR):
+        error = body.pop()[len(CODE_MODE_ERROR):]
+    if header is None or (header == "failed") != (error is not None):
+        return None
+    return header, body, error
+
+
+def json_object(text):
+    try:
+        value = strict_json(text)
+    except (ValueError, RecursionError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def exec_chunk(text):
+    """An exec_command result as code mode prints it: {chunk_id, exit_code or session_id, output, …}, or None."""
+    value = json_object(text)
+    if value is None or "error" in value or not isinstance(value.get("chunk_id"), str) \
+            or not isinstance(value.get("output"), str):
+        return None
+    code = value.get("exit_code")
+    if code is None and "session_id" not in value or code is not None and (
+            not isinstance(code, int) or isinstance(code, bool)):
+        return None
+    return value
+
+
+def code_mode_results(calls, parts):
+    """One result per call, in order: ("result", text), ("error", message) or "not_run" (after a Script error
+    ends the cell), or None when the parts cannot be tied one-to-one to the calls."""
+    _, body, error = parts
+    results, used, thrown = [], 0, False
+    for call in calls:
+        if used < len(body):
+            text, printed = body[used], json_object(body[used])
+            used += 1
+            if call["caught"] is None:
+                results.append(("result", text))
+            elif call["tool"] == "exec_command" and exec_chunk(text) is not None:
+                results.append(("result", text))
+            elif call["tool"] == "apply_patch" and printed is not None:
+                results.append(("result", text))
+            elif call["caught"] == "string" and printed is None:
+                results.append(("error", text))
+            elif call["caught"] == "object" and printed is not None and set(printed) == {"cmd", "error"} \
+                    and printed["cmd"] == call["command"] and isinstance(printed["error"], str):
+                results.append(("error", printed["error"]))
+            else:
+                return None
+        elif error is not None and not thrown and call["caught"] is None:
+            results.append(("error", error))
+            thrown = True
+        elif thrown:
+            results.append("not_run")
+        else:
+            return None
+    if used != len(body) or (error is not None and not thrown):
+        return None
+    return results
+
+
+def code_mode_entry(call, result, turn, call_id, witness):
+    """A command_executions or patch_applies entry for one code-mode call and its result (None: not tied)."""
+    entry = {"turn_id": turn, "call_id": call_id, "source": CODE_MODE, "shape": CODE_MODE_SHAPE, "stdout": None,
+             "stderr": None, "status": "unpaired"}
+    if result is not None and result[0] == "error":
+        entry["stderr"] = result[1]
+        entry["status"] = ("unavailable" if result[1].strip() == "TypeError: tools.%s is not a function" % call["tool"]
+                           else "failed")
+    if call["tool"] == "apply_patch":
+        entry.update(success=None, paths=call["paths"], declined=False)
+        if result is not None and result[0] == "error":
+            entry["success"] = False
+        elif result is not None and json_object(result[1]) == {}:
+            # Run 1 printed {} for a patch that applied (its FileChange item says completed).
+            entry.update(success=True, stdout=result[1], status="completed")
+        elif result is not None:
+            entry.update(stdout=result[1], status="unknown")
+        return {**entry, **witness}
+    entry.update(command=call["command"], command_text=call["command"], exit_code=None, aggregated_output=None,
+                 options=call["options"])
+    if result is not None and result[0] == "result":
+        chunk = exec_chunk(result[1])
+        code = None if chunk is None else chunk.get("exit_code")
+        entry["status"] = ("unknown" if chunk is None else "running" if code is None else
+                           "completed" if code == 0 else "failed")
+        if chunk is not None:
+            entry.update(exit_code=code, aggregated_output=chunk["output"])
+    return {**entry, **witness}
+
+
+def typed_text(entry):
+    """The command a typed CommandExecution ran: its string, or the CMD of a [shell, -c|-lc, CMD] argv."""
+    command = entry.get("command")
+    if isinstance(command, str):
+        return command
+    if isinstance(command, list) and len(command) == 3 and command[1] in ("-c", "-lc"):
+        return command[2]
+    return None
+
+
+def cover(open_cells, typed, shell):
+    """A typed item_completed record wins over the code-mode parse: mark the first open cell call of its turn that
+    it records (same command, or same paths) as covered, so the cell adds no second entry for it."""
+    if shell:
+        # Identical command text does not identify which occurrence produced the typed event. Preserve every
+        # matching call's options, including already-covered occurrences, so ambiguity never removes a restriction.
+        options = {option for cell in open_cells.values() if cell["turn"] == typed["turn_id"]
+                   for call in cell["calls"] if call["tool"] == "exec_command"
+                   and typed_text(typed) == call["command"] for option in call["options"]}
+        if options:
+            typed["options"] = sorted(options)
+    for cell in open_cells.values():
+        if cell["turn"] != typed["turn_id"]:
+            continue
+        for index, call in enumerate(cell["calls"]):
+            if index in cell["covered"] or call["tool"] != ("exec_command" if shell else "apply_patch"):
+                continue
+            if (shell and typed_text(typed) == call["command"]) or (
+                    not shell and sorted(set(typed["paths"])) == sorted(set(call["paths"]))):
+                cell["covered"].add(index)
+                return
+
+
+def code_mode_close(cell, payload, witness, executions, patches):
+    results = None
+    if payload is not None and cell["paired"]:
+        parts = code_mode_parts(payload)
+        results = None if parts is None else code_mode_results(cell["calls"], parts)
+    for index, call in enumerate(cell["calls"]):
+        result = None if results is None else results[index]
+        if index in cell["covered"] or result == "not_run":
+            continue
+        entry = code_mode_entry(call, result, cell["turn"], cell["call_id"], {**witness, "call_line": cell["line"]})
+        (executions if call["tool"] == "exec_command" else patches).append(entry)
+
+
 def exec_events(rollout, cid, scope="current", tolerant=False):
     """Shell executions and patch applications recorded in the rollout, never model text.
 
     Read shapes: event_msg exec_command_end and patch_apply_end, event_msg item_completed with a
-    CommandExecution or FileChange item, item.* stream records with command_execution or file_change items, and
-    response_item custom_tool_call / function_call named apply_patch paired with its output by call_id (that last
-    shape is unconfirmed against a real host; its entries say so in "shape"). A declined patch is marked declined.
+    CommandExecution or FileChange item, item.* stream records with command_execution or file_change items,
+    Codex code mode (a custom_tool_call named exec, one entry per tools.exec_command or tools.apply_patch call in
+    its cell, source "code_mode"), and response_item custom_tool_call / function_call named apply_patch paired with
+    its output by call_id (that last shape is unconfirmed against a real host; its entries say so in "shape"). A
+    declined patch is marked declined.
+
+    A code-mode call pairs with its output by call_id; its printed parts are tied to its calls only when the whole
+    cell is a known statement shape, otherwise each call is listed with status "unpaired" and no result. A call to a
+    tool the session lacks is status "unavailable". A typed item_completed record for a call wins over the parse.
+    Calls whose argument is not a strict literal are listed in "code_mode_unparsed".
 
     An event's own turn_id wins; otherwise it belongs to the turn started last before it. With scope "current"
     only the latest started turn is listed, so a new task_started hides every earlier attempt. This is the
@@ -437,13 +875,22 @@ def exec_events(rollout, cid, scope="current", tolerant=False):
     """
     require(scope in {"current", "all"}, "turn scope must be current or all")
     metadata, started_turn = None, None
-    executions, patches = [], []
-    calls = {}
+    executions, patches, unparsed = [], [], []
+    calls, cells = {}, {}
     for path, number, raw, record in rollout_records(rollout, tolerant):
         kind, payload, event = record.get("type"), record.get("payload"), event_type(record)
         if kind == "response_item" and isinstance(payload, dict):
             call = payload.get("call_id")
-            if payload.get("type") in PATCH_CALLS and payload.get("name") == "apply_patch" and isinstance(call, str):
+            if payload.get("type") == "custom_tool_call" and payload.get("name") == "exec" and isinstance(call, str) \
+                    and isinstance(payload.get("input"), str):
+                found, paired, skipped = code_mode_calls(payload["input"])
+                unparsed += [{**entry, "turn_id": started_turn, "call_id": call, "line": number} for entry in skipped]
+                if found:
+                    cells[call] = {"calls": found, "paired": paired, "turn": started_turn, "call_id": call,
+                                   "line": number, "covered": set(), "witness": witness_of(path, number, raw, record)}
+            elif payload.get("type") == "custom_tool_call_output" and isinstance(call, str) and call in cells:
+                code_mode_close(cells.pop(call), payload, witness_of(path, number, raw, record), executions, patches)
+            elif payload.get("type") in PATCH_CALLS and payload.get("name") == "apply_patch" and isinstance(call, str):
                 calls[call] = (payload, started_turn, witness_of(path, number, raw, record))
             elif payload.get("type") in PATCH_CALLS.values() and isinstance(call, str) and call in calls:
                 found, turn, opened = calls.pop(call)
@@ -471,7 +918,7 @@ def exec_events(rollout, cid, scope="current", tolerant=False):
                 patches.append(patch_apply(payload, turn, event, witness))
         elif event == "item_completed" and isinstance(payload.get("item"), dict) \
                 and payload["item"].get("type") in {"CommandExecution", "FileChange"}:
-            # The rollout shape (0.166, per lane B; unconfirmed here): the item rides in an event_msg.
+            # The rollout shape (codex-cli 0.166, confirmed by native probe run 1): the item rides in an event_msg.
             entry = payload["item"]
             turn = payload.get("turn_id", started_turn)
             shell = entry["type"] == "CommandExecution"
@@ -481,6 +928,7 @@ def exec_events(rollout, cid, scope="current", tolerant=False):
                 executions.append(command_execution(entry, turn, event, witness))
             else:
                 patches.append(patch_apply(entry, turn, event, witness))
+            cover(cells, (executions if shell else patches)[-1], shell)
         elif kind in {"item.started", "item.updated", "item.completed"} and isinstance(record.get("item"), dict):
             entry = record["item"]
             if entry.get("type") == "command_execution":
@@ -489,13 +937,76 @@ def exec_events(rollout, cid, scope="current", tolerant=False):
                 patches.append(patch_apply(entry, started_turn, kind, witness))
     for found, turn, opened in calls.values():
         patches.append(response_patch(found, None, turn, opened))
+    for cell in cells.values():
+        # A cell with no output yet (a cut or still running turn): its calls are listed, none tied to a result.
+        code_mode_close(cell, None, cell["witness"], executions, patches)
     require(metadata is not None, "no native session identity in rollout")
     if scope == "current" and started_turn is not None:
         executions = [entry for entry in executions if entry["turn_id"] == started_turn]
         patches = [entry for entry in patches if entry["turn_id"] == started_turn]
+        unparsed = [entry for entry in unparsed if entry["turn_id"] == started_turn]
     return {"schema": EXEC_SCHEMA, "cid": cid, "turn_scope": scope, "current_turn_id": started_turn,
-            "command_executions": executions, "patch_applies": patches,
+            "command_executions": executions, "patch_applies": patches, "code_mode_unparsed": unparsed,
             "native_execution_qualified": False, "qualification_blocker": NATIVE_GAP}
+
+
+def offered_agent_tools(payload, number):
+    """(agent tools, unknown tools) as <namespace>.<name>, or a bare name outside a namespace."""
+    malformed = "malformed additional_tools record at line %d" % number
+    entries = payload.get("tools")
+    require(isinstance(entries, list), malformed)
+    # These are the non-agent names in the retained native catalog. An unfamiliar capability needs review before
+    # it can establish MULTI_AGENT_OFF, even when its name does not mention agents (for example workers.launch).
+    non_agent = {"functions.exec", "functions.wait", "functions.request_user_input",
+                 "functions.request_user_input_async", "clock.sleep"}
+    found, unknown = [], []
+    for entry in entries:
+        require(isinstance(entry, dict) and isinstance(entry.get("name"), str), malformed)
+        if entry.get("type") != "namespace":
+            if entry["name"] in AGENT_TOOL_NAMES:
+                found.append(entry["name"])
+            elif entry["name"] not in non_agent:
+                unknown.append(entry["name"])
+            continue
+        require(isinstance(entry.get("tools"), list), malformed)
+        for tool in entry["tools"]:
+            require(isinstance(tool, dict) and isinstance(tool.get("name"), str), malformed)
+            if entry["name"] == AGENT_NAMESPACE or tool["name"] in AGENT_TOOL_NAMES:
+                found.append(entry["name"] + "." + tool["name"])
+            elif entry["name"] + "." + tool["name"] not in non_agent:
+                unknown.append(entry["name"] + "." + tool["name"])
+    return found, unknown
+
+
+def multi_agent_state(rollout, cid=None, tolerant=False):
+    """Whether a Codex session was offered sub-agent tools, read from its rollout.
+
+    agent_tools is the evidence: every tool an additional_tools record offered in the collaboration namespace, or
+    under a multi-agent v2 tool name anywhere. version is the latest turn_context's multi_agent_version (None when
+    absent) and is reported only, because Codex may record a version with the tools off. turns counts turn_context
+    records and tool_records the additional_tools records; with no tools record the rollout says nothing about the
+    tools either way. Unknown names are retained in unknown_tools, when present, and cannot establish that agents
+    are disabled. With cid, the rollout's session identity must match it.
+    """
+    metadata, version, turns, records, offered, unknown = None, None, 0, 0, set(), set()
+    for _path, number, _raw, record in rollout_records(rollout, tolerant):
+        kind, payload = record.get("type"), record.get("payload")
+        if kind == "session_meta":
+            require(isinstance(payload, dict), "native record payload must be an object")
+            require(cid is None or payload.get("id") == cid, "rollout identity does not match requested CID")
+            metadata = payload
+        elif kind == "turn_context" and isinstance(payload, dict):
+            turns += 1
+            version = payload.get("multi_agent_version")
+        elif kind == "response_item" and isinstance(payload, dict) and payload.get("type") == "additional_tools":
+            records += 1
+            agent_tools, unknown_tools = offered_agent_tools(payload, number)
+            offered.update(agent_tools)
+            unknown.update(unknown_tools)
+    require(cid is None or metadata is not None, "no native session identity in rollout")
+    return {"schema": MULTI_AGENT_SCHEMA, "cid": None if metadata is None else metadata.get("id"), "version": version,
+            "agent_tools": sorted(offered), "turns": turns, "tool_records": records,
+            **({"unknown_tools": sorted(unknown)} if unknown else {})}
 
 
 def main(argv=None):
@@ -503,11 +1014,14 @@ def main(argv=None):
     parser.add_argument("--rollout", required=True, help="Absolute path to the native session record")
     parser.add_argument("--cid", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "check", "admit", "events"):
+    for name in ("inspect", "check", "admit", "events", "multi-agent"):
         command = commands.add_parser(name)
         if name == "events":
             command.add_argument("--turn", choices=("current", "all"), default="current",
                                  help="List the latest started turn's attempts, or every turn's")
+            continue
+        if name == "multi-agent":
+            command.description = "Exit 2 when the session was offered sub-agent tools; the version alone is reported"
             continue
         command.add_argument("--requested-tier", default="default")
         if name == "check":
@@ -529,6 +1043,10 @@ def main(argv=None):
         if args.command == "events":
             print(encoded(exec_events(args.rollout, args.cid, args.turn)).decode())
             return 0
+        if args.command == "multi-agent":
+            state = multi_agent_state(args.rollout, args.cid)
+            print(encoded(state).decode())
+            return 2 if state["agent_tools"] or state.get("unknown_tools") or not state["tool_records"] else 0
         observation = inspect_codex(args.rollout, args.cid, args.requested_tier)
         if args.command == "check":
             result = check_profile(observation, args.model, args.effort, args.cwd, write_roots=args.write_root,

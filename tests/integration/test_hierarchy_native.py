@@ -34,7 +34,7 @@ def rollout(tmp_path, rows=None):
     return path
 
 
-def run_tool(path, *args):
+def run_tool(path, *args, cid=CID):
     # The reader runs no tool, so its PATH is an empty fake-bin dir and HOME a disposable folder: a stray
     # lookup of codex or ~/.codex would find nothing real.
     base = Path(path).parent
@@ -43,11 +43,11 @@ def run_tool(path, *args):
     env = {"PATH": str(base / "fake-bin"), "HOME": str(base / "home"), "CODEX_THREAD_ID": CID,
            "CODEX_SESSION_ID": CID, "LANG": os.environ.get("LANG", "C.UTF-8")}
     return subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--rollout", str(path),
-                           "--cid", CID, *args], text=True, capture_output=True, timeout=5, env=env)
+                           "--cid", cid, *args], text=True, capture_output=True, timeout=5, env=env)
 
 
-def invoke(path, *args, code=0):
-    proc = run_tool(path, *args)
+def invoke(path, *args, code=0, cid=CID):
+    proc = run_tool(path, *args, cid=cid)
     assert proc.returncode == code, proc.stdout + proc.stderr
     assert not proc.stderr, proc.stderr
     return json.loads(proc.stdout)
@@ -654,3 +654,358 @@ def test_events_read_a_file_change_item_keyed_by_path_and_a_declined_status(tmp_
     rows = [META, started("t1"), turn("t1"), completed_item("t1", change)]
     patches = invoke(rollout(tmp_path, rows), "events")["patch_applies"]
     assert [(p["paths"], p["success"], p["declined"]) for p in patches] == [([WORK + "/n0nce"], None, True)]
+
+
+# Item 9: Codex code mode, in the shapes native probe run 1 recorded (codex-cli 0.166.0). The model sends a
+# custom_tool_call named exec whose input is a JavaScript cell; its output is a list of input_text parts.
+
+CODE_MODE_SHAPE = "confirmed by native probe run 1 (codex-cli 0.166.0)"
+REJECTED = "patch rejected: writing outside of the project; rejected by user approval settings"
+NOT_A_FUNCTION = "TypeError: tools.exec_command is not a function"
+
+
+def attempt_command(target):
+    return "/usr/bin/python3 -I /probe/helper/native-probe-attempt.py %s/aegis-probe-%s %s" % (WORK, target, target)
+
+
+def helper_output(target, errno=None):
+    value = {"ok": errno is None, "path": "%s/aegis-probe-%s" % (WORK, target), "nonce": target}
+    if errno is not None:
+        value.update(errno=errno, error="OSError: [Errno %d] Read-only file system" % errno)
+    return json.dumps(value) + "\n"
+
+
+def cell(call, script):
+    return {"type": "response_item", "payload": {"type": "custom_tool_call", "status": "completed", "call_id": call,
+                                                 "name": "exec", "input": script}}
+
+
+def printed(call, *parts, failed=None):
+    """The cell's output: its header, one part per text() call and, after an uncaught throw, the Script error."""
+    texts = [("Script failed" if failed is not None else "Script completed") + "\nWall time 0.0 seconds\nOutput:\n",
+             *parts] + ([] if failed is None else ["Script error:\n" + failed])
+    return {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": call,
+                                                 "output": [{"type": "input_text", "text": text} for text in texts]}}
+
+
+def chunk(code, output, **extra):
+    value = {"chunk_id": "343926", "wall_time_seconds": 0.0, "exit_code": code, "original_token_count": 36,
+             "output": output, **extra}
+    return json.dumps({key: item for key, item in value.items() if item is not None}, separators=(",", ":"))
+
+
+def shell_call(command, options=""):
+    return "text(await tools.exec_command({cmd:%s%s}));\n" % (json.dumps(command), options)
+
+
+def patch_text(target):
+    return "*** Begin Patch\n*** Add File: %s/aegis-probe-%s\n+aegis-native-probe %s\n*** End Patch" % (
+        WORK, target, target)
+
+
+def patch_call(target):
+    return "text(await tools.apply_patch(%s));\n" % json.dumps(patch_text(target))
+
+
+def caught(statement, catch="text(String(error));"):
+    return "try {\n  %s} catch (error) {\n  %s\n}\n" % (statement, catch)
+
+
+def code_rows(*records):
+    return [META, started("t1"), turn("t1"), *records]
+
+
+def shells(result):
+    return [(e["call_id"], e["command"], e["exit_code"], e["status"], e["source"])
+            for e in result["command_executions"]]
+
+
+def test_code_mode_lists_each_exec_command_call_with_its_own_exit_code(tmp_path):
+    rows = code_rows(cell("c0", "text(ALL_TOOLS.filter(x => /exec_command/.test(x.name)));\n"), printed("c0", "[]"),
+                     cell("c1", shell_call(attempt_command("in")) + shell_call(attempt_command("out"))),
+                     printed("c1", chunk(0, helper_output("in")), chunk(1, helper_output("out", 30))))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert shells(result) == [("c1", attempt_command("in"), 0, "completed", "code_mode"),
+                              ("c1", attempt_command("out"), 1, "failed", "code_mode")]
+    refused = result["command_executions"][1]
+    assert refused["aggregated_output"] == helper_output("out", 30)
+    assert refused["command_text"] == attempt_command("out") and refused["shape"] == CODE_MODE_SHAPE
+    assert (refused["line"], refused["call_line"], len(refused["sha256"])) == (7, 6, 64)
+    assert result["patch_applies"] == [] and result["code_mode_unparsed"] == []
+
+
+def test_a_typed_item_completed_record_wins_over_the_code_mode_parse(tmp_path):
+    typed_shell = {"type": "CommandExecution", "id": "exec-1", "status": "completed", "exit_code": 0,
+                   "command": ["/usr/bin/zsh", "-lc", attempt_command("in")], "aggregated_output": helper_output("in")}
+    typed_patch = {"type": "FileChange", "id": "exec-2", "status": "completed", "stdout": "Success.", "stderr": "",
+                   "changes": {"%s/aegis-probe-in" % WORK: {"type": "add", "content": "aegis-native-probe in\n"}}}
+    rows = code_rows(cell("c1", shell_call(attempt_command("in")) + shell_call(attempt_command("out"))),
+                     completed_item("t1", typed_shell),
+                     printed("c1", chunk(0, helper_output("in")), chunk(1, helper_output("out", 30))),
+                     cell("c2", patch_call("in") + patch_call("out")), completed_item("t1", typed_patch),
+                     printed("c2", "{}", failed=REJECTED))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert shells(result) == [("exec-1", ["/usr/bin/zsh", "-lc", attempt_command("in")], 0, "completed",
+                               "item_completed"),
+                              ("c1", attempt_command("out"), 1, "failed", "code_mode")]
+    assert [(p["call_id"], p["paths"], p["success"], p["source"]) for p in result["patch_applies"]] == [
+        ("exec-2", ["%s/aegis-probe-in" % WORK], True, "item_completed"),
+        ("c2", ["%s/aegis-probe-out" % WORK], False, "code_mode")]
+
+
+def test_a_script_error_ends_a_plain_cell_so_its_later_calls_never_ran(tmp_path):
+    rows = code_rows(cell("c1", "".join(patch_call(target) for target in ("in", "out", "git", "home"))),
+                     printed("c1", "{}", failed=REJECTED))
+    patches = invoke(rollout(tmp_path, rows), "events")["patch_applies"]
+    assert [(p["paths"], p["success"], p["status"], p["stdout"], p["stderr"], p["declined"]) for p in patches] == [
+        (["%s/aegis-probe-in" % WORK], True, "completed", "{}", None, False),
+        (["%s/aegis-probe-out" % WORK], False, "failed", None, REJECTED, False)]
+
+
+def test_a_caught_error_prints_one_part_per_call(tmp_path):
+    loop = ('const commands = [\n%s,\n%s\n];\nfor (const cmd of commands) {\n  try {\n    text(await '
+            'tools.exec_command({cmd}));\n  } catch (error) {\n    text({cmd, error: String(error)});\n  }\n}\n'
+            % (json.dumps(attempt_command("in")), json.dumps(attempt_command("out"))))
+    rows = code_rows(cell("c1", caught(patch_call("git")) + caught(patch_call("home"))),
+                     printed("c1", REJECTED, REJECTED),
+                     cell("c2", loop),
+                     printed("c2", *[json.dumps({"cmd": attempt_command(target), "error": NOT_A_FUNCTION},
+                                                separators=(",", ":")) for target in ("in", "out")]),
+                     cell("c3", caught(shell_call(attempt_command("in")))), printed("c3", NOT_A_FUNCTION))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert [(p["paths"], p["success"], p["stderr"]) for p in result["patch_applies"]] == [
+        (["%s/aegis-probe-git" % WORK], False, REJECTED), (["%s/aegis-probe-home" % WORK], False, REJECTED)]
+    assert shells(result) == [("c2", attempt_command("in"), None, "unavailable", "code_mode"),
+                              ("c2", attempt_command("out"), None, "unavailable", "code_mode"),
+                              ("c3", attempt_command("in"), None, "unavailable", "code_mode")]
+    assert {e["stderr"] for e in result["command_executions"]} == {NOT_A_FUNCTION}
+
+
+@pytest.mark.parametrize("case", ["fewer-parts", "other-statement", "running-cell", "no-output", "header-disagrees",
+                                  "other-cmd-in-catch"])
+def test_code_mode_output_that_cannot_be_tied_to_its_calls_leaves_each_call_unpaired(tmp_path, case):
+    two = shell_call(attempt_command("in")) + shell_call(attempt_command("out"))
+    loop = ('const commands = [%s, %s];\nfor (const cmd of commands) { try { text(await tools.exec_command({cmd})); }'
+            ' catch (e) { text({cmd, error: String(e)}); } }\n' % (json.dumps(attempt_command("in")),
+                                                                     json.dumps(attempt_command("out"))))
+    swapped = [json.dumps({"cmd": attempt_command(target), "error": "x"}) for target in ("out", "in")]
+    running = {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c1",
+                                                    "output": "Script running with cell ID 4\nWall time 31.0 seconds"
+                                                              "\nOutput:\n"}}
+    disagrees = printed("c1", chunk(0, "a"), chunk(1, "b"))
+    disagrees["payload"]["output"].append({"type": "input_text", "text": "Script error:\nboom"})
+    script, output = {
+        "fewer-parts": (two, printed("c1", chunk(1, helper_output("out", 30)))),
+        "other-statement": (two + "text(ALL_TOOLS.length);\n", printed("c1", chunk(0, "a"), chunk(1, "b"), "3")),
+        "running-cell": (two, running),
+        "no-output": (two, None),
+        "header-disagrees": (two, disagrees),
+        "other-cmd-in-catch": (loop, printed("c1", *swapped)),
+    }[case]
+    rows = code_rows(cell("c1", script), *([] if output is None else [output]))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert shells(result) == [("c1", attempt_command(target), None, "unpaired", "code_mode")
+                              for target in ("in", "out")]
+    assert all(e["aggregated_output"] is None and e["stderr"] is None for e in result["command_executions"])
+
+
+@pytest.mark.parametrize("argument,reason", [
+    ("{cmd: 'echo single'}", "expected a string or number or name"),
+    ("{cmd: `echo template`}", "expected a string or number or name"),
+    ('{cmd: "echo \\x41"}', "a string literal JSON cannot decode"),
+    ('{cmd: "echo " + name}', "expected }"),
+    ("{cmd: name}", "cmd is not a string literal"),
+])
+def test_only_a_strict_double_quoted_literal_is_decoded(tmp_path, argument, reason):
+    rows = code_rows(cell("c1", "text(await tools.exec_command(%s));\n" % argument), printed("c1", chunk(0, "")))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert result["command_executions"] == []
+    assert result["code_mode_unparsed"] == [{"tool": "exec_command", "reason": reason, "turn_id": "t1",
+                                             "call_id": "c1", "line": 4}]
+
+
+def test_an_exec_command_option_is_kept_with_its_call(tmp_path):
+    options = ',yield_time_ms:1000,"shell":"/tmp/bash",login:false'
+    rows = code_rows(cell("c1", shell_call(attempt_command("out"), options)),
+                     printed("c1", chunk(1, helper_output("out", 30))))
+    entry = invoke(rollout(tmp_path, rows), "events")["command_executions"][0]
+    assert (entry["options"], entry["exit_code"], entry["status"]) == (["login", "shell", "yield_time_ms"], 1, "failed")
+
+
+def test_a_still_running_command_has_no_exit_code_and_code_mode_keeps_turn_attribution(tmp_path):
+    rows = code_rows(cell("c1", shell_call("sleep 600", ",yield_time_ms:1000,max_output_tokens:1000")),
+                     printed("c1", chunk(None, "", session_id=81995)), completed("t1"), started("t2"), turn("t2"))
+    assert invoke(rollout(tmp_path, rows), "events")["command_executions"] == []
+    every = invoke(rollout(tmp_path, rows), "events", "--turn", "all")["command_executions"]
+    assert [(e["turn_id"], e["command"], e["exit_code"], e["status"], e["options"]) for e in every] == [
+        ("t1", "sleep 600", None, "running", ["max_output_tokens", "yield_time_ms"])]
+
+
+# -- Codex multi-agent: whether a session was offered sub-agent tools ---------------------------------------------
+
+MULTI_AGENT = Path(__file__).resolve().parents[1] / "fixtures" / "hierarchy_native_multi_agent" / "v2.jsonl"
+V2_AGENT_TOOLS = ["collaboration." + name for name in ("followup_task", "interrupt_agent", "list_agents", "send_message",
+                                                      "spawn_agent", "wait_agent")]
+
+
+def live_records():
+    """The sanitized records of a live role session started with --disable multi_agent (see the fixture README)."""
+    return [json.loads(line) for line in MULTI_AGENT.read_text(encoding="utf-8").splitlines()]
+
+
+LIVE_CID = live_records()[0]["payload"]["id"]
+
+
+def offered_tools(records):
+    return next(record["payload"] for record in records if record["payload"].get("type") == "additional_tools")
+
+
+def without_collaboration(records):
+    tools = offered_tools(records)
+    tools["tools"] = [entry for entry in tools["tools"] if entry["name"] != "collaboration"]
+    return records
+
+
+def multi_agent_state(path, cid=LIVE_CID):
+    sys.path.insert(0, str(TOOL.parent))
+    import hierarchy_native
+
+    return hierarchy_native.multi_agent_state(str(path), cid)
+
+
+def test_a_live_session_offered_the_v2_agent_tools_reports_each_and_its_version():
+    assert multi_agent_state(MULTI_AGENT) == {"schema": "aegis.native-multi-agent/v1", "cid": LIVE_CID, "version": "v2",
+                                              "agent_tools": V2_AGENT_TOOLS, "turns": 1, "tool_records": 1}
+
+
+@pytest.mark.parametrize("version", [True, False])
+def test_without_the_collaboration_namespace_no_agent_tool_is_offered_and_a_version_is_only_reported(tmp_path, version):
+    records = without_collaboration(live_records())
+    if not version:
+        for record in records:
+            record["payload"].pop("multi_agent_version", None)
+    state = multi_agent_state(rollout(tmp_path, records))
+    assert (state["agent_tools"], state["version"], state["tool_records"]) == ([], "v2" if version else None, 1)
+
+
+def test_an_agent_tool_offered_outside_the_namespace_still_counts(tmp_path):
+    records = without_collaboration(live_records())
+    offered_tools(records)["tools"].append({"type": "function", "name": "spawn_agent"})
+    assert multi_agent_state(rollout(tmp_path, records))["agent_tools"] == ["spawn_agent"]
+
+
+def test_a_rollout_with_no_tools_record_offers_nothing_and_says_so(tmp_path):
+    records = [record for record in live_records() if record["payload"].get("type") != "additional_tools"]
+    state = multi_agent_state(rollout(tmp_path, records))
+    assert (state["agent_tools"], state["tool_records"], state["turns"]) == ([], 0, 1)
+
+
+@pytest.mark.parametrize("change,error", [
+    (lambda tools: tools.update(tools="collaboration"), "malformed additional_tools record at line 3"),
+    (lambda tools: tools["tools"].append({"type": "namespace", "name": "collaboration", "tools": None}),
+     "malformed additional_tools record at line 3"),
+    (lambda tools: tools["tools"].append({"type": "function"}), "malformed additional_tools record at line 3"),
+])
+def test_a_malformed_tools_record_fails_closed(tmp_path, change, error):
+    records = live_records()
+    change(offered_tools(records))
+    with pytest.raises(ValueError) as caught:
+        multi_agent_state(rollout(tmp_path, records))
+    assert str(caught.value) == error
+
+
+def test_multi_agent_state_needs_the_matching_session_identity():
+    with pytest.raises(ValueError) as caught:
+        multi_agent_state(MULTI_AGENT, CID)
+    assert str(caught.value) == "rollout identity does not match requested CID"
+
+
+@pytest.mark.parametrize("offered,code", [(True, 2), (False, 0)])
+def test_the_multi_agent_command_fails_only_when_agent_tools_were_offered(tmp_path, offered, code):
+    records = live_records() if offered else without_collaboration(live_records())
+    result = invoke(rollout(tmp_path, records), "multi-agent", code=code, cid=LIVE_CID)
+    assert result["agent_tools"] == (V2_AGENT_TOOLS if offered else []) and result["version"] == "v2"
+
+
+@pytest.mark.parametrize("script", [
+    lambda call: call + "/* unterminated",
+    lambda call: call.rstrip().rstrip(";") + " " + call,
+    lambda call: 'const commands = ["echo"] ' + call,
+])
+def test_malformed_javascript_is_never_paired_with_a_successful_output(tmp_path, script):
+    source = script(shell_call("echo"))
+    rows = code_rows(cell("c1", source), printed("c1", *[chunk(0, "echo")] * source.count("tools.exec_command")))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert all(entry["status"] == "unpaired" for entry in result["command_executions"])
+    assert all(entry["exit_code"] is None for entry in result["command_executions"])
+
+
+def test_code_mode_expansion_is_bounded_across_the_entire_cell(tmp_path):
+    commands = json.dumps(["echo"] * 40)
+    script = "const commands = %s;\n" % commands + '\n'.join(
+        'for (const cmd of commands) { text(await tools.exec_command({cmd})); }' for _ in range(40))
+    result = invoke(rollout(tmp_path, code_rows(cell("c1", script))), "events")
+    assert result["command_executions"] == []
+    assert result["code_mode_unparsed"][0]["reason"] == "code-mode cell exceeds 1000 calls"
+
+
+def test_a_typed_command_retains_the_options_of_the_call_it_covers(tmp_path):
+    typed = {"type": "CommandExecution", "id": "exec-1", "status": "failed", "exit_code": 1,
+             "command": ["/usr/bin/zsh", "-lc", attempt_command("out")],
+             "aggregated_output": helper_output("out", 30)}
+    rows = code_rows(cell("c1", shell_call(attempt_command("out"), ',workdir:"/tmp"')),
+                     completed_item("t1", typed), printed("c1", chunk(1, helper_output("out", 30))))
+    entries = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert len(entries) == 1
+    assert entries[0]["options"] == ["workdir"]
+
+
+def test_duplicate_typed_commands_cannot_drop_an_ambiguous_calls_options(tmp_path):
+    typed = {"type": "CommandExecution", "id": "exec-1", "status": "failed", "exit_code": 1,
+             "command": attempt_command("out"), "aggregated_output": helper_output("out", 30)}
+    source = shell_call(attempt_command("out")) + shell_call(attempt_command("out"), ',shell:"/tmp/wrapper"')
+    rows = code_rows(cell("c1", source), completed_item("t1", typed),
+                     completed_item("t1", {**typed, "id": "exec-2"}),
+                     printed("c1", chunk(1, helper_output("out", 30)), chunk(1, helper_output("out", 30))))
+    entries = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert len(entries) == 2
+    assert [entry.get("options") for entry in entries] == [["shell"], ["shell"]]
+
+
+def test_an_exec_chunk_with_an_error_field_cannot_prove_an_exit_code(tmp_path):
+    rows = code_rows(cell("c1", shell_call(attempt_command("out"))),
+                     printed("c1", chunk(1, helper_output("out", 30), error="incomplete process result")))
+    entry, = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert entry["status"] == "unknown" and entry["exit_code"] is None
+
+
+def test_multi_agent_command_refuses_absent_tool_catalog(tmp_path):
+    records = [record for record in live_records() if record["payload"].get("type") != "additional_tools"]
+    result = invoke(rollout(tmp_path, records), "multi-agent", code=2, cid=LIVE_CID)
+    assert result["tool_records"] == 0
+
+
+@pytest.mark.parametrize("tool", [
+    {"type": "function", "name": "new_agent_tool"},
+    {"type": "namespace", "name": "agents_v3", "tools": [{"name": "new_tool"}]},
+    {"type": "namespace", "name": "workers", "tools": [{"name": "launch"}]},
+])
+def test_an_unrecognized_tool_catalog_cannot_establish_agents_are_off(tmp_path, tool):
+    records = without_collaboration(live_records())
+    offered_tools(records)["tools"].append(tool)
+    result = invoke(rollout(tmp_path, records), "multi-agent", code=2, cid=LIVE_CID)
+    name = tool["name"] + ("." + tool["tools"][0]["name"] if tool["type"] == "namespace" else "")
+    assert result["unknown_tools"] == [name]
+
+
+@pytest.mark.parametrize("prefix", [
+    'const commands = ["echo"]; const commands = ["echo"]; ',
+    'const await = ["echo"]; ',
+    'const tools = ["echo"]; ',
+    'const text = ["echo"]; ',
+])
+def test_invalid_or_shadowed_code_mode_bindings_never_pair_outputs(tmp_path, prefix):
+    source = prefix + shell_call("echo")
+    rows = code_rows(cell("c1", source), printed("c1", chunk(0, "echo")))
+    entry, = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert entry["status"] == "unpaired" and entry["exit_code"] is None

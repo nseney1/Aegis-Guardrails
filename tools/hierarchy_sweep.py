@@ -11,6 +11,12 @@ session that ignored its mail is not retried in the same sweep, nor, with --dura
 its 90 minutes are only reported, because jobs go through `tools/hierarchy_jobs.py` and only root can
 rotate itself. An endpoint named with --skip is reported with its unread count and never woken. This runs nothing on its own schedule, and a read here means what `delivery` says it
 means: the adapter returned the message.
+
+Two more reports are judged from the mailbox's own files, with nothing kept between sweeps. `silent_roles`: an
+orchestrator, lane or decider whose completed turn read work it owes an answer to and that has published nothing
+since that turn began. Later receipt-only turns do not clear earlier unanswered work. `stalled_dispatches`: a lane that accepted a dispatch, has answered none of it, and has
+no unread mail and no running turn, even when a manually started turn left no wake receipts, so no wake will come.
+Neither changes `quiet`, which stays about mail.
 """
 from __future__ import annotations
 
@@ -39,6 +45,12 @@ ERRORS = (ValueError, OSError, UnicodeError, RecursionError)
 # wake receipt ledger (MAX_RECORDS) with one failure per pass.
 FAILED_START_LIMIT = 3
 START_BACKOFF = timedelta(seconds=300)
+# What each role owes an answer to: (sender role in its own team, message type). The Router acts through its own
+# tool and publishes nothing by design, so it is absent, like every role not listed.
+OWED = {"orchestrator": {("router", "info"), ("front-door", "info"), ("lane", "result"), ("lane", "review")},
+        "lane": {("orchestrator", "dispatch")},
+        "decider": {("orchestrator", "info")}}
+FINISHED = {"exited", "timed_out"}
 
 
 def profile_for(mailbox_root, endpoint, binding):
@@ -161,11 +173,11 @@ def endpoint_summary(mailbox, initiative, name, records, durable):
     # The summary has no generation on woken_unread and caps its IDs, so durable mode reads the receipts it came
     # from and the full unread set, each unread ID with when it was published.
     directory = initiative["delivery_dir"]
-    read = {identifier for receipt in mailbox.delivery_receipts(directory, "reads", name, records)
-            for identifier in receipt["message_ids"]}
+    reads = mailbox.delivery_receipts(directory, "reads", name, records)
+    read = {identifier for receipt in reads for identifier in receipt["message_ids"]}
     pending = {record["message"]["message_id"]: record["message"]["created_at"] for record in records.values()
                if record["message"]["to"] == name and record["message"]["message_id"] not in read}
-    return {**summary, "marker": mailbox.wake_marker(name), "pending": pending,
+    return {**summary, "marker": mailbox.wake_marker(name), "pending": pending, "reads": reads,
             "wakes": mailbox.delivery_receipts(directory, "wakes", name, records)}
 
 
@@ -174,7 +186,7 @@ def summaries(initiative, durable=False):
     records = mailbox.messages()
     found = {name: endpoint_summary(mailbox, initiative, name, records, durable)
              for name in sorted(mailbox.manifest["endpoints"])}
-    return found, mailbox.open_job_requests(records)
+    return found, mailbox.open_job_requests(records), records
 
 
 def fresh_summary(initiative, name):
@@ -186,12 +198,89 @@ def is_root(endpoint):
     return endpoint_parts(endpoint)[1] == "root"
 
 
+def by_time(receipts):
+    """Oldest first; the stable sort keeps write order between receipts stamped in the same instant."""
+    return sorted(receipts, key=lambda receipt: parse_time(receipt["at"]))
+
+
+def silent_role(name, summary, records):
+    """Retain work read in completed turns until the endpoint publishes an answer.
+
+    Later receipt-only turns cannot erase an earlier owed read. While the latest turn is unfinished, or its
+    marker exists, the endpoint can still answer, so no silent hold is raised. Read windows retain the background
+    launch rule: reads after the previous finish and up to this finish belong to this turn, even before its start
+    receipt. Only a publication at or after an owed read answers that read; an earlier publication cannot answer
+    work that the endpoint has not read yet.
+    """
+    owed = OWED.get(endpoint_parts(name)[1])
+    binding = summary["binding"]
+    if owed is None or binding is None or summary["marker"].exists():
+        return None
+    current = [wake for wake in summary["wakes"]
+               if (wake["generation"], wake["session"]) == (binding["generation"], binding["session"])]
+    started = by_time([wake for wake in current if wake["state"] == "started"])
+    finished = {wake["wake_id"]: wake for wake in current if wake["state"] in FINISHED}
+    if not started or started[-1]["wake_id"] not in finished:
+        return None
+    publications = [parse_time(record["message"]["created_at"]) for record in records.values()
+                    if record["message"]["from"] == name]
+    published = max(publications) if publications else None
+    for start in started:
+        finish = finished.get(start["wake_id"])
+        if finish is None:
+            continue
+        opened, closed = parse_time(start["at"]), parse_time(finish["at"])
+        earlier = [parse_time(wake["at"]) for wake in current
+                   if wake["state"] in FINISHED and wake["wake_id"] != start["wake_id"] and parse_time(wake["at"]) <= opened]
+        after = max(earlier) if earlier else None
+        team = endpoint_parts(name)[0]
+        work, first_read = [], None
+        for receipt in summary["reads"]:
+            at = parse_time(receipt["at"])
+            if (receipt["session"], receipt["generation"]) != (start["session"], start["generation"]) or at > closed \
+                    or (after is not None and at <= after) or (published is not None and at <= published):
+                continue
+            for identifier in receipt["message_ids"]:
+                message = records[identifier]["message"]
+                sender = endpoint_parts(message["from"])
+                if sender[0] == team and (sender[1], message["type"]) in owed:
+                    first_read = at if first_read is None else min(first_read, at)
+                    work.append({"message_id": identifier, "type": message["type"], "from": message["from"]})
+        # A refused publish writes nothing, so a role whose every answer was refused remains silent.
+        if not work:
+            continue
+        return {"endpoint": name, "wake_id": start["wake_id"], "started_at": start["at"], "finished_at": finish["at"],
+                "ended": finish["state"], "exit_code": finish.get("exit_code"), "read": work,
+                "silent_since": first_read.isoformat(timespec="microseconds").replace("+00:00", "Z")}
+    return None
+
+
+def stalled_dispatch(name, summary, records):
+    """The lane accepted a dispatch it has not answered, and nothing will wake it: no unread mail, no turn running,
+    including turns started manually with no sweep receipt. A session that died after accepting gets no further
+    wakes, so this cannot wait on a wake count. A result clears it; a running wake suspends it."""
+    if endpoint_parts(name)[1] != "lane" or summary["unread_count"] or summary["marker"].exists():
+        return None
+    finished = by_time([wake for wake in summary["wakes"] if wake["state"] in FINISHED])
+    last = finished[-1] if finished else None
+    # The mailbox's own closed set: a result, a review or a completed ack answers a dispatch.
+    closed, accepted = Mailbox.dispatch_history(records)
+    waiting = sorted((ack for ack in accepted if ack["from"] == name and ack["in_reply_to"] not in closed),
+                     key=lambda ack: (ack["created_at"], ack["message_id"]))
+    if not waiting:
+        return None
+    return {"endpoint": name, "wake_id": last["wake_id"] if last else None,
+            "finished_at": last["at"] if last else None,
+            "dispatches": [{"dispatch": ack["in_reply_to"], "accepted": ack["message_id"],
+                            "accepted_at": ack["created_at"]} for ack in waiting]}
+
+
 def sweep_round(initiatives, rows, tried, broken, dry_run, durable=False, skip=frozenset()):
     """One pass in priority order. Returns how many turns it started."""
     woken = 0
     for initiative in initiatives:
         try:
-            found, _ = summaries(initiative, durable)
+            found = summaries(initiative, durable)[0]
         except ERRORS as exc:
             if initiative["id"] not in broken:
                 broken.add(initiative["id"])
@@ -227,10 +316,13 @@ def root_time(binding):
 
 def remaining(initiatives, broken=None, rows=None):
     """Described from the mailboxes as they are now, because a round's own view goes stale as turns publish."""
-    still_unread, root_queue, root_sessions = [], [], {}
+    still_unread, root_queue, root_sessions, silent, stalled = [], [], {}, [], []
     for initiative in initiatives:
         try:
-            found, jobs = summaries(initiative)
+            # Durable summaries carry the receipts and marker the silent and stalled checks read.
+            found, jobs, records = summaries(initiative, durable=True)
+            judged = {name: (silent_role(name, summary, records), stalled_dispatch(name, summary, records))
+                      for name, summary in found.items()}
         except ERRORS as exc:
             if rows is not None and (broken is None or initiative["id"] not in broken):
                 rows.append({"initiative": initiative["id"], "state": "mailbox_error", "error": str(exc)[:512]})
@@ -247,7 +339,10 @@ def remaining(initiatives, broken=None, rows=None):
                     root_sessions[summary["binding"]["host"], summary["binding"]["session"]] = summary["binding"]
             elif summary["unread_count"]:
                 still_unread.append(entry)
-    return still_unread, root_queue, [root_time(binding) for binding in root_sessions.values()]
+            for held, into in zip(judged[name], (silent, stalled)):
+                if held is not None:
+                    into.append({"initiative": initiative["id"], **held})
+    return still_unread, root_queue, [root_time(binding) for binding in root_sessions.values()], silent, stalled
 
 
 def run(store_path, rounds, chosen, dry_run, lifecycle_path=None, *, durable=False, skip=()):
@@ -268,14 +363,15 @@ def run(store_path, rounds, chosen, dry_run, lifecycle_path=None, *, durable=Fal
             lifecycle = Lifecycle(lifecycle_path).status()
         except ERRORS + (TypeError, KeyError) as exc:
             lifecycle = {"state": "hold", "work_complete": False, "execution_enabled": False, "error": str(exc)}
-            still_unread, root_queue, root_times = remaining(initiatives, broken, rows)
+            still_unread, root_queue, root_times, silent, stalled = remaining(initiatives, broken, rows)
             return 3, {"rounds": 0, "quiet": False, "mail_quiet": not still_unread and not root_queue and not broken,
                        "work_complete": False, "lifecycle": lifecycle, "rows": rows, "still_unread": still_unread,
-                       "root_queue": root_queue, "root_time": root_times, "rotate_needed": []}
+                       "root_queue": root_queue, "root_time": root_times, "rotate_needed": [],
+                       "silent_roles": silent, "stalled_dispatches": stalled}
     completed = 0
     while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run, durable, skip):
         completed += 1
-    still_unread, root_queue, root_times = remaining(initiatives, broken, rows)
+    still_unread, root_queue, root_times, silent, stalled = remaining(initiatives, broken, rows)
     rotate = [{key: row[key] for key in ("initiative", "endpoint", "session")}
               for row in rows if row["state"] == "rotate_needed"]
     mail_quiet = not still_unread and not root_queue and not broken
@@ -288,7 +384,8 @@ def run(store_path, rounds, chosen, dry_run, lifecycle_path=None, *, durable=Fal
     return (0 if quiet else 3), {"rounds": completed, "quiet": quiet, "mail_quiet": mail_quiet,
                                  "work_complete": lifecycle["work_complete"], "lifecycle": lifecycle,
                                  "rows": rows, "still_unread": still_unread,
-                                 "root_queue": root_queue, "root_time": root_times, "rotate_needed": rotate}
+                                 "root_queue": root_queue, "root_time": root_times, "rotate_needed": rotate,
+                                 "silent_roles": silent, "stalled_dispatches": stalled}
 
 
 def main(argv=None):

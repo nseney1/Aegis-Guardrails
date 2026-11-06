@@ -302,7 +302,8 @@ def test_a_read_only_codex_role_matches_the_profile_that_worked_on_a_real_host(s
     assert argv[argv.index("-C") + 1] == str(setup.source)
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert "--ignore-user-config" in argv and "--json" in argv
-    for feature in ("shell_tool", "unified_exec", "multi_agent", "apps", "plugins", "memories", "goals"):
+    # multi_agent_v2 too: run 1's sessions were offered the v2 agent tools with only multi_agent disabled.
+    for feature in ("shell_tool", "unified_exec", "multi_agent", "multi_agent_v2", "apps", "plugins", "memories", "goals"):
         assert feature in [argv[index + 1] for index, word in enumerate(argv) if word == "--disable"]
     config = codex_config(argv)
     assert config["approval_policy"] == "never"
@@ -602,10 +603,15 @@ def unbound(setup, endpoint):
     return invoke(setup.root, "status")["bindings"][endpoint] is None
 
 
-def root_args(setup, host, session=ROOT_SESSION, actor="root-1"):
-    return ["-I", "-B", str(setup.source / "tools" / "hierarchy_mailbox.py"), "--root", str(setup.root), "serve",
+ROOT_TOOLS = ["root_decide", "team_status", "team_pending", "team_request"]
+ROOT_READS = "loop_state and evidence are only for ROOT's decision adapter, with its lifecycle and actor"
+
+
+def root_args(setup, host, session=ROOT_SESSION, actor="root-1", reads=()):
+    # ROOT's own entry, which also carries the read-only --loop-state and --evidence the pinned mailbox CLI cannot.
+    return ["-I", "-B", str(setup.source / "tools" / "hierarchy_mailbox_mcp.py"), "--root", str(setup.root), "serve",
             "--endpoint", "pilot/root", "--host", host, "--session", session, "--generation", "1",
-            "--lifecycle", setup.lifecycle, "--actor", actor]
+            "--lifecycle", setup.lifecycle, "--actor", actor, *reads]
 
 
 def call_server(definition, calls):
@@ -626,7 +632,7 @@ def test_root_with_a_journal_gets_a_decision_connection_that_records_root_decide
     definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]
     assert definition == {"command": "/usr/bin/python3", "args": root_args(team, "claude-code")}
     assert Path(role["connection"]).name == "pilot%2Froot-g1.json"
-    assert start_connection(role["connection"], "aegis_decision") == {"root_decide"}
+    assert start_connection(role["connection"], "aegis_decision") == set(ROOT_TOOLS)
     value = lifecycle_request("feature-1")
     team.ledger.publish(value)
     [answer] = call_server(definition, [("root_decide", {
@@ -640,9 +646,10 @@ def test_root_with_a_journal_gets_a_decision_connection_that_records_root_decide
 def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_file(team, tmp_path):
     tomllib = pytest.importorskip("tomllib", reason="Codex settings are read with tomllib, Python 3.11+")
     role = team.add_role("pilot/root", "codex-cli", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
+    # ROOT runs with approval_policy "never", so each enabled tool, the read tools too, carries its approve entry.
     assert tomllib.loads(role["mcp_config"]) == {"mcp_servers": {"aegis_decision": {
         "command": "/usr/bin/python3", "args": root_args(team, "codex-cli"), "required": True,
-        "enabled_tools": ["root_decide"], "tools": {"root_decide": {"approval_mode": "approve"}}}}}
+        "enabled_tools": ROOT_TOOLS, "tools": {name: {"approval_mode": "approve"} for name in ROOT_TOOLS}}}}
     assert json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]["args"] == root_args(team, "codex-cli")
     (tmp_path / "native").mkdir()
     native = Setup(tmp_path / "native")
@@ -656,6 +663,57 @@ def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_f
 def test_root_without_a_journal_keeps_its_binding_only_answer(team):
     role = team.add_role("pilot/root", session=ROOT_SESSION)
     assert role == {"endpoint": "pilot/root", "host": "claude-code", "session": ROOT_SESSION, "generation": 1}
+
+
+def test_roots_enabled_tools_are_its_adapters_own_list(team):
+    """The Codex allow-list and the adapter's tools/list come from the same registry entry, so neither drifts."""
+    tomllib = pytest.importorskip("tomllib", reason="Codex settings are read with tomllib, Python 3.11+")
+    role = team.add_role("pilot/root", "codex-cli", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
+    enabled = tomllib.loads(role["mcp_config"])["mcp_servers"]["aegis_decision"]["enabled_tools"]
+    definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]
+    frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+              {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+    listed = subprocess.run([definition["command"], *definition["args"]], capture_output=True, text=True, timeout=20,
+                            input="".join(json.dumps(f) + "\n" for f in frames),
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert enabled == [tool["name"] for tool in json.loads(listed.stdout.splitlines()[1])["result"]["tools"]]
+
+
+def test_root_given_the_loop_state_and_evidence_reads_them_through_its_connection(team, tmp_path):
+    state_dir, evidence = tmp_path / "loop", tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "init.json").write_text("{}")
+    role = team.add_role("pilot/root", "codex-cli", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1",
+                         loop_state=str(state_dir), evidence=str(evidence))
+    definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]
+    assert definition["args"] == root_args(team, "codex-cli", reads=["--loop-state", str(state_dir),
+                                                                     "--evidence", str(evidence)])
+    [answer] = call_server(definition, [("team_status", {})])
+    status = json.loads(answer["result"]["content"][0]["text"])
+    # The loop has not run yet, so its folder has no status file; the evidence folder holds one file.
+    assert status["loop"]["state"] == "absent"
+    assert (status["evidence"]["present"], status["evidence"]["files"]) == (True, 1)
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize("endpoint,changes,error", [
+    ("pilot/root", {"loop_state": "<loop>"}, ROOT_READS),
+    ("pilot/root", {"evidence": "<loop>"}, ROOT_READS),
+    ("pilot/root", {"lifecycle": "<journal>", "actor": "root-1", "loop_state": "relative/loop"},
+     "path must be absolute without traversal"),
+    ("pilot/root", {"lifecycle": "<journal>", "actor": "root-1", "evidence": 7}, "invalid evidence"),
+    ("pilot/root", {"lifecycle": "<journal>", "actor": "root-1", "loop_state": ""}, "invalid loop_state"),
+    ("pilot/orchestrator", {"loop_state": "<loop>"}, ROOT_READS),
+    ("pilot/decider", {"lifecycle": "<journal>", "actor": "decider-1", "evidence": "<loop>"}, ROOT_READS),
+    ("pilot/router", {"lifecycle": "<journal>", "loop_state": "<loop>"}, ROOT_READS),
+])
+def test_loop_state_and_evidence_go_only_to_roots_decision_adapter(team, endpoint, changes, error):
+    swap = {"<journal>": team.lifecycle, "<loop>": str(team.tmp / "loop")}
+    changes = {key: swap.get(value, value) if isinstance(value, str) else value for key, value in changes.items()}
+    session = ROOT_SESSION if endpoint == "pilot/root" else str(uuid.uuid4())
+    refused = team.add_role(endpoint, session=session, cwd=str(team.tmp), expect=2, **changes)
+    assert refused["error"] == error
+    assert unbound(team, endpoint) and not (team.base / "connections").exists()
 
 
 @pytest.mark.parametrize("changes,error", [

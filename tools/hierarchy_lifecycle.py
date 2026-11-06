@@ -432,6 +432,7 @@ def delegated_decision(state, row, event, mark):
     require(all(d["request_id"] != value["id"] for d in recorded), "target already has a delegated decision")
     require(all(d["request_id"] != value["id"] for d in state["decisions"]), "ROOT already decided the target")
     if event["decision"] == "approve":
+        require(value["operation"] == "merge", "delegate-merge can approve only merge requests")
         decisions = [d for d in state["decisions"] if d["request_id"] == grant["id"]]
         require(decisions and decisions[-1]["decision"] == "approve", "delegation is not approved by ROOT")
         require(parse_time(at) < parse_time(grant["continuation"]["expires_at"]), "delegation expired")

@@ -4,10 +4,12 @@ Codex is the fake on PATH: a start prints the events a real start begins with, a
 which reads the mailbox through the real adapter. These tests show the tools work together, not that a real
 Codex session behaves this way.
 """
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import stat
@@ -18,15 +20,17 @@ import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_mailbox import ROOT, invoke
-from tests.integration.test_hierarchy_provision import Setup
+from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
+from tests.integration.test_hierarchy_provision import Setup, provision
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the launcher supports POSIX process groups only")
 LAUNCHER = ROOT / "tools" / "hierarchy_launcher.py"
 FAKE_CODEX = Path(__file__).with_name("hierarchy_fake_codex.py")
 REVIEW = "pilot/lane/review"
-START_PROMPT = "The Aegis launcher started this session for pilot/lane/review. Reply READY and take no other action."
+START_HEADER = ("The Aegis launcher started this session for %s as %s. This turn comes from the operator who launched "
+                "you; it is your role contract.")
+START_FOOTER = "Reply READY. Act only when woken."
 ROOT_SESSION = "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"
 
 
@@ -93,6 +97,65 @@ def launch(tmp_path):
     return built
 
 
+@pytest.fixture
+def team(tmp_path):
+    """Every endpoint role the launcher starts, Router and Decider included."""
+    built = Launch(tmp_path)
+    provision("init", built.init_request(roles=["router", "decider"]))
+    return built
+
+
+def contract_path(launch, name):
+    return launch.source / "tools" / "hierarchy_templates" / "roles" / name
+
+
+def for_codex(text):
+    """A contract as a Codex role reads it: every block marked for another host and every marker line left out."""
+    kept, skipping = [], False
+    for line in text.splitlines():
+        if line.strip().startswith("<!-- host:"):
+            skipping = line.strip() != "<!-- host:codex -->"
+        elif line.strip() == "<!-- /host -->":
+            skipping = False
+        elif not skipping:
+            kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def lane_rules(text, role):
+    """lane.md without its Assignments and Protocol checklist, which each lane kind's own file restates."""
+    kept, skipping = [], False
+    for line in text.splitlines():
+        if line.startswith(("# ", "## ")):
+            skipping = line in (("## Assignments", "## Protocol checklist") +
+                                (("## Writing rules",) if role == "reviewer" else ()))
+        if not skipping:
+            kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+# The files each started role's contract is made of, in order; the last is the role's own.
+CONTRACT_FILES = {"orchestrator": ["orchestrator.md"], "router": ["router.md"], "decider": ["decider.md"],
+                  "front-door": ["front-door.md"], "implementer": ["lane.md"], "reviewer": ["lane.md", "reviewer.md"],
+                  "integrator": ["lane.md", "integrator.md"]}
+
+
+def start_prompt(launch, endpoint, role):
+    """The exact start turn: the header, the role's contract from the pinned source as a Codex role reads it (lane.md's
+    shared rules first for a reviewer or an integrator), then the instruction to wait."""
+    names = CONTRACT_FILES[role]
+    parts = [for_codex(contract_path(launch, name).read_text(encoding="utf-8")) for name in names]
+    if len(names) > 1:
+        parts[0] = lane_rules(parts[0], role)
+    return "\n\n".join([START_HEADER % (endpoint, role), *parts, START_FOOTER])
+
+
+def references(launch, role):
+    return [{"path": str(contract_path(launch, name)),
+             "sha256": hashlib.sha256(contract_path(launch, name).read_bytes()).hexdigest()}
+            for name in CONTRACT_FILES[role]]
+
+
 def census(session):
     rows = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,stat=,args="], capture_output=True, text=True, timeout=10).stdout
     return [int(line.split()[0]) for line in rows.splitlines()
@@ -123,7 +186,8 @@ def test_start_runs_the_start_argv_once_binds_the_session_and_records_it(launch)
     assert profile["session"] == thread and profile["argv"][-2:] == ["resume", thread]
     assert Path(answer["connection"]).is_file()
     started = [json.loads(line) for line in launch.codex_log.read_text().splitlines()]
-    assert len(started) == 1 and started[0]["argv"][-1] == START_PROMPT and "resume" not in started[0]["argv"]
+    assert len(started) == 1 and started[0]["argv"][-1] == start_prompt(launch, REVIEW, "reviewer")
+    assert "resume" not in started[0]["argv"]
     assert started[0]["cwd"] == str(launch.source)
     assert '"thread.started"' in Path(answer["log"]["stdout"]).read_text()
     [record] = launch.records()
@@ -134,6 +198,160 @@ def test_start_runs_the_start_argv_once_binds_the_session_and_records_it(launch)
     # No temporary record name and no start lock outlive the start.
     assert sorted(entry.name for entry in folder.iterdir()) == sorted([path.name, "logs"])
     assert stat.S_IMODE((launch.base / "launches").stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("endpoint,role,name", [
+    ("pilot/orchestrator", "orchestrator", "orchestrator.md"),
+    ("pilot/router", "router", "router.md"),
+    ("pilot/decider", "decider", "decider.md"),
+    ("pilot/front-door", "front-door", "front-door.md"),
+    ("pilot/lane/f2", "implementer", "lane.md"),
+    ("pilot/lane/review", "reviewer", "reviewer.md"),
+    ("pilot/lane/integration", "integrator", "integrator.md"),
+])
+def test_each_launched_role_starts_with_its_contract_inline(team, endpoint, role, name):
+    answer = team.start(endpoint=endpoint)
+    assert answer["state"] == "bound", answer
+    [started] = [json.loads(line) for line in team.codex_log.read_text().splitlines()]
+    prompt = started["argv"][-1]
+    assert prompt == start_prompt(team, endpoint, role)
+    assert prompt.startswith(START_HEADER % (endpoint, role) + "\n\n") and prompt.endswith("\n\n" + START_FOOTER)
+    assert "take no other action" not in prompt
+    raw = contract_path(team, name).read_bytes()
+    assert answer["contract"] == {"path": str(contract_path(team, name)), "sha256": hashlib.sha256(raw).hexdigest()}
+    assert answer["contracts"] == references(team, role) and answer["contracts"][-1] == answer["contract"]
+    assert team.records(endpoint)[-1]["argv"][-1] == prompt
+
+
+# Instructions only a Claude host can follow: its self-stop, its messaging tool and its environment variables.
+CLAUDE_ONLY = ("claude stop", "SendMessage", "CLAUDE_")
+
+
+@pytest.mark.parametrize("endpoint", ["pilot/orchestrator", "pilot/router", "pilot/decider", "pilot/front-door",
+                                      "pilot/lane/f2", "pilot/lane/review", "pilot/lane/integration"])
+def test_a_codex_role_is_sent_no_claude_only_instruction_and_no_host_marker(team, endpoint):
+    assert team.start(endpoint=endpoint)["state"] == "bound"
+    [started] = [json.loads(line) for line in team.codex_log.read_text().splitlines()]
+    argv = "\n".join(started["argv"])
+    assert [phrase for phrase in CLAUDE_ONLY if phrase in argv] == []
+    assert "<!-- host:" not in argv and "<!-- /host -->" not in argv
+    if endpoint.startswith("pilot/lane/") or endpoint == "pilot/orchestrator":
+        # In their place a Codex lane or orchestrator is told how its turn ends.
+        assert "Never run a command to stop a session" in started["argv"][-1]
+
+
+@pytest.mark.parametrize("endpoint,own,checklist", [
+    ("pilot/lane/review", "# Reviewer role", "A bare `ack`"),
+    ("pilot/lane/integration", "# Integrator role", "An Integrator writes, so add `readiness`"),
+])
+def test_a_reviewer_or_integrator_gets_the_shared_lane_rules_but_only_its_own_checklist(team, endpoint, own, checklist):
+    answer = team.start(endpoint=endpoint)
+    prompt = answer["argv"][-1]
+    for shared in ("# Shared lane rules", "Execute exactly one hash-bound assignment", "**Hashes and times, T92.**",
+                   "**Deadline, T111 (3), T117 and T126 (1).**"):
+        assert prompt.index(shared) < prompt.index(own), shared
+    assert checklist in prompt
+    assert "A writing lane adds `readiness` with exactly these 11 fields" not in prompt
+    assert prompt.count("## Assignments") == 1 and prompt.count("## Protocol checklist") == 1
+    assert prompt.index("## Protocol checklist") > prompt.index(own)
+    lane, kind = answer["contracts"]
+    assert lane["path"].endswith("/roles/lane.md") and kind == answer["contract"]
+
+
+def commit_contract(built, name, text):
+    """A pinned source whose role contract reads `text`."""
+    contract_path(built, name).write_text(text, encoding="utf-8")
+    git(built.source, "add", str(contract_path(built, name)))
+    git(built.source, "commit", "-qm", "a pinned source with an edited %s" % name)
+
+
+@pytest.mark.parametrize("change,error", [
+    (lambda text, lines: text + "\n<!-- host:claude -->\nClaude only.\n",
+     lambda path, lines: "unbalanced host markers in %s: the block opened at line %d is not closed" % (path, lines + 2)),
+    (lambda text, lines: "<!-- /host -->\n" + text,
+     lambda path, lines: "unbalanced host markers in %s: line 1 closes a block that is not open" % path),
+    (lambda text, lines: "<!-- host:claude -->\n<!-- host:codex -->\nx\n<!-- /host -->\n<!-- /host -->\n" + text,
+     lambda path, lines: "unbalanced host markers in %s: line 2 opens a block inside the one opened at line 1" % path),
+    (lambda text, lines: "<!-- host:gemini -->\nx\n<!-- /host -->\n" + text,
+     lambda path, lines: "invalid host marker in %s: line 1 names an unknown host: gemini" % path),
+    (lambda text, lines: "Read this <!-- host:claude --> inline.\n" + text,
+     lambda path, lines: "invalid host marker in %s: line 1: a host marker must stand alone on its line" % path),
+])
+def test_a_contract_with_unbalanced_or_invalid_host_markers_refuses_the_start(tmp_path, change, error):
+    built = Launch(tmp_path)
+    original = contract_path(built, "decider.md").read_text(encoding="utf-8")
+    commit_contract(built, "decider.md", change(original, len(original.splitlines())))
+    provision("init", built.init_request(roles=["decider"]))
+    refused = built.start(expect=2, endpoint="pilot/decider")
+    assert refused["error"] == error(contract_path(built, "decider.md"), len(original.splitlines()))
+    assert refused["state"] == "refused" and refused["session"] is None
+    assert not built.codex_log.exists() and built.binding("pilot/decider") is None
+
+
+def test_a_reviewer_is_refused_when_the_shared_lane_rules_are_unbalanced(tmp_path):
+    built = Launch(tmp_path)
+    commit_contract(built, "lane.md", "<!-- host:codex -->\n" + contract_path(built, "lane.md").read_text(encoding="utf-8"))
+    built.init()
+    refused = built.start(expect=2)
+    assert refused["error"].startswith("unbalanced host markers in %s: " % contract_path(built, "lane.md"))
+    assert not built.codex_log.exists() and built.binding() is None
+
+
+@pytest.mark.parametrize("marker", ["<!--host:claude-->", "<!-- HOST:claude -->", "<!-- / host -->"])
+def test_misspelled_host_markers_refuse_before_start(tmp_path, marker):
+    built = Launch(tmp_path)
+    commit_contract(built, "decider.md", marker + "\nClaude-only instructions.\n")
+    provision("init", built.init_request(roles=["decider"]))
+    refused = built.start(expect=2, endpoint="pilot/decider")
+    assert refused["error"] == ("invalid host marker in %s: line 1: a host marker must stand alone on its line"
+                                 % contract_path(built, "decider.md"))
+    assert not built.codex_log.exists() and built.binding("pilot/decider") is None
+
+
+@pytest.mark.parametrize("fence", ["```markdown", "~~~~markdown"])
+def test_fenced_marker_examples_are_literal_contract_text(tmp_path, fence):
+    built = Launch(tmp_path)
+    example = fence + "\n<!-- host:claude -->\nexample\n<!-- /host -->\n" + fence[:4 if fence[0] == "~" else 3]
+    commit_contract(built, "decider.md", example + "\n<!-- host:claude -->\nprivate instructions\n<!-- /host -->\n")
+    provision("init", built.init_request(roles=["decider"]))
+    prompt = built.start(endpoint="pilot/decider")["argv"][-1]
+    assert example in prompt
+    assert "private instructions" not in prompt
+
+
+def test_reviewer_start_omits_writer_operations_but_preserves_shared_evidence_rules(team):
+    prompt = team.start(endpoint=REVIEW)["argv"][-1]
+    for instruction in ("Before each commit", "Scan each path you will edit", "Remove build caches",
+                        "run `pwd` before your first Write", "Run `pwd` before the first Write", "**Lint and size"):
+        assert instruction not in prompt
+    assert "**Hashes and times, T92.**" in prompt
+    assert "**Deadline, T111 (3), T117 and T126 (1).**" in prompt
+
+
+def test_orchestrator_start_routes_physical_work_to_the_operator(team):
+    prompt = team.start(endpoint="pilot/orchestrator")["argv"][-1]
+    assert "Create writing worktrees manually" not in prompt
+    assert "Claim leases serially" not in prompt
+    assert "Only this role reads and updates GitHub" not in prompt
+    assert "`after_message_id`" in prompt
+
+
+@pytest.mark.parametrize("endpoint,role,name", [
+    ("pilot/decider", "decider", "decider.md"),
+    ("pilot/lane/f2", "implementer", "lane.md"),
+])
+def test_a_role_whose_contract_file_is_missing_is_refused_before_anything_runs(tmp_path, endpoint, role, name):
+    built = Launch(tmp_path)
+    missing = contract_path(built, name)
+    if missing.exists():
+        git(built.source, "rm", "-q", str(missing))
+        git(built.source, "commit", "-qm", "a pinned source without the %s contract" % role)
+    provision("init", built.init_request(roles=["decider"]))
+    refused = built.start(expect=2, endpoint=endpoint)
+    assert refused["error"] == "no role contract for %s: %s" % (role, missing)
+    assert refused["state"] == "refused" and refused["session"] is None
+    assert [row["state"] for row in built.records(endpoint)] == ["refused"]
+    assert not built.codex_log.exists() and built.binding(endpoint) is None
 
 
 def test_a_bound_endpoint_is_refused_and_the_refusal_is_recorded(launch):

@@ -1,6 +1,6 @@
 # Host-neutral hierarchy pilot prototype
 
-This source-checkout prototype supplies six role contracts, plain-file mailboxes,
+This source-checkout prototype supplies eight role contracts, plain-file mailboxes,
 stable endpoint bindings, checkpoint handoffs and a workspace controller. The stdlib-only
 helper is `tools/hierarchy_mailbox.py`; it is outside Aegis core and is not installed
 in the wheel. Nothing watches folders or tracks repository work for Aegis unless root starts
@@ -11,7 +11,8 @@ Host configuration, manager policy/membership and release gates are unchanged.
 
 To move live sessions or run a trial with real sessions, follow the [dogfood guide](hierarchy-dogfood.md).
 To take one feature through the M1 loop with real sessions, and induce its failure cases, follow the
-[M1 loop runbook](hierarchy-m1-loop-runbook.md).
+[M1 loop runbook](hierarchy-m1-loop-runbook.md). Its setup, start, status and cleanup steps run through one command,
+`tools/hierarchy_team.py`, described in [the team guide](hierarchy-team.md).
 
 | Tool | Root uses it to |
 | --- | --- |
@@ -26,6 +27,7 @@ To take one feature through the M1 loop with real sessions, and induce its failu
 | `tools/hierarchy_router.py` | Route ROOT-approved canonical requests to each team's orchestrator, and report what is held |
 | `tools/hierarchy_loop.py` | Keep routing, waking and running open jobs without a nudge, and report what waits on whom |
 | `tools/hierarchy_board.py` | Keep [board](workspace-board-contract.md) channels and grants, and read digests |
+| `tools/hierarchy_team.py` | Run one team from setup to cleanup with one config file ([team guide](hierarchy-team.md)) |
 
 ## Role contracts
 
@@ -53,7 +55,9 @@ flowchart LR
 `tools/hierarchy_templates/role-registry.json` records every role as data: its kind, the
 reads, writes, calls and approvals it may use, what it must never be given, its independence
 rule, model profile and who it reports to. Actions come from a closed vocabulary in
-`tools/hierarchy_roles.py`, and a role that both allows and prohibits an action is refused.
+`tools/hierarchy_roles.py`, and a role that both allows and prohibits an action is refused. The `reads`
+vocabulary includes `loop_status` (the loop's `status.json`) and `team_evidence` (a run's evidence folder), which
+ROOT's read tools need.
 
 What reads the registry at this tier:
 
@@ -64,7 +68,9 @@ What reads the registry at this tier:
   recorded as not applied. Whether Codex serves the tier is for the native probe to show.
 - **Lifecycle connections** come from each role's `provision.lifecycle_tools`: `router_status` for the
   Router and `decider_record` for the Decider. Every other role is refused `--lifecycle` and `--actor`
-  with "the <role> role has no lifecycle connection". ROOT keeps its decision adapter. The `serve`
+  with "the <role> role has no lifecycle connection". ROOT keeps its decision adapter, and its
+  `provision.decision_tools` lists the read tools that adapter offers beside `root_decide`. Only the decision
+  adapter may carry `decision_tools`, and each tool needs the reads it shows ROOT. The `serve`
   help text in `tools/hierarchy_mailbox.py` still calls `--lifecycle` and `--actor` ROOT only; it
   predates these connections and is pinned by the native foundation corpus.
 - **Every bind refuses one session for both sides of an independence rule**, such as an implementer
@@ -108,6 +114,25 @@ Host-neutral role prompts and hierarchy/lane briefs are under
 executable lane briefs after source and ownership checks. Every lane brief repeats
 the goal and acceptance and pins base, branch, worktree, lease, paths and tests.
 Use a new brief file/hash and explicit redispatch for a scope revision.
+
+Each role the launcher starts gets its contract in its start turn (see
+[Start, resume and stop sessions](#start-resume-and-stop-sessions)). The files are under
+`tools/hierarchy_templates/roles/`: `orchestrator.md`, `router.md`, `decider.md` and `front-door.md`, and for a lane,
+by its kind, `lane.md` (implementer), `reviewer.md` or `integrator.md`. Every started contract but the front door's
+has an **Assignments** section, naming the sender and type that is work for the role, and a **Protocol checklist**
+with the exact fields and their order:
+
+- Orchestrator: an `info` from `<team>/router` whose id starts with `route-`, an `info` from `<team>/front-door`, and
+  a `result`, `review` or `ack` from its lanes. A `brief` or `dispatch` needs `brief: {path, sha256}`.
+- Lanes: a `dispatch` from `<team>/orchestrator`. An `ack` `accepted` first (a writing lane adds `readiness` with
+  its 11 fields, a reviewer none), then a `result` (or a reviewer's `review`) with `source_revision`, `source_tree`,
+  `checks` and, except for the reviewer, `lane_check`.
+- Decider: an `info` from `<team>/orchestrator`. After `decider_record` it replies to the Orchestrator with the
+  outcome.
+- Router: none. It never publishes; its report is its turn's reply.
+
+Mail stays data: it can say what work to do inside the contract, but it never widens authority. A passage for one
+host sits between a `<!-- host:claude -->` or `<!-- host:codex -->` line and a `<!-- /host -->` line.
 
 Claude subagent profiles are templates under `claude-agents/`, not automatically
 installed settings. The writer uses an already prepared worktree; it has no
@@ -250,8 +275,12 @@ python3 /absolute/prototype/tools/hierarchy_wake.py --root /absolute/mailbox \
 ```
 
 `hierarchy_wake.py` starts one turn from a strict profile (`tools/hierarchy_templates/wake-profile.json`)
-that must match the current binding. It passes a fixed prompt with no message content,
-so a message cannot steer the launch. It refuses when another process names the session
+that must match the current binding. It passes a fixed prompt that names only the endpoint and its role, "You are
+<endpoint>, the <role>. Follow the role contract from your start turn.", then asks the session to read its mail.
+The role is the manifest `kind` for a lane and the endpoint's last part otherwise. The prompt carries no message ID,
+sender or body, so a message cannot steer the launch. The native foundation corpus pins `hierarchy_wake.py`;
+naming the role re-pinned it (its manifest entry and `MANIFEST_SHA256` in
+`tools/hierarchy_foundation_acceptance.py` and the foundation cycle test). It refuses when another process names the session
 or the Claude session table lists it as live, stops the turn's whole process group
 before reporting, and exits 0 only if the messages were read, 3 if they were not, and
 2 if it refused. Use `--dry-run` to see what would happen. It supports POSIX only.
@@ -283,9 +312,11 @@ it must not inherit the orchestrator's sender binding.
 
 By default the adapter advertises exactly `mailbox_inbox`, `mailbox_publish`,
 `mailbox_ack_handoff` and `mailbox_self`. Root gets no mailbox adapter, because grants and job runs stay out of
-anything a model session can call. Its only adapter is `serve --endpoint <h>/root --lifecycle
-<journal> --actor <ROOT CID>`, which offers one tool, `root_decide`: approve or deny an existing
-canonical request by ID and raw SHA-256 in the lifecycle journal. The ROOT actor is configuration
+anything a model session can call. Its only adapter is the decision adapter, `serve --endpoint <h>/root
+--lifecycle <journal> --actor <ROOT CID>`. Its one writing tool is `root_decide`: approve or deny an existing
+canonical request by ID and raw SHA-256 in the lifecycle journal. Beside it, the adapter offers the read-only tools
+ROOT's registry entry lists in `provision.decision_tools`: `team_status`, `team_pending` and `team_request` (see
+**ROOT's read tools** below). The ROOT actor is configuration
 and every answer says it is not authenticated. A replaced ROOT session, a successor that has not
 acknowledged its checkpoint and a ROOT fenced by lifecycle succession are refused before anything
 is written, and retrying the same `event_id` returns the original receipt. Sender identity and root come only from process startup;
@@ -309,7 +340,16 @@ inspect its own checkpoint before acknowledging it without a controller relay.
 `mailbox_publish` takes the message fields except `from`, `host`, `session` and
 `binding_generation`, which the adapter supplies. It validates nested fields with
 the same file protocol and cannot claim leases, edit source, run supplied commands
-or invoke manager policy. `mailbox_ack_handoff` accepts only `checkpoint_sha256`
+or invoke manager policy. Its schema types `readiness` (the 11 required fields, with
+`enforcement_tier` `advisory` or `best-effort`) and `result` (`source_revision`,
+`source_tree` and `checks` of `{check, outcome, reference}` with `outcome` `pass`,
+`fail`, `not_run` or `partial`, plus an optional `lane_check`). Both come from the
+pinned validator in `tools/hierarchy_mailbox.py`, a test compares them with it, and
+the validator stays the check. The tool's description gives the order for answering
+a dispatch: 1. an `ack` `accepted` in reply to it (a writing lane adds `readiness`, a
+reviewer none); 2. then a `result` or `review` in reply to the same dispatch; 3. on a
+refusal, read its text and fix exactly the field it names, never re-sending unchanged.
+`mailbox_ack_handoff` accepts only `checkpoint_sha256`
 and is available to a successor before its binding is ready. A restricted reviewer
 can thus receive, accept and report independently with source-read tools plus these
 narrowly scoped mailbox tools.
@@ -318,6 +358,45 @@ narrowly scoped mailbox tools.
 registry role, host, session and generation, whether the binding has acknowledged its checkpoint,
 and the tools offered. Like every other call it is refused for a replaced session, so an answer
 always means `current: true`. The identity is configuration (`authenticated: false`).
+
+**ROOT's read tools.** They change nothing and are marked `readOnlyHint`. Each reads the journal under its writer
+lock, as router `status` does, through `tools/hierarchy_team_view.py`; `hierarchy_team.py status` calls the same
+functions, so the owner and ROOT read one JSON contract.
+
+- `team_pending` returns `aegis.team-pending/v1`: one row per request ROOT owes a decision on, with `request_id`,
+  `request_sha256` (the journal's raw hash), `team`, `operation`, `phase`, `owner`, `paths`, `source`, `why` and
+  `root_decide` (`request_id`, `request_sha256`, `event_id_approve`, `event_id_deny`), so ROOT adds only the
+  decision and a reason. `why` is `awaiting_decision` (no ROOT decision, not routed, not closed), `escalated` (the
+  Decider escalated it; the row adds `delegation_id` and `escalation_reason`) or `within_delegation` (an undecided
+  merge a live delegation still covers; the row adds `delegation_id`). A `within_delegation` request is the
+  Decider's to decide first: once ROOT decides it, the Decider's decision is refused.
+- `team_status` returns `aegis.team-status/v1`: `loop` (`state`, `pass_id`, `finished_at`, `current_step`,
+  `step_started_at`, `interval`), `holds_by_act` (`root`, `owner`, `router`), `pending` (the ids `team_pending`
+  lists), `requests` (each id and its `state`), `delegated_decisions` (each with ROOT's last decision on its target)
+  and `evidence` (the folder, its file count, and the `SHA256SUMS` path and line count). `loop` and `evidence` are
+  null when the connection has no folder for them. `loop.state` is `absent` (no `status.json`), `fresh` or `stale`
+  (no pass finished and no step began within three intervals). It reads only the file, so it is not liveness;
+  `hierarchy_loop.py status` checks the loop's lock. A request's `state` is `awaiting_decision`,
+  `within_delegation`, `escalated`, `delegated_approved`, `approved`, `approval_expired`, `denied`, `delegation`,
+  `routed`, `closed` or `continuation_member`.
+- `team_request` takes a request's fields and returns `aegis.team-request/v1`: the canonical `raw` text, its
+  `sha256`, the exact publish `event` (id `publish-<id>`, the journal's current coordinator, ROOT's custody) and
+  `published`. The draft meets the journal's own checks on a copy of its state and writes nothing. ROOT cannot
+  publish: the owner publishes the draft with `hierarchy_team.py request`.
+
+The decision adapter runs from its own entry, because the pinned mailbox CLI cannot carry the two read-only
+folders:
+
+```sh
+python3 -I -B tools/hierarchy_mailbox_mcp.py --root /abs/mailbox serve --endpoint m1/root --host codex-cli \
+  --session <ROOT session> --generation 1 --lifecycle /abs/lifecycle --actor root-1 \
+  [--loop-state /abs/loop] [--evidence /abs/evidence]
+```
+
+That entry serves only `<h>/root`, and it still refuses the mailbox, workspace, board and source options. `add-role`
+for ROOT with `lifecycle` and `actor` writes a connection that runs it. The optional request keys `loop_state` and
+`evidence` (absolute paths, which need not exist yet) add `--loop-state` and `--evidence`; for any other role they
+are refused with "loop_state and evidence are only for ROOT's decision adapter, with its lifecycle and actor".
 
 **The write fence.** Every write checks, under the mailbox writer lock, that the configured sender
 is the endpoint's current binding, so a replaced session is refused. A write the session authors
@@ -596,6 +675,9 @@ python3 -I -B tools/hierarchy_loop.py ... once        # one pass
 python3 -I -B tools/hierarchy_loop.py ... status [--text]
 ```
 
+For a team run, [`hierarchy_team.py up`](hierarchy-team.md) starts the loop detached with the run's `CODEX_HOME`
+and checks its environment, `status` reads it, and `down` stops it.
+
 Each pass runs these tools as child processes, in order, and acts on nothing else:
 
 1. `hierarchy_router.py status`, to read the journal under its lock and learn the current router.
@@ -626,6 +708,11 @@ Among them:
   escalations, for the Router session or root.
 - Sweep rows such as `ignored_mail`, `wake_marker_held`, `start_failed`, `start_backoff`, root's queue
   and rotation; and jobs that need root (`job_<state>`).
+- `silent_role` and `stalled_dispatch` for root, one per row of the sweep's `silent_roles` and
+  `stalled_dispatches` (see [Run several initiatives](#run-several-initiatives) for the rules). The detail names
+  what the role read, or the dispatches it accepted, and its last wake. The sweep recomputes both from mailbox files
+  every pass, so a hold clears once its rule stops holding. The owner answers a silent role with one trusted turn,
+  `hierarchy_team.py turn` ([team guide](hierarchy-team.md)).
 - `start_failing` for the owner, once an endpoint failed to start in 3 passes in a row. The loop then
   skips that endpoint (`sweep --skip`) until the owner deletes `status.json`, which also clears the
   other counts. A malformed `status.json` restarts the counts with a one-pass `status_reset` hold.
@@ -666,13 +753,20 @@ Limits in M1:
   journal refuses and the Decider retries. The protected host qualifies only the original five roles,
   so a protected plan with a decider actor is refused.
 - Router `status` shows a request the Decider approved as `awaiting_decision`, because no ROOT decision
-  exists for it; the delegated approval is in the journal's `delegated_decisions`.
+  exists for it; the delegated approval is in the journal's `delegated_decisions`. ROOT's `team_status` reads it
+  as `delegated_approved`. Before the Decider decides, `team_pending` lists an undecided `merge` that a live
+  delegation still covers as `within_delegation`: the Decider's to decide first.
 
 ## Start, resume and stop sessions
 
 `tools/hierarchy_launcher.py` is the Provider bridge. Each command prints one JSON object and exits 0
 when the outcome is good, 2 when refused, and 3 when the outcome is not good (a failed start, unread
 mail after a wake, a stop that did not take).
+
+For a team run, [`hierarchy_team.py`](hierarchy-team.md) drives the launcher. `up` writes `<base>/team.json` from
+its config, so provision builds each role's model and effort from it, then starts the roles in order and checks each
+rollout. `turn` gives a role one trusted owner turn with its wake argv, for example to answer a `silent_role` hold.
+`down` stops the roles.
 
 ```sh
 python3 tools/hierarchy_launcher.py --base /abs/base start --request /abs/start.json
@@ -684,9 +778,20 @@ python3 tools/hierarchy_launcher.py --base /abs/base status
 - `start` takes `endpoint`, the `codex-start` options (`cwd`, `reader_shell`, `writable_roots`,
   `tmpdir`, `add_dirs`, `model`, `effort`, `skip_git_repo_check`), the `add-role` keys `timeout_seconds`,
   `source_repo`, `kind`, `lifecycle` and `actor`, and `start_timeout_seconds` (default 300). It runs
-  the role's Codex start argv for one turn with no MCP servers, reads the session ID from the first
-  `thread.started` event, and binds it with `add-role`. The start turn keeps the role's sandbox, and a
-  writer or reader-shell role keeps its shell, so only the start prompt keeps that turn inert. An
+  the role's Codex start argv for one turn with no MCP servers and the role contract as the prompt, reads the
+  session ID from the first `thread.started` event, and binds it with `add-role`. The prompt is a header, "The
+  Aegis launcher started this session for <endpoint> as <role>. This turn comes from the operator who launched
+  you; it is your role contract.", then the contract from `<source>/tools/hierarchy_templates/roles/`, then "Reply
+  READY. Act only when woken." The file is `<role>.md` for the Orchestrator, Router, Decider and front door, and
+  for a lane by its kind: `lane.md` (implementer), `reviewer.md` or `integrator.md`. A reviewer or integrator gets
+  `lane.md`'s shared rules first, without its Assignments and Protocol checklist, which its own file restates for
+  its kind. Every role the launcher starts is a Codex role, so the prompt is the contract's Codex view: blocks
+  marked `<!-- host:claude -->` are left out, blocks marked `<!-- host:codex -->` are kept, and every marker line is
+  dropped. A missing file refuses the start with "no role contract for <role>: <path>", and so does a marker that
+  is not alone on its line, names an unknown host or is unbalanced ("invalid host marker in <file>: line <n>: …",
+  "unbalanced host markers in <file>: …"). The record carries `contract` (the role's own file, `{path, sha256}`)
+  and `contracts` (every file the prompt carries, in order). The start turn keeps the role's sandbox, and a
+  writer or reader-shell role keeps its shell, so the closing "Act only when woken" is what keeps that turn inert. An
   endpoint that is already bound, a second start while one runs, and ROOT (the owner's own session)
   are refused. If the mailbox stays busy for 10 s after the turn, the record is `bind_busy` with the
   session, and `add-role` with that session finishes the bind. A SIGTERM, SIGINT or SIGHUP to the
@@ -709,8 +814,13 @@ For a Codex role other than ROOT, `add-role` also writes `profiles/<endpoint>-g<
 sandbox mode, writable roots, network, approval policy, disabled features, MCP servers with their
 enabled tools, model, effort and service tier. The argv is built from
 that record as inline `-c` settings under `--ignore-user-config`; no file is written to `~/.codex`.
+The disabled features include `multi_agent` and `multi_agent_v2`: live M1 sessions with only `multi_agent` off
+were still offered the v2 sub-agent tools. Whether Codex honours either flag under an account's managed settings
+is unverified; the native probe's `multi_agent` row and `hierarchy_team.py up` read each rollout for an offer.
 ROOT given `lifecycle` and `actor` gets a connection file for its decision adapter (`aegis_decision`)
-and, on Codex, the matching `mcp_config` setting, but no wake profile: the supervisor never wakes ROOT.
+and, on Codex, the matching `mcp_config` setting, but no wake profile: the supervisor never wakes ROOT. That
+setting enables `root_decide` and the read tools, each with an approve entry, because ROOT runs with
+`approval_policy="never"`.
 
 ## Run several initiatives
 
@@ -785,6 +895,33 @@ root's unread mail, open jobs and active time against its 90 minutes. Root reads
 with `inbox --mark-read --host <host> --session <session> --generation <n>`, giving its own
 binding, so its unread count means what it means for everyone else. A replaced root's read is
 not recorded.
+
+Every sweep also reports two lists, judged from the mailbox's own files with nothing kept between sweeps. Neither
+changes `quiet`, which stays about mail. [The loop](#run-the-loop) turns each row into a root hold.
+
+- `silent_roles`: an Orchestrator, lane or Decider whose latest finished wake read work it owes an answer to, and
+  that has published nothing since. Work is a message from its own team: for the Orchestrator an `info` from the
+  Router or the front door, or a `result` or `review` from a lane; for a lane a `dispatch` from the Orchestrator;
+  for the Decider an `info` from the Orchestrator. The Router publishes nothing by design and is exempt, as is every
+  other role. Only the latest started wake of the binding's current generation counts, and only once it has a
+  finish receipt and no wake marker remains. A read belongs to that wake when it has the wake's session and
+  generation, comes after the previous finished wake of the generation, and comes no later than this wake's finish.
+  The start receipt is not the bound, because a background wake writes it only once its launcher returns. A
+  publish counts from 5 s before the start receipt, or from the first read charged to the wake when that is
+  earlier. A row has `initiative`, `endpoint`, `wake_id`, `started_at`, `finished_at`, `ended`, `exit_code`,
+  `read` (each `message_id`, `type` and `from`) and `silent_since`. Any later publish, or a later wake, clears it.
+  A refused publish writes nothing, so a role whose every answer was refused stays silent.
+- `stalled_dispatches`: a lane that accepted a dispatch no `result`, `review` or `completed` ack has answered, with
+  no unread mail and no wake marker, and whose last finished wake ended after the acceptance. A session that died
+  after accepting gets no further wakes, so this cannot wait on a wake count. A row has `initiative`, `endpoint`,
+  `wake_id`, `finished_at` and `dispatches` (each `dispatch`, `accepted` and `accepted_at`). An answer, unread mail
+  or a running turn clears it.
+
+Known false negatives: work that arrives under a type outside that list; a partial answer, because any publish
+clears the silent hold; and a publish by an earlier turn within 5 s before a wake's start. A Decider that records
+with `decider_record` and sends no mail is reported silent, so its contract has it reply to the Orchestrator. A
+`stalled_dispatch` can also fire while a lane waits for the answer to its own question; the answer arrives as
+unread mail and clears it.
 
 The [workspace board](workspace-board-contract.md) carries information across initiatives
 through a server of its own, when a connection starts with `--board`. It cannot change bindings,

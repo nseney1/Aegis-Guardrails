@@ -28,6 +28,12 @@ An endpoint whose sweep row is `failed_to_start` in 3 passes in a row (for examp
 could not be written, which the durable sweep's own cap cannot count) gets an owner `start_failing` hold,
 and later passes give the sweep `--skip <endpoint>`. The skip lasts as long as that hold is in status.json:
 the owner clears it by deleting `<state-dir>/status.json` once the cause is fixed.
+
+The sweep's `silent_roles` (a role that read work it owes an answer to and published nothing) and
+`stalled_dispatches` (a lane that accepted a dispatch and has nothing that will wake it) become ROOT
+`silent_role` and `stalled_dispatch` holds. The sweep recomputes both from mailbox files every pass: a publication
+after an owed read clears silence, and a result clears its dispatch. A running turn suspends the reports; later
+receipt-only wakes do not erase unanswered work.
 """
 from __future__ import annotations
 
@@ -162,6 +168,22 @@ def run_child(tool, args):
     return proc.returncode, parsed if isinstance(parsed, dict) else None, proc.stderr.strip()[-DETAIL_LIMIT:]
 
 
+def silent_detail(row):
+    read = ", ".join("%s %s from %s" % (item["type"], item["message_id"], item["from"]) for item in row["read"])
+    if row["ended"] == "timed_out":
+        ended = "timed out"
+    else:
+        ended = "exited" if row["exit_code"] is None else "exited with code %s" % row["exit_code"]
+    return "read %s in wake %s (%s at %s) and has published nothing since %s" % (
+        read, row["wake_id"], ended, row["finished_at"], row["silent_since"])
+
+
+def stalled_detail(row):
+    accepted = ", ".join("dispatch %s at %s" % (item["dispatch"], item["accepted_at"]) for item in row["dispatches"])
+    return ("accepted %s but sent no result or review; its last wake %s ended at %s and nothing is unread or running, "
+            "so no wake will come" % (accepted, row["wake_id"], row["finished_at"]))
+
+
 def child_failure(step, code, stderr):
     """A hold for an exit the tool does not define: a crash, a kill, or output that is not its JSON."""
     if code < 0:
@@ -289,6 +311,11 @@ class Pass:
         for row in result["root_queue"]:
             self.hold("sweep", "root_queue", {"unread_count": row["unread_count"], "open_jobs": row["open_jobs"]},
                       "root", initiative=row["initiative"], endpoint=row["endpoint"])
+        # A sweep that predates these reports has none to give.
+        for kind, key, describe in (("silent_role", "silent_roles", silent_detail),
+                                    ("stalled_dispatch", "stalled_dispatches", stalled_detail)):
+            for row in result.get(key, []):
+                self.hold("sweep", kind, describe(row), "root", initiative=row["initiative"], endpoint=row["endpoint"])
         for row in result["root_time"]:
             if row["state"] == "rotate_now":
                 self.hold("sweep", "root_rotate", row, "root")

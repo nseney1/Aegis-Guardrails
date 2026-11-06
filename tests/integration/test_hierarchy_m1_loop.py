@@ -1,27 +1,35 @@
 """The M1 end-to-end loop on fixtures: owner request to Decider, plus the five failure cases.
 
 M1 definition: aegis-guides/v5.0-m1-definition-20261105.md, loop steps :60-67, failure cases :70-74. Each test
-names the lines it covers. The runbook for the real run is docs/hierarchy-m1-loop-runbook.md.
+names the lines it covers. The runbook for the real run is docs/hierarchy-m1-loop-runbook.md, and the owner's command
+for it is tools/hierarchy_team.py (docs/hierarchy-team.md).
+
+This rehearsal is the team command's integration test: every scenario is set up with `hierarchy_team.py init` from a
+team-run.json (recipes, store, initiative, journal, front door, writer slot, worktree, lease, checkouts and the
+preflight on the base), `root --session` for ROOT's decision connection and `up --no-loop` for the Router,
+Orchestrator, Decider, Reviewer and Implementer, each a Codex session the launcher starts and `up` checks. `--no-loop`
+leaves the passes to the test, which runs `hierarchy_loop.py once` so each step is observable; a silent role is
+answered with `turn`, an escalation with `approve`, and the happy path ends with `status` and `down`.
 
 Every tool is the real one, run as a child process: `hierarchy_lifecycle.py record` for the operator's publish,
 ROOT's decision connection (`root_decide`) for ROOT, `hierarchy_loop.py once` for routing, the durable sweep and
-run-open, `hierarchy_launcher.py start` for the lanes, `hierarchy_workspace.py` and `aegis team claim` for the
-operator's lease, and the mailbox adapter for every session write. The sessions are fake hosts: the fake host plays
-Claude roles and the fake Codex resumes into the fake host for launcher-started lanes. Each plan is the script a
-real session would follow; the commits a real Implementer would write are made by the test. Every child process,
-`aegis team claim` included, runs with the same sealed environment: PATH is only the fake binaries plus links to git
-and ps, Python is named by its absolute path (`sys.executable`) with PYTHONPATH set to this checkout for `aegis_cli`,
-and HOME, CODEX_HOME and CLAUDE_CONFIG_DIR are temporary, so no real model can start. These tests show the tools
-carry the loop together on fixtures, not that real sessions behave this way, and they support no enforcement claim
-(definition :83).
+run-open, `hierarchy_launcher.py` (through `up`) for the roles, and the mailbox adapter for every session write. The
+sessions are fakes: the fake Codex (in rollout mode, so `up` reads a rollout per role) resumes into the fake host,
+which plays each role's plan, and a wrapper plays ROOT's `approve` turn over ROOT's own connection. Each plan is the
+script a real session would follow; the commits a real Implementer would write are made by the test. Every child
+process runs with the same sealed environment: PATH is only the fake binaries plus links to git and ps (a guard fails
+any spawn that could reach a real codex), Python is named by its absolute path (`sys.executable`), and HOME,
+CODEX_HOME and CLAUDE_CONFIG_DIR are temporary, so no real model can start. These tests show the tools carry the loop
+together on fixtures, not that real sessions behave this way, and they support no enforcement claim (definition :83).
 
 How the fixture differs from a real run, beyond the fake hosts:
-- The first-turn transcript a real Codex lane writes is written by the test (`started`), because the meter reads it.
 - The Implementer's own test run (:64) is not done: its result says `lane_check: "not_run: fixture"`, and the red and
   green evidence is the Orchestrator's `targeted-tests` jobs on c1 and c2 instead.
 - Readiness is checked by the mailbox for the worktree root, the branch, the base revision and the lease expiry; the
   lease oid is checked for shape only. `Mailbox.readiness` in the pinned `tools/hierarchy_mailbox.py` never reads
   `lease_ref` in git, so a made-up oid of the right shape is accepted. That is a known product gap, not covered here.
+- The operator publishes with `hierarchy_lifecycle.py record` (the request bytes the fixtures hash); the team
+  command's own `request` is tested in test_hierarchy_team.py.
 
 Out of scope here, by design: CI on the branch and the owner's merge (:67). Neither can be faked honestly, so the
 runbook covers them and the owner records the CI run URL and the merge on the exact commit. The real-session pass
@@ -31,27 +39,25 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
-import stat
 import subprocess
 import sys
 import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_decider import Decider
 from tests.integration.test_hierarchy_jobs import JOBS, PACKET_SCHEMA, Shop, verified_evidence
-from tests.integration.test_hierarchy_lifecycle import raw_request, request
+from tests.integration.test_hierarchy_lifecycle import Ledger, raw_request, request
 from tests.integration.test_hierarchy_loop import World, holds
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, mailbox_snapshot
 from tests.integration.test_hierarchy_mailbox_mcp import payload
-from tests.integration.test_hierarchy_provision import provision
-from tests.integration.test_hierarchy_sweep import SealedFleet, started
+from tests.integration.test_hierarchy_sweep import SealedFleet
+from tests.integration.test_hierarchy_team import TEAM, TEAM_SETTINGS, fake_codex, seal_spawns, stub
+from tests.integration.test_hierarchy_workspace import Workspace
 
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
                                 reason="run-open reads /proc and the wake supports POSIX process groups only")
 LAUNCHER = ROOT / "tools" / "hierarchy_launcher.py"
-FAKE_CODEX = Path(__file__).with_name("hierarchy_fake_codex.py")
 IMPLEMENTER, REVIEWER = "pilot/lane/f2", "pilot/lane/review"
 BRANCH = "feature/pilot-f2"
 TEST_PATHS = ["tests/test_app.py", "tests/test_feature.py"]
@@ -92,9 +98,22 @@ HOLD_MAILBOX = ("import glob, sys, time\ndeadline = time.monotonic() + 25\nwhile
                 "    time.sleep(0.01)\nopen(%r, 'x').close()")
 
 
+@pytest.fixture(autouse=True)
+def sealed_spawns(tmp_path, monkeypatch):
+    """Every process a test here spawns gets a PATH on which any codex is a test fake (see test_hierarchy_team)."""
+    folder = tmp_path / "sealed-path"
+    folder.mkdir()
+    for tool in ("git", "ps"):
+        found = shutil.which(tool)
+        assert found, tool + " is needed by the tools under test"
+        (folder / tool).symlink_to(found)
+    seal_spawns(monkeypatch, folder)
+
+
 class Scenario(SealedFleet):
-    """One team, `pilot`: Router, Orchestrator, Decider and ROOT bound with the journal, a project repository, and
-    root's recipes. The lanes are started later, by the launcher, as the runbook orders it."""
+    """One team, `pilot`, set up as the owner sets one up: `hierarchy_team.py init`, `root` and `up --no-loop` from a
+    team-run.json, with a project repository on `develop`, root's recipes and the lane f2 worktree and lease. The
+    journal is the team's own; `ledger` writes to it as the operator CLI does."""
 
     flags, loop, once, status, inbox, woken = World.flags, World.loop, World.once, World.status, World.inbox, World.woken
     status_path = World.status_path
@@ -102,40 +121,73 @@ class Scenario(SealedFleet):
     publish = Shop.publish
 
     def __init__(self, tmp_path):
-        super().__init__(tmp_path)
-        (self.bin / "git").symlink_to(shutil.which("git"))
-        codex = self.bin / "codex"
-        codex.unlink()
-        codex.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE_CODEX), encoding="utf-8")
-        codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
         self.home = tmp_path / "home"
+        super().__init__(tmp_path)
         self.home.mkdir()
-        provision("init", self.init_request(roles=["router", "decider"]))
-        self.ledger = Decider(tmp_path)
-        journal = str(self.ledger.path)
-        self.add_role("pilot/front-door", cwd=str(tmp_path))
-        self.add_role("pilot/orchestrator", cwd=str(tmp_path))
-        self.router_role = self.add_role("pilot/router", cwd=str(tmp_path), lifecycle=journal)
-        self.add_role("pilot/decider", cwd=str(tmp_path), lifecycle=journal, actor="decider-1")
-        self.root_role = self.add_role("pilot/root", session="root-session", lifecycle=journal, actor="root-1")
+        (self.bin / "git").symlink_to(shutil.which("git"))
+        (self.bin / "codex").unlink()
+        fake_codex(self.bin)
+        stub(self.bin, "bwrap", 'echo "bwrap stub: the fixture recipes use sandbox none" >&2\nexit 1\n')
         self.checkout = self.make_project()
         self.worktree = tmp_path / "worktrees" / "f2"
-        self.register(self.checkout)
-        self.recipes_path = tmp_path / "recipes.json"
+        self.run = tmp_path / "run"
+        # The team's store, initiative base and loop folder, so the fixture's helpers read what the team command made.
+        self.workspace = Workspace(self.run)
+        self.base = self.run / "initiatives" / "pilot"
+        self.state_dir = self.run / "loop"
+        self.recipes_path = self.run / "recipes.json"
+        template = tmp_path / "recipes-template.json"
         tests = Shop.command(["$python", "-B", "-c", RUNNER, "$scratch/junit.xml", "$paths"],
                              require_clean=True, expects_tests=True, keep=["run/junit.xml"])
-        self.recipes = {"schema": "aegis.hierarchy-job-recipes/v1", "python": sys.executable, "path": ["/usr/bin", "/bin"],
-                        "identity": {"name": "Hierarchy Root", "email": "root@example.invalid"},
-                        "recipes": {"targeted-tests": tests}}
-        self.save_recipes()
-        self.state_dir = tmp_path / "loop-state"
-        self.threads = {}
+        template.write_text(json.dumps({"schema": "aegis.hierarchy-job-recipes/v1",
+                                        "python": "/REPLACE/WITH/dev-venv/bin/python", "path": ["/usr/bin", "/bin"],
+                                        "identity": {"name": "Aegis hierarchy root", "email": "root@example.invalid"},
+                                        "recipes": {"targeted-tests": tests}}), encoding="utf-8")
+        self.config_path = tmp_path / "team-run.json"
+        self.config_path.write_text(json.dumps({
+            "schema": "aegis.team-run/v1", "run": str(self.run), "codex_home": str(tmp_path / "codex-home"),
+            "source": str(self.source), "project": str(self.checkout), "base": git(self.checkout, "rev-parse", "HEAD"),
+            "branch": BRANCH,
+            "initiative": {"id": "pilot", "project": "aegis", "repository": "aegis", "priority": 5,
+                           "target_branch": "develop"},
+            "roles": ["router", "decider"],
+            "lanes": [{"id": "f2", "kind": "implementer", "paths": ["src/**", "tests/**"], "worktree": str(self.worktree)},
+                      {"id": "review", "kind": "reviewer"}],
+            "recipes": {"keep": ["targeted-tests"], "python": sys.executable,
+                        "commit_identity": {"name": "Hierarchy Root", "email": "root@example.invalid"},
+                        "template": str(template)},
+            "limits": {"writer_limit": 3, "heavy_limit": 3},
+            "preflight": {"recipes": ["targeted-tests"],
+                          "expect": {"targeted-tests": {"state": "completed", "failed": 0, "min_passed": 1}},
+                          "paths": {"targeted-tests": ["tests/test_app.py"]}},
+            "min_free_gb": 1, "loop": {"interval": 5}, "team": TEAM_SETTINGS}), encoding="utf-8")
+        self.team("init")
+        self.root_role = self.team("root", "--session", "root-session")
+        (tmp_path / "ledger").mkdir()
+        self.ledger = Ledger(tmp_path / "ledger", initialize=False)
+        self.ledger.path = self.run / "lifecycle"
+        self.started = self.team("up", "--no-loop")
+        self.threads = {row["endpoint"]: row["session"] for row in self.started["roles"]}
+        self.router_role = self.launch_records("pilot/router")[-1]
+        self.recipes = json.loads(self.recipes_path.read_text(encoding="utf-8"))
         self.decisions = 0
 
     # -- fixture plumbing -------------------------------------------------------------------------------------------
 
     def env(self):
-        return {**super().env(), "HOME": str(self.home), "TMPDIR": "/tmp"}
+        return {**super().env(), "HOME": str(self.home), "TMPDIR": "/tmp", "FAKE_CODEX_ROLLOUT": "1",
+                "FAKE_TEAM_LOG": str(self.tmp / "fake-team.log")}
+
+    def team(self, *words, expect=0, text=False):
+        """`hierarchy_team.py` with this scenario's config, in the sealed environment."""
+        proc = subprocess.run([sys.executable, "-I", "-B", str(TEAM), "--config", str(self.config_path), *words],
+                              capture_output=True, text=True, timeout=300, env=self.env())
+        assert proc.returncode == expect, proc.stdout[-6000:] + proc.stderr[-3000:]
+        assert not proc.stderr, proc.stderr
+        return proc.stdout if text else json.loads(proc.stdout.splitlines()[-1])
+
+    def evidence_file(self, name):
+        return json.loads((self.run / "evidence" / name).read_text(encoding="utf-8"))
 
     def save_recipes(self):
         self.recipes_path.write_text(json.dumps(self.recipes), encoding="utf-8")
@@ -151,9 +203,6 @@ class Scenario(SealedFleet):
         git(checkout, "commit", "-qm", "base")
         return checkout
 
-    def register(self, *checkouts):
-        self.workspace.run("update", {"initiative": "pilot", "source": "owner", "checkouts": [str(c) for c in checkouts]})
-
     def head(self, checkout=None):
         checkout = checkout or self.worktree
         return {"checkout": str(checkout), "commit": git(checkout, "rev-parse", "HEAD"),
@@ -168,16 +217,6 @@ class Scenario(SealedFleet):
         git(self.worktree, "commit", "-qm", message)
         return self.head()
 
-    def aegis(self, cwd, *arguments):
-        """`aegis` in the sealed environment: fake-only PATH, temporary HOME, this checkout on PYTHONPATH."""
-        env = {**self.env(), "PYTHONPATH": str(ROOT)}
-        for name in ("AEGIS_WORKSPACE", "AEGIS_MANAGER_CONFIG", "AEGIS_MANAGER_CONFIG_SHA256", "GITHUB_BASE_REF"):
-            env.pop(name, None)
-        proc = subprocess.run([sys.executable, "-m", "aegis_cli", *arguments, "--json"], cwd=cwd, env=env,
-                              capture_output=True, text=True, timeout=30)
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        return json.loads(proc.stdout)
-
     def launcher(self, *words, expect=0, thread=None):
         env = {**self.env(), "FAKE_CODEX_THREAD": thread or "", "FAKE_CODEX_LOG": str(self.tmp / "fake-codex.log")}
         proc = subprocess.run([sys.executable, "-I", str(LAUNCHER), "--base", str(self.base), *words],
@@ -185,16 +224,6 @@ class Scenario(SealedFleet):
         assert not proc.stderr, proc.stderr
         assert proc.returncode == expect, proc.stdout
         return json.loads(proc.stdout)
-
-    def start_lane(self, endpoint, cwd):
-        thread = "019a" + uuid.uuid4().hex[:28]
-        path = self.tmp / ("start-%s.json" % uuid.uuid4().hex)
-        path.write_text(json.dumps({"endpoint": endpoint, "cwd": str(cwd)}), encoding="utf-8")
-        answer = self.launcher("start", "--request", str(path), thread=thread)
-        assert (answer["state"], answer["session"]) == ("bound", thread), answer
-        started(self, "codex-cli", thread)  # the first turn's transcript, which the meter reads
-        self.threads[endpoint] = thread
-        return answer
 
     def launch_records(self, endpoint):
         folder = self.base / "launches" / endpoint.replace("/", "%2F")
@@ -299,24 +328,19 @@ def operator_publishes_and_root_approves(s):
 
 
 def operator_lease_and_worktree(s):
-    """Step 3, first half (:63): the operator grants the writer slot, adds the worktree and claims the lease, then
-    starts the Implementer with the launcher. This is the runbook's operator step, a deviation from the definition's
-    automatic provisioning (owner choice, 2026-11-05)."""
-    s.workspace.run("request", {"initiative": "pilot", "kind": "writer", "holder": IMPLEMENTER})
-    granted = s.workspace.run("grant-next", kind="writer")["granted"]
+    """Step 3, first half (:63): the operator's writer grant, worktree and Aegis lease, and the Implementer's start by
+    the launcher. `hierarchy_team.py init` and `up` did all four; this reads what they recorded. These are the
+    runbook's operator steps, a deviation from the definition's automatic provisioning (owner choice, 2026-11-05)."""
+    granted = s.evidence_file("slot-grant-f2.json")["granted"]
+    lease = s.evidence_file("lease-claim-f2.json")["lease"]
     base = git(s.checkout, "rev-parse", "HEAD")
-    s.worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(s.checkout, "worktree", "add", "-q", "-b", BRANCH, str(s.worktree), "develop")
-    lease = s.aegis(s.checkout, "team", "claim", "pilot-f2", "--paths", "src/**", "tests/**", "--owner", IMPLEMENTER,
-                    "--role", "implementer", "--branch", BRANCH)["lease"]
-    s.register(s.checkout, s.worktree)
-    started_lane = s.start_lane(IMPLEMENTER, s.worktree)
     readiness = {"worktree": str(s.worktree), "branch": BRANCH, "base_revision": base,
                  "lease_ref": "refs/aegis/lanes/pilot-f2", "lease_oid": lease["oid"],
                  "lease_expires_at": lease["expires_at"], "owned_paths": lease["paths"],
                  "scan_workspace": str(s.worktree), "scan_evidence": "not_run: fixture",
                  "enforcement_tier": "advisory", "hook_evidence": "not_observed: fixture"}
-    return {"granted": granted, "lease": lease, "base": base, "launch": started_lane, "readiness": readiness}
+    return {"granted": granted, "lease": lease, "base": base, "launch": s.launch_records(IMPLEMENTER)[-1],
+            "readiness": readiness}
 
 
 def orchestrator_dispatches(s, base):
@@ -362,8 +386,7 @@ def implementer_goes_green(s):
 
 def review_and_result(s, c1, c2):
     """Step 4 (:65): the Orchestrator asks the Implementer for its result and the Reviewer for a verdict on c2, with
-    the jobs' evidence references; both answer through their own adapters."""
-    s.start_lane(REVIEWER, s.checkout)
+    the jobs' evidence references; both answer through their own adapters. `up` started the Reviewer."""
     _, red_files, _ = s.evidence("tests-c1", "failed")
     _, green_files, _ = s.evidence("tests-c2", "completed")
     refs = {"c1": "%s sha256=%s" % (red_files["result.json"], sha(red_files["result.json"])),
@@ -587,6 +610,50 @@ def test_step4_reviewer_names_c2_with_the_job_evidence_and_the_decider_approves_
     assert escalated["act"] == "root"
     assert {r["request_id"] for r in s.status(expect=3)["last"]["holds"] if r["kind"] == "escalation"} == {"merge-outside"}
 
+    # The team command reads the same state: ROOT owes the escalated merge-outside, and merge-again, which the spent
+    # delegation can no longer cover; the Decider's decisions are listed.
+    status = s.team("status")
+    assert [(row["request_id"], row["why"]) for row in status["pending"]] == [
+        ("merge-again", "awaiting_decision"), ("merge-outside", "escalated")]
+    assert status["team"]["pending"] == ["merge-again", "merge-outside"]
+    assert ("escalation", "merge-outside") in {(r["kind"], r.get("request_id"))
+                                               for r in status["team"]["holds_by_act"]["root"]}
+    assert [(d["request_id"], d["decision"]) for d in status["team"]["delegated_decisions"]] == [
+        ("merge-c2", "approve"), ("merge-outside", "escalate")]
+
+
+def test_step4_then_down_collects_the_evidence_and_releases_what_the_run_holds(tmp_path):
+    """Step 17-18 of the runbook, through `hierarchy_team.py down`: the roles are stopped, every record is copied into
+    evidence with SHA256SUMS and a turn ledger per role, the lease is released with its live oid, the writer slot with
+    that release as evidence, and only this run's worktree is removed; the branch keeps c2. A second down changes
+    nothing."""
+    s, _, lease, c1, c2 = through_jobs(tmp_path)
+    review_and_result(s, c1, c2)
+    woken = len(s.woken())
+
+    down = s.team("down")
+
+    assert down["loop"] == {"state": "already_stopped"}, "--no-loop: the test ran every pass"
+    assert {row["endpoint"] for row in down["roles"]} == set(s.threads)
+    assert down["leases"] == [{"lane": "pilot-f2", "state": "released", "oid": lease["lease"]["oid"]}]
+    assert down["slots"] == [{"lane": "f2", "state": "released"}]
+    assert down["worktrees"] == [{"lane": "f2", "state": "removed", "path": str(s.worktree)}]
+    assert not s.worktree.exists() and git(s.checkout, "rev-parse", BRANCH) == c2["commit"]
+    evidence = s.run / "evidence"
+    for name in ("jobs/tests-c1/result.json", "jobs/tests-c2/result.json", "checkpoint-after.json", "router-end.json",
+                 "lease-release-f2.json", "slot-release-f2.json", "turn-ledger.json"):
+        assert (evidence / name).is_file(), name
+    listed = dict(reversed(line.split("  ", 1)) for line in (evidence / "SHA256SUMS").read_text().splitlines())
+    assert listed["jobs/tests-c2/result.json"] == sha(evidence / "jobs" / "tests-c2" / "result.json")
+    ledger = s.evidence_file("turn-ledger.json")
+    assert ledger["total"]["turns"] == len(s.threads) + woken, "one start turn per role, then one turn per wake"
+    assert {row["endpoint"] for row in ledger["roles"]} == set(s.threads)
+
+    again = s.team("down")
+    assert (again["evidence"], again["leases"], again["slots"]) == (
+        "already_collected", [{"lane": "pilot-f2", "state": "already_released"}],
+        [{"lane": "f2", "state": "already_released"}])
+
 
 # -- the failure cases -------------------------------------------------------------------------------------------------
 
@@ -622,6 +689,7 @@ def test_failure_lost_deliveries_are_repaired_republished_and_rewoken_without_du
     """:71 -- the losses the loop recovers today (owner choice, 2026-11-05): a route delivered but never recorded is
     recorded by the next pass with no second message; a job receipt the mailbox could not take is published by the
     next run-open exactly once; and the receipt, arriving after the Orchestrator's turn, wakes it on the next pass.
+    The Orchestrator that read its route and sent nothing is held as silent_role until the owner's `turn`.
     A lost lane `result` or `review` has no detector yet (the runbook says how to handle one)."""
     monkeypatch.syspath_prepend(str(ROOT / "tools"))
     import hierarchy_router
@@ -636,12 +704,24 @@ def test_failure_lost_deliveries_are_repaired_republished_and_rewoken_without_du
                                "binding_generation": router["generation"], "type": "info",
                                "body": hierarchy_router.route_body(value["id"], target)})
     assert s.status(expect=3)["state"] == "not_running"
-    repaired = s.once()
+    repaired = s.once(expect=3)
 
     route = next(row for row in repaired["steps"] if row["step"] == "route")
     assert route["routed"] == ["feature-1"]
     assert [r["message"]["message_id"] for r in s.inbox("pilot/orchestrator")] == [identifier]
     assert s.ledger.status()["requests"]["feature-1"]["routed"]["to"] == "pilot/orchestrator"
+    # The fake Orchestrator read its route and published nothing, which is the silent_role hold for ROOT.
+    [silent] = [row for row in repaired["holds"] if row["kind"] == "silent_role"]
+    assert (silent["act"], silent["endpoint"]) == ("root", "pilot/orchestrator")
+    assert silent["detail"].startswith("read info %s from pilot/router in wake " % identifier)
+    assert "and has published nothing since " in silent["detail"]
+    # As in the real run, the owner answers a silent role with a trusted turn in its own session; it publishes now.
+    s.plan_for("pilot/orchestrator", {"name": "answer-route", "tool": "mailbox_publish", "arguments": {
+        "message_id": "route-noted", "to": IMPLEMENTER, "type": "info", "body": "feature-1 is routed to me."}})
+    turned = s.team("turn", "pilot/orchestrator", "Owner: answer the route you read, as your contract says.")
+    assert turned["exit_code"] == 0 and "error" not in s.results("pilot/orchestrator")["answer-route"]
+    cleared = s.once()
+    assert not cleared["holds"], "the publish cleared silent_role, and the Implementer read the note"
 
     lock = s.root / ".write.lock"
     published = str(s.root / "pilot" / "orchestrator" / "*-root-to-orchestrator-*.md")
@@ -704,7 +784,9 @@ def test_failure_stale_and_revoked_sessions_are_refused_with_no_write(tmp_path):
 
 def test_failure_an_out_of_delegation_request_reaches_root_and_root_decides(tmp_path):
     """:73 -- the Decider may only escalate a request outside its delegation; the loop raises the escalation for ROOT,
-    ROOT approves it with `root_decide`, the hold clears, and the next pass routes it like any approved request."""
+    ROOT approves it in one `hierarchy_team.py approve` turn (team_pending, then root_decide), the hold clears, and the
+    next pass routes it like any approved request. The Decider's silent wake (it recorded and sent no mail) is held
+    for ROOT until the owner's `turn` has it reply."""
     s = Scenario(tmp_path)
     granted = delegation(s)
     s.ledger.publish(granted)
@@ -722,17 +804,37 @@ def test_failure_an_out_of_delegation_request_reaches_root_and_root_decides(tmp_
                 "arguments": {"event_id": "decider-escalate", **target, "decision": "escalate"}})
     s.send("pilot/orchestrator", "pilot/decider", "decide-merge-outside")
 
-    s.once()
+    first = s.once(expect=3)
+    # The fake Decider recorded with decider_record and published no mail: silent_role, for ROOT.
+    [silent] = [row for row in first["holds"] if row["kind"] == "silent_role"]
+    assert (silent["act"], silent["endpoint"]) == ("root", "pilot/decider")
+    assert silent["detail"].startswith("read info decide-merge-outside from pilot/orchestrator in wake ")
+    # Its contract says to tell the Orchestrator the outcome; the owner's turn has it do so, which clears the hold.
+    s.plan_for("pilot/decider", {"name": "reply", "tool": "mailbox_publish", "arguments": {
+        "message_id": "outside-escalated", "to": "pilot/orchestrator", "type": "info",
+        "body": "merge-outside is outside delegation-1's paths; escalated to ROOT."}})
+    assert s.team("turn", "pilot/decider", "Owner: tell the Orchestrator what you decided.")["exit_code"] == 0
     raised = s.once(expect=3)
+    assert ("sweep", "silent_role", "pilot/decider") not in holds(raised)
     assert s.results("pilot/decider")["approve"]["error"] == "target path is outside the delegation's paths"
     assert holds(raised)[("router_status", "escalation", "merge-outside")]["act"] == "root"
-    assert json.loads(s.status(expect=3)["last"]["holds"][0]["detail"])["reason"] == "path outside the delegation"
+    [escalation_hold] = [row for row in s.status(expect=3)["last"]["holds"] if row["kind"] == "escalation"]
+    assert json.loads(escalation_hold["detail"])["reason"] == "path outside the delegation"
     assert s.ledger.status()["requests"]["merge-outside"]["routed"] is None, "an escalation is not an approval"
+    text = s.team("status", "--text", text=True)
+    assert "root (ROOT must act):\n  router_status escalation merge-outside: " in text
+    assert ("  merge-outside (escalated): hierarchy_team.py --config %s approve merge-outside --reason TEXT"
+            % s.config_path) in text
 
-    s.root_decide(outside)
-    cleared = s.once()
+    approved = s.team("approve", "merge-outside", "--reason", "outside the delegation, and fine")
+    assert (approved["decision"], approved["root_last_message"]) == ("approve", "Recorded.")
+    # A real Orchestrator answers the route that follows; the publish wakes the Decider on the next pass.
+    s.plan_for("pilot/orchestrator", {"name": "answer-route", "tool": "mailbox_publish", "when_inbox": {"type": "info"},
+                                      "arguments": {"message_id": "merge-outside-noted", "to": "pilot/decider",
+                                                    "type": "info", "body": "merge-outside is routed to me."}})
+    cleared = s.once(expect=3)
 
-    assert ("router_status", "escalation", "merge-outside") not in holds(cleared)
+    assert set(holds(cleared)) == {("sweep", "still_unread", "pilot/decider")}
     assert next(row for row in cleared["steps"] if row["step"] == "route")["routed"] == ["merge-outside"]
     [escalation] = json.loads(subprocess.run(
         [sys.executable, "-I", "-B", str(ROOT / "tools" / "hierarchy_router.py"), "--lifecycle", str(s.ledger.path),
@@ -796,4 +898,6 @@ def test_failure_root_and_router_attempts_to_execute_work_are_refused(tmp_path):
     assert [(r["step"], r["kind"]) for r in result["holds"] if r.get("endpoint") == "pilot/root"] == [
         ("sweep", "root_queue")], "the sweep never tries to wake ROOT, so no no_profile or wake row names it"
     assert "pilot/root" not in next(row for row in result["steps"] if row["step"] == "sweep")["woken"]
-    assert "pilot/root" not in s.woken() and s.launch_records("pilot/router") == []
+    assert "pilot/root" not in s.woken()
+    assert [(r["action"], r["state"]) for r in s.launch_records("pilot/router")] == [("start", "bound")], \
+        "the Router's one launch is its start by `up`; nothing resumes it"

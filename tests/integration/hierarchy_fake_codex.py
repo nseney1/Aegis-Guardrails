@@ -233,6 +233,8 @@ def rollout_main(argv):
                                        "cwd": options["cwd"], "originator": "codex_exec", "source": "exec",
                                        "cli_version": os.environ.get("FAKE_CODEX_CLI_VERSION", "0.166.0"),
                                        "model_provider": "openai"})
+        # The fake exposes no dynamic tools. Record that fact explicitly; absent evidence is not a disabled catalog.
+        rollout.write("response_item", {"type": "additional_tools", "tools": []})
     log_call(argv, rollout=str(rollout.path))
     try:
         turn = pick_turn(options["prompt"])
