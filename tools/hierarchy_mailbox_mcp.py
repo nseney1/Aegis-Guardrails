@@ -14,6 +14,27 @@ from pathlib import Path
 import sys
 import time
 
+# Old provisioned profiles may still call the mailbox entry directly. Fence that route before importing
+# peers, while keeping the standalone two-file mailbox adapter independent of the provisioning runtime.
+if "serve" in sys.argv[1:] and not getattr(sys, "_aegis_verified_runtime_entry", None):
+    early = argparse.ArgumentParser(add_help=False)
+    early.add_argument("--root")
+    parsed, _ = early.parse_known_args()
+    provision = Path(parsed.root).parent / "provision.json" if parsed.root else None
+    if provision is not None and provision.is_file():
+        try:
+            setup = json.loads(provision.read_text(encoding="utf-8"))
+            verifier = provision.parent / "runtime-source.py"
+            if not verifier.is_file():
+                raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
+            # A fresh interpreter avoids reusing this module while its legacy import is still in progress.
+            entry = Path(setup["source"]) / "tools" / Path(sys.argv[0]).name
+            os.execv(sys.executable, [sys.executable, "-I", "-B", str(verifier), "--provision", str(provision),
+                                     "--entry", str(entry), "--", *sys.argv[1:]])
+        except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
+            print(json.dumps({"error": str(exc)}, sort_keys=True))
+            sys.exit(2)
+
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))

@@ -70,9 +70,6 @@ class World(SealedFleet):
 
     def __init__(self, tmp_path, policy_changes=None):
         super().__init__(tmp_path)
-        found = shutil.which("git")
-        assert found, "run-open inspects the checkout with git"
-        (self.bin / "git").symlink_to(found)
         provision("init", self.init_request(roles=["router"]))
         self.front_door = self.add_role("pilot/front-door", cwd=str(tmp_path))
         self.orchestrator = self.add_role("pilot/orchestrator", cwd=str(tmp_path))

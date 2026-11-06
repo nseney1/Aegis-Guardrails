@@ -28,6 +28,32 @@ import sys
 import time
 import uuid
 
+# Provisioned CLI actions must enter through the retained verifier before importing any peer module.
+# A process-local marker prevents recursion; an environment variable cannot bypass verification.
+if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None) != str(Path(__file__).resolve()):
+    import runpy
+    early = argparse.ArgumentParser(add_help=False)
+    guarded = False
+    try:
+        early.add_argument("--base")
+        early.add_argument("command", nargs="?")
+        parsed, _ = early.parse_known_args()
+        if parsed.command in ("start", "resume") and parsed.base:
+            base = Path(parsed.base)
+            guarded = True
+        if guarded:
+            provision = base / "provision.json"
+            setup = json.loads(provision.read_text(encoding="utf-8"))
+            verifier = base / "runtime-source.py"
+            if not verifier.is_file():
+                raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
+            loaded = runpy.run_path(str(verifier))
+            loaded["run"](provision, Path(setup["source"]) / "tools" / Path(__file__).name, sys.argv[1:])
+            sys.exit(0)
+    except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        sys.exit(2)
+
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -37,6 +63,7 @@ from hierarchy_provision import CODEX, NATIVE, SESSION, add_role, codex_start  #
 from hierarchy_roles import role_name  # noqa: E402
 from hierarchy_router import patient  # noqa: E402
 from hierarchy_wake import stop_group  # noqa: E402
+import hierarchy_runtime_source  # noqa: E402
 
 
 SCHEMA = "aegis.hierarchy-launch/v1"
@@ -346,6 +373,7 @@ def start_prompt(launches, endpoint):
 
 
 def start(launches, request_path):
+    hierarchy_runtime_source.verify(launches.setup, launches.base)
     request = read_json(safe_path(text(request_path, "request")))
     require(isinstance(request, dict), "expected a JSON object")
     endpoint = launches.resolve(request.get("endpoint"))
@@ -429,6 +457,7 @@ def bound_session(launches, endpoint, identifier, action):
 
 
 def resume(launches, endpoint, dry_run):
+    hierarchy_runtime_source.verify(launches.setup, launches.base)
     endpoint = launches.resolve(endpoint)
     identifier = launches.new_id()
     known, profile = bound_session(launches, endpoint, identifier, "resume")
@@ -436,7 +465,7 @@ def resume(launches, endpoint, dry_run):
         launches.refuse(endpoint, identifier, "resume", "a native thread is resumed by its own app, not the launcher", **known)
     if not profile.is_file():
         launches.refuse(endpoint, identifier, "resume", "no wake profile for the current binding: " + str(profile), **known)
-    argv = [sys.executable, "-I", "-B", str(Path(launches.setup["source"]) / "tools" / "hierarchy_wake.py"),
+    argv = [sys.executable, *hierarchy_runtime_source.entry_args(launches.setup, "hierarchy_wake.py"),
             "--root", launches.setup["mailbox_root"], "--delivery-dir", launches.setup["delivery_dir"],
             "--endpoint", endpoint, "--profile", str(profile)] + (["--dry-run"] if dry_run else [])
     # No outer timeout: the wake tool bounds every phase itself, and killing it mid-turn would leave the

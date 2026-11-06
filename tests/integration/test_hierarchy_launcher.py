@@ -762,8 +762,12 @@ def test_resume_records_a_wake_tool_that_cannot_run(launch, monkeypatch, capsys)
     launch.start()
     module = launcher_module()
 
+    run = module.subprocess.run
+
     def unrunnable(argv, **options):
-        raise OSError(8, "Exec format error")
+        if any(str(word).endswith("hierarchy_wake.py") for word in argv):
+            raise OSError(8, "Exec format error")
+        return run(argv, **options)
     monkeypatch.setattr(module.subprocess, "run", unrunnable)
     assert module.main(["--base", str(launch.base), "resume", "--endpoint", REVIEW]) == 2
     monkeypatch.undo()

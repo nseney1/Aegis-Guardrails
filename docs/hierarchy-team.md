@@ -2,8 +2,8 @@
 
 `tools/hierarchy_team.py` is the owner's one command for a team run. It replaces the real run's shell guide (steps
 1-18), its `m1.py` helper and `role_turn.py` with one config file and nine subcommands. It drives the existing tools
-(launcher, provision, lifecycle, workspace, jobs, loop, router, review, `aegis team`) and adds no checks of its own to
-theirs: when a tool refuses, you see that tool's message.
+(launcher, provision, lifecycle, workspace, jobs, loop, router, review, `aegis team`) and retains their admission
+checks: when a tool refuses, you see that tool's message.
 
 The same flow runs on fixtures in
 [`tests/integration/test_hierarchy_team.py`](../tests/integration/test_hierarchy_team.py) and in the M1 rehearsal
@@ -121,6 +121,19 @@ They remain available below the disk-space threshold and without the tools requi
 The run records its custody configuration at initialization. Changing its project, lanes or other custody fields
 requires restoring that configuration before another mutation. Once teardown starts, only inspection and repeated
 teardown are allowed; another run needs a new folder.
+
+Provisioning records the runtime source commit and tree. Profile generation, role start/resume and provisioned
+MCP startup check that identity and the actual runtime and template bytes. Hidden index flags, staged changes and
+untracked or ignored importable code refuse the check. Each new base retains its own verifier; generated MCP
+connections enter through it before loading source modules or local bytecode caches.
+
+A source-drift refusal reports the expected and observed identity. From a separate clean control checkout,
+inspect the run and stop its owned actors, then use the existing [handoff flow](hierarchy-dogfood.md) to provision
+a new base from the reviewed checkout.
+Keep the active base and its recorded pin intact. A base created before the verifier existed also needs that
+handoff; regenerating profiles does not silently adopt a different tool version. Status, stopping and safe cleanup
+remain available from that trusted control checkout after source drift. These checks establish reproducibility,
+not native host authentication; they cannot make an altered entry script itself safe to execute.
 
 The role registry sets the maximum file tools for each role. A `file_tools` override can narrow that set;
 it cannot grant additional tools. Reviewer, Router and Decider connections also refuse direct board access.

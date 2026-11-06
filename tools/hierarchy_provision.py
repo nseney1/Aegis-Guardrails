@@ -32,6 +32,33 @@ import subprocess
 import sys
 import uuid
 
+# Provisioned CLI actions must enter through the retained verifier before importing any peer module.
+# A process-local marker prevents recursion; an environment variable cannot bypass verification.
+if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None) != str(Path(__file__).resolve()):
+    import runpy
+    early = argparse.ArgumentParser(add_help=False)
+    guarded = False
+    try:
+        early.add_argument("command", nargs="?")
+        early.add_argument("--request")
+        parsed, _ = early.parse_known_args()
+        if parsed.command in ("add-role", "codex-start") and parsed.request:
+            request = json.loads(Path(parsed.request).read_text(encoding="utf-8"))
+            base = Path(request["base"])
+            guarded = True
+        if guarded:
+            provision = base / "provision.json"
+            setup = json.loads(provision.read_text(encoding="utf-8"))
+            verifier = base / "runtime-source.py"
+            if not verifier.is_file():
+                raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
+            loaded = runpy.run_path(str(verifier))
+            loaded["run"](provision, Path(setup["source"]) / "tools" / Path(__file__).name, sys.argv[1:])
+            sys.exit(0)
+    except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        sys.exit(2)
+
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -41,6 +68,8 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
 import hierarchy_roles  # noqa: E402
+import hierarchy_runtime_source  # noqa: E402
+from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
 from hierarchy_workspace import Store, validate_initiative  # noqa: E402
 
 
@@ -88,8 +117,8 @@ TEAM_KINDS = hierarchy_roles.team_kinds()
 
 
 def git(cwd, *arguments):
-    return subprocess.run(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", *arguments], cwd=cwd,
-                          capture_output=True, text=True, timeout=60)
+    return subprocess.run(object_read_argv(*arguments), cwd=cwd,
+                          capture_output=True, text=True, timeout=60, env=object_read_env())
 
 
 def pin_source(source):
@@ -97,11 +126,12 @@ def pin_source(source):
     require(source.is_dir(), "source checkout is unavailable: " + str(source))
     head = git(source, "rev-parse", "--show-toplevel", "HEAD", "HEAD^{tree}")
     require(head.returncode == 0, "source checkout is not a git checkout: " + str(source))
-    top, commit, tree = head.stdout.split()
+    top, commit, tree = head.stdout.splitlines()
     require(Path(top).resolve() == source.resolve(), "source checkout must be the repository root: " + str(source))
     require(not git(source, "status", "--porcelain").stdout.strip(),
             "source checkout must be clean so adapters run exact committed code")
     require((source / "tools" / "hierarchy_mailbox.py").is_file(), "source checkout has no mailbox helper")
+    hierarchy_runtime_source.verify({"source": str(source), "source_commit": commit, "source_tree": tree})
     return source, commit, tree
 
 
@@ -142,6 +172,7 @@ def init(request):
         if record_path.exists():
             # An earlier run set this up and stopped before registering it, so this run finishes that one.
             record = read_json(record_path)
+            hierarchy_runtime_source.verify(record, base)
             require(record.get("initiative") == hierarchy and record.get("store") == str(store.path),
                     "initiative base already exists: " + str(base))
         else:
@@ -165,6 +196,7 @@ def build_base(base, endpoints, writer_limit, record):
     try:
         initialize(pending / "mailbox", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "counterparts": [],
                                          "writer_limit": writer_limit})
+        publish_file(pending / "runtime-source.py", hierarchy_runtime_source.verify(record))
         publish_file(pending / "provision.json", encoded(record) + b"\n")
         pending.rename(base)
     except BaseException:
@@ -173,7 +205,7 @@ def build_base(base, endpoints, writer_limit, record):
 
 
 def adapter_args(setup, endpoint, host, session, generation, source_repo=None, lifecycle=()):
-    return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
+    return hierarchy_runtime_source.entry_args(setup, "hierarchy_mailbox.py") + ["--root", setup["mailbox_root"],
             "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
             "--delivery-dir", setup["delivery_dir"], "--workspace-store", setup["store"],
             "--initiative", setup["initiative"]] + (["--source-repo", source_repo] if source_repo else []) + list(lifecycle)
@@ -187,7 +219,7 @@ def lifecycle_args(request):
 def decision_args(setup, endpoint, host, session, generation, request):
     """ROOT's decision adapter takes the journal and its actor, and only read-only folders beside them. It runs from
     its own entry, because the pinned mailbox CLI cannot carry --loop-state and --evidence."""
-    return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox_mcp.py"), "--root",
+    return hierarchy_runtime_source.entry_args(setup, "hierarchy_mailbox_mcp.py") + ["--root",
             setup["mailbox_root"], "serve", "--endpoint", endpoint, "--host", host, "--session", session,
             "--generation", str(generation), *lifecycle_args(request),
             *(["--loop-state", request["loop_state"]] if "loop_state" in request else []),
@@ -196,7 +228,7 @@ def decision_args(setup, endpoint, host, session, generation, request):
 
 def board_args(setup, endpoint, host, session, generation):
     """A server of its own, so a damaged board cannot take a session's mailbox with it."""
-    return ["-I", "-B", str(Path(setup["source"]) / "tools" / "hierarchy_mailbox.py"), "--root", setup["mailbox_root"],
+    return hierarchy_runtime_source.entry_args(setup, "hierarchy_mailbox.py") + ["--root", setup["mailbox_root"],
             "serve", "--endpoint", endpoint, "--host", host, "--session", session, "--generation", str(generation),
             "--board", setup["board"]]
 
@@ -519,6 +551,7 @@ def check_role_request(request, setup):
 def add_role(request):
     base = safe_path(text(request.get("base"), "base"))
     setup = read_json(base / "provision.json")
+    hierarchy_runtime_source.verify(setup, base)
     mailbox = Mailbox(setup["mailbox_root"])
     endpoint = request.get("endpoint")
     mailbox.endpoint(endpoint)
@@ -638,6 +671,7 @@ def codex_start(request):
     fields(request, {"base", "endpoint"}, {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"})
     base = safe_path(text(request["base"], "base"))
     setup = read_json(base / "provision.json")
+    hierarchy_runtime_source.verify(setup, base)
     mailbox = Mailbox(setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
     check_codex_options(request, mailbox, request["endpoint"], CODEX)
