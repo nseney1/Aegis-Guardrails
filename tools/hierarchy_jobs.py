@@ -74,9 +74,10 @@ import xml.etree.ElementTree as ElementTree
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import (GIT_ID, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
+from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
+from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
                                publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
-                               writer_lock)
+                               status_entries, writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
 from hierarchy_workspace import (Store, absolute, capacity_view, check_paths, grant_next, initiative_view,  # noqa: E402
                                  verify_evidence)
@@ -146,9 +147,6 @@ MERGE_CONFIG = ("merge.renames=true", "merge.directoryRenames=false", "merge.ren
 # The built-in merge drivers as check-attr reports them: unspecified or set is text, unset is binary.
 BUILT_IN_MERGE = {b"unspecified", b"set", b"unset", b"text", b"binary"}
 PINNED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-# Reads of the packet's commit objects: a missing object in a partial clone must be an error, never a fetch, since the
-# repository's own config names what a fetch runs. Git before 2.44 ignores this variable, so refuse_partial_clone comes first.
-OBJECT_GIT_ENV = {**PINNED_GIT_ENV, "GIT_NO_LAZY_FETCH": "1"}
 # The merge steps' view of the owner's files: no global or system config, and a HOME and XDG_CONFIG_HOME that hold
 # nothing, so no global excludes or attributes. A merge's clean checks read status this way too, so a file only the owner's
 # global excludes ignore counts as uncommitted there, and read-tree never meets it as a surprise after HEAD has moved.
@@ -436,15 +434,15 @@ def refuse_paths_outside_commit(checkout, commit, paths):
         # `<commit>:` names the root tree; `<commit>:.` is refused by git, so "." would never pass.
         inside = "" if name.rstrip("/") in ("", ".") else name.rstrip("/")
         # Replace refs are ignored as in the export, so a replaced tree cannot make a path look present.
-        found = pinned_git(checkout, "--no-replace-objects", "cat-file", "-e", "%s:%s" % (commit, inside), env=OBJECT_GIT_ENV)
+        found = object_git(checkout, "cat-file", "-e", "%s:%s" % (commit, inside))
         require(found.returncode == 0, "path %s is not in commit %s" % (name, commit[:12]))
 
 
 def refuse_partial_clone(checkout):
     """A partial clone fetches a missing object on read, running whatever its remote config names, so its commit is not
     read at all. Read with includes, as Git itself reads them."""
-    partial = pinned_git(checkout, "config", "--local", "--includes", "--get", "extensions.partialClone")
-    promisors = pinned_git(checkout, "config", "--local", "--includes", "--type=bool", "--get-regexp",
+    partial = object_git(checkout, "config", "--local", "--includes", "--get", "extensions.partialClone")
+    promisors = object_git(checkout, "config", "--local", "--includes", "--type=bool", "--get-regexp",
                            r"^remote\..*\.promisor$")
     # Exit 1 is "not set"; anything else, such as a promisor value that is no boolean, is refused as unreadable.
     require(partial.returncode in (0, 1) and promisors.returncode in (0, 1),
@@ -466,11 +464,10 @@ def commit_entries(checkout, commit, tree):
     """The commit's blobs and symlinks in tree order, as (path, mode, id). A gitlink is refused: its content is not in
     the commit. Replace refs are ignored here and in the export, so the ids are the commit's own."""
     refuse_partial_clone(checkout)
-    found = pinned_git(checkout, "--no-replace-objects", "rev-parse", "--verify", "--quiet", commit + "^{tree}",
-                       env=OBJECT_GIT_ENV)
+    found = object_git(checkout, "rev-parse", "--verify", "--quiet", commit + "^{tree}")
     actual = found.stdout.decode().strip() if found.returncode == 0 else "nothing readable"
     require(actual == tree, "commit %s has tree %s, not the packet's tree %s" % (commit[:12], actual[:12], tree[:12]))
-    listed = pinned_git(checkout, "--no-replace-objects", "ls-tree", "-r", "-z", "-l", "--full-tree", tree, env=OBJECT_GIT_ENV)
+    listed = object_git(checkout, "ls-tree", "-r", "-z", "-l", "--full-tree", tree)
     require(listed.returncode == 0, "could not list the tree of commit " + commit[:12])
     entries, size = [], 0
     for row in listed.stdout.split(b"\0"):
@@ -607,8 +604,7 @@ def export_commit(checkout, commit, tree, target, git_stub=False):
     root = os.fsencode(os.path.realpath(target))
     folders, size, expired = {b""}, 0, []
     with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(["git", "--no-optional-locks", "--no-replace-objects", "-c", "core.fsmonitor=false",
-                                    "cat-file", "--batch"], cwd=checkout, env={**os.environ, **OBJECT_GIT_ENV},
+        process = subprocess.Popen(object_read_argv("cat-file", "--batch"), cwd=checkout, env=object_read_env(),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
         # The kill ends any read or write that waits on git once the deadline passes.
         timer = threading.Timer(max(0, deadline - time.monotonic()), lambda: (expired.append(True), process.kill()))
@@ -682,23 +678,26 @@ def refuse_submodules(checkout, revisions=()):
     for any of them, while a clean or uninitialized one shows nothing. None can be bound to a packet, so all are
     refused by path. The submodule itself is never read, so nothing outside the checkout is followed. A merge also
     names commits that are not checked out, so their trees are read as well."""
-    listed = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"],
-                            cwd=checkout, capture_output=True, timeout=120)
+    listed = object_git(checkout, "ls-files", "--stage", "-z")
     require(listed.returncode == 0, "could not read the index of " + str(checkout))
     gitlinks = [entry.partition(b"\t")[2] for entry in listed.stdout.split(b"\0") if entry.startswith(b"160000 ")]
     for revision in revisions:
-        tree = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "ls-tree", "-r", "-z", "--full-tree",
-                               revision], cwd=checkout, capture_output=True, timeout=120)
+        tree = object_git(checkout, "ls-tree", "-r", "-z", "--full-tree", revision)
         require(tree.returncode == 0, "could not read the tree of " + revision)
         gitlinks += [entry.partition(b"\t")[2] for entry in tree.stdout.split(b"\0") if entry.startswith(b"160000 ")]
     require(not gitlinks, "submodules are not supported, because their content cannot be witnessed byte for byte: "
             + ", ".join(sorted({os.fsdecode(path) for path in gitlinks}))[:1024])
 
 
+def object_git(checkout, *args):
+    """Raw object reads; these must never inherit the mutation runner's Git policy."""
+    return subprocess.run(object_read_argv(*args), cwd=checkout, env=object_read_env(), capture_output=True, timeout=120)
+
+
 def pinned_git(checkout, *args, stdin=None, env=PINNED_GIT_ENV):
     """A read with the config the merge steps see, so what admit refuses and what the merge does agree."""
-    return subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args], cwd=checkout, input=stdin,
-                          env={**os.environ, **env}, capture_output=True, timeout=120)
+    return subprocess.run(object_read_argv(*args), cwd=checkout, input=stdin,
+                          env=object_read_env(env), capture_output=True, timeout=120)
 
 
 def refuse_attributes(checkout, paths, revisions):
@@ -764,8 +763,8 @@ def merge_refusals(checkout, commit, merge):
 def uncommitted_content(checkout, view=None):
     """Git status names the paths that differ, not their bytes, so one status can hide different content. `view` overrides
     part of the environment, as a merge's checks do to read status the way its steps do."""
-    status = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                            cwd=checkout, env={**os.environ, **view} if view else None, capture_output=True, timeout=120)
+    status = subprocess.run(object_read_argv("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                            cwd=checkout, env=object_read_env(view, inherit_config=True), capture_output=True, timeout=120)
     require(status.returncode == 0, "could not read the status of " + str(checkout))
     refuse_submodules(checkout)
     tokens = status.stdout.split(b"\0")
@@ -787,15 +786,39 @@ def uncommitted_content(checkout, view=None):
     return digest.hexdigest(), count
 
 
+def source_identity(checkout, *arguments):
+    """The mailbox witness contract, with the job reader's no-fetch/no-replacement policy."""
+    try:
+        result = subprocess.run(object_read_argv(*arguments), cwd=checkout, capture_output=True, text=True,
+                                env=object_read_env(inherit_config=True), timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("git identity check timed out") from exc
+    require(result.returncode == 0, "git identity check failed")
+    return result.stdout.rstrip("\r\n")
+
+
 def source_state(mailbox, checkout, view=None):
-    return {**mailbox.source_witness(checkout), "dirty_content_sha256": uncommitted_content(checkout, view)[0]}
+    # Keep the persisted mailbox witness fields and its ordinary ignore view; only the content digest uses `view`.
+    # The pinned, standalone mailbox implementation cannot depend on the shared Git policy module.
+    checkout = safe_path(checkout)
+    try:
+        status = subprocess.run(object_read_argv("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                                cwd=checkout, capture_output=True, env=object_read_env(inherit_config=True),
+                                timeout=GIT_STATUS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("git identity check timed out") from exc
+    require(status.returncode == 0, "git identity check failed")
+    return {"worktree": str(checkout), "source_revision": source_identity(checkout, "rev-parse", "HEAD"),
+            "source_tree": source_identity(checkout, "rev-parse", "HEAD^{tree}"),
+            "dirty_state_sha256": hashlib.sha256(status.stdout).hexdigest(), "dirty_entries": status_entries(status.stdout),
+            "dirty_content_sha256": uncommitted_content(checkout, view)[0]}
 
 
 def source_digest(checkout):
     """What an orchestrator needs for a packet. A lane with a shell can run this and report it."""
     path = safe_path(text(checkout, "checkout"))
     digest, count = uncommitted_content(path)
-    return 0, {"commit": Mailbox.git(path, "rev-parse", "HEAD"), "tree": Mailbox.git(path, "rev-parse", "HEAD^{tree}"),
+    return 0, {"commit": source_identity(path, "rev-parse", "HEAD"), "tree": source_identity(path, "rev-parse", "HEAD^{tree}"),
                "dirty_content_sha256": digest, "dirty_entries": count}
 
 
@@ -1293,8 +1316,8 @@ def refuse(store, job, reason, wait, recipes_sha256=None):
 
 
 def git_folders(checkout):
-    found = subprocess.run(["git", "-c", "core.fsmonitor=false", "rev-parse", "--path-format=absolute", "--git-dir",
-                            "--git-common-dir"], cwd=checkout, capture_output=True, text=True, timeout=30)
+    found = subprocess.run(object_read_argv("rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"),
+                            cwd=checkout, env=object_read_env(inherit_config=True), capture_output=True, text=True, timeout=30)
     require(found.returncode == 0, "could not locate the checkout's Git data")
     return sorted(set(found.stdout.splitlines()))
 

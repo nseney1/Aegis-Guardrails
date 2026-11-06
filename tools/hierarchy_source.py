@@ -6,7 +6,7 @@ Both read Git objects only, never the working tree, the index or untracked files
 the adapter starts, so no tool argument can point a view at another one.
 
 A writer may share the repository's own configuration, so nothing in it may run a command or reshape output:
-- Every call refuses all transports (protocol.allow=never), so a promisor remote can never be fetched from, and
+- Every call refuses all transports, including explicitly enabled protocols, so a promisor remote cannot be fetched from, and
   its configured upload-pack or ssh command never runs. A partial clone is refused at startup anyway, because
   its views would depend on objects it does not have.
 - Only plumbing that applies no filters runs: cat-file for blobs, and grep without textconv, columns or
@@ -22,6 +22,7 @@ import tempfile
 import time
 
 from hierarchy_mailbox import GIT_ID, fields, require, text
+from hierarchy_git import object_read_argv, object_read_env
 
 
 GIT_TIMEOUT_SECONDS = 30
@@ -38,11 +39,7 @@ MAX_GREP_OUTPUT_BYTES = 4194304
 MAX_GREP_PATHS = 64
 MAX_PATH_CHARS = 1024
 MAX_PATTERN_CHARS = 256
-GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_LITERAL_PATHSPECS": "1",
-           "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1",
-           "GIT_NO_LAZY_FETCH": "1", "GIT_PROTOCOL_FROM_USER": "0"}
-GIT_SETTINGS = ("-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "submodule.recurse=false",
-                "-c", "grep.column=false")
+GIT_SETTINGS = ("-c", "submodule.recurse=false", "-c", "grep.column=false", "--literal-pathspecs")
 TIMED_OUT = "git timed out in the source repository"
 COMMIT = {"type": "string", "pattern": "^[0-9a-f]{40}$"}
 PATH = {"type": "string", "maxLength": MAX_PATH_CHARS}
@@ -87,12 +84,12 @@ class SourceViews:
                 "--source-repo is a partial clone; source views need every object locally: " + str(repository))
 
     def argv(self, *arguments):
-        return ["git", "-C", str(self.repository), *GIT_SETTINGS, *arguments]
+        return object_read_argv("-C", str(self.repository), *GIT_SETTINGS, *arguments)
 
     def git(self, *arguments, check=True):
         try:
             result = subprocess.run(self.argv(*arguments), capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
-                                    env={**os.environ, **GIT_ENV}, check=False)
+                                    env=object_read_env(), check=False)
         except subprocess.TimeoutExpired as exc:
             raise ValueError(TIMED_OUT) from exc
         require(not check or result.returncode == 0, "git failed in the source repository")
@@ -105,7 +102,7 @@ class SourceViews:
         exits 1, as for no match, even when it could not read an object, so any error line is a failure."""
         errors = tempfile.TemporaryFile()
         process = subprocess.Popen(self.argv(*arguments), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=errors, env={**os.environ, **GIT_ENV})
+                                   stderr=errors, env=object_read_env())
         deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
         chunks, size, cut = [], 0, False
         try:
