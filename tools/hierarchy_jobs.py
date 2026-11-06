@@ -200,7 +200,7 @@ def validate_recipe(name, recipe):
         fields(recipe, {"kind", "timeout_seconds", "sandbox"})
         return
     fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"},
-           {"writable_checkout", "heavy_tests", "keep", "require_clean", "expects_tests"})
+           {"writable_checkout", "heavy_tests", "keep", "require_clean", "expects_tests", "export_git"})
     keep = recipe.get("keep", [])
     require(isinstance(keep, list) and len(keep) <= MAX_KEEP, "invalid keep for recipe %s: at most %d paths" % (name, MAX_KEEP))
     for entry in keep:
@@ -214,6 +214,10 @@ def validate_recipe(name, recipe):
     require(not (recipe.get("require_clean", False) and recipe.get("writable_checkout", False)),
             "require_clean recipe %s cannot take writable_checkout: it runs on a read-only export of the commit" % name)
     require(type(recipe.get("expects_tests", False)) is bool, "invalid expects_tests flag for recipe " + name)
+    require(type(recipe.get("export_git", False)) is bool, "invalid export_git flag for recipe " + name)
+    # The stub is written into the export, so a recipe that runs on the checkout has nowhere to put it.
+    require(recipe.get("require_clean", False) or not recipe.get("export_git", False),
+            "export_git needs require_clean for recipe " + name)
     # The counts are read from the kept copy, so a report that is not kept could never be read.
     require(not recipe.get("expects_tests", False) or JUNIT_KEEP in keep,
             "expects_tests needs keep to include %s for recipe %s" % (JUNIT_KEEP, name))
@@ -571,7 +575,26 @@ def refuse_leaving_links(root, deadline):
                     % shown)
 
 
-def export_commit(checkout, commit, tree, target):
+# A build script such as stormheir's crates/sim/build.rs asks git for HEAD and panics outside a repository. These are all
+# Git needs to find one and resolve a detached HEAD: no objects, refs, hooks, alternates or info, so nothing it reads can
+# name a command, a path outside the export, or content other than the commit's id.
+GIT_STUB_CONFIG = b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+
+
+def write_git_stub(root, commit):
+    """<root>/.git naming commit as a detached HEAD, read-only. Not counted in the export's entries or bytes."""
+    stub = os.path.join(root, b".git")
+    os.mkdir(stub, 0o700)
+    for name in (b"objects", b"refs"):
+        os.mkdir(os.path.join(stub, name), 0o555)
+    for name, data in ((b"HEAD", commit.encode() + b"\n"), (b"config", GIT_STUB_CONFIG)):
+        descriptor = os.open(os.path.join(stub, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+        with os.fdopen(descriptor, "wb") as out:
+            out.write(data)
+    os.chmod(stub, 0o555)
+
+
+def export_commit(checkout, commit, tree, target, git_stub=False):
     """Materialise exactly the packet's commit at target, read-only, and return its record for the result.
 
     The entries come from `ls-tree` of the commit's tree and their bytes from one `git cat-file --batch`, which applies
@@ -623,10 +646,17 @@ def export_commit(checkout, commit, tree, target):
         require(code == 0, "git cat-file exited %d: %s"
                 % (code, errors.read(512).decode("utf-8", "replace").strip()))
     refuse_leaving_links(root, deadline)
+    if git_stub:
+        # After the link check, which it would pass anyway, and before the root turns read-only. The commit cannot
+        # already hold a .git: commit_entries refused that before a byte was written.
+        write_git_stub(root, commit)
     # Folders last, read-only like the files, so even sandbox none cannot change what the steps run.
     for folder in sorted(folders, key=len, reverse=True):
         os.chmod(os.path.join(root, folder) if folder else root, 0o555)
-    return {"commit": commit, "tree": tree, "entries": len(entries), "bytes": size}
+    record = {"commit": commit, "tree": tree, "entries": len(entries), "bytes": size}
+    if git_stub:
+        record["git_stub"] = True
+    return record
 
 
 def path_fingerprint(path, name):
@@ -1331,7 +1361,8 @@ def job_environment(recipes, job, checkout, export=None):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         env[name] = str(path)
     if export is not None:
-        # The export has no .git, so git must not walk up from it into whatever repository holds the store.
+        # The export has no .git, or only export_git's stub, so git must not walk up from it into whatever repository
+        # holds the store. Discovery stops below the job folder, so it finds the stub or nothing.
         env["GIT_CEILING_DIRECTORIES"] = str(job.folder)
     tokens = {"$checkout": export or checkout, "$scratch": scratch_argument(job)}
     for key, value in recipes.get("env", {}).items():
@@ -1624,7 +1655,8 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         export = str(job.folder / EXPORT_FOLDER)
         try:
             remove_work_folders(job, (EXPORT_FOLDER,))
-            extra["source_export"] = export_commit(checkout, packet["commit"], packet["tree"], export)
+            extra["source_export"] = export_commit(checkout, packet["commit"], packet["tree"], export,
+                                                   git_stub=recipe.get("export_git", False))
         except ERRORS as exc:
             try:
                 remove_work_folders(job, (EXPORT_FOLDER,))
@@ -2216,7 +2248,8 @@ def main(argv=None):
                                                       "heavy_tests": recipe.get("heavy_tests", False),
                                                       "sandbox": recipe["sandbox"],
                                                       "require_clean": recipe.get("require_clean", False),
-                                                      "expects_tests": recipe.get("expects_tests", False)}
+                                                      "expects_tests": recipe.get("expects_tests", False),
+                                                      "export_git": recipe.get("export_git", False)}
                                                for name, recipe in recipes["recipes"].items()}}
             else:
                 code, result = run_open(args.store, args.recipes, args.initiative, args.max_jobs, args.census_fixture, args.lock_wait)
