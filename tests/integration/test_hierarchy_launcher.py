@@ -4,6 +4,7 @@ Codex is the fake on PATH: a start prints the events a real start begins with, a
 which reads the mailbox through the real adapter. These tests show the tools work together, not that a real
 Codex session behaves this way.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -18,15 +19,17 @@ import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_mailbox import ROOT, invoke
-from tests.integration.test_hierarchy_provision import Setup
+from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
+from tests.integration.test_hierarchy_provision import Setup, provision
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the launcher supports POSIX process groups only")
 LAUNCHER = ROOT / "tools" / "hierarchy_launcher.py"
 FAKE_CODEX = Path(__file__).with_name("hierarchy_fake_codex.py")
 REVIEW = "pilot/lane/review"
-START_PROMPT = "The Aegis launcher started this session for pilot/lane/review. Reply READY and take no other action."
+START_HEADER = ("The Aegis launcher started this session for %s as %s. This turn comes from the operator who launched "
+                "you; it is your role contract.")
+START_FOOTER = "Reply READY. Act only when woken."
 ROOT_SESSION = "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"
 
 
@@ -93,6 +96,24 @@ def launch(tmp_path):
     return built
 
 
+@pytest.fixture
+def team(tmp_path):
+    """Every endpoint role the launcher starts, Router and Decider included."""
+    built = Launch(tmp_path)
+    provision("init", built.init_request(roles=["router", "decider"]))
+    return built
+
+
+def contract_path(launch, name):
+    return launch.source / "tools" / "hierarchy_templates" / "roles" / name
+
+
+def start_prompt(launch, endpoint, role, name):
+    """The exact start turn: the header, the contract from the pinned source, then the instruction to wait."""
+    contract = contract_path(launch, name).read_text(encoding="utf-8").strip()
+    return "\n\n".join([START_HEADER % (endpoint, role), contract, START_FOOTER])
+
+
 def census(session):
     rows = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,stat=,args="], capture_output=True, text=True, timeout=10).stdout
     return [int(line.split()[0]) for line in rows.splitlines()
@@ -123,7 +144,8 @@ def test_start_runs_the_start_argv_once_binds_the_session_and_records_it(launch)
     assert profile["session"] == thread and profile["argv"][-2:] == ["resume", thread]
     assert Path(answer["connection"]).is_file()
     started = [json.loads(line) for line in launch.codex_log.read_text().splitlines()]
-    assert len(started) == 1 and started[0]["argv"][-1] == START_PROMPT and "resume" not in started[0]["argv"]
+    assert len(started) == 1 and started[0]["argv"][-1] == start_prompt(launch, REVIEW, "reviewer", "reviewer.md")
+    assert "resume" not in started[0]["argv"]
     assert started[0]["cwd"] == str(launch.source)
     assert '"thread.started"' in Path(answer["log"]["stdout"]).read_text()
     [record] = launch.records()
@@ -134,6 +156,46 @@ def test_start_runs_the_start_argv_once_binds_the_session_and_records_it(launch)
     # No temporary record name and no start lock outlive the start.
     assert sorted(entry.name for entry in folder.iterdir()) == sorted([path.name, "logs"])
     assert stat.S_IMODE((launch.base / "launches").stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("endpoint,role,name", [
+    ("pilot/orchestrator", "orchestrator", "orchestrator.md"),
+    ("pilot/router", "router", "router.md"),
+    ("pilot/decider", "decider", "decider.md"),
+    ("pilot/front-door", "front-door", "front-door.md"),
+    ("pilot/lane/f2", "implementer", "lane.md"),
+    ("pilot/lane/review", "reviewer", "reviewer.md"),
+    ("pilot/lane/integration", "integrator", "integrator.md"),
+])
+def test_each_launched_role_starts_with_its_contract_inline(team, endpoint, role, name):
+    answer = team.start(endpoint=endpoint)
+    assert answer["state"] == "bound", answer
+    [started] = [json.loads(line) for line in team.codex_log.read_text().splitlines()]
+    prompt = started["argv"][-1]
+    assert prompt == start_prompt(team, endpoint, role, name)
+    assert prompt.startswith(START_HEADER % (endpoint, role) + "\n\n") and prompt.endswith("\n\n" + START_FOOTER)
+    assert "take no other action" not in prompt
+    raw = contract_path(team, name).read_bytes()
+    assert answer["contract"] == {"path": str(contract_path(team, name)), "sha256": hashlib.sha256(raw).hexdigest()}
+    assert team.records(endpoint)[-1]["argv"][-1] == prompt
+
+
+@pytest.mark.parametrize("endpoint,role,name", [
+    ("pilot/decider", "decider", "decider.md"),
+    ("pilot/lane/f2", "implementer", "lane.md"),
+])
+def test_a_role_whose_contract_file_is_missing_is_refused_before_anything_runs(tmp_path, endpoint, role, name):
+    built = Launch(tmp_path)
+    missing = contract_path(built, name)
+    if missing.exists():
+        git(built.source, "rm", "-q", str(missing))
+        git(built.source, "commit", "-qm", "a pinned source without the %s contract" % role)
+    provision("init", built.init_request(roles=["decider"]))
+    refused = built.start(expect=2, endpoint=endpoint)
+    assert refused["error"] == "no role contract for %s: %s" % (role, missing)
+    assert refused["state"] == "refused" and refused["session"] is None
+    assert [row["state"] for row in built.records(endpoint)] == ["refused"]
+    assert not built.codex_log.exists() and built.binding(endpoint) is None
 
 
 def test_a_bound_endpoint_is_refused_and_the_refusal_is_recorded(launch):
