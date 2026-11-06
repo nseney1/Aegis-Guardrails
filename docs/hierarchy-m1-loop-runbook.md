@@ -58,9 +58,10 @@ sequenceDiagram
 - **A disposable GitHub repository** the owner creates, with a tiny Python project, a `tests/`
   folder and a CI workflow that runs the tests on push and pull request. A public repository gets
   free Actions minutes; a private one spends the owner's. Nothing here touches Aegis or Stormheir.
-- `OPENAI_API_KEY` set in the operator shell, and a **disposable `CODEX_HOME`**: an empty folder that
-  is logged in with that key and deleted afterward. Never use `~/.codex`, and never touch the shared
-  Codex app server. The launcher, the wake and the loop pass their environment to Codex unchanged, so
+- A **disposable `CODEX_HOME`**: an empty folder that is logged in once for this run and deleted
+  afterward, either with an API key (`OPENAI_API_KEY` set in the operator shell) or with ChatGPT SSO
+  (`CODEX_HOME=$RUN/codex-home codex login`). Never run `codex login` without `CODEX_HOME`: it replaces
+  `~/.codex/auth.json`. Never use `~/.codex`, and never touch the shared Codex app server. The launcher, the wake and the loop pass their environment to Codex unchanged, so
   the `CODEX_HOME` in the environment that starts them is what keeps every session in it.
 - **A disposable ROOT session**: a new session the owner opens for this run only. Never bind the live
   dogfood ROOT, or any other session in use, to `m1/root`.
@@ -79,15 +80,24 @@ sequenceDiagram
 export RUN=/absolute/path/m1-run                 # everything this run writes
 export TOOLS=$RUN/tools-clone                    # clean Aegis clone at the commit under trial
 export PROJECT=$RUN/project                      # clone of the disposable GitHub repository
-export CODEX_HOME=$RUN/codex-home                # disposable; logged in with OPENAI_API_KEY
+export CODEX_HOME=$RUN/codex-home                # disposable; logged in below (API key or SSO)
 export TMPDIR=/tmp
 tool() { python3 -I -B "$TOOLS/tools/hierarchy_$1.py" "${@:2}"; }
 [ "$(realpath -m "$CODEX_HOME")" != "$(realpath -m "$HOME/.codex")" ] || echo "STOP: CODEX_HOME is ~/.codex"
 mkdir -p "$RUN/evidence"
 ```
 
-Log the disposable home in once, with the key on stdin, so the key never lands in shell history or
-in a file: `printenv OPENAI_API_KEY | codex login --with-api-key`.
+Log the disposable home in once, by one of two routes, in the shell where `CODEX_HOME` is exported
+above (check with `printenv CODEX_HOME` first):
+
+- **API key**, with the key on stdin so it never lands in shell history or in a file:
+  `printenv OPENAI_API_KEY | codex login --with-api-key`.
+- **ChatGPT SSO**: `CODEX_HOME="$RUN/codex-home" codex login`, and finish the sign-in in the browser.
+  Name `CODEX_HOME` on the command itself: `codex login` without it replaces `~/.codex/auth.json`.
+
+Either way `$RUN/codex-home/auth.json` is the run's only login, and step 6 of the teardown deletes it.
+The native probe from the prerequisites uses its own `codex-home`; for SSO there, log that folder in
+the same way and pass `run --auth existing` (see [the restart guide](hierarchy-restart.md)). For `--auth existing`, unset `OPENAI_API_KEY` and `CODEX_API_KEY` first (the probe refuses while either is set, so turns cannot bill to a key), and pass `CODEX_HOME` spelled exactly as the plan prints it.
 
 ## Provision, in this order
 
