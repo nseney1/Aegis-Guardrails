@@ -94,6 +94,8 @@ above (check with `printenv CODEX_HOME` first):
   `printenv OPENAI_API_KEY | codex login --with-api-key`.
 - **ChatGPT SSO**: `CODEX_HOME="$RUN/codex-home" codex login`, and finish the sign-in in the browser.
   Name `CODEX_HOME` on the command itself: `codex login` without it replaces `~/.codex/auth.json`.
+  Leave the `auth.lock`, `log/` and `tmp/` that it writes beside `auth.json`: the native probe's
+  `--auth existing` accepts them and its cleanup deletes them.
 
 Either way `$RUN/codex-home/auth.json` is the run's only login, and step 6 of the teardown deletes it.
 The native probe from the prerequisites uses its own `codex-home`; for SSO there, log that folder in
