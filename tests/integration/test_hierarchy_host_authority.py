@@ -552,7 +552,7 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
     uid = os.geteuid()
     executable = Path(os.readlink("/proc/self/exe"))
     peer_pid = os.getpid() + 1000000  # Only the actual OS readback is mocked.
-    actual_stat, actual_fstat = os.stat, os.fstat
+    actual_stat, actual_fstat, actual_listxattr = os.stat, os.fstat, os.listxattr
     actual_readlink = os.readlink
     actual_read_bytes, actual_read_text = Path.read_bytes, Path.read_text
     actual_getsockopt = socket.socket.getsockopt
@@ -708,6 +708,11 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
             boundary.setattr(os, "stat", kernel_stat)
             boundary.setattr(os, "fstat", lambda fd: protected_metadata(actual_fstat(fd)))
             boundary.setattr(os, "readlink", kernel_readlink)
+            # Like the 0o022 masking above: the host interpreter's install path may carry
+            # POSIX ACLs (GitHub's hosted toolcache does), which is host provenance, not fixture state.
+            boundary.setattr(os, "listxattr", lambda path, *args, **kwargs: [
+                name for name in actual_listxattr(path, *args, **kwargs)
+                if name not in ("system.posix_acl_access", "system.posix_acl_default")])
             boundary.setattr(Path, "read_bytes", kernel_bytes)
             boundary.setattr(Path, "read_text", kernel_text)
             boundary.setattr(socket.socket, "getsockopt", peer_credentials)

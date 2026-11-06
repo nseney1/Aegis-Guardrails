@@ -54,7 +54,7 @@
     "docs/hierarchy-watch-bridge.md": "d2cee2f1d6e699bdef6a5d495b9726a2a00c1557fbde43372e0959cf99d3269a",
     "docs/hierarchy-watch-supervisor.md": "d276052c00e2a0fa954b1e5b2c20124ed9317ae0e1e61807f55514381d64f038",
     "tests/integration/test_hierarchy_delivery.py": "be0ad6e14695f56b993c46f7cd678eadc331a69fc6672800b7ccec060a22a76c",
-    "tests/integration/test_hierarchy_lifecycle.py": "fb11265d56c2b33199db781fa83dbb308ae24438446dd54d5da9593972bd245c",
+    "tests/integration/test_hierarchy_lifecycle.py": "7b2545191379c07350eb7600e316180e51233cfc192318ef3465c4b0432da578",
     "tests/integration/test_hierarchy_native_protocol.py": "0556861a4b2de1f81449e38563ec5aeb6a6594ffe7c56ab5e3a350e4574c448a",
     "tests/integration/test_hierarchy_operator.py": "a2a58673aa5e3c30f0f3138ba71137f3bebc0a5a621305f214e76ee8b0624f22",
     "tests/integration/test_hierarchy_watch_bridge.py": "1412ab09d1935b297eda48fc0560d42c72f175a5cd47451e096d7f28205008e1",
