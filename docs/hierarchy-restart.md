@@ -84,6 +84,31 @@ worktree (`git worktree remove` only), and writes a report with state
 `interrupted`; after a SIGKILL, `cleanup --probe-root` does the same from the
 launch records and may be repeated.
 
+The probe's `CODEX_HOME` is the plan's `codex-home` folder, logged in one of two
+ways. With an API key (`run --auth api-key`, the default), the folder must be
+empty but for the plan's owner mark, and the probe runs
+`codex login --with-api-key` with the key from `OPENAI_API_KEY` (or
+`--api-key-env`) on stdin. With ChatGPT SSO, the owner first runs
+`CODEX_HOME=<probe_root>/codex-home codex login`, then
+`run --auth existing`: the probe never calls `codex login`, needs no key
+variable, refuses while `OPENAI_API_KEY` or `CODEX_API_KEY` is set (codex could
+bill the turns to the key instead of the SSO login), and refuses unless the folder holds only the owner mark with this
+plan's probe id and an `auth.json` that is a regular file (not a symlink), has
+one link, is owned by the user and is not readable by group or others. It
+refuses `sessions/` (a prior session's rollouts would mix with the probe's),
+`config.toml` (the probe's `codex_home` write target, and it would change the
+run's settings) and any other entry. The report's `login` records
+`mode: existing`, the file's `auth_file_sha256_before`, and that `codex login`
+was not called; the folder and the hash are checked again before the first
+turn. Never run `codex login` without `CODEX_HOME`: it replaces
+`~/.codex/auth.json`. In both modes `CODEX_HOME` must be spelled exactly as the
+plan's path (one trailing slash allowed; no `..` or symlink alias), and the
+cleanup deletes the disposable `auth.json`, so a new plan needs a new login.
+The cleanup deletes it only through a handle on `codex-home` opened without
+following a link, and only while `codex-home` is a real directory at the plan
+path outside `~/.codex`; otherwise it leaves the file and records a cleanup
+failure.
+
 When a native `task_started` event is present, the context must follow it and
 name that same turn. A missing or mismatched context refuses observation; an old
 turn's profile cannot qualify a newly resumed turn. Historical records without

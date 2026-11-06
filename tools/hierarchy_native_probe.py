@@ -6,9 +6,13 @@ source's .git. The root holds a linked worktree of the source checkout, a
 sibling folder outside it, an empty CODEX_HOME the probe owns, a hash-pinned helper script, and one initiative per
 role, provisioned with the existing tools. It prints every role's start argv, targets, nonces and prompts.
 
-`run` spends model turns, so it refuses unless CODEX_HOME is that empty folder (never ~/.codex), the API key
-variable is set, the worktree is still the linked one the plan made, a turn cap is given, and, under pytest, the
-codex on PATH is the test fake. It logs the disposable home in with the key on stdin. For each role it uses the
+`run` spends model turns, so it refuses unless CODEX_HOME is that folder (never ~/.codex), the worktree is still
+the linked one the plan made, a turn cap is given, and, under pytest, the codex on PATH is the test fake. With
+`--auth api-key` (the default) the folder must be empty, the API key variable set, and the probe logs the disposable
+home in with the key on stdin. With `--auth existing` the owner has already logged that folder in
+(`CODEX_HOME=<codex-home> codex login`, e.g. ChatGPT SSO): it may then hold only the owner mark and a private,
+single-link auth.json, and the probe never calls codex login. Never run codex login without CODEX_HOME: it replaces
+~/.codex/auth.json. Either way the disposable auth.json is deleted at cleanup, so a new run needs a new login. For each role it uses the
 launcher to start the session, runs one probe turn with the role's own bound argv, stops a long turn with the
 launcher mid-turn, then publishes a mailbox message and wakes the role with the launcher. ROOT is read for its
 settings only, from a rollout the owner names; the probe never starts or stops it. ~/.codex is hashed before and
@@ -104,6 +108,14 @@ FAKE_MARK = b"hierarchy_fake_codex.py"
 FAKE_CLAIM = "none: the codex on PATH is the test fake"
 REAL_CLAIM = "this host and Codex version only; a model that declines shows NOT_ATTEMPTED, never REFUSED"
 CAP_REASON = "turn cap reached"
+AUTH_MODES = ("api-key", "existing")
+AUTH_FILE = "auth.json"
+# What an existing login's CODEX_HOME may hold: the plan's owner mark and the auth.json `codex login` writes. Nothing
+# else is taken on trust: sessions/ would put a prior session's rollouts beside the probe's, config.toml is the
+# codex_home write target and would change the run's settings, and any other entry is unexplained.
+EXISTING_LOGIN_ENTRIES = (OWNER_MARK, AUTH_FILE)
+API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY")
+AUTH_CLEANUP_NOTE = "auth.json is deleted at cleanup; log in again for a new run"
 
 
 class Refusal(Exception):
@@ -285,15 +297,19 @@ def plan(request):
                  "channels": channels, "approvals_reviewer": request.get("approvals_reviewer"),
                  "timeouts": timeouts, "turns_per_role": TURNS_PER_ROLE, "turns_needed": TURNS_PER_ROLE * len(roles),
                  "roles": roles, "root": root,
-                 "note": "A run spends about %d model turns, billed to the API key." % (TURNS_PER_ROLE * len(roles))}
+                 "note": "A run spends about %d model turns, billed to the API key or the ChatGPT plan that logged "
+                         "CODEX_HOME in." % (TURNS_PER_ROLE * len(roles))}
         write_private(probe_root / "probe.json", state)
     except BaseException:
         if added:
             git("-C", str(source), "worktree", "remove", "--force", str(worktree))
         shutil.rmtree(probe_root, ignore_errors=True)
         raise
-    return {**state, "next": "export CODEX_HOME=%s and the API key variable, then run: %s run --probe-root %s "
-                             "--turn-cap %d" % (codex_home, Path(__file__).name, probe_root, state["turns_needed"])}
+    command = "%s run --probe-root %s --turn-cap %d" % (Path(__file__).name, probe_root, state["turns_needed"])
+    return {**state, "next": "export CODEX_HOME=%s, then either set the API key variable and run: %s; or log in "
+                             "with SSO by running CODEX_HOME=%s codex login, then run: %s --auth existing. "
+                             "Warning: never run codex login without CODEX_HOME (it replaces ~/.codex/auth.json). "
+                             "auth.json is deleted at cleanup." % (codex_home, command, codex_home, command)}
 
 
 def plan_role(entry, request, channels, timeouts, python, source, probe_root, store, layout, helper):
@@ -478,8 +494,53 @@ def linked_worktree(state):
                                           for line in listed.stdout.splitlines() if line.startswith("worktree "))
 
 
+def existing_login(codex_home, state):
+    """The owner's own login in the probe's CODEX_HOME. Returns auth.json's sha256; raises Refusal otherwise."""
+    folder = Path(codex_home)
+    mark = folder / OWNER_MARK
+    entries = sorted(os.listdir(folder))
+    if (OWNER_MARK not in entries or not mark.is_file() or mark.is_symlink()
+            or mark.read_text(encoding="utf-8").strip() != state["probe_id"]):
+        raise Refusal("CODEX_HOME does not carry this probe's owner mark: " + str(codex_home))
+    if "sessions" in entries:
+        raise Refusal("CODEX_HOME already holds sessions/; a prior session would pollute the probe's rollout reads: "
+                      + str(codex_home))
+    extra = [entry for entry in entries if entry not in EXISTING_LOGIN_ENTRIES]
+    if extra:
+        raise Refusal("CODEX_HOME holds entries a codex login does not create: " + ", ".join(extra))
+    auth = folder / AUTH_FILE
+    if AUTH_FILE not in entries:
+        raise Refusal("CODEX_HOME has no auth.json; log in first with: CODEX_HOME=%s codex login" % codex_home)
+    return auth_digest(auth)
+
+
+def auth_digest(auth):
+    info = os.lstat(auth)
+    if stat.S_ISLNK(info.st_mode):
+        raise Refusal("auth.json in CODEX_HOME is a symlink: " + str(auth))
+    if not stat.S_ISREG(info.st_mode):
+        raise Refusal("auth.json in CODEX_HOME is not a regular file: " + str(auth))
+    # A second link could be ~/.codex/auth.json itself: the cleanup would then leave the owner's login behind.
+    if info.st_nlink != 1:
+        raise Refusal("auth.json in CODEX_HOME has %d hard links: %s" % (info.st_nlink, auth))
+    if info.st_uid != os.getuid():
+        raise Refusal("auth.json in CODEX_HOME is not owned by this user: " + str(auth))
+    if info.st_mode & 0o077:
+        raise Refusal("auth.json in CODEX_HOME is readable by group or others (mode %04o): %s"
+                      % (stat.S_IMODE(info.st_mode), auth))
+    # O_NONBLOCK: a FIFO swapped in after the lstat would otherwise block this open forever.
+    fd = os.open(auth, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise Refusal("auth.json in CODEX_HOME is not a regular file: " + str(auth))
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise Refusal("auth.json in CODEX_HOME changed while it was checked: " + str(auth))
+        return hashlib.sha256(stream.read()).hexdigest()
+
+
 def preflight(args):
-    """Every check before anything spends a turn. Returns (state, cap, key name, codex path)."""
+    """Every check before anything spends a turn. Returns (state, cap, key name, codex path, fake, auth sha256)."""
     probe_root = args.probe_root
     state = load_state(probe_root)
     if os.path.lexists(Path(probe_root) / ".run.lock") or os.path.lexists(Path(probe_root) / "report.json"):
@@ -497,15 +558,30 @@ def preflight(args):
         raise Refusal("CODEX_HOME is inside ~/.codex: " + value)
     if os.path.realpath(value) != os.path.realpath(state["codex_home"]):
         raise Refusal("CODEX_HOME is not the probe's own folder: " + value)
-    mark = Path(value) / OWNER_MARK
-    entries = sorted(os.listdir(value))
-    if entries != [OWNER_MARK] or not mark.is_file() or mark.read_text(encoding="utf-8").strip() != state["probe_id"]:
-        raise Refusal("CODEX_HOME is not fresh: " + value)
-    name = args.api_key_env
-    if not API_KEY_NAME.fullmatch(name):
-        raise Refusal("invalid API key variable name")
-    if not os.environ.get(name):
-        raise Refusal("API key variable %s is not set" % name)
+    # The turns' verdicts compare paths as spelled, so a .. or symlink alias of the folder is refused here.
+    if (value[:-1] if value.endswith("/") else value) != state["codex_home"]:
+        raise Refusal("CODEX_HOME must be spelled exactly as the plan's path %s: %s" % (state["codex_home"], value))
+    name = auth_sha = None
+    if args.auth == "existing":
+        if args.api_key_env is not None:
+            raise Refusal("--api-key-env applies only to --auth api-key")
+        # codex may prefer a key in its environment over auth.json; the report would then claim the wrong billing.
+        keys = [key for key in API_KEY_VARIABLES if key in os.environ]
+        if keys:
+            raise Refusal("unset OPENAI_API_KEY and CODEX_API_KEY for --auth existing: codex could bill turns to "
+                          "the key instead of the SSO login (set: %s)" % ", ".join(keys))
+        auth_sha = existing_login(value, state)
+    else:
+        mark = Path(value) / OWNER_MARK
+        entries = sorted(os.listdir(value))
+        if (entries != [OWNER_MARK] or not mark.is_file()
+                or mark.read_text(encoding="utf-8").strip() != state["probe_id"]):
+            raise Refusal("CODEX_HOME is not fresh: " + value)
+        name = "OPENAI_API_KEY" if args.api_key_env is None else args.api_key_env
+        if not API_KEY_NAME.fullmatch(name):
+            raise Refusal("invalid API key variable name")
+        if not os.environ.get(name):
+            raise Refusal("API key variable %s is not set" % name)
     if not linked_worktree(state):
         raise Refusal("the probe cwd is not a linked worktree the probe created: " + state["worktree"])
     if codex is None:
@@ -514,7 +590,7 @@ def preflight(args):
         raise Refusal("under pytest the codex on PATH must be the fake: " + codex)
     if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(FAKE_PASSWD_HOME):
         raise Refusal("under pytest %s must name a stand-in passwd home" % FAKE_PASSWD_HOME)
-    return state, args.turn_cap, name, codex, fake
+    return state, args.turn_cap, name, codex, fake, auth_sha
 
 
 def tree_digest(path, errors=None):
@@ -900,8 +976,9 @@ def settings_check(rollout, session, profile, reviewer, turn_id):
 # ---------------------------------------------------------------- run
 
 class Runner:
-    def __init__(self, state, cap, key_name, codex, fake):
+    def __init__(self, state, cap, key_name, codex, fake, auth="api-key", auth_sha=None):
         self.state, self.cap, self.key_name, self.codex, self.fake = state, cap, key_name, codex, fake
+        self.auth, self.auth_sha = auth, auth_sha
         self.root = Path(state["probe_root"])
         self.turns_used = 0
         self.capped = False
@@ -935,6 +1012,18 @@ class Runner:
         return process.returncode, timed_out, {kind: str(path) for kind, path in logs.items()}
 
     def login(self):
+        if self.auth == "existing":
+            # The owner's login is used as found; the probe never calls codex login, and re-checks the folder and
+            # the file here so a swap or a new entry (sessions/) after the preflight is caught before any turn.
+            auth = Path(self.state["codex_home"]) / AUTH_FILE
+            answer = {"mode": "existing", "auth_file": str(auth), "codex_login_called": False,
+                      "auth_file_sha256_before": self.auth_sha, "cleanup": AUTH_CLEANUP_NOTE}
+            try:
+                if existing_login(self.state["codex_home"], self.state) != self.auth_sha:
+                    answer["error"] = "auth.json changed after the preflight"
+            except (Refusal, OSError) as exc:
+                answer["error"] = str(exc)
+            return answer
         key = os.environ[self.key_name]
         try:
             done = subprocess.run(["codex", "login", "--with-api-key"], input=key + "\n", capture_output=True,
@@ -1230,24 +1319,67 @@ class Runner:
         removed = None
         if registered or os.path.lexists(self.state["worktree"]):
             removed = subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
-        auth = Path(self.state["codex_home"]) / "auth.json"
-        try:
-            auth.unlink()
-        except FileNotFoundError:
-            pass
+        auth_removed, auth_error = remove_login(self.state["codex_home"], guarded_homes(self.fake))
         answer = {"worktree_removed": (removed is None or removed.returncode == 0)
                   and not os.path.lexists(self.state["worktree"]),
-                  "auth_removed": not os.path.lexists(auth), "leftover_processes": sorted(leftover, key=str),
+                  "auth_removed": auth_removed, "leftover_processes": sorted(leftover, key=str),
                   "found_running": running, "command": command}
         if removed is not None and removed.returncode != 0:
             answer["error"] = removed.stderr.strip()[:500]
+        if auth_error:
+            answer["auth_error"] = auth_error
         if not answer["worktree_removed"]:
             self.failures.append("cleanup: the worktree was not removed")
         if leftover:
             self.failures.append("cleanup: processes still name a probe session")
         if not answer["auth_removed"]:
-            self.failures.append("cleanup: the disposable login was not removed")
+            self.failures.append("cleanup: the disposable login was not removed"
+                                 + (": " + auth_error if auth_error else ""))
         return answer
+
+
+def remove_login(codex_home, guarded):
+    """Deletes auth.json from the plan's codex-home, never through a symlink. Returns (removed, error).
+
+    The folder could have been swapped for a symlink to ~/.codex after the preflight; a path unlink would then
+    delete the owner's own login. So the folder must be a real directory at the plan path outside every guarded
+    home, and the unlink goes through a handle opened with O_NOFOLLOW."""
+    try:
+        info = os.lstat(codex_home)
+    except FileNotFoundError:
+        return True, None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False, "codex-home is not a real directory (a symlink or another type); auth.json left: " + codex_home
+    if os.path.realpath(codex_home) != codex_home:
+        return False, "codex-home does not resolve to the plan path; auth.json left: " + codex_home
+    if any(inside(codex_home, folder) for folder in guarded):
+        return False, "codex-home is inside ~/.codex; auth.json left: " + codex_home
+    try:
+        fd = os.open(codex_home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return False, "codex-home could not be opened without following a link (%s); auth.json left: %s" % (
+            exc.strerror, codex_home)
+    try:
+        try:
+            os.unlink(AUTH_FILE, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return False, "auth.json could not be deleted (%s): %s" % (exc.strerror, codex_home)
+        try:
+            os.stat(AUTH_FILE, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True, None
+        return False, "auth.json is still in codex-home: " + codex_home
+    finally:
+        os.close(fd)
+
+
+def login_failed(login):
+    """The failure a login step records, or None when the run may go on."""
+    if login.get("mode") == "existing":
+        return "existing login: " + login["error"] if "error" in login else None
+    return None if login["exit_code"] == 0 else "codex login failed: exit %s" % login["exit_code"]
 
 
 def run(args):
@@ -1259,14 +1391,14 @@ def run(args):
     try:
         for number in INTERRUPTS:
             signal.signal(number, on_signal)
-        state, cap, key_name, codex, fake = preflight(args)
+        state, cap, key_name, codex, fake, auth_sha = preflight(args)
         root = Path(state["probe_root"])
         lock = root / ".run.lock"
         fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 stream.write(json.dumps({"pid": os.getpid(), "started_at": now()}) + "\n")
-            return run_locked(state, cap, key_name, codex, fake, root)
+            return run_locked(state, cap, key_name, codex, fake, root, args.auth, auth_sha)
         finally:
             # report.json (written first) keeps the root from running twice; the lock only guards this run.
             try:
@@ -1280,8 +1412,8 @@ def run(args):
         signal.pthread_sigmask(signal.SIG_UNBLOCK, INTERRUPTS)
 
 
-def run_locked(state, cap, key_name, codex, fake, root):
-    runner = Runner(state, cap, key_name, codex, fake)
+def run_locked(state, cap, key_name, codex, fake, root, auth="api-key", auth_sha=None):
+    runner = Runner(state, cap, key_name, codex, fake, auth, auth_sha)
     homes = home_codexes(fake)
     report = {"schema": REPORT_SCHEMA, "probe_root": str(root), "probe_id": state["probe_id"], "started_at": now(),
               "codex": {"path": codex, "fake": fake}, "enforcement_claim": FAKE_CLAIM if fake else REAL_CLAIM,
@@ -1296,10 +1428,10 @@ def run_locked(state, cap, key_name, codex, fake, root):
             entry["before"] = tree_digest(entry["path"], entry["errors"])
         if state["roles"]:
             report["login"] = runner.login()
-            if report["login"]["exit_code"] != 0:
-                runner.failures.append("codex login failed: exit %s" % report["login"]["exit_code"])
+            if login_failed(report["login"]):
+                runner.failures.append(login_failed(report["login"]))
         for planned in state["roles"]:
-            if report["login"]["exit_code"] != 0:
+            if login_failed(report["login"]):
                 break
             report["roles"].append(runner.role(planned))
         if state["root"] is not None:
@@ -1387,7 +1519,9 @@ def cleanup_command(args):
             live = True
         if live:
             raise Refusal("a run still holds this probe root: " + str(lock))
-    runner = Runner(state, 0, None, None, False)
+    # The guarded homes follow the codex on PATH, as in the preflight: under the test fake the stand-in counts.
+    codex = shutil.which("codex", path=os.environ.get("PATH", ""))
+    runner = Runner(state, 0, None, codex, codex is not None and is_fake(codex))
     answer = {"schema": CLEANUP_SCHEMA, "probe_root": str(root), "at": now(), "cleanup": runner.cleanup()}
     answer["failures"] = runner.failures
     if not os.path.lexists(root / "report.json"):
@@ -1437,6 +1571,8 @@ def text_report(report):
         lines.append("ROOT %s: read-only %s, started no session%s" % (
             root["rollout"], "yes" if root.get("read_only") else "no",
             "; " + root["error"] if "error" in root else ""))
+    if (report.get("login") or {}).get("mode") == "existing":
+        lines.append("login: existing auth.json (codex login not called); deleted at cleanup")
     lines.append("cleanup: worktree removed %s, login removed %s" % (
         "yes" if report["cleanup"]["worktree_removed"] else "no", "yes" if report["cleanup"]["auth_removed"] else "no"))
     for failure in summary["failures"]:
@@ -1463,7 +1599,14 @@ def main(argv=None):
     running = commands.add_parser("run")
     running.add_argument("--probe-root", required=True, help="The probe root a plan created")
     running.add_argument("--turn-cap", type=int, help="Most model turns this run may start (required)")
-    running.add_argument("--api-key-env", default="OPENAI_API_KEY", help="The variable that holds the API key")
+    running.add_argument("--auth", choices=AUTH_MODES, default="api-key",
+                         help="api-key (default): log CODEX_HOME in from the API key variable. existing: use the "
+                              "login the owner made with 'CODEX_HOME=<codex-home> codex login' (e.g. ChatGPT SSO); "
+                              "codex login is never called. Never run codex login without CODEX_HOME: it replaces "
+                              "~/.codex/auth.json. Either way auth.json is deleted at cleanup, so log in again for a "
+                              "new run.")
+    running.add_argument("--api-key-env", help="With --auth api-key: the variable that holds the API key "
+                                               "(default OPENAI_API_KEY)")
     cleaning = commands.add_parser("cleanup", help="Clean up after a run that was killed without cleaning up")
     cleaning.add_argument("--probe-root", required=True)
     shown = commands.add_parser("report")
