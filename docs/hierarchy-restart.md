@@ -42,12 +42,42 @@ it was given no value for as `unchecked`, which holds. `events` lists the
 recorded shell attempts (command, exit code, aggregated output, turn) and patch
 applications for the current turn, or every turn with `--turn all`:
 `exec_command_end` and `patch_apply_end` events, `item_completed` events carrying
-a `CommandExecution` or `FileChange` item, `item.*` stream records, and
-`response_item` `custom_tool_call` / `function_call` records named `apply_patch`
-paired with their output by `call_id` (targets from the `*** Add File:` and
-`*** Update File:` headers). That last shape is unconfirmed against a real host,
-and its entries and the probe report say so. A declined patch is marked
-`declined`. It reports what the host recorded, never model text.
+a `CommandExecution` or `FileChange` item, `item.*` stream records, Codex code
+mode, and `response_item` `custom_tool_call` / `function_call` records named
+`apply_patch` paired with their output by `call_id` (targets from the
+`*** Add File:` and `*** Update File:` headers). That last shape is unconfirmed
+against a real host, and its entries and the probe report say so. Native probe
+run 1 confirmed the `item_completed` shape and code mode, for codex-cli 0.166.0
+only. A declined patch is marked `declined`. It reports what the host recorded,
+never model text.
+
+In code mode the model sends a `custom_tool_call` named `exec` whose input is a
+JavaScript cell. `events` lists one entry per `tools.exec_command({cmd})` or
+`tools.apply_patch("…")` call in the cell, with `source: "code_mode"`. A `cmd`
+that names a loop variable over a `const` array of strings gives one entry per
+string. Only a double-quoted literal that decodes as JSON is read; a call with any
+other argument is listed under `code_mode_unparsed`, with the reason. The cell's
+`custom_tool_call_output` (same `call_id`) holds a "Script completed" or "Script
+failed" header and one printed part per call. Those parts are tied to the calls
+only when the whole cell is a known shape: plain `text(await CALL);` statements,
+the same wrapped in a try/catch that prints `String(error)`, or the
+`const commands = [...]; for (const cmd of commands)` loop, whose catch may also
+print `{cmd, error: String(error)}`. A last `Script error:` part is the failure of
+the call that threw, and it ends a plain cell: the calls after it never ran and get
+no entry. Each entry's `status` is `completed`, `failed`, `running` (a command
+still running, with a session id and no exit code), `unavailable` (`TypeError:
+tools.X is not a function`: the session lacks the tool), `unknown` (printed output
+that is not a result the reader knows) or `unpaired` (no output tied to it). A
+typed `item_completed` record of the same turn, for the same command or the same
+paths, wins: the cell adds no entry for that call.
+
+`multi-agent` reports whether the session was offered Codex sub-agent tools
+(`aegis.native-multi-agent/v1`). Its evidence is `agent_tools`: each tool an
+`additional_tools` record offered in the `collaboration` namespace, or under a
+multi-agent v2 tool name anywhere (`followup_task`, `interrupt_agent`,
+`list_agents`, `send_message`, `spawn_agent`, `wait_agent`).
+The latest `turn_context`'s `multi_agent_version` is reported only, because Codex
+may record a version with the tools off. It exits 2 when tools were offered.
 
 `tools/hierarchy_native_probe.py` drives provisioned roles through a disposable
 probe. A shell attempt is `REFUSED` only when the nonce file is absent and the
@@ -83,6 +113,33 @@ stops the role's session through the launcher, removes the login and the probe
 worktree (`git worktree remove` only), and writes a report with state
 `interrupted`; after a SIGKILL, `cleanup --probe-root` does the same from the
 launch records and may be repeated.
+
+A code-mode call counts only where its cell's output is tied to it. An `unpaired`,
+`unknown` or `running` call is `INCONCLUSIVE`, never `ALLOWED` or `REFUSED`. A
+call the session could not make (`tools.X is not a function`) is no attempt: the
+attempt is `UNAVAILABLE` when the profile has no such tool, else `NOT_ATTEMPTED`. A
+code-mode `exec_command` with any option other than `yield_time_ms` and
+`max_output_tokens` (such as `shell` or `workdir`) lets the model choose what ran
+the command, so it is an untrusted wrapper and `INCONCLUSIVE`.
+
+Each role's hold is one-shot. Its prompt names a per-hold nonce and a read-only
+command: if `hold-<nonce>.done` exists in the probe root, it prints "already held"
+and runs nothing; otherwise it waits at most 600 s, checking every 5 s, for
+`hold-<nonce>.release`. After the launcher has stopped the hold turn, the probe
+writes both marks itself, because a writer can write only its worktree and a reader
+nothing. A resumed session that re-runs the hold on wake therefore runs nothing.
+The report's `steps.hold` carries `nonce` and `marks` (`done` and `release`, each
+`written`, `present` or `error: …`). A `.done` mark that was not written fails the
+run with `<role> hold: the .done mark was not written: <state>`.
+
+Each role, and ROOT, gets a `multi_agent` row read from its rollout after its last
+turn: `state` (`MULTI_AGENT_OFF`, `MULTI_AGENT_OFFERED`, or `UNAVAILABLE` when the
+rollout could not be read), `reasons`, `version`, `agent_tools`, `turns` and
+`tool_records`. Any state but `MULTI_AGENT_OFF` fails the run, with
+`<role> multi-agent: <reasons>` or `ROOT multi-agent: <reasons>`; an offer reads
+`the session was offered sub-agent tools: <tools> (multi_agent_version <version>)`.
+A sub-agent is a session no launcher started or bound. A version alone is only
+reported.
 
 The probe's `CODEX_HOME` is the plan's `codex-home` folder, logged in one of two
 ways. With an API key (`run --auth api-key`, the default), the folder must be
@@ -135,6 +192,7 @@ python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid 
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID check --model gpt-6-astra --effort ultra --cwd /absolute/workspace
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID check --model gpt-6-astra --effort ultra --cwd /absolute/workspace --approval-policy never --approvals-reviewer user --allow-special-write tmpdir
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID events --turn all
+python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID multi-agent
 python3 -I -B tools/hierarchy_native.py --rollout /absolute/rollout.jsonl --cid CID admit --role operator
 ```
 
