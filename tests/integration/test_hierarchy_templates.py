@@ -409,10 +409,15 @@ def test_the_job_recipe_template_needs_local_values_then_passes_its_own_check(tm
                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
 
     assert check().returncode == 2, "the placeholder paths must not pass as real ones"
-    recipes.update(python=sys.executable, hide=[str(tmp_path)])
+    home = tmp_path / "home"
+    for folder in (".cargo/bin", ".rustup"):
+        (home / folder).mkdir(parents=True)
+    recipes = json.loads(json.dumps(recipes).replace("/REPLACE/WITH/your/home/folder", str(home)))
+    recipes.update(python=sys.executable, hide=[str(home)])
     result = check()
     assert result.returncode == 0, result.stdout
-    assert set(json.loads(result.stdout)["recipes"]) == {"targeted-tests", "full-suite", "lint", "aegis-check", "commit-exact"}
+    assert set(json.loads(result.stdout)["recipes"]) == {"targeted-tests", "full-suite", "lint", "aegis-check", "commit-exact",
+                                                         "rust-targeted-tests", "rust-lint"}
     assert not any(word == "push" for recipe in recipes["recipes"].values() for step in recipe.get("steps", []) for word in step)
     assert all(recipe["sandbox"] == "bwrap" for recipe in recipes["recipes"].values())
 
