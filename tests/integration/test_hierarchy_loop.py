@@ -605,7 +605,7 @@ def test_a_lock_path_that_is_not_a_regular_file_is_refused(world):
 def test_router_request_rows_and_unresolved_escalations_become_holds(world):
     status = {"router": "router-1", "escalations": [
         {"request_id": "r-esc", "reason": "over budget", "team": "pilot", "root_decision": None},
-        {"request_id": "r-decided", "reason": "over budget", "team": "pilot", "root_decision": {"decision": "deny"}}],
+        {"request_id": "r-decided", "reason": "over budget", "team": "pilot", "root_decision": "deny"}],
         "requests": [
             {"request_id": "r-held", "state": "held", "reason": "approval_expired", "detail": "expired at noon"},
             {"request_id": "r-unrecorded", "state": "delivered_unrecorded", "to": "pilot/orchestrator"},
