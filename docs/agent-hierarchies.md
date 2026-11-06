@@ -483,6 +483,20 @@ when the job was admitted, or `null` if none was. Each time root pins or changes
 publishes the hash `check-recipes` prints, so a Reviewer has a value to compare. The template's `targeted-tests` and `full-suite` set
 both flags. Its `lint` runs the same command as `make lint`, takes no paths, and so cannot be narrowed.
 
+A `require_clean` recipe may add `export_git` for a build that asks Git about itself, such as a
+`build.rs` that runs `git rev-parse HEAD`. The export then gets a read-only `.git` holding only `HEAD`
+(the packet's full commit id, so HEAD is detached there), empty `objects/` and `refs/`, and a
+`config` with only `repositoryformatversion = 0` and `bare = false`: no hooks, alternates, packed refs
+or `info/`. It is not counted in the export's entries or bytes, and `source_export` gains
+`git_stub: true`. A commit that itself holds a `.git` is still refused. `GIT_CEILING_DIRECTORIES` is
+the job folder, so Git in any folder of the export finds the stub and never a repository around the
+store. The template's `rust-targeted-tests` and `rust-lint` set `require_clean`, `export_git` and
+`heavy_tests`, and run cargo offline (`--frozen`, `CARGO_NET_OFFLINE`) with `CARGO_HOME` and
+`RUSTUP_HOME` bound read-only through `ro_binds` and the build in the job's cargo target folder.
+`rust-targeted-tests` first writes a nextest config into `$scratch` that sends nextest's store there
+and its JUnit report to `$scratch/junit.xml`, so `expects_tests` counts the run and nothing is
+written into the commit. Both name the crate (`-p stormheir-sim`); change it for another workspace.
+
 **Reviewing with job evidence.** The orchestrator files `targeted-tests` on the exact commit under
 review and forwards the receipt's evidence references (paths and sha256) in the review dispatch. The
 Reviewer then checks:
