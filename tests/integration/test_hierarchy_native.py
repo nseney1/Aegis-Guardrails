@@ -34,10 +34,20 @@ def rollout(tmp_path, rows=None):
     return path
 
 
+def run_tool(path, *args):
+    # The reader runs no tool, so its PATH is an empty fake-bin dir and HOME a disposable folder: a stray
+    # lookup of codex or ~/.codex would find nothing real.
+    base = Path(path).parent
+    (base / "fake-bin").mkdir(exist_ok=True)
+    (base / "home").mkdir(exist_ok=True)
+    env = {"PATH": str(base / "fake-bin"), "HOME": str(base / "home"), "CODEX_THREAD_ID": CID,
+           "CODEX_SESSION_ID": CID, "LANG": os.environ.get("LANG", "C.UTF-8")}
+    return subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--rollout", str(path),
+                           "--cid", CID, *args], text=True, capture_output=True, timeout=5, env=env)
+
+
 def invoke(path, *args, code=0):
-    proc = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--rollout", str(path),
-                           "--cid", CID, *args], text=True, capture_output=True, timeout=10,
-                          env={**os.environ, "CODEX_THREAD_ID": CID, "CODEX_SESSION_ID": CID})
+    proc = run_tool(path, *args)
     assert proc.returncode == code, proc.stdout + proc.stderr
     assert not proc.stderr, proc.stderr
     return json.loads(proc.stdout)
@@ -195,3 +205,452 @@ def test_matching_new_turn_context_replaces_previous_profile(tmp_path):
     assert result["state"] == "PROFILE_HOLD"
     assert result["reasons"] == ["reasoning effort mismatch"]
     assert result["observation"]["turn_record"]["line"] == 4
+
+
+# Real rollout shapes (Codex 0.165/0.166, per evidence/30-item7-understand.json): the served tier is only in
+# event_msg/thread_settings_applied, and a default workspace-write profile carries slash_tmp and tmpdir writes,
+# read carve-outs for <ws>/.git and the like, and entries with missing_path_behavior.
+REGISTRY = Path(__file__).resolve().parents[2] / "tools" / "hierarchy_templates" / "role-registry.json"
+
+
+def started(turn):
+    return {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn, "root_turn_id": turn}}
+
+
+def completed(turn):
+    return {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn}}
+
+
+def settings(tier, turn=None, **changes):
+    value = {"model": "gpt-6-astra", "service_tier": tier, "approval_policy": "never",
+             "approvals_reviewer": "user", **changes}
+    payload = {"type": "thread_settings_applied", "thread_settings": value}
+    if turn is not None:
+        payload["turn_id"] = turn
+    return {"type": "event_msg", "timestamp": "2026-11-03T21:53:30Z", "payload": payload}
+
+
+def real_profile(*extra):
+    return {"type": "managed", "network": "restricted", "file_system": {"type": "restricted", "entries": [
+        {"path": {"type": "special", "value": {"kind": "root"}}, "access": "read"},
+        {"path": {"type": "path", "path": WORK}, "access": "write"},
+        {"path": {"type": "special", "value": {"kind": "slash_tmp"}}, "access": "write"},
+        {"path": {"type": "special", "value": {"kind": "tmpdir"}}, "access": "write"},
+        {"path": {"type": "path", "path": WORK + "/.git"}, "access": "read", "missing_path_behavior": "skip"},
+        {"path": {"type": "path", "path": WORK + "/.codex"}, "access": "read", "missing_path_behavior": "skip"},
+        *extra]}}
+
+
+def turn(turn_id, **changes):
+    return context(turn_id=turn_id, **changes)
+
+
+META = {"type": "session_meta", "payload": {"id": CID, "source": "exec", "cwd": WORK, "cli_version": "0.166.0"}}
+
+
+def test_served_tier_comes_from_thread_settings_applied_for_the_current_turn(tmp_path):
+    rows = [META, settings("flex"), started("t1"), turn("t1")]
+    result = invoke(rollout(tmp_path, rows), "inspect", "--requested-tier", "flex")
+    assert result["served_tier"] == "flex"
+    assert result["served_tier_source"] == "thread_settings_applied"
+    assert result["settings_record"]["line"] == 2
+    assert result["applied_settings"]["approval_policy"] == "never"
+    assert result["profile"]["model"] == "gpt-6-astra"
+
+
+def test_settings_applied_inside_the_current_turn_are_read(tmp_path):
+    rows = [META, started("t1"), settings("ultrafast"), turn("t1")]
+    assert invoke(rollout(tmp_path, rows), "inspect")["served_tier"] == "ultrafast"
+
+
+@pytest.mark.parametrize("rows", [
+    [META, settings("flex"), started("t1"), turn("t1"), completed("t1"), started("t2"), turn("t2")],
+    [META, started("t1"), settings("flex"), turn("t1"), completed("t1"), started("t2"), turn("t2")],
+    [META, settings("flex", turn="t1"), started("t2"), turn("t2")],
+    [META, started("t2"), settings("flex", turn="t1"), turn("t2")],
+])
+def test_an_earlier_turns_settings_never_report_the_current_served_tier(tmp_path, rows):
+    result = invoke(rollout(tmp_path, rows), "inspect")
+    assert result["served_tier"] is None
+    assert result["served_tier_source"] is None
+    assert "settings_record" not in result
+
+
+def test_settings_applied_between_turns_belong_to_the_next_turn(tmp_path):
+    rows = [META, settings("default"), started("t1"), turn("t1"), completed("t1"),
+            settings("ultrafast"), started("t2"), turn("t2")]
+    result = invoke(rollout(tmp_path, rows), "inspect")
+    assert result["served_tier"] == "ultrafast"
+    assert result["settings_record"]["line"] == 6
+
+
+def test_malformed_thread_settings_fail_closed(tmp_path):
+    bad = {"type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": "fast"}}
+    result = invoke(rollout(tmp_path, [META, bad, started("t1"), turn("t1")]), "inspect", code=2)
+    assert result["error"] == "thread settings at line 2 must be an object"
+
+
+def test_inspect_reports_the_observed_real_profile_structurally(tmp_path):
+    rows = [META, started("t1"), turn("t1", permission_profile=real_profile())]
+    observed = invoke(rollout(tmp_path, rows), "inspect")["observed_permissions"]
+    assert observed["supported"] is True
+    assert observed["network"] == "restricted"
+    assert observed["entries"] == [
+        {"kind": "special", "path_or_special": "root", "access": "read", "missing_path_behavior": None},
+        {"kind": "path", "path_or_special": WORK, "access": "write", "missing_path_behavior": None},
+        {"kind": "special", "path_or_special": "slash_tmp", "access": "write", "missing_path_behavior": None},
+        {"kind": "special", "path_or_special": "tmpdir", "access": "write", "missing_path_behavior": None},
+        {"kind": "path", "path_or_special": WORK + "/.git", "access": "read", "missing_path_behavior": "skip"},
+        {"kind": "path", "path_or_special": WORK + "/.codex", "access": "read", "missing_path_behavior": "skip"}]
+
+
+def test_inspect_reports_an_unsupported_profile_without_guessing(tmp_path):
+    rows = [META, context(permission_profile={"type": "future-policy"})]
+    observed = invoke(rollout(tmp_path, rows), "inspect")["observed_permissions"]
+    assert observed == {"supported": False, "network": None, "entries": [],
+                        "reasons": ["permission profile is not a managed restricted profile"]}
+
+
+def test_check_refuses_unrequested_special_writes_and_names_each(tmp_path):
+    rows = [META, started("t1"), turn("t1", permission_profile=real_profile())]
+    path = rollout(tmp_path, rows)
+    args = ("check", "--model", "gpt-6-astra", "--effort", "ultra", "--cwd", WORK)
+    result = invoke(path, *args, code=2)
+    assert result["reasons"] == ["special write access was not requested: slash_tmp",
+                                 "special write access was not requested: tmpdir"]
+    result = invoke(path, *args, "--allow-special-write", "tmpdir", code=2)
+    assert result["reasons"] == ["special write access was not requested: slash_tmp"]
+    result = invoke(path, *args, "--allow-special-write", "tmpdir", "--allow-special-write", "slash_tmp")
+    assert result["state"] == "PROFILE_MATCH"
+    result = invoke(path, *args, "--allow-tmpdir", "--allow-special-write", "slash_tmp")
+    assert result["state"] == "PROFILE_MATCH"
+
+
+def test_check_still_refuses_an_unexpected_path_write_in_a_real_profile(tmp_path):
+    extra = {"path": {"type": "path", "path": WORK + "/.git"}, "access": "write", "missing_path_behavior": "skip"}
+    rows = [META, started("t1"), turn("t1", permission_profile=real_profile(extra))]
+    result = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra",
+                    "--cwd", "/other-workspace", "--allow-special-write", "tmpdir",
+                    "--allow-special-write", "slash_tmp", code=2)
+    assert "write root is outside requested scope: " + WORK in result["reasons"]
+    assert "write root is outside requested scope: " + WORK + "/.git" in result["reasons"]
+
+
+def test_root_write_can_never_be_allowed(tmp_path):
+    extra = {"path": {"type": "special", "value": {"kind": "root"}}, "access": "write"}
+    rows = [META, started("t1"), turn("t1", permission_profile=real_profile(extra))]
+    path = rollout(tmp_path, rows)
+    args = ("check", "--model", "gpt-6-astra", "--effort", "ultra", "--cwd", WORK)
+    result = invoke(path, *args, "--allow-special-write", "tmpdir", "--allow-special-write", "slash_tmp", code=2)
+    assert result["reasons"] == ["special write access was not requested: root"]
+    result = invoke(path, *args, "--allow-special-write", "root", code=2)
+    assert result["error"] == "root write access cannot be allowed"
+
+
+@pytest.mark.parametrize("entry,reason", [
+    ({"path": {"type": "path", "path": WORK}, "access": "execute"}, "unsupported access at entry 7"),
+    ({"path": {"type": "path", "path": WORK}, "access": "read", "missing_path_behavior": 3},
+     "unsupported missing_path_behavior at entry 7"),
+    ({"path": {"type": "special", "value": {}}, "access": "read"}, "unsupported special path at entry 7"),
+    ({"path": "loose", "access": "read"}, "unsupported path at entry 7"),
+])
+def test_malformed_profile_entries_are_reported_and_held(tmp_path, entry, reason):
+    rows = [META, started("t1"), turn("t1", permission_profile=real_profile(entry))]
+    path = rollout(tmp_path, rows)
+    observed = invoke(path, "inspect")["observed_permissions"]
+    assert observed["supported"] is False and observed["reasons"] == [reason]
+    result = invoke(path, "check", "--model", "gpt-6-astra", "--effort", "ultra", "--cwd", WORK,
+                    "--allow-tmpdir", "--allow-special-write", "slash_tmp", code=2)
+    assert result["reasons"] == ["effective restricted permission profile unavailable"]
+
+
+@pytest.mark.parametrize("reviewer,code,reasons", [
+    (None, 0, []),
+    ("user", 2, ["approval reviewer mismatch"]),
+])
+def test_provisioned_never_policy_with_no_reviewer_can_be_expected(tmp_path, reviewer, code, reasons):
+    rows = [META, started("t1"), turn("t1", approval_policy="never", approvals_reviewer=reviewer)]
+    result = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra",
+                    "--cwd", WORK, "--approval-policy", "never", "--approvals-reviewer", "none", code=code)
+    assert result["reasons"] == reasons
+
+
+def codex_roles():
+    roles = json.loads(REGISTRY.read_text())["roles"]
+    return sorted(name for name, entry in roles.items() if entry["endpoint"] is not None)
+
+
+def test_registry_lists_the_codex_roles_this_reader_must_know():
+    assert codex_roles() == ["decider", "front-door", "implementer", "integrator", "orchestrator",
+                             "reviewer", "root", "router"]
+
+
+@pytest.mark.parametrize("role", codex_roles())
+def test_every_registry_codex_role_is_assessed_and_held(tmp_path, role):
+    rows = [META, started("t1"), turn("t1", effort="medium")]
+    result = invoke(rollout(tmp_path, rows), "admit", "--role", role, "--requested-tier", "ultrafast", code=2)
+    assert result["state"] == "NATIVE_HOLD"
+    assert result["role"] == role
+    assert result["reasons"][-1] == "authenticated native identity and tool capabilities are unavailable"
+
+
+def test_a_role_without_a_codex_endpoint_is_refused(tmp_path):
+    proc = run_tool(rollout(tmp_path), "admit", "--role", "owner")
+    assert proc.returncode == 2
+    assert "invalid choice: 'owner'" in proc.stderr
+
+
+def test_root_with_real_workspace_profile_is_not_read_only(tmp_path):
+    rows = [META, started("t1"), turn("t1", permission_profile=real_profile())]
+    result = invoke(rollout(tmp_path, rows), "admit", "--role", "root", code=2)
+    assert "ROOT requires an effective read-only filesystem" in result["reasons"]
+
+
+def exec_end(turn_id, call, command, code, output, **extra):
+    payload = {"type": "exec_command_end", "call_id": call, "command": command, "cwd": WORK,
+               "exit_code": code, "aggregated_output": output, "stdout": output, "stderr": "", **extra}
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    return {"type": "event_msg", "timestamp": "2026-11-03T21:54:00Z", "payload": payload}
+
+
+def patch_end(turn_id, call, success, changes, stderr=""):
+    payload = {"type": "patch_apply_end", "call_id": call, "success": success, "changes": changes,
+               "stdout": "", "stderr": stderr}
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    return {"type": "event_msg", "payload": payload}
+
+
+def item(command, code, output, status="completed"):
+    return {"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": command,
+                                              "aggregated_output": output, "exit_code": code, "status": status}}
+
+
+ATTEMPT = ["/bin/bash", "-lc", "python3 .aegis-probe/attempt.py n0nce"]
+EROFS = "OSError(30, 'Read-only file system')"
+
+
+def exec_rows():
+    return [META, started("t1"), turn("t1"),
+            exec_end("t1", "c1", ATTEMPT, 0, "ok"),
+            completed("t1"), started("t2"), turn("t2"),
+            exec_end(None, "c2", ATTEMPT, 1, EROFS),
+            patch_end("t2", "p1", False, {WORK + "/../outside/n0nce": {"add": {"content": "n0nce"}}},
+                      "patch rejected: writing outside of the project; rejected by user approval settings"),
+            item("python3 .aegis-probe/attempt.py n0nce", None, "", status="in_progress"),
+            {"type": "response_item", "payload": {"role": "assistant", "content": "exit_code 1 EROFS"}}]
+
+
+def test_events_lists_the_current_turns_executions_and_patches(tmp_path):
+    result = invoke(rollout(tmp_path, exec_rows()), "events")
+    assert result["schema"] == "aegis.native-exec-events/v1"
+    assert result["turn_scope"] == "current" and result["current_turn_id"] == "t2"
+    executions = result["command_executions"]
+    assert [(e["turn_id"], e["call_id"], e["exit_code"], e["line"]) for e in executions] == [
+        ("t2", "c2", 1, 8), ("t2", "item_1", None, 10)]
+    assert executions[0]["command"] == ATTEMPT
+    assert executions[0]["command_text"] == "/bin/bash -lc 'python3 .aegis-probe/attempt.py n0nce'"
+    assert executions[0]["aggregated_output"] == EROFS
+    assert executions[0]["source"] == "exec_command_end"
+    assert executions[1]["status"] == "in_progress" and executions[1]["source"] == "item.completed"
+    assert len(executions[0]["sha256"]) == 64
+    patches = result["patch_applies"]
+    assert len(patches) == 1
+    assert patches[0]["turn_id"] == "t2" and patches[0]["success"] is False
+    assert patches[0]["paths"] == [WORK + "/../outside/n0nce"]
+    assert patches[0]["stderr"].startswith("patch rejected")
+    assert result["native_execution_qualified"] is False
+
+
+def test_events_read_file_change_items_as_patch_attempts(tmp_path):
+    change = {"type": "item.completed", "item": {"id": "item_2", "type": "file_change", "status": "failed",
+                                                 "changes": [{"path": WORK + "/n0nce", "kind": "add"}]}}
+    patches = invoke(rollout(tmp_path, [META, started("t1"), turn("t1"), change]), "events")["patch_applies"]
+    assert [(p["turn_id"], p["call_id"], p["success"], p["paths"], p["source"]) for p in patches] == [
+        ("t1", "item_2", False, [WORK + "/n0nce"], "item.completed")]
+
+
+def test_events_for_all_turns_keeps_turn_attribution(tmp_path):
+    result = invoke(rollout(tmp_path, exec_rows()), "events", "--turn", "all")
+    assert result["turn_scope"] == "all"
+    assert [(e["turn_id"], e["exit_code"]) for e in result["command_executions"]] == [
+        ("t1", 0), ("t2", 1), ("t2", None)]
+
+
+def test_events_after_a_new_turn_start_do_not_reuse_old_executions(tmp_path):
+    rows = exec_rows() + [started("t3")]
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert result["current_turn_id"] == "t3"
+    assert result["command_executions"] == [] and result["patch_applies"] == []
+
+
+def test_an_event_naming_another_turn_is_attributed_to_that_turn(tmp_path):
+    rows = [META, started("t1"), turn("t1"), completed("t1"), started("t2"),
+            exec_end("t1", "late", ATTEMPT, 0, "ok")]
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert result["command_executions"] == []
+    every = invoke(rollout(tmp_path, rows), "events", "--turn", "all")["command_executions"]
+    assert [(e["turn_id"], e["call_id"]) for e in every] == [("t1", "late")]
+
+
+@pytest.mark.parametrize("record,error", [
+    (exec_end("t1", "c1", ATTEMPT, "1", EROFS), "malformed command execution at line 4"),
+    (exec_end("t1", "c1", [1, 2], 1, EROFS), "malformed command execution at line 4"),
+    (exec_end("t1", "c1", ATTEMPT, 1, None), "malformed command execution at line 4"),
+    (patch_end("t1", "p1", "no", {}), "malformed patch apply at line 4"),
+    (patch_end("t1", "p1", True, ["x"]), "malformed patch apply at line 4"),
+])
+def test_malformed_exec_events_fail_closed(tmp_path, record, error):
+    rows = [META, started("t1"), turn("t1"), record]
+    assert invoke(rollout(tmp_path, rows), "events", code=2)["error"] == error
+
+
+def test_events_needs_the_matching_session_identity(tmp_path):
+    rows = [{"type": "session_meta", "payload": {"id": "other"}}, started("t1")]
+    assert invoke(rollout(tmp_path, rows), "events", code=2)["error"] == "rollout identity does not match requested CID"
+
+
+@pytest.mark.parametrize("served,requested,code,reasons", [
+    ("default", "ultrafast", 2, ["served tier mismatch: requested ultrafast, served default"]),
+    ("flex", "default", 2, ["served tier mismatch: requested default, served flex"]),
+    ("ultrafast", "ultrafast", 0, []),
+])
+def test_check_holds_when_the_known_served_tier_differs_from_the_requested_tier(tmp_path, served, requested, code,
+                                                                               reasons):
+    rows = [META, started("t1"), settings(served), turn("t1")]
+    result = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra", "--cwd", WORK,
+                    "--requested-tier", requested, code=code)
+    assert result["reasons"] == reasons
+    assert result["observation"]["served_tier"] == served
+
+
+def test_an_unrequested_model_or_effort_is_unchecked_and_holds():
+    sys.path.insert(0, str(TOOL.parent))
+    import hierarchy_native
+    observation = {"profile": {"model": "gpt-6-astra", "effort": "ultra", "cwd": WORK, "approval_policy": "on-request",
+                               "approvals_reviewer": "auto_review",
+                               "permission_profile": context()["payload"]["permission_profile"]},
+                   "requested_tier": "default", "served_tier": None}
+    checked = hierarchy_native.check_profile(observation, None, None, WORK)
+    assert checked["state"] == "PROFILE_HOLD"
+    assert checked["checks"] == {"model": "unchecked", "effort": "unchecked", "cwd": "checked"}
+    assert checked["reasons"] == ["model unchecked: no value was requested", "effort unchecked: no value was requested"]
+    assert hierarchy_native.check_profile(observation, "gpt-6-astra", "ultra", WORK)["state"] == "PROFILE_MATCH"
+
+
+def completed_item(turn_id, item):
+    payload = {"type": "item_completed", "thread_id": CID, "item": item}
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    return {"type": "event_msg", "payload": payload}
+
+
+def test_events_read_event_msg_item_completed_command_and_file_change_items(tmp_path):
+    shell = {"type": "CommandExecution", "id": "item_0", "command": ATTEMPT, "status": "failed",
+             "aggregated_output": EROFS, "exit_code": 1}
+    change = {"type": "FileChange", "id": "patch_0", "status": "failed", "stderr": "patch rejected: read-only",
+              "changes": [{"path": WORK + "/n0nce", "kind": "add"}]}
+    message = {"type": "AgentMessage", "id": "msg", "content": [{"type": "Text", "text": "exit_code 1 EROFS"}]}
+    rows = [META, started("t1"), turn("t1"), completed_item("t1", shell), completed_item(None, change),
+            completed_item("t1", message), completed("t1"), started("t2"), turn("t2")]
+    every = invoke(rollout(tmp_path, rows), "events", "--turn", "all")
+    assert [(e["turn_id"], e["call_id"], e["exit_code"], e["source"], e["line"]) for e in every["command_executions"]] == [
+        ("t1", "item_0", 1, "item_completed", 4)]
+    assert every["command_executions"][0]["command_text"] == "/bin/bash -lc 'python3 .aegis-probe/attempt.py n0nce'"
+    assert [(p["turn_id"], p["call_id"], p["success"], p["paths"], p["stderr"], p["source"])
+            for p in every["patch_applies"]] == [
+        ("t1", "patch_0", False, [WORK + "/n0nce"], "patch rejected: read-only", "item_completed")]
+    current = invoke(rollout(tmp_path, rows), "events")
+    assert current["command_executions"] == [] and current["patch_applies"] == []
+
+
+@pytest.mark.parametrize("item,error", [
+    ({"type": "CommandExecution", "id": "i", "command": [1], "exit_code": 1}, "malformed command execution at line 4"),
+    ({"type": "FileChange", "id": "p", "status": "failed", "changes": "x"}, "malformed patch apply at line 4"),
+])
+def test_malformed_item_completed_records_fail_closed(tmp_path, item, error):
+    rows = [META, started("t1"), turn("t1"), completed_item("t1", item)]
+    assert invoke(rollout(tmp_path, rows), "events", code=2)["error"] == error
+
+
+# Second-round review fixes: stopped turns, once-per-thread settings, item turn ids and tool-call patches.
+
+def aborted(turn):
+    return {"type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": turn, "reason": "interrupted"}}
+
+
+@pytest.mark.parametrize("end", [[], ["aborted"]])
+def test_a_resumed_turns_early_settings_are_not_lost_to_the_stopped_turn(tmp_path, end):
+    # t1 is stopped (no task_complete; maybe turn_aborted); the resumed process writes settings, then starts t2.
+    rows = [META, started("t1"), settings("ultrafast"), turn("t1"), *[aborted("t1") for _ in end],
+            settings("flex"), started("t2"), turn("t2")]
+    result = invoke(rollout(tmp_path, rows), "inspect", "--requested-tier", "ultrafast")
+    assert (result["served_tier"], result["served_tier_source"]) == ("flex", "thread_settings_applied")
+    assert result["settings_record"]["line"] == (6 if end else 5)
+
+
+def test_settings_after_turn_aborted_belong_to_the_next_turn(tmp_path):
+    rows = [META, started("t1"), turn("t1"), aborted("t1"), settings("flex"), started("t2"), turn("t2")]
+    assert invoke(rollout(tmp_path, rows), "inspect")["served_tier"] == "flex"
+
+
+def test_an_unknown_served_tier_holds_when_a_tier_was_requested(tmp_path):
+    # Settings written once per thread leave every later turn without a served tier.
+    rows = [META, settings("ultrafast"), started("t1"), turn("t1"), completed("t1"), started("t2"), turn("t2")]
+    result = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra", "--cwd", WORK,
+                    "--requested-tier", "ultrafast", code=2)
+    assert result["observation"]["served_tier"] is None
+    assert result["reasons"] == ["served tier unavailable: requested ultrafast"]
+    default = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra", "--cwd", WORK)
+    assert default["reasons"] == []
+
+
+def test_an_item_completed_record_keeps_its_own_turn_id(tmp_path):
+    shell = {"type": "CommandExecution", "id": "late", "command": ATTEMPT, "status": "failed",
+             "aggregated_output": EROFS, "exit_code": 1}
+    rows = [META, started("t1"), turn("t1"), completed("t1"), started("t2"), turn("t2"), completed_item("t1", shell)]
+    every = invoke(rollout(tmp_path, rows), "events", "--turn", "all")["command_executions"]
+    assert [(e["turn_id"], e["call_id"]) for e in every] == [("t1", "late")]
+    assert invoke(rollout(tmp_path, rows), "events")["command_executions"] == []
+
+
+def tool_call(call, kind="custom_tool_call", **extra):
+    patch = "*** Begin Patch\n*** Add File: %s/n0nce\n+line\n*** End Patch\n" % WORK
+    payload = {"type": kind, "name": "apply_patch", "call_id": call, **extra}
+    if kind == "custom_tool_call":
+        payload["input"] = patch
+    else:
+        payload["arguments"] = json.dumps({"input": patch})
+    return {"type": "response_item", "payload": payload}
+
+
+def tool_output(call, output, kind="custom_tool_call_output"):
+    return {"type": "response_item", "payload": {"type": kind, "call_id": call, "output": output}}
+
+
+def test_events_read_apply_patch_tool_call_pairs_and_mark_their_shape_unconfirmed(tmp_path):
+    rejected = "patch rejected: writing outside of the project; rejected by user approval settings"
+    rows = [META, started("t1"), turn("t1"),
+            tool_call("c1"), tool_output("c1", rejected),
+            tool_call("c2", "function_call"), tool_output("c2", {"content": "Success. Updated the following files"},
+                                                          "function_call_output"),
+            tool_call("c3", status="declined"), tool_output("c3", "declined"),
+            tool_call("c4", "custom_tool_call"),
+            tool_output("c5", "an output with no call")]
+    patches = invoke(rollout(tmp_path, rows), "events")["patch_applies"]
+    found = [(p["call_id"], p["success"], p["paths"], p["source"], p["declined"], p["shape"]) for p in patches]
+    shape = "unconfirmed against a real host"
+    assert found == [("c1", False, [WORK + "/n0nce"], "custom_tool_call", False, shape),
+                     ("c2", True, [WORK + "/n0nce"], "function_call", False, shape),
+                     ("c3", False, [WORK + "/n0nce"], "custom_tool_call", True, shape),
+                     ("c4", None, [WORK + "/n0nce"], "custom_tool_call", False, shape)]
+    assert patches[0]["stderr"] == rejected and patches[0]["line"] == 5 and patches[0]["call_line"] == 4
+
+
+def test_events_read_a_file_change_item_keyed_by_path_and_a_declined_status(tmp_path):
+    change = {"type": "FileChange", "id": "patch_0", "status": "declined",
+              "changes": {WORK + "/n0nce": {"type": "add", "content": "x"}}}
+    rows = [META, started("t1"), turn("t1"), completed_item("t1", change)]
+    patches = invoke(rollout(tmp_path, rows), "events")["patch_applies"]
+    assert [(p["paths"], p["success"], p["declined"]) for p in patches] == [([WORK + "/n0nce"], None, True)]
