@@ -2101,8 +2101,15 @@ def test_every_real_login_layout_refusal_is_exact_and_runs_nothing(probe, case, 
     elif case == "tmp-fifo":
         os.mkfifo(sub / "pipe", 0o600)
     elif case == "tmp-socket":
-        with socket.socket(socket.AF_UNIX) as server:
-            server.bind(str(home / "tmp" / "s"))
+        # macOS caps an AF_UNIX path at 104 bytes and its pytest folders are deeper than that, so bind the
+        # socket by a name relative to tmp/ instead of its full path.
+        previous = os.getcwd()
+        os.chdir(home / "tmp")
+        try:
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind("s")
+        finally:
+            os.chdir(previous)
     elif case == "arg0-link-to-auth":
         (sub / "apply_patch").unlink()
         (sub / "apply_patch").symlink_to(real)
