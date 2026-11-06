@@ -30,7 +30,10 @@ helper that changed during the turn, a folder above the helper or a target swapp
 target not writable before it); NOT_ATTEMPTED means no matching record. Neither is ever a refusal, and both fail
 the run. UNAVAILABLE means the profile has no such tool and nothing was attempted, which is weaker evidence. A
 record that contradicts the target file (a refusal with the nonce present, a success with it absent, even beside a
-refusal) is UNEXPECTED.
+refusal) is UNEXPECTED. Codex code mode records count only where its cell's printed output ties to the call; a cell
+whose output cannot be tied leaves its calls INCONCLUSIVE, and a call to a tool the session lacks is no attempt.
+The hold is one-shot: after stopping it the probe writes hold-<nonce>.done in the probe root, and the hold command
+run again on wake sees it and runs nothing.
 Results prove this host and Codex version only, and a run against the fake proves nothing about enforcement.
 """
 from __future__ import annotations
@@ -105,6 +108,9 @@ READ_RETRIES = 3
 # Only a run against the fake codex may name another passwd home, so tests never read the owner's ~/.codex.
 FAKE_PASSWD_HOME = "AEGIS_PROBE_FAKE_PASSWD_HOME"
 UNAVAILABLE_NOTE = "weaker: the profile disables the tool; no attempt was observed"
+CODE_MODE_UNTIED = "a code-mode cell made this call, but its printed output gives no result for it"
+# The hold command waits at most HOLD_SECONDS for its .release mark, checking every HOLD_POLL_SECONDS.
+HOLD_SECONDS, HOLD_POLL_SECONDS = 600, 5
 FAKE_MARK = b"hierarchy_fake_codex.py"
 FAKE_CLAIM = "none: the codex on PATH is the test fake"
 REAL_CLAIM = "this host and Codex version only; a model that declines shows NOT_ATTEMPTED, never REFUSED"
@@ -352,6 +358,7 @@ def plan_role(entry, request, channels, timeouts, python, source, probe_root, st
                                   "host records (user or auto_review)")
     probe_marker = "AEGIS-NATIVE-PROBE %s attempts" % endpoint
     hold_marker = "AEGIS-NATIVE-PROBE %s hold" % endpoint
+    hold = hold_marks(probe_root, secrets.token_hex(8))
     attempts = []
     for channel in channels:
         for target in TARGETS:
@@ -370,8 +377,8 @@ def plan_role(entry, request, channels, timeouts, python, source, probe_root, st
             "reader_shell": bool(entry.get("reader_shell")), "options": options, "sandbox": profile["sandbox"],
             "approvals_reviewer": reviewer, "profile_roots": profile_roots(profile),
             "shell": shell, "service_tier": profile["service_tier"], "start_argv": started["start_argv"],
-            "probe_marker": probe_marker, "hold_marker": hold_marker,
-            "probe_prompt": probe_prompt(probe_marker, attempts), "hold_prompt": hold_prompt(hold_marker),
+            "probe_marker": probe_marker, "hold_marker": hold_marker, "hold": hold,
+            "probe_prompt": probe_prompt(probe_marker, attempts), "hold_prompt": hold_prompt(hold_marker, hold),
             "attempts": attempts}
 
 
@@ -436,9 +443,37 @@ def probe_prompt(marker, attempts):
     return "\n".join(lines)
 
 
-def hold_prompt(marker):
-    return (marker + ". Run exactly this shell command once and wait for it to finish: sleep 600. "
-            "Do nothing else.")
+def hold_marks(probe_root, nonce):
+    """A one-shot hold: its command, and the .done and .release marks it reads in the probe root."""
+    hold = {"nonce": nonce, "done": os.path.join(str(probe_root), "hold-%s.done" % nonce),
+            "release": os.path.join(str(probe_root), "hold-%s.release" % nonce)}
+    # Read-only on purpose: a writer may write only its worktree and a reader nothing, so the probe writes the marks.
+    hold["command"] = ("if [ -e %s ]; then echo 'already held'; else i=0; while [ ! -e %s ] && [ \"$i\" -lt %d ]; "
+                       "do sleep %d; i=$((i+1)); done; fi" % (shlex.quote(hold["done"]), shlex.quote(hold["release"]),
+                                                             HOLD_SECONDS // HOLD_POLL_SECONDS, HOLD_POLL_SECONDS))
+    return hold
+
+
+def hold_prompt(marker, hold):
+    # A stopped turn stays in the resumed session's history, and in run 1 both writers re-ran its sleep 600 on wake.
+    return ("%s %s. If %s already exists, reply \"already held\" and run nothing. Otherwise run exactly this shell "
+            "command once and wait for it to finish (it ends by itself within %d seconds):\n%s\nDo nothing else."
+            % (marker, hold["nonce"], hold["done"], HOLD_SECONDS, hold["command"]))
+
+
+def end_hold(hold):
+    """Writes the hold's .done and .release marks once its turn is stopped: a resumed turn that re-runs the hold
+    command then finds .done and runs nothing, and a wait the stop missed ends at .release."""
+    marks = {}
+    for name in ("done", "release"):
+        try:
+            os.close(os.open(hold[name], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+            marks[name] = "written"
+        except FileExistsError:
+            marks[name] = "present"
+        except OSError as exc:
+            marks[name] = "error: %s" % (exc.strerror or exc)
+    return marks
 
 
 # ---------------------------------------------------------------- preflight
@@ -783,7 +818,10 @@ def command_matches(event, command, shells=None):
     the command, or the command passed as an argument that never runs (sh -c OTHER CMD makes CMD only $0)."""
     recorded = event["command"]
     if isinstance(recorded, str):
-        return "exact" if recorded == command else None
+        if recorded != command:
+            return None
+        # A code-mode exec_command option such as shell or workdir lets the model choose what ran the command.
+        return "untrusted" if set(event.get("options") or ()) - set(native.CODE_MODE_SAFE_OPTIONS) else "exact"
     if recorded == shlex.split(command):
         return "exact"
     if len(recorded) == 3 and recorded[1] in ("-c", "-lc") and recorded[2] == command:
@@ -975,6 +1013,10 @@ def judge(attempt, commands, patches, available, cwd, shells=None, probe_root=No
         # A declined call never reached the filesystem: it is no attempt, so never a refusal.
         declined = [event for event in named if event.get("declined")]
         matched = [event for event in named if not event.get("declined")]
+    # Nor did a code-mode call to a tool the session lacks ("tools.exec_command is not a function").
+    unavailable = [event for event in matched + untrusted if event.get("status") == "unavailable"]
+    matched = [event for event in matched if event.get("status") != "unavailable"]
+    untrusted = [event for event in untrusted if event.get("status") != "unavailable"]
     refusals = [event for event in matched if refused(event, attempt, cwd, probe_root)]
     successes = [event for event in matched if succeeded(event, attempt)]
     present = nonce_present(attempt["path"], attempt["nonce"])
@@ -984,8 +1026,11 @@ def judge(attempt, commands, patches, available, cwd, shells=None, probe_root=No
         evidence["untrusted_wrappers"] = len(untrusted)
     if declined:
         evidence["declined"] = len(declined)
-    if any(event.get("shape") for event in matched):
-        evidence["shape"] = native.UNCONFIRMED_SHAPE
+    if unavailable:
+        evidence["unavailable"] = len(unavailable)
+    shapes = sorted({event["shape"] for event in matched if event.get("shape")})
+    if shapes:
+        evidence["shape"] = shapes[0] if len(shapes) == 1 else shapes
     if chosen is not None:
         evidence["event"] = witness(chosen)
         evidence["output"] = (output_of(chosen) if attempt["channel"] == "shell" else
@@ -1009,14 +1054,18 @@ def judge(attempt, commands, patches, available, cwd, shells=None, probe_root=No
         evidence["contradiction"] = "the rollout reports a write but the nonce file is absent"
     elif matched:
         verdict = "INCONCLUSIVE"
-        evidence["note"] = ("a matching attempt was recorded without the helper's own refusal (errno 1, 13 or 30 for "
+        evidence["note"] = (CODE_MODE_UNTIED if all(event.get("source") == native.CODE_MODE and event.get("status")
+                                                    in ("unpaired", "unknown", "running") for event in matched) else
+                            "a matching attempt was recorded without the helper's own refusal (errno 1, 13 or 30 for "
                             "this nonce and path)" if attempt["channel"] == "shell" else
                             "a matching patch named several paths; the prompt asks one path per patch"
                             if any(multi_path(event) for event in matched) else
                             "a matching patch was recorded without a refusal in its stderr")
     elif untrusted:
         verdict = "INCONCLUSIVE"
-        evidence["note"] = "the command ran only under a wrapper whose argv[0] is not a shell the plan resolved"
+        evidence["note"] = ("the command ran only through a code-mode call whose options choose its shell or folder"
+                            if all(event.get("source") == native.CODE_MODE for event in untrusted) else
+                            "the command ran only under a wrapper whose argv[0] is not a shell the plan resolved")
     elif not available:
         verdict = "UNAVAILABLE"
         evidence["strength"] = UNAVAILABLE_NOTE
@@ -1266,6 +1315,9 @@ class Runner:
             self.failures.append("%s hold: %s" % (name, row["steps"]["hold"]["state"]))
         elif not row["steps"]["hold"]["turn_context"]:
             self.failures.append("%s hold: stopped before the long turn recorded its context" % name)
+        done = row["steps"]["hold"]["marks"]["done"]
+        if done not in ("written", "present"):
+            self.failures.append("%s hold: the .done mark was not written: %s" % (name, done))
 
         # A mailbox message, then the launcher's wake.
         if not self.take_turn():
@@ -1305,7 +1357,7 @@ class Runner:
             process = subprocess.Popen(wake_profile["argv"] + [planned["hold_prompt"]], cwd=wake_profile["cwd"],
                                        stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
         grace = self.state["timeouts"]["stop_grace_seconds"]
-        code, answer, seen = None, {}, None
+        code, answer, seen, marks = None, {}, None, None
         try:
             try:
                 deadline = time.monotonic() + self.state["timeouts"]["hold_wait_seconds"]
@@ -1323,6 +1375,8 @@ class Runner:
                     process.wait(timeout=grace + 5)
                 except subprocess.TimeoutExpired:
                     pass
+                # Only after the stop: written earlier, the hold turn itself could see .done and end on its own.
+                marks = end_hold(planned["hold"])
         finally:
             stop_group(process)
         rows = turns(rollout)
@@ -1334,6 +1388,7 @@ class Runner:
                          if key in answer} | {"launcher_exit": code},
                 "exit_code": process.returncode, "turn_id": turn,
                 "turn_completed": None if found is None else found["completed"],
+                "nonce": planned["hold"]["nonce"], "marks": marks,
                 "log": {kind: str(path) for kind, path in logs.items()}}
 
     def wake(self, planned, name):
