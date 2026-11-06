@@ -5,6 +5,7 @@ The current supported record format exposes identity/profile provenance, but not
 an authenticated caller, effective tool allowlist or decision-only service.
 `check` verifies a standalone maintenance profile; `admit` deliberately refuses
 workflow admission until those independent native boundaries are implemented.
+`multi-agent` reports whether the session was offered Codex sub-agent tools.
 No command writes configuration, binds a session or launches an actor.
 """
 from __future__ import annotations
@@ -40,6 +41,10 @@ def codex_roles():
 ROLES = codex_roles()
 NATIVE_GAP = "authenticated native identity and tool capabilities are unavailable"
 EXEC_SCHEMA = "aegis.native-exec-events/v1"
+MULTI_AGENT_SCHEMA = "aegis.native-multi-agent/v1"
+# What Codex multi-agent v2 offered in additional_tools (codex-cli 0.166.0, every role of the M1 run of 2026-11-06).
+AGENT_NAMESPACE = "collaboration"
+AGENT_TOOL_NAMES = ("followup_task", "interrupt_agent", "list_agents", "send_message", "spawn_agent", "wait_agent")
 
 
 def rollout_records(rollout, tolerant=False):
@@ -906,16 +911,66 @@ def exec_events(rollout, cid, scope="current", tolerant=False):
             "native_execution_qualified": False, "qualification_blocker": NATIVE_GAP}
 
 
+def offered_agent_tools(payload, number):
+    """Agent tools in one additional_tools payload, as <namespace>.<name>, or a bare name outside a namespace."""
+    malformed = "malformed additional_tools record at line %d" % number
+    entries = payload.get("tools")
+    require(isinstance(entries, list), malformed)
+    found = []
+    for entry in entries:
+        require(isinstance(entry, dict) and isinstance(entry.get("name"), str), malformed)
+        if entry.get("type") != "namespace":
+            if entry["name"] in AGENT_TOOL_NAMES:
+                found.append(entry["name"])
+            continue
+        require(isinstance(entry.get("tools"), list), malformed)
+        for tool in entry["tools"]:
+            require(isinstance(tool, dict) and isinstance(tool.get("name"), str), malformed)
+            if entry["name"] == AGENT_NAMESPACE or tool["name"] in AGENT_TOOL_NAMES:
+                found.append(entry["name"] + "." + tool["name"])
+    return found
+
+
+def multi_agent_state(rollout, cid=None, tolerant=False):
+    """Whether a Codex session was offered sub-agent tools, read from its rollout.
+
+    agent_tools is the evidence: every tool an additional_tools record offered in the collaboration namespace, or
+    under a multi-agent v2 tool name anywhere. version is the latest turn_context's multi_agent_version (None when
+    absent) and is reported only, because Codex may record a version with the tools off. turns counts turn_context
+    records and tool_records the additional_tools records; with no tools record the rollout says nothing about the
+    tools either way. With cid, the rollout's session identity must match it.
+    """
+    metadata, version, turns, records, offered = None, None, 0, 0, set()
+    for _path, number, _raw, record in rollout_records(rollout, tolerant):
+        kind, payload = record.get("type"), record.get("payload")
+        if kind == "session_meta":
+            require(isinstance(payload, dict), "native record payload must be an object")
+            require(cid is None or payload.get("id") == cid, "rollout identity does not match requested CID")
+            metadata = payload
+        elif kind == "turn_context" and isinstance(payload, dict):
+            turns += 1
+            version = payload.get("multi_agent_version")
+        elif kind == "response_item" and isinstance(payload, dict) and payload.get("type") == "additional_tools":
+            records += 1
+            offered.update(offered_agent_tools(payload, number))
+    require(cid is None or metadata is not None, "no native session identity in rollout")
+    return {"schema": MULTI_AGENT_SCHEMA, "cid": None if metadata is None else metadata.get("id"), "version": version,
+            "agent_tools": sorted(offered), "turns": turns, "tool_records": records}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rollout", required=True, help="Absolute path to the native session record")
     parser.add_argument("--cid", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "check", "admit", "events"):
+    for name in ("inspect", "check", "admit", "events", "multi-agent"):
         command = commands.add_parser(name)
         if name == "events":
             command.add_argument("--turn", choices=("current", "all"), default="current",
                                  help="List the latest started turn's attempts, or every turn's")
+            continue
+        if name == "multi-agent":
+            command.description = "Exit 2 when the session was offered sub-agent tools; the version alone is reported"
             continue
         command.add_argument("--requested-tier", default="default")
         if name == "check":
@@ -937,6 +992,10 @@ def main(argv=None):
         if args.command == "events":
             print(encoded(exec_events(args.rollout, args.cid, args.turn)).decode())
             return 0
+        if args.command == "multi-agent":
+            state = multi_agent_state(args.rollout, args.cid)
+            print(encoded(state).decode())
+            return 2 if state["agent_tools"] else 0
         observation = inspect_codex(args.rollout, args.cid, args.requested_tier)
         if args.command == "check":
             result = check_profile(observation, args.model, args.effort, args.cwd, write_roots=args.write_root,

@@ -302,7 +302,8 @@ def test_a_read_only_codex_role_matches_the_profile_that_worked_on_a_real_host(s
     assert argv[argv.index("-C") + 1] == str(setup.source)
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert "--ignore-user-config" in argv and "--json" in argv
-    for feature in ("shell_tool", "unified_exec", "multi_agent", "apps", "plugins", "memories", "goals"):
+    # multi_agent_v2 too: run 1's sessions were offered the v2 agent tools with only multi_agent disabled.
+    for feature in ("shell_tool", "unified_exec", "multi_agent", "multi_agent_v2", "apps", "plugins", "memories", "goals"):
         assert feature in [argv[index + 1] for index, word in enumerate(argv) if word == "--disable"]
     config = codex_config(argv)
     assert config["approval_policy"] == "never"

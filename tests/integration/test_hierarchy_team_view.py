@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from tests.integration.test_hierarchy_decider import Decider, merge
+from tests.integration.test_hierarchy_decider import Decider, delegation, merge
 from tests.integration.test_hierarchy_lifecycle import SOURCE, raw_request, request
 from tests.integration.test_hierarchy_mailbox import ROOT
 
@@ -188,6 +188,59 @@ def test_a_later_root_decision_on_the_escalation_clears_it(ledger, verdict):
     ledger.event("decision", actor="root-1", decision=verdict, reason="ROOT decided the escalation",
                  **ledger.target(outside))
     assert pending(ledger) == []
+
+
+def test_an_undecided_merge_inside_a_live_delegation_is_listed_as_the_deciders(ledger):
+    """Still listed, so ROOT sees it, but marked: the Decider owns it until it escalates or the delegation lapses."""
+    ledger.delegate()
+    value = merge("merge-3")
+    ledger.publish(value)
+    sha = raw_request(value)["sha256"]
+    [row] = pending(ledger)
+    assert (row["request_id"], row["why"], row.get("delegation_id")) == ("merge-3", "within_delegation", "delegation-1")
+    assert "escalation_reason" not in row
+    assert row["root_decide"] == {"request_id": "merge-3", "request_sha256": sha,
+                                  "event_id_approve": "root-merge-3-approve", "event_id_deny": "root-merge-3-deny"}
+    answer = status(ledger)
+    assert answer["pending"] == ["merge-3"]
+    assert {"request_id": "merge-3", "state": "within_delegation"} in answer["requests"]
+
+
+def test_the_deciders_escalation_of_a_merge_inside_its_delegation_is_escalated(ledger):
+    granted = ledger.delegate()
+    value = merge("merge-3")
+    ledger.publish(value)
+    ledger.decide(value, granted, "escalate", reason="the review failed")
+    [row] = pending(ledger)
+    assert (row["request_id"], row["why"], row["delegation_id"], row["escalation_reason"]) == (
+        "merge-3", "escalated", "delegation-1", "the review failed")
+
+
+@pytest.mark.parametrize("case", ["expired", "exhausted", "unapproved", "denied", "other_team", "outside",
+                                  "not_a_merge"])
+def test_a_merge_the_delegation_cannot_take_is_awaiting_roots_decision(ledger, monkeypatch, case):
+    if case == "expired":
+        ends = datetime.now(timezone.utc) + timedelta(hours=1)
+        ledger.delegate(delegation(expires_at=stamp(ends)))
+        monkeypatch.setattr(hierarchy_team_view, "timestamp", lambda: stamp(ends + timedelta(seconds=1)))
+    elif case == "exhausted":
+        granted = ledger.delegate(delegation(max_starts=1))
+        used = merge("merge-1")
+        ledger.publish(used)
+        ledger.decide(used, granted)
+    elif case == "unapproved":
+        ledger.publish(delegation())
+    elif case == "denied":
+        refused = delegation()
+        ledger.publish(refused)
+        deny(ledger, refused)
+    else:
+        ledger.delegate()
+    changes = {"other_team": {"team": "forge"}, "outside": {"paths": ["/fixture/other"]},
+               "not_a_merge": {"operation": "targeted-tests"}}.get(case, {})
+    ledger.publish(merge("merge-3", **changes))
+    rows = {row["request_id"]: row for row in pending(ledger)}
+    assert rows["merge-3"]["why"] == "awaiting_decision" and "delegation_id" not in rows["merge-3"]
 
 
 def test_a_request_id_too_long_for_the_event_id_gets_its_hash_instead(ledger):
