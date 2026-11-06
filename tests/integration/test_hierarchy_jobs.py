@@ -1012,8 +1012,14 @@ def test_resolve_needs_a_confirmation_when_no_process_was_ever_recorded(shop, tm
     refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", expect=2)
     assert "--process-stopped" in refused["error"]
     assert shop.heavy()["used"] == 1
+    # A claim written before the hash was stored: the resolution records null rather than hash the file given now.
+    claim_path = shop.workspace.store / "jobs" / "pilot" / "job-1" / "claim.json"
+    claim = json.loads(claim_path.read_text())
+    assert claim.pop("recipes_sha256") == recipes_sha256(shop)
+    claim_path.write_text(json.dumps(claim))
     assert shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.", "--process-stopped")["state"] == "failed"
     assert shop.heavy()["used"] == 0
+    assert recorded(shop)["recipes_sha256"] is None
 
 
 def test_a_runner_that_dies_leaves_a_clear_unknown_and_keeps_the_slot_until_root_resolves_it(shop, tmp_path):
@@ -1035,8 +1041,12 @@ def test_a_runner_that_dies_leaves_a_clear_unknown_and_keeps_the_slot_until_root
     while shop.run_open(expect=3)["rows"][0]["process_alive"]:
         assert time.monotonic() < deadline
         time.sleep(0.05)
+    claimed = recipes_sha256(shop)
+    shop.recipes_path.write_bytes(shop.recipes_path.read_bytes() + b"\n")
     resolved = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "The runner crashed.")
     assert resolved["state"] == "failed"
+    assert recorded(shop)["recipes_sha256"] == claimed != recipes_sha256(shop), \
+        "a root resolution names the recipe file the job was claimed under, not the one given at resolve time"
     assert shop.states("job-1") == ["started", "unknown", "failed"]
     final = shop.receipts("job-1")[-1]
     assert "The runner crashed." in final["receipt"]["reason"] and verified_evidence(final)
@@ -1336,6 +1346,8 @@ def test_a_commit_recipe_needs_an_identity(shop):
     (lambda r: r["recipes"]["ok"].update(keep=["/etc/passwd"]), "invalid keep"),
     (lambda r: r["recipes"]["ok"].update(keep=["file-%d" % n for n in range(17)]), "invalid keep"),
     (lambda r: r["recipes"]["commit"].update(keep=["report.xml"]), "unexpected"),
+    (lambda r: r["recipes"]["ok"].update(require_clean=True, writable_checkout=True),
+     "require_clean recipe ok cannot take writable_checkout: it runs on a read-only export of the commit"),
     (lambda r: r["recipes"].update(merge={"kind": "merge", "sandbox": "none", "timeout_seconds": 30, "steps": [["x"]]}),
      "unexpected"),
 ])
@@ -1960,3 +1972,932 @@ def test_a_sandboxed_merge_can_bring_the_working_tree_forward(shop):
     assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
     assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
     assert git(shop.checkout, "status", "--porcelain=v1", "--untracked-files=all") == ""
+
+
+# Item 6 (ADR-JOB-EVIDENCE): the evidence a Reviewer reads. A test recipe can demand a clean checkout, keeps its junit
+# report, and settles as failed when that report shows no tests or cannot be read; every result names the recipe file's
+# hash and the interpreter's version.
+TEMPLATE = ROOT / "tools" / "hierarchy_templates" / "job-recipes.json"
+CLEAN_REFUSAL = "recipe tests requires a clean checkout; commit or discard local changes"
+WRITE_JUNIT = ("import os, sys\npath, content = sys.argv[1], sys.argv[2]\n"
+               "if content == 'big':\n    content = '<testsuites>' + ' ' * (8 * 1048576) + '</testsuites>'\n"
+               "if content != '-':\n    os.makedirs(os.path.dirname(path), exist_ok=True)\n"
+               "    open(path, 'w', encoding='utf-8').write(content)\n"
+               "print('junit written to', path)\nsys.exit(int(sys.argv[3]))\n")
+
+
+def suite(tests, failures=0, errors=0, skipped=0):
+    return '<testsuite name="pytest" tests="%d" failures="%d" errors="%d" skipped="%d"/>' % (tests, failures, errors, skipped)
+
+
+def with_tests_recipe(shop, junit, exit_code=0, *, heavy=False, **flags):
+    flags = {"keep": ["run/junit.xml"], "expects_tests": True, "require_clean": True, **flags}
+    shop.recipes["recipes"]["tests"] = shop.command(["$python", "-c", WRITE_JUNIT, "$scratch/junit.xml", junit, str(exit_code)],
+                                                    heavy=heavy, **flags)
+    shop.save_recipes()
+
+
+def final_result(shop, identifier="job-1"):
+    receipt = shop.receipts(identifier)[-1]
+    return receipt, json.loads(verified_evidence(receipt)["result.json"].read_text())
+
+
+def test_a_test_job_records_its_counts_in_the_result_and_the_receipt(shop):
+    with_tests_recipe(shop, "<testsuites>%s%s</testsuites>" % (suite(3, skipped=1), suite(2)))
+    shop.request_job("job-1", "tests")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    receipt, result = final_result(shop)
+    assert result["state"] == "completed" and result["exit_code"] == 0 and result["reason"] is None
+    assert result["tests"] == {"total": 5, "passed": 4, "failed": 0, "errors": 0, "skipped": 1}
+    assert "Tests: 5 total, 4 passed, 0 failed, 0 errors, 1 skipped." in receipt["body"]
+    kept = {item["path"]: item for item in result["kept"]}
+    assert Path(kept["run/junit.xml"]["copy"]).read_text().startswith("<testsuites>")
+
+
+def test_a_failing_test_job_keeps_its_exit_and_still_records_its_counts(shop):
+    with_tests_recipe(shop, suite(4, failures=1, errors=1), 1)
+    shop.request_job("job-1", "tests")
+    assert shop.run_open()["rows"][0]["state"] == "failed"
+    receipt, result = final_result(shop)
+    assert (result["exit_code"], result["reason"]) == (1, "step 1 exited 1")
+    assert result["tests"] == {"total": 4, "passed": 2, "failed": 1, "errors": 1, "skipped": 0}
+    assert "Tests: 4 total, 2 passed, 1 failed, 1 errors, 0 skipped." in receipt["body"]
+
+
+def test_a_single_testsuite_root_is_counted_too(shop):
+    with_tests_recipe(shop, suite(2, skipped=1))
+    shop.request_job("job-1", "tests")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    assert final_result(shop)[1]["tests"] == {"total": 2, "passed": 1, "failed": 0, "errors": 0, "skipped": 1}
+
+
+def test_a_test_job_that_passes_no_tests_fails_and_a_failed_step_keeps_its_own_reason(shop):
+    with_tests_recipe(shop, suite(2, failures=2), 1)
+    shop.request_job("job-1", "tests")
+    shop.run_open()
+    result = final_result(shop)[1]
+    assert (result["state"], result["exit_code"], result["reason"]) == ("failed", 1, "step 1 exited 1")
+    assert result["tests"]["passed"] == 0
+
+
+@pytest.mark.parametrize("junit, reason", [
+    (suite(0), "the run reported no tests"),
+    ("<testsuites></testsuites>", "the run reported no tests"),
+    ("-", "junit.xml is missing"),
+])
+def test_a_test_job_that_shows_no_tests_fails_even_with_a_clean_exit(shop, junit, reason):
+    with_tests_recipe(shop, junit)
+    shop.request_job("job-1", "tests")
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("failed", reason)
+    receipt, result = final_result(shop)
+    assert (result["state"], result["exit_code"], result["reason"]) == ("failed", -1, reason)
+    assert result["steps"][0]["exit_code"] == 0
+    assert result["tests"] == ({"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0} if junit != "-" else None)
+    assert receipt["receipt"]["state"] == "failed" and receipt["receipt"]["reason"] == reason
+
+
+BILLION_LAUGHS = ('<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;">]>'
+                  '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0" name="&lol2;"/></testsuites>')
+
+
+@pytest.mark.parametrize("junit, reason", [
+    ("<testsuites><testsuite", "junit.xml is unreadable: it is not well-formed XML"),
+    (BILLION_LAUGHS, "junit.xml is unreadable: it has a DOCTYPE or ENTITY declaration"),
+    ('<!ENTITY x "y"><testsuites/>', "junit.xml is unreadable: it has a DOCTYPE or ENTITY declaration"),
+    ("<html><testsuite tests='1'/></html>", "junit.xml is unreadable: its root is html, not testsuites or testsuite"),
+    ('<!DOCTYPE testsuites><testsuites><testsuite tests="1"/></testsuites>',
+     "junit.xml is unreadable: it has a DOCTYPE or ENTITY declaration"),
+    ("<testsuites><testsuite tests='many'/></testsuites>",
+     "junit.xml is unreadable: testsuite attribute tests is not a non-negative integer"),
+    ("<testsuites><testsuite tests='1' skipped='-2'/></testsuites>",
+     "junit.xml is unreadable: testsuite attribute skipped is not a non-negative integer"),
+    ("<testsuites><testsuite tests='1' failures='2'/></testsuites>",
+     "junit.xml is unreadable: failures, errors and skipped exceed tests"),
+    ("big", "junit.xml is unreadable: it is larger than 8388608 bytes"),
+])
+def test_an_unreadable_junit_report_fails_the_job(shop, junit, reason):
+    with_tests_recipe(shop, junit)
+    shop.request_job("job-1", "tests")
+    assert shop.run_open()["rows"][0]["state"] == "failed"
+    receipt, result = final_result(shop)
+    assert (result["exit_code"], result["reason"], result["tests"]) == (-1, reason, None)
+    assert reason in receipt["body"]
+
+
+def test_a_junit_report_that_is_not_utf8_is_unreadable(shop):
+    with_tests_recipe(shop, "x")
+    script = ("import os, sys\nos.makedirs(os.path.dirname(sys.argv[1]))\n"
+              "open(sys.argv[1], 'wb').write('<testsuites/>'.encode('utf-16'))\n")
+    shop.recipes["recipes"]["tests"]["steps"] = [["$python", "-c", script, "$scratch/junit.xml"]]
+    shop.save_recipes()
+    shop.request_job("job-1", "tests")
+    shop.run_open()
+    assert final_result(shop)[1]["reason"] == "junit.xml is unreadable: it is not UTF-8"
+
+
+def test_a_failed_step_keeps_its_own_reason_when_the_junit_report_is_missing(shop):
+    with_tests_recipe(shop, "-", 2)
+    shop.request_job("job-1", "tests")
+    shop.run_open()
+    result = final_result(shop)[1]
+    assert (result["exit_code"], result["reason"], result["tests"]) == (2, "step 1 exited 2", None)
+
+
+def test_a_recipe_without_expects_tests_records_no_counts(shop):
+    shop.request_job("job-1", "ok")
+    shop.run_open()
+    receipt, result = final_result(shop)
+    assert result["tests"] is None and "Tests:" not in receipt["body"]
+
+
+def test_a_recipe_that_requires_a_clean_checkout_refuses_uncommitted_changes_at_admit(shop):
+    with_tests_recipe(shop, suite(1))
+    (shop.checkout / "src" / "app.py").write_text("value = 2\n")
+    shop.request_job("job-1", "tests", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("refused", CLEAN_REFUSAL)
+    assert shop.states("job-1") == ["refused"]
+    assert shop.receipts("job-1")[-1]["receipt"]["reason"] == CLEAN_REFUSAL
+    assert recorded(shop)["recipes_sha256"] == recipes_sha256(shop), "an admit refusal names the recipe file too"
+
+
+def test_a_recipe_that_requires_a_clean_checkout_runs_on_a_clean_one(shop):
+    with_tests_recipe(shop, suite(1))
+    (shop.checkout / "notes.txt").write_text("ignored? no, untracked\n")
+    shop.request_job("job-2", "tests", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    assert shop.run_open()["rows"][0]["reason"] == CLEAN_REFUSAL, "an untracked file is uncommitted content too"
+    (shop.checkout / "notes.txt").unlink()
+    shop.request_job("job-1", "tests")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+
+
+def test_a_recipe_that_requires_a_clean_checkout_is_checked_again_when_its_slot_comes(shop):
+    with_tests_recipe(shop, suite(1), heavy=True)
+    shop.request_job("job-1", "tests")
+    assert shop.run_open(census=[101, 102, 103], expect=3)["rows"][0]["state"] == "waiting"
+    (shop.checkout / "src" / "app.py").write_text("value = 3\n")
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("refused", CLEAN_REFUSAL), "a packet that claimed a clean checkout learns why"
+    assert shop.heavy()["used"] == 0 and shop.states("job-1") == ["refused"]
+
+
+DIRTY = "import sys; open(sys.argv[1] + '/src/app.py', 'w').write('value = 9\\n')"
+
+
+def test_a_recipe_that_requires_a_clean_checkout_is_witnessed_again_just_before_it_runs(shop):
+    with_tests_recipe(shop, suite(1))
+    shop.recipes["recipes"]["dirty"] = shop.command(["$python", "-c", DIRTY, "$checkout"])
+    shop.save_recipes()
+    shop.request_job("job-a", "dirty")
+    shop.request_job("job-b", "tests")
+    rows = {row["job"]: row for row in shop.run_open()["rows"]}
+    assert rows["pilot/job-a"]["state"] == "failed", "the first job changed the source it ran on"
+    assert (rows["pilot/job-b"]["state"], rows["pilot/job-b"]["reason"]) == ("refused", CLEAN_REFUSAL)
+    result = json.loads((shop.workspace.store / "jobs" / "pilot" / "job-b" / "result.json").read_text())
+    assert result["recipes_sha256"] == hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+    assert result["steps"] == [] and "python" not in result
+
+
+def test_a_result_names_the_recipe_file_hash_and_the_python_version(shop):
+    shop.request_job("job-1", "ok")
+    shop.recipes_path.write_bytes(shop.recipes_path.read_bytes() + b"\n\n")
+    shop.run_open()
+    result = final_result(shop)[1]
+    assert result["recipes_sha256"] == hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+    version = subprocess.run([sys.executable, "-c", "import platform; print(platform.python_version())"],
+                             capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+    assert result["python"] == {"version": version, "executable": sys.executable}
+    assert shop.jobs("check-recipes")["recipes_sha256"] == result["recipes_sha256"]
+
+
+def test_a_commit_result_names_the_recipe_file_hash_but_no_python(shop):
+    (shop.checkout / "src" / "app.py").write_text("value = 2\n")
+    git(shop.checkout, "add", "src/app.py")
+    tree = git(shop.checkout, "write-tree")
+    git(shop.checkout, "reset", "-q")
+    shop.request_job("job-1", "commit", paths=["src/app.py"], expected_tree=tree, message="fix: value",
+                     dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]
+    result = final_result(shop)[1]
+    assert result["recipes_sha256"] == hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+    assert result["python"] is None and result["tests"] is None
+
+
+def fake_python(shop, body):
+    """A stand-in interpreter that logs each call and then runs the real one; it never reaches any other program."""
+    calls = shop.tmp / "python-calls"
+    fake = shop.tmp / "bin" / "python"
+    fake.parent.mkdir(exist_ok=True)
+    fake.write_text("#!/bin/sh\necho \"$*\" >> %s\n%s\n" % (calls, body))
+    fake.chmod(0o755)
+    shop.recipes["python"] = str(fake)
+    shop.save_recipes()
+    return calls
+
+
+def test_the_python_version_is_read_once_per_run(shop):
+    calls = fake_python(shop, 'exec %s "$@"' % sys.executable)
+    shop.request_job("job-1", "ok")
+    shop.request_job("job-2", "ok")
+    assert [row["state"] for row in shop.run_open()["rows"]] == ["completed", "completed"]
+    lines = calls.read_text().splitlines()
+    assert len(lines) == 3 and sum(line.startswith("-I -S -c") for line in lines) == 1, lines
+    assert final_result(shop, "job-2")[1]["python"]["executable"] == str(shop.tmp / "bin" / "python")
+
+
+def test_a_python_whose_version_cannot_be_read_is_recorded_without_failing_the_job(shop):
+    fake_python(shop, 'case "$1" in -I) exit 4;; esac\nexec %s "$@"' % sys.executable)
+    shop.request_job("job-1", "ok")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    python = final_result(shop)[1]["python"]
+    assert python["version"] is None and python["executable"] == str(shop.tmp / "bin" / "python")
+    assert python["error"] == "the version probe exited 4"
+
+
+@pytest.mark.parametrize("change, error", [
+    (lambda r: r["recipes"]["ok"].update(require_clean="yes"), "invalid require_clean flag for recipe ok"),
+    (lambda r: r["recipes"]["ok"].update(expects_tests=1), "invalid expects_tests flag for recipe ok"),
+    (lambda r: r["recipes"]["ok"].update(expects_tests=True), "expects_tests needs keep to include run/junit.xml for recipe ok"),
+    (lambda r: r["recipes"]["ok"].update(expects_tests=True, keep=["junit.xml"]),
+     "expects_tests needs keep to include run/junit.xml for recipe ok"),
+    (lambda r: r["recipes"]["ok"].update(requires_clean=True), "unexpected fields: requires_clean"),
+    (lambda r: r["recipes"]["commit"].update(require_clean=True), "unexpected fields: require_clean"),
+    (lambda r: r["recipes"]["commit"].update(expects_tests=True), "unexpected fields: expects_tests"),
+    (lambda r: r["recipes"]["ok"].update(steps=[["$python", "$scratch/../escape"]]),
+     "unsupported token in recipe ok: $scratch/../escape"),
+    (lambda r: r["recipes"]["ok"].update(steps=[["$python", "$scratch/"]]), "unsupported token in recipe ok: $scratch/"),
+    (lambda r: r["recipes"]["ok"].update(steps=[["$python", "$scratch/$paths"]]),
+     "unsupported token in recipe ok: $scratch/$paths"),
+    (lambda r: r["recipes"]["ok"].update(steps=[["$python", "$checkout/x"]]), "unsupported token in recipe ok: $checkout/x"),
+    (lambda r: r.update(env={"X": "$scratch/junit.xml"}), "unsupported token in env: $scratch/junit.xml"),
+])
+def test_bad_evidence_flags_are_refused_with_an_exact_error(shop, change, error):
+    change(shop.recipes)
+    shop.save_recipes()
+    shop.request_job("job-1", "ok")
+    assert shop.jobs("run-open", expect=2) == {"error": error}
+    assert shop.jobs("check-recipes", expect=2) == {"error": error}
+    assert shop.states("job-1") == []
+
+
+def test_check_recipes_summarizes_the_evidence_flags(shop):
+    with_tests_recipe(shop, suite(1))
+    summary = shop.jobs("check-recipes")
+    assert summary["recipes"]["tests"]["require_clean"] is True and summary["recipes"]["tests"]["expects_tests"] is True
+    assert summary["recipes"]["ok"]["require_clean"] is False and summary["recipes"]["ok"]["expects_tests"] is False
+
+
+def template_for_this_machine(shop):
+    """The template with its placeholders filled the way an owner fills them: a real python, and nothing to hide."""
+    recipes = json.loads(TEMPLATE.read_text())
+    recipes.update(python=sys.executable, hide=[])
+    shop.recipes_path.write_text(json.dumps(recipes))
+    return recipes
+
+
+def test_the_template_test_recipes_demand_a_clean_checkout_and_a_junit_report(shop):
+    recipes = json.loads(TEMPLATE.read_text())["recipes"]
+    for name in ("targeted-tests", "full-suite"):
+        recipe = recipes[name]
+        assert recipe["require_clean"] is True and recipe["expects_tests"] is True and recipe["keep"] == ["run/junit.xml"]
+        step = recipe["steps"][0]
+        assert step[step.index("--junitxml") + 1] == "$scratch/junit.xml"
+        assert step[step.index("--basetemp") + 1] == "$scratch"
+
+
+def test_the_template_lint_recipe_checks_the_fixed_tree_and_takes_no_paths(shop):
+    lint = json.loads(TEMPLATE.read_text())["recipes"]["lint"]
+    assert lint["steps"] == [["$python", "-m", "ruff", "check", "--isolated", "--no-cache", "--select", "E9,F63,F7,F82",
+                              "aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests", ".github/scripts", "tools"]]
+    assert not any("$paths" in word for step in lint["steps"] for word in step)
+
+
+def test_the_template_loads_once_its_placeholders_are_filled(shop):
+    template_for_this_machine(shop)
+    summary = shop.jobs("check-recipes")
+    assert summary["recipes_sha256"] == hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+    assert summary["recipes"]["full-suite"] == {"kind": "command", "heavy": True, "heavy_tests": False, "sandbox": "bwrap",
+                                                "require_clean": True, "expects_tests": True}
+    assert summary["recipes"]["lint"]["require_clean"] is False
+
+
+def pytest_env(shop):
+    shop.recipes["env"] = {"PYTHONPATH": "$checkout"}
+    if "PYTHONUSERBASE" in os.environ:  # Local runs may keep pytest in the user site.
+        shop.recipes["env"].update(PYTHONUSERBASE=os.environ["PYTHONUSERBASE"], PYTHONNOUSERSITE="")
+
+
+@pytest.mark.parametrize("sandbox", ["none", pytest.param("bwrap", marks=needs_bubblewrap)])
+def test_the_template_targeted_tests_recipe_counts_a_real_pytest_run(shop, sandbox):
+    template = template_for_this_machine(shop)
+    recipe = {**template["recipes"]["targeted-tests"], "sandbox": sandbox}
+    shop.recipes["recipes"]["targeted-tests"] = recipe
+    pytest_env(shop)
+    shop.save_recipes()
+    shop.request_job("job-1", "targeted-tests", paths=["tests/test_app.py"])
+    assert shop.run_open()["rows"][0]["state"] == "completed", shop.receipts("job-1")[-1]["body"]
+    receipt, result = final_result(shop)
+    assert result["tests"] == {"total": 1, "passed": 1, "failed": 0, "errors": 0, "skipped": 0}
+    assert "Tests: 1 total, 1 passed, 0 failed, 0 errors, 0 skipped." in receipt["body"]
+
+
+def test_the_template_targeted_tests_recipe_fails_a_selection_that_collects_nothing(shop):
+    template = template_for_this_machine(shop)
+    shop.recipes["recipes"]["targeted-tests"] = {**template["recipes"]["targeted-tests"], "sandbox": "none"}
+    pytest_env(shop)
+    shop.save_recipes()
+    (shop.checkout / "tests" / "test_app.py").write_text("def check_app():\n    pass\n")
+    git(shop.checkout, "commit", "-qam", "no tests")
+    shop.request_job("job-1", "targeted-tests", paths=["tests/test_app.py"])
+    assert shop.run_open()["rows"][0]["state"] == "failed"
+    result = final_result(shop)[1]
+    assert result["steps"][0]["exit_code"] == 5 and result["tests"]["total"] == 0
+
+
+def recorded(shop, identifier="job-1"):
+    return json.loads((shop.workspace.store / "jobs" / "pilot" / identifier / "result.json").read_text())
+
+
+def recipes_sha256(shop):
+    return hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+
+
+def test_a_clean_checkout_refuses_a_packet_that_claims_uncommitted_bytes_with_the_clean_reason(shop):
+    with_tests_recipe(shop, suite(1))
+    shop.request_job("job-1", "tests", dirty_content_sha256="ab" * 32)
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("refused", CLEAN_REFUSAL)
+    assert recorded(shop)["recipes_sha256"] == recipes_sha256(shop)
+
+
+def first_job(shop, script, identifier="job-0", **changes):
+    """A job that runs before the next one and changes what that one was admitted against."""
+    shop.recipes["recipes"]["first"] = shop.command(["$python", "-c", script, "$checkout"])
+    shop.save_recipes()
+    shop.request_job(identifier, "first", **changes)
+
+
+def assert_refused_before_running(shop, identifier, reason):
+    row = next(row for row in shop.run_open()["rows"] if row["job"] == "pilot/" + identifier)
+    assert row["state"] == "refused" and reason in row["reason"], row
+    result = recorded(shop, identifier)
+    assert result["state"] == "refused" and result["steps"] == [] and reason in result["reason"]
+    assert result["recipes_sha256"] == recipes_sha256(shop)
+
+
+def test_a_source_that_cannot_be_witnessed_when_the_slot_comes_is_refused_with_the_recipe_hash(shop):
+    first_job(shop, "import shutil, sys; shutil.rmtree(sys.argv[1] + '/.git')")
+    shop.request_job("job-1", "touch")
+    assert_refused_before_running(shop, "job-1", "could not witness the source: ")
+    assert not shop.sentinel.exists()
+
+
+def test_a_source_that_changed_while_the_job_waited_is_refused_with_the_recipe_hash(shop):
+    first_job(shop, DIRTY)
+    shop.request_job("job-1", "touch")
+    assert_refused_before_running(shop, "job-1", "source does not match the packet: it changed while the job waited")
+    assert not shop.sentinel.exists()
+
+
+SWITCH_BRANCH = "import subprocess, sys; subprocess.run(['git', 'switch', '-q', '-c', 'other'], cwd=sys.argv[1], check=True)"
+
+
+def test_a_merge_whose_branch_changed_while_it_waited_is_refused_with_the_recipe_hash(shop):
+    side, _ = two_sides(shop)
+    first_job(shop, SWITCH_BRANCH)
+    merge_request(shop, side)
+    before = git(shop.checkout, "rev-parse", "HEAD")
+    assert_refused_before_running(shop, "job-1", "HEAD points at refs/heads/other now, not refs/heads/feature/x")
+    assert git(shop.checkout, "rev-parse", "HEAD") == before
+
+
+LEASE = ("import json, subprocess, sys, time\n"
+         "blob = json.dumps({'v': 1, 'lane': 'someone-else', 'role': 'implementer', 'owner': 'test@host',\n"
+         "                   'claim_id': '9f2c0d1e2b3a4f56', 'gen': 1, 'branch': 'lane/someone-else',\n"
+         "                   'paths': ['src/app.py'], 'ts': int(time.time()), 'ttl_s': 3600})\n"
+         "oid = subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=sys.argv[1], input=blob, text=True,\n"
+         "                     capture_output=True, check=True).stdout.strip()\n"
+         "subprocess.run(['git', 'update-ref', 'refs/aegis/lanes/someone-else', oid], cwd=sys.argv[1], check=True)\n")
+
+
+def test_a_commit_whose_paths_were_leased_while_it_waited_is_refused_with_the_recipe_hash(shop):
+    # The same bytes commit_request writes, so the first job is admitted against the source the commit needs.
+    (shop.checkout / "src" / "app.py").write_text("value = 2\n")
+    (shop.checkout / "src" / "other.py").write_text("not part of this commit\n")
+    (shop.checkout / "tests" / "test_app.py").write_text("def test_app():\n    assert True\n")
+    first_job(shop, LEASE, dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    before = shop.head()["commit"]
+    commit_request(shop)
+    assert_refused_before_running(shop, "job-1", "path ownership changed before execution: ")
+    assert "someone-else" in recorded(shop)["reason"] and git(shop.checkout, "rev-parse", "HEAD") == before
+
+
+def test_a_template_test_recipe_whose_tests_are_all_skipped_fails(shop):
+    template = template_for_this_machine(shop)
+    shop.recipes["recipes"]["targeted-tests"] = {**template["recipes"]["targeted-tests"], "sandbox": "none"}
+    pytest_env(shop)
+    shop.save_recipes()
+    (shop.checkout / "tests" / "test_app.py").write_text(
+        "import pytest\n\n\n@pytest.mark.skip(reason='not today')\ndef test_app():\n    pass\n\n\n"
+        "def test_other():\n    pytest.skip('nor this')\n")
+    git(shop.checkout, "commit", "-qam", "all skipped")
+    shop.request_job("job-1", "targeted-tests", paths=["tests/test_app.py"])
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("failed", "the run passed no tests")
+    receipt, result = final_result(shop)
+    assert (result["state"], result["exit_code"], result["reason"]) == ("failed", -1, "the run passed no tests")
+    assert result["steps"][0]["exit_code"] == 0, "pytest itself exits 0 when everything is skipped"
+    assert result["tests"] == {"total": 2, "passed": 0, "failed": 0, "errors": 0, "skipped": 2}
+    assert receipt["receipt"]["reason"] == "the run passed no tests"
+
+
+def test_expects_tests_needs_a_step_that_writes_the_junit_report(shop):
+    with_tests_recipe(shop, suite(1))
+    shop.recipes["recipes"]["tests"]["steps"] = [["$python", "-c", "print('no report')", "$scratch/other.xml"],
+                                                 ["$python", "-c", "pass", "--junitxml", "$scratch/junit.xml.tmp"]]
+    shop.save_recipes()
+    error = "expects_tests needs a step that writes $scratch/junit.xml for recipe tests"
+    assert shop.jobs("check-recipes", expect=2) == {"error": error}
+    shop.request_job("job-1", "tests")
+    assert shop.jobs("run-open", expect=2) == {"error": error}
+    assert shop.states("job-1") == []
+
+
+def load_jobs_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("hierarchy_jobs_probe_test", JOBS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def gone(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as stream:
+            return stream.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        # Reaped between open() and read() reads as ESRCH (ProcessLookupError), not as a missing file.
+        return True
+
+
+def test_a_version_probe_past_its_timeout_takes_what_it_started_with_it(tmp_path, monkeypatch):
+    jobs = load_jobs_module()
+    monkeypatch.setattr(jobs, "PYTHON_PROBE_SECONDS", 0.5)
+    monkeypatch.setattr(jobs, "PYTHON_INFO", {})
+    pidfile = tmp_path / "sleeper.pid"
+    # Not a python at all: it starts a sleeper that lets go of the pipe, then hangs itself, so only its group stops both.
+    fake = tmp_path / "python"
+    fake.write_text("#!/bin/sh\nsleep 30 >/dev/null 2>&1 </dev/null &\necho $! > %s\nexec sleep 30\n" % pidfile)
+    fake.chmod(0o755)
+    started = time.monotonic()
+    info = jobs.python_info({"python": str(fake), "path": ["/usr/bin", "/bin"]})
+    sleeper = int(pidfile.read_text())
+    try:
+        assert time.monotonic() - started < 10
+        assert info["version"] is None and info["error"].startswith("the version probe took longer than"), info
+        deadline = time.monotonic() + 2
+        while not gone(sleeper):
+            assert time.monotonic() < deadline, "the probe's child outlived its timeout"
+            time.sleep(0.05)
+    finally:
+        try:
+            os.kill(sleeper, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+
+# Review fixes for item 6 (evidence/27-item6-review.json).
+@pytest.mark.parametrize("junit, counts", [
+    ("<testsuites><testsuite tests='2'><testsuite tests='2'/></testsuite></testsuites>",
+     {"total": 2, "passed": 2, "failed": 0, "errors": 0, "skipped": 0}),
+    ("<testsuite tests='5' failures='1'><testsuite tests='3' failures='1'/><testsuite tests='2' skipped='1'/></testsuite>",
+     {"total": 5, "passed": 3, "failed": 1, "errors": 0, "skipped": 1}),
+    ("<testsuites><testsuite tests='many'><testsuite tests='1'/></testsuite></testsuites>",
+     {"total": 1, "passed": 1, "failed": 0, "errors": 0, "skipped": 0}),
+])
+def test_nested_testsuites_are_summed_only_at_the_leaves(shop, junit, counts):
+    with_tests_recipe(shop, junit, 1 if counts["failed"] else 0)
+    shop.request_job("job-1", "tests")
+    shop.run_open()
+    assert final_result(shop)[1]["tests"] == counts
+
+
+@pytest.mark.parametrize("make", [
+    "os.makedirs(path)",
+    "os.makedirs(os.path.dirname(path), exist_ok=True); open(path + '.real', 'w').write('<testsuite tests=\"1\"/>'); "
+    "os.symlink(path + '.real', path)",
+])
+def test_a_junit_report_that_is_kept_with_an_error_fails_the_job(shop, make):
+    with_tests_recipe(shop, "x")
+    shop.recipes["recipes"]["tests"]["steps"] = [["$python", "-c", "import os, sys\npath = sys.argv[1]\n" + make,
+                                                  "$scratch/junit.xml"]]
+    shop.save_recipes()
+    shop.request_job("job-1", "tests")
+    row = shop.run_open()["rows"][0]
+    reason = "junit.xml is unreadable: not a regular file inside scratch"
+    assert (row["state"], row["reason"]) == ("failed", reason), row
+    result = final_result(shop)[1]
+    assert (result["state"], result["exit_code"], result["reason"], result["tests"]) == ("failed", -1, reason, None)
+
+
+def test_a_version_probe_that_prints_no_version_is_recorded_without_one(shop):
+    fake_python(shop, 'case "$1" in -I) echo "not a version"; exit 0;; esac\nexec %s "$@"' % sys.executable)
+    shop.request_job("job-1", "ok")
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    python = final_result(shop)[1]["python"]
+    assert python["version"] is None and python["error"] == "the version probe printed no version"
+
+
+def test_a_version_probe_whose_escaped_child_holds_the_pipe_still_returns(tmp_path, monkeypatch):
+    jobs = load_jobs_module()
+    monkeypatch.setattr(jobs, "PYTHON_PROBE_SECONDS", 0.5)
+    monkeypatch.setattr(jobs, "PYTHON_PROBE_DRAIN_SECONDS", 1, raising=False)
+    monkeypatch.setattr(jobs, "PYTHON_INFO", {})
+    pidfile = tmp_path / "escaped.pid"
+    # Not a python: a child in its own session keeps stdout open, so the group kill misses it and EOF never comes.
+    fake = tmp_path / "python"
+    fake.write_text("#!/bin/sh\nsetsid sleep 60 &\necho $! > %s\nexec sleep 60\n" % pidfile)
+    fake.chmod(0o755)
+    started = time.monotonic()
+    try:
+        info = jobs.python_info({"python": str(fake), "path": ["/usr/bin", "/bin"]})
+        assert time.monotonic() - started < 10, "the probe waited on a pipe its escaped child held"
+        assert info["version"] is None and info["error"] == "the version probe took longer than 0.5 seconds", info
+    finally:
+        if pidfile.exists() and pidfile.read_text().strip():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def paths_tests_recipe(shop):
+    shop.recipes["recipes"]["paths-tests"] = shop.command(["$python", "-c", "print('ran')", "$paths"], require_clean=True)
+    shop.save_recipes()
+
+
+def commit_ignore(shop, pattern):
+    (shop.checkout / ".gitignore").write_text(pattern + "\n")
+    git(shop.checkout, "add", ".gitignore")
+    git(shop.checkout, "commit", "-qm", "ignore")
+
+
+@pytest.mark.parametrize("path", ["build/test_feature.py", "build/test_feature.py::test_it", "build"])
+def test_a_clean_test_recipe_refuses_a_path_that_is_not_in_the_commit(shop, path):
+    paths_tests_recipe(shop)
+    commit_ignore(shop, "build/")
+    (shop.checkout / "build").mkdir()
+    (shop.checkout / "build" / "test_feature.py").write_text("def test_it():\n    pass\n")
+    short = git(shop.checkout, "rev-parse", "HEAD")[:12]
+    shop.request_job("job-1", "paths-tests", paths=[path])
+    row = shop.run_open()["rows"][0]
+    reason = "path %s is not in commit %s" % (path.partition("::")[0], short)
+    assert (row["state"], row["reason"]) == ("refused", reason), row
+    assert recorded(shop)["steps"] == []
+
+
+# A require_clean job runs on an export of its commit, so code Git ignores in the checkout never runs in the commit's name.
+# The ignored code writes run/evil below the job's scratch folder, which the recipe keeps, so its absence is evidence in
+# either sandbox: under bubblewrap /tmp is private, and a marker there would prove nothing.
+EVIL = ("import os\npath = os.path.join(os.path.dirname(os.environ['TMPDIR']), 'scratch', 'run')\n"
+        "os.makedirs(path, exist_ok=True)\nopen(os.path.join(path, 'evil'), 'a').write('ran\\n')\n")
+SANDBOXES = ["none", pytest.param("bwrap", marks=needs_bubblewrap)]
+
+
+def clean_pytest_recipe(shop, sandbox):
+    shop.recipes["recipes"]["pt"] = shop.command(
+        ["$python", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--junitxml", "$scratch/junit.xml", "$paths"],
+        sandbox=sandbox, require_clean=True, expects_tests=True, keep=["run/junit.xml", "run/evil"])
+    shop.recipes["env"] = {"PYTHONPATH": "$checkout"}
+    if "PYTHONUSERBASE" in os.environ:  # Local runs may keep pytest in the user site.
+        shop.recipes["env"].update(PYTHONUSERBASE=os.environ["PYTHONUSERBASE"], PYTHONNOUSERSITE="")
+    shop.save_recipes()
+
+
+def commit_all(shop, message="c"):
+    git(shop.checkout, "add", "-A")
+    git(shop.checkout, "commit", "-qm", message)
+
+
+def evil_ran(result):
+    return next(row for row in result["kept"] if row["path"] == "run/evil").get("error") != "missing"
+
+
+def plant(shop, case):
+    """Code outside the commit, as each case hides it; returns the paths to name and whether the run can pass."""
+    c = shop.checkout
+    (c / ".gitignore").write_text("build/\nconftest.py\npytest.ini\ntests/vendor/\ntests/evil\nsitecustomize.py\npytest.py\n")
+    commit_all(shop, "ignore")
+    (c / "build").mkdir()
+    (c / "build" / "test_real.py").write_text(EVIL + "def test_real():\n    pass\n")
+    if case == "committed_symlink_to_ignored_file":
+        os.symlink("../build/test_real.py", c / "tests" / "test_link.py")
+        commit_all(shop)
+        return ["tests/test_link.py"], False
+    if case == "committed_symlink_to_ignored_dir":
+        os.symlink("../build", c / "tests" / "linkdir")
+        commit_all(shop)
+        return ["tests/linkdir"], False
+    if case == "ignored_conftest_beside":
+        (c / "tests" / "conftest.py").write_text(EVIL)
+    elif case in ("ignored_root_conftest", "ignored_root_conftest_dot"):
+        (c / "conftest.py").write_text(EVIL)
+        return ["tests" if case == "ignored_root_conftest" else "."], True
+    elif case == "ignored_pytest_ini_plugin":
+        (c / "pytest.ini").write_text("[pytest]\naddopts = -p build.plug\n")
+        (c / "build" / "__init__.py").write_text("")
+        (c / "build" / "plug.py").write_text(EVIL)
+    elif case == "ignored_nested_repo":
+        vendor = c / "tests" / "vendor"
+        vendor.mkdir()
+        git(vendor, "init", "-q")
+        (vendor / "test_evil.py").write_text(EVIL + "def test_e():\n    pass\n")
+        return ["tests"], True
+    elif case == "ignored_symlink_dir":
+        os.symlink("../build", c / "tests" / "evil")
+        return ["tests"], True
+    elif case == "ignored_pytest_shadow":
+        (c / "pytest.py").write_text(EVIL + "import sys\nsys.exit(0)\n")
+    elif case == "ignored_sitecustomize":
+        (c / "sitecustomize.py").write_text(EVIL)
+    return ["tests/test_app.py"], True
+
+
+@pytest.mark.parametrize("sandbox", SANDBOXES)
+@pytest.mark.parametrize("case", ["ignored_conftest_beside", "ignored_root_conftest", "ignored_root_conftest_dot",
+                                  "ignored_pytest_ini_plugin", "ignored_nested_repo", "ignored_symlink_dir",
+                                  "ignored_pytest_shadow", "ignored_sitecustomize", "committed_symlink_to_ignored_file",
+                                  "committed_symlink_to_ignored_dir"])
+def test_a_clean_test_job_never_runs_code_outside_its_commit(shop, case, sandbox):
+    clean_pytest_recipe(shop, sandbox)
+    paths, passes = plant(shop, case)
+    assert git(shop.checkout, "status", "--porcelain=v1", "--untracked-files=all") == ""
+    shop.request_job("job-1", "pt", paths=paths)
+    row = shop.run_open()["rows"][0]
+    result = recorded(shop)
+    assert not evil_ran(result), "%s ran code outside the commit: %s" % (case, row)
+    if passes:
+        assert row["state"] == "completed", row
+        assert (result["tests"]["total"], result["tests"]["passed"]) == (1, 1), "the committed test still runs and counts"
+    else:
+        # The link is in the commit, its target is not, so it dangles in the export and the run fails instead of passing.
+        assert row["state"] == "failed" and not (result["tests"] or {}).get("passed"), row
+    entries = len(git(shop.checkout, "ls-tree", "-r", "--name-only", "HEAD").splitlines())
+    assert result["source_export"] == {"commit": git(shop.checkout, "rev-parse", "HEAD"), "removed": True,
+                                       "tree": git(shop.checkout, "rev-parse", "HEAD^{tree}"), "entries": entries,
+                                       "bytes": result["source_export"]["bytes"]}
+    assert not (shop.workspace.store / "jobs" / "pilot" / "job-1" / "source").exists(), "the export is removed after the run"
+
+
+def remove_tree(folder):
+    """The export's folders are read-only, so they are made writable before the removal."""
+    for current, folders, _ in os.walk(folder):
+        for child in folders:
+            if not os.path.islink(os.path.join(current, child)):
+                os.chmod(os.path.join(current, child), 0o700)
+    shutil.rmtree(folder)
+
+
+@pytest.mark.parametrize("sandbox", SANDBOXES)
+def test_a_clean_test_job_runs_in_the_export_and_bubblewrap_hides_the_live_checkout(sandbox):
+    # Outside /tmp, because bubblewrap mounts an empty /tmp anyway: a checkout there would look hidden even if the
+    # export's own mounts left it visible.
+    base = Path(tempfile.mkdtemp(prefix="aegis-jobs-", dir="/var/tmp"))
+    try:
+        shop = Shop(base)
+        clean_pytest_recipe(shop, sandbox)
+        commit_ignore(shop, "build/")
+        (shop.checkout / "build").mkdir()
+        (shop.checkout / "build" / "local.txt").write_text("ignored\n")
+        export = shop.workspace.store / "jobs" / "pilot" / "job-1" / "source"
+        live = str(shop.checkout / "build" / "local.txt")
+        assert not live.startswith("/tmp/")
+        (shop.checkout / "tests" / "test_where.py").write_text(
+            "import os, subprocess\n\ndef test_where():\n"
+            "    assert os.getcwd() == %r and os.environ['PYTHONPATH'] == %r\n"
+            "    assert os.path.exists(%r) == %r\n"
+            "    assert not os.access('tests/test_where.py', os.W_OK), 'the export is read-only'\n"
+            "    assert subprocess.run(['git', 'rev-parse', '--git-dir'], capture_output=True).returncode != 0, 'no repository'\n"
+            % (str(export), str(export), live, sandbox == "none"))
+        commit_all(shop)
+        shop.request_job("job-1", "pt", paths=["tests/test_where.py"])
+        row = shop.run_open()["rows"][0]
+        assert row["state"] == "completed", (row, (shop.workspace.store / "jobs" / "pilot" / "job-1" / "step-1.log").read_text())
+    finally:
+        remove_tree(base)
+
+
+def test_a_clean_test_job_runs_a_directory_without_a_test_file_only_info_exclude_hides(shop):
+    clean_pytest_recipe(shop, "none")
+    (shop.checkout / ".git" / "info" / "exclude").write_text("tests/test_extra.py\n")
+    (shop.checkout / "tests" / "test_extra.py").write_text(EVIL + "def test_extra():\n    pass\n")
+    assert git(shop.checkout, "status", "--porcelain=v1", "--untracked-files=all") == ""
+    shop.request_job("job-1", "pt", paths=["tests/test_extra.py"])
+    shop.request_job("job-2", "pt", paths=["tests"])
+    rows = {row["job"]: row for row in shop.run_open()["rows"]}
+    short = git(shop.checkout, "rev-parse", "HEAD")[:12]
+    assert rows["pilot/job-1"]["reason"] == "path tests/test_extra.py is not in commit " + short
+    assert rows["pilot/job-2"]["state"] == "completed", rows["pilot/job-2"]
+    result = recorded(shop, "job-2")
+    assert result["tests"]["total"] == 1 and not evil_ran(result), "only the committed test ran"
+
+
+def test_a_clean_test_job_ignores_a_test_file_added_while_it_waited(shop):
+    clean_pytest_recipe(shop, "none")
+    commit_ignore(shop, "tests/test_local_*.py")
+    first_job(shop, "import sys; open(sys.argv[1] + '/tests/test_local_x.py', 'w').write(%r)"
+              % (EVIL + "def test_x():\n    pass\n"))
+    shop.request_job("job-1", "pt", paths=["tests"])
+    rows = {row["job"]: row for row in shop.run_open()["rows"]}
+    assert rows["pilot/job-0"]["state"] == "completed", "an ignored file changes no status, so job-0 itself passed"
+    assert rows["pilot/job-1"]["state"] == "completed", rows["pilot/job-1"]
+    result = recorded(shop)
+    assert result["tests"]["total"] == 1 and not evil_ran(result)
+    assert (shop.checkout / "tests" / "test_local_x.py").exists(), "the live checkout still holds it"
+
+
+@pytest.mark.parametrize("make, reason", [
+    (lambda c: os.symlink("/etc/hostname", c / "tests" / "outside"), "the commit has a symlink that leaves it: tests/outside"),
+    (lambda c: os.symlink("../../x", c / "tests" / "outside"), "the commit has a symlink that leaves it: tests/outside"),
+    # Each link stays inside lexically, but d resolves to the export's root, so esc resolves two folders above it.
+    (lambda c: (os.symlink(".", c / "d"), os.symlink("d/d/../..", c / "esc"), os.symlink("../esc/x", c / "tests" / "via")),
+     "the commit has a symlink that leaves it: esc -> d/d/../.."),
+])
+def test_a_commit_that_cannot_be_exported_exactly_is_refused_before_anything_runs(shop, make, reason):
+    clean_pytest_recipe(shop, "none")
+    make(shop.checkout)
+    commit_all(shop)
+    shop.request_job("job-1", "pt", paths=["tests/test_app.py"])
+    row = shop.run_open()["rows"][0]
+    short = git(shop.checkout, "rev-parse", "HEAD")[:12]
+    assert row["state"] == "refused" and row["reason"].startswith("could not export commit %s: " % short), row
+    assert reason in row["reason"], row
+    assert recorded(shop)["steps"] == []
+    assert not (shop.workspace.store / "jobs" / "pilot" / "job-1" / "source").exists()
+
+
+POINTER = "version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize 3\n" % ("0" * 64)
+
+
+@pytest.mark.parametrize("case", ["export-ignore", "export-subst", "eol", "lfs-filter", "replace-ref"])
+def test_a_clean_test_job_exports_the_committed_bytes_whatever_attributes_or_replace_refs_say(shop, case):
+    """The export reads blobs, never a checkout or an archive, so no attribute, filter or replace ref changes a byte."""
+    clean_pytest_recipe(shop, "none")
+    c = shop.checkout
+    marker = shop.tmp / "smudge-ran"
+    expected = {"src/app.py": "value = 1\n", "tests/test_app.py": "def test_app():\n    pass\n"}
+    if case == "export-ignore":
+        (c / ".gitattributes").write_text("tests/test_app.py export-ignore\n")
+    elif case == "export-subst":
+        (c / ".gitattributes").write_text("src/app.py export-subst\n")
+        expected["src/app.py"] = "$Format:%H$\n"
+    elif case == "eol":
+        (c / ".gitattributes").write_text("* text eol=crlf\n")
+    elif case == "lfs-filter":
+        # As Git LFS sets it up: the commit holds a pointer, and the repository's own config names a smudge filter.
+        git(c, "config", "filter.lfs.smudge", "echo ran >> '%s'; cat" % marker)
+        git(c, "config", "filter.lfs.clean", "cat")
+        (c / ".gitattributes").write_text("*.bin filter=lfs\n")
+        expected["data.bin"] = POINTER
+    for path, data in expected.items():
+        (c / path).write_text(data)
+    (c / "tests" / "test_exact.py").write_text(
+        "import pathlib\n\ndef test_exact():\n    for path, data in %r.items():\n"
+        "        assert pathlib.Path(path).read_bytes() == data.encode(), path\n" % expected)
+    commit_all(shop)
+    if case == "replace-ref":
+        (shop.tmp / "other.py").write_text("value = 2\n")
+        git(c, "replace", git(c, "rev-parse", "HEAD:src/app.py"), git(c, "hash-object", "-w", str(shop.tmp / "other.py")))
+    assert git(c, "status", "--porcelain=v1", "--untracked-files=all") == "" and not marker.exists()
+    shop.request_job("job-1", "pt", paths=["tests/test_exact.py"])
+    row = shop.run_open()["rows"][0]
+    log = shop.workspace.store / "jobs" / "pilot" / "job-1" / "step-1.log"
+    assert row["state"] == "completed", (row, log.read_text() if log.exists() else "no step ran")
+    result = recorded(shop)
+    assert (result["tests"]["total"], result["tests"]["passed"]) == (1, 1)
+    assert result["source_export"]["entries"] == len(git(c, "ls-tree", "-r", "--name-only", "HEAD").splitlines())
+    assert not marker.exists(), "the smudge filter ran"
+
+
+# Hand-made trees: Git's own porcelain refuses most of these names, so they are written as raw objects.
+def stored(repo, data, kind="blob"):
+    return subprocess.run(["git", "hash-object", "-t", kind, "--literally", "-w", "--stdin"], cwd=repo, input=data,
+                          capture_output=True, check=True).stdout.decode().strip()
+
+
+def hand_made_tree(repo, rows):
+    """rows are (mode, name, id); they are sorted here as Git sorts a tree, folders as if their name ended in '/'."""
+    rows = sorted(rows, key=lambda row: row[1] + (b"/" if row[0] == "40000" else b""))
+    return stored(repo, b"".join(mode.encode() + b" " + name + b"\0" + bytes.fromhex(oid) for mode, name, oid in rows), "tree")
+
+
+def hand_made_commit(tmp_path, rows):
+    repo = tmp_path / "repo"
+    if not repo.exists():
+        repo.mkdir()
+        git(repo, "init", "-q")
+    tree = hand_made_tree(repo, rows(repo))
+    commit = subprocess.run(["git", "commit-tree", tree, "-m", "hand-made"], cwd=repo, capture_output=True, check=True,
+                            text=True).stdout.strip()
+    return repo, commit, tree
+
+
+def export_or_refusal(jobs, repo, commit, tree, target):
+    try:
+        return jobs.export_commit(str(repo), commit, tree, str(target))
+    except jobs.ERRORS as exc:
+        return str(exc)
+
+
+def test_an_export_whose_link_checks_outlast_its_deadline_is_refused_within_it(tmp_path, monkeypatch):
+    """The link walk shares the export's one deadline, so a tree of costly links is refused instead of stalling."""
+    jobs = load_jobs_module()
+    monkeypatch.setattr(jobs, "EXPORT_SECONDS", 1.5)
+    # Each link of the chain is within the hop limit but makes the resolver stat x 800 times, and many links share it.
+    detour = b"x/../" * 800
+
+    def rows(repo):
+        chain = [("120000", b"a%02d" % i, stored(repo, detour + b"a%02d" % (i + 1))) for i in range(35)]
+        many = [("120000", b"p%04d" % i, stored(repo, b"a00")) for i in range(400)]
+        folder = hand_made_tree(repo, [("100644", b"keep", stored(repo, b"x\n"))])
+        return chain + many + [("100644", b"a35", stored(repo, b"end\n")), ("40000", b"x", folder)]
+
+    repo, commit, tree = hand_made_commit(tmp_path, rows)
+    started = time.monotonic()
+    outcome = export_or_refusal(jobs, repo, commit, tree, tmp_path / "out")
+    assert outcome == "the export took longer than 1.5 seconds", outcome
+    assert time.monotonic() - started < 6, "the link walk ran past the export's deadline"
+
+
+@pytest.mark.parametrize("links, shown", [
+    # 45 links in a row to a file inside the export: the kernel stops at 40 hops, and so does the check.
+    (lambda repo: [("120000", b"l%02d" % i, stored(repo, b"l%02d" % (i + 1))) for i in range(45)]
+     + [("100644", b"l45", stored(repo, b"end\n"))], "l00 -> l01"),
+    (lambda repo: [("120000", b"a", stored(repo, b"b")), ("120000", b"b", stored(repo, b"a"))], "a -> b"),
+])
+def test_an_export_refuses_a_link_that_loops_or_needs_more_than_40_hops(tmp_path, links, shown):
+    jobs = load_jobs_module()
+    repo, commit, tree = hand_made_commit(tmp_path, links)
+    outcome = export_or_refusal(jobs, repo, commit, tree, tmp_path / "out")
+    assert outcome == "the commit has a symlink that loops or passes more than 40 links: " + shown, outcome
+
+
+@pytest.mark.parametrize("rows, name", [
+    (lambda repo: [("100644", b".git", stored(repo, b"gitdir: /elsewhere\n"))], ".git"),
+    (lambda repo: [("40000", b".GIT", hand_made_tree(repo, [("100644", b"config", stored(repo, b"[core]\n"))]))],
+     ".GIT/config"),
+    (lambda repo: [("40000", b"sub", hand_made_tree(repo, [("100644", b".Git", stored(repo, b"x\n"))]))], "sub/.Git"),
+])
+def test_an_export_refuses_a_commit_that_holds_a_git_entry(tmp_path, rows, name):
+    """A .git in the export would make it, or a folder of it, a repository whose config Git runs."""
+    jobs = load_jobs_module()
+    repo, commit, tree = hand_made_commit(tmp_path, lambda repo: rows(repo) + [("100644", b"f", stored(repo, b"x\n"))])
+    outcome = export_or_refusal(jobs, repo, commit, tree, tmp_path / "out")
+    assert outcome == "the commit holds a .git entry: " + name, outcome
+    assert not (tmp_path / "out").exists(), "refused before a byte was written"
+
+
+def test_a_partial_clone_is_refused_before_a_missing_object_is_fetched(shop):
+    """A partial clone fetches a missing object on read, through whatever command its remote config names."""
+    clean_pytest_recipe(shop, "none")
+    c = shop.checkout
+    (c / "tests" / "data.txt").write_text("lazy\n")
+    commit_all(shop)
+    missing = git(c, "rev-parse", "HEAD:tests/data.txt")
+    os.remove(c / ".git" / "objects" / missing[:2] / missing[2:])
+    marker = shop.tmp / "fetch-ran"
+    for key, value in {"core.repositoryformatversion": "1", "extensions.partialClone": "origin",
+                       "remote.origin.url": "ext::sh -c touch%% %s" % marker, "remote.origin.promisor": "true",
+                       "protocol.ext.allow": "always"}.items():
+        git(c, "config", key, value)
+    shop.request_job("job-1", "pt", paths=["tests/test_app.py"])
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("refused", "a partial clone cannot be exported: its missing objects would be "
+                                                        "fetched"), row
+    jobs = load_jobs_module()
+    outcome = export_or_refusal(jobs, c, git(c, "rev-parse", "HEAD"), git(c, "rev-parse", "HEAD^{tree}"), shop.tmp / "out")
+    assert outcome == "a partial clone cannot be exported: its missing objects would be fetched", outcome
+    assert not marker.exists(), "the fetch command ran"
+
+
+def test_a_commit_whose_blob_is_missing_is_refused_with_its_name(shop):
+    c = shop.checkout
+    (c / "tests" / "data.txt").write_text("gone\n")
+    commit_all(shop)
+    missing = git(c, "rev-parse", "HEAD:tests/data.txt")
+    os.remove(c / ".git" / "objects" / missing[:2] / missing[2:])
+    jobs = load_jobs_module()
+    outcome = export_or_refusal(jobs, c, git(c, "rev-parse", "HEAD"), git(c, "rev-parse", "HEAD^{tree}"), shop.tmp / "out")
+    assert outcome == "the commit lacks the object of tests/data.txt: " + missing, outcome
+
+
+def test_a_replaced_tree_cannot_make_a_path_look_present_in_the_commit(tmp_path):
+    jobs = load_jobs_module()
+    repo, commit, tree = hand_made_commit(tmp_path, lambda repo: [("100644", b"f", stored(repo, b"1\n"))])
+    fake = hand_made_tree(repo, [("100644", b"f", stored(repo, b"1\n")), ("100644", b"only_in_fake", stored(repo, b"2\n"))])
+    git(repo, "replace", tree, fake)
+    with pytest.raises(ValueError) as refused:
+        jobs.refuse_paths_outside_commit(str(repo), commit, ["only_in_fake"])
+    assert str(refused.value) == "path only_in_fake is not in commit " + commit[:12]

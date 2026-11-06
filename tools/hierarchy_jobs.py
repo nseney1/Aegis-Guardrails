@@ -4,11 +4,19 @@
 Validation, commits and other physical work used to be hand-run by root from free-text requests.
 This tool does the routine part. An orchestrator names a recipe and an exact source in a hash-bound
 packet; root's recipe file says what that recipe runs. The argv comes only from that file, with
-exact-word substitution and no shell, so nothing in a message can become a command or an option.
+exact-word substitution and no shell, so nothing in a message can become a command or an option. A recipe word may
+also be `$scratch/<plain relative path>`, which joins only the job's scratch folder with that fixed suffix from the
+recipe file; packet values are never joined into a word.
 
 A job is refused unless the checkout is registered for the initiative and its revision, tree and
 the bytes of its uncommitted files match the packet exactly. The source is witnessed again afterward,
-so a clean exit over changed source is not reported as success. Files Git ignores are not covered.
+so a clean exit over changed source is not reported as success. Files Git ignores are not covered by the witness, so a
+`require_clean` recipe does not run on the checkout at all: it refuses a path not in the packet's commit, then runs on
+`<job>/source/`, a read-only export of exactly that commit (its blobs as `cat-file` reads them, so no attribute applies),
+which `$checkout`, the working folder and bubblewrap's `--chdir` all name. Ignored files, nested repositories and
+symlinks into ignored folders are simply absent there. Under bubblewrap the live checkout and its Git data are hidden
+behind empty tmpfs mounts; `sandbox: none` cannot hide them, so there only the working folder and `$checkout` move. The
+export is removed once the steps end; the logs and kept files are the evidence.
 
 A `merge` recipe merges one commit (`merge`) into a clean checkout's HEAD (`commit`); a second merge is a second job.
 Its packet names `merge`, `expected_tree` and `message`, has no `paths` key, and omits `dirty_content_sha256` or gives
@@ -54,16 +62,20 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import xml.etree.ElementTree as ElementTree
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (GIT_ID, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
-                               publish_file, read_json, require, safe_path, strict_json, strings, text, timestamp,
+                               publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
 from hierarchy_workspace import (Store, absolute, capacity_view, check_paths, grant_next, initiative_view,  # noqa: E402
@@ -101,6 +113,15 @@ PATH_ARGUMENT = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./@+-]*(::[^\x00-\x1f]{1,51
 JOB_ID = re.compile(SLUG.pattern + "/" + SLUG.pattern)
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError, TypeError, KeyError, subprocess.SubprocessError)
 WORK_FOLDERS = ("scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis")
+# A require_clean job's read-only export of its commit. Not a work folder: the job never writes it, and it is removed
+# after the steps whatever their outcome, or by clean if the runner was lost first.
+EXPORT_FOLDER = "source"
+CLEANUP_FOLDERS = WORK_FOLDERS + (EXPORT_FOLDER,)
+MAX_EXPORT_BYTES = 2147483648
+MAX_EXPORT_ENTRIES = 200000
+EXPORT_SECONDS = 600
+# As the kernel's ELOOP limit: a link that needs more hops than this to resolve is refused, so one link costs a bounded walk.
+MAX_LINK_HOPS = 40
 # Tagged so backup and indexing tools skip them (https://bford.info/cachedir/). Only the first line is the standard.
 CACHE_FOLDERS = ("cargo-target", "ruff-cache", "hypothesis")
 CACHEDIR_TAG = (b"Signature: 8a477f597d28d172789f06886806bc55\n"
@@ -109,12 +130,25 @@ CACHEDIR_TAG = (b"Signature: 8a477f597d28d172789f06886806bc55\n"
 # A recipe's kept files are evidence a green runner may never print, so they are copied out before cleanup.
 MAX_KEEP = 16
 MAX_KEEP_BYTES = 67108864
+# A test recipe's report, named in keep relative to scratch/, where `$scratch/junit.xml` (scratch/run/junit.xml) lands.
+JUNIT_KEEP = "run/junit.xml"
+JUNIT_WORD = "$scratch/junit.xml"
+MAX_JUNIT_BYTES = 8388608
+JUNIT_COUNTS = ("tests", "failures", "errors", "skipped")
+# A step word may name a plain path below $scratch, such as pytest's --junitxml target. Only the recipe file writes these.
+SCRATCH_WORD = "$scratch/"
+PYTHON_PROBE_SECONDS = 30
+PYTHON_PROBE_DRAIN_SECONDS = 5
+PYTHON_PROBE = "import platform; print(platform.python_version())"
 # Rename handling is pinned so the orchestrator's merge-tree prediction and the runner's merge agree. Repository-local
 # config still applies under GIT_CONFIG_GLOBAL=/dev/null, so these go on the command line, where they win over it.
 MERGE_CONFIG = ("merge.renames=true", "merge.directoryRenames=false", "merge.renameLimit=7000", "merge.renormalize=false")
 # The built-in merge drivers as check-attr reports them: unspecified or set is text, unset is binary.
 BUILT_IN_MERGE = {b"unspecified", b"set", b"unset", b"text", b"binary"}
 PINNED_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+# Reads of the packet's commit objects: a missing object in a partial clone must be an error, never a fetch, since the
+# repository's own config names what a fetch runs. Git before 2.44 ignores this variable, so refuse_partial_clone comes first.
+OBJECT_GIT_ENV = {**PINNED_GIT_ENV, "GIT_NO_LAZY_FETCH": "1"}
 # The merge steps' view of the owner's files: no global or system config, and a HOME and XDG_CONFIG_HOME that hold
 # nothing, so no global excludes or attributes. A merge's clean checks read status this way too, so a file only the owner's
 # global excludes ignore counts as uncommitted there, and read-tree never meets it as a surprise after HEAD has moved.
@@ -125,11 +159,22 @@ HOME_FOLDERS = {"HOME": "", "USERPROFILE": "", "APPDATA": "AppData/Roaming", "LO
                 "CARGO_HOME": ".cargo", "PYTHONUSERBASE": ".local"}
 
 
-def checked_words(words, allowed, label):
+def plain_relative(path):
+    return all(part not in ("", ".", "..") for part in path.split("/"))
+
+
+def scratch_word(word):
+    """`$scratch/<plain path>`: the one token that joins a fixed suffix, so a recipe can name a file pytest writes there."""
+    rest = word[len(SCRATCH_WORD):]
+    return word.startswith(SCRATCH_WORD) and "$" not in rest and plain_relative(rest)
+
+
+def checked_words(words, allowed, label, scratch_paths=False):
     for word in words:
-        # Exact words only: no recipe or packet value is ever formatted into a larger argument.
+        # Exact words only: no packet value is ever formatted into a larger argument, and a recipe joins only $scratch/.
         require(isinstance(word, str) and word and "\0" not in word, "invalid word in " + label)
-        require("$" not in word or word in allowed, "unsupported token in " + label + ": " + word)
+        require("$" not in word or word in allowed or (scratch_paths and scratch_word(word)),
+                "unsupported token in " + label + ": " + word)
 
 
 def cargo_step(words):
@@ -154,28 +199,39 @@ def validate_recipe(name, recipe):
     if recipe["kind"] in ("commit", "merge"):
         fields(recipe, {"kind", "timeout_seconds", "sandbox"})
         return
-    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"}, {"writable_checkout", "heavy_tests", "keep"})
+    fields(recipe, {"kind", "timeout_seconds", "sandbox", "heavy", "steps"},
+           {"writable_checkout", "heavy_tests", "keep", "require_clean", "expects_tests"})
     keep = recipe.get("keep", [])
     require(isinstance(keep, list) and len(keep) <= MAX_KEEP, "invalid keep for recipe %s: at most %d paths" % (name, MAX_KEEP))
     for entry in keep:
         # Relative to scratch/ and plain, so a kept path can neither leave scratch nor name it twice.
-        require(isinstance(entry, str) and "\0" not in entry and all(part not in ("", ".", "..") for part in entry.split("/")),
+        require(isinstance(entry, str) and "\0" not in entry and plain_relative(entry),
                 "invalid keep for recipe %s: %s" % (name, str(entry)[:256]))
     require(type(recipe["heavy"]) is bool, "invalid heavy flag for recipe " + name)
     require(type(recipe.get("writable_checkout", False)) is bool, "invalid writable_checkout for recipe " + name)
     require(type(recipe.get("heavy_tests", False)) is bool, "invalid heavy_tests flag for recipe " + name)
+    require(type(recipe.get("require_clean", False)) is bool, "invalid require_clean flag for recipe " + name)
+    require(not (recipe.get("require_clean", False) and recipe.get("writable_checkout", False)),
+            "require_clean recipe %s cannot take writable_checkout: it runs on a read-only export of the commit" % name)
+    require(type(recipe.get("expects_tests", False)) is bool, "invalid expects_tests flag for recipe " + name)
+    # The counts are read from the kept copy, so a report that is not kept could never be read.
+    require(not recipe.get("expects_tests", False) or JUNIT_KEEP in keep,
+            "expects_tests needs keep to include %s for recipe %s" % (JUNIT_KEEP, name))
     # Heavy-Tests is a heavy slot of its own, so a recipe that is light cannot claim it.
     require(recipe["heavy"] or not recipe.get("heavy_tests", False), "heavy_tests needs heavy for recipe " + name)
     steps = recipe["steps"]
     require(isinstance(steps, list) and 0 < len(steps) <= MAX_STEPS and all(isinstance(step, list) and step for step in steps),
             "invalid steps for recipe " + name)
     for number, step in enumerate(steps, 1):
-        checked_words(step, COMMAND_TOKENS, "recipe " + name)
+        checked_words(step, COMMAND_TOKENS, "recipe " + name, scratch_paths=True)
         # Cargo fills gigabytes and saturates the machine, so the owner allows it only in the single Heavy-Tests slot.
         compiles = cargo_step(step)
         require(not compiles or recipe.get("heavy_tests", False),
                 "recipe %s step %d runs a cargo build or test (%s), which only a heavy_tests recipe may run"
                 % (name, number, compiles))
+    # Without the exact word no step can be shown to write the report that keep copies.
+    require(not recipe.get("expects_tests", False) or any(JUNIT_WORD in step for step in steps),
+            "expects_tests needs a step that writes %s for recipe %s" % (JUNIT_WORD, name))
 
 
 def existing_folders(value, label):
@@ -186,7 +242,8 @@ def existing_folders(value, label):
 
 
 def load_recipes(path):
-    recipes = read_json(path)
+    raw = read_bytes(path)
+    recipes = strict_json(raw.decode("utf-8"))
     fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
     if "min_free_gigabytes" in recipes:
         integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
@@ -214,7 +271,115 @@ def load_recipes(path):
         fields(identity, {"name", "email"})
         text(identity["name"], "identity name", 256)
         text(identity["email"], "identity email", 256)
+    # Hashed from the bytes that were parsed, so a result names exactly the recipe file it ran under. The key cannot come
+    # from the file: fields() above refuses it there.
+    recipes["recipes_sha256"] = hashlib.sha256(raw).hexdigest()
     return recipes
+
+
+def clean_refusal(name):
+    return "recipe %s requires a clean checkout; commit or discard local changes" % name
+
+
+PYTHON_INFO = {}
+
+
+def python_info(recipes):
+    """The recipe python's version, read once per run without the sandbox. It is provenance, so a probe that fails is
+    recorded with its error and never fails the job: the steps themselves show whether that python runs."""
+    executable = recipes["python"]
+    if executable not in PYTHON_INFO:
+        info = {"version": None, "executable": executable}
+        try:
+            # -S keeps site-packages and .pth files out; its own session lets a timeout stop anything it started, and
+            # a child left holding the pipe would otherwise keep communicate() waiting.
+            process = subprocess.Popen([executable, "-I", "-S", "-c", PYTHON_PROBE], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True,
+                                       env={"PATH": os.pathsep.join(recipes["path"]), "LANG": "C.UTF-8"})
+            try:
+                stdout, _ = process.communicate(timeout=PYTHON_PROBE_SECONDS)
+            except subprocess.TimeoutExpired as expired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                # A child that left the group (setsid, a daemonizing shim) can still hold the pipe, so the drain is bounded.
+                try:
+                    process.communicate(timeout=PYTHON_PROBE_DRAIN_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise expired
+            version = stdout.decode("utf-8", errors="replace").strip()
+            if process.returncode != 0:
+                info["error"] = "the version probe exited %d" % process.returncode
+            elif re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+]*", version) is None:
+                info["error"] = "the version probe printed no version"
+            else:
+                info["version"] = version
+        except subprocess.TimeoutExpired:
+            info["error"] = "the version probe took longer than %s seconds" % PYTHON_PROBE_SECONDS
+        except (OSError, subprocess.SubprocessError) as exc:
+            info["error"] = "the version probe could not run: " + str(exc)[:256]
+        PYTHON_INFO[executable] = info
+    return dict(PYTHON_INFO[executable])
+
+
+def junit_counts(raw):
+    """Counts from a junit report, summed over the leaf testsuites: a testsuite that holds testsuites contributes nothing
+    itself, because producers that nest suites write the children's totals on the parent. Returns (counts, None) or
+    (None, why it is unreadable).
+    A DOCTYPE or ENTITY is refused before parsing, so no entity is ever expanded; the text must be UTF-8 so that
+    check cannot be dodged by another encoding."""
+    if len(raw) > MAX_JUNIT_BYTES:
+        return None, "it is larger than %d bytes" % MAX_JUNIT_BYTES
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeError:
+        return None, "it is not UTF-8"
+    upper = content.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
+        return None, "it has a DOCTYPE or ENTITY declaration"
+    try:
+        root = ElementTree.fromstring(content)
+    except (ElementTree.ParseError, ValueError):
+        return None, "it is not well-formed XML"
+    if root.tag not in ("testsuites", "testsuite"):
+        return None, "its root is %s, not testsuites or testsuite" % str(root.tag)[:64]
+    sums = dict.fromkeys(JUNIT_COUNTS, 0)
+    for suite in root.iter("testsuite"):
+        if suite.find("testsuite") is not None:
+            continue
+        for name in JUNIT_COUNTS:
+            value = suite.get(name, "0")
+            if re.fullmatch(r"[0-9]{1,12}", value) is None:
+                return None, "testsuite attribute %s is not a non-negative integer" % name
+            sums[name] += int(value)
+    passed = sums["tests"] - sums["failures"] - sums["errors"] - sums["skipped"]
+    if passed < 0:
+        return None, "failures, errors and skipped exceed tests"
+    return {"total": sums["tests"], "passed": passed, "failed": sums["failures"], "errors": sums["errors"],
+            "skipped": sums["skipped"]}, None
+
+
+def kept_junit(kept):
+    """The counts from the kept copy of the report, and the reason a recipe that expects tests fails, if it does."""
+    row = next((item for item in kept if item["path"] == JUNIT_KEEP), None)
+    if row is None or row.get("error") == "missing":
+        return None, "junit.xml is missing"
+    if "error" in row:
+        return None, "junit.xml is unreadable: " + row["error"]
+    try:
+        with open(row["copy"], "rb") as stream:
+            raw = stream.read(MAX_JUNIT_BYTES + 1)
+    except OSError as exc:
+        return None, "junit.xml is unreadable: " + str(exc)[:256]
+    counts, problem = junit_counts(raw)
+    if problem:
+        return None, "junit.xml is unreadable: " + problem
+    if not counts["total"]:
+        return counts, "the run reported no tests"
+    # Every test skipped is still exit 0 for pytest, and proves nothing about the commit.
+    return counts, None if counts["passed"] else "the run passed no tests"
 
 
 def is_heavy(recipe):
@@ -257,6 +422,213 @@ def checked_paths(packet, recipe, checkout):
     return paths
 
 
+def refuse_paths_outside_commit(checkout, commit, paths):
+    """For a require_clean recipe: every path is in the packet's commit. The job runs on an export of that commit, where
+    any other path would be missing, so this only turns a confusing run over nothing into a clear refusal. Ignored files
+    under a named folder need no check of their own: the export does not hold them."""
+    refuse_partial_clone(checkout)
+    for path in paths:
+        name = path.partition("::")[0]
+        # `<commit>:` names the root tree; `<commit>:.` is refused by git, so "." would never pass.
+        inside = "" if name.rstrip("/") in ("", ".") else name.rstrip("/")
+        # Replace refs are ignored as in the export, so a replaced tree cannot make a path look present.
+        found = pinned_git(checkout, "--no-replace-objects", "cat-file", "-e", "%s:%s" % (commit, inside), env=OBJECT_GIT_ENV)
+        require(found.returncode == 0, "path %s is not in commit %s" % (name, commit[:12]))
+
+
+def refuse_partial_clone(checkout):
+    """A partial clone fetches a missing object on read, running whatever its remote config names, so its commit is not
+    read at all. Read with includes, as Git itself reads them."""
+    partial = pinned_git(checkout, "config", "--local", "--includes", "--get", "extensions.partialClone")
+    promisors = pinned_git(checkout, "config", "--local", "--includes", "--type=bool", "--get-regexp",
+                           r"^remote\..*\.promisor$")
+    # Exit 1 is "not set"; anything else, such as a promisor value that is no boolean, is refused as unreadable.
+    require(partial.returncode in (0, 1) and promisors.returncode in (0, 1),
+            "could not read the local config of " + str(checkout))
+    require(partial.returncode == 1 and not any(line.endswith(b" true") for line in promisors.stdout.splitlines()),
+            "a partial clone cannot be exported: its missing objects would be fetched")
+
+
+def plain_entry(path):
+    """A tree path that stays inside the export: relative, no '..', no empty or '.' part, and no .git in any case, which
+    would make a folder of the export a repository whose config Git runs."""
+    return bool(path) and all(part not in (b"", b".", b"..") and part.lower() != b".git" for part in path.split(b"/"))
+
+
+EXPORT_MODES = {"100644": 0o444, "100755": 0o555, "120000": None}
+
+
+def commit_entries(checkout, commit, tree):
+    """The commit's blobs and symlinks in tree order, as (path, mode, id). A gitlink is refused: its content is not in
+    the commit. Replace refs are ignored here and in the export, so the ids are the commit's own."""
+    refuse_partial_clone(checkout)
+    found = pinned_git(checkout, "--no-replace-objects", "rev-parse", "--verify", "--quiet", commit + "^{tree}",
+                       env=OBJECT_GIT_ENV)
+    actual = found.stdout.decode().strip() if found.returncode == 0 else "nothing readable"
+    require(actual == tree, "commit %s has tree %s, not the packet's tree %s" % (commit[:12], actual[:12], tree[:12]))
+    listed = pinned_git(checkout, "--no-replace-objects", "ls-tree", "-r", "-z", "-l", "--full-tree", tree, env=OBJECT_GIT_ENV)
+    require(listed.returncode == 0, "could not list the tree of commit " + commit[:12])
+    entries, size = [], 0
+    for row in listed.stdout.split(b"\0"):
+        if not row:
+            continue
+        meta, _, path = row.partition(b"\t")
+        mode, kind, oid, length = meta.decode().split()
+        name = os.fsdecode(path)[:256]
+        require(kind != "commit", "a submodule cannot be exported, because its content is not in the commit: " + name)
+        require(all(part.lower() != b".git" for part in path.split(b"/")), "the commit holds a .git entry: " + name)
+        require(plain_entry(path), "the commit holds an unsafe entry name: " + name)
+        require(kind == "blob" and mode in EXPORT_MODES, "the commit holds %s with mode %s, which cannot be exported" % (name, mode))
+        entries.append((path, mode, oid))
+        require(len(entries) <= MAX_EXPORT_ENTRIES, "the commit has more than %d entries to export" % MAX_EXPORT_ENTRIES)
+        # Refused before a byte is written; the sizes git reports while writing are checked again below.
+        # ls-tree prints "-" (or garbage) as the size of an object the repository does not have.
+        require(length.isdigit(), "the commit lacks the object of %s: %s" % (name, oid))
+        size += int(length)
+        require(size <= MAX_EXPORT_BYTES, "the export is larger than its limit of %d bytes" % MAX_EXPORT_BYTES)
+    return entries
+
+
+def read_exactly(stream, length, name):
+    data = stream.read(length)
+    require(len(data) == length, "git cat-file stopped before the end of " + name)
+    return data
+
+
+def write_entry(source, root, folders, path, mode, length):
+    """Write one entry of `length` bytes from cat-file below root. Every folder on the way is made here, so nothing is
+    written through a symlink, and the entry itself is created afresh, never opened through one."""
+    name = os.fsdecode(path)[:256]
+    parent = b""
+    for part in path.split(b"/")[:-1]:
+        parent = parent + b"/" + part if parent else part
+        if parent not in folders:
+            # A file or symlink already there means the tree names this path twice; mkdir refuses that too.
+            require(not os.path.lexists(os.path.join(root, parent)), "the commit names %s both as a file and a folder" % name)
+            os.mkdir(os.path.join(root, parent), 0o700)
+            folders.add(parent)
+    target = os.path.join(root, path)
+    require(path not in folders and not os.path.lexists(target), "the commit names %s more than once" % name)
+    if mode == "120000":
+        require(length <= 4096, "the commit has a symlink with a target longer than 4096 bytes: " + name)
+        os.symlink(read_exactly(source, length, name), target)
+        return
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, EXPORT_MODES[mode])
+    with os.fdopen(descriptor, "wb") as out:
+        left = length
+        while left:
+            chunk = source.read(min(left, 1048576))
+            require(chunk, "git cat-file stopped before the end of " + name)
+            out.write(chunk)
+            left -= len(chunk)
+
+
+def resolved_link(path, deadline):
+    """Where the link at path resolves, as realpath would, or None past MAX_LINK_HOPS links on the way, as the kernel
+    gives ELOOP. A part that does not exist is taken lexically, as realpath does, so '..' after it is never trusted."""
+    pending, current, hops = path.split(b"/")[::-1], b"", 0
+    while pending:
+        part = pending.pop()
+        require(time.monotonic() < deadline, "the export took longer than %s seconds" % EXPORT_SECONDS)
+        if part in (b"", b"."):
+            continue
+        if part == b"..":
+            current = current.rpartition(b"/")[0]
+            continue
+        candidate = current + b"/" + part
+        try:
+            is_link = stat.S_ISLNK(os.lstat(candidate).st_mode)
+        except OSError:
+            is_link = False
+        if not is_link:
+            current = candidate
+            continue
+        hops += 1
+        if hops > MAX_LINK_HOPS:
+            return None
+        target = os.readlink(candidate)
+        if target.startswith(b"/"):
+            current = b""
+        pending.extend(target.split(b"/")[::-1])
+    return current or b"/"
+
+
+def refuse_leaving_links(root, deadline):
+    """A link whose resolved target leaves the export would reach the live filesystem, which is outside the commit.
+    Resolved, not read lexically, so a chain such as `d -> .` and `esc -> d/d/../..` is caught too. Each link is resolved
+    with a bounded number of hops, and the walk shares the export's deadline, so a tree of costly links cannot stall it."""
+    for current, folders, files in os.walk(root):
+        for child in sorted(folders + files):
+            require(time.monotonic() < deadline, "the export took longer than %s seconds" % EXPORT_SECONDS)
+            path = os.path.join(current, child)
+            if not os.path.islink(path):
+                continue
+            shown = (os.fsdecode(os.path.relpath(path, root))[:256], os.fsdecode(os.readlink(path))[:256])
+            resolved = resolved_link(path, deadline)
+            require(resolved is not None, "the commit has a symlink that loops or passes more than %d links: %s -> %s"
+                    % ((MAX_LINK_HOPS,) + shown))
+            require(resolved == root or resolved.startswith(root + b"/"), "the commit has a symlink that leaves it: %s -> %s"
+                    % shown)
+
+
+def export_commit(checkout, commit, tree, target):
+    """Materialise exactly the packet's commit at target, read-only, and return its record for the result.
+
+    The entries come from `ls-tree` of the commit's tree and their bytes from one `git cat-file --batch`, which applies
+    no attribute: no filter (LFS and the like) runs, and eol, export-subst and export-ignore change nothing, so the
+    export holds exactly the committed bytes. A symlink that resolves outside the export is refused, not run."""
+    # One deadline for the whole export, from the tree listing to the last link checked.
+    deadline = time.monotonic() + EXPORT_SECONDS
+    entries = commit_entries(checkout, commit, tree)
+    os.mkdir(target, 0o700)
+    root = os.fsencode(os.path.realpath(target))
+    folders, size, expired = {b""}, 0, []
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(["git", "--no-optional-locks", "--no-replace-objects", "-c", "core.fsmonitor=false",
+                                    "cat-file", "--batch"], cwd=checkout, env={**os.environ, **OBJECT_GIT_ENV},
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        # The kill ends any read or write that waits on git once the deadline passes.
+        timer = threading.Timer(max(0, deadline - time.monotonic()), lambda: (expired.append(True), process.kill()))
+        timer.start()
+        try:
+            for path, mode, oid in entries:
+                process.stdin.write(oid.encode() + b"\n")
+                process.stdin.flush()
+                header = process.stdout.readline().split()
+                require(len(header) == 3 and header[:2] == [oid.encode(), b"blob"] and header[2].isdigit(),
+                        "git cat-file did not return the blob of " + os.fsdecode(path)[:256])
+                length = int(header[2])
+                size += length
+                require(size <= MAX_EXPORT_BYTES, "the export is larger than its limit of %d bytes" % MAX_EXPORT_BYTES)
+                write_entry(process.stdout, root, folders, path, mode, length)
+                require(process.stdout.read(1) == b"\n", "git cat-file stopped before the end of " + os.fsdecode(path)[:256])
+            process.stdin.close()
+            code = process.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException as exc:
+            process.kill()
+            process.wait()
+            # The final wait can run out a moment before the timer fires; either way the deadline passed.
+            if expired or isinstance(exc, subprocess.TimeoutExpired):
+                raise ValueError("the export took longer than %s seconds" % EXPORT_SECONDS) from None
+            raise
+        finally:
+            timer.cancel()
+            for stream in (process.stdin, process.stdout):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        require(not expired, "the export took longer than %s seconds" % EXPORT_SECONDS)
+        errors.seek(0)
+        require(code == 0, "git cat-file exited %d: %s"
+                % (code, errors.read(512).decode("utf-8", "replace").strip()))
+    refuse_leaving_links(root, deadline)
+    # Folders last, read-only like the files, so even sandbox none cannot change what the steps run.
+    for folder in sorted(folders, key=len, reverse=True):
+        os.chmod(os.path.join(root, folder) if folder else root, 0o555)
+    return {"commit": commit, "tree": tree, "entries": len(entries), "bytes": size}
+
+
 def path_fingerprint(path, name):
     try:
         info = os.lstat(path)
@@ -293,10 +665,10 @@ def refuse_submodules(checkout, revisions=()):
             + ", ".join(sorted({os.fsdecode(path) for path in gitlinks}))[:1024])
 
 
-def pinned_git(checkout, *args, stdin=None):
+def pinned_git(checkout, *args, stdin=None, env=PINNED_GIT_ENV):
     """A read with the config the merge steps see, so what admit refuses and what the merge does agree."""
     return subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args], cwd=checkout, input=stdin,
-                          env={**os.environ, **PINNED_GIT_ENV}, capture_output=True, timeout=120)
+                          env={**os.environ, **env}, capture_output=True, timeout=120)
 
 
 def refuse_attributes(checkout, paths, revisions):
@@ -418,6 +790,8 @@ def admit(ledger, initiative, message, mailbox, recipes):
     matching(packet["tree"], GIT_ID, "tree")
     dirty = packet.get("dirty_content_sha256", EMPTY_STATUS)
     matching(dirty, SHA256, "dirty_content_sha256")
+    # A test run over uncommitted bytes says nothing about any commit a Reviewer can read.
+    require(not recipe.get("require_clean", False) or dirty == EMPTY_STATUS, clean_refusal(name))
     paths = checked_paths(packet, recipe, checkout)
     kind = recipe["kind"]
     if kind in ("commit", "merge"):
@@ -446,8 +820,12 @@ def admit(ledger, initiative, message, mailbox, recipes):
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
     witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None)
+    # Named before the plain mismatch, so a packet that claimed a clean checkout learns why it cannot run.
+    require(not recipe.get("require_clean", False) or witness["dirty_content_sha256"] == EMPTY_STATUS, clean_refusal(name))
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
             (packet["commit"], packet["tree"], dirty), "source does not match the packet")
+    if recipe.get("require_clean", False):
+        refuse_paths_outside_commit(checkout, packet["commit"], paths)
     admitted = {**packet, "dirty_content_sha256": dirty, "paths": paths}
     if kind == "merge":
         merge_refusals(checkout, packet["commit"], packet["merge"])
@@ -617,8 +995,9 @@ class Job:
                 "job result state and exit code disagree")
         return result
 
-    def claim(self, packet_raw):
-        """Exclusive, so two runners or a retry can never start the same job twice."""
+    def claim(self, packet_raw, recipes_sha256=None):
+        """Exclusive, so two runners or a retry can never start the same job twice. The recipe file's hash is kept here so
+        a later root resolution records the file the job was taken under, not whatever file exists by then."""
         self.folder.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.folder.mkdir(mode=0o700)
@@ -626,7 +1005,7 @@ class Job:
             return False
         ticks = process_start(os.getpid())
         publish_file(self.claim_path, encoded({"pid": os.getpid(), "start": ticks, "job": self.id, "at": timestamp(),
-                                             "process_scope": process_scope()}) + b"\n")
+                                             "process_scope": process_scope(), "recipes_sha256": recipes_sha256}) + b"\n")
         if packet_raw is not None:
             publish_file(self.folder / "packet.md", packet_raw)
         return True
@@ -736,6 +1115,10 @@ def result_body(job, result):
         lines.append(result["reason"])
     if result.get("commit"):
         lines.append("New commit: " + result["commit"])
+    tests = result.get("tests")
+    if tests:
+        lines.append("Tests: %(total)d total, %(passed)d passed, %(failed)d failed, %(errors)d errors, %(skipped)d skipped."
+                     % tests)
     if any(step.get("stopped_leftovers") for step in result["steps"]):
         lines.append("A step left processes running; they were stopped afterward.")
     missed = ["%s (%s)" % (item["path"], item["error"]) for item in result.get("kept", []) if "error" in item]
@@ -802,7 +1185,7 @@ def write_result(job, state, exit_code, *, reason=None, recipe=None, steps=(), b
     publish_file(job.result_path, encoded(result) + b"\n", limit=MAX_RESULT_BYTES)
 
 
-def remove_work_folders(job, names=WORK_FOLDERS):
+def remove_work_folders(job, names=CLEANUP_FOLDERS):
     """Logs and the result are the evidence, and they stay."""
     removed = []
     for name in names:
@@ -872,10 +1255,10 @@ def keep_evidence(job, keep):
     return rows
 
 
-def refuse(store, job, reason, wait):
-    if not job.claim(None):
+def refuse(store, job, reason, wait, recipes_sha256=None):
+    if not job.claim(None, recipes_sha256):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
-    write_result(job, "refused", None, reason=reason[:4096])
+    write_result(job, "refused", None, reason=reason[:4096], recipes_sha256=recipes_sha256)
     return settle(store, job, wait)
 
 
@@ -886,7 +1269,8 @@ def git_folders(checkout):
     return sorted(set(found.stdout.splitlines()))
 
 
-def sandbox_prefix(recipes, recipe, job, checkout):
+def sandbox_prefix(recipes, recipe, job, checkout, export=None):
+    """export, for a require_clean job, is the folder the steps run in; the live checkout is then hidden, not bound."""
     if recipe["sandbox"] == "none":
         return []
     bwrap = shutil.which("bwrap")
@@ -901,16 +1285,22 @@ def sandbox_prefix(recipes, recipe, job, checkout):
     argv += ["--dev", "/dev", "--proc", "/proc"]
     for folder in recipes.get("ro_binds", []):
         argv += ["--ro-bind", folder, folder]
-    writes_git = recipe["kind"] in ("commit", "merge")
-    # A merge brings the working tree forward itself, so it writes the checkout as well as the Git data.
-    argv += ["--bind" if recipe.get("writable_checkout") or recipe["kind"] == "merge" else "--ro-bind", checkout, checkout]
-    for folder in git_folders(checkout):
-        argv += ["--bind" if writes_git else "--ro-bind", folder, folder]
-    # The job folder itself stays read-only inside, so a job cannot write its own result, claim or logs.
+    if export is not None:
+        # Empty tmpfs over the live checkout and its Git data, so not even an absolute path reaches an ignored file there.
+        # Before the job folder's bind, so an export below either of them is mounted again on top.
+        for folder in [checkout] + [path for path in git_folders(checkout) if not path.startswith(checkout + os.sep)]:
+            argv += ["--tmpfs", folder]
+    else:
+        writes_git = recipe["kind"] in ("commit", "merge")
+        # A merge brings the working tree forward itself, so it writes the checkout as well as the Git data.
+        argv += ["--bind" if recipe.get("writable_checkout") or recipe["kind"] == "merge" else "--ro-bind", checkout, checkout]
+        for folder in git_folders(checkout):
+            argv += ["--bind" if writes_git else "--ro-bind", folder, folder]
+    # The job folder itself stays read-only inside, so a job cannot write its own result, claim or logs, nor its export.
     argv += ["--ro-bind", str(job.folder), str(job.folder)]
     for name in WORK_FOLDERS:
         argv += ["--bind", str(job.folder / name), str(job.folder / name)]
-    return argv + ["--chdir", checkout, "--"]
+    return argv + ["--chdir", export or checkout, "--"]
 
 
 def scratch_argument(job):
@@ -923,7 +1313,7 @@ def cargo_target(job):
     return str(job.folder / "cargo-target")
 
 
-def job_environment(recipes, job, checkout):
+def job_environment(recipes, job, checkout, export=None):
     for name in WORK_FOLDERS:
         (job.folder / name).mkdir(mode=0o700, exist_ok=True)
     for name in CACHE_FOLDERS:
@@ -940,7 +1330,10 @@ def job_environment(recipes, job, checkout):
         path = home / folder
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         env[name] = str(path)
-    tokens = {"$checkout": checkout, "$scratch": scratch_argument(job)}
+    if export is not None:
+        # The export has no .git, so git must not walk up from it into whatever repository holds the store.
+        env["GIT_CEILING_DIRECTORIES"] = str(job.folder)
+    tokens = {"$checkout": export or checkout, "$scratch": scratch_argument(job)}
     for key, value in recipes.get("env", {}).items():
         env[key] = tokens.get(value, value)
     return env
@@ -975,11 +1368,12 @@ def stop_for_certain(process):
         raise StillRunning(process.pid, str(exc)[:512]) from exc
 
 
-def command_steps(recipe, packet, recipes, job):
+def command_steps(recipe, packet, recipes, job, checkout):
     tokens = {"$python": [recipes["python"]], "$paths": packet["paths"], "$scratch": [scratch_argument(job)],
-              "$checkout": [packet["checkout"]], "$cargo_target": [cargo_target(job)]}
+              "$checkout": [checkout], "$cargo_target": [cargo_target(job)]}
     for step in recipe["steps"]:
-        yield Step([part for word in step for part in tokens.get(word, [word])])
+        yield Step([part for word in step for part in tokens.get(word, [scratch_argument(job) + word[len("$scratch"):]]
+                                                                     if scratch_word(word) else [word])])
     return None
 
 
@@ -1113,10 +1507,11 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     return row, source.read_text(encoding="utf-8", errors="replace").strip() if source else None
 
 
-def execute(job, recipe, packet, recipes, on_start, details):
-    checkout = packet["checkout"]
-    env = job_environment(recipes, job, checkout)
-    sandbox = sandbox_prefix(recipes, recipe, job, checkout)
+def execute(job, recipe, packet, recipes, on_start, details, export=None):
+    """export, for a require_clean job, replaces the checkout as the steps' folder and $checkout."""
+    env = job_environment(recipes, job, packet["checkout"], export)
+    sandbox = sandbox_prefix(recipes, recipe, job, packet["checkout"], export)
+    checkout = export or packet["checkout"]
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
     if recipe["kind"] == "commit":
@@ -1124,7 +1519,7 @@ def execute(job, recipe, packet, recipes, on_start, details):
     elif recipe["kind"] == "merge":
         plan = merge_steps(packet, recipes, job, details)
     else:
-        plan = command_steps(recipe, packet, recipes, job)
+        plan = command_steps(recipe, packet, recipes, job, checkout)
     rows, reason, exit_code, created, output = [], None, 0, None, None
     started = False
 
@@ -1175,25 +1570,37 @@ def checkout_state(checkout, commit, created, view):
 
 def run_job(store, job, packet, packet_raw, recipes, wait):
     recipe = recipes["recipes"][packet["recipe"]]
-    if not job.claim(packet_raw):
+    if not job.claim(packet_raw, recipes["recipes_sha256"]):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
     view = MERGE_VIEW_ENV if recipe["kind"] == "merge" else None
+    provenance = {"recipes_sha256": recipes["recipes_sha256"]}
     try:
         before = source_state(mailbox, checkout, view)
         branch = head_ref(checkout) if recipe["kind"] == "merge" else None
     except ERRORS as exc:
-        write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048])
+        write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048], **provenance)
+        return settle(store, job, wait)
+    if recipe.get("require_clean", False) and before["dirty_content_sha256"] != EMPTY_STATUS:
+        write_result(job, "refused", None, reason=clean_refusal(packet["recipe"]), **provenance)
         return settle(store, job, wait)
     if (before["source_revision"], before["source_tree"], before["dirty_content_sha256"]) != (
             packet["commit"], packet["tree"], packet["dirty_content_sha256"]):
         # The job may have waited hours for a slot, so the exact source is checked again here.
-        write_result(job, "refused", None, reason="source does not match the packet: it changed while the job waited")
+        write_result(job, "refused", None, reason="source does not match the packet: it changed while the job waited",
+                     **provenance)
         return settle(store, job, wait)
+    if recipe.get("require_clean", False):
+        # An ignored file changes no status, so one added while the job waited is looked for again here.
+        try:
+            refuse_paths_outside_commit(checkout, packet["commit"], packet["paths"])
+        except ERRORS as exc:
+            write_result(job, "refused", None, reason=str(exc)[:2048], **provenance)
+            return settle(store, job, wait)
     if recipe["kind"] == "merge" and branch != packet["head_ref"]:
         write_result(job, "refused", None, reason="HEAD points at %s now, not %s as at admit, so the swap would move another "
-                     "branch" % (branch or "no branch", packet["head_ref"] or "no branch"))
+                     "branch" % (branch or "no branch", packet["head_ref"] or "no branch"), **provenance)
         return settle(store, job, wait)
     if recipe["kind"] == "commit":
         # Admission can precede a capacity wait or claim publication. A lease acquired
@@ -1202,15 +1609,33 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             code, overlap = check_paths(store.load(), job.initiative["id"], packet["paths"])
             require(code == 0, json.dumps(overlap, sort_keys=True)[:2048])
         except ERRORS as exc:
-            write_result(job, "refused", None, reason="path ownership changed before execution: " + str(exc)[:2048])
+            write_result(job, "refused", None, reason="path ownership changed before execution: " + str(exc)[:2048],
+                         **provenance)
             return settle(store, job, wait)
 
     def announce():
         publish_receipt(job, "started", "Job %s started." % job.id, wait)
 
+    # Before the steps and outside their deadline, so a slow probe never eats a recipe's own time.
+    provenance["python"] = python_info(recipes) if recipe["kind"] == "command" else None
+    export, extra = None, {}
+    if recipe.get("require_clean", False):
+        # The steps run on exactly the commit, so nothing Git ignores in the checkout can run in its name.
+        export = str(job.folder / EXPORT_FOLDER)
+        try:
+            remove_work_folders(job, (EXPORT_FOLDER,))
+            extra["source_export"] = export_commit(checkout, packet["commit"], packet["tree"], export)
+        except ERRORS as exc:
+            try:
+                remove_work_folders(job, (EXPORT_FOLDER,))
+            except OSError:
+                pass
+            write_result(job, "refused", None, reason="could not export commit %s: %s" % (packet["commit"][:12], str(exc)[:2048]),
+                         **provenance)
+            return settle(store, job, wait)
     details = {}
     try:
-        rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce, details)
+        rows, reason, exit_code, created = execute(job, recipe, packet, recipes, announce, details, export)
     except StillRunning as exc:
         # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
         row = {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
@@ -1219,6 +1644,16 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         return row
     except ERRORS as exc:
         rows, reason, exit_code, created = [], "the job could not run: " + str(exc)[:2048], NO_VERDICT_EXIT, None
+    cleanup_error = None
+    if export is not None:
+        # Removed whatever the outcome: the logs and kept files are the evidence, and a full tree per job would fill the
+        # disk. An abandoned job above keeps it, because its processes may still read it; clean removes it then.
+        try:
+            remove_work_folders(job, (EXPORT_FOLDER,))
+            extra["source_export"]["removed"] = True
+        except OSError as exc:
+            extra["source_export"]["removed"] = False
+            cleanup_error = str(exc)[:512]
     try:
         after = source_state(mailbox, checkout, view)
     except ERRORS as exc:
@@ -1242,7 +1677,14 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         commit = created
     else:
         commit = moved if after is not None and moved and after["source_revision"] == moved else None
-    extra = {"kept": keep_evidence(job, recipe["keep"])} if recipe.get("keep") else {}
+    if recipe.get("keep"):
+        extra["kept"] = keep_evidence(job, recipe["keep"])
+    extra["tests"] = None
+    if recipe.get("expects_tests", False):
+        extra["tests"], problem = kept_junit(extra["kept"])
+        # An exit 0 over no tests, or over a report nobody can read, proves nothing. A step's own failure keeps its reason.
+        if problem and not reason:
+            reason, exit_code = problem, NO_VERDICT_EXIT
     if recipe["kind"] == "merge":
         # Every input and the pinned config, so the receipt binds them and anyone can predict the tree again.
         extra["merge"] = {"commit": packet["commit"], "merge": packet["merge"], "merge_bases": details.get("merge_bases"),
@@ -1253,11 +1695,11 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     # process-record write. Unknown stop evidence raises StillRunning above and cannot
     # reach this result. Preserve that confirmation when the last group record is absent.
     write_result(job, "failed" if reason else "completed", exit_code if reason else 0, reason=reason, recipe=packet["recipe"],
-                 steps=rows, before=before, after=after, commit=commit, process_stopped_confirmed=True, **extra)
+                 steps=rows, before=before, after=after, commit=commit, process_stopped_confirmed=True, **provenance, **extra)
     # A build cache is never evidence, and a cargo job's can be gigabytes, so Heavy-Tests leaves nothing behind. Other
     # failed jobs keep the rest of their work for diagnosis until root runs clean.
     names = WORK_FOLDERS if not reason or recipe.get("heavy_tests", False) else ("cargo-target",)
-    removed, cleanup_error = [], None
+    removed = []
     for name in names:
         try:
             removed += remove_work_folders(job, (name,))
@@ -1344,7 +1786,7 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
                 packet, raw = admit(ledger, initiative, message, mailbox, recipes)
             except ERRORS as exc:
                 try:
-                    rows.append(refuse(store, job, str(exc), wait))
+                    rows.append(refuse(store, job, str(exc), wait, recipes["recipes_sha256"]))
                 except ERRORS as failure:
                     rows.append(blocked_row(job, failure))
                 continue
@@ -1524,8 +1966,12 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     if unrecorded:
         require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
                 "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
+    # runner_alive above has read and checked this claim. A claim written before the hash was stored records null.
+    recipes_sha256 = read_json(job.claim_path).get("recipes_sha256")
+    require(recipes_sha256 is None or (isinstance(recipes_sha256, str) and SHA256.fullmatch(recipes_sha256) is not None),
+            "invalid recipes_sha256 in the claim of job: " + identifier)
     write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
-                 process_stopped_confirmed=process_stopped)
+                 process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256)
     return 0, settle(store, job, wait)
 
 
@@ -1542,7 +1988,7 @@ def clean(store_path, identifier):
 def work_bytes(folder):
     """Bytes the work folders hold, counted without following a symlink out of them."""
     total = 0
-    for name in WORK_FOLDERS:
+    for name in CLEANUP_FOLDERS:
         path = folder / name
         if path.is_symlink() or not path.is_dir():
             continue
@@ -1752,6 +2198,7 @@ def main(argv=None):
         elif args.command == "recovery-status":
             code, result = recovery_status(args.store, args.initiative)
         elif args.command == "resolve":
+            # --recipes is accepted but not read: the result records the hash the job's claim stored, the file it ran under.
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait, args.process_stopped)
         elif args.command == "clean" and args.job is None:
             require(args.initiative is not None, "clean needs --job, or --initiative with --finished")
@@ -1764,9 +2211,12 @@ def main(argv=None):
             require(args.recipes is not None, "--recipes is required")
             if args.command == "check-recipes":
                 recipes = load_recipes(args.recipes)
-                code, result = 0, {"recipes": {name: {"kind": recipe["kind"], "heavy": is_heavy(recipe),
+                code, result = 0, {"recipes_sha256": recipes["recipes_sha256"],
+                                   "recipes": {name: {"kind": recipe["kind"], "heavy": is_heavy(recipe),
                                                       "heavy_tests": recipe.get("heavy_tests", False),
-                                                      "sandbox": recipe["sandbox"]}
+                                                      "sandbox": recipe["sandbox"],
+                                                      "require_clean": recipe.get("require_clean", False),
+                                                      "expects_tests": recipe.get("expects_tests", False)}
                                                for name, recipe in recipes["recipes"].items()}}
             else:
                 code, result = run_open(args.store, args.recipes, args.initiative, args.max_jobs, args.census_fixture, args.lock_wait)

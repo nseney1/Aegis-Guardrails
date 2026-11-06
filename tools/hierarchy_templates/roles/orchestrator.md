@@ -56,7 +56,9 @@ without authority may go by SendMessage, and the receiver records them in its ST
 Each orchestrator routes work to its own lanes. A peer still cannot dispatch your lanes.
 Collect and spot-check exact-source reports; preserve failed/incomplete evidence.
 Arrange independent review from a read-only checkout of base and candidate, plus one
-fix round. Only this role reads and updates GitHub under the existing handoff. The owner signs governance changes and merges every PR.
+fix round. Before review, file `targeted-tests` on the exact clean candidate commit and forward its
+receipt's evidence references (paths and sha256) in the review dispatch, with the recipe file
+hash root published. Only this role reads and updates GitHub under the existing handoff. The owner signs governance changes and merges every PR.
 Verify exact-merge push CI after a merge before continuing release work.
 
 Maintain STATUS and attribute evidence by hierarchy, endpoint, host, generation,
