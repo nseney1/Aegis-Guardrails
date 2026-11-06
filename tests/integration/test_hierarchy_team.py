@@ -22,7 +22,6 @@ import stat
 import subprocess
 import sys
 import time
-import uuid
 
 import pytest
 
@@ -351,11 +350,11 @@ class Run:
                 "FAKE_HOST_LOG": str(self.host_log), "FAKE_HOST_PLAN": str(self.plan_path),
                 "CLAUDE_CONFIG_DIR": str(self.tmp / "claude-home"), **extra}
 
-    def team(self, *words, expect=0, **extra):
+    def team(self, *words, expect=0, stderr="", **extra):
         proc = subprocess.run([sys.executable, "-I", "-B", str(TEAM), "--config", str(self.config_path), *words],
                               capture_output=True, text=True, timeout=600, env=self.env(**extra))
         assert proc.returncode == expect, proc.stdout[-6000:] + proc.stderr[-3000:]
-        assert not proc.stderr, proc.stderr
+        assert proc.stderr == stderr, proc.stderr
         return json.loads(proc.stdout.splitlines()[-1])
 
     def calls(self, kind):
@@ -657,7 +656,8 @@ def test_login_runs_codex_login_in_the_runs_codex_home_and_checks_the_folder(run
 def test_login_refuses_a_folder_a_real_login_would_not_leave(run, mode, error):
     run.team("init")
     expect = 3 if mode == "fail" else 2
-    answer = run.team("login", expect=expect, FAKE_TEAM_LOGIN=mode)
+    # codex login runs in the owner's terminal, so what it prints is not captured.
+    answer = run.team("login", expect=expect, stderr="login failed\n" if mode == "fail" else "", FAKE_TEAM_LOGIN=mode)
     assert answer["error"] == (error % (run.codex_home / "auth.json") if "%s" in error else error)
 
 
@@ -706,6 +706,9 @@ def test_up_writes_team_json_starts_each_role_checks_its_rollout_and_starts_the_
                       "pilot/decider": ("gpt-6.1-sol", "medium"), REVIEWER: ("gpt-6.1-sol", "high"),
                       IMPLEMENTER: ("gpt-6.1-sol", "high")}
     assert all(row["state"] == "bound" and row["agent_tools"] == [] for row in answer["roles"])
+    tiers = {row["endpoint"]: (row["tier"], row["tier_asked"]) for row in answer["roles"]}
+    assert tiers == {e: ("ultrafast", "ultrafast") if e == "pilot/router" else ("default", "default")
+                     for e in ROLE_ORDER}, "reported, not checked: whether a tier is served is the probe's question"
     assert answer["router"] == ("the Router runs at effort medium and tier ultrafast from the role registry; team.json "
                                 "cannot change it")
     status = json.loads(subprocess.run([sys.executable, "-I", str(ROOT / "tools" / "hierarchy_launcher.py"), "--base",
@@ -792,7 +795,7 @@ def test_request_publishes_bare_fields_or_a_team_request_draft_as_the_coordinato
         "error": "the draft's sha256 does not match its raw text"}
     changed = run.request("feature-1", next_decision="something else")
     assert run.team("request", "feature-1", "--file", str(run.write("changed.json", changed)), expect=2) == {
-        "error": "request id conflicts with different bytes"}
+        "error": "event id conflicts with different bytes"}
 
 
 def test_approve_runs_one_root_turn_and_checks_the_journal_for_the_decision(run):
