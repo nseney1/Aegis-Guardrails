@@ -72,6 +72,8 @@ CONTRACT_HOSTS = ("claude", "codex")
 START_HOST = "codex"
 HOST_OPEN = re.compile(r"<!-- host:([a-z]+) -->")
 HOST_CLOSE = "<!-- /host -->"
+HOST_LIKE = re.compile(r"<!--\s*/?\s*host\b", re.IGNORECASE)
+FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)$")
 
 
 class Interrupted(Exception):
@@ -259,8 +261,22 @@ def host_view(text, host, origin):
 
     A marker stands alone on its line and blocks do not nest. Anything else that looks like a marker refuses the
     contract, so a typo can never hand one host's instructions to another."""
-    kept, opened = [], None
+    kept, opened, fence = [], None, None
     for number, line in enumerate(text.splitlines(), 1):
+        # Markdown examples are literal text, including marker examples. A closing
+        # fence must use the opening character and be at least as long.
+        if fence is not None:
+            if opened is None or opened[1] == host:
+                kept.append(line)
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + r"{%d,}\s*" % len(fence), line):
+                fence = None
+            continue
+        opening = FENCE_OPEN.fullmatch(line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence = opening.group(1)
+            if opened is None or opened[1] == host:
+                kept.append(line)
+            continue
         marker = HOST_OPEN.fullmatch(line.strip())
         if marker:
             if opened is not None:
@@ -274,7 +290,7 @@ def host_view(text, host, origin):
                     "unbalanced host markers in %s: line %d closes a block that is not open" % (origin, number))
             opened = None
         else:
-            require("<!-- host:" not in line and "<!-- /host" not in line,
+            require(HOST_LIKE.search(line) is None,
                     "invalid host marker in %s: line %d: a host marker must stand alone on its line" % (origin, number))
             if opened is None or opened[1] == host:
                 kept.append(line)
@@ -323,7 +339,8 @@ def start_prompt(launches, endpoint):
         lines = parts[-1].splitlines()
         require(all(heading in lines for heading in KIND_SECTIONS),
                 "%s must restate lane.md's %s for its kind" % (path, " and ".join(KIND_SECTIONS)))
-        parts[0] = without_sections(parts[0], KIND_SECTIONS)
+        headings = KIND_SECTIONS + (("## Writing rules",) if role == "reviewer" else ())
+        parts[0] = without_sections(parts[0], headings)
     prompt = "\n\n".join((START_HEADER % (endpoint, role), *parts, START_FOOTER))
     return prompt, contracts
 

@@ -13,9 +13,9 @@ rotate itself. An endpoint named with --skip is reported with its unread count a
 means: the adapter returned the message.
 
 Two more reports are judged from the mailbox's own files, with nothing kept between sweeps. `silent_roles`: an
-orchestrator, lane or decider whose latest finished turn read work it owes an answer to (a read after the previous
-finished turn and by that turn's end) and that has published nothing since that turn began. `stalled_dispatches`: a lane that accepted a dispatch, has answered none of it, and has
-no unread mail and no running turn, with its last finished turn ending after the acceptance, so no wake will come.
+orchestrator, lane or decider whose completed turn read work it owes an answer to and that has published nothing
+since that turn began. Later receipt-only turns do not clear earlier unanswered work. `stalled_dispatches`: a lane that accepted a dispatch, has answered none of it, and has
+no unread mail and no running turn, even when a manually started turn left no wake receipts, so no wake will come.
 Neither changes `quiet`, which stays about mail.
 """
 from __future__ import annotations
@@ -50,8 +50,6 @@ START_BACKOFF = timedelta(seconds=300)
 OWED = {"orchestrator": {("router", "info"), ("front-door", "info"), ("lane", "result"), ("lane", "review")},
         "lane": {("orchestrator", "dispatch")},
         "decider": {("orchestrator", "info")}}
-# A background wake records its start only once the launcher returns, and the turn may have published by then.
-PUBLISH_SLACK = timedelta(seconds=5)
 FINISHED = {"exited", "timed_out"}
 
 
@@ -206,72 +204,73 @@ def by_time(receipts):
 
 
 def silent_role(name, summary, records):
-    """The endpoint's latest wake of its current generation read work it owes an answer to, and it has published
-    nothing since that wake began. A later publish or a later wake clears it, because only the latest wake counts.
+    """Retain work read in completed turns until the endpoint publishes an answer.
 
-    A read is charged to the wake by its session and generation, after the previous finished wake of this generation
-    (or, with none, the binding's start, which every read of this generation follows) and up to this wake's finish.
-    The start receipt is not the bound: a background wake writes it only once its launcher returns, and the turn may
-    have read its mail by then. A publish counts from 5 s before the start receipt, or from the first read charged
-    to the wake when that is earlier, because a publish after that read is this turn's too."""
+    Later receipt-only turns cannot erase an earlier owed read. While the latest turn is unfinished, or its
+    marker exists, the endpoint can still answer, so no silent hold is raised. Read windows retain the background
+    launch rule: reads after the previous finish and up to this finish belong to this turn, even before its start
+    receipt. Only a publication at or after an owed read answers that read; an earlier publication cannot answer
+    work that the endpoint has not read yet.
+    """
     owed = OWED.get(endpoint_parts(name)[1])
     binding = summary["binding"]
     if owed is None or binding is None or summary["marker"].exists():
         return None
-    current = [wake for wake in summary["wakes"] if wake["generation"] == binding["generation"]]
+    current = [wake for wake in summary["wakes"]
+               if (wake["generation"], wake["session"]) == (binding["generation"], binding["session"])]
     started = by_time([wake for wake in current if wake["state"] == "started"])
-    if not started:
+    finished = {wake["wake_id"]: wake for wake in current if wake["state"] in FINISHED}
+    if not started or started[-1]["wake_id"] not in finished:
         return None
-    start = started[-1]
-    finish = next((wake for wake in current if wake["wake_id"] == start["wake_id"] and wake["state"] in FINISHED), None)
-    if finish is None:
-        # Still running, or it died before recording its end; the marker and ignored_mail speak for those.
-        return None
-    opened, closed = parse_time(start["at"]), parse_time(finish["at"])
-    earlier = [parse_time(wake["at"]) for wake in current
-               if wake["state"] in FINISHED and wake["wake_id"] != start["wake_id"] and parse_time(wake["at"]) <= opened]
-    after = max(earlier) if earlier else None
-    team = endpoint_parts(name)[0]
-    work, first_read = [], None
-    for receipt in summary["reads"]:
-        at = parse_time(receipt["at"])
-        if (receipt["session"], receipt["generation"]) != (start["session"], start["generation"]) or at > closed \
-                or (after is not None and at <= after):
+    publications = [parse_time(record["message"]["created_at"]) for record in records.values()
+                    if record["message"]["from"] == name]
+    published = max(publications) if publications else None
+    for start in started:
+        finish = finished.get(start["wake_id"])
+        if finish is None:
             continue
-        first_read = at if first_read is None else min(first_read, at)
-        for identifier in receipt["message_ids"]:
-            message = records[identifier]["message"]
-            sender = endpoint_parts(message["from"])
-            if sender[0] == team and (sender[1], message["type"]) in owed:
-                work.append({"message_id": identifier, "type": message["type"], "from": message["from"]})
-    since = opened - PUBLISH_SLACK if first_read is None else min(opened - PUBLISH_SLACK, first_read)
-    # A refused publish writes nothing, so a role whose every answer was refused reads as silent, which it is.
-    if not work or any(record["message"]["from"] == name and parse_time(record["message"]["created_at"]) >= since
-                       for record in records.values()):
-        return None
-    return {"endpoint": name, "wake_id": start["wake_id"], "started_at": start["at"], "finished_at": finish["at"],
-            "ended": finish["state"], "exit_code": finish.get("exit_code"), "read": work,
-            "silent_since": since.isoformat(timespec="microseconds").replace("+00:00", "Z")}
+        opened, closed = parse_time(start["at"]), parse_time(finish["at"])
+        earlier = [parse_time(wake["at"]) for wake in current
+                   if wake["state"] in FINISHED and wake["wake_id"] != start["wake_id"] and parse_time(wake["at"]) <= opened]
+        after = max(earlier) if earlier else None
+        team = endpoint_parts(name)[0]
+        work, first_read = [], None
+        for receipt in summary["reads"]:
+            at = parse_time(receipt["at"])
+            if (receipt["session"], receipt["generation"]) != (start["session"], start["generation"]) or at > closed \
+                    or (after is not None and at <= after) or (published is not None and at <= published):
+                continue
+            for identifier in receipt["message_ids"]:
+                message = records[identifier]["message"]
+                sender = endpoint_parts(message["from"])
+                if sender[0] == team and (sender[1], message["type"]) in owed:
+                    first_read = at if first_read is None else min(first_read, at)
+                    work.append({"message_id": identifier, "type": message["type"], "from": message["from"]})
+        # A refused publish writes nothing, so a role whose every answer was refused remains silent.
+        if not work:
+            continue
+        return {"endpoint": name, "wake_id": start["wake_id"], "started_at": start["at"], "finished_at": finish["at"],
+                "ended": finish["state"], "exit_code": finish.get("exit_code"), "read": work,
+                "silent_since": first_read.isoformat(timespec="microseconds").replace("+00:00", "Z")}
+    return None
 
 
 def stalled_dispatch(name, summary, records):
     """The lane accepted a dispatch it has not answered, and nothing will wake it: no unread mail, no turn running,
-    and its last finished wake ended after the acceptance. A session that died after accepting gets no further
-    wakes, so this cannot wait on a wake count. A result or a new wake clears it."""
+    including turns started manually with no sweep receipt. A session that died after accepting gets no further
+    wakes, so this cannot wait on a wake count. A result clears it; a running wake suspends it."""
     if endpoint_parts(name)[1] != "lane" or summary["unread_count"] or summary["marker"].exists():
         return None
     finished = by_time([wake for wake in summary["wakes"] if wake["state"] in FINISHED])
-    if not finished:
-        return None
-    last = finished[-1]
-    ended = parse_time(last["at"])
+    last = finished[-1] if finished else None
     # The mailbox's own closed set: a result, a review or a completed ack answers a dispatch.
     closed, accepted = Mailbox.dispatch_history(records)
-    waiting = sorted((ack for ack in accepted if ack["from"] == name and ack["in_reply_to"] not in closed
-                      and parse_time(ack["created_at"]) < ended), key=lambda ack: (ack["created_at"], ack["message_id"]))
+    waiting = sorted((ack for ack in accepted if ack["from"] == name and ack["in_reply_to"] not in closed),
+                     key=lambda ack: (ack["created_at"], ack["message_id"]))
     if not waiting:
         return None
-    return {"endpoint": name, "wake_id": last["wake_id"], "finished_at": last["at"],
+    return {"endpoint": name, "wake_id": last["wake_id"] if last else None,
+            "finished_at": last["at"] if last else None,
             "dispatches": [{"dispatch": ack["in_reply_to"], "accepted": ack["message_id"],
                             "accepted_at": ack["created_at"]} for ack in waiting]}
 

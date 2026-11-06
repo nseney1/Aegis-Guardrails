@@ -40,16 +40,16 @@ Prepare lane briefs with goal, acceptance, worktree, branch, owned paths, tests 
 lease.
 An immutable informational message can hold the full lane brief: publish it,
 then use its returned path/raw SHA256 in the dispatch. Do not rewrite that file.
-Create writing worktrees manually from the approved develop/wave base;
-do not rely on host-generated branches. Claim leases serially with stable endpoint
-owner labels, then re-read shared refs for unresolved overlaps before dispatch.
+Ask the qualified operator to create writing worktrees from the approved develop/wave base
+and claim leases serially with stable endpoint owner labels. Read the returned evidence
+for unresolved overlaps before dispatch; do not run worktree or lease commands yourself.
 Inspect effective scan/MCP binding and live hook evidence for each writing lane.
 Writers are one global limit that root sets from the owner's decision (`set-limits`,
 T59 and T63), and integration lanes count; each manifest's `writer_limit` also caps
 that hierarchy's accepted writer dispatches.
 
 Read every inbox page before an ack, a dispatch or opening a PR, using
-`--after <next_after>` until `remaining` is 0 (T15, T28). Use the same mailbox for
+`after_message_id` set to `next_after` until `remaining` is 0 (T15, T28). Use the same mailbox for
 every vertical hop. Requests that change another team's work (paths, merges, queue
 moves) go by ROOT relay (owner decision `c12-cross-orchestrator-traffic-a`).
 <!-- host:claude -->
@@ -60,7 +60,7 @@ Collect and spot-check exact-source reports; preserve failed/incomplete evidence
 Arrange independent review from a read-only checkout of base and candidate, plus one
 fix round. Before review, file `targeted-tests` on the exact clean candidate commit and forward its
 receipt's evidence references (paths and sha256) in the review dispatch, with the recipe file
-hash root published. Only this role reads and updates GitHub under the existing handoff. The owner signs governance changes and merges every PR.
+hash root published. Ask the operator for GitHub status and draft PR updates under the existing handoff. This session has no network or GitHub execution tools. The owner signs governance changes and merges every PR.
 Verify exact-merge push CI after a merge before continuing release work.
 
 Maintain STATUS and attribute evidence by hierarchy, endpoint, host, generation,
@@ -114,7 +114,7 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters.
 - **Hashes and times, T92.** Send full hashes copied from command output in the same turn, or only the path. Never type a hash or a time, and mark prefixes as prefixes.
 - **Governance paths before a cutover, T106.** Before a cutover request, list the governance-classified paths (`aegis_core.governance`) in `<PR base>..<tip>`, and put each that needs the owner's signature in the same owner batch.
 - **Absolute paths, T100.** Packets, prompts and specs write every path in a command line as absolute.
-- **Cwd, T97, T104, T135 and T139.** Never call `EnterWorktree` and keep the launch cwd. Never `cd`, not even inside a compound command or a subshell; use `git -C` and absolute paths. Run `pwd` before the first Write; if it is not the launch cwd, run one lone `cd <launch cwd>` and report it.
+- **Cwd, T97, T104, T135 and T139.** Never call `EnterWorktree` and keep the launch cwd. Never `cd`, not even inside a compound command or a subshell; use `git -C` and absolute paths. If the observed cwd differs from the launch cwd, report the mismatch and stop; ask the operator to correct the launch.
 - **Launch order, T117 and T137 (b).** worktree → lease → writer → bind → launch → dispatch → accept. Every writing dispatch names a lease, which ROOT claims before the launch.
 - **Quiet binds and closed dispatches, T118.** Until `ack-lineage` (T69's fix) is live, bind a successor orchestrator at a quiet moment. Every writer dispatch ends with "close this dispatch with a mailbox `result` before the self-stop". Close a dispatch before its worktree is removed; otherwise every later bind and ack fails with "git identity check failed".
 - **Owner-approved backlog, T130.** Every handoff carries the "Owner-approved backlog" table, copied forward verbatim. An item leaves only as done (with evidence) or retired by a cited record, and the successor re-checks the table against the owner records during its read.

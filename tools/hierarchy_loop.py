@@ -31,8 +31,9 @@ the owner clears it by deleting `<state-dir>/status.json` once the cause is fixe
 
 The sweep's `silent_roles` (a role that read work it owes an answer to and published nothing) and
 `stalled_dispatches` (a lane that accepted a dispatch and has nothing that will wake it) become ROOT
-`silent_role` and `stalled_dispatch` holds. The sweep recomputes both from mailbox files every pass, so a later
-publish, result or wake clears them.
+`silent_role` and `stalled_dispatch` holds. The sweep recomputes both from mailbox files every pass: a publication
+after an owed read clears silence, and a result clears its dispatch. A running turn suspends the reports; later
+receipt-only wakes do not erase unanswered work.
 """
 from __future__ import annotations
 

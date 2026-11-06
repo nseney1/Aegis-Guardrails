@@ -149,7 +149,7 @@ def test_root_reads_the_team_status_from_the_journal_alone_when_given_no_loop_or
     assert (answer["loop"], answer["evidence"]) == (None, None)
     assert answer["holds_by_act"] == {"root": [], "owner": [], "router": []}
     assert answer["pending"] == ["feature-1"]
-    assert answer["requests"] == [{"request_id": "feature-1", "state": "awaiting_decision"},
+    assert [{k: row[k] for k in ("request_id", "state")} for row in answer["requests"]] == [{"request_id": "feature-1", "state": "awaiting_decision"},
                                   {"request_id": "feature-2", "state": "approved"}]
 
 

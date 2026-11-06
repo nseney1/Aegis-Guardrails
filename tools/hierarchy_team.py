@@ -2,8 +2,9 @@
 """The owner's one command for a team run: init, login, root, up, request, approve, turn, status and down.
 
 One config, `team-run.json` (aegis.team-run/v1, template in hierarchy_templates/team-run.json), replaces the real
-run's shell guide and its helpers. Every subcommand first runs the guard: CODEX_HOME is the run's codex_home and
-never ~/.codex or a folder inside it (by realpath); free disk is at least min_free_gb; git, bwrap and codex are on
+run's shell guide and its helpers. Every subcommand checks path safety: CODEX_HOME is the run's codex_home and
+never ~/.codex or a folder inside it (by realpath). Commands that start work require free disk at least min_free_gb;
+git, bwrap and codex are on
 PATH, and cargo and cargo-nextest on the recipes' path when a kept recipe runs them. A command that spends model
 turns (login, up, approve, turn) also refuses an API key in the environment.
 
@@ -13,7 +14,7 @@ re-check nothing those tools check: a tool's refusal is passed on with its own t
 evidence/index.json. `down` copies the rest there, writes the turn ledger and SHA256SUMS.
 
 ROOT stays the owner's session. `root` binds an existing ROOT session with its decision connection; `approve` runs
-one ROOT turn whose prompt names only the request id and the decision, so no hash is pasted, then checks the
+one ROOT turn whose prompt names the request id, decision and owner's reason, so no hash is pasted, then checks the
 journal; the loop never wakes ROOT. `request` publishes as the coordinator, never as ROOT.
 
 Exit codes: 0 done; 2 refused (this command changed nothing); 3 failed (a step ran and did not succeed). The result is
@@ -360,15 +361,36 @@ def nearest(path):
     return path
 
 
-def guard(run, command):
+def safe_codex_home(run):
     owner = Path.home() / ".codex"
     real, owner_real = os.path.realpath(run.codex_home), os.path.realpath(owner)
     if real == owner_real or real.startswith(owner_real.rstrip(os.sep) + os.sep):
         refuse("CODEX_HOME %s is inside ~/.codex (%s); a team run uses its own folder" % (run.codex_home, owner))
+    candidate = Path(real)
+    def contains(parent, child):
+        return parent == child or parent in child.parents
+    for protected in (Path.home(), run.run, owner):
+        if contains(candidate, protected.resolve()):
+            refuse("unsafe codex_home: it contains %s" % protected)
+    for protected in (run.project, run.source, run.evidence, *[run.run / name for name in MANAGED]):
+        protected = protected.resolve()
+        if contains(candidate, protected) or contains(protected, candidate):
+            refuse("unsafe codex_home: it overlaps %s" % protected)
+    if run.codex_home.is_symlink():
+        refuse("unsafe codex_home: it is a symlink")
+    return real
+
+
+def guard(run, command):
+    real = safe_codex_home(run)
+    if command == "down":
+        return {}
     ambient = os.environ.get("CODEX_HOME")
     if ambient and os.path.realpath(ambient) != real:
         refuse("CODEX_HOME in this shell is %s, not this run's codex_home %s; unset it or export the run's"
                % (ambient, run.codex_home))
+    if command == "status":
+        return {}
     probe = nearest(run.run)
     free = shutil.disk_usage(str(probe)).free / 2 ** 30
     if free < run.min_free_gb:
@@ -402,6 +424,11 @@ def load_state(run):
     return read_json(run.state_path) if run.state_path.is_file() else None
 
 
+def custody(run):
+    return {key: run.raw.get(key) for key in ("run", "project", "source", "codex_home", "base", "branch",
+                                             "initiative", "lanes", "roles")}
+
+
 def save_state(run, state):
     write_atomic(run.state_path, as_json(state))
 
@@ -414,6 +441,8 @@ def require_init(run):
     state = load_state(run)
     if not init_complete(state):
         refuse("init has not completed; run init first")
+    if state.get("down", {}).get("started_at") or state.get("down", {}).get("done"):
+        refuse("teardown has started; a new run needs a new run folder")
     return state
 
 
@@ -513,8 +542,8 @@ def preconditions(run):
     for name in MANAGED:
         if (run.run / name).exists():
             refuse("run folder already holds %s; init needs a fresh run folder" % name)
-    if run.codex_home.exists() and (not run.codex_home.is_dir() or any(run.codex_home.iterdir())):
-        refuse("codex_home %s already holds files; init needs a new or empty folder" % run.codex_home)
+    if run.codex_home.exists():
+        refuse("codex_home %s already exists; init needs a new folder" % run.codex_home)
     real = os.path.realpath(run.project)
     for live in run.live:
         mine = os.path.realpath(live)
@@ -538,18 +567,28 @@ def preconditions(run):
 
 
 def once(run, state, key, action):
-    """One external command of an init step. Recorded when it succeeds, so `init --continue` never repeats it."""
+    """Persist intent before an external command; an uncertain result must never authorize a replay."""
     done = state["init"]["done"]
     if key not in done:
+        pending = state["init"].get("pending")
+        if pending:
+            fail("init step %s has an unresolved outcome; inspect durable records before continuing" % pending)
+        state["init"]["pending"] = key
+        save_state(run, state)
         value = action()
         done[key] = value if isinstance(value, dict) else {"at": timestamp()}
+        state["init"].pop("pending", None)
         save_state(run, state)
     return done[key]
 
 
 def step_codex_home(run, state):
+    safe_codex_home(run)
     run.run.mkdir(parents=True, exist_ok=True, mode=0o700)
-    run.codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if run.codex_home.exists():
+        ownership(run)
+        return {"codex_home": str(run.codex_home)}
+    run.codex_home.mkdir(parents=True, mode=0o700)
     os.chmod(run.codex_home, 0o700)
     mark = {"run": str(run.run), "initiative": run.id, "created_at": timestamp()}
     write_atomic(run.codex_home / OWNER_MARK, as_json(mark))
@@ -785,6 +824,8 @@ def next_step(state):
 
 def init(run, args):
     state = load_state(run)
+    if state and (state.get("down", {}).get("started_at") or state.get("down", {}).get("done")):
+        refuse("teardown has started; a new run needs a new run folder")
     if init_complete(state):
         refuse("init already completed at %s; a new run needs a new run folder" % state["init"]["complete_at"])
     if args.resume:
@@ -796,6 +837,7 @@ def init(run, args):
     else:
         tree = preconditions(run)
         state = {"schema": STATE_SCHEMA, "created_at": timestamp(), "config": str(run.config_path),
+                 "custody": custody(run),
                  "init": {"steps": {}, "done": {}, "failed": None, "complete_at": None, "base_tree": tree},
                  "root": None, "up": None, "down": {"done": {}}}
         run.run.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -973,7 +1015,15 @@ def check_role(run, endpoint, session, want, accept):
     """The started role's rollout: no sub-agent tools (unless accepted), and the model and effort asked for. The served
     tier is reported, not checked: whether an account is served the Router's ultrafast tier is the probe's question."""
     rollout = find_rollout(run, endpoint, session)
-    offered = hierarchy_native.multi_agent_state(str(rollout), cid=session)["agent_tools"]
+    try:
+        catalog = hierarchy_native.multi_agent_state(str(rollout), cid=session)
+    except ValueError as exc:
+        stop_role(run, endpoint)
+        refuse("%s tool catalog is unavailable; it was stopped: %s" % (endpoint, exc))
+    offered = catalog["agent_tools"]
+    if not catalog["tool_records"] or catalog.get("unknown_tools"):
+        stop_role(run, endpoint)
+        refuse("%s tool catalog is unavailable; it was stopped" % endpoint)
     if offered and not accept:
         stop_role(run, endpoint)
         refuse("%s was offered sub-agent tools: %s; it was stopped. Pass --accept-agent-tools to accept that, which is "
@@ -1153,18 +1203,25 @@ def approve(run, args):
     text(reason, "reason", 512)
     decision = "deny" if args.deny else "approve"
     lifecycle = hierarchy_lifecycle.Lifecycle(run.lifecycle)
+    _policy, before = hierarchy_router.locked_load(lifecycle, 5.0)
     row = next((row for row in hierarchy_team_view.pending(lifecycle)["pending"] if row["request_id"] == args.id), None)
     if row is None:
-        standing = {r["request_id"]: r["state"] for r in hierarchy_team_view.status(lifecycle)["requests"]}
-        refuse("request %s is not pending a ROOT decision (journal state: %s)" % (args.id,
-                                                                                  standing.get(args.id, "not published")))
+        rows = {r["request_id"]: r for r in hierarchy_team_view.status(lifecycle)["requests"]}
+        existing = rows.get(args.id)
+        latest = next((r for r in reversed(before["decisions"]) if r["request_id"] == args.id), None)
+        if args.deny and existing and latest and latest["decision"] == "approve":
+            row = existing
+        else:
+            refuse("request %s is not pending a ROOT decision (journal state: %s)" % (
+                args.id, existing["state"] if existing else "not published"))
     argv = ["codex"]
     # ROOT reads and decides only: no shell, as provision gives any reader without reader_shell.
     for feature in hierarchy_provision.CODEX_DISABLED + hierarchy_provision.CODEX_SHELL:
         argv += ["--disable", feature]
     argv += ["exec", "--ignore-user-config", "--sandbox", "read-only", "-c", 'approval_policy="never"',
              "-c", bound["mcp_config"], "--json", "-C", str(run.project), "resume", bound["session"],
-             ROOT_PROMPT % (args.id, decision, reason)]
+             (ROOT_PROMPT if not args.deny else ROOT_PROMPT.replace("Call team_pending", "Call team_status"))
+             % (args.id, decision, reason)]
     proc = subprocess.run(argv, cwd=str(run.project), env=child_env(run), stdin=subprocess.DEVNULL,
                           capture_output=True)
     stdout = proc.stdout.decode("utf-8", "replace")
@@ -1172,6 +1229,13 @@ def approve(run, args):
     messages = [item["text"] for item in agent_items(stdout) if item["type"] == "agent_message"]
     last = messages[-1] if messages else None
     _policy, journal = hierarchy_router.locked_load(lifecycle, 5.0)
+    previous = before["decisions"]
+    added = journal["decisions"][len(previous):]
+    if journal["decisions"][:len(previous)] != previous or any(
+            entry["request_id"] != args.id or entry["decision"] != decision or
+            entry["request_sha256"] != row["request_sha256"] for entry in added) or len(added) > 1:
+        fail("ROOT recorded unexpected journal decisions; inspect retained journal before continuing",
+             decisions=added, codex_exit=proc.returncode)
     recorded = [entry for entry in journal["decisions"] if entry["request_id"] == args.id]
     if not (recorded and recorded[-1]["decision"] == decision and
             recorded[-1]["request_sha256"] == row["request_sha256"]):
@@ -1209,9 +1273,18 @@ def turn(run, args):
     profile = read_json(profile_path)
     by_argv = profile["prompt_via"] == "argv"
     argv = profile["argv"] + ([args.prompt] if by_argv else [])
+    from hierarchy_mailbox import writer_lock
+    from hierarchy_wake import claim_wake
+    with writer_lock(mailbox.root):
+        current = Mailbox(mailbox.root).current_binding(endpoint)
+        require(all(profile[key] == current[key] for key in ("host", "session", "generation")),
+                "binding changed before owner turn; the outgoing session was not started")
+        marker = claim_wake(mailbox, endpoint)
     proc = subprocess.run(argv, cwd=profile["cwd"], env=child_env(run), capture_output=True,
                           input=None if by_argv else args.prompt.encode("utf-8"),
                           stdin=subprocess.DEVNULL if by_argv else None)
+    # An interrupted or uncertain launch retains the marker for inspection.
+    marker.unlink()
     log = append_evidence(run, "role-turns-%s.jsonl" % quoted, proc.stdout)
     answer = {"endpoint": endpoint, "exit_code": proc.returncode, "items": agent_items(proc.stdout.decode("utf-8",
                                                                                                           "replace")),
@@ -1476,6 +1549,10 @@ def release_leases(run, state):
                 save(run, "lease-absent-%s.json" % lane.id, listing)
             rows.append({"lane": lane.lease, "state": "already_released"})
             continue
+        claimed = read_json(run.evidence / ("lease-claim-%s.json" % lane.id)).get("lease")
+        identity = ("lane", "claim_id", "owner", "role", "branch", "paths")
+        if not isinstance(claimed, dict) or any(lease.get(key) != claimed.get(key) for key in identity):
+            fail("lease ownership changed for %s; resources were kept for inspection" % lane.lease)
         # The oid is read now: a renewal since the claim changed it, and the real run failed on a pasted placeholder.
         code, answer, proc = aegis(run, "team", "release", lane.lease, "--workspace", str(run.project), "--expect",
                                    lease["oid"], "--json")
@@ -1518,15 +1595,16 @@ def remove_worktrees(run, state):
     for lane in run.implementers:
         if "worktree:" + lane.id not in state["init"]["done"]:
             continue
-        if not lane.worktree.exists():
-            rows.append({"lane": lane.id, "state": "already_removed", "path": str(lane.worktree)})
+        worktree = Path(state["init"]["done"]["worktree:" + lane.id]["path"])
+        if not worktree.exists():
+            rows.append({"lane": lane.id, "state": "already_removed", "path": str(worktree)})
             continue
         # Only this run's worktree, by path; never prune or repair, which touch every worktree of the clone.
-        removed = git(run.project, "worktree", "remove", str(lane.worktree), ok=True)
+        removed = git(run.project, "worktree", "remove", str(worktree), ok=True)
         if removed.returncode != 0:
             fail("git worktree remove refused %s: %s; clean it by hand, never with prune or repair"
-                 % (lane.worktree, removed.stderr.strip()[-400:]))
-        rows.append({"lane": lane.id, "state": "removed", "path": str(lane.worktree)})
+                 % (worktree, removed.stderr.strip()[-400:]))
+        rows.append({"lane": lane.id, "state": "removed", "path": str(worktree)})
     return rows
 
 
@@ -1552,11 +1630,20 @@ def parsed_sums(run):
     return found
 
 
+def ownership(run):
+    mark = run.codex_home / OWNER_MARK
+    if not mark.is_file() or mark.is_symlink():
+        refuse("codex_home was kept: it has no %s mark, so this run did not make it" % OWNER_MARK)
+    record = read_json(mark)
+    if not isinstance(record, dict) or record.get("run") != str(run.run) or record.get("initiative") != run.id:
+        refuse("codex_home was kept: ownership record does not match this run")
+
+
 def purge(run):
+    safe_codex_home(run)
     if not run.codex_home.exists():
         return "already_purged"
-    if not (run.codex_home / OWNER_MARK).is_file():
-        refuse("codex_home was kept: it has no %s mark, so this run did not make it" % OWNER_MARK)
+    ownership(run)
     sessions, copies, sums = run.codex_home / "sessions", run.evidence / "codex-sessions", parsed_sums(run)
     for path in sorted(sessions.rglob("*")) if sessions.is_dir() else []:
         if path.is_dir() and not path.is_symlink():
@@ -1565,7 +1652,7 @@ def purge(run):
         copy = copies / relative
         if path.is_symlink() or not path.is_file():
             refuse("codex_home was kept: sessions/%s is not a regular file" % relative)
-        if not copy.is_file():
+        if not copy.is_file() or copy.is_symlink() or run.codex_home.resolve() in copy.resolve().parents:
             refuse("codex_home was kept: sessions/%s has no copy in evidence/codex-sessions" % relative)
         digest = sha_file(path)
         if sha_file(copy) != digest:
@@ -1582,6 +1669,8 @@ def down(run, args):
     if state is None:
         return OK, {"state": "nothing to take down: init has not run in %s" % run.run}
     done = state.setdefault("down", {"done": {}})["done"]
+    state["down"].setdefault("started_at", timestamp())
+    save_state(run, state)
     answer = {"loop": stop_loop(run, args.loop_wait), "roles": stop_roles(run)}
     if "evidence" in done:
         answer["evidence"] = "already_collected"
@@ -1589,10 +1678,19 @@ def down(run, args):
         answer["evidence"] = collect(run, state)
         done["evidence"] = {"at": timestamp(), **answer["evidence"]}
         save_state(run, state)
+    if state["init"].get("pending"):
+        fail("init has an unresolved outcome; resources were kept for inspection")
+    if "workspace" in state["init"]["steps"] and (not run.store.is_dir() or not run.recipes.is_file()):
+        fail("job cleanup inputs are unavailable; resources were kept for inspection")
     if run.store.is_dir() and run.recipes.is_file():
         cleaned = checked(run, "jobs clean", "jobs", "--store", run.store, "--recipes", run.recipes, "clean",
                           "--initiative", run.id, "--finished")
-        answer["jobs"] = {"cleaned": len(cleaned.get("jobs", [])), "not_finished": cleaned.get("not_finished", [])}
+        if (not isinstance(cleaned.get("jobs"), list) or not isinstance(cleaned.get("not_finished"), list)
+                or any(not isinstance(row, str) for row in cleaned["not_finished"])):
+            fail("jobs clean returned invalid completion evidence; resources were kept for inspection")
+        answer["jobs"] = {"cleaned": len(cleaned["jobs"]), "not_finished": cleaned["not_finished"]}
+        if cleaned.get("not_finished"):
+            fail("unfinished jobs retain this run's leases, slots and worktrees", jobs=answer["jobs"])
     answer["leases"] = release_leases(run, state)
     answer["slots"] = release_slots(run, state)
     answer["worktrees"] = remove_worktrees(run, state)
@@ -1653,6 +1751,9 @@ def main(argv=None):
     run = None
     try:
         run = Run(args.config)
+        state = load_state(run)
+        if args.command != "status" and state and "custody" in state and state["custody"] != custody(run):
+            refuse("run custody changed since init; restore the recorded configuration")
         guard(run, args.command)
         code, result = COMMANDS[args.command](run, args)
     except Stop as stop:

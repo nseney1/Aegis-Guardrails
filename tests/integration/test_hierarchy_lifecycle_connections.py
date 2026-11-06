@@ -422,3 +422,16 @@ def test_without_a_lifecycle_journal_the_decider_has_only_its_mail(team):
 ])
 def test_roles_without_lifecycle_tools_have_no_lifecycle_connection(team, endpoint, kwargs, role):
     assert refused_at_startup(serve(team, endpoint, **kwargs)) == "the %s role has no lifecycle connection" % role
+
+
+@posix_only
+def test_the_decider_adapter_refuses_a_non_merge_approval_without_recording(team):
+    granted = team.ledger.delegate()
+    target = merge(operation="targeted-tests")
+    team.ledger.publish(target)
+    before = team.ledger.files()
+    answer = responses(decider(team, [record(team, target, granted)]))[-1]
+    assert tool_error(answer) == "delegate-merge can approve only merge requests"
+    assert team.ledger.files() == before
+    answer = responses(decider(team, [record(team, target, granted, "escalate")]))[-1]
+    assert payload(answer)["receipt"]["event_id"] == "decider-event-1"

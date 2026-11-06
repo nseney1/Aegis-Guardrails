@@ -114,6 +114,9 @@ def test_a_start_writes_a_dated_rollout_with_the_settings_its_argv_asked_for(fak
     assert str(path.parent.relative_to(fake.codex_home / "sessions")) == day
     assert path.name.startswith("rollout-" + day.replace("/", "-") + "T") and path.name.endswith("-" + THREAD + ".jsonl")
     records = fake.records()
+    catalog = [record for record in records if record["type"] == "response_item"]
+    assert [record["payload"] for record in catalog] == [{"type": "additional_tools", "tools": []}]
+    records = [record for record in records if record["type"] != "response_item"]
     assert kinds(records) == [("session_meta", None), ("event_msg", "task_started"), ("event_msg", "thread_settings_applied"),
                               ("turn_context", None), ("event_msg", "item_completed"), ("event_msg", "task_complete")]
     meta = records[0]["payload"]

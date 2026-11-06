@@ -144,12 +144,22 @@ def root(argv, server):
         wanted = re.search(r"find request (\S+), then", prompt).group(1)
         decision = re.search(r"decision=(approve|deny)", prompt).group(1)
         reason = re.search(r'reason="(.*)"\. Do nothing else\.$', prompt).group(1)
-        row = next(row for row in pending["pending"] if row["request_id"] == wanted)
+        row = next((row for row in pending["pending"] if row["request_id"] == wanted), None)
+        if row is None and decision == "deny":
+            status = tool(5, "team_status", {})
+            row = next(row for row in status["requests"] if row["request_id"] == wanted)
+            row["root_decide"] = {"request_sha256": row["request_sha256"],
+                                  "event_id_deny": "root-" + wanted + "-deny"}
         arguments = {"event_id": row["root_decide"]["event_id_" + decision], "request_id": wanted,
                      "request_sha256": row["root_decide"]["request_sha256"], "decision": decision, "reason": reason}
         if mode == "wrong-sha":
             arguments["request_sha256"] = "0" * 64
         answer = tool(3, "root_decide", arguments)
+        if mode == "extra-decision":
+            other = next(row for row in pending["pending"] if row["request_id"] != wanted)
+            tool(4, "root_decide", {"event_id": other["root_decide"]["event_id_approve"],
+                                   "request_id": other["request_id"], "request_sha256": other["request_sha256"],
+                                   "decision": "approve", "reason": "unexpected"})
         adapter.stdin.close()
         adapter.wait(timeout=20)
         adapter.stdout.close()
@@ -171,6 +181,16 @@ def role(argv):
         thread = env.get("FAKE_CODEX_THREAD") or str(uuid.uuid4())
         env["FAKE_CODEX_THREAD"] = thread
     code = subprocess.run([sys.executable, FAKE, *argv], env=env).returncode
+    if thread and os.environ.get("FAKE_TEAM_NO_CATALOG"):
+        for path in (Path(env["CODEX_HOME"]) / "sessions").glob("**/*%%s.jsonl" %% thread):
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows = [row for row in rows if row.get("payload", {}).get("type") != "additional_tools"]
+            mode = os.environ["FAKE_TEAM_NO_CATALOG"]
+            if mode != "missing":
+                tools = None if mode == "malformed" else [{"type": "namespace", "name": "workers",
+                                                          "tools": [{"name": "launch"}]}]
+                rows.append({"type": "response_item", "payload": {"type": "additional_tools", "tools": tools}})
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     wanted = os.environ.get("FAKE_TEAM_AGENT_TOOLS")
     if thread and wanted and "for %%s as" %% wanted in argv[-1]:
         [rollout] = Path(env["CODEX_HOME"]).glob("sessions/*/*/*/rollout-*-%%s.jsonl" %% thread)
@@ -825,6 +845,104 @@ def test_approve_runs_one_root_turn_and_checks_the_journal_for_the_decision(run)
     again = run.team("approve", "feature-1", "--reason", "twice", expect=2)
     assert again["error"] == "request feature-1 is not pending a ROOT decision (journal state: approved)"
     assert len(run.calls("root")) == 1, "a refused approve spends no turn"
+
+
+def test_approve_detects_a_second_request_decided_in_the_same_turn(run):
+    run.ready("--no-loop")
+    for name in ("feature-1", "feature-2"):
+        run.team("request", name, "--file", str(run.write(name + ".json", run.request(name))))
+    answer = run.team("approve", "feature-1", "--reason", "one only", expect=3, FAKE_TEAM_ROOT="extra-decision")
+    assert "unexpected journal decisions" in answer["error"]
+    assert len(run.journal()["decisions"]) == 2, "reporting a failure must retain completed effects"
+
+
+@pytest.mark.parametrize("folder", ["run", "home", "source", "project", "evidence", "unmarked"])
+def test_init_refuses_unsafe_codex_home_without_claiming_it(run, folder):
+    path = {"run": run.run, "home": run.home, "source": run.source, "project": run.project,
+            "evidence": run.run / "evidence", "unmarked": run.tmp / "existing"}[folder]
+    path.mkdir(parents=True, exist_ok=True)
+    sentinel = path / "keep.txt"
+    sentinel.write_text("keep")
+    run.config["codex_home"] = str(path)
+    run.save()
+    answer = run.team("init", expect=2)
+    assert "codex_home" in answer["error"]
+    assert sentinel.read_text() == "keep"
+    assert not (path / ".aegis-team-run").exists()
+
+
+def test_status_and_down_remain_available_with_low_disk(run, capsys):
+    run.team("init")
+    run.config["min_free_gb"] = 10 ** 9
+    run.save()
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    assert in_process(run, "down", capsys=capsys)[0] == 0
+
+
+def test_purge_checks_the_ownership_record_not_just_its_presence(run):
+    run.team("init")
+    mark = run.codex_home / ".aegis-team-run"
+    mark.write_text(json.dumps({"run": str(run.tmp / "other"), "initiative": "other"}))
+    answer = run.team("down", "--purge-codex-home", expect=2)
+    assert "ownership" in answer["error"]
+    assert mark.exists()
+
+
+def test_init_refuses_an_empty_preexisting_codex_home(run):
+    run.codex_home.mkdir(parents=True)
+    answer = run.team("init", expect=2)
+    assert "already exists" in answer["error"]
+    assert list(run.codex_home.iterdir()) == []
+
+
+@pytest.mark.parametrize("catalog", ["missing", "unknown", "malformed"])
+def test_up_refuses_missing_tool_catalog_even_when_agent_tools_are_accepted(run, catalog):
+    run.team("init")
+    run.team("login")
+    run.team("root", "--session", "root-session")
+    answer = run.team("up", "--no-loop", "--accept-agent-tools", expect=2, FAKE_TEAM_NO_CATALOG=catalog)
+    assert "tool catalog is unavailable" in answer["error"]
+    assert run.team("status")["roles"]["pilot/router"]["last"]["action"] == "stop"
+
+
+def test_deny_can_revoke_a_previously_approved_request(run):
+    run.ready("--no-loop")
+    run.team("request", "feature-1", "--file", str(run.write("bare.json", run.request())))
+    run.team("approve", "feature-1", "--reason", "approved")
+    answer = run.team("approve", "feature-1", "--deny", "--reason", "revoked")
+    assert answer["decision"] == "deny"
+    assert [row["decision"] for row in run.journal()["decisions"]] == ["approve", "deny"]
+
+
+def test_owner_turn_holds_the_wake_marker_until_its_process_finishes(run, capsys):
+    run.ready("--no-loop")
+    original = subprocess.run
+    marker = run.mailbox().wake_marker(REVIEWER)
+    seen = []
+    def inspect(argv, **kwargs):
+        if argv[0] == "codex":
+            seen.append(marker.exists())
+        return original(argv, **kwargs)
+    run.monkeypatch.setattr(subprocess, "run", inspect)
+    for key, value in run.env().items():
+        run.monkeypatch.setenv(key, value)
+    code, answer = in_process(run, "turn", REVIEWER, "Check in.", capsys=capsys)
+    assert code == 0, answer
+    assert seen == [True]
+    assert not marker.exists()
+
+
+def test_down_preserves_a_transferred_lease(run):
+    run.team("init")
+    old = run.leases()["pilot-f2"]["oid"]
+    proc = subprocess.run([sys.executable, "-B", "-m", "aegis_cli", "team", "transfer", "pilot-f2",
+                           "--workspace", str(run.project), "--expect", old, "--owner", "other-session", "--json"],
+                          cwd=ROOT, capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(ROOT)})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    answer = run.team("down", expect=3)
+    assert "lease ownership changed" in answer["error"]
+    assert run.leases()["pilot-f2"]["owner"] == "other-session"
+    assert (run.run / "worktrees" / "f2").exists()
 
 
 @pytest.mark.parametrize("mode", ["silent", "wrong-sha"])

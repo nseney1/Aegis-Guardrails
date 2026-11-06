@@ -76,8 +76,8 @@ def covering_delegation(state, key, row, at):
     path rule (hierarchy_lifecycle.covered): a current Decider; a delegate-merge authority request without members
     whose last ROOT decision is approve, unexpired at `at`, for the request's team, not over the whole filesystem,
     covering every request path, with approvals left. The reviewed commit is left out because only the review names
-    it, and so is the publisher rule because only a coordinator or the Router publishes. The journal does not check the
-    target's operation; a delegate-merge delegation is read here as covering merges only."""
+    it, and so is the publisher rule because only a coordinator or the Router publishes. A delegate-merge delegation
+    covers merges only, as the journal checks on approval too."""
     value = row["request"]
     if value["operation"] != MERGE or state["current"].get("decider") is None:
         return None
@@ -128,7 +128,8 @@ def pending(lifecycle, wait=WAIT_SECONDS):
     why is awaiting_decision, escalated (by the Decider) or within_delegation (the Decider's to decide first; deciding
     it would pre-empt the Decider). lifecycle is a hierarchy_lifecycle.Lifecycle."""
     _policy, state = hierarchy_router.locked_load(lifecycle, wait)
-    return {"schema": PENDING, "pending": owed(state, timestamp()), "execution_enabled": False}
+    return {"schema": PENDING, "content_trust": "untrusted_data", "pending": owed(state, timestamp()),
+            "execution_enabled": False}
 
 
 def loop_view(state_dir):
@@ -184,9 +185,11 @@ def status(lifecycle, loop_state=None, evidence=None, wait=WAIT_SECONDS):
                   "actor": entry["actor"], "at": entry["at"],
                   "root_decision": hierarchy_router.last_decision(state, entry["request_id"])}
                  for entry in state.get("delegated_decisions", [])]
-    return {"schema": STATUS, "loop": loop, "holds_by_act": holds_by_act,
+    return {"schema": STATUS, "content_trust": "untrusted_data", "loop": loop, "holds_by_act": holds_by_act,
             "pending": [row["request_id"] for row in owed(state, at)],
-            "requests": [{"request_id": key, "state": standing(state, key, row, at)}
+            "requests": [{"request_id": key, "request_sha256": row["raw"]["sha256"],
+                          "state": standing(state, key, row, at),
+                          "root_decide": owed_row(key, row, None)["root_decide"]}
                          for key, row in sorted(state["requests"].items())],
             "delegated_decisions": delegated, "evidence": None if evidence is None else evidence_view(evidence),
             "execution_enabled": False}

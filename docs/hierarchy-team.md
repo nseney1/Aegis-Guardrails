@@ -61,7 +61,7 @@ schema does not name.
 |---|---|
 | `schema` | `aegis.team-run/v1` |
 | `run` | Absolute path of the run folder. It may hold the config itself, nothing else `init` makes. `<base>` below is `<run>/initiatives/<initiative id>`, not the `base` commit. |
-| `codex_home` | Optional. Default `<run>/codex-home`. A new or empty folder; must not be `~/.codex` or inside it, by realpath. |
+| `codex_home` | Optional. Default `<run>/codex-home`. A new dedicated folder; cannot overlap the project, source, managed run data or `~/.codex`, or contain the run or home folder. |
 | `source` | Optional. The Aegis checkout the adapters run from. Default: this tool's checkout. |
 | `project` | The project clone. |
 | `live_checkouts` | Optional. Paths `project` must not be or be inside. |
@@ -108,7 +108,7 @@ without `..`.
 
 ## What each subcommand does and refuses
 
-Every subcommand first runs the guard. It refuses, with exit 2:
+Every subcommand checks path safety. Commands that start work also check disk space and tools, refusing with exit 2:
 - `CODEX_HOME <path> is inside ~/.codex (<path>); a team run uses its own folder`
 - `CODEX_HOME in this shell is <a>, not this run's codex_home <b>; unset it or export the run's`
 - `only <n> GB free at <folder>; this run needs min_free_gb <n>`
@@ -117,6 +117,10 @@ Every subcommand first runs the guard. It refuses, with exit 2:
 
 `login`, `root`, `up`, `request`, `approve` and `turn` then refuse until `init` has completed: `init has not completed;
 run init first`. `status` and `down` work at any point.
+They remain available below the disk-space threshold and without the tools required to start a run.
+The run records its custody configuration at initialization. Changing its project, lanes or other custody fields
+requires restoring that configuration before another mutation. Once teardown starts, only inspection and repeated
+teardown are allowed; another run needs a new folder.
 
 ### `init [--continue]`
 
@@ -158,6 +162,8 @@ checked. After each start:
   exit <n>, state <state>)`;
 - the role's rollout must not offer Codex sub-agent tools, or the role is stopped and `up` refuses, unless you
   pass `--accept-agent-tools`, which is recorded in `evidence/up-agent-tools-accepted.json`;
+- a missing tool catalog or an unfamiliar tool name remains unavailable and stops the role, including with
+  `--accept-agent-tools`; qualifying a new tool catalog requires review;
 - the rollout's served model and effort must be what `team.json` (or, for the Router's effort, the role registry)
   asks for, or the role is stopped and `up` refuses, for example `<team>/router was served model X, but team.json
   asks for Y`. The served tier is reported, not checked.
@@ -178,12 +184,15 @@ Prints the id and sha256; you never paste a hash.
 ### `approve <id> [--deny] --reason TEXT`
 
 Refuses unless ROOT is bound (`root --session`) and the request is pending a ROOT decision (`team_pending` lists
-it); otherwise `request <id> is not pending a ROOT decision (journal state: <state>)`. Then runs one ROOT turn,
+it); `--deny` also accepts an approved request for revocation, using its hash from `team_status`.
+Otherwise it reports `request <id> is not pending a ROOT decision (journal state: <state>)`. Then runs one ROOT turn,
 `codex exec ... resume <root session>`, with Codex's extra features and its shell disabled, a read-only sandbox,
 `approval_policy="never"` and ROOT's connection. Its prompt names only the request id, the decision and the reason
 (`reason="owner: <reason>"`), and tells ROOT to call `team_pending`, then `root_decide` with that row's arguments.
 The turn's output is appended to `evidence/root-turns.jsonl`. Afterwards the journal must hold that decision on the
-request's exact sha256; otherwise `approve` exits 3 with ROOT's last message. The reason is 1 to 512 characters, with
+request's exact sha256. Any unexpected decision during the turn fails the command and retains all journal effects
+for inspection. Read-tool text is untrusted data, never permission to decide another request.
+Otherwise `approve` exits 3 with ROOT's last message. The reason is 1 to 512 characters, with
 no double quotes or line breaks.
 
 ### `turn <endpoint> <prompt>`
@@ -194,6 +203,8 @@ approve`), for an endpoint that is not bound or has no wake profile for its curr
 the role, and while it has unread mail (the loop's wake reads that mail, so an owner turn would race it). It does not
 stop the loop. The output is appended to `evidence/role-turns-<endpoint>.jsonl`, with each `/` in the endpoint written
 as `%2F`.
+The command claims the wake marker under the mailbox lock and rechecks the binding before launching. It retains
+the marker after an uncertain interruption so another turn cannot silently overlap it.
 
 ### `status [--text]`
 
@@ -213,16 +224,25 @@ raises and clears them.
    requests, events, the mailbox, store events, jobs, Codex sessions, policy, recipes, the loop log and pid, and
    `team-commands.jsonl`; the turn ledger (`evidence/turn-ledger.json`: each role's turns, tokens and publishes, with
    retries, plus the owner's commands); then `SHA256SUMS`.
-4. Cleans finished jobs, releases each lease with the oid it reads now, releases each writer slot with that release
+4. Holds resources when an initialization operation has an unresolved outcome or a job has not finished. Otherwise
+   cleans finished jobs, checks each lease's claim and owner against the recorded claim, releases it with the oid it reads now, releases each writer slot with that release
    as evidence, removes only this run's worktrees (`git worktree remove`, never prune or repair; the branches stay),
    and removes review copies that carry a review manifest.
 5. Writes `SHA256SUMS` again, so it also covers the release records.
-6. With `--purge-codex-home`, deletes `codex_home` only when it carries the run's mark and every session file in it
+6. With `--purge-codex-home`, deletes `codex_home` only when its ownership record matches this run and every session file in it
    has an identical copy in `evidence/codex-sessions` that `SHA256SUMS` lists; otherwise it refuses with `codex_home
    was kept: <why>` and keeps it.
 
 A second `down` reports the loop, the evidence, the leases, the slots, the worktrees and the purge as already done.
 It sends each role a launcher `stop` again, and runs the job and review-copy cleanup again.
+
+Journal reads use the existing writer lock to avoid observing a half-published event. A forcibly killed reader
+can leave that lock behind. Treat this as a hold requiring inspection of the recorded process and journal; never
+delete a lock automatically based on age. Changing the journal lock protocol is outside item 9.
+
+Initialization records an intent before each external setup operation. If a reply is lost, `init --continue` holds
+at that operation until its durable records have been inspected; it does not repeat the command. Teardown also
+keeps resources while such an outcome is unresolved.
 
 ## Where evidence lands
 

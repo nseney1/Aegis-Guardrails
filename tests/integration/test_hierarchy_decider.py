@@ -405,3 +405,12 @@ def test_the_router_status_lists_each_escalation_for_root(tmp_path):
                           "reason": "path outside the delegation", "root_decision": None}
     loop.ledger.approve(outside)
     assert loop.run("status")["escalations"][0]["root_decision"] == "approve"
+
+
+def test_a_non_merge_target_can_only_be_escalated(decider):
+    granted = decider.delegate()
+    target = request("tests-1")
+    decider.publish(target)
+    assert decider.refused(target, granted) == "delegate-merge can approve only merge requests"
+    decider.decide(target, granted, "escalate")
+    assert decider.status()["delegated_decisions"][-1]["decision"] == "escalate"

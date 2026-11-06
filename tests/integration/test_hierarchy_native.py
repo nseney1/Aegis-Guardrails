@@ -925,3 +925,87 @@ def test_the_multi_agent_command_fails_only_when_agent_tools_were_offered(tmp_pa
     records = live_records() if offered else without_collaboration(live_records())
     result = invoke(rollout(tmp_path, records), "multi-agent", code=code, cid=LIVE_CID)
     assert result["agent_tools"] == (V2_AGENT_TOOLS if offered else []) and result["version"] == "v2"
+
+
+@pytest.mark.parametrize("script", [
+    lambda call: call + "/* unterminated",
+    lambda call: call.rstrip().rstrip(";") + " " + call,
+    lambda call: 'const commands = ["echo"] ' + call,
+])
+def test_malformed_javascript_is_never_paired_with_a_successful_output(tmp_path, script):
+    source = script(shell_call("echo"))
+    rows = code_rows(cell("c1", source), printed("c1", *[chunk(0, "echo")] * source.count("tools.exec_command")))
+    result = invoke(rollout(tmp_path, rows), "events")
+    assert all(entry["status"] == "unpaired" for entry in result["command_executions"])
+    assert all(entry["exit_code"] is None for entry in result["command_executions"])
+
+
+def test_code_mode_expansion_is_bounded_across_the_entire_cell(tmp_path):
+    commands = json.dumps(["echo"] * 40)
+    script = "const commands = %s;\n" % commands + '\n'.join(
+        'for (const cmd of commands) { text(await tools.exec_command({cmd})); }' for _ in range(40))
+    result = invoke(rollout(tmp_path, code_rows(cell("c1", script))), "events")
+    assert result["command_executions"] == []
+    assert result["code_mode_unparsed"][0]["reason"] == "code-mode cell exceeds 1000 calls"
+
+
+def test_a_typed_command_retains_the_options_of_the_call_it_covers(tmp_path):
+    typed = {"type": "CommandExecution", "id": "exec-1", "status": "failed", "exit_code": 1,
+             "command": ["/usr/bin/zsh", "-lc", attempt_command("out")],
+             "aggregated_output": helper_output("out", 30)}
+    rows = code_rows(cell("c1", shell_call(attempt_command("out"), ',workdir:"/tmp"')),
+                     completed_item("t1", typed), printed("c1", chunk(1, helper_output("out", 30))))
+    entries = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert len(entries) == 1
+    assert entries[0]["options"] == ["workdir"]
+
+
+def test_duplicate_typed_commands_cannot_drop_an_ambiguous_calls_options(tmp_path):
+    typed = {"type": "CommandExecution", "id": "exec-1", "status": "failed", "exit_code": 1,
+             "command": attempt_command("out"), "aggregated_output": helper_output("out", 30)}
+    source = shell_call(attempt_command("out")) + shell_call(attempt_command("out"), ',shell:"/tmp/wrapper"')
+    rows = code_rows(cell("c1", source), completed_item("t1", typed),
+                     completed_item("t1", {**typed, "id": "exec-2"}),
+                     printed("c1", chunk(1, helper_output("out", 30)), chunk(1, helper_output("out", 30))))
+    entries = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert len(entries) == 2
+    assert [entry.get("options") for entry in entries] == [["shell"], ["shell"]]
+
+
+def test_an_exec_chunk_with_an_error_field_cannot_prove_an_exit_code(tmp_path):
+    rows = code_rows(cell("c1", shell_call(attempt_command("out"))),
+                     printed("c1", chunk(1, helper_output("out", 30), error="incomplete process result")))
+    entry, = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert entry["status"] == "unknown" and entry["exit_code"] is None
+
+
+def test_multi_agent_command_refuses_absent_tool_catalog(tmp_path):
+    records = [record for record in live_records() if record["payload"].get("type") != "additional_tools"]
+    result = invoke(rollout(tmp_path, records), "multi-agent", code=2, cid=LIVE_CID)
+    assert result["tool_records"] == 0
+
+
+@pytest.mark.parametrize("tool", [
+    {"type": "function", "name": "new_agent_tool"},
+    {"type": "namespace", "name": "agents_v3", "tools": [{"name": "new_tool"}]},
+    {"type": "namespace", "name": "workers", "tools": [{"name": "launch"}]},
+])
+def test_an_unrecognized_tool_catalog_cannot_establish_agents_are_off(tmp_path, tool):
+    records = without_collaboration(live_records())
+    offered_tools(records)["tools"].append(tool)
+    result = invoke(rollout(tmp_path, records), "multi-agent", code=2, cid=LIVE_CID)
+    name = tool["name"] + ("." + tool["tools"][0]["name"] if tool["type"] == "namespace" else "")
+    assert result["unknown_tools"] == [name]
+
+
+@pytest.mark.parametrize("prefix", [
+    'const commands = ["echo"]; const commands = ["echo"]; ',
+    'const await = ["echo"]; ',
+    'const tools = ["echo"]; ',
+    'const text = ["echo"]; ',
+])
+def test_invalid_or_shadowed_code_mode_bindings_never_pair_outputs(tmp_path, prefix):
+    source = prefix + shell_call("echo")
+    rows = code_rows(cell("c1", source), printed("c1", chunk(0, "echo")))
+    entry, = invoke(rollout(tmp_path, rows), "events")["command_executions"]
+    assert entry["status"] == "unpaired" and entry["exit_code"] is None

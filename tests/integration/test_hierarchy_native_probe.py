@@ -282,7 +282,7 @@ def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery
         assert row["settings"]["wake"]["state"] == "PROFILE_MATCH"
         assert row["recovery"]["recovered"] is True
         assert row["multi_agent"] == {"state": "MULTI_AGENT_OFF", "version": None, "agent_tools": [], "turns": 4,
-                                      "tool_records": 0, "reasons": []}
+                                      "tool_records": 1, "reasons": []}
         assert census(row["session"]) == []
     router = role_report(report, "router")
     assert router["settings"]["probe"]["requested_tier"] == "ultrafast"
@@ -507,14 +507,14 @@ def test_a_role_offered_codex_sub_agent_tools_fails_the_run_and_names_them(probe
     probe.plan([{"role": "implementer"}])
     record = probe.tmp / "additional-tools.jsonl"
     record.write_text(offered_tools_line() + "\n", encoding="utf-8")
-    # The fake writes no additional_tools record, so the probe turn appends the live one to the only rollout.
+    # The fake starts with an empty catalog; the probe turn appends the live catalog to the only rollout.
     append = 'for f in %s/sessions/*/*/*/rollout-*.jsonl; do /bin/cat %s >> "$f"; done' % (
         shlex.quote(str(probe.codex_home)), shlex.quote(str(record)))
     probe.script_turns(first={"implementer": [{"command": append, "target": None}]})
     report = probe.run(expect=3, cap=4)
     row = role_report(report, "implementer")
     assert row["multi_agent"] == {"state": "MULTI_AGENT_OFFERED", "version": None, "agent_tools": V2_AGENT_TOOLS,
-                                  "turns": 4, "tool_records": 1, "reasons": [OFFERED_FAILURE]}
+                                  "turns": 4, "tool_records": 2, "reasons": [OFFERED_FAILURE]}
     assert report["summary"]["failures"] == ["implementer multi-agent: " + OFFERED_FAILURE]
     assert row["recovery"]["recovered"] is True and row["settings"]["probe"]["state"] == "PROFILE_MATCH"
     text = probe.invoke("report", "--probe-root", str(probe.root), "--text", expect=3)
@@ -529,6 +529,7 @@ def test_a_multi_agent_read_that_fails_is_unavailable_never_off():
 def root_rollout(path, cid, entries):
     records = [
         {"timestamp": "t", "type": "session_meta", "payload": {"id": cid, "source": "vscode"}},
+        {"timestamp": "t", "type": "response_item", "payload": {"type": "additional_tools", "tools": []}},
         {"timestamp": "t", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
         {"timestamp": "t", "type": "turn_context", "payload": {
             "turn_id": "turn-1", "model": "gpt-owner", "effort": "high", "cwd": "/owner", "approval_policy": "never",
@@ -2516,3 +2517,75 @@ def test_a_resumed_writer_that_reruns_the_hold_sees_its_done_mark_and_runs_nothi
     assert [(item["command"][2], item["exit_code"], item["aggregated_output"]) for item in ran] == [
         (hold["command"], 0, "already held\n")]
     assert census(row["session"]) == []
+
+
+def test_absent_tool_catalog_makes_probe_multi_agent_evidence_unavailable(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text('\n'.join(json.dumps(row) for row in (
+        {"type": "session_meta", "payload": {"id": "session"}},
+        {"type": "turn_context", "payload": {}},
+    )) + '\n')
+    result = native_probe.multi_agent_check(str(path), "session")
+    assert result["state"] == "UNAVAILABLE"
+    assert result["reasons"] == ["no additional_tools record in the rollout"]
+
+
+@pytest.mark.parametrize("kind", ["directory", "dangling-link", "regular-link"])
+def test_hold_marks_must_be_regular_files_not_links_or_directories(tmp_path, kind):
+    hold = native_probe.hold_marks(tmp_path, "nonce")
+    mark = Path(hold["done"])
+    if kind == "directory":
+        mark.mkdir()
+    else:
+        target = tmp_path / "target"
+        if kind == "regular-link":
+            target.touch()
+        mark.symlink_to(target)
+    marks = native_probe.end_hold(hold)
+    assert marks["done"] == "error: hold mark is not a regular file"
+    assert marks["release"] == "written"
+
+
+def test_a_code_mode_shell_error_without_an_exit_code_is_never_a_refusal(tmp_path):
+    attempt = shell_attempt(tmp_path)
+    event = code_mode_event(attempt, "failed", stderr=helper_json(attempt, 30))
+    assert judged(attempt, commands=[event]) == ("INCONCLUSIVE", "INCONCLUSIVE")
+
+
+def test_a_typed_command_with_untrusted_code_mode_options_is_inconclusive(tmp_path):
+    attempt = shell_attempt(tmp_path)
+    event = code_mode_event(attempt, "failed", helper_json(attempt, 30), 1, options=["workdir"],
+                            source="item_completed", command=[SH, "-c", attempt["command"]])
+    found = native_probe.judge(attempt, [event], [], True, "/", host_shells(tmp_path))
+    assert (found["verdict"], found["assessment"]) == ("INCONCLUSIVE", "INCONCLUSIVE")
+    assert found["evidence"]["note"] == ("the command ran only through a code-mode call whose options choose its "
+                                         "shell or folder")
+
+
+@pytest.mark.parametrize("reason", ["unknown path", "malformed request", "backend unavailable", "declined"])
+def test_generic_patch_rejection_is_not_evidence_of_sandbox_refusal(tmp_path, reason):
+    attempt, root = patch_attempt(tmp_path)
+    event = patch_event([attempt["path"]], "patch rejected: " + reason)
+    assert judged(attempt, patches=[event], probe_root=str(root)) == ("INCONCLUSIVE", "INCONCLUSIVE")
+
+
+@pytest.mark.parametrize("binding", ["class", "await", "eval", "String", "text"])
+def test_reserved_or_shadowed_catch_binding_cannot_establish_a_probe_refusal(tmp_path, binding):
+    attempt = shell_attempt(tmp_path)
+    source = ('try { text(await tools.exec_command({cmd: %s})); } catch (%s) { text(String(%s)); }'
+              % (json.dumps(attempt["command"]), binding, binding))
+    rows = [
+        {"type": "session_meta", "payload": {"id": "session"}},
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1",
+                                               "input": source}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c1", "output": [
+            {"type": "input_text", "text": "Script completed\n"},
+            {"type": "input_text", "text": json.dumps({"chunk_id": "chunk", "exit_code": 1,
+                                                       "output": helper_json(attempt, 30)})}]}},
+    ]
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    commands, patches = native_probe.probe_events(str(rollout), "session", "turn-1")
+    assert judged(attempt, commands=commands, patches=patches) == ("INCONCLUSIVE", "INCONCLUSIVE")
+    assert len(commands) == 1 and commands[0]["status"] == "unpaired"

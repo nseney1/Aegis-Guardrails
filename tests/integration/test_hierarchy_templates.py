@@ -281,8 +281,12 @@ def test_managers_never_call_enter_worktree(name):
 
 @pytest.mark.parametrize("name", ["roles/orchestrator.md", "roles/operator.md", "roles/reviewer.md"])
 def test_managers_and_reviewers_keep_the_launch_cwd(name):
-    assert missing(name, ["not even inside a compound command or a subshell", "Run `pwd` before the first Write",
-                          "run one lone `cd <launch cwd>` and report it"]) == []
+    assert missing(name, ["not even inside a compound command or a subshell"]) == []
+    if name == "roles/operator.md":
+        assert missing(name, ["Run `pwd` before the first Write", "run one lone `cd <launch cwd>` and report it"]) == []
+    else:
+        assert missing(name, ["report the mismatch and stop", "ask the operator to correct the launch"]) == []
+        assert "run one lone `cd" not in words(name)
     assert "subshell `(cd" not in words(name)
 
 

@@ -440,6 +440,13 @@ CODE_MODE_TOOLS = ("exec_command", "apply_patch")
 # exec_command options that change neither the shell nor the sandbox. Any other (shell, workdir, login, an
 # escalation request) leaves the record untrusted: the model then chose what ran the command.
 CODE_MODE_SAFE_OPTIONS = ("yield_time_ms", "max_output_tokens")
+CODE_MODE_MAX_CALLS = 1000
+# Bindings in the recognized subset must not be JavaScript reserved words or shadow the called helpers.
+JS_RESERVED_BINDINGS = frozenset((
+    "await break case catch class const continue debugger default delete do else enum export extends false finally "
+    "for function if implements import in instanceof interface let new null package private protected public return "
+    "static super switch this throw true try typeof var void while with yield eval arguments tools text String"
+).split())
 CODE_MODE_ERROR = "Script error:\n"
 CODE_MODE_HEADERS = {"Script completed\n": "completed", "Script failed\n": "failed"}
 # Every alternative consumes what it starts, an unterminated literal or comment up to its line or the cell's end, so
@@ -452,11 +459,17 @@ class Unrecognized(Exception):
     """A code-mode cell, or one call in it, that is not one of the shapes whose printed output is known."""
 
 
+class CellLimit(Unrecognized):
+    """Expansion must stop before allocating an unbounded call list."""
+
+
 def js_tokens(source):
     """(kind, text) tokens of a cell; whitespace and comments are dropped. A single-quoted or template literal is
     kind "other": only a double-quoted literal is ever decoded."""
     tokens = []
     for match in JS_TOKEN.finditer(source):
+        if match.group().startswith("/*") and not match.group().endswith("*/"):
+            tokens.append(("invalid", match.group()))
         for kind, value in zip(("string", "other", "name", "number", "punct"), match.groups()):
             if value is not None:
                 tokens.append((kind, value))
@@ -548,7 +561,8 @@ def js_print(cursor, bound):
     cursor.need("text", "(", "await")
     call = js_call(cursor, bound)
     cursor.need(")")
-    cursor.accept(";")
+    if not cursor.done() and not cursor.ahead("}"):
+        cursor.need(";")
     return call
 
 
@@ -560,6 +574,8 @@ def js_statement(cursor, bound):
     call = js_print(cursor, bound)
     cursor.need("}", "catch", "(")
     error = cursor.take("name")[1]
+    if error in JS_RESERVED_BINDINGS:
+        raise Unrecognized("unsupported catch binding")
     cursor.need(")", "{", "text", "(")
     if cursor.accept("String", "(", error, ")"):
         caught = "string"
@@ -578,6 +594,8 @@ def js_statement(cursor, bound):
 def js_array(cursor):
     """NAME = ["…", …] after const or let: (NAME, its strings)."""
     name = cursor.take("name")[1]
+    if name in JS_RESERVED_BINDINGS:
+        raise Unrecognized("unsupported array binding")
     cursor.need("=", "[")
     values = []
     while not cursor.accept("]"):
@@ -598,10 +616,15 @@ def js_loop(cursor):
     cursor.need("of")
     name = cursor.take("name")[1]
     cursor.need(")")
+    if variable in JS_RESERVED_BINDINGS or variable == name:
+        raise Unrecognized("unsupported loop binding")
     return variable, name
 
 
-def expanded(call):
+def expanded(call, available):
+    count = len(call["command"]) if isinstance(call.get("command"), list) else 1
+    if count > available:
+        raise CellLimit("code-mode cell exceeds %d calls" % CODE_MODE_MAX_CALLS)
     if call["tool"] == "exec_command" and isinstance(call["command"], list):
         return [{**call, "command": command} for command in call["command"]]
     return [call]
@@ -614,8 +637,10 @@ def js_cell(tokens):
     while not cursor.done():
         if cursor.accept("const") or cursor.accept("let"):
             name, values = js_array(cursor)
+            if name in arrays:
+                raise Unrecognized("duplicate array binding")
             arrays[name] = values
-            cursor.accept(";")
+            cursor.need(";")
         elif cursor.accept("for", "("):
             variable, name = js_loop(cursor)
             if name not in arrays:
@@ -626,9 +651,9 @@ def js_cell(tokens):
                 cursor.need("}")
             if not isinstance(call.get("command"), list):
                 raise Unrecognized("a loop whose call does not use its variable")
-            calls += expanded(call)
+            calls += expanded(call, CODE_MODE_MAX_CALLS - len(calls))
         else:
-            calls.append(js_statement(cursor, {}))
+            calls += expanded(js_statement(cursor, {}), CODE_MODE_MAX_CALLS - len(calls))
     return calls
 
 
@@ -655,7 +680,10 @@ def js_scan(tokens):
                 or tokens[at + 3] != ("punct", "("):
             continue
         try:
-            calls += expanded({**js_call(JsCursor(tokens, at), bound), "caught": None})
+            calls += expanded({**js_call(JsCursor(tokens, at), bound), "caught": None},
+                              CODE_MODE_MAX_CALLS - len(calls))
+        except CellLimit:
+            raise
         except Unrecognized as exc:
             unparsed.append({"tool": tool, "reason": str(exc)})
     return calls, unparsed
@@ -667,8 +695,11 @@ def code_mode_calls(source):
     try:
         return js_cell(tokens), True, []
     except Unrecognized:
-        calls, unparsed = js_scan(tokens)
-        return calls, False, unparsed
+        try:
+            calls, unparsed = js_scan(tokens)
+            return calls, False, unparsed
+        except CellLimit as exc:
+            return [], False, [{"tool": "exec", "reason": str(exc)}]
 
 
 def code_mode_parts(payload):
@@ -790,6 +821,14 @@ def typed_text(entry):
 def cover(open_cells, typed, shell):
     """A typed item_completed record wins over the code-mode parse: mark the first open cell call of its turn that
     it records (same command, or same paths) as covered, so the cell adds no second entry for it."""
+    if shell:
+        # Identical command text does not identify which occurrence produced the typed event. Preserve every
+        # matching call's options, including already-covered occurrences, so ambiguity never removes a restriction.
+        options = {option for cell in open_cells.values() if cell["turn"] == typed["turn_id"]
+                   for call in cell["calls"] if call["tool"] == "exec_command"
+                   and typed_text(typed) == call["command"] for option in call["options"]}
+        if options:
+            typed["options"] = sorted(options)
     for cell in open_cells.values():
         if cell["turn"] != typed["turn_id"]:
             continue
@@ -912,23 +951,31 @@ def exec_events(rollout, cid, scope="current", tolerant=False):
 
 
 def offered_agent_tools(payload, number):
-    """Agent tools in one additional_tools payload, as <namespace>.<name>, or a bare name outside a namespace."""
+    """(agent tools, unknown tools) as <namespace>.<name>, or a bare name outside a namespace."""
     malformed = "malformed additional_tools record at line %d" % number
     entries = payload.get("tools")
     require(isinstance(entries, list), malformed)
-    found = []
+    # These are the non-agent names in the retained native catalog. An unfamiliar capability needs review before
+    # it can establish MULTI_AGENT_OFF, even when its name does not mention agents (for example workers.launch).
+    non_agent = {"functions.exec", "functions.wait", "functions.request_user_input",
+                 "functions.request_user_input_async", "clock.sleep"}
+    found, unknown = [], []
     for entry in entries:
         require(isinstance(entry, dict) and isinstance(entry.get("name"), str), malformed)
         if entry.get("type") != "namespace":
             if entry["name"] in AGENT_TOOL_NAMES:
                 found.append(entry["name"])
+            elif entry["name"] not in non_agent:
+                unknown.append(entry["name"])
             continue
         require(isinstance(entry.get("tools"), list), malformed)
         for tool in entry["tools"]:
             require(isinstance(tool, dict) and isinstance(tool.get("name"), str), malformed)
             if entry["name"] == AGENT_NAMESPACE or tool["name"] in AGENT_TOOL_NAMES:
                 found.append(entry["name"] + "." + tool["name"])
-    return found
+            elif entry["name"] + "." + tool["name"] not in non_agent:
+                unknown.append(entry["name"] + "." + tool["name"])
+    return found, unknown
 
 
 def multi_agent_state(rollout, cid=None, tolerant=False):
@@ -938,9 +985,10 @@ def multi_agent_state(rollout, cid=None, tolerant=False):
     under a multi-agent v2 tool name anywhere. version is the latest turn_context's multi_agent_version (None when
     absent) and is reported only, because Codex may record a version with the tools off. turns counts turn_context
     records and tool_records the additional_tools records; with no tools record the rollout says nothing about the
-    tools either way. With cid, the rollout's session identity must match it.
+    tools either way. Unknown names are retained in unknown_tools, when present, and cannot establish that agents
+    are disabled. With cid, the rollout's session identity must match it.
     """
-    metadata, version, turns, records, offered = None, None, 0, 0, set()
+    metadata, version, turns, records, offered, unknown = None, None, 0, 0, set(), set()
     for _path, number, _raw, record in rollout_records(rollout, tolerant):
         kind, payload = record.get("type"), record.get("payload")
         if kind == "session_meta":
@@ -952,10 +1000,13 @@ def multi_agent_state(rollout, cid=None, tolerant=False):
             version = payload.get("multi_agent_version")
         elif kind == "response_item" and isinstance(payload, dict) and payload.get("type") == "additional_tools":
             records += 1
-            offered.update(offered_agent_tools(payload, number))
+            agent_tools, unknown_tools = offered_agent_tools(payload, number)
+            offered.update(agent_tools)
+            unknown.update(unknown_tools)
     require(cid is None or metadata is not None, "no native session identity in rollout")
     return {"schema": MULTI_AGENT_SCHEMA, "cid": None if metadata is None else metadata.get("id"), "version": version,
-            "agent_tools": sorted(offered), "turns": turns, "tool_records": records}
+            "agent_tools": sorted(offered), "turns": turns, "tool_records": records,
+            **({"unknown_tools": sorted(unknown)} if unknown else {})}
 
 
 def main(argv=None):
@@ -995,7 +1046,7 @@ def main(argv=None):
         if args.command == "multi-agent":
             state = multi_agent_state(args.rollout, args.cid)
             print(encoded(state).decode())
-            return 2 if state["agent_tools"] else 0
+            return 2 if state["agent_tools"] or state.get("unknown_tools") or not state["tool_records"] else 0
         observation = inspect_codex(args.rollout, args.cid, args.requested_tier)
         if args.command == "check":
             result = check_profile(observation, args.model, args.effort, args.cwd, write_roots=args.write_root,

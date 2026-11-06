@@ -644,3 +644,52 @@ def test_mcp_bounded_inbox_errors_do_not_misreport_mutations(pilot):  # noqa: F8
         "checkpoint_sha256": binding["checkpoint_sha256"]}
     assert invoke(root, "inbox", endpoint="a/orchestrator")["messages"] == [
         {"path": receipt["path"], "message": receipt["message"]}]
+
+
+def test_publish_schema_has_nonempty_text_bounds_and_utc_time(pilot):  # noqa: F811
+    import re
+    root, _ = pilot
+    fields = publish_tool(root)["inputSchema"]["properties"]
+    readiness, result = fields["readiness"]["properties"], fields["result"]["properties"]
+    for key in ("worktree", "branch", "scan_workspace", "scan_evidence", "hook_evidence"):
+        assert readiness[key]["minLength"] == 1
+        assert readiness[key]["maxLength"] == (256 if key == "branch" else 4096)
+    assert result["lane_check"]["minLength"] == 1
+    assert readiness["owned_paths"]["items"]["minLength"] == 1
+    pattern = readiness["lease_expires_at"]["pattern"]
+    assert re.fullmatch(pattern, "2099-01-01T00:00:00.000001Z")
+    assert not re.fullmatch(pattern, "2099-01-01T00:00:00+00:00")
+
+
+@pytest.mark.parametrize("field,label", [
+    ("worktree", "worktree"), ("branch", "branch"), ("scan_workspace", "scan workspace"),
+    ("scan_evidence", "scan_evidence"), ("hook_evidence", "hook_evidence"),
+])
+def test_publish_refuses_text_beyond_its_advertised_readiness_limit(pilot, tmp_path, field, label):  # noqa: F811
+    from tests.integration.test_hierarchy_mailbox import readiness
+    root, brief = pilot
+    invoke(root, "publish", message(kind="dispatch", brief=brief))
+    ready = readiness(tmp_path)
+    schema = publish_tool(root)["inputSchema"]["properties"]["readiness"]["properties"][field]
+    ready[field] = "x" * (schema["maxLength"] + 1)
+    answer = exchange(root, [("mailbox_publish", {"message_id": "accepted", "to": "a/orchestrator",
+                         "type": "ack", "body": "Accepted", "in_reply_to": "dispatch-1",
+                         "acknowledgment": "accepted", "readiness": ready})], endpoint="a/lane/f2")[-1]
+    assert answer["result"]["isError"] is True
+    assert payload(answer)["error"] == "invalid " + label
+
+
+def test_publish_requires_the_writers_advertised_lane_check(pilot, tmp_path):  # noqa: F811
+    from tests.integration.test_hierarchy_mailbox import readiness
+    root, brief = pilot
+    invoke(root, "publish", message(kind="dispatch", brief=brief))
+    evidence = {"source_revision": "a" * 40, "source_tree": "b" * 40,
+                "checks": [{"check": "affected-tests", "outcome": "pass", "reference": "tests.log"}]}
+    answers = exchange(root, [
+        ("mailbox_publish", {"message_id": "accepted", "to": "a/orchestrator", "type": "ack", "body": "Accepted",
+                             "in_reply_to": "dispatch-1", "acknowledgment": "accepted", "readiness": readiness(tmp_path)}),
+        ("mailbox_publish", {"message_id": "result", "to": "a/orchestrator", "type": "result", "body": "Done",
+                             "in_reply_to": "dispatch-1", "result": evidence})], endpoint="a/lane/f2")
+    assert not answers[2]["result"].get("isError", False)
+    assert answers[3]["result"]["isError"] is True
+    assert payload(answers[3])["error"] == "invalid lane check reference"

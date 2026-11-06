@@ -122,12 +122,13 @@ def for_codex(text):
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
-def lane_rules(text):
+def lane_rules(text, role):
     """lane.md without its Assignments and Protocol checklist, which each lane kind's own file restates."""
     kept, skipping = [], False
     for line in text.splitlines():
         if line.startswith(("# ", "## ")):
-            skipping = line in ("## Assignments", "## Protocol checklist")
+            skipping = line in (("## Assignments", "## Protocol checklist") +
+                                (("## Writing rules",) if role == "reviewer" else ()))
         if not skipping:
             kept.append(line)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
@@ -145,7 +146,7 @@ def start_prompt(launch, endpoint, role):
     names = CONTRACT_FILES[role]
     parts = [for_codex(contract_path(launch, name).read_text(encoding="utf-8")) for name in names]
     if len(names) > 1:
-        parts[0] = lane_rules(parts[0])
+        parts[0] = lane_rules(parts[0], role)
     return "\n\n".join([START_HEADER % (endpoint, role), *parts, START_FOOTER])
 
 
@@ -294,6 +295,45 @@ def test_a_reviewer_is_refused_when_the_shared_lane_rules_are_unbalanced(tmp_pat
     refused = built.start(expect=2)
     assert refused["error"].startswith("unbalanced host markers in %s: " % contract_path(built, "lane.md"))
     assert not built.codex_log.exists() and built.binding() is None
+
+
+@pytest.mark.parametrize("marker", ["<!--host:claude-->", "<!-- HOST:claude -->", "<!-- / host -->"])
+def test_misspelled_host_markers_refuse_before_start(tmp_path, marker):
+    built = Launch(tmp_path)
+    commit_contract(built, "decider.md", marker + "\nClaude-only instructions.\n")
+    provision("init", built.init_request(roles=["decider"]))
+    refused = built.start(expect=2, endpoint="pilot/decider")
+    assert refused["error"] == ("invalid host marker in %s: line 1: a host marker must stand alone on its line"
+                                 % contract_path(built, "decider.md"))
+    assert not built.codex_log.exists() and built.binding("pilot/decider") is None
+
+
+@pytest.mark.parametrize("fence", ["```markdown", "~~~~markdown"])
+def test_fenced_marker_examples_are_literal_contract_text(tmp_path, fence):
+    built = Launch(tmp_path)
+    example = fence + "\n<!-- host:claude -->\nexample\n<!-- /host -->\n" + fence[:4 if fence[0] == "~" else 3]
+    commit_contract(built, "decider.md", example + "\n<!-- host:claude -->\nprivate instructions\n<!-- /host -->\n")
+    provision("init", built.init_request(roles=["decider"]))
+    prompt = built.start(endpoint="pilot/decider")["argv"][-1]
+    assert example in prompt
+    assert "private instructions" not in prompt
+
+
+def test_reviewer_start_omits_writer_operations_but_preserves_shared_evidence_rules(team):
+    prompt = team.start(endpoint=REVIEW)["argv"][-1]
+    for instruction in ("Before each commit", "Scan each path you will edit", "Remove build caches",
+                        "run `pwd` before your first Write", "Run `pwd` before the first Write", "**Lint and size"):
+        assert instruction not in prompt
+    assert "**Hashes and times, T92.**" in prompt
+    assert "**Deadline, T111 (3), T117 and T126 (1).**" in prompt
+
+
+def test_orchestrator_start_routes_physical_work_to_the_operator(team):
+    prompt = team.start(endpoint="pilot/orchestrator")["argv"][-1]
+    assert "Create writing worktrees manually" not in prompt
+    assert "Claim leases serially" not in prompt
+    assert "Only this role reads and updates GitHub" not in prompt
+    assert "`after_message_id`" in prompt
 
 
 @pytest.mark.parametrize("endpoint,role,name", [

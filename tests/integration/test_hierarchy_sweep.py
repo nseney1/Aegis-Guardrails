@@ -995,7 +995,7 @@ def team(tmp_path):
 
 @pytest.fixture
 def clock(monkeypatch):
-    """Stamps this process's mailbox writes `seconds` ago, so a test can place mail before a turn's 5 s slack."""
+    """Stamps this process's mailbox writes `seconds` ago to establish read and publication order."""
     sys.path.insert(0, str(ROOT / "tools"))
     import hierarchy_mailbox
 
@@ -1095,7 +1095,7 @@ def test_an_orchestrator_that_reads_a_route_and_publishes_nothing_is_a_silent_ro
         "initiative": "pilot", "endpoint": "pilot/orchestrator", "wake_id": woken["wake_id"], "ended": "exited",
         "exit_code": 0, "read": [{"message_id": "route-1", "type": "info", "from": "pilot/router"}]}
     assert moment(row["started_at"]) <= moment(row["finished_at"])
-    assert moment(row["silent_since"]) == moment(row["started_at"]) - timedelta(seconds=5)
+    assert moment(row["started_at"]) <= moment(row["silent_since"]) <= moment(row["finished_at"])
     assert result["stalled_dispatches"] == []
 
 
@@ -1152,7 +1152,7 @@ def test_a_turn_still_running_or_with_no_finish_receipt_is_never_silent(team):
 
 @posix_only
 def test_a_wake_that_carried_only_receipts_and_acknowledgments_is_not_silent_but_one_that_read_a_review_is(team, clock):
-    # The Orchestrator's own mail is older than the turns' 5 s slack, so only the allow-list decides.
+    # The Orchestrator's own mail predates the reads, so only the allow-list decides.
     clock(600)
     dispatch(team, "pilot/lane/review", "review-1")
     packet = team.base / "packet.md"
@@ -1182,7 +1182,7 @@ def test_a_wake_that_carried_only_receipts_and_acknowledgments_is_not_silent_but
 
 @posix_only
 @pytest.mark.parametrize("clear", ["publish", "wake"])
-def test_a_later_publish_or_a_later_wake_clears_a_silent_role(team, clear):
+def test_only_a_later_publish_clears_a_silent_role(team, clear):
     post(team, "pilot/router", "pilot/orchestrator", "route-1")
     assert [row["endpoint"] for row in team.sweep("--durable")["silent_roles"]] == ["pilot/orchestrator"]
 
@@ -1190,12 +1190,12 @@ def test_a_later_publish_or_a_later_wake_clears_a_silent_role(team, clear):
         post(team, "pilot/orchestrator", "pilot/front-door", "answer")
         result = team.sweep("--dry-run", expect=3)
     else:
-        # ROOT's note is not work the Orchestrator owes an answer to, so this turn is not silent either.
+        # A receipt-only turn does not answer the earlier routed work.
         post(team, "pilot/root", "pilot/orchestrator", "root-note")
         result = team.sweep("--durable")
         assert [(row["endpoint"], row["read"]) for row in result["rows"]] == [("pilot/orchestrator", ["root-note"])]
 
-    assert result["silent_roles"] == []
+    assert [row["endpoint"] for row in result["silent_roles"]] == ([] if clear == "publish" else ["pilot/orchestrator"])
 
 
 @posix_only
@@ -1220,7 +1220,7 @@ def test_a_background_turn_that_read_its_work_before_its_start_receipt_is_still_
 
 @posix_only
 def test_a_background_turn_that_published_after_its_early_read_is_not_silent(team, clock):
-    """The publish slack is 5 s, but a publish after a read the wake is charged with also belongs to that turn."""
+    """A publish after the owed read answers it even when the wake start receipt is recorded later."""
     lane = "pilot/lane/f2"
     clock(600)
     dispatch(team, lane, "work-1")
@@ -1236,7 +1236,7 @@ def test_a_background_turn_that_published_after_its_early_read_is_not_silent(tea
 
 
 @posix_only
-def test_a_read_from_the_previous_wake_is_not_charged_to_the_next_one(team, clock):
+def test_a_previous_unanswered_read_survives_the_next_receipt_only_wake(team, clock):
     lane = "pilot/lane/f2"
     clock(600)
     dispatch(team, lane, "work-1")
@@ -1251,7 +1251,8 @@ def test_a_read_from_the_previous_wake_is_not_charged_to_the_next_one(team, cloc
     turn_ends(team, later)
     clock(0)
 
-    assert team.sweep()["silent_roles"] == []
+    assert [row["read"] for row in team.sweep()["silent_roles"]] == [
+        [{"message_id": "work-1", "type": "dispatch", "from": "pilot/orchestrator"}]]
 
 
 @posix_only
@@ -1275,7 +1276,7 @@ def test_a_lane_that_accepted_and_ended_its_turn_without_an_answer_is_stalled_un
 
 
 @posix_only
-@pytest.mark.parametrize("then", ["mail_pending", "turn_running", "accepted_after_its_last_wake"])
+@pytest.mark.parametrize("then", ["mail_pending", "turn_running"])
 def test_a_lane_with_mail_pending_a_turn_running_or_no_wake_since_it_accepted_is_not_stalled(team, then):
     lane = "pilot/lane/f2"
     dispatch(team, lane, "work-1")
@@ -1291,3 +1292,41 @@ def test_a_lane_with_mail_pending_a_turn_running_or_no_wake_since_it_accepted_is
         (team.root / ".wake-pilot%2Flane%2Ff2.lock").write_text("fixture turn in progress")
 
     assert team.sweep("--dry-run", expect=3)["stalled_dispatches"] == []
+
+
+@posix_only
+@pytest.mark.parametrize("has_old_wake", [False, True])
+def test_an_accepted_dispatch_is_stalled_without_a_subsequent_wake_receipt(team, has_old_wake):
+    lane = "pilot/lane/f2"
+    dispatch(team, lane, "work-1")
+    if has_old_wake:
+        turn_ends(team, turn_starts(team, lane, read=["work-1"]))
+    else:
+        reads(team, lane, ["work-1"])
+    accept(team, lane, "work-1")
+    [row] = team.sweep("--dry-run", expect=3)["stalled_dispatches"]
+    assert row["endpoint"] == lane
+    assert row["dispatches"][0]["dispatch"] == "work-1"
+    if not has_old_wake:
+        assert row["wake_id"] is None and row["finished_at"] is None
+
+
+@posix_only
+@pytest.mark.parametrize("first_was_work", [False, True])
+def test_a_publish_before_an_owed_read_does_not_answer_that_read(team, clock, first_was_work):
+    endpoint = "pilot/orchestrator"
+    clock(600)
+    post(team, "pilot/router" if first_was_work else "pilot/root", endpoint, "first")
+    clock(590)
+    started = turn_starts(team, endpoint, read=["first"])
+    post(team, endpoint, "pilot/root", "earlier-publish")
+    clock(589)
+    post(team, "pilot/router", endpoint, "next-work")
+    clock(588)
+    reads(team, endpoint, ["next-work"])
+    clock(587)
+    turn_ends(team, started)
+    clock(0)
+    [row] = team.sweep("--dry-run", expect=3)["silent_roles"]
+    assert row["read"] == [{"message_id": "next-work", "type": "info", "from": "pilot/router"}]
+    assert moment(row["silent_since"]) > moment(started["at"])
