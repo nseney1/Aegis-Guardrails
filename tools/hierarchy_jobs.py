@@ -1041,6 +1041,36 @@ class Job:
         require(result.get("job") == self.id, "result does not belong to job: " + self.id)
         require(result.get("state") in ("completed", "failed", "refused"), "invalid terminal job state")
         require(isinstance(result.get("steps"), list), "invalid job result steps")
+        # A durable result can survive a lost writer. Validate the fields settlement reads before
+        # publishing a receipt or releasing capacity; a malformed row leaves its effects uncertain.
+        def valid(condition, field):
+            require(condition, "invalid job result " + field)
+
+        for index, step in enumerate(result["steps"]):
+            field = "steps[%d]" % index
+            valid(isinstance(step, dict), field)
+            argv = step.get("argv")
+            valid(isinstance(argv, list) and bool(argv) and all(isinstance(word, str) for word in argv), field + ".argv")
+            valid("exit_code" in step and (step["exit_code"] is None or type(step["exit_code"]) is int), field + ".exit_code")
+            if "stopped_leftovers" in step:
+                valid(type(step["stopped_leftovers"]) is bool, field + ".stopped_leftovers")
+        for field in ("reason", "commit"):
+            valid(result.get(field) is None or isinstance(result[field], str), field)
+        if "process_stopped_confirmed" in result:
+            valid(type(result["process_stopped_confirmed"]) is bool, "process_stopped_confirmed")
+        if result.get("tests") is not None:
+            tests = result["tests"]
+            valid(isinstance(tests, dict), "tests")
+            for field in ("total", "passed", "failed", "errors", "skipped"):
+                valid(type(tests.get(field)) is int and tests[field] >= 0, "tests." + field)
+        if "kept" in result:
+            valid(isinstance(result["kept"], list), "kept")
+            for index, item in enumerate(result["kept"]):
+                field = "kept[%d]" % index
+                valid(isinstance(item, dict), field)
+                valid(isinstance(item.get("path"), str), field + ".path")
+                if "error" in item:
+                    valid(isinstance(item["error"], str), field + ".error")
         code = result.get("exit_code")
         require((result["state"] == "refused" and code is None)
                 or (result["state"] == "completed" and type(code) is int and code == 0)

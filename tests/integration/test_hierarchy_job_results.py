@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from tests.integration.test_hierarchy_jobs import shop, verified_evidence
+from tests.integration.test_hierarchy_recovery import stage_interrupted_job
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the job runner reads /proc")
 
@@ -52,3 +53,54 @@ def test_successful_steps_keep_the_existing_result_shape(shop):
     assert [step["exit_code"] for step in result["steps"]] == [0, 0]
     assert "failed_launch" not in result
 
+
+@pytest.mark.parametrize("changes,field", [
+    ({"steps": [None]}, "steps[0]"),
+    ({"steps": [[]]}, "steps[0]"),
+    ({"steps": [{}]}, "steps[0].argv"),
+    ({"steps": [{"argv": "pytest", "exit_code": 0}]}, "steps[0].argv"),
+    ({"steps": [{"argv": [False], "exit_code": 0}]}, "steps[0].argv"),
+    ({"steps": [{"argv": ["pytest"], "exit_code": False}]}, "steps[0].exit_code"),
+    ({"steps": [{"argv": ["pytest"], "exit_code": 0, "stopped_leftovers": "yes"}]},
+     "steps[0].stopped_leftovers"),
+    ({"reason": []}, "reason"),
+    ({"commit": {}}, "commit"),
+    ({"tests": []}, "tests"),
+    ({"tests": {"total": True}}, "tests.total"),
+    ({"tests": {"total": 1}}, "tests.passed"),
+    ({"kept": "output"}, "kept"),
+    ({"kept": [None]}, "kept[0]"),
+    ({"kept": [{"error": "missing"}]}, "kept[0].path"),
+    ({"kept": [{"path": "output", "error": []}]}, "kept[0].error"),
+    ({"process_stopped_confirmed": "true"}, "process_stopped_confirmed"),
+], ids=["null-step", "array-step", "missing-argv", "string-argv", "boolean-arg", "boolean-exit",
+        "string-leftovers", "array-reason", "object-commit", "array-tests", "boolean-count", "missing-count",
+        "string-kept", "null-kept", "missing-kept-path", "array-kept-error", "string-stop-confirmation"])
+def test_malformed_durable_result_holds_capacity_without_receipt_or_replay(shop, changes, field):
+    folder, _ = stage_interrupted_job(shop, result={"process_stopped_confirmed": True, **changes})
+    before, events = (folder / "result.json").read_bytes(), shop.events()
+
+    for _ in range(2):
+        [row] = shop.run_open(expect=3)["rows"]
+        assert row["state"] == "settle_pending"
+        assert row["error"] == "invalid job result " + field
+        assert shop.heavy()["used"] == 1
+        assert shop.receipts("engine-partial") == []
+        assert shop.events() == events
+        assert (folder / "result.json").read_bytes() == before
+        assert not list(folder.glob("step-*.log")), "a malformed result must never replay a completed job"
+
+
+def test_legacy_minimal_step_result_can_settle_without_replaying(shop):
+    folder, _ = stage_interrupted_job(shop, result={
+        "steps": [{"argv": ["pytest"], "exit_code": 0}], "process_stopped_confirmed": True,
+        "future_field": {"diagnostic": "kept"},
+    })
+
+    [row] = shop.run_open()["rows"]
+
+    assert row["state"] == "completed"
+    assert shop.heavy()["used"] == 0
+    assert shop.states("engine-partial") == ["completed"]
+    assert not list(folder.glob("step-*.log"))
+    assert shop.run_open()["rows"] == []
