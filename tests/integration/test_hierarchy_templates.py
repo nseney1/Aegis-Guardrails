@@ -16,6 +16,8 @@ from tests.integration.test_hierarchy_workspace import Workspace
 
 
 TEMPLATES = ROOT / "tools" / "hierarchy_templates"
+sys.path.insert(0, str(ROOT / "tools"))
+import hierarchy_launcher  # noqa: E402
 ASSISTANTS = {"front-door": {"inbox-digest"}, "orchestrator": {"brief-checker", "log-reader"},
               "builder": {"code-locator", "failure-reader"}, "reviewer": {"usage-tracer", "coverage-mapper"}}
 
@@ -68,9 +70,16 @@ def test_lanes_put_evidence_too_long_for_a_field_in_a_cited_file():
     assert missing("roles/lane.md", ["4096 characters", "absolute path, its sha256 and the rule ids"]) == []
 
 
+def view(name, host):
+    """The contract as a role on `host` reads it: the launcher drops blocks marked for another host."""
+    path = TEMPLATES / name
+    return hierarchy_launcher.host_view(path.read_text(encoding="utf-8"), host, path)
+
+
 @pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md", "roles/orchestrator.md"])
 def test_lane_kinds_end_with_the_self_stop_line(name):
-    last = (TEMPLATES / name).read_text(encoding="utf-8").rstrip().splitlines()[-1]
+    """On a Claude host. A Codex role's turn ends with its reply, so its view ends with that rule instead (below)."""
+    last = view(name, "claude").splitlines()[-1]
     assert SELF_STOP in last
 
 
@@ -532,3 +541,30 @@ def test_the_job_recipe_template_needs_local_values_then_passes_its_own_check(tm
 
 def test_archived_operator_has_no_assistant_list():
     assert not (TEMPLATES / "claude-agents" / "assistants-root.json").exists()
+
+
+# Host markers: what a Codex role reads of each contract the launcher starts it with.
+CLAUDE_ONLY = ["claude stop", "SendMessage", "CLAUDE_", "ListAgents", "`waitingFor`", "/var/tmp"]
+
+
+@pytest.mark.parametrize("name", STARTED_CONTRACTS + ["roles/front-door.md"])
+def test_every_started_contract_has_balanced_markers_and_a_codex_view_without_claude_only_instructions(name):
+    assert view(name, "claude").strip() and view(name, "codex").strip()
+    codex = view(name, "codex")
+    assert [phrase for phrase in CLAUDE_ONLY if phrase in codex] == []
+
+
+@pytest.mark.parametrize("name", ["roles/lane.md", "roles/orchestrator.md"])
+def test_a_codex_lane_or_orchestrator_ends_its_turn_and_never_stops_a_session(name):
+    assert "Never run a command to stop a session" in view(name, "codex").splitlines()[-1]
+
+
+def test_a_codex_lane_reports_by_mailbox_and_ends_its_turn_instead_of_polling():
+    codex = " ".join(view("roles/lane.md", "codex").split())
+    assert [phrase for phrase in ["Report only through the mailbox (`ack`, `result`, `info`)",
+                                  "New mail for you starts your next turn",
+                                  "never poll your inbox or wait under a sleep",
+                                  "If `apply_patch` or a command is refused",
+                                  "a `mktemp -d` folder under the `TMPDIR` your session sets"]
+            if phrase not in codex] == []
+    assert "sleep 600" not in codex
