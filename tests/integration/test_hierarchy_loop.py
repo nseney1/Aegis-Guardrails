@@ -5,6 +5,7 @@ binaries plus links to the tools the steps need, so no real model binary can sta
 tools work together on fixtures, not that real sessions behave this way.
 """
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ from tests.integration.test_hierarchy_jobs import Shop
 from tests.integration.test_hierarchy_lifecycle import Ledger, request
 from tests.integration.test_hierarchy_mailbox import ROOT, invoke
 from tests.integration.test_hierarchy_provision import provision
-from tests.integration.test_hierarchy_sweep import SealedFleet, ago, codex_transcript
+from tests.integration.test_hierarchy_sweep import EVIDENCE, SealedFleet, ago, codex_transcript
 
 
 LOOP = ROOT / "tools" / "hierarchy_loop.py"
@@ -50,6 +51,8 @@ threading.Timer(0.3, os.close, [descriptor]).start()
 sys.exit(module.main(sys.argv[3:]))
 """
 EMPTY_SWEEP = {"rows": [], "still_unread": [], "root_queue": [], "root_time": []}
+STAMP = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z"
+WAKE_ID = r"wake-[0-9a-f]{32}"
 
 
 def router_policy(tmp_path):
@@ -149,10 +152,12 @@ def world(tmp_path):
 def test_an_approved_request_is_routed_and_the_orchestrator_woken_in_the_same_pass(world):
     world.approved(request("feature-1", team="pilot"))
 
-    result = world.once()
+    result = world.once(expect=3)
 
-    assert result["schema"] == "aegis.loop-status/v1" and result["holds"] == []
-    assert step_states(result) == {"router_status": "ok", "route": "ok", "sweep": "ok", "run_open": "ok"}
+    # The fake Orchestrator reads the route and answers nothing, which is the only hold.
+    assert result["schema"] == "aegis.loop-status/v1"
+    assert set(holds(result)) == {("sweep", "silent_role", "pilot/orchestrator")}
+    assert step_states(result) == {"router_status": "ok", "route": "ok", "sweep": "hold", "run_open": "ok"}
     assert [row["step"] for row in result["steps"]] == ["router_status", "route", "sweep", "run_open"]
     route = next(row for row in result["steps"] if row["step"] == "route")
     assert (route["actor"], route["routed"]) == ("router-1", ["feature-1"])
@@ -165,12 +170,13 @@ def test_an_approved_request_is_routed_and_the_orchestrator_woken_in_the_same_pa
 
 def test_a_second_pass_routes_nothing_wakes_nothing_and_writes_nothing(world):
     world.approved(request("feature-1", team="pilot"))
-    first = world.once()
+    first = world.once(expect=3)
     journal, launches = world.ledger.files(), world.launches()
 
-    second = world.once()
+    second = world.once(expect=3)
 
-    assert step_states(second) == {"router_status": "ok", "route": "skipped", "sweep": "ok", "run_open": "ok"}
+    assert step_states(second) == {"router_status": "ok", "route": "skipped", "sweep": "hold", "run_open": "ok"}
+    assert set(holds(second)) == {("sweep", "silent_role", "pilot/orchestrator")}
     assert second["pass_id"] == first["pass_id"] + 1
     assert world.ledger.files() == journal
     assert world.launches() == launches
@@ -209,7 +215,8 @@ def test_a_second_instance_is_refused_while_the_first_holds_either_lock(world):
 
 
 def test_a_held_journal_lock_is_a_hold_and_after_three_passes_an_owner_hold_and_is_never_removed(world):
-    world.send("pilot/front-door", "pilot/orchestrator", "hello")
+    # From ROOT, so reading it owes no answer and no silent_role hold outlives the lock.
+    world.send("pilot/root", "pilot/orchestrator", "hello")
     lock = world.ledger.path / ".write.lock"
     lock.write_text("fixture writer")
 
@@ -653,7 +660,7 @@ def test_a_job_that_needs_root_is_a_hold_for_root_and_a_finished_one_is_not(worl
 
 
 def test_the_real_sweep_skips_an_endpoint_under_a_start_failing_hold(world):
-    world.send("pilot/front-door", "pilot/orchestrator", "hello")
+    world.send("pilot/root", "pilot/orchestrator", "hello")
     world.state_dir.mkdir()
     world.status_path.write_text(json.dumps({
         "schema": "aegis.loop-status/v1", "pass_id": 7, "consecutive_journal_unavailable": 0, "interval": None,
@@ -670,3 +677,62 @@ def test_the_real_sweep_skips_an_endpoint_under_a_start_failing_hold(world):
     world.status_path.unlink()
     world.once()
     assert world.woken() == ["pilot/orchestrator"]
+
+
+def root_lines(text):
+    lines = text.splitlines()
+    block = lines[lines.index("root:") + 1:]
+    return block[:next((i for i, line in enumerate(block) if not line.startswith("  ")), len(block))]
+
+
+def test_a_route_the_orchestrator_reads_and_leaves_unanswered_is_a_silent_role_hold_for_root_until_it_publishes(world):
+    world.approved(request("feature-1", team="pilot"))
+    route = "route-" + world.ledger.status()["requests"]["feature-1"]["raw"]["sha256"]
+
+    first, second = world.once(expect=3), world.once(expect=3)
+
+    key = ("sweep", "silent_role", "pilot/orchestrator")
+    held = holds(second)[key]
+    assert (held["act"], held["initiative"], held["count"]) == ("root", "pilot", 2)
+    assert held["first_seen"] == holds(first)[key]["first_seen"]
+    assert re.fullmatch(r"read info %s from pilot/router in wake %s \(exited with code 0 at %s\) and has published "
+                        r"nothing since %s" % (route, WAKE_ID, STAMP, STAMP), held["detail"]), held["detail"]
+    assert "  sweep silent_role pilot/orchestrator: %s (seen 2 times since %s)" % (
+        held["detail"], held["first_seen"]) in root_lines(world.status("--text", expect=3))
+
+    world.send("pilot/orchestrator", "pilot/root", "answer")
+    answered = world.once(expect=3)
+
+    assert key not in holds(answered)
+    assert ("sweep", "root_queue", "pilot/root") in holds(answered)
+
+
+def test_a_lane_that_accepts_its_dispatch_and_stops_is_a_stalled_dispatch_hold_for_root_until_it_answers(world):
+    world.add_role("pilot/lane/review", cwd=str(world.tmp))
+    world.plan({"pilot/lane/review": {"send": [{"message_id": "review-1-accepted", "to": "pilot/orchestrator",
+                                                "type": "ack", "acknowledgment": "accepted", "in_reply_to": "review-1",
+                                                "body": "Accepted."}]}})
+    brief = world.base / "review-brief.md"
+    brief.write_bytes(b"Review it.\n")
+    world.send("pilot/orchestrator", "pilot/lane/review", "review-1", type="dispatch",
+               brief={"path": str(brief), "sha256": hashlib.sha256(b"Review it.\n").hexdigest()})
+
+    accepted = world.once(expect=3)     # the Reviewer's turn: it accepts, publishes nothing more, and ends
+    again = world.once(expect=3)        # the Orchestrator reads the ack; nothing will wake the Reviewer again
+
+    key = ("sweep", "stalled_dispatch", "pilot/lane/review")
+    assert ("sweep", "silent_role", "pilot/lane/review") not in holds(accepted), "the acceptance was a publish"
+    held = holds(again)[key]
+    assert (held["act"], held["initiative"], held["count"]) == ("root", "pilot", 2)
+    assert held["first_seen"] == holds(accepted)[key]["first_seen"]
+    assert re.fullmatch(r"accepted dispatch review-1 at %s but sent no result or review; its last wake %s ended at %s "
+                        r"and nothing is unread or running, so no wake will come" % (STAMP, WAKE_ID, STAMP),
+                        held["detail"]), held["detail"]
+    assert "  sweep stalled_dispatch pilot/lane/review: %s (seen 2 times since %s)" % (
+        held["detail"], held["first_seen"]) in root_lines(world.status("--text", expect=3))
+
+    world.send("pilot/lane/review", "pilot/orchestrator", "review-1-verdict", type="review", in_reply_to="review-1",
+               result=EVIDENCE)
+    answered = world.once(expect=3)
+
+    assert key not in holds(answered)
