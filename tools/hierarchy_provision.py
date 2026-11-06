@@ -384,6 +384,7 @@ def role_tools(endpoint, mailbox, requested):
         names = [name for name in text(requested, "tools").split(",") if name]
         for name in names:
             require(name in SUPPORTED_TOOLS, "unsupported tool: " + name)
+        hierarchy_roles.require_file_tools(endpoint, mailbox.endpoint(endpoint).get("kind"), names)
         return names, writer
     return hierarchy_roles.file_tools(entry), writer
 

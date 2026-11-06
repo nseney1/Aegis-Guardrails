@@ -122,6 +122,10 @@ The run records its custody configuration at initialization. Changing its projec
 requires restoring that configuration before another mutation. Once teardown starts, only inspection and repeated
 teardown are allowed; another run needs a new folder.
 
+The role registry sets the maximum file tools for each role. A `file_tools` override can narrow that set;
+it cannot grant additional tools. Reviewer, Router and Decider connections also refuse direct board access.
+Provisioning and the MCP adapter enforce these limits independently.
+
 ### `init [--continue]`
 
 Every setup step that spends no model turn, in order: `codex-home` (made with mode 0700 and an

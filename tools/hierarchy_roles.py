@@ -220,6 +220,13 @@ def file_tools(entry):
     return (READ_TOOLS if "source" in entry["reads"] else []) + (WRITE_TOOLS if writer(entry) else [])
 
 
+def require_file_tools(endpoint, kind, names):
+    name = role_name(endpoint, kind)
+    permitted = file_tools(registry()["roles"][name])
+    for tool in names:
+        require(tool in permitted, "the %s role does not permit file tool: %s" % (name, tool))
+
+
 def workspace_tools(entry):
     return tuple(name for name in WORKSPACE_TOOLS if name in entry["reads"])
 
@@ -235,6 +242,11 @@ def decision_tools(entry):
 
 def takes_board(entry):
     return "board" in entry["reads"]
+
+
+def require_board(endpoint, kind=None):
+    name = role_name(endpoint, kind)
+    require(takes_board(registry()["roles"][name]), "the %s role has no board access" % name)
 
 
 # In the order the adapter offers them.

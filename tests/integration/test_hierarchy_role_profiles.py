@@ -7,6 +7,9 @@ role gained or lost a tool, a sandbox setting or an option, which the registry m
 M1 item 2 regenerated it once, after checking that the only difference was the new read-only mailbox_self
 tool in every mailbox role's allowlist and Codex enabled_tools. M1 item 9 inserted multi_agent_v2 after multi_agent
 in every Codex disabled_features list and --disable pair, and changed nothing else.
+
+PR259's registry enforcement now refuses the front door's former Read override: that role does not read source.
+The archived golden remains unchanged; the expected successor explicitly names this capability correction.
 """
 import json
 import os
@@ -123,6 +126,8 @@ def team_kinds(tmp_path):
 
 def test_every_legacy_role_keeps_its_exact_profile(tmp_path):
     expected = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    expected["profiles"]['claude-code pilot/front-door {"tools": "Read"}'] = {
+        "error": "the front-door role does not permit file tool: Read"}
     actual = {"profiles": build(tmp_path), "team_kinds": team_kinds(tmp_path)}
     assert set(actual["profiles"]) == set(expected["profiles"])
     for key in sorted(expected["profiles"]):

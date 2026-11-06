@@ -454,6 +454,8 @@ class Connection:
         self.board_specs = {}
         self.pending_position = None
         if board is not None:
+            import hierarchy_roles
+            hierarchy_roles.require_board(endpoint, mailbox.endpoint(endpoint).get("kind"))
             import hierarchy_board
             self.board = hierarchy_board.Board(board)
             self.board.load()
