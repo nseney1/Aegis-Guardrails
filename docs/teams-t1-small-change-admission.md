@@ -109,17 +109,15 @@ failure and local Go metadata timeout remain retained; causation is not inferred
 | Gate | This slice |
 |---|---|
 | Implementation | Registration/admission and the complete lifecycle evidence path; separate `small_change_ready` eligibility, stable canonical watch hold, provider association refused, terminal review survives expiry/writer rotation |
-| Public RED/GREEN | Per-commit lane runs in the [slice evidence folder][t1-evidence] |
+| Public RED/GREEN | Per-commit lane runs in the slice evidence folder named below |
 | Independent frozen-commit review | Round 2 on `e94fa2ec`: Codex ACCEPT, Claude REQUEST CHANGES; this start/terminal fix awaits review |
-| Affected / full local verification | Per-commit lane runs, container A/B and full-suite records in the [slice evidence folder][t1-evidence] |
+| Affected / full local verification | Per-commit lane runs, container A/B and full-suite records in the slice evidence folder named below |
 | Hosted verification | Pending publication |
 | Native / installed runtime / efficiency / Teams acceptance | Open; owner explicitly authorizes this slice's integration under the qualification gaps below |
 
 The workspace evidence folder is
 `aegis-guides/v5.0-teams-t2a-evidence-20261107/t1-lifecycle-seam/`.
 Use its per-commit records rather than treating historical counts as head results.
-
-[t1-evidence]: /home/nseney/Documents/workspace/aegis-guides/v5.0-teams-t2a-evidence-20261107/t1-lifecycle-seam/
 
 The registered-workspace Aegis scan supplied repository guidance from the
 reviewed merge-base with `origin/HEAD`, not host authentication or execution
