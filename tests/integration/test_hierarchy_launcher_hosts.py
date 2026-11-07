@@ -157,6 +157,21 @@ def claude_prompt(hosts, endpoint, role):
     return "\n\n".join([START_HEADER % (endpoint, role), *parts, START_FOOTER])
 
 
+def family_only_lines(hosts, role):
+    """(claude-only, codex-only): the non-blank lines of the role's contract files that only one family's rendering
+    has, rendered by the launcher's own host_view. Taken from the contract source, so no wording is pinned here."""
+    module = launcher_module()
+    views = {}
+    for family in ("claude", "codex"):
+        names = CONTRACT_FILES[role]
+        parts = [module.host_view(contract_path(hosts, name).read_text(encoding="utf-8"), family,
+                                  contract_path(hosts, name)) for name in names]
+        if len(names) > 1:
+            parts[0] = lane_rules(parts[0], role)
+        views[family] = {line for part in parts for line in part.splitlines() if line.strip()}
+    return views["claude"] - views["codex"], views["codex"] - views["claude"]
+
+
 def chosen(answer):
     argv = answer["argv"]
     return argv[argv.index("--session-id") + 1]
@@ -192,8 +207,11 @@ def test_a_claude_team_starts_each_role_on_claude_with_the_session_the_launcher_
     assert answer["prompt_via"] == "stdin" and prompt_file == Path(answer["log"]["stdout"]).with_suffix(".prompt")
     prompt = prompt_file.read_text(encoding="utf-8")
     assert prompt == claude_prompt(claude_team, endpoint, role)
-    assert 'claude stop "${CLAUDE_CODE_SESSION_ID:0:8}"' in prompt
-    assert "Never run a command to stop a session" not in prompt
+    claude_only, codex_only = family_only_lines(claude_team, role)
+    lines = set(prompt.splitlines())
+    # Both non-empty, so neither check can pass vacuously.
+    assert claude_only and codex_only
+    assert claude_only <= lines and not codex_only & lines
     assert "<!-- host:" not in prompt and "<!-- /host -->" not in prompt
     assert answer["contracts"] == references(claude_team, role) and answer["contract"] == answer["contracts"][-1]
     [transcript] = hierarchy_hosts.transcripts(CLAUDE, claude_team.claude_home, session)
