@@ -6,10 +6,15 @@ For each one the registry names its contract family, team start mode, home folde
 variable, transcript locator, usage reader, writer scope and qualification per role, and it holds the readers for
 Claude's own output: stream-json events, usage, turn items and `claude auth status --json`.
 
-Data and pure functions only. Nothing here starts, stops or writes anything, and `transcripts` only lists the folder
-it is given. Starting and stopping processes stay in hierarchy_provision and hierarchy_launcher until later PRs route
-them through this registry. `describe()` is the declarative part as JSON (aegis.hierarchy-host-registry/v1), so a run
-can record the registry it used.
+It also holds a team run's host plan (aegis.hierarchy-host-plan/v1, `<base>/host-plan.json`): which host runs ROOT,
+which one runs every role below it, and which bindings are stand-ins that run no host. `require_binding` is the one
+check every team-run path that binds applies (spec rule 1; ADR T2(a) question A, answer A2), and `session_record` is
+the host-neutral record (aegis.team-session/v1) written beside each binding it allows.
+
+Data and pure functions only. Nothing here starts, stops or writes anything; `transcripts` only lists the folder it is
+given, and `read_plan` and `session_recorded` only read. Starting and stopping processes stay in hierarchy_provision and
+hierarchy_launcher until later PRs route them through this registry. `describe()` is the declarative part as JSON
+(aegis.hierarchy-host-registry/v1), so a run can record the registry it used.
 """
 from __future__ import annotations
 
@@ -17,6 +22,11 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
+
+# With -I the script directory is absent from sys.path. Add only this reviewed directory, as hierarchy_roles does.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_mailbox import endpoint_parts, integer, read_json, require, text  # noqa: E402
 
 
 SCHEMA = "aegis.hierarchy-host-registry/v1"
@@ -43,6 +53,15 @@ CLAUDE_AUTH_KEYS = ("loggedIn", "authMethod", "apiProvider", "configDirectory", 
 CLAUDE_AUTH_TYPES = {"loggedIn": (bool,), "authMethod": (str,), "apiProvider": (str,), "configDirectory": (str,),
                      "projectsDirectory": (str,), "loginExpiresAt": (str, int, type(None))}
 READER_SCOPE = {"boundary": "no write tools"}
+# A team run starts its sessions itself, so native threads (owner-created) are no team host.
+TEAM_HOSTS = (CLAUDE, CODEX)
+PLAN_SCHEMA = "aegis.hierarchy-host-plan/v1"
+PLAN_FILE = "host-plan.json"
+PLAN_KEYS = ("schema", "hierarchy", "root", "team", "stand_ins", "config_sha256")
+SESSION_SCHEMA = "aegis.team-session/v1"
+STAND_IN_SCOPE = {"boundary": "stand-in: runs no host"}
+START_MODES = ("print", "background", "exec", None)
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 _HOSTS = {
     CLAUDE: {
@@ -273,3 +292,137 @@ def claude_auth_check(exit_code, status, home):
             os.path.realpath(configured) != os.path.realpath(os.fspath(home)):
         problems.append("config directory is not the run's claude home")
     return record, problems
+
+
+# -- the run's host plan and session records ------------------------------------------------------------------------------
+
+def _endpoint(name):
+    try:
+        return endpoint_parts(name)
+    except ValueError:
+        return None
+
+
+def validate_plan(value):
+    require(isinstance(value, dict), "host plan must be a JSON object")
+    missing, extra = set(PLAN_KEYS) - value.keys(), value.keys() - set(PLAN_KEYS)
+    require(not missing, "host plan is missing " + ", ".join(sorted(missing)))
+    require(not extra, "host plan has unexpected fields: " + ", ".join(sorted(map(str, extra))))
+    require(value["schema"] == PLAN_SCHEMA, "unsupported host plan schema: " + repr(value["schema"])[:80])
+    hierarchy = value["hierarchy"]
+    # Checked as an endpoint's first part, so the mailbox's reserved names are refused too.
+    require(isinstance(hierarchy, str) and _endpoint(hierarchy + "/root") is not None,
+            "host plan hierarchy is not a hierarchy id: " + repr(hierarchy)[:80])
+    for key in ("root", "team"):
+        require(isinstance(value[key], str) and value[key] in TEAM_HOSTS,
+                "host plan %s must be claude-code or codex-cli, not %s" % (key, repr(value[key])[:80]))
+    stand_ins = value["stand_ins"]
+    require(isinstance(stand_ins, dict), "host plan stand_ins must be a JSON object")
+    for name, kind in stand_ins.items():
+        parts = _endpoint(name)
+        require(parts is not None and parts[0] == hierarchy,
+                "host plan stand-in %s is not an endpoint of %s" % (str(name)[:256], hierarchy))
+        # ROOT decides for the run, so it can never be a binding that runs nothing.
+        require(parts[1] != "root", "host plan stand-in %s is ROOT, which always runs a host" % name)
+        # Any host kind: a stand-in never runs, so its label is recorded, not qualified (ADR T2(a) §1).
+        require(isinstance(kind, str) and kind in HOST_KINDS,
+                "host plan stand-in %s has unknown host kind %s" % (name, repr(kind)[:80]))
+    require(isinstance(value["config_sha256"], str) and SHA256.fullmatch(value["config_sha256"]) is not None,
+            "host plan config_sha256 must be 64 lowercase hex characters")
+    return value
+
+
+def plan_record(hierarchy, root, team, stand_ins, config_sha256):
+    record = {"schema": PLAN_SCHEMA, "hierarchy": hierarchy, "root": root, "team": team, "stand_ins": stand_ins,
+              "config_sha256": config_sha256}
+    validate_plan(record)
+    record["stand_ins"] = dict(stand_ins)
+    return record
+
+
+def read_plan(base):
+    """The base's validated host plan, or None when it has none: a standalone or older base keeps today's binding."""
+    path = Path(base) / PLAN_FILE
+    # A dangling link does not exist(), so it is refused here rather than read as "no plan".
+    require(not path.is_symlink(), "host plan must not be a symlink: " + str(path))
+    if not path.exists():
+        return None
+    try:
+        value = read_json(path)
+    except ValueError as exc:
+        raise ValueError("invalid host plan %s: %s" % (path, exc)) from exc
+    return validate_plan(value)
+
+
+def plan_host(plan, endpoint):
+    """(host kind, stand-in) the plan assigns this endpoint; (None, False) when no plan covers it."""
+    if plan is None:
+        return None, False
+    parts = endpoint_parts(endpoint)
+    if parts[0] != plan["hierarchy"]:
+        return None, False
+    if endpoint in plan["stand_ins"]:
+        return plan["stand_ins"][endpoint], True
+    return (plan["root"] if parts[1] == "root" else plan["team"]), False
+
+
+def require_binding(plan, endpoint, host, writer):
+    """The write scope a session on `host` gets at this endpoint under the plan, None when unconstrained, or a refusal.
+
+    Called before anything binds, so a refusal leaves the endpoint as it was.
+    """
+    expected, stand_in = plan_host(plan, endpoint)
+    if expected is None:
+        return None
+    if host != expected:
+        raise ValueError("%s runs on %s in this run's host plan, not %s" % (endpoint, expected, host))
+    if stand_in:
+        return dict(STAND_IN_SCOPE)
+    return qualify(host, writer)
+
+
+def team_start_mode(host_kind, stand_in, background=False):
+    """How a team run starts this session: the host's team start, or Claude background mode; a stand-in has none."""
+    team_start = _host(host_kind)["team_start"]
+    if stand_in:
+        return None
+    if background:
+        require(host_kind == CLAUDE, "background is only for claude-code roles")
+        return "background"
+    return team_start
+
+
+def session_record(endpoint, role_kind, host_kind, start_mode, session, generation, stand_in, write_scope):
+    endpoint_parts(endpoint)
+    text(role_kind, "role_kind", 64)
+    _host(host_kind)
+    require(start_mode is None or (isinstance(start_mode, str) and start_mode in START_MODES), "invalid start_mode")
+    # The mailbox's own limit for a bound session.
+    text(session, "session", 256)
+    integer(generation, "generation")
+    require(type(stand_in) is bool, "invalid stand_in")
+    require(isinstance(write_scope, dict) and isinstance(write_scope.get("boundary"), str), "invalid write_scope")
+    return {"schema": SESSION_SCHEMA, "endpoint": endpoint, "role_kind": role_kind, "host_kind": host_kind,
+            "start_mode": start_mode, "session": session, "generation": generation, "stand_in": stand_in,
+            "write_scope": dict(write_scope)}
+
+
+def session_record_path(base, endpoint, generation):
+    endpoint_parts(endpoint)
+    integer(generation, "generation")
+    # Quoted as provision names connections and profiles, so one endpoint's files sort together.
+    return Path(base) / "sessions" / ("%s-g%d.json" % (endpoint.replace("/", "%2F"), generation))
+
+
+def session_recorded(path, record):
+    """True when this record is already on file, False when none is; a different record there is refused.
+
+    A record is written once per endpoint and generation, so a re-run never rewrites history.
+    """
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
+        return False
+    if read_json(path) != record:
+        raise ValueError("session record for %s generation %d differs from this binding" % (
+            record["endpoint"], record["generation"]))
+    return True

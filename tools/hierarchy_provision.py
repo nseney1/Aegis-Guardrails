@@ -67,6 +67,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
+import hierarchy_hosts  # noqa: E402
 import hierarchy_roles  # noqa: E402
 import hierarchy_runtime_source  # noqa: E402
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
@@ -114,6 +115,9 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
 TEAM_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
 TEAM_KINDS = hierarchy_roles.team_kinds()
+# ADR T2(a) §4: a team run's Claude roles run in print mode with no sub-agents, and the worktree as their only
+# writable folder.
+TEAM_CLAUDE_REFUSED = ("background", "assistants", "add_dirs")
 
 
 def git(cwd, *arguments):
@@ -548,6 +552,21 @@ def check_role_request(request, setup):
     return cwd, timeout, assistants
 
 
+def check_host_plan(plan, request, mailbox, endpoint):
+    """(write scope, stand-in) under the run's host plan; the scope is None when the plan does not cover the endpoint.
+
+    Before binding, so a refusal leaves the endpoint unbound.
+    """
+    host = request["host"]
+    writer = hierarchy_roles.writer(registry_role(mailbox, endpoint))
+    scope = hierarchy_hosts.require_binding(plan, endpoint, host, writer)
+    stand_in = hierarchy_hosts.plan_host(plan, endpoint)[1]
+    if scope is not None and host == CLAUDE and not stand_in:
+        for key in TEAM_CLAUDE_REFUSED:
+            require(not request.get(key), "%s: a claude-code role in a team run takes no %s" % (endpoint, key))
+    return scope, stand_in
+
+
 def add_role(request):
     base = safe_path(text(request.get("base"), "base"))
     setup = read_json(base / "provision.json")
@@ -557,6 +576,8 @@ def add_role(request):
     mailbox.endpoint(endpoint)
     cwd, timeout, assistants = check_role_request(request, setup)
     host = request["host"]
+    plan = hierarchy_hosts.read_plan(base)
+    scope, stand_in = check_host_plan(plan, request, mailbox, endpoint) if plan is not None else (None, False)
     team = None
     fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
@@ -573,9 +594,22 @@ def add_role(request):
         if history:
             require(history[-1]["session"] == session and history[-1]["host"] == host,
                     "endpoint is bound to another session; hand it off first")
+        record = recorded = None
+        if scope is not None:
+            # A new binding is generation 1 (expected_generation 0). Compared before binding, so a conflicting record
+            # leaves a new endpoint unbound; under the mailbox lock, which handoff also holds while it records.
+            record = hierarchy_hosts.session_record(
+                endpoint, hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")), host,
+                hierarchy_hosts.team_start_mode(host, stand_in, request.get("background", False)), session,
+                history[-1]["generation"] if history else 1, stand_in, scope)
+            record_path = hierarchy_hosts.session_record_path(base, endpoint, record["generation"])
+            recorded = hierarchy_hosts.session_recorded(record_path, record)
+        if history:
             binding = history[-1]
         else:
             binding = mailbox.bind({"endpoint": endpoint, "host": host, "session": session, "expected_generation": 0})
+        if record is not None and not recorded:
+            publish_file(record_path, encoded(record) + b"\n")
     generation = binding["generation"]
     answer = {"endpoint": endpoint, "host": host, "session": session, "generation": generation}
     if team is not None:
