@@ -22,9 +22,6 @@ Preserve existing repository instructions and source semantics.
 
 Accept by publishing a mailbox `ack` in reply to the dispatch, with readiness for a
 writing lane.
-<!-- host:claude -->
-For a Claude lane, a SendMessage is a notice, not the acceptance (T134, T126 (2)).
-<!-- /host -->
 A separate received message is optional, because a read receipt already records that. Scan in the exact
 worktree before editing, test through public behavior, and preserve RED/GREEN and
 sad-path evidence. Send completion with exact commit/tree, check references and a
@@ -80,15 +77,14 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters. In 
 ## Writing rules
 
 <!-- host:claude -->
-- **Layout (f), T38 and T48.** Writing lanes: you are launched in the trusted workspace. Work only in the ROOT-registered worktree under `<repo>/.claude/worktrees/`, from the launch cwd (Cwd below).
+- **Layout (f), T38 and T48.** Writing lanes: work only in the worktree your brief names, the one your `readiness` reports. It is your launch cwd and the only folder your file tools reach.
+- **Scan before edit, T50, T76 and T109.** You cannot run `aegis scan`. Before your first Edit or Write, hold the scan result for every path you will edit, delivered in your brief or dispatch from a `scan` job your orchestrator filed. If any path lacks one, edit nothing: report a blocker naming those paths. Follow the union of the rule ids those results list, and cite them in `scan_evidence`.
+- **Checks and commits through jobs.** You run no commands (No commands, under Working rules), so ask your orchestrator only for jobs root's recipes provide: `commit-exact` for the exact paths you changed, then `targeted-tests` on that commit with the test ids, and `full-suite`, `lint` or `aegis-check` where your brief needs them. Write the test first all the same; its RED and GREEN runs are `targeted-tests` jobs too. Leave your edits uncommitted in the worktree. Your `result` names each job you need and why, each with outcome `not_run`. A rule in this section whose check no recipe provides (`git diff` before a commit, `ruff` with its default rules, the source digest) is recorded `not_run` with that reason, under owner decision 4's weaker boundary: do not ask for a job that no recipe provides. Rules about running commands yourself (cwd, worktree admin, build caches) do not apply to you. You make no commit, so `source_revision` and `source_tree` are your brief's base commit and tree, copied from it, and `lane_check` says it was not run and why; ask your orchestrator for an id the brief lacks and never type one (T92). You cannot check hooks either: say so in `hook_evidence`.
 <!-- /host -->
 <!-- host:codex -->
 - **Layout, T38 and T48.** Writing lanes: work only in the worktree your brief names, the one your `readiness` reports.
 <!-- /host -->
 - **Scan, T50, T76 and T109.** Scan each path you will edit on its own, and follow the union of the rule ids: a combined scan can drop rules without printing an "omitted" line. If the MCP scan says not governed for your worktree, use the repository's CLI scan from the worktree with `AEGIS_MAX_JIT_TOKENS=8000`. If a per-path scan still lists omitted rules, follow those ids too. Record which scans you used.
-<!-- host:claude -->
-- **Temp and home folders, T135.** Pytest and tool runs put `TMPDIR` and `HOME` in a `mktemp -d /var/tmp/…` folder, not under `/tmp`: a Codex sandbox can leave an empty `/tmp/.git`, which fails 12 `test_hierarchy_root.py` tests. Output into your own `$CLAUDE_JOB_DIR/tmp` stays allowed.
-<!-- /host -->
 <!-- host:codex -->
 - **Temp and home folders, T135.** Pytest and tool runs put `TMPDIR` and `HOME` in a `mktemp -d` folder under the `TMPDIR` your session sets, never under `/tmp`: a Codex sandbox can leave an empty `/tmp/.git`, which fails 12 `test_hierarchy_root.py` tests. If your session sets no `TMPDIR`, ask your orchestrator for a writable folder instead of writing anywhere else.
 <!-- /host -->
@@ -104,13 +100,12 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters. In 
 ## Working rules
 
 <!-- host:claude -->
-- **No `EnterWorktree`, T38, T48 and T139.** No lane calls `EnterWorktree`, whatever its kind: its dialog cannot be answered remotely.
-<!-- /host -->
-<!-- host:claude -->
-- **Refusals, T13.** If Edit or Write is refused, or a permission dialog appears, report the exact text and stop. Never work around a refused tool, guard or classifier decision, and never fall back to shell writes.
-<!-- /host -->
-<!-- host:claude -->
-- **Shell output, T54 and T135.** Redirecting command output into your own `$CLAUDE_JOB_DIR/tmp` (or a `mktemp -d /var/tmp/…` folder) is allowed; writing repository, brief or report files with the shell is not.
+- **Print mode, owner decision 3.** Each turn is one `claude --print` process. Your start turn carries this contract and has no MCP tools; each later turn is a wake that resumes your session with your mailbox prompt, and it ends when you stop replying. Nothing of yours runs between turns.
+- **Tools.** You have only the file tools your launch lists (Read, Glob and Grep, plus Edit and Write for a writing lane) and the mailbox (and board) tools. File tools reach only your working directories. Anything else is denied at once, and no prompt waits for an answer.
+- **No `EnterWorktree`, T38, T48 and T139.** No lane calls `EnterWorktree`, whatever its kind: it is not available in a team run, and neither are sub-agents.
+- **No commands.** You have no command tool: no shell, tests, linters, scans or git, and no web fetch. Rules here or in your brief that name a command, a shell or command output are for hosts that run commands; copy hashes and times from your tools' output instead (T92). Never attempt a shell-like workaround: no file, tool call or message meant to get a command run for you. A check you cannot make with your tools is `not_run`: name it in your `result` with why it is needed, and ask your orchestrator for it only when one of root's recipes provides it.
+- **Write boundary, owner decision 4.** For a writing lane the boundary is the worktree and the path lease, enforced by permission rules plus independent review and CI: status and evidence record its write scope as "permission rules, not OS-enforced". Edit and Write outside the worktree, and writes to settings, git or tool-configuration files, are denied. A reviewer has no write tools, and its independent review is part of that boundary.
+- **Refusals, T13.** If Edit or Write is refused, or any other tool call is denied, report the exact text and stop. Never work around a refused tool or permission decision, and never retry the write another way.
 <!-- /host -->
 <!-- host:codex -->
 - **Refusals, T13.** If `apply_patch` or a command is refused (a sandbox denial, a rejected patch or an approval request), report the exact text and stop. Never work around a refused tool, guard or sandbox decision, and never retry the write another way.
@@ -119,7 +114,7 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters. In 
 - **Shell output, T54 and T135.** Redirecting command output into a `mktemp -d` folder under the `TMPDIR` your session sets is allowed; writing repository, brief or report files with the shell is not.
 <!-- /host -->
 <!-- host:claude -->
-- **Session id, T77.** Your own session id is `$CLAUDE_CODE_SESSION_ID`; the host does not set `CLAUDE_SESSION_ID`.
+- **Session id, T77.** Your own session id is the one `mailbox_self` returns, never one read from the environment.
 <!-- /host -->
 - **Pacing, T5.** Take small test-first steps and prefer a command to long deliberation. Record an item blocked for more than 10 minutes as unfinished and move on. Give `</dev/null` to every command that could read stdin.
 - **Shell quoting, T11, T17, T36 and T47.** Quote separators, globs and words that start with `=` (`'====='`, `--include='*.py'`): in zsh a bare `=word` is a command lookup. Write `${VAR}:path`, never `$VAR:path`, because zsh applies `:t`/`:a` modifiers. Do not pass flags through an unquoted `$VAR`; zsh does not split words.
@@ -127,13 +122,9 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters. In 
 - **Absolute paths, T100.** Packets, prompts and specs write every path in a command line as absolute; placeholders say so (`<absolute spec path>`).
 - **Deadline, T111 (3), T117 and T126 (1).** Your deadline counts from the dispatch, and the wait for the dispatch does not count. If the prompt, the brief and the dispatch give different deadlines, ask your orchestrator before you start.
 <!-- host:claude -->
-- **Mixed hosts, T136.** If your launch prompt says your manager's host is `codex`, report only through the mailbox (`ack`, `result`, `info`), and keep SendMessage for ROOT, for urgent items only. A published dispatch or verdict does not wake you, so while you wait for one, poll your inbox under a bounded background sleep (about 120 s, capped by your deadline). The open-items wait below polls the same way.
-<!-- /host -->
-<!-- host:claude -->
-- **Open items before the self-stop, T125 (2).** If your result lists open items for your manager, end your turn under a background timer (`sleep 600` run in the background, capped by your deadline) instead of stopping. On an "accept" message, or when the timer fires, self-stop; on a fix-round dispatch, do the work, then self-stop. A result with no open items stops at once. T99 c stays the last action.
-<!-- /host -->
-<!-- host:claude -->
-- **Last action, T99 c.** After your final SendMessage, run `claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null` once; if it is refused, send one line saying so, and never stop another session.
+- **Mailbox only, T136.** Report only through the mailbox (`ack`, `result`, `info`). New mail for you starts your next turn, so never poll your inbox or wait inside a turn: end your turn instead.
+- **Open items, T125 (2).** A result that lists open items for your manager still ends your turn; an "accept" message or a fix-round dispatch starts your next one, and you do a fix round like any other dispatch.
+- **End of turn, T99 c.** Your turn ends with your final reply, and its process ends with it: there is no self-stop and no stop command, and you never stop another session.
 <!-- /host -->
 <!-- host:codex -->
 - **Mailbox only, T136.** Report only through the mailbox (`ack`, `result`, `info`). New mail for you starts your next turn, so never poll your inbox or wait under a sleep: end your turn instead.

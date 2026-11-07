@@ -52,9 +52,6 @@ Read every inbox page before an ack, a dispatch or opening a PR, using
 `after_message_id` set to `next_after` until `remaining` is 0 (T15, T28). Use the same mailbox for
 every vertical hop. Requests that change another team's work (paths, merges, queue
 moves) go by ROOT relay (owner decision `c12-cross-orchestrator-traffic-a`).
-<!-- host:claude -->
-On a Claude host, notices without authority may go by SendMessage, and the receiver records them in its STATUS.
-<!-- /host -->
 Each orchestrator routes work to its own lanes. A peer still cannot dispatch your lanes.
 Collect and spot-check exact-source reports; preserve failed/incomplete evidence.
 Arrange independent review from a read-only checkout of base and candidate, plus one
@@ -104,9 +101,6 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters.
 ## Working rules
 
 - **Stalls, T3.** A lane whose request has been open longer than 20 minutes (xhigh) or 25 minutes (max), or that has been silent for 15 minutes, cannot read messages: ask root to stop and relaunch it.
-<!-- host:claude -->
-- **Dialogs, T10, T26 and T62.** A present `waitingFor` (e.g. `"permission prompt"`) is a dialog whatever `status` says. Otherwise decide on `status`: `idle` is idle and `busy` is busy, whatever `state` says (an idle session also shows `state: blocked`), and a non-idle status with an unanswered request is a dialog. Then read `claude logs` and tell root, which tells the owner.
-<!-- /host -->
 - **Refusals, T13.** No brief or prompt may tell a lane to work around a refused tool, guard, classifier decision or write.
 - **Writing lanes, T38 and T48.** Writing lanes use layout (f): launched in the trusted workspace, working in a ROOT-registered worktree, never calling `EnterWorktree`.
 - **Endpoints, T61 and T87.** Name only endpoints the manifest declares. For a new lane, ask root to rebind a finished endpoint of the lane's kind whose holder is stopped, and expect the launch prompt to state the binding.
@@ -119,8 +113,10 @@ digits, `-` and `_`, starting with a letter or digit, at most 80 characters.
 - **Quiet binds and closed dispatches, T118.** Until `ack-lineage` (T69's fix) is live, bind a successor orchestrator at a quiet moment. Every writer dispatch ends with "close this dispatch with a mailbox `result` before the self-stop". Close a dispatch before its worktree is removed; otherwise every later bind and ack fails with "git identity check failed".
 - **Owner-approved backlog, T130.** Every handoff carries the "Owner-approved backlog" table, copied forward verbatim. An item leaves only as done (with evidence) or retired by a cited record, and the successor re-checks the table against the owner records during its read.
 <!-- host:claude -->
-- **Addressing, T132 (2), T136 and T145.** ListAgents can show a successor before its bind, so send to the session the binding names (`hierarchy_mailbox.py --root <mailbox> status </dev/null`, field `bindings["<endpoint>"]`), whose name ListAgents shows; until a successor is bound, its predecessor is still the manager. Codex-hosted roles are not in ListAgents: reach them through the mailbox only, and read their binding the same way. Their Claude lanes poll their inbox (`lane.md`, mixed hosts).
-- **Rotation stop, T99 c.** When root says `stop` after your successor reports read complete, send root one final line, then run `claude stop "${CLAUDE_CODE_SESSION_ID:0:8}" </dev/null` as your last action; if it is refused, tell root; never stop another session.
+- **Print mode, owner decision 3.** Each turn is one `claude --print` process. Your start turn carries this contract and has no MCP tools; each later turn is a wake that ends when you stop replying. Your tools are Read, Glob and Grep inside your working directories; the mailbox tools; `workspace_capacity` and `workspace_initiative`; `source_show` and `source_grep` when your connection offers them; and the board tools when the run has a board. There is no command tool and there are no sub-agents. A step above that names a command (`git`, a scan) is a job you request from root by recipe or evidence you ask for, never a value you type (T92).
+- **Claude lanes.** One host serves every role below ROOT, so your lanes run on Claude too, with no commands. Fill their briefs from `tools/hierarchy_templates/lane-brief-claude.md`, not `lane-brief.md`. Before you dispatch a writer, file a `scan` job for every path it will edit and put each result in its brief: a writer edits no path whose scan result it lacks. If that job is refused, report the blocker to root and the front door and do not dispatch the writer. A writing lane leaves its edits uncommitted in its worktree, and its `result` names the jobs it needs, each `not_run`: file those that root's recipes provide, and leave a check that no recipe provides as `not_run`. Its `source_revision` and `source_tree` are its brief's base, not a tested candidate, so do not read them as "no change". A packet field you cannot copy from a tool's output (`dirty_content_sha256`, `expected_tree`) is a blocker to report to root and the front door, never a guess. In a writer dispatch, "the self-stop" means the end of the lane's turn.
+- **Addressing, T136.** Reach every role through the mailbox only, by its endpoint: the mailbox delivers to whichever session the endpoint's binding names.
+- **Rotation stop, T99 c.** When root says `stop` after your successor reports read complete, send root one final `info` and end your turn. Each turn is its own process, so nothing of yours keeps running: there is no self-stop and no stop command, and you never stop another session.
 <!-- /host -->
 <!-- host:codex -->
 - **Addressing, T136.** Reach every role through the mailbox only, by its endpoint: the mailbox delivers to whichever session the endpoint's binding names.

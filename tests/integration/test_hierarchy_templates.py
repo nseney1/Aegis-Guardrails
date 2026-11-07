@@ -76,13 +76,6 @@ def view(name, host):
     return hierarchy_launcher.host_view(path.read_text(encoding="utf-8"), host, path)
 
 
-@pytest.mark.parametrize("name", ["roles/lane.md", "roles/reviewer.md", "roles/orchestrator.md"])
-def test_lane_kinds_end_with_the_self_stop_line(name):
-    """On a Claude host. A Codex role's turn ends with its reply, so its view ends with that rule instead (below)."""
-    last = view(name, "claude").splitlines()[-1]
-    assert SELF_STOP in last
-
-
 @pytest.mark.parametrize("name", ["roles/lane.md", "roles/orchestrator.md"])
 def test_a_self_stop_never_stops_another_session(name):
     assert missing(name, ["never stop another session"]) == []
@@ -96,12 +89,6 @@ def test_only_writers_cd_into_their_worktree_and_read_only_roles_never_use_a_bar
                                      "read-only roles follow `reviewer.md`"]) == []
     assert "first-step `cd`" not in words("roles/lane.md")
     assert "first step is a Bash `cd`" not in words("roles/lane.md")
-
-
-def test_orchestrators_read_a_dialog_from_waiting_for_not_from_blocked_alone():
-    assert missing("roles/orchestrator.md", ["`waitingFor`", "whatever `state` says", "`state: blocked`",
-                                             "A present `waitingFor` (e.g. `\"permission prompt\"`) is a dialog "
-                                             "whatever `status` says"]) == []
 
 
 def test_orchestrators_bind_by_kind_and_list_governance_paths_without_a_fixed_writer_count():
@@ -145,10 +132,12 @@ def test_the_lane_brief_asks_for_binding_kind_worktree_and_owner_decisions():
                                      "unless the push-exception field names an owner decision"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
-def test_lanes_accept_a_dispatch_by_a_mailbox_ack_and_a_received_message_is_optional(name):
+@pytest.mark.parametrize("name, host_note", [("roles/lane.md", None),
+                                             ("lane-brief.md", "a SendMessage is a notice, not the acceptance"),
+                                             ("lane-brief-claude.md", "only that `ack` is the acceptance")])
+def test_lanes_accept_a_dispatch_by_a_mailbox_ack_and_a_received_message_is_optional(name, host_note):
     assert missing(name, ["publishing a mailbox `ack` in reply to the dispatch, with readiness for a writing lane",
-                          "a SendMessage is a notice, not the acceptance", "received message is optional"]) == []
+                          "received message is optional"] + ([host_note] if host_note else [])) == []
     assert "Send separate received and accepted messages" not in words(name)
 
 
@@ -159,19 +148,18 @@ def test_deadlines_count_from_the_dispatch_and_lanes_ask_when_they_differ():
                                      "ask your orchestrator before you start"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
-def test_a_lane_with_open_items_waits_under_a_bounded_timer_before_its_self_stop(name):
-    assert missing(name, ["open items for your manager", "`sleep 600` run in the background, capped by your deadline",
-                          "an \"accept\" message", "when the timer fires", "fix-round dispatch",
-                          "no open items stops at once"]) == []
+@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief-claude.md"])
+def test_a_lane_with_open_items_ends_its_turn_and_a_reply_starts_the_next(name):
+    assert missing(name, ["open items for your manager", "still ends your turn", "an \"accept\" message",
+                          "fix-round dispatch"]) == []
 
 
-def test_lanes_under_a_codex_manager_report_by_mailbox_and_poll_their_inbox():
-    assert missing("roles/lane.md", ["your manager's host is `codex`",
-                                     "report only through the mailbox (`ack`, `result`, `info`)",
-                                     "keep SendMessage for ROOT, for urgent items only",
-                                     "does not wake you",
-                                     "poll your inbox under a bounded background sleep (about 120 s, capped by your deadline)"]) == []
+def test_the_codex_era_lane_brief_keeps_its_open_items_timer_wording():
+    """lane-brief.md stays byte-identical to the T2(a) base; Claude lanes get lane-brief-claude.md instead."""
+    assert missing("lane-brief.md", ["open items for your manager",
+                                     "`sleep 600` run in the background, capped by your deadline",
+                                     "an \"accept\" message", "when the timer fires", "fix-round dispatch",
+                                     "no open items stops at once"]) == []
 
 
 def test_lanes_route_cross_initiative_traffic_through_their_orchestrator():
@@ -191,9 +179,7 @@ def test_no_lane_kind_calls_enter_worktree(name):
 
 
 def test_lanes_keep_tmpdir_and_home_out_of_slash_tmp():
-    assert missing("roles/lane.md", ["`TMPDIR` and `HOME` in a `mktemp -d /var/tmp/…` folder, not under `/tmp`",
-                                     "an empty `/tmp/.git`", "12 `test_hierarchy_root.py` tests",
-                                     "your own `$CLAUDE_JOB_DIR/tmp`"]) == []
+    assert missing("roles/lane.md", ["an empty `/tmp/.git`", "12 `test_hierarchy_root.py` tests"]) == []
     assert "Keep `TMPDIR` under `/tmp`" not in words("roles/lane.md")
     assert "`mktemp` dir under `/tmp`" not in words("roles/lane.md")
 
@@ -253,10 +239,9 @@ BY_BINDING = ["send to the session the binding names", "field `bindings[\"<endpo
 
 def test_orchestrators_relay_cross_team_requests_through_root_and_address_roles_by_their_binding():
     assert missing("roles/orchestrator.md", ["go by ROOT relay", "`c12-cross-orchestrator-traffic-a`",
-                                             "notices without authority may go by SendMessage",
-                                             "the receiver records them in its STATUS",
                                              "A peer still cannot dispatch your lanes",
-                                             "Their Claude lanes poll their inbox"] + BY_BINDING) == []
+                                             "Reach every role through the mailbox only, by its endpoint: the mailbox "
+                                             "delivers to whichever session the endpoint's binding names"]) == []
     assert "Cross-hierarchy findings go orchestrator to orchestrator" not in words("roles/orchestrator.md")
 
 
