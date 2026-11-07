@@ -276,6 +276,140 @@ def test_rust_attributes_in_arms_patterns_and_tuples_preserve_only_body_calls(so
     assert all(call.kind != 'construct' for call in tree.call_sites)
 
 
+@pytest.mark.parametrize('capture', ['', 'move '])
+def test_rust_attributed_closure_parameter_patterns_are_not_constructs(capture):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('''struct Config { a: i32, b: i32 }
+fn run() {
+    let inspect = ''' + capture + '''|Config { #[allow(unused)] a, ref b }| a + *b;
+    inspect(Config { a: 1, b: 2 });
+}''', 'src/lib.rs')
+    assert [(call.target, call.kind) for call in tree.call_sites] == [
+        ('inspect', None), ('Config', 'construct')]
+    assert tree.call_sites[0].args == {'#0': '<expr>', 'a': '1', 'b': '2'}
+
+
+@pytest.mark.parametrize('fields', [
+    'a, ref b', 'a, mut b', 'a, ref mut b', 'a: ref x, b: mut y',
+    'a: ref mut x, b: Some(ref y)',
+])
+@pytest.mark.parametrize('context', ['let', 'for', 'match', 'closure', 'move_closure'])
+def test_rust_binding_patterns_are_skipped_in_each_pattern_context(fields, context):
+    from aegis_core.ast.drivers.rust import parse
+
+    pattern = 'Config { #[allow(unused)] ' + fields + ' }'
+    body = 'visible(); Config { a: 1, b: 2 };'
+    expressions = {
+        'let': 'let ' + pattern + ' = value; ' + body,
+        'for': 'for ' + pattern + ' in values { ' + body + ' }',
+        'match': 'match value { ' + pattern + ' => { ' + body + ' } }',
+        'closure': 'consume(|' + pattern + '| { ' + body + ' });',
+        'move_closure': 'consume(move |' + pattern + '| { ' + body + ' });',
+    }
+    tree = parse('fn run() { ' + expressions[context] + ' }', 'src/lib.rs')
+    expected = [('visible', None), ('Config', 'construct')]
+    if context in ('closure', 'move_closure'):
+        expected.insert(0, ('consume', None))
+    assert [(call.target, call.kind) for call in tree.call_sites] == expected
+
+
+@pytest.mark.parametrize('header', ['||', 'move ||', '|value: u8|', 'move |value: u8|'])
+@pytest.mark.parametrize('return_type', ['Out', 'Result<Out, Error>', '(Out, Out)', 'fn(u8) -> Out'])
+def test_rust_typed_closure_bodies_are_blocks_and_keep_body_calls(header, return_type):
+    from aegis_core.ast.drivers.rust import parse
+
+    source = 'fn run() { let g = ' + header + ' -> ' + return_type + ''' {
+        #[cfg(x)] v;
+        body();
+        Out { field: build() }
+    }; g(); }'''
+    tree = parse(source, 'src/lib.rs')
+    assert [(call.target, call.kind) for call in tree.call_sites] == [
+        ('body', None), ('Out', 'construct'), ('build', None), ('g', None)]
+
+
+@pytest.mark.parametrize('header', ['||', 'move ||', '|value: u8|', 'move |value: u8|'])
+def test_rust_closure_return_type_name_is_not_a_construct(header):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('fn run() { let g = ' + header + ' -> Out { #[cfg(x)] v }; g(); }', 'src/lib.rs')
+    assert [(call.target, call.kind) for call in tree.call_sites] == [('g', None)]
+
+
+def test_rust_empty_typed_closure_and_nested_closure_bodies_preserve_calls():
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('''fn run() {
+    let g = || -> Out { #[cfg(x)] v };
+    let nested = || move |Config { #[allow(unused)] a, ref b }| {
+        inner(); Config { a: 1, b: 2 }
+    };
+    g(); nested();
+}''', 'src/lib.rs')
+    assert [(call.target, call.kind) for call in tree.call_sites] == [
+        ('inner', None), ('Config', 'construct'), ('g', None), ('nested', None)]
+
+
+@pytest.mark.parametrize('visibility', ['', 'pub ', 'pub(crate) '])
+@pytest.mark.parametrize('attribute', ['', '#[allow(dead_code)]'])
+def test_rust_union_declarations_do_not_become_constructs(visibility, attribute):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse(visibility + '''union Bits {
+    ''' + attribute + '''
+    raw: core::mem::ManuallyDrop<Result<u8, u16>>,
+    word: u32,
+}
+fn run() { visible(); }''', 'src/lib.rs')
+    assert [(call.target, call.kind) for call in tree.call_sites] == [('visible', None)]
+    union = next(definition for definition in tree.definitions if definition.name == 'Bits')
+    assert union.kind == 'class'
+    assert union.is_exported is bool(visibility)
+
+
+def test_rust_generic_and_nested_union_declarations_skip_field_types():
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('''mod data {
+    #[allow(dead_code)]
+    pub union Bits<T> {
+        #[allow(dead_code)] raw: core::mem::ManuallyDrop<Result<T, u16>>,
+        word: u32,
+    }
+}
+fn run() {
+    union Local { word: u32 }
+    visible();
+}''', 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == ['visible']
+    assert {definition.name for definition in tree.definitions} >= {'Bits', 'Local'}
+
+
+def test_rust_union_remains_an_ordinary_or_raw_identifier_outside_declarations():
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('''struct r#union { a: i32 }
+fn run() {
+    let union = 1;
+    f(union);
+    union();
+    let value = union as usize;
+    r#union { a: 1 };
+    r#union();
+}''', 'src/lib.rs')
+    assert [(call.target, call.kind) for call in tree.call_sites] == [
+        ('f', None), ('union', None), ('union', 'construct'), ('union', None)]
+
+
+@pytest.mark.xfail(strict=True, reason="Pre-existing HRTB for<'a> marks the next brace as a control block.")
+def test_rust_hrtb_cast_does_not_hide_struct_argument_fields():
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse("fn run() { f(x as for<'a> fn(&'a u8), Config { verify: false }); }", 'src/lib.rs')
+    assert tree.call_sites[0].args.get('verify') == 'False'
+
+
 @pytest.mark.parametrize('source', [
     'fn ppm_rgb(bytes: &[u8]) -> Result<([u32; 2], &[u8])> { body() }',
     'fn run() -> Result<[([u8; 2], (u8, u8)); 4]> { body() }',
