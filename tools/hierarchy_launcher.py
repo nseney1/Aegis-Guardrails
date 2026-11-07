@@ -88,6 +88,8 @@ STAND_IN_START = "%s is a stand-in and runs no host"
 NATIVE_START = "a native codex thread is started by its own app, not the launcher"
 CLAUDE_HOME_UNSET = "a claude-code start needs CLAUDE_CONFIG_DIR set to the run's claude home"
 CLAUDE_HOME_OWNERS = "CLAUDE_CONFIG_DIR is the owner's ~/.claude; a team run uses its own claude home"
+CLAUDE_HOME_LINK = "%s is a symlink; a team run's claude home keeps its own files"
+TRANSCRIPT_OUTSIDE = "the transcript for session %s is a symlink or lies outside CLAUDE_CONFIG_DIR %s: %s"
 CODEX_START_KEYS = {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"}
 ADD_ROLE_KEYS = CODEX_START_KEYS | {"timeout_seconds", "source_repo", "kind", "lifecycle", "actor"}
 START_HEADER = ("The Aegis launcher started this session for %s as %s. This turn comes from the operator who launched "
@@ -448,11 +450,23 @@ def claude_home():
     # By realpath, so a link to the owner's folder, or to a folder inside it, is refused too.
     found = os.path.realpath(home)
     require(found != owner and not found.startswith(owner.rstrip(os.sep) + os.sep), CLAUDE_HOME_OWNERS)
+    # A separate home whose entries link elsewhere, such as projects into the owner's history, would put the start's
+    # files there. Every entry of the home counts, not a list: no real login has shown which ones a start writes
+    # (ADR T2(a) §3). So do the project folders a transcript is written into. confirmed() checks the transcript too,
+    # for a link made after this look.
+    for folder in (home, os.path.join(home, "projects")):
+        if folder != home and (os.path.islink(folder) or not os.path.isdir(folder)):
+            continue
+        with os.scandir(folder) as entries:
+            linked = sorted(entry.path for entry in entries if entry.is_symlink())
+        if linked:
+            raise ValueError(CLAUDE_HOME_LINK % linked[0])
     return home
 
 
 def confirmed(reported, chosen, home, error):
-    """(session, error): the chosen session once the init event reported it and its transcript exists, else None.
+    """(session, error): the chosen session once the init event reported it and its transcript is a regular file
+    inside the run's home, else None.
 
     Either check failing means no session to bind: a different id means the host did not run --session-id, and
     with no transcript under the run's home a later --resume finds no conversation.
@@ -464,8 +478,16 @@ def confirmed(reported, chosen, home, error):
         problem = "the start reported session %s, not the session the launcher chose: %s" % (str(reported)[:128], chosen)
     else:
         try:
-            if not hierarchy_hosts.transcripts(CLAUDE, home, chosen):
+            found = hierarchy_hosts.transcripts(CLAUDE, home, chosen)
+            # A regular file inside the home itself: the glob follows links, and a transcript that resolves elsewhere
+            # is in someone else's history, not the run's.
+            inside = os.path.realpath(home).rstrip(os.sep) + os.sep
+            kept = [path for path in found
+                    if not path.is_symlink() and path.is_file() and os.path.realpath(path).startswith(inside)]
+            if not found:
                 problem = "no transcript for session %s under CLAUDE_CONFIG_DIR %s" % (chosen, home)
+            elif not kept:
+                problem = TRANSCRIPT_OUTSIDE % (chosen, home, found[0])
         except (OSError, ValueError) as exc:
             problem = "reading the start's transcript failed: " + str(exc)
     if problem is None:

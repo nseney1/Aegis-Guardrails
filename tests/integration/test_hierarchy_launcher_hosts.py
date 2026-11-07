@@ -43,6 +43,19 @@ OTHER_SESSION = "0b1f7c52-5d2e-4e07-9a41-3c8e2f9d6a10"
 HOME_UNSET = "a claude-code start needs CLAUDE_CONFIG_DIR set to the run's claude home"
 HOME_INVALID = "CLAUDE_CONFIG_DIR must be an absolute path to an existing folder: "
 HOME_OWNERS = "CLAUDE_CONFIG_DIR is the owner's ~/.claude; a team run uses its own claude home"
+HOME_LINK = "%s is a symlink; a team run's claude home keeps its own files"
+TRANSCRIPT_OUTSIDE = "the transcript for session %s is a symlink or lies outside CLAUDE_CONFIG_DIR %s: %s"
+# Moves the newest start's transcript (or its project folder) out of the home and links it back, as a host following a
+# link planted after the launcher looked would leave it.
+RELINK = r"""
+import os, sys
+from pathlib import Path
+home, outside, what = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+[transcript] = home.glob("projects/*/*.jsonl")
+moved = transcript if what == "file" else transcript.parent
+os.replace(moved, outside / moved.name)
+moved.symlink_to(outside / moved.name, target_is_directory=what != "file")
+"""
 NATIVE_START = "a native codex thread is started by its own app, not the launcher"
 CLAUDE_WRITER = "permission rules, not OS-enforced"
 # Today's launch record keys: a Codex record must gain none.
@@ -230,31 +243,66 @@ def test_a_relative_or_missing_claude_config_dir_is_refused_before_anything_runs
     assert claude_team.claude_calls() == [] and unbound(claude_team, IMPLEMENTER)
 
 
-@pytest.mark.parametrize("where", ["itself", "inside", "through a link"])
-def test_the_owners_own_claude_home_is_refused_before_anything_runs(hosts, monkeypatch, capsys, where):
-    # The owner's home comes from the password database, which is patched to a temporary folder: the real ~/.claude
-    # is never named, read or written. HOME points elsewhere, since it must not be what the launcher trusts.
+def start_as_owner(hosts, monkeypatch, capsys, owner, claude_home):
+    """(exit code, answer) of an in-process claude start whose owner's home is `owner`.
+
+    The owner's home comes from the password database, which is patched to a temporary folder: the real ~/.claude is
+    never named, read or written. HOME points elsewhere, since it must not be what the launcher trusts.
+    """
     write_plan(hosts, CLAUDE)
-    owner = hosts.tmp / "owner"
-    (owner / ".claude" / "inside").mkdir(parents=True)
-    value = {"itself": owner / ".claude", "inside": owner / ".claude" / "inside", "through a link": hosts.tmp / "link"}
-    if where == "through a link":
-        value[where].symlink_to(owner / ".claude", target_is_directory=True)
     import pwd
     monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(owner)))
     for key in [key for key in os.environ if key.startswith(("CLAUDE", "ANTHROPIC"))]:
         monkeypatch.delenv(key)
-    for key, setting in hosts.env(CLAUDE_CONFIG_DIR=str(value[where]), HOME=str(hosts.tmp)).items():
+    for key, setting in hosts.env(CLAUDE_CONFIG_DIR=str(claude_home), HOME=str(hosts.tmp)).items():
         monkeypatch.setenv(key, setting)
     module = launcher_module()
     code = module.main(["--base", str(hosts.base), "start", "--request",
                         str(hosts.start_request(endpoint=IMPLEMENTER))])
     monkeypatch.undo()
-    refused = json.loads(capsys.readouterr().out)
+    return code, json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("where", ["itself", "inside", "through a link"])
+def test_the_owners_own_claude_home_is_refused_before_anything_runs(hosts, monkeypatch, capsys, where):
+    owner = hosts.tmp / "owner"
+    (owner / ".claude" / "inside").mkdir(parents=True)
+    value = {"itself": owner / ".claude", "inside": owner / ".claude" / "inside", "through a link": hosts.tmp / "link"}
+    if where == "through a link":
+        value[where].symlink_to(owner / ".claude", target_is_directory=True)
+    code, refused = start_as_owner(hosts, monkeypatch, capsys, owner, value[where])
     assert code == 2 and refused["error"] == HOME_OWNERS
     assert (refused["state"], refused["host"], refused["session"]) == ("refused", CLAUDE, None)
     assert [row["state"] for row in hosts.records(IMPLEMENTER)] == ["refused"]
     assert hosts.claude_calls() == [] and unbound(hosts, IMPLEMENTER)
+
+
+@pytest.mark.parametrize("name", ["projects", ".claude.json", "sessions", ".credentials.json",
+                                  "projects/-elsewhere-project"])
+def test_a_run_home_entry_linked_into_the_owners_claude_home_is_refused_before_anything_runs(hosts, monkeypatch,
+                                                                                             capsys, name):
+    # A separate folder, logged in, so that without the check the start would run and write its transcript through
+    # the link into the owner's own history.
+    owner = hosts.tmp / "owner"
+    for folder in ("projects/-elsewhere-project", "sessions"):
+        (owner / ".claude" / folder).mkdir(parents=True)
+    for file in (".claude.json", ".credentials.json"):
+        (owner / ".claude" / file).write_text("{}", encoding="utf-8")
+    run_home = hosts.tmp / "run-claude-home"
+    run_home.mkdir(mode=0o700)
+    hosts.login(run_home)
+    linked = run_home / name
+    if linked.exists():
+        linked.unlink()
+    linked.parent.mkdir(exist_ok=True)
+    linked.symlink_to(owner / ".claude" / name, target_is_directory=(owner / ".claude" / name).is_dir())
+    before = sorted(owner.rglob("*"))
+    code, refused = start_as_owner(hosts, monkeypatch, capsys, owner, run_home)
+    assert code == 2 and refused["error"] == HOME_LINK % linked, refused
+    assert (refused["state"], refused["host"], refused["session"]) == ("refused", CLAUDE, None)
+    assert [row["state"] for row in hosts.records(IMPLEMENTER)] == ["refused"]
+    assert hosts.claude_calls() == [] and unbound(hosts, IMPLEMENTER)
+    assert sorted(owner.rglob("*")) == before
 
 
 def test_a_stand_in_is_refused_at_start(claude_team):
@@ -307,6 +355,24 @@ def test_a_start_whose_transcript_is_not_under_the_runs_claude_home_is_a_failed_
     assert answer["error"] == "no transcript for session %s under CLAUDE_CONFIG_DIR %s" % (session,
                                                                                             claude_team.claude_home)
     assert hierarchy_hosts.transcripts(CLAUDE, elsewhere, session)
+    assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["failed_to_start"]
+    assert unbound(claude_team, IMPLEMENTER)
+
+
+@pytest.mark.parametrize("what", ["file", "folder"])
+def test_a_transcript_that_is_a_symlink_or_resolves_outside_the_home_does_not_confirm_a_start(claude_team, tmp_path,
+                                                                                              what):
+    outside, relink = tmp_path / "outside", tmp_path / "relink.py"
+    outside.mkdir()
+    relink.write_text(RELINK, encoding="utf-8")
+    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\"\ncode=$?\n%%(python)s -I %s \"$CLAUDE_CONFIG_DIR\" %s %s\n"
+                            "exit $code" % (shlex.quote(str(relink)), shlex.quote(str(outside)), what))
+    answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
+    session = chosen(answer)
+    [found] = hierarchy_hosts.transcripts(CLAUDE, claude_team.claude_home, session)
+    assert (found.is_symlink(), found.parent.is_symlink()) == (what == "file", what == "folder")
+    assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
+    assert answer["error"] == TRANSCRIPT_OUTSIDE % (session, claude_team.claude_home, found)
     assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["failed_to_start"]
     assert unbound(claude_team, IMPLEMENTER)
 
