@@ -462,6 +462,28 @@ and binds each entry in `tools/hierarchy_templates/handoff-spec.json`, reports a
 on one without hiding or blocking the others, and leaves finished entries alone when
 run again. Each successor still acknowledges separately through its own connection.
 
+With `delivery_dir`, the draft includes every unread message ID, including messages
+that were woken but not read. The delivery status page's 100-ID display limit does
+not limit the handoff. Pending IDs and checkpoint brief references are deduplicated;
+the existing checkpoint limits remain 256 each. An overflow refuses the draft and
+preserves the current binding instead of omitting work. Resolve pending work or
+prepare a complete bounded handoff before rotating; marking a message read is not
+evidence that its assignment or job finished.
+
+Ordinary unread messages retain their hash-bound brief references in the inbox.
+The successor reads them with `include_briefs` and follows `next_after` while
+`remaining` is nonzero. Their contents stay pageable instead of accumulating in
+mandatory checkpoint metadata. Active/job, explicit and inherited checkpoint
+briefs retain their existing validation and response limits.
+
+For a mailbox move, current carry briefs retain each open job's original full ID
+and the path and SHA-256 of its original request. Missing terminal receipts can
+hide running, completed or uncertain effects. Before any replacement request, the
+operator must identify the original workspace store and reconcile its claims,
+results, receipts and reservations with `hierarchy_jobs.py --store
+<original-workspace-store> recovery-status --initiative <id>`. A mailbox move
+neither settles nor restarts those jobs. Hold if the original store cannot be verified.
+
 A source witness carries a digest of the exact `git status --porcelain=v1 -z
 --untracked-files=all` bytes and an entry count, with the raw status in `evidence_dir`
 if given. This replaced a literal status field whose 4096-character limit blocked real
@@ -541,6 +563,10 @@ outside heavy processes count against the same limit. The result is written befo
 so a busy mailbox or store only delays a receipt or a release until the next run. A lost runner
 leaves `unknown` and keeps the slot until root runs `resolve`. See the
 [dogfood guide](hierarchy-dogfood.md) for packets and recipes.
+
+For pre-submitted checks on one fixed source, the opt-in
+[v2 dependency packet](hierarchy-job-dependencies.md) lets `run-open` advance from
+verified predecessor evidence without another relay turn.
 
 A recipe with `require_clean` refuses a checkout with local changes and a path that is not in the
 packet's commit. It then runs on an export of that commit, not on the checkout:
