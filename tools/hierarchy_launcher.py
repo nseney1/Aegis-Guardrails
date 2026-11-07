@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""The provider bridge: start, resume and stop a provisioned Codex role, and record every outcome.
+"""The provider bridge: start, resume and stop a provisioned role, and record every outcome.
 
-`start` runs a role's start argv once with its role contract as the prompt, reads the session ID from the
-first `thread.started` event and binds it through add-role. Every role it starts is a Codex role, so the contract
-leaves out passages marked for another host; a reviewer or an integrator also gets lane.md's shared rules.
+`start` runs a role's start argv once with its role contract as the prompt and binds the session through add-role.
+The role runs on the host the base's host plan assigns it (ADR T2(a) §1), or on codex-cli where no plan covers it,
+as before plans existed. The contract leaves out passages marked for another host family; a reviewer or an
+integrator also gets lane.md's shared rules. A codex-cli start takes the prompt as its last argument and reports the
+session in its first `thread.started` event. A claude-code start runs under a session the launcher chooses, takes
+the prompt on stdin, and is bound only once its stream-json init event reports that session and its transcript is
+under CLAUDE_CONFIG_DIR. A stand-in runs no host, and a native thread belongs to its app: neither is started.
 `resume` runs the pinned wake tool with the bound wake profile, unchanged. `stop` signals the process groups of
 the processes that name the bound session, so it cannot stop a session on another host. `status` reads the
 records back.
@@ -15,7 +19,7 @@ role. A clean start proves a process ran and reported a thread, not that the rol
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -59,7 +63,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (Mailbox, endpoint_parts, fields, integer, read_json, require, safe_path, text,  # noqa: E402
                                timestamp)
-from hierarchy_provision import CODEX, NATIVE, SESSION, add_role, codex_start  # noqa: E402
+from hierarchy_provision import CLAUDE, CODEX, NATIVE, SESSION, add_role, claude_start, codex_start  # noqa: E402
+import hierarchy_hosts  # noqa: E402
+import hierarchy_roles  # noqa: E402
 from hierarchy_roles import role_name  # noqa: E402
 from hierarchy_router import patient  # noqa: E402
 from hierarchy_wake import stop_group  # noqa: E402
@@ -78,6 +84,12 @@ INTERRUPTS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGH
 INTERRUPTED = "the launcher was interrupted"
 ROOT_START = "ROOT is the owner's session; bind it with add-role"
 ROOT_STOP = "ROOT is the owner's session; the launcher does not stop it"
+STAND_IN_START = "%s is a stand-in and runs no host"
+NATIVE_START = "a native codex thread is started by its own app, not the launcher"
+CLAUDE_HOME_UNSET = "a claude-code start needs CLAUDE_CONFIG_DIR set to the run's claude home"
+CLAUDE_HOME_OWNERS = "CLAUDE_CONFIG_DIR is the owner's ~/.claude; a team run uses its own claude home"
+CLAUDE_HOME_LINK = "%s is a symlink; a team run's claude home keeps its own files"
+TRANSCRIPT_OUTSIDE = "the transcript for session %s is a symlink or lies outside CLAUDE_CONFIG_DIR %s: %s"
 CODEX_START_KEYS = {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"}
 ADD_ROLE_KEYS = CODEX_START_KEYS | {"timeout_seconds", "source_repo", "kind", "lifecycle", "actor"}
 START_HEADER = ("The Aegis launcher started this session for %s as %s. This turn comes from the operator who launched "
@@ -93,8 +105,9 @@ CONTRACTS = {"orchestrator": "orchestrator.md", "router": "router.md", "decider"
 SHARED_LANE_RULES = "lane.md"
 SHARED_FOR = ("reviewer", "integrator")
 KIND_SECTIONS = ("## Assignments", "## Protocol checklist")
-# A contract marks a passage for one host with a line `<!-- host:claude -->` or `<!-- host:codex -->` and ends it with
-# `<!-- /host -->`. The launcher starts Codex roles only.
+# A contract marks a passage for one host family with a line `<!-- host:claude -->` or `<!-- host:codex -->` and ends
+# it with `<!-- /host -->`. A start renders it for its host's family (hierarchy_hosts.family); START_HOST is the family
+# of codex-cli, the host where no plan covers an endpoint.
 CONTRACT_HOSTS = ("claude", "codex")
 START_HOST = "codex"
 HOST_OPEN = re.compile(r"<!-- host:([a-z]+) -->")
@@ -212,7 +225,15 @@ def first_session(path):
     return None
 
 
-def run_start(argv, cwd, logs, timeout, deferred):
+def claude_session(path):
+    """The session_id of the first stream-json init event in the start's stdout log."""
+    with open(path, "rb") as stream:
+        # Line by line, as first_session reads, so a start that floods its log is not read whole.
+        init = hierarchy_hosts.claude_init(stream)
+    return None if init is None else init["session_id"]
+
+
+def run_start(argv, cwd, logs, timeout, deferred, stdin_path=None, read_session=first_session):
     """Return (session, exit_code, timed_out, error); this raises nothing an outcome record cannot hold.
 
     stdout goes to a file, not a pipe: a descendant that leaves the group can keep a pipe open forever,
@@ -220,10 +241,15 @@ def run_start(argv, cwd, logs, timeout, deferred):
     it running unrecorded; on return every interrupt signal is ignored until the caller has written the
     record. The caller installs the raising handlers (see start); on the way out they become `deferred`,
     switched with the signals blocked so none lands between the two.
+
+    stdin is stdin_path's file when given, not a pipe, for the same reason: feeding a pipe would mean
+    writing while the start runs, and a start that never reads it would block that write once the pipe
+    filled. read_session reads the session from the stdout log.
     """
     process, timed_out, error = None, False, None
     try:
-        with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr:
+        with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr, \
+                (nullcontext(subprocess.DEVNULL) if stdin_path is None else open(stdin_path, "rb")) as stdin:
             # Deferred across Popen: a signal raised after the fork but before `process` is assigned would leave
             # a child in its own session that nothing stops. Not a blocked mask, which the child would inherit
             # and so ignore stop_group's SIGTERM; exec resets handled signals to their defaults.
@@ -231,7 +257,7 @@ def run_start(argv, cwd, logs, timeout, deferred):
             for number in INTERRUPTS:
                 signal.signal(number, spawning)
             try:
-                process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                process = subprocess.Popen(argv, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr,
                                            start_new_session=True)
             finally:
                 for number in INTERRUPTS:
@@ -260,21 +286,21 @@ def run_start(argv, cwd, logs, timeout, deferred):
         except OSError as exc:
             error += "; stopping the start's process group failed: " + str(exc)
     try:
-        session = first_session(logs["stdout"])
+        session = read_session(logs["stdout"])
     except OSError as exc:
         session, error = None, error or str(exc)
     return session, None if process is None else process.returncode, timed_out, error
 
 
 @contextmanager
-def start_lock(launches, endpoint, identifier):
+def start_lock(launches, endpoint, identifier, host):
     """One start per endpoint at a time, so two starts cannot both pass the unbound check and both pay for a turn."""
     lock = launches.make(endpoint) / ".start.lock"
     try:
         fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         launches.refuse(endpoint, identifier, "start", "a start is already running for %s; inspect %s if none is"
-                        % (endpoint, lock), host=CODEX)
+                        % (endpoint, lock), host=host)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write((json.dumps({"pid": os.getpid(), "created_at": timestamp()}, sort_keys=True) + "\n").encode("utf-8"))
@@ -343,9 +369,9 @@ def without_sections(text, headings):
     return tidy(kept)
 
 
-def start_prompt(launches, endpoint):
-    """(prompt, contracts) for the start turn. contracts lists {path, sha256} for each file the prompt carries, in
-    order; the last is the role's own.
+def start_prompt(launches, endpoint, family=START_HOST):
+    """(prompt, contracts) for the start turn, rendered for the host family. contracts lists {path, sha256} for each
+    file the prompt carries, in order; the last is the role's own.
 
     The contract goes inline: the start turn has no MCP servers and may run in a cwd that cannot see the
     source. It is read from the pinned source, beside the mailbox code the role's adapter runs, so the
@@ -360,7 +386,7 @@ def start_prompt(launches, endpoint):
     for each in files:
         require(each.is_file(), "no role contract for %s: %s" % (role, each))
         raw = each.read_bytes()
-        parts.append(host_view(raw.decode("utf-8"), START_HOST, each))
+        parts.append(host_view(raw.decode("utf-8"), family, each))
         contracts.append({"path": str(each), "sha256": hashlib.sha256(raw).hexdigest()})
     if len(files) > 1:
         lines = parts[-1].splitlines()
@@ -378,42 +404,147 @@ def start(launches, request_path):
     require(isinstance(request, dict), "expected a JSON object")
     endpoint = launches.resolve(request.get("endpoint"))
     identifier = launches.new_id()
+    plan, host, stand_in = start_host(launches, endpoint, identifier)
     # Installed before the lock is taken and kept until the outcome is recorded: a signal with its default
     # action would skip start_lock's finally and leave the endpoint refusing every later start.
     previous = {number: signal.getsignal(number) for number in INTERRUPTS}
     try:
         for number in INTERRUPTS:
             signal.signal(number, interrupt)
-        with start_lock(launches, endpoint, identifier):
-            return locked_start(launches, request, endpoint, identifier)
+        with start_lock(launches, endpoint, identifier, host):
+            return locked_start(launches, request, endpoint, identifier, plan, host, stand_in)
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
 
 
-def locked_start(launches, request, endpoint, identifier):
-    known = {"host": CODEX}
+def start_host(launches, endpoint, identifier):
+    """(plan, host, stand-in) for the endpoint: the plan's host, or codex-cli where no plan covers it.
+
+    Read before the start lock, so that even a lock refusal names the host; a plan that cannot be read is refused
+    here, before anything runs, rather than after a start already paid for meets the same refusal in add-role.
+    """
+    try:
+        plan = hierarchy_hosts.read_plan(launches.base)
+    # RecursionError: a deeply nested file defeats the JSON parser, and its refusal must be recorded like any other.
+    except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
+        launches.refuse(endpoint, identifier, "start", str(exc))
+    host, stand_in = hierarchy_hosts.plan_host(plan, endpoint)
+    return plan, CODEX if host is None else host, stand_in
+
+
+def claude_home():
+    """The run's claude home from CLAUDE_CONFIG_DIR, which the start inherits. Never a default: without it a real
+    claude would use ~/.claude, the owner's own login, history and settings."""
+    home = os.environ.get("CLAUDE_CONFIG_DIR")
+    require(home, CLAUDE_HOME_UNSET)
+    # Relative, it would resolve against the start's cwd there and the launcher's here.
+    require(os.path.isabs(home) and os.path.isdir(home),
+            "CLAUDE_CONFIG_DIR must be an absolute path to an existing folder: " + home[:256])
+    import pwd  # POSIX only, like every start; imported here so status still loads on any platform.
+    try:
+        # From the password database, not HOME: a changed HOME must not hide the owner's real folder.
+        owner = os.path.realpath(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude"))
+    except KeyError:
+        raise ValueError("cannot find the owner's home folder, so ~/.claude cannot be kept out") from None
+    # By realpath, so a link to the owner's folder, or to a folder inside it, is refused too.
+    found = os.path.realpath(home)
+    require(found != owner and not found.startswith(owner.rstrip(os.sep) + os.sep), CLAUDE_HOME_OWNERS)
+    # A separate home whose entries link elsewhere, such as projects into the owner's history, would put the start's
+    # files there. Every entry of the home counts, not a list: no real login has shown which ones a start writes
+    # (ADR T2(a) §3). So do the project folders a transcript is written into. confirmed() checks the transcript too,
+    # for a link made after this look.
+    for folder in (home, os.path.join(home, "projects")):
+        if folder != home and (os.path.islink(folder) or not os.path.isdir(folder)):
+            continue
+        with os.scandir(folder) as entries:
+            linked = sorted(entry.path for entry in entries if entry.is_symlink())
+        if linked:
+            raise ValueError(CLAUDE_HOME_LINK % linked[0])
+    return home
+
+
+def confirmed(reported, chosen, home, error):
+    """(session, error): the chosen session once the init event reported it and its transcript is a regular file
+    inside the run's home, else None.
+
+    Either check failing means no session to bind: a different id means the host did not run --session-id, and
+    with no transcript under the run's home a later --resume finds no conversation.
+    """
+    if reported is None:
+        return None, error
+    problem = None
+    if reported != chosen:
+        problem = "the start reported session %s, not the session the launcher chose: %s" % (str(reported)[:128], chosen)
+    else:
+        try:
+            found = hierarchy_hosts.transcripts(CLAUDE, home, chosen)
+            # A regular file inside the home itself: the glob follows links, and a transcript that resolves elsewhere
+            # is in someone else's history, not the run's.
+            inside = os.path.realpath(home).rstrip(os.sep) + os.sep
+            kept = [path for path in found
+                    if not path.is_symlink() and path.is_file() and os.path.realpath(path).startswith(inside)]
+            if not found:
+                problem = "no transcript for session %s under CLAUDE_CONFIG_DIR %s" % (chosen, home)
+            elif not kept:
+                problem = TRANSCRIPT_OUTSIDE % (chosen, home, found[0])
+        except (OSError, ValueError) as exc:
+            problem = "reading the start's transcript failed: " + str(exc)
+    if problem is None:
+        return reported, error
+    return None, problem if error is None else error + "; " + problem
+
+
+def locked_start(launches, request, endpoint, identifier, plan, host, stand_in):
+    known = {"host": host}
     try:
         fields(request, {"endpoint"}, ADD_ROLE_KEYS | {"start_timeout_seconds"})
         timeout = integer(request.get("start_timeout_seconds", DEFAULT_START_TIMEOUT_SECONDS), "start_timeout_seconds",
                           maximum=3600)
         require(endpoint_parts(endpoint)[1] != "root", ROOT_START)
         require(launches.binding(endpoint) is None, "endpoint is already bound; resume it or hand it off")
-        prompt, contracts = start_prompt(launches, endpoint)
-        started = codex_start({"base": str(launches.base), "endpoint": endpoint,
-                               **{key: request[key] for key in CODEX_START_KEYS if key in request}})
-        argv = started["start_argv"] + [prompt]
+        require(not stand_in, STAND_IN_START % endpoint)
+        require(host != NATIVE, NATIVE_START)
+        if plan is not None:
+            # The start's enforcement point (ADR T2(a) "Enforcement points"): qualified before a turn is paid for.
+            entry = hierarchy_roles.role(endpoint, launches.mailbox.endpoint(endpoint).get("kind"))
+            hierarchy_hosts.require_binding(plan, endpoint, host, hierarchy_roles.writer(entry))
+        if host == CLAUDE:
+            home = claude_home()
+        prompt, contracts = start_prompt(launches, endpoint, hierarchy_hosts.family(host))
+        options = {key: request[key] for key in CODEX_START_KEYS if key in request}
+        if host == CLAUDE:
+            # Chosen here so that the start can be checked against it; Codex picks its own.
+            session = str(uuid.uuid4())
+            # Codex-only options go along so that claude_start refuses them by name.
+            started = claude_start({"base": str(launches.base), "endpoint": endpoint, "session": session, **options})
+            argv = started["start_argv"]
+        else:
+            started = codex_start({"base": str(launches.base), "endpoint": endpoint, **options})
+            argv = started["start_argv"] + [prompt]
         folder = launches.make(endpoint, "logs")
+        via = {}
+        if host == CLAUDE:
+            # Kept beside the logs as the exact bytes the start read.
+            prompt_file = folder / (identifier + ".prompt")
+            with open(prompt_file, "xb") as stream:
+                stream.write(prompt.encode("utf-8"))
+            via = {"prompt_via": "stdin", "prompt_file": str(prompt_file)}
     except Interrupted:
         launches.refuse(endpoint, identifier, "start", INTERRUPTED, **known)
     except (ValueError, OSError, TypeError, KeyError) as exc:
         launches.refuse(endpoint, identifier, "start", str(exc), **known)
     logs = {name: str(folder / (identifier + "." + name)) for name in ("stdout", "stderr")}
     deferred = Deferred()
-    session, exit_code, timed_out, error = run_start(argv, started["cwd"], logs, timeout, deferred)
+    if host == CLAUDE:
+        reported, exit_code, timed_out, error = run_start(argv, started["cwd"], logs, timeout, deferred,
+                                                          stdin_path=prompt_file, read_session=claude_session)
+        session, error = confirmed(reported, session, home, error)
+    else:
+        session, exit_code, timed_out, error = run_start(argv, started["cwd"], logs, timeout, deferred)
     # contract keeps its meaning (the role's own file); contracts lists every file the prompt carries.
     details = {"argv": argv, "cwd": started["cwd"], "contract": contracts[-1], "contracts": contracts,
-               "start_timeout_seconds": timeout, "exit_code": exit_code, "timed_out": timed_out}
+               "start_timeout_seconds": timeout, "exit_code": exit_code, "timed_out": timed_out, **via}
     if not (isinstance(session, str) and SESSION.fullmatch(session)):
         error = error or (None if session is None else "the start reported an invalid session")
         record = launches.record(endpoint, identifier, "start", "failed_to_start", **known, **details,
@@ -429,7 +560,7 @@ def locked_start(launches, request, endpoint, identifier):
         # Checked before each attempt, so an interrupt ends the busy wait; an add_role already running finishes.
         if deferred.seen:
             raise Interrupted()
-        return add_role({"base": str(launches.base), "endpoint": endpoint, "host": CODEX, "session": session,
+        return add_role({"base": str(launches.base), "endpoint": endpoint, "host": host, "session": session,
                          **{key: request[key] for key in ADD_ROLE_KEYS if key in request}})
     try:
         bound = patient(bind, BIND_WAIT_SECONDS)
