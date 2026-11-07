@@ -1,15 +1,17 @@
 """Handoff verifies launcher stop evidence before processing any endpoint in a spec."""
 import hashlib
+import importlib.util
 import json
 import os
 import shlex
 import signal
+import subprocess
 import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_handoff import handoff, mailbox_files
-from tests.integration.test_hierarchy_launcher import REVIEW, census, hold, launch, wait_until  # noqa: F401
+from tests.integration.test_hierarchy_handoff import HANDOFF, handoff, mailbox_files
+from tests.integration.test_hierarchy_launcher import Launch, REVIEW, census, hold, launch, wait_until  # noqa: F401
 from tests.integration.test_hierarchy_mailbox import invoke
 
 
@@ -40,9 +42,48 @@ def refused_unchanged(launch, spec, reason, endpoint=REVIEW):
     result = handoff(launch.tmp, spec, 2)
     assert mailbox_files(launch.base) == before
     assert endpoint in result["error"] and reason in result["error"]
-    command = shlex.join(["hierarchy_launcher.py", "--base", str(launch.base), "stop", "--endpoint", endpoint])
-    assert command in result["error"]
+    assert stop_command(launch, endpoint) in result["error"]
     return result
+
+
+def stop_command(launch, endpoint=REVIEW):
+    return shlex.join(["hierarchy_launcher.py", "--base", str(launch.base), "stop", "--endpoint", endpoint])
+
+
+def handoff_module():
+    definition = importlib.util.spec_from_file_location("hierarchy_handoff_under_test", HANDOFF)
+    module = importlib.util.module_from_spec(definition)
+    definition.loader.exec_module(module)
+    return module
+
+
+def run_main(module, launch, spec, capsys, expected):
+    path = launch.tmp / "handoff-spec.json"
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    code = module.main(["--spec", str(path)])
+    captured = capsys.readouterr()
+    assert not captured.err, captured.err
+    assert code == expected, captured.out
+    return json.loads(captured.out)
+
+
+def added_session(launch, generation, session=None):
+    session = session or str(uuid.uuid4())
+    if generation == 2:
+        launch.add_role(REVIEW, host="codex-cli", session=str(uuid.uuid4()), cwd=str(launch.source))
+        result = handoff(launch.tmp, spec_for(launch, session=session), 0)
+        invoke(launch.root, "ack-handoff", result["entries"][0]["acknowledge"])
+    result = launch.add_role(REVIEW, host="codex-cli", session=session, cwd=str(launch.source))
+    assert result["generation"] == generation
+    return session
+
+
+def assert_evidence(entry, status, activity=None):
+    assert entry["stop_evidence"] == {
+        "launch": str(activity) if activity else None,
+        "launch_sha256": hashlib.sha256(activity.read_bytes()).hexdigest() if activity else None,
+        "status": str(status), "status_sha256": hashlib.sha256(status.read_bytes()).hexdigest(),
+        "state": json.loads(status.read_text(encoding="utf-8"))["state"]}
 
 
 def held_session(launch, session):
@@ -99,7 +140,10 @@ def test_a_held_wake_marker_refuses_before_any_entry(launch):  # noqa: F811
     stopped(launch)
     marker = launch.root / ".wake-pilot%2Flane%2Freview.lock"
     marker.write_text("{}", encoding="utf-8")
-    refused_unchanged(launch, spec_for(launch, ("pilot/front-door", REVIEW)), "wake marker")
+    result = refused_unchanged(launch, spec_for(launch, ("pilot/front-door", REVIEW)), "wake marker")
+    assert result["error"] == (
+        "stop evidence for %s: wake marker is held: %s; inspect %s; once %s reports not_running, "
+        "remove the marker and retry" % (REVIEW, marker, marker, stop_command(launch)))
     assert marker.read_text(encoding="utf-8") == "{}"
 
 
@@ -185,13 +229,47 @@ def test_a_later_launch_requires_its_own_stop(launch):  # noqa: F811
     refused_unchanged(launch, spec_for(launch), "stop record")
 
 
-def test_a_failed_census_refuses_with_stop_guidance_and_no_writes(launch, monkeypatch):  # noqa: F811
+def test_a_failed_census_explains_that_stop_cannot_fix_it(launch, monkeypatch):  # noqa: F811
     stopped(launch)
     ps = launch.bin / "ps"
     ps.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     ps.chmod(0o700)
     monkeypatch.setenv("PATH", str(launch.bin) + os.pathsep + os.environ["PATH"])
-    refused_unchanged(launch, spec_for(launch), "process census failed")
+    result = refused_unchanged(launch, spec_for(launch), "process census failed")
+    assert result["error"] == (
+        "stop evidence for %s: process census failed; error: process census failed; "
+        "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
+
+
+def test_a_missing_ps_explains_the_census_error_and_recovery(launch, monkeypatch):  # noqa: F811
+    stopped(launch)
+    monkeypatch.setenv("PATH", str(launch.bin))
+    result = refused_unchanged(launch, spec_for(launch), "process census failed")
+    assert result["error"] == (
+        "stop evidence for %s: process census failed; error: [Errno 2] No such file or directory: 'ps'; "
+        "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
+
+
+def test_a_census_timeout_preserves_the_error_and_changes_nothing(launch, monkeypatch, capsys):  # noqa: F811
+    stopped(launch)
+    spec = spec_for(launch)
+    before = mailbox_files(launch.base)
+    module = handoff_module()
+    run = module.hierarchy_launcher.subprocess.run
+
+    def timeout(argv, **options):
+        if argv[0] == "ps":
+            raise subprocess.TimeoutExpired(argv, 10)
+        return run(argv, **options)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.hierarchy_launcher.subprocess, "run", timeout)
+        result = run_main(module, launch, spec, capsys, 2)
+    assert result["error"] == (
+        "stop evidence for %s: process census failed; error: "
+        "Command '['ps', '-ax', '-ww', '-o', 'pid=,pgid=,stat=,args=']' timed out after 10 seconds; "
+        "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
+    assert mailbox_files(launch.base) == before
 
 
 def test_a_rerun_does_not_treat_the_successor_as_a_writer_to_replace(launch):  # noqa: F811
@@ -201,4 +279,144 @@ def test_a_rerun_does_not_treat_the_successor_as_a_writer_to_replace(launch):  #
     before = mailbox_files(launch.base)
     result = handoff(launch.tmp, spec, 0)
     assert result["entries"][0]["already_bound"] is True
+    assert result["entries"][0]["stop_evidence"] is None
     assert mailbox_files(launch.base) == before
+
+
+@pytest.mark.parametrize("generation", [1, 2])
+def test_an_added_session_with_stop_failed_is_launcher_managed(launch, generation):  # noqa: F811
+    added_session(launch, generation)
+    launch.run("stop", "--endpoint", REVIEW)
+    change_record(record_paths(launch)[-1], state="stop_failed")
+    refused_unchanged(launch, spec_for(launch), "stop_failed")
+
+
+def test_a_generation_two_resume_after_a_stop_requires_another_stop(launch):  # noqa: F811
+    added_session(launch, 2)
+    launch.run("stop", "--endpoint", REVIEW)
+    assert launch.run("resume", "--endpoint", REVIEW)["state"] == "resumed"
+    refused_unchanged(launch, spec_for(launch), "resumed")
+
+
+def test_a_generation_two_stop_after_a_resume_records_launcher_evidence(launch):  # noqa: F811
+    session = added_session(launch, 2)
+    launch.run("stop", "--endpoint", REVIEW)
+    change_record(record_paths(launch)[-1], state="stop_failed")
+    launch.run("resume", "--endpoint", REVIEW)
+    activity = record_paths(launch)[-1]
+    process = held_session(launch, session)
+    try:
+        assert launch.run("stop", "--endpoint", REVIEW)["state"] == "stopped"
+        process.wait(timeout=5)
+    finally:
+        finish(process)
+    status = record_paths(launch)[-1]
+    result = handoff(launch.tmp, spec_for(launch), 0)
+    assert result["entries"][0]["generation"] == 3
+    assert_evidence(result["entries"][0], status, activity)
+
+
+def test_a_stop_only_history_records_evidence_without_inventing_a_launch(launch):  # noqa: F811
+    session = added_session(launch, 2)
+    launch.run("stop", "--endpoint", REVIEW)
+    change_record(record_paths(launch)[-1], state="stop_failed")
+    process = held_session(launch, session)
+    try:
+        assert launch.run("stop", "--endpoint", REVIEW)["state"] == "stopped"
+        process.wait(timeout=5)
+    finally:
+        finish(process)
+    status = record_paths(launch)[-1]
+    result = handoff(launch.tmp, spec_for(launch), 0)
+    assert result["entries"][0]["generation"] == 3
+    assert_evidence(result["entries"][0], status)
+
+
+@pytest.mark.parametrize("generation", [1, 2])
+@pytest.mark.parametrize("state", ["bind_busy", "bind_refused", "start_incomplete"])
+def test_a_generationless_record_only_manages_generation_one(launch, generation, state):  # noqa: F811
+    session = str(uuid.uuid4())
+    result = launch.start(expect=3, mode="fail-after-thread", thread=session, cwd=str(launch.source))
+    assert result["state"] == "start_incomplete" and result["generation"] is None
+    [activity] = record_paths(launch)
+    change_record(activity, state=state)
+    added_session(launch, generation, session)
+    if generation == 1:
+        refused_unchanged(launch, spec_for(launch), "stop record")
+        launch.run("stop", "--endpoint", REVIEW)
+        result = handoff(launch.tmp, spec_for(launch), 0)
+        assert_evidence(result["entries"][0], record_paths(launch)[-1], activity)
+    else:
+        result = handoff(launch.tmp, spec_for(launch), 0)
+        assert result["entries"][0]["stop_evidence"] == "caller_asserted"
+
+
+@pytest.mark.parametrize("endpoint,host", [("pilot/root", "codex-cli"), (REVIEW, "codex")])
+def test_a_refused_stop_alone_does_not_manage_an_owner_or_native_session(launch, endpoint, host):  # noqa: F811
+    launch.add_role(endpoint, host=host, session=str(uuid.uuid4()), cwd=str(launch.source))
+    assert launch.run("stop", "--endpoint", endpoint, expect=2)["state"] == "refused"
+    result = handoff(launch.tmp, spec_for(launch, (endpoint,)), 0)
+    assert result["entries"][0]["stop_evidence"] == "caller_asserted"
+
+
+def test_a_refused_resume_does_not_invalidate_a_valid_stop(launch):  # noqa: F811
+    stopped(launch)
+    activity, status = record_paths(launch)
+    refused = launch.run("resume", "--endpoint", REVIEW)
+    assert refused["state"] == "resumed"
+    change_record(record_paths(launch)[-1], state="refused")
+    result = handoff(launch.tmp, spec_for(launch), 0)
+    assert_evidence(result["entries"][0], status, activity)
+
+
+def test_a_stop_must_be_recorded_after_the_latest_resume(launch):  # noqa: F811
+    added_session(launch, 2)
+    launch.run("resume", "--endpoint", REVIEW)
+    activity = json.loads(record_paths(launch)[-1].read_text(encoding="utf-8"))
+    launch.run("stop", "--endpoint", REVIEW)
+    change_record(record_paths(launch)[-1], at=activity["at"])
+    refused_unchanged(launch, spec_for(launch), "after")
+
+
+def test_a_wake_after_preflight_refuses_only_its_entry_and_a_rerun_finishes(launch, monkeypatch, capsys):  # noqa: F811
+    stopped(launch)
+    other_tmp = launch.tmp / "second"
+    other_tmp.mkdir()
+    other = Launch(other_tmp)
+    other.init()
+    stopped(other)
+    spec = spec_for(launch)
+    spec["entries"] += spec_for(other)["entries"]
+    bindings_before = mailbox_files(other.root / "bindings")
+    marker = other.root / ".wake-pilot%2Flane%2Freview.lock"
+    module = handoff_module()
+    check = module.stop_evidence
+    injected = []
+
+    def wake_at_recheck(mailbox, current):
+        if mailbox.root == other.root and (mailbox.root / ".write.lock").exists():
+            assert not injected
+            marker.write_text("{}", encoding="utf-8")
+            injected.append(True)
+        return check(mailbox, current)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "stop_evidence", wake_at_recheck)
+        result = run_main(module, launch, spec, capsys, 3)
+    assert injected == [True]
+    first, second = result["entries"]
+    assert first["ok"] is True and first["generation"] == 2
+    assert second["ok"] is False
+    assert second["error"].startswith("stop evidence changed during handoff: stop evidence for %s: " % REVIEW)
+    assert "wake marker is held: " + str(marker) in second["error"]
+    assert mailbox_files(other.root / "bindings") == bindings_before
+    assert other.binding()["generation"] == 1
+    first_bindings = mailbox_files(launch.root / "bindings")
+    assert other.run("stop", "--endpoint", REVIEW)["state"] == "not_running"
+    marker.unlink()
+    result = handoff(launch.tmp, spec, 0)
+    first, second = result["entries"]
+    assert first["already_bound"] is True and first["stop_evidence"] is None
+    assert second["ok"] is True and second["generation"] == 2
+    assert mailbox_files(launch.root / "bindings") == first_bindings
+    assert other.binding()["session"] == spec["session"]
