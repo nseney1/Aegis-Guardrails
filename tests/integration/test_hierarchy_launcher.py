@@ -20,6 +20,7 @@ import uuid
 
 import pytest
 
+from tests.integration.hierarchy_fake_wrapper import shell_exec
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration.test_hierarchy_provision import Setup, provision
 
@@ -40,7 +41,7 @@ class Launch(Setup):
         self.bin = tmp_path / "fake-bin"
         self.bin.mkdir()
         codex = self.bin / "codex"
-        codex.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE_CODEX), encoding="utf-8")
+        codex.write_text('#!/bin/bash\n%s "$@"\n' % shell_exec("codex", FAKE_CODEX), encoding="utf-8")
         codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
         self.codex_log = tmp_path / "fake-codex.log"
         self.host_log = tmp_path / "fake-host.log"
@@ -683,7 +684,8 @@ def test_stop_refuses_root_and_a_native_thread_and_signals_nothing(launch):
 
 def hold(launch, session, script, *words, **popen):
     """A process naming the session, kept running the way a hung codex turn is."""
-    return subprocess.Popen(["sh", "-c", script, *words], env=launch.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session,
+    return subprocess.Popen(["codex", "-c", script, *words], executable="sh",
+                            env=launch.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session,
                             HELD_SESSION=session), stdout=subprocess.DEVNULL, **popen)
 
 

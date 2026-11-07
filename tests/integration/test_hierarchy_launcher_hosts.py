@@ -106,7 +106,8 @@ class Hosts(Launch):
         """Put a shell wrapper around the fake on the sealed PATH; the PATH guard still finds the fake in it."""
         path = self.bin / "claude"
         path.unlink()
-        path.write_text("#!/bin/sh\n" + body % {"python": shlex.quote(sys.executable), "fake": shlex.quote(str(fake.HERE))}
+        path.write_text("#!/bin/bash\n" + body % {"python": shlex.quote(sys.executable),
+                                                  "host": fake.shell_exec("claude", fake.HERE)}
                         + "\n", encoding="utf-8")
         path.chmod(0o700)
         fake.require_fake(str(self.bin))
@@ -352,7 +353,7 @@ def test_a_native_host_is_refused_at_start(hosts, monkeypatch, capsys):
 
 def test_an_init_event_that_reports_another_session_is_a_failed_start(claude_team):
     # sed by its absolute path: the sealed PATH holds no sed.
-    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\" | %s 's/\"session_id\": \"[^\"]*\"/\"session_id\": \"%s\"/g'"
+    claude_team.wrap_claude("(%%(host)s \"$@\") | %s 's/\"session_id\": \"[^\"]*\"/\"session_id\": \"%s\"/g'"
                             % (shlex.quote(shutil.which("sed")), OTHER_SESSION))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     assert answer["state"] == "failed_to_start" and answer["session"] is None
@@ -366,7 +367,7 @@ def test_a_start_whose_transcript_is_not_under_the_runs_claude_home_is_a_failed_
     elsewhere = tmp_path / "other-claude-home"
     elsewhere.mkdir(mode=0o700)
     claude_team.login(elsewhere)
-    claude_team.wrap_claude("CLAUDE_CONFIG_DIR=%s exec %%(python)s %%(fake)s \"$@\"" % shlex.quote(str(elsewhere)))
+    claude_team.wrap_claude("CLAUDE_CONFIG_DIR=%s %%(host)s \"$@\"" % shlex.quote(str(elsewhere)))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     session = chosen(answer)
     assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
@@ -383,7 +384,7 @@ def test_a_transcript_that_is_a_symlink_or_resolves_outside_the_home_does_not_co
     outside, relink = tmp_path / "outside", tmp_path / "relink.py"
     outside.mkdir()
     relink.write_text(RELINK, encoding="utf-8")
-    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\"\ncode=$?\n%%(python)s -I %s \"$CLAUDE_CONFIG_DIR\" %s %s\n"
+    claude_team.wrap_claude("(%%(host)s \"$@\")\ncode=$?\n%%(python)s -I %s \"$CLAUDE_CONFIG_DIR\" %s %s\n"
                             "exit $code" % (shlex.quote(str(relink)), shlex.quote(str(outside)), what))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     session = chosen(answer)
@@ -401,7 +402,7 @@ def test_a_transcript_that_is_a_symlink_or_resolves_outside_the_home_does_not_co
 
 def test_a_start_whose_output_has_no_init_event_is_a_failed_start(claude_team):
     # grep by its absolute path: the sealed PATH holds no grep.
-    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\" | %s -v '\"subtype\": \"init\"'"
+    claude_team.wrap_claude("(%%(host)s \"$@\") | %s -v '\"subtype\": \"init\"'"
                             % shlex.quote(shutil.which("grep")))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0

@@ -41,6 +41,11 @@ import sys
 import time
 import uuid
 
+if __package__:
+    from .hierarchy_fake_wrapper import python_argv
+else:
+    from hierarchy_fake_wrapper import python_argv
+
 HOST = Path(__file__).resolve().with_name("hierarchy_fake_host.py")
 EROFS = "OSError: [Errno 30] Read-only file system: '%s'\n"
 HELPER = "native-probe-attempt.py"
@@ -55,7 +60,7 @@ def main():
     if os.environ.get("FAKE_CODEX_ROLLOUT"):
         sys.exit(rollout_main(argv))
     if "resume" in argv:
-        os.execv(sys.executable, [sys.executable, str(HOST), *argv])
+        os.execv(sys.executable, [*python_argv("codex", HOST), *argv])
     log_call(argv)
     mode = os.environ.get("FAKE_CODEX_MODE", "")
     if mode == "no-thread":

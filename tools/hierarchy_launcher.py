@@ -9,7 +9,7 @@ session in its first `thread.started` event. A claude-code start runs under a se
 the prompt on stdin, and is bound only once its stream-json init event reports that session and its transcript is
 under CLAUDE_CONFIG_DIR. A stand-in runs no host, and a native thread belongs to its app: neither is started.
 `resume` runs the pinned wake tool with the bound wake profile, unchanged. `stop` signals the process groups of
-the processes that name the bound session, so it cannot stop a session on another host. `status` reads the
+the bound host's programs that name the bound session. `status` reads the
 records back.
 ROOT is the owner's session and a native thread belongs to its app: the launcher starts and stops neither.
 
@@ -628,10 +628,11 @@ def ancestors():
     return mine
 
 
-def session_processes(session, excluded):
-    """(pid, pgid) of every live process that names the session as a whole argument, as the wake tool's check does."""
+def session_processes(session, excluded, host=CODEX):
+    """(pid, pgid) of live host programs naming the session as a whole argument."""
     census = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,pgid=,stat=,args="], capture_output=True, text=True, timeout=10)
     require(census.returncode == 0, "process census failed")
+    program = {CLAUDE: "claude", CODEX: "codex"}.get(host)
     found = []
     for line in census.stdout.splitlines():
         words = line.split()
@@ -639,7 +640,17 @@ def session_processes(session, excluded):
             continue
         pid, pgid = int(words[0]), int(words[1])
         # A zombie has already ended; it only waits for its parent to collect it.
-        if pid not in excluded and not words[2].startswith("Z") and session in words[3:]:
+        if pid in excluded or words[2].startswith("Z") or session not in words[3:]:
+            continue
+        argv = words[3:]
+        if Path(argv[0]).name == "env":
+            argv = argv[1:]
+            while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+                argv = argv[1:]
+        if argv and Path(argv[0]).name == "node":
+            argv = argv[1:]
+        # A diagnostic command naming the session must never be signalled.
+        if argv and Path(argv[0]).name == program:
             found.append((pid, pgid))
     return found
 
@@ -659,10 +670,10 @@ def signal_all(found, number):
             continue
 
 
-def gone_within(session, excluded, pids, seconds):
+def gone_within(session, excluded, pids, seconds, host):
     deadline = time.monotonic() + seconds
     while True:
-        left = {pid for pid, _ in session_processes(session, excluded)} & pids
+        left = {pid for pid, _ in session_processes(session, excluded, host)} & pids
         if not left or time.monotonic() >= deadline:
             return not left
         time.sleep(POLL_SECONDS)
@@ -689,16 +700,16 @@ def stop(launches, endpoint, grace):
     signalled = False
     try:
         excluded = ancestors()
-        found = session_processes(known["session"], excluded)
+        found = session_processes(known["session"], excluded, known["host"])
         marker = {"wake_marker_present": launches.mailbox.wake_marker(endpoint).exists(), "grace_seconds": grace}
         pids, stopped = {pid for pid, _ in found}, True
         if found:
             signalled = True
             signal_all(found, signal.SIGTERM)
-            stopped = gone_within(known["session"], excluded, pids, grace)
+            stopped = gone_within(known["session"], excluded, pids, grace, known["host"])
             if not stopped:
-                signal_all(session_processes(known["session"], excluded), signal.SIGKILL)
-                stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS)
+                signal_all(session_processes(known["session"], excluded, known["host"]), signal.SIGKILL)
+                stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS, known["host"])
             # The marker belongs to the wake that made it; whoever inspects it decides whether that turn has ended.
             marker["wake_marker_present"] = launches.mailbox.wake_marker(endpoint).exists()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
