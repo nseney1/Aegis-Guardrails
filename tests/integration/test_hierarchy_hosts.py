@@ -381,3 +381,268 @@ def test_transcripts_refuse_a_symlinked_home_component(tmp_path):
     home.mkdir()
     _symlink_or_skip(home / "projects", outside)
     assert hierarchy_hosts.transcripts("claude-code", home, SESSION) == []
+
+
+# -- the run's host plan and session records (T2(a) PR3) ----------------------------------------------------------------
+
+DIGEST = "ab" * 32
+CLAUDE_SCOPE = {"boundary": "permission rules, not OS-enforced", "mechanism": "claude --restricted",
+                "os_enforced": False, "owner_decision": "teams 2026-11-07 decision 4",
+                "ends_when": "T2(b) qualifies an OS-enforced Claude write scope"}
+CODEX_SCOPE = {"boundary": "OS sandbox, qualification pending T2(b)", "mechanism": "codex sandbox writable_roots",
+               "os_enforced": None}
+STAND_IN = {"boundary": "stand-in: runs no host"}
+
+
+def plan(**change):
+    found = hierarchy_hosts.plan_record("m1", "codex-cli", "claude-code", {"m1/front-door": "claude-code"}, DIGEST)
+    found.update(change)
+    return found
+
+
+def test_plan_constants_name_the_team_hosts_and_record_schemas():
+    assert hierarchy_hosts.TEAM_HOSTS == ("claude-code", "codex-cli")
+    assert hierarchy_hosts.PLAN_SCHEMA == "aegis.hierarchy-host-plan/v1"
+    assert hierarchy_hosts.PLAN_FILE == "host-plan.json"
+    assert hierarchy_hosts.SESSION_SCHEMA == "aegis.team-session/v1"
+    assert hierarchy_hosts.STAND_IN_SCOPE == STAND_IN
+
+
+def test_plan_record_is_the_validated_adr_shape():
+    stand_ins = {"m1/front-door": "claude-code"}
+    record = hierarchy_hosts.plan_record("m1", "codex-cli", "claude-code", stand_ins, DIGEST)
+    assert record == {"schema": "aegis.hierarchy-host-plan/v1", "hierarchy": "m1", "root": "codex-cli",
+                      "team": "claude-code", "stand_ins": {"m1/front-door": "claude-code"}, "config_sha256": DIGEST}
+    stand_ins["m1/orchestrator"] = "codex-cli"
+    assert record["stand_ins"] == {"m1/front-door": "claude-code"}, "the record keeps its own copy"
+    assert hierarchy_hosts.validate_plan(json.loads(json.dumps(record))) == record
+    assert hierarchy_hosts.plan_record("m1", "claude-code", "codex-cli", {}, DIGEST)["stand_ins"] == {}
+
+
+@pytest.mark.parametrize("value,error", [
+    ([], "host plan must be a JSON object"),
+    ({k: v for k, v in plan().items() if k != "config_sha256"}, "host plan is missing config_sha256"),
+    (plan(extra=1), "host plan has unexpected fields: extra"),
+    (plan(schema="aegis.hierarchy-host-plan/v2"), "unsupported host plan schema: 'aegis.hierarchy-host-plan/v2'"),
+    (plan(hierarchy="Bad Id"), "host plan hierarchy is not a hierarchy id: 'Bad Id'"),
+    (plan(hierarchy="across"), "host plan hierarchy is not a hierarchy id: 'across'"),
+    (plan(hierarchy=7), "host plan hierarchy is not a hierarchy id: 7"),
+    (plan(root="codex"), "host plan root must be claude-code or codex-cli, not 'codex'"),
+    (plan(team="codex"), "host plan team must be claude-code or codex-cli, not 'codex'"),
+    (plan(team="gemini"), "host plan team must be claude-code or codex-cli, not 'gemini'"),
+    (plan(team=None), "host plan team must be claude-code or codex-cli, not None"),
+    (plan(stand_ins=["m1/front-door"]), "host plan stand_ins must be a JSON object"),
+    (plan(stand_ins={"other/front-door": "claude-code"}), "host plan stand-in other/front-door is not an endpoint of m1"),
+    (plan(stand_ins={"m1/nowhere": "claude-code"}), "host plan stand-in m1/nowhere is not an endpoint of m1"),
+    (plan(stand_ins={"m1/root": "codex-cli"}), "only the front door may be a stand-in, not m1/root"),
+    (plan(stand_ins={"m1/orchestrator": "claude-code"}), "only the front door may be a stand-in, not m1/orchestrator"),
+    (plan(stand_ins={"m1/lane/f2": "claude-code"}), "only the front door may be a stand-in, not m1/lane/f2"),
+    (plan(stand_ins={"m1/front-door": "gemini"}), "host plan stand-in m1/front-door has unknown host kind 'gemini'"),
+    (plan(config_sha256="AB" * 32), "host plan config_sha256 must be 64 lowercase hex characters"),
+    (plan(config_sha256="ab" * 31), "host plan config_sha256 must be 64 lowercase hex characters"),
+    (plan(config_sha256=None), "host plan config_sha256 must be 64 lowercase hex characters"),
+])
+def test_validate_plan_refuses_each_malformed_field(value, error):
+    assert refusal(hierarchy_hosts.validate_plan, value) == error
+
+
+def test_plan_record_refuses_a_native_team_host():
+    assert refusal(hierarchy_hosts.plan_record, "m1", "codex-cli", "codex", {}, DIGEST) == (
+        "host plan team must be claude-code or codex-cli, not 'codex'")
+
+
+def test_a_stand_in_may_name_any_host_kind_because_it_never_runs():
+    assert hierarchy_hosts.validate_plan(plan(stand_ins={"m1/front-door": "codex"}))["stand_ins"] == {
+        "m1/front-door": "codex"}
+
+
+def test_read_plan_is_none_without_a_file_and_the_validated_plan_with_one(tmp_path):
+    assert hierarchy_hosts.read_plan(tmp_path) is None
+    assert hierarchy_hosts.read_plan(tmp_path / "missing-base") is None
+    (tmp_path / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.read_plan(tmp_path) == plan()
+
+
+def test_read_plan_refuses_malformed_and_invalid_plans(tmp_path):
+    path = tmp_path / "host-plan.json"
+    path.write_text("{", encoding="utf-8")
+    assert refusal(hierarchy_hosts.read_plan, tmp_path).startswith("invalid host plan %s: " % path)
+    path.write_text(json.dumps(plan(team="codex")), encoding="utf-8")
+    assert refusal(hierarchy_hosts.read_plan, tmp_path) == "host plan team must be claude-code or codex-cli, not 'codex'"
+    path.unlink()
+    path.mkdir()
+    assert refusal(hierarchy_hosts.read_plan, tmp_path) == (
+        "invalid host plan %s: input must be a regular file" % path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize("dangling", [False, True])
+def test_read_plan_refuses_a_symlink(tmp_path, dangling):
+    real = tmp_path / "real.json"
+    if not dangling:
+        real.write_text(json.dumps(plan()), encoding="utf-8")
+    (tmp_path / "host-plan.json").symlink_to(real)
+    assert refusal(hierarchy_hosts.read_plan, tmp_path) == (
+        "host plan must not be a symlink: %s" % (tmp_path / "host-plan.json"))
+
+
+def test_plan_host_maps_root_team_and_stand_ins_and_leaves_other_hierarchies_alone():
+    found = plan()
+    assert hierarchy_hosts.plan_host(None, "m1/lane/f2") == (None, False)
+    assert hierarchy_hosts.plan_host(found, "other/lane/f2") == (None, False)
+    assert hierarchy_hosts.plan_host(found, "m1/root") == ("codex-cli", False)
+    assert hierarchy_hosts.plan_host(found, "m1/front-door") == ("claude-code", True)
+    for endpoint in ("m1/orchestrator", "m1/router", "m1/decider", "m1/lane/f2", "m1/lane/review"):
+        assert hierarchy_hosts.plan_host(found, endpoint) == ("claude-code", False)
+    assert refusal(hierarchy_hosts.plan_host, found, "m1") == "invalid endpoint"
+
+
+def test_require_binding_is_unconstrained_only_without_a_plan():
+    assert hierarchy_hosts.require_binding(None, "m1/lane/f2", "codex", True) is None
+    assert refusal(hierarchy_hosts.require_binding, plan(), "other/lane/f2", "codex-cli", True) == (
+        "other/lane/f2 is not an endpoint of host plan hierarchy m1")
+
+
+def test_base_plan_refuses_a_plan_written_for_another_hierarchy(tmp_path):
+    assert hierarchy_hosts.base_plan(tmp_path, "m1") is None
+    (tmp_path / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.base_plan(tmp_path, "m1") == plan()
+    assert refusal(hierarchy_hosts.base_plan, tmp_path, "pilot") == (
+        "host plan is for hierarchy m1, but this base serves pilot")
+
+
+@pytest.mark.parametrize("endpoint,host,expected", [
+    ("m1/lane/f2", "codex-cli", "claude-code"),
+    ("m1/lane/f2", "codex", "claude-code"),
+    ("m1/orchestrator", "host-two", "claude-code"),
+    ("m1/root", "claude-code", "codex-cli"),
+    ("m1/front-door", "codex-cli", "claude-code"),
+])
+def test_require_binding_refuses_a_host_the_plan_does_not_assign(endpoint, host, expected):
+    assert refusal(hierarchy_hosts.require_binding, plan(), endpoint, host, False) == (
+        "%s runs on %s in this run's host plan, not %s" % (endpoint, expected, host))
+
+
+def test_require_binding_returns_the_qualified_write_scope():
+    claude_team, codex_team = plan(), plan(team="codex-cli", root="claude-code")
+    assert hierarchy_hosts.require_binding(claude_team, "m1/lane/f2", "claude-code", True) == CLAUDE_SCOPE
+    assert hierarchy_hosts.require_binding(claude_team, "m1/lane/review", "claude-code", False) == {
+        "boundary": "no write tools"}
+    assert hierarchy_hosts.require_binding(claude_team, "m1/root", "codex-cli", False) == {"boundary": "no write tools"}
+    assert hierarchy_hosts.require_binding(codex_team, "m1/lane/f2", "codex-cli", True) == CODEX_SCOPE
+    assert hierarchy_hosts.require_binding(codex_team, "m1/root", "claude-code", False) == {"boundary": "no write tools"}
+    assert refusal(hierarchy_hosts.require_binding, codex_team, "m1/lane/f2", "codex-cli", 1) == "writer must be a bool"
+
+
+def test_a_stand_in_gets_the_stand_in_scope_without_qualification():
+    native = plan(stand_ins={"m1/front-door": "codex"})
+    scope = hierarchy_hosts.require_binding(native, "m1/front-door", "codex", False)
+    assert scope == STAND_IN
+    scope["boundary"] = "changed"
+    assert hierarchy_hosts.STAND_IN_SCOPE == STAND_IN, "callers get a copy"
+    assert hierarchy_hosts.require_binding(plan(), "m1/front-door", "claude-code", False) == STAND_IN
+
+
+def test_a_stand_in_whose_role_writes_source_is_refused_even_past_validation():
+    # validate_plan admits only the front door; this plan skips it, as a hand-edited file read elsewhere might.
+    unchecked = dict(plan(), stand_ins={"m1/lane/f2": "claude-code"})
+    assert refusal(hierarchy_hosts.require_binding, unchecked, "m1/lane/f2", "claude-code", True) == (
+        "m1/lane/f2 cannot be a stand-in: its role writes source")
+
+
+def test_governing_plan_reads_the_request_base_and_the_mailboxs_own_base(tmp_path):
+    own, copy = tmp_path / "own", tmp_path / "copy"
+    (own / "mailbox").mkdir(parents=True)
+    copy.mkdir()
+    mailbox = own / "mailbox"
+    assert hierarchy_hosts.governing_plan(own, mailbox, "m1") is None
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") is None
+    (own / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.governing_plan(own, mailbox, "m1") == plan()
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") == plan(), "a copied provision.json still answers to it"
+    (copy / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") == plan()
+    (copy / "host-plan.json").write_text(json.dumps(plan(team="codex-cli")), encoding="utf-8")
+    assert refusal(hierarchy_hosts.governing_plan, copy, mailbox, "m1") == (
+        "host plans in %s and %s differ" % (copy, own))
+    (own / "host-plan.json").unlink()
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") == plan(team="codex-cli")
+    assert refusal(hierarchy_hosts.governing_plan, copy, mailbox, "pilot") == (
+        "host plan is for hierarchy m1, but this base serves pilot")
+
+
+def record_arguments(**change):
+    found = {"endpoint": "m1/lane/f2", "role_kind": "implementer", "host_kind": "claude-code", "start_mode": "print",
+             "session": SESSION, "generation": 1, "stand_in": False, "write_scope": CLAUDE_SCOPE}
+    found.update(change)
+    return found
+
+
+def test_session_record_is_the_adr_shape():
+    assert hierarchy_hosts.session_record(**record_arguments()) == {
+        "schema": "aegis.team-session/v1", "endpoint": "m1/lane/f2", "role_kind": "implementer",
+        "host_kind": "claude-code", "start_mode": "print", "session": SESSION, "generation": 1, "stand_in": False,
+        "write_scope": CLAUDE_SCOPE}
+    for mode in ("background", "exec", None):
+        assert hierarchy_hosts.session_record(**record_arguments(start_mode=mode))["start_mode"] == mode
+    roots = dict(CLAUDE_SCOPE, roots=["/work/lane"])
+    assert hierarchy_hosts.session_record(**record_arguments(write_scope=roots))["write_scope"] == roots
+    stand_in = hierarchy_hosts.session_record(**record_arguments(
+        endpoint="m1/front-door", role_kind="front-door", start_mode=None, stand_in=True, write_scope=STAND_IN))
+    assert (stand_in["stand_in"], stand_in["write_scope"]) == (True, STAND_IN)
+
+
+@pytest.mark.parametrize("change,error", [
+    ({"endpoint": "m1"}, "invalid endpoint"),
+    ({"endpoint": None}, "invalid endpoint"),
+    ({"role_kind": ""}, "invalid role_kind"),
+    ({"role_kind": 7}, "invalid role_kind"),
+    ({"host_kind": "claude"}, "unsupported host kind: 'claude'"),
+    ({"start_mode": "bg"}, "invalid start_mode"),
+    ({"start_mode": ["print"]}, "invalid start_mode"),
+    ({"session": ""}, "invalid session"),
+    ({"session": "s" * 257}, "invalid session"),
+    ({"generation": 0}, "invalid generation"),
+    ({"generation": True}, "invalid generation"),
+    ({"generation": "1"}, "invalid generation"),
+    ({"stand_in": 0}, "invalid stand_in"),
+    ({"write_scope": None}, "invalid write_scope"),
+    ({"write_scope": {"mechanism": "x"}}, "invalid write_scope"),
+    ({"write_scope": dict(CLAUDE_SCOPE, roots="/work")}, "invalid write_scope"),
+    ({"write_scope": dict(CLAUDE_SCOPE, roots=["/work", ""])}, "invalid write_scope"),
+    ({"write_scope": dict(CLAUDE_SCOPE, roots=[7])}, "invalid write_scope"),
+])
+def test_session_record_refuses_each_malformed_field(change, error):
+    with pytest.raises(ValueError) as caught:
+        hierarchy_hosts.session_record(**record_arguments(**change))
+    assert str(caught.value) == error
+
+
+def test_session_record_path_quotes_the_endpoint_per_generation(tmp_path):
+    assert hierarchy_hosts.session_record_path(tmp_path, "m1/lane/f2", 2) == tmp_path / "sessions" / "m1%2Flane%2Ff2-g2.json"
+    assert hierarchy_hosts.session_record_path(str(tmp_path), "m1/root", 1) == tmp_path / "sessions" / "m1%2Froot-g1.json"
+    assert refusal(hierarchy_hosts.session_record_path, tmp_path, "m1/lane/f2", 0) == "invalid generation"
+    assert refusal(hierarchy_hosts.session_record_path, tmp_path, "m1/../x", 1) == "invalid endpoint role"
+
+
+def test_team_start_mode_follows_the_registry_and_a_stand_in_has_none():
+    assert hierarchy_hosts.team_start_mode("claude-code", False) == "print"
+    assert hierarchy_hosts.team_start_mode("claude-code", False, True) == "background"
+    assert hierarchy_hosts.team_start_mode("codex-cli", False) == "exec"
+    assert hierarchy_hosts.team_start_mode("codex", False) is None
+    for kind in hierarchy_hosts.HOST_KINDS:
+        assert hierarchy_hosts.team_start_mode(kind, True) is None
+    assert refusal(hierarchy_hosts.team_start_mode, "codex-cli", False, True) == "background is only for claude-code roles"
+    assert refusal(hierarchy_hosts.team_start_mode, "gemini", False) == "unsupported host kind: 'gemini'"
+
+
+def test_session_recorded_compares_an_existing_record_and_refuses_a_different_one(tmp_path):
+    record = hierarchy_hosts.session_record(**record_arguments(generation=3))
+    path = hierarchy_hosts.session_record_path(tmp_path, "m1/lane/f2", 3)
+    assert hierarchy_hosts.session_recorded(path, record) is False
+    path.parent.mkdir()
+    path.write_text(json.dumps(record), encoding="utf-8")
+    assert hierarchy_hosts.session_recorded(path, record) is True
+    path.write_text(json.dumps({**record, "start_mode": "background"}), encoding="utf-8")
+    assert refusal(hierarchy_hosts.session_recorded, path, record) == (
+        "session record for m1/lane/f2 generation 3 differs from this binding")

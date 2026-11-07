@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -67,6 +68,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
                                timestamp, writer_lock)
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
+import hierarchy_hosts  # noqa: E402
 import hierarchy_roles  # noqa: E402
 import hierarchy_runtime_source  # noqa: E402
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
@@ -114,6 +116,9 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
 TEAM_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 ULTRACODE_SETTINGS = json.dumps({"ultracode": True})
 TEAM_KINDS = hierarchy_roles.team_kinds()
+# ADR T2(a) §4: a team run's Claude roles run in print mode with no sub-agents, and the worktree as their only
+# writable folder.
+TEAM_CLAUDE_REFUSED = ("background", "assistants", "add_dirs")
 
 
 def git(cwd, *arguments):
@@ -548,6 +553,48 @@ def check_role_request(request, setup):
     return cwd, timeout, assistants
 
 
+def write_roots(cwd, request):
+    """The folders a writer's host is told it may write, as real paths, once each and in order.
+
+    A team run's Claude role takes no writable_roots, add_dirs or tmpdir (check_codex_options, TEAM_CLAUDE_REFUSED), so
+    for it this is the cwd alone.
+    """
+    roots = []
+    for folder in [cwd, *request.get("writable_roots", []), *request.get("add_dirs", []),
+                   *([request["tmpdir"]] if "tmpdir" in request else [])]:
+        real = str(Path(folder).resolve())
+        if real not in roots:
+            roots.append(real)
+    return roots
+
+
+def check_host_plan(plan, request, mailbox, endpoint, cwd):
+    """(write scope, stand-in) under the run's host plan, before binding, so a refusal leaves the endpoint unbound."""
+    host = request["host"]
+    writer = hierarchy_roles.writer(registry_role(mailbox, endpoint))
+    scope = hierarchy_hosts.require_binding(plan, endpoint, host, writer)
+    stand_in = hierarchy_hosts.plan_host(plan, endpoint)[1]
+    if host == CLAUDE and not stand_in:
+        for key in TEAM_CLAUDE_REFUSED:
+            require(not request.get(key), "%s: a claude-code role in a team run takes no %s" % (endpoint, key))
+    if writer and not stand_in:
+        scope["roots"] = write_roots(cwd, request)
+    return scope, stand_in
+
+
+def planned(folder):
+    path = folder / hierarchy_hosts.PLAN_FILE
+    return path.exists() or path.is_symlink()
+
+
+def session_folder(base):
+    """<base>/sessions, made before anything binds: a record that cannot be written must not leave a bound endpoint."""
+    folder = base / "sessions"
+    if not folder.exists() and not folder.is_symlink():
+        folder.mkdir(mode=0o700)
+    require(folder.is_dir() and not folder.is_symlink(), "session records need a real folder: " + str(folder))
+
+
 def add_role(request):
     base = safe_path(text(request.get("base"), "base"))
     setup = read_json(base / "provision.json")
@@ -557,6 +604,8 @@ def add_role(request):
     mailbox.endpoint(endpoint)
     cwd, timeout, assistants = check_role_request(request, setup)
     host = request["host"]
+    plan = hierarchy_hosts.governing_plan(base, setup["mailbox_root"], setup["initiative"])
+    scope, stand_in = check_host_plan(plan, request, mailbox, endpoint, cwd) if plan is not None else (None, False)
     team = None
     fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
@@ -573,9 +622,33 @@ def add_role(request):
         if history:
             require(history[-1]["session"] == session and history[-1]["host"] == host,
                     "endpoint is bound to another session; hand it off first")
-            binding = history[-1]
-        else:
-            binding = mailbox.bind({"endpoint": endpoint, "host": host, "session": session, "expected_generation": 0})
+        staged = None
+        if scope is not None:
+            # A new binding is generation 1 (expected_generation 0). Everything is checked and the record staged before
+            # binding, so a sessions folder that is not real or not writable, or a conflicting record, leaves a new
+            # endpoint unbound. A handed-off successor is recorded here too, by the add-role that builds its connection
+            # and profile. Beside the mailbox, whichever base names it, so each generation has one record.
+            home = root.parent
+            session_folder(home)
+            record = hierarchy_hosts.session_record(
+                endpoint, hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")), host,
+                hierarchy_hosts.team_start_mode(host, stand_in, request.get("background", False)), session,
+                history[-1]["generation"] if history else 1, stand_in, scope)
+            record_path = hierarchy_hosts.session_record_path(home, endpoint, record["generation"])
+            if not hierarchy_hosts.session_recorded(record_path, record):
+                staged = record_path.with_name(".staged-%s-%s" % (uuid.uuid4().hex, record_path.name))
+                publish_file(staged, encoded(record) + b"\n")
+        try:
+            if history:
+                binding = history[-1]
+            else:
+                binding = mailbox.bind({"endpoint": endpoint, "host": host, "session": session, "expected_generation": 0})
+            if staged is not None:
+                # A hard link publishes the whole record under its final name, and never over another one.
+                os.link(staged, record_path)
+        finally:
+            if staged is not None:
+                staged.unlink()
     generation = binding["generation"]
     answer = {"endpoint": endpoint, "host": host, "session": session, "generation": generation}
     if team is not None:
@@ -882,6 +955,8 @@ def move(request):
     require(isinstance(request["root"]["session"], str) and UUID.fullmatch(request["root"]["session"]) is not None,
             "root needs the actual session ID of the active root")
     old = Mailbox(safe_path(text(request["old_root"], "old_root")))
+    # A moved base would carry no plan, so its sessions would bind unchecked: a team run starts over instead.
+    require(not planned(old.root.parent), "a planned team hierarchy cannot be moved; start a new team run")
     endpoints = {name: spec for name, spec in old.manifest["endpoints"].items() if name.split("/")[0] == hierarchy}
     require(bool(endpoints), "the old root has no such hierarchy: " + str(hierarchy))
     roles, replaced = request.get("roles", {}), request.get("replaced", {})
@@ -895,6 +970,15 @@ def move(request):
     initiative = request["initiative"]
     fields(initiative, {"project", "repository", "priority", "target_branch"}, {"touched_paths", "blocked_by", "checkouts", "lanes", "source"})
     base = safe_path(text(request["base"], "base"))
+    # A move binds without the plan check, so it must not land where a plan governs, through the base or its mailbox.
+    homes = [base]
+    if (base / "provision.json").is_file():
+        named = read_json(base / "provision.json")
+        mailbox_root = named.get("mailbox_root") if isinstance(named, dict) else None
+        require(isinstance(mailbox_root, str), "invalid provision.json in " + str(base))
+        homes.append(Path(mailbox_root).parent)
+    require(not any(planned(home) for home in homes),
+            "a move cannot go into a planned team hierarchy; start a new team run")
     if hierarchy not in Store(text(request["store"], "store")).load().initiatives:
         # Sets it up, or finishes registering a setup that an earlier run left unregistered.
         lanes = {name.split("/")[2]: spec["kind"] for name, spec in endpoints.items() if name.split("/")[1] == "lane"}
