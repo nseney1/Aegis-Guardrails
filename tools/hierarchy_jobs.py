@@ -823,6 +823,20 @@ def source_digest(checkout):
                "dirty_content_sha256": digest, "dirty_entries": count}
 
 
+def derive_host_plan(initiative):
+    """Provision registers <base>/mailbox, so the team plan needs no new store field or CLI option."""
+    path = Path(initiative["mailbox_root"]).parent / "host-plan.json"
+    reason = "derive is for shell-less teams"
+    try:
+        raw = read_bytes(path)
+        plan = strict_json(raw.decode("utf-8"))
+    except ERRORS as exc:
+        raise ValueError(reason + ": could not read host plan " + str(path)) from exc
+    require(isinstance(plan, dict) and plan.get("schema") == "aegis.hierarchy-host-plan/v1"
+            and plan.get("hierarchy") == initiative["id"] and plan.get("team") == "claude-code", reason)
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "team": plan["team"]}
+
+
 class DependencyPending(ValueError):
     """No dependent effect was admitted; keep the original request available for reconciliation."""
 
@@ -919,11 +933,17 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     dependent = isinstance(packet, dict) and packet.get("schema") == DEPENDENT_PACKET_SCHEMA
     fields(packet, {"schema", "recipe", "checkout", "commit", "tree"} |
            ({"after", "recipes_sha256"} if dependent else set()),
-           {"dirty_content_sha256", "paths", "expected_tree", "message", "merge"})
+           {"dirty_content_sha256", "paths", "expected_tree", "message", "merge", "derive"})
     require(packet["schema"] in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA), "unsupported packet schema")
     name = packet["recipe"]
     require(isinstance(name, str) and name in recipes["recipes"], "unknown recipe: " + str(name)[:128])
     recipe = recipes["recipes"][name]
+    kind = recipe["kind"]
+    derive = "derive" in packet
+    if derive:
+        require(packet["derive"] == "runner", "derive must be runner")
+        require(kind == "commit", "only a commit recipe takes derive")
+        host_plan = derive_host_plan(initiative)
     checkout = absolute(packet["checkout"], "checkout")
     require(checkout in initiative["checkouts"], "checkout is not registered for this initiative: " + checkout)
     matching(packet["commit"], GIT_ID, "commit")
@@ -933,7 +953,6 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     # A test run over uncommitted bytes says nothing about any commit a Reviewer can read.
     require(not recipe.get("require_clean", False) or dirty == EMPTY_STATUS, clean_refusal(name))
     paths = checked_paths(packet, recipe, checkout)
-    kind = recipe["kind"]
     if dependent:
         require(kind == "command" and dirty == EMPTY_STATUS, "dependent jobs require command checks on clean source")
         fields(packet["after"], {"message_id", "sha256"})
@@ -944,15 +963,18 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
         require(store is not None, "dependent jobs require the workspace store")
         check_dependency(store, initiative, message, packet, recipes)
     if kind in ("commit", "merge"):
-        require("expected_tree" in packet and "message" in packet, "a %s recipe needs expected_tree and message" % kind)
-        matching(packet["expected_tree"], GIT_ID, "expected_tree")
+        require(("expected_tree" in packet or derive) and "message" in packet,
+                "a %s recipe needs expected_tree and message" % kind)
+        if "expected_tree" in packet:
+            matching(packet["expected_tree"], GIT_ID, "expected_tree")
         text(packet["message"], "commit message", 65536)
     else:
         require("expected_tree" not in packet and "message" not in packet,
                 "only a commit recipe or a merge recipe takes expected_tree or message")
     require(kind == "merge" or "merge" not in packet, "only a merge recipe takes merge")
     if kind == "commit":
-        require(packet["expected_tree"] != packet["tree"], "this commit would make no change")
+        if "expected_tree" in packet:
+            require(packet["expected_tree"] != packet["tree"], "this commit would make no change")
         code, overlap = check_paths(ledger, initiative["id"], paths)
         require(code == 0, "paths overlap another lease or a checkout could not be read: " + json.dumps(
             overlap["conflicts"] + overlap["unreadable_checkouts"], sort_keys=True)[:1024])
@@ -969,6 +991,8 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
     witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None)
+    if derive and "dirty_content_sha256" not in packet:
+        dirty = witness["dirty_content_sha256"]
     # Named before the plain mismatch, so a packet that claimed a clean checkout learns why it cannot run.
     require(not recipe.get("require_clean", False) or witness["dirty_content_sha256"] == EMPTY_STATUS, clean_refusal(name))
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
@@ -976,6 +1000,12 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     if recipe.get("require_clean", False):
         refuse_paths_outside_commit(checkout, packet["commit"], paths)
     admitted = {**packet, "dirty_content_sha256": dirty, "paths": paths}
+    if derive:
+        tree = derive_commit_tree(admitted, recipes, initiative, message)
+        require(tree != packet["tree"], "this commit would make no change")
+        require("expected_tree" not in packet or packet["expected_tree"] == tree,
+                "the derived tree %s is not the expected tree %s" % (tree, packet.get("expected_tree")))
+        admitted.update(expected_tree=tree, derived_by="runner", host_plan=host_plan)
     if kind == "merge":
         merge_refusals(checkout, packet["commit"], packet["merge"])
         # The witness binds the revision and tree, not the branch, so the branch is held here and checked again at run time.
@@ -1231,7 +1261,8 @@ class Job:
         return None
 
     def evidence(self):
-        names = sorted(path for path in self.folder.iterdir() if path.name.startswith("step-") or path.name == "result.json")
+        names = sorted(path for path in self.folder.iterdir()
+                       if path.name.startswith("step-") or path.name in ("result.json", "derivation.json"))
         return [{"path": str(path), "sha256": file_sha256(path)} for path in names]
 
 
@@ -1589,19 +1620,50 @@ def put_back(git, env, job, old, new, failed, code, output):
     raise Halt("%s failed after HEAD moved to %s (exit %d): %s. %s." % (failed, new, code, git_error(output), outcome))
 
 
+def commit_git(recipes):
+    identity = recipes["identity"]
+    return ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+            "-c", "user.name=" + identity["name"], "-c", "user.email=" + identity["email"]]
+
+
+def stage_commit_tree(packet, recipes, job):
+    """Admission and execution stage the same paths, with the same Git config and a private index."""
+    git = commit_git(recipes)
+    temporary = {"GIT_LITERAL_PATHSPECS": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_INDEX_FILE": str(job.folder / "scratch" / "index")}
+    yield Step(git + ["read-tree", packet["commit"]], temporary)
+    yield Step(git + ["add", "--", *packet["paths"]], temporary)
+    return (yield Step(git + ["write-tree"], temporary, capture=True))
+
+
+def derive_commit_tree(packet, recipes, initiative, message):
+    """Use the recipe's sandbox, PATH, prefix and environment before taking any execution claim."""
+    folder = Path(tempfile.mkdtemp(prefix="hierarchy-derive-"))
+    job = Job(folder, initiative, message)
+    job.folder.mkdir(parents=True, mode=0o700)
+    try:
+        result = execute(job, recipes["recipes"][packet["recipe"]], packet, recipes, lambda: None, {},
+                         plan=stage_commit_tree(packet, recipes, job))
+    except StillRunning as exc:
+        # Do not erase the process record or report a confirmed stop if the existing process guard cannot prove one.
+        raise ValueError("derivation process stop is unknown; evidence kept at %s: %s" % (folder, exc)) from exc
+    except BaseException:
+        shutil.rmtree(folder)
+        raise
+    shutil.rmtree(folder)
+    require(result.reason is None, "could not derive expected_tree: " + str(result.reason))
+    matching(result.created, GIT_ID, "derived expected_tree")
+    return result.created
+
+
 def commit_steps(packet, recipes, job, details):
     """Built on a throwaway index, so a wrong tree leaves the checkout's index, HEAD and files as they were."""
-    identity = recipes["identity"]
-    git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-           "-c", "user.name=" + identity["name"], "-c", "user.email=" + identity["email"]]
+    git = commit_git(recipes)
     plain = {"GIT_LITERAL_PATHSPECS": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    temporary = {**plain, "GIT_INDEX_FILE": str(job.folder / "scratch" / "index")}
     message_file = job.folder / "scratch" / "commit-message"
     message_file.parent.mkdir(mode=0o700, exist_ok=True)
     message_file.write_text(packet["message"], encoding="utf-8")
-    yield Step(git + ["read-tree", packet["commit"]], temporary)
-    yield Step(git + ["add", "--", *packet["paths"]], temporary)
-    tree = yield Step(git + ["write-tree"], temporary, capture=True)
+    tree = yield from stage_commit_tree(packet, recipes, job)
     if tree != packet["expected_tree"]:
         raise Halt("the staged tree %s is not the expected tree %s" % (tree, packet["expected_tree"]))
     commit = details["new_commit"] = yield Step(git + ["commit-tree", tree, "-p", packet["commit"], "-F", str(message_file)],
@@ -1717,19 +1779,20 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     return row, source.read_text(encoding="utf-8", errors="replace").strip() if source else None
 
 
-def execute(job, recipe, packet, recipes, on_start, details, export=None):
+def execute(job, recipe, packet, recipes, on_start, details, export=None, *, plan=None):
     """export, for a require_clean job, replaces the checkout as the steps' folder and $checkout."""
     env = job_environment(recipes, job, packet["checkout"], export)
     sandbox = sandbox_prefix(recipes, recipe, job, packet["checkout"], export)
     checkout = export or packet["checkout"]
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
-    if recipe["kind"] == "commit":
-        plan = commit_steps(packet, recipes, job, details)
-    elif recipe["kind"] == "merge":
-        plan = merge_steps(packet, recipes, job, details)
-    else:
-        plan = command_steps(recipe, packet, recipes, job, checkout)
+    if plan is None:
+        if recipe["kind"] == "commit":
+            plan = commit_steps(packet, recipes, job, details)
+        elif recipe["kind"] == "merge":
+            plan = merge_steps(packet, recipes, job, details)
+        else:
+            plan = command_steps(recipe, packet, recipes, job, checkout)
     rows, reason, exit_code, created, output = [], None, 0, None, None
     failed_launch = None
     started = False
@@ -1804,6 +1867,12 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     checkout = packet["checkout"]
     view = MERGE_VIEW_ENV if recipe["kind"] == "merge" else None
     provenance = {"recipes_sha256": recipes["recipes_sha256"]}
+    if packet.get("derived_by") == "runner":
+        derivation = {key: packet[key] for key in ("derived_by", "dirty_content_sha256", "expected_tree", "host_plan")}
+        # The original, hash-bound packet omits these values. Persist them before any execution so a lost runner's
+        # resolution can still publish evidence of what was admitted, even when no normal result was written.
+        publish_file(job.folder / "derivation.json", encoded(derivation) + b"\n")
+        provenance.update(derivation)
     try:
         before = source_state(mailbox, checkout, view)
         branch = head_ref(checkout) if recipe["kind"] == "merge" else None
