@@ -90,6 +90,8 @@ def decision_state(state, row, at):
     resolution = row["resolution"]
     if resolution and resolution["kind"] in {"complete", "next"}:
         return "closed", None
+    if "small_change" in row:
+        return "held", "small_change_dispatch_unavailable"
     if decision is None:
         return "awaiting_decision", None
     if decision == "deny":

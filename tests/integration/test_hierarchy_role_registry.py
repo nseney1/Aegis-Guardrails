@@ -210,9 +210,12 @@ def test_root_reads_the_loop_and_the_team_evidence_through_three_read_tools_on_i
     assert hierarchy_roles.lifecycle_tools(root) == ()
     assert {name for name, entry in roles.items() if entry["provision"] and hierarchy_roles.decision_tools(entry)} == {
         "root"}
-    # The read tools add no write, call or approval: ROOT still only decides.
+    # ROOT still only decides, including the separate evidence-only plan decision.
+    # Its provisioned decision adapter and read tools do not gain new operations.
     assert root["writes"] == ["lifecycle:succeed"] and root["calls"] == []
-    assert root["approvals"] == ["lifecycle:decision"]
+    assert root["approvals"] == ["lifecycle:decision", "lifecycle:small_change_decision"]
+    assert {name for name, entry in roles.items()
+            if "lifecycle:small_change_decision" in entry["approvals"]} == {"root"}
 
 
 def test_a_decision_adapter_without_read_tools_is_still_valid():

@@ -20,7 +20,8 @@ from hierarchy_mailbox import (ENDPOINT_ROLES, LANE_KINDS, VERTICAL_ROUTES, endp
 SCHEMA = "aegis.role-registry/v1"
 PATH = Path(__file__).resolve().parent / "hierarchy_templates" / "role-registry.json"
 LIFECYCLE_EVENTS = ("publish", "read", "route", "admit", "wait", "intent", "start", "terminal", "meter", "delivery",
-                    "disposition", "resolve", "succeed", "associate", "observe", "cancel_attempt")
+                    "disposition", "resolve", "succeed", "associate", "observe", "cancel_attempt",
+                    "small_change_plan", "small_change_admit")
 VOCABULARY = {
     # loop_status is the loop's status.json; team_evidence is the run's evidence folder and its SHA256SUMS.
     "reads": {"source", "mailbox", "board", "lifecycle", "job_evidence", "owner_records", "workspace_capacity",
@@ -32,7 +33,8 @@ VOCABULARY = {
     # lets the caller write mail or the journal, or run a job itself.
     "calls": {"mailbox:dispatch", "mailbox:job_request", "mailbox:job_receipt", "session:start", "session:resume",
               "session:stop", "session:wake", "router:route", "jobs:run-open", "job:run", "merge", "publish_release"},
-    "approvals": {"lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision", "owner_reserved",
+    "approvals": {"lifecycle:decision", "lifecycle:review", "lifecycle:delegated_decision",
+                  "lifecycle:small_change_decision", "owner_reserved",
                   "release_signature"},
 }
 KINDS = {"global", "per-team", "on-demand", "service", "legacy"}

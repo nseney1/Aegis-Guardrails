@@ -43,7 +43,9 @@ PERMISSIONS = {"publish": {"coordinator", "router"}, "read": {"router", "coordin
                "start": {"operator"}, "terminal": {"operator"}, "meter": {"operator"},
                "review": {"reviewer"}, "delivery": {"coordinator"}, "disposition": {"coordinator"},
                "resolve": {"coordinator"}, "succeed": ROLES,
-               "associate": {"operator"}, "observe": {"operator"}, "cancel_attempt": {"operator"}}
+               "associate": {"operator"}, "observe": {"operator"}, "cancel_attempt": {"operator"},
+               "small_change_plan": {"coordinator", "router"}, "small_change_decision": {"root"},
+               "small_change_admit": {"operator"}}
 GATES = {"source", "capability", "lease", "capacity", "observer", "job"}
 PROVIDER_STATES = {"not_started", "running", "disconnected", "ambiguous", "cancel_requested",
                    "cancelled", "passed", "failed", "unknown"}
@@ -489,6 +491,97 @@ def covered(scope, path):
     return any(parts[:len(PurePosixPath(granted).parts)] == PurePosixPath(granted).parts for granted in scope)
 
 
+def small_change_participants(policy, state, row, plan, participants):
+    """Check configured identity/generation only. This is not host authentication."""
+    fields(participants, {"writer", "reviewer"})
+    expected = {"writer": plan["writing_lanes"][0]["writer"], "reviewer": plan["reviewer"]}
+    for name, role in (("writer", "operator"), ("reviewer", "reviewer")):
+        binding = participants[name]
+        fields(binding, {"cid", "generation"})
+        require(binding["cid"] == expected[name], "small-change " + name + " mismatch")
+        require(type(binding["generation"]) is int and binding["generation"] > 0,
+                "invalid small-change participant generation")
+        actor = policy["actors"].get(binding["cid"])
+        require(actor is not None and actor["role"] == role, "small-change participant role mismatch")
+        require(binding["generation"] == actor["generation"], "small-change participant generation mismatch")
+        require(state["current"][role] == binding["cid"], "small-change participant is no longer current")
+    require(participants["reviewer"]["cid"] not in {row["publisher"], participants["writer"]["cid"]},
+            "small-change reviewer must be independent")
+
+
+def small_change_event(policy, state, row, event, mark, at):
+    """Durable pre-dispatch evidence, deliberately separate from v1 work authority."""
+    kind = event["type"]
+    value = row["request"]
+    require(row["resolution"] is None and row["routed"] is None and row["admission"] is None
+            and row["intent"] is None, "small-change plan requires an untouched request")
+    if kind == "small_change_plan":
+        require("small_change" not in row, "small-change plan already registered")
+        proposal = raw_value(event["proposal"])
+        inspection = inspect_request(proposal)
+        require(inspection["classification"] == "declared_eligible",
+                "small-change requires full planning: " + ", ".join(inspection["escalation_reasons"]))
+        require(proposal["request"] == row["raw"], "small-change request bytes mismatch")
+        require(value["authority"] == value["id"] and not value["continuation"]["members"]
+                and value["continuation"]["max_starts"] == 1 and value["operation"] != "delegate-merge",
+                "small-change requires a single bounded request")
+        small_change_participants(policy, state, row, proposal["plan"], event["participants"])
+        # Lazy keys preserve old checkpoint hashes and historical replay exactly.
+        row["small_change"] = {"registration": {**mark, "proposal": event["proposal"],
+                                                 "participants": event["participants"]},
+                               "decisions": [], "admission": None}
+        return
+    change = row.get("small_change")
+    require(change is not None, "small-change plan is not registered")
+    registration = change["registration"]
+    require(event["plan_sha256"] == registration["proposal"]["sha256"], "small-change plan sha256 mismatch")
+    if kind == "small_change_admit" or event.get("decision") == "approve":
+        canonical = [d for d in state["decisions"] if d["request_id"] == value["id"]]
+        require(not canonical or canonical[-1]["decision"] != "deny", "canonical request is denied")
+    if kind == "small_change_decision":
+        require(event["decision"] in {"approve", "deny"}, "decision must be approve or deny")
+        text(event["reason"], "decision reason", 1024)
+        decisions = change["decisions"]
+        require(not decisions or (decisions[-1]["decision"] == "approve" and event["decision"] == "deny"),
+                "small-change decision already recorded; use a new immutable request version")
+        if event["decision"] == "approve":
+            require(parse_time(at) < parse_time(value["continuation"]["expires_at"]), "bounded authority expired")
+            proposal = raw_value(registration["proposal"])
+            small_change_participants(policy, state, row, proposal["plan"], registration["participants"])
+        decisions.append({**mark, **event})
+        return
+    decisions = change["decisions"]
+    require(decisions and decisions[-1]["decision"] == "approve", "small-change plan lacks approval")
+    require(event["decision_sha256"] == digest(decisions[-1]), "small-change decision sha256 mismatch")
+    require(event["source"] == value["source"], "small-change admission source mismatch")
+    require(event["participants"] == registration["participants"], "small-change admission participants mismatch")
+    proposal = raw_value(registration["proposal"])
+    small_change_participants(policy, state, row, proposal["plan"], registration["participants"])
+    require(mark["actor"] == registration["participants"]["writer"]["cid"], "small-change admission writer mismatch")
+    require(parse_time(at) < parse_time(value["continuation"]["expires_at"]), "bounded authority expired")
+    for prerequisite in value["prerequisites"]:
+        prior = state["requests"].get(prerequisite)
+        require(prior is not None and prior["resolution"] is not None and prior["resolution"]["kind"] == "complete",
+                "prerequisite lacks accepted delivery")
+    checks = event["checks"]
+    require(isinstance(checks, list) and len(checks) <= 256, "invalid small-change checks")
+    names = []
+    for check in checks:
+        fields(check, {"check", "recipe", "recipes_sha256", "evidence"})
+        matching(check["check"], SLUG, "small-change check")
+        matching(check["recipe"], SLUG, "small-change recipe")
+        matching(check["recipes_sha256"], SHA256, "small-change recipes sha256")
+        evidence(check["evidence"])
+        names.append(check["check"])
+    require(len(set(names)) == len(names) and set(names) == set(proposal["plan"]["checks"]),
+            "small-change checks mismatch")
+    fields(event["gates"], GATES | {"reviewer"})
+    for refs in event["gates"].values():
+        evidence(refs)
+    require(change["admission"] is None, "small-change admission already recorded")
+    change["admission"] = {**mark, **event}
+
+
 def delegated_decision(state, row, event, mark):
     """Record the Decider's approve or escalate. It is non-admitting: it never touches decisions,
     consumed or approved_authority, so nothing it records makes a request admissible."""
@@ -599,13 +692,18 @@ def reduce_event(policy, state, envelope, at):
              "disposition": {"status", "resolution"}, "resolve": {"blocker_sha256", "resolution"},
              "associate": {"association"}, "observe": {"intent_id", "association_sha256", "observation"},
              "cancel_attempt": {"intent_id", "association_sha256", "reason"},
-             "delegated_decision": {"delegation_id", "delegation_sha256", "commit", "review", "decision", "reason"}}
+             "delegated_decision": {"delegation_id", "delegation_sha256", "commit", "review", "decision", "reason"},
+             "small_change_plan": {"proposal", "participants"},
+             "small_change_decision": {"plan_sha256", "decision", "reason"},
+             "small_change_admit": {"plan_sha256", "decision_sha256", "source", "participants", "checks", "gates"}}
     fields(event, common | extra[kind])
     row = target(state, event)
     value = row["request"]
     if row["resolution"] and row["resolution"]["kind"] in {"complete", "next"}:
         require(kind in {"read", "route", "decision"}, "closed request requires a new immutable version")
-    if kind == "associate":
+    if kind in {"small_change_plan", "small_change_decision", "small_change_admit"}:
+        small_change_event(policy, state, row, event, mark, at)
+    elif kind == "associate":
         binding = validate_association(policy, state, row, event["association"], cid, at)
         # Lazy projection is essential: old succession events hash the exact old
         # state. Do not add these keys when replaying any legacy event.
@@ -637,9 +735,11 @@ def reduce_event(policy, state, envelope, at):
     elif kind == "read":
         row["read"] = mark
     elif kind == "route":
+        require("small_change" not in row, "small-change dispatch is not activated")
         text(event["to"], "route recipient")
         row["routed"] = {**mark, "to": event["to"]}
     elif kind in {"admit", "intent"}:
+        require("small_change" not in row, "small-change dispatch is not activated")
         require(row["intent"] is None, "request already has an intent; settle its unknown effect")
         require(row["resolution"] is None, "disposed request cannot be admitted")
         authority = approved_authority(state, row, at)
@@ -837,6 +937,7 @@ class Lifecycle:
                                 "blocker": resolution if resolution and resolution["kind"] == "blocked" else None})
             if not resolution and row["intent"] is None:
                 try:
+                    require("small_change" not in row, "small-change dispatch is not activated")
                     operator = state["current"]["operator"]
                     require(active_seconds(state, operator, at) < policy["actors"][operator]["cap_seconds"],
                             "actor cumulative active cap reached")
