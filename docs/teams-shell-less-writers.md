@@ -39,6 +39,12 @@ The durable records are:
   recipe and derivation bytes by SHA-256. Later polls reuse the first admission's
   digest and tree, including after a job-limit wait; they never derive again.
 - `execution.json`: the one-use execution claim, separate from admission custody.
+- `disposition.lock`: an exclusive kernel file lock shared by execution admission
+  and root resolution. Both recheck terminal state and runner ownership while
+  holding it; resolution holds it until the terminal result is durable. Execution
+  checks for a result again after publishing its claim and never starts a resolved
+  job. The kernel releases the lock when its holder exits; the file's presence
+  alone does not mean it is held.
 - `result.json`: the outcome and repeated derivation fields when available. Its
   `steps` describe execution; the separate staging logs remain alongside it.
 

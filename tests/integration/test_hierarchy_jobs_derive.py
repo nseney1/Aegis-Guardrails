@@ -145,6 +145,113 @@ def test_first_admission_survives_a_job_limit_and_later_polls(claude_shop, edit)
         assert shop.run_open()["rows"] == []
 
 
+def waiting_admission(shop):
+    """A completed first invocation leaves a saved admission and a dead original runner."""
+    edit_source(shop)
+    shop.request_job("job-0", "ok", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    request_derive(shop)
+    assert shop.run_open("--max-jobs", "1", expect=3)["rows"][-1]["state"] == "waiting"
+    return (shop.workspace.store / "jobs" / "pilot" / "job-1", shop.head()["commit"],
+            (shop.checkout / ".git" / "index").read_bytes())
+
+
+def test_resolve_after_readmission_prevents_the_resumed_commit(claude_shop, monkeypatch):
+    shop = claude_shop
+    folder, head, index = waiting_admission(shop)
+    jobs = load_jobs_module()
+    original_run = jobs.run_job
+    original_write = jobs.write_result
+    resolved = []
+    ready = []
+    blocked = []
+
+    def execute_between_result_and_receipt(job, state, exit_code, **extra):
+        original_write(job, state, exit_code, **extra)
+        if extra.get("resolved_by_root"):
+            # Root has written failed but has not receipted it yet. Dispatch the already-admitted execution here:
+            # before the fix it could publish started, commit, and then collide with this durable failed result.
+            try:
+                original_run(*ready[0])
+            except jobs.ERRORS as exc:
+                blocked.append(str(exc))
+
+    def resolve_before_dispatch(store, job, packet, raw, recipes, wait):
+        # The second invocation has already re-admitted the request, but has not taken execution custody.
+        assert job.id == "pilot/job-1" and not job.execution_path.exists()
+        ready.append((store, job, packet, raw, recipes, wait))
+        _code, row = jobs.resolve(str(shop.workspace.store), job.id, "root resolved while waiting", 0)
+        resolved.append(row)
+        # Once root releases the disposition lock, the post-claim terminal check must still prevent execution.
+        return original_run(store, job, packet, raw, recipes, wait)
+
+    monkeypatch.setattr(jobs, "write_result", execute_between_result_and_receipt)
+    monkeypatch.setattr(jobs, "run_job", resolve_before_dispatch)
+    code, answer = jobs.run_open(str(shop.workspace.store), str(shop.recipes_path), [], 20, [], 0)
+    assert resolved[0]["state"] == "failed"
+    assert git(shop.checkout, "rev-parse", "HEAD") == head, "a terminal resolution must exclude a later commit"
+    assert (shop.checkout / ".git" / "index").read_bytes() == index
+    assert len(blocked) == 1 and "job disposition is busy" in blocked[0]
+    assert code == 0 and answer["rows"][0]["state"] == "failed", answer
+    result = recorded(shop)
+    assert result["resolved_by_root"] is True and result["commit"] is None
+    assert shop.states("job-1") == ["failed"]
+    evidence = verified_evidence(shop.receipts("job-1")[-1])
+    assert json.loads(evidence["result.json"].read_text()) == result
+    assert not (folder / "step-5.log").exists(), "execution must not launch after the resolution"
+
+
+def test_resolver_excludes_execution_and_other_resolvers_until_its_result_is_durable(claude_shop, monkeypatch):
+    shop = claude_shop
+    folder, head, index = waiting_admission(shop)
+    jobs = load_jobs_module()
+    original_write = jobs.write_result
+    contenders = []
+
+    def contend_before_terminal_write(job, state, exit_code, **extra):
+        # The resolver has checked the dead original runner, but has not yet published result.json.
+        assert extra.get("resolved_by_root") is True and not job.result_path.exists()
+        contenders.append(shop.run_open(expect=3)["rows"][0])
+        assert contenders[-1]["state"] == "settle_pending"
+        assert "job disposition is busy" in contenders[-1]["error"]
+        refused = shop.jobs("resolve", "--job", job.id, "--reason", "second resolver", expect=2)
+        assert "job disposition is busy" in refused["error"]
+        assert not job.execution_path.exists()
+        return original_write(job, state, exit_code, **extra)
+
+    monkeypatch.setattr(jobs, "write_result", contend_before_terminal_write)
+    code, row = jobs.resolve(str(shop.workspace.store), "pilot/job-1", "root closing waiting job", 0)
+    assert code == 0 and row["state"] == "failed"
+    assert len(contenders) == 1
+    assert git(shop.checkout, "rev-parse", "HEAD") == head
+    assert (shop.checkout / ".git" / "index").read_bytes() == index
+    assert json.loads((folder / "result.json").read_text())["resolved_by_root"] is True
+    assert shop.states("job-1") == ["failed"]
+
+
+def test_live_execution_claim_excludes_resolve_between_stopped_steps(claude_shop, monkeypatch):
+    shop = claude_shop
+    folder, head, _index = waiting_admission(shop)
+    jobs = load_jobs_module()
+    original_execute = jobs.execute
+    refused = []
+
+    def resolve_before_steps(job, *args, **kwargs):
+        assert job.execution_path.exists() and job.runner_alive() is True
+        assert not jobs.group_members(job.process_group()), "the staging steps already stopped"
+        refused.append(shop.jobs("resolve", "--job", job.id, "--reason", "must not resolve live execution", expect=2))
+        assert "its runner is still running" in refused[-1]["error"]
+        assert not job.result_path.exists()
+        return original_execute(job, *args, **kwargs)
+
+    monkeypatch.setattr(jobs, "execute", resolve_before_steps)
+    code, answer = jobs.run_open(str(shop.workspace.store), str(shop.recipes_path), [], 20, [], 0)
+    assert code == 0 and answer["rows"][0]["state"] == "completed", answer
+    assert len(refused) == 1
+    assert git(shop.checkout, "rev-parse", "HEAD^") == head
+    assert json.loads((folder / "result.json").read_text())["state"] == "completed"
+    assert shop.states("job-1") == ["started", "completed"]
+
+
 @pytest.mark.parametrize("alive, raise_error", [(False, True), (True, True), (True, False)])
 def test_uncertain_derivation_stays_in_job_custody_until_resolved(claude_shop, alive, raise_error):
     shop = claude_shop

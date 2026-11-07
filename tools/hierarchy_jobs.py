@@ -56,6 +56,7 @@ Linux only, because the census and the liveness checks read /proc.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -1289,20 +1290,42 @@ class Job:
             return None
         return process_start(claim["pid"]) == claim["start"]
 
+    @contextmanager
+    def disposition(self):
+        """Serialize execution claims and root resolution; a crashed holder cannot leave a stale file lock."""
+        import fcntl  # Linux-only runner; keep recipe inspection importable on other platforms.
+
+        with open(safe_path(self.folder / "disposition.lock"), "a+b") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("job disposition is busy: " + self.id) from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def take_execution(self, packet_raw, recipes_sha256):
         """A successful derived admission may wait across polls; its execution claim is still one-use."""
         if not (self.folder / "admitted.json").exists():
             return self.claim(packet_raw, recipes_sha256)
-        raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
-        admitted_derivation(self, raw, recipes_sha256)
-        check_settlement_processes(self, {"steps": []})
-        claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
-                 "process_scope": process_scope(), "recipes_sha256": recipes_sha256}
-        try:
-            publish_file(self.execution_path, encoded(claim) + b"\n")
-        except FileExistsError:
-            return False
-        return True
+        with self.disposition():
+            raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
+            admitted_derivation(self, raw, recipes_sha256)
+            check_settlement_processes(self, {"steps": []})
+            claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
+                     "process_scope": process_scope(), "recipes_sha256": recipes_sha256}
+            try:
+                publish_file(self.execution_path, encoded(claim) + b"\n")
+            except FileExistsError:
+                return False
+            # A scheduler may have re-admitted this job before root resolved it. Claim publication alone is not
+            # permission to run: check the terminal record and our ownership under the same exclusion as resolve.
+            if self.result_path.exists():
+                return False
+            require(read_json(self.execution_path) == claim and self.runner_alive() is True,
+                    "execution claim ownership changed: " + self.id)
+            return True
 
     def process_record(self):
         try:
@@ -1949,6 +1972,8 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     else:
         claimed = job.take_execution(packet_raw, recipes["recipes_sha256"])
     if not claimed:
+        if packet.get("derived_by") == "runner" and job.result_path.exists():
+            return settle(store, job, wait)
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
@@ -2365,22 +2390,23 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     folder = safe_path(store.path / "jobs" / initiative_id / message_id)
     require(record is not None and folder.exists(), "no running job here: " + identifier)
     job = Job(store.path, initiative, record["message"])
-    require(not job.result_path.exists(), "job is already finished: " + identifier)
-    runner = job.runner_alive()
-    require(runner is not None, "runner visibility is unknown: " + identifier)
-    require(not runner, "its runner is still running: " + identifier)
-    group = job.process_group()
-    require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
-    unrecorded = job.unrecorded_step()
-    if unrecorded:
-        require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
-                "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
-    # runner_alive above has read and checked this claim. A claim written before the hash was stored records null.
-    recipes_sha256 = read_json(job.claim_path).get("recipes_sha256")
-    require(recipes_sha256 is None or (isinstance(recipes_sha256, str) and SHA256.fullmatch(recipes_sha256) is not None),
-            "invalid recipes_sha256 in the claim of job: " + identifier)
-    write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
-                 process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256, **derivation_provenance(job))
+    with job.disposition():
+        require(not job.result_path.exists(), "job is already finished: " + identifier)
+        runner = job.runner_alive()
+        require(runner is not None, "runner visibility is unknown: " + identifier)
+        require(not runner, "its runner is still running: " + identifier)
+        group = job.process_group()
+        require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
+        unrecorded = job.unrecorded_step()
+        if unrecorded:
+            require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
+                    "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
+        # runner_alive above has read and checked this claim. A claim written before the hash was stored records null.
+        recipes_sha256 = read_json(job.claim_path).get("recipes_sha256")
+        require(recipes_sha256 is None or (isinstance(recipes_sha256, str) and SHA256.fullmatch(recipes_sha256) is not None),
+                "invalid recipes_sha256 in the claim of job: " + identifier)
+        write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
+                     process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256, **derivation_provenance(job))
     return 0, settle(store, job, wait)
 
 
