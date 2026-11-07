@@ -13,9 +13,15 @@ SCRIPT = '''import json, os, subprocess, sys, time
 mode = sys.argv[1]
 for line in sys.stdin:
     request = json.loads(line)
+    if mode in ('hello_timeout', 'timeout'):
+        receipt = os.path.join(os.path.dirname(__file__), 'requests.jsonl')
+        with open(receipt, 'a', encoding='utf-8') as log:
+            log.write(json.dumps(request) + '\\n')
     if request['op'] == 'hello':
+        if mode == 'language':
+            time.sleep(0.5)
         if mode == 'hello_timeout':
-            time.sleep(5)
+            time.sleep(60)
         answer = {'aegis_ast': 2, 'op': 'hello', 'driver': 'fixture',
                   'driver_version': '2.0.0', 'languages': ['go'],
                   'capabilities': ['allow_comments', 'args']}
@@ -31,8 +37,8 @@ for line in sys.stdin:
             sys.stderr.write('bounded diagnostic:' + 'x' * (70 * 1024))
             sys.stderr.flush()
             sys.exit(7)
-        if mode == 'timeout':
-            time.sleep(5)
+        if mode == 'timeout' and request['id'] == 2:
+            time.sleep(60)
         if mode == 'oversize':
             sys.stdout.write('x' * (8 * 1024 * 1024 + 1) + '\\n')
             sys.stdout.flush()
@@ -57,6 +63,8 @@ for line in sys.stdin:
             answer['id'] = True
         if mode == 'language':
             answer['ast']['language'] = 'python'
+        if mode == 'schema':
+            answer['ast']['version'] = '2.0'
         if mode == 'malformed':
             print('not json', flush=True)
             continue
@@ -93,20 +101,59 @@ def test_one_process_serves_ordered_files_in_empty_cwd_without_path(tmp_path):
 
 
 @pytest.mark.parametrize('mode,reason', [
-    ('bad_hello', 'hello'), ('hello_timeout', 'timed out'), ('id', 'id'),
-    ('oversize', '8 MiB'), ('timeout', 'timed out'), ('crash', 'driver crashed'),
-    ('malformed', 'JSON'), ('bool_id', 'id'), ('language', 'language'),
+    ('bad_hello', 'hello'), ('id', 'id'), ('oversize', '8 MiB'),
+    ('crash', 'driver crashed'), ('malformed', 'JSON'), ('bool_id', 'id'),
+    ('language', 'language'), ('schema', 'schema version'),
 ])
 def test_protocol_failure_poisoned_session_fails_every_remaining_file(tmp_path, mode, reason):
-    from aegis_core.ast.runner import ASTDriverError
+    from aegis_core.ast.runner import ASTDriverError, ASTDriverTimeoutError
 
-    driver = _driver(tmp_path, mode, timeout=0.3)
-    with pytest.raises(ASTDriverError, match=reason) as first:
-        driver.parse(tmp_path / 'a.go')
-    with pytest.raises(ASTDriverError) as remaining:
-        driver.parse(tmp_path / 'b.go')
-    assert str(remaining.value) == str(first.value)
-    driver.close()
+    # The language fixture delays hello beyond the old shared 0.3s allowance.
+    # Content validation must still reach its intended defect on a loaded host.
+    driver = _driver(tmp_path, mode, timeout=30)
+    try:
+        with pytest.raises(ASTDriverError, match=reason) as first:
+            driver.parse(tmp_path / 'a.go')
+        assert not isinstance(first.value, ASTDriverTimeoutError)
+        with pytest.raises(ASTDriverError) as remaining:
+            driver.parse(tmp_path / 'b.go')
+        assert str(remaining.value) == str(first.value)
+        assert remaining.value is first.value
+    finally:
+        driver.close()
+
+
+@pytest.mark.parametrize('mode,operation', [('hello_timeout', 'hello'), ('timeout', 'parse')])
+def test_timeout_in_requested_phase_poisons_every_remaining_file(tmp_path, mode, operation):
+    from aegis_core.ast.runner import ASTDriverTimeoutError
+
+    driver = _driver(tmp_path, mode, timeout=30)
+    expected = [{'aegis_ast': 2, 'op': 'hello'}]
+    target = tmp_path / 'a.go'
+    try:
+        if operation == 'parse':
+            # Public warmup completes startup before the short parse deadline is used.
+            warmup = tmp_path / 'warmup.go'
+            assert driver.parse(warmup).file_path == str(warmup)
+            expected.extend([
+                {'op': 'parse', 'id': 1, 'path': str(warmup)},
+                {'op': 'parse', 'id': 2, 'path': str(target)},
+            ])
+        driver.timeout = 3.0
+        with pytest.raises(ASTDriverTimeoutError, match=f'waiting for {operation}') as first:
+            driver.parse(target)
+        # The child records receipt before stalling: startup delay alone cannot pass.
+        received = [
+            json.loads(line)
+            for line in (tmp_path / 'requests.jsonl').read_text(encoding='utf-8').splitlines()
+        ]
+        assert received == expected
+        with pytest.raises(ASTDriverTimeoutError, match=f'waiting for {operation}') as remaining:
+            driver.parse(tmp_path / 'b.go')
+        assert str(remaining.value) == str(first.value)
+        assert remaining.value is first.value
+    finally:
+        driver.close()
 
 
 def test_valid_syntax_error_does_not_poison_following_file(tmp_path):

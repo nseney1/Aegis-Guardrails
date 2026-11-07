@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import threading
 import time
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -802,11 +803,17 @@ def test_compiler_communication_error_or_cancellation_reaps_root_before_removing
 
     monkeypatch.setattr(subprocess, "Popen", interrupted)
     error_type = KeyboardInterrupt if cancel else GoDriverUnavailableError
-    with pytest.raises(error_type, match="fixture cancellation" if cancel else "fixture pipe error"):
+    with pytest.raises(error_type, match="fixture cancellation" if cancel else "fixture pipe error") as error:
         prepare_go_driver(compiler.workspace)
-    assert processes and all(proc.poll() is not None for proc in processes)
-    assert all(proc.stdout.closed and proc.stderr.closed for proc in processes)
-    assert not list(compiler.cache.glob(".go-build-*"))
+    diagnostic = (
+        f"go build: reason={getattr(error.value, 'reason', None)!r}, "
+        f"detail={getattr(error.value, 'detail', None)!r}; "
+        f"processes (pid, returncode)={[(proc.pid, proc.poll()) for proc in processes]!r}\n"
+        + "".join(traceback.format_exception(type(error.value), error.value, error.value.__traceback__))
+    )
+    assert processes and all(proc.poll() is not None for proc in processes), diagnostic
+    assert all(proc.stdout.closed and proc.stderr.closed for proc in processes), diagnostic
+    assert not list(compiler.cache.glob(".go-build-*")), diagnostic
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group failure boundary")
