@@ -16,6 +16,7 @@ import uuid
 
 import pytest
 
+from tests.integration.hierarchy_fake_wrapper import shell_exec
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the probe drives POSIX process groups")
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,7 +43,7 @@ if [ "$1" = login ]; then
   fi
   exit 0
 fi
-exec "%s" "%s" "$@"
+%s "$@"
 """
 
 
@@ -72,7 +73,7 @@ class Probe:
         self.bin = tmp_path / "fake-bin"
         self.bin.mkdir()
         self.codex = self.bin / "codex"
-        self.codex.write_text(WRAPPER % (sys.executable, FAKE_CODEX), encoding="utf-8")
+        self.codex.write_text(WRAPPER % shell_exec("codex", FAKE_CODEX, self.tmp), encoding="utf-8")
         self.codex.chmod(self.codex.stat().st_mode | stat.S_IXUSR)
         (self.bin / "git").symlink_to(GIT)
         (self.bin / "ps").symlink_to(PS)

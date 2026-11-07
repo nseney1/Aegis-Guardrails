@@ -25,6 +25,7 @@ import time
 
 import pytest
 
+from tests.integration.hierarchy_fake_wrapper import shell_exec
 from tests.integration.test_hierarchy_mailbox import ROOT, git
 
 
@@ -70,6 +71,8 @@ sys.exit(1 if failed else 0)
 CODEX_WRAPPER = r'''
 import json, os, re, subprocess, sys, uuid
 from pathlib import Path
+
+from tests.integration.hierarchy_fake_wrapper import python_argv
 
 FAKE = %(fake)r
 AGENT_RECORD = %(agent)r
@@ -180,7 +183,7 @@ def role(argv):
     if "resume" not in argv:
         thread = env.get("FAKE_CODEX_THREAD") or str(uuid.uuid4())
         env["FAKE_CODEX_THREAD"] = thread
-    code = subprocess.run([sys.executable, FAKE, *argv], env=env).returncode
+    code = subprocess.run([*python_argv("codex", FAKE, Path(sys.argv[0]).parent.parent), *argv], env=env).returncode
     if thread and os.environ.get("FAKE_TEAM_NO_CATALOG"):
         for path in (Path(env["CODEX_HOME"]) / "sessions").glob("**/*%%s.jsonl" %% thread):
             rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -246,7 +249,9 @@ def seal_spawns(monkeypatch, folder):
 def fake_codex(folder, log=None):
     """The test's `codex`: the wrapper above around the repo's fake codex."""
     path = folder / "codex"
-    path.write_text("#!" + sys.executable + "\n" + CODEX_WRAPPER % {"fake": str(FAKE_CODEX), "agent": str(AGENT_TOOLS)},
+    script = folder / "codex-wrapper.py"
+    script.write_text(CODEX_WRAPPER % {"fake": str(FAKE_CODEX), "agent": str(AGENT_TOOLS)}, encoding="utf-8")
+    path.write_text("#!/bin/sh\n# hierarchy_fake_codex.py\n%s \"$@\"\n" % shell_exec("codex", script, folder.parent),
                     encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path

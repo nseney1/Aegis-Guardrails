@@ -107,7 +107,7 @@ class Hosts(Launch):
         path = self.bin / "claude"
         path.unlink()
         path.write_text("#!/bin/bash\n" + body % {"python": shlex.quote(sys.executable),
-                                                  "host": fake.shell_exec("claude", fake.HERE)}
+                                                  "host": fake.shell_exec("claude", fake.HERE, self.tmp)}
                         + "\n", encoding="utf-8")
         path.chmod(0o700)
         fake.require_fake(str(self.bin))
@@ -496,7 +496,7 @@ def test_stop_ends_a_hung_turn_of_a_claude_started_role(claude_team, tmp_path):
     try:
         # After init, the fake's MCP probes (which also name the session) have ended; only the turn is left.
         wait_until(lambda: '"subtype": "init"' in out.read_text(), 30)
-        wait_until(lambda: census(session) == [hung.pid])
+        wait_until(lambda: launcher_module().session_processes(session, set(), CLAUDE) == [(hung.pid, hung.pid)])
         stopped = claude_team.run("stop", "--endpoint", IMPLEMENTER, "--grace-seconds", "2")
         assert stopped["state"] == "stopped" and stopped["pids"] == [hung.pid]
         assert (stopped["host"], stopped["session"]) == (CLAUDE, session)

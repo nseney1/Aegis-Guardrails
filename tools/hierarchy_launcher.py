@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -628,30 +629,62 @@ def ancestors():
     return mine
 
 
-def session_processes(session, excluded, host=CODEX):
-    """(pid, pgid) of live host programs naming the session as a whole argument."""
+def process_census():
+    """Read Linux argument boundaries directly; ps is the fallback without /proc."""
+    proc = Path("/proc")
+    if proc.is_dir():
+        for folder in proc.iterdir():
+            if not folder.name.isdigit():
+                continue
+            try:
+                fields = (folder / "stat").read_bytes().rpartition(b")")[2].split()
+                arguments = (folder / "cmdline").read_bytes().split(b"\0")
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                # A process can end during the census; inaccessible argv cannot establish ownership.
+                continue
+            if arguments[-1] == b"":
+                arguments.pop()
+            if len(fields) >= 3 and fields[2].isdigit():
+                yield int(folder.name), int(fields[2]), fields[0].decode("ascii"), [os.fsdecode(a) for a in arguments]
+        return
     census = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,pgid=,stat=,args="], capture_output=True, text=True, timeout=10)
     require(census.returncode == 0, "process census failed")
-    program = {CLAUDE: "claude", CODEX: "codex"}.get(host)
-    found = []
     for line in census.stdout.splitlines():
-        words = line.split()
+        words = line.split(None, 3)
         if len(words) < 4 or not (words[0].isdigit() and words[1].isdigit()):
             continue
-        pid, pgid = int(words[0]), int(words[1])
+        yield int(words[0]), int(words[1]), words[2], shlex.split(words[3])
+
+
+def host_program(argv, host):
+    if argv and Path(argv[0]).name == "env":
+        argv = argv[1:]
+        while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+            argv = argv[1:]
+    if not argv:
+        return False
+    program = Path(argv[0]).name
+    if host == CLAUDE:
+        if program in ("claude", "claude.exe", ".claude-wrapped"):
+            return True
+        return program == "node" and len(argv) > 1 and (
+            Path(argv[1]).name == "claude" or Path(argv[1]).parts[-3:] == ("@anthropic-ai", "claude-code", "cli.js"))
+    return host == CODEX and (program == "codex" or (
+        program == "node" and len(argv) > 1 and Path(argv[1]).name == "codex"))
+
+
+def session_processes(session, excluded, host=CODEX, unowned=None):
+    """(pid, pgid) of live host programs naming the session as a whole argument."""
+    found = []
+    for pid, pgid, state, argv in process_census():
         # A zombie has already ended; it only waits for its parent to collect it.
-        if pid in excluded or words[2].startswith("Z") or session not in words[3:]:
+        if pid in excluded or state.startswith("Z") or session not in argv:
             continue
-        argv = words[3:]
-        if Path(argv[0]).name == "env":
-            argv = argv[1:]
-            while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
-                argv = argv[1:]
-        if argv and Path(argv[0]).name == "node":
-            argv = argv[1:]
         # A diagnostic command naming the session must never be signalled.
-        if argv and Path(argv[0]).name == program:
+        if host_program(argv, host):
             found.append((pid, pgid))
+        elif unowned is not None:
+            unowned.append(pid)
     return found
 
 
@@ -700,8 +733,11 @@ def stop(launches, endpoint, grace):
     signalled = False
     try:
         excluded = ancestors()
-        found = session_processes(known["session"], excluded, known["host"])
+        unowned = []
+        found = session_processes(known["session"], excluded, known["host"], unowned)
         marker = {"wake_marker_present": launches.mailbox.wake_marker(endpoint).exists(), "grace_seconds": grace}
+        if unowned:
+            marker["unowned_pids"] = sorted(unowned)
         pids, stopped = {pid for pid, _ in found}, True
         if found:
             signalled = True

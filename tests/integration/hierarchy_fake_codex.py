@@ -58,9 +58,13 @@ CARVE_OUTS = (".git", ".agents", ".codex")
 def main():
     argv = sys.argv[1:]
     if os.environ.get("FAKE_CODEX_ROLLOUT"):
-        sys.exit(rollout_main(argv))
+        if not os.environ.get("CODEX_HOME"):
+            sys.exit(rollout_main(argv))
+        command = python_argv("codex", __file__, Path(os.environ["CODEX_HOME"]).parent, "rollout_main")
+        os.execv(command[0], [*command, *argv])
     if "resume" in argv:
-        os.execv(sys.executable, [*python_argv("codex", HOST), *argv])
+        command = python_argv("codex", HOST, Path(os.environ["FAKE_HOST_LOG"]).parent)
+        os.execv(command[0], [*command, *argv])
     log_call(argv)
     mode = os.environ.get("FAKE_CODEX_MODE", "")
     if mode == "no-thread":

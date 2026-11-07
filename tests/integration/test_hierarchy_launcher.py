@@ -41,7 +41,7 @@ class Launch(Setup):
         self.bin = tmp_path / "fake-bin"
         self.bin.mkdir()
         codex = self.bin / "codex"
-        codex.write_text('#!/bin/bash\n%s "$@"\n' % shell_exec("codex", FAKE_CODEX), encoding="utf-8")
+        codex.write_text('#!/bin/sh\n%s "$@"\n' % shell_exec("codex", FAKE_CODEX, self.tmp), encoding="utf-8")
         codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
         self.codex_log = tmp_path / "fake-codex.log"
         self.host_log = tmp_path / "fake-host.log"
@@ -489,7 +489,7 @@ def test_stop_ends_the_process_group_of_a_hung_session(launch):
     hung = subprocess.Popen(["sh", "-c", 'sleep 30 & exec codex exec --json hold "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
                             FAKE_CODEX_THREAD=session), stdout=subprocess.DEVNULL, start_new_session=True)
     try:
-        wait_until(lambda: census(session) == [hung.pid])
+        wait_until(lambda: owned_pids(session) == [hung.pid])
         children = [int(pid) for pid in subprocess.run(["pgrep", "-g", str(hung.pid)], capture_output=True, text=True,
                                                        timeout=10).stdout.split() if int(pid) != hung.pid]
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "2")
@@ -694,14 +694,19 @@ def group(pid):
                                                      timeout=10).stdout.split()]
 
 
+def owned_pids(session, host="codex-cli"):
+    return sorted(pid for pid, _ in launcher_module().session_processes(session, set(), host))
+
+
 def test_stop_spares_a_caller_that_names_the_session(launch):
     session = launch.start()["session"]
     hung = hold(launch, session, 'exec codex exec --json hold "$0"', session, start_new_session=True)
-    caller = subprocess.Popen(["sh", "-c", '"$1" -I "$2" --base "$3" stop --endpoint "$4" --grace-seconds 2; echo "exit=$?"',
+    wait_until(lambda: owned_pids(session) == [hung.pid])
+    caller = subprocess.Popen(["codex", "-c", '"$1" -I "$2" --base "$3" stop --endpoint "$4" --grace-seconds 2; echo "exit=$?"',
                                session, sys.executable, str(LAUNCHER), str(launch.base), REVIEW], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, env=launch.env(), start_new_session=True)
+                              stderr=subprocess.PIPE, text=True, env=launch.env(), executable="sh", start_new_session=True)
     try:
-        wait_until(lambda: hung.pid in census(session))
+        wait_until(lambda: hung.pid in owned_pids(session))
         out, err = caller.communicate(timeout=30)
         assert caller.returncode == 0 and err == "", out + err
         answer, last = out.splitlines()
@@ -720,7 +725,7 @@ def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
     session = launch.start()["session"]
     leader = hold(launch, session, 'sleep 30 & codex exec --json hold "$HELD_SESSION"; wait', start_new_session=True)
     try:
-        wait_until(lambda: len(census(session)) == 1 and len(group(leader.pid)) == 3)
+        wait_until(lambda: len(owned_pids(session)) == 1 and len(group(leader.pid)) == 3)
         [named] = census(session)
         others = [pid for pid in group(leader.pid) if pid not in (leader.pid, named)]
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "2")
@@ -737,7 +742,7 @@ def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace
     stubborn = hold(launch, session, 'trap "" TERM; sleep 30; :', session, start_new_session=True)
     try:
         # The sleep starts after the trap is set, so a SIGTERM now is known to be ignored.
-        wait_until(lambda: len(group(stubborn.pid)) == 2)
+        wait_until(lambda: stubborn.pid in owned_pids(session) and len(group(stubborn.pid)) == 2)
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", grace)
         assert answer["state"] == "stopped" and answer["pids"] == [stubborn.pid] and answer["grace_seconds"] == int(grace)
         assert stubborn.wait(timeout=5) == -signal.SIGKILL
@@ -826,7 +831,7 @@ def test_a_census_that_fails_after_signals_were_sent_is_recorded_as_stop_failed(
     hung = subprocess.Popen(["sh", "-c", 'exec codex exec --json hold "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
                             FAKE_CODEX_THREAD=session), stdout=subprocess.DEVNULL, start_new_session=True)
     try:
-        wait_until(lambda: census(session) == [hung.pid])
+        wait_until(lambda: owned_pids(session) == [hung.pid])
         module = launcher_module()
         real, calls = module.session_processes, []
 
