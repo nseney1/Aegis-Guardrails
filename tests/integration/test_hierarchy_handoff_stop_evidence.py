@@ -420,3 +420,137 @@ def test_a_wake_after_preflight_refuses_only_its_entry_and_a_rerun_finishes(laun
     assert second["ok"] is True and second["generation"] == 2
     assert mailbox_files(launch.root / "bindings") == first_bindings
     assert other.binding()["session"] == spec["session"]
+
+
+def background_session(launch, resumed=True):
+    role = launch.add_role(REVIEW, host="claude-code", session=str(uuid.uuid4()),
+                           cwd=str(launch.source), background=True)
+    profile = json.loads((launch.base / "profiles" / "pilot%2Flane%2Freview-g1.wake.json").read_text(encoding="utf-8"))
+    assert profile["mode"] == "background"
+    if resumed:
+        assert launch.run("resume", "--endpoint", REVIEW)["state"] == "resumed"
+    return role["session"]
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_a_background_session_keeps_the_caller_assertion_after_resume(launch, resumed):  # noqa: F811
+    background_session(launch, resumed)
+    result = handoff(launch.tmp, spec_for(launch), 0)
+    assert result["entries"][0]["stop_evidence"] == "caller_asserted"
+    assert launch.binding()["generation"] == 2
+
+
+def test_a_background_session_still_requires_outgoing_stopped(launch):  # noqa: F811
+    background_session(launch)
+    spec = spec_for(launch, outgoing_stopped=False)
+    before = mailbox_files(launch.base)
+    result = handoff(launch.tmp, spec, 2)
+    assert result == {"error": "outgoing session must be stopped before replacement"}
+    assert mailbox_files(launch.base) == before
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("blocker", ["wake marker", "live process"])
+def test_a_background_writer_blocks_the_whole_batch(launch, resumed, blocker):  # noqa: F811
+    session = background_session(launch, resumed)
+    other_tmp = launch.tmp / "first-entry"
+    other_tmp.mkdir()
+    other = Launch(other_tmp)
+    other.init()
+    other.add_role(REVIEW, host="codex-cli", session=str(uuid.uuid4()), cwd=str(other.source))
+    spec = spec_for(other)
+    spec["entries"] += spec_for(launch)["entries"]
+    other_before = mailbox_files(other.base)
+    process = held_session(launch, session) if blocker == "live process" else None
+    marker = launch.root / ".wake-pilot%2Flane%2Freview.lock"
+    if blocker == "wake marker":
+        marker.write_text("{}", encoding="utf-8")
+    try:
+        result = refused_unchanged(launch, spec, blocker)
+        assert mailbox_files(other.base) == other_before
+        assert "%s refuses background sessions" % stop_command(launch) in result["error"]
+        if process is not None:
+            assert process.poll() is None
+        else:
+            assert "inspect " + str(marker) in result["error"]
+            assert "remove the marker and retry" in result["error"]
+    finally:
+        if process is not None:
+            finish(process)
+
+
+def test_a_background_session_still_requires_a_successful_census(launch, monkeypatch):  # noqa: F811
+    background_session(launch)
+    ps = launch.bin / "ps"
+    ps.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    ps.chmod(0o700)
+    monkeypatch.setenv("PATH", str(launch.bin) + os.pathsep + os.environ["PATH"])
+    result = refused_unchanged(launch, spec_for(launch), "process census failed")
+    assert result["error"] == (
+        "stop evidence for %s: process census failed; error: process census failed; "
+        "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
+
+
+def test_only_the_current_generations_background_mode_applies(launch):  # noqa: F811
+    added_session(launch, 2)
+    change_record(launch.base / "profiles" / "pilot%2Flane%2Freview-g1.wake.json", mode="background")
+    launch.run("resume", "--endpoint", REVIEW)
+    refused_unchanged(launch, spec_for(launch), "resumed")
+
+
+def test_a_mailbox_association_error_gives_setup_guidance(launch):  # noqa: F811
+    stopped(launch)
+    other = launch.base / "other-mailbox"
+    other.mkdir()
+    (other / "manifest.json").write_bytes((launch.root / "manifest.json").read_bytes())
+    provision = launch.base / "provision.json"
+    change_record(provision, mailbox_root=str(other))
+    result = refused_unchanged(launch, spec_for(launch), "launch records do not cover this mailbox")
+    assert result["error"] == (
+        "stop evidence for %s: launch records do not cover this mailbox; inspect %s mailbox_root and %s; "
+        "%s will not change this setup; correct the mailbox association and retry"
+        % (REVIEW, provision, launch.root, stop_command(launch)))
+
+
+@pytest.mark.parametrize("raw,error", [
+    ("{}", ""), ("[]", ""),
+    ("{", "; error: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"),
+])
+def test_invalid_launch_records_give_data_guidance(launch, raw, error):  # noqa: F811
+    stopped(launch)
+    record = record_paths(launch)[-1]
+    record.write_text(raw, encoding="utf-8")
+    result = refused_unchanged(launch, spec_for(launch), "invalid launch record")
+    assert result["error"] == (
+        "stop evidence for %s: invalid launch record: %s%s; inspect %s and its retained evidence; "
+        "%s will not change this record; owner must reconcile the invalid data before retrying"
+        % (REVIEW, record, error, record, stop_command(launch)))
+
+
+@pytest.mark.parametrize("extra,last", [(0, "resumed"), (1, "resumed"), (0, "not_running")])
+def test_a_full_history_explains_the_limit_and_missing_archive_procedure(launch, extra, last):  # noqa: F811
+    launch.start(cwd=str(launch.source))
+    if last == "resumed":
+        launch.run("resume", "--endpoint", REVIEW)
+    else:
+        launch.run("stop", "--endpoint", REVIEW)
+    assert launch.records()[-1]["state"] == last
+    paths = record_paths(launch)
+    folder = paths[0].parent
+    filler = launch.tmp / "unrelated-refusal.json"
+    record = json.loads(paths[0].read_text(encoding="utf-8"))
+    filler.write_text(json.dumps({**record, "session": "another-session", "state": "refused"}), encoding="utf-8")
+    limit = handoff_module().hierarchy_launcher.MAX_RECORDS
+    count = limit + extra
+    for number in range(count - len(paths)):
+        os.link(filler, folder / ("20000101T000000000000Z-%05d.json" % number))
+    assert len(record_paths(launch)) == count
+    assert launch.run("stop", "--endpoint", REVIEW, expect=2) == {
+        "error": "launch record limit reached for " + REVIEW}
+    result = refused_unchanged(launch, spec_for(launch), "launch record limit")
+    assert result["error"] == (
+        "stop evidence for %s: launch record limit %d reached (%d records); inspect %s; "
+        "%s cannot append a stop record at this limit; docs/hierarchy-maintenance-runbook.md has no "
+        "launch-record archive procedure yet; owner must preserve the history and arrange an "
+        "archive/recovery procedure before retrying"
+        % (REVIEW, limit, count, folder, stop_command(launch)))

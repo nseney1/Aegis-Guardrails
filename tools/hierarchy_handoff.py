@@ -20,6 +20,11 @@ retain the caller's outgoing_stopped assertion. Binding grants no sender authori
 each successor must still read its checkpoint and acknowledge it through its own
 connection, so acknowledgments are not batched here.
 
+Background-mode wake profiles also use the caller's assertion, because launcher
+stop refuses them, but still require no wake marker and no live session process.
+Other launch histories at the launcher's record cap require owner archive/recovery
+before handoff; the maintenance runbook has no archive procedure yet.
+
 A mailbox root beside a team run's host plan binds only a successor on the host
 the plan assigns, and refuses the entry when the plan is not that root's own. The
 successor's session record comes from the add-role that builds its connection and
@@ -97,42 +102,72 @@ def stop_evidence(mailbox, current):
     command = shlex.join(["hierarchy_launcher.py", "--base", str(base), "stop", "--endpoint", endpoint])
     guidance = "obtain evidence with: " + command
     try:
-        folder = safe_path(base / "launches" / hierarchy_launcher.quoted(endpoint))
-        if not folder.exists():
-            return "caller_asserted"
-        launches = hierarchy_launcher.Launches(str(base))
-        require(os.path.samefile(launches.mailbox.root, mailbox.root),
-                "launch records do not cover this mailbox")
-        paths = launches.paths(endpoint)
-        require(len(paths) <= hierarchy_launcher.MAX_RECORDS, "launch history exceeds record limit")
-        records = []
-        for path in paths:
-            # Hash the exact bytes parsed, so the evidence cannot describe a different read of the file.
-            raw = read_bytes(path)
-            record = strict_json(raw.decode("utf-8"))
-            require(isinstance(record, dict) and record.get("schema") == hierarchy_launcher.SCHEMA,
-                    "invalid launch record: " + str(path))
-            generation = record.get("generation")
-            if (record.get("state") != "refused"
-                    and all(record.get(key) == current[key] for key in ("endpoint", "session"))
-                    and (generation == current["generation"] or generation is None and current["generation"] == 1)):
-                records.append((path, record, hashlib.sha256(raw).hexdigest()))
-        if not records:
-            return "caller_asserted"
-        # The launcher orders its immutable records by their timestamp-prefixed filenames, including status().
-        status_path, status, status_hash = records[-1]
-        require(status.get("action") == "stop" and status.get("state") in ("stopped", "not_running"),
-                "latest launch status is %s (%s); a stopped or not_running stop record is required"
-                % (status.get("state"), status.get("action")))
-        activities = [row for row in records if row[1].get("action") in ("start", "resume")]
-        launch_path, launch_hash = None, None
-        if activities:
-            launch_path, launch, launch_hash = activities[-1]
-            require(status_path > launch_path and parse_time(status.get("at")) > parse_time(launch.get("at")),
-                    "stop record must be recorded after the latest start or resume")
+        profile = base / "profiles" / ("%s-g%d.wake.json" % (hierarchy_launcher.quoted(endpoint), current["generation"]))
+        guidance = "inspect %s; %s will not change this wake profile; correct the profile and retry" % (profile, command)
+        # Same path and predicate as hierarchy_launcher.bound_session()/stop(); no exported predicate exists.
+        background = profile.is_file() and read_json(profile).get("mode") == "background"
+        evidence = "caller_asserted"
+        if background:
+            guidance = ("%s refuses background sessions; stop the background session through claude stop or the "
+                        "wake tool's control and retry after it has ended" % command)
+        else:
+            guidance = "obtain evidence with: " + command
+            folder = safe_path(base / "launches" / hierarchy_launcher.quoted(endpoint))
+            if not folder.exists():
+                return evidence
+            guidance = ("inspect %s mailbox_root and %s; %s will not change this setup; "
+                        "correct the mailbox association and retry" % (base / "provision.json", mailbox.root, command))
+            launches = hierarchy_launcher.Launches(str(base))
+            require(os.path.samefile(launches.mailbox.root, mailbox.root),
+                    "launch records do not cover this mailbox")
+            paths = launches.paths(endpoint)
+            limit, count = hierarchy_launcher.MAX_RECORDS, len(paths)
+            guidance = ("inspect %s; %s cannot append a stop record at this limit; "
+                        "docs/hierarchy-maintenance-runbook.md has no launch-record archive procedure yet; "
+                        "owner must preserve the history and arrange an archive/recovery procedure before retrying"
+                        % (folder, command))
+            require(count < limit, "launch record limit %d reached (%d records)" % (limit, count))
+            records = []
+            for path in paths:
+                guidance = ("inspect %s and its retained evidence; %s will not change this record; "
+                            "owner must reconcile the invalid data before retrying" % (path, command))
+                # Hash the exact bytes parsed, so the evidence cannot describe a different read of the file.
+                try:
+                    raw = read_bytes(path)
+                    record = strict_json(raw.decode("utf-8"))
+                except (ValueError, OSError, UnicodeError, RecursionError) as exc:
+                    raise ValueError("invalid launch record: %s; error: %s" % (path, exc)) from exc
+                require(isinstance(record, dict) and record.get("schema") == hierarchy_launcher.SCHEMA,
+                        "invalid launch record: " + str(path))
+                generation = record.get("generation")
+                if (record.get("state") != "refused"
+                        and all(record.get(key) == current[key] for key in ("endpoint", "session"))
+                        and (generation == current["generation"] or generation is None and current["generation"] == 1)):
+                    records.append((path, record, hashlib.sha256(raw).hexdigest()))
+            if not records:
+                return evidence
+            guidance = "obtain evidence with: " + command
+            # The launcher orders its immutable records by their timestamp-prefixed filenames, including status().
+            status_path, status, status_hash = records[-1]
+            require(status.get("action") == "stop" and status.get("state") in ("stopped", "not_running"),
+                    "latest launch status is %s (%s); a stopped or not_running stop record is required"
+                    % (status.get("state"), status.get("action")))
+            activities = [row for row in records if row[1].get("action") in ("start", "resume")]
+            launch_path, launch_hash = None, None
+            if activities:
+                launch_path, launch, launch_hash = activities[-1]
+                require(status_path > launch_path and parse_time(status.get("at")) > parse_time(launch.get("at")),
+                        "stop record must be recorded after the latest start or resume")
+            evidence = {"launch": str(launch_path) if launch_path is not None else None, "launch_sha256": launch_hash,
+                        "status": str(status_path), "status_sha256": status_hash, "state": status["state"]}
         marker = mailbox.wake_marker(endpoint)
         if marker.exists() or marker.is_symlink():
-            guidance = "inspect %s; once %s reports not_running, remove the marker and retry" % (marker, command)
+            if background:
+                guidance = ("inspect %s; %s refuses background sessions; stop the background session through "
+                            "claude stop or the wake tool's control; once it has ended, remove the marker and retry"
+                            % (marker, command))
+            else:
+                guidance = "inspect %s; once %s reports not_running, remove the marker and retry" % (marker, command)
             raise ValueError("wake marker is held: " + str(marker))
         # Unlike stop(), we signal nothing, so exclude no ancestors that could still be the outgoing writer.
         try:
@@ -142,9 +177,9 @@ def stop_evidence(mailbox, current):
             raise ValueError("process census failed; error: " + str(exc)) from exc
         require(not found, "live process remains for session %s: %s"
                 % (current["session"], ", ".join(str(pid) for pid, _ in found)))
-        return {"launch": str(launch_path) if launch_path is not None else None, "launch_sha256": launch_hash,
-                "status": str(status_path), "status_sha256": status_hash, "state": status["state"]}
-    except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError, subprocess.SubprocessError) as exc:
+        return evidence
+    except (ValueError, OSError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError,
+            subprocess.SubprocessError) as exc:
         raise ValueError("stop evidence for %s: %s; %s" % (endpoint, exc, guidance)) from exc
 
 
