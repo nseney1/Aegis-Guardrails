@@ -89,16 +89,6 @@ class Extractor:
     def text(self, lo, hi):
         return ''.join(token.value for token in self.t[lo:hi])
 
-    def _closure_end(self, start, hi):
-        if self.t[start].value == '||':
-            return start + 1
-        end = start + 1
-        while end < hi and self.t[end].value != '|':
-            end = self.pairs[end] + 1 if end in self.pairs and self.pairs[end] > end else end + 1
-        if end >= hi:
-            error('unclosed closure parameters', self.t[start].line)
-        return end + 1
-
     def split(self, lo, hi, *, expressions=False):
         start, i, operand = lo, lo, True
         while i < hi:
@@ -118,11 +108,16 @@ class Extractor:
                     error('invalid generic arguments', token.line)
                 operand = False
                 continue
-            elif expressions and value in ('|', '||') and operand:
+            elif expressions and value == '|' and operand:
+                i += 1
+                while i < hi and self.t[i].value != '|':
+                    i = self.pairs[i] + 1 if i in self.pairs and self.pairs[i] > i else i + 1
+                if i == hi:
+                    error('unclosed closure parameters', token.line)
                 # A closure body can itself begin with another closure. Only its
                 # parameter region is skipped here; executable body facts stay visible.
-                i = self._closure_end(i, hi)
-                continue
+            elif expressions and value == '||' and operand:
+                pass
             elif expressions and operand and not token.raw and value in ('async', 'move', 'static'):
                 pass
             else:
@@ -361,27 +356,6 @@ class Extractor:
         self._validate_types(start, end)
         self.skip.update(range(start, end + 1))
 
-    def _union_start(self, start):
-        if start + 1 >= len(self.t) or self.t[start + 1].kind != 'ident':
-            return None
-        if self.t[start + 1].value == 'as' and not self.t[start + 1].raw:
-            return None  # a cast of the ordinary identifier `union`
-        before = start - 1
-        if before >= 0 and self.t[before].value == ')':
-            opening = self.pairs[before]
-            if opening > 0 and self.t[opening - 1].value == 'pub':
-                before = opening - 2
-        elif before >= 0 and self.t[before].value == 'pub':
-            before -= 1
-        while before >= 0 and self.t[before].value == ']':
-            attribute = self.pairs[before] - 1
-            if attribute >= 0 and self.t[attribute].value == '!':
-                attribute -= 1
-            if attribute < 0 or self.t[attribute].value != '#':
-                break
-            before = attribute - 1
-        return before + 1 if before < 0 or self.t[before].value in ('{', '}', ';') else None
-
     def definitions_and_scopes(self):
         context, pending, i = [], [], 0
         while i < len(self.t):
@@ -405,12 +379,6 @@ class Extractor:
                 if end < len(self.t) and self.t[end].value == '{':
                     context.append((self.pairs[end], 'impl', name))
                 self.skip.update(range(i, end + 1))
-            elif value == 'union' and not self.t[i].raw:
-                header = self._union_start(i)
-                if header is not None:
-                    self.skip.update(range(header, i))
-                    i = self.definition(i, context, pending)
-                pending = []
             elif value in ('fn', 'struct', 'enum', 'trait', 'mod', 'const', 'static', 'macro_rules') and not self.t[i].raw:
                 if value == 'const' and i + 1 < len(self.t) and self.t[i + 1].value == 'fn':
                     i += 1
@@ -429,7 +397,7 @@ class Extractor:
         if name_at >= len(self.t) or self.t[name_at].kind != 'ident':
             if keyword == 'fn' and name_at < len(self.t) and self.t[name_at].value == '(':
                 return i  # function pointer type, not a declaration
-            if keyword in ('fn', 'struct', 'union', 'enum', 'trait', 'mod', 'static', 'macro_rules'):
+            if keyword in ('fn', 'struct', 'enum', 'trait', 'mod', 'static', 'macro_rules'):
                 error('invalid ' + keyword + ' declaration', self.t[i].line)
             return i
         name = self.t[name_at].value
@@ -438,7 +406,7 @@ class Extractor:
         modules = [name for _, kind, name in context if kind == 'mod']
         attrs = tuple(name for name, _ in pending)
         exported = self._exported(i)
-        kind = 'method' if keyword == 'fn' and owner else {'fn': 'function', 'struct': 'class', 'union': 'class', 'trait': 'class',
+        kind = 'method' if keyword == 'fn' and owner else {'fn': 'function', 'struct': 'class', 'trait': 'class',
                                                         'enum': 'class', 'mod': 'module'}.get(keyword, keyword)
         self.definitions.append(DefinitionNode(name, kind, self.t[i].line, exported, owner, attrs))
         end = self._body(name_at + 1)
@@ -463,7 +431,7 @@ class Extractor:
                 scope = '::'.join(([owner] if owner else modules) + [name])
                 self.scopes[end] = (self.pairs[end], scope) if keyword == 'fn' else None
                 context.append((self.pairs[end], keyword if keyword == 'fn' else 'mod', name))
-            elif keyword in ('struct', 'union'):
+            elif keyword == 'struct':
                 self._validate_types(end + 1, self.pairs[end])
                 self.skip.update(range(end, self.pairs[end] + 1))
             elif keyword == 'enum':
@@ -531,35 +499,6 @@ class Extractor:
             while end < len(self.t) and self.t[end].value not in (marker, ';'):
                 end = self.pairs[end] + 1 if end in self.pairs and self.pairs[end] > end else end + 1
             self.skip.update(range(start + 1, end))
-        self._closure_regions()
-
-    def _closure_regions(self):
-        i, operand = 0, True
-        while i < len(self.t):
-            if i in self.skip:
-                i += 1
-                continue
-            token = self.t[i]
-            value = token.value
-            if value in ('|', '||') and operand:
-                end = self._closure_end(i, len(self.t))
-                self.skip.update(range(i, end))
-                if end < len(self.t) and self.t[end].value == '->':
-                    opening = self._body(end + 1)
-                    self._validate_types(end + 1, opening)
-                    self.skip.update(range(end, opening))
-                    if opening < len(self.t) and self.t[opening].value == '{':
-                        self.control_blocks.add(opening)
-                    end = opening
-                i = end
-                operand = True
-                continue
-            if not token.raw and value in ('async', 'move', 'static', 'return', 'break', 'yield', 'if', 'while', 'match', 'in'):
-                operand = True
-            else:
-                operand = value in ('=', '(', '[', '{', ',', ';', ':', '=>', '+', '-', '*', '/', '%', '&', '|', '^',
-                                    '!', '&&', '||', '==', '!=', '<', '>', '<=', '>=')
-            i += 1
 
     def arguments(self, opening):
         result, named, updates = {}, {}, set()
@@ -630,10 +569,8 @@ class Extractor:
             return False
         if closing == opening + 1:
             return True
-        start = self._skip_attributes(opening + 1, closing)
-        inner = self.t[start: min(start + 2, closing)]
-        return bool(inner) and (inner[0].value == '..' or
-                                (inner[0].kind == 'ident' and (len(inner) == 1 or inner[1].value in (':', ','))))
+        inner = self.t[opening + 1: min(opening + 3, closing)]
+        return inner[0].value == '..' or (inner[0].kind == 'ident' and (len(inner) == 1 or inner[1].value in (':', ',')))
 
     def mutations(self):
         rows = []
