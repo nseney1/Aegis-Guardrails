@@ -138,6 +138,42 @@ def check_cli(ws):
     print("ok  aegis --help")
 
 
+def check_team_status():
+    """The installed CLI observes a captured lane tip without changing refs or events."""
+    from pathlib import Path
+    from aegis_core import events, gitsafe
+
+    with tempfile.TemporaryDirectory(prefix="aegis-smoke-team-") as temporary:
+        root = Path(temporary)
+        repo, home = root / "repo", root / "home"
+        (repo / ".aegis").mkdir(parents=True)
+        home.mkdir()
+        env = _home_env(str(home), drop=("PYTHONPATH", "AEGIS_WORKSPACE", "CLAUDE_CONFIG_DIR", "CODEX_HOME"))
+        for args in (("init", "-q", "-b", "main"),
+                     ("-c", "user.name=Smoke", "-c", "user.email=smoke@example.test", "-c", "commit.gpgsign=false",
+                      "commit", "--allow-empty", "-qm", "base")):
+            subprocess.run([gitsafe.git_executable(), *args], cwd=repo, env=env, check=True,
+                           capture_output=True, timeout=30)
+        cli = [sys.executable, _SUBPROC_FLAG, "-m", "aegis_cli.cli", "team"]
+        claim = subprocess.run([*cli, "claim", "docs", "--paths", "docs/**", "--branch", "main", "--json"],
+                               cwd=repo, env=env, capture_output=True, text=True, timeout=60)
+        if claim.returncode != 0 or json.loads(claim.stdout).get("schema") != "aegis.team.claim/v1":
+            fail(f"installed team claim failed: {claim.stdout[-500:]} {claim.stderr[-500:]}")
+        before = (gitsafe.list_refs(repo, "refs/aegis/lanes"), events.read(repo).rows)
+        report = subprocess.run([*cli, "status", "--check", "--json"], cwd=repo, env=env,
+                                capture_output=True, text=True, timeout=60)
+        if report.returncode != 0:
+            fail(f"installed team status failed: {report.stdout[-500:]} {report.stderr[-500:]}")
+        value = json.loads(report.stdout)
+        if (value.get("schema") != "aegis.team.status/v1" or len(value.get("lanes", [])) != 1
+                or value["lanes"][0]["check"]["status"] != "pass"
+                or value["lanes"][0]["tip"] != gitsafe.head_commit(repo)
+                or before != (gitsafe.list_refs(repo, "refs/aegis/lanes"), events.read(repo).rows)):
+            fail(f"installed team status returned an invalid or mutating observation: {value!r}")
+    check_module_origins(("aegis_core.team_status",))
+    print("ok  installed team status --check --json (read-only lane observation)")
+
+
 def check_doctor(ws):
     """`aegis doctor --json` imports the whole doctor family from the wheel; a fresh HOME and an empty
     PATH keep the machine's hosts, git and gh out of it. A failed check (exit 1) is fine, a crash is not."""
@@ -354,6 +390,7 @@ def main():
     ws = make_workspace()
     check_native_ast(ws)
     check_cli(ws)
+    check_team_status()
     check_doctor(ws)
     check_mcp(ws)
     check_mcp_launcher()

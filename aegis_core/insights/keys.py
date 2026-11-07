@@ -210,12 +210,20 @@ def insights_path(workspace: Any, home: Optional[Path] = None) -> Path:
     return layout.aegis_dir / "insights" / f"{insight_workspace_id(workspace)}.jsonl"
 
 
+#: How long one insight append waits for the log's lock. The lock is held only for one
+#: O_APPEND write and its fsync, but that lock is not fair: a busy writer (another session's
+#: prompts, a parallel suite) can keep a poller out past file_lock's generic 5 s, and a
+#: timeout drops the row (the prompt hook fails open). Rows are written only under the
+#: lock, so none is torn; the bound stays under a host's 60 s default hook timeout.
+INSIGHT_APPEND_LOCK_TIMEOUT_SECONDS = 30.0
+
+
 def _append_user_insights(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
         return
     _ensure_private_dir(path.parent.parent)
     _ensure_private_dir(path.parent)
-    with storage.file_lock(path.with_suffix(".lock")):
+    with storage.file_lock(path.with_suffix(".lock"), timeout=INSIGHT_APPEND_LOCK_TIMEOUT_SECONDS):
         append_jsonl(path, list(rows), mode=0o600)  # the mode is set through the descriptor
 
 

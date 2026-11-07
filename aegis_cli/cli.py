@@ -278,7 +278,8 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
 
     try:
         try:
-            _attach_workspace(args)
+            if args.command != "workspace":
+                _attach_workspace(args)
         except WorkspaceError as exc:
             if isinstance(exc, WorkspaceHold):
                 _print_hold(args, exc)

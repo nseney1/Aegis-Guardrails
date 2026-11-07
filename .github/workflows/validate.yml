@@ -7,6 +7,10 @@ on:
     branches: [main, develop, 'release/**']
   workflow_call:
   workflow_dispatch:
+  # Nightly full matrix (CI plan, 2026-11-05). GitHub runs schedules only from the default branch's
+  # copy of this file, against main's tip; develop gets the full matrix from its pushes.
+  schedule:
+    - cron: '17 4 * * *'
 
 # Least privilege: every job gets a read-only token unless it grants more below.
 permissions:
@@ -16,6 +20,10 @@ permissions:
 # (2026-10-20/21: validate 146 min on macOS 3.9, of which check --ci was about 120; aegis-check
 # 27; test-windows 16; the rest under 1), never below 45 for validate and test-windows, at most
 # GitHub's 360. Lower them only from new measurements: a limit must not turn a slow green run red.
+# test-windows: 90, three times the ~29 min green dispatch runs of 2026-11-04 (41768431362).
+# Dispatch run 41796679010 (2026-11-04) was cancelled at the old 45 with the suite still running;
+# its log has expired, so a hang there is not ruled out. test-fast: 45, against 17.6 min for the
+# ubuntu-latest 3.11 leg (41768431362), the slowest of its last 5 green runs.
 jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
@@ -90,8 +98,67 @@ jobs:
           name: aegis-wheel
           path: dist/
 
+  # The per-PR leg (CI plan, owner-approved 2026-11-05): the whole suite on Linux 3.11 with xdist.
+  # It runs on every event, wave PRs into develop included. It executes the pull request's own
+  # code, so it gets the read-only token only, no secrets, and a checkout that keeps no
+  # credentials. Wave PRs build no wheel, so it installs the checkout into its own venv.
+  test-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        run: make test PYTHON="$VENV/bin/python"
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
+
   aegis-check:
-    needs: [dependency-audit, build-wheel, validate, test-windows]
+    needs: [dependency-audit, build-wheel, validate, test-windows, test-fast]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -104,8 +171,10 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           EXPECTED_RESULT: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && 'skipped' || 'success' }}
+          # Jobs that run on every event, wave PRs included, so they must always succeed.
+          ALWAYS_SUCCESS: test-fast
         run: |
-          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != expected}; sys.exit(f"Unexpected upstream job results (expected {expected}): {bad}" if bad else 0)'
+          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; always = os.environ["ALWAYS_SUCCESS"].split(); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != ("success" if k in always else expected)}; bad.update({k: "missing" for k in always if k not in needs}); sys.exit(f"Unexpected upstream job results (expected {expected}, and success for {always}): {bad}" if bad else 0)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && github.event.pull_request.base.sha || github.sha }}
@@ -116,8 +185,8 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
-      # Wave tests run locally. This unconditional, base-sourced comparison keeps
-      # the required aegis-check context without executing the wave's code.
+      # On a wave PR the tests run in test-fast (gated by the first step). This unconditional,
+      # base-sourced comparison keeps the governance verdict free of the wave's own code.
       - name: Run CI governance without execution
         env:
           GH_TOKEN: ${{ github.token }}
@@ -214,6 +283,22 @@ jobs:
       - name: Run Layer 1 Deterministic Verification
         run: python3 -m aegis_cli.cli check
 
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe as tests/integration/test_hierarchy_jobs.py. The job tests skip when it fails,
+      # so it runs here as a hard step. Ubuntu 23.10 and later block unprivileged user namespaces
+      # through AppArmor; the sysctl lifts that for this throwaway runner.
+      - name: Prove bubblewrap runs
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
       - name: Run test suite
         id: test
         run: make test
@@ -234,7 +319,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: build-wheel
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -480,7 +565,7 @@ jobs:
   # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
   # once every job passed, only on the events doctor --release consumes (not release, not PRs).
   verdict:
-    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows]
+    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows, test-fast]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10

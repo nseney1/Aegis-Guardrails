@@ -1,0 +1,763 @@
+{
+ "cli_version": "0.166.0",
+ "codex_home": "@PROBE_ROOT@/codex-home",
+ "gitdir": "@SOURCE@/.git/worktrees/worktree",
+ "helper": {
+  "path": "@PROBE_ROOT@/helper/native-probe-attempt.py",
+  "sha256": "20d79fd48564ce8ae55dca72d89232d644987ed92138b0f6f203cb685999bf03"
+ },
+ "outside": "@PROBE_ROOT@/outside",
+ "probe_root": "@PROBE_ROOT@",
+ "python": "/usr/bin/python3",
+ "roles": [
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-288147d49bd6f0f8 288147d49bd6f0f8",
+     "expected": "ALLOWED",
+     "id": "implementer-shell-worktree",
+     "nonce": "288147d49bd6f0f8",
+     "nonce_file": true,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-288147d49bd6f0f8",
+     "run1_verdict": "ALLOWED",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-c459e8760863f92b c459e8760863f92b",
+     "expected": "REFUSED",
+     "id": "implementer-shell-outside",
+     "nonce": "c459e8760863f92b",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-c459e8760863f92b",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-6726ca5e1526677e 6726ca5e1526677e",
+     "expected": "REFUSED",
+     "id": "implementer-shell-gitdir",
+     "nonce": "6726ca5e1526677e",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-6726ca5e1526677e",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml bf06531a9d92af12",
+     "expected": "REFUSED",
+     "id": "implementer-shell-codex_home",
+     "nonce": "bf06531a9d92af12",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "ALLOWED",
+     "id": "implementer-apply_patch-worktree",
+     "line": "aegis-native-probe 7df81d5d8f34a180",
+     "nonce": "7df81d5d8f34a180",
+     "nonce_file": true,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-7df81d5d8f34a180",
+     "run1_verdict": "ALLOWED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "implementer-apply_patch-outside",
+     "line": "aegis-native-probe 53ef4894b62c0c2f",
+     "nonce": "53ef4894b62c0c2f",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-53ef4894b62c0c2f",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "implementer-apply_patch-gitdir",
+     "line": "aegis-native-probe a4164de51afd13eb",
+     "nonce": "a4164de51afd13eb",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-a4164de51afd13eb",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "implementer-apply_patch-codex_home",
+     "line": "aegis-native-probe 7d1fb60d8a51da91",
+     "nonce": "7d1fb60d8a51da91",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-implementer/lane/probe",
+   "probe_turn_id": "01a1b0d3-08dc-75f1-b8c4-4a4eb9deac65",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "implementer",
+   "rollout": "implementer.jsonl",
+   "sandbox": "workspace-write",
+   "session": "01a1b0d2-f376-79c1-a3ae-8b671c2f9018",
+   "shell": true,
+   "source_rollout": "rollout-2026-11-06T07-26-18-01a1b0d2-f376-79c1-a3ae-8b671c2f9018.jsonl",
+   "source_sha256": "f2a26a5accf4eea7cc922fd945e0500018471eb1f0fd133d29f0c92989e43664",
+   "wake_turn_id": "01a1b0d3-9185-7a51-a12c-eca10568106c"
+  },
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-16f520863bc2826e 16f520863bc2826e",
+     "expected": "UNAVAILABLE",
+     "id": "reviewer-shell-worktree",
+     "nonce": "16f520863bc2826e",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-16f520863bc2826e",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-0a0e364fe519c468 0a0e364fe519c468",
+     "expected": "UNAVAILABLE",
+     "id": "reviewer-shell-outside",
+     "nonce": "0a0e364fe519c468",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-0a0e364fe519c468",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-fb9697588c891401 fb9697588c891401",
+     "expected": "UNAVAILABLE",
+     "id": "reviewer-shell-gitdir",
+     "nonce": "fb9697588c891401",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-fb9697588c891401",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml 8c2d4d39a548276b",
+     "expected": "UNAVAILABLE",
+     "id": "reviewer-shell-codex_home",
+     "nonce": "8c2d4d39a548276b",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "reviewer-apply_patch-worktree",
+     "line": "aegis-native-probe 68f9ba95d0cc8b1d",
+     "nonce": "68f9ba95d0cc8b1d",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-68f9ba95d0cc8b1d",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "reviewer-apply_patch-outside",
+     "line": "aegis-native-probe fec0e2e0cb8e0d0c",
+     "nonce": "fec0e2e0cb8e0d0c",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-fec0e2e0cb8e0d0c",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "reviewer-apply_patch-gitdir",
+     "line": "aegis-native-probe 7126d5bc1002a624",
+     "nonce": "7126d5bc1002a624",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-7126d5bc1002a624",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "reviewer-apply_patch-codex_home",
+     "line": "aegis-native-probe 681a036b53403b73",
+     "nonce": "681a036b53403b73",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-reviewer/lane/probe",
+   "probe_turn_id": "01a1b0dc-cda6-70d2-9bcd-d9d3ca71843c",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "reviewer",
+   "rollout": "reviewer.jsonl",
+   "sandbox": "read-only",
+   "session": "01a1b0dc-b8ee-7a73-89a4-e015b0192e0c",
+   "shell": false,
+   "source_rollout": "rollout-2026-11-06T07-36-57-01a1b0dc-b8ee-7a73-89a4-e015b0192e0c.jsonl",
+   "source_sha256": "afffa6470b00a40b8c5e8e1e4e4fb0bff682d0d8b406cd117683e62f598d57f4",
+   "wake_turn_id": "01a1b0dd-897a-7fa1-8d46-c441fa4ed41e"
+  },
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-5484e6df7a5f4337 5484e6df7a5f4337",
+     "expected": "UNAVAILABLE",
+     "id": "orchestrator-shell-worktree",
+     "nonce": "5484e6df7a5f4337",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-5484e6df7a5f4337",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-08fceec9011ae3a2 08fceec9011ae3a2",
+     "expected": "UNAVAILABLE",
+     "id": "orchestrator-shell-outside",
+     "nonce": "08fceec9011ae3a2",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-08fceec9011ae3a2",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-854d75068356edb6 854d75068356edb6",
+     "expected": "UNAVAILABLE",
+     "id": "orchestrator-shell-gitdir",
+     "nonce": "854d75068356edb6",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-854d75068356edb6",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml bddbccbd38ea532b",
+     "expected": "UNAVAILABLE",
+     "id": "orchestrator-shell-codex_home",
+     "nonce": "bddbccbd38ea532b",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "orchestrator-apply_patch-worktree",
+     "line": "aegis-native-probe 24f43635259a0945",
+     "nonce": "24f43635259a0945",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-24f43635259a0945",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "orchestrator-apply_patch-outside",
+     "line": "aegis-native-probe 0c2b717fe04f2791",
+     "nonce": "0c2b717fe04f2791",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-0c2b717fe04f2791",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "orchestrator-apply_patch-gitdir",
+     "line": "aegis-native-probe 08876072c4d0a1d9",
+     "nonce": "08876072c4d0a1d9",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-08876072c4d0a1d9",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "orchestrator-apply_patch-codex_home",
+     "line": "aegis-native-probe eae17dd8ae3d6a60",
+     "nonce": "eae17dd8ae3d6a60",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-orchestrator/orchestrator",
+   "probe_turn_id": "01a1b0dd-fe31-76c0-b028-a17c5ff526dd",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "orchestrator",
+   "rollout": "orchestrator.jsonl",
+   "sandbox": "read-only",
+   "session": "01a1b0dd-eb29-7cf2-9639-210a63b068cd",
+   "shell": false,
+   "source_rollout": "rollout-2026-11-06T07-38-16-01a1b0dd-eb29-7cf2-9639-210a63b068cd.jsonl",
+   "source_sha256": "f92f808fafb3e99edae51dae6da3df09039c0a5cf877270885d560546743362b",
+   "wake_turn_id": "01a1b0de-b9d5-7321-ae91-4050341b68cf"
+  },
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-313645ea953e3376 313645ea953e3376",
+     "expected": "UNAVAILABLE",
+     "id": "decider-shell-worktree",
+     "nonce": "313645ea953e3376",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-313645ea953e3376",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-61f2beceb212b18e 61f2beceb212b18e",
+     "expected": "UNAVAILABLE",
+     "id": "decider-shell-outside",
+     "nonce": "61f2beceb212b18e",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-61f2beceb212b18e",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-7bfd79fcde507f7c 7bfd79fcde507f7c",
+     "expected": "UNAVAILABLE",
+     "id": "decider-shell-gitdir",
+     "nonce": "7bfd79fcde507f7c",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-7bfd79fcde507f7c",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml f1f2b59cb03fcba1",
+     "expected": "UNAVAILABLE",
+     "id": "decider-shell-codex_home",
+     "nonce": "f1f2b59cb03fcba1",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "decider-apply_patch-worktree",
+     "line": "aegis-native-probe 2a3cab0d89066ecc",
+     "nonce": "2a3cab0d89066ecc",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-2a3cab0d89066ecc",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "decider-apply_patch-outside",
+     "line": "aegis-native-probe d4164d2322679c16",
+     "nonce": "d4164d2322679c16",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-d4164d2322679c16",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "decider-apply_patch-gitdir",
+     "line": "aegis-native-probe 354e2971556490d0",
+     "nonce": "354e2971556490d0",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-354e2971556490d0",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "decider-apply_patch-codex_home",
+     "line": "aegis-native-probe 19b8fabce26b6745",
+     "nonce": "19b8fabce26b6745",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-decider/decider",
+   "probe_turn_id": "01a1b0df-1860-7972-be0a-19ea391adc6e",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "decider",
+   "rollout": "decider.jsonl",
+   "sandbox": "read-only",
+   "session": "01a1b0df-0150-7fe0-a960-87dac29ba43c",
+   "shell": false,
+   "source_rollout": "rollout-2026-11-06T07-39-27-01a1b0df-0150-7fe0-a960-87dac29ba43c.jsonl",
+   "source_sha256": "38e2c97d725f3b41e619f153bbfebcf97d640bd89755eafa9749b0a2218e3d83",
+   "wake_turn_id": "01a1b0df-a688-7971-9ef7-37f14cbda392"
+  },
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-7f5a14d4022ce0bf 7f5a14d4022ce0bf",
+     "expected": "UNAVAILABLE",
+     "id": "router-shell-worktree",
+     "nonce": "7f5a14d4022ce0bf",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-7f5a14d4022ce0bf",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-15e8856d64f0b552 15e8856d64f0b552",
+     "expected": "UNAVAILABLE",
+     "id": "router-shell-outside",
+     "nonce": "15e8856d64f0b552",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-15e8856d64f0b552",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-9938a6c70bbee7ac 9938a6c70bbee7ac",
+     "expected": "UNAVAILABLE",
+     "id": "router-shell-gitdir",
+     "nonce": "9938a6c70bbee7ac",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-9938a6c70bbee7ac",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml eb66f0d79d38ef13",
+     "expected": "UNAVAILABLE",
+     "id": "router-shell-codex_home",
+     "nonce": "eb66f0d79d38ef13",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "router-apply_patch-worktree",
+     "line": "aegis-native-probe 803dab65d9a01a05",
+     "nonce": "803dab65d9a01a05",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-803dab65d9a01a05",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "router-apply_patch-outside",
+     "line": "aegis-native-probe 0202f8d72dc0901d",
+     "nonce": "0202f8d72dc0901d",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-0202f8d72dc0901d",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "router-apply_patch-gitdir",
+     "line": "aegis-native-probe d4a8ddf551f830f0",
+     "nonce": "d4a8ddf551f830f0",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-d4a8ddf551f830f0",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "router-apply_patch-codex_home",
+     "line": "aegis-native-probe 22aaac929a63ed7a",
+     "nonce": "22aaac929a63ed7a",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-router/router",
+   "probe_turn_id": "01a1b0df-f297-7ac2-8e56-b22ae841ff07",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "router",
+   "rollout": "router.jsonl",
+   "sandbox": "read-only",
+   "session": "01a1b0df-d940-7c91-8b46-3a83ece2c84c",
+   "shell": false,
+   "source_rollout": "rollout-2026-11-06T07-40-22-01a1b0df-d940-7c91-8b46-3a83ece2c84c.jsonl",
+   "source_sha256": "8a9a505018bbf48e83401f0df0bf61d8595f78be3bd1c57ce9964be4e920e1b2",
+   "wake_turn_id": "01a1b0e0-5e8e-7d83-88cc-dacdd1e8068d"
+  },
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-5e9cbfd466eb4818 5e9cbfd466eb4818",
+     "expected": "ALLOWED",
+     "id": "integrator-shell-worktree",
+     "nonce": "5e9cbfd466eb4818",
+     "nonce_file": true,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-5e9cbfd466eb4818",
+     "run1_verdict": "ALLOWED",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-24ccb80f4fd843e4 24ccb80f4fd843e4",
+     "expected": "REFUSED",
+     "id": "integrator-shell-outside",
+     "nonce": "24ccb80f4fd843e4",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-24ccb80f4fd843e4",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-6919387e530f0e2c 6919387e530f0e2c",
+     "expected": "REFUSED",
+     "id": "integrator-shell-gitdir",
+     "nonce": "6919387e530f0e2c",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-6919387e530f0e2c",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml 66d5846899a44939",
+     "expected": "REFUSED",
+     "id": "integrator-shell-codex_home",
+     "nonce": "66d5846899a44939",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "ALLOWED",
+     "id": "integrator-apply_patch-worktree",
+     "line": "aegis-native-probe 462033535ee0aa60",
+     "nonce": "462033535ee0aa60",
+     "nonce_file": true,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-462033535ee0aa60",
+     "run1_verdict": "ALLOWED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "integrator-apply_patch-outside",
+     "line": "aegis-native-probe db0dc1ef66ea1ec8",
+     "nonce": "db0dc1ef66ea1ec8",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-db0dc1ef66ea1ec8",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "integrator-apply_patch-gitdir",
+     "line": "aegis-native-probe 22ac11129ff3f3e3",
+     "nonce": "22ac11129ff3f3e3",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-22ac11129ff3f3e3",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "integrator-apply_patch-codex_home",
+     "line": "aegis-native-probe af7fd07296a2f06a",
+     "nonce": "af7fd07296a2f06a",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-integrator/lane/probe",
+   "probe_turn_id": "01a1b0e0-a235-7400-bcc1-2cf3be551136",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "integrator",
+   "rollout": "integrator.jsonl",
+   "sandbox": "workspace-write",
+   "session": "01a1b0e0-8f9a-7503-94bb-a6fd2e77d6b8",
+   "shell": true,
+   "source_rollout": "rollout-2026-11-06T07-41-09-01a1b0e0-8f9a-7503-94bb-a6fd2e77d6b8.jsonl",
+   "source_sha256": "ea3c9f327fd9678e1208fa2405c4e703f7040016740fe2dc5b620fe760375372",
+   "wake_turn_id": "01a1b0e1-e659-7ee2-a598-0d689692c30f"
+  },
+  {
+   "attempts": [
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/worktree/aegis-probe-2ffbf87a3dab2996 2ffbf87a3dab2996",
+     "expected": "UNAVAILABLE",
+     "id": "front-door-shell-worktree",
+     "nonce": "2ffbf87a3dab2996",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-2ffbf87a3dab2996",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "worktree"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/outside/aegis-probe-9716f7995935b64a 9716f7995935b64a",
+     "expected": "UNAVAILABLE",
+     "id": "front-door-shell-outside",
+     "nonce": "9716f7995935b64a",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-9716f7995935b64a",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "outside"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @SOURCE@/.git/worktrees/worktree/aegis-probe-77a32401daa1c416 77a32401daa1c416",
+     "expected": "UNAVAILABLE",
+     "id": "front-door-shell-gitdir",
+     "nonce": "77a32401daa1c416",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-77a32401daa1c416",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "gitdir"
+    },
+    {
+     "channel": "shell",
+     "command": "/usr/bin/python3 -I @PROBE_ROOT@/helper/native-probe-attempt.py @PROBE_ROOT@/codex-home/config.toml d15678cf9335c5f4",
+     "expected": "UNAVAILABLE",
+     "id": "front-door-shell-codex_home",
+     "nonce": "d15678cf9335c5f4",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "UNAVAILABLE",
+     "target": "codex_home"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "front-door-apply_patch-worktree",
+     "line": "aegis-native-probe 63d1116c55d82573",
+     "nonce": "63d1116c55d82573",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/worktree/aegis-probe-63d1116c55d82573",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "worktree"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "front-door-apply_patch-outside",
+     "line": "aegis-native-probe b56f2d8ef2190d2f",
+     "nonce": "b56f2d8ef2190d2f",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/outside/aegis-probe-b56f2d8ef2190d2f",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "outside"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "front-door-apply_patch-gitdir",
+     "line": "aegis-native-probe d81b5039d84a346c",
+     "nonce": "d81b5039d84a346c",
+     "nonce_file": false,
+     "path": "@SOURCE@/.git/worktrees/worktree/aegis-probe-d81b5039d84a346c",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "gitdir"
+    },
+    {
+     "channel": "apply_patch",
+     "expected": "REFUSED",
+     "id": "front-door-apply_patch-codex_home",
+     "line": "aegis-native-probe 167d3a6a0298c69e",
+     "nonce": "167d3a6a0298c69e",
+     "nonce_file": false,
+     "path": "@PROBE_ROOT@/codex-home/config.toml",
+     "run1_verdict": "NOT_ATTEMPTED",
+     "target": "codex_home"
+    }
+   ],
+   "endpoint": "probe-front-door/front-door",
+   "probe_turn_id": "01a1b0eb-21bc-7073-aa3c-cde1b60b0ff9",
+   "profile_roots": [
+    "@PROBE_ROOT@/worktree"
+   ],
+   "role": "front-door",
+   "rollout": "front-door.jsonl",
+   "sandbox": "read-only",
+   "session": "01a1b0eb-0e7b-7210-a6f7-a91318e57d3e",
+   "shell": false,
+   "source_rollout": "rollout-2026-11-06T07-52-37-01a1b0eb-0e7b-7210-a6f7-a91318e57d3e.jsonl",
+   "source_sha256": "c45d6e91cf900b1d041eb247a3b5a7501ccf32e5c6f6431a35f024db18668ee3",
+   "wake_turn_id": "01a1b0eb-cbce-74c2-bc94-af40c2152f5c"
+  }
+ ],
+ "shells": {
+  "forbidden": [
+   "@PROBE_ROOT@",
+   "@PROBE_ROOT@/worktree"
+  ],
+  "lookup": {
+   "bash": "/usr/bin/bash",
+   "dash": "/usr/bin/dash",
+   "sh": "/usr/bin/dash",
+   "zsh": "/usr/bin/zsh"
+  }
+ },
+ "source": "evidence/41-native-probe-run1-plan.json and -report.json, probe probe-7208b75459e4",
+ "worktree": "@PROBE_ROOT@/worktree"
+}

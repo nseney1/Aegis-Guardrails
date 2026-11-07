@@ -15,6 +15,61 @@ aegis team claim docs --paths 'docs/**' --branch lane/docs --ttl 3600 --json
 aegis team list --json
 ```
 
+## Inspect every lane
+
+```sh
+aegis team status --base origin/develop
+aegis team status --base origin/develop --check --json
+```
+
+`status` lists every readable or unreadable lease ref, including expired leases.
+Each readable row includes the holder label, expiry, recorded branch, captured tip,
+commits ahead/behind the base, and overlaps with live declarations. Unreadable
+leases appear separately in each readable row's `unknown_overlaps`: their scope
+cannot be ruled out. `stale` means expired or a recorded branch is missing;
+unreadable leases have `stale: null`. None of these fields establish actor liveness
+or reserve runtime capacity.
+
+Without `--base`, status uses the same base selection as `check --lane`. An explicit
+base that cannot resolve is a usage error (exit 2). A missing default base, shallow
+history, absent branch or unreadable object leaves the affected counts unknown
+(`null` in JSON), with an explanation. Inspection still exits 0 when individual
+leases are expired, stale or unreadable. Repository-wide Git failures exit 1.
+
+`--check` applies the existing lane gate to each live lease's captured branch tip,
+using its declared paths and `shared` policy from that exact tip. This is
+**self-attested** policy. It does not read the caller's dirty working-tree policy,
+switch branches, run tests, launch agents, write events or change leases. Short
+branch labels name local branches; `refs/heads/...` and `refs/remotes/...` are
+accepted explicitly. Tags and revision expressions are not branch labels.
+The result identifies the exact lease and commit it observed; concurrent changes
+can make that observation stale. Re-run before making a separate write decision.
+
+Checks exit 1 when any verdict fails or cannot be established, including expired
+or unreadable leases and missing branches. Rows remain visible so uncertainty
+cannot silently produce a passing result. Without `--check`, every `check` field
+is `null` and no verdict is requested. Runtime reservations and native execution
+remain separate from this repository inspection.
+
+### Lane JSON schemas
+
+Schema IDs are additive to the existing envelopes, fields and exit codes:
+
+| JSON surface | `schema` |
+| --- | --- |
+| `team claim`, `renew`, `transfer`, `release`, `gc`, `list`, `metrics` | `aegis.team.<action>/v1` |
+| `team status` | `aegis.team.status/v1` |
+| `check --lane` | `aegis.check.lane/v1` |
+| `check --partition` | `aegis.check.partition/v1` |
+
+Handled refusals and errors carry the same schema ID as their command. Existing
+lease blobs and `.aegis/team.json` remain version 1. Readers of the older CLI
+documents can continue using their existing fields and ignoring the added ID.
+These repository schemas are distinct from runtime `aegis.team-run-status/v1`
+and its nested `aegis.team-status/v1`; they do not describe a running team.
+
+## Renew and finish a lane
+
 The claim prints its lease object ID. Save that ID for compare-and-swap operations:
 
 ```sh

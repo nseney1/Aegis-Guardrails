@@ -1,0 +1,82 @@
+{
+  "schema": "aegis.team-run/v1",
+  "run": "/REPLACE/WITH/an/empty/run/folder",
+  "project": "/REPLACE/WITH/a/fresh/clone/of/the/project",
+  "live_checkouts": [
+    "/REPLACE/WITH/your/live/checkout/of/the/project"
+  ],
+  "base": "REPLACE-WITH-THE-40-HEX-BASE-COMMIT",
+  "branch": "feature/REPLACE-WITH-the-lane-branch",
+  "initiative": {
+    "id": "m1",
+    "project": "REPLACE-WITH-project-name",
+    "repository": "REPLACE-WITH-repository-name",
+    "priority": 5,
+    "target_branch": "develop"
+  },
+  "roles": [
+    "router",
+    "decider"
+  ],
+  "lanes": [
+    {
+      "id": "f2",
+      "kind": "implementer",
+      "paths": [
+        "REPLACE/WITH/the/paths/the/lane/may/change"
+      ],
+      "tmpdir": "target/aegis-tmp"
+    },
+    {
+      "id": "review",
+      "kind": "reviewer"
+    }
+  ],
+  "recipes": {
+    "keep": [
+      "rust-targeted-tests",
+      "rust-lint",
+      "commit-exact"
+    ],
+    "python": "/usr/bin/python3",
+    "commit_identity": {
+      "name": "Aegis M1 Implementer",
+      "email": "m1-run@localhost"
+    }
+  },
+  "limits": {
+    "writer_limit": 3,
+    "heavy_limit": 3,
+    "heavy_tests_limit": 1
+  },
+  "preflight": {
+    "recipes": [
+      "rust-targeted-tests",
+      "rust-lint"
+    ],
+    "expect": {
+      "rust-targeted-tests": {
+        "state": "completed",
+        "failed": 0,
+        "min_passed": 1
+      },
+      "rust-lint": {
+        "state": "completed"
+      }
+    }
+  },
+  "min_free_gb": 8,
+  "loop": {
+    "interval": 30
+  },
+  "team": {
+    "model": "gpt-6.1-sol",
+    "reasoning": "high",
+    "reasoning_by_kind": {
+      "orchestrator": "medium",
+      "decider": "medium",
+      "implementer": "high",
+      "reviewer": "high"
+    }
+  }
+}

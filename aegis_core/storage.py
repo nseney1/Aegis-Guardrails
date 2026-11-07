@@ -553,7 +553,7 @@ def ledger_locked(workspace: Any, timeout: Optional[float] = None) -> Iterator[L
 
 @contextmanager
 def _hold(lock_path: Path, key: str, timeout: float, shared: bool, *, ordered: bool = True,
-          mode: Optional[int] = None) -> Iterator[Path]:
+          mode: Optional[int] = None, opened_fd: Optional[int] = None) -> Iterator[Path]:
     """Hold the lock file ``lock_path`` (``key``: its one spelling) for the block:
     re-entrant per thread, a thread lock then the OS lock, bounded by ``timeout``.
 
@@ -590,9 +590,10 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool, *, ordered: b
     thread_lock = _thread_lock(key)
     if not thread_lock.acquire(timeout=max(0.0, timeout)):
         raise _timeout_error(lock_path, timeout, kind)
-    fd = None
+    fd = opened_fd
     try:
-        fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT, mode=mode)
+        if fd is None:
+            fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT, mode=mode)
         interval = LOCK_RETRY_INTERVAL_SECONDS
         while not _try_os_lock(fd):
             if time.monotonic() >= deadline:
@@ -609,7 +610,7 @@ def _hold(lock_path: Path, key: str, timeout: float, shared: bool, *, ordered: b
             leaves.pop(key, None)
             _os_unlock(fd)
     finally:
-        if fd is not None:
+        if fd is not None and opened_fd is None:
             os.close(fd)
         thread_lock.release()
 
@@ -637,20 +638,58 @@ def locked(workspace: Any, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[Pa
 
 
 @contextmanager
-def file_lock(lock_path: Path, timeout: float = 5.0) -> Iterator[None]:
+def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = None) -> Iterator[None]:
     """Hold an arbitrary lock file ``lock_path`` (e.g. a user-scope ``.lock`` file).
 
     Re-entrant per thread, bounded by ``timeout`` seconds: ``locked``'s primitive
     (``_hold``) on its own key and a 0o600 lock file, without participating in
-    workspace/shared lock ordering.
+    workspace/shared lock ordering. With ``dir_fd``, open only the basename relative
+    to that caller-owned POSIX directory descriptor, refusing symlinks, hardlinks
+    and nonregular files; the caller retains ownership of the descriptor.
     """
     target = Path(os.fspath(lock_path))
+    if dir_fd is not None:
+        with _file_lock_at(target, timeout, dir_fd):
+            yield
+        return
     if target.parent.is_symlink():
         raise _link_error(target.parent)
     target.parent.mkdir(parents=True, exist_ok=True)
     key = f"file:{os.path.normcase(real_path(target))}"
     with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
         yield
+
+
+@contextmanager
+def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None]:
+    """Open only the basename relative to a caller-owned POSIX directory descriptor."""
+    if type(directory) is not int or directory < 0 or os.name != "posix":
+        raise ValueError("dir_fd requires a POSIX directory descriptor")
+    if not stat.S_ISDIR(os.fstat(directory).st_mode):
+        raise ValueError("dir_fd requires a directory descriptor")
+    key = f"file:{os.path.normcase(real_path(target))}"
+    flags = os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
+    try:
+        fd = os.open(target.name, flags, _PRIVATE_FILE_MODE, dir_fd=directory)
+    except OSError as exc:
+        try:
+            info = os.stat(target.name, dir_fd=directory, follow_symlinks=False)
+        except OSError:
+            raise exc
+        if stat.S_ISLNK(info.st_mode):
+            raise _link_error(target) from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target)) from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target))
+        _make_private(fd, _PRIVATE_FILE_MODE)
+        with _hold(target, key, timeout, shared=False, ordered=False, opened_fd=fd):
+            yield
+    finally:
+        os.close(fd)
 
 
 # ── JSONL ─────────────────────────────────────────────────────────────────────

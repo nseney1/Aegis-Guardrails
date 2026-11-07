@@ -18,7 +18,8 @@ Aegis Governance — make AI coding agents trustworthy
 
 ### Global options
 
-Every command also accepts `-h/--help`, `--json`, `--plain` and `--workspace`.
+Repository commands also accept `-h/--help`, `--json`, `--plain` and `--workspace`.
+The manager `workspace` namespace requires `--config` and refuses `--workspace`.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
@@ -42,7 +43,8 @@ Every command also accepts `-h/--help`, `--json`, `--plain` and `--workspace`.
 | `aegis check` | Daily Workflow & Verification | Verify changes: Layer 1 checks, plus a Layer 2 model review with --full |
 | `aegis scan` | Daily Workflow & Verification | Show which rules apply to the given files (run before editing them) |
 | `aegis status` | Daily Workflow & Verification | Show active rules and stats |
-| `aegis team` | Daily Workflow & Verification | Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics) |
+| `aegis team` | Daily Workflow & Verification | Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics) |
+| `aegis workspace` | Daily Workflow & Verification | Audit management decisions using a separately approved manager policy |
 | `aegis rule` | Rule Evolution & Intelligence | Manage rule lifecycle (list, create, promote, demote, archive) and share rules as unsigned packs |
 | `aegis sync` | Rule Evolution & Intelligence | Rebuild rule fitness from the ledger and suggest promotions (--apply to apply them) |
 | `aegis benchmark` | Plumbing | Measure scan and hook latency, payload size and Layer 1 throughput (not an efficacy measure) |
@@ -214,11 +216,11 @@ Category: Daily Workflow & Verification.
 
 ### `aegis team`
 
-Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics)
+Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics)
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `gc`, `list`, `metrics`, `release`, `renew`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `gc`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -280,6 +282,17 @@ Renew by compare-and-swap; an expired lease is re-claimed, overlap check include
 | `--expect` | `OID` |  | The lease oid the lane must hold now (printed by claim, renew, transfer and list) |
 | `--ttl` | `SECONDS` |  | New lifetime in seconds, at most 86400 (default: keep it) |
 
+### `aegis team status`
+
+Inspect every lane, branch and optional tip verdict
+
+A lease is conflict input, not liveness proof: it records which paths a lane declared and until when, not that its agent is still working. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics. Inspection changes no leases, worktrees or events.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--base` | `REF` |  | Compare branch tips to this commit (default: the base resolved by check --lane) |
+| `--check` |  |  | Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts |
+
 ### `aegis team transfer`
 
 Give a live lease to another owner
@@ -292,6 +305,72 @@ Change a live lease's owner (and role) by compare-and-swap.
 | `--expect` | `OID` |  | The lease oid the lane must hold now (printed by claim, renew, transfer and list) |
 | `--owner` | `OWNER` |  | The new owner label |
 | `--role` | `ROLE` |  | The new role label (default: keep it) |
+
+### `aegis workspace`
+
+Audit management decisions using a separately approved manager policy
+
+Manager audit prototype: explicit configuration, zero fitness credit, and no native Teams enforcement or delegation authority.
+
+Category: Daily Workflow & Verification. Subcommands: `activate`, `init`, `report`, `scan`, `status`.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Explicit manager configuration path |
+
+### `aegis workspace activate`
+
+Review or apply an owner-signed revision
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Explicit manager configuration path |
+| `--revision` | `REVISION` |  | Full control-repository policy commit |
+| `--expect` | `EXPECT` |  | Expected active revision, or none for bootstrap |
+| `--approval` | `APPROVAL` |  | JSON containing the exact statement and owner-signed approval commit |
+
+### `aegis workspace init`
+
+Prepare draft configuration and registration
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Explicit manager configuration path |
+| `--workspace-id` | `WORKSPACE_ID` |  | Stable manager workspace identity |
+| `--control-repo` | `CONTROL_REPO` |  | Private control repository root |
+| `--store` | `STORE` |  | External manager audit directory |
+| `--trusted-signers` | `TRUSTED_SIGNERS` |  | Owner-selected public allowed-signers file |
+
+### `aegis workspace report`
+
+Append an audit outcome without fitness credit
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Explicit manager configuration path |
+| `--decision` | `DECISION` |  | Immutable decision reference returned by scan |
+| `--rules` | `[RULES ...]` | `[]` | Served manager rule IDs used in this decision |
+| `--outcome` | `OUTCOME` |  | Claimed outcome; acknowledgement grants no verified completion |
+| `--evidence` | `EVIDENCE` | `"[]"` | Qualified evidence references as a JSON array |
+| `--idempotency-key` | `IDEMPOTENCY_KEY` |  | Stable key reused for identical outcome retries |
+
+### `aegis workspace scan`
+
+Record a management decision and matching rules
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Explicit manager configuration path |
+| `--action` | `ACTION` |  | Management action to match against manager policy |
+| `--context` | `CONTEXT` |  | Bounded management context as a JSON object |
+
+### `aegis workspace status`
+
+Inspect audit, approval and native enforcement states
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Explicit manager configuration path |
 
 ### `aegis rule`
 
@@ -549,6 +628,10 @@ Each of these exits with status 2 and prints where to go instead.
 | `aegis verify` | use aegis check |
 
 ## MCP server: `aegis-mcp`
+
+This section describes repository mode. The separately registered manager audit surface is
+documented in [Manager workspaces](manager-workspaces.md) and pinned in
+`tests/contract/manager_mcp_tools.json`.
 
 The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A write tool declares only `readOnlyHint: false`, so the MCP defaults apply to its other hints:
 

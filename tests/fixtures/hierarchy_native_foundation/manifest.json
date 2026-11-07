@@ -1,0 +1,69 @@
+{
+  "files": {
+    "case-matrix.json": "b56683d6c238d765ca2506fcb8db7cfe233b78988fe15b6848ddc922475594f4",
+    "legacy-expired/checkpoint.json": "f534c15bc3655241e9302bb0f71c0253c9b26adb1cd7b504462213b9d6ae657d",
+    "legacy-expired/events/000001.json": "f2e52ee45778a462d5405d7574232b1ed9bfa1252c9953fddb0ec45e0434ce70",
+    "legacy-expired/events/000002.json": "701dc3e6f594bc3bb26e0b8d830c0ea8f72c88a472b6fc1022500cb2c144e819",
+    "legacy-expired/policy.json": "050b1a897e5ca56aa25cd69ceef415be69b74dbc15fee18e906037718634a3ad",
+    "legacy-expired/receipt.json": "541a3712bd19aacb045ce83073c7789c03b0b4873e2b303cfec5af48ed7745ca",
+    "legacy-expired/request.json": "8738f96c8f9a2dd23e582f5ebe7901f47314ae814b787f819b57f7bf95f73d96",
+    "legacy-intent/checkpoint.json": "87158ac3ec7828e665f456e631f8f13741ffa158988ffdf95ac1b5fe247b13ac",
+    "legacy-intent/events/000001.json": "893c6170b246b0d1f1b11729d2921a0666e000f52071e32da9ec33e9154af0df",
+    "legacy-intent/events/000002.json": "4ef0c37ce47e5ede5f081e92b399845590040f44f75e3a99e1b9352880127172",
+    "legacy-intent/events/000003.json": "31ed256b71d719eff32343812e0f081fd457c509e736f6b2410f1885ed960694",
+    "legacy-intent/events/000004.json": "36449a6ee557bbe6cdb7e1bfb04aa471c971ff939571fab28785546b07700b01",
+    "legacy-intent/events/000005.json": "f4f10868ce19627259da3dc6c3057334f03dfbc80f7e19abe8ef0ceb6b02ae93",
+    "legacy-intent/policy.json": "050b1a897e5ca56aa25cd69ceef415be69b74dbc15fee18e906037718634a3ad",
+    "legacy-intent/receipt.json": "027127a89af9d11b7b9a8bfe71a00b0d0edae90599531951801dcd747292a646",
+    "legacy-intent/request.json": "4398247a24b2b8809fc7435917bb82cc4d374f820191e030a0f47632711d7206"
+  },
+  "legacy_cases": [
+    {
+      "case_id": "legacy-unassociated-intent",
+      "expected_intent": "legacy-attempt",
+      "expected_operator": "operator-2",
+      "expected_sequence": 5,
+      "prefix": "legacy-intent",
+      "receipt_id": "legacy-approve",
+      "request_id": "legacy-unassociated-intent"
+    },
+    {
+      "case_id": "legacy-expired-approval",
+      "expected_intent": null,
+      "expected_operator": "operator-1",
+      "expected_sequence": 2,
+      "prefix": "legacy-expired",
+      "receipt_id": "legacy-approve",
+      "request_id": "legacy-expired-approval"
+    }
+  ],
+  "matrix": "case-matrix.json",
+  "provenance": {
+    "historical_execution_captured": false,
+    "kind": "reconstructed_legacy_fixture",
+    "reference_commit": "c3471723d32706852a8c182de0eef8cce87e7465",
+    "reference_tests": [
+      "test_async_legacy_unassociated_intent_and_historical_checkpoint_are_unchanged",
+      "test_old_expired_approval_journal_replays_unchanged_and_still_allows_denial"
+    ]
+  },
+  "schema": "aegis.foundation-corpus/v1",
+  "source_files": {
+    "docs/hierarchy-dogfood.md": "66acfbd2cd14534bf8148362c2229d13b0241ea08b0fa29c7a4e3e058e3604ae",
+    "docs/hierarchy-native-protocol.md": "f1bb7a7f0e4f669129dc2803df77c65e9e38d7541ea130891074c64f01b527f4",
+    "docs/hierarchy-watch-bridge.md": "d2cee2f1d6e699bdef6a5d495b9726a2a00c1557fbde43372e0959cf99d3269a",
+    "docs/hierarchy-watch-supervisor.md": "d276052c00e2a0fa954b1e5b2c20124ed9317ae0e1e61807f55514381d64f038",
+    "tests/integration/test_hierarchy_delivery.py": "be0ad6e14695f56b993c46f7cd678eadc331a69fc6672800b7ccec060a22a76c",
+    "tests/integration/test_hierarchy_lifecycle.py": "7b2545191379c07350eb7600e316180e51233cfc192318ef3465c4b0432da578",
+    "tests/integration/test_hierarchy_native_protocol.py": "0556861a4b2de1f81449e38563ec5aeb6a6594ffe7c56ab5e3a350e4574c448a",
+    "tests/integration/test_hierarchy_operator.py": "a2a58673aa5e3c30f0f3138ba71137f3bebc0a5a621305f214e76ee8b0624f22",
+    "tests/integration/test_hierarchy_watch_bridge.py": "1412ab09d1935b297eda48fc0560d42c72f175a5cd47451e096d7f28205008e1",
+    "tests/integration/test_hierarchy_watch_supervisor.py": "3dc61f509c916ecba1c889159589479d16494a7d5decfa95f9a72f9e84d36ea4",
+    "tools/hierarchy_lifecycle.py": "759d93c37e720c7ca4bd6d75634c46b8a5aec14ca74765903368450c3a9f6ea5",
+    "tools/hierarchy_native_protocol.py": "7703696341a2861b08bb22c82127b84e3e79c0ebef92e575df716d2bdc953a02",
+    "tools/hierarchy_operator.py": "d95c797a55138f6563843ab3ab727d3d11cdbf432e39d881300c68f34a34df03",
+    "tools/hierarchy_wake.py": "fe197a220c4f0a5e0df5a43d7acb5279e2c5dca9eb192b10c280614c3bc70a36",
+    "tools/hierarchy_watch_bridge.py": "b6dc3a9b2d9abbab2e5b36aff197934e043f6fd25a31625851afd314d0976b2f",
+    "tools/hierarchy_watch_supervisor.py": "d1a569fea5e359590a0159fa779a20979191a71b1df6d29e7b7c531c38a35903"
+  }
+}

@@ -145,6 +145,7 @@ LIMITS = (
 )
 
 SOURCE = "aegis check --lane"
+SCHEMA = "aegis.check.lane/v1"
 NEEDS_HISTORY = "needs history: fetch with fetch-depth 0"
 WITNESSED = "witnessed: base policy"
 SELF_ATTESTED = "self-attested"
@@ -291,6 +292,7 @@ class LaneCheck:
         """The ``--json`` document."""
         return {
             **primitives.envelope(SOURCE, {"workspace": self.workspace, "repository": self.repository, "lane": self.lane, **self._range()}, checked_at=self.checked_at),
+            "schema": SCHEMA,
             "status": "pass" if self.passed else "fail",
             "label": self.label,
             "provenance": {"paths": self.paths_source, "shared": self.shared_source},
@@ -318,6 +320,7 @@ def error_report(workspace: Any, lane: str, message: str, now: Optional[int] = N
     """The ``--json`` document of a gate that could not run."""
     return {
         **primitives.envelope(SOURCE, {"workspace": str(workspace), "lane": lane}, now=now),
+        "schema": SCHEMA,
         "status": "error",
         "error": message,
     }
@@ -354,7 +357,7 @@ def _cli_globs(paths: object) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _commit_range(top: Path, base: Optional[str]) -> Tuple[str, str, str, str]:
+def _commit_range(top: Path, base: Optional[str], tip: Optional[str] = None) -> Tuple[str, str, str, str]:
     """(base ref, base commit, merge base, HEAD), or LaneGateError."""
     shallow = gitsafe.run(["rev-parse", "--is-shallow-repository"], top)
     answer = shallow.stdout.strip()
@@ -369,7 +372,7 @@ def _commit_range(top: Path, base: Optional[str]) -> Tuple[str, str, str, str]:
     base_commit = gitsafe.resolve_commit(top, ref)
     if not base_commit:
         raise LaneGateError(f"{NEEDS_HISTORY} (cannot resolve the base {ref!r})")
-    head = gitsafe.head_commit(top)
+    head = gitsafe.head_commit(top) if tip is None else gitsafe.resolve_commit(top, tip)
     if not head:
         raise LaneGateError("HEAD names no commit yet: there is nothing to check")
     merge_base = gitsafe.merge_base(top, base_commit, head)
@@ -515,9 +518,12 @@ def _record(top: Path, result: LaneCheck) -> Tuple[str, ...]:
 
 
 def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional[Sequence[str]] = None,
-               base_policy: bool = False, now: Optional[int] = None) -> LaneCheck:
+               base_policy: bool = False, now: Optional[int] = None, *, tip: Optional[str] = None,
+               record: bool = True) -> LaneCheck:
     """Check what ``lane`` changed since ``merge-base(base, HEAD)`` (see the module
-    docstring) and append a ``lane_check`` event.
+    docstring) and append a ``lane_check`` event. ``tip`` substitutes an explicit
+    commit for HEAD and reads shared policy from that commit; ``record=False``
+    suppresses the event for read-only repository status. Default behavior is unchanged.
 
     Raises TeamUsageError for an invalid lane name; LaneGateUsage for ``paths`` with
     ``base_policy``, an invalid glob or no git work tree; TeamFileError for an unusable
@@ -535,7 +541,7 @@ def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional
     if top is None:
         raise LaneGateUsage("not in a git work tree: the lane gate checks git history")
     moment = int(time.time()) if now is None else int(now)
-    ref, base_commit, merge_base, head = _commit_range(top, base)
+    ref, base_commit, merge_base, head = _commit_range(top, base, tip)
     if base_policy:
         policy = team.load_team_at(top, base_commit)
         if policy.lanes is None or lane not in policy.lanes:
@@ -548,7 +554,8 @@ def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional
             lane_paths, paths_source = cli_paths, "cli"
         else:
             lane_paths, paths_source = _lease_paths(top, lane, moment), "lease"
-        shared, shared_source = team.load_team(top).shared, "worktree"
+        shared = team.load_team(top).shared if tip is None else team.load_team_at(top, head).shared
+        shared_source = "worktree" if tip is None else f"tip@{head}"
     allowed = [(glob, paths_source) for glob in lane_paths] + [(glob, shared_source) for glob in shared]
     entries = gitsafe.diff_entries(top, merge_base, head)
     findings, checked, not_checked = _integrity(top, merge_base, head, entries)
@@ -561,4 +568,4 @@ def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional
         changes=tuple(_contain(entry, allowed) for entry in entries),
         findings=findings, checked=checked, not_checked=not_checked, checked_at=utc_stamp(moment), warnings=empty,
     )
-    return dataclasses.replace(result, warnings=empty + _record(top, result))
+    return dataclasses.replace(result, warnings=empty + _record(top, result)) if record else result

@@ -1,0 +1,809 @@
+"""Published, woken and read stay separate states in the public CLI, adapter and wake tool.
+
+Host processes here are stubs at the subprocess boundary. They show how the tools report
+delivery, not that a real Claude or Codex session reads its mail.
+"""
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import uuid
+
+import pytest
+
+from tests.integration.test_hierarchy_mailbox import HELPER, ROOT, invoke, mailbox_snapshot, message
+
+
+WAKE = ROOT / "tools" / "hierarchy_wake.py"
+BODY_SENTINEL = "UNTRUSTED-BODY-SENTINEL"
+TARGET = "a/lane/review"
+posix_only = pytest.mark.skipif(os.name == "nt", reason="wake tool process groups are POSIX only")
+
+STUB = r'''
+import json, os, subprocess, sys, time
+mode, helper, root, endpoint, host, session, delivery, record = sys.argv[1:9]
+with open(record, "w", encoding="utf-8") as stream:
+    json.dump({"argv": sys.argv[1:], "stdin": sys.stdin.read()}, stream)
+if mode == "reader":
+    frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+              {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "mailbox_inbox", "arguments": {}}}]
+    subprocess.run([sys.executable, "-I", helper, "--root", root, "serve", "--endpoint", endpoint,
+                    "--host", host, "--session", session, "--generation", "1", "--delivery-dir", delivery],
+                   input="".join(json.dumps(f) + "\n" for f in frames), text=True, capture_output=True, check=True)
+elif mode == "crash":
+    sys.exit(7)
+elif mode == "sleeper":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    with open(record + ".child", "w", encoding="utf-8") as stream:
+        stream.write(str(child.pid))
+    time.sleep(60)
+elif mode in ("bind", "publish"):
+    outcome = subprocess.run([sys.executable, "-I", helper, "--root", root, mode, "--request", record + ".request"],
+                             text=True, capture_output=True)
+    with open(record + ".result", "w", encoding="utf-8") as stream:
+        stream.write(outcome.stdout)
+'''
+
+# Stands in for the liveness census, which runs between the first binding check and the launch.
+FAKE_PS = '''
+import json, os, subprocess
+subprocess.run(json.loads(os.environ["FAKE_PS_ARGV"]), check=True, capture_output=True)
+'''
+
+# A disposable observer around the public CLI; it must preserve its exit status and JSON.
+WAKE_DIAGNOSTIC = r'''
+from pathlib import Path
+import json, os, runpy, sys
+wake_path, diagnostic_path = sys.argv[1:3]
+sys.argv = [wake_path] + sys.argv[3:]
+Path(diagnostic_path).write_text("", encoding="utf-8")
+watched = {wake_path, str(Path(wake_path).with_name("hierarchy_mailbox.py"))}
+
+def record(row):
+    with open(diagnostic_path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+def observe(frame, event, argument):
+    if frame.f_code.co_filename not in watched:
+        return None
+    frame.f_trace_lines = False
+    location = {"file": frame.f_code.co_filename, "function": frame.f_code.co_name,
+                "line": frame.f_lineno}
+    if event == "exception" and isinstance(argument[1], OSError):
+        error = argument[1]
+        record({**location, "event": "oserror", "errno": error.errno,
+                "filename": error.filename, "error_type": type(error).__name__})
+    elif event == "return" and frame.f_code.co_name == "start_turn" and argument is not None:
+        pid = argument[0].pid
+        row = {**location, "event": "started", "pid": pid}
+        try:
+            row["pgid"] = os.getpgid(pid)
+        except OSError as error:
+            row["pgid_error"] = {"errno": error.errno, "error_type": type(error).__name__}
+        record(row)
+    return observe
+
+sys.settrace(observe)
+try:
+    runpy.run_path(wake_path, run_name="__main__")
+finally:
+    sys.settrace(None)
+'''
+
+# Only the OS process boundary is substituted; the public CLI and store are real.
+WAKE_GROUP_FAULT = r'''
+import errno, json, os, runpy, signal, subprocess, sys
+wake_path, mode, record_path = sys.argv[1:4]
+sys.argv = [wake_path] + sys.argv[4:]
+real_killpg, real_popen = os.killpg, subprocess.Popen
+processes, calls = [], []
+def popen(*args, **kwargs):
+    process = real_popen(*args, **kwargs)
+    if kwargs.get("start_new_session"):
+        processes.append(process)
+    return process
+def killpg(pid, number):
+    calls.append({"pid": pid, "signal": number})
+    if mode == "persistent" and number == signal.SIGKILL:
+        # An accepted signal is not confirmation of group disappearance.
+        return None
+    if number == 0 and (mode == "persistent" or
+                         (mode == "transient" and sum(c["signal"] == 0 for c in calls) == 1)):
+        raise PermissionError(errno.EPERM, "fixture probe denied")
+    if number != 0 and mode == "signal":
+        raise PermissionError(errno.EPERM, "fixture signal denied")
+    return real_killpg(pid, number)
+subprocess.Popen, os.killpg = popen, killpg
+try:
+    runpy.run_path(wake_path, run_name="__main__")
+finally:
+    # Fixture teardown is separate from the CLI's recorded outcome.
+    with open(record_path, "w", encoding="utf-8") as stream:
+        json.dump({"calls": calls, "pids": [p.pid for p in processes]}, stream)
+    for process in processes:
+        try:
+            real_killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+'''
+
+
+class Pilot:
+    def __init__(self, tmp_path, host="host-one", root=None, delivery=None):
+        self.tmp = tmp_path
+        self.root = root or tmp_path / "mailbox"
+        self.delivery = delivery or tmp_path / "delivery"
+        self.host = host
+        self.session = "session-" + uuid.uuid4().hex
+        self.record = tmp_path / "stub-record.json"
+        self.stub = tmp_path / "host_stub.py"
+        self.stub.write_text(STUB, encoding="utf-8")
+        endpoints = {"a/front-door": {}, "a/orchestrator": {}, TARGET: {"kind": "reviewer"}}
+        invoke(self.root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints,
+                                   "counterparts": [], "writer_limit": 3})
+        for endpoint in endpoints:
+            target = endpoint == TARGET
+            invoke(self.root, "bind", {"endpoint": endpoint, "host": host if target else "host-one",
+                                       "session": self.session if target else endpoint,
+                                       "expected_generation": 0})
+
+    def publish(self, identifier="note-1", body=BODY_SENTINEL):
+        request = message(recipient=TARGET, identifier=identifier)
+        request["body"] = body
+        return invoke(self.root, "publish", request)
+
+    def state(self, identifier="note-1"):
+        return invoke(self.root, "delivery", delivery_dir=self.delivery, message_id=identifier)["message"]
+
+    def summary(self, *, timeout=15):
+        data = invoke(self.root, "delivery", delivery_dir=self.delivery, endpoint=TARGET, process_timeout=timeout)
+        return data["endpoints"][TARGET]
+
+    def adapter_argv(self, delivery=True):
+        argv = [sys.executable, "-I", str(HELPER), "--root", str(self.root), "serve", "--endpoint", TARGET,
+                "--host", self.host, "--session", self.session, "--generation", "1"]
+        if delivery:
+            argv += ["--delivery-dir", str(self.delivery if delivery is True else delivery)]
+        return argv
+
+    def adapter(self, calls, *, delivery=True, timeout=15):
+        frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}]
+        frames += [{"jsonrpc": "2.0", "id": index + 2, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}}
+                   for index, (name, arguments) in enumerate(calls)]
+        return subprocess.run(self.adapter_argv(delivery), input="".join(json.dumps(f) + "\n" for f in frames),
+                              capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+    def read_inbox(self, **arguments):
+        result = self.adapter([("mailbox_inbox", arguments)])
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(json.loads(result.stdout.splitlines()[-1])["result"]["content"][0]["text"])
+
+    def profile(self, mode="reader", **changes):
+        argv = [sys.executable, str(self.stub), mode, str(HELPER), str(self.root), TARGET, self.host,
+                self.session, str(self.delivery), str(self.record)]
+        document = {"schema": "aegis.hierarchy-wake-profile/v1", "endpoint": TARGET, "host": self.host,
+                    "session": self.session, "generation": 1, "argv": argv, "cwd": str(self.tmp),
+                    "timeout_seconds": 20, "prompt_via": "stdin"}
+        document.update(changes)
+        path = self.tmp / "wake-profile.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def wake(self, profile, *flags, home=None, timeout=30, extra_env=None, diagnostic=False, group_fault=None):
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
+        if home is not None:
+            env["HOME"] = str(home)
+        command = [sys.executable, "-I", str(WAKE)]
+        if group_fault is not None:
+            boundary = self.tmp / "wake_group_fault.py"
+            boundary.write_text(WAKE_GROUP_FAULT, encoding="utf-8")
+            self.group_fault_record = self.tmp / "group-fault.json"
+            command = [sys.executable, "-I", str(boundary), str(WAKE), group_fault,
+                       str(self.group_fault_record)]
+        if diagnostic:
+            observer = self.tmp / "observe_wake.py"
+            observer.write_text(WAKE_DIAGNOSTIC, encoding="utf-8")
+            self.diagnostic = self.tmp / "wake-diagnostic.jsonl"
+            command = [sys.executable, "-I", str(observer), str(WAKE), str(self.diagnostic)]
+        result = subprocess.run([*command, "--root", str(self.root), "--delivery-dir",
+                                 str(self.delivery), "--endpoint", TARGET, "--profile", str(profile), *flags],
+                                capture_output=True, text=True, timeout=timeout, env=env)
+        assert not result.stderr, result.stderr
+        return result.returncode, json.loads(result.stdout)
+
+
+@pytest.fixture
+def pilot(tmp_path):
+    return Pilot(tmp_path)
+
+
+def test_published_message_is_not_read_until_the_adapter_returns_it(pilot):
+    pilot.publish()
+    state = pilot.state()
+    assert state["state"] == "published"
+    assert state["read_at"] is None and state["woken_at"] is None
+    assert pilot.summary()["unread"] == ["note-1"]
+    assert [row["message"]["message_id"] for row in pilot.read_inbox()["messages"]] == ["note-1"]
+    state = pilot.state()
+    assert state["state"] == "read"
+    assert state["read_by"] == {"host": "host-one", "session": pilot.session, "generation": 1}
+    summary = pilot.summary()
+    assert summary["unread"] == [] and summary["unread_count"] == 0 and summary["read"] == 1
+
+
+def test_cli_inbox_does_not_count_as_the_session_reading(pilot):
+    pilot.publish()
+    invoke(pilot.root, "inbox", endpoint=TARGET)
+    assert pilot.state()["state"] == "published"
+
+
+def test_only_messages_actually_returned_count_as_read(pilot):
+    for index in range(3):
+        pilot.publish("note-%d" % index)
+    first = pilot.read_inbox(limit=1)
+    assert [row["message"]["message_id"] for row in first["messages"]] == ["note-0"]
+    summary = pilot.summary()
+    assert summary["read"] == 1 and summary["unread"] == ["note-1", "note-2"]
+    pilot.read_inbox(after_message_id=first["next_after"], limit=100)
+    assert pilot.summary()["unread"] == []
+
+
+def test_rereading_adds_no_receipts(pilot):
+    pilot.publish()
+    pilot.read_inbox()
+    receipts = sorted((pilot.delivery / "reads").rglob("*.json"))
+    assert len(receipts) == 1
+    pilot.read_inbox()
+    assert sorted((pilot.delivery / "reads").rglob("*.json")) == receipts
+
+
+def test_adapter_without_delivery_dir_stays_read_only(pilot):
+    pilot.publish()
+    before = mailbox_snapshot(pilot.root)
+    result = pilot.adapter([("mailbox_inbox", {})], delivery=False)
+    assert result.returncode == 0 and not result.stderr
+    assert mailbox_snapshot(pilot.root) == before
+
+
+def test_delivery_dir_inside_the_mailbox_is_refused(pilot):
+    inside = pilot.root / "receipts"
+    result = pilot.adapter([], delivery=inside)
+    assert result.returncode == 2
+    assert json.loads(result.stdout)["error"] == "delivery directory must be outside the mailbox root"
+    refused = invoke(pilot.root, "delivery", delivery_dir=inside, ok=False)
+    assert refused["error"] == "delivery directory must be outside the mailbox root"
+    assert not inside.exists()
+
+
+def test_a_delivery_dir_above_the_mailbox_is_refused_by_every_tool(pilot):
+    above = pilot.root.parent
+    expected = "delivery directory must not contain the mailbox root"
+    result = pilot.adapter([], delivery=above)
+    assert result.returncode == 2 and json.loads(result.stdout)["error"] == expected
+    assert invoke(pilot.root, "delivery", delivery_dir=above, ok=False)["error"] == expected
+
+
+def test_the_mailbox_root_itself_is_not_a_delivery_dir(pilot):
+    refused = invoke(pilot.root, "delivery", delivery_dir=pilot.root, ok=False)
+    assert refused["error"] == "delivery directory must be outside the mailbox root"
+
+
+def test_a_sibling_delivery_dir_is_accepted(pilot):
+    pilot.publish()
+    assert invoke(pilot.root, "delivery", delivery_dir=pilot.root.parent / "sibling")["endpoints"][TARGET]["published"] == 1
+
+
+@posix_only
+def test_wake_logs_cannot_land_inside_mailbox_history(tmp_path):
+    parent = tmp_path / "pilot"
+    parent.mkdir()
+    pilot = Pilot(tmp_path, root=parent / "wake-logs", delivery=parent)
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(mode="ignore"))
+    assert [row["message"]["message_id"] for row in invoke(pilot.root, "inbox", endpoint=TARGET)["messages"]] == ["note-1"]
+    assert code == 2 and result["error"] == "delivery directory must not contain the mailbox root"
+    assert not pilot.record.exists()
+
+
+def test_unwritable_receipt_keeps_the_read_and_leaves_the_message_unread(pilot, tmp_path):
+    pilot.publish()
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file where the delivery directory belongs")
+    result = pilot.adapter([("mailbox_inbox", {})], delivery=blocked)
+    assert result.returncode == 0
+    response = json.loads(result.stdout.splitlines()[-1])["result"]
+    assert "isError" not in response
+    assert [r["message"]["message_id"] for r in json.loads(response["content"][0]["text"])["messages"]] == ["note-1"]
+    assert "read receipt not recorded" in result.stderr
+    assert pilot.state()["state"] == "published"
+
+
+def read_with_a_connection_that_closes_first(pilot):
+    process = subprocess.Popen(pilot.adapter_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n")
+    process.stdin.flush()
+    assert json.loads(process.stdout.readline())["id"] == 1
+    process.stdout.close()
+    process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                    "params": {"name": "mailbox_inbox", "arguments": {}}}) + "\n")
+    process.stdin.close()
+    process.wait(timeout=15)
+    stderr = process.stderr.read()
+    process.stderr.close()
+    return process.returncode, stderr
+
+
+def test_a_response_that_never_reaches_the_connection_leaves_the_message_unread(pilot):
+    pilot.publish()
+    code, stderr = read_with_a_connection_that_closes_first(pilot)
+    assert code == 0
+    assert "Traceback" not in stderr and "Exception ignored" not in stderr
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["unread"] == ["note-1"]
+    assert not (pilot.delivery / "reads").exists()
+
+
+@posix_only
+def test_a_message_whose_response_failed_can_still_be_delivered_by_a_wake(pilot):
+    pilot.publish()
+    read_with_a_connection_that_closes_first(pilot)
+    code, result = pilot.wake(pilot.profile())
+    assert code == 0 and result["state"] == "read" and result["read"] == ["note-1"]
+
+
+def fill_receipts(pilot, kind, count, **extra):
+    folder = pilot.delivery / kind / TARGET
+    folder.mkdir(parents=True)
+    receipt = {"schema": "aegis.hierarchy-delivery-receipt/v1", "endpoint": TARGET, "host": pilot.host,
+               "session": pilot.session, "generation": 1, "at": "2026-11-02T00:00:00.000000Z",
+               "message_ids": ["seed-note"], **extra}
+    raw = json.dumps(receipt)
+    for number in range(count):
+        (folder / ("20261102T000000000000Z-%05d.json" % number)).write_text(raw)
+    return folder
+
+
+def test_a_full_read_ledger_refuses_more_receipts_and_stays_readable(pilot):
+    pilot.publish("seed-note")
+    pilot.publish()
+    folder = fill_receipts(pilot, "reads", 10000)
+    # Validate the full receipt history within a finite budget on slower filesystems.
+    result = pilot.adapter([("mailbox_inbox", {})], timeout=60)
+    assert result.returncode == 0
+    delivered = json.loads(json.loads(result.stdout.splitlines()[-1])["result"]["content"][0]["text"])["messages"]
+    assert [row["message"]["message_id"] for row in delivered] == ["seed-note", "note-1"]
+    assert "read receipt not recorded: delivery receipt history limit reached" in result.stderr
+    assert len(list(folder.glob("*.json"))) == 10000
+    summary = pilot.summary(timeout=60)
+    assert summary["read"] == 1 and summary["unread"] == ["note-1"]
+    assert not (folder / ".write.lock").exists()
+
+
+def test_a_busy_receipt_folder_leaves_the_message_unread(pilot):
+    pilot.publish()
+    folder = pilot.delivery / "reads" / TARGET
+    folder.mkdir(parents=True)
+    lock = folder / ".write.lock"
+    lock.write_text("fixture active writer")
+    result = pilot.adapter([("mailbox_inbox", {})])
+    assert result.returncode == 0 and "read receipt not recorded" in result.stderr
+    assert pilot.state()["state"] == "published"
+    assert lock.read_text() == "fixture active writer"
+
+
+WAKE_RECEIPT = {"wake_id": "wake-old", "state": "exited", "exit_code": 0, "timed_out": False}
+
+
+@posix_only
+def test_a_wake_needs_room_for_both_receipts_before_it_launches(pilot):
+    pilot.publish("seed-note")
+    pilot.publish()
+    folder = fill_receipts(pilot, "wakes", 9999, **WAKE_RECEIPT)
+    code, result = pilot.wake(pilot.profile())
+    assert code == 2 and result["error"] == "delivery receipt history limit reached"
+    assert not pilot.record.exists()
+    assert len(list(folder.glob("*.json"))) == 9999
+    assert pilot.summary()["unread"] == ["seed-note", "note-1"]
+
+
+@posix_only
+def test_a_wake_can_use_the_last_two_receipts(pilot):
+    pilot.publish("seed-note")
+    folder = fill_receipts(pilot, "wakes", 9998, **WAKE_RECEIPT)
+    code, result = pilot.wake(pilot.profile(mode="ignore"), timeout=60)
+    assert code == 3 and result["state"] == "woken_unread"
+    assert len(list(folder.glob("*.json"))) == 10000
+    assert pilot.summary()["last_wake"]["state"] == "exited"
+
+
+@pytest.mark.parametrize("change,error", [
+    ({"session": "someone-else"}, "receipt does not match binding history"),
+    ({"generation": 9}, "receipt does not match binding history"),
+    ({"message_ids": ["unknown-message"]}, "receipt names a message not addressed to this endpoint"),
+    ({"endpoint": "a/front-door"}, "wrong receipt schema or endpoint"),
+    ({"extra": True}, "unexpected fields"),
+])
+def test_forged_or_mismatched_receipts_fail_loudly(pilot, change, error):
+    pilot.publish()
+    pilot.read_inbox()
+    path = next((pilot.delivery / "reads").rglob("*.json"))
+    path.write_text(json.dumps({**json.loads(path.read_text()), **change}))
+    refused = invoke(pilot.root, "delivery", delivery_dir=pilot.delivery, endpoint=TARGET, ok=False)
+    assert "malformed delivery receipt" in refused["error"] and error in refused["error"]
+
+
+def test_truncated_receipt_fails_loudly(pilot):
+    pilot.publish()
+    pilot.read_inbox()
+    next((pilot.delivery / "reads").rglob("*.json")).write_text("{truncated")
+    refused = invoke(pilot.root, "delivery", delivery_dir=pilot.delivery, ok=False)
+    assert "malformed delivery receipt" in refused["error"]
+
+
+def test_unknown_message_and_endpoint_are_refused(pilot):
+    assert "unknown message" in invoke(pilot.root, "delivery", delivery_dir=pilot.delivery,
+                                       message_id="missing", ok=False)["error"]
+    assert "unknown endpoint" in invoke(pilot.root, "delivery", delivery_dir=pilot.delivery,
+                                        endpoint="a/lane/none", ok=False)["error"]
+
+
+def test_summary_covers_every_endpoint_and_the_current_binding(pilot):
+    pilot.publish()
+    data = invoke(pilot.root, "delivery", delivery_dir=pilot.delivery)
+    assert set(data["endpoints"]) == {"a/front-door", "a/orchestrator", TARGET}
+    binding = data["endpoints"][TARGET]["binding"]
+    assert binding == {"host": "host-one", "session": pilot.session, "generation": 1, "ready": True}
+    assert "does not prove" in data["meaning"]
+
+
+@posix_only
+def test_nothing_unread_means_nothing_is_launched(pilot):
+    code, result = pilot.wake(pilot.profile())
+    assert code == 0 and result["state"] == "nothing_unread"
+    assert not pilot.record.exists()
+    assert not (pilot.delivery / "wakes").exists()
+
+
+@posix_only
+@pytest.mark.parametrize("prompt_via", ["stdin", "argv"])
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_a_session_that_reads_its_mail_is_reported_as_read(pilot, prompt_via, diagnostic):
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(prompt_via=prompt_via), diagnostic=diagnostic)
+    assert code == 0, result
+    assert result["state"] == "read" and result["exit_code"] == 0 and result["timed_out"] is False
+    assert result["read"] == ["note-1"] and result["still_unread"] == []
+    assert pilot.state()["state"] == "read"
+    assert pilot.state()["woken_at"] is not None
+    observed = json.loads(pilot.record.read_text())
+    prompt = observed["stdin"] if prompt_via == "stdin" else observed["argv"][-1]
+    assert "mailbox_inbox" in prompt
+    assert BODY_SENTINEL not in json.dumps(observed)
+    assert "note-1" not in json.dumps(observed)
+    if diagnostic:
+        events = [json.loads(line) for line in pilot.diagnostic.read_text().splitlines()]
+        started = [row for row in events if row["event"] == "started"]
+        assert len(started) == 1 and started[0]["pgid"] == started[0]["pid"], events
+        assert process_gone(started[0]["pid"])
+
+
+@posix_only
+def test_a_session_that_never_reads_is_not_reported_as_delivered(pilot):
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(mode="ignore"))
+    assert code == 3
+    assert result["state"] == "woken_unread"
+    assert result["exit_code"] == 0
+    assert result["read"] == [] and result["still_unread"] == ["note-1"]
+    state = pilot.state()
+    assert state["state"] == "woken" and state["read_at"] is None
+    summary = pilot.summary()
+    assert summary["woken_unread"] == ["note-1"] and summary["last_wake"]["state"] == "exited"
+
+
+@posix_only
+def test_a_failed_turn_is_explicit(pilot):
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(mode="crash"))
+    assert code == 3 and result["exit_code"] == 7 and result["state"] == "woken_unread"
+    assert Path(result["log"]["stderr"]).is_file()
+
+
+@posix_only
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_a_missing_host_binary_never_counts_as_woken(pilot, diagnostic):
+    pilot.publish()
+    argv = [str(pilot.tmp / "no-such-host"), pilot.session]
+    code, result = pilot.wake(pilot.profile(argv=argv), diagnostic=diagnostic)
+    assert code == 3 and result["state"] == "failed_to_start" and result["exit_code"] is None
+    assert "error" in result
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["last_wake"]["state"] == "failed_to_start"
+    if diagnostic:
+        events = [json.loads(line) for line in pilot.diagnostic.read_text().splitlines()]
+        assert any(row.get("errno") == errno.ENOENT and row.get("filename") == argv[0]
+                   for row in events), events
+
+
+@posix_only
+def test_an_unusable_log_location_never_counts_as_woken(pilot):
+    pilot.publish()
+    pilot.delivery.mkdir()
+    (pilot.delivery / "wake-logs").write_text("a file where the log directory belongs")
+    code, result = pilot.wake(pilot.profile())
+    assert not pilot.record.exists()
+    state = pilot.state()
+    assert state["state"] == "published" and state["woken_at"] is None
+    assert pilot.summary()["woken_unread"] == []
+    assert code == 3 and result["state"] == "failed_to_start" and result["exit_code"] is None
+    assert result["error"]
+    assert pilot.summary()["last_wake"]["state"] == "failed_to_start"
+
+
+def session_process_exists(session, deadline=2.0):
+    stop = time.monotonic() + deadline
+    while time.monotonic() < stop:
+        listing = subprocess.run(["ps", "-ax", "-ww", "-o", "stat=,args="], capture_output=True, text=True).stdout
+        if not any(session in line.split() and not line.lstrip().startswith("Z") for line in listing.splitlines()):
+            return False
+        time.sleep(0.05)
+    return True
+
+
+@posix_only
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the directory permission")
+def test_a_process_whose_start_cannot_be_recorded_is_stopped_and_not_counted(pilot):
+    pilot.publish()
+    folder = pilot.delivery / "wakes" / TARGET
+    folder.mkdir(parents=True)
+    folder.chmod(0o555)
+    try:
+        code, result = pilot.wake(pilot.profile(mode="sleeper"), timeout=20, diagnostic=True)
+    finally:
+        folder.chmod(0o755)
+    events = [json.loads(line) for line in pilot.diagnostic.read_text().splitlines()]
+    session_alive = session_process_exists(pilot.session)
+    started = [row for row in events if row["event"] == "started"]
+    process_state = {row["pid"]: subprocess.run(
+        ["ps", "-o", "pid=,pgid=,stat=", "-p", str(row["pid"])],
+        capture_output=True, text=True, timeout=5).stdout.strip() for row in started}
+    child_file = Path(str(pilot.record) + ".child")
+    child_pid = int(child_file.read_text()) if child_file.exists() else None
+    child_gone = process_gone(child_pid) if child_pid is not None else None
+    evidence = {"code": code, "result": result, "os_events": events, "process_state": process_state,
+                "session_alive": session_alive, "child_pid": child_pid, "child_gone": child_gone}
+    if code != 3 or result.get("state") != "failed_to_start":
+        print(json.dumps({"wake_failure_diagnostic": evidence}, sort_keys=True))
+    assert code == 3 and result["state"] == "failed_to_start", evidence
+    assert "could not record the start" in result["error"]
+    assert not session_alive, evidence
+    assert child_gone is not False, evidence
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["last_wake"] is None
+
+
+def process_gone(pid, deadline=2.0):
+    stop = time.monotonic() + deadline
+    while time.monotonic() < stop:
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        if not state or state.startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@posix_only
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the directory permission")
+@pytest.mark.parametrize("fault", ["transient", "persistent", "signal"])
+def test_failed_start_cleanup_distinguishes_probe_and_signal_denial(pilot, fault):
+    import signal
+    pilot.publish()
+    folder = pilot.delivery / "wakes" / TARGET
+    folder.mkdir(parents=True)
+    folder.chmod(0o555)
+    try:
+        code, result = pilot.wake(pilot.profile(mode="sleeper"), group_fault=fault, timeout=25)
+    finally:
+        folder.chmod(0o755)
+    boundary = json.loads(pilot.group_fault_record.read_text())
+    signals = [call["signal"] for call in boundary["calls"]]
+    assert signal.SIGTERM in signals
+    if fault == "transient":
+        assert code == 3 and result["state"] == "failed_to_start", (code, result, boundary)
+        assert "could not record the start" in result["error"]
+        assert signals.count(0) >= 2
+    elif fault == "persistent":
+        assert code == 2 and result == {"error": "[Errno 1] fixture probe denied"}, (code, result)
+        assert signal.SIGKILL in signals, boundary
+    else:
+        assert code == 2 and result == {"error": "[Errno 1] fixture signal denied"}, (code, result)
+        assert signals == [signal.SIGTERM]
+    assert pilot.state()["state"] == "published"
+    assert pilot.summary()["last_wake"] is None
+    assert all(process_gone(pid) for pid in boundary["pids"])
+
+
+@posix_only
+def test_a_timeout_stops_the_whole_process_group_before_reporting(pilot):
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(mode="sleeper", timeout_seconds=1))
+    assert code == 3 and result["state"] == "timed_out" and result["timed_out"] is True, (code, result)
+    child = int(Path(str(pilot.record) + ".child").read_text())
+    assert process_gone(child)
+    assert pilot.state()["state"] == "woken"
+    assert pilot.summary()["last_wake"]["timed_out"] is True
+
+
+@posix_only
+@pytest.mark.parametrize("change,error", [
+    ({"session": "other-session"}, "profile does not match the current binding"),
+    ({"host": "other-host"}, "profile does not match the current binding"),
+    ({"generation": 2}, "profile does not match the current binding"),
+    ({"endpoint": "a/orchestrator"}, "profile is for a different endpoint"),
+    ({"argv": []}, "invalid argv"),
+    ({"argv": [sys.executable, 5]}, "invalid argv"),
+    ({"argv": [sys.executable, "--no-session-here"]}, "argv does not name the bound session"),
+    ({"cwd": "relative/path"}, "path must be absolute"),
+    ({"timeout_seconds": 0}, "invalid timeout_seconds"),
+    ({"timeout_seconds": 86401}, "invalid timeout_seconds"),
+    ({"prompt_via": "shell"}, "invalid prompt_via"),
+    ({"schema": "other"}, "unsupported wake profile schema"),
+    ({"run_this": "rm -rf /"}, "unexpected fields"),
+])
+def test_invalid_profiles_launch_nothing_and_record_nothing(pilot, change, error):
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(**change))
+    assert code == 2 and error in result["error"]
+    assert not pilot.record.exists()
+    assert not (pilot.delivery / "wakes").exists()
+
+
+@posix_only
+def test_a_process_already_naming_the_session_blocks_the_wake(pilot):
+    pilot.publish()
+    busy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", pilot.session])
+    try:
+        code, result = pilot.wake(pilot.profile())
+    finally:
+        busy.kill()
+        busy.wait(timeout=5)
+    assert code == 2 and "session is already running" in result["error"]
+    assert not pilot.record.exists()
+
+
+@posix_only
+@pytest.mark.parametrize("alive,expected", [(True, 2), (False, 0)])
+def test_claude_session_table_blocks_only_a_live_session(tmp_path, alive, expected):
+    pilot = Pilot(tmp_path, host="claude-code")
+    pilot.publish()
+    home = tmp_path / "home"
+    (home / ".claude" / "sessions").mkdir(parents=True)
+    if alive:
+        pid = os.getpid()
+    else:
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait(timeout=5)
+        pid = gone.pid
+    (home / ".claude" / "sessions" / "1.json").write_text(json.dumps({"sessionId": pilot.session, "pid": pid}))
+    code, result = pilot.wake(pilot.profile(), home=home)
+    assert code == expected, result
+    if alive:
+        assert "session is already running" in result["error"]
+    else:
+        assert result["state"] == "read"
+
+
+def replacement_request(pilot):
+    brief = pilot.tmp / "handoff-brief.md"
+    brief.write_bytes(b"Handoff.\n")
+    return invoke(pilot.root, "draft-handoff", {
+        "endpoint": TARGET, "host": "host-two", "session": "replacement-session", "outgoing_stopped": True,
+        "briefs": [{"path": str(brief), "sha256": hashlib.sha256(b"Handoff.\n").hexdigest()}]})
+
+
+def current_session(pilot):
+    return invoke(pilot.root, "status")["bindings"][TARGET]["session"]
+
+
+def wake_locks(pilot):
+    return list(pilot.root.glob(".wake-*"))
+
+
+@posix_only
+def test_a_binding_replaced_after_the_first_check_stops_the_launch(pilot, tmp_path):
+    pilot.publish()
+    profile = pilot.profile()
+    request = tmp_path / "replacement.json"
+    request.write_text(json.dumps(replacement_request(pilot)), encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text("#!" + sys.executable + "\n" + FAKE_PS, encoding="utf-8")
+    fake_ps.chmod(0o755)
+    code, result = pilot.wake(profile, extra_env={
+        "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+        "FAKE_PS_ARGV": json.dumps([sys.executable, "-I", str(HELPER), "--root", str(pilot.root), "bind",
+                                    "--request", str(request)])})
+    assert current_session(pilot) == "replacement-session"
+    assert not pilot.record.exists(), "the outgoing session was started after its binding was replaced"
+    assert code == 2 and result["error"] == "binding changed before launch; the outgoing session was not started"
+    assert not (pilot.delivery / "wakes").exists()
+    assert wake_locks(pilot) == []
+
+
+@posix_only
+def test_a_replacement_is_refused_while_a_wake_is_running_and_works_afterward(pilot):
+    pilot.publish()
+    request = replacement_request(pilot)
+    Path(str(pilot.record) + ".request").write_text(json.dumps(request), encoding="utf-8")
+    code, result = pilot.wake(pilot.profile(mode="bind"))
+    during = json.loads(Path(str(pilot.record) + ".result").read_text())
+    assert during.get("error") == "a wake is in progress for this endpoint; stop it and remove its lock before replacing the session"
+    assert current_session(pilot) == pilot.session
+    assert code == 3 and result["state"] == "woken_unread"
+    assert invoke(pilot.root, "bind", request)["generation"] == 2
+
+
+@posix_only
+def test_mailbox_writers_keep_working_during_a_turn(pilot):
+    pilot.publish()
+    Path(str(pilot.record) + ".request").write_text(
+        json.dumps(message(recipient=TARGET, identifier="sent-during-turn")), encoding="utf-8")
+    pilot.wake(pilot.profile(mode="publish"))
+    during = json.loads(Path(str(pilot.record) + ".result").read_text())
+    assert during["message"]["message_id"] == "sent-during-turn"
+
+
+@posix_only
+def test_a_busy_mailbox_writer_stops_the_launch(pilot):
+    pilot.publish()
+    lock = pilot.root / ".write.lock"
+    lock.write_text("fixture active writer")
+    code, result = pilot.wake(pilot.profile())
+    assert code == 2 and "writer is busy" in result["error"]
+    assert not pilot.record.exists()
+    assert lock.read_text() == "fixture active writer"
+
+
+@posix_only
+@pytest.mark.parametrize("mode,argv", [("ignore", None), ("crash", None), (None, ["/no/such/host", "SESSION"])])
+def test_a_finished_or_failed_wake_leaves_the_mailbox_root_as_it_was(pilot, mode, argv):
+    pilot.publish()
+    before = sorted(path.name for path in pilot.root.iterdir())
+    changes = {} if argv is None else {"argv": [item.replace("SESSION", pilot.session) for item in argv]}
+    pilot.wake(pilot.profile(mode=mode or "ignore", **changes))
+    assert sorted(path.name for path in pilot.root.iterdir()) == before
+
+
+@posix_only
+def test_an_abandoned_wake_lock_blocks_both_sides_and_keeps_history_readable(pilot):
+    pilot.publish()
+    request = replacement_request(pilot)
+    lock = pilot.root / (".wake-" + TARGET.replace("/", "%2F") + ".lock")
+    lock.write_text("left by a crashed wake")
+    code, result = pilot.wake(pilot.profile())
+    assert code == 2 and "a wake is already in progress" in result["error"]
+    assert not pilot.record.exists()
+    assert "a wake is in progress" in invoke(pilot.root, "bind", request, ok=False)["error"]
+    assert lock.read_text() == "left by a crashed wake"
+    assert invoke(pilot.root, "inbox", endpoint=TARGET)["messages"]
+    lock.unlink()
+    assert invoke(pilot.root, "bind", request)["generation"] == 2
+
+
+@posix_only
+def test_dry_run_writes_nothing_and_launches_nothing(pilot):
+    pilot.publish()
+    code, result = pilot.wake(pilot.profile(), "--dry-run")
+    assert code == 0 and result["state"] == "dry_run" and result["would_wake"] == ["note-1"]
+    assert not pilot.record.exists()
+    assert not pilot.delivery.exists()
