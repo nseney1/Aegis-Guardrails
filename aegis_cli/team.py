@@ -29,11 +29,12 @@ __all__ = ["TeamCommand", "run_team"]
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
-ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "metrics")
+ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "status", "metrics")
 
 
 def _team_payload(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
-    return primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now)
+    return {**primitives.envelope(f"aegis team {action}", {"workspace": str(root), **scope}, now=now),
+            "schema": f"aegis.team.{action}/v1"}
 
 
 def _emit(payload: Dict[str, Any]) -> None:
@@ -155,6 +156,22 @@ def _list(args: argparse.Namespace, root: Path, now: int) -> int:
     return EXIT_OK
 
 
+def _status(args: argparse.Namespace, root: Path, now: int) -> int:
+    from aegis_cli.formatters.text import render_team_status
+    from aegis_core.team_status import status
+
+    found = status(root, now, base=args.base, check=args.check)
+    payload = _team_payload("status", root, now, refs=team.LANES_REF,
+                            base=found.pop("base"), base_commit=found.pop("base_commit"))
+    payload.update(note=team.LEASE_NOTE, **found)
+    if args.json:
+        _emit(payload)
+    else:
+        for line in render_team_status(payload):
+            print(sanitize_display(line, max_len=None))
+    return EXIT_REFUSED if found["checks_passed"] is False else EXIT_OK
+
+
 def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     merges = team.merge_metrics(root, base=args.base)
     counts = team.event_counts(root)
@@ -189,6 +206,7 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
     "release": _release,
     "gc": _gc,
     "list": _list,
+    "status": _status,
     "metrics": _metrics,
 }
 
@@ -250,7 +268,7 @@ class TeamCommand(AegisCommand):
 
     name = "team"
     category = CommandCategory.WORKFLOW
-    help = "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics)"
+    help = "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics)"
     description = (
         "Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is "
         "cooperative conflict input, not a lock, not an identity and not proof that an agent is "
@@ -312,6 +330,12 @@ class TeamCommand(AegisCommand):
                        description="Delete every expired lease by compare-and-swap; unreadable leases are kept.")
         sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
                        description=team.LEASE_NOTE)
+        status = sub.add_parser("status", parents=[common], help="Inspect every lane, branch and optional tip verdict",
+                                description=team.LEASE_NOTE + " Inspection changes no leases, worktrees or events.")
+        status.add_argument("--base", default=None, metavar="REF",
+                            help="Compare branch tips to this commit (default: the base resolved by check --lane)")
+        status.add_argument("--check", action="store_true",
+                            help="Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts")
         metrics = sub.add_parser(
             "metrics", parents=[common], help="Lease events and merge outcomes",
             description=(

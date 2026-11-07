@@ -1,11 +1,8 @@
 """Every git subprocess Aegis runs, except treeid's (scrubbed environment, private index;
 SECURITY.md). D20, host-matrix §3.7, v4.3 spec §10.1.
 
-A repository's own config is attacker-controlled: ``core.fsmonitor`` names a program
-that ``git status``/``git diff`` run, hooks run on many commands, a clean filter
-(``filter.<driver>.clean``) runs whenever git hashes a working-tree file that
-``.gitattributes`` assigns to that driver, and remotes can prompt for credentials. So
-every call here:
+Repository config can run fsmonitor, hooks, clean filters (through .gitattributes)
+and remote credential helpers. Each call uses these defenses:
 
 - runs ``git`` as an argv list (no shell) with a timeout;
 - passes ``-c core.fsmonitor=false -c core.hooksPath=<devnull> -c protocol.allow=never
@@ -13,6 +10,7 @@ every call here:
   signature programs (``gpg.program``, ``gpg.openpgp.program``, ``gpg.x509.program``) at
   <devnull> (command-line config beats repo config);
 - sets ``GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 LC_ALL=C``.
+  ``GIT_ALLOW_PROTOCOL= GIT_NO_LAZY_FETCH=1`` blocks fetches; validated sync push opts in.
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
   Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
@@ -140,6 +138,8 @@ _ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_ALLOW_PROTOCOL": "",
+    "GIT_NO_LAZY_FETCH": "1",
     "LC_ALL": "C",
 }
 # What ``git rev-parse --local-env-vars`` lists: each points git at another repository, index or

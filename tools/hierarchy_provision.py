@@ -780,8 +780,22 @@ def carry_text(request, record, old, names, in_order, new):
                 lines.append("  Worktree %s, branch %s, lease %s oid %s, expires %s. It holds a writer slot in the shared ledger." % (
                     ready["worktree"], ready["branch"], ready["lease_ref"], ready["lease_oid"], ready["lease_expires_at"]))
     if record["open_job_requests"]:
-        lines += ["", "## Open job requests", "", "These were never answered there. Ask root again here if they are still wanted: " +
-                  ", ".join(record["open_job_requests"])]
+        from hierarchy_mailbox import read_bytes
+        lines += ["", "## Open job requests", "",
+                  "These original requests have no terminal receipt. Their effects may be running, completed or uncertain; "
+                  "moving the mailbox does not settle them.",
+                  "Before any new request, ask the operator to identify and verify the original workspace store and reconcile "
+                  "the original claims, results, receipts and reservations.",
+                  "Inspect that store with tools/hierarchy_jobs.py --store <original-workspace-store> recovery-status --initiative " +
+                  record["hierarchy"] + ". This report is read-only and does not settle or restart jobs.",
+                  "Do not submit a new request, replay work or release reservations from missing replies or a mailbox move. "
+                  "If the original store cannot be verified, hold for operator reconciliation.", ""]
+        requests = {row["message"]["message_id"]: row for row in in_order}
+        for identifier in record["open_job_requests"]:
+            row = requests[identifier]
+            sha256 = hashlib.sha256(read_bytes(row["path"])).hexdigest()
+            lines.append("- %s/%s: original request %s sha256 %s" % (
+                record["hierarchy"], identifier, row["path"], sha256))
     lines += ["", "## Newest messages", ""]
     for row in reversed(in_order[-RECENT_MESSAGES:]):
         message = row["message"]

@@ -127,6 +127,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.baseline": 2,
     "aegis_core.card": 3,
     "aegis_core.partition": 3,
+    # Read-only lane status report over lease declarations and the existing tip gate.
+    "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.
     "aegis_core.packs": 2,
     # The benchmark: scan, Layer 1 and events over a fixture corpus it ships as package data.

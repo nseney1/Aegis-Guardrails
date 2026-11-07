@@ -425,6 +425,9 @@ def _run_mode(flag: str, args: argparse.Namespace) -> int:
     def fail(message: str, code: int) -> int:
         if use_json:
             document = primitives.envelope(source, {"workspace": str(root)})
+            if flag == "--partition":
+                from aegis_core.partition import SCHEMA
+                document["schema"] = SCHEMA
             document.update(status="error", error=message)
             print(json.dumps(document, indent=2))
         else:

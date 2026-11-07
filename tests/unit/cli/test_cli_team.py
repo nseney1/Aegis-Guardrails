@@ -71,6 +71,7 @@ def _json(capsys, *argv: str):
 
 
 def _envelope(payload: dict, action: str) -> None:
+    assert payload["schema"] == f"aegis.team.{action}/v1"
     assert payload["source"] == f"aegis team {action}"
     assert payload["aegis_version"] == __version__
     assert TS.match(payload["checked_at"])
@@ -227,7 +228,7 @@ def test_outside_a_git_repository_team_is_a_usage_error(tmp_path: Path, monkeypa
 def test_no_action_prints_usage_and_exits_2(ws: Path, capsys):
     rc, out, err = _run(capsys)
     assert (rc, out) == (2, "")
-    assert err == ("usage: aegis team {claim,renew,transfer,release,gc,list,metrics} ...\n"
+    assert err == ("usage: aegis team {claim,renew,transfer,release,gc,list,status,metrics} ...\n"
                    "aegis team --help describes each action.\n")
 
 

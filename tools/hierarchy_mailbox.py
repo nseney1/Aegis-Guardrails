@@ -796,11 +796,17 @@ class Mailbox:
                 sources.append(self.source_witness(readiness["worktree"], request.get("evidence_dir")))
         pending.extend(job["message_id"] for job in jobs)
         if "delivery_dir" in request:
-            _, summary = self.endpoint_delivery(request["delivery_dir"], endpoint, records)
-            pending.extend(identifier for identifier in summary["unread"] if identifier not in pending)
+            delivery, _ = self.endpoint_delivery(request["delivery_dir"], endpoint, records)
+            # The status summary is capped for display. A handoff must retain every unread obligation.
+            unread = [identifier for identifier, row in delivery.items() if row["state"] != "read"]
+            pending.extend(identifier for identifier in unread if identifier not in pending)
+            # Keep ordinary unread briefs on the paged inbox surface; making all of them mandatory
+            # checkpoint metadata could prevent the successor from reading even its first page.
+        require(len(pending) <= 256, "handoff exceeds 256 pending messages")
+        require(len(briefs) <= 256, "handoff exceeds 256 brief references")
         acknowledgments = [m["message_id"] for m in touching if m["type"] == "ack"]
-        checkpoint = {"outgoing_stopped": True, "briefs": briefs[:256], "sources": sources, "lease_refs": lease_refs,
-                      "completed_checks": request.get("completed_checks", []), "pending_message_ids": pending[:256],
+        checkpoint = {"outgoing_stopped": True, "briefs": briefs, "sources": sources, "lease_refs": lease_refs,
+                      "completed_checks": request.get("completed_checks", []), "pending_message_ids": pending,
                       "last_acknowledgment_ids": acknowledgments[-MAX_RECENT_ACKNOWLEDGMENTS:]}
         self.checkpoint(checkpoint, records)
         self.checkpoint_assignments(endpoint, checkpoint, records)

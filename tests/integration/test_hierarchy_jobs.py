@@ -1228,12 +1228,21 @@ def test_resolve_refuses_a_job_with_no_claim_or_one_already_finished(shop):
     assert "invalid job" in shop.jobs("resolve", "--job", "../../etc", "--reason", "x", expect=2)["error"]
 
 
+def lock_after_started_receipt(shop, lock):
+    # Publication can become visible before its writer releases the lock. Keep the
+    # existing ten-second budget for both observing the receipt and acquiring our obstacle.
+    published = str(shop.root / "pilot" / "orchestrator" / "*-root-to-orchestrator-*-started.md")
+    return ("import glob, time\ndeadline = time.monotonic() + 10\nwhile time.monotonic() < deadline:\n"
+            "    if glob.glob(%r):\n        try:\n            open(%r, 'x').close()\n"
+            "        except FileExistsError:\n            pass\n        else:\n            break\n"
+            "    time.sleep(0.01)\nelse:\n"
+            "    raise TimeoutError('fixture could not acquire lock after started receipt within 10 seconds')\n"
+            % (published, str(lock)))
+
+
 def test_a_receipt_blocked_by_a_busy_mailbox_is_published_later_exactly_once(shop):
     lock = shop.root / ".write.lock"
-    # Waits for the started receipt first, so only the final receipt meets the busy mailbox.
-    published = str(shop.root / "pilot" / "orchestrator" / "*-root-to-orchestrator-*.md")
-    script = ("import glob, time\nfor _ in range(1000):\n    if glob.glob(%r):\n        break\n    time.sleep(0.01)\n"
-              "open(%r, 'x').close()" % (published, str(lock)))
+    script = lock_after_started_receipt(shop, lock)
     shop.recipes["recipes"]["locks"] = shop.command(["$python", "-c", script], heavy=True)
     shop.save_recipes()
     shop.request_job("job-1", "locks")
@@ -1251,9 +1260,7 @@ def test_a_receipt_blocked_by_a_busy_mailbox_is_published_later_exactly_once(sho
 def test_a_slot_blocked_by_a_busy_store_is_released_later(shop):
     """The receipt is already out by then, so the request is closed and only the ledger still remembers the job."""
     lock = shop.workspace.store / ".write.lock"
-    published = str(shop.root / "pilot" / "orchestrator" / "*-root-to-orchestrator-*.md")
-    script = ("import glob, time\nfor _ in range(1000):\n    if glob.glob(%r):\n        break\n    time.sleep(0.01)\n"
-              "open(%r, 'x').close()" % (published, str(lock)))
+    script = lock_after_started_receipt(shop, lock)
     shop.recipes["recipes"]["locks"] = shop.command(["$python", "-c", script], heavy=True)
     shop.save_recipes()
     shop.request_job("job-1", "locks")

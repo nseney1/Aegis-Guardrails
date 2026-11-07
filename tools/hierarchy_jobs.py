@@ -85,6 +85,7 @@ from hierarchy_workspace import (Store, absolute, capacity_view, check_paths, gr
 
 RECIPES_SCHEMA = "aegis.hierarchy-job-recipes/v1"
 PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
+DEPENDENT_PACKET_SCHEMA = "aegis.hierarchy-job-packet/v2"
 RESULT_SCHEMA = "aegis.hierarchy-job-result/v1"
 RECOVERY_SCHEMA = "aegis.hierarchy-recovery-status/v1"
 COMMAND_TOKENS = {"$python", "$paths", "$scratch", "$checkout", "$cargo_target"}
@@ -822,7 +823,91 @@ def source_digest(checkout):
                "dirty_content_sha256": digest, "dirty_entries": count}
 
 
-def admit(ledger, initiative, message, mailbox, recipes):
+class DependencyPending(ValueError):
+    """No dependent effect was admitted; keep the original request available for reconciliation."""
+
+    def __init__(self, detail, reason="dependency_pending"):
+        super().__init__(detail)
+        self.reason = reason
+
+    def row(self, job):
+        return {"job": job.id, "state": "waiting", "reason": self.reason, "detail": str(self)[:2048]}
+
+
+def check_dependency(store, initiative, message, packet, recipes):
+    """Require exact completed evidence, never a loop/status summary. This does not settle or publish anything."""
+    try:
+        require(packet["recipes_sha256"] == recipes["recipes_sha256"], "dependent recipe file changed")
+        mailbox = Mailbox(initiative["mailbox_root"])
+        mailbox.fence(message)
+        records = mailbox.messages()
+        previous = records.get(packet["after"]["message_id"])
+        if previous is None:
+            raise DependencyPending("predecessor request is not present")
+        require(file_sha256(safe_path(previous["path"])) == packet["after"]["sha256"],
+                "predecessor request hash mismatch")
+        parent = previous["message"]
+        require(parent["type"] == "job_request" and parent["from"] == message["from"]
+                and parent["to"] == message["to"], "predecessor must have the same requester and recipient")
+        raw = mailbox.brief(parent["brief"])
+        original = strict_json(packet_text(raw))
+        require(isinstance(original, dict) and original.get("schema") in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA),
+                "invalid predecessor packet")
+        require(all(original.get(key) == packet[key] for key in ("checkout", "commit", "tree"))
+                and original.get("dirty_content_sha256", EMPTY_STATUS) == EMPTY_STATUS,
+                "predecessor source differs from dependent source")
+        require(isinstance(original.get("recipe"), str) and original["recipe"] in recipes["recipes"]
+                and recipes["recipes"][original["recipe"]]["kind"] == "command",
+                "predecessor must be a command check")
+        job = Job(store.path, initiative, parent)
+        result = job.result()
+        if result is None:
+            raise DependencyPending("predecessor has no validated terminal result")
+        require(result["state"] == "completed", "predecessor did not complete successfully")
+        require(result.get("recipe") == original["recipe"] and result.get("recipes_sha256") == packet["recipes_sha256"],
+                "predecessor recipe provenance mismatch")
+        claim = read_json(job.claim_path)
+        require(isinstance(claim, dict) and claim.get("recipes_sha256") == packet["recipes_sha256"],
+                "predecessor claim recipe provenance mismatch")
+        require(read_bytes(job.folder / "packet.md") == raw, "predecessor retained packet mismatch")
+        for name in ("before", "after"):
+            witness = result.get(name)
+            require(isinstance(witness, dict) and witness.get("worktree") == packet["checkout"]
+                    and witness.get("source_revision") == packet["commit"]
+                    and witness.get("source_tree") == packet["tree"]
+                    and witness.get("dirty_content_sha256") == EMPTY_STATUS,
+                    "predecessor source witness mismatch")
+        check_settlement_processes(job, result)
+        require(job.runner_alive() is False, "predecessor runner is still live or unknown")
+        require(not any(r["holder"] == job.holder and r["state"] in ("queued", "granted")
+                        for r in store.load().requests.values()), "predecessor reservation is not settled")
+        receipt = {"state": "completed", "exit_code": 0, "evidence": job.evidence()}
+        if result.get("reason") is not None:
+            receipt["reason"] = result["reason"][:4096]
+        prior = records.get(receipt_id(job, "completed"))
+        if prior is None:
+            raise DependencyPending("predecessor terminal receipt is not published")
+        require(receipt_matches(job, prior["message"], receipt, result_body(job, result)),
+                "predecessor terminal receipt does not match retained evidence")
+    except DependencyPending:
+        raise
+    except ERRORS as exc:
+        raise DependencyPending(str(exc), "dependency_held") from exc
+
+
+def pending_dependency(store, job, exc, wait, recipes_sha256):
+    """A reserved job needs a durable no-effect refusal, not an orphaned slot or release from absence."""
+    try:
+        if any(r["holder"] == job.holder and r["state"] in ("queued", "granted")
+               for r in store.load().requests.values()):
+            # refuse takes the exclusive claim first. A competing runner keeps its claim and capacity.
+            return refuse(store, job, "dependency changed after capacity admission: " + str(exc), wait, recipes_sha256)
+        return exc.row(job)
+    except ERRORS as failure:
+        return blocked_row(job, failure)
+
+
+def admit(ledger, initiative, message, mailbox, recipes, store=None):
     """Everything a job must satisfy before it runs. A ValueError here becomes the refusal's reason."""
     raw = mailbox.brief(message["brief"])
     try:
@@ -831,9 +916,11 @@ def admit(ledger, initiative, message, mailbox, recipes):
         raise ValueError("packet is not UTF-8") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("packet is not valid JSON") from exc
-    fields(packet, {"schema", "recipe", "checkout", "commit", "tree"},
+    dependent = isinstance(packet, dict) and packet.get("schema") == DEPENDENT_PACKET_SCHEMA
+    fields(packet, {"schema", "recipe", "checkout", "commit", "tree"} |
+           ({"after", "recipes_sha256"} if dependent else set()),
            {"dirty_content_sha256", "paths", "expected_tree", "message", "merge"})
-    require(packet["schema"] == PACKET_SCHEMA, "unsupported packet schema")
+    require(packet["schema"] in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA), "unsupported packet schema")
     name = packet["recipe"]
     require(isinstance(name, str) and name in recipes["recipes"], "unknown recipe: " + str(name)[:128])
     recipe = recipes["recipes"][name]
@@ -847,6 +934,15 @@ def admit(ledger, initiative, message, mailbox, recipes):
     require(not recipe.get("require_clean", False) or dirty == EMPTY_STATUS, clean_refusal(name))
     paths = checked_paths(packet, recipe, checkout)
     kind = recipe["kind"]
+    if dependent:
+        require(kind == "command" and dirty == EMPTY_STATUS, "dependent jobs require command checks on clean source")
+        fields(packet["after"], {"message_id", "sha256"})
+        matching(packet["after"]["message_id"], SLUG, "predecessor message id")
+        matching(packet["after"]["sha256"], SHA256, "predecessor sha256")
+        matching(packet["recipes_sha256"], SHA256, "recipes sha256")
+        require(packet["after"]["message_id"] != message["message_id"], "a job cannot depend on itself")
+        require(store is not None, "dependent jobs require the workspace store")
+        check_dependency(store, initiative, message, packet, recipes)
     if kind in ("commit", "merge"):
         require("expected_tree" in packet and "message" in packet, "a %s recipe needs expected_tree and message" % kind)
         matching(packet["expected_tree"], GIT_ID, "expected_tree")
@@ -1692,7 +1788,17 @@ def checkout_state(checkout, commit, created, view):
 
 def run_job(store, job, packet, packet_raw, recipes, wait):
     recipe = recipes["recipes"][packet["recipe"]]
-    if not job.claim(packet_raw, recipes["recipes_sha256"]):
+    if packet["schema"] == DEPENDENT_PACKET_SCHEMA:
+        # Capacity may have delayed this request. Revalidate before taking an irreversible execution claim.
+        try:
+            with writer_lock(Path(job.initiative["mailbox_root"])):
+                check_dependency(store, job.initiative, job.message, packet, recipes)
+                claimed = job.claim(packet_raw, recipes["recipes_sha256"])
+        except DependencyPending as exc:
+            return pending_dependency(store, job, exc, wait, recipes["recipes_sha256"])
+    else:
+        claimed = job.claim(packet_raw, recipes["recipes_sha256"])
+    if not claimed:
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
@@ -1909,7 +2015,10 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
                 rows.append(existing)
                 continue
             try:
-                packet, raw = admit(ledger, initiative, message, mailbox, recipes)
+                packet, raw = admit(ledger, initiative, message, mailbox, recipes, store)
+            except DependencyPending as exc:
+                rows.append(pending_dependency(store, job, exc, wait, recipes["recipes_sha256"]))
+                continue
             except ERRORS as exc:
                 try:
                     rows.append(refuse(store, job, str(exc), wait, recipes["recipes_sha256"]))
@@ -2153,7 +2262,8 @@ def recovery_source(job, mailbox, result):
     if mailbox is None or "brief" not in job.message:
         return {"state": "unavailable", "reason": "original mailbox request is unavailable"}
     packet = strict_json(packet_text(mailbox.brief(job.message["brief"])))
-    require(isinstance(packet, dict) and packet.get("schema") == PACKET_SCHEMA, "invalid recovery packet")
+    require(isinstance(packet, dict) and packet.get("schema") in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA),
+            "invalid recovery packet")
     checkout = absolute(packet["checkout"], "checkout")
     require(checkout in job.initiative["checkouts"], "checkout is no longer registered for this initiative")
     view = MERGE_VIEW_ENV if "merge" in packet else None
